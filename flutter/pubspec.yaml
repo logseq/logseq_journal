@@ -1,0 +1,29 @@
+name: bonsai_flutter_logseq_journal_host
+description: Mechanical Flutter host for the OCaml-owned logseq_journal application.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.12.2
+  flutter: ">=3.44.0"
+
+hooks:
+  user_defines:
+    bonsai_flutter_native:
+      native_artifact_root: ../_build/bonsai-flutter/native-artifacts/logseq_journal/
+      ios_deployment_target: '15.0'
+      require_ocaml_backend: true
+
+dependencies:
+  bonsai_flutter:
+    path: ../.bonsai-flutter/flutter-packages/bonsai_flutter
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

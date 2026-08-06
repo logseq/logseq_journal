@@ -1,0 +1,3 @@
+(test
+ (name app_test)
+ (libraries app bonsai bonsai_flutter.spec bonsai_flutter_test core))

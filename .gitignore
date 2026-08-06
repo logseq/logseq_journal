@@ -1,0 +1,32 @@
+# macOS and editor state
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+
+# OCaml, Dune, and local OPAM state
+/_build/
+/_opam/
+*.install
+.merlin
+.merlin-exist-*
+*.coverage
+/_bisect_ppx_coverage/
+
+# bonsai_flutter dependency and artifact staging
+/.bonsai-flutter/
+
+# Local environment and cache directories
+.env
+.env.*
+!.env.example
+.direnv/
+.cache/
+
+# Logs and local runtime data
+*.log
+/journal.sqlite3
+/journal.sqlite3-shm
+/journal.sqlite3-wal

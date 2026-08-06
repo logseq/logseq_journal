@@ -1,0 +1,22 @@
+opam-version: "2.0"
+name: "logseq_journal"
+version: "0.1.0"
+synopsis: "logseq_journal Bonsai Flutter application"
+maintainer: "application authors"
+authors: ["application authors"]
+license: "MIT"
+depends: [
+  "ocaml" {= "5.1.1"}
+  "dune" {>= "3.17"}
+  "bonsai_flutter" {= "0.1.0~dev"}
+  "bonsai_flutter_test" {with-test & = "0.1.0~dev"}
+  "bonsai_flutter_tool" {= "0.1.0~dev"}
+  "base" {>= "v0.17" & < "v0.18~"}
+  "bonsai" {>= "v0.17" & < "v0.18~"}
+  "core" {>= "v0.17" & < "v0.18~"}
+  "incr_dom" {>= "v0.17" & < "v0.18~"}
+  "virtual_dom" {>= "v0.17" & < "v0.18~"}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]

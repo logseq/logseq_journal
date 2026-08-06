@@ -1,0 +1,26 @@
+(library
+ (name app)
+ (wrapped false)
+ (modules application)
+ (libraries
+  bonsai_flutter.spec_impl
+  base
+  bonsai
+  bonsai_flutter.ui
+  bonsai_flutter.driver
+  core
+  incr_dom.ui_incr
+  virtual_dom.ui_effect))
+
+(executable
+ (name native_embed)
+ (modules native_embed)
+ (enabled_if
+  (= %{env:BONSAI_FLUTTER_EMBED_OCAML=disabled} enabled))
+ (libraries
+  bonsai_flutter.spec_impl
+  app
+  bonsai_flutter.driver
+  bonsai_flutter.native_backend)
+ (modes
+  (native object)))
