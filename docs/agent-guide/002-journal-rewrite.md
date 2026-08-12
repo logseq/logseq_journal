@@ -4,22 +4,98 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposed implementation baseline; implementation blocked on Phase 0 gates |
-| Date | 2026-08-06 |
+| Status | Application implementation complete; local OCaml, Flutter, managed-host, macOS app-bundle, and unsigned iPhoneOS app-bundle gates are green, with the macOS deployment target and signed-device persistence proof still external |
+| Date | 2026-08-07 |
 | Scope | Rewrite the current in-memory prototype as a local-first journal app |
 | UI runtime | `bonsai_flutter` |
 | Data runtime | `datascript_ocaml` on one OCaml Worker Domain |
 | MVP persistence | App-private SQLite through `datascript-ocaml-native.sqlite` |
+| DataScript source policy | Pin and consume the researched version unchanged; harden it in a separate follow-up project |
 | Development target | macOS arm64 |
 | Mobile target | Physical iPhoneOS arm64, iOS 15 or later |
 | Supersedes | `001-journal-mobile-app-architecture.md` as the implementation baseline |
-| Implementation effect | Design only; no application code or build metadata is changed by this document |
+| Implementation effect | Governs the in-repository rewrite and its release gates |
 
 The previous architecture document remains useful historical research for
 native Logseq graph interoperability. It is no longer the current
 implementation baseline because the repository now contains a runnable
 prototype, the Worker API has evolved, the dependency commits have moved, and
 the former OCaml version conflict has been removed.
+
+The application-owned Phase 0 slice is implemented and tested: exact nested
+startup bytes, canonical Application Support containment, exact pinned
+dependencies, app-private schema and metadata admission, generic SQLite first
+store/restore/tail behavior, one Serial Worker owner, typed fact persistence
+across runtime replacement, process-lifetime path quarantine, and a bounded
+volatile accepted-mutation registry. `bonsai_flutter` commit
+`2838c77a9e4235e423e8a9a5340086aa1c119801` supplies the managed adapter,
+application request/event bridge, retained sparse-list transition state,
+typed `Viewport`/`Body` constraint boundary, and generic Dune-closure resolver.
+Managed-host synchronization is clean. The
+iPhoneOS resolver now builds and verifies the complete 66-package target
+closure, including DataScript, SQLite, Transit/EDN, `uucp`, and `uunf`, as an
+arm64 iOS 15 complete object. The unsigned iPhoneOS `Runner.app` also passes
+final arm64/iOS 15 framework and app-bundle verification. Remaining Phase 0
+external gates are the macOS deployment-target fix and the signed
+physical-iPhone persistence proof.
+
+The application-owned Phase 1 data slice is implemented and tested. Stable-ID
+Capture validates date, UUID, UTF-8, nonempty content, and the 65,536-byte
+bound before transaction construction; creates at most one page per journal
+day; writes the complete block, revision, task state, order, and mutation
+identity in one transaction; returns `db_after` projections; treats
+same-mutation redelivery as already applied; rejects block-ID collision; and
+restores the captured block through the Serial Worker after runtime
+replacement. Recent days, top-level blocks, compound sibling continuations,
+depth-two/eight-node previews, and bounded detail pages use derived tuple AVET
+seeks. Oversized stored content becomes a bounded sentinel, locks mutations,
+and never crosses into the rendered tree. Opening, empty, ready, recovery,
+mutation-locked, and terminal states render through the complete application.
+
+Phase 2 includes a pure bounded feed-state reducer, stable tagged slot
+keys, a hard 31-day/512-slot terminal Search boundary, the regular 48/88/56/64
+extent profile, a 24-child overlapping sparse-list window, and the complete
+single-destination `Navigation_shell` contract. Near-tail visible-range events
+load compound per-day continuations only after Worker admission and merge them
+through request-ID, request-generation, and cursor fencing. Older-day
+admission now preserves the loaded prefix, rejects stale or overlapping pages,
+and terminates at the 31-day/512-slot Search boundary. One-open previews load
+at most depth 2 and 8 descendants, update the `Morphing_surface` endpoint and
+extent override in the same domain-0 state transition, and discard stale
+responses. Block bodies open declarative `block-detail:<uuid>` pages with a
+bounded immediate-child page; platform pop is accepted only for the actual
+top page key and returns to the retained feed/window state. The centered shell
+is capped at 720 pixels, renders only the working Today destination, reserves
+bottom inset for a bottom-center Capture layer, and has tested motion,
+text-scale, semantic, contrast, live-region, and 48-pixel target profiles.
+Generation-fenced batches localize visible day headings through the native
+calendar formatter. A confirmed Capture made away from the top retains the
+current feed window behind a live saved-entry banner; Show recreates the list
+at the top and merges only after the top visible range settles. Drawer settled
+state is synchronized with OCaml while Flutter consumes system Back/Escape
+locally before reporting Closed. Every mounted block also exposes a bounded
+More action that opens its detail actions.
+
+Phase 3 includes complete durable Capture, child creation, task transition,
+and expected-revision edit vertical paths. Read-write feed states expose a
+dedicated, non-platform-pop editor route; recovery-only, opening, loading,
+mutation-locked, and terminal states do not expose mutation controls. The
+editor uses the retained 65,536-byte Flutter guard and document/local-revision
+acknowledgement protocol, disables blank Save, retains rejected or conflicting
+drafts, and requires explicit Keep/Discard for dirty cancellation. Save
+allocates stable IDs, observes an action-time calendar snapshot, records a
+pending command only after `Worker.Accepted`, and displays `Saved` only after a
+fenced durable response. Detail child creation atomically updates the parent,
+task and content mutations use compare-and-set revisions, and the process
+registry reconciles accepted commands after runtime replacement. Clean close
+writes basis-keyed atomic snapshots and retains the newest three without
+changing the pinned DataScript source.
+
+Phase 4 includes a 250 ms debounced Unicode NFKC-casefold Search route with a
+512-candidate request budget, automatic bounded continuation, 50-result and
+2 MiB work caps, 512-byte snippets, and raw 512-byte/256-scalar query limits.
+The remaining production gates are recorded explicitly rather than being
+claimed by the current test suite.
 
 ## Executive decision
 
@@ -37,8 +113,12 @@ one worker-backed vertical architecture:
    remains Worker-confined because queries may fill internal caches and lazily
    restore storage nodes.
 4. The greenfield MVP uses the installable public `Datascript_sqlite`
-   sublibrary at a pinned commit and a new app-private database. It does not
-   open or overwrite an existing Logseq `db.sqlite` file.
+   sublibrary at a pinned commit and a new app-private database. The journal
+   consumes that dependency unchanged: this implementation does not patch,
+   vendor, or otherwise modify `datascript-ocaml`. Backend cleanup, strict
+   restore, and failure-injection work proceed later as a separate dependency
+   project and do not block the journal rewrite. The MVP does not open or
+   overwrite an existing Logseq `db.sqlite` file.
 5. The Mail example supplies interaction and ownership patterns, not Gmail
    taxonomy. The journal adopts its rounded shell, drawer, bounded virtual
    window, single inline preview, stable declarative navigation, semantics, and
@@ -85,26 +165,43 @@ only that the current demo still runs; it does not verify Worker lifecycle,
 DataScript, SQLite, restart persistence, routing, text editing, or mobile
 packaging.
 
-The current build path also depends on a local, uncommitted
-`bonsai_flutter_tool` directory through `dune-project`. That tool generates
-`flutter/lib/main.dart` and synchronizes the generated host before a build, so
-the raw-string startup payload cannot be replaced safely only by hand-editing
-the generated Dart file. Commit `7ddb3a5a89d44c2e38bed66dfee1271febb60663`
-does not contain this local tool work. Phase 0 must choose one reproducible
-host-generation authority: pin a clean dependency commit that contains the
-tool and extend its generator for the typed host adapters, or explicitly leave
-managed-host synchronization and own the Dart host files in this repository.
+The reproducible build path uses the managed host authority in
+`bonsai_flutter` commit `2838c77a9e4235e423e8a9a5340086aa1c119801`.
+That clean commit includes the application-owned adapter and BFR1 bootstrap,
+the UTF-8 text-input byte-limit contract, the application request/event bridge,
+retained sparse-list transition state, typed axis-specific viewport/body slots,
+and generic per-application iPhoneOS Dune-closure resolution. Normal host
+synchronization preserves the selected
+application adapter and passes `bonsai-flutter sync-host --check`.
+`flutter/lib/main.dart` remains generated; Application Support and journal
+startup bytes belong in the application-owned adapter selected by
+`bonsai-flutter.sexp`.
 
-The current `bonsai-flutter.sexp` also has an empty feature set. The rewrite
-requires the SQLite feature and a complete iPhoneOS target closure that
-includes DataScript, `persistent_sorted_set_ocaml`, Transit, and their native
-dependencies, plus the chosen Unicode search stack (`uutf`, `uunf`, and `uucp`
-or an API-equivalent pinned implementation). The current tool's iPhoneOS
-allowlist does not yet admit that closure. A successful macOS build alone is
-therefore not dependency evidence for the mobile target. The active
-`bonsai-flutter-v017-exact` switch also has none of the DataScript closure
-packages installed, so metadata compatibility is research evidence rather
-than a completed integration build.
+The current `bonsai-flutter.sexp` enables SQLite. `dune-project` and
+`logseq_journal.opam` declare and pin DataScript,
+`persistent_sorted_set_ocaml`, Transit, EDN, SQLite, and the Unicode search
+stack (`uutf`, `uunf`, and `uucp`). The exact closure is installed in the
+`bonsai-flutter-v017-exact` host switch without modifying any dependency
+source. The macOS application library now links the generic
+`Datascript_sqlite` adapter and passes create, transact, close, reopen,
+restore, empty/nonempty tail, and 32/33-datom compaction tests.
+
+The generic iPhoneOS resolver excludes application-local Dune libraries while
+retaining their external dependencies. The recorded build resolves 66 target
+packages, 135 host-only packages, and 103 components, then verifies DataScript,
+SQLite, Transit/EDN, `persistent_sorted_set_ocaml`, `uucp`, and `uunf` objects
+as arm64 iOS 15 Mach-O before producing the application complete object. The
+remaining mobile gate is installation and persistence verification on a signed
+physical iPhone, not dependency declaration or cross-compilation.
+
+The official macOS native build produces the combined arm64 complete object,
+but the result still records macOS 26.0 while the application contract is
+macOS 13.0. Flutter's macOS 13 native hook therefore emits a newer-object
+linker warning. At `2838c77`, `artifact.ml` also hard-codes `26.0` for macOS
+verification rather than using `config.macos.minimum_version`. This cannot be
+fixed by declaring more application packages. `bonsai_flutter` must compile
+the macOS closure under the configured deployment target and verify the staged
+object against that same value.
 
 ### Corrections to the previous architecture baseline
 
@@ -164,7 +261,8 @@ backend must never be presented as a Logseq graph file even if both tables are
 named `kvs` and both codecs use Transit.
 
 The generic backend is the better MVP boundary, but it is still development
-software. Release readiness requires additional hardening:
+software. The following work remains desirable in a separate
+`datascript-ocaml` hardening project:
 
 - guarantee statement finalization and rollback for bind, step, finalize, and
   commit failures;
@@ -178,6 +276,16 @@ software. Release readiness requires additional hardening:
   uncertain write phase; and
 - build and execute the complete DataScript plus SQLite closure on macOS and a
   signed physical iPhone.
+
+That upstream hardening list is explicitly outside this repository's
+implementation scope. `logseq_journal` pins the researched dependency, tests
+its supported happy path, and compensates at the application boundary: one
+Worker owns one session, no accepted write is cancelled, `db_after` is
+installed only after `Datascript.transact` returns, and any storage exception
+is treated as durability-unknown and terminal for the remainder of the OS
+process. The app never promises same-process recovery, precise mutation
+reconciliation after a process restart, or complete detection of a tail group
+that the current dependency silently skips.
 
 ### Database value instead of mutable connection
 
@@ -202,8 +310,7 @@ validate command
   -> calculate and persist transaction
   -> success: install db_after and return its projection
   -> storage exception: retain no speculative database, quarantine session,
-     and enter Terminal until a process restart; after native cleanup is
-     hardened, close/reopen/restore and reconcile in-process
+     enter Terminal, and require a full process restart
 ```
 
 No `db`, connection, entity, storage callback, or lazy `Seq.t` crosses to
@@ -513,8 +620,10 @@ locale string alone.
 read-only SQLite mode. The generic backend opens every session with
 `sqlite3_open` and executes `CREATE TABLE IF NOT EXISTS` during open, including
 when the application intends only to read. A true read-only mode requires a
-separate native open API and is a release gate if product recovery must inspect
-a filesystem-read-only database.
+separate native open API. Filesystem-read-only inspection is therefore outside
+the current MVP; if it becomes a product requirement, it belongs to the
+separate `datascript-ocaml` hardening and dependency-upgrade track rather than
+blocking this journal implementation.
 
 ### Worker service state
 
@@ -548,24 +657,31 @@ ordering concern.
 6. Return a bounded initial feed projection with its basis.
 7. On shutdown, stop accepting work, cancel only bounded reads, let accepted
    durable mutations resolve or become outcome-unknown, close the session, and
-   record whether the canonical path closed cleanly.
+   record that the dependency's close call returned. The current API does not
+   expose a checked native-close result, so the journal does not claim that it
+   can detect a silent `sqlite3_close` failure.
 
-Restore returning `Some db` is not sufficient proof of health because the
-current implementation can skip an invalid tail group. Strict restore
-diagnostics are a release gate.
+Restore returning `Some db` is not sufficient proof of complete storage health
+because the current dependency can skip an invalid tail group. The journal
+validates the restored schema, store identity, and all bounded structural
+invariants it can observe, but this version does not claim strict tail
+diagnostics. Strict replay and corruption classification remain an upstream
+follow-up and are not a journal implementation gate.
 
 `App.shutdown` and `Worker_runtime.stop` do not return a storage-close result
 that can veto `Replace_existing`. Therefore `journal_storage` also owns a
 thread-safe, process-lifetime quarantine registry keyed by canonical database
-path and located outside an individual Worker service state. Unknown-write or
-failed-close paths are tombstoned before cleanup is attempted. Every future
-service initialization checks the registry before `open_session`; normal
-shutdown and runtime replacement never clear it. At the researched backend
-commit only an OS process restart clears a tombstone. After cleanup hardening,
-a controlled recovery may clear it only after checked rollback, finalize,
-close, reopen, strict restore, and reconciliation have all succeeded. Phase 0
-must prove the registry survives the framework's default `Replace_existing`
-cycle.
+path and located outside an individual Worker service state. A surfaced
+unknown-write or lifecycle-outcome-unknown path is tombstoned before cleanup
+is attempted. Every future service initialization checks the registry before
+`open_session`; normal shutdown and runtime replacement never clear an
+existing tombstone. At the researched backend commit only an OS process
+restart clears a tombstone. A future hardened dependency may enable a
+controlled recovery flow, but this journal baseline never clears a tombstone
+in-process. Phase 0 must prove the registry survives the framework's default
+`Replace_existing` cycle and prevents a second open until the OS process
+exits. A native close failure that the dependency does not report cannot be
+tombstoned and remains an accepted upstream risk in this pinned baseline.
 
 ### Query plans
 
@@ -712,20 +828,16 @@ The volatile pending registry does not survive an OS process restart. Because
 the mutation ID is written in the same uncertain transaction as the business
 change, its absence cannot reveal an attempted-but-not-applied command whose
 only copy was in memory. A crash-durable draft/intent journal would be a
-separate product and privacy design. Therefore the process-restart-only path at
-the researched commit is diagnostic behavior, not an acceptable foundation
-for Phase 3 writes.
-
-After the backend guarantees finalize, rollback, and checked close on every
-path, an internal one-use recovery capability may replace steps 3-4 with a
-controlled close and reopen while ordinary service initialization remains
-rejected. Only strict restore and successful reconciliation may then clear the
-tombstone. This path requires failure-injection evidence before it can avoid a
-process restart, and it is a mandatory writable-MVP gate before Phase 3.
+separate product and privacy design. The MVP therefore accepts a conservative
+process-restart-only recovery boundary: it reports only that the previous
+write outcome is unknown, never claims that the draft was recovered, and on
+the next launch presents only state restored from the canonical database.
+This limitation does not block Phase 3.
 
 Blind retry in the same session is always forbidden. Same-process reopen is
-also forbidden until the native backend guarantees rollback, statement
-cleanup, and checked close on every failure path.
+also forbidden in this journal baseline. A later `datascript-ocaml` release may
+support a stronger recovery contract, but adopting it requires a separate
+dependency update and does not change the current implementation plan.
 
 ### Worker protocol
 
@@ -818,14 +930,14 @@ remain below their real framework transport ceilings. Unicode normalization
 expansion is checked before matching. A command that exceeds a limit returns
 typed validation and creates no datom.
 
-The current text-field API has no UTF-8 byte cap, so Phase 0 must add a retained
-Flutter-side `max_utf8_bytes`/input-formatter contract for content and Search
-fields. It rejects an over-limit insertion or paste before EventBatch encoding,
-preserves the last valid controller/selection/composing state, and emits one
-bounded limit-reached action for accessible feedback. It never truncates in the
-middle of UTF-8, a scalar, or an active IME composition. This local guard is
-required because a value above the framework's 1 MiB string ceiling can fail
-encoding before either OCaml validator runs.
+The pinned text-field API exposes a retained Flutter-side
+`max_utf8_bytes`/input-formatter contract. Content and Search fields must use
+it so an over-limit insertion or paste is rejected before EventBatch encoding,
+the last valid controller/selection/composing state is preserved, and one
+bounded limit-reached action provides accessible feedback. It never truncates
+in the middle of UTF-8, a scalar, or an active IME composition. This local
+guard is required because a value above the framework's 1 MiB string ceiling
+can fail encoding before either OCaml validator runs.
 
 The host calendar adapter likewise enforces its 64-day batch and 256-byte
 per-heading limits before emitting an event; domain 0 rechecks them before
@@ -1147,35 +1259,39 @@ Before implementation starts:
   `bonsai-flutter.sexp`, generated-host/tooling files, and `spec/*.mli`
   contracts that the implementation will create or modify;
 - decide that app-private generic SQLite is the MVP product mode;
-- resolve the uncommitted `bonsai_flutter_tool` dependency by choosing and
-  pinning a clean managed-host toolchain or by explicitly owning the Dart host
-  outside that synchronization path;
-- pin exact clean commits for `bonsai_flutter`, `datascript-ocaml`,
+- pin `bonsai_flutter` commit
+  `2838c77a9e4235e423e8a9a5340086aa1c119801` as the clean managed-host,
+  typed viewport/body, UTF-8-limit, generic target-closure, and signed-device
+  SQLite authority;
+- pin exact clean commits for `datascript-ocaml`,
   `persistent-sorted-set-ocaml`, Transit, and the Unicode UTF/normalization/
   property stack (`uutf`, `uunf`, and `uucp`, or a reviewed equivalent);
-- enable `(features sqlite)` in `bonsai-flutter.sexp`, add the complete
-  DataScript/SQLite/Unicode transitive closure to the SDK feature profile and
-  iPhoneOS allowlist, and record the resulting target closure;
-- extend the chosen host authority with the versioned startup envelope,
-  Application Support path resolver, lifecycle events, and live typed calendar
-  bridge; prove that a build sync preserves rather than overwrites them;
+- consume the pinned `datascript-ocaml` commit unchanged; do not patch its
+  SQLite stubs, storage implementation, tests, Dune files, or package metadata
+  from the journal implementation;
+- enable `(features sqlite)` in `bonsai-flutter.sexp`, declare the complete
+  DataScript/SQLite/Unicode transitive closure in this application, use the
+  framework's generic per-application resolver, and record the resulting
+  iPhoneOS target closure; the verified closure contains 66 target packages,
+  135 host-only packages, and 103 components;
+- implement the versioned startup envelope and Application Support path
+  resolver in the application-owned adapter;
+- extend the host authority with an application request/event extension point
+  that is available when `BonsaiFlutterRoot` is constructed, then implement
+  lifecycle events and the live typed calendar bridge through that extension;
+  prove that a build sync preserves rather than overwrites the adapter;
 - verify the exact BFR1 outer bytes, `logseq_journal` entrypoint,
   `replaceExisting` policy, inner journal codec, and 1 MiB rejection on both
   Dart and OCaml sides;
-- add and verify the retained Flutter text-input UTF-8 byte-limit contract so
+- use and verify the framework Flutter text-input UTF-8 byte-limit contract so
   oversized paste/composition cannot fail EventBatch before OCaml validation;
 - prove canonical parent containment and reject traversal, symlink-component,
   and symlink-leaf database paths;
 - build a minimal combined `App.create_with_worker` plus
   `Datascript_sqlite` complete object on OCaml 5.1.1;
-- harden SQLite failure paths with guaranteed finalize/rollback, checked close,
-  bounded busy handling, same-path session rejection, and typed error phases;
-- make tail replay strict or add diagnostics that make any skipped group a
-  corrupt-store result;
-- add begin/bind/step/finalize/commit failure injection and prove that no
-  statement, transaction, connection, or lock is orphaned;
 - add the process-lifetime canonical-path quarantine registry and prove that a
-  failed close/unknown write cannot reopen through `Replace_existing`;
+  surfaced storage exception or lifecycle-outcome-unknown state cannot reopen
+  through `Replace_existing` during the same OS process;
 - add the process-lifetime volatile pending-mutation registry and prove that an
   accepted command survives same-process runtime replacement for reconciliation;
 - prove create, transact, close, reopen, and restore on macOS;
@@ -1183,11 +1299,12 @@ Before implementation starts:
 - define the app schema and Worker protocol in reviewed `.mli` contracts.
 
 Exit criterion: the combined runtime persists one typed fact across a full
-runtime shutdown/restart on both supported targets, strict restore rejects
-corrupt tails, and every injected supported storage-failure phase ends in
-checked cleanup plus controlled same-process reopen/strict-restore/
-reconciliation. A process-restart-only result remains a safe tombstoned
-diagnostic fallback, but does not satisfy the writable Phase 3 gate.
+runtime shutdown/restart on both supported targets. A surfaced storage
+exception tombstones the canonical path, enters `Terminal`, prevents
+same-process reopen through `Replace_existing`, and requires an OS process
+restart; strict tail diagnostics, injected storage-failure cleanup, and
+controlled same-process recovery are explicitly deferred to the independent
+`datascript-ocaml` hardening track and are not writable Phase 3 gates.
 The generated host survives its normal sync command, live calendar events
 cross the real host boundary, and the recorded iPhoneOS closure contains every
 DataScript/SQLite/Unicode dependency. Startup uses the nested framework/application
@@ -1241,9 +1358,10 @@ extent overrides beyond their hard cap.
 - Add conflict, uncertain-write, recovery, and mutation-locked flows.
 
 Exit criterion: capture/edit/task changes survive restart, failed writes never
-display `Saved`, recoverable same-process uncertain outcomes reconcile by
-stable identity, and a tombstoned process-restart case reports only canonical
-restore health rather than inventing a lost mutation result.
+display `Saved`, healthy same-process runtime replacement reconciles accepted
+commands by stable identity, and any storage-exception tombstone requires a
+full process restart that reports only canonical restore health rather than
+inventing a lost mutation result.
 
 ### Phase 4: bounded search and production hardening
 
@@ -1253,8 +1371,9 @@ restore health rather than inventing a lost mutation result.
 - Add backups, schema upgrade fixtures, long-running soak tests, and
   content-free operational diagnostics.
 
-Exit criterion: all release gates and supported-device tests pass with no
-content in diagnostics.
+Exit criterion: all journal-owned release gates and supported-device tests
+pass with no content in diagnostics. Deferred `datascript-ocaml` hardening is
+tracked independently and does not change this exit criterion.
 
 ### Optional Phase 5: native Logseq interoperability
 
@@ -1324,17 +1443,22 @@ extension change.
 - first create/store/close/reopen/restore;
 - empty and nonempty tail;
 - 32/33-datom compaction boundary;
-- root, tail, and missing/corrupt node diagnostics;
-- begin/bind/step/finalize/commit failure injection;
-- rollback and statement cleanup;
-- busy timeout and same-path second-session rejection;
+- surfaced root and missing/corrupt-node errors supported by the pinned
+  dependency, without claiming strict invalid-tail detection;
 - canonical-root containment plus traversal/symlink rejection;
 - process-lifetime path tombstone across service and runtime replacement;
 - process-restart canonical restore at the researched commit with no false
   mutation-specific or draft-recovery claim;
-- safe same-process reopen/reconciliation after checked cleanup hardening;
-- checked shutdown and runtime replacement; and
+- normal shutdown and runtime replacement without an injected backend failure;
+- a surfaced storage exception enters `Terminal` and prevents same-process
+  reopen, without injecting failures into or modifying `datascript-ocaml`; and
 - macOS and physical-iPhone system SQLite behavior.
+
+Tests for bind/step/finalize/commit failure injection, checked rollback/close,
+busy handling, second-session rejection inside the adapter, strict tail replay,
+and safe same-process reopen belong to the separate `datascript-ocaml`
+hardening project. This journal suite must not claim those properties from the
+pinned dependency.
 
 ### Bonsai and Flutter tests
 
@@ -1388,7 +1512,9 @@ The implementation is not complete until evidence proves all of the following:
 
 - no current application data remains hard-coded in the UI component;
 - one Worker exclusively owns DataScript and SQLite;
-- all durable commands survive close/reopen;
+- all confirmed durable commands survive normal close/reopen, while any
+  surfaced storage exception enters `Terminal` and requires an OS process
+  restart;
 - every response is bounded and fenced;
 - only an accepted Worker request can create in-flight mutation UI, and every
   accepted request is resolved or cleared by a typed event;
@@ -1412,16 +1538,18 @@ The implementation is not complete until evidence proves all of the following:
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Generic SQLite backend has incomplete failure cleanup | Same-process retry or reopen can encounter an orphaned connection/lock | Phase 0 hardening; until then process-lifetime path tombstone, terminal state, and full process restart |
-| Worker shutdown cannot veto runtime replacement | A failed close is followed by a new open in the same process | Check a process-global canonical-path tombstone before every session open and test `Replace_existing` |
+| Generic SQLite backend has incomplete failure cleanup | Same-process retry or reopen can encounter an orphaned connection/lock | Consume the dependency unchanged; on any surfaced storage exception, tombstone the path, enter `Terminal`, and require a full process restart; harden upstream separately |
+| Worker shutdown cannot veto runtime replacement, and the pinned dependency does not report native close failure | A silent failed close may be followed by a new open in the same process | Test the normal close/reopen path, check a process-global tombstone after every surfaced storage/lifecycle failure, never clear that tombstone in-process, and defer checked-close guarantees to the upstream hardening track |
 | Startup receives an unanchored absolute path | OCaml cannot prove Application Support containment | Pass canonical support root plus fixed relative name; verify parent and reject symlinks natively |
-| Tail replay silently skips invalid groups | Restore can look successful while omitting facts | Strict replay diagnostics and corrupt-store rejection |
+| Tail replay silently skips invalid groups | Restore can look successful while omitting facts | Record this pinned-dependency limitation, validate all observable journal invariants, maintain backups, and fix strict replay only in the separate upstream hardening track |
 | `Conn.transact` advances memory before store | Memory can get ahead of disk | Worker owns one persistent database value; install `db_after` only after `Datascript.transact` returns |
 | Floating transitive pins | Builds are not reproducible | Pin exact commits and record them in the implementation baseline |
 | Uncommitted host generator rewrites `main.dart` | Typed startup/calendar adapters disappear during build sync | Resolve one clean host authority in Phase 0 and test sync preservation |
-| iPhoneOS allowlist omits the DataScript closure | macOS succeeds while device packaging fails | Enable SQLite feature, record the full closure, update the profile, and prove a signed device slice |
+| The declared application closure omits a DataScript dependency | macOS succeeds while device packaging fails | Enable SQLite, declare and record the full closure through the generic resolver, and prove a signed device slice |
+| The iPhoneOS resolver treats application-local Dune libraries as host opam libraries | Target resolution stops at `Dune library app does not resolve in the pinned host switch` | Fix `bonsai_flutter` to exclude workspace-local libraries from external closure roots while preserving their external library dependencies; do not restructure this application as a workaround |
+| Host-switch native objects inherit the current macOS SDK deployment minimum | The staged complete object advertises macOS 26.0 and produces linker warnings in a macOS 13.0 application | Build the host closure with the configured deployment target and make complete-object verification reject a mismatched `LC_BUILD_VERSION` minimum |
 | Generic database mistaken for Logseq format | Data loss or incompatible file | App-private path/name, explicit metadata, no direct import/export claim |
-| Dune, build metadata, or `spec/*.mli` edits lack explicit authorization | Rewrite cannot add dependencies or reviewed contracts | Obtain file-specific authorization before Phase 0 implementation; stop if a contract is unclear |
+| A reviewed `.mli` contract is unclear or unreasonable | Implementation can encode the wrong boundary | Stop at that contract, report the exact issue and proposed change, and wait for review |
 | Known-extent list clips arbitrary content | Broken feed layout | Bounded lines, explicit extent profiles, limited preview, detail route |
 | Whole-row pointer host lacks keyboard activation | Desktop/accessibility action is unreachable | Explicit focusable actions and keyboard tests |
 | Sparse list cannot key-anchor prefix insertion | Capture shifts a reader's viewport | Stage the new entry behind a banner away from the top, or first add a tested keyed-anchor primitive |
@@ -1433,7 +1561,7 @@ The implementation is not complete until evidence proves all of the following:
 | Search becomes one unbounded scan or silently partial | Slow Worker queue or missing results | Continue bounded stable-ID candidate pages with explicit complete/truncated state; add a derived index only if measured |
 | Search falls back to ASCII lowercase | Non-ASCII queries miss or mismatch content | Pin one Unicode NFKC/case-fold stack in Phase 0, include it in iPhoneOS closure, and share fixtures across targets |
 | A bounded item count carries an unbounded string | Worker, normalization, SQLite, or FFI work can still explode | Enforce UTF-8/scalar/snippet/estimated-response budgets in Flutter and both OCaml domains; mutation-lock oversized stored values |
-| Text input exceeds transport before OCaml sees it | EventBatch encoding fails and the root enters an error state | Add a retained Flutter byte-limit/input-formatter contract and test oversized paste plus IME recovery |
+| Text input exceeds transport before OCaml sees it | EventBatch encoding fails and the root enters an error state | Use the retained Flutter byte-limit/input-formatter contract and test oversized paste plus IME recovery |
 | Local midnight changes while Capture is open | Block saved into yesterday | Read a fresh typed calendar snapshot at submit and validate its generation |
 | OCaml formats headings from a locale string alone | Dates use English assumptions or the wrong calendar | Use bounded generation-fenced host formatting; keep `YYYYMMDD` identity proleptic Gregorian |
 | Application mutation lock is mistaken for SQLite read-only | A recovery inspection may still open or create storage | Name it mutation-locked; add a real native read-only open API before claiming filesystem-safe recovery |
@@ -1457,7 +1585,7 @@ should be confirmed before their affected phase:
 5. **Desktop layout:** default remains the Mail-style centered single column;
    split view requires a separate UX design.
 
-## Implementation authorization required
+## Implementation authorization
 
 The repository currently has no `spec/` directory, but it does have restrictive
 development instructions:
@@ -1467,15 +1595,18 @@ development instructions:
 - do not modify Dune files unless explicitly asked; and
 - stop if a future `.mli` contract is unclear or unreasonable.
 
-The rewrite necessarily changes `app/dune`, `test/dune`, `dune-project`,
-dependency metadata, `bonsai-flutter.sexp`, the selected generated-host/tooling
-authority, and reviewed public contracts. The next implementation request must
-therefore explicitly authorize each concrete Dune/build-metadata/tooling edit
-and the creation or modification of the named `spec/*.mli` files. A generic
-request to start coding is not interpreted as permission to edit those
-protected paths. If any proposed `.mli` definition is unclear or unreasonable,
-implementation stops immediately and reports the exact issue, proposed change,
-and rationale. This design does not grant that authority.
+The follow-up implementation request explicitly authorizes all files in this
+repository, including Dune files, dependency metadata,
+`bonsai-flutter.sexp`, generated-host/tooling files, and `spec/*.mli` files.
+That authorization is now satisfied. If any proposed `.mli` definition is
+unclear or unreasonable, implementation still stops immediately and reports
+the exact issue, proposed change, and rationale.
+
+This implementation does not require or authorize changes in the
+`datascript-ocaml` repository. It pins and consumes the researched dependency
+unchanged. SQLite cleanup, strict restore, typed native errors, and failure-
+injection work require a separate task, repository scope, review, and future
+dependency update.
 
 ## Research baseline
 
@@ -1489,6 +1620,12 @@ Research used local source state on 2026-08-06:
   - current test: [`test/app_test.ml`](../../test/app_test.ml)
   - previous architecture: [`001-journal-mobile-app-architecture.md`](001-journal-mobile-app-architecture.md)
 - [`RCmerci/bonsai_flutter` at `7ddb3a5a89d44c2e38bed66dfee1271febb60663`](https://github.com/RCmerci/bonsai_flutter/tree/7ddb3a5a89d44c2e38bed66dfee1271febb60663)
+  - implementation authority subsequently advanced to
+    [`2838c77a9e4235e423e8a9a5340086aa1c119801`](https://github.com/RCmerci/bonsai_flutter/tree/2838c77a9e4235e423e8a9a5340086aa1c119801),
+    which contains the clean managed-adapter generator and BFR1 bootstrap,
+    UTF-8 text-input byte limits, the application bridge, retained sparse-list
+    transition state, typed axis-specific viewport/body slots, and generic
+    per-application iPhoneOS Dune-closure resolution;
   - the Mail source and README were unchanged from
     [`1fb0950ac40e06683ff28b19d0f410174d816d36`](https://github.com/RCmerci/bonsai_flutter/tree/1fb0950ac40e06683ff28b19d0f410174d816d36)
   - [Mail application](https://github.com/RCmerci/bonsai_flutter/blob/1fb0950ac40e06683ff28b19d0f410174d816d36/examples/mail/ocaml/mail.ml)
@@ -1510,13 +1647,20 @@ Research used local source state on 2026-08-06:
   - [Logseq SQLite table](https://github.com/logseq/logseq/blob/4975d5c21398d6173a2ef4444cb0f7c44817000e/deps/db/src/logseq/db/common/sqlite.cljs)
   - [WAL checkpoint and backup lifecycle](https://github.com/logseq/logseq/blob/4975d5c21398d6173a2ef4444cb0f7c44817000e/src/main/frontend/worker/db_core.cljs)
 
-The `bonsai_flutter` checkout was dirty. Its Mail source and README matched the
-recorded commit, so the Mail conclusions above are attributable to that pinned
-source. In contrast, the locally present `bonsai_flutter_tool` host generator,
-build-sync behavior, and iPhoneOS feature allowlist were uncommitted and are
-not part of `7ddb3a5a89d44c2e38bed66dfee1271febb60663`; they are recorded only as
-the current project's effective local build dependency and a Phase 0 blocker.
+The `bonsai_flutter` checkout was dirty during the original research. Its Mail
+source and README matched the recorded commit, so the Mail conclusions above
+remain attributable to that source. Managed-host generation, UTF-8 byte
+limits, the application bridge, retained sparse-list state, and generic
+per-application iPhoneOS closure resolution were subsequently committed and
+extended with typed axis-specific viewport/body slots at
+`2838c77a9e4235e423e8a9a5340086aa1c119801`; that commit is now the
+implementation pin. The application declares and has built its concrete
+DataScript/SQLite/Unicode target closure. The remaining framework defect is
+the macOS deployment-target mismatch described above.
 The `datascript-ocaml` files used by this research matched their recorded HEAD.
+The journal implementation deliberately consumes that recorded source
+unchanged; the hardening findings above are retained as input to a separate
+future dependency project, not as work items or gates for this repository.
 The `logseq` checkout also contained local changes, but none touched the three
 schema/SQLite lifecycle files cited above; those files matched the recorded
 Logseq commit. Implementation must start from explicit clean, pinned dependency

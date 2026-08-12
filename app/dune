@@ -1,15 +1,40 @@
 (library
  (name app)
  (wrapped false)
- (modules application)
+ (modules
+  application
+  journal_capture
+  journal_detail
+  journal_header
+  journal_model
+  journal_platform
+  journal_process_recovery
+  journal_repository
+  journal_routes
+  journal_row
+  journal_schema
+  journal_startup
+  journal_storage
+  journal_storage_path
+  journal_time
+  journal_timeline
+  journal_timeline_state
+  journal_validation
+  journal_visual_tokens
+  journal_worker)
  (libraries
   bonsai_flutter.spec_impl
   base
   bonsai
+  bonsai_flutter
   bonsai_flutter.ui
   bonsai_flutter.driver
   core
+  datascript-ocaml-native
+  datascript-ocaml-native.sqlite
   incr_dom.ui_incr
+  threads
+  unix
   virtual_dom.ui_effect))
 
 (executable
@@ -22,5 +47,23 @@
   app
   bonsai_flutter.driver
   bonsai_flutter.native_backend)
+ (link_flags
+  (:standard -cclib -L%{env:BONSAI_FLUTTER_APPLE_SDK_ROOT=}/usr/lib))
  (modes
   (native object)))
+
+; BEGIN bonsai-flutter native aliases
+
+(alias
+ (name bonsai-flutter-macos)
+ (enabled_if
+  (= %{context_name} default))
+ (deps native_embed.exe.o))
+
+(alias
+ (name bonsai-flutter-ios)
+ (enabled_if
+  (= %{context_name} default.ios))
+ (deps native_embed.exe.o))
+
+; END bonsai-flutter native aliases

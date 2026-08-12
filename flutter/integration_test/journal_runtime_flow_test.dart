@@ -1,0 +1,883 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
+
+import 'package:bonsai_flutter/bonsai_flutter.dart';
+// ignore: implementation_imports
+import 'package:bonsai_flutter/src/runtime/foreground_frame_loop.dart';
+import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  if (binding is LiveTestWidgetsFlutterBinding) {
+    binding.framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.onlyPumps;
+  }
+
+  for (final locale in const [
+    Locale('ar', 'SA'),
+    Locale('fa', 'IR'),
+    Locale('he', 'IL'),
+    Locale('ur', 'PK'),
+  ]) {
+    testWidgets('compiled OCaml runtime centers Capture for '
+        '${locale.toLanguageTag()}', (tester) async {
+      final harness = await _RuntimeHarness.start(tester);
+      final semantics = tester.ensureSemantics();
+      try {
+        await harness.show(
+          tester,
+          locale: locale,
+          textDirection: TextDirection.rtl,
+        );
+        await _pumpUntil(
+          tester,
+          () => find.text('No journal entries yet').evaluate().isNotEmpty,
+        );
+        await _pumpRuntime(tester);
+        await _pumpRuntime(tester);
+        expect(
+          tester.getCenter(find.text('Today')).dx,
+          closeTo(_renderViewWidth(tester) / 2, 2),
+        );
+        expect(find.bySemanticsLabel('Menu'), findsNothing);
+        expect(find.bySemanticsLabel('More'), findsNothing);
+        expect(
+          tester.getCenter(_materialGlyph(0xe3dc)).dx,
+          greaterThan(tester.getCenter(_materialGlyph(0xe402)).dx),
+          reason: 'RTL must mirror the noninteractive header shells',
+        );
+        expect(
+          tester.getCenter(find.bySemanticsLabel('Capture')).dx,
+          closeTo(_applicationViewportSize(tester).width / 2, 2),
+          reason: '${locale.toLanguageTag()} must center Capture',
+        );
+        expect(tester.takeException(), isNull);
+      } finally {
+        semantics.dispose();
+        await harness.dispose(tester);
+      }
+    }, timeout: const Timeout(Duration(minutes: 2)));
+  }
+
+  testWidgets(
+    'compiled OCaml runtime centers Capture and preserves route admission for en-US',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(tester);
+      final semantics = tester.ensureSemantics();
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('No journal entries yet').evaluate().isNotEmpty,
+        );
+        await _pumpRuntime(tester);
+        await _pumpRuntime(tester);
+        expect(
+          tester.getCenter(find.text('Today')).dx,
+          closeTo(_renderViewWidth(tester) / 2, 2),
+        );
+        expect(find.bySemanticsLabel('Menu'), findsNothing);
+        expect(find.bySemanticsLabel('More'), findsNothing);
+        expect(
+          tester.getCenter(_materialGlyph(0xe3dc)).dx,
+          lessThan(tester.getCenter(_materialGlyph(0xe402)).dx),
+          reason: 'LTR must preserve the noninteractive header shells',
+        );
+        expect(
+          tester.getCenter(find.bySemanticsLabel('Capture')).dx,
+          closeTo(_applicationViewportSize(tester).width / 2, 2),
+          reason: 'en-US must center Capture',
+        );
+        final capture = find.bySemanticsLabel('Capture');
+        if (!Platform.isIOS) {
+          final cancelled = await tester.startGesture(
+            tester.getCenter(capture),
+          );
+          await tester.pump();
+          expect(_pressedOverlay, findsOneWidget);
+          expect(find.text('New block'), findsNothing);
+          await cancelled.moveBy(const Offset(80, 0));
+          await tester.pump();
+          await cancelled.up();
+          await tester.pump(const Duration(milliseconds: 100));
+          expect(_pressedOverlay, findsNothing);
+          expect(find.text('New block'), findsNothing);
+        }
+
+        final captureSemantics = tester.getSemantics(capture);
+        expect(
+          captureSemantics.getSemanticsData().hasAction(SemanticsAction.tap),
+          isTrue,
+        );
+        captureSemantics.owner!.performAction(
+          captureSemantics.id,
+          SemanticsAction.tap,
+        );
+        captureSemantics.owner!.performAction(
+          captureSemantics.id,
+          SemanticsAction.tap,
+        );
+        await tester.pump();
+        if (!Platform.isIOS) {
+          expect(_pressedOverlay, findsOneWidget);
+          expect(find.text('New block'), findsNothing);
+          await tester.pump(const Duration(milliseconds: 80));
+        }
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('New block').evaluate().isNotEmpty,
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.text('New block'), findsOneWidget);
+        expect(find.byType(ModalBarrier), findsWidgets);
+        expect(find.text('Today'), findsOneWidget);
+        expect(
+          find.bySemanticsLabel('Adjust new block editor height'),
+          findsOneWidget,
+        );
+        expect(
+          ModalRoute.of(tester.element(find.text('New block'))),
+          isA<ModalBottomSheetRoute<void>>(),
+        );
+        expect(find.byType(TextField), findsOneWidget);
+        expect(
+          tester.widget<TextField>(find.byType(TextField)).autofocus,
+          isTrue,
+        );
+        expect(tester.takeException(), isNull);
+        await tester.drag(
+          find.bySemanticsLabel('Adjust new block editor height'),
+          const Offset(0, 600),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('New block').evaluate().isEmpty,
+        );
+        expect(find.text('Today'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      } finally {
+        semantics.dispose();
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'compiled OCaml runtime honors the safe-area adaptive environment',
+    (tester) async {
+      tester.view.padding = const FakeViewPadding(top: 47, bottom: 34);
+      tester.platformDispatcher.textScaleFactorTestValue = 2;
+      final harness = await _RuntimeHarness.start(tester);
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('No journal entries yet').evaluate().isNotEmpty,
+        );
+        expect(
+          tester.getBottomRight(find.bySemanticsLabel('Capture')).dy,
+          lessThanOrEqualTo(810),
+          reason: 'the Capture target must clear the 34-point safe bottom',
+        );
+      } finally {
+        tester.view.resetPadding();
+        tester.platformDispatcher.clearTextScaleFactorTestValue();
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'compiled OCaml runtime owns the contextual Capture sheet and task flow',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(tester);
+      final semantics = tester.ensureSemantics();
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('No journal entries yet').evaluate().isNotEmpty,
+        );
+        expect(find.text('Today'), findsOneWidget);
+        await _pumpUntil(
+          tester,
+          () =>
+              find.text('Fri, Aug 7').evaluate().isNotEmpty ||
+              find.text('Date unavailable').evaluate().isNotEmpty,
+        );
+        await _tapSemantics(tester, 'Capture');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('New block').evaluate().isNotEmpty,
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.text('Today'), findsOneWidget);
+        expect(find.byType(ModalBarrier), findsWidgets);
+        expect(
+          ModalRoute.of(tester.element(find.text('New block'))),
+          isA<ModalBottomSheetRoute<void>>(),
+        );
+        expect(
+          tester.getSemantics(find.bySemanticsLabel('Capture')).owner,
+          isNull,
+          reason:
+              'the Timeline semantics node must be detached by the modal route',
+        );
+        const literalSource = '中文 👩🏽‍💻 e\u0301 #literal @mention';
+        await tester.enterText(find.byType(TextField), literalSource);
+        await _pumpRuntime(tester);
+        await tester.drag(
+          find.bySemanticsLabel('Adjust new block editor height'),
+          const Offset(0, 700),
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        await _pumpRuntime(tester);
+        expect(find.text('New block'), findsOneWidget);
+        expect(find.text(literalSource), findsOneWidget);
+
+        await _tapSemantics(tester, 'Close new block editor');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('Discard draft?').evaluate().isNotEmpty,
+        );
+        await tester.tap(find.text('Keep editing').last);
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('Discard draft?').evaluate().isEmpty,
+        );
+        expect(find.text(literalSource), findsOneWidget);
+
+        await _tapSemantics(tester, 'Make task');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('To do').evaluate().isNotEmpty,
+        );
+        await _tapSemantics(tester, 'Save journal block');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text(literalSource).evaluate().isNotEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () => find
+              .bySemanticsLabel('Mark as done: $literalSource')
+              .evaluate()
+              .isNotEmpty,
+        );
+
+        await _tapSemantics(tester, 'Mark as done: $literalSource');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find
+              .bySemanticsLabel('Mark as todo: $literalSource')
+              .evaluate()
+              .isNotEmpty,
+        );
+
+        expect(find.text('Entry detail'), findsNothing);
+        await _exerciseEnvironmentMatrix(tester, source: literalSource);
+        await _requireMechanicalBudgets(tester, harness.runtime);
+
+        expect(find.textContaining('Search'), findsNothing);
+        expect(find.textContaining('Attachment'), findsNothing);
+        expect(find.textContaining('Thumbnail'), findsNothing);
+        expect(
+          find.text('Fri, Aug 7').evaluate().length +
+              find.text('Date unavailable').evaluate().length,
+          1,
+          reason: 'the compiled runtime must expose one truthful date context',
+        );
+      } finally {
+        semantics.dispose();
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'compiled OCaml runtime arbitrates end-to-start delete, scrolling, RTL, and Undo',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(tester);
+      final semantics = tester.ensureSemantics();
+      const source = 'Swipe delete compiled runtime row';
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('No journal entries yet').evaluate().isNotEmpty,
+        );
+        await _tapSemantics(tester, 'Capture');
+        await _pumpUntil(
+          tester,
+          () => find.text('New block').evaluate().isNotEmpty,
+        );
+        await tester.enterText(find.byType(TextField), source);
+        await _pumpRuntime(tester);
+        await _tapSemantics(tester, 'Make task');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('To do').evaluate().isNotEmpty,
+        );
+        await _tapSemantics(tester, 'Save journal block');
+        await _pumpUntil(tester, () => find.text(source).evaluate().isNotEmpty);
+        await _pumpUntil(
+          tester,
+          () =>
+              find.text('New block').evaluate().isEmpty &&
+              find.byType(TextField).evaluate().isEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () => find
+              .bySemanticsLabel(RegExp('Mark as done: $source'))
+              .evaluate()
+              .isNotEmpty,
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+
+        await tester.drag(find.text(source).first, const Offset(140, 0));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(find.text(source), findsOneWidget);
+        expect(find.text('Block and descendants removed'), findsNothing);
+
+        await tester.drag(find.text(source).first, const Offset(0, -100));
+        await tester.pump();
+        expect(find.text(source), findsOneWidget);
+        expect(find.text('Block and descendants removed'), findsNothing);
+
+        final task = _materialGlyph(0xe504).first;
+        await tester.drag(task, const Offset(-160, 0));
+        await tester.pump(const Duration(milliseconds: 250));
+        await _pumpRuntime(tester);
+        expect(find.text(source), findsNothing);
+        expect(
+          find.bySemanticsLabel(RegExp('Mark as done: $source')),
+          findsNothing,
+        );
+        expect(find.text('Block and descendants removed'), findsOneWidget);
+        final undo = find.bySemanticsLabel('Undo block deletion');
+        expect(undo, findsOneWidget);
+        expect(tester.getSize(undo).height, greaterThanOrEqualTo(48));
+        final snackbarRect = tester.getRect(
+          find.text('Block and descendants removed'),
+        );
+        final captureRect = tester.getRect(find.bySemanticsLabel('Capture'));
+        expect(snackbarRect.bottom, lessThan(captureRect.top));
+        expect(snackbarRect.left, greaterThanOrEqualTo(12));
+        expect(snackbarRect.right, lessThanOrEqualTo(378));
+        await tester.tap(undo);
+        await _pumpRuntime(tester);
+        await _pumpUntil(tester, () => find.text(source).evaluate().isNotEmpty);
+        expect(
+          find.bySemanticsLabel(RegExp('Mark as done: $source')),
+          findsOneWidget,
+        );
+
+        tester.platformDispatcher.accessibilityFeaturesTestValue =
+            const FakeAccessibilityFeatures(
+              disableAnimations: true,
+              reduceMotion: true,
+            );
+        await harness.show(
+          tester,
+          locale: const Locale('ar', 'SA'),
+          textDirection: TextDirection.rtl,
+        );
+        await _pumpUntil(tester, () => find.text(source).evaluate().isNotEmpty);
+        await tester.drag(find.text(source).first, const Offset(160, 0));
+        await tester.pump();
+        await _pumpRuntime(tester);
+        expect(find.text(source), findsNothing);
+        expect(find.text('Block and descendants removed'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+        await tester.tap(find.bySemanticsLabel('Undo block deletion'));
+        await _pumpRuntime(tester);
+      } finally {
+        tester.platformDispatcher.clearAccessibilityFeaturesTestValue();
+        semantics.dispose();
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'compiled OCaml runtime exposes a truthful startup error',
+    (tester) async {
+      final config = RuntimeBootstrapConfig(
+        entrypoint: 'logseq_journal',
+        launchPolicy: RuntimeLaunchPolicy.replaceExisting,
+        applicationPayload: Uint8List.fromList([0]),
+      ).encode();
+      await tester.pumpWidget(
+        MaterialApp(home: BonsaiFlutterRoot(config: config)),
+      );
+      await _pumpUntil(
+        tester,
+        () => find.textContaining('Bonsai runtime error').evaluate().isNotEmpty,
+      );
+      expect(find.textContaining('Bonsai runtime error'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _pumpRuntime(tester);
+    },
+    timeout: const Timeout(Duration(seconds: 45)),
+  );
+}
+
+Finder get _pressedOverlay => find.byWidgetPredicate(
+  (widget) => widget is ColoredBox && widget.color == const Color(0x1f0d142f),
+  description: 'active journal pressed overlay',
+);
+
+double _renderViewWidth(WidgetTester tester) =>
+    tester.binding.renderViews.first.size.width;
+
+Size _applicationViewportSize(WidgetTester tester) => Platform.isIOS
+    ? tester.view.physicalSize / tester.view.devicePixelRatio
+    : tester.binding.renderViews.first.size;
+
+Future<void> _exerciseEnvironmentMatrix(
+  WidgetTester tester, {
+  required String source,
+}) async {
+  if (Platform.isIOS) {
+    await _pumpRuntime(tester);
+    final renderViewSize = tester.binding.renderViews.first.size;
+    final applicationViewportSize = _applicationViewportSize(tester);
+    expect(
+      tester.getCenter(find.text('Today')).dx,
+      closeTo(renderViewSize.width / 2, 2),
+    );
+    expect(
+      tester.getCenter(find.bySemanticsLabel('Capture')).dx,
+      closeTo(applicationViewportSize.width / 2, 2),
+    );
+    expect(
+      tester.getBottomRight(find.bySemanticsLabel('Capture')).dy,
+      lessThanOrEqualTo(applicationViewportSize.height),
+    );
+    expect(find.text(source), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    return;
+  }
+
+  for (final size in const [Size(320, 720), Size(390, 844), Size(1200, 900)]) {
+    tester.view.physicalSize = size;
+    await _pumpRuntime(tester);
+    await _pumpUntil(tester, () => find.text('Today').evaluate().isNotEmpty);
+    expect(
+      tester.getCenter(find.text('Today')).dx,
+      closeTo(_applicationViewportSize(tester).width / 2, 2),
+    );
+    expect(tester.takeException(), isNull);
+  }
+
+  tester.platformDispatcher.platformBrightnessTestValue = Brightness.dark;
+  tester.platformDispatcher.accessibilityFeaturesTestValue =
+      const FakeAccessibilityFeatures(
+        highContrast: true,
+        disableAnimations: true,
+        reduceMotion: true,
+      );
+  await _pumpRuntime(tester);
+  await _pumpUntil(tester, () => find.text('Today').evaluate().isNotEmpty);
+  expect(tester.takeException(), isNull);
+
+  tester.view.physicalSize = const Size(744, 900);
+  tester.view.padding = const FakeViewPadding(top: 47, bottom: 34);
+  tester.platformDispatcher.textScaleFactorTestValue = 2;
+  await _pumpRuntime(tester);
+  await _pumpUntil(tester, () => find.text(source).evaluate().isNotEmpty);
+  await _pumpUntil(
+    tester,
+    () =>
+        (tester.getTopLeft(find.text(source)).dy -
+                tester.getTopLeft(find.text('00:30')).dy)
+            .abs() >
+        2,
+  );
+  final sourceTop = tester.getTopLeft(find.text(source)).dy;
+  final timeTop = tester.getTopLeft(find.text('00:30')).dy;
+  final timelineTop = tester.getTopLeft(find.byType(Scrollable).first).dy;
+  expect(
+    sourceTop - timelineTop,
+    lessThan(30),
+    reason:
+        'the adaptive timeline must not reapply the 47-point top safe area '
+        'below the header',
+  );
+  expect(
+    (sourceTop - timeTop).abs(),
+    greaterThan(2),
+    reason: 'text scale 2.0 must select the adaptive two-line row',
+  );
+  expect(
+    tester.getBottomRight(find.bySemanticsLabel('Capture')).dy,
+    lessThanOrEqualTo(866),
+    reason: 'the Capture target must clear the 34-point safe bottom',
+  );
+  tester.view.resetPadding();
+  tester.platformDispatcher.clearTextScaleFactorTestValue();
+}
+
+Future<void> _requireMechanicalBudgets(
+  WidgetTester tester,
+  RuntimeClient runtime,
+) async {
+  const maximumPatchBytes = 256 * 1024;
+  const maximumMountedNodes = 800;
+  const maximumResidentBytes = 512 * 1024 * 1024;
+  // This suite uses a debug native artifact; release/profile traces remain a
+  // physical-device acceptance gate.
+  const maximumFrameDuration = Duration(milliseconds: 75);
+
+  await _pumpRuntime(tester);
+  final frames = BonsaiFlutterDebug.frameStats();
+  expect(frames, isNotEmpty);
+  expect(
+    frames.map((frame) => frame.patchBytes).reduce((a, b) => a > b ? a : b),
+    lessThanOrEqualTo(maximumPatchBytes),
+  );
+  expect(
+    find.byType(NodeHost).evaluate().length,
+    lessThanOrEqualTo(maximumMountedNodes),
+  );
+  expect(ProcessInfo.currentRss, lessThanOrEqualTo(maximumResidentBytes));
+  for (final frame in frames) {
+    if (frame.flutterBuildDuration case final duration?) {
+      expect(
+        duration,
+        lessThanOrEqualTo(maximumFrameDuration),
+        reason:
+            'Flutter build exceeded the budget at revision ${frame.revision}',
+      );
+    }
+    if (frame.paintDuration case final duration?) {
+      expect(
+        duration,
+        lessThanOrEqualTo(maximumFrameDuration),
+        reason:
+            'Flutter paint exceeded the budget at revision ${frame.revision}',
+      );
+    }
+  }
+  final snapshot = await tester.runAsync(runtime.debugSnapshot);
+  expect(snapshot, isNotNull);
+  expect(snapshot!.pumpCount, greaterThan(0));
+}
+
+final class _RuntimeHarness {
+  _RuntimeHarness({
+    required this.root,
+    required this.ownsRoot,
+    required this.config,
+    required this.runtime,
+    required this.recordingSession,
+    required this.adapter,
+    required this.frameEligibility,
+  });
+
+  final Directory root;
+  final bool ownsRoot;
+  final Uint8List config;
+  final RuntimeClient runtime;
+  final _RecordingRuntimeSession recordingSession;
+  final ApplicationHostAdapter adapter;
+  final _ControllableFrameEligibilitySource frameEligibility;
+
+  static Future<_RuntimeHarness> start(
+    WidgetTester tester, {
+    Directory? supportRoot,
+  }) async {
+    final root =
+        supportRoot ??
+        await tester.runAsync(
+          () => Directory.systemTemp.createTemp('journal-flow-'),
+        );
+    expect(root, isNotNull);
+    var generation = 1;
+    Future<JournalCalendarSnapshot> calendar() async => JournalCalendarSnapshot(
+      instantUnixMilliseconds: 1786055400000,
+      localDay: 20260807,
+      locale: 'en_US',
+      timeZoneId: 'Europe/Paris',
+      utcOffsetSeconds: 7200,
+      generation: generation++,
+    );
+    final adapter = ApplicationHostAdapter(
+      applicationSupportDirectory: () async => root!,
+      initialCalendarSnapshot: calendar,
+      liveCalendarSnapshot: calendar,
+    );
+    final payload = await tester.runAsync(adapter.createApplicationPayload);
+    expect(payload, isNotNull);
+    final config = RuntimeBootstrapConfig(
+      entrypoint: 'logseq_journal',
+      launchPolicy: RuntimeLaunchPolicy.replaceExisting,
+      applicationPayload: payload!,
+    ).encode();
+    final runtime = await tester.runAsync(
+      () => RuntimeClient.start(
+        config: config,
+      ).timeout(const Duration(seconds: 15)),
+    );
+    expect(runtime, isNotNull);
+    final recordingSession = _RecordingRuntimeSession(runtime!);
+    return _RuntimeHarness(
+      root: root!,
+      ownsRoot: supportRoot == null,
+      config: config,
+      runtime: runtime,
+      recordingSession: recordingSession,
+      adapter: adapter,
+      frameEligibility: _ControllableFrameEligibilitySource(),
+    );
+  }
+
+  Future<void> show(
+    WidgetTester tester, {
+    Locale? locale,
+    TextDirection? textDirection,
+  }) async {
+    BonsaiFlutterDebug.reset();
+    if (!Platform.isIOS) {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+    }
+    await tester.pumpWidget(
+      MaterialApp(
+        builder: locale == null && textDirection == null
+            ? null
+            : (context, child) {
+                final directed = textDirection == null
+                    ? child!
+                    : Directionality(
+                        textDirection: textDirection,
+                        child: child!,
+                      );
+                return locale == null
+                    ? directed
+                    : Localizations(
+                        locale: locale,
+                        delegates: const [_AnyLocaleWidgetsDelegate()],
+                        child: directed,
+                      );
+              },
+        home: BonsaiFlutterRoot(
+          config: config,
+          runtimeStarter: (_) async => recordingSession,
+          applicationPlatform: adapter.createApplicationPlatform(),
+          frameEligibilitySource: frameEligibility,
+        ),
+      ),
+    );
+  }
+
+  Future<void> dispose(WidgetTester tester) async {
+    var settled = await tester.runAsync(runtime.debugSnapshot);
+    if (settled?.state == RuntimeWorkerState.awaitingPresentation) {
+      runtime.presentationSucceeded(
+        generation: settled!.liveGeneration,
+        presentationId: settled.unresolvedPresentationId!,
+        revision: settled.unresolvedRevision!,
+        eventBatch: Uint8List(0),
+      );
+      settled = await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        return runtime.debugSnapshot();
+      });
+    }
+    expect(settled?.state, RuntimeWorkerState.ready);
+    frameEligibility.setEligible(false);
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 10)),
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.runAsync(
+      () => runtime.dispose().timeout(const Duration(seconds: 15)),
+    );
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+    tester.platformDispatcher.clearPlatformBrightnessTestValue();
+    tester.platformDispatcher.clearAccessibilityFeaturesTestValue();
+    if (ownsRoot && root.existsSync()) {
+      await tester.runAsync(() => root.delete(recursive: true));
+    }
+  }
+}
+
+final class _AnyLocaleWidgetsDelegate
+    extends LocalizationsDelegate<WidgetsLocalizations> {
+  const _AnyLocaleWidgetsDelegate();
+
+  @override
+  bool isSupported(Locale locale) => true;
+
+  @override
+  Future<WidgetsLocalizations> load(Locale locale) async =>
+      const DefaultWidgetsLocalizations();
+
+  @override
+  bool shouldReload(_AnyLocaleWidgetsDelegate old) => false;
+}
+
+final class _RecordingRuntimeSession implements RuntimeSession {
+  _RecordingRuntimeSession(this._inner) {
+    updates = _inner.updates.map(_record);
+  }
+
+  final RuntimeSession _inner;
+  final Set<String> _presentedText = <String>{};
+  @override
+  late final Stream<RuntimeUpdate> updates;
+  String? _targetText;
+
+  void startRecordingText(String text) {
+    _targetText = text;
+  }
+
+  RuntimeUpdate _record(RuntimeUpdate update) {
+    final targetText = _targetText;
+    if (targetText == null) return update;
+    if (update case CycleReady(
+      :final presentationId,
+      :final revision,
+      :final bytes,
+      :final recoverableDiagnostic,
+    )) {
+      final payload = bytes.materialize().asUint8List();
+      final decoded = utf8.decode(payload, allowMalformed: true);
+      if (decoded.contains(targetText)) {
+        _presentedText.add(targetText);
+        _targetText = null;
+      }
+      return CycleReady(
+        presentationId: presentationId,
+        revision: revision,
+        bytes: TransferableTypedData.fromList([payload]),
+        recoverableDiagnostic: recoverableDiagnostic,
+      );
+    }
+    return update;
+  }
+
+  bool sawFrameContaining(String text) => _presentedText.contains(text);
+
+  @override
+  void grantVsync({required int generation}) =>
+      _inner.grantVsync(generation: generation);
+
+  @override
+  void setFrameEligibility({required int generation, required bool eligible}) =>
+      _inner.setFrameEligibility(generation: generation, eligible: eligible);
+
+  @override
+  void presentationSucceeded({
+    required int generation,
+    required int presentationId,
+    required int revision,
+    required Uint8List eventBatch,
+  }) => _inner.presentationSucceeded(
+    generation: generation,
+    presentationId: presentationId,
+    revision: revision,
+    eventBatch: eventBatch,
+  );
+
+  @override
+  void presentationRejected({
+    required int generation,
+    required int presentationId,
+    required int revision,
+    required PresentationRejectionReason reason,
+  }) => _inner.presentationRejected(
+    generation: generation,
+    presentationId: presentationId,
+    revision: revision,
+    reason: reason,
+  );
+
+  @override
+  Future<RuntimeDebugSnapshot> debugSnapshot() => _inner.debugSnapshot();
+
+  @override
+  Future<void> dispose() => _inner.dispose();
+}
+
+final class _ControllableFrameEligibilitySource
+    implements FrameEligibilitySource {
+  bool _eligible = true;
+  void Function(bool)? _onChanged;
+
+  @override
+  bool get isEligible => _eligible;
+
+  @override
+  void start(void Function(bool isEligible) onChanged) {
+    _onChanged = onChanged;
+  }
+
+  void setEligible(bool eligible) {
+    if (_eligible == eligible) return;
+    _eligible = eligible;
+    _onChanged?.call(eligible);
+  }
+
+  @override
+  void dispose() {
+    _onChanged = null;
+  }
+}
+
+Finder _materialGlyph(int codePoint) => find.byWidgetPredicate(
+  (widget) =>
+      widget is Text &&
+      widget.data == String.fromCharCode(codePoint) &&
+      widget.style?.fontFamily == 'MaterialIcons',
+  description: 'MaterialIcons U+${codePoint.toRadixString(16)}',
+);
+
+Future<void> _pumpRuntime(WidgetTester tester) async {
+  await tester.runAsync(
+    () => Future<void>.delayed(const Duration(milliseconds: 10)),
+  );
+  await tester.pump();
+}
+
+Future<void> _pumpUntil(
+  WidgetTester tester,
+  bool Function() predicate, {
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  final stopwatch = Stopwatch()..start();
+  while (!predicate() && stopwatch.elapsed < timeout) {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 10)),
+    );
+    await tester.pump();
+  }
+  expect(predicate(), isTrue);
+}
+
+Future<void> _tapSemantics(WidgetTester tester, String label) async {
+  await tester.tap(find.bySemanticsLabel(label).last);
+  await tester.pump(const Duration(milliseconds: 80));
+}

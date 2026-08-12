@@ -1,0 +1,17 @@
+module Context : sig
+  type t
+
+  val today : subtitle:string -> t
+  val selected : title:string -> subtitle:string -> t
+  val is_today : t -> bool
+  val title : t -> string
+  val subtitle : t -> string
+  val semantics_label : t -> string
+end
+
+val view
+  :  tokens:Journal_visual_tokens.t
+  -> text_scale:float
+  -> device_pixel_ratio:float
+  -> context:Context.t
+  -> Bonsai_flutter_ui.Widget.t

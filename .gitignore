@@ -30,3 +30,4 @@
 /journal.sqlite3
 /journal.sqlite3-shm
 /journal.sqlite3-wal
+/.dir-locals.el

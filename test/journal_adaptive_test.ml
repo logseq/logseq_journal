@@ -1,0 +1,409 @@
+module Tokens = Journal_visual_tokens
+module Ui = Bonsai_flutter_ui
+
+let require condition format =
+  Printf.ksprintf (fun message -> if not condition then failwith message) format
+;;
+
+let argb color = Ui.Style.Color.Private.to_argb32 color
+
+let require_color name expected actual =
+  require
+    (Int32.equal expected (argb actual))
+    "%s expected 0x%lx, got 0x%lx"
+    name
+    expected
+    (argb actual)
+;;
+
+let relative_luminance color =
+  let packed = argb color in
+  let channel shift =
+    let value = Int32.(logand (shift_right_logical packed shift) 0xffl) |> Int32.to_int in
+    let srgb = Float.of_int value /. 255. in
+    if Float.compare srgb 0.04045 <= 0
+    then srgb /. 12.92
+    else Float.pow ((srgb +. 0.055) /. 1.055) 2.4
+  in
+  (0.2126 *. channel 16) +. (0.7152 *. channel 8) +. (0.0722 *. channel 0)
+;;
+
+let contrast_ratio left right =
+  let left = relative_luminance left in
+  let right = relative_luminance right in
+  (Float.max left right +. 0.05) /. (Float.min left right +. 0.05)
+;;
+
+let test_light_palette_and_interaction_tokens () =
+  let tokens = Tokens.resolve ~high_contrast:false in
+  let palette = Tokens.palette tokens in
+  require_color "background" 0xfffdfdfdl palette.background;
+  require_color "header" 0xfffdfdfdl palette.header;
+  require_color "text primary" 0xff0d142fl palette.text_primary;
+  require_color "text secondary" 0xff656b8fl palette.text_secondary;
+  require_color "timestamp" 0xff6e7388l palette.text_timestamp;
+  require_color "divider" 0xffe8e9edl palette.divider;
+  require_color "FAB" 0xff181e34l palette.fab;
+  require_color "on FAB" 0xfffcfcfdl palette.on_fab;
+  require_color "success" 0xff058e46l palette.success;
+  let interaction = Tokens.interaction tokens in
+  require_color "pressed" 0x1f0d142fl interaction.pressed;
+  require_color "focused" 0xff315ef5l interaction.focused;
+  require_color "disabled" 0xffa5a8b6l interaction.disabled;
+  require_color "error" 0xffb3261el interaction.error
+;;
+
+let test_light_high_contrast_palette_is_explicit () =
+  let light_high = Tokens.resolve ~high_contrast:true |> Tokens.palette in
+  require_color "light HC background" 0xffffffffl light_high.background;
+  require_color "light HC primary" 0xff000000l light_high.text_primary;
+  require_color "light HC secondary" 0xff313131l light_high.text_secondary;
+  require_color "light HC timestamp" 0xff313131l light_high.text_timestamp;
+  require_color "light HC divider" 0xff666666l light_high.divider;
+  require_color "light HC success" 0xff006b33l light_high.success
+;;
+
+let test_timestamp_contrast_meets_small_text_target () =
+  let palette = Tokens.resolve ~high_contrast:false |> Tokens.palette in
+  require
+    (Float.compare (contrast_ratio palette.text_timestamp palette.background) 4.5 >= 0)
+    "light timestamp contrast is below 4.5:1"
+;;
+
+let test_capture_sheet_palette_roles_and_contrast () =
+  let cases =
+    [ ( false
+      , "light"
+      , 0xffffffffl
+      , 0xffe8e9edl
+      , 0x470d142fl
+      , 0xff181e34l
+      , 0xfff5f5f6l
+      , 0xffb3261el )
+    ; ( true
+      , "light high contrast"
+      , 0xffffffffl
+      , 0xff666666l
+      , 0x8c000000l
+      , 0xff000000l
+      , 0xffeeeeeel
+      , 0xff800000l )
+    ]
+  in
+  List.iter
+    (fun ( high_contrast
+         , name
+         , sheet_surface
+         , sheet_outline
+         , modal_scrim
+         , sheet_primary_action
+         , sheet_secondary_action
+         , sheet_error ) ->
+       let palette = Tokens.resolve ~high_contrast |> Tokens.palette in
+       require_color (name ^ " sheet surface") sheet_surface palette.sheet_surface;
+       require_color (name ^ " sheet outline") sheet_outline palette.sheet_outline;
+       require_color (name ^ " modal scrim") modal_scrim palette.modal_scrim;
+       require_color
+         (name ^ " sheet primary action")
+         sheet_primary_action
+         palette.sheet_primary_action;
+       require_color
+         (name ^ " sheet secondary action")
+         sheet_secondary_action
+         palette.sheet_secondary_action;
+       require_color (name ^ " sheet error") sheet_error palette.sheet_error;
+       require
+         (Float.compare (contrast_ratio palette.text_primary palette.sheet_surface) 4.5
+          >= 0)
+         "%s sheet primary text contrast is below 4.5:1"
+         name;
+       require
+         (Float.compare (contrast_ratio palette.sheet_error palette.sheet_surface) 4.5
+          >= 0)
+         "%s sheet error contrast is below 4.5:1"
+         name;
+       require
+         (Float.compare (contrast_ratio palette.on_fab palette.sheet_primary_action) 4.5
+          >= 0)
+         "%s sheet action contrast is below 4.5:1"
+         name)
+    cases
+;;
+
+let test_typography_spacing_motion_and_hit_regions () =
+  let typography = Tokens.typography in
+  require
+    (typography.header_title.font_size = 22.
+     && typography.header_title.line_height = 28.
+     && typography.header_title.weight = Ui.Style.Font_weight.Bold)
+    "header title typography changed";
+  require
+    (typography.entry.font_size = 15.
+     && typography.entry.line_height = 20.
+     && typography.entry.weight = Ui.Style.Font_weight.Normal)
+    "entry typography changed";
+  require
+    (typography.supporting.font_size = 14.
+     && typography.supporting.line_height = 20.
+     && typography.supporting.weight = Ui.Style.Font_weight.Normal)
+    "supporting typography changed";
+  require
+    (typography.disclosure.font_size = 11.
+     && typography.disclosure.line_height = 16.
+     && typography.disclosure.weight = Ui.Style.Font_weight.Medium)
+    "disclosure typography changed";
+  require
+    (typography.timestamp.font_size = 13.
+     && typography.timestamp.line_height = 18.
+     && typography.timestamp.weight = Ui.Style.Font_weight.Normal)
+    "timestamp typography changed";
+  let spacing = Tokens.spacing in
+  require
+    ([ spacing.x1
+     ; spacing.x2
+     ; spacing.x3
+     ; spacing.x4
+     ; spacing.x5
+     ; spacing.x6
+     ; spacing.x7
+     ]
+     = [ 4.; 8.; 12.; 16.; 20.; 24.; 28. ])
+    "spacing grid changed";
+  let hit = Tokens.hit_regions in
+  require
+    (hit.header_visual = 30.
+     && hit.minimum_target = 44.
+     && hit.fab_visual = 48.
+     && hit.fab_target = 56.
+     && hit.fab_bottom_inset = 20.)
+    "hit-region tokens changed";
+  let row = Tokens.row_geometry in
+  require
+    (row.divider_inset = 18.
+     && row.time_slot_base = 52.
+     && row.task_visual = 14.
+     && row.disclosure_visual = 14.)
+    "row geometry tokens changed";
+  let standard = Tokens.motion ~reduced_motion:false in
+  let reduced = Tokens.motion ~reduced_motion:true in
+  require
+    (standard.press_release_ms = 80
+     && standard.route_transition_ms = 180
+     && standard.capture_sheet_enter_ms = 220
+     && standard.capture_sheet_exit_ms = 180)
+    "standard motion tokens changed";
+  require
+    (reduced.press_release_ms = 0
+     && reduced.route_transition_ms = 0
+     && reduced.capture_sheet_enter_ms = 0
+     && reduced.capture_sheet_exit_ms = 0)
+    "reduced-motion tokens are not disabled"
+;;
+
+let test_dividers_resolve_to_one_physical_pixel () =
+  List.iter
+    (fun device_pixel_ratio ->
+       let logical = Tokens.physical_divider_thickness ~device_pixel_ratio in
+       require
+         (Float.equal (logical *. device_pixel_ratio) 1.)
+         "divider is not one physical pixel at %.0fx"
+         device_pixel_ratio)
+    [ 1.; 2.; 3.; 4. ];
+  require
+    (Float.equal (Tokens.physical_divider_thickness ~device_pixel_ratio:0.) 1.)
+    "invalid DPR does not retain the safe one-pixel fallback"
+;;
+
+let require_profile
+      ~width
+      ~scale
+      ~kind
+      ~block_extent
+      ~day_header_extent
+      ~content_leading
+      ~time_slot_width
+  =
+  let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
+  require (profile.kind = kind) "profile kind changed at %.0f/%.2f" width scale;
+  require
+    (profile.block_extent = block_extent)
+    "block extent changed at %.0f/%.2f"
+    width
+    scale;
+  require
+    (profile.day_header_extent = day_header_extent)
+    "day extent changed at %.0f/%.2f"
+    width
+    scale;
+  require
+    (profile.content_leading = content_leading)
+    "content leading changed at %.0f/%.2f"
+    width
+    scale;
+  require
+    (profile.time_slot_width = time_slot_width)
+    "time slot width changed at %.0f/%.2f"
+    width
+    scale
+;;
+
+let test_known_row_profile_selection () =
+  require_profile
+    ~width:360.
+    ~scale:1.3
+    ~kind:Tokens.Compact
+    ~block_extent:48.
+    ~day_header_extent:36.
+    ~content_leading:28.
+    ~time_slot_width:52.;
+  require_profile
+    ~width:359.
+    ~scale:1.
+    ~kind:Tokens.Adaptive
+    ~block_extent:80.
+    ~day_header_extent:48.
+    ~content_leading:24.
+    ~time_slot_width:52.;
+  require_profile
+    ~width:390.
+    ~scale:1.31
+    ~kind:Tokens.Adaptive
+    ~block_extent:95.
+    ~day_header_extent:56.
+    ~content_leading:28.
+    ~time_slot_width:69.;
+  require_profile
+    ~width:744.
+    ~scale:2.
+    ~kind:Tokens.Adaptive
+    ~block_extent:128.
+    ~day_header_extent:72.
+    ~content_leading:28.
+    ~time_slot_width:104.;
+  require_profile
+    ~width:1_200.
+    ~scale:3.2
+    ~kind:Tokens.Adaptive
+    ~block_extent:186.
+    ~day_header_extent:101.
+    ~content_leading:28.
+    ~time_slot_width:167.
+;;
+
+let test_row_profiles_cover_required_width_and_scale_matrix () =
+  let cases =
+    [ 320., 1., Tokens.Adaptive, 80., 48., 24., 52.
+    ; 320., 1.3, Tokens.Adaptive, 95., 56., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 128., 72., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 186., 101., 24., 167.
+    ; 390., 1., Tokens.Compact, 48., 36., 28., 52.
+    ; 390., 1.3, Tokens.Compact, 48., 36., 28., 52.
+    ; 390., 2., Tokens.Adaptive, 128., 72., 28., 104.
+    ; 390., 3.2, Tokens.Adaptive, 186., 101., 28., 167.
+    ; 744., 1., Tokens.Compact, 48., 36., 28., 52.
+    ; 744., 1.3, Tokens.Compact, 48., 36., 28., 52.
+    ; 744., 2., Tokens.Adaptive, 128., 72., 28., 104.
+    ; 744., 3.2, Tokens.Adaptive, 186., 101., 28., 167.
+    ; 1_200., 1., Tokens.Compact, 48., 36., 28., 52.
+    ; 1_200., 1.3, Tokens.Compact, 48., 36., 28., 52.
+    ; 1_200., 2., Tokens.Adaptive, 128., 72., 28., 104.
+    ; 1_200., 3.2, Tokens.Adaptive, 186., 101., 28., 167.
+    ]
+  in
+  List.iter
+    (fun ( width
+         , scale
+         , kind
+         , block_extent
+         , day_header_extent
+         , content_leading
+         , time_slot_width ) ->
+       require_profile
+         ~width
+         ~scale
+         ~kind
+         ~block_extent
+         ~day_header_extent
+         ~content_leading
+         ~time_slot_width)
+    cases
+;;
+
+let test_zero_viewport_and_profile_growth_remain_known_extent () =
+  require_profile
+    ~width:0.
+    ~scale:0.
+    ~kind:Tokens.Adaptive
+    ~block_extent:80.
+    ~day_header_extent:48.
+    ~content_leading:24.
+    ~time_slot_width:52.;
+  let scales = [ 1.; 1.3; 2.; 3.2 ] in
+  let profiles =
+    List.map
+      (fun text_scale -> Tokens.select_row_profile ~viewport_width:320. ~text_scale)
+      scales
+  in
+  let rec require_monotonic (profiles : Tokens.row_profile list) =
+    match profiles with
+    | left :: (right :: _ as rest) ->
+      require
+        (Float.compare left.block_extent right.block_extent <= 0
+         && Float.compare left.day_header_extent right.day_header_extent <= 0
+         && Float.compare left.time_slot_width right.time_slot_width <= 0)
+        "known extents shrink as text scale increases";
+      require_monotonic rest
+    | [] | [ _ ] -> ()
+  in
+  require_monotonic profiles;
+  require
+    (Journal_timeline_state.extent_strategy = Journal_timeline_state.Known_profile_extents)
+    "adaptive behavior introduced intrinsic measurement"
+;;
+
+let test_header_context_copy_is_pure_product_state () =
+  let today = Journal_header.Context.today ~subtitle:"Sunday, August 9" in
+  require (Journal_header.Context.is_today today) "Today context lost its state";
+  require
+    (String.equal (Journal_header.Context.title today) "Today")
+    "Today title changed";
+  require
+    (String.equal
+       (Journal_header.Context.semantics_label today)
+       "Today, Sunday, August 9")
+    "Today semantics changed";
+  let selected =
+    Journal_header.Context.selected ~title:"August 8" ~subtitle:"Saturday, 2026"
+  in
+  require (not (Journal_header.Context.is_today selected)) "selected context became Today";
+  require
+    (String.equal (Journal_header.Context.title selected) "August 8")
+    "selected title changed";
+  require
+    (String.equal (Journal_header.Context.subtitle selected) "Saturday, 2026")
+    "selected subtitle changed"
+;;
+
+let tests =
+  [ "light palette and interaction", test_light_palette_and_interaction_tokens
+  ; "light high contrast", test_light_high_contrast_palette_is_explicit
+  ; "timestamp contrast", test_timestamp_contrast_meets_small_text_target
+  ; "Capture sheet palette and contrast", test_capture_sheet_palette_roles_and_contrast
+  ; ( "typography, spacing, motion, and hit regions"
+    , test_typography_spacing_motion_and_hit_regions )
+  ; "one-physical-pixel dividers", test_dividers_resolve_to_one_physical_pixel
+  ; "known row profiles", test_known_row_profile_selection
+  ; "required row profile matrix", test_row_profiles_cover_required_width_and_scale_matrix
+  ; ( "zero viewport and monotonic known extents"
+    , test_zero_viewport_and_profile_growth_remain_known_extent )
+  ; "header context", test_header_context_copy_is_pure_product_state
+  ]
+;;
+
+let () =
+  List.iter
+    (fun (name, test) ->
+       Printf.printf "running %s\n%!" name;
+       test ())
+    tests
+;;

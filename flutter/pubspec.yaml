@@ -10,19 +10,27 @@ environment:
 hooks:
   user_defines:
     bonsai_flutter_native:
-      native_artifact_root: ../_build/bonsai-flutter/native-artifacts/logseq_journal/
+      # bonsai-flutter:begin native-hook
+      native_artifact_root: ../_build/bonsai-flutter/artifacts/
+      macos_deployment_target: '26.0'
       ios_deployment_target: '15.0'
       require_ocaml_backend: true
+      link_system_sqlite3: true
+      # bonsai-flutter:end native-hook
 
 dependencies:
+  # bonsai-flutter:begin packages
   bonsai_flutter:
     path: ../.bonsai-flutter/flutter-packages/bonsai_flutter
+  # bonsai-flutter:end packages
   flutter:
     sdk: flutter
 
 dev_dependencies:
   flutter_lints: ^6.0.0
   flutter_test:
+    sdk: flutter
+  integration_test:
     sdk: flutter
 
 flutter:
