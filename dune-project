@@ -1,5 +1,6 @@
 (lang dune 3.17)
 (name logseq_journal)
+(version 0.1.0)
 (generate_opam_files false)
 (license MIT)
 
@@ -9,6 +10,7 @@
  (depends
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
+  (logseq_db_worker (= 0.1.0))
   (bonsai_flutter (= 0.1.0~dev))
   (bonsai_flutter_test (= 0.1.0~dev))
   (base (= v0.17.3))
@@ -27,3 +29,28 @@
   (uunf (= 17.0.0))
   (uutf (= 1.0.4))
   (virtual_dom (= v0.17.0))))
+
+(package
+ (name logseq_db_worker)
+ (allow_empty)
+ (depends
+  (ocaml (= 5.1.1))
+  (dune (= 3.23.1))
+  (base (= v0.17.3))
+  (bonsai (= v0.17.0))
+  (bonsai_flutter (= 0.1.0~dev))
+  (bonsai_flutter_test (= 0.1.0~dev))
+  (cmdliner (= 2.1.1))
+  (core (= v0.17.2))
+  (datascript_ocaml (= dev))
+  (datascript-ocaml-native (= dev))
+  (digestif (= 1.3.1))
+  (eio (= 1.2))
+  (melange-transit-native (= 0.1.0))
+  (mtime (= 2.1.0))
+  (persistent_sorted_set_ocaml (= dev))
+  (sqlite3 (= 5.4.0))
+  (uucp (= 17.0.0))
+  (uunf (= 17.0.0))
+  (uutf (= 1.0.4))
+  (yojson (= 3.0.0))))

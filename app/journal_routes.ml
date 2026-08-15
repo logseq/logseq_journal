@@ -48,11 +48,11 @@ let route t =
 let anchor_to_restore t = Some t.anchor
 let set_anchor t anchor = { t with anchor }
 
-let open_capture t ~session_number =
+let open_capture t ~session_number ~source =
   match t.view with
   | Capture_view _ -> t
   | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ ->
-    { t with view = Capture_view (Journal_capture.create ~session_number) }
+    { t with view = Capture_view (Journal_capture.create ~session_number ~source) }
 ;;
 
 let capture t =
@@ -174,6 +174,7 @@ let discard t =
 ;;
 
 let background t = t
+let graph_unavailable t = { t with view = Timeline_view }
 
 let runtime_replaced t =
   match t.view with

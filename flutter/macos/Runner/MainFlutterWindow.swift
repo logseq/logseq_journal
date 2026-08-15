@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import FlutterMacOS
 
 enum JournalPlatformEnvironment {
@@ -6,6 +7,8 @@ enum JournalPlatformEnvironment {
 
   static func snapshot(
     applicationSupportPath: String,
+    homeDirectoryPath: String,
+    graphName: String = "logseq_journal",
     now: Date,
     locale: Locale,
     timeZone: TimeZone,
@@ -22,6 +25,9 @@ enum JournalPlatformEnvironment {
       + (components.day ?? 0)
     return [
       "applicationSupportPath": applicationSupportPath,
+      "platform": "desktop",
+      "homeDirectoryPath": homeDirectoryPath,
+      "graphName": graphName,
       "instantUnixMilliseconds": Int64(now.timeIntervalSince1970 * 1_000),
       "localDay": localDay,
       "locale": locale.identifier,
@@ -40,8 +46,21 @@ enum JournalPlatformEnvironment {
       create: true
     )
     let canonicalPath = supportURL.resolvingSymlinksInPath().standardizedFileURL.path
+    guard
+      let account = getpwuid(getuid()),
+      let homeDirectory = account.pointee.pw_dir
+    else {
+      throw CocoaError(.fileReadUnknown)
+    }
+    let accountHomePath = String(cString: homeDirectory)
+    guard accountHomePath.hasPrefix("/") else {
+      throw CocoaError(.fileReadInvalidFileName)
+    }
+    let homePath = URL(fileURLWithPath: accountHomePath, isDirectory: true)
+      .resolvingSymlinksInPath().standardizedFileURL.path
     return snapshot(
       applicationSupportPath: canonicalPath,
+      homeDirectoryPath: homePath,
       now: Date(),
       locale: Locale.current,
       timeZone: TimeZone.current,

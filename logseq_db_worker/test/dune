@@ -1,0 +1,99 @@
+(library
+ (name logseq_db_worker_test_support)
+ (modules test_support structural_fixture adapter_fixture)
+ (libraries datascript_ocaml logseq_db_worker sqlite3 unix yojson))
+
+(tests
+ (names
+  test_protocol
+  test_graph_locator
+  test_codec
+  test_storage_atomicity
+  test_admission
+  test_ownership
+  test_snapshot
+  test_query
+  test_order
+  test_save_block
+  test_insert_blocks
+  test_move_blocks
+  test_indent_outdent
+  test_delete_blocks
+  test_pages
+  test_properties
+  test_engine
+  test_engine_open
+  test_cross_runtime
+  test_performance
+  test_fixture_generator)
+ (modules
+  test_protocol
+  test_graph_locator
+  test_codec
+  test_storage_atomicity
+  test_admission
+  test_ownership
+  test_snapshot
+  test_query
+  test_order
+  test_save_block
+  test_insert_blocks
+  test_move_blocks
+  test_indent_outdent
+  test_delete_blocks
+  test_pages
+  test_properties
+  test_engine
+  test_engine_open
+  test_cross_runtime
+  test_performance
+  test_fixture_generator)
+ (libraries
+  datascript_ocaml
+  logseq_db_worker
+  logseq_db_worker_cli
+  logseq_db_worker_fixture_generator
+  logseq_db_worker_test_support
+  sqlite3
+  unix
+  yojson))
+
+(test
+ (name test_cli)
+ (modules test_cli)
+ (libraries
+  bonsai_flutter.driver
+  logseq_db_worker
+  logseq_db_worker.bonsai
+  logseq_db_worker_cli
+  logseq_db_worker_test_support
+  sqlite3
+  unix
+  yojson))
+
+(test
+ (name test_bonsai_service)
+ (modules test_bonsai_service)
+ (libraries
+  bonsai_flutter.driver
+  bonsai_flutter_test
+  logseq_db_worker
+  logseq_db_worker.bonsai
+  logseq_db_worker_test_support))
+
+(rule
+ (alias runtest)
+ (deps
+  test_ios_device_harness.sh
+  ../tool/test_ios_device.sh)
+ (action
+  (run sh %{dep:test_ios_device_harness.sh} %{dep:../tool/test_ios_device.sh})))
+
+(rule
+ (alias runtest)
+ (deps (source_tree fixtures/expected))
+ (action
+  (run
+   %{exe:../tool/compare_canonical_graphs.exe}
+   --fixtures
+   %{workspace_root}/logseq_db_worker/test/fixtures/expected)))

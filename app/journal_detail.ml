@@ -11,12 +11,11 @@ type mode =
   | Adding_child
   | Saving_child
   | Committed
-  | Recovery_only
 
 type pending =
-  | Source of Journal_worker.request
-  | Task of Journal_worker.request
-  | Child of Journal_worker.request
+  | Source of Journal_graph_request.t
+  | Task of Journal_graph_request.t
+  | Child of Journal_graph_request.t
 
 type editor =
   { session_id : ID.Text_input.session_id
@@ -44,7 +43,7 @@ let value_for_source source =
   Ui.Text_editing.Value.create ~text:source ~selection ()
 ;;
 
-let create ~session_number (detail : Journal_repository.detail) =
+let create ~session_number (detail : Journal_graph_projection.detail) =
   { root = detail.root
   ; children = detail.children.blocks
   ; editor =
@@ -79,8 +78,7 @@ let editor_value t =
   | Failed _
   | Adding_child
   | Saving_child
-  | Committed
-  | Recovery_only -> Some t.editor.value
+  | Committed -> Some t.editor.value
 ;;
 
 let editor_source t = Ui.Text_editing.Value.text t.editor.value
@@ -101,8 +99,7 @@ let begin_edit t =
   | Conflict
   | Failed _
   | Adding_child
-  | Saving_child
-  | Recovery_only -> t
+  | Saving_child -> t
 ;;
 
 let value_of_edit (edit : Ui.Event.Payload.text_edit) =
@@ -155,7 +152,7 @@ let request_back t =
   | Reading | Committed -> `Close
   | (Editing | Failed _) when dirty t -> `State { t with mode = Confirm_discard }
   | Editing | Failed _ -> `Close
-  | Confirm_discard | Saving | Conflict | Adding_child | Saving_child | Recovery_only ->
+  | Confirm_discard | Saving | Conflict | Adding_child | Saving_child ->
     `State t
 ;;
 
@@ -169,8 +166,7 @@ let keep_editing t =
   | Failed _
   | Adding_child
   | Saving_child
-  | Committed
-  | Recovery_only -> t
+  | Committed -> t
 ;;
 
 let discard_edit t =
@@ -189,7 +185,7 @@ let discard_edit t =
 ;;
 
 let update_request t ~mutation_id ~expected_revision =
-  Journal_worker.Update_source
+  Journal_graph_request.Update_source
     { mutation_id
     ; block_id = Journal_model.id t.root
     ; expected_revision
@@ -226,8 +222,6 @@ let fail t ~message =
   | None -> t
 ;;
 
-let recovery_only t = { t with mode = Recovery_only }
-
 let retry t ~mutation_id =
   match t.mode with
   | Conflict ->
@@ -248,8 +242,7 @@ let retry t ~mutation_id =
   | Saving
   | Adding_child
   | Saving_child
-  | Committed
-  | Recovery_only -> t, None
+  | Committed -> t, None
 ;;
 
 let admit_task_toggle t ~mutation_id =
@@ -263,7 +256,7 @@ let admit_task_toggle t ~mutation_id =
       | Not_a_task -> Todo
     in
     let request =
-      Journal_worker.Set_task_state
+      Journal_graph_request.Set_task_state
         { mutation_id
         ; block_id = Journal_model.id t.root
         ; expected_revision = Journal_model.revision t.root
@@ -279,7 +272,7 @@ let begin_child t ~session_number =
   else
     { t with
       mode = Adding_child
-    ; child_capture = Some (Journal_capture.create ~session_number)
+    ; child_capture = Some (Journal_capture.create ~session_number ~source:"")
     }
 ;;
 
@@ -296,7 +289,7 @@ let admit_child t ~mutation_id ~block_id ~sibling_order ~creation_time =
   match t.mode, t.child_capture with
   | Adding_child, Some capture when Journal_capture.can_save capture ->
     let request =
-      Journal_worker.Create_child
+      Journal_graph_request.Create_child
         { mutation_id
         ; block_id
         ; parent_block_id = Journal_model.id t.root
@@ -316,8 +309,7 @@ let admit_child t ~mutation_id ~block_id ~sibling_order ~creation_time =
   | Failed _, _
   | Adding_child, _
   | Saving_child, _
-  | Committed, _
-  | Recovery_only, _ -> t, None
+  | Committed, _ -> t, None
 ;;
 
 let apply_block t block =

@@ -1,0 +1,23 @@
+{
+  "apiVersion": 1,
+  "pinnedLogseqCommit": "4f21d068aed43bb2ea5823247cae73ecdd8d60f8",
+  "minimumSchema": "65.33",
+  "schemaCases": [
+    {"name":"minimum","actual":"65.33","expected":"admit"},
+    {"name":"newer-minor","actual":"65.34","expected":"admit"},
+    {"name":"newer-major","actual":"66.0","expected":"admit"},
+    {"name":"older-minor","actual":"65.32","expected":"unsupportedSchema"},
+    {"name":"older-major","actual":"64.99","expected":"unsupportedSchema"},
+    {"name":"malformed","actual":"65.x","expected":"unsupportedSchema"}
+  ],
+  "cases": [
+    {"name":"local-graph-uuid-only","remoteFlag":"absent","localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":null,"clientOpsGraphUuid":null,"clientOpsRows":0,"expected":"admit"},
+    {"name":"explicit-local-with-history","remoteFlag":false,"localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":null,"clientOpsGraphUuid":null,"clientOpsRows":12,"expected":"admit"},
+    {"name":"value-less-rtc-schema-ident","remoteFlag":false,"localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":null,"clientOpsGraphUuid":null,"clientOpsRows":0,"rtcSchemaIdentExists":true,"expected":"admit"},
+    {"name":"remote-true","remoteFlag":true,"localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":"50000000-0000-4000-8000-000000000001","clientOpsGraphUuid":"50000000-0000-4000-8000-000000000001","clientOpsRows":1,"expected":"remoteGraph"},
+    {"name":"rtc-identity-without-remote","remoteFlag":"absent","localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":"50000000-0000-4000-8000-000000000001","clientOpsGraphUuid":null,"clientOpsRows":0,"expected":"ambiguousSyncState"},
+    {"name":"client-ops-rtc-identity-with-local-flag","remoteFlag":false,"localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":null,"clientOpsGraphUuid":"50000000-0000-4000-8000-000000000001","clientOpsRows":1,"expected":"ambiguousSyncState"},
+    {"name":"non-boolean-remote-flag","remoteFlag":"true","localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":null,"clientOpsGraphUuid":null,"clientOpsRows":0,"expected":"ambiguousSyncState"},
+    {"name":"conflicting-rtc-identities","remoteFlag":true,"localGraphUuid":"40000000-0000-4000-8000-000000000001","rtcGraphUuid":"50000000-0000-4000-8000-000000000001","clientOpsGraphUuid":"50000000-0000-4000-8000-000000000002","clientOpsRows":1,"expected":"ambiguousSyncState"}
+  ]
+}

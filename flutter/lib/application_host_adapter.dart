@@ -157,183 +157,323 @@ abstract final class _CalendarFacts {
   }
 }
 
-final class JournalStartupEnvelope {
-  const JournalStartupEnvelope({
-    required this.applicationSupportRoot,
-    required this.initialCalendar,
-    this.lifecycleGeneration = 0,
+enum LogseqDbTargetKind { snapshot, importSnapshot, nativeLocalGraph }
+
+final class LogseqDbTarget {
+  const LogseqDbTarget._({
+    required this.kind,
+    this.snapshotToken,
+    this.inboxEntry,
+    this.graphName,
+    this.graphDirectory,
   });
 
-  static const _magic = 'LJR1';
-  static const _envelopeVersion = 1;
-  static const _headerSize = 64;
-  static const _maximumPayloadBytes = 1024 * 1024;
-  static const _maximumRootBytes = 4096;
+  factory LogseqDbTarget.snapshot(String token) {
+    final canonical = token.toLowerCase();
+    if (!RegExp(
+      r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    ).hasMatch(canonical)) {
+      throw ArgumentError.value(token, 'token', 'must be a UUID');
+    }
+    return LogseqDbTarget._(
+      kind: LogseqDbTargetKind.snapshot,
+      snapshotToken: canonical,
+    );
+  }
 
-  final String applicationSupportRoot;
-  final JournalCalendarSnapshot initialCalendar;
-  final int lifecycleGeneration;
+  factory LogseqDbTarget.importSnapshot(String inboxEntry) {
+    _validatePathComponent(inboxEntry, 'inboxEntry');
+    return LogseqDbTarget._(
+      kind: LogseqDbTargetKind.importSnapshot,
+      inboxEntry: inboxEntry,
+    );
+  }
+
+  static Future<LogseqDbTarget> desktopNative({
+    required Directory homeDirectory,
+    required String graphName,
+  }) => _native(
+    baseDirectory: Directory('${homeDirectory.path}/logseq'),
+    graphName: graphName,
+  );
+
+  static Future<LogseqDbTarget> iosNative({
+    required Directory applicationDataDirectory,
+    required String graphName,
+  }) => _native(
+    baseDirectory: Directory('${applicationDataDirectory.path}/graphs'),
+    graphName: graphName,
+  );
+
+  static Future<LogseqDbTarget> _native({
+    required Directory baseDirectory,
+    required String graphName,
+  }) async {
+    _validatePathComponent(graphName, 'graphName');
+    final canonicalBase = await _canonicalDirectoryOrMissing(baseDirectory);
+    final graph = Directory.fromUri(
+      Directory(canonicalBase).uri.resolve(graphName),
+    );
+    final graphType = await FileSystemEntity.type(
+      graph.path,
+      followLinks: false,
+    );
+    final canonicalGraph = graphType == FileSystemEntityType.notFound
+        ? graph.path
+        : await graph.resolveSymbolicLinks();
+    if (Directory(canonicalGraph).parent.path != canonicalBase) {
+      throw FileSystemException(
+        'native graph resolves outside its platform graph directory',
+        graph.path,
+      );
+    }
+    return LogseqDbTarget._(
+      kind: LogseqDbTargetKind.nativeLocalGraph,
+      graphName: graphName,
+      graphDirectory: canonicalGraph,
+    );
+  }
+
+  static Future<String> _canonicalDirectoryOrMissing(
+    Directory directory,
+  ) async {
+    final entityType = await FileSystemEntity.type(
+      directory.path,
+      followLinks: false,
+    );
+    if (entityType != FileSystemEntityType.notFound) {
+      return directory.resolveSymbolicLinks();
+    }
+    final canonicalParent = await directory.parent.resolveSymbolicLinks();
+    final directoryName = directory.uri.pathSegments.lastWhere(
+      (segment) => segment.isNotEmpty,
+    );
+    return Directory(canonicalParent).uri.resolve(directoryName).toFilePath();
+  }
+
+  static void _validatePathComponent(String value, String name) {
+    if (value.isEmpty ||
+        value == '.' ||
+        value == '..' ||
+        value.contains('/') ||
+        value.contains('\\') ||
+        value.contains('\u0000') ||
+        utf8.encode(value).length > 255) {
+      throw ArgumentError.value(
+        value,
+        name,
+        'must be one bounded path component',
+      );
+    }
+  }
+
+  final LogseqDbTargetKind kind;
+  final String? snapshotToken;
+  final String? inboxEntry;
+  final String? graphName;
+  final String? graphDirectory;
+
+  Map<String, Object> toJson() => switch (kind) {
+    LogseqDbTargetKind.snapshot => <String, Object>{
+      'kind': 'snapshot',
+      'token': snapshotToken!,
+    },
+    LogseqDbTargetKind.importSnapshot => <String, Object>{
+      'kind': 'importSnapshot',
+      'inboxEntry': inboxEntry!,
+    },
+    LogseqDbTargetKind.nativeLocalGraph => <String, Object>{
+      'kind': 'nativeLocalGraph',
+      'graphName': graphName!,
+      'graphDir': graphDirectory!,
+    },
+  };
+
+  static LogseqDbTarget fromJson(Object? value) {
+    if (value is! Map<String, dynamic>) {
+      throw const FormatException('startup target must be an object');
+    }
+    switch (value['kind']) {
+      case 'snapshot':
+        _requireExactKeys(value, const {'kind', 'token'});
+        final token = value['token'];
+        if (token is! String) {
+          throw const FormatException('snapshot token must be a string');
+        }
+        return _decode(() => LogseqDbTarget.snapshot(token));
+      case 'importSnapshot':
+        _requireExactKeys(value, const {'kind', 'inboxEntry'});
+        final entry = value['inboxEntry'];
+        if (entry is! String) {
+          throw const FormatException('inbox entry must be a string');
+        }
+        return _decode(() => LogseqDbTarget.importSnapshot(entry));
+      case 'nativeLocalGraph':
+        _requireExactKeys(value, const {'kind', 'graphName', 'graphDir'});
+        final graphName = value['graphName'];
+        final graphDirectory = value['graphDir'];
+        if (graphName is! String || graphDirectory is! String) {
+          throw const FormatException('native graph target fields are invalid');
+        }
+        _decode(() {
+          _validatePathComponent(graphName, 'graphName');
+          _validateCanonicalAbsolutePath(graphDirectory, 'graphDir');
+          if (graphDirectory.split('/').last != graphName) {
+            throw ArgumentError('native graph name and directory mismatch');
+          }
+          return graphName;
+        });
+        return LogseqDbTarget._(
+          kind: LogseqDbTargetKind.nativeLocalGraph,
+          graphName: graphName,
+          graphDirectory: graphDirectory,
+        );
+      default:
+        throw const FormatException('startup target kind is invalid');
+    }
+  }
+
+  static T _decode<T>(T Function() decode) {
+    try {
+      return decode();
+    } on ArgumentError catch (error) {
+      throw FormatException(
+        error.message?.toString() ?? 'invalid startup target',
+      );
+    }
+  }
+}
+
+final class LogseqDbWorkerStartupEnvelope {
+  const LogseqDbWorkerStartupEnvelope({
+    required this.applicationSupportDirectory,
+    required this.target,
+  });
+
+  static const _magic = 'LDB1';
+  static const _headerSize = 8;
+  static const _maximumPayloadBytes = 1024 * 1024;
+  static const _maximumPathBytes = 4096;
+  static const responseBudgetBytes = 262144;
+  static const defaultPageSize = 50;
+
+  final String applicationSupportDirectory;
+  final LogseqDbTarget target;
 
   Uint8List encode() {
-    _validate(argumentError: true);
-    final root = utf8.encode(applicationSupportRoot);
-    final locale = utf8.encode(initialCalendar.locale);
-    final timeZone = utf8.encode(initialCalendar.timeZoneId);
-    final size = _headerSize + root.length + locale.length + timeZone.length;
-    if (size > _maximumPayloadBytes) {
-      throw ArgumentError.value(size, 'startup payload', 'exceeds 1 MiB');
-    }
-
-    final bytes = Uint8List(size);
-    final data = ByteData.sublistView(bytes);
-    bytes.setRange(0, 4, ascii.encode(_magic));
-    data.setUint32(4, _envelopeVersion, Endian.little);
-    data.setUint32(8, root.length, Endian.little);
-    data.setUint32(12, locale.length, Endian.little);
-    data.setUint32(16, timeZone.length, Endian.little);
-    data.setInt64(24, initialCalendar.instantUnixMilliseconds, Endian.little);
-    data.setUint32(32, initialCalendar.localDay, Endian.little);
-    data.setUint16(
-      36,
-      _CalendarFacts.localMinuteOfDay(
-        initialCalendar,
-        invalid: (message) => throw ArgumentError(message),
-      ),
-      Endian.little,
+    _validateCanonicalAbsolutePath(
+      applicationSupportDirectory,
+      'applicationSupportDirectory',
     );
-    data.setInt32(40, initialCalendar.utcOffsetSeconds, Endian.little);
-    data.setInt64(48, initialCalendar.generation, Endian.little);
-    data.setInt64(56, lifecycleGeneration, Endian.little);
-    var offset = _headerSize;
-    for (final field in [root, locale, timeZone]) {
-      bytes.setRange(offset, offset + field.length, field);
-      offset += field.length;
+    final json = utf8.encode(
+      jsonEncode(<String, Object>{
+        'applicationSupportDirectory': applicationSupportDirectory,
+        'target': target.toJson(),
+        'compatibilityProfile': 'logseq-65.33-or-newer',
+        'responseBudgetBytes': responseBudgetBytes,
+        'defaultPageSize': defaultPageSize,
+      }),
+    );
+    if (_headerSize + json.length > _maximumPayloadBytes) {
+      throw ArgumentError.value(
+        json.length,
+        'startup payload',
+        'exceeds 1 MiB',
+      );
     }
+    final bytes = Uint8List(_headerSize + json.length);
+    bytes.setRange(0, 4, ascii.encode(_magic));
+    ByteData.sublistView(bytes).setUint32(4, json.length, Endian.little);
+    bytes.setRange(_headerSize, bytes.length, json);
     return bytes;
   }
 
-  static JournalStartupEnvelope decode(Uint8List bytes) {
-    if (bytes.isEmpty) {
-      throw const FormatException('startup payload is empty');
+  static LogseqDbWorkerStartupEnvelope decode(Uint8List bytes) {
+    if (bytes.length < _headerSize || bytes.length > _maximumPayloadBytes) {
+      throw const FormatException('startup payload size is invalid');
     }
-    if (bytes.length > _maximumPayloadBytes) {
-      throw const FormatException('startup payload exceeds 1 MiB');
-    }
-    if (bytes.length < _headerSize) {
-      throw const FormatException('startup payload is truncated');
-    }
-    final data = ByteData.sublistView(bytes);
     if (ascii.decode(bytes.sublist(0, 4), allowInvalid: true) != _magic) {
       throw const FormatException('invalid startup magic');
     }
-    if (data.getUint32(4, Endian.little) != _envelopeVersion) {
-      throw const FormatException('unsupported startup envelope version');
-    }
-    if (data.getUint32(20, Endian.little) != 0 ||
-        data.getUint16(38, Endian.little) != 0 ||
-        data.getUint32(44, Endian.little) != 0) {
-      throw const FormatException('startup reserved bytes must be zero');
-    }
-    final rootLength = data.getUint32(8, Endian.little);
-    final localeLength = data.getUint32(12, Endian.little);
-    final timeZoneLength = data.getUint32(16, Endian.little);
-    if (_headerSize + rootLength + localeLength + timeZoneLength !=
-        bytes.length) {
+    final length = ByteData.sublistView(bytes).getUint32(4, Endian.little);
+    if (length != bytes.length - _headerSize) {
       throw const FormatException(
         'startup payload has trailing or missing bytes',
       );
     }
-
-    var offset = _headerSize;
-    String take(int length, String name) {
-      final field = bytes.sublist(offset, offset + length);
-      offset += length;
-      try {
-        return utf8.decode(field, allowMalformed: false);
-      } on FormatException {
-        throw FormatException('$name must be valid UTF-8');
-      }
-    }
-
-    final root = take(rootLength, 'Application Support root');
-    final locale = take(localeLength, 'calendar locale');
-    final timeZone = take(timeZoneLength, 'calendar time-zone ID');
-    final envelope = JournalStartupEnvelope(
-      applicationSupportRoot: root,
-      initialCalendar: JournalCalendarSnapshot(
-        instantUnixMilliseconds: data.getInt64(24, Endian.little),
-        localDay: data.getUint32(32, Endian.little),
-        locale: locale,
-        timeZoneId: timeZone,
-        utcOffsetSeconds: data.getInt32(40, Endian.little),
-        generation: data.getInt64(48, Endian.little),
-      ),
-      lifecycleGeneration: data.getInt64(56, Endian.little),
-    );
-    envelope._validate(argumentError: false);
-    final encodedMinute = data.getUint16(36, Endian.little);
-    final actualMinute = _CalendarFacts.localMinuteOfDay(
-      envelope.initialCalendar,
-      invalid: (message) => throw FormatException(message),
-    );
-    if (encodedMinute != actualMinute) {
-      throw const FormatException('calendar local minute is inconsistent');
-    }
-    return envelope;
-  }
-
-  void _validate({required bool argumentError}) {
-    Never invalid(String message) {
-      if (argumentError) throw ArgumentError(message);
-      throw FormatException(message);
-    }
-
-    final rootBytes = utf8.encode(applicationSupportRoot).length;
-    final rootComponents = applicationSupportRoot.split('/');
-    if (!applicationSupportRoot.startsWith('/')) {
-      invalid('Application Support root must be absolute');
-    }
-    if (applicationSupportRoot == '/' ||
-        rootComponents.first.isNotEmpty ||
-        rootComponents
-            .skip(1)
-            .any(
-              (component) =>
-                  component.isEmpty || component == '.' || component == '..',
-            )) {
-      invalid('Application Support root must be a canonical absolute path');
-    }
-    if (applicationSupportRoot.contains('\\')) {
-      invalid('Application Support root must use platform separators');
-    }
-    if (applicationSupportRoot.contains('\u0000')) {
-      invalid('Application Support root must not contain NUL');
-    }
-    if (rootBytes > _maximumRootBytes) {
-      invalid(
-        'Application Support root exceeds $_maximumRootBytes UTF-8 bytes',
+    Object? decoded;
+    try {
+      decoded = jsonDecode(
+        utf8.decode(bytes.sublist(_headerSize), allowMalformed: false),
+      );
+    } on FormatException {
+      throw const FormatException(
+        'startup configuration must be valid UTF-8 JSON',
       );
     }
-    if (lifecycleGeneration < 0 ||
-        lifecycleGeneration > _CalendarFacts.maximumSignedInt64) {
-      invalid('lifecycle generation must be a nonnegative signed 64-bit value');
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('startup configuration must be an object');
     }
-    _CalendarFacts.localMinuteOfDay(initialCalendar, invalid: invalid);
+    _requireExactKeys(decoded, const {
+      'applicationSupportDirectory',
+      'target',
+      'compatibilityProfile',
+      'responseBudgetBytes',
+      'defaultPageSize',
+    });
+    final directory = decoded['applicationSupportDirectory'];
+    if (directory is! String ||
+        decoded['compatibilityProfile'] != 'logseq-65.33-or-newer' ||
+        decoded['responseBudgetBytes'] != responseBudgetBytes ||
+        decoded['defaultPageSize'] != defaultPageSize) {
+      throw const FormatException('startup configuration fields are invalid');
+    }
+    try {
+      _validateCanonicalAbsolutePath(directory, 'applicationSupportDirectory');
+    } on ArgumentError catch (error) {
+      throw FormatException(
+        error.message?.toString() ?? 'invalid startup directory',
+      );
+    }
+    return LogseqDbWorkerStartupEnvelope(
+      applicationSupportDirectory: directory,
+      target: LogseqDbTarget.fromJson(decoded['target']),
+    );
   }
+}
 
-  @override
-  bool operator ==(Object other) =>
-      other is JournalStartupEnvelope &&
-      other.applicationSupportRoot == applicationSupportRoot &&
-      other.initialCalendar == initialCalendar &&
-      other.lifecycleGeneration == lifecycleGeneration;
+void _requireExactKeys(Map<String, dynamic> value, Set<String> expected) {
+  if (value.keys.toSet().length != expected.length ||
+      !value.keys.toSet().containsAll(expected)) {
+    throw const FormatException('startup object contains unexpected fields');
+  }
+}
 
-  @override
-  int get hashCode =>
-      Object.hash(applicationSupportRoot, initialCalendar, lifecycleGeneration);
+void _validateCanonicalAbsolutePath(String value, String name) {
+  final components = value.split('/');
+  if (!value.startsWith('/') ||
+      value == '/' ||
+      components.first.isNotEmpty ||
+      components
+          .skip(1)
+          .any(
+            (component) =>
+                component.isEmpty || component == '.' || component == '..',
+          ) ||
+      value.contains('\\') ||
+      value.contains('\u0000') ||
+      utf8.encode(value).length >
+          LogseqDbWorkerStartupEnvelope._maximumPathBytes) {
+    throw ArgumentError.value(
+      value,
+      name,
+      'must be a bounded canonical absolute path',
+    );
+  }
 }
 
 typedef ApplicationSupportDirectoryProvider = Future<Directory> Function();
+typedef GraphTargetProvider = Future<LogseqDbTarget> Function();
 typedef InitialCalendarSnapshotProvider =
     Future<JournalCalendarSnapshot> Function();
 typedef JournalDayHeadingFormatter =
@@ -826,6 +966,7 @@ BonsaiFlutterHostAdapter createBonsaiFlutterHostAdapter() {
   final environment = _NativeStartupEnvironment();
   return ApplicationHostAdapter(
     applicationSupportDirectory: environment.applicationSupportDirectory,
+    graphTarget: environment.graphTarget,
     initialCalendarSnapshot: environment.initialCalendarSnapshot,
     liveCalendarSnapshot: environment.currentCalendarSnapshot,
   );
@@ -849,6 +990,39 @@ final class _NativeStartupEnvironment {
       throw const FormatException('native Application Support path is invalid');
     }
     return Directory(value);
+  }
+
+  Future<LogseqDbTarget> graphTarget() async {
+    final environment = await _load();
+    final platform = environment['platform'];
+    final graphName = environment['graphName'];
+    if (graphName is! String || graphName.isEmpty) {
+      throw const FormatException('native graph name is invalid');
+    }
+    switch (platform) {
+      case 'desktop':
+        final homePath = environment['homeDirectoryPath'];
+        if (homePath is! String || homePath.isEmpty) {
+          throw const FormatException('native home directory is invalid');
+        }
+        return LogseqDbTarget.desktopNative(
+          homeDirectory: Directory(homePath),
+          graphName: graphName,
+        );
+      case 'ios':
+        final applicationDataPath = environment['applicationDataPath'];
+        if (applicationDataPath is! String || applicationDataPath.isEmpty) {
+          throw const FormatException(
+            'native application data directory is invalid',
+          );
+        }
+        return LogseqDbTarget.iosNative(
+          applicationDataDirectory: Directory(applicationDataPath),
+          graphName: graphName,
+        );
+      default:
+        throw const FormatException('native graph platform is invalid');
+    }
   }
 
   Future<JournalCalendarSnapshot> initialCalendarSnapshot() async {
@@ -924,11 +1098,13 @@ final class _NativeStartupEnvironment {
 final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   ApplicationHostAdapter({
     required this.applicationSupportDirectory,
+    required this.graphTarget,
     required this.initialCalendarSnapshot,
     InitialCalendarSnapshotProvider? liveCalendarSnapshot,
   }) : liveCalendarSnapshot = liveCalendarSnapshot ?? initialCalendarSnapshot;
 
   final ApplicationSupportDirectoryProvider applicationSupportDirectory;
+  final GraphTargetProvider graphTarget;
   final InitialCalendarSnapshotProvider initialCalendarSnapshot;
   final InitialCalendarSnapshotProvider liveCalendarSnapshot;
   late final Future<JournalCalendarSnapshot> _initialSnapshot =
@@ -949,9 +1125,9 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
       await supportDirectory.create(recursive: true);
     }
     final canonicalRoot = await supportDirectory.resolveSymbolicLinks();
-    return JournalStartupEnvelope(
-      applicationSupportRoot: canonicalRoot,
-      initialCalendar: await _initialSnapshot,
+    return LogseqDbWorkerStartupEnvelope(
+      applicationSupportDirectory: canonicalRoot,
+      target: await graphTarget(),
     ).encode();
   }
 

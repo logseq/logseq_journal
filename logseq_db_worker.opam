@@ -1,0 +1,42 @@
+opam-version: "2.0"
+name: "logseq_db_worker"
+version: "0.1.0"
+synopsis: "Logseq DB graph worker for OCaml"
+maintainer: "application authors"
+authors: ["application authors"]
+license: "MIT"
+homepage: "https://github.com/RCmerci/logseq_journal"
+bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
+depends: [
+  "ocaml" {= "5.1.1"}
+  "dune" {= "3.23.1"}
+  "base" {= "v0.17.3"}
+  "bonsai" {= "v0.17.0"}
+  "bonsai_flutter" {= "0.1.0~dev"}
+  "bonsai_flutter_test" {with-test & = "0.1.0~dev"}
+  "cmdliner" {= "2.1.1"}
+  "core" {= "v0.17.2"}
+  "datascript_ocaml" {= "dev"}
+  "datascript-ocaml-native" {= "dev"}
+  "digestif" {= "1.3.1"}
+  "eio" {= "1.2"}
+  "melange-transit-native" {= "0.1.0"}
+  "mtime" {= "2.1.0"}
+  "persistent_sorted_set_ocaml" {= "dev"}
+  "sqlite3" {= "5.4.0"}
+  "uucp" {= "17.0.0"}
+  "uunf" {= "17.0.0"}
+  "uutf" {= "1.0.4"}
+  "yojson" {= "3.0.0"}
+]
+pin-depends: [
+  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#f6d27175632d26e759532f6ee81e8d1383490533"]
+  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#f6d27175632d26e759532f6ee81e8d1383490533"]
+  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
+  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
+  ["melange-transit-native.0.1.0" "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"]
+  ["persistent_sorted_set_ocaml.dev" "git+https://github.com/logseq/persistent-sorted-set-ocaml.git#4016dae1cdf4304207d8277ff9957656cdd8b177"]
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]

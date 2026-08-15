@@ -60,9 +60,6 @@ type spacing =
 type hit_regions =
   { header_visual : float
   ; minimum_target : float
-  ; fab_visual : float
-  ; fab_target : float
-  ; fab_bottom_inset : float
   }
 
 type header_geometry =
@@ -71,19 +68,26 @@ type header_geometry =
   ; vertical_inset : float
   }
 
-type fab_geometry =
-  { plus_size : float
-  ; plus_stroke : float
-  ; shadow_size : float
-  ; shadow_alpha : int
+type composer_geometry =
+  { horizontal_margin : float
+  ; bottom_inset : float
+  ; minimum_height : float
+  ; reserved_extent : float
   }
 
 type row_geometry =
-  { divider_inset : float
-  ; time_slot_base : float
+  { time_slot_base : float
   ; trailing_inset : float
   ; task_visual : float
   ; disclosure_visual : float
+  }
+
+type preview_geometry =
+  { connector_leading : float
+  ; bullet_center_leading : float
+  ; bullet_diameter : float
+  ; text_leading : float
+  ; narrow_leading_delta : float
   }
 
 type snackbar_geometry =
@@ -107,11 +111,23 @@ type profile_kind =
 
 type row_profile =
   { kind : profile_kind
-  ; block_extent : float
+  ; top_level_extent : float
+  ; child_extent : float
+  ; continuation_extent : float
   ; day_header_extent : float
   ; content_leading : float
   ; time_slot_width : float
   }
+
+type extent_role =
+  | Top_level
+  | Child_preview
+  | Children_loading
+  | Children_more
+  | Day_heading
+  | Day_continuation
+  | Feed_continuation
+  | Bottom_clearance
 
 type t
 
@@ -122,10 +138,13 @@ val typography : typography
 val spacing : spacing
 val hit_regions : hit_regions
 val header_geometry : header_geometry
-val fab_geometry : fab_geometry
+val composer_geometry : composer_geometry
 val row_geometry : row_geometry
+val preview_geometry : preview_geometry
 val snackbar_geometry : snackbar_geometry
 val motion : reduced_motion:bool -> motion
 val physical_divider_thickness : device_pixel_ratio:float -> float
 val timeline_max_width : float
 val select_row_profile : viewport_width:float -> text_scale:float -> row_profile
+val extent_for_role : profile:row_profile -> safe_bottom:float -> extent_role -> float
+val expanded_parent_extent : profile:row_profile -> source:string -> float

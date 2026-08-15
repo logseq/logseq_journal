@@ -8,6 +8,7 @@ class RunnerTests: XCTestCase {
     calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
     let payload = JournalPlatformEnvironment.snapshot(
       applicationSupportPath: "/tmp/support",
+      applicationDataPath: "/tmp/app-data",
       now: Date(timeIntervalSince1970: 0),
       locale: Locale(identifier: "en_US"),
       timeZone: calendar.timeZone,
@@ -15,6 +16,9 @@ class RunnerTests: XCTestCase {
     )
 
     XCTAssertEqual(payload["applicationSupportPath"] as? String, "/tmp/support")
+    XCTAssertEqual(payload["platform"] as? String, "ios")
+    XCTAssertEqual(payload["applicationDataPath"] as? String, "/tmp/app-data")
+    XCTAssertEqual(payload["graphName"] as? String, "logseq_journal")
     XCTAssertEqual(payload["instantUnixMilliseconds"] as? Int64, 0)
     XCTAssertEqual(payload["localDay"] as? Int, 19700101)
     XCTAssertEqual(payload["locale"] as? String, "en_US")

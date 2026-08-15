@@ -1,13 +1,39 @@
 import Foundation
+import Darwin
+import Security
 import XCTest
 @testable import bonsai_flutter_logseq_journal_host
 
 class RunnerTests: XCTestCase {
+  func testMacOSHostIsNotSandboxedForFixedGraphDirectory() throws {
+    let task = try XCTUnwrap(SecTaskCreateFromSelf(nil))
+    let sandboxValue = SecTaskCopyValueForEntitlement(
+      task,
+      "com.apple.security.app-sandbox" as CFString,
+      nil
+    ) as? Bool
+
+    XCTAssertNotEqual(sandboxValue, true)
+  }
+
+  func testCurrentEnvironmentUsesTheUnixAccountHomeOutsideTheSandboxContainer() throws {
+    let account = try XCTUnwrap(getpwuid(getuid()))
+    let expectedHome = String(cString: try XCTUnwrap(account.pointee.pw_dir))
+    let payload = try JournalPlatformEnvironment.current()
+
+    XCTAssertEqual(payload["homeDirectoryPath"] as? String, expectedHome)
+    XCTAssertFalse(
+      try XCTUnwrap(payload["homeDirectoryPath"] as? String)
+        .contains("/Library/Containers/")
+    )
+  }
+
   func testStartupEnvironmentSnapshotIsTypedAndContentFree() throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
     let payload = JournalPlatformEnvironment.snapshot(
       applicationSupportPath: "/tmp/support",
+      homeDirectoryPath: "/Users/test",
       now: Date(timeIntervalSince1970: 0),
       locale: Locale(identifier: "en_US"),
       timeZone: calendar.timeZone,
@@ -15,6 +41,9 @@ class RunnerTests: XCTestCase {
     )
 
     XCTAssertEqual(payload["applicationSupportPath"] as? String, "/tmp/support")
+    XCTAssertEqual(payload["platform"] as? String, "desktop")
+    XCTAssertEqual(payload["homeDirectoryPath"] as? String, "/Users/test")
+    XCTAssertEqual(payload["graphName"] as? String, "logseq_journal")
     XCTAssertEqual(payload["instantUnixMilliseconds"] as? Int64, 0)
     XCTAssertEqual(payload["localDay"] as? Int, 19700101)
     XCTAssertEqual(payload["locale"] as? String, "en_US")

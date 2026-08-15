@@ -4,16 +4,6 @@
  (libraries app))
 
 (test
- (name storage_path_test)
- (modules storage_path_test)
- (libraries app unix))
-
-(test
- (name journal_storage_test)
- (modules journal_storage_test)
- (libraries app datascript-ocaml-native sqlite3 unix))
-
-(test
  (name journal_platform_test)
  (modules journal_platform_test)
  (libraries app))
@@ -34,7 +24,8 @@
   bonsai_flutter.ui
   bonsai_flutter_test
   core
-  sqlite3
+  logseq_db_worker
+  logseq_db_worker_test_support
   unix))
 
 (test
@@ -63,7 +54,7 @@
 (executable
  (name journal_runtime_golden_fixture)
  (modules journal_runtime_golden_fixture)
- (libraries app unix))
+ (libraries app logseq_db_worker logseq_db_worker_test_support unix))
 
 (test
  (name journal_time_test)
@@ -76,32 +67,22 @@
  (libraries app))
 
 (test
- (name journal_schema_test)
- (modules journal_schema_test)
- (libraries app datascript-ocaml-native))
-
-(test
- (name journal_recovery_test)
- (modules journal_recovery_test)
- (libraries app unix))
-
-(test
- (name journal_repository_test)
- (modules journal_repository_test)
- (libraries app datascript-ocaml-native unix))
-
-(test
- (name journal_worker_test)
- (modules journal_worker_test)
- (libraries
-  app
-  bonsai_flutter.driver
-  bonsai_flutter.spec
-  datascript-ocaml-native
-  sqlite3
-  unix))
-
-(test
  (name journal_routes_test)
  (modules journal_routes_test)
  (libraries app bonsai_flutter.spec bonsai_flutter.ui))
+
+(test
+ (name logseq_db_worker_application_integration_test)
+ (modules logseq_db_worker_application_integration_test)
+ (libraries
+  app
+  bonsai
+  bonsai_flutter
+  bonsai_flutter.driver
+  bonsai_flutter.spec
+  bonsai_flutter.ui
+  bonsai_flutter_test
+  core
+  logseq_db_worker
+  logseq_db_worker_test_support
+  unix))

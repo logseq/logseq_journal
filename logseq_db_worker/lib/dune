@@ -1,0 +1,17 @@
+(include_subdirs qualified)
+
+(library
+ (name logseq_db_worker)
+ (public_name logseq_db_worker)
+ (libraries
+  datascript-ocaml-native
+  datascript_ocaml
+  digestif
+  melange-transit-native
+  persistent_sorted_set_ocaml
+  sqlite3
+  unix
+  uucp
+  uunf
+  uutf
+  yojson))

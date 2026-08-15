@@ -68,6 +68,22 @@ let create
         })
 ;;
 
+let of_instant_unix_ms ~instant_unix_ms ~time_zone_id ~utc_offset_seconds =
+  let seconds = Int64.to_float instant_unix_ms /. 1_000. in
+  let local_time = Unix.gmtime (seconds +. Float.of_int utc_offset_seconds) in
+  let local_day =
+    ((local_time.Unix.tm_year + 1900) * 10_000)
+    + ((local_time.tm_mon + 1) * 100)
+    + local_time.tm_mday
+  in
+  create
+    ~instant_unix_ms
+    ~local_day
+    ~local_minute_of_day:((local_time.tm_hour * 60) + local_time.tm_min)
+    ~time_zone_id
+    ~utc_offset_seconds
+;;
+
 let equal = ( = )
 let instant_unix_ms value = value.instant_unix_ms
 let local_day value = value.local_day

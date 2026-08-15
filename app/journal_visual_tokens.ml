@@ -60,9 +60,6 @@ type spacing =
 type hit_regions =
   { header_visual : float
   ; minimum_target : float
-  ; fab_visual : float
-  ; fab_target : float
-  ; fab_bottom_inset : float
   }
 
 type header_geometry =
@@ -71,19 +68,26 @@ type header_geometry =
   ; vertical_inset : float
   }
 
-type fab_geometry =
-  { plus_size : float
-  ; plus_stroke : float
-  ; shadow_size : float
-  ; shadow_alpha : int
+type composer_geometry =
+  { horizontal_margin : float
+  ; bottom_inset : float
+  ; minimum_height : float
+  ; reserved_extent : float
   }
 
 type row_geometry =
-  { divider_inset : float
-  ; time_slot_base : float
+  { time_slot_base : float
   ; trailing_inset : float
   ; task_visual : float
   ; disclosure_visual : float
+  }
+
+type preview_geometry =
+  { connector_leading : float
+  ; bullet_center_leading : float
+  ; bullet_diameter : float
+  ; text_leading : float
+  ; narrow_leading_delta : float
   }
 
 type snackbar_geometry =
@@ -107,11 +111,24 @@ type profile_kind =
 
 type row_profile =
   { kind : profile_kind
-  ; block_extent : float
+  ; top_level_extent : float
+  ; child_extent : float
+  ; continuation_extent : float
   ; day_header_extent : float
   ; content_leading : float
   ; time_slot_width : float
   }
+
+
+type extent_role =
+  | Top_level
+  | Child_preview
+  | Children_loading
+  | Children_more
+  | Day_heading
+  | Day_continuation
+  | Feed_continuation
+  | Bottom_clearance
 
 type t =
   { palette : palette
@@ -221,9 +238,6 @@ let spacing = { x1 = 4.; x2 = 8.; x3 = 12.; x4 = 16.; x5 = 20.; x6 = 24.; x7 = 2
 let hit_regions =
   { header_visual = 30.
   ; minimum_target = 44.
-  ; fab_visual = 48.
-  ; fab_target = 56.
-  ; fab_bottom_inset = 20.
   }
 ;;
 
@@ -231,16 +245,28 @@ let header_geometry =
   { content_height = 48.; horizontal_inset = 12.; vertical_inset = 4. }
 ;;
 
-let fab_geometry =
-  { plus_size = 18.; plus_stroke = 1.5; shadow_size = 52.; shadow_alpha = 18 }
+let composer_geometry =
+  { horizontal_margin = 12.
+  ; bottom_inset = 12.
+  ; minimum_height = 56.
+  ; reserved_extent = 80.
+  }
 ;;
 
 let row_geometry =
-  { divider_inset = 18.
-  ; time_slot_base = 52.
+  { time_slot_base = 52.
   ; trailing_inset = 24.
   ; task_visual = 14.
   ; disclosure_visual = 14.
+  }
+;;
+
+let preview_geometry =
+  { connector_leading = 32.
+  ; bullet_center_leading = 50.
+  ; bullet_diameter = 3.
+  ; text_leading = 68.
+  ; narrow_leading_delta = 8.
   }
 ;;
 
@@ -273,21 +299,51 @@ let physical_divider_thickness ~device_pixel_ratio = 1. /. Float.max 1. device_p
 let timeline_max_width = 720.
 
 let select_row_profile ~viewport_width ~text_scale =
-  let content_leading = if Float.compare viewport_width 360. < 0 then 24. else 28. in
-  if Float.compare viewport_width 360. >= 0 && Float.compare text_scale 1.3 <= 0
+  let narrow = Float.compare viewport_width 360. < 0 in
+  let content_leading = if narrow then 24. else 32. in
+  let scale = Float.max 1. text_scale in
+  if (not narrow) && Float.compare scale 1.3 <= 0
   then
     { kind = Compact
-    ; block_extent = 48.
+    ; top_level_extent = Float.ceil (36. +. (40. *. scale))
+    ; child_extent = Float.ceil (16. +. (20. *. scale))
+    ; continuation_extent = Float.ceil (28. +. (20. *. scale))
     ; day_header_extent = 36.
     ; content_leading
     ; time_slot_width = row_geometry.time_slot_base
     }
   else (
-    let scale = Float.max 1. text_scale in
+    let top_level_extent =
+      if Float.compare scale 1.3 <= 0
+      then Float.ceil (44. +. (40. *. scale))
+      else Float.ceil (24. +. (58. *. scale))
+    in
     { kind = Adaptive
-    ; block_extent = Float.ceil (32. +. (48. *. scale))
+    ; top_level_extent
+    ; child_extent = Float.ceil (16. +. (20. *. scale))
+    ; continuation_extent = Float.ceil (28. +. (20. *. scale))
     ; day_header_extent = Float.ceil (24. +. (24. *. scale))
     ; content_leading
     ; time_slot_width = Float.ceil (row_geometry.time_slot_base *. scale)
     })
+;;
+
+let extent_for_role ~profile ~safe_bottom = function
+  | Top_level -> profile.top_level_extent
+  | Child_preview | Children_loading | Children_more -> profile.child_extent
+  | Day_heading -> profile.day_header_extent
+  | Day_continuation | Feed_continuation -> profile.continuation_extent
+  | Bottom_clearance -> composer_geometry.reserved_extent +. max 0. safe_bottom
+;;
+
+let expanded_parent_extent ~profile ~source =
+  let source_lines =
+    String.fold_left
+      (fun lines character ->
+         if lines < 3 && Char.equal character '\n' then lines + 1 else lines)
+      1
+      source
+  in
+  let additional_line_extent = profile.child_extent -. spacing.x4 in
+  profile.child_extent +. (float_of_int (source_lines - 1) *. additional_line_extent)
 ;;

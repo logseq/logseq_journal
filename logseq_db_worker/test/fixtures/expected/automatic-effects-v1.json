@@ -1,0 +1,26 @@
+{
+  "apiVersion": 1,
+  "pinnedLogseqCommit": "4f21d068aed43bb2ea5823247cae73ecdd8d60f8",
+  "minimumSchema": "65.33",
+  "operations": {
+    "saveBlock": {"required":["builtInProtection","uuidImmutability","updatedAt","pageUpdatedAt","titleReferences","tags","scheduledReferences","deadlineReferences","orphanCleanup","transactionMetadata","blockTxId"],"prestageReject":["commands","templates","unimplementedAssetEffects"]},
+    "insertBlocks": {"required":["fractionalOrders","parentAndPage","createdAt","updatedAt","internalReferenceRemap","referenceStubs","replaceEmpty","transactionMetadata","blockTxId"],"prestageReject":["commands","templates","unsupportedAssetRelations"]},
+    "moveBlocks": {"required":["selectionNormalization","cyclePrevention","fractionalOrders","crossPageDescendantRewrite","transactionMetadata","blockTxId"],"prestageReject":["propertyValueMembership"]},
+    "moveUpDown": {"required":["contextualTarget","sharedMovePlanner","boundaryNoChange","transactionMetadata","blockTxId"],"prestageReject":[]},
+    "indentOutdent": {"required":["continuousSelection","collapsedTargetSemantics","directOutdentRightSiblingReparenting","fractionalOrders","transactionMetadata","blockTxId"],"prestageReject":["propertyValueMembership"]},
+    "deleteBlocks": {"required":["ancestorDeduplication","hardSubtreeDelete","referenceCleanup","rangeCommentCleanup","defaultValueReplacement","transactionMetadata"],"prestageReject":["builtInNodes"]},
+    "createPage": {"required":["collisionPolicy","pageNameNormalization","journalUuid","timestamps","classIdentity","transactionMetadata"],"prestageReject":["namespaceParentCreation","restoreByCreate","pageKindConversion","propertiesOrTagsAtCreate"]},
+    "renamePage": {"required":["savePipeline","pageNameNormalization","uuidAliases","referenceRewrite","orphanCleanup","transactionMetadata","blockTxId"],"prestageReject":[]},
+    "deletePage": {"required":["ordinaryRecycle","todayJournalClear","classAndPropertyRules","recycleMetadata","transactionMetadata"],"prestageReject":["builtInPages","hiddenPages"]},
+    "restoreRecycledPage": {"required":["recordedParent","recordedOrder","topLevelRestore","recycleMetadataCleanup","transactionMetadata"],"prestageReject":["nonPageRoots","orderRepair"]},
+    "permanentlyDeleteRecycledPage": {"required":["eligibility","hardSubtreeDelete","relationCleanup","transactionMetadata"],"prestageReject":["nonPageRoots"]},
+    "upsertProperty": {"required":["qualifiedIdentity","derivedPropertyUuid","schemaValidation","cardinalityValidation","existingValueValidation","transactionMetadata"],"prestageReject":["independentPropertyUuid","pageConversion","unsupportedInternalUserTypes"]},
+    "setProperty": {"required":["typedValidation","selfReferenceProtection","closedValues","defaultPlaceholder","statusClassAliasRules","idempotentNoChange","transactionMetadata"],"prestageReject":[]},
+    "removeProperty": {"required":["statusDefaultExtendsAliasRules","placeholderCleanup","orphanValueCleanup","transactionMetadata"],"prestageReject":[]},
+    "batchSetProperty": {"required":["resolveAllTargetsFirst","explicitAppendOrReplace","typedValidation","atomicity","transactionMetadata"],"prestageReject":[]},
+    "batchRemoveProperty": {"required":["resolveAllTargetsFirst","statusHandling","orphanGeneratedValueCleanup","atomicity","transactionMetadata"],"prestageReject":[]},
+    "manageClosedValues": {"required":["typeEligibility","valueIdentity","valueValidation","associationCleanup","transactionMetadata"],"prestageReject":["nonClosedValuePropertyTypes"]},
+    "manageClassProperty": {"required":["classValidation","propertyValidation","defaultValidation","classPropertyRelations","transactionMetadata"],"prestageReject":["builtInProtectedRelations"]}
+  },
+  "separateIntegrationGates": ["searchSidecarInvalidation","vectorSidecarInvalidation","clientOperationHistoryCoexistence","undoHistoryCoexistence","checksumCoexistence","laterSyncCoexistence"]
+}

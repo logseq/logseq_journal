@@ -172,18 +172,30 @@ let test_typography_spacing_motion_and_hit_regions () =
   let hit = Tokens.hit_regions in
   require
     (hit.header_visual = 30.
-     && hit.minimum_target = 44.
-     && hit.fab_visual = 48.
-     && hit.fab_target = 56.
-     && hit.fab_bottom_inset = 20.)
+     && hit.minimum_target = 44.)
     "hit-region tokens changed";
   let row = Tokens.row_geometry in
   require
-    (row.divider_inset = 18.
-     && row.time_slot_base = 52.
+    (row.time_slot_base = 52.
      && row.task_visual = 14.
-     && row.disclosure_visual = 14.)
+     && row.disclosure_visual = 14.
+     && row.trailing_inset = 24.)
     "row geometry tokens changed";
+  let preview = Tokens.preview_geometry in
+  require
+    (preview.connector_leading = 32.
+     && preview.bullet_center_leading = 50.
+     && preview.bullet_diameter = 3.
+     && preview.text_leading = 68.
+     && preview.narrow_leading_delta = 8.)
+    "preview geometry tokens changed";
+  let composer = Tokens.composer_geometry in
+  require
+    (composer.horizontal_margin = 12.
+     && composer.bottom_inset = 12.
+     && composer.minimum_height = 56.
+     && composer.reserved_extent = 80.)
+    "Capture composer geometry tokens changed";
   let standard = Tokens.motion ~reduced_motion:false in
   let reduced = Tokens.motion ~reduced_motion:true in
   require
@@ -218,7 +230,9 @@ let require_profile
       ~width
       ~scale
       ~kind
-      ~block_extent
+      ~top_level_extent
+      ~child_extent
+      ~continuation_extent
       ~day_header_extent
       ~content_leading
       ~time_slot_width
@@ -226,8 +240,18 @@ let require_profile
   let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
   require (profile.kind = kind) "profile kind changed at %.0f/%.2f" width scale;
   require
-    (profile.block_extent = block_extent)
-    "block extent changed at %.0f/%.2f"
+    (profile.top_level_extent = top_level_extent)
+    "top-level extent changed at %.0f/%.2f"
+    width
+    scale;
+  require
+    (profile.child_extent = child_extent)
+    "child extent changed at %.0f/%.2f"
+    width
+    scale;
+  require
+    (profile.continuation_extent = continuation_extent)
+    "continuation extent changed at %.0f/%.2f"
     width
     scale;
   require
@@ -252,69 +276,81 @@ let test_known_row_profile_selection () =
     ~width:360.
     ~scale:1.3
     ~kind:Tokens.Compact
-    ~block_extent:48.
+    ~top_level_extent:88.
+    ~child_extent:42.
+    ~continuation_extent:54.
     ~day_header_extent:36.
-    ~content_leading:28.
+    ~content_leading:32.
     ~time_slot_width:52.;
   require_profile
     ~width:359.
     ~scale:1.
     ~kind:Tokens.Adaptive
-    ~block_extent:80.
+    ~top_level_extent:84.
+    ~child_extent:36.
+    ~continuation_extent:48.
     ~day_header_extent:48.
     ~content_leading:24.
     ~time_slot_width:52.;
   require_profile
     ~width:390.
-    ~scale:1.31
-    ~kind:Tokens.Adaptive
-    ~block_extent:95.
-    ~day_header_extent:56.
-    ~content_leading:28.
-    ~time_slot_width:69.;
+    ~scale:1.3
+    ~kind:Tokens.Compact
+    ~top_level_extent:88.
+    ~child_extent:42.
+    ~continuation_extent:54.
+    ~day_header_extent:36.
+    ~content_leading:32.
+    ~time_slot_width:52.;
   require_profile
     ~width:744.
     ~scale:2.
     ~kind:Tokens.Adaptive
-    ~block_extent:128.
+    ~top_level_extent:140.
+    ~child_extent:56.
+    ~continuation_extent:68.
     ~day_header_extent:72.
-    ~content_leading:28.
+    ~content_leading:32.
     ~time_slot_width:104.;
   require_profile
     ~width:1_200.
     ~scale:3.2
     ~kind:Tokens.Adaptive
-    ~block_extent:186.
+    ~top_level_extent:210.
+    ~child_extent:80.
+    ~continuation_extent:92.
     ~day_header_extent:101.
-    ~content_leading:28.
+    ~content_leading:32.
     ~time_slot_width:167.
 ;;
 
 let test_row_profiles_cover_required_width_and_scale_matrix () =
   let cases =
-    [ 320., 1., Tokens.Adaptive, 80., 48., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 95., 56., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 128., 72., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 186., 101., 24., 167.
-    ; 390., 1., Tokens.Compact, 48., 36., 28., 52.
-    ; 390., 1.3, Tokens.Compact, 48., 36., 28., 52.
-    ; 390., 2., Tokens.Adaptive, 128., 72., 28., 104.
-    ; 390., 3.2, Tokens.Adaptive, 186., 101., 28., 167.
-    ; 744., 1., Tokens.Compact, 48., 36., 28., 52.
-    ; 744., 1.3, Tokens.Compact, 48., 36., 28., 52.
-    ; 744., 2., Tokens.Adaptive, 128., 72., 28., 104.
-    ; 744., 3.2, Tokens.Adaptive, 186., 101., 28., 167.
-    ; 1_200., 1., Tokens.Compact, 48., 36., 28., 52.
-    ; 1_200., 1.3, Tokens.Compact, 48., 36., 28., 52.
-    ; 1_200., 2., Tokens.Adaptive, 128., 72., 28., 104.
-    ; 1_200., 3.2, Tokens.Adaptive, 186., 101., 28., 167.
+    [ 320., 1., Tokens.Adaptive, 84., 36., 48., 48., 24., 52.
+    ; 320., 1.3, Tokens.Adaptive, 96., 42., 54., 56., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 140., 56., 68., 72., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 24., 167.
+    ; 390., 1., Tokens.Compact, 76., 36., 48., 36., 32., 52.
+    ; 390., 1.3, Tokens.Compact, 88., 42., 54., 36., 32., 52.
+    ; 390., 2., Tokens.Adaptive, 140., 56., 68., 72., 32., 104.
+    ; 390., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 32., 167.
+    ; 744., 1., Tokens.Compact, 76., 36., 48., 36., 32., 52.
+    ; 744., 1.3, Tokens.Compact, 88., 42., 54., 36., 32., 52.
+    ; 744., 2., Tokens.Adaptive, 140., 56., 68., 72., 32., 104.
+    ; 744., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 32., 167.
+    ; 1_200., 1., Tokens.Compact, 76., 36., 48., 36., 32., 52.
+    ; 1_200., 1.3, Tokens.Compact, 88., 42., 54., 36., 32., 52.
+    ; 1_200., 2., Tokens.Adaptive, 140., 56., 68., 72., 32., 104.
+    ; 1_200., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 32., 167.
     ]
   in
   List.iter
     (fun ( width
          , scale
          , kind
-         , block_extent
+         , top_level_extent
+         , child_extent
+         , continuation_extent
          , day_header_extent
          , content_leading
          , time_slot_width ) ->
@@ -322,7 +358,9 @@ let test_row_profiles_cover_required_width_and_scale_matrix () =
          ~width
          ~scale
          ~kind
-         ~block_extent
+         ~top_level_extent
+         ~child_extent
+         ~continuation_extent
          ~day_header_extent
          ~content_leading
          ~time_slot_width)
@@ -334,7 +372,9 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     ~width:0.
     ~scale:0.
     ~kind:Tokens.Adaptive
-    ~block_extent:80.
+    ~top_level_extent:84.
+    ~child_extent:36.
+    ~continuation_extent:48.
     ~day_header_extent:48.
     ~content_leading:24.
     ~time_slot_width:52.;
@@ -348,7 +388,7 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     match profiles with
     | left :: (right :: _ as rest) ->
       require
-        (Float.compare left.block_extent right.block_extent <= 0
+        (Float.compare left.top_level_extent right.top_level_extent <= 0
          && Float.compare left.day_header_extent right.day_header_extent <= 0
          && Float.compare left.time_slot_width right.time_slot_width <= 0)
         "known extents shrink as text scale increases";
@@ -359,6 +399,49 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
   require
     (Journal_timeline_state.extent_strategy = Journal_timeline_state.Known_profile_extents)
     "adaptive behavior introduced intrinsic measurement"
+;;
+
+let test_every_sparse_role_has_one_authoritative_exact_extent () =
+  let check ~width ~scale ~safe_bottom expected =
+    let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
+    List.iter
+      (fun (role, extent) ->
+         let actual = Tokens.extent_for_role ~profile ~safe_bottom role in
+         require
+           (Float.equal actual extent)
+           "role extent %.1f, expected %.1f at %.0f/%.1f"
+           actual
+           extent
+           width
+           scale)
+      expected
+  in
+  check
+    ~width:390.
+    ~scale:1.
+    ~safe_bottom:34.
+    [ Tokens.Top_level, 76.
+    ; Tokens.Child_preview, 36.
+    ; Tokens.Children_loading, 36.
+    ; Tokens.Children_more, 36.
+    ; Tokens.Day_heading, 36.
+    ; Tokens.Day_continuation, 48.
+    ; Tokens.Feed_continuation, 48.
+    ; Tokens.Bottom_clearance, 114.
+    ];
+  check
+    ~width:320.
+    ~scale:3.2
+    ~safe_bottom:0.
+    [ Tokens.Top_level, 210.
+    ; Tokens.Child_preview, 80.
+    ; Tokens.Children_loading, 80.
+    ; Tokens.Children_more, 80.
+    ; Tokens.Day_heading, 101.
+    ; Tokens.Day_continuation, 92.
+    ; Tokens.Feed_continuation, 92.
+    ; Tokens.Bottom_clearance, 80.
+    ]
 ;;
 
 let test_header_context_copy_is_pure_product_state () =
@@ -396,6 +479,8 @@ let tests =
   ; "required row profile matrix", test_row_profiles_cover_required_width_and_scale_matrix
   ; ( "zero viewport and monotonic known extents"
     , test_zero_viewport_and_profile_growth_remain_known_extent )
+  ; ( "authoritative role-specific exact extents"
+    , test_every_sparse_role_has_one_authoritative_exact_extent )
   ; "header context", test_header_context_copy_is_pure_product_state
   ]
 ;;

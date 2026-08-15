@@ -11,11 +11,10 @@ type mode =
   | Adding_child
   | Saving_child
   | Committed
-  | Recovery_only
 
 type t
 
-val create : session_number:int64 -> Journal_repository.detail -> t
+val create : session_number:int64 -> Journal_graph_projection.detail -> t
 val root : t -> Journal_model.t
 val children : t -> Journal_model.t list
 val mode : t -> mode
@@ -31,12 +30,11 @@ val apply_text_edit : t -> Ui.Event.Payload.text_edit -> t
 val request_back : t -> [ `Close | `State of t ]
 val keep_editing : t -> t
 val discard_edit : t -> t
-val admit_save : t -> mutation_id:string -> t * Journal_worker.request option
+val admit_save : t -> mutation_id:string -> t * Journal_graph_request.t option
 val apply_conflict : t -> Journal_model.t -> t
 val fail : t -> message:string -> t
-val recovery_only : t -> t
-val retry : t -> mutation_id:string -> t * Journal_worker.request option
-val admit_task_toggle : t -> mutation_id:string -> t * Journal_worker.request option
+val retry : t -> mutation_id:string -> t * Journal_graph_request.t option
+val admit_task_toggle : t -> mutation_id:string -> t * Journal_graph_request.t option
 val begin_child : t -> session_number:int64 -> t
 val child_capture : t -> Journal_capture.t option
 val apply_child_text_edit : t -> Ui.Event.Payload.text_edit -> t
@@ -47,7 +45,7 @@ val admit_child
   -> block_id:string
   -> sibling_order:string
   -> creation_time:Journal_time.t
-  -> t * Journal_worker.request option
+  -> t * Journal_graph_request.t option
 
 val apply_block : t -> Journal_model.t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent_revision:int -> t

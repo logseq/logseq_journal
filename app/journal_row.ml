@@ -8,6 +8,7 @@ module Item = struct
     ; task_state : Journal_model.task_state
     ; child_count : int
     ; time : string option
+    ; supporting : string list
     }
 
   let of_block block =
@@ -16,6 +17,17 @@ module Item = struct
     ; task_state = Journal_model.task_state block
     ; child_count = Journal_model.child_count block
     ; time = Some (Journal_time.format_hh_mm (Journal_model.creation_time block))
+    ; supporting = []
+    }
+  ;;
+
+  let of_timeline_entry (entry : Journal_graph_projection.timeline_entry) =
+    let item = of_block entry.block in
+    { item with
+      supporting =
+        List.map
+          (fun (summary : Journal_graph_projection.child_summary) -> summary.source)
+          entry.child_summaries
     }
   ;;
 
@@ -26,17 +38,55 @@ module Item = struct
         Some source
       | Some _ | None -> None
     in
-    { id; source; task_state = Journal_model.Not_a_task; child_count = 0; time = None }
+    { id
+    ; source
+    ; task_state = Journal_model.Not_a_task
+    ; child_count = 0
+    ; time = None
+    ; supporting = []
+    }
   ;;
 
   let source_for_detail t = t.source
   let id t = t.id
   let display_source t = Option.value t.source ~default:"Unavailable journal entry"
 
+  let line_count source =
+    let lines = ref 1 in
+    String.iter (fun character -> if Char.equal character '\n' then incr lines) source;
+    !lines
+  ;;
+
+  let preview t =
+    let source_lines = Int.min 3 (line_count (display_source t)) in
+    let rec take_supporting remaining reversed = function
+      | [] -> List.rev reversed
+      | _ when remaining = 0 -> List.rev reversed
+      | source :: rest ->
+        let lines = Int.min remaining (line_count source) in
+        take_supporting (remaining - lines) ((source, lines) :: reversed) rest
+    in
+    source_lines, take_supporting (3 - source_lines) [] t.supporting
+  ;;
+
   let semantic_label t =
     match t.time with
     | Some time -> display_source t ^ ", created at " ^ time
     | None -> display_source t
+  ;;
+
+  let semantic_label_for_state t ~expanded =
+    let source =
+      match expanded with
+      | true -> display_source t
+      | false ->
+        let _, supporting = preview t in
+        List.fold_left
+          (fun label (supporting, _) -> label ^ ", " ^ supporting)
+          (display_source t)
+          supporting
+    in
+    match t.time with Some time -> source ^ ", created at " ^ time | None -> source
   ;;
 end
 
@@ -171,43 +221,28 @@ let disclosure_indicator ~tokens ~rtl ~expanded item =
         ()
       |> test_id ("journal-row-disclosure-icon:" ^ Item.id item)
     in
-    let count =
-      Ui.Widget.text
-        ~style:(text_style Tokens.typography.disclosure palette.text_secondary)
-        (string_of_int item.child_count)
-      |> Ui.Widget.padding
-           ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:Tokens.spacing.x1 ())
-      |> Ui.Widget.decorated_box
-           ~decoration:
-             (Ui.Style.Decoration.create
-                ~background:palette.neutral_badge
-                ~border_radius:6.
-                ())
-    in
-    Ui.Widget.Flex.row
-      [ Ui.Widget.Flex.fixed glyph
-      ; Ui.Widget.Flex.fixed (Ui.Widget.sized_box ~width:2. (Ui.Widget.empty ()))
-      ; Ui.Widget.Flex.fixed count
-      ]
+    glyph
     |> Ui.Widget.center
+    |> Ui.Widget.sized_box ~width:Tokens.row_geometry.disclosure_visual
     |> test_id ("journal-row-disclosure-indicator:" ^ Item.id item)
     |> Option.some)
 ;;
 
-let source_text tokens item =
+let source_text tokens item ~max_lines =
   Ui.Widget.text
     ~style:(text_style Tokens.typography.entry (Tokens.palette tokens).text_primary)
-    ~max_lines:1
+    ~max_lines
     ~overflow:Ui.Style.Text_overflow.Ellipsis
     (Item.display_source item)
   |> test_id ("journal-row-source:" ^ Item.id item)
 ;;
 
-let time_slot tokens profile item =
+let time_slot tokens profile item ~show_timestamp =
   let child =
-    match item.Item.time with
-    | None -> Ui.Widget.empty ()
-    | Some time ->
+    match item.Item.time, show_timestamp with
+    | None, _ -> Ui.Widget.empty ()
+    | Some _, false -> Ui.Widget.empty ()
+    | Some time, true ->
       Ui.Widget.text
         ~style:
           (text_style Tokens.typography.timestamp (Tokens.palette tokens).text_timestamp)
@@ -232,24 +267,29 @@ let view
       ~device_pixel_ratio
       ~rtl
       ~item
+      ~show_timestamp
       ~expanded
+      ~show_divider
       ~sort_base
       ~reduced_motion
       ~on_task_toggle
       ~on_toggle_children
   =
   let divider_thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
-  let body_height = profile.Tokens.block_extent -. divider_thickness in
-  let adaptive_stacked =
-    profile.Tokens.kind = Tokens.Adaptive
-    && Float.compare body_height (2. *. Tokens.hit_regions.minimum_target) >= 0
+  let row_extent =
+    if expanded
+    then
+      Tokens.expanded_parent_extent ~profile ~source:(Item.display_source item)
+    else profile.top_level_extent
   in
-  let source_slot_height =
-    if adaptive_stacked then body_height /. 2. else Tokens.hit_regions.minimum_target
+  let body_height =
+    row_extent -. if show_divider then divider_thickness else 0.
   in
   let source =
-    let text =
-      source_text tokens item
+    let source_lines, supporting = Item.preview item in
+    let supporting = if expanded then [] else supporting in
+    let primary =
+      source_text tokens item ~max_lines:source_lines
       |> Ui.Widget.padding
            ~insets:
              (Ui.Layout.Edge_insets.only
@@ -258,22 +298,36 @@ let view
                 ())
       |> test_id ("journal-row-source-gap:" ^ Item.id item)
     in
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.expanded (Ui.Widget.empty ())
-      ; Ui.Widget.Flex.fixed text
-      ; Ui.Widget.Flex.expanded (Ui.Widget.empty ())
-      ]
-    |> Ui.Widget.sized_box ~height:source_slot_height
+    let text_lines =
+      Ui.Widget.Flex.fixed primary
+      :: List.mapi
+           (fun index (supporting, max_lines) ->
+              Ui.Widget.text
+                ~style:
+                  (text_style
+                     Tokens.typography.supporting
+                     (Tokens.palette tokens).text_secondary)
+                ~max_lines
+                ~overflow:Ui.Style.Text_overflow.Ellipsis
+                supporting
+              |> test_id
+                   (Printf.sprintf "journal-row-supporting:%s:%d" (Item.id item) index)
+              |> Ui.Widget.Flex.fixed)
+           supporting
+    in
+    Ui.Widget.Flex.column text_lines
+    |> test_id ("journal-row-text-stack:" ^ Item.id item)
+    |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Top_start
     |> test_id ("journal-row-body-content:" ^ Item.id item)
   in
   let task = task_control ~tokens ~reduced_motion ~sort_base item on_task_toggle in
   let disclosure = disclosure_indicator ~tokens ~rtl ~expanded item in
-  let time = time_slot tokens profile item in
+  let time = time_slot tokens profile item ~show_timestamp in
   let fixed_options widgets = List.filter_map (Option.map Ui.Widget.Flex.fixed) widgets in
   let inline =
     Ui.Widget.Flex.row
       ~key:(Ui.Key.string ("journal-row-inline-layout:" ^ Item.id item))
-      ([ Ui.Widget.Flex.flexible source ] @ fixed_options [ disclosure ])
+      [ Ui.Widget.Flex.flexible source ]
     |> test_id ("journal-row-inline:" ^ Item.id item)
   in
   let layout =
@@ -281,32 +335,14 @@ let view
     | Tokens.Compact ->
       Ui.Widget.Flex.row
         ~key:(Ui.Key.string ("journal-row-compact-layout:" ^ Item.id item))
-        [ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
+        ([ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
+         @ fixed_options [ disclosure ])
       |> test_id ("journal-row-compact:" ^ Item.id item)
-    | Tokens.Adaptive when not adaptive_stacked ->
-      Ui.Widget.Flex.row
-        ~key:(Ui.Key.string ("journal-row-adaptive-inline-layout:" ^ Item.id item))
-        [ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
-      |> test_id ("journal-row-adaptive:" ^ Item.id item)
     | Tokens.Adaptive ->
-      let metadata =
-        Ui.Widget.Flex.row
-          ~key:(Ui.Key.string ("journal-row-adaptive-metadata:" ^ Item.id item))
-          (fixed_options [ disclosure ]
-           @ [ Ui.Widget.Flex.expanded (Ui.Widget.empty ()); Ui.Widget.Flex.fixed time ])
-        |> Ui.Widget.sized_box
-             ~key:(Ui.Key.string ("journal-row-adaptive-metadata-slot:" ^ Item.id item))
-             ~height:((profile.block_extent -. divider_thickness) /. 2.)
-        |> test_id ("journal-row-adaptive-metadata-slot:" ^ Item.id item)
-      in
-      let content =
-        Ui.Widget.Flex.column
-          ~key:(Ui.Key.string ("journal-row-adaptive-content:" ^ Item.id item))
-          [ Ui.Widget.Flex.expanded source; Ui.Widget.Flex.fixed metadata ]
-      in
       Ui.Widget.Flex.row
-        ~key:(Ui.Key.string ("journal-row-adaptive-stacked-layout:" ^ Item.id item))
-        [ Ui.Widget.Flex.expanded content ]
+        ~key:(Ui.Key.string ("journal-row-adaptive-layout:" ^ Item.id item))
+        ([ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
+         @ fixed_options [ disclosure ])
       |> test_id ("journal-row-adaptive:" ^ Item.id item)
   in
   let body =
@@ -314,7 +350,7 @@ let view
       Printf.sprintf
         "journal-row-body:%s:%.0f:%.0f"
         (Item.id item)
-        profile.Tokens.block_extent
+        row_extent
         profile.time_slot_width
     in
     let height = body_height in
@@ -331,6 +367,8 @@ let view
              (Ui.Layout.Edge_insets.only
                 ~left:(if rtl then trailing else leading)
                 ~right:(if rtl then leading else trailing)
+                ~top:Tokens.spacing.x2
+                ~bottom:Tokens.spacing.x2
                 ())
       |> test_id ("journal-row-body-padding:" ^ Item.id item)
       |> Ui.Widget.sized_box ~key:(Ui.Key.string profile_key) ~height
@@ -339,29 +377,31 @@ let view
     let body =
       if item.Item.child_count > 0
       then
-        content
-        |> pressable
-             ~tokens
-             ~reduced_motion
-             ~control_id:("journal-row-toggle-children:" ^ Item.id item)
-             ~label:(Item.semantic_label item)
-             ~hint:
-               (if expanded
-                then "Hide direct child blocks"
-                else "Show direct child blocks")
-             ~value:(Some (if expanded then "Expanded" else "Collapsed"))
-             ~role:Ui.Semantics.Role.Button
-             ~checked:None
-             ~sort_key:(sort_base +. 2.)
-             ~on_press:on_toggle_children
-        |> minimum_target
+        let target =
+          content
+          |> pressable
+               ~tokens
+               ~reduced_motion
+               ~control_id:("journal-row-toggle-children:" ^ Item.id item)
+               ~label:(Item.semantic_label_for_state item ~expanded)
+               ~hint:
+                 (if expanded
+                  then "Hide direct child blocks"
+                  else "Show direct child blocks")
+               ~value:(Some (if expanded then "Expanded" else "Collapsed"))
+               ~role:Ui.Semantics.Role.Button
+               ~checked:None
+               ~sort_key:(sort_base +. 2.)
+               ~on_press:on_toggle_children
+        in
+        (if expanded then target else minimum_target target)
         |> test_id ("journal-row-toggle-children-target:" ^ Item.id item)
       else
         content
         |> Ui.Widget.semantics
              ~properties:
                (Ui.Semantics.create
-                  ~label:(Item.semantic_label item)
+                  ~label:(Item.semantic_label_for_state item ~expanded)
                   ~role:Ui.Semantics.Role.Generic
                   ~sort_key:(sort_base +. 2.)
                   ())
@@ -397,15 +437,16 @@ let view
     |> test_id ("journal-row-divider:" ^ Item.id item)
     |> Ui.Widget.padding
          ~insets:
-           (Ui.Layout.Edge_insets.only
-              ~left:(if rtl then 0. else Tokens.row_geometry.divider_inset)
-              ~right:(if rtl then Tokens.row_geometry.divider_inset else 0.)
-              ())
+           (Ui.Layout.Edge_insets.only ~left:0. ~right:0. ())
     |> test_id ("journal-row-divider-padding:" ^ Item.id item)
   in
-  Ui.Widget.Flex.column [ Ui.Widget.Flex.fixed body; Ui.Widget.Flex.fixed divider ]
-  |> Ui.Widget.sized_box ~height:profile.block_extent
+  Ui.Widget.Flex.column
+    ([ Ui.Widget.Flex.fixed body ]
+     @ if show_divider then [ Ui.Widget.Flex.fixed divider ] else [])
+  |> Ui.Widget.sized_box ~height:row_extent
   |> test_id ("journal-row-extent:" ^ Item.id item)
+  |> Ui.Widget.decorated_box
+       ~decoration:(Ui.Style.Decoration.create ~background:(Tokens.palette tokens).background ())
   |> Ui.Widget.environment_boundary
   |> test_id ("journal-row:" ^ Item.id item)
 ;;

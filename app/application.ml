@@ -1,6 +1,7 @@
 module ID = Bonsai_flutter_spec.Id
 module Platform = Bonsai_flutter.Application_platform
 module Ui = Bonsai_flutter_ui
+module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 
 type delete_phase =
   | Undoable
@@ -22,26 +23,26 @@ type timeline_notice =
 type state =
   { routes : Journal_routes.t
   ; timeline : Journal_timeline_state.t
-  ; capture_pressed : bool
   ; next_request_generation : int64
   ; next_local_sequence : int64
-  ; calendar : Journal_startup.calendar_snapshot option
+  ; calendar : Journal_calendar.t option
   ; formatted_generation : int64 option
   ; day_labels : (int * string) list
   ; pending_timeline_mutation : string option
   ; pending_delete : pending_delete option
   ; timeline_notice : timeline_notice option
-  ; worker_ready : bool
   ; write_enabled : bool
+  ; graph_ready : bool
   ; feed_loaded : bool
+  ; graph_error : string option
   }
 
 let initial_anchor : Journal_routes.anchor = { block_id = None; first_index = 0 }
+let feed_day_limit = 7
 
 let initial_state =
   { routes = Journal_routes.create ~anchor:initial_anchor
   ; timeline = Journal_timeline_state.empty ~today:0
-  ; capture_pressed = false
   ; next_request_generation = 1L
   ; next_local_sequence = 1L
   ; calendar = None
@@ -50,42 +51,43 @@ let initial_state =
   ; pending_timeline_mutation = None
   ; pending_delete = None
   ; timeline_notice = None
-  ; worker_ready = false
   ; write_enabled = false
+  ; graph_ready = false
   ; feed_loaded = false
+  ; graph_error = None
   }
 ;;
 
 let worker_request generation = function
   | Journal_timeline_state.Feed { before_day } ->
-    Journal_worker.Load_feed
+    Journal_graph_request.Load_feed
       { before_day
-      ; day_limit = 31
+      ; day_limit = feed_day_limit
       ; blocks_per_day = 64
       ; slot_limit = 128
       ; request_generation = generation
       }
   | Day { day; after } ->
-    Journal_worker.Load_day_blocks
+    Journal_graph_request.Load_day_blocks
       { day; after; limit = 64; request_generation = generation }
-  | Children { parent_id; after } ->
-    Journal_worker.Load_detail
-      { block_id = parent_id; after; limit = 64; request_generation = generation }
-;;
-
-let send_worker client request =
-  Bonsai.Effect.of_thunk (fun () -> ignore (Worker.send client request))
+  | Children { parent_id; epoch = _ } ->
+    Journal_graph_request.Load_detail
+      { block_id = parent_id; after = None; limit = 3; request_generation = generation }
 ;;
 
 let block_in_timeline timeline block_id =
   Journal_timeline_state.retained_slots timeline
   |> List.find_map (function
-    | Journal_timeline_state.Block { block; _ }
+    | Journal_timeline_state.Top_level entry
+      when String.equal (Journal_model.id entry.block) block_id -> Some entry.block
+    | Child_preview { block; _ }
       when String.equal (Journal_model.id block) block_id -> Some block
     | Day_heading _
-    | Block _
+    | Top_level _
+    | Child_preview _
     | Day_continuation _
-    | Children_continuation _
+    | Children_loading _
+    | Children_more _
     | Feed_continuation _
     | Bottom_clearance -> None)
 ;;
@@ -128,22 +130,16 @@ let fail_active_mutation state message =
      | None, None -> { state with pending_timeline_mutation = None })
 ;;
 
-let enter_recovery_only state =
-  let state =
-    { state with write_enabled = false; pending_delete = None; timeline_notice = None }
-  in
-  match Journal_routes.capture state.routes, Journal_routes.detail state.routes with
-  | Some capture, _ ->
-    { state with
-      routes =
-        Journal_routes.update_capture state.routes (Journal_capture.recovery_only capture)
-    }
-  | None, Some detail ->
-    { state with
-      routes =
-        Journal_routes.update_detail state.routes (Journal_detail.recovery_only detail)
-    }
-  | None, None -> { state with pending_timeline_mutation = None }
+let terminal_graph_state state message =
+  { state with
+    routes = Journal_routes.graph_unavailable state.routes
+  ; write_enabled = false
+  ; graph_ready = false
+  ; feed_loaded = true
+  ; pending_timeline_mutation = None
+  ; pending_delete = None
+  ; graph_error = Some message
+  }
 ;;
 
 let journal_day_iso day =
@@ -155,9 +151,13 @@ let distinct_days state =
     Journal_timeline_state.retained_slots state.timeline
     |> List.filter_map (function
       | Journal_timeline_state.Day_heading page -> Some page.day
-      | Block { block; _ } -> Some (Journal_model.journal_day block)
+      | Top_level entry -> Some (Journal_model.journal_day entry.block)
+      | Child_preview { block; _ } -> Some (Journal_model.journal_day block)
       | Day_continuation { day; _ } -> Some day
-      | Children_continuation _ | Feed_continuation _ | Bottom_clearance -> None)
+      | Children_loading _
+      | Children_more _
+      | Feed_continuation _
+      | Bottom_clearance -> None)
   in
   let days =
     match state.calendar with
@@ -218,36 +218,14 @@ let back_state state =
   { state with routes; timeline }
 ;;
 
-let apply_worker_response state (response : Journal_worker.response) =
-  let calendar =
-    match state.calendar with
-    | Some current when Int64.compare current.generation response.calendar.generation > 0
-      -> current
-    | None | Some _ -> response.calendar
-  in
-  let generation_changed =
-    match state.calendar with
-    | None -> true
-    | Some current -> not (Int64.equal current.generation calendar.generation)
-  in
-  let state =
-    if generation_changed
-    then
-      { state with
-        calendar = Some calendar
-      ; formatted_generation = None
-      ; day_labels = []
-      }
-    else { state with calendar = Some calendar }
-  in
-  let state =
-    { state with
-      write_enabled =
-        state.worker_ready && response.access_mode = Journal_startup.Read_write
-    }
-  in
+let apply_worker_response state (response : Journal_graph_runtime.response) =
   match response.payload with
-  | Journal_worker.Store_ready _ | Status _ | Calendar_observed _ -> state
+  | Journal_graph_runtime.Graph_ready _ ->
+    { state with
+      write_enabled = true
+    ; graph_ready = true
+    ; graph_error = None
+    }
   | Feed_loaded { request_generation; feed } ->
     let accepted_initial_feed =
       match Journal_timeline_state.pending_request state.timeline with
@@ -269,7 +247,7 @@ let apply_worker_response state (response : Journal_worker.response) =
   | Day_blocks_loaded { request_generation; page } ->
     { state with
       timeline =
-        Journal_timeline_state.apply_block_page
+        Journal_timeline_state.apply_timeline_entry_page
           state.timeline
           ~generation:request_generation
           page
@@ -285,7 +263,7 @@ let apply_worker_response state (response : Journal_worker.response) =
           ~generation:request_generation
           detail
     }
-  | Block_captured block ->
+  | Block_captured { block; timeline_entry_update } ->
     (match Journal_routes.capture state.routes with
      | None -> state
      | Some capture ->
@@ -295,9 +273,13 @@ let apply_worker_response state (response : Journal_worker.response) =
        in
        { state with
          routes
-       ; timeline = Journal_timeline_state.prepend_block state.timeline block
+       ; timeline =
+           Option.fold
+             ~none:state.timeline
+             ~some:(Journal_timeline_state.prepend_timeline_entry state.timeline)
+             timeline_entry_update
        })
-  | Block_updated block ->
+  | Block_updated { block; timeline_entry_update } ->
     let routes =
       match Journal_routes.detail state.routes with
       | None -> state.routes
@@ -308,7 +290,11 @@ let apply_worker_response state (response : Journal_worker.response) =
     in
     { state with
       routes
-    ; timeline = Journal_timeline_state.replace_block state.timeline block
+    ; timeline =
+        Option.fold
+          ~none:(Journal_timeline_state.replace_block state.timeline block)
+          ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
+          timeline_entry_update
     ; pending_timeline_mutation = None
     }
   | Update_conflict latest ->
@@ -321,7 +307,7 @@ let apply_worker_response state (response : Journal_worker.response) =
              state.routes
              (Journal_detail.apply_conflict detail latest)
        })
-  | Child_created { child; parent_revision } ->
+  | Child_created { child; parent_revision; timeline_entry_update } ->
     (match Journal_routes.detail state.routes with
      | None -> state
      | Some detail ->
@@ -332,26 +318,24 @@ let apply_worker_response state (response : Journal_worker.response) =
        { state with
          routes = Journal_routes.update_detail state.routes detail
        ; timeline =
-           Journal_timeline_state.replace_block
+           Journal_timeline_state.replace_timeline_entry
              state.timeline
-             (Journal_detail.root detail)
+             timeline_entry_update
        })
-  | Reconciled_applied block | Reconciled_superseded block ->
-    { state with
-      timeline = Journal_timeline_state.replace_block state.timeline block
-    ; pending_timeline_mutation = None
-    }
-  | Reconciled_not_applied -> fail_active_mutation state "Mutation was not applied"
   | Block_found _ -> state
-  | Subtree_deleted { block_id; parent; _ } ->
+  | Subtree_deleted { block_id; parent; timeline_entry_update; _ } ->
     (match state.pending_delete with
      | Some pending when String.equal pending.block_id block_id ->
        { state with
          timeline =
            Option.fold
-             ~none:state.timeline
-             ~some:(Journal_timeline_state.replace_block state.timeline)
-             parent
+             ~none:
+               (Option.fold
+                  ~none:state.timeline
+                  ~some:(Journal_timeline_state.replace_block state.timeline)
+                  parent)
+             ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
+             timeline_entry_update
        ; pending_delete = None
        ; timeline_notice = None
        }
@@ -367,9 +351,9 @@ let apply_worker_response state (response : Journal_worker.response) =
        ; pending_delete = None
        ; timeline_notice = Some Delete_failed
        })
-  | Oversized_source _ -> fail_active_mutation state "Source exceeds the supported limit"
-  | Startup_failed _ -> fail_active_mutation state "Journal storage is unavailable"
-  | Rejected (Invalid_request _)
+  | Open_failed error ->
+    terminal_graph_state state (Logseq_db_worker.Error.message error)
+  | Rejected _
     when Journal_routes.route state.routes = Journal_routes.Detail_loading ->
     { state with
       routes =
@@ -377,11 +361,7 @@ let apply_worker_response state (response : Journal_worker.response) =
           state.routes
           ~request_generation:(Journal_routes.detail_request_generation state.routes)
     }
-  | Rejected Recovery_only | Rejected Storage_unavailable -> enter_recovery_only state
-  | Rejected Editing_locked
-  | Rejected Stale_calendar_generation
-  | Rejected Invalid_calendar_snapshot
-  | Rejected (Invalid_request _) -> fail_active_mutation state "Journal mutation failed"
+  | Rejected message -> fail_active_mutation state message
 ;;
 
 let color red green blue = Ui.Style.Color.rgb ~red ~green ~blue
@@ -436,10 +416,6 @@ let action_target
 let bind_action handler action =
   Ui.Event.Handler.create ~name:("journal-action:" ^ action) (fun _payload ->
     Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text action))
-;;
-
-let ignore_animation_completion =
-  Ui.Event.Handler.create ~name:"journal-ignore-animation-completion" (fun _ -> ())
 ;;
 
 let live_region_text ?color value =
@@ -509,6 +485,7 @@ let timeline_page
       ~device_pixel_ratio
       ~timeline_state
       ~loading
+      ~graph_error
       ~today_subtitle
       ~day_label
       ~reduced_motion
@@ -516,10 +493,9 @@ let timeline_page
       ~safe_bottom
       ~viewport_width
       ~content_horizontal_inset
-      ~capture_pressed
-      ~capture
-      ~on_capture_pointer_down
-      ~on_capture_pointer_up
+      ~capture_enabled
+      ~capture_composer_key
+      ~on_capture_event
       ~on_visible_range
       ~on_task_toggle
       ~on_toggle_children
@@ -536,174 +512,63 @@ let timeline_page
       ~device_pixel_ratio
       ~context:(Journal_header.Context.today ~subtitle:today_subtitle)
   in
-  let plus_bar ~id ~width ~height =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:(Ui.Style.Decoration.create ~background:palette.on_fab ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string (id ^ "-surface"))
-    |> Ui.Widget.sized_box ~width ~height
-    |> Ui.Widget.with_test_id (Ui.Test_id.string id)
-  in
-  let capture_plus id =
-    let geometry = Journal_visual_tokens.fab_geometry in
-    let center_offset = (geometry.plus_size -. geometry.plus_stroke) /. 2. in
-    let horizontal =
-      plus_bar
-        ~id:(id ^ "-horizontal")
-        ~width:geometry.plus_size
-        ~height:geometry.plus_stroke
-    in
-    let vertical =
-      plus_bar
-        ~id:(id ^ "-vertical")
-        ~width:geometry.plus_stroke
-        ~height:geometry.plus_size
-    in
-    Ui.Widget.Stack.create
-      [ Ui.Widget.Stack.positioned ~left:0. ~top:center_offset horizontal
-      ; Ui.Widget.Stack.positioned ~left:center_offset ~top:0. vertical
-      ]
-    |> Ui.Widget.sized_box ~width:geometry.plus_size ~height:geometry.plus_size
-    |> Ui.Widget.with_test_id (Ui.Test_id.string id)
-  in
-  let capture_visual =
-    capture_plus "journal-capture-plus"
-    |> Ui.Widget.center
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create
-              ~background:palette.fab
-              ~border_radius:(Journal_visual_tokens.hit_regions.fab_visual /. 2.)
-              ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-circle")
-    |> Ui.Widget.sized_box
-         ~width:Journal_visual_tokens.hit_regions.fab_visual
-         ~height:Journal_visual_tokens.hit_regions.fab_visual
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-visual")
-  in
-  let shadow_circle ~alpha ~size ~id =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create
-              ~background:(Ui.Style.Color.argb ~alpha ~red:13 ~green:20 ~blue:47)
-              ~border_radius:(size /. 2.)
-              ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string id)
-    |> Ui.Widget.sized_box ~width:size ~height:size
-  in
-  let capture_visual =
-    let visual_size = Journal_visual_tokens.hit_regions.fab_visual in
-    let geometry = Journal_visual_tokens.fab_geometry in
-    let outer_size = geometry.shadow_size in
-    let outer =
-      shadow_circle
-        ~alpha:geometry.shadow_alpha
-        ~size:outer_size
-        ~id:"journal-capture-shadow-outer"
-    in
-    let visual_offset = (outer_size -. visual_size) /. 2. in
-    Ui.Widget.Stack.create
-      [ Ui.Widget.Stack.child outer
-      ; Ui.Widget.Stack.positioned ~left:visual_offset ~top:0. capture_visual
-      ]
-    |> Ui.Widget.sized_box ~width:outer_size ~height:outer_size
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-shadow")
-  in
-  let feedback_duration_ms = if reduced_motion || capture_pressed then 0 else 160 in
-  let feedback_animation id =
-    Ui.Animation.create
-      ~id:(ID.Ui.Animation_id.of_int64 id)
-      ~duration_ms:feedback_duration_ms
-      ~curve:Ui.Animation.Curve.Ease_out
+  let capture_button ~id ~tooltip ~position ~visibility ~style label =
+    Ui.Native_widget.Message_composer.button
+      ~id
+      ~tooltip
+      ~position
+      ~visibility
+      ~style
+      ~child:
+        (styled_text ~size:20. ~color:palette.on_fab label
+         |> Ui.Widget.with_test_id
+              (Ui.Test_id.string
+                 (if id = 1
+                  then "journal-capture-composer-plus"
+                  else "journal-capture-composer-submit")))
       ()
-  in
-  let resting_feedback =
-    capture_visual
-    |> Ui.Widget.animated_opacity
-         ~animation:(feedback_animation 1_001L)
-         ~opacity:(if capture_pressed then 0. else 1.)
-         ~on_completed:ignore_animation_completion
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-resting-feedback")
-  in
-  let pressed_shadow =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create
-              ~background:(Ui.Style.Color.argb ~alpha:18 ~red:13 ~green:20 ~blue:47)
-              ~border_radius:25.
-              ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-pressed-shadow-surface")
-    |> Ui.Widget.sized_box ~width:50. ~height:50.
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-pressed-shadow")
-  in
-  let pressed_circle =
-    capture_plus "journal-capture-pressed-plus"
-    |> Ui.Widget.center
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create ~background:palette.fab ~border_radius:22.08 ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-pressed-circle")
-    |> Ui.Widget.sized_box ~width:44.16 ~height:44.16
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-pressed-visual")
-  in
-  let pressed_feedback =
-    Ui.Widget.Stack.create
-      [ Ui.Widget.Stack.positioned ~left:1. ~top:2. pressed_shadow
-      ; Ui.Widget.Stack.positioned ~left:3.92 ~top:3.92 pressed_circle
-      ]
-    |> Ui.Widget.sized_box ~width:52. ~height:52.
-    |> Ui.Widget.animated_opacity
-         ~animation:(feedback_animation 1_002L)
-         ~opacity:(if capture_pressed then 1. else 0.)
-         ~on_completed:ignore_animation_completion
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-pressed-feedback")
-  in
-  let capture_feedback =
-    Ui.Widget.Stack.create
-      [ Ui.Widget.Stack.child resting_feedback; Ui.Widget.Stack.child pressed_feedback ]
-    |> Ui.Widget.sized_box ~width:52. ~height:52.
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-feedback")
   in
   let capture =
-    capture_feedback
-    |> Ui.Widget.center
-    |> Ui.Widget.sized_box
-         ~width:Journal_visual_tokens.hit_regions.fab_target
-         ~height:Journal_visual_tokens.hit_regions.fab_target
-    |> Ui.Widget.semantics
-         ~properties:
-           (Ui.Semantics.create
-              ~label:"Capture"
-              ~hint:"Create a new journal entry"
-              ~role:Ui.Semantics.Role.Generic
-              ~enabled:true
-              ~actions:[]
-              ())
-    |> fun child ->
-    Ui.Widget.pressable
-      ~overlay_color:(Ui.Style.Color.argb ~alpha:0 ~red:0 ~green:0 ~blue:0)
-      ~release_delay_ms:(Journal_visual_tokens.motion ~reduced_motion).press_release_ms
-      ~on_press:capture
-      ~child
+    Ui.Native_widget.Message_composer.create_with_handler
+      ~key:(Ui.Key.string ("journal-capture-composer:" ^ Int64.to_string capture_composer_key))
+      ~enabled:capture_enabled
+      ~autofocus:false
+      ~max_lines:5
+      ~hint_text:"Capture a thought"
+      ~buttons:
+        [ capture_button
+            ~id:1
+            ~tooltip:"Open full Capture editor"
+            ~position:Ui.Native_widget.Message_composer.Leading
+            ~visibility:Always
+            ~style:Plain
+            "+"
+        ; capture_button
+            ~id:2
+            ~tooltip:"Continue Capture"
+            ~position:Trailing
+            ~visibility:When_non_empty
+            ~style:Filled
+            "↑"
+        ]
+      ~on_event:on_capture_event
       ()
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture")
-    |> Ui.Widget.gesture
-         ~on_pointer_down:on_capture_pointer_down
-         ~on_pointer_up:on_capture_pointer_up
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-gesture")
-    |> Ui.Widget.sized_box
-         ~width:Journal_visual_tokens.hit_regions.fab_target
-         ~height:Journal_visual_tokens.hit_regions.fab_target
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-target")
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-composer")
     |> Ui.Widget.safe_area ~left:false ~top:false ~right:false
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-safe-area")
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-composer-safe-area")
   in
   let timeline =
-    if loading
-    then Journal_timeline.Empty (Journal_timeline.loading_view tokens)
-    else
+    match graph_error with
+    | Some message ->
+      Journal_timeline.Empty
+        (live_region_text
+           ~color:palette.sheet_error
+           ("Unable to open Logseq graph: " ^ message)
+         |> Ui.Widget.center
+         |> Ui.Widget.with_test_id (Ui.Test_id.string "logseq-graph-open-failed"))
+    | None when loading ->
+      Journal_timeline.Empty (Journal_timeline.loading_view tokens)
+    | None ->
       Journal_timeline.view
         ~tokens
         ~profile
@@ -737,16 +602,12 @@ let timeline_page
     |> Ui.Widget.Body.safe_area ~left:false ~right:false ~bottom:false
   in
   let overlay =
-    let content_width =
-      Float.max 0. (viewport_width -. (2. *. content_horizontal_inset))
-    in
-    let left =
-      Float.max 0. ((content_width -. Journal_visual_tokens.hit_regions.fab_target) /. 2.)
-    in
+    let geometry = Journal_visual_tokens.composer_geometry in
     capture
     |> Ui.Widget.Stack.positioned
-         ~left
-         ~bottom:Journal_visual_tokens.hit_regions.fab_bottom_inset
+         ~left:geometry.horizontal_margin
+         ~right:geometry.horizontal_margin
+         ~bottom:geometry.bottom_inset
   in
   let overlays =
     match timeline_notice with
@@ -764,8 +625,8 @@ let timeline_page
       let left = Float.max 0. ((content_width -. snackbar_width) /. 2.) in
       let bottom =
         safe_bottom
-        +. Journal_visual_tokens.hit_regions.fab_bottom_inset
-        +. Journal_visual_tokens.hit_regions.fab_target
+        +. Journal_visual_tokens.composer_geometry.bottom_inset
+        +. Journal_visual_tokens.composer_geometry.minimum_height
         +. geometry.vertical_gap
       in
       let snackbar =
@@ -850,6 +711,27 @@ let capture_text_field capture dispatch =
   |> Ui.Widget.with_test_id (Ui.Test_id.string "capture-editor")
 ;;
 
+let capture_child_text_field index editor dispatch =
+  let test_id = Printf.sprintf "capture-child-editor:%d" index in
+  Ui.Material.text_field
+    ~key:(Ui.Key.string test_id)
+    ~enabled:true
+    ~keyboard_type:Ui.Text_editing.Multiline
+    ~input_action:Ui.Text_editing.Newline
+    ~max_utf8_bytes:65_536
+    ~session_id:(Journal_capture.editor_session_id editor)
+    ~document_revision:(Journal_capture.editor_document_revision editor)
+    ~accepted_local_revision:(Journal_capture.editor_accepted_local_revision editor)
+    ~update_mode:(Journal_capture.editor_update_mode editor)
+    ~value:(Journal_capture.editor_value editor)
+    ~on_edit:dispatch
+    ~on_submit:dispatch
+    ~on_focus_changed:dispatch
+    ~on_limit_reached:dispatch
+    ()
+  |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
+;;
+
 let capture_sheet_page
       ~tokens
       ~device_pixel_ratio
@@ -878,6 +760,7 @@ let capture_sheet_page
   let close = bind_action dispatch "capture-close" in
   let save = bind_action dispatch "capture-save" in
   let task = bind_action dispatch "capture-task" in
+  let add_child = bind_action dispatch "capture-add-child" in
   let close_target =
     action_target
       ~enabled:(Journal_capture.phase capture <> Journal_capture.Saving)
@@ -941,6 +824,15 @@ let capture_sheet_page
               ~border_radius:22.
               ())
   in
+  let add_child =
+    action_target
+      ~enabled:(Journal_capture.can_add_child capture)
+      ~test_id:"capture-add-child"
+      ~label:"Add direct child"
+      ~hint:"Add a direct child to this new block"
+      ~on_press:add_child
+      (styled_text ~size:15. "Add child")
+  in
   let status =
     (match Journal_capture.phase capture with
      | Journal_capture.Failed message ->
@@ -954,7 +846,6 @@ let capture_sheet_page
                 ~on_press:(bind_action dispatch "capture-retry")
                 (styled_text "Retry"))
          ]
-     | Recovery_only -> live_region_text ~color:palette.sheet_error "Journal is read-only"
      | Saving -> live_region_text "Saving journal block"
      | Editing | Confirm_discard | Committed -> Ui.Widget.empty ())
     |> Ui.Widget.with_test_id (Ui.Test_id.string "capture-status")
@@ -985,7 +876,11 @@ let capture_sheet_page
                 ())
   in
   let action_row =
-    Ui.Widget.Flex.row [ Ui.Widget.Flex.expanded task; Ui.Widget.Flex.fixed save_action ]
+    Ui.Widget.Flex.row
+      [ Ui.Widget.Flex.expanded task
+      ; Ui.Widget.Flex.expanded add_child
+      ; Ui.Widget.Flex.fixed save_action
+      ]
     |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:12. ~right:12. ())
     |> Ui.Widget.constrained_box
          ~constraints:(Ui.Layout.Box_constraints.create ~min_height:action_min_height ())
@@ -993,7 +888,9 @@ let capture_sheet_page
     |> Ui.Widget.with_test_id (Ui.Test_id.string "capture-action-row")
   in
   let editor =
-    let editor_input =
+    let child_editors = Journal_capture.child_editors capture in
+    let parent_height = if List.is_empty child_editors then editor_height else 120. in
+    let parent =
       capture_text_field capture dispatch
       |> Ui.Widget.semantics
            ~properties:
@@ -1001,7 +898,24 @@ let capture_sheet_page
                 ~label:"Journal block content"
                 ~role:Ui.Semantics.Role.Text_field
                 ())
-      |> Ui.Widget.sized_box ~height:editor_height
+      |> Ui.Widget.sized_box ~height:parent_height
+    in
+    let children =
+      List.mapi
+        (fun index child_editor ->
+           capture_child_text_field index child_editor dispatch
+           |> Ui.Widget.semantics
+                ~properties:
+                  (Ui.Semantics.create
+                     ~label:(Printf.sprintf "Direct child %d content" (index + 1))
+                     ~role:Ui.Semantics.Role.Text_field
+                     ())
+           |> Ui.Widget.sized_box ~height:120.
+           |> Ui.Widget.Flex.fixed)
+        child_editors
+    in
+    let editor_input =
+      Ui.Widget.Flex.column (Ui.Widget.Flex.fixed parent :: children)
     in
     Ui.Widget.Scroll_view.vertical ~primary:true ~on_scroll:dispatch editor_input ()
     |> Ui.Widget.Viewport.Vertical.with_test_id
@@ -1161,8 +1075,7 @@ let detail_page detail dispatch =
     | Conflict
     | Failed _
     | Adding_child
-    | Committed
-    | Recovery_only -> true
+    | Committed -> true
   in
   let back =
     action_target
@@ -1234,7 +1147,6 @@ let detail_page detail dispatch =
                ~on_press:(bind_action dispatch "detail-retry")
                (styled_text "Retry"))
         ]
-    | Recovery_only -> live_region_text ~color:(color 176 32 32) "Journal is read-only"
     | Saving | Saving_child -> live_region_text "Saving"
     | Reading | Editing | Confirm_discard | Adding_child | Committed -> Ui.Widget.empty ()
   in
@@ -1315,15 +1227,27 @@ let message_page ~page_key ~title dispatch =
   route_page ~page_key ~transition:Ui.Navigation.Fade (Ui.Widget.Body.static content)
 ;;
 
+let identity_sequence = ref 0L
+
 let fresh_identity () =
-  match Datascript.squuid () with
-  | Datascript.Uuid uuid -> uuid
-  | _ -> assert false
+  identity_sequence := Int64.succ !identity_sequence;
+  let entropy =
+    Printf.sprintf "%f:%Ld:%d" (Unix.gettimeofday ()) !identity_sequence (Unix.getpid ())
+    |> Digest.string
+    |> Digest.to_hex
+  in
+  Printf.sprintf
+    "%s-%s-4%s-8%s-%s"
+    (String.sub entropy 0 8)
+    (String.sub entropy 8 4)
+    (String.sub entropy 13 3)
+    (String.sub entropy 17 3)
+    (String.sub entropy 20 12)
 ;;
 
 let sibling_order value = Printf.sprintf "%012Ld" value
 
-let creation_time (calendar : Journal_startup.calendar_snapshot) =
+let creation_time (calendar : Journal_calendar.t) =
   Journal_time.create
     ~instant_unix_ms:calendar.instant_unix_ms
     ~local_day:calendar.local_day
@@ -1334,12 +1258,16 @@ let creation_time (calendar : Journal_startup.calendar_snapshot) =
 
 let component client handlers graph =
   let state, set_state = Bonsai_v017.state ~equal:( = ) initial_state graph in
+  let set_state_ref = ref None in
+  let state_ref = ref initial_state in
+  let graph_runtime = Journal_graph_runtime.create () in
+  let submit request = Journal_graph_runtime.submit graph_runtime request in
   let pending_delete_ref : pending_delete option ref = ref None in
   let clear_delete_command response =
-    match (response : Journal_worker.response).payload with
-    | Subtree_deleted _ | Delete_conflict _ | Startup_failed _ | Rejected _ ->
+    match (response : Journal_graph_runtime.response).payload with
+    | Subtree_deleted _ | Delete_conflict _ | Open_failed _ | Rejected _ ->
       pending_delete_ref := None
-    | Store_ready _
+    | Graph_ready _
     | Feed_loaded _
     | Day_blocks_loaded _
     | Detail_loaded _
@@ -1347,13 +1275,44 @@ let component client handlers graph =
     | Block_updated _
     | Update_conflict _
     | Child_created _
-    | Block_found _
-    | Reconciled_applied _
-    | Reconciled_not_applied
-    | Reconciled_superseded _
-    | Oversized_source _
-    | Calendar_observed _
-    | Status _ -> ()
+    | Block_found _ -> ()
+  in
+  let fail_graph_transport state message =
+    pending_delete_ref := None;
+    terminal_graph_state state message
+  in
+  let deliver_output output =
+    Journal_graph_transport.deliver
+      ~runtime:graph_runtime
+      ~send:(fun request ->
+        match Worker.send client request with
+        | Accepted _ -> Journal_graph_transport.Accepted
+        | Full -> Full
+        | Not_ready -> Not_ready
+        | Stopping -> Stopping)
+      output
+  in
+  let apply_delivery_responses state delivery =
+    let state =
+      List.fold_left
+        (fun state response -> apply_worker_response state response)
+        state
+        delivery.Journal_graph_transport.responses
+    in
+    match delivery.error with
+    | None -> state
+    | Some message -> fail_graph_transport state message
+  in
+  let send request =
+    let output = submit request in
+    Bonsai.Effect.bind
+      (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+      ~f:(fun delivery ->
+        List.iter clear_delete_command delivery.responses;
+        match !set_state_ref with
+        | None -> Bonsai.Effect.Ignore
+        | Some set_state ->
+          set_state (fun state -> apply_delivery_responses state delivery))
   in
   let timer_branch =
     Bonsai.Cont.map state ~f:(fun state ->
@@ -1382,7 +1341,7 @@ let component client handlers graph =
                            && latest.phase = Undoable ->
                       let committing = { latest with phase = Committing } in
                       pending_delete_ref := Some committing;
-                      let request : Journal_repository.delete_subtree =
+                      let request : Journal_graph_projection.delete_subtree =
                         { mutation_id = latest.mutation_id
                         ; block_id = latest.block_id
                         ; expected_revision = latest.expected_revision
@@ -1399,7 +1358,7 @@ let component client handlers graph =
                               ; timeline_notice = None
                               }
                             | None | Some _ -> state)
-                        ; send_worker client (Journal_worker.Delete_subtree request)
+                        ; send (Journal_graph_request.Delete_subtree request)
                         ]
                     | None | Some _ -> Bonsai.Effect.Ignore)
                 in
@@ -1411,51 +1370,135 @@ let component client handlers graph =
   in
   let application_platform = Driver.Handler.application_platform handlers in
   let registered = ref false in
+  let apply_response_and_drain response state =
+    let state = apply_worker_response state response in
+    match response.Journal_graph_runtime.payload with
+    | Detail_loaded _ ->
+      (match Journal_timeline_state.next_request state.timeline with
+       | Some (Journal_timeline_state.Children _ as request) ->
+         let generation = state.next_request_generation in
+         let output = submit (worker_request generation request) in
+         let delivery = deliver_output output in
+         List.iter clear_delete_command delivery.responses;
+         let state = apply_delivery_responses state delivery in
+         (match delivery.error with
+          | Some _ -> state
+          | None ->
+            { state with
+              timeline =
+                Journal_timeline_state.begin_request state.timeline ~generation request
+            ; next_request_generation = Int64.succ generation
+            })
+       | Some (Feed _ | Day _) | None -> state)
+    | Graph_ready _
+    | Block_captured _
+    | Child_created _
+    | Block_updated _
+    | Update_conflict _
+    | Subtree_deleted _
+    | Delete_conflict _
+    | Block_found _
+    | Feed_loaded _
+    | Day_blocks_loaded _
+    | Open_failed _
+    | Rejected _ -> state
+  in
   let event_subscription =
-    Bonsai.Cont.map set_state ~f:(fun set_state ->
+    Bonsai.Cont.map2 state set_state ~f:(fun snapshot set_state ->
+      state_ref := snapshot;
+      set_state_ref := Some set_state;
       if not !registered
       then (
         registered := true;
+        let startup_delivery =
+          deliver_output
+            Journal_graph_runtime.
+              { requests = [ start graph_runtime ]; responses = [] }
+        in
+        (match startup_delivery.error with
+         | None -> ()
+         | Some message ->
+           set_state (fun state -> fail_graph_transport state message)
+           |> Bonsai.Effect.Expert.handle);
         Worker.on_event client (fun event ->
           match event with
-          | Worker.Push { payload = Journal_worker.Ready response; _ } ->
-            (match response.payload with
-             | Journal_worker.Store_ready _ ->
-               let generation = 1L in
-               let request = Journal_timeline_state.Feed { before_day = None } in
-               Bonsai.Effect.Many
-                 [ set_state (fun state ->
-                     if state.worker_ready
-                     then state
-                     else
-                       { state with
-                         timeline =
-                           (Journal_timeline_state.empty ~today:response.local_day
-                            |> fun timeline ->
-                            Journal_timeline_state.begin_request
-                              timeline
-                              ~generation
-                              request)
-                       ; next_request_generation = Int64.succ generation
-                       ; calendar = Some response.calendar
-                       ; worker_ready = true
-                       ; write_enabled = response.access_mode = Journal_startup.Read_write
-                       })
-                 ; send_worker client (worker_request generation request)
-                 ]
-             | _ ->
-               clear_delete_command response;
-               set_state (fun state -> apply_worker_response state response))
+          | Worker.Push
+              { payload = Logseq_db_worker.Protocol.Graph_invalidated invalidation; _ } ->
+            let snapshot = !state_ref in
+            if not snapshot.graph_ready
+            then Bonsai.Effect.Ignore
+            else (
+              let generation = snapshot.next_request_generation in
+              let output =
+                Journal_graph_runtime.reconcile_invalidation
+                  graph_runtime
+                  ~request_generation:generation
+                  invalidation
+              in
+              if output.requests = [] && output.responses = []
+              then Bonsai.Effect.Ignore
+              else
+                let reloads_feed =
+                  List.exists
+                    (fun (request : Logseq_db_worker.Protocol.request) ->
+                       match request.command with
+                       | Read (List_pages _) -> true
+                       | Read _ | Mutate _ -> false)
+                    output.requests
+                in
+                Bonsai.Effect.bind
+                  (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+                  ~f:(fun delivery ->
+                    List.iter clear_delete_command delivery.responses;
+                    set_state (fun state ->
+                      let state = apply_delivery_responses state delivery in
+                      match delivery.error, reloads_feed, state.calendar with
+                      | None, true, Some calendar when state.graph_ready ->
+                        { state with
+                          timeline =
+                            (Journal_timeline_state.empty ~today:calendar.local_day
+                             |> fun timeline ->
+                             Journal_timeline_state.begin_request
+                               timeline
+                               ~generation
+                               (Feed { before_day = None }))
+                        ; feed_loaded = false
+                        ; next_request_generation = Int64.succ generation
+                        }
+                      | None, false, _
+                      | None, true, None
+                      | None, true, Some _
+                      | Some _, _, _ -> state)))
           | Worker.Response
-              { outcome = Worker.Completed (response : Journal_worker.response); _ } ->
-            clear_delete_command response;
-            set_state (fun state -> apply_worker_response state response)
+              { outcome =
+                  Worker.Completed
+                    (response : Logseq_db_worker.Protocol.response)
+              ; _
+              } ->
+            let output = Journal_graph_runtime.receive graph_runtime response in
+            Bonsai.Effect.bind
+              (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+              ~f:(fun delivery ->
+                List.iter clear_delete_command delivery.responses;
+                set_state (fun state ->
+                  let state =
+                    List.fold_left
+                      (fun state response -> apply_response_and_drain response state)
+                      state
+                      delivery.responses
+                  in
+                  match delivery.error with
+                  | None -> state
+                  | Some message -> fail_graph_transport state message))
           | Worker.Response { outcome = Failed error; _ } ->
             pending_delete_ref := None;
             set_state (fun state -> fail_active_mutation state error)
-          | Worker.Response { outcome = Cancelled | Shutdown; _ } | Worker.Terminal _ ->
+          | Worker.Response { outcome = Cancelled | Shutdown; _ } ->
             pending_delete_ref := None;
-            set_state (fun state -> fail_active_mutation state "Worker unavailable")));
+            set_state (fun state -> fail_active_mutation state "Worker unavailable")
+          | Worker.Terminal { error; _ } ->
+            pending_delete_ref := None;
+            set_state (fun state -> terminal_graph_state state error)));
       ())
   in
   let platform_registered = ref false in
@@ -1464,31 +1507,88 @@ let component client handlers graph =
       if not !platform_registered
       then (
         platform_registered := true;
-        Platform.on_event application_platform (fun payload ->
+        let apply_calendar payload =
           match Journal_platform.decode_calendar payload with
           | Error _ -> Bonsai.Effect.Ignore
           | Ok event ->
-            Bonsai.Effect.Many
-              [ set_state (fun state ->
-                  match state.calendar with
-                  | Some current
-                    when Int64.compare current.generation event.snapshot.generation >= 0
-                    -> state
-                  | None | Some _ ->
-                    { state with
-                      calendar = Some event.snapshot
-                    ; formatted_generation = None
-                    ; day_labels = []
-                    })
-              ; send_worker
-                  client
-                  (Journal_worker.Observe_calendar
-                     { generation = event.snapshot.generation
-                     ; local_day = event.snapshot.local_day
-                     })
-              ]));
+            Journal_graph_runtime.set_calendar graph_runtime event.snapshot;
+            set_state (fun state ->
+              match state.calendar with
+              | Some current
+                when Int64.compare current.generation event.snapshot.generation >= 0
+                -> state
+              | None | Some _ ->
+                { state with
+                  calendar = Some event.snapshot
+                ; formatted_generation = None
+                ; day_labels = []
+                })
+        in
+        Platform.on_event application_platform apply_calendar;
+        Platform.request application_platform Journal_platform.get_calendar_request
+        |> Bonsai.Effect.bind ~f:(function
+          | Error _ -> Bonsai.Effect.Ignore
+          | Ok payload -> apply_calendar payload)
+        |> Bonsai.Effect.Expert.handle);
       ())
   in
+  let feed_key =
+    Bonsai.Cont.map state ~f:(fun state ->
+      match state.graph_ready, state.calendar with
+      | true, Some calendar -> Some (calendar.generation, calendar.local_day)
+      | false, _ | true, None -> None)
+  in
+  let feed_callback =
+    Bonsai.Cont.map2 state set_state ~f:(fun snapshot set_state -> function
+      | None -> Bonsai.Effect.Ignore
+      | Some (calendar_generation, today) ->
+        (match snapshot.calendar with
+         | Some calendar
+           when snapshot.graph_ready
+                && Int64.equal calendar.generation calendar_generation
+                && calendar.local_day = today ->
+           let generation = snapshot.next_request_generation in
+           let output =
+             submit
+               (Journal_graph_request.Load_feed
+                  { before_day = None
+                  ; day_limit = feed_day_limit
+                  ; blocks_per_day = 64
+                  ; slot_limit = 128
+                  ; request_generation = generation
+                 })
+           in
+           let request = Journal_timeline_state.Feed { before_day = None } in
+           Bonsai.Effect.bind
+             (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+             ~f:(fun delivery ->
+               List.iter clear_delete_command delivery.responses;
+               set_state (fun state ->
+                 let state = apply_delivery_responses state delivery in
+                 match delivery.error, state.calendar with
+                 | ( None
+                   , Some current )
+                   when state.graph_ready
+                        && Int64.equal current.generation calendar_generation
+                        && current.local_day = today ->
+                   { state with
+                     timeline =
+                       (Journal_timeline_state.empty ~today
+                        |> fun timeline ->
+                        Journal_timeline_state.begin_request timeline ~generation request)
+                   ; feed_loaded = false
+                   ; next_request_generation = Int64.succ generation
+                   }
+                 | Some _, _ | None, None | None, Some _ -> state))
+         | None | Some _ -> Bonsai.Effect.Ignore))
+  in
+  Bonsai.Cont.Edge.on_change
+    ~equal:
+      (Option.equal (fun (left_generation, left_day) (right_generation, right_day) ->
+         Int64.equal left_generation right_generation && left_day = right_day))
+    feed_key
+    ~callback:feed_callback
+    graph;
   let format_key =
     Bonsai.Cont.map state ~f:(fun state ->
       match state.calendar with
@@ -1562,9 +1662,23 @@ let component client handlers graph =
       dependencies
       ~f:(fun (snapshot, set_state, environment, current_time) payload ->
         let update f = set_state f in
-        let send request = send_worker client request in
         let with_request next request =
           Bonsai.Effect.Many [ update (fun _ -> next); send request ]
+        in
+        let open_capture source =
+          update (fun state ->
+            match state.write_enabled, state.pending_delete with
+            | false, _ | true, Some _ -> state
+            | true, None ->
+              let session_number = state.next_local_sequence in
+              { state with
+                routes =
+                  Journal_routes.open_capture
+                    state.routes
+                    ~session_number
+                    ~source
+              ; next_local_sequence = Int64.succ session_number
+              })
         in
         match payload with
         | Ui.Event.Payload.Text_edit edit ->
@@ -1596,31 +1710,45 @@ let component client handlers graph =
               }
             | None, None -> state)
         | Ui.Event.Payload.Native_event _ as payload ->
-          (match Ui.Native_widget.Sparse_extent_list.visible_range_of_payload payload with
-           | None -> Bonsai.Effect.Ignore
-           | Some range ->
-             let total_count = Journal_timeline_state.total_count snapshot.timeline in
-             let bounded value =
-               value
-               |> Int64.max 0L
-               |> Int64.min (Int64.of_int total_count)
-               |> Int64.to_int
+          (match Ui.Native_widget.Message_composer.event_of_payload payload with
+           | Some (Text_changed _) -> Bonsai.Effect.Ignore
+           | Some (Button_pressed { button_id = 1; _ }) -> open_capture ""
+           | Some (Button_pressed { button_id = 2; text })
+             when String.equal (String.trim text) "" -> Bonsai.Effect.Ignore
+           | Some (Button_pressed { button_id = 2; text }) -> open_capture text
+           | Some (Button_pressed _) -> Bonsai.Effect.Ignore
+           | None ->
+             (match Ui.Native_widget.Sparse_extent_list.visible_range_of_payload payload with
+              | None -> Bonsai.Effect.Ignore
+              | Some range ->
+             let observe timeline =
+               let total_count = Journal_timeline_state.total_count timeline in
+               let bounded value =
+                 value
+                 |> Int64.max 0L
+                 |> Int64.min (Int64.of_int total_count)
+                 |> Int64.to_int
+               in
+               let first_index = bounded range.first_index in
+               let last_exclusive = bounded range.last_exclusive in
+               ( Journal_timeline_state.observe_visible_range
+                   timeline
+                   ~first_index
+                   ~last_exclusive
+               , first_index
+               , last_exclusive )
              in
-             let first_index = bounded range.first_index in
-             let last_exclusive = bounded range.last_exclusive in
-             let timeline =
-               Journal_timeline_state.observe_visible_range
-                 snapshot.timeline
-                 ~first_index
-                 ~last_exclusive
-             in
+             let timeline, first_index, last_exclusive = observe snapshot.timeline in
              (match
                 Journal_timeline_state.request_for_visible_range
                   timeline
                   ~first_index
                   ~last_exclusive
               with
-              | None -> update (fun state -> { state with timeline })
+              | None ->
+                update (fun state ->
+                  let timeline, _, _ = observe state.timeline in
+                  { state with timeline })
               | Some request ->
                 let generation = snapshot.next_request_generation in
                 with_request
@@ -1629,29 +1757,11 @@ let component client handlers graph =
                       Journal_timeline_state.begin_request timeline ~generation request
                   ; next_request_generation = Int64.succ generation
                   }
-                  (worker_request generation request)))
+                    (worker_request generation request))))
         | Ui.Event.Payload.Route_pop _ -> update back_state
         | Ui.Event.Payload.Text action ->
-          if String.equal action "capture-press-start"
-          then
-            update (fun state ->
-              match Journal_routes.route state.routes with
-              | Journal_routes.Timeline -> { state with capture_pressed = true }
-              | Capture | Detail_loading | Detail | Missing_detail -> state)
-          else if String.equal action "capture-press-end"
-          then update (fun state -> { state with capture_pressed = false })
-          else if String.equal action "open-capture"
-          then
-            update (fun state ->
-              match state.pending_delete with
-              | Some _ -> { state with capture_pressed = false }
-              | None ->
-                let session_number = state.next_local_sequence in
-                { state with
-                  routes = Journal_routes.open_capture state.routes ~session_number
-                ; capture_pressed = false
-                ; next_local_sequence = Int64.succ session_number
-                })
+          if String.equal action "open-capture"
+          then open_capture ""
           else if String.equal action "delete-undo"
           then (
             pending_delete_ref := None;
@@ -1686,6 +1796,20 @@ let component client handlers graph =
                       state.routes
                       (Journal_capture.toggle_task capture)
                 })
+          else if String.equal action "capture-add-child"
+          then
+            update (fun state ->
+              match Journal_routes.capture state.routes with
+              | None -> state
+              | Some capture ->
+                let session_number = state.next_local_sequence in
+                { state with
+                  routes =
+                    Journal_routes.update_capture
+                      state.routes
+                      (Journal_capture.add_child capture ~session_number)
+                ; next_local_sequence = Int64.succ session_number
+                })
           else if String.equal action "capture-save"
           then (
             match Journal_routes.capture snapshot.routes, snapshot.calendar with
@@ -1694,12 +1818,21 @@ let component client handlers graph =
                | Error _ -> Bonsai.Effect.Ignore
                | Ok creation_time ->
                  let number = snapshot.next_local_sequence in
+                 let child_identities =
+                   Journal_capture.child_editors capture
+                   |> List.mapi (fun index _ ->
+                     ( fresh_identity ()
+                     , fresh_identity ()
+                     , sibling_order
+                         Int64.(add number (of_int (index + 1))) ))
+                 in
                  let capture, request =
                    Journal_capture.admit_save
                      capture
                      ~mutation_id:(fresh_identity ())
                      ~block_id:(fresh_identity ())
                      ~sibling_order:(sibling_order number)
+                     ~child_identities
                      ~calendar_generation:calendar.generation
                      ~creation_time
                  in
@@ -1709,7 +1842,10 @@ let component client handlers graph =
                     with_request
                       { snapshot with
                         routes = Journal_routes.update_capture snapshot.routes capture
-                      ; next_local_sequence = Int64.succ number
+                      ; next_local_sequence =
+                          Int64.add
+                            number
+                            (Int64.of_int (List.length child_identities + 1))
                       }
                       request))
             | None, _ | _, None -> Bonsai.Effect.Ignore)
@@ -1875,7 +2011,7 @@ let component client handlers graph =
                 | Not_a_task -> Todo
               in
               let request =
-                Journal_worker.Set_task_state
+                Journal_graph_request.Set_task_state
                   { mutation_id = fresh_identity ()
                   ; block_id
                   ; expected_revision = Journal_model.revision block
@@ -1951,6 +2087,7 @@ let component client handlers graph =
         ~device_pixel_ratio:environment.device_pixel_ratio
         ~timeline_state:state.timeline
         ~loading:(not state.feed_loaded)
+        ~graph_error:state.graph_error
         ~today_subtitle:(today_label state)
         ~day_label:(label_for_day state)
         ~reduced_motion
@@ -1958,10 +2095,9 @@ let component client handlers graph =
         ~safe_bottom:environment.safe_area.bottom
         ~viewport_width:environment.viewport_width
         ~content_horizontal_inset
-        ~capture_pressed:state.capture_pressed
-        ~capture:(bind_action dispatch "open-capture")
-        ~on_capture_pointer_down:(bind_action dispatch "capture-press-start")
-        ~on_capture_pointer_up:(bind_action dispatch "capture-press-end")
+        ~capture_enabled:(state.write_enabled && Option.is_none state.pending_delete)
+        ~capture_composer_key:state.next_local_sequence
+        ~on_capture_event:dispatch
         ~on_visible_range:dispatch
         ~on_task_toggle:(prefix_action dispatch "timeline-task:")
         ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
@@ -2026,6 +2162,6 @@ let app =
   App.create_with_worker
     ~name:"Logseq Journal"
     ~decode_config
-    ~service:Journal_worker.service
+    ~service:Graph_service.service
     component
 ;;

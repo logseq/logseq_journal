@@ -1,0 +1,27 @@
+(library
+ (name logseq_db_worker_fixture_generator)
+ (modules fixture_generator)
+ (libraries logseq_db_worker logseq_db_worker_test_support sqlite3 unix yojson))
+
+(executable
+ (name generate_fixtures)
+ (modules generate_fixtures)
+ (libraries logseq_db_worker_fixture_generator yojson))
+
+(executable
+ (name compare_canonical_graphs)
+ (modules compare_canonical_graphs)
+ (libraries logseq_db_worker unix yojson))
+
+(executable
+ (name performance_benchmark)
+ (modules performance_benchmark)
+ (libraries
+  core_unix
+  digestif
+  logseq_db_worker
+  logseq_db_worker_test_support
+  mtime.clock.os
+  sqlite3
+  unix
+  yojson))

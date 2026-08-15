@@ -6,6 +6,8 @@ enum JournalPlatformEnvironment {
 
   static func snapshot(
     applicationSupportPath: String,
+    applicationDataPath: String,
+    graphName: String = "logseq_journal",
     now: Date,
     locale: Locale,
     timeZone: TimeZone,
@@ -22,6 +24,9 @@ enum JournalPlatformEnvironment {
       + (components.day ?? 0)
     return [
       "applicationSupportPath": applicationSupportPath,
+      "platform": "ios",
+      "applicationDataPath": applicationDataPath,
+      "graphName": graphName,
       "instantUnixMilliseconds": Int64(now.timeIntervalSince1970 * 1_000),
       "localDay": localDay,
       "locale": locale.identifier,
@@ -42,6 +47,7 @@ enum JournalPlatformEnvironment {
     let canonicalPath = supportURL.resolvingSymlinksInPath().standardizedFileURL.path
     return snapshot(
       applicationSupportPath: canonicalPath,
+      applicationDataPath: canonicalPath,
       now: Date(),
       locale: Locale.current,
       timeZone: TimeZone.current,

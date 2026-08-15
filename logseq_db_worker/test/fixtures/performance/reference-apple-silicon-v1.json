@@ -1,0 +1,44 @@
+{
+  "formatVersion": 1,
+  "recordedAt": "2026-08-14",
+  "fixtureContentSha256": "534a3e9f71595299c74956b4acfd8c3afd903a6222315ea834b45ece580075eb",
+  "environment": {
+    "architecture": "arm64",
+    "memoryBytes": 68719476736,
+    "cpu": "Apple M4 Max",
+    "os": "26.5.2",
+    "sqliteVersion": "3.51.0",
+    "buildProfile": "release",
+    "cacheCondition": "fresh measurement process; normal host filesystem cache; no privileged eviction",
+    "rssSampler": "getrusage(RUSAGE_SELF).ru_maxrss"
+  },
+  "measurements": {
+    "coldOpenMilliseconds": 11517.140000000001,
+    "peakRssBytes": 667713536
+  },
+  "latency": {
+    "getBlock": {
+      "samples": 100,
+      "p95Milliseconds": 0.14466700000070887
+    },
+    "getChildren100": {
+      "samples": 100,
+      "p95Milliseconds": 16.440040999999184
+    },
+    "postBackupSaveBlock": {
+      "samples": 100,
+      "p95Milliseconds": 484.2070840000048
+    }
+  },
+  "boundedness": {
+    "depth64Accepted": true,
+    "depth65Rejected": true,
+    "largeSiblingPaginationDeterministic": true,
+    "highReferencesWithinResponseBudget": true,
+    "highReferencesResponseBytes": 23135
+  },
+  "throughput": {
+    "snapshotBytesPerSecond": 290228263.2245169,
+    "firstBackupBytesPerSecond": 168999157.58450198
+  }
+}

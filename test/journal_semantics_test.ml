@@ -86,7 +86,9 @@ let component ~tokens ~profile ~rtl ~item ~expanded handlers graph =
                ~device_pixel_ratio:3.
                ~rtl
                ~item
+               ~show_timestamp:true
                ~expanded
+               ~show_divider:true
                ~sort_base:0.
                ~reduced_motion:false
                ~on_task_toggle:task
@@ -368,6 +370,12 @@ let test_independent_task_and_row_body_actions () =
          (Option.is_none
             (Test.Handle.find
                handle
+               (Test.Query.test_id ("journal-row-surface:" ^ block_id))))
+         "flat row retained a rounded app-owned surface";
+       require
+         (Option.is_none
+            (Test.Handle.find
+               handle
                (Test.Query.test_id ("journal-row-disclosure-target:" ^ block_id))))
          "passive disclosure retained an independent target";
        require
@@ -395,11 +403,11 @@ let test_independent_task_and_row_body_actions () =
        require_tree_order
          handle
          ("test_id=journal-row-source:" ^ block_id)
-         ("test_id=journal-row-disclosure-icon:" ^ block_id);
+         ("test_id=journal-row-time-slot:" ^ block_id);
        require_tree_order
          handle
-         ("test_id=journal-row-disclosure-icon:" ^ block_id)
-         ("test_id=journal-row-time-slot:" ^ block_id);
+         ("test_id=journal-row-time-slot:" ^ block_id)
+         ("test_id=journal-row-disclosure-icon:" ^ block_id);
        require_semantics handle ("Mark as todo: " ^ source) (fun props ->
          require (props.role = Ui.Semantics.Role.Checkbox) "task role changed";
          require (props.checked = Some true) "Done task is not checked";
@@ -473,7 +481,7 @@ let test_conditional_task_leading_slot_and_todo_icon () =
        require_padding
          plain_handle
          ("journal-row-body-padding:" ^ block_id)
-         ~left:28.
+         ~left:32.
          ~right:24.);
   let todo =
     Journal_row.Item.of_block (block ~task_state:Journal_model.Todo ~child_count:0 ())
@@ -502,8 +510,8 @@ let test_conditional_task_leading_slot_and_todo_icon () =
             require (props.role = Ui.Semantics.Role.Generic) "leaf body is not static";
             require (props.actions = []) "leaf body exposes Tap");
        match (node todo_handle ("journal-row-body-content:" ^ block_id)).props with
-       | Ui.Widget.Private.Sized_box_props { height = Some 44.; width = None } -> ()
-       | _ -> fail "leaf body does not use a finite center slot")
+       | Ui.Widget.Private.Align_props _ -> ()
+       | _ -> fail "leaf body does not use a bounded center alignment")
 ;;
 
 let header_component ~tokens _handlers _graph =
@@ -565,21 +573,14 @@ let test_header_shells_and_view_only_date_have_truthful_semantics () =
          require (props.sort_key = Some 2.) "date semantic order changed"))
 ;;
 
-let require_row_shape
-      ?expected_metadata_height
-      ?(expected_source_height = 44.)
-      width
-      scale
-      expected_kind
-      expected_extent
-      expected_time_width
+let require_row_shape width scale expected_kind expected_extent expected_time_width
   =
   let item = Journal_row.Item.of_block (block ()) in
   let handle, profile = create_handle ~width ~scale item in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
-       require (profile.block_extent = expected_extent) "profile extent changed";
+       require (profile.top_level_extent = expected_extent) "profile extent changed";
        (match (node handle ("journal-row-extent:" ^ block_id)).props with
         | Ui.Widget.Private.Sized_box_props { height = Some height; _ } ->
           require (height = expected_extent) "row extent is %.1f" height
@@ -596,27 +597,9 @@ let require_row_shape
             max_width
             expected_time_width
         | _ -> fail "time slot is not reserved");
-       (match (node handle ("journal-row-body-content:" ^ block_id)).props with
-        | Ui.Widget.Private.Sized_box_props { height = Some height; _ } ->
-          require
-            (Float.equal height expected_source_height)
-            "source center slot is %.1f, expected %.1f"
-            height
-            expected_source_height
-        | _ -> fail "source center slot does not publish a finite height");
-       Option.iter
-         (fun expected_height ->
-            match
-              (node handle ("journal-row-adaptive-metadata-slot:" ^ block_id)).props
-            with
-            | Ui.Widget.Private.Sized_box_props { height = Some height; _ } ->
-              require
-                (height = expected_height)
-                "adaptive metadata height is %.1f, expected %.1f"
-                height
-                expected_height
-            | _ -> fail "adaptive metadata does not publish a finite height")
-         expected_metadata_height;
+       (match (node handle ("journal-row-text-stack:" ^ block_id)).props with
+        | Ui.Widget.Private.Linear_props -> ()
+        | _ -> fail "top-level content is not a bounded two-line stack");
        match (node handle ("journal-row-divider:" ^ block_id)).props with
        | Ui.Widget.Private.Sized_box_props { height = Some height; _ } ->
          require
@@ -627,24 +610,10 @@ let require_row_shape
 ;;
 
 let test_compact_and_adaptive_shapes_at_required_extremes () =
-  require_row_shape 390. 1. "journal-row-compact" 48. 52.;
-  require_row_shape 320. 1. "journal-row-adaptive" 80. 52.;
-  require_row_shape
-    ~expected_metadata_height:(383. /. 6.)
-    ~expected_source_height:(383. /. 6.)
-    744.
-    2.
-    "journal-row-adaptive"
-    128.
-    104.;
-  require_row_shape
-    ~expected_metadata_height:(557. /. 6.)
-    ~expected_source_height:(557. /. 6.)
-    1_200.
-    3.2
-    "journal-row-adaptive"
-    186.
-    167.
+  require_row_shape 390. 1. "journal-row-compact" 76. 52.;
+  require_row_shape 320. 1. "journal-row-adaptive" 84. 52.;
+  require_row_shape 744. 2. "journal-row-adaptive" 140. 104.;
+  require_row_shape 1_200. 3.2 "journal-row-adaptive" 210. 167.
 ;;
 
 let test_rtl_row_geometry_uses_logical_edges () =
@@ -658,13 +627,17 @@ let test_rtl_row_geometry_uses_logical_edges () =
          ("journal-row-disclosure-icon:" ^ block_id)
          ~code_point:0xe15e
          ~color:0xff656b8fl;
-       require_padding handle ("journal-row-body-padding:" ^ block_id) ~left:24. ~right:4.;
+       require_padding
+         handle
+         ("journal-row-body-padding:" ^ block_id)
+         ~left:24.
+         ~right:4.;
        require_padding handle ("journal-row-source-gap:" ^ block_id) ~left:8. ~right:0.;
        require_padding
          handle
          ("journal-row-divider-padding:" ^ block_id)
          ~left:0.
-         ~right:18.)
+         ~right:0.)
 ;;
 
 let test_child_count_widths_and_long_parent_source_remain_bounded () =
@@ -687,11 +660,17 @@ let test_child_count_widths_and_long_parent_source_remain_bounded () =
             require_tree_order
               handle
               ("test_id=journal-row-source:" ^ block_id)
-              ("test_id=journal-row-disclosure-icon:" ^ block_id);
+              ("test_id=journal-row-time-slot:" ^ block_id);
             require_tree_order
               handle
-              ("test_id=journal-row-disclosure-icon:" ^ block_id)
-              ("test_id=journal-row-time-slot:" ^ block_id)))
+              ("test_id=journal-row-time-slot:" ^ block_id)
+              ("test_id=journal-row-disclosure-icon:" ^ block_id);
+            require
+              (Option.is_none
+                 (Test.Handle.find
+                    handle
+                    (Test.Query.test_id ("journal-row-child-count:" ^ block_id))))
+              "row retained the passive child-count badge"))
     [ 1; 12; 123 ]
 ;;
 
@@ -717,10 +696,11 @@ let delete_timeline_component ~delete_enabled handlers _graph =
       Journal_timeline_state.apply_feed
         state
         ~generation:1L
-        { Journal_repository.days =
+        { Journal_graph_projection.days =
             [ { page = { id = page_id; day = 20260809; title = "Today" }
-              ; blocks = [ block ]
-              ; has_more_blocks = false
+              ; entries = [ { block; child_summaries = [] } ]
+              ; has_more_entries = false
+              ; continuation = None
               }
             ]
         ; slot_count = 1

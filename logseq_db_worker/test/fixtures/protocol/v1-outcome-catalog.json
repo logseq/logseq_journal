@@ -1,0 +1,17 @@
+{
+  "apiVersion": 1,
+  "responses": [
+    {"type":"succeeded","requestId":"00000000-0000-4000-8000-000000000001","basis":"100","success":{"type":"mutation","status":"applied","basisBefore":"99","basisAfter":"100","changedUuids":["10000000-0000-4000-8000-000000000001"],"changedUuidsTruncated":false}},
+    {"type":"failed","requestId":"00000000-0000-4000-8000-000000000002","phase":"open","basis":null,"error":{"code":"unsupportedSchema","message":"Graph schema is older than 65.33.","details":[{"name":"minimum","value":{"type":"string","value":"65.33"}},{"name":"actual","value":{"type":"string","value":"65.32"}}]}},
+    {"type":"failed","requestId":"00000000-0000-4000-8000-000000000003","phase":"execute","basis":"100","error":{"code":"conflict","message":"The graph basis changed.","details":[{"name":"expectedBasis","value":{"type":"int64","value":"99"}},{"name":"actualBasis","value":{"type":"int64","value":"100"}}]}}
+  ],
+  "pushes": [
+    {"type":"graphInvalidated","basis":"100","changedUuids":["10000000-0000-4000-8000-000000000001"],"changedUuidsTruncated":false,"invalidateGraphInfo":false,"invalidatePages":false,"invalidateTags":false,"invalidateProperties":false,"invalidateTasks":false,"invalidateReferences":true}
+  ],
+  "cursorEnvelope": {
+    "encoding": "base64url(canonical-json || hmac-sha256)",
+    "fields": ["apiVersion","keyVersion","queryFingerprint","basis","lastSortKey","expiresAtUnixMs"],
+    "failureOnBasisOrFingerprintMismatch": "conflict"
+  },
+  "errorCodes": ["invalidRequest","unsupportedApiVersion","graphNotFound","graphLocked","unsupportedSchema","remoteGraph","ambiguousSyncState","unsupportedValue","unsupportedSemantics","corruptStorage","notFound","ambiguousSelector","duplicateSelector","builtInProtected","invalidTree","invalidOrder","invalidPosition","conflict","responseTooLarge","storageBusy","closedSession"]
+}

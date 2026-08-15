@@ -169,9 +169,11 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "a51276a09eb1cdf9c87f07ac4c7558ed7c6b2d69" in
+  let current_bonsai_flutter_revision = "f6d27175632d26e759532f6ee81e8d1383490533" in
   let obsolete_bonsai_flutter_revisions =
-    [ "26f5bf6c3b4cdd61ccd5c1660f6cf9f72fe523da"
+    [ "d5f8d36b5539550cbc2466311acda4d8c609032e"
+    ; "a51276a09eb1cdf9c87f07ac4c7558ed7c6b2d69"
+    ; "26f5bf6c3b4cdd61ccd5c1660f6cf9f72fe523da"
     ; "066179956545cc12871862879fc906f09519788c"
     ]
   in
@@ -184,15 +186,18 @@ let () =
     (require_file root)
     [ "bonsai-flutter.sexp"
     ; "app/application.ml"
-    ; "app/journal_repository.ml"
-    ; "app/journal_schema.ml"
+    ; "app/journal_calendar.ml"
+    ; "app/journal_graph_projection.ml"
+    ; "app/journal_graph_projection.mli"
+    ; "app/journal_graph_request.ml"
+    ; "app/journal_graph_runtime.ml"
+    ; "app/journal_graph_runtime.mli"
     ; "app/journal_model.ml"
     ; "app/journal_model.mli"
     ; "app/journal_time.ml"
     ; "app/journal_time.mli"
     ; "app/journal_timeline_state.ml"
     ; "app/journal_timeline_state.mli"
-    ; "app/journal_worker.ml"
     ; "flutter/lib/application_host_adapter.dart"
     ; "flutter/lib/main.dart"
     ; "flutter/test/application_host_adapter_test.dart"
@@ -214,6 +219,18 @@ let () =
     ; "test/feed_app_test.ml"
     ; "test/feed_state_test.ml"
     ; "test/schema_repository_test.ml"
+    ; "app/journal_repository.ml"
+    ; "app/journal_repository.mli"
+    ; "app/journal_schema.ml"
+    ; "app/journal_schema.mli"
+    ; "app/journal_storage.ml"
+    ; "app/journal_storage.mli"
+    ; "app/journal_storage_path.ml"
+    ; "app/journal_storage_path.mli"
+    ; "app/journal_worker.ml"
+    ; "app/journal_worker.mli"
+    ; "app/journal_process_recovery.ml"
+    ; "app/journal_process_recovery.mli"
     ];
   require_allowed_dart_files
     root
@@ -223,13 +240,18 @@ let () =
     root
     "flutter/test"
     [ "flutter/test/application_host_adapter_test.dart"
+    ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
     ; "flutter/test/journal_runtime_golden_test.dart"
     ; "flutter/test/widget_test.dart"
     ];
   require_allowed_dart_files
     root
     "flutter/integration_test"
-    [ "flutter/integration_test/journal_runtime_flow_test.dart" ];
+    [ "flutter/integration_test/journal_runtime_flow_test.dart"
+    ; "flutter/integration_test/logseq_db_worker_ios_device_test.dart"
+    ; "flutter/integration_test/logseq_db_worker_runtime_flow_test.dart"
+    ; "flutter/integration_test/runtime_flow_fixture.dart"
+    ];
   let forbidden_dart_text =
     [ "package:logseq_journal/app/"
     ; "package:logseq_journal/core/"
@@ -323,6 +345,13 @@ let () =
     ; "more-unconfirmed"
     ; "fab_horizontal_inset"
     ; "journal-capture-alignment"
+    ; "Children_continuation"
+    ; "apply_block_page"
+    ; "block_extent"
+    ; "divider_inset"
+    ; "shadow_size"
+    ; "shadow_alpha"
+    ; "journal-row-child-count"
     ]
   in
   let deferred_capability_symbols =
@@ -339,6 +368,7 @@ let () =
     forbid_text root relative obsolete_product_symbols;
     forbid_text root relative deferred_capability_symbols);
   forbid_text root "app/application.ml" [ "timeline-open:"; "timeline-disclosure:" ];
+  forbid_text root "app/journal_row.ml" [ "Tokens.row_geometry.corner_radius" ];
   forbid_text
     root
     "app/application.ml"
@@ -381,6 +411,35 @@ let () =
     ; "journal-capture-sheet"
     ; "Journal_capture.can_pop"
     ];
+  require_text
+    root
+    "app/journal_graph_projection.mli"
+    [ "type child_summary"; "type timeline_entry"; "type timeline_entry_page" ];
+  require_text
+    root
+    "app/journal_timeline_state.mli"
+    [ "Top_level"; "Child_preview"; "Children_loading"; "Children_more"; "epoch : int64" ];
+  require_text
+    root
+    "app/journal_visual_tokens.mli"
+    [ "type extent_role"; "val extent_for_role"; "type preview_geometry" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/engine.ml"
+    [ "Datascript.serializable"
+    ; "validate_storage_header connection"
+    ; "let structurally_valid schema db"
+    ];
+  require_occurrences root "logseq_db_worker/lib/engine.ml" "tree_structurally_valid" 2;
+  forbid_text
+    root
+    "logseq_db_worker/lib/storage_session.ml"
+    [ "db |> Datascript.serializable |> Datascript.from_serializable"
+    ; "Datascript.from_serializable"
+    ];
+  files_with_suffixes root "logseq_db_worker" [ ".ml"; ".mli" ]
+  |> List.iter (fun relative ->
+    forbid_text root relative [ "Datascript.from_serializable" ]);
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"
   | failures ->

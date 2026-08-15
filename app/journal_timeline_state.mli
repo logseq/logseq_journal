@@ -4,27 +4,29 @@ type request =
   | Feed of { before_day : int option }
   | Day of
       { day : int
-      ; after : Journal_repository.block_cursor option
+      ; after : Journal_graph_projection.block_cursor option
       }
   | Children of
       { parent_id : string
-      ; after : Journal_repository.block_cursor option
+      ; epoch : int64
       }
 
 type slot =
-  | Day_heading of Journal_repository.page
-  | Block of
-      { block : Journal_model.t
-      ; depth : int
+  | Day_heading of Journal_graph_projection.page
+  | Top_level of Journal_graph_projection.timeline_entry
+  | Child_preview of
+      { parent_id : string
+      ; block : Journal_model.t
       }
   | Day_continuation of
       { day : int
-      ; after : Journal_repository.block_cursor option
+      ; after : Journal_graph_projection.block_cursor option
       }
-  | Children_continuation of
+  | Children_loading of
       { parent_id : string
-      ; after : Journal_repository.block_cursor option
+      ; epoch : int64
       }
+  | Children_more of { parent_id : string }
   | Feed_continuation of { before_day : int }
   | Bottom_clearance
 
@@ -64,9 +66,13 @@ val extent_strategy : extent_strategy
 val renderer_event_surface : [ `Visible_range ] list
 val empty : today:int -> t
 val begin_request : t -> generation:int64 -> request -> t
-val apply_feed : t -> generation:int64 -> Journal_repository.feed -> t
-val apply_block_page : t -> generation:int64 -> Journal_repository.block_page -> t
-val apply_detail : t -> generation:int64 -> Journal_repository.detail -> t
+val apply_feed : t -> generation:int64 -> Journal_graph_projection.feed -> t
+val apply_timeline_entry_page
+  :  t
+  -> generation:int64
+  -> Journal_graph_projection.timeline_entry_page
+  -> t
+val apply_detail : t -> generation:int64 -> Journal_graph_projection.detail -> t
 val next_request : t -> request option
 
 val request_for_visible_range
@@ -79,7 +85,8 @@ val pending_request : t -> (int64 * request) option
 val expand : t -> parent_id:string -> t
 val collapse : t -> parent_id:string -> t
 val replace_block : t -> Journal_model.t -> t
-val prepend_block : t -> Journal_model.t -> t
+val replace_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
+val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
 val stage_delete : t -> block_id:string -> (t * staged_delete) option
 val undo_delete : staged_delete -> t
 val return_from_detail : t -> block_id:string -> t
@@ -89,6 +96,7 @@ val retained_slots : t -> slot list
 val retained_slot_count : t -> int
 val first_retained_index : t -> int
 val total_count : t -> int
+val today : t -> int
 val anchor_decision : t -> anchor_decision
 val focus_restore_block_id : t -> string option
 val is_expanded : t -> block_id:string -> bool

@@ -49,7 +49,7 @@ let block
   | Error error -> fail "block fixture failed: %s" error
 ;;
 
-let detail ?(root = block ()) () : Journal_repository.detail =
+let detail ?(root = block ()) () : Journal_graph_projection.detail =
   { root; children = { blocks = []; continuation = None } }
 ;;
 
@@ -88,7 +88,7 @@ let require_range range ~start_utf16 ~end_utf16 label =
 ;;
 
 let test_capture_plain_ime_dirty_cancel_and_retry () =
-  let capture = Journal_capture.create ~session_number:11L in
+  let capture = Journal_capture.create ~session_number:11L ~source:"" in
   require (not (Journal_capture.can_save capture)) "blank Capture enabled Save";
   require (not (Journal_capture.dirty capture)) "new Capture started dirty";
   require
@@ -181,12 +181,13 @@ let test_capture_plain_ime_dirty_cancel_and_retry () =
       ~mutation_id:"70000000-0000-4000-9000-000000000011"
       ~block_id:"70000000-0000-4000-a000-000000000011"
       ~sibling_order:"000000000011"
+      ~child_identities:[]
       ~calendar_generation:7L
       ~creation_time:(creation_time 541)
   in
   (match request with
    | Some
-       (Journal_worker.Capture
+       (Journal_graph_request.Capture
           { calendar_generation = 7L
           ; command = { source; task_state = Journal_model.Not_a_task; _ }
           }) -> require_string composed source "admitted Capture source"
@@ -197,6 +198,7 @@ let test_capture_plain_ime_dirty_cancel_and_retry () =
       ~mutation_id:"70000000-0000-4000-9000-000000000012"
       ~block_id:"70000000-0000-4000-a000-000000000012"
       ~sibling_order:"000000000012"
+      ~child_identities:[]
       ~calendar_generation:7L
       ~creation_time:(creation_time 542)
   in
@@ -216,8 +218,8 @@ let test_capture_plain_ime_dirty_cancel_and_retry () =
     "Capture retry did not return to Saving"
 ;;
 
-let test_capture_dismissal_policy_covers_task_failure_and_recovery () =
-  let clean = Journal_capture.create ~session_number:31L in
+let test_capture_dismissal_policy_covers_task_failure () =
+  let clean = Journal_capture.create ~session_number:31L ~source:"" in
   let task_dirty = Journal_capture.toggle_task clean in
   require
     (Journal_capture.task_state task_dirty = Journal_model.Todo)
@@ -256,6 +258,7 @@ let test_capture_dismissal_policy_covers_task_failure_and_recovery () =
       ~mutation_id:"70000000-0000-4000-9000-000000000031"
       ~block_id:"70000000-0000-4000-a000-000000000031"
       ~sibling_order:"000000000031"
+      ~child_identities:[]
       ~calendar_generation:7L
       ~creation_time:(creation_time 544)
   in
@@ -287,7 +290,6 @@ let test_capture_dismissal_policy_covers_task_failure_and_recovery () =
     | Block -> fail "%s blocked explicit confirmed discard" label
   in
   require_confirmable "failed Capture" failed;
-  require_confirmable "recovery-only Capture" (Journal_capture.recovery_only failed);
   let committed = Journal_capture.commit saving (block ()) in
   require
     (Journal_capture.request_dismiss committed = Journal_capture.Block)
@@ -297,8 +299,22 @@ let test_capture_dismissal_policy_covers_task_failure_and_recovery () =
 let test_capture_route_admission_and_confirmed_dismissal () =
   let anchor : Journal_routes.anchor = { block_id = None; first_index = 0 } in
   let routes = Journal_routes.create ~anchor in
-  let opened = Journal_routes.open_capture routes ~session_number:41L in
-  let opened_again = Journal_routes.open_capture opened ~session_number:42L in
+  let clean_opened =
+    Journal_routes.open_capture routes ~session_number:40L ~source:""
+  in
+  let clean_closed = Journal_routes.back clean_opened in
+  require
+    (Journal_routes.route clean_closed = Journal_routes.Timeline)
+    "clean Capture did not close";
+  let opened =
+    Journal_routes.open_capture
+      routes
+      ~session_number:41L
+      ~source:"Composer-seeded route draft"
+  in
+  let opened_again =
+    Journal_routes.open_capture opened ~session_number:42L ~source:"replacement"
+  in
   let capture =
     match Journal_routes.capture opened_again with
     | Some capture -> capture
@@ -308,11 +324,11 @@ let test_capture_route_admission_and_confirmed_dismissal () =
     (ID.Text_input.Session_id.equal
        (Journal_capture.session_id capture)
        (ID.Text_input.Session_id.of_int64 41L))
-    "duplicate Center Orb activation replaced the Capture session";
-  let clean_closed = Journal_routes.back opened_again in
-  require
-    (Journal_routes.route clean_closed = Journal_routes.Timeline)
-    "clean Capture did not close";
+    "duplicate MessageComposer activation replaced the Capture session";
+  require_string
+    "Composer-seeded route draft"
+    (Journal_capture.source capture)
+    "Capture route seed";
   let capture =
     Journal_capture.apply_text_edit
       capture
@@ -356,7 +372,7 @@ let test_detail_task_child_conflict_and_back_order () =
   in
   (match task_request with
    | Some
-       (Journal_worker.Set_task_state
+       (Journal_graph_request.Set_task_state
           { block_id; expected_revision = 1; task_state = Journal_model.Done; _ }) ->
      require_string (Journal_model.id original) block_id "task block ID"
    | _ -> fail "Detail task toggle did not admit an atomic mutation");
@@ -397,7 +413,7 @@ let test_detail_task_child_conflict_and_back_order () =
   in
   (match child_request with
    | Some
-       (Journal_worker.Create_child
+       (Journal_graph_request.Create_child
           { parent_block_id; expected_parent_revision = 1; source; _ }) ->
      require_string (Journal_model.id original) parent_block_id "child parent";
      require_string "Direct child 👶" source "child source"
@@ -449,7 +465,7 @@ let test_detail_task_child_conflict_and_back_order () =
   in
   (match retry with
    | Some
-       (Journal_worker.Update_source
+       (Journal_graph_request.Update_source
           { expected_revision = 2; source = "我的草稿 👩🏽‍💻 e\204\129"; _ }) -> ()
    | _ -> fail "conflict retry did not rebase the literal draft on the latest revision");
   require
@@ -539,8 +555,8 @@ let test_route_generation_anchor_background_and_runtime_replacement () =
 let tests =
   [ ( "Capture plain IME, dirty cancel, and retry"
     , test_capture_plain_ime_dirty_cancel_and_retry )
-  ; ( "Capture dismissal covers task, failure, and recovery"
-    , test_capture_dismissal_policy_covers_task_failure_and_recovery )
+  ; ( "Capture dismissal covers task and failure"
+    , test_capture_dismissal_policy_covers_task_failure )
   ; ( "Capture route admission and confirmed dismissal"
     , test_capture_route_admission_and_confirmed_dismissal )
   ; ( "Detail task, child, conflict, and Back order"

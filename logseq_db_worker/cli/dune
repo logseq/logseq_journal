@@ -1,0 +1,12 @@
+(library
+ (name logseq_db_worker_cli)
+ (wrapped false)
+ (modules cli_command cli_output)
+ (libraries cmdliner logseq_db_worker mtime.clock.os unix yojson))
+
+(executable
+ (name main)
+ (public_name logseq-db-worker)
+ (package logseq_db_worker)
+ (modules main)
+ (libraries cmdliner logseq_db_worker_cli))

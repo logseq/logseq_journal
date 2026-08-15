@@ -6,7 +6,7 @@ type reason =
   | Locale_changed
 
 type calendar =
-  { snapshot : Journal_startup.calendar_snapshot
+  { snapshot : Journal_calendar.t
   ; reason : reason
   }
 
@@ -86,7 +86,7 @@ let decode_calendar bytes =
           Result.map
             (fun reason ->
                { snapshot =
-                   { Journal_startup.instant_unix_ms = Bytes.get_int64_le bytes 16
+                   { Journal_calendar.instant_unix_ms = Bytes.get_int64_le bytes 16
                    ; local_day
                    ; local_minute_of_day
                    ; locale

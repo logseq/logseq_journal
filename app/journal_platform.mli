@@ -6,7 +6,7 @@ type reason =
   | Locale_changed
 
 type calendar =
-  { snapshot : Journal_startup.calendar_snapshot
+  { snapshot : Journal_calendar.t
   ; reason : reason
   }
 

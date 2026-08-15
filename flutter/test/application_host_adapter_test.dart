@@ -18,38 +18,25 @@ const sampleCalendar = JournalCalendarSnapshot(
 
 Uint8List startupPacket({
   String root = '/tmp/support',
-  String locale = 'en_US',
-  String timeZoneId = 'Europe/Paris',
-  int instantUnixMilliseconds = 1786055400000,
-  int localDay = 20260807,
-  int localMinuteOfDay = 30,
-  int utcOffsetSeconds = 7200,
-  int calendarGeneration = 7,
-  int lifecycleGeneration = 0,
+  Map<String, Object> target = const {
+    'kind': 'snapshot',
+    'token': '10000000-0000-4000-8000-000000000001',
+  },
 }) {
-  final rootBytes = utf8.encode(root);
-  final localeBytes = utf8.encode(locale);
-  final timeZoneBytes = utf8.encode(timeZoneId);
-  final value = Uint8List(
-    64 + rootBytes.length + localeBytes.length + timeZoneBytes.length,
+  final json = utf8.encode(
+    jsonEncode(<String, Object>{
+      'applicationSupportDirectory': root,
+      'target': target,
+      'compatibilityProfile': 'logseq-65.33-or-newer',
+      'responseBudgetBytes': 262144,
+      'defaultPageSize': 50,
+    }),
   );
+  final value = Uint8List(8 + json.length);
   final data = ByteData.sublistView(value);
-  value.setRange(0, 4, ascii.encode('LJR1'));
-  data.setUint32(4, 1, Endian.little);
-  data.setUint32(8, rootBytes.length, Endian.little);
-  data.setUint32(12, localeBytes.length, Endian.little);
-  data.setUint32(16, timeZoneBytes.length, Endian.little);
-  data.setInt64(24, instantUnixMilliseconds, Endian.little);
-  data.setUint32(32, localDay, Endian.little);
-  data.setUint16(36, localMinuteOfDay, Endian.little);
-  data.setInt32(40, utcOffsetSeconds, Endian.little);
-  data.setInt64(48, calendarGeneration, Endian.little);
-  data.setInt64(56, lifecycleGeneration, Endian.little);
-  var offset = 64;
-  for (final field in [rootBytes, localeBytes, timeZoneBytes]) {
-    value.setRange(offset, offset + field.length, field);
-    offset += field.length;
-  }
+  value.setRange(0, 4, ascii.encode('LDB1'));
+  data.setUint32(4, json.length, Endian.little);
+  value.setRange(8, value.length, json);
   return value;
 }
 
@@ -76,14 +63,18 @@ void main() {
 
   test('startup codec carries only bounded mechanical host facts', () {
     final expected = startupPacket();
-    final decoded = JournalStartupEnvelope.decode(expected);
+    final decoded = LogseqDbWorkerStartupEnvelope.decode(expected);
 
-    expect(decoded.applicationSupportRoot, '/tmp/support');
-    expect(decoded.initialCalendar, sampleCalendar);
-    expect(packetData(expected).getUint32(8, Endian.little), 12);
-    expect(packetData(expected).getUint16(36, Endian.little), 30);
-    expect(packetData(expected).getInt64(48, Endian.little), 7);
-    expect(packetData(expected).getInt64(56, Endian.little), 0);
+    expect(decoded.applicationSupportDirectory, '/tmp/support');
+    expect(decoded.target.kind, LogseqDbTargetKind.snapshot);
+    expect(
+      decoded.target.snapshotToken,
+      '10000000-0000-4000-8000-000000000001',
+    );
+    expect(
+      packetData(expected).getUint32(4, Endian.little),
+      expected.length - 8,
+    );
 
     for (final bytes in <Uint8List>[
       Uint8List(0),
@@ -92,16 +83,16 @@ void main() {
       startupPacket(root: 'tmp/support'),
       startupPacket(root: '/tmp/../tmp/support'),
       startupPacket(root: '/'),
-      startupPacket(locale: ''),
-      startupPacket(timeZoneId: ''),
-      startupPacket(localDay: 20260229),
-      startupPacket(localMinuteOfDay: 31),
-      startupPacket(utcOffsetSeconds: 64801),
-      startupPacket(calendarGeneration: -1),
-      startupPacket(lifecycleGeneration: -1),
+      startupPacket(target: const {'kind': 'snapshot', 'token': 'invalid'}),
+      startupPacket(
+        target: const {'kind': 'importSnapshot', 'inboxEntry': '..'},
+      ),
       startupPacket(root: '/${List.filled(4097, 'x').join()}'),
     ]) {
-      expect(() => JournalStartupEnvelope.decode(bytes), throwsFormatException);
+      expect(
+        () => LogseqDbWorkerStartupEnvelope.decode(bytes),
+        throwsFormatException,
+      );
     }
   });
 
@@ -128,9 +119,7 @@ void main() {
 
     expect(
       infoPlist,
-      contains(
-        '<key>UIUserInterfaceStyle</key>\n\t<string>Light</string>',
-      ),
+      contains('<key>UIUserInterfaceStyle</key>\n\t<string>Light</string>'),
     );
   });
 
@@ -149,6 +138,8 @@ void main() {
 
       final adapter = ApplicationHostAdapter(
         applicationSupportDirectory: () async => Directory(alias.path),
+        graphTarget: () async =>
+            LogseqDbTarget.snapshot('10000000-0000-4000-8000-000000000001'),
         initialCalendarSnapshot: () async => sampleCalendar,
       );
       final payload = await adapter.createApplicationPayload();
@@ -156,7 +147,9 @@ void main() {
 
       expect(payload, startupPacket(root: canonicalRoot));
       expect(
-        JournalStartupEnvelope.decode(payload).applicationSupportRoot,
+        LogseqDbWorkerStartupEnvelope.decode(
+          payload,
+        ).applicationSupportDirectory,
         canonicalRoot,
       );
       expect(
@@ -169,6 +162,8 @@ void main() {
   testWidgets('adapter preserves the generated host child', (tester) async {
     final adapter = ApplicationHostAdapter(
       applicationSupportDirectory: () async => Directory('/tmp/unused'),
+      graphTarget: () async =>
+          LogseqDbTarget.snapshot('10000000-0000-4000-8000-000000000001'),
       initialCalendarSnapshot: () async => sampleCalendar,
     );
     await tester.pumpWidget(
@@ -394,9 +389,19 @@ void main() {
   });
 
   test('production adapter rejects every missing native fact', () async {
+    final temporary = await Directory.systemTemp.createTemp(
+      'journal-platform-missing-',
+    );
+    addTearDown(() => temporary.delete(recursive: true));
+    await Directory(
+      '${temporary.path}/logseq/logseq_journal',
+    ).create(recursive: true);
     const channel = MethodChannel('logseq_journal/platform');
     final complete = <String, Object>{
-      'applicationSupportPath': '/tmp/support',
+      'applicationSupportPath': temporary.path,
+      'platform': 'desktop',
+      'homeDirectoryPath': temporary.path,
+      'graphName': 'logseq_journal',
       'instantUnixMilliseconds': sampleCalendar.instantUnixMilliseconds,
       'localDay': sampleCalendar.localDay,
       'locale': sampleCalendar.locale,
@@ -404,7 +409,12 @@ void main() {
       'utcOffsetSeconds': sampleCalendar.utcOffsetSeconds,
       'generation': sampleCalendar.generation,
     };
-    for (final missing in complete.keys) {
+    for (final missing in <String>[
+      'applicationSupportPath',
+      'platform',
+      'homeDirectoryPath',
+      'graphName',
+    ]) {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(channel, (call) async {
             final value = Map<String, Object>.of(complete)..remove(missing);
@@ -425,6 +435,8 @@ void main() {
       'journal-platform-',
     );
     addTearDown(() => temporary.delete(recursive: true));
+    final graph = Directory('${temporary.path}/logseq/logseq_journal');
+    await graph.create(recursive: true);
     const channel = MethodChannel('logseq_journal/platform');
     final calls = <MethodCall>[];
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -432,6 +444,9 @@ void main() {
           calls.add(call);
           return <String, Object>{
             'applicationSupportPath': temporary.path,
+            'platform': 'desktop',
+            'homeDirectoryPath': temporary.path,
+            'graphName': 'logseq_journal',
             'instantUnixMilliseconds': sampleCalendar.instantUnixMilliseconds,
             'localDay': sampleCalendar.localDay,
             'locale': sampleCalendar.locale,
@@ -451,7 +466,14 @@ void main() {
     expect(calls.single.method, 'getStartupEnvironment');
     expect(
       payload,
-      startupPacket(root: await temporary.resolveSymbolicLinks()),
+      startupPacket(
+        root: await temporary.resolveSymbolicLinks(),
+        target: <String, Object>{
+          'kind': 'nativeLocalGraph',
+          'graphName': 'logseq_journal',
+          'graphDir': await graph.resolveSymbolicLinks(),
+        },
+      ),
     );
   });
 }

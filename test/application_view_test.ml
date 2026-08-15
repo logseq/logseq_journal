@@ -4,6 +4,7 @@ module Protocol = Bonsai_flutter_protocol
 module Runtime = Bonsai_flutter_runtime
 module Test = Bonsai_flutter_test
 module Ui = Bonsai_flutter_ui
+module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 
 let fail format = Printf.ksprintf failwith format
 
@@ -11,38 +12,11 @@ let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
 ;;
 
-let rec remove_tree path =
-  match Unix.lstat path with
-  | { Unix.st_kind = Unix.S_DIR; _ } ->
-    Sys.readdir path |> Array.iter (fun name -> remove_tree (Filename.concat path name));
-    Unix.rmdir path
-  | _ -> Unix.unlink path
-  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
-;;
+module Graph = Logseq_db_worker.Graph_types
+module Graph_protocol = Logseq_db_worker.Protocol
 
 let with_startup test =
-  let root = Filename.temp_file "journal-timeline-view-" "" in
-  Sys.remove root;
-  Unix.mkdir root 0o700;
-  Unix.mkdir (Filename.concat root "logseq_journal") 0o700;
-  let startup : Journal_startup.t =
-    { application_support_root = Unix.realpath root
-    ; expected_schema_version = Journal_schema.version
-    ; initial_calendar =
-        { instant_unix_ms = 1_786_259_700_000L
-        ; local_day = 20260809
-        ; local_minute_of_day = 915
-        ; locale = "en_US"
-        ; time_zone_id = "Asia/Shanghai"
-        ; utc_offset_seconds = 28_800
-        ; generation = 1L
-        ; lifecycle_generation = 0L
-        }
-    ; access_mode = Read_write
-    ; diagnostic_mode = Operational_only
-    }
-  in
-  Fun.protect ~finally:(fun () -> remove_tree root) (fun () -> test startup)
+  Adapter_fixture.with_snapshot (fun fixture -> test fixture.Adapter_fixture.config)
 ;;
 
 let encode_startup startup =
@@ -52,13 +26,113 @@ let encode_startup startup =
     fail "startup encode failed: %s" (Journal_startup.Error.to_string error)
 ;;
 
+let initial_calendar_packet =
+  let locale = "en_US" in
+  let time_zone_id = "Asia/Shanghai" in
+  let header_size = 56 in
+  let bytes =
+    Bytes.make (header_size + String.length locale + String.length time_zone_id) '\000'
+  in
+  Bytes.blit_string "LJP1" 0 bytes 0 4;
+  Bytes.set_uint16_le bytes 4 1;
+  Bytes.set_uint16_le bytes 6 2;
+  Bytes.set_uint16_le bytes 8 0;
+  Bytes.set_uint16_le bytes 10 (String.length locale);
+  Bytes.set_uint16_le bytes 12 (String.length time_zone_id);
+  Bytes.set_int64_le bytes 16 1_786_204_800_000L;
+  Bytes.set_int32_le bytes 24 20260809l;
+  Bytes.set_uint16_le bytes 28 0;
+  Bytes.set_int32_le bytes 32 28_800l;
+  Bytes.set_int64_le bytes 40 1L;
+  Bytes.set_int64_le bytes 48 0L;
+  Bytes.blit_string locale 0 bytes header_size (String.length locale);
+  Bytes.blit_string
+    time_zone_id
+    0
+    bytes
+    (header_size + String.length locale)
+    (String.length time_zone_id);
+  bytes
+;;
+
+let initialize_test_calendar ?(packet = initial_calendar_packet) handle =
+  (match Journal_platform.decode_calendar packet with
+   | Ok _ -> ()
+   | Error message -> fail "initial calendar fixture is invalid: %s" message);
+  let rec wait_for_request remaining =
+    if remaining = 0
+    then fail "timed out waiting for the initial calendar request"
+    else (
+      Test.Handle.present handle;
+      let request =
+        match Test.Handle.last_frame handle with
+        | None -> None
+        | Some frame ->
+          (match Protocol.Binary_codec.decode frame.bytes with
+           | Error error -> fail "application frame did not decode: %s" error.message
+           | Ok wire ->
+             List.find_map
+               (function
+                 | Protocol.Wire_frame.Application_request { request_id; payload }
+                   when Bytes.equal payload Journal_platform.get_calendar_request ->
+                   Some request_id
+                 | _ -> None)
+               wire.operations)
+      in
+      match request with
+      | Some request_id -> request_id
+      | None ->
+        Test.Handle.pump_next handle ();
+        wait_for_request (remaining - 1))
+  in
+  let request_id = wait_for_request 500 in
+  let event =
+    Protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 1L
+      ; displayed_revision = Test.Handle.revision handle
+      ; node_id = ID.Ui.Node_id.zero
+      ; handler_id = ID.Ui.Handler_id.zero
+      ; event_tag = Protocol.Generated_protocol.Event_tag.application_response
+      ; payload = Application_response { request_id; payload = packet }
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
+    ();
+  Test.Handle.present handle;
+  Test.Handle.resize handle ~width:390. ~height:844.;
+  Test.Handle.present handle;
+  Test.Handle.resize handle ~width:390. ~height:844.;
+  Test.Handle.present handle
+;;
+
 let create_handle startup =
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
-  Test.Handle.create_app
-    ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
-    ~time_source
-    Application.app
-    ~application_payload:(encode_startup startup)
+  let handle =
+    Test.Handle.create_app
+      ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
+      ~time_source
+      Application.app
+      ~application_payload:(encode_startup startup)
+  in
+  initialize_test_calendar handle;
+  handle
+;;
+
+let create_handle_with_calendar startup packet =
+  let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
+  let handle =
+    Test.Handle.create_app
+      ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
+      ~time_source
+      Application.app
+      ~application_payload:(encode_startup startup)
+  in
+  initialize_test_calendar ~packet handle;
+  handle
 ;;
 
 let create_timed_handle startup =
@@ -70,6 +144,7 @@ let create_timed_handle startup =
       Application.app
       ~application_payload:(encode_startup startup)
   in
+  initialize_test_calendar handle;
   handle, ref 0L
 ;;
 
@@ -79,31 +154,6 @@ let advance_clock handle monotonic_now_ns seconds =
   := Int64.add !monotonic_now_ns (Int64.of_float (seconds *. 1_000_000_000.));
   ignore (Test.Handle.pump handle ~monotonic_now_ns:!monotonic_now_ns ());
   Test.Handle.presentation_succeeded handle ~monotonic_now_ns:!monotonic_now_ns
-;;
-
-let database_path startup =
-  match
-    Journal_storage_path.resolve
-      ~support_root:startup.Journal_startup.application_support_root
-      ~relative_path:Journal_startup.database_relative_path
-  with
-  | Ok path -> path
-  | Error error ->
-    fail
-      "database path resolution failed: %s"
-      (Journal_storage_path.Error.to_string error)
-;;
-
-let open_store startup =
-  match Journal_storage.open_store ~canonical_path:(database_path startup) with
-  | Ok (store, _) -> store
-  | Error error -> fail "store open failed: %s" (Journal_storage.Error.to_string error)
-;;
-
-let close_store store =
-  match Journal_storage.close store with
-  | Ok () -> ()
-  | Error error -> fail "store close failed: %s" (Journal_storage.Error.to_string error)
 ;;
 
 let fixture_time day index =
@@ -125,7 +175,7 @@ let fixture_time day index =
 ;;
 
 let capture ?(day = 20260809) ?(task_state = Journal_model.Not_a_task) index source
-  : Journal_repository.capture
+  : Journal_graph_projection.capture
   =
   { mutation_id = Printf.sprintf "70000000-0000-4000-9000-%012d" index
   ; block_id = Printf.sprintf "70000000-0000-4000-a000-%012d" index
@@ -133,69 +183,217 @@ let capture ?(day = 20260809) ?(task_state = Journal_model.Not_a_task) index sou
   ; source
   ; task_state
   ; creation_time = fixture_time day (index mod 1_440)
+  ; children = []
   }
 ;;
 
-let seed startup captures =
-  let store = open_store startup in
-  Fun.protect
-    ~finally:(fun () -> close_store store)
-    (fun () ->
-       List.iter
-         (fun command ->
-            match
-              Journal_repository.prepare_capture
-                (Journal_storage.current_db store)
-                command
-            with
-            | Error error ->
-              fail "capture prepare failed: %s" (Journal_repository.Error.to_string error)
-            | Ok (Journal_repository.Already_applied _) ->
-              fail "fresh capture fixture was already applied"
-            | Ok (Journal_repository.Apply transaction) ->
-              (match Journal_storage.transact store transaction with
-               | Ok _ -> ()
-               | Error error ->
-                 fail
-                   "capture transact failed: %s"
-                   (Journal_storage.Error.to_string error)))
-         captures)
+let fixture_request_sequence = ref 100_000L
+
+let fresh_fixture_uuid () =
+  fixture_request_sequence := Int64.succ !fixture_request_sequence;
+  Graph.Uuid.of_string
+    (Printf.sprintf "a0000000-0000-4000-8000-%012Lx" !fixture_request_sequence)
+  |> Result.get_ok
 ;;
 
-let seed_child startup ~(parent : Journal_repository.capture) index source =
-  let store = open_store startup in
-  Fun.protect
-    ~finally:(fun () -> close_store store)
-    (fun () ->
-       let db = Journal_storage.current_db store in
-       let parent_block =
-         match Journal_repository.find_block db ~id:parent.block_id with
-         | Ok (Some block) -> block
-         | Ok None -> fail "seed parent does not exist"
-         | Error error ->
-           fail "seed parent lookup failed: %s" (Journal_repository.Error.to_string error)
+let uuid value = Graph.Uuid.of_string value |> Result.get_ok
+
+let graph_request command =
+  Graph_protocol.
+    { api_version; request_id = fresh_fixture_uuid (); command }
+;;
+
+let execute engine command =
+  match Logseq_db_worker.Engine.execute engine (graph_request command) with
+  | Graph_protocol.Succeeded { success; _ } -> success
+  | Failed failure ->
+    fail "graph fixture request failed: %s" (Logseq_db_worker.Error.message failure.error)
+;;
+
+let context engine mutation_id =
+  Graph_protocol.
+    { mutation_id = uuid mutation_id
+    ; expected_basis = Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
+    }
+;;
+
+let journal_page_uuid day =
+  let text = Printf.sprintf "%08d" day in
+  Graph.Uuid.of_string
+    (Printf.sprintf
+       "00000001-%s-%s-0000-000000000000"
+       (String.sub text 0 4)
+       (String.sub text 4 4))
+  |> Result.get_ok
+;;
+
+let ensure_journal engine day =
+  let page = journal_page_uuid day in
+  match
+    Logseq_db_worker.Engine.execute
+      engine
+      (graph_request
+         (Read (Get_page { page = Graph.Page_by_uuid page })))
+  with
+  | Succeeded _ -> page
+  | Failed failure when Logseq_db_worker.Error.code failure.error = Not_found ->
+    ignore
+      (execute
+         engine
+         (Mutate
+            (Page
+               (Create_page
+                  { title =
+                      Printf.sprintf
+                        "%04d-%02d-%02d"
+                        (day / 10_000)
+                        (day / 100 mod 100)
+                        (day mod 100)
+                  ; kind = Create_journal_page { journal_day = day; supplied_uuid = Some page }
+                  ; context =
+                      { mutation_id = fresh_fixture_uuid ()
+                      ; expected_basis =
+                          Option.value
+                            (Logseq_db_worker.Engine.basis engine)
+                            ~default:0L
+                      }
+                  }))));
+    page
+  | Failed failure ->
+    fail "journal lookup failed: %s" (Logseq_db_worker.Error.message failure.error)
+;;
+
+let set_task engine block task_state =
+  match task_state with
+  | Journal_model.Not_a_task -> ()
+  | Todo | Done ->
+    let value =
+      match task_state with
+      | Todo -> Graph.Default_value "Todo"
+      | Done -> Default_value "Done"
+      | Not_a_task -> assert false
+    in
+    ignore
+      (execute
+         engine
+         (Mutate
+            (Property
+               (Set_property
+                  { block
+                  ; property = Property_by_ident "logseq.property/status"
+                  ; value
+                  ; context =
+                      { mutation_id = fresh_fixture_uuid ()
+                      ; expected_basis =
+                          Option.value
+                            (Logseq_db_worker.Engine.basis engine)
+                            ~default:0L
+                      }
+                  }))))
+;;
+
+let seed startup captures =
+  List.iter
+    (fun (command : Journal_graph_projection.capture) ->
+       let epoch_ms = Journal_time.instant_unix_ms command.creation_time in
+       let dependencies : Logseq_db_worker.Engine.dependencies =
+         { clocks =
+             { epoch_ms = (fun () -> epoch_ms)
+             ; monotonic_ns = (fun () -> 1_000_000L)
+             }
+         ; cursor_authentication_key = Bytes.make 32 'a'
+         }
        in
-       let command : Journal_repository.create_child =
+       let engine =
+         Logseq_db_worker.Engine.open_ ~dependencies startup |> Result.get_ok
+       in
+       Fun.protect
+         ~finally:(fun () ->
+           match Logseq_db_worker.Engine.close engine with
+           | Ok () -> ()
+           | Error message -> fail "graph fixture close failed: %s" message)
+         (fun () ->
+            let page = ensure_journal engine (Journal_time.local_day command.creation_time) in
+            let tree : Graph_protocol.block_tree =
+              { uuid = uuid command.block_id
+              ; title = command.source
+              ; children =
+                  List.map
+                    (fun (child : Journal_graph_projection.capture_child) ->
+                       { Graph_protocol.uuid = uuid child.block_id
+                       ; title = child.source
+                       ; children = []
+                       })
+                    command.children
+              }
+            in
+            ignore
+              (execute
+                 engine
+                 (Mutate
+                    (Structural
+                       (Insert_blocks
+                          { roots = [ tree ]
+                          ; position = Relative (Last_child page)
+                          ; context = context engine command.mutation_id
+                          }))));
+            set_task engine tree.uuid command.task_state))
+    captures
+;;
+
+let seed_child_by_parent_id
+      startup
+      ~parent_block_id
+      ?(task_state = Journal_model.Not_a_task)
+      index
+      source
+  =
+  let engine =
+    Logseq_db_worker.Engine.open_ ~dependencies:Adapter_fixture.dependencies startup
+    |> Result.get_ok
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
+    (fun () ->
+       let command : Journal_graph_projection.create_child =
          { mutation_id = Printf.sprintf "71000000-0000-4000-9000-%012d" index
          ; block_id = Printf.sprintf "71000000-0000-4000-a000-%012d" index
-         ; parent_block_id = parent.block_id
-         ; expected_parent_revision = Journal_model.revision parent_block
+         ; parent_block_id
+         ; expected_parent_revision = 1
          ; sibling_order = Printf.sprintf "%012d" index
          ; source
-         ; task_state = Journal_model.Not_a_task
+         ; task_state
          ; creation_time = fixture_time 20260809 (index mod 1_440)
          }
        in
-       match Journal_repository.prepare_create_child db command with
-       | Error error ->
-         fail "child prepare failed: %s" (Journal_repository.Error.to_string error)
-       | Ok (Journal_repository.Child_already_applied _) ->
-         fail "fresh child fixture was already applied"
-       | Ok (Journal_repository.Create_child transaction) ->
-         (match Journal_storage.transact store transaction with
-          | Ok _ -> command
-          | Error error ->
-            fail "child transact failed: %s" (Journal_storage.Error.to_string error)))
+       let child = uuid command.block_id in
+       ignore
+         (execute
+            engine
+            (Mutate
+               (Structural
+                  (Insert_blocks
+                     { roots = [ { uuid = child; title = source; children = [] } ]
+                     ; position = Relative (Last_child (uuid parent_block_id))
+                     ; context = context engine command.mutation_id
+                     }))));
+       set_task engine child task_state;
+       command)
+;;
+
+let seed_child
+      startup
+      ~(parent : Journal_graph_projection.capture)
+      ?(task_state = Journal_model.Not_a_task)
+      index
+      source
+  =
+  seed_child_by_parent_id
+    startup
+    ~parent_block_id:parent.block_id
+    ~task_state
+    index
+    source
 ;;
 
 let pump_worker handle =
@@ -206,6 +404,7 @@ let pump_worker handle =
 let environment
       ?(viewport_width = 390.)
       ?(viewport_height = 844.)
+      ?(device_pixel_ratio = 3.)
       ?(text_scale = 1.)
       ?(brightness = Environment.Light)
       ?(high_contrast = false)
@@ -223,7 +422,7 @@ let environment
   let zero : Environment.edge_insets = { left = 0.; top = 0.; right = 0.; bottom = 0. } in
   { viewport_width
   ; viewport_height
-  ; device_pixel_ratio = 3.
+  ; device_pixel_ratio
   ; text_scale
   ; brightness
   ; platform
@@ -318,6 +517,17 @@ let require_no_visible_text handle text =
     (Test.Handle.show handle)
 ;;
 
+let require_visible_text_count handle text expected =
+  let actual = List.length (Test.Handle.find_all handle (Test.Query.visible_text text)) in
+  require
+    (actual = expected)
+    "visible text %S has %d nodes, expected %d\n%s"
+    text
+    actual
+    expected
+    (Test.Handle.show handle)
+;;
+
 let require_semantics handle label =
   require
     (Option.is_some (Test.Handle.find handle (Test.Query.semantics_label label)))
@@ -408,6 +618,33 @@ let timeline_props handle =
   | _ -> fail "journal timeline is not a Sparse_extent_list"
 ;;
 
+let capture_composer_props handle =
+  match (node_by_test_id handle "journal-capture-composer").props with
+  | Ui.Widget.Private.Native_widget_props { kind_id; payload; _ } ->
+    require
+      (kind_id = Ui.Native_widget.Message_composer.kind_id)
+      "Capture composer uses the wrong native widget kind";
+    Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload
+  | _ -> fail "journal-capture-composer is not a Message_composer"
+;;
+
+let send_capture_composer_button handle ~button_id ~text =
+  let payload = Bytes.make (4 + String.length text) '\000' in
+  Bytes.set_int32_le payload 0 (Int32.of_int button_id);
+  Bytes.blit_string text 0 payload 4 (String.length text);
+  Test.Handle.present handle;
+  Test.Handle.native_event
+    handle
+    (Test.Query.test_id "journal-capture-composer")
+    ~kind_id:Ui.Native_widget.Message_composer.kind_id
+    ~version:1
+    ~event_id:Ui.Native_widget.Message_composer.button_pressed_event_id
+    ~payload;
+  Test.Handle.present handle
+;;
+
+let open_capture handle = send_capture_composer_button handle ~button_id:1 ~text:""
+
 let send_visible_range handle ~first_index ~last_exclusive =
   Test.Handle.present handle;
   Test.Handle.native_event
@@ -422,6 +659,64 @@ let send_visible_range handle ~first_index ~last_exclusive =
          ~last_exclusive)
 ;;
 
+type stale_native_binding =
+  { displayed_revision : ID.Runtime.renderer_revision
+  ; node_id : ID.Ui.node_id
+  ; handler_id : ID.Ui.handler_id
+  }
+
+let capture_native_binding handle test_id =
+  Test.Handle.present handle;
+  let node = node_by_test_id handle test_id in
+  let binding =
+    Array.find_opt
+      (fun (binding : Runtime.Mounted_tree.Mounted_binding.t) ->
+         Ui.Event.Tag.equal binding.event_tag Ui.Event.Tag.Native_event)
+      node.event_bindings
+    |> function
+    | Some binding -> binding
+    | None -> fail "%s does not bind native events" test_id
+  in
+  { displayed_revision = Test.Handle.revision handle
+  ; node_id = node.node_id
+  ; handler_id = binding.handler_id
+  }
+;;
+
+let send_stale_visible_range
+      handle
+      (binding : stale_native_binding)
+      ~first_index
+      ~last_exclusive
+  =
+  Test.Handle.present handle;
+  let event =
+    Protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 9_000L
+      ; displayed_revision = binding.displayed_revision
+      ; node_id = binding.node_id
+      ; handler_id = binding.handler_id
+      ; event_tag = Protocol.Generated_protocol.Event_tag.native_event
+      ; payload =
+          Native_event
+            { kind_id = Ui.Native_widget.Sparse_extent_list.kind_id
+            ; version = 1
+            ; event_id = Ui.Native_widget.Sparse_extent_list.visible_range_event_id
+            ; payload =
+                Ui.Native_widget.Sparse_extent_list.For_testing.encode_visible_range
+                  ~first_index
+                  ~last_exclusive
+            }
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
+    ()
+;;
+
 let require_decoration handle test_id expected =
   match (node_by_test_id handle test_id).props with
   | Ui.Widget.Private.Decorated_box_props { background = Some actual; _ } ->
@@ -431,21 +726,6 @@ let require_decoration handle test_id expected =
       test_id
       expected
       actual
-  | _ -> fail "%s is not a colored DecoratedBox" test_id
-;;
-
-let require_decoration_shape handle test_id ~background ~border_radius =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Decorated_box_props
-      { background = Some actual_background; border_radius = actual_radius } ->
-    require
-      (Int32.equal actual_background background && Float.equal actual_radius border_radius)
-      "%s decoration expected 0x%lx/r%.1f, got 0x%lx/r%.1f"
-      test_id
-      background
-      border_radius
-      actual_background
-      actual_radius
   | _ -> fail "%s is not a colored DecoratedBox" test_id
 ;;
 
@@ -502,85 +782,19 @@ let require_sized_size handle test_id ~width ~height =
   | _ -> fail "%s is not a size-constrained SizedBox" test_id
 ;;
 
-let require_pressable handle test_id ~release_delay_ms =
+let require_horizontal_padding handle test_id ~left ~right =
   match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Pressable_props { overlay_color; release_delay_ms = actual } ->
+  | Ui.Widget.Private.Padding_props
+      { left = actual_left; right = actual_right; top = _; bottom = _ } ->
     require
-      (Int32.equal (Ui.Style.Color.Private.to_argb32 overlay_color) 0x00000000l
-       && actual = release_delay_ms)
-      "%s pressed feedback differs"
+      (Float.equal actual_left left && Float.equal actual_right right)
+      "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
       test_id
-  | _ -> fail "%s is not Pressable" test_id
-;;
-
-let require_animated_opacity handle test_id ~opacity ~duration_ms ~curve =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Animated_opacity_props { opacity = actual_opacity; animation } ->
-    require
-      (Float.equal actual_opacity opacity)
-      "%s opacity is %.2f, expected %.2f"
-      test_id
-      actual_opacity
-      opacity;
-    require
-      (Ui.Animation.Private.duration_ms animation = duration_ms)
-      "%s duration differs"
-      test_id;
-    require
-      (Ui.Animation.Curve.equal (Ui.Animation.Private.curve animation) curve)
-      "%s curve differs"
-      test_id
-  | _ -> fail "%s is not AnimatedOpacity" test_id
-;;
-
-let require_stack_position handle test_id ~left ~top =
-  match (node_by_test_id handle test_id).parent_data with
-  | Ui.Widget.Private.Stack_position position ->
-    require
-      (Option.equal Float.equal position.left (Some left)
-       && Option.equal Float.equal position.top (Some top))
-      "%s stack position differs"
-      test_id
-  | _ -> fail "%s is not a positioned Stack child" test_id
-;;
-
-let send_pointer_event handle ~sequence ~ui_tag ~protocol_tag test_id =
-  Test.Handle.present handle;
-  let node = node_by_test_id handle test_id in
-  let binding =
-    Array.find_opt
-      (fun (binding : Runtime.Mounted_tree.Mounted_binding.t) ->
-         Ui.Event.Tag.equal binding.event_tag ui_tag)
-      node.event_bindings
-    |> function
-    | Some binding -> binding
-    | None -> fail "%s does not bind %s" test_id (Ui.Event.Tag.to_string ui_tag)
-  in
-  let event =
-    Protocol.Inbound_event.
-      { sequence = ID.Runtime.Event_sequence.of_int64 sequence
-      ; displayed_revision = Test.Handle.revision handle
-      ; node_id = node.node_id
-      ; handler_id = binding.handler_id
-      ; event_tag = protocol_tag
-      ; payload =
-          Pointer
-            { pointer_id = ID.Input.Pointer_id.of_int64 1L
-            ; local_x = 28.
-            ; local_y = 28.
-            ; global_x = 195.
-            ; global_y = 780.
-            ; pointer_kind = Touch
-            ; buttons = 1
-            }
-      }
-  in
-  Test.Handle.pump_next
-    handle
-    ~events:
-      Protocol.Inbound_event.
-        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
-    ()
+      actual_left
+      actual_right
+      left
+      right
+  | _ -> fail "%s is not Padding" test_id
 ;;
 
 let require_button_enabled handle test_id expected =
@@ -636,34 +850,14 @@ let require_capture_modal_page handle ~can_pop ~enter_ms ~exit_ms =
        fail "Capture modal is not the fixed-large scroll-controlled sheet")
 ;;
 
-let require_capture_position handle ~viewport_width =
-  let positioned = node_by_test_id handle "journal-capture-safe-area" in
-  let content_width = Float.min viewport_width Journal_visual_tokens.timeline_max_width in
-  let expected_left =
-    (content_width -. Journal_visual_tokens.hit_regions.fab_target) /. 2.
-  in
+let require_capture_composer_position handle =
+  let positioned = node_by_test_id handle "journal-capture-composer-safe-area" in
   match positioned.parent_data with
   | Ui.Widget.Private.Stack_position { left; right; top; bottom } ->
     require
-      (top = None && bottom = Some 20. && left = Some expected_left && right = None)
-      "Capture overlay is not centered across the content viewport"
-  | _ -> fail "Capture is not a positioned overlay child"
-;;
-
-let require_capture_plus handle =
-  require_sized_size handle "journal-capture-plus" ~width:18. ~height:18.;
-  require_sized_size handle "journal-capture-plus-horizontal" ~width:18. ~height:1.5;
-  require_sized_size handle "journal-capture-plus-vertical" ~width:1.5 ~height:18.;
-  require_decoration_shape
-    handle
-    "journal-capture-plus-horizontal-surface"
-    ~background:0xfffcfcfdl
-    ~border_radius:0.;
-  require_decoration_shape
-    handle
-    "journal-capture-plus-vertical-surface"
-    ~background:0xfffcfcfdl
-    ~border_radius:0.
+      (top = None && bottom = Some 12. && left = Some 12. && right = Some 12.)
+      "Capture composer does not span the content viewport margins"
+  | _ -> fail "Capture composer is not a positioned overlay child"
 ;;
 
 let substring_index text needle =
@@ -701,6 +895,43 @@ let require_text_style handle test_id ~size ~line_height ~weight ~color =
       "%s has unexpected typography"
       test_id
   | _ -> fail "%s is not styled Text" test_id
+;;
+
+let require_text_max_lines handle test_id expected =
+  match (node_by_test_id handle test_id).props with
+  | Ui.Widget.Private.Text_props { max_lines; _ } ->
+    require
+      (max_lines = Some expected)
+      "%s max_lines differs from %d"
+      test_id
+      expected
+  | _ -> fail "%s is not Text" test_id
+;;
+
+let require_padding handle test_id ~left ~top ~right ~bottom =
+  match (node_by_test_id handle test_id).props with
+  | Ui.Widget.Private.Padding_props
+      { left = actual_left
+      ; top = actual_top
+      ; right = actual_right
+      ; bottom = actual_bottom
+      } ->
+    require
+      (Float.equal actual_left left
+       && Float.equal actual_top top
+       && Float.equal actual_right right
+       && Float.equal actual_bottom bottom)
+      "%s padding is %.1f/%.1f/%.1f/%.1f, expected %.1f/%.1f/%.1f/%.1f"
+      test_id
+      actual_left
+      actual_top
+      actual_right
+      actual_bottom
+      left
+      top
+      right
+      bottom
+  | _ -> fail "%s is not Padding" test_id
 ;;
 
 let require_header_geometry handle =
@@ -767,7 +998,7 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_visible_text handle "Today";
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
-         require_semantics handle "Capture";
+         require_test_id handle "journal-capture-composer";
          require_test_id handle "journal-header";
          require_test_id handle "journal-date-context";
          require_test_id handle "journal-menu-shell";
@@ -778,7 +1009,7 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_no_test_id handle "journal-more-target";
          require_no_test_id handle "journal-date-target";
          require_test_id handle "journal-timeline";
-         require_test_id handle "journal-capture";
+         require_no_test_id handle "journal-capture";
          require_no_visible_text handle "Search";
          require_no_visible_text handle "Search journal";
          require_no_visible_text handle "Search journal entries";
@@ -786,6 +1017,50 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_no_visible_text handle "Attachment";
          require_no_visible_text handle "Thumbnail";
          require_no_visible_text handle "Styled token"))
+;;
+
+let test_capture_composer_replaces_the_center_orb_and_prefills_capture () =
+  with_startup (fun startup ->
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle "No journal entries yet";
+         let props = capture_composer_props handle in
+         require props.enabled "Capture composer is disabled after graph startup";
+         require (not props.autofocus) "Capture composer unexpectedly steals focus";
+         require (props.max_lines = 5) "Capture composer max-lines policy changed";
+         require
+           (String.equal props.hint_text "Capture a thought")
+           "Capture composer hint changed";
+         (match props.buttons with
+          | [ plus; submit ] ->
+            require (plus.id = 1) "Capture composer plus button ID changed";
+            require
+              (plus.position = Ui.Native_widget.Message_composer.Leading
+               && plus.visibility = Always
+               && plus.style = Plain)
+              "Capture composer plus button policy changed";
+            require (submit.id = 2) "Capture composer submit button ID changed";
+            require
+              (submit.position = Ui.Native_widget.Message_composer.Trailing
+               && submit.visibility = When_non_empty
+               && submit.style = Filled)
+              "Capture composer submit button policy changed"
+          | _ -> fail "Capture composer must expose plus and submit actions");
+         require_no_test_id handle "journal-capture-target";
+         require_no_test_id handle "journal-capture-feedback";
+         send_capture_composer_button handle ~button_id:2 ~text:"   \n";
+         require_no_test_id handle "journal-capture-sheet";
+         let source = "Composer 中文 👩🏽‍💻 #literal" in
+         send_capture_composer_button handle ~button_id:2 ~text:source;
+         require_test_id handle "journal-capture-sheet";
+         require
+           (String.equal
+              (Ui.Text_editing.Value.text (text_field_value handle "capture-editor"))
+              source)
+           "MessageComposer text was not transferred to Capture";
+         require_button_enabled handle "capture-save" true))
 ;;
 
 let test_capture_is_an_ocaml_contextual_modal_sheet () =
@@ -796,8 +1071,7 @@ let test_capture_is_an_ocaml_contextual_modal_sheet () =
       (fun () ->
          set_environment handle (environment ());
          pump_until_text handle "No journal entries yet";
-         Test.Handle.present handle;
-         Test.Handle.click handle (Test.Query.test_id "journal-capture");
+         open_capture handle;
          require_visible_text handle "New block";
          require_test_id handle "capture-editor";
          require_test_id handle "capture-sheet-surface";
@@ -850,7 +1124,7 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
       (fun () ->
          set_environment handle (environment ());
          pump_until_text handle "No journal entries yet";
-         click_test_id handle "journal-capture";
+         open_capture handle;
          let original = text_field_value handle "capture-editor" in
          let original_session =
            match (node_by_test_id handle "capture-editor").props with
@@ -971,30 +1245,15 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
          require_test_id handle "journal-more-shell";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more-target";
-         (match (node_by_test_id handle "journal-capture-safe-area").props with
+         (match (node_by_test_id handle "journal-capture-composer-safe-area").props with
           | Ui.Widget.Private.Safe_area_props { left; top; right; bottom; _ } ->
             require
               ((not left) && (not top) && (not right) && bottom)
-              "Capture safe-area edges changed"
-          | _ -> fail "journal-capture-safe-area is not SafeArea");
-         require_sized_size handle "journal-capture-visual" ~width:48. ~height:48.;
-         require_decoration_shape
-           handle
-           "journal-capture-circle"
-           ~background:0xff181e34l
-           ~border_radius:24.;
-         require_capture_plus handle;
-         require_sized_size handle "journal-capture-shadow" ~width:52. ~height:52.;
-         require_decoration_shape
-           handle
-           "journal-capture-shadow-outer"
-           ~background:0x120d142fl
-           ~border_radius:26.;
-         require_no_test_id handle "journal-capture-shadow-inner";
-         require_no_test_id handle "journal-capture-elevation";
-         require_sized_size handle "journal-capture-target" ~width:56. ~height:56.;
-         require_pressable handle "journal-capture" ~release_delay_ms:80;
-         require_capture_position handle ~viewport_width:390.;
+              "Capture composer safe-area edges changed"
+          | _ -> fail "journal-capture-composer-safe-area is not SafeArea");
+         require_capture_composer_position handle;
+         require_test_id handle "journal-capture-composer-plus";
+         require_test_id handle "journal-capture-composer-submit";
          require_no_visible_text handle "Search"))
 ;;
 
@@ -1017,140 +1276,7 @@ let test_header_adapts_without_exposing_deferred_actions () =
          require_no_visible_text handle "Search";
          set_environment handle (environment ~locale:"ar_SA" ());
          pump_worker handle;
-         require_capture_position handle ~viewport_width:390.))
-;;
-
-let test_capture_soft_press_has_tactile_down_and_ease_out_release () =
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         set_environment handle (environment ());
-         pump_until_text handle "No journal entries yet";
-         require_pressable handle "journal-capture" ~release_delay_ms:80;
-         require_animated_opacity
-           handle
-           "journal-capture-resting-feedback"
-           ~opacity:1.
-           ~duration_ms:160
-           ~curve:Ui.Animation.Curve.Ease_out;
-         require_animated_opacity
-           handle
-           "journal-capture-pressed-feedback"
-           ~opacity:0.
-           ~duration_ms:160
-           ~curve:Ui.Animation.Curve.Ease_out;
-         require_sized_size
-           handle
-           "journal-capture-pressed-visual"
-           ~width:44.16
-           ~height:44.16;
-         require_decoration_shape
-           handle
-           "journal-capture-pressed-circle"
-           ~background:0xff181e34l
-           ~border_radius:22.08;
-         require_stack_position
-           handle
-           "journal-capture-pressed-visual"
-           ~left:3.92
-           ~top:3.92;
-         require_sized_size handle "journal-capture-pressed-shadow" ~width:50. ~height:50.;
-         require_decoration_shape
-           handle
-           "journal-capture-pressed-shadow-surface"
-           ~background:0x120d142fl
-           ~border_radius:25.;
-         send_pointer_event
-           handle
-           ~sequence:10_000L
-           ~ui_tag:Ui.Event.Tag.Pointer_down
-           ~protocol_tag:Protocol.Generated_protocol.Event_tag.pointer_down
-           "journal-capture-gesture";
-         require_animated_opacity
-           handle
-           "journal-capture-resting-feedback"
-           ~opacity:0.
-           ~duration_ms:0
-           ~curve:Ui.Animation.Curve.Ease_out;
-         require_animated_opacity
-           handle
-           "journal-capture-pressed-feedback"
-           ~opacity:1.
-           ~duration_ms:0
-           ~curve:Ui.Animation.Curve.Ease_out;
-         require_no_test_id handle "journal-capture-sheet";
-         send_pointer_event
-           handle
-           ~sequence:10_001L
-           ~ui_tag:Ui.Event.Tag.Pointer_down
-           ~protocol_tag:Protocol.Generated_protocol.Event_tag.pointer_down
-           "journal-capture-gesture";
-         require_animated_opacity
-           handle
-           "journal-capture-pressed-feedback"
-           ~opacity:1.
-           ~duration_ms:0
-           ~curve:Ui.Animation.Curve.Ease_out;
-         send_pointer_event
-           handle
-           ~sequence:10_002L
-           ~ui_tag:Ui.Event.Tag.Pointer_up
-           ~protocol_tag:Protocol.Generated_protocol.Event_tag.pointer_up
-           "journal-capture-gesture";
-         require_animated_opacity
-           handle
-           "journal-capture-resting-feedback"
-           ~opacity:1.
-           ~duration_ms:160
-           ~curve:Ui.Animation.Curve.Ease_out;
-         require_animated_opacity
-           handle
-           "journal-capture-pressed-feedback"
-           ~opacity:0.
-           ~duration_ms:160
-           ~curve:Ui.Animation.Curve.Ease_out))
-;;
-
-let test_capture_soft_press_respects_reduced_motion () =
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         set_environment handle (environment ~reduced_motion:true ());
-         pump_until_text handle "No journal entries yet";
-         require_animated_opacity
-           handle
-           "journal-capture-resting-feedback"
-           ~opacity:1.
-           ~duration_ms:0
-           ~curve:Ui.Animation.Curve.Ease_out;
-         send_pointer_event
-           handle
-           ~sequence:20_000L
-           ~ui_tag:Ui.Event.Tag.Pointer_down
-           ~protocol_tag:Protocol.Generated_protocol.Event_tag.pointer_down
-           "journal-capture-gesture";
-         require_animated_opacity
-           handle
-           "journal-capture-pressed-feedback"
-           ~opacity:1.
-           ~duration_ms:0
-           ~curve:Ui.Animation.Curve.Ease_out;
-         send_pointer_event
-           handle
-           ~sequence:20_001L
-           ~ui_tag:Ui.Event.Tag.Pointer_up
-           ~protocol_tag:Protocol.Generated_protocol.Event_tag.pointer_up
-           "journal-capture-gesture";
-         require_animated_opacity
-           handle
-           "journal-capture-pressed-feedback"
-           ~opacity:0.
-           ~duration_ms:0
-           ~curve:Ui.Animation.Curve.Ease_out))
+         require_capture_composer_position handle))
 ;;
 
 let test_timeline_content_is_capped_and_centered () =
@@ -1224,8 +1350,8 @@ let test_timeline_uses_exact_sparse_extent_window () =
            props.total_count;
          require (props.first_index = 0) "initial timeline does not start at zero";
          require
-           (Float.equal props.default_item_extent 48.)
-           "timeline default extent is %.1f, expected 48"
+           (Float.equal props.default_item_extent 76.)
+           "timeline default extent is %.1f, expected 76"
            props.default_item_extent;
          require (props.overscan = 4) "timeline overscan is %d, expected 4" props.overscan;
          require
@@ -1251,6 +1377,32 @@ let test_timeline_uses_exact_sparse_extent_window () =
            (Array.length paged_node.children)))
 ;;
 
+let test_collapsed_group_divider_is_full_width_and_one_physical_pixel () =
+  with_startup (fun startup ->
+    let leaf = capture 75 "Full width divider row" in
+    seed startup [ leaf ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle leaf.source;
+         List.iter
+           (fun device_pixel_ratio ->
+              set_environment handle (environment ~device_pixel_ratio ());
+              pump_worker handle;
+              require_test_id handle ("journal-group-divider:" ^ leaf.block_id);
+              require_horizontal_padding
+                handle
+                ("journal-group-divider-padding:" ^ leaf.block_id)
+                ~left:0.
+                ~right:0.;
+              require_sized_height
+                handle
+                ("journal-group-divider:" ^ leaf.block_id)
+                (1. /. device_pixel_ratio))
+           [ 1.; 2.; 3.; 4. ]))
+;;
+
 let test_timeline_uses_truthful_fallback_labels_without_duplicate_today () =
   with_startup (fun startup ->
     seed startup [ capture 80 "Today row"; capture ~day:20260808 81 "Older row" ];
@@ -1268,6 +1420,109 @@ let test_timeline_uses_truthful_fallback_labels_without_duplicate_today () =
            "Today heading was duplicated inside the timeline"))
 ;;
 
+let test_timeline_deemphasizes_repeated_and_historical_timestamps () =
+  with_startup (fun startup ->
+    let at_minute day minute index source =
+      let capture = capture ~day index source in
+      { capture with creation_time = fixture_time day minute }
+    in
+    let first = at_minute 20260809 600 80 "First at ten" in
+    let duplicate = at_minute 20260809 600 81 "Also at ten" in
+    let next_minute = at_minute 20260809 601 82 "At ten oh one" in
+    let repeated_later = at_minute 20260809 600 83 "Back at ten" in
+    let historical = at_minute 20260808 602 84 "Historical entry" in
+    seed startup [ first; duplicate; next_minute; repeated_later; historical ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle historical.source;
+         require_test_id handle ("journal-row-time:" ^ first.block_id);
+         require_no_test_id handle ("journal-row-time:" ^ duplicate.block_id);
+         require_test_id handle ("journal-row-time:" ^ next_minute.block_id);
+         require_test_id handle ("journal-row-time:" ^ repeated_later.block_id);
+         require_no_test_id handle ("journal-row-time:" ^ historical.block_id);
+         require_semantics handle (duplicate.source ^ ", created at 10:00");
+         require_semantics handle (historical.source ^ ", created at 10:02")))
+;;
+
+let test_timeline_projects_creation_time_across_a_negative_offset_day_boundary () =
+  with_startup (fun startup ->
+    let creation_time =
+      Journal_time.create
+        ~instant_unix_ms:1_786_239_000_000L
+        ~local_day:20260808
+        ~local_minute_of_day:1_290
+        ~time_zone_id:"America/New_York"
+        ~utc_offset_seconds:(-14_400)
+      |> function
+      | Ok value -> value
+      | Error error -> fail "negative-offset fixture time failed: %s" error
+    in
+    let entry =
+      { (capture ~day:20260808 85 "New York evening") with creation_time }
+    in
+    seed startup [ entry ];
+    let packet =
+      let locale = "en_US" in
+      let time_zone_id = "America/New_York" in
+      let header_size = 56 in
+      let bytes =
+        Bytes.make (header_size + String.length locale + String.length time_zone_id) '\000'
+      in
+      Bytes.blit_string "LJP1" 0 bytes 0 4;
+      Bytes.set_uint16_le bytes 4 1;
+      Bytes.set_uint16_le bytes 6 2;
+      Bytes.set_uint16_le bytes 8 0;
+      Bytes.set_uint16_le bytes 10 (String.length locale);
+      Bytes.set_uint16_le bytes 12 (String.length time_zone_id);
+      Bytes.set_int64_le bytes 16 1_786_239_000_000L;
+      Bytes.set_int32_le bytes 24 20260808l;
+      Bytes.set_uint16_le bytes 28 1_290;
+      Bytes.set_int32_le bytes 32 (-14_400l);
+      Bytes.set_int64_le bytes 40 1L;
+      Bytes.set_int64_le bytes 48 0L;
+      Bytes.blit_string locale 0 bytes header_size (String.length locale);
+      Bytes.blit_string
+        time_zone_id
+        0
+        bytes
+        (header_size + String.length locale)
+        (String.length time_zone_id);
+      bytes
+    in
+    let handle = create_handle_with_calendar startup packet in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle entry.source;
+         require_semantics handle (entry.source ^ ", created at 21:30")))
+;;
+
+let test_virtualized_timeline_does_not_repeat_time_at_window_boundary () =
+  with_startup (fun startup ->
+    let captures =
+      List.init 70 (fun offset ->
+        let number = 300 + offset in
+        let capture =
+          capture number (Printf.sprintf "Repeated minute row %02d" (offset + 1))
+        in
+        { capture with creation_time = fixture_time 20260809 600 })
+    in
+    seed startup captures;
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         set_environment handle (environment ~safe_area_bottom:34. ());
+         pump_until_text handle "Repeated minute row 01";
+         require_visible_text handle "10:00";
+         require_no_test_id handle ("journal-row-time:" ^ (List.nth captures 1).block_id);
+         send_visible_range handle ~first_index:58 ~last_exclusive:65;
+         pump_until_text handle "Repeated minute row 70";
+         require_no_visible_text handle "10:00"))
+;;
+
 let test_view_only_date_and_capture_route_own_plain_text_mutation_behavior () =
   with_startup (fun startup ->
     let handle = create_handle startup in
@@ -1279,13 +1534,13 @@ let test_view_only_date_and_capture_route_own_plain_text_mutation_behavior () =
          require_no_test_id handle "journal-date-target";
          require_no_test_id handle "journal-date-dialog";
          require_no_test_id handle "journal-date-selection";
-         click_test_id handle "journal-capture";
+         open_capture handle;
          require_test_id handle "capture-editor";
          require_test_id handle "capture-save";
          require_test_id handle "capture-task";
          require_no_test_id handle "capture-attachment";
          require_no_test_id handle "capture-token-action";
-         let source = "中文 👩🏽‍💻 e\204\129 #literal @mention" in
+         let source = "中文 👩🏽‍💻 e\204\129 literal-token @mention" in
          Test.Handle.apply_text_edit
            handle
            (Test.Query.test_id "capture-editor")
@@ -1324,20 +1579,60 @@ let test_view_only_date_and_capture_route_own_plain_text_mutation_behavior () =
            "rapid presentation duplicated the captured row"))
 ;;
 
+let test_capture_adds_multiple_children_and_persists_them_with_the_parent () =
+  with_startup (fun startup ->
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle "No journal entries yet";
+         open_capture handle;
+         Test.Handle.input_text
+           handle
+           (Test.Query.test_id "capture-editor")
+           "Captured parent";
+         Test.Handle.present handle;
+         require_test_id handle "capture-add-child";
+         click_test_id handle "capture-add-child";
+         require_test_id handle "capture-child-editor:0";
+         require_button_enabled handle "capture-save" false;
+         Test.Handle.input_text
+           handle
+           (Test.Query.test_id "capture-child-editor:0")
+           "Captured first child";
+         Test.Handle.present handle;
+         require_button_enabled handle "capture-save" true;
+         click_test_id handle "capture-add-child";
+         require_test_id handle "capture-child-editor:1";
+         require_button_enabled handle "capture-save" false;
+         Test.Handle.input_text
+           handle
+           (Test.Query.test_id "capture-child-editor:1")
+           "Captured second child";
+         Test.Handle.present handle;
+         require_button_enabled handle "capture-save" true;
+         click_test_id handle "capture-save";
+         pump_until_text handle "Captured parent";
+         require_visible_text handle "Captured first child";
+         require_visible_text handle "Captured second child";
+         require_no_test_id handle "journal-capture-sheet"))
+;;
+
 let test_capture_allocates_fresh_block_identity_after_restart () =
   with_startup (fun startup ->
-    let persisted : Journal_repository.capture =
+    let persisted : Journal_graph_projection.capture =
       { mutation_id = "80000000-0000-4000-9000-000000000002"
       ; block_id = "80000000-0000-4000-a000-000000000002"
       ; sibling_order = "000000000002"
       ; source = "Persisted before restart"
       ; task_state = Journal_model.Not_a_task
       ; creation_time = fixture_time 20260809 2
+      ; children = []
       }
     in
     seed startup [ persisted ];
     let save_capture handle source =
-      click_test_id handle "journal-capture";
+      open_capture handle;
       Test.Handle.input_text handle (Test.Query.test_id "capture-editor") source;
       Test.Handle.present handle;
       click_test_id handle "capture-save";
@@ -1427,7 +1722,7 @@ let pump_until_application_request_generation handle generation =
   loop 500
 ;;
 
-let respond_to_application_request ?(sequence = 1L) handle request_id payload =
+let respond_to_application_request ?(sequence = 3L) handle request_id payload =
   Test.Handle.present handle;
   let event =
     Protocol.Inbound_event.
@@ -1575,7 +1870,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
          let old_request_id, _old_payload = pump_until_application_request handle in
          send_application_event
            handle
-           ~sequence:1L
+           ~sequence:3L
            (calendar_event
               ~generation:2L
               ~local_day:20260810
@@ -1589,7 +1884,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
            (Bytes.get_int64_le new_payload 8 = 2L)
            "locale event did not issue a generation-2 formatting request";
          respond_to_application_request
-           ~sequence:2L
+           ~sequence:4L
            handle
            old_request_id
            (formatted_response
@@ -1599,7 +1894,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
          require_no_visible_text handle "stale locale today";
          require_no_visible_text handle "stale locale older";
          respond_to_application_request
-           ~sequence:3L
+           ~sequence:5L
            handle
            new_request_id
            (formatted_response
@@ -1607,7 +1902,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
               [ 20260810, "周一，8月10日"; 20260808, "周六，8月8日" ]);
          Test.Handle.present handle;
          require_visible_text handle "周一，8月10日";
-         require_visible_text handle "周六，8月8日"))
+         pump_until_text handle "周六，8月8日"))
 ;;
 
 let test_timeline_task_and_row_body_toggle_are_independent () =
@@ -1628,15 +1923,200 @@ let test_timeline_task_and_row_body_toggle_are_independent () =
                 handle
                 (Test.Query.semantics_label ("Mark as todo: " ^ parent.source))));
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
-         pump_until_text handle child.source;
+         pump_until handle "direct child preview" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))));
          require_no_test_id handle ("journal-row-open:" ^ parent.block_id);
          require_no_test_id handle ("journal-row-disclosure:" ^ parent.block_id);
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "row-body collapse" (fun () ->
-           Option.is_none (Test.Handle.find handle (Test.Query.visible_text child.source)))))
+           Option.is_none
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id ("journal-child-preview:" ^ child.block_id)))))
+      )
 ;;
 
-let test_loading_recovery_and_adaptive_environment_surfaces_are_truthful () =
+let test_loaded_children_survive_a_stale_ios_visible_range_event () =
+  with_startup (fun startup ->
+    let parent = capture 118 "iOS child loading parent" in
+    seed startup [ parent ];
+    let child = seed_child startup ~parent 119 "iOS loaded direct child" in
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         set_environment handle (environment ~platform:"ios" ());
+         pump_until_text handle parent.source;
+         click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
+         require_test_id handle ("journal-children-loading:" ^ parent.block_id);
+         let stale_binding = capture_native_binding handle "journal-timeline" in
+         pump_until handle "loaded iOS direct child" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))));
+         send_stale_visible_range
+           handle
+           stale_binding
+           ~first_index:0
+           ~last_exclusive:3;
+         Test.Handle.present handle;
+         require_test_id handle ("journal-child-preview:" ^ child.block_id);
+         require_no_test_id handle ("journal-children-loading:" ^ parent.block_id)))
+;;
+
+let test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed () =
+  with_startup (fun startup ->
+    let parent = capture 120 "Parent summary source" in
+    let leaf = capture 121 "Leaf without summary" in
+    seed startup [ parent; leaf ];
+    let child = seed_child startup ~parent 122 "First direct child summary" in
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle parent.source;
+         require_visible_text handle child.source;
+         require_test_id handle ("journal-row-supporting:" ^ parent.block_id ^ ":0");
+         require_visible_text_count handle child.source 1;
+         require_visible_text_count handle leaf.source 1;
+         require_no_test_id handle ("journal-row-supporting:" ^ leaf.block_id ^ ":0");
+         require_no_test_id handle ("journal-children-loading:" ^ parent.block_id);
+         require_semantics
+           handle
+           (parent.source ^ ", " ^ child.source ^ ", created at 02:00");
+         require_no_semantics handle ("Direct child: " ^ child.source)))
+;;
+
+let test_collapsed_rows_share_three_lines_between_parent_and_child_content () =
+  with_startup (fun startup ->
+    let two_line_parent = capture 123 "Parent line one\nParent line two" in
+    let one_line_parent = capture 126 "Single parent line" in
+    let three_line_parent = capture 131 "Line one\nLine two\nLine three\nLine four" in
+    seed startup [ two_line_parent; one_line_parent; three_line_parent ];
+    let first_for_two = seed_child startup ~parent:two_line_parent 124 "Two-line child one" in
+    let second_for_two = seed_child startup ~parent:two_line_parent 125 "Two-line child two" in
+    let first_for_one = seed_child startup ~parent:one_line_parent 127 "One-line child one" in
+    let second_for_one = seed_child startup ~parent:one_line_parent 128 "One-line child two" in
+    let third_for_one = seed_child startup ~parent:one_line_parent 129 "One-line child three" in
+    let hidden_for_three =
+      seed_child startup ~parent:three_line_parent 132 "Three-line hidden child"
+    in
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle one_line_parent.source;
+         require_text_max_lines
+           handle
+           ("journal-row-source:" ^ two_line_parent.block_id)
+           2;
+         require_visible_text handle first_for_two.source;
+         require_no_visible_text handle second_for_two.source;
+         require_text_max_lines
+           handle
+           ("journal-row-source:" ^ one_line_parent.block_id)
+           1;
+         require_visible_text handle first_for_one.source;
+         require_visible_text handle second_for_one.source;
+         require_no_visible_text handle third_for_one.source;
+         require_text_max_lines
+           handle
+           ("journal-row-source:" ^ three_line_parent.block_id)
+           3;
+         require_no_visible_text handle hidden_for_three.source;
+         require_padding
+           handle
+           ("journal-row-body-padding:" ^ one_line_parent.block_id)
+           ~left:32.
+           ~top:8.
+           ~right:24.
+           ~bottom:8.))
+;;
+
+let test_expanded_children_are_static_previews_without_group_separator () =
+  with_startup (fun startup ->
+    let parent =
+      capture
+        ~task_state:Journal_model.Todo
+        130
+        "Bounded preview parent\nSecond parent line"
+    in
+    seed startup [ parent ];
+    let first = seed_child startup ~parent 131 "Preview child one" in
+    let second =
+      seed_child
+        startup
+        ~parent
+        ~task_state:Journal_model.Todo
+        132
+        "Preview task child"
+    in
+    let third = seed_child startup ~parent 133 "Preview child with descendant" in
+    let fourth = seed_child startup ~parent 134 "Preview child beyond bound" in
+    ignore
+      (seed_child_by_parent_id
+         startup
+         ~parent_block_id:third.block_id
+         135
+         "Nested child must not appear");
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle parent.source;
+         require_visible_text_count handle first.source 1;
+         click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
+         pump_until handle "three child previews and static More" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id ("journal-children-more:" ^ parent.block_id))));
+         require_visible_text_count handle first.source 1;
+         require_visible_text_count handle second.source 1;
+         require_no_test_id
+           handle
+           ("journal-row-supporting:" ^ parent.block_id ^ ":0");
+         require_no_test_id
+           handle
+           ("journal-row-supporting:" ^ parent.block_id ^ ":1");
+         List.iter
+           (fun (child : Journal_graph_projection.create_child) ->
+              require_test_id handle ("journal-child-preview:" ^ child.block_id);
+              require_no_test_id handle ("journal-row-swipe:" ^ child.block_id);
+              require_no_test_id handle ("journal-row-task:" ^ child.block_id);
+              require_no_test_id handle ("journal-row-toggle-children:" ^ child.block_id))
+           [ first; second; third ];
+         require_no_visible_text handle fourth.source;
+         require_no_visible_text handle "Nested child must not appear";
+         require_semantics handle ("Direct child: " ^ first.source);
+         require_semantics handle ("Direct child task Todo: " ^ second.source);
+         require_semantics handle ("Direct child: " ^ third.source);
+         require_semantics handle "More direct child blocks are not shown";
+         require_semantics_view handle "More direct child blocks are not shown" (fun view ->
+           require (not view.live_region) "static More is a live region");
+         require_no_semantics
+           handle
+           (parent.source ^ ", " ^ first.source ^ ", created at 02:10");
+         require_semantics handle (parent.source ^ ", created at 02:10");
+         require_no_test_id handle ("journal-group-divider:" ^ first.block_id);
+         require_no_test_id handle ("journal-group-divider:" ^ second.block_id);
+         require_no_test_id handle ("journal-group-divider:" ^ parent.block_id);
+         require_sized_height handle ("journal-row-extent:" ^ parent.block_id) 56.;
+         click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
+         pump_until handle "preview collapse" (fun () ->
+           Option.is_none
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id ("journal-child-preview:" ^ third.block_id))));
+         require_visible_text_count handle first.source 1;
+         require_no_visible_text handle second.source))
+;;
+
+let test_loading_and_adaptive_environment_surfaces_are_truthful () =
   with_startup (fun startup ->
     let parent = capture 100 "Adaptive application row" in
     seed startup [ parent ];
@@ -1665,7 +2145,7 @@ let test_loading_recovery_and_adaptive_environment_surfaces_are_truthful () =
               in
               let props = timeline_props handle in
               require
-                (Float.equal props.default_item_extent expected.block_extent)
+                (Float.equal props.default_item_extent expected.top_level_extent)
                 "Application profile changed at %.0f/%.1f on %s/%s"
                 width
                 scale
@@ -1689,37 +2169,7 @@ let test_loading_recovery_and_adaptive_environment_surfaces_are_truthful () =
               (transition.expand_duration_ms = 0 && transition.collapse_duration_ms = 0)
               "reduced motion kept nonzero list durations"
           | None -> fail "Timeline omitted its explicit transition policy");
-         require_no_test_id handle ("journal-row-open:" ^ parent.block_id)));
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    let competing = ref None in
-    Fun.protect
-      ~finally:(fun () ->
-        Option.iter
-          (fun database ->
-             ignore (Sqlite3.exec database "ROLLBACK");
-             require (Sqlite3.db_close database) "failed to close competing SQLite handle")
-          !competing;
-        Test.Handle.shutdown handle)
-      (fun () ->
-         pump_until_text handle "No journal entries yet";
-         let database = Sqlite3.db_open (database_path startup) in
-         competing := Some database;
-         let result = Sqlite3.exec database "BEGIN EXCLUSIVE" in
-         require
-           (Sqlite3.Rc.is_success result)
-           "failed to acquire competing SQLite lock: %s"
-           (Sqlite3.Rc.to_string result);
-         click_test_id handle "journal-capture";
-         Test.Handle.input_text
-           handle
-           (Test.Query.test_id "capture-editor")
-           "Cannot persist in recovery";
-         Test.Handle.present handle;
-         click_test_id handle "capture-save";
-         pump_until_text handle "Journal is read-only";
-         require_live_region handle "Journal is read-only";
-         require_no_test_id handle "capture-retry"))
+         require_no_test_id handle ("journal-row-open:" ^ parent.block_id)))
 ;;
 
 let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
@@ -1737,7 +2187,7 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
          require_no_visible_text handle command.source;
          require_live_region handle "Block and descendants removed";
          require_test_id handle "journal-delete-snackbar-position";
-         require_stack_bottom handle "journal-delete-snackbar-position" 122.;
+         require_stack_bottom handle "journal-delete-snackbar-position" 114.;
          require_test_id handle "journal-delete-undo";
          require_button_enabled handle "journal-delete-undo" true;
          advance_clock handle monotonic_now_ns 4.9;
@@ -1757,23 +2207,33 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
     pump_until handle "durable subtree delete" (fun () ->
       Option.is_none
         (Test.Handle.find handle (Test.Query.test_id "journal-delete-snackbar")));
+    for _ = 1 to 64 do
+      pump_worker handle
+    done;
     require_no_test_id handle "journal-delete-undo";
     Test.Handle.shutdown handle;
-    let store = open_store startup in
+    let engine =
+      Logseq_db_worker.Engine.open_
+        ~dependencies:Adapter_fixture.dependencies
+        startup
+      |> Result.get_ok
+    in
     Fun.protect
-      ~finally:(fun () -> close_store store)
+      ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
       (fun () ->
          match
-           Journal_repository.find_block
-             (Journal_storage.current_db store)
-             ~id:command.block_id
+           Logseq_db_worker.Engine.execute
+             engine
+             (graph_request
+                (Read (Get_block { block = uuid command.block_id })))
          with
-         | Ok None -> ()
-         | Ok (Some _) -> fail "deadline delete was not durable"
-         | Error error ->
+         | Failed failure
+           when Logseq_db_worker.Error.code failure.error = Not_found -> ()
+         | Succeeded _ -> fail "deadline delete was not durable"
+         | Failed failure ->
            fail
              "deadline delete lookup failed: %s"
-             (Journal_repository.Error.to_string error)))
+             (Logseq_db_worker.Error.message failure.error)))
 ;;
 
 let test_swipe_delete_accessibility_duration_and_single_mutation_gate () =
@@ -1802,21 +2262,29 @@ let () =
   test_initial_feed_has_a_truthful_loading_state ();
   test_timeline_content_is_capped_and_centered ();
   test_root_is_owned_by_the_ocaml_timeline ();
+  test_capture_composer_replaces_the_center_orb_and_prefills_capture ();
   test_capture_is_an_ocaml_contextual_modal_sheet ();
   test_capture_sheet_protects_dirty_state_and_reconciles_environment ();
   test_header_uses_tokens_safe_area_and_independent_center ();
   test_header_adapts_without_exposing_deferred_actions ();
-  test_capture_soft_press_has_tactile_down_and_ease_out_release ();
-  test_capture_soft_press_respects_reduced_motion ();
   test_header_stays_light_when_the_system_uses_dark_appearance ();
   test_timeline_uses_exact_sparse_extent_window ();
+  test_collapsed_group_divider_is_full_width_and_one_physical_pixel ();
   test_timeline_uses_truthful_fallback_labels_without_duplicate_today ();
+  test_timeline_deemphasizes_repeated_and_historical_timestamps ();
+  test_timeline_projects_creation_time_across_a_negative_offset_day_boundary ();
+  test_virtualized_timeline_does_not_repeat_time_at_window_boundary ();
   test_view_only_date_and_capture_route_own_plain_text_mutation_behavior ();
+  test_collapsed_rows_share_three_lines_between_parent_and_child_content ();
+  test_capture_adds_multiple_children_and_persists_them_with_the_parent ();
   test_capture_allocates_fresh_block_identity_after_restart ();
   test_localized_day_request_updates_only_matching_generation ();
   test_locale_event_invalidates_labels_and_rejects_in_flight_response ();
   test_timeline_task_and_row_body_toggle_are_independent ();
-  test_loading_recovery_and_adaptive_environment_surfaces_are_truthful ();
+  test_loaded_children_survive_a_stale_ios_visible_range_event ();
+  test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed ();
+  test_expanded_children_are_static_previews_without_group_separator ();
+  test_loading_and_adaptive_environment_surfaces_are_truthful ();
   test_swipe_delete_stages_undoes_and_commits_only_after_deadline ();
   test_swipe_delete_accessibility_duration_and_single_mutation_gate ()
 ;;

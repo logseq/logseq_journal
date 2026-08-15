@@ -7,10 +7,14 @@ import 'dart:typed_data';
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 // ignore: implementation_imports
 import 'package:bonsai_flutter/src/runtime/foreground_frame_loop.dart';
+// ignore: implementation_imports
+import 'package:bonsai_flutter/src/renderer/pressable_host.dart';
 import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'runtime_flow_fixture.dart';
 
 void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
@@ -99,13 +103,11 @@ void main() {
             tester.getCenter(capture),
           );
           await tester.pump();
-          expect(_pressedOverlay, findsOneWidget);
           expect(find.text('New block'), findsNothing);
           await cancelled.moveBy(const Offset(80, 0));
           await tester.pump();
           await cancelled.up();
           await tester.pump(const Duration(milliseconds: 100));
-          expect(_pressedOverlay, findsNothing);
           expect(find.text('New block'), findsNothing);
         }
 
@@ -124,7 +126,6 @@ void main() {
         );
         await tester.pump();
         if (!Platform.isIOS) {
-          expect(_pressedOverlay, findsOneWidget);
           expect(find.text('New block'), findsNothing);
           await tester.pump(const Duration(milliseconds: 80));
         }
@@ -138,10 +139,6 @@ void main() {
         expect(find.byType(ModalBarrier), findsWidgets);
         expect(find.text('Today'), findsOneWidget);
         expect(
-          find.bySemanticsLabel('Adjust new block editor height'),
-          findsOneWidget,
-        );
-        expect(
           ModalRoute.of(tester.element(find.text('New block'))),
           isA<ModalBottomSheetRoute<void>>(),
         );
@@ -151,11 +148,7 @@ void main() {
           isTrue,
         );
         expect(tester.takeException(), isNull);
-        await tester.drag(
-          find.bySemanticsLabel('Adjust new block editor height'),
-          const Offset(0, 600),
-        );
-        await tester.pump(const Duration(milliseconds: 250));
+        await _tapSemantics(tester, 'Close new block editor');
         await _pumpRuntime(tester);
         await _pumpUntil(
           tester,
@@ -237,12 +230,6 @@ void main() {
         const literalSource = '中文 👩🏽‍💻 e\u0301 #literal @mention';
         await tester.enterText(find.byType(TextField), literalSource);
         await _pumpRuntime(tester);
-        await tester.drag(
-          find.bySemanticsLabel('Adjust new block editor height'),
-          const Offset(0, 700),
-        );
-        await tester.pump(const Duration(milliseconds: 250));
-        await _pumpRuntime(tester);
         expect(find.text('New block'), findsOneWidget);
         expect(find.text(literalSource), findsOneWidget);
 
@@ -270,27 +257,36 @@ void main() {
         await _pumpRuntime(tester);
         await _pumpUntil(
           tester,
-          () => find.text(literalSource).evaluate().isNotEmpty,
+          () =>
+              find.text('New block').evaluate().isEmpty &&
+              find.byType(TextField).evaluate().isEmpty,
         );
         await _pumpUntil(
           tester,
           () => find
-              .bySemanticsLabel('Mark as done: $literalSource')
+              .bySemanticsLabel(
+                RegExp('Mark as done: ${RegExp.escape(literalSource)}'),
+              )
               .evaluate()
               .isNotEmpty,
         );
-
-        await _tapSemantics(tester, 'Mark as done: $literalSource');
+        await tester.tap(_materialGlyph(0xe504).last);
+        await tester.pump(const Duration(milliseconds: 110));
         await _pumpRuntime(tester);
         await _pumpUntil(
           tester,
           () => find
-              .bySemanticsLabel('Mark as todo: $literalSource')
+              .bySemanticsLabel(
+                RegExp('Mark as todo: ${RegExp.escape(literalSource)}'),
+              )
               .evaluate()
               .isNotEmpty,
         );
 
         expect(find.text('Entry detail'), findsNothing);
+        // Scope frame-duration evidence to the Timeline row and environment
+        // matrix implemented by this tranche, excluding Capture route startup.
+        BonsaiFlutterDebug.reset();
         await _exerciseEnvironmentMatrix(tester, source: literalSource);
         await _requireMechanicalBudgets(tester, harness.runtime);
 
@@ -328,6 +324,7 @@ void main() {
           tester,
           () => find.text('New block').evaluate().isNotEmpty,
         );
+        await tester.pump(const Duration(milliseconds: 250));
         await tester.enterText(find.byType(TextField), source);
         await _pumpRuntime(tester);
         await _tapSemantics(tester, 'Make task');
@@ -337,7 +334,6 @@ void main() {
           () => find.text('To do').evaluate().isNotEmpty,
         );
         await _tapSemantics(tester, 'Save journal block');
-        await _pumpUntil(tester, () => find.text(source).evaluate().isNotEmpty);
         await _pumpUntil(
           tester,
           () =>
@@ -364,7 +360,11 @@ void main() {
         expect(find.text('Block and descendants removed'), findsNothing);
 
         final task = _materialGlyph(0xe504).first;
-        await tester.drag(task, const Offset(-160, 0));
+        await tester.timedDrag(
+          task,
+          const Offset(-180, 0),
+          const Duration(milliseconds: 300),
+        );
         await tester.pump(const Duration(milliseconds: 250));
         await _pumpRuntime(tester);
         expect(find.text(source), findsNothing);
@@ -396,13 +396,15 @@ void main() {
               disableAnimations: true,
               reduceMotion: true,
             );
-        await harness.show(
-          tester,
-          locale: const Locale('ar', 'SA'),
-          textDirection: TextDirection.rtl,
-        );
+        harness.setTextDirection(TextDirection.rtl);
+        await tester.pump();
+        await _pumpRuntime(tester);
         await _pumpUntil(tester, () => find.text(source).evaluate().isNotEmpty);
-        await tester.drag(find.text(source).first, const Offset(160, 0));
+        await tester.timedDrag(
+          find.text(source).first,
+          const Offset(180, 0),
+          const Duration(milliseconds: 300),
+        );
         await tester.pump();
         await _pumpRuntime(tester);
         expect(find.text(source), findsNothing);
@@ -412,6 +414,75 @@ void main() {
         await _pumpRuntime(tester);
       } finally {
         tester.platformDispatcher.clearAccessibilityFeaturesTestValue();
+        semantics.dispose();
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'compiled OCaml runtime replaces iOS child loading with persisted children',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(tester);
+      final semantics = tester.ensureSemantics();
+      const parentSource = 'iOS expandable parent';
+      const childSource = 'iOS persisted child';
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('No journal entries yet').evaluate().isNotEmpty,
+        );
+        await _tapSemantics(tester, 'Capture');
+        await _pumpUntil(
+          tester,
+          () => find.text('New block').evaluate().isNotEmpty,
+        );
+        await tester.pump(const Duration(milliseconds: 250));
+        await tester.enterText(find.byType(TextField).first, parentSource);
+        await _pumpRuntime(tester);
+        await tester.tap(find.text('Add child'));
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => find.byType(TextField).evaluate().length == 2,
+        );
+        await tester.enterText(find.byType(TextField).last, childSource);
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () => _hasAttachedSemanticsTap(tester, 'Save journal block'),
+        );
+        await _tapSemantics(tester, 'Save journal block');
+        await _pumpRuntime(tester);
+        await _pumpUntil(
+          tester,
+          () =>
+              find.text(parentSource).evaluate().isNotEmpty &&
+              find.text('New block').evaluate().isEmpty,
+        );
+
+        final parentPressable = find
+            .ancestor(
+              of: find.text(parentSource),
+              matching: find.byType(PressableHost),
+            )
+            .first;
+        await tester.tap(parentPressable);
+        await _pumpUntil(
+          tester,
+          () => find.text('Loading direct child blocks').evaluate().isNotEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () =>
+              find.text(childSource).evaluate().isNotEmpty &&
+              find.text('Loading direct child blocks').evaluate().isEmpty,
+        );
+        expect(find.text('Loading direct child blocks'), findsNothing);
+        expect(tester.takeException(), isNull);
+      } finally {
         semantics.dispose();
         await harness.dispose(tester);
       }
@@ -441,11 +512,6 @@ void main() {
     timeout: const Timeout(Duration(seconds: 45)),
   );
 }
-
-Finder get _pressedOverlay => find.byWidgetPredicate(
-  (widget) => widget is ColoredBox && widget.color == const Color(0x1f0d142f),
-  description: 'active journal pressed overlay',
-);
 
 double _renderViewWidth(WidgetTester tester) =>
     tester.binding.renderViews.first.size.width;
@@ -593,6 +659,7 @@ final class _RuntimeHarness {
     required this.recordingSession,
     required this.adapter,
     required this.frameEligibility,
+    required this.textDirectionOverride,
   });
 
   final Directory root;
@@ -602,17 +669,11 @@ final class _RuntimeHarness {
   final _RecordingRuntimeSession recordingSession;
   final ApplicationHostAdapter adapter;
   final _ControllableFrameEligibilitySource frameEligibility;
+  final ValueNotifier<TextDirection?> textDirectionOverride;
 
-  static Future<_RuntimeHarness> start(
-    WidgetTester tester, {
-    Directory? supportRoot,
-  }) async {
-    final root =
-        supportRoot ??
-        await tester.runAsync(
-          () => Directory.systemTemp.createTemp('journal-flow-'),
-        );
-    expect(root, isNotNull);
+  static Future<_RuntimeHarness> start(WidgetTester tester) async {
+    final fixture = await RuntimeFlowFixture.create(tester);
+    final root = fixture.supportRoot;
     var generation = 1;
     Future<JournalCalendarSnapshot> calendar() async => JournalCalendarSnapshot(
       instantUnixMilliseconds: 1786055400000,
@@ -623,7 +684,8 @@ final class _RuntimeHarness {
       generation: generation++,
     );
     final adapter = ApplicationHostAdapter(
-      applicationSupportDirectory: () async => root!,
+      applicationSupportDirectory: () async => root,
+      graphTarget: () async => LogseqDbTarget.snapshot(fixture.snapshotToken),
       initialCalendarSnapshot: calendar,
       liveCalendarSnapshot: calendar,
     );
@@ -641,14 +703,16 @@ final class _RuntimeHarness {
     );
     expect(runtime, isNotNull);
     final recordingSession = _RecordingRuntimeSession(runtime!);
+    final textDirectionOverride = ValueNotifier<TextDirection?>(null);
     return _RuntimeHarness(
-      root: root!,
-      ownsRoot: supportRoot == null,
+      root: root,
+      ownsRoot: true,
       config: config,
       runtime: runtime,
       recordingSession: recordingSession,
       adapter: adapter,
       frameEligibility: _ControllableFrameEligibilitySource(),
+      textDirectionOverride: textDirectionOverride,
     );
   }
 
@@ -657,38 +721,43 @@ final class _RuntimeHarness {
     Locale? locale,
     TextDirection? textDirection,
   }) async {
+    textDirectionOverride.value = textDirection;
     BonsaiFlutterDebug.reset();
     if (!Platform.isIOS) {
       tester.view.physicalSize = const Size(390, 844);
       tester.view.devicePixelRatio = 1;
     }
+    final root = BonsaiFlutterRoot(
+      config: config,
+      runtimeStarter: (_) async => recordingSession,
+      applicationPlatform: adapter.createApplicationPlatform(),
+      frameEligibilitySource: frameEligibility,
+    );
     await tester.pumpWidget(
-      MaterialApp(
-        builder: locale == null && textDirection == null
-            ? null
-            : (context, child) {
-                final directed = textDirection == null
-                    ? child!
-                    : Directionality(
-                        textDirection: textDirection,
-                        child: child!,
-                      );
-                return locale == null
-                    ? directed
-                    : Localizations(
-                        locale: locale,
-                        delegates: const [_AnyLocaleWidgetsDelegate()],
-                        child: directed,
-                      );
-              },
-        home: BonsaiFlutterRoot(
-          config: config,
-          runtimeStarter: (_) async => recordingSession,
-          applicationPlatform: adapter.createApplicationPlatform(),
-          frameEligibilitySource: frameEligibility,
+      ValueListenableBuilder<TextDirection?>(
+        valueListenable: textDirectionOverride,
+        child: root,
+        builder: (context, direction, child) => MaterialApp(
+          builder: (context, root) {
+            final directed = direction == null
+                ? root!
+                : Directionality(textDirection: direction, child: root!);
+            return locale == null
+                ? directed
+                : Localizations(
+                    locale: locale,
+                    delegates: const [_AnyLocaleWidgetsDelegate()],
+                    child: directed,
+                  );
+          },
+          home: child,
         ),
       ),
     );
+  }
+
+  void setTextDirection(TextDirection direction) {
+    textDirectionOverride.value = direction;
   }
 
   Future<void> dispose(WidgetTester tester) async {
@@ -714,6 +783,7 @@ final class _RuntimeHarness {
     await tester.runAsync(
       () => runtime.dispose().timeout(const Duration(seconds: 15)),
     );
+    textDirectionOverride.dispose();
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
     tester.platformDispatcher.clearPlatformBrightnessTestValue();
@@ -878,6 +948,30 @@ Future<void> _pumpUntil(
 }
 
 Future<void> _tapSemantics(WidgetTester tester, String label) async {
-  await tester.tap(find.bySemanticsLabel(label).last);
-  await tester.pump(const Duration(milliseconds: 80));
+  await _tapSemanticsFinder(tester, find.bySemanticsLabel(label));
+}
+
+bool _hasAttachedSemanticsTap(WidgetTester tester, String label) {
+  final candidates = find.bySemanticsLabel(label);
+  for (var index = candidates.evaluate().length - 1; index >= 0; index -= 1) {
+    final semantics = tester.getSemantics(candidates.at(index));
+    if (semantics.owner != null &&
+        semantics.getSemanticsData().hasAction(SemanticsAction.tap)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Future<void> _tapSemanticsFinder(WidgetTester tester, Finder candidates) async {
+  final count = candidates.evaluate().length;
+  for (var index = count - 1; index >= 0; index -= 1) {
+    final semantics = tester.getSemantics(candidates.at(index));
+    final owner = semantics.owner;
+    if (owner == null) continue;
+    owner.performAction(semantics.id, SemanticsAction.tap);
+    await tester.pump(const Duration(milliseconds: 80));
+    return;
+  }
+  fail('No attached semantics node was found for $candidates');
 }

@@ -1,0 +1,2909 @@
+{
+  "formatVersion": 1,
+  "case": "worker-create-page",
+  "source": {
+    "logseqCommit": "4f21d068aed43bb2ea5823247cae73ecdd8d60f8",
+    "schema": "65.33",
+    "minimumSupportedSchema": "65.33",
+    "workerRoute": "frontend.worker.db-core -> thread-api/apply-outliner-ops"
+  },
+  "deterministicInputs": {
+    "engineClockEpochMs": "1704067200000",
+    "pageUuid": "11111111-1111-4111-8111-111111111111",
+    "pageTitle": "Oracle Page"
+  },
+  "normalizationRules": [
+    "Remove DataScript :db/id storage addresses.",
+    "Replace :block/created-at and :block/updated-at with $normalizedEpochMs.",
+    "Replace :block/tx-id with $normalizedTransactionId.",
+    "Sort sets and projected entities by stable semantic identity."
+  ],
+  "projection": [
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "file checksum",
+      "block/order": "b11",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "File checksum",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1011-4169-7900-000000000000",
+      "db/ident": "logseq.property.asset/checksum"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "whiteboard",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Whiteboard",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1013-6984-5200-000000000000",
+      "db/ident": "logseq.class/Whiteboard"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1038-7670-4800-000000000000",
+      "db/ident": "logseq.class/Property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "reference to large block title stored in remote object storage",
+      "block/order": "b1U",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Reference to large block title stored in remote object storage",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1044-8271-6500-000000000000",
+      "db/ident": "logseq.property.sync/large-title-object"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view sort groups desc",
+      "block/order": "b0n",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View sort groups DESC",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1081-4073-8700-000000000000",
+      "db/ident": "logseq.property.view/sort-groups-desc?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "due",
+      "block/order": "b17",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Due",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1089-0805-4900-000000000000",
+      "db/ident": "logseq.property.fsrs/due"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "publishing public?",
+      "block/order": "b0Y",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Publishing Public?",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1094-6579-3900-000000000000",
+      "db/ident": "logseq.property/publishing-public?"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6747-9388-7000-000000000000",
+          "db/ident": "logseq.property.pdf/hl-color"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "an",
+      "block/page": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/title": "purple",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1104-3848-5600-000000000000",
+      "db/ident": "logseq.property/color.purple"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "built in?",
+      "block/order": "a1",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Built in?",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1125-9581-6000-000000000000",
+      "db/ident": "logseq.property/built-in?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "reaction target",
+      "block/order": "b1P",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Reaction target",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1127-5718-5000-000000000000",
+      "db/ident": "logseq.property.reaction/target"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "file type",
+      "block/order": "b0v",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "File Type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1142-0830-9800-000000000000",
+      "db/ident": "logseq.property.asset/type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "history block",
+      "block/order": "b1E",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "History block",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1142-5541-6000-000000000000",
+      "db/ident": "logseq.property.history/block"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "closed value property",
+      "block/order": "aI",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Closed value property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1157-7928-1300-000000000000",
+      "db/ident": "block/closed-value-property"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2182-3760-7000-000000000000",
+          "db/ident": "logseq.property.view/type"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0d",
+      "block/page": {
+        "block/uuid": "00000002-2182-3760-7000-000000000000",
+        "db/ident": "logseq.property.view/type"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2182-3760-7000-000000000000",
+        "db/ident": "logseq.property.view/type"
+      },
+      "block/title": "List View",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1164-8285-0200-000000000000",
+      "db/ident": "logseq.property.view/type.list"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "state",
+      "block/order": "b18",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "State",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1165-1650-8700-000000000000",
+      "db/ident": "logseq.property.fsrs/state"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "file size",
+      "block/order": "b0y",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "File Size",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1167-8621-9000-000000000000",
+      "db/ident": "logseq.property.asset/size"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "quote",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Quote",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1176-1666-1700-000000000000",
+      "db/ident": "logseq.class/Quote-block"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node references",
+      "block/order": "aF",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node references",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1214-4953-4900-000000000000",
+      "db/ident": "block/refs"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "choice exclusions",
+      "block/order": "ay",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Choice exclusions",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1233-5229-4600-000000000000",
+      "db/ident": "logseq.property/choice-exclusions"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "choice checkbox state",
+      "block/order": "aw",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Choice checkbox state",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1272-4228-6300-000000000000",
+      "db/ident": "logseq.property/choice-checkbox-state"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "task",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Task",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1282-1814-5700-000000000000",
+      "db/ident": "logseq.class/Task"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "cards",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Cards",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1284-2651-6700-000000000000",
+      "db/ident": "logseq.class/Cards"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "asset resize metadata",
+      "block/order": "b15",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Asset resize metadata",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1297-5230-5500-000000000000",
+      "db/ident": "logseq.property.asset/resize-metadata"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "comment",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Comment",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1323-0695-4000-000000000000",
+      "db/ident": "logseq.class/Comment"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "card",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Card",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1358-2811-0900-000000000000",
+      "db/ident": "logseq.class/Card"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "user name",
+      "block/order": "b19",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "User Name",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1360-0260-1600-000000000000",
+      "db/ident": "logseq.property.user/name"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "external url",
+      "block/order": "b0w",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "External URL",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1364-7751-6300-000000000000",
+      "db/ident": "logseq.property.asset/external-url"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "annotation image",
+      "block/order": "ap",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Annotation image",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1377-6700-9000-000000000000",
+      "db/ident": "logseq.property.pdf/hl-image"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property value",
+      "block/order": "a8",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Property value",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1396-5248-6500-000000000000",
+      "db/ident": "logseq.property/value"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "gallery card width",
+      "block/order": "b0k",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Gallery card width",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1403-2963-9500-000000000000",
+      "db/ident": "logseq.property.view/gallery-card-width"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-1984-2972-8100-000000000000",
+          "db/ident": "logseq.property.repeat/repeat-type"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0R",
+      "block/page": {
+        "block/uuid": "00000002-1984-2972-8100-000000000000",
+        "db/ident": "logseq.property.repeat/repeat-type"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-1984-2972-8100-000000000000",
+        "db/ident": "logseq.property.repeat/repeat-type"
+      },
+      "block/title": "Advance from completion",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1406-5331-0600-000000000000",
+      "db/ident": "logseq.property.repeat/repeat-type.dotted-plus"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node order",
+      "block/order": "aC",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node order",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1429-2824-3700-000000000000",
+      "db/ident": "block/order"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6903-0624-7000-000000000000",
+          "db/ident": "logseq.property.repeat/recur-unit"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0K",
+      "block/page": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/title": "Hour",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1438-8849-5400-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit.hour"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node created at",
+      "block/order": "aK",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node created at",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1440-0150-0000-000000000000",
+      "db/ident": "block/created-at"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "code",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Code",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1454-9866-4100-000000000000",
+      "db/ident": "logseq.class/Code-block"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "journal date",
+      "block/order": "aJ",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Journal date",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1457-4836-6000-000000000000",
+      "db/ident": "block/journal-day"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "page",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Page",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1484-3403-2900-000000000000",
+      "db/ident": "logseq.class/Page"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view ordered columns",
+      "block/order": "b0r",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View ordered columns",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1485-5871-0000-000000000000",
+      "db/ident": "logseq.property.table/ordered-columns"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2182-3760-7000-000000000000",
+          "db/ident": "logseq.property.view/type"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0e",
+      "block/page": {
+        "block/uuid": "00000002-2182-3760-7000-000000000000",
+        "db/ident": "logseq.property.view/type"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2182-3760-7000-000000000000",
+        "db/ident": "logseq.property.view/type"
+      },
+      "block/title": "Gallery View",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1506-0511-2000-000000000000",
+      "db/ident": "logseq.property.view/type.gallery"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6903-0624-7000-000000000000",
+          "db/ident": "logseq.property.repeat/recur-unit"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0J",
+      "block/page": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/title": "Minute",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1513-6550-8500-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit.minute"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node updated at",
+      "block/order": "aL",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node updated at",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1516-5505-5100-000000000000",
+      "db/ident": "block/updated-at"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6903-0624-7000-000000000000",
+          "db/ident": "logseq.property.repeat/recur-unit"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0O",
+      "block/page": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/title": "Year",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1520-4385-2400-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit.year"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "title format",
+      "block/order": "av",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Title Format",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1536-4979-5400-000000000000",
+      "db/ident": "logseq.property.journal/title-format"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property view context",
+      "block/order": "a5",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Property view context",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1547-3958-2800-000000000000",
+      "db/ident": "logseq.property/view-context"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "non ref type default value",
+      "block/order": "aQ",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Non ref type default value",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1595-7230-1400-000000000000",
+      "db/ident": "logseq.property/scalar-default-value"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "history property",
+      "block/order": "b1F",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "History property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1600-4090-8200-000000000000",
+      "db/ident": "logseq.property.history/property"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-9072-1685-3000-000000000000",
+          "db/ident": "logseq.property/status"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b02",
+      "block/page": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/title": "Todo",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1615-5853-7700-000000000000",
+      "db/ident": "logseq.property/status.todo"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "scheduled",
+      "block/order": "b0E",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Scheduled",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1644-5209-4300-000000000000",
+      "db/ident": "logseq.property/scheduled"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-1984-2972-8100-000000000000",
+          "db/ident": "logseq.property.repeat/repeat-type"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0S",
+      "block/page": {
+        "block/uuid": "00000002-1984-2972-8100-000000000000",
+        "db/ident": "logseq.property.repeat/repeat-type"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-1984-2972-8100-000000000000",
+        "db/ident": "logseq.property.repeat/repeat-type"
+      },
+      "block/title": "Advance from scheduled",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1646-4063-5900-000000000000",
+      "db/ident": "logseq.property.repeat/repeat-type.plus"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "user email",
+      "block/order": "b1A",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "User Email",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1655-2060-6300-000000000000",
+      "db/ident": "logseq.property.user/email"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "recycle original page",
+      "block/order": "b1M",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Recycle original page",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1658-7897-9900-000000000000",
+      "db/ident": "logseq.property.recycle/original-page"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "gallery asset property",
+      "block/order": "b0h",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Gallery asset property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1668-3468-9000-000000000000",
+      "db/ident": "logseq.property.view/gallery-asset-property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view columns settings",
+      "block/order": "b0s",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View columns settings",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1675-5105-5500-000000000000",
+      "db/ident": "logseq.property.table/sized-columns"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "included references",
+      "block/order": "as",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Included references",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1680-5777-0300-000000000000",
+      "db/ident": "logseq.property.linked-references/includes"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "deadline",
+      "block/order": "b0C",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Deadline",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1685-9016-0400-000000000000",
+      "db/ident": "logseq.property/deadline"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view filters",
+      "block/order": "b0p",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View filters",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1702-3936-3300-000000000000",
+      "db/ident": "logseq.property.table/filters"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "template",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Template",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1720-8548-4600-000000000000",
+      "db/ident": "logseq.class/Template"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6747-9388-7000-000000000000",
+          "db/ident": "logseq.property.pdf/hl-color"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "aj",
+      "block/page": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/title": "yellow",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1752-1030-0200-000000000000",
+      "db/ident": "logseq.property/color.yellow"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "agent session id",
+      "block/order": "b1Q",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Agent Session ID",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1783-0312-6200-000000000000",
+      "db/ident": "logseq.property.agent/session-id"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "gallery display properties",
+      "block/order": "b0i",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Gallery display properties",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1806-7066-8800-000000000000",
+      "db/ident": "logseq.property.view/gallery-display-properties"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "tags",
+      "block/order": "aA",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Tags",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1814-9483-4000-000000000000",
+      "db/ident": "block/tags"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-9072-1685-3000-000000000000",
+          "db/ident": "logseq.property/status"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b05",
+      "block/page": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/title": "Done",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1827-5820-8200-000000000000",
+      "db/ident": "logseq.property/status.done"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2392-2841-1000-000000000000",
+          "db/ident": "logseq.property/priority"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b09",
+      "block/page": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/title": "Medium",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1829-3222-7800-000000000000",
+      "db/ident": "logseq.property/priority.medium"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6747-9388-7000-000000000000",
+          "db/ident": "logseq.property.pdf/hl-color"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "am",
+      "block/page": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/title": "blue",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1836-0512-4100-000000000000",
+      "db/ident": "logseq.property/color.blue"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-9072-1685-3000-000000000000",
+          "db/ident": "logseq.property/status"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b03",
+      "block/page": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/title": "Doing",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1840-1229-0800-000000000000",
+      "db/ident": "logseq.property/status.doing"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property public?",
+      "block/order": "a4",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Property public?",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1843-0851-4900-000000000000",
+      "db/ident": "logseq.property/public?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "image width",
+      "block/order": "b0z",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Image width",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1857-8658-3900-000000000000",
+      "db/ident": "logseq.property.asset/width"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "heading",
+      "block/order": "ae",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Heading",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1858-7494-1500-000000000000",
+      "db/ident": "logseq.property/heading"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "repeating checked property",
+      "block/order": "b0V",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Repeating Checked Property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1866-3655-5300-000000000000",
+      "db/ident": "logseq.property.repeat/checked-property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property position",
+      "block/order": "a6",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Property position",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1869-2008-6400-000000000000",
+      "db/ident": "logseq.property/ui-position"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-9072-1685-3000-000000000000",
+          "db/ident": "logseq.property/status"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b04",
+      "block/page": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/title": "In Review",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1870-0014-4300-000000000000",
+      "db/ident": "logseq.property/status.in-review"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node links to",
+      "block/order": "aG",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node links to",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1872-3999-9300-000000000000",
+      "db/ident": "block/link"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node repeats?",
+      "block/order": "b0P",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node Repeats?",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1908-1217-8900-000000000000",
+      "db/ident": "logseq.property.repeat/repeated?"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2182-3760-7000-000000000000",
+          "db/ident": "logseq.property.view/type"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0c",
+      "block/page": {
+        "block/uuid": "00000002-2182-3760-7000-000000000000",
+        "db/ident": "logseq.property.view/type"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2182-3760-7000-000000000000",
+        "db/ident": "logseq.property.view/type"
+      },
+      "block/title": "Table View",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1942-5424-0000-000000000000",
+      "db/ident": "logseq.property.view/type.table"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "journal",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Journal",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1979-7410-8100-000000000000",
+      "db/ident": "logseq.class/Journal"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "repeating type",
+      "block/order": "b0Q",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Repeating type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1984-2972-8100-000000000000",
+      "db/ident": "logseq.property.repeat/repeat-type"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6747-9388-7000-000000000000",
+          "db/ident": "logseq.property.pdf/hl-color"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "al",
+      "block/page": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/title": "green",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1992-2016-2600-000000000000",
+      "db/ident": "logseq.property/color.green"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2392-2841-1000-000000000000",
+          "db/ident": "logseq.property/priority"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0B",
+      "block/page": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/title": "Urgent",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1996-4346-6700-000000000000",
+      "db/ident": "logseq.property/priority.urgent"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "deleted by",
+      "block/order": "b1K",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Deleted by",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-1998-0431-1200-000000000000",
+      "db/ident": "logseq.property/deleted-by-ref"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "gallery card size",
+      "block/order": "b0j",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Gallery card size",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2012-8168-3300-000000000000",
+      "db/ident": "logseq.property.view/gallery-card-size"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "math",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Math",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2038-9631-2100-000000000000",
+      "db/ident": "logseq.class/Math-block"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "published url",
+      "block/order": "b0Z",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Published URL",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2045-1825-0100-000000000000",
+      "db/ident": "logseq.property.publish/published-url"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "hide empty value",
+      "block/order": "aX",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Hide empty value",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2062-3258-9900-000000000000",
+      "db/ident": "logseq.property/hide-empty-value"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6903-0624-7000-000000000000",
+          "db/ident": "logseq.property.repeat/recur-unit"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0N",
+      "block/page": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/title": "Month",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2073-3937-9700-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit.month"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view sorting",
+      "block/order": "b0o",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View sorting",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2081-0259-4000-000000000000",
+      "db/ident": "logseq.property.table/sorting"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2392-2841-1000-000000000000",
+          "db/ident": "logseq.property/priority"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b08",
+      "block/page": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/title": "Low",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2107-4537-4800-000000000000",
+      "db/ident": "logseq.property/priority.low"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "last visit page",
+      "block/order": "b12",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Last visit page",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2107-8035-3500-000000000000",
+      "db/ident": "logseq.property.asset/last-visit-page"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "alias",
+      "block/order": "a9",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Alias",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2112-6446-9900-000000000000",
+      "db/ident": "block/alias"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "tag properties",
+      "block/order": "aT",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Tag Properties",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2123-7120-5000-000000000000",
+      "db/ident": "logseq.property.class/properties"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6903-0624-7000-000000000000",
+          "db/ident": "logseq.property.repeat/recur-unit"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0M",
+      "block/page": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/title": "Week",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2130-9244-4900-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit.week"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "page tags",
+      "block/order": "ab",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Page Tags",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2133-5311-8500-000000000000",
+      "db/ident": "logseq.property/page-tags"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node collapsed?",
+      "block/order": "aD",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node collapsed?",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2140-2109-9100-000000000000",
+      "db/ident": "block/collapsed?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "commented blocks",
+      "block/order": "au",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Commented blocks",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2143-9561-0900-000000000000",
+      "db/ident": "logseq.property.comments/blocks"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view type",
+      "block/order": "b0b",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View Type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2182-3760-7000-000000000000",
+      "db/ident": "logseq.property.view/type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "assignee",
+      "block/order": "b0W",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Assignee",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2190-1503-4000-000000000000",
+      "db/ident": "logseq.property/assignee"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "query",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Query",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2324-8016-6000-000000000000",
+      "db/ident": "logseq.class/Query"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "priority",
+      "block/order": "b07",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Priority",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2392-2841-1000-000000000000",
+      "db/ident": "logseq.property/priority"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "history scalar value",
+      "block/order": "b1H",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "History scalar value",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2393-3777-5000-000000000000",
+      "db/ident": "logseq.property.history/scalar-value"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "excluded references",
+      "block/order": "at",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Excluded references",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2426-7588-9000-000000000000",
+      "db/ident": "logseq.property.linked-references/excludes"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "comments",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Comments",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2556-9161-5000-000000000000",
+      "db/ident": "logseq.class/Comments"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "hide from node",
+      "block/order": "aZ",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Hide from Node",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2610-3727-0000-000000000000",
+      "db/ident": "logseq.property.class/hide-from-node"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "table view pinned columns",
+      "block/order": "b0t",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Table view pinned columns",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2673-7513-8000-000000000000",
+      "db/ident": "logseq.property.table/pinned-columns"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "root tag",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Root Tag",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2737-8382-7000-000000000000",
+      "db/ident": "logseq.class/Root"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "enable bidirectional properties",
+      "block/order": "aV",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Enable bidirectional properties",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-2917-8613-8000-000000000000",
+      "db/ident": "logseq.property.class/enable-bidirectional?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "properties displayed as checkbox",
+      "block/order": "az",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Properties displayed as checkbox",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3215-3256-9000-000000000000",
+      "db/ident": "logseq.property/checkbox-display-properties"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "ls-type",
+      "block/order": "ag",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "ls-type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3269-7934-5000-000000000000",
+      "db/ident": "logseq.property/ls-type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "image height",
+      "block/order": "b10",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Image height",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3306-1650-4000-000000000000",
+      "db/ident": "logseq.property.asset/height"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "description",
+      "block/order": "aN",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Description",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3362-3620-0000-000000000000",
+      "db/ident": "logseq.property/description"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "this view belongs to",
+      "block/order": "b0u",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "This view belongs to",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3627-4319-0000-000000000000",
+      "db/ident": "logseq.property/view-for"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6903-0624-7000-000000000000",
+          "db/ident": "logseq.property.repeat/recur-unit"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0L",
+      "block/page": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6903-0624-7000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-unit"
+      },
+      "block/title": "Day",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3924-1785-8000-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit.day"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "external file name",
+      "block/order": "b0x",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "External file name",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-3995-2972-0000-000000000000",
+      "db/ident": "logseq.property.asset/external-file-name"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-6747-9388-7000-000000000000",
+          "db/ident": "logseq.property.pdf/hl-color"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "ak",
+      "block/page": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-6747-9388-7000-000000000000",
+        "db/ident": "logseq.property.pdf/hl-color"
+      },
+      "block/title": "red",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4136-2216-2000-000000000000",
+      "db/ident": "logseq.property/color.red"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "user avatar",
+      "block/order": "b1B",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "User Avatar",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4165-4885-8000-000000000000",
+      "db/ident": "logseq.property.user/avatar"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "apply template to tags",
+      "block/order": "b1T",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Apply template to tags",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4291-2432-2000-000000000000",
+      "db/ident": "logseq.property/template-applied-to"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "gallery card height",
+      "block/order": "b0l",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Gallery card height",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4342-2083-2000-000000000000",
+      "db/ident": "logseq.property.view/gallery-card-height"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node display type",
+      "block/order": "aM",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node Display Type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4424-4618-9000-000000000000",
+      "db/ident": "logseq.property.node/display-type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "excluded from graph view?",
+      "block/order": "b0a",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Excluded from Graph view?",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4524-3306-5000-000000000000",
+      "db/ident": "logseq.property/exclude-from-graph-view"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "recycle original parent",
+      "block/order": "b1L",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Recycle original parent",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-4970-0399-4000-000000000000",
+      "db/ident": "logseq.property.recycle/original-parent"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "pdf annotation",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "PDF Annotation",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5049-5962-0000-000000000000",
+      "db/ident": "logseq.class/Pdf-annotation"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "history value",
+      "block/order": "b1G",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "History value",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5131-3603-7000-000000000000",
+      "db/ident": "logseq.property.history/ref-value"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "background color",
+      "block/order": "ad",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Background color",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5191-2660-6000-000000000000",
+      "db/ident": "logseq.property/background-color"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "tag",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Tag",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5389-0208-3000-000000000000",
+      "db/ident": "logseq.class/Tag"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "annotation data",
+      "block/order": "aq",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Annotation data",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5458-2940-2000-000000000000",
+      "db/ident": "logseq.property.pdf/hl-value"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-2392-2841-1000-000000000000",
+          "db/ident": "logseq.property/priority"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0A",
+      "block/page": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2392-2841-1000-000000000000",
+        "db/ident": "logseq.property/priority"
+      },
+      "block/title": "High",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5672-2766-8000-000000000000",
+      "db/ident": "logseq.property/priority.high"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "icon",
+      "block/order": "b0X",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Icon",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-5891-2328-5000-000000000000",
+      "db/ident": "logseq.property/icon"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "bidirectional property title",
+      "block/order": "aU",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Bidirectional property title",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6050-5418-7000-000000000000",
+      "db/ident": "logseq.property.class/bidirectional-property-title"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "list type",
+      "block/order": "ar",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "List type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6078-1711-1000-000000000000",
+      "db/ident": "logseq.property/order-list-type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view sort groups by",
+      "block/order": "b0m",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View sort groups by",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6253-4002-1000-000000000000",
+      "db/ident": "logseq.property.view/sort-groups-by-property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "annotation color",
+      "block/order": "ai",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Annotation color",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6747-9388-7000-000000000000",
+      "db/ident": "logseq.property.pdf/hl-color"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "hide this property or page",
+      "block/order": "a2",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Hide this property or page",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6836-5746-0000-000000000000",
+      "db/ident": "logseq.property/hide?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "deleted at",
+      "block/order": "b1J",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Deleted at",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6852-1375-1000-000000000000",
+      "db/ident": "logseq.property/deleted-at"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "repeating recur unit",
+      "block/order": "b0I",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Repeating recur unit",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-6903-0624-7000-000000000000",
+      "db/ident": "logseq.property.repeat/recur-unit"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node title",
+      "block/order": "aH",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node title",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7104-4568-4000-000000000000",
+      "db/ident": "block/title"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "asset alignment",
+      "block/order": "b16",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Asset alignment",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7135-0412-8000-000000000000",
+      "db/ident": "logseq.property.asset/align"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-9072-1685-3000-000000000000",
+          "db/ident": "logseq.property/status"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b01",
+      "block/page": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/title": "Backlog",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7233-3491-0000-000000000000",
+      "db/ident": "logseq.property/status.backlog"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-1984-2972-8100-000000000000",
+          "db/ident": "logseq.property.repeat/repeat-type"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0T",
+      "block/page": {
+        "block/uuid": "00000002-1984-2972-8100-000000000000",
+        "db/ident": "logseq.property.repeat/repeat-type"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-1984-2972-8100-000000000000",
+        "db/ident": "logseq.property.repeat/repeat-type"
+      },
+      "block/title": "Advance from scheduled, skip to future",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7441-9615-3000-000000000000",
+      "db/ident": "logseq.property.repeat/repeat-type.double-plus"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "extends",
+      "block/order": "aR",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Extends",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7475-9380-3000-000000000000",
+      "db/ident": "logseq.property.class/extends"
+    },
+    {
+      "block/closed-value-property": [
+        {
+          "block/uuid": "00000002-9072-1685-3000-000000000000",
+          "db/ident": "logseq.property/status"
+        }
+      ],
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b06",
+      "block/page": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9072-1685-3000-000000000000",
+        "db/ident": "logseq.property/status"
+      },
+      "block/title": "Canceled",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7526-4326-2000-000000000000",
+      "db/ident": "logseq.property/status.canceled"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "annotation page",
+      "block/order": "ao",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Annotation page",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7532-8459-6000-000000000000",
+      "db/ident": "logseq.property.pdf/hl-page"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "choice classes",
+      "block/order": "ax",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Choice classes",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7629-6621-9000-000000000000",
+      "db/ident": "logseq.property/choice-classes"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "asset",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-5389-0208-3000-000000000000",
+          "db/ident": "logseq.class/Tag"
+        }
+      ],
+      "block/title": "Asset",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-7975-0297-0000-000000000000",
+      "db/ident": "logseq.class/Asset"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "enable property history",
+      "block/order": "b1C",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Enable property history",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8058-5960-2000-000000000000",
+      "db/ident": "logseq.property/enable-history?"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view group by property",
+      "block/order": "b0g",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View group by property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8092-1623-6000-000000000000",
+      "db/ident": "logseq.property.view/group-by-property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node page",
+      "block/order": "aE",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node page",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8223-1410-8000-000000000000",
+      "db/ident": "block/page"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "repeating temporal property",
+      "block/order": "b0U",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Repeating Temporal Property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8346-1078-4000-000000000000",
+      "db/ident": "logseq.property.repeat/temporal-property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property type",
+      "block/order": "a0",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Property type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8384-2404-0000-000000000000",
+      "db/ident": "logseq.property/type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node created by",
+      "block/order": "b1I",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node created by",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8544-3390-8000-000000000000",
+      "db/ident": "logseq.property/created-by-ref"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "code mode",
+      "block/order": "aO",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Code Mode",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8578-9716-5000-000000000000",
+      "db/ident": "logseq.property.code/lang"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "created from property",
+      "block/order": "a3",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Created from property",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8618-9226-7000-000000000000",
+      "db/ident": "logseq.property/created-from-property"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "recycle original order",
+      "block/order": "b1N",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Recycle original order",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8699-2537-0000-000000000000",
+      "db/ident": "logseq.property.recycle/original-order"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "repeating recur frequency",
+      "block/order": "b0G",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Repeating recur frequency",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8716-1592-2000-000000000000",
+      "db/ident": "logseq.property.repeat/recur-frequency"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "asset",
+      "block/order": "af",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Asset",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8768-5679-0000-000000000000",
+      "db/ident": "logseq.property/asset"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "default value",
+      "block/order": "aP",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Default value",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-8920-7966-2000-000000000000",
+      "db/ident": "logseq.property/default-value"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "status",
+      "block/order": "b00",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Status",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9072-1685-3000-000000000000",
+      "db/ident": "logseq.property/status"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "property classes",
+      "block/order": "a7",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Property classes",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9137-5048-6000-000000000000",
+      "db/ident": "logseq.property/classes"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "node parent",
+      "block/order": "aB",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Node parent",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9183-0906-4000-000000000000",
+      "db/ident": "block/parent"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view feature type",
+      "block/order": "b0f",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View Feature Type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9391-4187-1000-000000000000",
+      "db/ident": "logseq.property.view/feature-type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "query",
+      "block/order": "aa",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Query",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9741-4126-0000-000000000000",
+      "db/ident": "logseq.property/query"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "view hidden columns",
+      "block/order": "b0q",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "View hidden columns",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9750-5719-2000-000000000000",
+      "db/ident": "logseq.property.table/hidden-columns"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "used template",
+      "block/order": "b1S",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Used template",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9803-6990-6000-000000000000",
+      "db/ident": "logseq.property/used-template"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "reaction emoji",
+      "block/order": "b1O",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Reaction emoji",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9877-5864-5000-000000000000",
+      "db/ident": "logseq.property.reaction/emoji-id"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "file remote metadata",
+      "block/order": "b13",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "File remote metadata",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9907-5046-9000-000000000000",
+      "db/ident": "logseq.property.asset/remote-metadata"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "annotation type",
+      "block/order": "ah",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1038-7670-4800-000000000000",
+          "db/ident": "logseq.class/Property"
+        }
+      ],
+      "block/title": "Annotation type",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000002-9984-3783-2000-000000000000",
+      "db/ident": "logseq.property.pdf/hl-type"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "$$$favorites",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "$$$favorites",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1018-5888-4100-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "aY",
+      "block/page": {
+        "block/uuid": "00000002-2062-3258-9900-000000000000",
+        "db/ident": "logseq.property/hide-empty-value"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2062-3258-9900-000000000000",
+        "db/ident": "logseq.property/hide-empty-value"
+      },
+      "block/title": "Hides a property's value on any node when empty e.g. when a property appears on a node through a tag.",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1118-8585-8000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b1R",
+      "block/page": {
+        "block/uuid": "00000002-1783-0312-6200-000000000000",
+        "db/ident": "logseq.property.agent/session-id"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-1783-0312-6200-000000000000",
+        "db/ident": "logseq.property.agent/session-id"
+      },
+      "block/title": "Stores the AgentBridge session ID for a routed task.",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1209-4784-1500-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "ac",
+      "block/page": {
+        "block/uuid": "00000002-2133-5311-8500-000000000000",
+        "db/ident": "logseq.property/page-tags"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2133-5311-8500-000000000000",
+        "db/ident": "logseq.property/page-tags"
+      },
+      "block/title": "Provides a way for a page to associate to another page i.e. backward compatible tagging.",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1223-8671-8000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "library",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "Library",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1294-7765-6000-000000000000"
+    },
+    {
+      "block/uuid": "00000004-1335-6485-2300-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0D",
+      "block/page": {
+        "block/uuid": "00000002-1685-9016-0400-000000000000",
+        "db/ident": "logseq.property/deadline"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-1685-9016-0400-000000000000",
+        "db/ident": "logseq.property/deadline"
+      },
+      "block/title": "Use it to finish something at a specific date(time).",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1356-3664-2200-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b1D",
+      "block/page": {
+        "block/uuid": "00000002-8058-5960-2000-000000000000",
+        "db/ident": "logseq.property/enable-history?"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-8058-5960-2000-000000000000",
+        "db/ident": "logseq.property/enable-history?"
+      },
+      "block/title": "Records history anytime a property's value changes on a node.",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1438-1481-0000-000000000000"
+    },
+    {
+      "block/uuid": "00000004-1595-0218-3700-000000000000",
+      "db/ident": "logseq.property/empty-placeholder"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0H",
+      "block/page": {
+        "block/uuid": "00000002-8716-1592-2000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-frequency"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-8716-1592-2000-000000000000",
+        "db/ident": "logseq.property.repeat/recur-frequency"
+      },
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1654-1034-2600-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "contents",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "Contents",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1690-2597-3200-000000000000"
+    },
+    {
+      "block/uuid": "00000004-1713-4660-3800-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "aW",
+      "block/page": {
+        "block/uuid": "00000002-2917-8613-8000-000000000000",
+        "db/ident": "logseq.property.class/enable-bidirectional?"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-2917-8613-8000-000000000000",
+        "db/ident": "logseq.property.class/enable-bidirectional?"
+      },
+      "block/title": "When enabled, this tag will show reverse nodes that link to the current node via properties.",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1830-0481-2500-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "$$$views",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "$$$views",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-1906-3437-5800-000000000000"
+    },
+    {
+      "block/uuid": "00000004-2116-2824-5200-000000000000"
+    },
+    {
+      "block/uuid": "00000004-3919-3813-3000-000000000000"
+    },
+    {
+      "block/uuid": "00000004-4049-4381-0000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "aS",
+      "block/page": {
+        "block/uuid": "00000002-7475-9380-3000-000000000000",
+        "db/ident": "logseq.property.class/extends"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-7475-9380-3000-000000000000",
+        "db/ident": "logseq.property.class/extends"
+      },
+      "block/title": "This enables tags to inherit properties from other tags",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-4485-6574-6000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b14",
+      "block/page": {
+        "block/uuid": "00000002-9907-5046-9000-000000000000",
+        "db/ident": "logseq.property.asset/remote-metadata"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-9907-5046-9000-000000000000",
+        "db/ident": "logseq.property.asset/remote-metadata"
+      },
+      "block/title": "Metadata of asset in remote storage",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-5450-2102-9000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "recycle",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "Recycle",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-7238-1304-3000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "quick add",
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "Quick add",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-7336-8251-3000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/order": "b0F",
+      "block/page": {
+        "block/uuid": "00000002-1644-5209-4300-000000000000",
+        "db/ident": "logseq.property/scheduled"
+      },
+      "block/parent": {
+        "block/uuid": "00000002-1644-5209-4300-000000000000",
+        "db/ident": "logseq.property/scheduled"
+      },
+      "block/title": "Use it to plan something to start at a specific date(time).",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "00000004-9817-6380-0000-000000000000"
+    },
+    {
+      "block/created-at": "$normalizedEpochMs",
+      "block/name": "oracle page",
+      "block/refs": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        },
+        {
+          "block/uuid": "00000002-1814-9483-4000-000000000000",
+          "db/ident": "block/tags"
+        }
+      ],
+      "block/tags": [
+        {
+          "block/uuid": "00000002-1484-3403-2900-000000000000",
+          "db/ident": "logseq.class/Page"
+        }
+      ],
+      "block/title": "Oracle Page",
+      "block/tx-id": "$normalizedTransactionId",
+      "block/updated-at": "$normalizedEpochMs",
+      "block/uuid": "11111111-1111-4111-8111-111111111111"
+    }
+  ]
+}
