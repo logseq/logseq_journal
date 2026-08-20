@@ -67,20 +67,15 @@ val renderer_event_surface : [ `Visible_range ] list
 val empty : today:int -> t
 val begin_request : t -> generation:int64 -> request -> t
 val apply_feed : t -> generation:int64 -> Journal_graph_projection.feed -> t
+
 val apply_timeline_entry_page
   :  t
   -> generation:int64
   -> Journal_graph_projection.timeline_entry_page
   -> t
+
 val apply_detail : t -> generation:int64 -> Journal_graph_projection.detail -> t
 val next_request : t -> request option
-
-val request_for_visible_range
-  :  t
-  -> first_index:int
-  -> last_exclusive:int
-  -> request option
-
 val pending_request : t -> (int64 * request) option
 val expand : t -> parent_id:string -> t
 val collapse : t -> parent_id:string -> t

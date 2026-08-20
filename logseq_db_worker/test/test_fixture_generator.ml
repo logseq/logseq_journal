@@ -61,7 +61,9 @@ let test_runtime_flow_fixture_opens_through_engine () =
       (String.equal
          generated.graph_dir
          (Filename.concat
-            (Filename.concat (Filename.concat generated.support_root "logseq-db-worker") "snapshots")
+            (Filename.concat
+               (Filename.concat generated.support_root "logseq-db-worker")
+               "snapshots")
             (G.Uuid.to_string generated.snapshot_token)))
       "generator returned an unexpected snapshot directory";
     let engine = engine generated in
@@ -71,7 +73,9 @@ let test_runtime_flow_fixture_opens_through_engine () =
          (String.equal info.graph_name "runtime-flow-source")
          "generated graph name changed"
      | _ -> T.fail "generated runtime fixture did not answer Graph_info");
-    T.require (Logseq_db_worker.Engine.close engine = Ok ()) "generated Engine did not close")
+    T.require
+      (Logseq_db_worker.Engine.close engine = Ok ())
+      "generated Engine did not close")
 ;;
 
 let test_failure_fixture_terminalizes_on_real_mutation () =
@@ -101,9 +105,44 @@ let test_failure_fixture_terminalizes_on_real_mutation () =
     (match Logseq_db_worker.Engine.execute engine request with
      | exception Logseq_db_worker.Engine.Fatal_storage_error _ -> ()
      | _ -> T.fail "persistence-failure fixture did not terminalize the Engine");
-    (match Logseq_db_worker.Engine.close engine with
-     | Error _ -> ()
-     | Ok () -> T.fail "terminal fixture Engine close lost its fatal diagnostic"))
+    match Logseq_db_worker.Engine.close engine with
+    | Error _ -> ()
+    | Ok () -> T.fail "terminal fixture Engine close lost its fatal diagnostic")
+;;
+
+let test_pagination_fixture_contains_two_continued_journal_days () =
+  with_temp_directory "logseq-pagination-fixture-" (fun support ->
+    let generated = create support F.Runtime_flow_with_pagination in
+    let engine = engine generated in
+    Fun.protect
+      ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
+      (fun () ->
+         let continued_page day =
+           let page =
+             uuid
+               (Printf.sprintf
+                  "00000001-%04d-%04d-0000-000000000000"
+                  (day / 10_000)
+                  (day mod 10_000))
+           in
+           let request =
+             P.
+               { api_version
+               ; request_id = uuid (Printf.sprintf "99000000-0000-4000-8000-%012x" day)
+               ; command =
+                   Read (Get_children { parent = page; limit = 64; cursor = None })
+               }
+           in
+           match Logseq_db_worker.Engine.execute engine request with
+           | P.Succeeded { success = Children_result result; _ } ->
+             T.require (List.length result.items = 64) "pagination fixture page is short";
+             T.require
+               (Option.is_some result.continuation)
+               "pagination fixture page has no continuation"
+           | _ -> T.fail "pagination fixture journal page did not load"
+         in
+         continued_page 20260805;
+         continued_page 20260804))
 ;;
 
 let test_generator_refuses_to_replace_existing_source () =
@@ -118,6 +157,14 @@ let () =
   T.run
     "fixture-generator"
     [ T.case "runtime fixture opens" test_runtime_flow_fixture_opens_through_engine
-    ; T.case "failure fixture terminalizes" test_failure_fixture_terminalizes_on_real_mutation
-    ; T.case "existing fixture is not replaced" test_generator_refuses_to_replace_existing_source
+    ; T.case
+        "failure fixture terminalizes"
+        test_failure_fixture_terminalizes_on_real_mutation
+    ; T.case
+        "pagination fixture has continued days"
+        test_pagination_fixture_contains_two_continued_journal_days
+    ; T.case
+        "existing fixture is not replaced"
+        test_generator_refuses_to_replace_existing_source
     ]
+;;

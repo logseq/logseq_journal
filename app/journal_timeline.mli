@@ -16,7 +16,6 @@ val view
   -> reduced_motion:bool
   -> safe_bottom:float
   -> on_visible_range:Ui.Event.Handler.t
-  -> on_task_toggle:Ui.Event.Handler.t
   -> on_toggle_children:Ui.Event.Handler.t
   -> delete_enabled:bool
   -> on_delete:Ui.Event.Handler.t

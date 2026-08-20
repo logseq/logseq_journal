@@ -6,6 +6,7 @@ module Item : sig
   val corrupt : id:string -> source:string option -> t
   val source_for_detail : t -> string option
   val semantic_label : t -> string
+  val visible_line_count : t -> expanded:bool -> int
 end
 
 val view
@@ -19,6 +20,5 @@ val view
   -> show_divider:bool
   -> sort_base:float
   -> reduced_motion:bool
-  -> on_task_toggle:Bonsai_flutter_ui.Event.Handler.t
   -> on_toggle_children:Bonsai_flutter_ui.Event.Handler.t
   -> Bonsai_flutter_ui.Widget.t

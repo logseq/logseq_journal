@@ -53,7 +53,7 @@ let block
       ?parent_id
       ?(order = "000000000001")
       ?(source = "Journal entry")
-      ?(task_state = Journal_model.Not_a_task)
+      ?(task_state = Journal_model.No_status)
       ?(child_count = 0)
       ?(revision = 1)
       index
@@ -95,7 +95,7 @@ let feed ?(more = false) days : Journal_graph_projection.feed =
 let continuation_of_entries ~more entries =
   if not more
   then None
-  else
+  else (
     match List.rev entries with
     | [] -> fail "a continued day fixture must contain at least one entry"
     | (entry : Journal_graph_projection.timeline_entry) :: _ ->
@@ -104,7 +104,7 @@ let continuation_of_entries ~more entries =
             Journal_model.sibling_order entry.block
         ; after_block_id = Journal_model.id entry.block
         ; protocol_cursor = None
-        }
+        })
 ;;
 
 let day_feed ?(more = false) day title blocks : Journal_graph_projection.day_feed =
@@ -116,7 +116,8 @@ let day_feed ?(more = false) day title blocks : Journal_graph_projection.day_fee
   }
 ;;
 
-let day_feed_entries ?(more = false) day title entries : Journal_graph_projection.day_feed =
+let day_feed_entries ?(more = false) day title entries : Journal_graph_projection.day_feed
+  =
   { page = page day title
   ; entries
   ; has_more_entries = more
@@ -124,7 +125,9 @@ let day_feed_entries ?(more = false) day title entries : Journal_graph_projectio
   }
 ;;
 
-let timeline_page ?(continuation = None) blocks : Journal_graph_projection.timeline_entry_page =
+let timeline_page ?(continuation = None) blocks
+  : Journal_graph_projection.timeline_entry_page
+  =
   { entries = List.map (fun block -> entry block) blocks; continuation }
 ;;
 
@@ -180,6 +183,260 @@ let test_projection_order_today_suppression_and_continuations () =
     "Today must not render a duplicate day heading"
 ;;
 
+let require_day_request request ~day label =
+  match request with
+  | Some (Timeline.Day candidate) ->
+    require
+      (candidate.day = day)
+      "%s targeted day %d instead of %d"
+      label
+      candidate.day
+      day;
+    Timeline.Day candidate
+  | Some (Timeline.Feed _ | Timeline.Children _) | None ->
+    fail "%s did not produce a day request" label
+;;
+
+let test_visible_range_demand_drains_in_order_without_another_event () =
+  let today_first = block ~source:"Today first" 6 in
+  let older_first = block ~day:20260808 ~source:"Older first" 7 in
+  let observed =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed ~more:true 20260809 "Today" [ today_first ]
+            ; day_feed ~more:true 20260808 "Older" [ older_first ]
+            ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:6
+  in
+  let first_request =
+    require_day_request
+      (Timeline.next_request observed)
+      ~day:20260809
+      "initial visible demand"
+  in
+  let today_page =
+    [ block ~order:"b" ~source:"Today second" 8
+    ; block ~order:"c" ~source:"Today third" 9
+    ; block ~order:"d" ~source:"Today fourth" 15
+    ]
+  in
+  let after_first =
+    Timeline.begin_request observed ~generation:2L first_request
+    |> fun state ->
+    Timeline.apply_timeline_entry_page state ~generation:2L (timeline_page today_page)
+  in
+  let second_request =
+    require_day_request
+      (Timeline.next_request after_first)
+      ~day:20260808
+      "remaining visible demand"
+  in
+  let settled =
+    Timeline.begin_request after_first ~generation:3L second_request
+    |> fun state ->
+    Timeline.apply_timeline_entry_page
+      state
+      ~generation:3L
+      (timeline_page [ block ~day:20260808 ~order:"b" ~source:"Older second" 16 ])
+  in
+  require
+    (Timeline.next_request settled = None)
+    "completed visible demand required another range event"
+;;
+
+let test_visible_range_demand_stops_on_stale_or_nonadvancing_page () =
+  let first = block ~source:"Cursor guard first" 17 in
+  let observed =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:10L
+         ~before_day:None
+         (feed [ day_feed ~more:true 20260809 "Today" [ first ] ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:2
+  in
+  let request =
+    require_day_request
+      (Timeline.next_request observed)
+      ~day:20260809
+      "cursor guard demand"
+  in
+  let waiting = Timeline.begin_request observed ~generation:11L request in
+  let stale =
+    Timeline.apply_timeline_entry_page
+      waiting
+      ~generation:9L
+      (timeline_page [ block ~order:"b" ~source:"Stale" 18 ])
+  in
+  require
+    (Timeline.next_request stale = None)
+    "a stale page response scheduled follow-up demand";
+  let repeated_cursor =
+    match request with
+    | Timeline.Day { after; _ } -> after
+    | Feed _ | Children _ -> assert false
+  in
+  let nonadvancing =
+    Timeline.apply_timeline_entry_page
+      waiting
+      ~generation:11L
+      (timeline_page ~continuation:repeated_cursor [])
+  in
+  require
+    (Timeline.next_request nonadvancing = None)
+    "a non-advancing page cursor created an automatic request loop"
+;;
+
+let require_child_request request ~parent_id label =
+  match request with
+  | Some (Timeline.Children candidate as request) ->
+    require
+      (String.equal candidate.parent_id parent_id)
+      "%s targeted parent %s instead of %s"
+      label
+      candidate.parent_id
+      parent_id;
+    request
+  | Some (Timeline.Day _ | Timeline.Feed _) | None ->
+    fail "%s did not produce a child request" label
+;;
+
+let test_pending_day_completion_prioritizes_new_child_demand () =
+  let parent = block ~source:"Queued child parent" ~child_count:1 30 in
+  let older = block ~day:20260808 ~source:"Older continued row" 31 in
+  let observed =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed ~more:true 20260809 "Today" [ parent ]
+            ; day_feed ~more:true 20260808 "Older" [ older ]
+            ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:6
+  in
+  let day_request =
+    require_day_request
+      (Timeline.next_request observed)
+      ~day:20260809
+      "pending day fixture"
+  in
+  let expanded =
+    Timeline.begin_request observed ~generation:2L day_request
+    |> fun state -> Timeline.expand state ~parent_id:(Journal_model.id parent)
+  in
+  require
+    (Timeline.next_request expanded = None)
+    "child demand started in parallel with the pending day request";
+  require
+    (List.length
+       (List.filter
+          (function
+            | Timeline.Children_loading _ -> true
+            | _ -> false)
+          (Timeline.retained_slots expanded))
+     = 1)
+    "expansion did not retain exactly one child loading slot";
+  let after_day =
+    Timeline.apply_timeline_entry_page
+      expanded
+      ~generation:2L
+      (timeline_page [ block ~order:"b" ~source:"Today continuation" 32 ])
+  in
+  let child_request =
+    require_child_request
+      (Timeline.next_request after_day)
+      ~parent_id:(Journal_model.id parent)
+      "accepted day completion"
+  in
+  let child =
+    block ~parent_id:(Journal_model.id parent) ~source:"Persisted queued child" 33
+  in
+  let after_child =
+    Timeline.begin_request after_day ~generation:3L child_request
+    |> fun state ->
+    Timeline.apply_detail
+      state
+      ~generation:3L
+      { Journal_graph_projection.root = parent
+      ; children = { blocks = [ child ]; continuation = None }
+      }
+  in
+  ignore
+    (require_day_request
+       (Timeline.next_request after_child)
+       ~day:20260808
+       "page demand after child completion")
+;;
+
+let test_pending_feed_completion_prioritizes_new_child_demand () =
+  let parent = block ~source:"Feed queued child parent" ~child_count:1 34 in
+  let observed =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:10L
+         ~before_day:None
+         (feed ~more:true [ day_feed 20260809 "Today" [ parent ] ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:3
+  in
+  let feed_request =
+    match Timeline.next_request observed with
+    | Some (Timeline.Feed _ as request) -> request
+    | Some (Timeline.Day _ | Timeline.Children _) | None ->
+      fail "pending feed fixture did not produce a feed request"
+  in
+  let expanded =
+    Timeline.begin_request observed ~generation:11L feed_request
+    |> fun state -> Timeline.expand state ~parent_id:(Journal_model.id parent)
+  in
+  let after_feed =
+    Timeline.apply_feed
+      expanded
+      ~generation:11L
+      (feed [ day_feed 20260808 "Older" [ block ~day:20260808 35 ] ])
+  in
+  ignore
+    (require_child_request
+       (Timeline.next_request after_feed)
+       ~parent_id:(Journal_model.id parent)
+       "accepted feed completion")
+;;
+
+let test_collapsed_queued_child_is_not_eligible_after_page_completion () =
+  let parent = block ~source:"Cancelled queued child parent" ~child_count:1 36 in
+  let observed =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:20L
+         ~before_day:None
+         (feed [ day_feed ~more:true 20260809 "Today" [ parent ] ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:3
+  in
+  let page_request =
+    require_day_request
+      (Timeline.next_request observed)
+      ~day:20260809
+      "cancelled child fixture"
+  in
+  let collapsed =
+    Timeline.begin_request observed ~generation:21L page_request
+    |> fun state ->
+    Timeline.expand state ~parent_id:(Journal_model.id parent)
+    |> fun state -> Timeline.collapse state ~parent_id:(Journal_model.id parent)
+  in
+  let settled =
+    Timeline.apply_timeline_entry_page
+      collapsed
+      ~generation:21L
+      (timeline_page [ block ~order:"b" ~source:"Completed page" 37 ])
+  in
+  require
+    (Timeline.next_request settled = None)
+    "collapsed child loading slot remained eligible after page completion"
+;;
+
 let test_direct_children_insert_after_parent_and_collapse () =
   let parent = block ~source:"Parent line one\nParent line two" ~child_count:3 10 in
   let sibling = block ~order:"b" ~source:"Sibling" 11 in
@@ -194,11 +451,11 @@ let test_direct_children_insert_after_parent_and_collapse () =
   let child_request =
     match Timeline.next_request expanded with
     | Some (Timeline.Children { parent_id; epoch } as request) ->
-     require
-       (String.equal parent_id (Journal_model.id parent))
-       "child request targeted the wrong parent";
-     require (Int64.compare epoch 0L > 0) "child request omitted its expansion epoch";
-     request
+      require
+        (String.equal parent_id (Journal_model.id parent))
+        "child request targeted the wrong parent";
+      require (Int64.compare epoch 0L > 0) "child request omitted its expansion epoch";
+      request
     | _ -> fail "expansion did not expose a bounded child request"
   in
   let child_b =
@@ -223,12 +480,7 @@ let test_direct_children_insert_after_parent_and_collapse () =
         }
     }
   in
-  let loaded =
-    Timeline.begin_request
-      expanded
-      ~generation:2L
-      child_request
-  in
+  let loaded = Timeline.begin_request expanded ~generation:2L child_request in
   let loaded = Timeline.apply_detail loaded ~generation:2L detail in
   require_equal_string_list
     (slot_keys loaded)
@@ -249,20 +501,12 @@ let test_direct_children_insert_after_parent_and_collapse () =
      :: Timeline.Children_more _
      :: _ -> ()
    | _ -> fail "explicit top-level and child-preview roles changed");
-  let require_role_extents ~width ~scale ~expected_parent ~expected_child =
+  let require_role_extents ~width ~scale ~expected_parent =
     let profile =
       Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
     in
     let geometry = Timeline.extent_geometry loaded ~profile ~safe_bottom:0. in
-    let expected =
-      [ 0, expected_parent
-      ; 1, expected_child
-      ; 2, expected_child
-      ; 3, expected_child
-      ; 4, expected_child
-      ; 6, 68.
-      ]
-    in
+    let expected = [ 0, expected_parent; 6, 68. ] in
     List.iter
       (fun (index, extent) ->
          require
@@ -275,16 +519,8 @@ let test_direct_children_insert_after_parent_and_collapse () =
            extent)
       expected
   in
-  require_role_extents
-    ~width:390.
-    ~scale:1.
-    ~expected_parent:56.
-    ~expected_child:36.;
-  require_role_extents
-    ~width:320.
-    ~scale:3.2
-    ~expected_parent:144.
-    ~expected_child:80.;
+  require_role_extents ~width:390. ~scale:1. ~expected_parent:56.;
+  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:144.;
   let collapsed = Timeline.collapse loaded ~parent_id:(Journal_model.id parent) in
   require_equal_string_list
     (slot_keys collapsed)
@@ -334,16 +570,18 @@ let test_collapsed_child_response_releases_the_matching_request () =
   let retry_request =
     match Timeline.next_request retry with
     | Some (Timeline.Children { parent_id; epoch } as retry_request) ->
-     require
-       (String.equal parent_id (Journal_model.id parent))
-       "re-expansion retried the wrong parent";
-     let old_epoch =
-       match request with Timeline.Children { epoch; _ } -> epoch | _ -> assert false
-     in
-     require
-       (Int64.compare epoch old_epoch > 0)
-       "re-expansion reused the stale child epoch";
-     retry_request
+      require
+        (String.equal parent_id (Journal_model.id parent))
+        "re-expansion retried the wrong parent";
+      let old_epoch =
+        match request with
+        | Timeline.Children { epoch; _ } -> epoch
+        | _ -> assert false
+      in
+      require
+        (Int64.compare epoch old_epoch > 0)
+        "re-expansion reused the stale child epoch";
+      retry_request
     | _ -> fail "re-expansion did not retry after the collapsed request completed"
   in
   let newer = Timeline.begin_request retry ~generation:4L retry_request in
@@ -436,6 +674,7 @@ let test_stale_generations_and_page_append () =
          ~generation:10L
          ~before_day:None
          (feed [ day_feed ~more:true 20260809 "Today" [ first ] ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:2
   in
   let cursor =
     match Timeline.next_request base with
@@ -449,19 +688,13 @@ let test_stale_generations_and_page_append () =
       (Timeline.Day { day = 20260809; after = Some cursor })
   in
   let stale =
-    Timeline.apply_timeline_entry_page
-      waiting
-      ~generation:9L
-      (timeline_page [ second ])
+    Timeline.apply_timeline_entry_page waiting ~generation:9L (timeline_page [ second ])
   in
   require
     (slot_keys stale = slot_keys waiting)
     "stale page response mutated timeline state";
   let appended =
-    Timeline.apply_timeline_entry_page
-      waiting
-      ~generation:11L
-      (timeline_page [ second ])
+    Timeline.apply_timeline_entry_page waiting ~generation:11L (timeline_page [ second ])
   in
   require_equal_string_list
     (slot_keys appended)
@@ -486,8 +719,7 @@ let test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id () =
     |> begin_and_apply_feed
          ~generation:1L
          ~before_day:None
-         (feed
-            [ day_feed_entries 20260809 "Today" [ initial_entry ] ])
+         (feed [ day_feed_entries 20260809 "Today" [ initial_entry ] ])
   in
   let refreshed_summary : Journal_graph_projection.child_summary =
     { block_id = id "block" 24; source = "Promoted summary" }
@@ -526,7 +758,8 @@ let test_ten_thousand_record_rolling_projection_is_bounded () =
        |> begin_and_apply_feed
             ~generation:1L
             ~before_day:None
-            (feed ~more:false [ day_feed ~more:true 20260809 "Today" initial_blocks ]))
+            (feed ~more:false [ day_feed ~more:true 20260809 "Today" initial_blocks ])
+       |> Timeline.observe_visible_range ~first_index:63 ~last_exclusive:65)
   in
   let generation = ref 2L in
   let next_index = ref 64 in
@@ -538,7 +771,8 @@ let test_ten_thousand_record_rolling_projection_is_bounded () =
       if !next_index + count < 10_000
       then
         Some
-          { Journal_graph_projection.after_sibling_order = Journal_model.sibling_order last
+          { Journal_graph_projection.after_sibling_order =
+              Journal_model.sibling_order last
           ; after_block_id = Journal_model.id last
           ; protocol_cursor = None
           }
@@ -613,16 +847,16 @@ let test_exact_profile_extents_and_final_clearance () =
          ~before_day:None
          (feed [ day_feed 20260808 "Saturday, August 8" [ older ] ])
   in
-  let check ~width ~scale ~top_level_extent ~day_extent =
+  let check ~width ~scale ~default_extent ~day_extent =
     let profile =
       Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
     in
     let geometry = Timeline.extent_geometry state ~profile ~safe_bottom:34. in
     require
-      (Float.equal geometry.default_extent top_level_extent)
+      (Float.equal geometry.default_extent default_extent)
       "profile default extent %.1f, expected %.1f"
       geometry.default_extent
-      top_level_extent;
+      default_extent;
     require
       (geometry.overrides
        = [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent }
@@ -633,10 +867,73 @@ let test_exact_profile_extents_and_final_clearance () =
       (Float.equal geometry.final_clearance_extent 102.)
       "final row does not clear 48pt FAB, 20pt spacing, and 34pt safe bottom"
   in
-  check ~width:320. ~scale:1. ~top_level_extent:84. ~day_extent:48.;
-  check ~width:390. ~scale:1. ~top_level_extent:76. ~day_extent:36.;
-  check ~width:390. ~scale:2. ~top_level_extent:140. ~day_extent:72.;
-  check ~width:1_200. ~scale:3.2 ~top_level_extent:210. ~day_extent:101.
+  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:48.;
+  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:36.;
+  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:72.;
+  check ~width:1_200. ~scale:3.2 ~default_extent:80. ~day_extent:101.
+;;
+
+let test_block_line_counts_are_the_authoritative_sparse_extents () =
+  let parent = block ~order:"a" ~source:"One" ~child_count:1 600 in
+  let two = block ~order:"b" ~source:"One\nTwo" 601 in
+  let three = block ~order:"c" ~source:"One\nTwo\nThree" 602 in
+  let four = block ~order:"d" ~source:"One\nTwo\nThree\nFour\nFive" 603 in
+  let expanded =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260809 "Today" [ parent; two; three; four ] ])
+    |> fun state -> Timeline.expand state ~parent_id:(Journal_model.id parent)
+  in
+  let child_request =
+    match Timeline.next_request expanded with
+    | Some (Timeline.Children _ as request) -> request
+    | _ -> fail "line extent fixture omitted child request"
+  in
+  let child =
+    block
+      ~parent_id:(Journal_model.id parent)
+      ~source:"Child one\nChild two\nChild three\nChild four\nChild five"
+      604
+  in
+  let state =
+    Timeline.begin_request expanded ~generation:2L child_request
+    |> fun state ->
+    Timeline.apply_detail
+      state
+      ~generation:2L
+      { Journal_graph_projection.root = parent
+      ; children = { blocks = [ child ]; continuation = None }
+      }
+  in
+  let check ~scale expected =
+    let profile =
+      Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:scale
+    in
+    let geometry = Timeline.extent_geometry state ~profile ~safe_bottom:0. in
+    let extent index =
+      match
+        List.find_opt
+          (fun (override : Ui.Widget.Sparse_extent_override.t) -> override.index = index)
+          geometry.overrides
+      with
+      | Some override -> override.extent
+      | None -> geometry.default_extent
+    in
+    List.iter
+      (fun (index, expected_extent) ->
+         require
+           (Float.equal (extent index) expected_extent)
+           "slot %d extent is %.1f, expected %.1f at scale %.1f"
+           index
+           (extent index)
+           expected_extent
+           scale)
+      expected
+  in
+  check ~scale:1. [ 0, 44.; 1, 96.; 2, 56.; 3, 76.; 4, 96.; 5, 68. ];
+  check ~scale:3.2 [ 0, 80.; 1, 272.; 2, 144.; 3, 208.; 4, 272.; 5, 68. ]
 ;;
 
 let test_anchor_decisions_replacements_and_route_return () =
@@ -762,9 +1059,7 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
     | Some (Timeline.Children _ as request) -> request
     | _ -> fail "expanded delete fixture omitted a child request"
   in
-  let waiting =
-    Timeline.begin_request expanded ~generation:2L child_request
-  in
+  let waiting = Timeline.begin_request expanded ~generation:2L child_request in
   let loaded =
     Timeline.apply_detail
       waiting
@@ -891,6 +1186,11 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
 
 let () =
   test_projection_order_today_suppression_and_continuations ();
+  test_visible_range_demand_drains_in_order_without_another_event ();
+  test_visible_range_demand_stops_on_stale_or_nonadvancing_page ();
+  test_pending_day_completion_prioritizes_new_child_demand ();
+  test_pending_feed_completion_prioritizes_new_child_demand ();
+  test_collapsed_queued_child_is_not_eligible_after_page_completion ();
   test_direct_children_insert_after_parent_and_collapse ();
   test_collapsed_child_response_releases_the_matching_request ();
   test_multiple_parent_expansions_drain_without_reusing_epochs ();
@@ -899,6 +1199,7 @@ let () =
   test_ten_thousand_record_rolling_projection_is_bounded ();
   test_fifty_thousand_synthetic_windows_are_bounded ();
   test_exact_profile_extents_and_final_clearance ();
+  test_block_line_counts_are_the_authoritative_sparse_extents ();
   test_anchor_decisions_replacements_and_route_return ();
   test_prepend_first_today_entry_before_older_days ();
   test_no_measurement_or_renderer_extension_surface_exists ();

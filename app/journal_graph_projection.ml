@@ -111,21 +111,16 @@ let page_of_summary (summary : Graph.page_summary) =
   match summary.kind, summary.recycled with
   | Graph.Journal_page { journal_day }, false ->
     Some
-      { id = Graph.Uuid.to_string summary.uuid
-      ; day = journal_day
-      ; title = summary.title
-      }
-  | ( Ordinary_page
-    | Class_page
-    | Property_page
-    | Hidden_page
-    | Built_in_page
-    | Journal_page _ ), true
-  | ( Ordinary_page
-    | Class_page
-    | Property_page
-    | Hidden_page
-    | Built_in_page ), false -> None
+      { id = Graph.Uuid.to_string summary.uuid; day = journal_day; title = summary.title }
+  | ( ( Ordinary_page
+      | Class_page
+      | Property_page
+      | Hidden_page
+      | Built_in_page
+      | Journal_page _ )
+    , true )
+  | (Ordinary_page | Class_page | Property_page | Hidden_page | Built_in_page), false ->
+    None
 ;;
 
 let task_state (block : Graph.block) =
@@ -161,10 +156,17 @@ let task_state (block : Graph.block) =
         property.values)
   in
   match status_ident with
-  | Some "logseq.property/status.done"
-  | Some "logseq.property/status.canceled" -> Journal_model.Done
-  | Some _ -> Journal_model.Todo
-  | None -> Journal_model.Not_a_task
+  | None -> Ok Journal_model.No_status
+  | Some "logseq.property/status.todo" -> Ok Journal_model.Todo
+  | Some "logseq.property/status.doing" -> Ok Journal_model.Doing
+  | Some "logseq.property/status.in-review" -> Ok Journal_model.In_review
+  | Some "logseq.property/status.now" -> Ok Journal_model.Now
+  | Some "logseq.property/status.done" -> Ok Journal_model.Done
+  | Some "logseq.property/status.canceled" -> Ok Journal_model.Canceled
+  | Some "logseq.property/status.backlog" -> Ok Journal_model.Backlog
+  | Some "logseq.property/status.waiting" -> Ok Journal_model.Waiting
+  | Some "logseq.property/status.later" -> Ok Journal_model.Later
+  | Some ident -> Error ("Unknown Logseq block status: " ^ ident)
 ;;
 
 let creation_time (context : time_context) instant_unix_ms =
@@ -182,16 +184,10 @@ let revision basis =
   else Int64.to_int basis
 ;;
 
-let block
-      ~page
-      ~basis
-      ~child_count
-      ~time_context
-      (value : Graph.block)
-  =
-  match creation_time time_context value.created_at_ms with
-  | Error _ as error -> error
-  | Ok creation_time ->
+let block ~page ~basis ~child_count ~time_context (value : Graph.block) =
+  match creation_time time_context value.created_at_ms, task_state value with
+  | (Error _ as error), _ | _, (Error _ as error) -> error
+  | Ok creation_time, Ok task_state ->
     let parent = Graph.Uuid.to_string value.parent in
     Journal_model.create
       ~id:(Graph.Uuid.to_string value.uuid)
@@ -200,7 +196,7 @@ let block
       ~parent_id:(if String.equal parent page.id then None else Some parent)
       ~sibling_order:value.order
       ~source:value.title
-      ~task_state:(task_state value)
+      ~task_state
       ~child_count
       ~creation_time
       ~revision:(revision basis)
@@ -211,8 +207,7 @@ let children_of (root : Graph.block) items =
   let root_id = Graph.Uuid.to_string root.Graph.uuid in
   List.filter_map
     (fun (item : Graph.block_tree_item) ->
-       if item.depth = 1
-          && String.equal (Graph.Uuid.to_string item.block.parent) root_id
+       if item.depth = 1 && String.equal (Graph.Uuid.to_string item.block.parent) root_id
        then Some item.block
        else None)
     items
@@ -253,12 +248,7 @@ let timeline_entry_page
     | (root : Graph.block) :: rest ->
       let children = children_of root result.items in
       (match
-         block
-           ~page
-           ~basis
-           ~child_count:(List.length children)
-           ~time_context
-           root
+         block ~page ~basis ~child_count:(List.length children) ~time_context root
        with
        | Error _ as error -> error
        | Ok block ->
@@ -273,13 +263,7 @@ let timeline_entry_page
   project [] roots
 ;;
 
-let detail
-      ~page
-      ~basis
-      ~time_context
-      ~root
-      (children : Graph.block Graph.page_result)
-  =
+let detail ~page ~basis ~time_context ~root (children : Graph.block Graph.page_result) =
   let child_count =
     List.length children.items + if Option.is_some children.continuation then 1 else 0
   in
@@ -304,9 +288,7 @@ let detail
               }
           }
       | child :: rest ->
-        (match
-           block ~page ~basis ~child_count:0 ~time_context child
-         with
+        (match block ~page ~basis ~child_count:0 ~time_context child with
          | Error _ as error -> error
          | Ok child -> project (child :: reversed) rest)
     in

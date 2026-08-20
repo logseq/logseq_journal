@@ -11,7 +11,7 @@ build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
   [
     "bonsai_flutter.0.1.0~dev"
-    "git+https://github.com/RCmerci/bonsai_flutter.git#f6d27175632d26e759532f6ee81e8d1383490533"
+    "git+https://github.com/RCmerci/bonsai_flutter.git#a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"
   ]
   [
     "datascript-ocaml-native.dev"

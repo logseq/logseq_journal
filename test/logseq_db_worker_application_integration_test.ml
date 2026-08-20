@@ -62,6 +62,27 @@ let block ~page ~parent ~order value : Graph.block =
   }
 ;;
 
+let status_property ident : Graph.property_summary =
+  { ident = "logseq.property/status"
+  ; uuid = uuid "91000000-0000-4000-b000-000000000001"
+  ; title = "Status"
+  ; schema = { property_type = Default; cardinality = One; hidden = false; public = true }
+  ; values = [ Default_value ident ]
+  ; values_truncated = false
+  }
+;;
+
+let string_contains text fragment =
+  let rec loop index =
+    if index + String.length fragment > String.length text
+    then false
+    else if String.sub text index (String.length fragment) = fragment
+    then true
+    else loop (index + 1)
+  in
+  loop 0
+;;
+
 let seed_fatal_test_block (fixture : Adapter_fixture.t) =
   let engine =
     Logseq_db_worker.Engine.open_
@@ -130,16 +151,13 @@ let seed_startup_feed_days (fixture : Adapter_fixture.t) count =
     match Logseq_db_worker.Engine.execute engine request with
     | Succeeded _ -> ()
     | Failed failure ->
-      fail
-        "startup feed seed failed: %s"
-        (Logseq_db_worker.Error.message failure.error)
+      fail "startup feed seed failed: %s" (Logseq_db_worker.Error.message failure.error)
   in
   let context serial =
     Protocol.
       { mutation_id =
           uuid (Printf.sprintf "97000000-0000-4000-a000-%012d" (serial + 2_000))
-      ; expected_basis =
-          Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
+      ; expected_basis = Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
       }
   in
   List.init count Fun.id
@@ -153,15 +171,19 @@ let seed_startup_feed_days (fixture : Adapter_fixture.t) count =
            (String.sub text 0 4)
            (String.sub text 4 4))
     in
-    let block_uuid =
-      uuid (Printf.sprintf "97000000-0000-4000-b000-%012d" (index + 1))
-    in
+    let block_uuid = uuid (Printf.sprintf "97000000-0000-4000-b000-%012d" (index + 1)) in
     execute
       (index * 2)
       (Page
          (Create_page
-            { title = Printf.sprintf "%04d-%02d-%02d" (day / 10_000) (day / 100 mod 100) (day mod 100)
-            ; kind = Create_journal_page { journal_day = day; supplied_uuid = Some page_uuid }
+            { title =
+                Printf.sprintf
+                  "%04d-%02d-%02d"
+                  (day / 10_000)
+                  (day / 100 mod 100)
+                  (day mod 100)
+            ; kind =
+                Create_journal_page { journal_day = day; supplied_uuid = Some page_uuid }
             ; context = context (index * 2)
             }));
     execute
@@ -311,8 +333,8 @@ let has_text handle value =
 let capture_composer_enabled handle =
   match Test.Handle.find handle (Test.Query.test_id "journal-capture-composer") with
   | Some node ->
-    (let Av view = Ui.Widget.Private.view node.widget in
-     match view.node with
+    let (Av view) = Ui.Widget.Private.view node.widget in
+    (match view.node with
      | Ui.Widget.Private.Native_widget { kind_id; payload; _ }
        when kind_id = Ui.Native_widget.Message_composer.kind_id ->
        (Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload).enabled
@@ -329,10 +351,10 @@ let commit_end_swipe handle block_id =
     | None -> fail "missing swipe wrapper for %s\n%s" block_id (Test.Handle.show handle)
   in
   let kind_id =
-    let Av view = Ui.Widget.Private.view node.widget in
-    (match view.node with
-     | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
-     | _ -> fail "delete wrapper is not a native widget")
+    let (Av view) = Ui.Widget.Private.view node.widget in
+    match view.node with
+    | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
+    | _ -> fail "delete wrapper is not a native widget"
   in
   Test.Handle.native_event
     handle
@@ -417,9 +439,7 @@ let test_initial_graph_info_drives_headless_application () =
       (fun () ->
          wait_for handle "initial graph feed" (fun () ->
            has_text handle "No journal entries yet");
-         require
-           (capture_composer_enabled handle)
-           "Graph_info did not enable capture"))
+         require (capture_composer_enabled handle) "Graph_info did not enable capture"))
 ;;
 
 let test_initial_feed_loads_at_most_seven_days () =
@@ -503,6 +523,58 @@ let test_projection_uses_stable_uuid_and_is_bounded () =
       "projection did not preserve graph basis"
 ;;
 
+let test_projection_preserves_every_known_status_and_rejects_unknown () =
+  let page = page_summary "91000000-0000-4000-8000-000000000002" in
+  let projected_page = Journal_graph_projection.page_of_summary page |> Option.get in
+  let time_context : Journal_graph_projection.time_context =
+    { time_zone_id = "UTC"; utc_offset_seconds = 0 }
+  in
+  let project ident =
+    let graph_block =
+      { (block
+           ~page:page.uuid
+           ~parent:page.uuid
+           ~order:ident
+           "91000000-0000-4000-a000-000000000002")
+        with
+        properties = [ status_property ident ]
+      }
+    in
+    Journal_graph_projection.block
+      ~page:projected_page
+      ~basis:7L
+      ~child_count:0
+      ~time_context
+      graph_block
+  in
+  List.iter
+    (fun (ident, status_name) ->
+       match project ident with
+       | Error message -> fail "known status %s was rejected: %s" ident message
+       | Ok projected ->
+         let semantic_label =
+           Journal_row.Item.of_block projected |> Journal_row.Item.semantic_label
+         in
+         require
+           (string_contains semantic_label ("status " ^ status_name))
+           "projection lost exact status %s in %S"
+           status_name
+           semantic_label)
+    [ "logseq.property/status.todo", "Todo"
+    ; "logseq.property/status.doing", "Doing"
+    ; "logseq.property/status.in-review", "In review"
+    ; "logseq.property/status.now", "Now"
+    ; "logseq.property/status.done", "Done"
+    ; "logseq.property/status.canceled", "Canceled"
+    ; "logseq.property/status.backlog", "Backlog"
+    ; "logseq.property/status.waiting", "Waiting"
+    ; "logseq.property/status.later", "Later"
+    ];
+  match project "logseq.property/status.unexpected" with
+  | Error _ -> ()
+  | Ok _ -> fail "unknown status ident was coerced instead of rejected"
+;;
+
 let test_feed_projection_ignores_blank_logseq_roots () =
   let summary = page_summary "91100000-0000-4000-8000-000000000001" in
   let page = Journal_graph_projection.page_of_summary summary |> Option.get in
@@ -511,7 +583,8 @@ let test_feed_projection_ignores_blank_logseq_roots () =
          ~page:summary.uuid
          ~parent:summary.uuid
          ~order:"a"
-         "91100000-0000-4000-a000-000000000001") with
+         "91100000-0000-4000-a000-000000000001")
+      with
       title = ""
     }
   in
@@ -916,6 +989,83 @@ let test_child_projection_retains_page_for_later_mutation () =
   | _ -> fail "child projection did not retain its page for a later mutation"
 ;;
 
+let test_status_mutation_serializes_the_exact_projected_value () =
+  let runtime = Journal_graph_runtime.create () in
+  let list_request =
+    Journal_graph_runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 1
+         ; blocks_per_day = 64
+         ; slot_limit = 128
+         ; request_generation = 61L
+         })
+    |> fun output -> only output.requests
+  in
+  let page = page_summary "93000000-0000-4000-8000-000000000011" in
+  let tree_request =
+    Journal_graph_runtime.receive
+      runtime
+      (succeeded
+         list_request
+         ~basis:6L
+         (Pages_result { items = [ page ]; continuation = None }))
+    |> fun output -> only output.requests
+  in
+  let root =
+    { (block
+         ~page:page.uuid
+         ~parent:page.uuid
+         ~order:"a"
+         "93000000-0000-4000-a000-000000000011")
+      with
+      properties = [ status_property "logseq.property/status.in-review" ]
+    }
+  in
+  ignore
+    (Journal_graph_runtime.receive
+       runtime
+       (succeeded
+          tree_request
+          ~basis:6L
+          (Page_tree_result
+             { items = [ { Graph.block = root; depth = 0 } ]; continuation = None })));
+  let projected_page = Journal_graph_projection.page_of_summary page |> Option.get in
+  let projected =
+    Journal_graph_projection.block
+      ~page:projected_page
+      ~basis:6L
+      ~child_count:0
+      ~time_context:{ time_zone_id = "UTC"; utc_offset_seconds = 0 }
+      root
+    |> function
+    | Ok projected -> projected
+    | Error message -> fail "status fixture projection failed: %s" message
+  in
+  let output =
+    Journal_graph_runtime.submit
+      runtime
+      (Journal_graph_request.Set_task_state
+         { mutation_id = "93000000-0000-4000-9000-000000000011"
+         ; block_id = Graph.Uuid.to_string root.uuid
+         ; expected_revision = 6
+         ; task_state = Journal_model.task_state projected
+         })
+  in
+  match output.requests with
+  | [ { Protocol.command =
+          Mutate (Property (Set_property { value = Graph.Default_value exact_status; _ }))
+      ; _
+      }
+    ] ->
+    require
+      (String.equal exact_status "In Review")
+      "exact In review status serialized as %S"
+      exact_status
+  | _ -> fail "exact status mutation did not emit Set_property"
+;;
+
 let test_stale_worker_response_cannot_update_runtime () =
   let runtime = Journal_graph_runtime.create () in
   let request = Journal_graph_runtime.start runtime in
@@ -1254,6 +1404,9 @@ let () =
   run "Open_failed UI" test_open_failed_renders_without_crashing_worker_runtime;
   run "fatal storage UI" test_fatal_storage_error_terminalizes_application;
   run "bounded stable projection" test_projection_uses_stable_uuid_and_is_bounded;
+  run
+    "exact status projection"
+    test_projection_preserves_every_known_status_and_rejects_unknown;
   run "blank feed roots" test_feed_projection_ignores_blank_logseq_roots;
   run "filtered feed pagination" test_feed_paginates_until_filtered_day_limit_is_satisfied;
   run
@@ -1266,6 +1419,7 @@ let () =
     "feed rejects oversized page response"
     test_feed_rejects_worker_page_response_above_allocated_limit;
   run "child page retention" test_child_projection_retains_page_for_later_mutation;
+  run "exact status mutation" test_status_mutation_serializes_the_exact_projected_value;
   run "stale response fence" test_stale_worker_response_cannot_update_runtime;
   run
     "transport preserves immediate rejection"

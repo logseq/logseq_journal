@@ -169,19 +169,25 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "f6d27175632d26e759532f6ee81e8d1383490533" in
+  let current_bonsai_flutter_revision = "a6bd9aa9906c0e49f0cc365e5ba33270e89655e6" in
   let obsolete_bonsai_flutter_revisions =
     [ "d5f8d36b5539550cbc2466311acda4d8c609032e"
     ; "a51276a09eb1cdf9c87f07ac4c7558ed7c6b2d69"
     ; "26f5bf6c3b4cdd61ccd5c1660f6cf9f72fe523da"
     ; "066179956545cc12871862879fc906f09519788c"
+    ; "f6d27175632d26e759532f6ee81e8d1383490533"
+    ; "2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"
     ]
   in
   List.iter
-    (fun relative ->
-       require_occurrences root relative current_bonsai_flutter_revision 2;
+    (fun (relative, occurrences) ->
+       require_occurrences root relative current_bonsai_flutter_revision occurrences;
        forbid_text root relative obsolete_bonsai_flutter_revisions)
-    [ "logseq_journal.opam"; "logseq_journal.opam.locked" ];
+    [ "logseq_journal.opam", 2
+    ; "logseq_journal.opam.locked", 2
+    ; "logseq_db_worker.opam", 2
+    ; "logseq_db_worker.opam.locked", 1
+    ];
   List.iter
     (require_file root)
     [ "bonsai-flutter.sexp"
@@ -347,7 +353,6 @@ let () =
     ; "journal-capture-alignment"
     ; "Children_continuation"
     ; "apply_block_page"
-    ; "block_extent"
     ; "divider_inset"
     ; "shadow_size"
     ; "shadow_alpha"
@@ -411,6 +416,7 @@ let () =
     ; "journal-capture-sheet"
     ; "Journal_capture.can_pop"
     ];
+  forbid_text root "app/application.ml" [ "timeline-task:" ];
   require_text
     root
     "app/journal_graph_projection.mli"
@@ -422,7 +428,11 @@ let () =
   require_text
     root
     "app/journal_visual_tokens.mli"
-    [ "type extent_role"; "val extent_for_role"; "type preview_geometry" ];
+    [ "type fixed_extent_role"
+    ; "val block_extent"
+    ; "val fixed_extent"
+    ; "type preview_geometry"
+    ];
   forbid_text
     root
     "logseq_db_worker/lib/engine.ml"

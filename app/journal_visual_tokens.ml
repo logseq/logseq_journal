@@ -10,8 +10,10 @@ type palette =
   ; neutral_badge : Ui.Style.Color.t
   ; fab : Ui.Style.Color.t
   ; on_fab : Ui.Style.Color.t
-  ; success : Ui.Style.Color.t
-  ; on_success : Ui.Style.Color.t
+  ; status_todo : Ui.Style.Color.t
+  ; status_doing : Ui.Style.Color.t
+  ; status_done : Ui.Style.Color.t
+  ; status_later : Ui.Style.Color.t
   ; sheet_surface : Ui.Style.Color.t
   ; sheet_outline : Ui.Style.Color.t
   ; modal_scrim : Ui.Style.Color.t
@@ -78,8 +80,9 @@ type composer_geometry =
 type row_geometry =
   { time_slot_base : float
   ; trailing_inset : float
-  ; task_visual : float
   ; disclosure_visual : float
+  ; status_rail_width : float
+  ; status_rail_radius : float
   }
 
 type preview_geometry =
@@ -111,18 +114,14 @@ type profile_kind =
 
 type row_profile =
   { kind : profile_kind
-  ; top_level_extent : float
-  ; child_extent : float
+  ; block_line_height : float
   ; continuation_extent : float
   ; day_header_extent : float
   ; content_leading : float
   ; time_slot_width : float
   }
 
-
-type extent_role =
-  | Top_level
-  | Child_preview
+type fixed_extent_role =
   | Children_loading
   | Children_more
   | Day_heading
@@ -148,8 +147,10 @@ let light_palette =
   ; neutral_badge = rgb 241 242 245
   ; fab = rgb 24 30 52
   ; on_fab = rgb 252 252 253
-  ; success = rgb 5 142 70
-  ; on_success = rgb 255 255 255
+  ; status_todo = rgb 100 116 139
+  ; status_doing = rgb 37 99 235
+  ; status_done = rgb 5 142 70
+  ; status_later = rgb 124 58 237
   ; sheet_surface = rgb 255 255 255
   ; sheet_outline = rgb 232 233 237
   ; modal_scrim = argb 71 13 20 47
@@ -174,8 +175,10 @@ let light_high_contrast_palette =
   ; neutral_badge = rgb 238 238 238
   ; fab = rgb 0 0 0
   ; on_fab = rgb 255 255 255
-  ; success = rgb 0 107 51
-  ; on_success = rgb 255 255 255
+  ; status_todo = rgb 31 41 55
+  ; status_doing = rgb 0 71 171
+  ; status_done = rgb 0 107 51
+  ; status_later = rgb 91 33 182
   ; sheet_surface = rgb 255 255 255
   ; sheet_outline = rgb 102 102 102
   ; modal_scrim = argb 140 0 0 0
@@ -234,12 +237,7 @@ let typography =
 ;;
 
 let spacing = { x1 = 4.; x2 = 8.; x3 = 12.; x4 = 16.; x5 = 20.; x6 = 24.; x7 = 28. }
-
-let hit_regions =
-  { header_visual = 30.
-  ; minimum_target = 44.
-  }
-;;
+let hit_regions = { header_visual = 30.; minimum_target = 44. }
 
 let header_geometry =
   { content_height = 48.; horizontal_inset = 12.; vertical_inset = 4. }
@@ -256,8 +254,9 @@ let composer_geometry =
 let row_geometry =
   { time_slot_base = 52.
   ; trailing_inset = 24.
-  ; task_visual = 14.
   ; disclosure_visual = 14.
+  ; status_rail_width = 4.
+  ; status_rail_radius = 2.
   }
 ;;
 
@@ -305,45 +304,42 @@ let select_row_profile ~viewport_width ~text_scale =
   if (not narrow) && Float.compare scale 1.3 <= 0
   then
     { kind = Compact
-    ; top_level_extent = Float.ceil (36. +. (40. *. scale))
-    ; child_extent = Float.ceil (16. +. (20. *. scale))
+    ; block_line_height = 20. *. scale
     ; continuation_extent = Float.ceil (28. +. (20. *. scale))
     ; day_header_extent = 36.
     ; content_leading
     ; time_slot_width = row_geometry.time_slot_base
     }
-  else (
-    let top_level_extent =
-      if Float.compare scale 1.3 <= 0
-      then Float.ceil (44. +. (40. *. scale))
-      else Float.ceil (24. +. (58. *. scale))
-    in
+  else
     { kind = Adaptive
-    ; top_level_extent
-    ; child_extent = Float.ceil (16. +. (20. *. scale))
+    ; block_line_height = 20. *. scale
     ; continuation_extent = Float.ceil (28. +. (20. *. scale))
     ; day_header_extent = Float.ceil (24. +. (24. *. scale))
     ; content_leading
     ; time_slot_width = Float.ceil (row_geometry.time_slot_base *. scale)
-    })
+    }
 ;;
 
-let extent_for_role ~profile ~safe_bottom = function
-  | Top_level -> profile.top_level_extent
-  | Child_preview | Children_loading | Children_more -> profile.child_extent
+let block_extent ~profile ~visible_lines =
+  let visible_lines = Int.max 1 (Int.min 4 visible_lines) in
+  Float.ceil
+    (Float.max
+       hit_regions.minimum_target
+       (spacing.x4 +. (float_of_int visible_lines *. profile.block_line_height)))
+;;
+
+let fixed_extent ~profile ~safe_bottom = function
+  | Children_loading | Children_more -> block_extent ~profile ~visible_lines:1
   | Day_heading -> profile.day_header_extent
   | Day_continuation | Feed_continuation -> profile.continuation_extent
   | Bottom_clearance -> composer_geometry.reserved_extent +. max 0. safe_bottom
 ;;
 
-let expanded_parent_extent ~profile ~source =
-  let source_lines =
-    String.fold_left
-      (fun lines character ->
-         if lines < 3 && Char.equal character '\n' then lines + 1 else lines)
-      1
-      source
-  in
-  let additional_line_extent = profile.child_extent -. spacing.x4 in
-  profile.child_extent +. (float_of_int (source_lines - 1) *. additional_line_extent)
+let status_rail_color t status =
+  match Journal_model.status_category status with
+  | None -> None
+  | Some Todo_category -> Some t.palette.status_todo
+  | Some Doing_category -> Some t.palette.status_doing
+  | Some Done_category -> Some t.palette.status_done
+  | Some Later_category -> Some t.palette.status_later
 ;;

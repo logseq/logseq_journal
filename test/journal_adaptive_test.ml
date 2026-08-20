@@ -45,7 +45,10 @@ let test_light_palette_and_interaction_tokens () =
   require_color "divider" 0xffe8e9edl palette.divider;
   require_color "FAB" 0xff181e34l palette.fab;
   require_color "on FAB" 0xfffcfcfdl palette.on_fab;
-  require_color "success" 0xff058e46l palette.success;
+  require_color "status todo" 0xff64748bl palette.status_todo;
+  require_color "status doing" 0xff2563ebl palette.status_doing;
+  require_color "status done" 0xff058e46l palette.status_done;
+  require_color "status later" 0xff7c3aedl palette.status_later;
   let interaction = Tokens.interaction tokens in
   require_color "pressed" 0x1f0d142fl interaction.pressed;
   require_color "focused" 0xff315ef5l interaction.focused;
@@ -60,7 +63,31 @@ let test_light_high_contrast_palette_is_explicit () =
   require_color "light HC secondary" 0xff313131l light_high.text_secondary;
   require_color "light HC timestamp" 0xff313131l light_high.text_timestamp;
   require_color "light HC divider" 0xff666666l light_high.divider;
-  require_color "light HC success" 0xff006b33l light_high.success
+  require_color "light HC status todo" 0xff1f2937l light_high.status_todo;
+  require_color "light HC status doing" 0xff0047abl light_high.status_doing;
+  require_color "light HC status done" 0xff006b33l light_high.status_done;
+  require_color "light HC status later" 0xff5b21b6l light_high.status_later
+;;
+
+let test_every_exact_status_maps_to_the_decided_rail_category () =
+  let open Journal_model in
+  List.iter
+    (fun (status, expected) ->
+       require
+         (status_category status = expected)
+         "exact status %s maps to the wrong rail category"
+         (status_name status))
+    [ No_status, None
+    ; Todo, Some Todo_category
+    ; Doing, Some Doing_category
+    ; In_review, Some Doing_category
+    ; Now, Some Doing_category
+    ; Done, Some Done_category
+    ; Canceled, Some Done_category
+    ; Backlog, Some Later_category
+    ; Waiting, Some Later_category
+    ; Later, Some Later_category
+    ]
 ;;
 
 let test_timestamp_contrast_meets_small_text_target () =
@@ -171,14 +198,14 @@ let test_typography_spacing_motion_and_hit_regions () =
     "spacing grid changed";
   let hit = Tokens.hit_regions in
   require
-    (hit.header_visual = 30.
-     && hit.minimum_target = 44.)
+    (hit.header_visual = 30. && hit.minimum_target = 44.)
     "hit-region tokens changed";
   let row = Tokens.row_geometry in
   require
     (row.time_slot_base = 52.
-     && row.task_visual = 14.
      && row.disclosure_visual = 14.
+     && row.status_rail_width = 4.
+     && row.status_rail_radius = 2.
      && row.trailing_inset = 24.)
     "row geometry tokens changed";
   let preview = Tokens.preview_geometry in
@@ -230,8 +257,7 @@ let require_profile
       ~width
       ~scale
       ~kind
-      ~top_level_extent
-      ~child_extent
+      ~block_line_height
       ~continuation_extent
       ~day_header_extent
       ~content_leading
@@ -240,13 +266,8 @@ let require_profile
   let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
   require (profile.kind = kind) "profile kind changed at %.0f/%.2f" width scale;
   require
-    (profile.top_level_extent = top_level_extent)
-    "top-level extent changed at %.0f/%.2f"
-    width
-    scale;
-  require
-    (profile.child_extent = child_extent)
-    "child extent changed at %.0f/%.2f"
+    (profile.block_line_height = block_line_height)
+    "block line height changed at %.0f/%.2f"
     width
     scale;
   require
@@ -276,8 +297,7 @@ let test_known_row_profile_selection () =
     ~width:360.
     ~scale:1.3
     ~kind:Tokens.Compact
-    ~top_level_extent:88.
-    ~child_extent:42.
+    ~block_line_height:26.
     ~continuation_extent:54.
     ~day_header_extent:36.
     ~content_leading:32.
@@ -286,8 +306,7 @@ let test_known_row_profile_selection () =
     ~width:359.
     ~scale:1.
     ~kind:Tokens.Adaptive
-    ~top_level_extent:84.
-    ~child_extent:36.
+    ~block_line_height:20.
     ~continuation_extent:48.
     ~day_header_extent:48.
     ~content_leading:24.
@@ -296,8 +315,7 @@ let test_known_row_profile_selection () =
     ~width:390.
     ~scale:1.3
     ~kind:Tokens.Compact
-    ~top_level_extent:88.
-    ~child_extent:42.
+    ~block_line_height:26.
     ~continuation_extent:54.
     ~day_header_extent:36.
     ~content_leading:32.
@@ -306,8 +324,7 @@ let test_known_row_profile_selection () =
     ~width:744.
     ~scale:2.
     ~kind:Tokens.Adaptive
-    ~top_level_extent:140.
-    ~child_extent:56.
+    ~block_line_height:40.
     ~continuation_extent:68.
     ~day_header_extent:72.
     ~content_leading:32.
@@ -316,8 +333,7 @@ let test_known_row_profile_selection () =
     ~width:1_200.
     ~scale:3.2
     ~kind:Tokens.Adaptive
-    ~top_level_extent:210.
-    ~child_extent:80.
+    ~block_line_height:64.
     ~continuation_extent:92.
     ~day_header_extent:101.
     ~content_leading:32.
@@ -326,30 +342,29 @@ let test_known_row_profile_selection () =
 
 let test_row_profiles_cover_required_width_and_scale_matrix () =
   let cases =
-    [ 320., 1., Tokens.Adaptive, 84., 36., 48., 48., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 96., 42., 54., 56., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 140., 56., 68., 72., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 24., 167.
-    ; 390., 1., Tokens.Compact, 76., 36., 48., 36., 32., 52.
-    ; 390., 1.3, Tokens.Compact, 88., 42., 54., 36., 32., 52.
-    ; 390., 2., Tokens.Adaptive, 140., 56., 68., 72., 32., 104.
-    ; 390., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 32., 167.
-    ; 744., 1., Tokens.Compact, 76., 36., 48., 36., 32., 52.
-    ; 744., 1.3, Tokens.Compact, 88., 42., 54., 36., 32., 52.
-    ; 744., 2., Tokens.Adaptive, 140., 56., 68., 72., 32., 104.
-    ; 744., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 32., 167.
-    ; 1_200., 1., Tokens.Compact, 76., 36., 48., 36., 32., 52.
-    ; 1_200., 1.3, Tokens.Compact, 88., 42., 54., 36., 32., 52.
-    ; 1_200., 2., Tokens.Adaptive, 140., 56., 68., 72., 32., 104.
-    ; 1_200., 3.2, Tokens.Adaptive, 210., 80., 92., 101., 32., 167.
+    [ 320., 1., Tokens.Adaptive, 20., 48., 48., 24., 52.
+    ; 320., 1.3, Tokens.Adaptive, 26., 54., 56., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 40., 68., 72., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 64., 92., 101., 24., 167.
+    ; 390., 1., Tokens.Compact, 20., 48., 36., 32., 52.
+    ; 390., 1.3, Tokens.Compact, 26., 54., 36., 32., 52.
+    ; 390., 2., Tokens.Adaptive, 40., 68., 72., 32., 104.
+    ; 390., 3.2, Tokens.Adaptive, 64., 92., 101., 32., 167.
+    ; 744., 1., Tokens.Compact, 20., 48., 36., 32., 52.
+    ; 744., 1.3, Tokens.Compact, 26., 54., 36., 32., 52.
+    ; 744., 2., Tokens.Adaptive, 40., 68., 72., 32., 104.
+    ; 744., 3.2, Tokens.Adaptive, 64., 92., 101., 32., 167.
+    ; 1_200., 1., Tokens.Compact, 20., 48., 36., 32., 52.
+    ; 1_200., 1.3, Tokens.Compact, 26., 54., 36., 32., 52.
+    ; 1_200., 2., Tokens.Adaptive, 40., 68., 72., 32., 104.
+    ; 1_200., 3.2, Tokens.Adaptive, 64., 92., 101., 32., 167.
     ]
   in
   List.iter
     (fun ( width
          , scale
          , kind
-         , top_level_extent
-         , child_extent
+         , block_line_height
          , continuation_extent
          , day_header_extent
          , content_leading
@@ -358,8 +373,7 @@ let test_row_profiles_cover_required_width_and_scale_matrix () =
          ~width
          ~scale
          ~kind
-         ~top_level_extent
-         ~child_extent
+         ~block_line_height
          ~continuation_extent
          ~day_header_extent
          ~content_leading
@@ -372,8 +386,7 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     ~width:0.
     ~scale:0.
     ~kind:Tokens.Adaptive
-    ~top_level_extent:84.
-    ~child_extent:36.
+    ~block_line_height:20.
     ~continuation_extent:48.
     ~day_header_extent:48.
     ~content_leading:24.
@@ -388,7 +401,7 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     match profiles with
     | left :: (right :: _ as rest) ->
       require
-        (Float.compare left.top_level_extent right.top_level_extent <= 0
+        (Float.compare left.block_line_height right.block_line_height <= 0
          && Float.compare left.day_header_extent right.day_header_extent <= 0
          && Float.compare left.time_slot_width right.time_slot_width <= 0)
         "known extents shrink as text scale increases";
@@ -402,11 +415,22 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
 ;;
 
 let test_every_sparse_role_has_one_authoritative_exact_extent () =
-  let check ~width ~scale ~safe_bottom expected =
+  let check ~width ~scale ~safe_bottom ~block_extents expected =
     let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
+    List.iteri
+      (fun index expected ->
+         require
+           (Float.equal
+              (Tokens.block_extent ~profile ~visible_lines:(index + 1))
+              expected)
+           "block extent changed for %d lines at %.0f/%.1f"
+           (index + 1)
+           width
+           scale)
+      block_extents;
     List.iter
       (fun (role, extent) ->
-         let actual = Tokens.extent_for_role ~profile ~safe_bottom role in
+         let actual = Tokens.fixed_extent ~profile ~safe_bottom role in
          require
            (Float.equal actual extent)
            "role extent %.1f, expected %.1f at %.0f/%.1f"
@@ -420,10 +444,9 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ~width:390.
     ~scale:1.
     ~safe_bottom:34.
-    [ Tokens.Top_level, 76.
-    ; Tokens.Child_preview, 36.
-    ; Tokens.Children_loading, 36.
-    ; Tokens.Children_more, 36.
+    ~block_extents:[ 44.; 56.; 76.; 96. ]
+    [ Tokens.Children_loading, 44.
+    ; Tokens.Children_more, 44.
     ; Tokens.Day_heading, 36.
     ; Tokens.Day_continuation, 48.
     ; Tokens.Feed_continuation, 48.
@@ -433,9 +456,8 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ~width:320.
     ~scale:3.2
     ~safe_bottom:0.
-    [ Tokens.Top_level, 210.
-    ; Tokens.Child_preview, 80.
-    ; Tokens.Children_loading, 80.
+    ~block_extents:[ 80.; 144.; 208.; 272. ]
+    [ Tokens.Children_loading, 80.
     ; Tokens.Children_more, 80.
     ; Tokens.Day_heading, 101.
     ; Tokens.Day_continuation, 92.
@@ -470,6 +492,7 @@ let test_header_context_copy_is_pure_product_state () =
 let tests =
   [ "light palette and interaction", test_light_palette_and_interaction_tokens
   ; "light high contrast", test_light_high_contrast_palette_is_explicit
+  ; "exact status rail categories", test_every_exact_status_maps_to_the_decided_rail_category
   ; "timestamp contrast", test_timestamp_contrast_meets_small_text_target
   ; "Capture sheet palette and contrast", test_capture_sheet_palette_roles_and_contrast
   ; ( "typography, spacing, motion, and hit regions"

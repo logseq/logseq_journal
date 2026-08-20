@@ -1,7 +1,8 @@
 module Generator = Logseq_db_worker_fixture_generator.Fixture_generator
 
 let usage =
-  "usage: generate_fixtures (runtime-flow|runtime-flow-failure) --support-root ROOT"
+  "usage: generate_fixtures (runtime-flow|runtime-flow-pagination|runtime-flow-failure) \
+   --support-root ROOT"
 ;;
 
 let parse arguments =
@@ -10,6 +11,7 @@ let parse arguments =
     let mode =
       match mode with
       | "runtime-flow" -> Ok Generator.Runtime_flow
+      | "runtime-flow-pagination" -> Ok Runtime_flow_with_pagination
       | "runtime-flow-failure" -> Ok Runtime_flow_with_persistence_failure
       | _ -> Error usage
     in
@@ -29,3 +31,4 @@ let () =
        exit 1
      | Ok generated ->
        Generator.to_yojson generated |> Yojson.Safe.to_string |> print_endline)
+;;

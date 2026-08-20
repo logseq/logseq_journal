@@ -28,7 +28,6 @@ type state =
   ; calendar : Journal_calendar.t option
   ; formatted_generation : int64 option
   ; day_labels : (int * string) list
-  ; pending_timeline_mutation : string option
   ; pending_delete : pending_delete option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
@@ -48,7 +47,6 @@ let initial_state =
   ; calendar = None
   ; formatted_generation = None
   ; day_labels = []
-  ; pending_timeline_mutation = None
   ; pending_delete = None
   ; timeline_notice = None
   ; write_enabled = false
@@ -80,8 +78,8 @@ let block_in_timeline timeline block_id =
   |> List.find_map (function
     | Journal_timeline_state.Top_level entry
       when String.equal (Journal_model.id entry.block) block_id -> Some entry.block
-    | Child_preview { block; _ }
-      when String.equal (Journal_model.id block) block_id -> Some block
+    | Child_preview { block; _ } when String.equal (Journal_model.id block) block_id ->
+      Some block
     | Day_heading _
     | Top_level _
     | Child_preview _
@@ -127,7 +125,7 @@ let fail_active_mutation state message =
          routes =
            Journal_routes.update_detail state.routes (Journal_detail.fail detail ~message)
        }
-     | None, None -> { state with pending_timeline_mutation = None })
+     | None, None -> state)
 ;;
 
 let terminal_graph_state state message =
@@ -136,7 +134,6 @@ let terminal_graph_state state message =
   ; write_enabled = false
   ; graph_ready = false
   ; feed_loaded = true
-  ; pending_timeline_mutation = None
   ; pending_delete = None
   ; graph_error = Some message
   }
@@ -154,10 +151,8 @@ let distinct_days state =
       | Top_level entry -> Some (Journal_model.journal_day entry.block)
       | Child_preview { block; _ } -> Some (Journal_model.journal_day block)
       | Day_continuation { day; _ } -> Some day
-      | Children_loading _
-      | Children_more _
-      | Feed_continuation _
-      | Bottom_clearance -> None)
+      | Children_loading _ | Children_more _ | Feed_continuation _ | Bottom_clearance ->
+        None)
   in
   let days =
     match state.calendar with
@@ -221,11 +216,7 @@ let back_state state =
 let apply_worker_response state (response : Journal_graph_runtime.response) =
   match response.payload with
   | Journal_graph_runtime.Graph_ready _ ->
-    { state with
-      write_enabled = true
-    ; graph_ready = true
-    ; graph_error = None
-    }
+    { state with write_enabled = true; graph_ready = true; graph_error = None }
   | Feed_loaded { request_generation; feed } ->
     let accepted_initial_feed =
       match Journal_timeline_state.pending_request state.timeline with
@@ -295,7 +286,6 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           ~none:(Journal_timeline_state.replace_block state.timeline block)
           ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
           timeline_entry_update
-    ; pending_timeline_mutation = None
     }
   | Update_conflict latest ->
     (match Journal_routes.detail state.routes with
@@ -351,10 +341,8 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        ; pending_delete = None
        ; timeline_notice = Some Delete_failed
        })
-  | Open_failed error ->
-    terminal_graph_state state (Logseq_db_worker.Error.message error)
-  | Rejected _
-    when Journal_routes.route state.routes = Journal_routes.Detail_loading ->
+  | Open_failed error -> terminal_graph_state state (Logseq_db_worker.Error.message error)
+  | Rejected _ when Journal_routes.route state.routes = Journal_routes.Detail_loading ->
     { state with
       routes =
         Journal_routes.apply_missing_detail
@@ -497,7 +485,6 @@ let timeline_page
       ~capture_composer_key
       ~on_capture_event
       ~on_visible_range
-      ~on_task_toggle
       ~on_toggle_children
       ~delete_enabled
       ~on_delete
@@ -530,7 +517,9 @@ let timeline_page
   in
   let capture =
     Ui.Native_widget.Message_composer.create_with_handler
-      ~key:(Ui.Key.string ("journal-capture-composer:" ^ Int64.to_string capture_composer_key))
+      ~key:
+        (Ui.Key.string
+           ("journal-capture-composer:" ^ Int64.to_string capture_composer_key))
       ~enabled:capture_enabled
       ~autofocus:false
       ~max_lines:5
@@ -566,8 +555,7 @@ let timeline_page
            ("Unable to open Logseq graph: " ^ message)
          |> Ui.Widget.center
          |> Ui.Widget.with_test_id (Ui.Test_id.string "logseq-graph-open-failed"))
-    | None when loading ->
-      Journal_timeline.Empty (Journal_timeline.loading_view tokens)
+    | None when loading -> Journal_timeline.Empty (Journal_timeline.loading_view tokens)
     | None ->
       Journal_timeline.view
         ~tokens
@@ -581,7 +569,6 @@ let timeline_page
         ~delete_enabled
         ~on_delete
         ~on_visible_range
-        ~on_task_toggle
         ~on_toggle_children
   in
   let base =
@@ -805,9 +792,8 @@ let capture_sheet_page
   in
   let task_label =
     match Journal_capture.task_state capture with
-    | Journal_model.Not_a_task -> "Make task"
-    | Todo -> "To do"
-    | Done -> "Done"
+    | Journal_model.No_status -> "Make task"
+    | status -> Journal_model.status_name status
   in
   let task =
     action_target
@@ -914,13 +900,11 @@ let capture_sheet_page
            |> Ui.Widget.Flex.fixed)
         child_editors
     in
-    let editor_input =
-      Ui.Widget.Flex.column (Ui.Widget.Flex.fixed parent :: children)
-    in
+    let editor_input = Ui.Widget.Flex.column (Ui.Widget.Flex.fixed parent :: children) in
     Ui.Widget.Scroll_view.vertical
       ~primary:true
       ~on_scroll:dispatch
-      [Ui.Widget.Sliver.box editor_input]
+      [ Ui.Widget.Sliver.box editor_input ]
       ()
     |> Ui.Widget.Viewport.Vertical.with_test_id
          (Ui.Test_id.string "capture-primary-scroll")
@@ -1073,13 +1057,8 @@ let detail_page detail dispatch =
   let navigation_enabled =
     match Journal_detail.mode detail with
     | Journal_detail.Saving | Saving_child -> false
-    | Reading
-    | Editing
-    | Confirm_discard
-    | Conflict
-    | Failed _
-    | Adding_child
-    | Committed -> true
+    | Reading | Editing | Confirm_discard | Conflict | Failed _ | Adding_child | Committed
+      -> true
   in
   let back =
     action_target
@@ -1115,9 +1094,9 @@ let detail_page detail dispatch =
       ~on_press:(bind_action dispatch "detail-task")
       (styled_text
          (match Journal_model.task_state root with
-          | Journal_model.Todo -> "Mark done"
-          | Done -> "Mark todo"
-          | Not_a_task -> "Make task"))
+          | Journal_model.No_status -> "Make task"
+          | Done | Canceled -> "Mark todo"
+          | Todo | Doing | In_review | Now | Backlog | Waiting | Later -> "Mark done"))
   in
   let children =
     Journal_detail.children detail
@@ -1374,39 +1353,6 @@ let component client handlers graph =
   in
   let application_platform = Driver.Handler.application_platform handlers in
   let registered = ref false in
-  let apply_response_and_drain response state =
-    let state = apply_worker_response state response in
-    match response.Journal_graph_runtime.payload with
-    | Detail_loaded _ ->
-      (match Journal_timeline_state.next_request state.timeline with
-       | Some (Journal_timeline_state.Children _ as request) ->
-         let generation = state.next_request_generation in
-         let output = submit (worker_request generation request) in
-         let delivery = deliver_output output in
-         List.iter clear_delete_command delivery.responses;
-         let state = apply_delivery_responses state delivery in
-         (match delivery.error with
-          | Some _ -> state
-          | None ->
-            { state with
-              timeline =
-                Journal_timeline_state.begin_request state.timeline ~generation request
-            ; next_request_generation = Int64.succ generation
-            })
-       | Some (Feed _ | Day _) | None -> state)
-    | Graph_ready _
-    | Block_captured _
-    | Child_created _
-    | Block_updated _
-    | Update_conflict _
-    | Subtree_deleted _
-    | Delete_conflict _
-    | Block_found _
-    | Feed_loaded _
-    | Day_blocks_loaded _
-    | Open_failed _
-    | Rejected _ -> state
-  in
   let event_subscription =
     Bonsai.Cont.map2 state set_state ~f:(fun snapshot set_state ->
       state_ref := snapshot;
@@ -1416,8 +1362,7 @@ let component client handlers graph =
         registered := true;
         let startup_delivery =
           deliver_output
-            Journal_graph_runtime.
-              { requests = [ start graph_runtime ]; responses = [] }
+            Journal_graph_runtime.{ requests = [ start graph_runtime ]; responses = [] }
         in
         (match startup_delivery.error with
          | None -> ()
@@ -1441,7 +1386,7 @@ let component client handlers graph =
               in
               if output.requests = [] && output.responses = []
               then Bonsai.Effect.Ignore
-              else
+              else (
                 let reloads_feed =
                   List.exists
                     (fun (request : Logseq_db_worker.Protocol.request) ->
@@ -1472,11 +1417,9 @@ let component client handlers graph =
                       | None, false, _
                       | None, true, None
                       | None, true, Some _
-                      | Some _, _, _ -> state)))
+                      | Some _, _, _ -> state))))
           | Worker.Response
-              { outcome =
-                  Worker.Completed
-                    (response : Logseq_db_worker.Protocol.response)
+              { outcome = Worker.Completed (response : Logseq_db_worker.Protocol.response)
               ; _
               } ->
             let output = Journal_graph_runtime.receive graph_runtime response in
@@ -1486,10 +1429,7 @@ let component client handlers graph =
                 List.iter clear_delete_command delivery.responses;
                 set_state (fun state ->
                   let state =
-                    List.fold_left
-                      (fun state response -> apply_response_and_drain response state)
-                      state
-                      delivery.responses
+                    List.fold_left apply_worker_response state delivery.responses
                   in
                   match delivery.error with
                   | None -> state
@@ -1519,8 +1459,8 @@ let component client handlers graph =
             set_state (fun state ->
               match state.calendar with
               | Some current
-                when Int64.compare current.generation event.snapshot.generation >= 0
-                -> state
+                when Int64.compare current.generation event.snapshot.generation >= 0 ->
+                state
               | None | Some _ ->
                 { state with
                   calendar = Some event.snapshot
@@ -1560,7 +1500,7 @@ let component client handlers graph =
                   ; blocks_per_day = 64
                   ; slot_limit = 128
                   ; request_generation = generation
-                 })
+                  })
            in
            let request = Journal_timeline_state.Feed { before_day = None } in
            Bonsai.Effect.bind
@@ -1570,8 +1510,7 @@ let component client handlers graph =
                set_state (fun state ->
                  let state = apply_delivery_responses state delivery in
                  match delivery.error, state.calendar with
-                 | ( None
-                   , Some current )
+                 | None, Some current
                    when state.graph_ready
                         && Int64.equal current.generation calendar_generation
                         && current.local_day = today ->
@@ -1579,7 +1518,8 @@ let component client handlers graph =
                      timeline =
                        (Journal_timeline_state.empty ~today
                         |> fun timeline ->
-                        Journal_timeline_state.begin_request timeline ~generation request)
+                        Journal_timeline_state.begin_request timeline ~generation request
+                       )
                    ; feed_loaded = false
                    ; next_request_generation = Int64.succ generation
                    }
@@ -1592,6 +1532,56 @@ let component client handlers graph =
          Int64.equal left_generation right_generation && left_day = right_day))
     feed_key
     ~callback:feed_callback
+    graph;
+  let timeline_drain_key =
+    Bonsai.Cont.map state ~f:(fun state ->
+      if not (state.graph_ready && state.feed_loaded)
+      then None
+      else
+        Option.map
+          (fun request -> state.next_request_generation, request)
+          (Journal_timeline_state.next_request state.timeline))
+  in
+  let timeline_drain_callback =
+    Bonsai.Cont.map set_state ~f:(fun set_state -> function
+      | None -> Bonsai.Effect.Ignore
+      | Some (generation, request) ->
+        let output = submit (worker_request generation request) in
+        let sent_request = output.requests <> [] in
+        Bonsai.Effect.bind
+          (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+          ~f:(fun delivery ->
+            List.iter clear_delete_command delivery.responses;
+            set_state (fun state ->
+              let state = apply_delivery_responses state delivery in
+              match
+                ( delivery.error
+                , sent_request
+                , Int64.equal state.next_request_generation generation
+                , Journal_timeline_state.next_request state.timeline )
+              with
+              | None, true, true, Some current when current = request ->
+                { state with
+                  timeline =
+                    Journal_timeline_state.begin_request
+                      state.timeline
+                      ~generation
+                      request
+                ; next_request_generation = Int64.succ generation
+                }
+              | None, false, _, _
+              | None, true, false, _
+              | None, true, true, None
+              | None, true, true, Some _
+              | Some _, _, _, _ -> state)))
+  in
+  Bonsai.Cont.Edge.on_change
+    ~equal:
+      (Option.equal
+         (fun (left_generation, left_request) (right_generation, right_request) ->
+            Int64.equal left_generation right_generation && left_request = right_request))
+    timeline_drain_key
+    ~callback:timeline_drain_callback
     graph;
   let format_key =
     Bonsai.Cont.map state ~f:(fun state ->
@@ -1676,11 +1666,7 @@ let component client handlers graph =
             | true, None ->
               let session_number = state.next_local_sequence in
               { state with
-                routes =
-                  Journal_routes.open_capture
-                    state.routes
-                    ~session_number
-                    ~source
+                routes = Journal_routes.open_capture state.routes ~session_number ~source
               ; next_local_sequence = Int64.succ session_number
               })
         in
@@ -1724,33 +1710,12 @@ let component client handlers graph =
             in
             let first_index = bounded range.first_index in
             let last_exclusive = bounded range.last_exclusive in
-            ( Journal_timeline_state.observe_visible_range
-                timeline
-                ~first_index
-                ~last_exclusive
-            , first_index
-            , last_exclusive )
+            Journal_timeline_state.observe_visible_range
+              timeline
+              ~first_index
+              ~last_exclusive
           in
-          let timeline, first_index, last_exclusive = observe snapshot.timeline in
-          (match
-             Journal_timeline_state.request_for_visible_range
-               timeline
-               ~first_index
-               ~last_exclusive
-           with
-           | None ->
-             update (fun state ->
-               let timeline, _, _ = observe state.timeline in
-               { state with timeline })
-           | Some request ->
-             let generation = snapshot.next_request_generation in
-             with_request
-               { snapshot with
-                 timeline =
-                   Journal_timeline_state.begin_request timeline ~generation request
-               ; next_request_generation = Int64.succ generation
-               }
-                 (worker_request generation request))
+          update (fun state -> { state with timeline = observe state.timeline })
         | Ui.Event.Payload.Native_event _ as payload ->
           (match Ui.Native_widget.Message_composer.event_of_payload payload with
            | Some (Text_changed _) -> Bonsai.Effect.Ignore
@@ -1825,8 +1790,7 @@ let component client handlers graph =
                    |> List.mapi (fun index _ ->
                      ( fresh_identity ()
                      , fresh_identity ()
-                     , sibling_order
-                         Int64.(add number (of_int (index + 1))) ))
+                     , sibling_order Int64.(add number (of_int (index + 1))) ))
                  in
                  let capture, request =
                    Journal_capture.admit_save
@@ -1964,11 +1928,10 @@ let component client handlers graph =
             let block_id = String.sub action 16 (String.length action - 16) in
             match
               ( snapshot.write_enabled
-              , snapshot.pending_timeline_mutation
               , snapshot.pending_delete
               , block_in_timeline snapshot.timeline block_id )
             with
-            | true, None, None, Some block ->
+            | true, None, Some block ->
               (match Journal_timeline_state.stage_delete snapshot.timeline ~block_id with
                | None -> Bonsai.Effect.Ignore
                | Some (timeline, staged) ->
@@ -1992,41 +1955,7 @@ let component client handlers graph =
                      ; next_request_generation =
                          Int64.succ snapshot.next_request_generation
                      })))
-            | false, _, _, _
-            | true, Some _, _, _
-            | true, None, Some _, _
-            | true, None, None, None -> Bonsai.Effect.Ignore)
-          else if String.length action > 14 && String.sub action 0 14 = "timeline-task:"
-          then (
-            let block_id = String.sub action 14 (String.length action - 14) in
-            match
-              ( snapshot.pending_timeline_mutation
-              , snapshot.pending_delete
-              , block_in_timeline snapshot.timeline block_id )
-            with
-            | None, None, Some block ->
-              let number = snapshot.next_local_sequence in
-              let task_state =
-                match Journal_model.task_state block with
-                | Journal_model.Todo -> Journal_model.Done
-                | Done -> Todo
-                | Not_a_task -> Todo
-              in
-              let request =
-                Journal_graph_request.Set_task_state
-                  { mutation_id = fresh_identity ()
-                  ; block_id
-                  ; expected_revision = Journal_model.revision block
-                  ; task_state
-                  }
-              in
-              with_request
-                { snapshot with
-                  pending_timeline_mutation = Some block_id
-                ; next_local_sequence = Int64.succ number
-                }
-                request
-            | Some _, _, _ | None, Some _, _ | None, None, None -> Bonsai.Effect.Ignore)
+            | false, _, _ | true, Some _, _ | true, None, None -> Bonsai.Effect.Ignore)
           else if
             String.length action > 25
             && String.sub action 0 25 = "timeline-toggle-children:"
@@ -2038,26 +1967,18 @@ let component client handlers graph =
             | Some _, _ -> Bonsai.Effect.Ignore
             | None, None -> Bonsai.Effect.Ignore
             | None, Some block when Journal_model.child_count block > 0 ->
-              let timeline =
-                if Journal_timeline_state.is_expanded snapshot.timeline ~block_id
-                then Journal_timeline_state.collapse snapshot.timeline ~parent_id:block_id
-                else Journal_timeline_state.expand snapshot.timeline ~parent_id:block_id
-              in
-              (match Journal_timeline_state.next_request timeline with
-               | None -> update (fun state -> { state with timeline })
-               | Some request ->
-                 let generation = snapshot.next_request_generation in
-                 with_request
-                   { snapshot with
-                     timeline =
-                       Journal_timeline_state.begin_request timeline ~generation request
-                   ; next_request_generation = Int64.succ generation
-                   }
-                   (worker_request generation request))
+              update (fun state ->
+                let timeline = state.timeline in
+                let timeline =
+                  if Journal_timeline_state.is_expanded timeline ~block_id
+                  then Journal_timeline_state.collapse timeline ~parent_id:block_id
+                  else Journal_timeline_state.expand timeline ~parent_id:block_id
+                in
+                { state with timeline })
             | None, Some _ -> Bonsai.Effect.Ignore)
           else Bonsai.Effect.Ignore
-        | Unit | Bool _ | Int64 _ | Tap _ | Pointer _ | Key _ | Scroll _
-          -> Bonsai.Effect.Ignore)
+        | Unit | Bool _ | Int64 _ | Tap _ | Pointer _ | Key _ | Scroll _ ->
+          Bonsai.Effect.Ignore)
   in
   let state = Bonsai.Cont.map2 state delete_timer ~f:(fun state () -> state) in
   let state =
@@ -2101,12 +2022,8 @@ let component client handlers graph =
         ~capture_composer_key:state.next_local_sequence
         ~on_capture_event:dispatch
         ~on_visible_range:dispatch
-        ~on_task_toggle:(prefix_action dispatch "timeline-task:")
         ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
-        ~delete_enabled:
-          (state.write_enabled
-           && Option.is_none state.pending_timeline_mutation
-           && Option.is_none state.pending_delete)
+        ~delete_enabled:(state.write_enabled && Option.is_none state.pending_delete)
         ~on_delete:(prefix_action dispatch "timeline-delete:")
         ~timeline_notice:state.timeline_notice
         ~on_delete_undo:(bind_action dispatch "delete-undo")

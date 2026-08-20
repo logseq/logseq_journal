@@ -15,7 +15,14 @@ let text_style token color =
     ()
 ;;
 
-let day_heading ~tokens ~profile ~rtl ~sort_key ~label (page : Journal_graph_projection.page) =
+let day_heading
+      ~tokens
+      ~profile
+      ~rtl
+      ~sort_key
+      ~label
+      (page : Journal_graph_projection.page)
+  =
   Ui.Widget.text
     ~key:(Ui.Key.string ("journal-day-heading:" ^ string_of_int page.day))
     ~style:
@@ -125,8 +132,7 @@ let group_separator ~tokens ~device_pixel_ratio ~owner_id ~extent content =
          ~decoration:
            (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
     |> Ui.Widget.sized_box ~height:thickness
-    |> Ui.Widget.with_test_id
-         (Ui.Test_id.string ("journal-group-divider:" ^ owner_id))
+    |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-group-divider:" ^ owner_id))
     |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:0. ~right:0. ())
     |> Ui.Widget.with_test_id
          (Ui.Test_id.string ("journal-group-divider-padding:" ^ owner_id))
@@ -138,24 +144,30 @@ let group_separator ~tokens ~device_pixel_ratio ~owner_id ~extent content =
   |> Ui.Widget.sized_box ~height:extent
 ;;
 
-let child_preview
-      ~tokens
-      ~profile
-      ~rtl
-      ~block
-      ~sort_key
-  =
+let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
   let geometry = Tokens.preview_geometry in
-  let leading_delta = if profile.Tokens.content_leading < 32. then geometry.narrow_leading_delta else 0. in
+  let leading_delta =
+    if profile.Tokens.content_leading < 32. then geometry.narrow_leading_delta else 0.
+  in
   let connector_leading = geometry.connector_leading -. leading_delta in
   let bullet_leading = geometry.bullet_center_leading -. leading_delta in
   let text_leading = geometry.text_leading -. leading_delta in
+  let lines =
+    let rec take remaining reversed = function
+      | _ when remaining <= 0 -> List.rev reversed
+      | [] -> List.rev reversed
+      | line :: rest -> take (remaining - 1) (line :: reversed) rest
+    in
+    Journal_model.source block |> String.split_on_char '\n' |> take 4 []
+  in
+  let visible_lines = Int.max 1 (List.length lines) in
+  let extent = Tokens.block_extent ~profile ~visible_lines in
   let connector =
     Ui.Widget.empty ()
     |> Ui.Widget.decorated_box
          ~decoration:
            (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
-    |> Ui.Widget.sized_box ~width:1. ~height:profile.child_extent
+    |> Ui.Widget.sized_box ~width:1. ~height:extent
     |> Ui.Widget.with_test_id
          (Ui.Test_id.string ("journal-child-connector:" ^ Journal_model.id block))
   in
@@ -174,11 +186,26 @@ let child_preview
          (Ui.Test_id.string ("journal-child-bullet:" ^ Journal_model.id block))
   in
   let source =
-    Ui.Widget.text
-      ~style:(text_style Tokens.typography.supporting (Tokens.palette tokens).text_primary)
-      ~max_lines:1
-      ~overflow:Ui.Style.Text_overflow.Ellipsis
-      (Journal_model.source block)
+    List.mapi
+      (fun index line ->
+         Ui.Widget.text
+           ~style:
+             (text_style
+                Tokens.typography.supporting
+                (Tokens.palette tokens).text_primary)
+           ~max_lines:1
+           ~overflow:Ui.Style.Text_overflow.Ellipsis
+           ~text_align:Ui.Style.Text_align.Start
+           line
+         |> Ui.Widget.with_test_id
+              (Ui.Test_id.string
+                 (Printf.sprintf
+                    "journal-child-source:%s:%d"
+                    (Journal_model.id block)
+                    index))
+         |> Ui.Widget.Flex.fixed)
+      lines
+    |> Ui.Widget.Flex.column
     |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
     |> Ui.Widget.padding
          ~insets:
@@ -198,23 +225,58 @@ let child_preview
     then
       Ui.Widget.Stack.positioned
         ~right:bullet_offset
-        ~top:((profile.child_extent -. geometry.bullet_diameter) /. 2.)
+        ~top:((extent -. geometry.bullet_diameter) /. 2.)
         bullet
     else
       Ui.Widget.Stack.positioned
         ~left:bullet_offset
-        ~top:((profile.child_extent -. geometry.bullet_diameter) /. 2.)
+        ~top:((extent -. geometry.bullet_diameter) /. 2.)
         bullet
   in
   let semantic_label =
     match Journal_model.task_state block with
-    | Journal_model.Not_a_task -> "Direct child: " ^ Journal_model.source block
-    | Todo -> "Direct child task Todo: " ^ Journal_model.source block
-    | Done -> "Direct child task Done: " ^ Journal_model.source block
+    | Journal_model.No_status -> "Direct child: " ^ Journal_model.source block
+    | status ->
+      "Direct child: "
+      ^ Journal_model.source block
+      ^ ", status "
+      ^ Journal_model.status_name status
   in
-  Ui.Widget.Stack.create
-    [ Ui.Widget.Stack.child source; positioned_connector; positioned_bullet ]
-  |> Ui.Widget.sized_box ~height:profile.child_extent
+  let children =
+    ref [ Ui.Widget.Stack.child source; positioned_connector; positioned_bullet ]
+  in
+  (match Tokens.status_rail_color tokens (Journal_model.task_state block) with
+   | None -> ()
+   | Some color ->
+     let rail =
+       Ui.Widget.empty ()
+       |> Ui.Widget.decorated_box
+            ~decoration:
+              (Ui.Style.Decoration.create
+                 ~background:color
+                 ~border_radius:Tokens.row_geometry.status_rail_radius
+                 ())
+       |> Ui.Widget.with_test_id
+            (Ui.Test_id.string ("journal-child-status-rail:" ^ Journal_model.id block))
+       |> Ui.Widget.sized_box
+            ~width:Tokens.row_geometry.status_rail_width
+            ~height:(float_of_int visible_lines *. profile.Tokens.block_line_height)
+     in
+     children
+     := (if rtl
+         then
+           Ui.Widget.Stack.positioned
+             ~right:(text_leading -. Tokens.spacing.x3)
+             ~top:Tokens.spacing.x2
+             rail
+         else
+           Ui.Widget.Stack.positioned
+             ~left:(text_leading -. Tokens.spacing.x3)
+             ~top:Tokens.spacing.x2
+             rail)
+        :: !children);
+  Ui.Widget.Stack.create (List.rev !children)
+  |> Ui.Widget.sized_box ~height:extent
   |> Ui.Widget.semantics
        ~properties:
          (Ui.Semantics.create
@@ -256,7 +318,6 @@ let render_slot
       ~day_label
       ~show_timestamp
       ~reduced_motion
-      ~on_task_toggle
       ~on_toggle_children
       ~delete_enabled
       ~on_delete
@@ -281,7 +342,6 @@ let render_slot
         ~show_divider:false
         ~sort_base
         ~reduced_motion
-        ~on_task_toggle:(for_block on_task_toggle id)
         ~on_toggle_children:(for_block on_toggle_children id)
     in
     let row =
@@ -296,15 +356,15 @@ let render_slot
         |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-swipe:" ^ id))
       else row
     in
-    Ui.Widget.sized_box
-      ~height:
-        (if expanded
-         then
-           Tokens.expanded_parent_extent
-             ~profile
-             ~source:(Journal_model.source block)
-         else profile.top_level_extent)
-      row
+    let extent =
+      Tokens.block_extent
+        ~profile
+        ~visible_lines:
+          (Journal_row.Item.visible_line_count
+             (Journal_row.Item.of_timeline_entry entry)
+             ~expanded)
+    in
+    Ui.Widget.sized_box ~height:extent row
     |> Ui.Widget.focus_scope
          ~key:(Ui.Key.string ("journal-row-focus:" ^ id))
          ~autofocus:(should_restore_focus state id)
@@ -313,21 +373,27 @@ let render_slot
     |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-focus:" ^ id))
     |> fun row ->
     if ends_group
+    then group_separator ~tokens ~device_pixel_ratio ~owner_id:id ~extent row
+    else row
+  | Timeline.Child_preview { block; _ } ->
+    let row = child_preview ~tokens ~profile ~rtl ~block ~sort_key:sort_base in
+    let extent =
+      Tokens.block_extent
+        ~profile
+        ~visible_lines:
+          (Journal_row.Item.visible_line_count
+             (Journal_row.Item.of_block block)
+             ~expanded:true)
+    in
+    if ends_group
     then
       group_separator
         ~tokens
         ~device_pixel_ratio
-        ~owner_id:id
-        ~extent:profile.top_level_extent
+        ~owner_id:(Journal_model.id block)
+        ~extent
         row
     else row
-  | Timeline.Child_preview { block; _ } ->
-    child_preview
-      ~tokens
-      ~profile
-      ~rtl
-      ~block
-      ~sort_key:sort_base
   | Timeline.Day_continuation { day; _ } ->
     continuation
       ~tokens
@@ -339,13 +405,15 @@ let render_slot
       ~tokens
       ~key:("journal-children-loading:" ^ parent_id)
       ~label:"Loading direct child blocks"
-    |> Ui.Widget.sized_box ~height:profile.child_extent
+    |> Ui.Widget.sized_box
+         ~height:(Tokens.fixed_extent ~profile ~safe_bottom:0. Tokens.Children_loading)
   | Timeline.Children_more { parent_id } ->
     continuation ~tokens ~key:("journal-children-more:" ^ parent_id) ~label:"More"
     |> Ui.Widget.semantics
          ~properties:
            (Ui.Semantics.create ~label:"More direct child blocks are not shown" ())
-    |> Ui.Widget.sized_box ~height:profile.child_extent
+    |> Ui.Widget.sized_box
+         ~height:(Tokens.fixed_extent ~profile ~safe_bottom:0. Tokens.Children_more)
   | Timeline.Feed_continuation { before_day } ->
     continuation
       ~tokens
@@ -398,7 +466,6 @@ let view
       ~reduced_motion
       ~safe_bottom
       ~on_visible_range
-      ~on_task_toggle
       ~on_toggle_children
       ~delete_enabled
       ~on_delete
@@ -431,7 +498,6 @@ let view
               ~day_label
               ~show_timestamp:(should_show_timestamp ~today ~previous_slot slot)
               ~reduced_motion
-              ~on_task_toggle
               ~on_toggle_children
               ~delete_enabled
               ~on_delete
@@ -440,7 +506,9 @@ let view
                 (ends_group
                    ~known_end:(rest = [] && supplied_end >= window.total_count)
                    slot
-                   (match rest with [] -> None | next :: _ -> Some next))
+                   (match rest with
+                    | [] -> None
+                    | next :: _ -> Some next))
               slot
           in
           item :: render (offset + 1) (Some slot) rest

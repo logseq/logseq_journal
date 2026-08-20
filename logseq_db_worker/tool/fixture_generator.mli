@@ -1,5 +1,6 @@
 type mode =
   | Runtime_flow
+  | Runtime_flow_with_pagination
   | Runtime_flow_with_persistence_failure
 
 type generated =

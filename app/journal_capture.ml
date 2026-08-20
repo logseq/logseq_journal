@@ -50,7 +50,7 @@ let create_editor ~session_number ~source =
 let create ~session_number ~source =
   { editor = create_editor ~session_number ~source
   ; child_editors = []
-  ; task_state = Journal_model.Not_a_task
+  ; task_state = Journal_model.No_status
   ; phase = Editing
   ; pending = None
   ; confirm_return_phase = None
@@ -74,17 +74,17 @@ let editor_value editor = editor.value
 
 let dirty t =
   (not (String.equal (source t) ""))
-  || t.task_state <> Journal_model.Not_a_task
+  || t.task_state <> Journal_model.No_status
   || not (List.is_empty t.child_editors)
 ;;
 
 let source_is_blank source = String.equal (String.trim source) ""
+
 let can_save t =
   t.phase = Editing
-  && not (source_is_blank (source t))
+  && (not (source_is_blank (source t)))
   && List.for_all
-       (fun editor ->
-          not (source_is_blank (Ui.Text_editing.Value.text editor.value)))
+       (fun editor -> not (source_is_blank (Ui.Text_editing.Value.text editor.value)))
        t.child_editors
 ;;
 
@@ -93,9 +93,9 @@ let can_add_child t = t.phase = Editing && List.length t.child_editors < 64
 let add_child t ~session_number =
   if not (can_add_child t)
   then t
-  else
+  else (
     let child = create_editor ~session_number ~source:"" in
-    { t with child_editors = t.child_editors @ [ child ] }
+    { t with child_editors = t.child_editors @ [ child ] })
 ;;
 
 let value_of_edit (edit : Ui.Event.Payload.text_edit) =
@@ -162,9 +162,10 @@ let toggle_task t =
   else (
     let task_state =
       match t.task_state with
-      | Journal_model.Not_a_task -> Journal_model.Todo
+      | Journal_model.No_status -> Journal_model.Todo
       | Todo -> Done
-      | Done -> Not_a_task
+      | Done -> No_status
+      | Doing | In_review | Now | Canceled | Backlog | Waiting | Later -> Done
     in
     { t with task_state })
 ;;
@@ -203,7 +204,7 @@ let discard t =
       ; value = value_for_source ""
       }
   ; child_editors = []
-  ; task_state = Journal_model.Not_a_task
+  ; task_state = Journal_model.No_status
   ; phase = Editing
   ; pending = None
   ; confirm_return_phase = None
@@ -229,7 +230,7 @@ let admit_save
            ; block_id
            ; sibling_order
            ; source = Ui.Text_editing.Value.text editor.value
-           ; task_state = Journal_model.Not_a_task
+           ; task_state = Journal_model.No_status
            ; creation_time
            })
         child_identities
@@ -260,11 +261,7 @@ let retry t =
   match t.phase, t.pending with
   | Failed _, Some request ->
     { t with phase = Saving; confirm_return_phase = None }, Some request
-  | Failed _, None
-  | Editing, _
-  | Confirm_discard, _
-  | Saving, _
-  | Committed, _ -> t, None
+  | Failed _, None | Editing, _ | Confirm_discard, _ | Saving, _ | Committed, _ -> t, None
 ;;
 
 let commit t _block =

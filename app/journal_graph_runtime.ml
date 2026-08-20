@@ -409,14 +409,17 @@ let submit t (request : Journal_graph_request.t) =
           let property = Graph.Property_by_ident "logseq.property/status" in
           let mutation =
             match command.task_state with
-            | Journal_model.Not_a_task ->
+            | Journal_model.No_status ->
               Protocol.Remove_property { block; property; context }
-            | Todo ->
+            | status ->
               Set_property
-                { block; property; value = Graph.Default_value "Todo"; context }
-            | Done ->
-              Set_property
-                { block; property; value = Graph.Default_value "Done"; context }
+                { block
+                ; property
+                ; value =
+                    Graph.Default_value
+                      (Option.get (Journal_model.status_default_value status))
+                ; context
+                }
           in
           requests
             [ mutate
@@ -533,19 +536,17 @@ let capture_insert t (command : Projection.capture) page =
 
 let capture_status t (command : Projection.capture) page =
   match command.Projection.task_state with
-  | Journal_model.Not_a_task ->
+  | Journal_model.No_status ->
     request_refresh t page (Captured { block_id = command.block_id })
-  | Todo | Done ->
+  | Todo | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
     (match
        ( mutation_context t (Graph.Uuid.to_string (request_uuid t))
        , parse_uuid "block UUID" command.block_id )
      with
      | Ok context, Ok block ->
        let value =
-         match command.task_state with
-         | Todo -> Graph.Default_value "Todo"
-         | Done -> Default_value "Done"
-         | Not_a_task -> assert false
+         Graph.Default_value
+           (Option.get (Journal_model.status_default_value command.task_state))
        in
        requests
          [ mutate

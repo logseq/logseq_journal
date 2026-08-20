@@ -32,9 +32,35 @@ void main() {
       expect(find.text(_parentSource), findsOneWidget);
       expect(find.text(_firstChild), findsOneWidget);
       expect(find.text('21:37'), findsOneWidget);
+      for (final line in const [
+        'Todo rail',
+        'Doing line one',
+        'Doing line two',
+        'Done line one',
+        'Done line two',
+        'Done line three',
+        'Later line one',
+        'Later line two',
+        'Later line three',
+        'Later line four',
+      ]) {
+        expect(find.text(line), findsOneWidget);
+      }
+      expect(find.text('Later line five'), findsNothing);
+      for (final status in const ['Todo', 'Doing', 'Done', 'Backlog']) {
+        expect(find.bySemanticsLabel(RegExp('status $status')), findsOneWidget);
+      }
+      for (final color in const [
+        Color(0xff64748b),
+        Color(0xff2563eb),
+        Color(0xff058e46),
+        Color(0xff7c3aed),
+      ]) {
+        expect(_statusRail(color), findsOneWidget);
+      }
       expect(
         find.bySemanticsLabel(
-          '$_parentSource, $_firstChild, $_secondChild, created at 21:37',
+          '$_parentSource, $_firstChild, $_secondChild, $_thirdChild, created at 21:37',
         ),
         findsOneWidget,
       );
@@ -42,7 +68,7 @@ void main() {
       final rowRect = _ancestorRectWithHeight(
         tester,
         find.text(_parentSource),
-        76,
+        96,
       );
       expect(rowRect.width, closeTo(390, 0.5));
       expect(
@@ -50,67 +76,16 @@ void main() {
         greaterThan(tester.getTopRight(find.text(_parentSource)).dx),
       );
       final dividers = _timelineDividers(tester, devicePixelRatio: 1);
-      expect(dividers, hasLength(4));
+      expect(dividers, hasLength(8));
       for (final rect in dividers) {
         expect(rect.left, closeTo(0, 0.25));
         expect(rect.right, closeTo(390, 0.25));
         expect(rect.height, closeTo(1, 0.05));
       }
 
-      final restingOuter = _decoratedCircle(
-        color: const Color(0x120d142f),
-        radius: 26,
-      );
-      final restingInner = _decoratedCircle(
-        color: const Color(0xff181e34),
-        radius: 24,
-      );
-      final pressedOuter = _decoratedCircle(
-        color: const Color(0x120d142f),
-        radius: 25,
-      );
-      final pressedInner = _decoratedCircle(
-        color: const Color(0xff181e34),
-        radius: 22.08,
-      );
-      expect(tester.getSize(restingOuter), const Size(52, 52));
-      expect(tester.getSize(restingInner), const Size(48, 48));
-      expect(tester.getSize(pressedOuter), const Size(50, 50));
-      expect(tester.getSize(pressedInner), const Size(44.16, 44.16));
-      _expectSameCenter(tester, restingOuter, restingInner);
-      _expectSameCenter(tester, pressedOuter, pressedInner);
-      final plusRects = find
-          .descendant(
-            of: restingInner,
-            matching: find.byWidgetPredicate(
-              (widget) =>
-                  widget is DecoratedBox &&
-                  widget.decoration is BoxDecoration &&
-                  (widget.decoration as BoxDecoration).color ==
-                      const Color(0xfffcfcfd),
-            ),
-          )
-          .evaluate()
-          .map(
-            (element) =>
-                tester.getRect(find.byElementPredicate((e) => e == element)),
-          )
-          .toList();
-      expect(plusRects, hasLength(2));
-      final plusBounds = plusRects.reduce(
-        (left, right) => left.expandToInclude(right),
-      );
-      expect(
-        plusBounds.center.dx,
-        closeTo(tester.getCenter(restingInner).dx, 0.05),
-      );
-      expect(
-        plusBounds.center.dy,
-        closeTo(tester.getCenter(restingInner).dy, 0.05),
-      );
       final disclosureSemantics = tester.getSemantics(
         find.bySemanticsLabel(
-          '$_parentSource, $_firstChild, $_secondChild, created at 21:37',
+          '$_parentSource, $_firstChild, $_secondChild, $_thirdChild, created at 21:37',
         ),
       );
       expect(
@@ -140,7 +115,7 @@ void main() {
           .getTopLeft(_directChildText(_secondChild))
           .dy;
       expect(firstChildTop - parentTop, closeTo(36, 0.1));
-      expect(secondChildTop - firstChildTop, closeTo(36, 0.1));
+      expect(secondChildTop - firstChildTop, closeTo(44, 0.1));
       expect(
         tester.getTopLeft(find.text(_parentSource)).dy,
         closeTo(collapsedParentTop, 0.1),
@@ -149,7 +124,7 @@ void main() {
         find.bySemanticsLabel('$_parentSource, created at 21:37'),
         findsOneWidget,
       );
-      expect(_timelineDividers(tester, devicePixelRatio: 1), hasLength(3));
+      expect(_timelineDividers(tester, devicePixelRatio: 1), hasLength(8));
       await expectLater(
         find.byKey(harness.boundaryKey),
         matchesGoldenFile('goldens/journal-reference-alignment.png'),
@@ -186,11 +161,11 @@ void main() {
         tester.view.physicalSize = Size(390 * dpr, 844 * dpr);
         tester.view.padding = FakeViewPadding(top: 47 * dpr, bottom: 34 * dpr);
         await harness.pumpUntil(
-          () => _timelineDividers(tester, devicePixelRatio: dpr).length == 4,
+          () => _timelineDividers(tester, devicePixelRatio: dpr).length == 8,
           reason: 'divider geometry did not settle at ${dpr.toInt()}x',
         );
         final scaledDividers = _timelineDividers(tester, devicePixelRatio: dpr);
-        expect(scaledDividers, hasLength(4));
+        expect(scaledDividers, hasLength(8));
         for (final rect in scaledDividers) {
           expect(rect.height * dpr, closeTo(1, 0.08));
           expect(rect.left, closeTo(0, 0.25));
@@ -203,6 +178,14 @@ void main() {
     timeout: const Timeout(Duration(seconds: 60)),
   );
 }
+
+Finder _statusRail(Color color) => find.byWidgetPredicate(
+  (widget) =>
+      widget is DecoratedBox &&
+      widget.decoration is BoxDecoration &&
+      (widget.decoration as BoxDecoration).color == color,
+  description: 'four-point status rail with color $color',
+);
 
 final class _RuntimeHarness {
   _RuntimeHarness({
@@ -261,7 +244,8 @@ final class _RuntimeHarness {
       );
       snapshotToken = fixture.stdout.toString().trim();
     } else {
-      snapshotToken = Platform.environment['JOURNAL_GOLDEN_SNAPSHOT_TOKEN'] ??
+      snapshotToken =
+          Platform.environment['JOURNAL_GOLDEN_SNAPSHOT_TOKEN'] ??
           (throw StateError(
             'JOURNAL_GOLDEN_SNAPSHOT_TOKEN is required with JOURNAL_GOLDEN_SUPPORT_ROOT',
           ));
@@ -422,27 +406,12 @@ List<Rect> _timelineDividers(
       .toList();
 }
 
-Finder _decoratedCircle({required Color color, required double radius}) =>
-    find.byWidgetPredicate(
-      (widget) =>
-          widget is DecoratedBox &&
-          widget.decoration is BoxDecoration &&
-          (widget.decoration as BoxDecoration).color == color &&
-          (widget.decoration as BoxDecoration).borderRadius ==
-              BorderRadius.circular(radius),
-    );
-
 Finder _directChildText(String source) => find.byWidgetPredicate(
   (widget) =>
       widget is Text &&
       widget.data == source &&
       widget.style?.color == const Color(0xff0d142f),
 );
-
-void _expectSameCenter(WidgetTester tester, Finder outer, Finder inner) {
-  expect(tester.getCenter(inner).dx, closeTo(tester.getCenter(outer).dx, 0.01));
-  expect(tester.getCenter(inner).dy, closeTo(tester.getCenter(outer).dy, 0.01));
-}
 
 Future<void> _loadGoldenFonts() async {
   final materialFonts = _findMaterialFontsDirectory();

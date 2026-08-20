@@ -9,11 +9,7 @@ let uuid value = Graph.Uuid.of_string value |> Result.get_ok
 
 let execute engine ~request_id mutation =
   let request =
-    Protocol.
-      { api_version
-      ; request_id = uuid request_id
-      ; command = Mutate mutation
-      }
+    Protocol.{ api_version; request_id = uuid request_id; command = Mutate mutation }
   in
   match Engine.execute engine request with
   | Succeeded { success = Mutation_result result; _ } -> result
@@ -55,19 +51,17 @@ let ensure_journal config =
          (Page
             (Create_page
                { title = "2026-08-12"
-               ; kind = Create_journal_page { journal_day = 20260812; supplied_uuid = Some journal_page }
+               ; kind =
+                   Create_journal_page
+                     { journal_day = 20260812; supplied_uuid = Some journal_page }
                ; context = context engine "90000000-0000-4000-9000-000000000000"
                }))))
 ;;
 
-let block_uuid index =
-  uuid (Printf.sprintf "90000000-0000-4000-a000-%012d" index)
-;;
+let block_uuid index = uuid (Printf.sprintf "90000000-0000-4000-a000-%012d" index)
 
 let insert config ~index ~minute ~parent ~source =
-  let epoch_ms =
-    Int64.add 1_786_485_600_000L (Int64.of_int (minute * 60_000))
-  in
+  let epoch_ms = Int64.add 1_786_485_600_000L (Int64.of_int (minute * 60_000)) in
   with_engine config ~epoch_ms (fun engine ->
     ignore
       (execute
@@ -78,9 +72,24 @@ let insert config ~index ~minute ~parent ~source =
                { roots = [ { uuid = block_uuid index; title = source; children = [] } ]
                ; position = Relative (Last_child parent)
                ; context =
-                   context
-                     engine
-                     (Printf.sprintf "90000000-0000-4000-9000-%012d" index)
+                   context engine (Printf.sprintf "90000000-0000-4000-9000-%012d" index)
+               }))))
+;;
+
+let set_status config ~index ~minute status =
+  let epoch_ms = Int64.add 1_786_485_600_000L (Int64.of_int (minute * 60_000)) in
+  with_engine config ~epoch_ms (fun engine ->
+    ignore
+      (execute
+         engine
+         ~request_id:(Printf.sprintf "91000000-0000-4000-8000-%012d" index)
+         (Property
+            (Set_property
+               { block = block_uuid index
+               ; property = Property_by_ident "logseq.property/status"
+               ; value = Default_value status
+               ; context =
+                   context engine (Printf.sprintf "91000000-0000-4000-9000-%012d" index)
                }))))
 ;;
 
@@ -139,12 +148,7 @@ let () =
     ~minute:1_158
     ~parent:(block_uuid 5)
     ~source:"Keep bounded virtualization";
-  insert
-    config
-    ~index:7
-    ~minute:1_102
-    ~parent:journal_page
-    ~source:"Test on iPhone";
+  insert config ~index:7 ~minute:1_102 ~parent:journal_page ~source:"Test on iPhone";
   insert
     config
     ~index:8
@@ -163,5 +167,29 @@ let () =
     ~minute:1_049
     ~parent:(block_uuid 9)
     ~source:"Prefer one clear tap target";
+  insert config ~index:11 ~minute:900 ~parent:journal_page ~source:"Todo rail";
+  set_status config ~index:11 ~minute:900 "Todo";
+  insert
+    config
+    ~index:12
+    ~minute:901
+    ~parent:journal_page
+    ~source:"Doing line one\nDoing line two";
+  set_status config ~index:12 ~minute:901 "Doing";
+  insert
+    config
+    ~index:13
+    ~minute:902
+    ~parent:journal_page
+    ~source:"Done line one\nDone line two\nDone line three";
+  set_status config ~index:13 ~minute:902 "Done";
+  insert
+    config
+    ~index:14
+    ~minute:903
+    ~parent:journal_page
+    ~source:
+      "Later line one\nLater line two\nLater line three\nLater line four\nLater line five";
+  set_status config ~index:14 ~minute:903 "Backlog";
   print_endline (Graph.Uuid.to_string token)
 ;;

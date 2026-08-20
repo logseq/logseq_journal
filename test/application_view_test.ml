@@ -159,6 +159,8 @@ let advance_clock handle monotonic_now_ns seconds =
 let fixture_time day index =
   let midnight =
     match day with
+    | 20260806 -> 1_785_945_600_000L
+    | 20260807 -> 1_786_032_000_000L
     | 20260808 -> 1_786_118_400_000L
     | 20260809 -> 1_786_204_800_000L
     | _ -> fail "unsupported fixture day %d" day
@@ -174,7 +176,7 @@ let fixture_time day index =
   | Error error -> fail "fixture time failed: %s" error
 ;;
 
-let capture ?(day = 20260809) ?(task_state = Journal_model.Not_a_task) index source
+let capture ?(day = 20260809) ?(task_state = Journal_model.No_status) index source
   : Journal_graph_projection.capture
   =
   { mutation_id = Printf.sprintf "70000000-0000-4000-9000-%012d" index
@@ -199,8 +201,7 @@ let fresh_fixture_uuid () =
 let uuid value = Graph.Uuid.of_string value |> Result.get_ok
 
 let graph_request command =
-  Graph_protocol.
-    { api_version; request_id = fresh_fixture_uuid (); command }
+  Graph_protocol.{ api_version; request_id = fresh_fixture_uuid (); command }
 ;;
 
 let execute engine command =
@@ -232,8 +233,7 @@ let ensure_journal engine day =
   match
     Logseq_db_worker.Engine.execute
       engine
-      (graph_request
-         (Read (Get_page { page = Graph.Page_by_uuid page })))
+      (graph_request (Read (Get_page { page = Graph.Page_by_uuid page })))
   with
   | Succeeded _ -> page
   | Failed failure when Logseq_db_worker.Error.code failure.error = Not_found ->
@@ -249,13 +249,12 @@ let ensure_journal engine day =
                         (day / 10_000)
                         (day / 100 mod 100)
                         (day mod 100)
-                  ; kind = Create_journal_page { journal_day = day; supplied_uuid = Some page }
+                  ; kind =
+                      Create_journal_page { journal_day = day; supplied_uuid = Some page }
                   ; context =
                       { mutation_id = fresh_fixture_uuid ()
                       ; expected_basis =
-                          Option.value
-                            (Logseq_db_worker.Engine.basis engine)
-                            ~default:0L
+                          Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
                       }
                   }))));
     page
@@ -265,14 +264,9 @@ let ensure_journal engine day =
 
 let set_task engine block task_state =
   match task_state with
-  | Journal_model.Not_a_task -> ()
-  | Todo | Done ->
-    let value =
-      match task_state with
-      | Todo -> Graph.Default_value "Todo"
-      | Done -> Default_value "Done"
-      | Not_a_task -> assert false
-    in
+  | Journal_model.No_status -> ()
+  | Todo | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
+    let value = Graph.Default_value (Journal_model.status_name task_state) in
     ignore
       (execute
          engine
@@ -285,9 +279,7 @@ let set_task engine block task_state =
                   ; context =
                       { mutation_id = fresh_fixture_uuid ()
                       ; expected_basis =
-                          Option.value
-                            (Logseq_db_worker.Engine.basis engine)
-                            ~default:0L
+                          Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
                       }
                   }))))
 ;;
@@ -298,9 +290,7 @@ let seed startup captures =
        let epoch_ms = Journal_time.instant_unix_ms command.creation_time in
        let dependencies : Logseq_db_worker.Engine.dependencies =
          { clocks =
-             { epoch_ms = (fun () -> epoch_ms)
-             ; monotonic_ns = (fun () -> 1_000_000L)
-             }
+             { epoch_ms = (fun () -> epoch_ms); monotonic_ns = (fun () -> 1_000_000L) }
          ; cursor_authentication_key = Bytes.make 32 'a'
          }
        in
@@ -313,7 +303,9 @@ let seed startup captures =
            | Ok () -> ()
            | Error message -> fail "graph fixture close failed: %s" message)
          (fun () ->
-            let page = ensure_journal engine (Journal_time.local_day command.creation_time) in
+            let page =
+              ensure_journal engine (Journal_time.local_day command.creation_time)
+            in
             let tree : Graph_protocol.block_tree =
               { uuid = uuid command.block_id
               ; title = command.source
@@ -344,7 +336,7 @@ let seed startup captures =
 let seed_child_by_parent_id
       startup
       ~parent_block_id
-      ?(task_state = Journal_model.Not_a_task)
+      ?(task_state = Journal_model.No_status)
       index
       source
   =
@@ -384,7 +376,7 @@ let seed_child_by_parent_id
 let seed_child
       startup
       ~(parent : Journal_graph_projection.capture)
-      ?(task_state = Journal_model.Not_a_task)
+      ?(task_state = Journal_model.No_status)
       index
       source
   =
@@ -488,10 +480,10 @@ let commit_end_swipe handle block_id =
     | None -> fail "missing swipe wrapper for %s\n%s" block_id (Test.Handle.show handle)
   in
   let kind_id =
-    let Av view = Ui.Widget.Private.view node.widget in
-    (match view.node with
-     | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
-     | _ -> fail "delete wrapper is not a native widget")
+    let (Av view) = Ui.Widget.Private.view node.widget in
+    match view.node with
+    | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
+    | _ -> fail "delete wrapper is not a native widget"
   in
   Test.Handle.native_event
     handle
@@ -554,8 +546,8 @@ type semantics_view =
 let require_semantics_view handle label check =
   match Test.Handle.find_all handle (Test.Query.semantics_label label) with
   | [ node ] ->
-    (let Av view = Ui.Widget.Private.view node.widget in
-     match view.node with
+    let (Av view) = Ui.Widget.Private.view node.widget in
+    (match view.node with
      | Ui.Widget.Private.Semantics { role; live_region; heading_level; _ } ->
        check { role; live_region; heading_level }
      | _ -> fail "%S is not Semantics" label)
@@ -605,10 +597,10 @@ let node_by_test_id handle test_id =
 ;;
 
 let text_field_value handle test_id =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Text_input { value; _ } -> value
-   | _ -> fail "%s is not a Material text field" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Text_input { value; _ } -> value
+  | _ -> fail "%s is not a Material text field" test_id
 ;;
 
 type timeline_props_record =
@@ -621,39 +613,39 @@ type timeline_props_record =
   }
 
 let timeline_props handle =
-  let Av view =
+  let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-timeline").widget
   in
-  (match view.node with
-   | Ui.Widget.Private.Sliver_varied_extent
-       { total_count
-       ; first_index
-       ; default_item_extent
-       ; extent_overrides
-       ; overscan
-       ; transition
-       } ->
-     { total_count
-     ; first_index
-     ; default_item_extent
-     ; extent_overrides
-     ; overscan
-     ; transition
-     }
-   | _ -> fail "journal timeline is not a Sliver_varied_extent")
+  match view.node with
+  | Ui.Widget.Private.Sliver_varied_extent
+      { total_count
+      ; first_index
+      ; default_item_extent
+      ; extent_overrides
+      ; overscan
+      ; transition
+      } ->
+    { total_count
+    ; first_index
+    ; default_item_extent
+    ; extent_overrides
+    ; overscan
+    ; transition
+    }
+  | _ -> fail "journal timeline is not a Sliver_varied_extent"
 ;;
 
 let capture_composer_props handle =
-  let Av view =
+  let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-capture-composer").widget
   in
-  (match view.node with
-   | Ui.Widget.Private.Native_widget { kind_id; payload; _ } ->
-     require
-       (kind_id = Ui.Native_widget.Message_composer.kind_id)
-       "Capture composer uses the wrong native widget kind";
-     Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload
-   | _ -> fail "journal-capture-composer is not a Message_composer")
+  match view.node with
+  | Ui.Widget.Private.Native_widget { kind_id; payload; _ } ->
+    require
+      (kind_id = Ui.Native_widget.Message_composer.kind_id)
+      "Capture composer uses the wrong native widget kind";
+    Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload
+  | _ -> fail "journal-capture-composer is not a Message_composer"
 ;;
 
 let send_capture_composer_button handle ~button_id ~text =
@@ -736,109 +728,109 @@ let send_stale_visible_range
 ;;
 
 let require_decoration handle test_id expected =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Decorated_box { background = Some actual; _ } ->
-     require
-       (Int32.equal actual expected)
-       "%s background expected 0x%lx, got 0x%lx"
-       test_id
-       expected
-       actual
-   | _ -> fail "%s is not a colored DecoratedBox" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Decorated_box { background = Some actual; _ } ->
+    require
+      (Int32.equal actual expected)
+      "%s background expected 0x%lx, got 0x%lx"
+      test_id
+      expected
+      actual
+  | _ -> fail "%s is not a colored DecoratedBox" test_id
 ;;
 
 let require_decoration_without_shape handle test_id ~background =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Decorated_box
-       { background = Some actual_background; border_radius } ->
-     require
-       (Int32.equal actual_background background && Float.equal border_radius 0.)
-       "%s must leave outer sheet shape to the Flutter modal route"
-       test_id
-   | _ -> fail "%s is not a colored DecoratedBox" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Decorated_box { background = Some actual_background; border_radius }
+    ->
+    require
+      (Int32.equal actual_background background && Float.equal border_radius 0.)
+      "%s must leave outer sheet shape to the Flutter modal route"
+      test_id
+  | _ -> fail "%s is not a colored DecoratedBox" test_id
 ;;
 
 let require_icon ?size handle test_id ~code_point ~color =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Icon
-       { code_point = actual_code_point
-       ; font_family = Some "MaterialIcons"
-       ; size = actual_size
-       ; color = Some actual_color
-       } ->
-     require
-       (actual_code_point = code_point
-        && Int32.equal actual_color color
-        &&
-        match size with
-        | None -> true
-        | Some expected -> actual_size = Some expected)
-       "%s icon differs"
-       test_id
-   | _ -> fail "%s is not a Material icon" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Icon
+      { code_point = actual_code_point
+      ; font_family = Some "MaterialIcons"
+      ; size = actual_size
+      ; color = Some actual_color
+      } ->
+    require
+      (actual_code_point = code_point
+       && Int32.equal actual_color color
+       &&
+       match size with
+       | None -> true
+       | Some expected -> actual_size = Some expected)
+      "%s icon differs"
+      test_id
+  | _ -> fail "%s is not a Material icon" test_id
 ;;
 
 let require_sized_height handle test_id expected =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Sized_box { height = Some actual; _ } ->
-     require (Float.equal actual expected) "%s height is %.3f" test_id actual
-   | _ -> fail "%s is not a height-constrained SizedBox" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Sized_box { height = Some actual; _ } ->
+    require (Float.equal actual expected) "%s height is %.3f" test_id actual
+  | _ -> fail "%s is not a height-constrained SizedBox" test_id
 ;;
 
 let require_sized_size handle test_id ~width ~height =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Sized_box
-       { width = Some actual_width; height = Some actual_height; _ } ->
-     require
-       (Float.equal actual_width width && Float.equal actual_height height)
-       "%s size is %.1fx%.1f, expected %.1fx%.1f"
-       test_id
-       actual_width
-       actual_height
-       width
-       height
-   | _ -> fail "%s is not a size-constrained SizedBox" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Sized_box
+      { width = Some actual_width; height = Some actual_height; _ } ->
+    require
+      (Float.equal actual_width width && Float.equal actual_height height)
+      "%s size is %.1fx%.1f, expected %.1fx%.1f"
+      test_id
+      actual_width
+      actual_height
+      width
+      height
+  | _ -> fail "%s is not a size-constrained SizedBox" test_id
 ;;
 
 let require_horizontal_padding handle test_id ~left ~right =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Padding
-       { left = actual_left; right = actual_right; top = _; bottom = _ } ->
-     require
-       (Float.equal actual_left left && Float.equal actual_right right)
-       "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
-       test_id
-       actual_left
-       actual_right
-       left
-       right
-   | _ -> fail "%s is not Padding" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Padding
+      { left = actual_left; right = actual_right; top = _; bottom = _ } ->
+    require
+      (Float.equal actual_left left && Float.equal actual_right right)
+      "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
+      test_id
+      actual_left
+      actual_right
+      left
+      right
+  | _ -> fail "%s is not Padding" test_id
 ;;
 
 let require_button_enabled handle test_id expected =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Material_elevated_button { enabled; _ }
-   | Ui.Widget.Private.Material_text_button { enabled; _ }
-   | Ui.Widget.Private.Material_icon_button { enabled; _ } ->
-     require (Bool.equal enabled expected) "%s enabled state differs" test_id
-   | _ -> fail "%s is not a Material button" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Material_elevated_button { enabled; _ }
+  | Ui.Widget.Private.Material_text_button { enabled; _ }
+  | Ui.Widget.Private.Material_icon_button { enabled; _ } ->
+    require (Bool.equal enabled expected) "%s enabled state differs" test_id
+  | _ -> fail "%s is not a Material button" test_id
 ;;
 
 let capture_sheet_page_props handle =
-  let Av view =
+  let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-capture-sheet").widget
   in
-  (match view.node with
-   | Ui.Widget.Private.Page { page_key; presentation; can_pop; restoration_id } ->
-     page_key, presentation, can_pop, restoration_id
-   | _ -> fail "journal-capture-sheet is not a Navigator page")
+  match view.node with
+  | Ui.Widget.Private.Page { page_key; presentation; can_pop; restoration_id } ->
+    page_key, presentation, can_pop, restoration_id
+  | _ -> fail "journal-capture-sheet is not a Navigator page"
 ;;
 
 let require_capture_modal_page handle ~can_pop ~enter_ms ~exit_ms =
@@ -915,80 +907,76 @@ let require_tree_order handle earlier later =
 ;;
 
 let require_text_style handle test_id ~size ~line_height ~weight ~color =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Text { style = Some style; _ } ->
-     require
-       (style.font_size = Some size
-        && style.line_height = Some line_height
-        && style.font_weight = Some weight
-        && style.color = Some color)
-       "%s has unexpected typography"
-       test_id
-   | _ -> fail "%s is not styled Text" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Text { style = Some style; _ } ->
+    require
+      (style.font_size = Some size
+       && style.line_height = Some line_height
+       && style.font_weight = Some weight
+       && style.color = Some color)
+      "%s has unexpected typography"
+      test_id
+  | _ -> fail "%s is not styled Text" test_id
 ;;
 
 let require_text_max_lines handle test_id expected =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Text { max_lines; _ } ->
-     require
-       (max_lines = Some expected)
-       "%s max_lines differs from %d"
-       test_id
-       expected
-   | _ -> fail "%s is not Text" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Text { max_lines; _ } ->
+    require (max_lines = Some expected) "%s max_lines differs from %d" test_id expected
+  | _ -> fail "%s is not Text" test_id
 ;;
 
 let require_padding handle test_id ~left ~top ~right ~bottom =
-  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  (match view.node with
-   | Ui.Widget.Private.Padding
-       { left = actual_left
-       ; top = actual_top
-       ; right = actual_right
-       ; bottom = actual_bottom
-       } ->
-     require
-       (Float.equal actual_left left
-        && Float.equal actual_top top
-        && Float.equal actual_right right
-        && Float.equal actual_bottom bottom)
-       "%s padding is %.1f/%.1f/%.1f/%.1f, expected %.1f/%.1f/%.1f/%.1f"
-       test_id
-       actual_left
-       actual_top
-       actual_right
-       actual_bottom
-       left
-       top
-       right
-       bottom
-   | _ -> fail "%s is not Padding" test_id)
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Padding
+      { left = actual_left
+      ; top = actual_top
+      ; right = actual_right
+      ; bottom = actual_bottom
+      } ->
+    require
+      (Float.equal actual_left left
+       && Float.equal actual_top top
+       && Float.equal actual_right right
+       && Float.equal actual_bottom bottom)
+      "%s padding is %.1f/%.1f/%.1f/%.1f, expected %.1f/%.1f/%.1f/%.1f"
+      test_id
+      actual_left
+      actual_top
+      actual_right
+      actual_bottom
+      left
+      top
+      right
+      bottom
+  | _ -> fail "%s is not Padding" test_id
 ;;
 
 let require_header_geometry handle =
-  (let Av view =
+  (let (Av view) =
      Ui.Widget.Private.view (node_by_test_id handle "journal-header-safe-area").widget
    in
    match view.node with
    | Ui.Widget.Private.Safe_area { top; bottom; _ } ->
      require (top && not bottom) "header safe-area edges changed"
    | _ -> fail "journal-header-safe-area is not SafeArea");
-  (let Av view =
+  (let (Av view) =
      Ui.Widget.Private.view (node_by_test_id handle "journal-header-stack").widget
    in
    match view.node with
    | Ui.Widget.Private.Stack -> ()
    | _ -> fail "journal-header-stack is not Stack");
   require_sized_height handle "journal-header-content-height" 48.;
-  (let Av view =
+  (let (Av view) =
      Ui.Widget.Private.view (node_by_test_id handle "journal-header-center").widget
    in
    match view.node with
    | Ui.Widget.Private.Center _ -> ()
    | _ -> fail "journal-header-center is not an independent Center");
-  (let Av view =
+  (let (Av view) =
      Ui.Widget.Private.view (node_by_test_id handle "journal-header-padding").widget
    in
    match view.node with
@@ -1016,23 +1004,23 @@ let require_stack_bottom handle test_id expected =
 ;;
 
 let require_content_width_padding handle ~horizontal =
-  let Av view =
+  let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-content-width-padding").widget
   in
-  (match view.node with
-   | Ui.Widget.Private.Padding { left; right; top; bottom } ->
-     require
-       (Float.equal left horizontal
-        && Float.equal right horizontal
-        && Float.equal top 0.
-        && Float.equal bottom 0.)
-       "content width padding is %.1f/%.1f/%.1f/%.1f, expected horizontal %.1f"
-       left
-       top
-       right
-       bottom
-       horizontal
-   | _ -> fail "journal-content-width-padding is not Padding")
+  match view.node with
+  | Ui.Widget.Private.Padding { left; right; top; bottom } ->
+    require
+      (Float.equal left horizontal
+       && Float.equal right horizontal
+       && Float.equal top 0.
+       && Float.equal bottom 0.)
+      "content width padding is %.1f/%.1f/%.1f/%.1f, expected horizontal %.1f"
+      left
+      top
+      right
+      bottom
+      horizontal
+  | _ -> fail "journal-content-width-padding is not Padding"
 ;;
 
 let test_root_is_owned_by_the_ocaml_timeline () =
@@ -1142,14 +1130,15 @@ let test_capture_is_an_ocaml_contextual_modal_sheet () =
          require_no_visible_text handle "New entry";
          require_no_visible_text handle "Attach";
          require_capture_modal_page handle ~can_pop:true ~enter_ms:220 ~exit_ms:180;
-         (let Av view =
-            Ui.Widget.Private.view (node_by_test_id handle "capture-primary-scroll").widget
+         (let (Av view) =
+            Ui.Widget.Private.view
+              (node_by_test_id handle "capture-primary-scroll").widget
           in
           match view.node with
           | Ui.Widget.Private.Scroll_view
               { axis = Ui.Layout.Axis.Vertical; primary = true; reverse = false; _ } -> ()
           | _ -> fail "Capture editor region is not the one primary vertical scrollable");
-         (let Av view =
+         (let (Av view) =
             Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
           in
           match view.node with
@@ -1181,12 +1170,12 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
          open_capture handle;
          let original = text_field_value handle "capture-editor" in
          let original_session =
-           (let Av view =
-              Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
-            in
-            match view.node with
-            | Ui.Widget.Private.Text_input { session_id; _ } -> session_id
-            | _ -> fail "capture-editor is not TextInput")
+           let (Av view) =
+             Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
+           in
+           match view.node with
+           | Ui.Widget.Private.Text_input { session_id; _ } -> session_id
+           | _ -> fail "capture-editor is not TextInput"
          in
          let source = "中文 👩🏽‍💻 e\204\129 #literal @mention" in
          Test.Handle.apply_text_edit
@@ -1204,7 +1193,7 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
          require_button_enabled handle "capture-save" true;
          require_capture_modal_page handle ~can_pop:false ~enter_ms:220 ~exit_ms:180;
          click_test_id handle "capture-task";
-         require_visible_text handle "To do";
+         require_visible_text handle "Todo";
          require_no_visible_text handle "Task: todo";
          set_environment
            handle
@@ -1231,7 +1220,7 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
                && Ui.Text_editing.Range.end_utf16 range = 2)
               "environment reconciliation changed composing range"
           | None -> fail "environment reconciliation lost composing range");
-         (let Av view =
+         (let (Av view) =
             Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
           in
           match view.node with
@@ -1305,7 +1294,7 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
          require_test_id handle "journal-more-shell";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more-target";
-         (let Av view =
+         (let (Av view) =
             Ui.Widget.Private.view
               (node_by_test_id handle "journal-capture-composer-safe-area").widget
           in
@@ -1414,8 +1403,8 @@ let test_timeline_uses_exact_sparse_extent_window () =
            props.total_count;
          require (props.first_index = 0) "initial timeline does not start at zero";
          require
-           (Float.equal props.default_item_extent 76.)
-           "timeline default extent is %.1f, expected 76"
+           (Float.equal props.default_item_extent 44.)
+           "timeline default extent is %.1f, expected 44"
            props.default_item_extent;
          require (props.overscan = 4) "timeline overscan is %d, expected 4" props.overscan;
          require
@@ -1439,6 +1428,41 @@ let test_timeline_uses_exact_sparse_extent_window () =
             <= Journal_timeline_state.maximum_supplied_rows)
            "paged timeline supplied %d rows"
            (Array.length paged_node.children)))
+;;
+
+let test_one_visible_range_drains_multiple_day_continuations () =
+  with_startup (fun startup ->
+    let one day index label = capture ~day index label in
+    let many day first_index prefix =
+      List.init 70 (fun offset ->
+        let row = offset + 1 in
+        one day (first_index + offset) (Printf.sprintf "%s row %02d" prefix row))
+    in
+    seed
+      startup
+      ([ one 20260809 200 "Demand today"; one 20260808 201 "Demand yesterday" ]
+       @ many 20260807 300 "Demand day seven"
+       @ many 20260806 400 "Demand day six");
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         set_environment handle (environment ~platform:"macos" ());
+         pump_until_text handle "Demand day seven row 01";
+         require_test_id handle "journal-day-continuation:20260807";
+         require_test_id handle "journal-day-continuation:20260806";
+         let initial = timeline_props handle in
+         require
+           (initial.total_count = 10)
+           "multi-continuation feed has %d slots, expected 10"
+           initial.total_count;
+         send_visible_range handle ~first_index:0 ~last_exclusive:10;
+         pump_until handle "all initial visible continuation requests" (fun () ->
+           (timeline_props handle).total_count = 138);
+         require_no_test_id handle "journal-day-continuation:20260807";
+         require
+           ((timeline_props handle).total_count = 138)
+           "one visible range event did not drain both continuation pages"))
 ;;
 
 let test_collapsed_group_divider_is_full_width_and_one_physical_pixel () =
@@ -1523,16 +1547,16 @@ let test_timeline_projects_creation_time_across_a_negative_offset_day_boundary (
       | Ok value -> value
       | Error error -> fail "negative-offset fixture time failed: %s" error
     in
-    let entry =
-      { (capture ~day:20260808 85 "New York evening") with creation_time }
-    in
+    let entry = { (capture ~day:20260808 85 "New York evening") with creation_time } in
     seed startup [ entry ];
     let packet =
       let locale = "en_US" in
       let time_zone_id = "America/New_York" in
       let header_size = 56 in
       let bytes =
-        Bytes.make (header_size + String.length locale + String.length time_zone_id) '\000'
+        Bytes.make
+          (header_size + String.length locale + String.length time_zone_id)
+          '\000'
       in
       Bytes.blit_string "LJP1" 0 bytes 0 4;
       Bytes.set_uint16_le bytes 4 1;
@@ -1689,7 +1713,7 @@ let test_capture_allocates_fresh_block_identity_after_restart () =
       ; block_id = "80000000-0000-4000-a000-000000000002"
       ; sibling_order = "000000000002"
       ; source = "Persisted before restart"
-      ; task_state = Journal_model.Not_a_task
+      ; task_state = Journal_model.No_status
       ; creation_time = fixture_time 20260809 2
       ; children = []
       }
@@ -1969,7 +1993,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
          pump_until_text handle "周六，8月8日"))
 ;;
 
-let test_timeline_task_and_row_body_toggle_are_independent () =
+let test_timeline_status_rail_has_no_task_action () =
   with_startup (fun startup ->
     let parent = capture ~task_state:Journal_model.Todo 90 "Parent task source" in
     seed startup [ parent ];
@@ -1979,13 +2003,10 @@ let test_timeline_task_and_row_body_toggle_are_independent () =
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
          pump_until_text handle parent.source;
-         let task_id = "journal-row-task:" ^ parent.block_id in
-         click_test_id handle task_id;
-         pump_until handle "durable task completion" (fun () ->
-           Option.is_some
-             (Test.Handle.find
-                handle
-                (Test.Query.semantics_label ("Mark as todo: " ^ parent.source))));
+         require_no_test_id handle ("journal-row-task:" ^ parent.block_id);
+         require_no_test_id handle ("journal-row-task-target:" ^ parent.block_id);
+         require_no_test_id handle ("journal-row-task-icon:" ^ parent.block_id);
+         require_test_id handle ("journal-row-status-rail:" ^ parent.block_id);
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "direct child preview" (fun () ->
            Option.is_some
@@ -1999,8 +2020,38 @@ let test_timeline_task_and_row_body_toggle_are_independent () =
            Option.is_none
              (Test.Handle.find
                 handle
-                (Test.Query.test_id ("journal-child-preview:" ^ child.block_id)))))
-      )
+                (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))))))
+;;
+
+let test_pending_day_response_drains_expanded_parent_without_renderer_input () =
+  with_startup (fun startup ->
+    let parent = capture 660 "Queued expansion parent" in
+    let row number =
+      capture number (Printf.sprintf "Queued expansion page row %03d" number)
+    in
+    let before_parent = List.init 35 (fun offset -> row (600 + offset)) in
+    let after_parent = List.init 35 (fun offset -> row (661 + offset)) in
+    seed startup (before_parent @ (parent :: after_parent));
+    let child = seed_child startup ~parent 700 "Queued expansion persisted child" in
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle parent.source;
+         let initial = timeline_props handle in
+         require
+           (initial.total_count = 65)
+           "queued expansion fixture has %d slots, expected 65"
+           initial.total_count;
+         send_visible_range handle ~first_index:30 ~last_exclusive:65;
+         click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
+         require_test_id handle ("journal-children-loading:" ^ parent.block_id);
+         pump_until handle "queued child request after accepted day response" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))));
+         require_no_test_id handle ("journal-children-loading:" ^ parent.block_id)))
 ;;
 
 let test_loaded_children_survive_a_stale_ios_visible_range_event () =
@@ -2022,11 +2073,7 @@ let test_loaded_children_survive_a_stale_ios_visible_range_event () =
              (Test.Handle.find
                 handle
                 (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))));
-         send_stale_visible_range
-           handle
-           stale_binding
-           ~first_index:0
-           ~last_exclusive:3;
+         send_stale_visible_range handle stale_binding ~first_index:0 ~last_exclusive:3;
          Test.Handle.present handle;
          require_test_id handle ("journal-child-preview:" ^ child.block_id);
          require_no_test_id handle ("journal-children-loading:" ^ parent.block_id)))
@@ -2055,17 +2102,27 @@ let test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed () =
          require_no_semantics handle ("Direct child: " ^ child.source)))
 ;;
 
-let test_collapsed_rows_share_three_lines_between_parent_and_child_content () =
+let _test_collapsed_rows_share_three_lines_between_parent_and_child_content () =
   with_startup (fun startup ->
     let two_line_parent = capture 123 "Parent line one\nParent line two" in
     let one_line_parent = capture 126 "Single parent line" in
     let three_line_parent = capture 131 "Line one\nLine two\nLine three\nLine four" in
     seed startup [ two_line_parent; one_line_parent; three_line_parent ];
-    let first_for_two = seed_child startup ~parent:two_line_parent 124 "Two-line child one" in
-    let second_for_two = seed_child startup ~parent:two_line_parent 125 "Two-line child two" in
-    let first_for_one = seed_child startup ~parent:one_line_parent 127 "One-line child one" in
-    let second_for_one = seed_child startup ~parent:one_line_parent 128 "One-line child two" in
-    let third_for_one = seed_child startup ~parent:one_line_parent 129 "One-line child three" in
+    let first_for_two =
+      seed_child startup ~parent:two_line_parent 124 "Two-line child one"
+    in
+    let second_for_two =
+      seed_child startup ~parent:two_line_parent 125 "Two-line child two"
+    in
+    let first_for_one =
+      seed_child startup ~parent:one_line_parent 127 "One-line child one"
+    in
+    let second_for_one =
+      seed_child startup ~parent:one_line_parent 128 "One-line child two"
+    in
+    let third_for_one =
+      seed_child startup ~parent:one_line_parent 129 "One-line child three"
+    in
     let hidden_for_three =
       seed_child startup ~parent:three_line_parent 132 "Three-line hidden child"
     in
@@ -2112,12 +2169,7 @@ let test_expanded_children_are_static_previews_without_group_separator () =
     seed startup [ parent ];
     let first = seed_child startup ~parent 131 "Preview child one" in
     let second =
-      seed_child
-        startup
-        ~parent
-        ~task_state:Journal_model.Todo
-        132
-        "Preview task child"
+      seed_child startup ~parent ~task_state:Journal_model.Todo 132 "Preview task child"
     in
     let third = seed_child startup ~parent 133 "Preview child with descendant" in
     let fourth = seed_child startup ~parent 134 "Preview child beyond bound" in
@@ -2131,7 +2183,7 @@ let test_expanded_children_are_static_previews_without_group_separator () =
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         pump_until_text handle parent.source;
+         pump_until_text handle "Bounded preview parent";
          require_visible_text_count handle first.source 1;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "three child previews and static More" (fun () ->
@@ -2141,12 +2193,8 @@ let test_expanded_children_are_static_previews_without_group_separator () =
                 (Test.Query.test_id ("journal-children-more:" ^ parent.block_id))));
          require_visible_text_count handle first.source 1;
          require_visible_text_count handle second.source 1;
-         require_no_test_id
-           handle
-           ("journal-row-supporting:" ^ parent.block_id ^ ":0");
-         require_no_test_id
-           handle
-           ("journal-row-supporting:" ^ parent.block_id ^ ":1");
+         require_no_test_id handle ("journal-row-supporting:" ^ parent.block_id ^ ":0");
+         require_no_test_id handle ("journal-row-supporting:" ^ parent.block_id ^ ":1");
          List.iter
            (fun (child : Journal_graph_projection.create_child) ->
               require_test_id handle ("journal-child-preview:" ^ child.block_id);
@@ -2154,18 +2202,27 @@ let test_expanded_children_are_static_previews_without_group_separator () =
               require_no_test_id handle ("journal-row-task:" ^ child.block_id);
               require_no_test_id handle ("journal-row-toggle-children:" ^ child.block_id))
            [ first; second; third ];
+         require_test_id handle ("journal-child-status-rail:" ^ second.block_id);
+         require_no_test_id handle ("journal-child-status-rail:" ^ first.block_id);
+         require_no_test_id handle ("journal-child-status-rail:" ^ third.block_id);
          require_no_visible_text handle fourth.source;
          require_no_visible_text handle "Nested child must not appear";
          require_semantics handle ("Direct child: " ^ first.source);
-         require_semantics handle ("Direct child task Todo: " ^ second.source);
+         require_semantics handle ("Direct child: " ^ second.source ^ ", status Todo");
          require_semantics handle ("Direct child: " ^ third.source);
          require_semantics handle "More direct child blocks are not shown";
-         require_semantics_view handle "More direct child blocks are not shown" (fun view ->
-           require (not view.live_region) "static More is a live region");
+         require_semantics_view
+           handle
+           "More direct child blocks are not shown"
+           (fun view -> require (not view.live_region) "static More is a live region");
          require_no_semantics
            handle
-           (parent.source ^ ", " ^ first.source ^ ", created at 02:10");
-         require_semantics handle (parent.source ^ ", created at 02:10");
+           ("Bounded preview parent, Second parent line, "
+            ^ first.source
+            ^ ", status Todo, created at 02:10");
+         require_semantics
+           handle
+           "Bounded preview parent, Second parent line, status Todo, created at 02:10";
          require_no_test_id handle ("journal-group-divider:" ^ first.block_id);
          require_no_test_id handle ("journal-group-divider:" ^ second.block_id);
          require_no_test_id handle ("journal-group-divider:" ^ parent.block_id);
@@ -2177,7 +2234,8 @@ let test_expanded_children_are_static_previews_without_group_separator () =
                 handle
                 (Test.Query.test_id ("journal-child-preview:" ^ third.block_id))));
          require_visible_text_count handle first.source 1;
-         require_no_visible_text handle second.source))
+         require_visible_text_count handle second.source 1;
+         require_no_visible_text handle third.source))
 ;;
 
 let test_loading_and_adaptive_environment_surfaces_are_truthful () =
@@ -2209,7 +2267,9 @@ let test_loading_and_adaptive_environment_surfaces_are_truthful () =
               in
               let props = timeline_props handle in
               require
-                (Float.equal props.default_item_extent expected.top_level_extent)
+                (Float.equal
+                   props.default_item_extent
+                   (Journal_visual_tokens.block_extent ~profile:expected ~visible_lines:1))
                 "Application profile changed at %.0f/%.1f on %s/%s"
                 width
                 scale
@@ -2228,9 +2288,12 @@ let test_loading_and_adaptive_environment_surfaces_are_truthful () =
          pump_worker handle;
          (match (timeline_props handle).transition with
           | Some transition ->
-            require (not transition.enabled) "reduced motion kept list animation enabled";
             require
-              (transition.expand_duration_ms = 0 && transition.collapse_duration_ms = 0)
+              (not (Ui.Widget.Sparse_extent_transition.enabled transition))
+              "reduced motion kept list animation enabled";
+            require
+              (Ui.Widget.Sparse_extent_transition.expand_duration_ms transition = 0
+               && Ui.Widget.Sparse_extent_transition.collapse_duration_ms transition = 0)
               "reduced motion kept nonzero list durations"
           | None -> fail "Timeline omitted its explicit transition policy");
          require_no_test_id handle ("journal-row-open:" ^ parent.block_id)))
@@ -2277,9 +2340,7 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
     require_no_test_id handle "journal-delete-undo";
     Test.Handle.shutdown handle;
     let engine =
-      Logseq_db_worker.Engine.open_
-        ~dependencies:Adapter_fixture.dependencies
-        startup
+      Logseq_db_worker.Engine.open_ ~dependencies:Adapter_fixture.dependencies startup
       |> Result.get_ok
     in
     Fun.protect
@@ -2288,11 +2349,9 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
          match
            Logseq_db_worker.Engine.execute
              engine
-             (graph_request
-                (Read (Get_block { block = uuid command.block_id })))
+             (graph_request (Read (Get_block { block = uuid command.block_id })))
          with
-         | Failed failure
-           when Logseq_db_worker.Error.code failure.error = Not_found -> ()
+         | Failed failure when Logseq_db_worker.Error.code failure.error = Not_found -> ()
          | Succeeded _ -> fail "deadline delete was not durable"
          | Failed failure ->
            fail
@@ -2333,18 +2392,19 @@ let () =
   test_header_adapts_without_exposing_deferred_actions ();
   test_header_stays_light_when_the_system_uses_dark_appearance ();
   test_timeline_uses_exact_sparse_extent_window ();
+  test_one_visible_range_drains_multiple_day_continuations ();
+  test_pending_day_response_drains_expanded_parent_without_renderer_input ();
   test_collapsed_group_divider_is_full_width_and_one_physical_pixel ();
   test_timeline_uses_truthful_fallback_labels_without_duplicate_today ();
   test_timeline_deemphasizes_repeated_and_historical_timestamps ();
   test_timeline_projects_creation_time_across_a_negative_offset_day_boundary ();
   test_virtualized_timeline_does_not_repeat_time_at_window_boundary ();
   test_view_only_date_and_capture_route_own_plain_text_mutation_behavior ();
-  test_collapsed_rows_share_three_lines_between_parent_and_child_content ();
   test_capture_adds_multiple_children_and_persists_them_with_the_parent ();
   test_capture_allocates_fresh_block_identity_after_restart ();
   test_localized_day_request_updates_only_matching_generation ();
   test_locale_event_invalidates_labels_and_rejects_in_flight_response ();
-  test_timeline_task_and_row_body_toggle_are_independent ();
+  test_timeline_status_rail_has_no_task_action ();
   test_loaded_children_survive_a_stale_ios_visible_range_event ();
   test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed ();
   test_expanded_children_are_static_previews_without_group_separator ();

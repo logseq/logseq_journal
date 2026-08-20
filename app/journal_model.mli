@@ -1,7 +1,24 @@
 type task_state =
-  | Not_a_task
+  | No_status
   | Todo
+  | Doing
+  | In_review
+  | Now
   | Done
+  | Canceled
+  | Backlog
+  | Waiting
+  | Later
+
+type status_category =
+  | Todo_category
+  | Doing_category
+  | Done_category
+  | Later_category
+
+val status_category : task_state -> status_category option
+val status_name : task_state -> string
+val status_default_value : task_state -> string option
 
 type t
 

@@ -165,6 +165,71 @@ void main() {
   );
 
   testWidgets(
+    'compiled OCaml runtime drains visible continuations without a gesture',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        fixtureMode: RuntimeFlowFixtureMode.pagination,
+      );
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('Pagination day five row 01').evaluate().isNotEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () => find.text('Loading more journal entries').evaluate().isEmpty,
+        );
+        expect(find.text('Loading more journal entries'), findsNothing);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'compiled OCaml runtime drains child demand queued behind pagination',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        fixtureMode: RuntimeFlowFixtureMode.pagination,
+      );
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('Pagination expandable parent').evaluate().isNotEmpty,
+        );
+        final parentPressable = find
+            .ancestor(
+              of: find.text('Pagination expandable parent'),
+              matching: find.byType(PressableHost),
+            )
+            .first;
+        await tester.tap(parentPressable);
+        await _pumpUntil(
+          tester,
+          () => find.text('Loading direct child blocks').evaluate().isNotEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () =>
+              find.text('Pagination persisted child').evaluate().isNotEmpty &&
+              find.text('Loading direct child blocks').evaluate().isEmpty,
+        );
+        expect(find.text('Loading direct child blocks'), findsNothing);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
     'compiled OCaml runtime honors the safe-area adaptive environment',
     (tester) async {
       tester.view.padding = const FakeViewPadding(top: 47, bottom: 34);
@@ -671,8 +736,11 @@ final class _RuntimeHarness {
   final _ControllableFrameEligibilitySource frameEligibility;
   final ValueNotifier<TextDirection?> textDirectionOverride;
 
-  static Future<_RuntimeHarness> start(WidgetTester tester) async {
-    final fixture = await RuntimeFlowFixture.create(tester);
+  static Future<_RuntimeHarness> start(
+    WidgetTester tester, {
+    RuntimeFlowFixtureMode fixtureMode = RuntimeFlowFixtureMode.normal,
+  }) async {
+    final fixture = await RuntimeFlowFixture.create(tester, mode: fixtureMode);
     final root = fixture.supportRoot;
     var generation = 1;
     Future<JournalCalendarSnapshot> calendar() async => JournalCalendarSnapshot(

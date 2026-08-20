@@ -10,8 +10,10 @@ type palette =
   ; neutral_badge : Ui.Style.Color.t
   ; fab : Ui.Style.Color.t
   ; on_fab : Ui.Style.Color.t
-  ; success : Ui.Style.Color.t
-  ; on_success : Ui.Style.Color.t
+  ; status_todo : Ui.Style.Color.t
+  ; status_doing : Ui.Style.Color.t
+  ; status_done : Ui.Style.Color.t
+  ; status_later : Ui.Style.Color.t
   ; sheet_surface : Ui.Style.Color.t
   ; sheet_outline : Ui.Style.Color.t
   ; modal_scrim : Ui.Style.Color.t
@@ -78,8 +80,9 @@ type composer_geometry =
 type row_geometry =
   { time_slot_base : float
   ; trailing_inset : float
-  ; task_visual : float
   ; disclosure_visual : float
+  ; status_rail_width : float
+  ; status_rail_radius : float
   }
 
 type preview_geometry =
@@ -111,17 +114,14 @@ type profile_kind =
 
 type row_profile =
   { kind : profile_kind
-  ; top_level_extent : float
-  ; child_extent : float
+  ; block_line_height : float
   ; continuation_extent : float
   ; day_header_extent : float
   ; content_leading : float
   ; time_slot_width : float
   }
 
-type extent_role =
-  | Top_level
-  | Child_preview
+type fixed_extent_role =
   | Children_loading
   | Children_more
   | Day_heading
@@ -146,5 +146,6 @@ val motion : reduced_motion:bool -> motion
 val physical_divider_thickness : device_pixel_ratio:float -> float
 val timeline_max_width : float
 val select_row_profile : viewport_width:float -> text_scale:float -> row_profile
-val extent_for_role : profile:row_profile -> safe_bottom:float -> extent_role -> float
-val expanded_parent_extent : profile:row_profile -> source:string -> float
+val block_extent : profile:row_profile -> visible_lines:int -> float
+val fixed_extent : profile:row_profile -> safe_bottom:float -> fixed_extent_role -> float
+val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option

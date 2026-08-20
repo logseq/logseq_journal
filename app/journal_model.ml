@@ -1,7 +1,47 @@
 type task_state =
-  | Not_a_task
+  | No_status
   | Todo
+  | Doing
+  | In_review
+  | Now
   | Done
+  | Canceled
+  | Backlog
+  | Waiting
+  | Later
+
+type status_category =
+  | Todo_category
+  | Doing_category
+  | Done_category
+  | Later_category
+
+let status_category = function
+  | No_status -> None
+  | Todo -> Some Todo_category
+  | Doing | In_review | Now -> Some Doing_category
+  | Done | Canceled -> Some Done_category
+  | Backlog | Waiting | Later -> Some Later_category
+;;
+
+let status_name = function
+  | No_status -> "No status"
+  | Todo -> "Todo"
+  | Doing -> "Doing"
+  | In_review -> "In review"
+  | Now -> "Now"
+  | Done -> "Done"
+  | Canceled -> "Canceled"
+  | Backlog -> "Backlog"
+  | Waiting -> "Waiting"
+  | Later -> "Later"
+;;
+
+let status_default_value = function
+  | No_status -> None
+  | In_review -> Some "In Review"
+  | status -> Some (status_name status)
+;;
 
 type t =
   { id : string

@@ -189,7 +189,7 @@ let test_capture_plain_ime_dirty_cancel_and_retry () =
    | Some
        (Journal_graph_request.Capture
           { calendar_generation = 7L
-          ; command = { source; task_state = Journal_model.Not_a_task; _ }
+          ; command = { source; task_state = Journal_model.No_status; _ }
           }) -> require_string composed source "admitted Capture source"
    | _ -> fail "Capture did not admit the expected Worker request");
   let still_saving, repeated =
@@ -299,9 +299,7 @@ let test_capture_dismissal_policy_covers_task_failure () =
 let test_capture_route_admission_and_confirmed_dismissal () =
   let anchor : Journal_routes.anchor = { block_id = None; first_index = 0 } in
   let routes = Journal_routes.create ~anchor in
-  let clean_opened =
-    Journal_routes.open_capture routes ~session_number:40L ~source:""
-  in
+  let clean_opened = Journal_routes.open_capture routes ~session_number:40L ~source:"" in
   let clean_closed = Journal_routes.back clean_opened in
   require
     (Journal_routes.route clean_closed = Journal_routes.Timeline)

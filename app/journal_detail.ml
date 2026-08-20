@@ -93,13 +93,8 @@ let can_save t =
 let begin_edit t =
   match t.mode with
   | Reading | Committed -> { t with mode = Editing }
-  | Editing
-  | Confirm_discard
-  | Saving
-  | Conflict
-  | Failed _
-  | Adding_child
-  | Saving_child -> t
+  | Editing | Confirm_discard | Saving | Conflict | Failed _ | Adding_child | Saving_child
+    -> t
 ;;
 
 let value_of_edit (edit : Ui.Event.Payload.text_edit) =
@@ -152,8 +147,7 @@ let request_back t =
   | Reading | Committed -> `Close
   | (Editing | Failed _) when dirty t -> `State { t with mode = Confirm_discard }
   | Editing | Failed _ -> `Close
-  | Confirm_discard | Saving | Conflict | Adding_child | Saving_child ->
-    `State t
+  | Confirm_discard | Saving | Conflict | Adding_child | Saving_child -> `State t
 ;;
 
 let keep_editing t =
@@ -236,13 +230,8 @@ let retry t ~mutation_id =
      | Some (Task request) -> { t with mode = Saving }, Some request
      | Some (Child request) -> { t with mode = Saving_child }, Some request
      | None -> t, None)
-  | Reading
-  | Editing
-  | Confirm_discard
-  | Saving
-  | Adding_child
-  | Saving_child
-  | Committed -> t, None
+  | Reading | Editing | Confirm_discard | Saving | Adding_child | Saving_child | Committed
+    -> t, None
 ;;
 
 let admit_task_toggle t ~mutation_id =
@@ -251,9 +240,9 @@ let admit_task_toggle t ~mutation_id =
   else (
     let task_state =
       match Journal_model.task_state t.root with
-      | Journal_model.Todo -> Journal_model.Done
-      | Done -> Todo
-      | Not_a_task -> Todo
+      | Journal_model.No_status -> Journal_model.Todo
+      | Done | Canceled -> Todo
+      | Todo | Doing | In_review | Now | Backlog | Waiting | Later -> Done
     in
     let request =
       Journal_graph_request.Set_task_state

@@ -40,7 +40,7 @@ module Item = struct
     in
     { id
     ; source
-    ; task_state = Journal_model.Not_a_task
+    ; task_state = Journal_model.No_status
     ; child_count = 0
     ; time = None
     ; supporting = []
@@ -50,44 +50,46 @@ module Item = struct
   let source_for_detail t = t.source
   let id t = t.id
   let display_source t = Option.value t.source ~default:"Unavailable journal entry"
+  let logical_lines source = String.split_on_char '\n' source
 
-  let line_count source =
-    let lines = ref 1 in
-    String.iter (fun character -> if Char.equal character '\n' then incr lines) source;
-    !lines
-  ;;
-
-  let preview t =
-    let source_lines = Int.min 3 (line_count (display_source t)) in
-    let rec take_supporting remaining reversed = function
+  let take count values =
+    let rec loop remaining reversed = function
+      | _ when remaining <= 0 -> List.rev reversed
       | [] -> List.rev reversed
-      | _ when remaining = 0 -> List.rev reversed
-      | source :: rest ->
-        let lines = Int.min remaining (line_count source) in
-        take_supporting (remaining - lines) ((source, lines) :: reversed) rest
+      | value :: rest -> loop (remaining - 1) (value :: reversed) rest
     in
-    source_lines, take_supporting (3 - source_lines) [] t.supporting
+    loop count [] values
   ;;
 
-  let semantic_label t =
-    match t.time with
-    | Some time -> display_source t ^ ", created at " ^ time
-    | None -> display_source t
+  let preview t ~expanded =
+    let source = take 4 (logical_lines (display_source t)) in
+    if expanded || List.length source = 4
+    then source, []
+    else (
+      let remaining = 4 - List.length source in
+      let supporting = t.supporting |> List.concat_map logical_lines |> take remaining in
+      source, supporting)
+  ;;
+
+  let visible_line_count t ~expanded =
+    let source, supporting = preview t ~expanded in
+    Int.max 1 (List.length source + List.length supporting)
   ;;
 
   let semantic_label_for_state t ~expanded =
-    let source =
-      match expanded with
-      | true -> display_source t
-      | false ->
-        let _, supporting = preview t in
-        List.fold_left
-          (fun label (supporting, _) -> label ^ ", " ^ supporting)
-          (display_source t)
-          supporting
+    let source, supporting = preview t ~expanded in
+    let text = String.concat ", " (source @ supporting) in
+    let status =
+      match t.task_state with
+      | Journal_model.No_status -> ""
+      | status -> ", status " ^ Journal_model.status_name status
     in
-    match t.time with Some time -> source ^ ", created at " ^ time | None -> source
+    match t.time with
+    | Some time -> text ^ status ^ ", created at " ^ time
+    | None -> text ^ status
   ;;
+
+  let semantic_label t = semantic_label_for_state t ~expanded:true
 end
 
 let test_id value widget = Ui.Widget.with_test_id (Ui.Test_id.string value) widget
@@ -118,8 +120,6 @@ let pressable
       ~label
       ~hint
       ~value
-      ~role
-      ~checked
       ~sort_key
       ~on_press
       child
@@ -138,9 +138,8 @@ let pressable
          (Ui.Semantics.create
             ~label
             ~hint
-            ?value
-            ~role
-            ?checked
+            ~value
+            ~role:Ui.Semantics.Role.Button
             ~sort_key
             ~enabled:true
             ~focusable:true
@@ -148,100 +147,43 @@ let pressable
             ())
 ;;
 
-type task_control = { target : Ui.Widget.t }
-
-let task_control ~tokens ~reduced_motion ~sort_base item on_task_toggle =
-  let palette = Tokens.palette tokens in
-  match item.Item.task_state with
-  | Journal_model.Not_a_task -> None
-  | (Todo | Done) as state ->
-    let done_ = state = Journal_model.Done in
-    let source = Item.display_source item in
-    let glyph =
-      Ui.Widget.icon
-        ~font_family:"MaterialIcons"
-        ~size:(if done_ then 10. else Tokens.row_geometry.task_visual)
-        ~color:(if done_ then palette.on_success else palette.text_primary)
-        ~code_point:(if done_ then 0xe156 else 0xe504)
-        ()
-      |> test_id ("journal-row-task-icon:" ^ Item.id item)
-    in
-    let visual =
-      (if done_
-       then
-         glyph
-         |> Ui.Widget.center
-         |> Ui.Widget.decorated_box
-              ~decoration:
-                (Ui.Style.Decoration.create
-                   ~background:palette.success
-                   ~border_radius:(Tokens.row_geometry.task_visual /. 2.)
-                   ())
-         |> test_id ("journal-row-task-visual:" ^ Item.id item)
-         |> Ui.Widget.sized_box
-              ~width:Tokens.row_geometry.task_visual
-              ~height:Tokens.row_geometry.task_visual
-       else glyph)
-      |> Ui.Widget.center
-      |> Ui.Widget.sized_box
-           ~width:(Tokens.row_geometry.task_visual +. Tokens.spacing.x1)
-           ~height:Tokens.hit_regions.minimum_target
-      |> test_id ("journal-row-task-slot:" ^ Item.id item)
-    in
-    let target =
-      visual
-      |> pressable
-           ~tokens
-           ~reduced_motion
-           ~control_id:("journal-row-task:" ^ Item.id item)
-           ~label:((if done_ then "Mark as todo: " else "Mark as done: ") ^ source)
-           ~hint:"Toggle task completion"
-           ~value:(Some (if done_ then "Done" else "Todo"))
-           ~role:Ui.Semantics.Role.Checkbox
-           ~checked:(Some done_)
-           ~sort_key:(sort_base +. 1.)
-           ~on_press:on_task_toggle
-      |> minimum_target
-      |> test_id ("journal-row-task-target:" ^ Item.id item)
-    in
-    Some { target }
-;;
-
 let disclosure_indicator ~tokens ~rtl ~expanded item =
   if item.Item.child_count = 0
   then None
-  else (
-    let palette = Tokens.palette tokens in
-    let glyph =
-      Ui.Widget.icon
-        ~font_family:"MaterialIcons"
-        ~size:Tokens.row_geometry.disclosure_visual
-        ~color:palette.text_secondary
-        ~code_point:(if expanded then 0xe246 else if rtl then 0xe15e else 0xe15f)
-        ()
-      |> test_id ("journal-row-disclosure-icon:" ^ Item.id item)
-    in
-    glyph
+  else
+    Ui.Widget.icon
+      ~font_family:"MaterialIcons"
+      ~size:Tokens.row_geometry.disclosure_visual
+      ~color:(Tokens.palette tokens).text_secondary
+      ~code_point:(if expanded then 0xe246 else if rtl then 0xe15e else 0xe15f)
+      ()
+    |> test_id ("journal-row-disclosure-icon:" ^ Item.id item)
     |> Ui.Widget.center
     |> Ui.Widget.sized_box ~width:Tokens.row_geometry.disclosure_visual
     |> test_id ("journal-row-disclosure-indicator:" ^ Item.id item)
-    |> Option.some)
+    |> Option.some
 ;;
 
-let source_text tokens item ~max_lines =
+let text_line ~tokens ~item ~kind ~index source =
+  let token, color, prefix =
+    match kind with
+    | `Source -> Tokens.typography.entry, (Tokens.palette tokens).text_primary, "source"
+    | `Supporting ->
+      Tokens.typography.supporting, (Tokens.palette tokens).text_secondary, "supporting"
+  in
   Ui.Widget.text
-    ~style:(text_style Tokens.typography.entry (Tokens.palette tokens).text_primary)
-    ~max_lines
+    ~style:(text_style token color)
+    ~max_lines:1
     ~overflow:Ui.Style.Text_overflow.Ellipsis
-    (Item.display_source item)
-  |> test_id ("journal-row-source:" ^ Item.id item)
+    ~text_align:Ui.Style.Text_align.Start
+    source
+  |> test_id (Printf.sprintf "journal-row-%s:%s:%d" prefix (Item.id item) index)
 ;;
 
 let time_slot tokens profile item ~show_timestamp =
   let child =
     match item.Item.time, show_timestamp with
-    | None, _ -> Ui.Widget.empty ()
-    | Some _, false -> Ui.Widget.empty ()
+    | None, _ | Some _, false -> Ui.Widget.empty ()
     | Some time, true ->
       Ui.Widget.text
         ~style:
@@ -261,6 +203,24 @@ let time_slot tokens profile item ~show_timestamp =
   |> test_id ("journal-row-time-slot:" ^ Item.id item)
 ;;
 
+let status_rail ~tokens ~profile item ~visible_lines =
+  Option.map
+    (fun color ->
+       Ui.Widget.empty ()
+       |> Ui.Widget.decorated_box
+            ~decoration:
+              (Ui.Style.Decoration.create
+                 ~background:color
+                 ~border_radius:Tokens.row_geometry.status_rail_radius
+                 ())
+       |> test_id ("journal-row-status-rail:" ^ Item.id item)
+       |> Ui.Widget.sized_box
+            ~width:Tokens.row_geometry.status_rail_width
+            ~height:(float_of_int visible_lines *. profile.Tokens.block_line_height)
+       |> test_id ("journal-row-status-rail-size:" ^ Item.id item))
+    (Tokens.status_rail_color tokens item.Item.task_state)
+;;
+
 let view
       ~tokens
       ~profile
@@ -272,55 +232,35 @@ let view
       ~show_divider
       ~sort_base
       ~reduced_motion
-      ~on_task_toggle
       ~on_toggle_children
   =
-  let divider_thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
-  let row_extent =
-    if expanded
-    then
-      Tokens.expanded_parent_extent ~profile ~source:(Item.display_source item)
-    else profile.top_level_extent
-  in
-  let body_height =
-    row_extent -. if show_divider then divider_thickness else 0.
-  in
+  let source_lines, supporting_lines = Item.preview item ~expanded in
+  let visible_lines = Item.visible_line_count item ~expanded in
+  let row_extent = Tokens.block_extent ~profile ~visible_lines in
   let source =
-    let source_lines, supporting = Item.preview item in
-    let supporting = if expanded then [] else supporting in
-    let primary =
-      source_text tokens item ~max_lines:source_lines
-      |> Ui.Widget.padding
-           ~insets:
-             (Ui.Layout.Edge_insets.only
-                ~left:(if rtl then Tokens.spacing.x2 else 0.)
-                ~right:(if rtl then 0. else Tokens.spacing.x2)
-                ())
-      |> test_id ("journal-row-source-gap:" ^ Item.id item)
+    let source_widgets =
+      List.mapi
+        (fun index line -> text_line ~tokens ~item ~kind:`Source ~index line)
+        source_lines
     in
-    let text_lines =
-      Ui.Widget.Flex.fixed primary
-      :: List.mapi
-           (fun index (supporting, max_lines) ->
-              Ui.Widget.text
-                ~style:
-                  (text_style
-                     Tokens.typography.supporting
-                     (Tokens.palette tokens).text_secondary)
-                ~max_lines
-                ~overflow:Ui.Style.Text_overflow.Ellipsis
-                supporting
-              |> test_id
-                   (Printf.sprintf "journal-row-supporting:%s:%d" (Item.id item) index)
-              |> Ui.Widget.Flex.fixed)
-           supporting
+    let supporting_widgets =
+      List.mapi
+        (fun index line -> text_line ~tokens ~item ~kind:`Supporting ~index line)
+        supporting_lines
     in
-    Ui.Widget.Flex.column text_lines
+    List.map Ui.Widget.Flex.fixed (source_widgets @ supporting_widgets)
+    |> Ui.Widget.Flex.column
     |> test_id ("journal-row-text-stack:" ^ Item.id item)
     |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Top_start
     |> test_id ("journal-row-body-content:" ^ Item.id item)
+    |> Ui.Widget.padding
+         ~insets:
+           (Ui.Layout.Edge_insets.only
+              ~left:(if rtl then Tokens.spacing.x2 else 0.)
+              ~right:(if rtl then 0. else Tokens.spacing.x2)
+              ())
+    |> test_id ("journal-row-source-gap:" ^ Item.id item)
   in
-  let task = task_control ~tokens ~reduced_motion ~sort_base item on_task_toggle in
   let disclosure = disclosure_indicator ~tokens ~rtl ~expanded item in
   let time = time_slot tokens profile item ~show_timestamp in
   let fixed_options widgets = List.filter_map (Option.map Ui.Widget.Flex.fixed) widgets in
@@ -331,122 +271,105 @@ let view
     |> test_id ("journal-row-inline:" ^ Item.id item)
   in
   let layout =
-    match profile.Tokens.kind with
-    | Tokens.Compact ->
-      Ui.Widget.Flex.row
-        ~key:(Ui.Key.string ("journal-row-compact-layout:" ^ Item.id item))
-        ([ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
-         @ fixed_options [ disclosure ])
-      |> test_id ("journal-row-compact:" ^ Item.id item)
-    | Tokens.Adaptive ->
-      Ui.Widget.Flex.row
-        ~key:(Ui.Key.string ("journal-row-adaptive-layout:" ^ Item.id item))
-        ([ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
-         @ fixed_options [ disclosure ])
-      |> test_id ("journal-row-adaptive:" ^ Item.id item)
+    Ui.Widget.Flex.row
+      ~key:(Ui.Key.string ("journal-row-layout:" ^ Item.id item))
+      ([ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
+       @ fixed_options [ disclosure ])
+    |> test_id
+         ((match profile.Tokens.kind with
+           | Tokens.Compact -> "journal-row-compact:"
+           | Tokens.Adaptive -> "journal-row-adaptive:")
+          ^ Item.id item)
   in
-  let body =
-    let profile_key =
-      Printf.sprintf
-        "journal-row-body:%s:%.0f:%.0f"
-        (Item.id item)
-        row_extent
-        profile.time_slot_width
-    in
-    let height = body_height in
-    let trailing = Tokens.row_geometry.trailing_inset in
-    let leading =
-      match task with
-      | None -> profile.Tokens.content_leading
-      | Some _ -> Tokens.spacing.x1
-    in
-    let content =
-      layout
-      |> Ui.Widget.padding
-           ~insets:
-             (Ui.Layout.Edge_insets.only
-                ~left:(if rtl then trailing else leading)
-                ~right:(if rtl then leading else trailing)
-                ~top:Tokens.spacing.x2
-                ~bottom:Tokens.spacing.x2
-                ())
-      |> test_id ("journal-row-body-padding:" ^ Item.id item)
-      |> Ui.Widget.sized_box ~key:(Ui.Key.string profile_key) ~height
-      |> test_id ("journal-row-body-surface:" ^ Item.id item)
-    in
-    let body =
-      if item.Item.child_count > 0
-      then
-        let target =
-          content
-          |> pressable
-               ~tokens
-               ~reduced_motion
-               ~control_id:("journal-row-toggle-children:" ^ Item.id item)
-               ~label:(Item.semantic_label_for_state item ~expanded)
-               ~hint:
-                 (if expanded
-                  then "Hide direct child blocks"
-                  else "Show direct child blocks")
-               ~value:(Some (if expanded then "Expanded" else "Collapsed"))
-               ~role:Ui.Semantics.Role.Button
-               ~checked:None
-               ~sort_key:(sort_base +. 2.)
-               ~on_press:on_toggle_children
-        in
-        (if expanded then target else minimum_target target)
-        |> test_id ("journal-row-toggle-children-target:" ^ Item.id item)
-      else
-        content
-        |> Ui.Widget.semantics
-             ~properties:
-               (Ui.Semantics.create
-                  ~label:(Item.semantic_label_for_state item ~expanded)
-                  ~role:Ui.Semantics.Role.Generic
-                  ~sort_key:(sort_base +. 2.)
-                  ())
-    in
-    match task with
-    | None -> body
-    | Some control ->
-      let task_slot = Tokens.row_geometry.task_visual +. Tokens.spacing.x1 in
-      let leading_offset =
-        profile.Tokens.content_leading
-        +. ((task_slot -. Tokens.hit_regions.minimum_target) /. 2.)
-      in
-      let body_offset = leading_offset +. Tokens.hit_regions.minimum_target in
-      let target =
-        let top = (height -. Tokens.hit_regions.minimum_target) /. 2. in
-        if rtl
-        then Ui.Widget.Stack.positioned ~right:leading_offset ~top control.target
-        else Ui.Widget.Stack.positioned ~left:leading_offset ~top control.target
-      in
-      let body =
-        if rtl
-        then Ui.Widget.Stack.positioned ~left:0. ~right:body_offset ~top:0. body
-        else Ui.Widget.Stack.positioned ~left:body_offset ~right:0. ~top:0. body
-      in
-      Ui.Widget.Stack.create [ body; target ] |> Ui.Widget.sized_box ~height
-  in
-  let divider =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
-    |> Ui.Widget.sized_box ~height:divider_thickness
-    |> test_id ("journal-row-divider:" ^ Item.id item)
+  let content =
+    layout
     |> Ui.Widget.padding
          ~insets:
-           (Ui.Layout.Edge_insets.only ~left:0. ~right:0. ())
-    |> test_id ("journal-row-divider-padding:" ^ Item.id item)
+           (Ui.Layout.Edge_insets.only
+              ~left:
+                (if rtl
+                 then Tokens.row_geometry.trailing_inset
+                 else profile.content_leading)
+              ~right:
+                (if rtl
+                 then profile.content_leading
+                 else Tokens.row_geometry.trailing_inset)
+              ~top:Tokens.spacing.x2
+              ~bottom:Tokens.spacing.x2
+              ())
+    |> test_id ("journal-row-body-padding:" ^ Item.id item)
+    |> Ui.Widget.sized_box
+         ~key:
+           (Ui.Key.string
+              (Printf.sprintf
+                 "journal-row-body:%s:%.0f:%.0f"
+                 (Item.id item)
+                 row_extent
+                 profile.time_slot_width))
+         ~height:row_extent
+    |> test_id ("journal-row-body-surface:" ^ Item.id item)
   in
-  Ui.Widget.Flex.column
-    ([ Ui.Widget.Flex.fixed body ]
-     @ if show_divider then [ Ui.Widget.Flex.fixed divider ] else [])
+  let body =
+    if item.Item.child_count > 0
+    then
+      content
+      |> pressable
+           ~tokens
+           ~reduced_motion
+           ~control_id:("journal-row-toggle-children:" ^ Item.id item)
+           ~label:(Item.semantic_label_for_state item ~expanded)
+           ~hint:
+             (if expanded then "Hide direct child blocks" else "Show direct child blocks")
+           ~value:(if expanded then "Expanded" else "Collapsed")
+           ~sort_key:(sort_base +. 2.)
+           ~on_press:on_toggle_children
+      |> fun target ->
+      if expanded
+      then target
+      else
+        minimum_target target
+        |> test_id ("journal-row-toggle-children-target:" ^ Item.id item)
+    else
+      content
+      |> Ui.Widget.semantics
+           ~properties:
+             (Ui.Semantics.create
+                ~label:(Item.semantic_label_for_state item ~expanded)
+                ~role:Ui.Semantics.Role.Generic
+                ~sort_key:(sort_base +. 2.)
+                ())
+  in
+  let children = ref [ Ui.Widget.Stack.child body ] in
+  (match status_rail ~tokens ~profile item ~visible_lines with
+   | None -> ()
+   | Some rail ->
+     let offset = profile.Tokens.content_leading -. Tokens.spacing.x3 in
+     children
+     := (if rtl
+         then Ui.Widget.Stack.positioned ~right:offset ~top:Tokens.spacing.x2 rail
+         else Ui.Widget.Stack.positioned ~left:offset ~top:Tokens.spacing.x2 rail)
+        :: !children);
+  if show_divider
+  then (
+    let divider =
+      Ui.Widget.empty ()
+      |> Ui.Widget.decorated_box
+           ~decoration:
+             (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
+      |> Ui.Widget.sized_box
+           ~height:(Tokens.physical_divider_thickness ~device_pixel_ratio)
+      |> test_id ("journal-row-divider:" ^ Item.id item)
+      |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:0. ~right:0. ())
+      |> test_id ("journal-row-divider-padding:" ^ Item.id item)
+    in
+    children
+    := Ui.Widget.Stack.positioned ~left:0. ~right:0. ~bottom:0. divider :: !children);
+  Ui.Widget.Stack.create (List.rev !children)
   |> Ui.Widget.sized_box ~height:row_extent
   |> test_id ("journal-row-extent:" ^ Item.id item)
   |> Ui.Widget.decorated_box
-       ~decoration:(Ui.Style.Decoration.create ~background:(Tokens.palette tokens).background ())
+       ~decoration:
+         (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).background ())
   |> Ui.Widget.environment_boundary
   |> test_id ("journal-row:" ^ Item.id item)
 ;;

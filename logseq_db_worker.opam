@@ -30,8 +30,8 @@ depends: [
   "yojson" {= "3.0.0"}
 ]
 pin-depends: [
-  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"]
-  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"]
+  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"]
+  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"]
   ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
   ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
   ["melange-transit-native.0.1.0" "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"]

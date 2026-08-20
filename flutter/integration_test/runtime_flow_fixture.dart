@@ -3,7 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
-enum RuntimeFlowFixtureMode { normal, persistenceFailure }
+enum RuntimeFlowFixtureMode { normal, pagination, persistenceFailure }
 
 final class RuntimeFlowFixture {
   const RuntimeFlowFixture({
@@ -19,6 +19,7 @@ final class RuntimeFlowFixture {
   final bool ownsSupportRoot;
 
   static var _normalFixtureIndex = 0;
+  static var _paginationFixtureIndex = 0;
   static var _failureFixtureIndex = 0;
 
   static Future<RuntimeFlowFixture> create(
@@ -40,6 +41,7 @@ final class RuntimeFlowFixture {
     );
     final command = switch (mode) {
       RuntimeFlowFixtureMode.normal => 'runtime-flow',
+      RuntimeFlowFixtureMode.pagination => 'runtime-flow-pagination',
       RuntimeFlowFixtureMode.persistenceFailure => 'runtime-flow-failure',
     };
     final result = await tester.runAsync(
@@ -74,11 +76,13 @@ final class RuntimeFlowFixture {
     final document = jsonDecode(encoded) as Map<String, dynamic>;
     final key = switch (mode) {
       RuntimeFlowFixtureMode.normal => 'normal',
+      RuntimeFlowFixtureMode.pagination => 'pagination',
       RuntimeFlowFixtureMode.persistenceFailure => 'persistenceFailure',
     };
     final fixtures = document[key]! as List<dynamic>;
     final index = switch (mode) {
       RuntimeFlowFixtureMode.normal => _normalFixtureIndex++,
+      RuntimeFlowFixtureMode.pagination => _paginationFixtureIndex++,
       RuntimeFlowFixtureMode.persistenceFailure => _failureFixtureIndex++,
     };
     if (index >= fixtures.length) {
