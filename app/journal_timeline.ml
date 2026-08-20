@@ -358,7 +358,7 @@ let render_slot
 ;;
 
 let transition ~reduced_motion:_ =
-  Ui.Native_widget.Sparse_extent_list.Transition.create
+  Ui.Widget.Sparse_extent_transition.create
     ~enabled:false
     ~expand_duration_ms:0
     ~collapse_duration_ms:0
@@ -447,17 +447,21 @@ let view
       in
       render 0 previous_slot slots
     in
-    Ui.Native_widget.Sparse_extent_list.vertical
-      ~key:(Ui.Key.string "journal-timeline-list")
-      ~total_count:window.total_count
-      ~first_index:window.first_index
-      ~default_item_extent:geometry.default_extent
-      ~extent_overrides:geometry.overrides
-      ~overscan:Timeline.overscan
-      ~transition:(transition ~reduced_motion)
-      ~items
-      ~on_visible_range
+    Ui.Widget.Scroll_view.vertical
+      ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
+      [ Ui.Widget.Sliver.varied_extent
+          ~key:(Ui.Key.string "journal-timeline-list")
+          ~total_count:window.total_count
+          ~first_index:window.first_index
+          ~default_item_extent:geometry.default_extent
+          ~extent_overrides:geometry.overrides
+          ~overscan:Timeline.overscan
+          ~transition:(transition ~reduced_motion)
+          ~items
+          ~on_visible_range
+          ()
+        |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
+      ]
       ()
-    |> Ui.Widget.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-timeline")
     |> fun list -> Populated list
 ;;

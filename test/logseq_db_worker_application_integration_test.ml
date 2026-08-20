@@ -310,10 +310,13 @@ let has_text handle value =
 
 let capture_composer_enabled handle =
   match Test.Handle.find handle (Test.Query.test_id "journal-capture-composer") with
-  | Some { props = Ui.Widget.Private.Native_widget_props { kind_id; payload; _ }; _ }
-    when kind_id = Ui.Native_widget.Message_composer.kind_id ->
-    (Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload).enabled
-  | Some _ -> fail "Capture composer is not a Message_composer"
+  | Some node ->
+    (let Av view = Ui.Widget.Private.view node.widget in
+     match view.node with
+     | Ui.Widget.Private.Native_widget { kind_id; payload; _ }
+       when kind_id = Ui.Native_widget.Message_composer.kind_id ->
+       (Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload).enabled
+     | _ -> fail "Capture composer is not a Message_composer")
   | None -> fail "Capture composer is not mounted"
 ;;
 
@@ -326,9 +329,10 @@ let commit_end_swipe handle block_id =
     | None -> fail "missing swipe wrapper for %s\n%s" block_id (Test.Handle.show handle)
   in
   let kind_id =
-    match node.props with
-    | Ui.Widget.Private.Native_widget_props { kind_id; _ } -> kind_id
-    | _ -> fail "delete wrapper is not a native widget"
+    let Av view = Ui.Widget.Private.view node.widget in
+    (match view.node with
+     | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
+     | _ -> fail "delete wrapper is not a native widget")
   in
   Test.Handle.native_event
     handle

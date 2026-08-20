@@ -120,10 +120,11 @@ let node handle test_id =
 ;;
 
 let require_text handle test_id expected =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Text_props { value; _ } ->
-    require (String.equal value expected) "%s text changed" test_id
-  | _ -> fail "%s is not Text" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Text { value; _ } ->
+     require (String.equal value expected) "%s text changed" test_id
+   | _ -> fail "%s is not Text" test_id)
 ;;
 
 type semantics_view =
@@ -141,108 +142,113 @@ type semantics_view =
 
 let require_semantics handle label check =
   match Test.Handle.find_all handle (Test.Query.semantics_label label) with
-  | [ { props =
-          Ui.Widget.Private.Semantics_props
-            { role
-            ; hint
-            ; value
-            ; checked
-            ; enabled
-            ; focusable
-            ; live_region
-            ; heading_level
-            ; sort_key
-            ; actions
-            ; _
-            }
-      ; _
-      }
-    ] ->
-    check
-      { role
-      ; hint
-      ; value
-      ; checked
-      ; enabled
-      ; focusable
-      ; live_region
-      ; heading_level
-      ; sort_key
-      ; actions
-      }
-  | [ _ ] -> fail "%S is not attached to Semantics" label
+  | [ node ] ->
+    (let Av view = Ui.Widget.Private.view node.widget in
+     match view.node with
+     | Ui.Widget.Private.Semantics
+         { role
+         ; hint
+         ; value
+         ; checked
+         ; enabled
+         ; focusable
+         ; live_region
+         ; heading_level
+         ; sort_key
+         ; actions
+         ; _
+         } ->
+       check
+         { role
+         ; hint
+         ; value
+         ; checked
+         ; enabled
+         ; focusable
+         ; live_region
+         ; heading_level
+         ; sort_key
+         ; actions
+         }
+     | _ -> fail "%S is not attached to Semantics" label)
   | [] -> fail "missing semantics label %S\n%s" label (Test.Handle.show handle)
   | matches -> fail "%S has %d duplicate semantic nodes" label (List.length matches)
 ;;
 
 let require_target handle test_id =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Constrained_box_props { min_width; min_height; _ } ->
-    require
-      (Float.compare min_width 44. >= 0 && Float.compare min_height 44. >= 0)
-      "%s is %.1fx%.1f, expected at least 44x44"
-      test_id
-      min_width
-      min_height
-  | _ -> fail "%s is not a constrained target" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Constrained_box { min_width; min_height; _ } ->
+     require
+       (Float.compare min_width 44. >= 0 && Float.compare min_height 44. >= 0)
+       "%s is %.1fx%.1f, expected at least 44x44"
+       test_id
+       min_width
+       min_height
+   | _ -> fail "%s is not a constrained target" test_id)
 ;;
 
 let require_pressable handle test_id ~release_delay_ms =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Pressable_props { overlay_color; release_delay_ms = actual } ->
-    require
-      (Int32.equal (Ui.Style.Color.Private.to_argb32 overlay_color) 0x1f0d142fl
-       && actual = release_delay_ms)
-      "%s pressed feedback differs"
-      test_id
-  | _ -> fail "%s is not Pressable" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Pressable { overlay_color; release_delay_ms = actual } ->
+     require
+       (Int32.equal (Ui.Style.Color.Private.to_argb32 overlay_color) 0x1f0d142fl
+        && actual = release_delay_ms)
+       "%s pressed feedback differs"
+       test_id
+   | _ -> fail "%s is not Pressable" test_id)
 ;;
 
 let require_sized_width handle test_id expected =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Sized_box_props { width = Some actual; _ } ->
-    require (Float.equal actual expected) "%s width is %.1f" test_id actual
-  | _ -> fail "%s is not a width-constrained SizedBox" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Sized_box { width = Some actual; _ } ->
+     require (Float.equal actual expected) "%s width is %.1f" test_id actual
+   | _ -> fail "%s is not a width-constrained SizedBox" test_id)
 ;;
 
 let require_padding handle test_id ~left ~right =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Padding_props { left = actual_left; right = actual_right; _ } ->
-    require
-      (Float.equal actual_left left && Float.equal actual_right right)
-      "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
-      test_id
-      actual_left
-      actual_right
-      left
-      right
-  | _ -> fail "%s is not Padding" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Padding { left = actual_left; right = actual_right; _ } ->
+     require
+       (Float.equal actual_left left && Float.equal actual_right right)
+       "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
+       test_id
+       actual_left
+       actual_right
+       left
+       right
+   | _ -> fail "%s is not Padding" test_id)
 ;;
 
 let require_icon handle test_id ~code_point ~color =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Icon_props
-      { code_point = actual_code_point
-      ; font_family = Some "MaterialIcons"
-      ; color = Some actual_color
-      ; _
-      } ->
-    require
-      (actual_code_point = code_point && Int32.equal actual_color color)
-      "%s icon differs"
-      test_id
-  | _ -> fail "%s is not a Material icon" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Icon
+       { code_point = actual_code_point
+       ; font_family = Some "MaterialIcons"
+       ; color = Some actual_color
+       ; _
+       } ->
+     require
+       (actual_code_point = code_point && Int32.equal actual_color color)
+       "%s icon differs"
+       test_id
+   | _ -> fail "%s is not a Material icon" test_id)
 ;;
 
 let require_decoration handle test_id ~background ~border_radius =
-  match (node handle test_id).props with
-  | Ui.Widget.Private.Decorated_box_props
-      { background = Some actual_background; border_radius = actual_radius } ->
-    require
-      (Int32.equal actual_background background && Float.equal actual_radius border_radius)
-      "%s decoration differs"
-      test_id
-  | _ -> fail "%s is not a colored DecoratedBox" test_id
+  let Av view = Ui.Widget.Private.view (node handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Decorated_box
+       { background = Some actual_background; border_radius = actual_radius } ->
+     require
+       (Int32.equal actual_background background && Float.equal actual_radius border_radius)
+       "%s decoration differs"
+       test_id
+   | _ -> fail "%s is not a colored DecoratedBox" test_id)
 ;;
 
 let substring_index text needle =
@@ -271,8 +277,11 @@ let test_literal_source_time_completion_and_full_access () =
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
-       (match (node handle ("journal-row-source:" ^ block_id)).props with
-        | Ui.Widget.Private.Text_props
+       (let Av view =
+          Ui.Widget.Private.view (node handle ("journal-row-source:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Text
             { value; max_lines = Some 1; overflow = Ui.Style.Text_overflow.Ellipsis; _ }
           -> require (String.equal value source) "literal source was parsed or changed"
         | _ -> fail "Timeline source is not one-line ellipsized Text");
@@ -463,8 +472,15 @@ let test_conditional_task_leading_slot_and_todo_icon () =
        require
          (Array.length body.children = 2)
          "plain compact row has unexpected fixed control space";
-       (match (node plain_handle ("journal-row-inline:" ^ block_id)).props with
-        | Ui.Widget.Private.Linear_props -> ()
+       (let Av view =
+          Ui.Widget.Private.view
+            (node plain_handle ("journal-row-inline:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Row
+        | Ui.Widget.Private.Column
+        | Ui.Widget.Private.Flex_row
+        | Ui.Widget.Private.Flex_column -> ()
         | _ -> fail "plain source does not use the bounded inline row");
        require
          (Option.is_none
@@ -509,9 +525,12 @@ let test_conditional_task_leading_slot_and_todo_icon () =
          (fun props ->
             require (props.role = Ui.Semantics.Role.Generic) "leaf body is not static";
             require (props.actions = []) "leaf body exposes Tap");
-       match (node todo_handle ("journal-row-body-content:" ^ block_id)).props with
-       | Ui.Widget.Private.Align_props _ -> ()
-       | _ -> fail "leaf body does not use a bounded center alignment")
+       (let Av view =
+          Ui.Widget.Private.view (node todo_handle ("journal-row-body-content:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Align _ -> ()
+        | _ -> fail "leaf body does not use a bounded center alignment"))
 ;;
 
 let header_component ~tokens _handlers _graph =
@@ -581,15 +600,27 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
        require (profile.top_level_extent = expected_extent) "profile extent changed";
-       (match (node handle ("journal-row-extent:" ^ block_id)).props with
-        | Ui.Widget.Private.Sized_box_props { height = Some height; _ } ->
+       (let Av view =
+          Ui.Widget.Private.view (node handle ("journal-row-extent:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Sized_box { height = Some height; _ } ->
           require (height = expected_extent) "row extent is %.1f" height
         | _ -> fail "row does not publish an exact extent");
-       (match (node handle (expected_kind ^ ":" ^ block_id)).props with
-        | Ui.Widget.Private.Linear_props -> ()
+       (let Av view =
+          Ui.Widget.Private.view (node handle (expected_kind ^ ":" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Row
+        | Ui.Widget.Private.Column
+        | Ui.Widget.Private.Flex_row
+        | Ui.Widget.Private.Flex_column -> ()
         | _ -> fail "%s layout is not a Flex node" expected_kind);
-       (match (node handle ("journal-row-time-slot:" ^ block_id)).props with
-        | Ui.Widget.Private.Constrained_box_props { min_width; max_width; _ } ->
+       (let Av view =
+          Ui.Widget.Private.view (node handle ("journal-row-time-slot:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Constrained_box { min_width; max_width; _ } ->
           require
             (min_width = expected_time_width && max_width = expected_time_width)
             "time slot is %.1f..%.1f, expected %.1f"
@@ -597,16 +628,25 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
             max_width
             expected_time_width
         | _ -> fail "time slot is not reserved");
-       (match (node handle ("journal-row-text-stack:" ^ block_id)).props with
-        | Ui.Widget.Private.Linear_props -> ()
+       (let Av view =
+          Ui.Widget.Private.view (node handle ("journal-row-text-stack:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Row
+        | Ui.Widget.Private.Column
+        | Ui.Widget.Private.Flex_row
+        | Ui.Widget.Private.Flex_column -> ()
         | _ -> fail "top-level content is not a bounded two-line stack");
-       match (node handle ("journal-row-divider:" ^ block_id)).props with
-       | Ui.Widget.Private.Sized_box_props { height = Some height; _ } ->
+       (let Av view =
+          Ui.Widget.Private.view (node handle ("journal-row-divider:" ^ block_id)).widget
+        in
+        match view.node with
+       | Ui.Widget.Private.Sized_box { height = Some height; _ } ->
          require
            (Float.equal height (1. /. 3.))
            "row divider is %.3f logical pixels at 3x, expected one physical pixel"
            height
-       | _ -> fail "row divider does not publish an exact physical-pixel height")
+       | _ -> fail "row divider does not publish an exact physical-pixel height"))
 ;;
 
 let test_compact_and_adaptive_shapes_at_required_extremes () =
@@ -740,8 +780,9 @@ let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
     (fun () ->
        Test.Handle.present handle;
        let swipe = node handle ("journal-row-swipe:" ^ block_id) in
-       (match swipe.props with
-        | Ui.Widget.Private.Native_widget_props { payload; _ } ->
+       (let Av view = Ui.Widget.Private.view swipe.widget in
+        match view.node with
+        | Ui.Widget.Private.Native_widget { payload; _ } ->
           require (Bytes.length payload > 44) "swipe payload omitted action label";
           require (Char.code (Bytes.get payload 0) = 2) "swipe enabled the start action";
           require (Char.code (Bytes.get payload 2) = 0) "end action is not Dismiss";
@@ -757,10 +798,13 @@ let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
             label;
           require (start_length = 0) "start action label is not empty"
         | _ -> fail "delete wrapper is not native");
-       (match (node handle ("journal-row-delete-icon:" ^ block_id)).props with
-        | Ui.Widget.Private.Icon_props
+       (let Av view =
+          Ui.Widget.Private.view (node handle ("journal-row-delete-icon:" ^ block_id)).widget
+        in
+        match view.node with
+        | Ui.Widget.Private.Icon
             { code_point = 0xe1b9; font_family = Some "MaterialIcons"; _ } -> ()
-        | Icon_props _ -> fail "delete feedback does not use the Material delete icon"
+        | Icon _ -> fail "delete feedback does not use the Material delete icon"
         | _ -> fail "delete feedback is not an icon");
        ignore (node handle ("journal-row-task:" ^ block_id));
        ignore (node handle ("journal-row-toggle-children:" ^ block_id)));

@@ -31,8 +31,8 @@ depends: [
   "virtual_dom" {= "v0.17.0"}
 ]
 pin-depends: [
-  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#f6d27175632d26e759532f6ee81e8d1383490533"]
-  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#f6d27175632d26e759532f6ee81e8d1383490533"]
+  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"]
+  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"]
   ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
   ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
   ["persistent_sorted_set_ocaml.dev" "git+https://github.com/logseq/persistent-sorted-set-ocaml.git#4016dae1cdf4304207d8277ff9957656cdd8b177"]

@@ -488,9 +488,10 @@ let commit_end_swipe handle block_id =
     | None -> fail "missing swipe wrapper for %s\n%s" block_id (Test.Handle.show handle)
   in
   let kind_id =
-    match node.props with
-    | Ui.Widget.Private.Native_widget_props { kind_id; _ } -> kind_id
-    | _ -> fail "delete wrapper is not a native widget"
+    let Av view = Ui.Widget.Private.view node.widget in
+    (match view.node with
+     | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
+     | _ -> fail "delete wrapper is not a native widget")
   in
   Test.Handle.native_event
     handle
@@ -552,11 +553,12 @@ type semantics_view =
 
 let require_semantics_view handle label check =
   match Test.Handle.find_all handle (Test.Query.semantics_label label) with
-  | [ { props = Ui.Widget.Private.Semantics_props { role; live_region; heading_level; _ }
-      ; _
-      }
-    ] -> check { role; live_region; heading_level }
-  | [ _ ] -> fail "%S is not Semantics" label
+  | [ node ] ->
+    (let Av view = Ui.Widget.Private.view node.widget in
+     match view.node with
+     | Ui.Widget.Private.Semantics { role; live_region; heading_level; _ } ->
+       check { role; live_region; heading_level }
+     | _ -> fail "%S is not Semantics" label)
   | [] -> fail "expected semantics label %S\n%s" label (Test.Handle.show handle)
   | nodes -> fail "%S has %d duplicate semantic nodes" label (List.length nodes)
 ;;
@@ -603,29 +605,55 @@ let node_by_test_id handle test_id =
 ;;
 
 let text_field_value handle test_id =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Text_input_props { value; _ } -> value
-  | _ -> fail "%s is not a Material text field" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Text_input { value; _ } -> value
+   | _ -> fail "%s is not a Material text field" test_id)
 ;;
 
+type timeline_props_record =
+  { total_count : int
+  ; first_index : int
+  ; default_item_extent : float
+  ; extent_overrides : Ui.Widget.Sparse_extent_override.t list
+  ; overscan : int
+  ; transition : Ui.Widget.Sparse_extent_transition.t option
+  }
+
 let timeline_props handle =
-  match (node_by_test_id handle "journal-timeline").props with
-  | Ui.Widget.Private.Native_widget_props { kind_id; payload; _ } ->
-    require
-      (kind_id = Ui.Native_widget.Sparse_extent_list.kind_id)
-      "journal timeline uses the wrong native widget kind";
-    Ui.Native_widget.Sparse_extent_list.For_testing.decode_props_exn payload
-  | _ -> fail "journal timeline is not a Sparse_extent_list"
+  let Av view =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-timeline").widget
+  in
+  (match view.node with
+   | Ui.Widget.Private.Sliver_varied_extent
+       { total_count
+       ; first_index
+       ; default_item_extent
+       ; extent_overrides
+       ; overscan
+       ; transition
+       } ->
+     { total_count
+     ; first_index
+     ; default_item_extent
+     ; extent_overrides
+     ; overscan
+     ; transition
+     }
+   | _ -> fail "journal timeline is not a Sliver_varied_extent")
 ;;
 
 let capture_composer_props handle =
-  match (node_by_test_id handle "journal-capture-composer").props with
-  | Ui.Widget.Private.Native_widget_props { kind_id; payload; _ } ->
-    require
-      (kind_id = Ui.Native_widget.Message_composer.kind_id)
-      "Capture composer uses the wrong native widget kind";
-    Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload
-  | _ -> fail "journal-capture-composer is not a Message_composer"
+  let Av view =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-capture-composer").widget
+  in
+  (match view.node with
+   | Ui.Widget.Private.Native_widget { kind_id; payload; _ } ->
+     require
+       (kind_id = Ui.Native_widget.Message_composer.kind_id)
+       "Capture composer uses the wrong native widget kind";
+     Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload
+   | _ -> fail "journal-capture-composer is not a Message_composer")
 ;;
 
 let send_capture_composer_button handle ~button_id ~text =
@@ -647,16 +675,11 @@ let open_capture handle = send_capture_composer_button handle ~button_id:1 ~text
 
 let send_visible_range handle ~first_index ~last_exclusive =
   Test.Handle.present handle;
-  Test.Handle.native_event
+  Test.Handle.visible_range
     handle
     (Test.Query.test_id "journal-timeline")
-    ~kind_id:Ui.Native_widget.Sparse_extent_list.kind_id
-    ~version:1
-    ~event_id:Ui.Native_widget.Sparse_extent_list.visible_range_event_id
-    ~payload:
-      (Ui.Native_widget.Sparse_extent_list.For_testing.encode_visible_range
-         ~first_index
-         ~last_exclusive)
+    ~first_index:(Int64.of_int first_index)
+    ~last_exclusive:(Int64.of_int last_exclusive)
 ;;
 
 type stale_native_binding =
@@ -671,11 +694,11 @@ let capture_native_binding handle test_id =
   let binding =
     Array.find_opt
       (fun (binding : Runtime.Mounted_tree.Mounted_binding.t) ->
-         Ui.Event.Tag.equal binding.event_tag Ui.Event.Tag.Native_event)
+         Ui.Event.Tag.equal binding.event_tag Ui.Event.Tag.Visible_range_changed)
       node.event_bindings
     |> function
     | Some binding -> binding
-    | None -> fail "%s does not bind native events" test_id
+    | None -> fail "%s does not bind visible range events" test_id
   in
   { displayed_revision = Test.Handle.revision handle
   ; node_id = node.node_id
@@ -696,16 +719,11 @@ let send_stale_visible_range
       ; displayed_revision = binding.displayed_revision
       ; node_id = binding.node_id
       ; handler_id = binding.handler_id
-      ; event_tag = Protocol.Generated_protocol.Event_tag.native_event
+      ; event_tag = Protocol.Generated_protocol.Event_tag.visible_range_changed
       ; payload =
-          Native_event
-            { kind_id = Ui.Native_widget.Sparse_extent_list.kind_id
-            ; version = 1
-            ; event_id = Ui.Native_widget.Sparse_extent_list.visible_range_event_id
-            ; payload =
-                Ui.Native_widget.Sparse_extent_list.For_testing.encode_visible_range
-                  ~first_index
-                  ~last_exclusive
+          Visible_range
+            { first_index = Int64.of_int first_index
+            ; last_exclusive = Int64.of_int last_exclusive
             }
       }
   in
@@ -718,97 +736,109 @@ let send_stale_visible_range
 ;;
 
 let require_decoration handle test_id expected =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Decorated_box_props { background = Some actual; _ } ->
-    require
-      (Int32.equal actual expected)
-      "%s background expected 0x%lx, got 0x%lx"
-      test_id
-      expected
-      actual
-  | _ -> fail "%s is not a colored DecoratedBox" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Decorated_box { background = Some actual; _ } ->
+     require
+       (Int32.equal actual expected)
+       "%s background expected 0x%lx, got 0x%lx"
+       test_id
+       expected
+       actual
+   | _ -> fail "%s is not a colored DecoratedBox" test_id)
 ;;
 
 let require_decoration_without_shape handle test_id ~background =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Decorated_box_props
-      { background = Some actual_background; border_radius } ->
-    require
-      (Int32.equal actual_background background && Float.equal border_radius 0.)
-      "%s must leave outer sheet shape to the Flutter modal route"
-      test_id
-  | _ -> fail "%s is not a colored DecoratedBox" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Decorated_box
+       { background = Some actual_background; border_radius } ->
+     require
+       (Int32.equal actual_background background && Float.equal border_radius 0.)
+       "%s must leave outer sheet shape to the Flutter modal route"
+       test_id
+   | _ -> fail "%s is not a colored DecoratedBox" test_id)
 ;;
 
 let require_icon ?size handle test_id ~code_point ~color =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Icon_props
-      { code_point = actual_code_point
-      ; font_family = Some "MaterialIcons"
-      ; size = actual_size
-      ; color = Some actual_color
-      } ->
-    require
-      (actual_code_point = code_point
-       && Int32.equal actual_color color
-       &&
-       match size with
-       | None -> true
-       | Some expected -> actual_size = Some expected)
-      "%s icon differs"
-      test_id
-  | _ -> fail "%s is not a Material icon" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Icon
+       { code_point = actual_code_point
+       ; font_family = Some "MaterialIcons"
+       ; size = actual_size
+       ; color = Some actual_color
+       } ->
+     require
+       (actual_code_point = code_point
+        && Int32.equal actual_color color
+        &&
+        match size with
+        | None -> true
+        | Some expected -> actual_size = Some expected)
+       "%s icon differs"
+       test_id
+   | _ -> fail "%s is not a Material icon" test_id)
 ;;
 
 let require_sized_height handle test_id expected =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Sized_box_props { height = Some actual; _ } ->
-    require (Float.equal actual expected) "%s height is %.3f" test_id actual
-  | _ -> fail "%s is not a height-constrained SizedBox" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Sized_box { height = Some actual; _ } ->
+     require (Float.equal actual expected) "%s height is %.3f" test_id actual
+   | _ -> fail "%s is not a height-constrained SizedBox" test_id)
 ;;
 
 let require_sized_size handle test_id ~width ~height =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Sized_box_props
-      { width = Some actual_width; height = Some actual_height; _ } ->
-    require
-      (Float.equal actual_width width && Float.equal actual_height height)
-      "%s size is %.1fx%.1f, expected %.1fx%.1f"
-      test_id
-      actual_width
-      actual_height
-      width
-      height
-  | _ -> fail "%s is not a size-constrained SizedBox" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Sized_box
+       { width = Some actual_width; height = Some actual_height; _ } ->
+     require
+       (Float.equal actual_width width && Float.equal actual_height height)
+       "%s size is %.1fx%.1f, expected %.1fx%.1f"
+       test_id
+       actual_width
+       actual_height
+       width
+       height
+   | _ -> fail "%s is not a size-constrained SizedBox" test_id)
 ;;
 
 let require_horizontal_padding handle test_id ~left ~right =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Padding_props
-      { left = actual_left; right = actual_right; top = _; bottom = _ } ->
-    require
-      (Float.equal actual_left left && Float.equal actual_right right)
-      "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
-      test_id
-      actual_left
-      actual_right
-      left
-      right
-  | _ -> fail "%s is not Padding" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Padding
+       { left = actual_left; right = actual_right; top = _; bottom = _ } ->
+     require
+       (Float.equal actual_left left && Float.equal actual_right right)
+       "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
+       test_id
+       actual_left
+       actual_right
+       left
+       right
+   | _ -> fail "%s is not Padding" test_id)
 ;;
 
 let require_button_enabled handle test_id expected =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Material_button_props { enabled; _ } ->
-    require (Bool.equal enabled expected) "%s enabled state differs" test_id
-  | _ -> fail "%s is not a Material button" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Material_elevated_button { enabled; _ }
+   | Ui.Widget.Private.Material_text_button { enabled; _ }
+   | Ui.Widget.Private.Material_icon_button { enabled; _ } ->
+     require (Bool.equal enabled expected) "%s enabled state differs" test_id
+   | _ -> fail "%s is not a Material button" test_id)
 ;;
 
 let capture_sheet_page_props handle =
-  match (node_by_test_id handle "journal-capture-sheet").props with
-  | Ui.Widget.Private.Page_props { page_key; presentation; can_pop; restoration_id } ->
-    page_key, presentation, can_pop, restoration_id
-  | _ -> fail "journal-capture-sheet is not a Navigator page"
+  let Av view =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-capture-sheet").widget
+  in
+  (match view.node with
+   | Ui.Widget.Private.Page { page_key; presentation; can_pop; restoration_id } ->
+     page_key, presentation, can_pop, restoration_id
+   | _ -> fail "journal-capture-sheet is not a Navigator page")
 ;;
 
 let require_capture_modal_page handle ~can_pop ~enter_ms ~exit_ms =
@@ -885,69 +915,84 @@ let require_tree_order handle earlier later =
 ;;
 
 let require_text_style handle test_id ~size ~line_height ~weight ~color =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Text_props { style = Some style; _ } ->
-    require
-      (style.font_size = Some size
-       && style.line_height = Some line_height
-       && style.font_weight = Some weight
-       && style.color = Some color)
-      "%s has unexpected typography"
-      test_id
-  | _ -> fail "%s is not styled Text" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Text { style = Some style; _ } ->
+     require
+       (style.font_size = Some size
+        && style.line_height = Some line_height
+        && style.font_weight = Some weight
+        && style.color = Some color)
+       "%s has unexpected typography"
+       test_id
+   | _ -> fail "%s is not styled Text" test_id)
 ;;
 
 let require_text_max_lines handle test_id expected =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Text_props { max_lines; _ } ->
-    require
-      (max_lines = Some expected)
-      "%s max_lines differs from %d"
-      test_id
-      expected
-  | _ -> fail "%s is not Text" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Text { max_lines; _ } ->
+     require
+       (max_lines = Some expected)
+       "%s max_lines differs from %d"
+       test_id
+       expected
+   | _ -> fail "%s is not Text" test_id)
 ;;
 
 let require_padding handle test_id ~left ~top ~right ~bottom =
-  match (node_by_test_id handle test_id).props with
-  | Ui.Widget.Private.Padding_props
-      { left = actual_left
-      ; top = actual_top
-      ; right = actual_right
-      ; bottom = actual_bottom
-      } ->
-    require
-      (Float.equal actual_left left
-       && Float.equal actual_top top
-       && Float.equal actual_right right
-       && Float.equal actual_bottom bottom)
-      "%s padding is %.1f/%.1f/%.1f/%.1f, expected %.1f/%.1f/%.1f/%.1f"
-      test_id
-      actual_left
-      actual_top
-      actual_right
-      actual_bottom
-      left
-      top
-      right
-      bottom
-  | _ -> fail "%s is not Padding" test_id
+  let Av view = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  (match view.node with
+   | Ui.Widget.Private.Padding
+       { left = actual_left
+       ; top = actual_top
+       ; right = actual_right
+       ; bottom = actual_bottom
+       } ->
+     require
+       (Float.equal actual_left left
+        && Float.equal actual_top top
+        && Float.equal actual_right right
+        && Float.equal actual_bottom bottom)
+       "%s padding is %.1f/%.1f/%.1f/%.1f, expected %.1f/%.1f/%.1f/%.1f"
+       test_id
+       actual_left
+       actual_top
+       actual_right
+       actual_bottom
+       left
+       top
+       right
+       bottom
+   | _ -> fail "%s is not Padding" test_id)
 ;;
 
 let require_header_geometry handle =
-  (match (node_by_test_id handle "journal-header-safe-area").props with
-   | Ui.Widget.Private.Safe_area_props { top; bottom; _ } ->
+  (let Av view =
+     Ui.Widget.Private.view (node_by_test_id handle "journal-header-safe-area").widget
+   in
+   match view.node with
+   | Ui.Widget.Private.Safe_area { top; bottom; _ } ->
      require (top && not bottom) "header safe-area edges changed"
    | _ -> fail "journal-header-safe-area is not SafeArea");
-  (match (node_by_test_id handle "journal-header-stack").props with
-   | Ui.Widget.Private.Stack_props -> ()
+  (let Av view =
+     Ui.Widget.Private.view (node_by_test_id handle "journal-header-stack").widget
+   in
+   match view.node with
+   | Ui.Widget.Private.Stack -> ()
    | _ -> fail "journal-header-stack is not Stack");
   require_sized_height handle "journal-header-content-height" 48.;
-  (match (node_by_test_id handle "journal-header-center").props with
-   | Ui.Widget.Private.Center_props _ -> ()
+  (let Av view =
+     Ui.Widget.Private.view (node_by_test_id handle "journal-header-center").widget
+   in
+   match view.node with
+   | Ui.Widget.Private.Center _ -> ()
    | _ -> fail "journal-header-center is not an independent Center");
-  (match (node_by_test_id handle "journal-header-padding").props with
-   | Ui.Widget.Private.Padding_props { left; right; top; bottom } ->
+  (let Av view =
+     Ui.Widget.Private.view (node_by_test_id handle "journal-header-padding").widget
+   in
+   match view.node with
+   | Ui.Widget.Private.Padding { left; right; top; bottom } ->
      require
        (Float.equal left 12.
         && Float.equal right 12.
@@ -971,20 +1016,23 @@ let require_stack_bottom handle test_id expected =
 ;;
 
 let require_content_width_padding handle ~horizontal =
-  match (node_by_test_id handle "journal-content-width-padding").props with
-  | Ui.Widget.Private.Padding_props { left; right; top; bottom } ->
-    require
-      (Float.equal left horizontal
-       && Float.equal right horizontal
-       && Float.equal top 0.
-       && Float.equal bottom 0.)
-      "content width padding is %.1f/%.1f/%.1f/%.1f, expected horizontal %.1f"
-      left
-      top
-      right
-      bottom
-      horizontal
-  | _ -> fail "journal-content-width-padding is not Padding"
+  let Av view =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-content-width-padding").widget
+  in
+  (match view.node with
+   | Ui.Widget.Private.Padding { left; right; top; bottom } ->
+     require
+       (Float.equal left horizontal
+        && Float.equal right horizontal
+        && Float.equal top 0.
+        && Float.equal bottom 0.)
+       "content width padding is %.1f/%.1f/%.1f/%.1f, expected horizontal %.1f"
+       left
+       top
+       right
+       bottom
+       horizontal
+   | _ -> fail "journal-content-width-padding is not Padding")
 ;;
 
 let test_root_is_owned_by_the_ocaml_timeline () =
@@ -1094,12 +1142,18 @@ let test_capture_is_an_ocaml_contextual_modal_sheet () =
          require_no_visible_text handle "New entry";
          require_no_visible_text handle "Attach";
          require_capture_modal_page handle ~can_pop:true ~enter_ms:220 ~exit_ms:180;
-         (match (node_by_test_id handle "capture-primary-scroll").props with
-          | Ui.Widget.Private.Scroll_view_props
-              { axis = Ui.Layout.Axis.Vertical; primary = true; reverse = false } -> ()
+         (let Av view =
+            Ui.Widget.Private.view (node_by_test_id handle "capture-primary-scroll").widget
+          in
+          match view.node with
+          | Ui.Widget.Private.Scroll_view
+              { axis = Ui.Layout.Axis.Vertical; primary = true; reverse = false; _ } -> ()
           | _ -> fail "Capture editor region is not the one primary vertical scrollable");
-         (match (node_by_test_id handle "capture-editor").props with
-          | Ui.Widget.Private.Text_input_props
+         (let Av view =
+            Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
+          in
+          match view.node with
+          | Ui.Widget.Private.Text_input
               { keyboard_type = Ui.Text_editing.Multiline
               ; input_action = Ui.Text_editing.Newline
               ; autofocus = true
@@ -1127,9 +1181,12 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
          open_capture handle;
          let original = text_field_value handle "capture-editor" in
          let original_session =
-           match (node_by_test_id handle "capture-editor").props with
-           | Ui.Widget.Private.Text_input_props { session_id; _ } -> session_id
-           | _ -> fail "capture-editor is not TextInput"
+           (let Av view =
+              Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
+            in
+            match view.node with
+            | Ui.Widget.Private.Text_input { session_id; _ } -> session_id
+            | _ -> fail "capture-editor is not TextInput")
          in
          let source = "中文 👩🏽‍💻 e\204\129 #literal @mention" in
          Test.Handle.apply_text_edit
@@ -1174,8 +1231,11 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
                && Ui.Text_editing.Range.end_utf16 range = 2)
               "environment reconciliation changed composing range"
           | None -> fail "environment reconciliation lost composing range");
-         (match (node_by_test_id handle "capture-editor").props with
-          | Ui.Widget.Private.Text_input_props { session_id; _ } ->
+         (let Av view =
+            Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
+          in
+          match view.node with
+          | Ui.Widget.Private.Text_input { session_id; _ } ->
             require
               (ID.Text_input.Session_id.equal original_session session_id)
               "detent reconciliation allocated a new text-input session"
@@ -1245,8 +1305,12 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
          require_test_id handle "journal-more-shell";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more-target";
-         (match (node_by_test_id handle "journal-capture-composer-safe-area").props with
-          | Ui.Widget.Private.Safe_area_props { left; top; right; bottom; _ } ->
+         (let Av view =
+            Ui.Widget.Private.view
+              (node_by_test_id handle "journal-capture-composer-safe-area").widget
+          in
+          match view.node with
+          | Ui.Widget.Private.Safe_area { left; top; right; bottom; _ } ->
             require
               ((not left) && (not top) && (not right) && bottom)
               "Capture composer safe-area edges changed"
@@ -1360,8 +1424,8 @@ let test_timeline_uses_exact_sparse_extent_window () =
            (Array.length node.children);
          require
            (List.exists
-              (fun (override : Ui.Native_widget.Sparse_extent_list.extent_override) ->
-                 override.index = 65 && Float.equal override.extent 114.)
+              (fun (override : Ui.Widget.Sparse_extent_override.t) ->
+                 override.index = 65 && Float.equal override.extent 102.)
               props.extent_overrides)
            "timeline is missing exact final FAB and safe-bottom clearance";
          send_visible_range handle ~first_index:58 ~last_exclusive:65;
@@ -2187,7 +2251,7 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
          require_no_visible_text handle command.source;
          require_live_region handle "Block and descendants removed";
          require_test_id handle "journal-delete-snackbar-position";
-         require_stack_bottom handle "journal-delete-snackbar-position" 114.;
+         require_stack_bottom handle "journal-delete-snackbar-position" 106.;
          require_test_id handle "journal-delete-undo";
          require_button_enabled handle "journal-delete-undo" true;
          advance_clock handle monotonic_now_ns 4.9;

@@ -260,14 +260,14 @@ let test_direct_children_insert_after_parent_and_collapse () =
       ; 2, expected_child
       ; 3, expected_child
       ; 4, expected_child
-      ; 6, 80.
+      ; 6, 68.
       ]
     in
     List.iter
       (fun (index, extent) ->
          require
            (List.exists
-              (fun (override : Ui.Native_widget.Sparse_extent_list.extent_override) ->
+              (fun (override : Ui.Widget.Sparse_extent_override.t) ->
                  override.index = index && Float.equal override.extent extent)
               geometry.overrides)
            "role override %d did not use exact extent %.1f"
@@ -625,13 +625,13 @@ let test_exact_profile_extents_and_final_clearance () =
       top_level_extent;
     require
       (geometry.overrides
-       = [ { Ui.Native_widget.Sparse_extent_list.index = 0; extent = day_extent }
-         ; { Ui.Native_widget.Sparse_extent_list.index = 2; extent = 114. }
+       = [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent }
+         ; { Ui.Widget.Sparse_extent_override.index = 2; extent = 102. }
          ])
       "profile extent overrides changed";
     require
-      (Float.equal geometry.final_clearance_extent 114.)
-      "final row does not clear 56pt FAB, 24pt spacing, and 34pt safe bottom"
+      (Float.equal geometry.final_clearance_extent 102.)
+      "final row does not clear 48pt FAB, 20pt spacing, and 34pt safe bottom"
   in
   check ~width:320. ~scale:1. ~top_level_extent:84. ~day_extent:48.;
   check ~width:390. ~scale:1. ~top_level_extent:76. ~day_extent:36.;

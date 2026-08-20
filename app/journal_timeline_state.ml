@@ -73,7 +73,7 @@ type synthetic_window =
 
 type extent_geometry =
   { default_extent : float
-  ; overrides : Ui.Native_widget.Sparse_extent_list.extent_override list
+  ; overrides : Ui.Widget.Sparse_extent_override.t list
   ; final_clearance_extent : float
   }
 
@@ -736,7 +736,7 @@ let extent_geometry (state : t) ~profile ~safe_bottom =
          | Top_level entry
            when is_expanded state ~block_id:(Journal_model.id entry.block) ->
            Some
-             { Ui.Native_widget.Sparse_extent_list.index = index
+             { Ui.Widget.Sparse_extent_override.index = index
              ; extent =
                  Journal_visual_tokens.expanded_parent_extent
                    ~profile
@@ -762,7 +762,7 @@ let extent_geometry (state : t) ~profile ~safe_bottom =
              | Top_level _ -> assert false
            in
            Some
-             { Ui.Native_widget.Sparse_extent_list.index = index
+             { Ui.Widget.Sparse_extent_override.index = index
              ; extent = Journal_visual_tokens.extent_for_role ~profile ~safe_bottom role
              })
       state.slots

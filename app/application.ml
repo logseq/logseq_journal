@@ -520,7 +520,7 @@ let timeline_page
       ~visibility
       ~style
       ~child:
-        (styled_text ~size:20. ~color:palette.on_fab label
+        (styled_text ~size:16. ~color:palette.on_fab label
          |> Ui.Widget.with_test_id
               (Ui.Test_id.string
                  (if id = 1
@@ -917,7 +917,11 @@ let capture_sheet_page
     let editor_input =
       Ui.Widget.Flex.column (Ui.Widget.Flex.fixed parent :: children)
     in
-    Ui.Widget.Scroll_view.vertical ~primary:true ~on_scroll:dispatch editor_input ()
+    Ui.Widget.Scroll_view.vertical
+      ~primary:true
+      ~on_scroll:dispatch
+      [Ui.Widget.Sliver.box editor_input]
+      ()
     |> Ui.Widget.Viewport.Vertical.with_test_id
          (Ui.Test_id.string "capture-primary-scroll")
     |> Ui.Widget.Viewport.Vertical.with_height ~height:editor_min_height
@@ -1709,6 +1713,44 @@ let component client handlers graph =
                     (Journal_detail.apply_text_edit detail edit)
               }
             | None, None -> state)
+        | Ui.Event.Payload.Visible_range range ->
+          let observe timeline =
+            let total_count = Journal_timeline_state.total_count timeline in
+            let bounded value =
+              value
+              |> Int64.max 0L
+              |> Int64.min (Int64.of_int total_count)
+              |> Int64.to_int
+            in
+            let first_index = bounded range.first_index in
+            let last_exclusive = bounded range.last_exclusive in
+            ( Journal_timeline_state.observe_visible_range
+                timeline
+                ~first_index
+                ~last_exclusive
+            , first_index
+            , last_exclusive )
+          in
+          let timeline, first_index, last_exclusive = observe snapshot.timeline in
+          (match
+             Journal_timeline_state.request_for_visible_range
+               timeline
+               ~first_index
+               ~last_exclusive
+           with
+           | None ->
+             update (fun state ->
+               let timeline, _, _ = observe state.timeline in
+               { state with timeline })
+           | Some request ->
+             let generation = snapshot.next_request_generation in
+             with_request
+               { snapshot with
+                 timeline =
+                   Journal_timeline_state.begin_request timeline ~generation request
+               ; next_request_generation = Int64.succ generation
+               }
+                 (worker_request generation request))
         | Ui.Event.Payload.Native_event _ as payload ->
           (match Ui.Native_widget.Message_composer.event_of_payload payload with
            | Some (Text_changed _) -> Bonsai.Effect.Ignore
@@ -1717,47 +1759,7 @@ let component client handlers graph =
              when String.equal (String.trim text) "" -> Bonsai.Effect.Ignore
            | Some (Button_pressed { button_id = 2; text }) -> open_capture text
            | Some (Button_pressed _) -> Bonsai.Effect.Ignore
-           | None ->
-             (match Ui.Native_widget.Sparse_extent_list.visible_range_of_payload payload with
-              | None -> Bonsai.Effect.Ignore
-              | Some range ->
-             let observe timeline =
-               let total_count = Journal_timeline_state.total_count timeline in
-               let bounded value =
-                 value
-                 |> Int64.max 0L
-                 |> Int64.min (Int64.of_int total_count)
-                 |> Int64.to_int
-               in
-               let first_index = bounded range.first_index in
-               let last_exclusive = bounded range.last_exclusive in
-               ( Journal_timeline_state.observe_visible_range
-                   timeline
-                   ~first_index
-                   ~last_exclusive
-               , first_index
-               , last_exclusive )
-             in
-             let timeline, first_index, last_exclusive = observe snapshot.timeline in
-             (match
-                Journal_timeline_state.request_for_visible_range
-                  timeline
-                  ~first_index
-                  ~last_exclusive
-              with
-              | None ->
-                update (fun state ->
-                  let timeline, _, _ = observe state.timeline in
-                  { state with timeline })
-              | Some request ->
-                let generation = snapshot.next_request_generation in
-                with_request
-                  { snapshot with
-                    timeline =
-                      Journal_timeline_state.begin_request timeline ~generation request
-                  ; next_request_generation = Int64.succ generation
-                  }
-                    (worker_request generation request))))
+           | None -> Bonsai.Effect.Ignore)
         | Ui.Event.Payload.Route_pop _ -> update back_state
         | Ui.Event.Payload.Text action ->
           if String.equal action "open-capture"
@@ -2054,7 +2056,7 @@ let component client handlers graph =
                    (worker_request generation request))
             | None, Some _ -> Bonsai.Effect.Ignore)
           else Bonsai.Effect.Ignore
-        | Unit | Bool _ | Int64 _ | Tap _ | Pointer _ | Key _ | Scroll _ | Visible_range _
+        | Unit | Bool _ | Int64 _ | Tap _ | Pointer _ | Key _ | Scroll _
           -> Bonsai.Effect.Ignore)
   in
   let state = Bonsai.Cont.map2 state delete_timer ~f:(fun state () -> state) in

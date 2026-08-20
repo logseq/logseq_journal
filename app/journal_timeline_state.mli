@@ -55,7 +55,7 @@ type synthetic_window =
 
 type extent_geometry =
   { default_extent : float
-  ; overrides : Ui.Native_widget.Sparse_extent_list.extent_override list
+  ; overrides : Ui.Widget.Sparse_extent_override.t list
   ; final_clearance_extent : float
   }
 

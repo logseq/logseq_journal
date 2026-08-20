@@ -248,8 +248,8 @@ let header_geometry =
 let composer_geometry =
   { horizontal_margin = 12.
   ; bottom_inset = 12.
-  ; minimum_height = 56.
-  ; reserved_extent = 80.
+  ; minimum_height = 48.
+  ; reserved_extent = 68.
   }
 ;;
 

@@ -193,8 +193,8 @@ let test_typography_spacing_motion_and_hit_regions () =
   require
     (composer.horizontal_margin = 12.
      && composer.bottom_inset = 12.
-     && composer.minimum_height = 56.
-     && composer.reserved_extent = 80.)
+     && composer.minimum_height = 48.
+     && composer.reserved_extent = 68.)
     "Capture composer geometry tokens changed";
   let standard = Tokens.motion ~reduced_motion:false in
   let reduced = Tokens.motion ~reduced_motion:true in
@@ -427,7 +427,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ; Tokens.Day_heading, 36.
     ; Tokens.Day_continuation, 48.
     ; Tokens.Feed_continuation, 48.
-    ; Tokens.Bottom_clearance, 114.
+    ; Tokens.Bottom_clearance, 102.
     ];
   check
     ~width:320.
@@ -440,7 +440,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ; Tokens.Day_heading, 101.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
-    ; Tokens.Bottom_clearance, 80.
+    ; Tokens.Bottom_clearance, 68.
     ]
 ;;
 
