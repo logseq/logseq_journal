@@ -510,6 +510,7 @@ let view
                     | [] -> None
                     | next :: _ -> Some next))
               slot
+            |> Ui.Widget.Keyed.create ~key:(Ui.Key.string (Timeline.slot_key slot))
           in
           item :: render (offset + 1) (Some slot) rest
       in

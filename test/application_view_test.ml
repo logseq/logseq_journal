@@ -635,6 +635,31 @@ let timeline_props handle =
   | _ -> fail "journal timeline is not a Sliver_varied_extent"
 ;;
 
+let timeline_item_keys handle =
+  let (Av view) =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-timeline").widget
+  in
+  Array.to_list view.children
+  |> List.mapi (fun index (child : Ui.Widget.Private.child) ->
+    match Ui.Widget.For_testing.key child.widget with
+    | Some key -> key
+    | None -> fail "journal timeline item %d has no root key" index)
+;;
+
+let require_unique_timeline_item_keys keys =
+  let sorted = List.sort Ui.Key.compare keys in
+  let rec require_unique = function
+    | left :: (right :: _ as rest) ->
+      require
+        (not (Ui.Key.equal left right))
+        "journal timeline has duplicate root key %s"
+        (Ui.Key.to_debug_string left);
+      require_unique rest
+    | [] | [ _ ] -> ()
+  in
+  require_unique sorted
+;;
+
 let capture_composer_props handle =
   let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-capture-composer").widget
@@ -1428,6 +1453,53 @@ let test_timeline_uses_exact_sparse_extent_window () =
             <= Journal_timeline_state.maximum_supplied_rows)
            "paged timeline supplied %d rows"
            (Array.length paged_node.children)))
+;;
+
+let test_timeline_preserves_stable_slot_keys_across_window_shifts () =
+  with_startup (fun startup ->
+    let captures =
+      List.init 70 (fun offset ->
+        let number = offset + 1 in
+        capture number (Printf.sprintf "Stable key row %02d" number))
+    in
+    seed startup captures;
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle "Stable key row 01";
+         let initial_keys = timeline_item_keys handle in
+         require_unique_timeline_item_keys initial_keys;
+         let overlapping_capture = List.nth captures 9 in
+         let logical_key = Ui.Key.string ("block:" ^ overlapping_capture.block_id) in
+         require
+           (List.exists (Ui.Key.equal logical_key) initial_keys)
+           "timeline root keys do not include logical slot %s"
+           (Ui.Key.to_debug_string logical_key);
+         let initial_node =
+           match Test.Handle.find handle (Test.Query.key logical_key) with
+           | Some node -> node
+           | None -> fail "missing keyed timeline slot before window shift"
+         in
+         send_visible_range handle ~first_index:8 ~last_exclusive:16;
+         pump_worker handle;
+         let shifted = timeline_props handle in
+         require
+           (shifted.first_index > 0)
+           "timeline window did not shift away from its initial origin";
+         let shifted_keys = timeline_item_keys handle in
+         require_unique_timeline_item_keys shifted_keys;
+         require
+           (List.exists (Ui.Key.equal logical_key) shifted_keys)
+           "overlapping logical slot lost its stable root key";
+         let shifted_node =
+           match Test.Handle.find handle (Test.Query.key logical_key) with
+           | Some node -> node
+           | None -> fail "missing keyed timeline slot after window shift"
+         in
+         require
+           (ID.Ui.Node_id.equal initial_node.node_id shifted_node.node_id)
+           "overlapping logical slot did not preserve its mounted node identity"))
 ;;
 
 let test_one_visible_range_drains_multiple_day_continuations () =
@@ -2392,6 +2464,7 @@ let () =
   test_header_adapts_without_exposing_deferred_actions ();
   test_header_stays_light_when_the_system_uses_dark_appearance ();
   test_timeline_uses_exact_sparse_extent_window ();
+  test_timeline_preserves_stable_slot_keys_across_window_shifts ();
   test_one_visible_range_drains_multiple_day_continuations ();
   test_pending_day_response_drains_expanded_parent_without_renderer_input ();
   test_collapsed_group_divider_is_full_width_and_one_physical_pixel ();

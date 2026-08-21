@@ -838,6 +838,66 @@ let test_fifty_thousand_synthetic_windows_are_bounded () =
     [ 0, 10; 1, 39; 10_000, 10_020; 25_000, 25_032; 49_980, 50_000 ]
 ;;
 
+let benchmark_visible_range_path ~name ~source =
+  let blocks =
+    List.init (Timeline.maximum_slots - 1) (fun index ->
+      block ~order:(Printf.sprintf "%012d" index) ~source:(source index) index)
+  in
+  let initial =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260809 "Today" blocks ])
+  in
+  require
+    (Timeline.retained_slot_count initial = Timeline.maximum_slots)
+    "benchmark fixture retained %d slots"
+    (Timeline.retained_slot_count initial);
+  let profile =
+    Journal_visual_tokens.select_row_profile ~viewport_width:1_200. ~text_scale:1.
+  in
+  let iterations = 5_000 in
+  let checksum = ref 0 in
+  let supplied_rows_bounded = ref true in
+  let started = Unix.gettimeofday () in
+  for iteration = 0 to iterations - 1 do
+    let first_index = iteration mod (Timeline.total_count initial - 12) in
+    let state =
+      Timeline.observe_visible_range
+        initial
+        ~first_index
+        ~last_exclusive:(first_index + 12)
+    in
+    let window = Timeline.current_window state in
+    let geometry = Timeline.extent_geometry state ~profile ~safe_bottom:0. in
+    let supplied_rows = List.length window.slots in
+    supplied_rows_bounded
+    := !supplied_rows_bounded && supplied_rows <= Timeline.maximum_supplied_rows;
+    checksum := !checksum + supplied_rows + List.length geometry.overrides
+  done;
+  let elapsed_us = int_of_float ((Unix.gettimeofday () -. started) *. 1_000_000.) in
+  require !supplied_rows_bounded "benchmark supplied more than the bounded window";
+  require (!checksum > 0) "benchmark work was optimized away";
+  Printf.printf
+    "SCROLL_BENCHMARK \
+     {\"schemaVersion\":1,\"layer\":\"ocaml-state\",\"case\":\"%s\",\"iterations\":%d,\"retainedSlots\":%d,\"elapsedUs\":%d,\"perIterationNs\":%d,\"checksum\":%d}\n\
+     %!"
+    name
+    iterations
+    (Timeline.retained_slot_count initial)
+    elapsed_us
+    (elapsed_us * 1_000 / iterations)
+    !checksum
+;;
+
+let benchmark_continuous_visible_ranges () =
+  benchmark_visible_range_path ~name:"sparse-extents" ~source:(fun index ->
+    Printf.sprintf "Benchmark row %03d" index);
+  benchmark_visible_range_path ~name:"dense-extents" ~source:(fun index ->
+    Printf.sprintf "Benchmark row %03d\nsecond line\nthird line\nfourth line" index)
+;;
+
 let test_exact_profile_extents_and_final_clearance () =
   let older = block ~day:20260808 30 in
   let state =
@@ -1198,6 +1258,7 @@ let () =
   test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id ();
   test_ten_thousand_record_rolling_projection_is_bounded ();
   test_fifty_thousand_synthetic_windows_are_bounded ();
+  benchmark_continuous_visible_ranges ();
   test_exact_profile_extents_and_final_clearance ();
   test_block_line_counts_are_the_authoritative_sparse_extents ();
   test_anchor_decisions_replacements_and_route_return ();

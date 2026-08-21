@@ -11,6 +11,7 @@ import 'package:bonsai_flutter/src/runtime/foreground_frame_loop.dart';
 import 'package:bonsai_flutter/src/renderer/pressable_host.dart';
 import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -183,6 +184,55 @@ void main() {
         );
         expect(find.text('Loading more journal entries'), findsNothing);
         expect(tester.takeException(), isNull);
+      } finally {
+        await harness.dispose(tester);
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
+
+  testWidgets(
+    'benchmark macOS continuous trackpad scrolling',
+    (tester) async {
+      if (!Platform.isMacOS) return;
+      final harness = await _RuntimeHarness.start(
+        tester,
+        fixtureMode: RuntimeFlowFixtureMode.pagination,
+      );
+      try {
+        await harness.show(tester);
+        await _pumpUntil(
+          tester,
+          () => find.text('Pagination day five row 01').evaluate().isNotEmpty,
+        );
+        await _pumpUntil(
+          tester,
+          () => find.text('Loading more journal entries').evaluate().isEmpty,
+        );
+        for (final benchmark in const [
+          (name: 'steady', flingDistance: 560.0, speed: 1800.0, flingCount: 6),
+          (
+            name: 'high-velocity',
+            flingDistance: 900.0,
+            speed: 9000.0,
+            flingCount: 6,
+          ),
+        ]) {
+          final position = tester
+              .state<ScrollableState>(find.byType(Scrollable).first)
+              .position;
+          position.jumpTo(position.minScrollExtent);
+          await tester.pump();
+          await _pumpRuntime(tester);
+          await _runMacosScrollBenchmark(
+            binding,
+            tester,
+            name: benchmark.name,
+            flingDistance: benchmark.flingDistance,
+            speed: benchmark.speed,
+            flingCount: benchmark.flingCount,
+          );
+        }
       } finally {
         await harness.dispose(tester);
       }
@@ -713,6 +763,139 @@ Future<void> _requireMechanicalBudgets(
   final snapshot = await tester.runAsync(runtime.debugSnapshot);
   expect(snapshot, isNotNull);
   expect(snapshot!.pumpCount, greaterThan(0));
+}
+
+Future<void> _runMacosScrollBenchmark(
+  TestWidgetsFlutterBinding binding,
+  WidgetTester tester, {
+  required String name,
+  required double flingDistance,
+  required double speed,
+  required int flingCount,
+}) async {
+  const maximumPatchBytes = 256 * 1024;
+  const maximumMountedNodes = 800;
+  final scrollable = find.byType(Scrollable).first;
+  final position = tester.state<ScrollableState>(scrollable).position;
+  final initialPixels = position.pixels;
+  final frameTimings = <FrameTiming>[];
+  final timingsCallback = frameTimings.addAll;
+  BonsaiFlutterDebug.reset();
+  binding.addTimingsCallback(timingsCallback);
+  final stopwatch = Stopwatch()..start();
+  try {
+    for (var fling = 0; fling < flingCount; fling += 1) {
+      if (position.extentAfter <= 1) break;
+      await tester.trackpadFling(
+        scrollable,
+        Offset(0, -flingDistance),
+        speed,
+        initialOffsetDelay: Duration.zero,
+      );
+      await _pumpRuntime(tester);
+    }
+    await tester.pump(const Duration(milliseconds: 32));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 1200)),
+    );
+    await tester.pump();
+  } finally {
+    stopwatch.stop();
+    binding.removeTimingsCallback(timingsCallback);
+  }
+
+  final runtimeFrames = BonsaiFlutterDebug.frameStats();
+  final patchBytes = runtimeFrames.map((frame) => frame.patchBytes).toList();
+  expect(position.pixels, greaterThan(initialPixels));
+  expect(frameTimings, isNotEmpty);
+  expect(runtimeFrames, isNotEmpty);
+  expect(tester.takeException(), isNull);
+  expect(
+    find.byType(NodeHost).evaluate().length,
+    lessThanOrEqualTo(maximumMountedNodes),
+  );
+  expect(
+    patchBytes.reduce((left, right) => left > right ? left : right),
+    lessThanOrEqualTo(maximumPatchBytes),
+  );
+
+  final report = {
+    'schemaVersion': 1,
+    'layer': 'compiled-runtime',
+    'platform': 'macos',
+    'case': name,
+    'flingDistance': flingDistance,
+    'speed': speed,
+    'requestedFlings': flingCount,
+    'scrollDistance': position.pixels - initialPixels,
+    'wallElapsedUs': stopwatch.elapsedMicroseconds,
+    'flutterFrames': frameTimings.length,
+    'flutterTotalUs': _numericSummary(
+      frameTimings.map((timing) => timing.totalSpan.inMicroseconds),
+    ),
+    'flutterBuildUs': _numericSummary(
+      frameTimings.map((timing) => timing.buildDuration.inMicroseconds),
+    ),
+    'flutterRasterUs': _numericSummary(
+      frameTimings.map((timing) => timing.rasterDuration.inMicroseconds),
+    ),
+    'framesOver16ms': frameTimings
+        .where(
+          (timing) => timing.totalSpan > const Duration(microseconds: 16667),
+        )
+        .length,
+    'runtimeFrames': runtimeFrames.length,
+    'eventBatchSize': _numericSummary(
+      runtimeFrames.map((frame) => frame.eventBatchSize),
+    ),
+    'coalescedEvents': runtimeFrames.fold<int>(
+      0,
+      (total, frame) => total + frame.coalescedEventCount,
+    ),
+    'patchBytes': _numericSummary(patchBytes),
+    'dirtyNodes': _numericSummary(
+      runtimeFrames.map((frame) => frame.dirtyNodeCount),
+    ),
+    'bonsaiFlushNs': _numericSummary(
+      runtimeFrames
+          .map((frame) => frame.bonsaiFlushNanoseconds)
+          .whereType<int>(),
+    ),
+    'reconcileNs': _numericSummary(
+      runtimeFrames.map((frame) => frame.reconcileNanoseconds).whereType<int>(),
+    ),
+    'encodeNs': _numericSummary(
+      runtimeFrames.map((frame) => frame.encodeNanoseconds).whereType<int>(),
+    ),
+    'decodeUs': _numericSummary(
+      runtimeFrames
+          .map((frame) => frame.decodeDuration)
+          .whereType<Duration>()
+          .map((duration) => duration.inMicroseconds),
+    ),
+    'nodeStoreApplyUs': _numericSummary(
+      runtimeFrames
+          .map((frame) => frame.nodeStoreApplyDuration)
+          .whereType<Duration>()
+          .map((duration) => duration.inMicroseconds),
+    ),
+    'mountedNodes': find.byType(NodeHost).evaluate().length,
+  };
+  debugPrint('SCROLL_BENCHMARK ${jsonEncode(report)}', wrapWidth: 100000);
+}
+
+Map<String, int> _numericSummary(Iterable<int> values) {
+  final sorted = values.toList()..sort();
+  if (sorted.isEmpty) {
+    return const {'samples': 0, 'p50': 0, 'p95': 0, 'max': 0};
+  }
+  int percentile(double value) => sorted[((sorted.length - 1) * value).round()];
+  return {
+    'samples': sorted.length,
+    'p50': percentile(0.50),
+    'p95': percentile(0.95),
+    'max': sorted.last,
+  };
 }
 
 final class _RuntimeHarness {
