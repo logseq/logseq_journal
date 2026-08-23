@@ -22,6 +22,9 @@ let with_engine config ~epoch_ms run =
   let dependencies : Engine.dependencies =
     { clocks = { epoch_ms = (fun () -> epoch_ms); monotonic_ns = (fun () -> 1_000_000L) }
     ; cursor_authentication_key = Bytes.make 32 'g'
+    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
+    ; unlock_graph_key =
+        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
     }
   in
   let engine = Engine.open_ ~dependencies config |> Result.get_ok in

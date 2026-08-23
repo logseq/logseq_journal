@@ -47,8 +47,10 @@
     {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000030","command":{"type":"batchSetProperty","blocks":["10000000-0000-4000-8000-000000000001"],"property":{"type":"ident","ident":"user.property/priority"},"mode":{"type":"append","value":{"type":"number","value":"3"}},"context":{"mutationId":"30000000-0000-4000-8000-000000000017","expectedBasis":"115"}}},
     {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000031","command":{"type":"batchRemoveProperty","blocks":["10000000-0000-4000-8000-000000000001"],"property":{"type":"ident","ident":"user.property/priority"},"context":{"mutationId":"30000000-0000-4000-8000-000000000018","expectedBasis":"116"}}},
     {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000032","command":{"type":"manageClosedValues","property":{"type":"ident","ident":"user.property/priority"},"action":{"type":"add","valueUuid":"10000000-0000-4000-8000-000000000004","value":{"type":"number","value":"5"},"icon":null},"context":{"mutationId":"30000000-0000-4000-8000-000000000019","expectedBasis":"117"}}},
-    {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000033","command":{"type":"manageClassProperty","class":"20000000-0000-4000-8000-000000000003","property":{"type":"ident","ident":"user.property/priority"},"action":{"type":"add","defaultValue":{"type":"number","value":"1"}},"context":{"mutationId":"30000000-0000-4000-8000-000000000020","expectedBasis":"118"}}}
+    {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000033","command":{"type":"manageClassProperty","class":"20000000-0000-4000-8000-000000000003","property":{"type":"ident","ident":"user.property/priority"},"action":{"type":"add","defaultValue":{"type":"number","value":"1"}},"context":{"mutationId":"30000000-0000-4000-8000-000000000020","expectedBasis":"118"}}},
+    {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000034","command":{"type":"syncStatus"}},
+    {"apiVersion":1,"requestId":"00000000-0000-4000-8000-000000000035","command":{"type":"syncReceive","transport":"websocket","payload":"{\"type\":\"changed\",\"t\":41}"}}
   ],
   "propertyTypes": ["default","number","date","datetime","checkbox","url","node","asset","keyword","map","collection","any","entity","class","page","property","string","json","rawNumber"],
-  "directNonGoals": ["applyTemplate","batchImportEdn","toggleReaction","transact","split","merge","undo","redo","sync","rtc"]
+  "directNonGoals": ["applyTemplate","batchImportEdn","toggleReaction","transact","split","merge","undo","redo"]
 }

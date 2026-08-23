@@ -9,6 +9,29 @@ let require_ok = function
   | Error message -> fail "unexpected platform error: %s" message
 ;;
 
+let contains text fragment =
+  let rec loop index =
+    if index + String.length fragment > String.length text
+    then false
+    else if String.sub text index (String.length fragment) = fragment
+    then true
+    else loop (index + 1)
+  in
+  loop 0
+;;
+
+let envelope ?(runtime_generation = 0L) ?(graph_generation = 0L) tag payload =
+  let bytes = Bytes.make (32 + Bytes.length payload) '\000' in
+  Bytes.blit_string "LJP2" 0 bytes 0 4;
+  Bytes.set_uint16_le bytes 4 2;
+  Bytes.set_uint16_le bytes 6 tag;
+  Bytes.set_int64_le bytes 8 runtime_generation;
+  Bytes.set_int64_le bytes 16 graph_generation;
+  Bytes.set_int32_le bytes 24 (Int32.of_int (Bytes.length payload));
+  Bytes.blit payload 0 bytes 32 (Bytes.length payload);
+  bytes
+;;
+
 let calendar_packet
       ?(tag = 3)
       ?(reason = 0)
@@ -45,7 +68,7 @@ let calendar_packet
     bytes
     (header_size + String.length locale)
     (String.length time_zone_id);
-  bytes
+  envelope tag bytes
 ;;
 
 let formatted_response ~generation headings =
@@ -71,13 +94,24 @@ let formatted_response ~generation headings =
           offset + 8 + String.length heading)
        20
        headings);
-  bytes
+  envelope 5 bytes
+;;
+
+let lifecycle_packet ~kind ~generation =
+  let payload = Bytes.make 16 '\000' in
+  Bytes.blit_string "LJP1" 0 payload 0 4;
+  Bytes.set_uint16_le payload 4 1;
+  Bytes.set_uint16_le payload 6 kind;
+  Bytes.set_int64_le payload 8 generation;
+  envelope 15 payload
 ;;
 
 let test_calendar_packet_decodes_complete_bounded_facts () =
   require
-    (Journal_platform.get_calendar_request = Bytes.of_string "LJP1\001\000\001\000")
-    "calendar request bytes changed";
+    (Bytes.length Journal_platform.get_calendar_request = 32
+     && Bytes.sub_string Journal_platform.get_calendar_request 0 4 = "LJP2"
+     && Bytes.get_uint16_le Journal_platform.get_calendar_request 6 = 1)
+    "calendar request envelope changed";
   let decoded =
     calendar_packet ~reason:3 () |> Journal_platform.decode_calendar |> require_ok
   in
@@ -155,16 +189,16 @@ let test_format_request_is_bounded_and_exact () =
     Journal_platform.format_journal_days_request ~generation:7L [ 20260807; 20260808 ]
     |> require_ok
   in
-  require (Bytes.length request = 28) "format request length is %d" (Bytes.length request);
-  require (Bytes.sub_string request 0 4 = "LJP1") "format request magic differs";
-  require (Bytes.get_uint16_le request 6 = 4) "format request tag differs";
-  require (Bytes.get_int64_le request 8 = 7L) "format request generation differs";
-  require (Bytes.get_uint16_le request 16 = 2) "format request count differs";
+  require (Bytes.length request = 60) "format request length is %d" (Bytes.length request);
+  require (Bytes.sub_string request 0 4 = "LJP2") "format request magic differs";
+  require (Bytes.get_uint16_le request 6 = 4) "format envelope tag differs";
+  require (Bytes.get_int64_le request 40 = 7L) "format request generation differs";
+  require (Bytes.get_uint16_le request 48 = 2) "format request count differs";
   require
-    (Bytes.get_int32_le request 20 = Int32.of_int 20260807)
+    (Bytes.get_int32_le request 52 = Int32.of_int 20260807)
     "first format request day differs";
   require
-    (Bytes.get_int32_le request 24 = Int32.of_int 20260808)
+    (Bytes.get_int32_le request 56 = Int32.of_int 20260808)
     "second format request day differs";
   let too_many = List.init 65 (fun index -> 20260101 + index) in
   require
@@ -192,9 +226,103 @@ let test_formatted_response_decodes_and_preserves_generation () =
   require
     (List.assoc 20260807 response.headings = "Friday, August 7")
     "English heading differs";
-  Bytes.set_int64_le bytes 8 6L;
+  Bytes.set_int64_le bytes 40 6L;
   let stale = Journal_platform.decode_formatted_journal_days bytes |> require_ok in
   require (stale.generation = 6L) "stale generation was not preserved"
+;;
+
+let test_auth_capability_envelopes_are_bounded_and_protocol_free () =
+  require
+    (Bytes.get_uint16_le Journal_platform.authenticated_user_request 6 = 6)
+    "authenticated-user request tag differs";
+  let authenticated =
+    envelope 7 (Bytes.of_string {|{"userId":"cognito-user-1"}|})
+    |> Journal_platform.decode_authenticated_user
+    |> require_ok
+  in
+  require (authenticated = Some "cognito-user-1") "authenticated-user response changed";
+  let challenge =
+    Logseq_db_worker.Sync_auth.
+      { challenge_id = "challenge-1"
+      ; purpose = Websocket_connect
+      ; user_id = "cognito-user-1"
+      ; account_generation = 3
+      ; graph_generation = Some 4
+      ; connection_generation = Some 5
+      }
+  in
+  let request = Journal_platform.id_token_request challenge in
+  require (Bytes.get_uint16_le request 6 = 8) "ID-token request tag differs";
+  require
+    (not (contains (Bytes.to_string request) "/sync/"))
+    "auth capability request contains sync protocol knowledge";
+  let token =
+    envelope
+      9
+      (Bytes.of_string {|{"challengeId":"challenge-1","token":"fresh-id-token"}|})
+    |> Journal_platform.decode_id_token_response ~challenge_id:"challenge-1"
+    |> require_ok
+  in
+  require (String.equal token "fresh-id-token") "fresh ID token response changed"
+;;
+
+let test_sign_out_capability_is_bounded_and_acknowledged () =
+  require
+    (Bytes.length Journal_platform.sign_out_request = 32
+     && Bytes.get_uint16_le Journal_platform.sign_out_request 6 = 10)
+    "sign-out request envelope changed";
+  envelope 11 (Bytes.of_string {|{"signedOut":true}|})
+  |> Journal_platform.decode_sign_out_response
+  |> require_ok;
+  require
+    (Result.is_error
+       (Journal_platform.decode_sign_out_response
+          (envelope 11 (Bytes.of_string {|{"signedOut":false}|}))))
+    "failed sign-out acknowledgement was accepted"
+;;
+
+let test_termination_handshake_is_bounded_and_acknowledged () =
+  require
+    (Journal_platform.is_prepare_to_terminate_event (envelope 12 Bytes.empty))
+    "prepare-to-terminate event was rejected";
+  require
+    (not
+       (Journal_platform.is_prepare_to_terminate_event
+          (envelope 12 (Bytes.of_string "unexpected"))))
+    "prepare-to-terminate event accepted a payload";
+  require
+    (Bytes.length Journal_platform.termination_ready_request = 32
+     && Bytes.get_uint16_le Journal_platform.termination_ready_request 6 = 13)
+    "termination-ready request envelope changed";
+  envelope 14 (Bytes.of_string {|{"ready":true}|})
+  |> Journal_platform.decode_termination_ready_response
+  |> require_ok
+;;
+
+let test_network_lifecycle_epochs_are_bounded_and_typed () =
+  (match
+     lifecycle_packet ~kind:1 ~generation:7L
+     |> Journal_platform.decode_network_lifecycle
+     |> require_ok
+   with
+   | Journal_platform.Backgrounded { generation = 7L } -> ()
+   | Backgrounded _ | Foreground_resumed _ -> fail "background lifecycle changed");
+  (match
+     lifecycle_packet ~kind:2 ~generation:7L
+     |> Journal_platform.decode_network_lifecycle
+     |> require_ok
+   with
+   | Journal_platform.Foreground_resumed { generation = 7L } -> ()
+   | Backgrounded _ | Foreground_resumed _ -> fail "foreground lifecycle changed");
+  [ lifecycle_packet ~kind:0 ~generation:7L
+  ; lifecycle_packet ~kind:3 ~generation:7L
+  ; lifecycle_packet ~kind:1 ~generation:(-1L)
+  ; envelope 15 Bytes.empty
+  ]
+  |> List.iter (fun packet ->
+    require
+      (Result.is_error (Journal_platform.decode_network_lifecycle packet))
+      "invalid network lifecycle packet was accepted")
 ;;
 
 let tests =
@@ -205,6 +333,11 @@ let tests =
   ; "bounded format request", test_format_request_is_bounded_and_exact
   ; ( "formatted response generation"
     , test_formatted_response_decodes_and_preserves_generation )
+  ; ( "bounded auth capability"
+    , test_auth_capability_envelopes_are_bounded_and_protocol_free )
+  ; "sign-out capability", test_sign_out_capability_is_bounded_and_acknowledged
+  ; "termination handshake", test_termination_handshake_is_bounded_and_acknowledged
+  ; "network lifecycle epochs", test_network_lifecycle_epochs_are_bounded_and_typed
   ]
 ;;
 

@@ -26,6 +26,17 @@ let encode_startup startup =
     fail "startup encode failed: %s" (Journal_startup.Error.to_string error)
 ;;
 
+let platform_envelope tag payload =
+  let header_size = 32 in
+  let bytes = Bytes.make (header_size + Bytes.length payload) '\000' in
+  Bytes.blit_string "LJP2" 0 bytes 0 4;
+  Bytes.set_uint16_le bytes 4 2;
+  Bytes.set_uint16_le bytes 6 tag;
+  Bytes.set_int32_le bytes 24 (Int32.of_int (Bytes.length payload));
+  Bytes.blit payload 0 bytes header_size (Bytes.length payload);
+  bytes
+;;
+
 let initial_calendar_packet =
   let locale = "en_US" in
   let time_zone_id = "Asia/Shanghai" in
@@ -52,7 +63,7 @@ let initial_calendar_packet =
     bytes
     (header_size + String.length locale)
     (String.length time_zone_id);
-  bytes
+  platform_envelope 2 bytes
 ;;
 
 let initialize_test_calendar ?(packet = initial_calendar_packet) handle =
@@ -292,6 +303,9 @@ let seed startup captures =
          { clocks =
              { epoch_ms = (fun () -> epoch_ms); monotonic_ns = (fun () -> 1_000_000L) }
          ; cursor_authentication_key = Bytes.make 32 'a'
+         ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
+         ; unlock_graph_key =
+             (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
          }
        in
        let engine =
@@ -777,27 +791,6 @@ let require_decoration_without_shape handle test_id ~background =
   | _ -> fail "%s is not a colored DecoratedBox" test_id
 ;;
 
-let require_icon ?size handle test_id ~code_point ~color =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  match view.node with
-  | Ui.Widget.Private.Icon
-      { code_point = actual_code_point
-      ; font_family = Some "MaterialIcons"
-      ; size = actual_size
-      ; color = Some actual_color
-      } ->
-    require
-      (actual_code_point = code_point
-       && Int32.equal actual_color color
-       &&
-       match size with
-       | None -> true
-       | Some expected -> actual_size = Some expected)
-      "%s icon differs"
-      test_id
-  | _ -> fail "%s is not a Material icon" test_id
-;;
-
 let require_sized_height handle test_id expected =
   let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
   match view.node with
@@ -1017,8 +1010,16 @@ let require_header_geometry handle =
        right
        bottom
    | _ -> fail "journal-header-padding is not Padding");
-  require_sized_size handle "journal-menu-shell" ~width:44. ~height:44.;
-  require_sized_size handle "journal-more-shell" ~width:44. ~height:44.
+  require_sized_size
+    handle
+    "journal-header-leading-placeholder"
+    ~width:44.
+    ~height:44.;
+  require_sized_size
+    handle
+    "journal-header-account-placeholder"
+    ~width:44.
+    ~height:44.
 ;;
 
 let require_stack_bottom handle test_id expected =
@@ -1062,8 +1063,8 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_test_id handle "journal-capture-composer";
          require_test_id handle "journal-header";
          require_test_id handle "journal-date-context";
-         require_test_id handle "journal-menu-shell";
-         require_test_id handle "journal-more-shell";
+         require_test_id handle "journal-header-leading-placeholder";
+         require_test_id handle "journal-header-account-placeholder";
          require_no_test_id handle "journal-menu";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more";
@@ -1285,18 +1286,6 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
          require_decoration handle "journal-header-surface" 0xfffdfdfdl;
          require_no_test_id handle "journal-header-handle";
          require_no_test_id handle "journal-more-surface";
-         require_icon
-           ~size:18.
-           handle
-           "journal-menu-icon"
-           ~code_point:0xe3dc
-           ~color:0xff0d142fl;
-         require_icon
-           ~size:18.
-           handle
-           "journal-more-icon"
-           ~code_point:0xe402
-           ~color:0xff0d142fl;
          require_sized_height handle "journal-header-divider" (1. /. 3.);
          require_header_geometry handle;
          require_text_style
@@ -1315,8 +1304,8 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
            ~color:0xff656b8fl;
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
-         require_test_id handle "journal-menu-shell";
-         require_test_id handle "journal-more-shell";
+         require_test_id handle "journal-header-leading-placeholder";
+         require_test_id handle "journal-header-account-placeholder";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more-target";
          (let (Av view) =
@@ -1649,7 +1638,7 @@ let test_timeline_projects_creation_time_across_a_negative_offset_day_boundary (
         bytes
         (header_size + String.length locale)
         (String.length time_zone_id);
-      bytes
+      platform_envelope 2 bytes
     in
     let handle = create_handle_with_calendar startup packet in
     Fun.protect
@@ -1868,11 +1857,15 @@ let pump_until_application_request handle =
 let pump_until_application_request_generation handle generation =
   let rec loop attempts =
     if attempts = 0
-    then fail "timed out waiting for formatted-day generation %Ld" generation
+    then
+      fail
+        "timed out waiting for formatted-day generation %Ld\n%s"
+        generation
+        (Test.Handle.show handle)
     else (
       match latest_application_request handle with
       | Some (_request_id, payload) as request
-        when Bytes.length payload >= 16 && Bytes.get_int64_le payload 8 = generation ->
+        when Bytes.length payload >= 48 && Bytes.get_int64_le payload 40 = generation ->
         Option.get request
       | None | Some _ ->
         Unix.sleepf 0.001;
@@ -1902,18 +1895,34 @@ let respond_to_application_request ?(sequence = 3L) handle request_id payload =
     ()
 ;;
 
-let calendar_event ~generation ~local_day ~locale ~time_zone_id ~utc_offset_seconds =
+let calendar_event
+      ~reason
+      ~generation
+      ~local_day
+      ~locale
+      ~time_zone_id
+      ~utc_offset_seconds
+  =
   let header_size = 56 in
+  let utc_midnight =
+    match local_day with
+    | 20260809 -> 1_786_233_600_000L
+    | 20260810 -> 1_786_320_000_000L
+    | _ -> fail "unsupported calendar-event day %d" local_day
+  in
+  let instant_unix_ms =
+    Int64.(sub (add utc_midnight 30_600_000L) (of_int (utc_offset_seconds * 1_000)))
+  in
   let bytes =
     Bytes.make (header_size + String.length locale + String.length time_zone_id) '\000'
   in
   Bytes.blit_string "LJP1" 0 bytes 0 4;
   Bytes.set_uint16_le bytes 4 1;
   Bytes.set_uint16_le bytes 6 3;
-  Bytes.set_uint16_le bytes 8 4;
+  Bytes.set_uint16_le bytes 8 reason;
   Bytes.set_uint16_le bytes 10 (String.length locale);
   Bytes.set_uint16_le bytes 12 (String.length time_zone_id);
-  Bytes.set_int64_le bytes 16 1_786_321_800_000L;
+  Bytes.set_int64_le bytes 16 instant_unix_ms;
   Bytes.set_int32_le bytes 24 (Int32.of_int local_day);
   Bytes.set_uint16_le bytes 28 510;
   Bytes.set_int32_le bytes 32 (Int32.of_int utc_offset_seconds);
@@ -1926,7 +1935,7 @@ let calendar_event ~generation ~local_day ~locale ~time_zone_id ~utc_offset_seco
     bytes
     (header_size + String.length locale)
     (String.length time_zone_id);
-  bytes
+  platform_envelope 3 bytes
 ;;
 
 let send_application_event handle ~sequence payload =
@@ -1972,7 +1981,114 @@ let formatted_response ~generation headings =
           offset + 8 + String.length heading)
        20
        headings);
-  bytes
+  platform_envelope 5 bytes
+;;
+
+let require_populated_timeline_during_calendar_event handle ~source ~sequence event =
+  send_application_event handle ~sequence event;
+  for _ = 1 to 8 do
+    Test.Handle.present handle;
+    require_visible_text handle source;
+    require_no_visible_text handle "Loading journal";
+    pump_worker handle
+  done
+;;
+
+let test_same_context_resume_keeps_the_populated_timeline () =
+  with_startup (fun startup ->
+    let row = capture 85 "Same-context resume row" in
+    seed startup [ row ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle row.source;
+         require_populated_timeline_during_calendar_event
+           handle
+           ~source:row.source
+           ~sequence:3L
+           (calendar_event
+              ~reason:1
+              ~generation:2L
+              ~local_day:20260809
+              ~locale:"en_US"
+              ~time_zone_id:"Asia/Shanghai"
+              ~utc_offset_seconds:28_800)))
+;;
+
+let test_locale_only_change_reformats_without_reloading () =
+  with_startup (fun startup ->
+    let row = capture ~day:20260808 86 "Locale-only row" in
+    seed startup [ row ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle row.source;
+         require_populated_timeline_during_calendar_event
+           handle
+           ~source:row.source
+           ~sequence:3L
+           (calendar_event
+              ~reason:4
+              ~generation:2L
+              ~local_day:20260809
+              ~locale:"zh_CN"
+              ~time_zone_id:"Asia/Shanghai"
+              ~utc_offset_seconds:28_800)))
+;;
+
+let test_day_rollover_refreshes_without_blanking_content () =
+  with_startup (fun startup ->
+    let row = capture 87 "Day-rollover row" in
+    seed startup [ row ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle row.source;
+         require_populated_timeline_during_calendar_event
+           handle
+           ~source:row.source
+           ~sequence:3L
+           (calendar_event
+              ~reason:2
+              ~generation:2L
+              ~local_day:20260810
+              ~locale:"en_US"
+              ~time_zone_id:"Asia/Shanghai"
+              ~utc_offset_seconds:28_800);
+         pump_until_text handle row.source;
+         require_no_visible_text handle "Loading journal"))
+;;
+
+let test_time_zone_refresh_reprojects_without_blanking_content () =
+  with_startup (fun startup ->
+    let row = capture 88 "Time-zone refresh row" in
+    seed startup [ row ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle row.source;
+         require_semantics handle (row.source ^ ", created at 01:28");
+         require_populated_timeline_during_calendar_event
+           handle
+           ~source:row.source
+           ~sequence:3L
+           (calendar_event
+              ~reason:3
+              ~generation:2L
+              ~local_day:20260809
+              ~locale:"en_US"
+              ~time_zone_id:"UTC"
+              ~utc_offset_seconds:0);
+         pump_until handle "UTC timestamp reprojection" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.semantics_label (row.source ^ ", created at 17:28"))));
+         require_no_visible_text handle "Loading journal"))
 ;;
 
 let test_localized_day_request_updates_only_matching_generation () =
@@ -1988,7 +2104,7 @@ let test_localized_day_request_updates_only_matching_generation () =
            (Bytes.get_uint16_le payload 6 = 4)
            "application did not request formatted journal days";
          require
-           (Bytes.get_int64_le payload 8 = 1L)
+           (Bytes.get_int64_le payload 40 = 1L)
            "formatted-day request used the wrong calendar generation";
          respond_to_application_request
            handle
@@ -2032,6 +2148,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
            handle
            ~sequence:3L
            (calendar_event
+              ~reason:4
               ~generation:2L
               ~local_day:20260810
               ~locale:"zh_CN"
@@ -2041,7 +2158,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
            pump_until_application_request_generation handle 2L
          in
          require
-           (Bytes.get_int64_le new_payload 8 = 2L)
+           (Bytes.get_int64_le new_payload 40 = 2L)
            "locale event did not issue a generation-2 formatting request";
          respond_to_application_request
            ~sequence:4L
@@ -2477,6 +2594,10 @@ let () =
   test_capture_allocates_fresh_block_identity_after_restart ();
   test_localized_day_request_updates_only_matching_generation ();
   test_locale_event_invalidates_labels_and_rejects_in_flight_response ();
+  test_same_context_resume_keeps_the_populated_timeline ();
+  test_locale_only_change_reformats_without_reloading ();
+  test_day_rollover_refreshes_without_blanking_content ();
+  test_time_zone_refresh_reprojects_without_blanking_content ();
   test_timeline_status_rail_has_no_task_action ();
   test_loaded_children_survive_a_stale_ios_visible_range_event ();
   test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed ();

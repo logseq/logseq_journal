@@ -8,7 +8,7 @@
 PRODUCT_NAME = bonsai_flutter_logseq_journal_host
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.example.bonsaiFlutterLogseqJournalHost
+PRODUCT_BUNDLE_IDENTIFIER = com.logseq.journal
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.

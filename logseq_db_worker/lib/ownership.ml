@@ -1,6 +1,7 @@
 type target =
   | Snapshot_target
   | Native_target
+  | Synced_target
 
 type lock =
   { repo : string
@@ -178,8 +179,15 @@ let acquire ~target ~graph_dir =
             | Some _ when target = Snapshot_target -> Error Ambiguous_stale_lock
             | Some _ ->
               (try
-                 Unix.unlink lock_path;
-                 Ok ()
+                 let current = Unix.stat graph_dir in
+                 if
+                   current.st_kind <> Unix.S_DIR
+                   || current.st_dev <> graph_stat.st_dev
+                   || current.st_ino <> graph_stat.st_ino
+                 then Error Identity_changed
+                 else (
+                   Unix.unlink lock_path;
+                   Ok ())
                with
                | Unix.Unix_error _ -> Error Ambiguous_stale_lock)
         in

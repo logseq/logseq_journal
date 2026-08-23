@@ -3,6 +3,7 @@ type code =
   | Unsupported_api_version
   | Graph_not_found
   | Graph_locked
+  | Ownership_recovery
   | Unsupported_schema
   | Remote_graph
   | Ambiguous_sync_state

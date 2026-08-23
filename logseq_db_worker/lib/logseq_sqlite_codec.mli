@@ -21,6 +21,7 @@ type root_index_metadata =
   ; avet : index_metadata
   }
 
+val decode_transit : string -> (Transit_core.Json.value, string) result
 val preflight : string -> (unit, error) result
 val decode_value : string -> (Datascript.value, error) result
 val encode_value : Datascript.value -> (string, error) result
@@ -35,7 +36,7 @@ val decode_physical_payload
 
 val encode_physical_payload
   :  Datascript.storage_payload
-  -> ((string * string list), error) result
+  -> (string * string list, error) result
 
 val encode_physical_batch
   :  ?restore:(Datascript.storage_address -> Datascript.storage_payload option)

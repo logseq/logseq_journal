@@ -39,6 +39,10 @@ type payload =
       { request_generation : int64
       ; detail : Projection.detail
       }
+  | Feed_failed of
+      { request_generation : int64
+      ; message : string
+      }
   | Open_failed of Error.t
   | Rejected of string
 
@@ -142,6 +146,10 @@ let requests values = { empty with requests = values }
 let response ?basis payload = { basis; payload }
 let responses values = { empty with responses = values }
 
+let feed_failure request_generation message =
+  responses [ response (Feed_failed { request_generation; message }) ]
+;;
+
 let create () =
   { pending = Hashtbl.create 32
   ; next_request = 1L
@@ -152,6 +160,15 @@ let create () =
   ; initial_feed = None
   ; reconciliation_basis = None
   }
+;;
+
+let reset t =
+  Hashtbl.clear t.pending;
+  t.basis <- 0L;
+  t.pages <- [];
+  t.block_pages <- [];
+  t.initial_feed <- None;
+  t.reconciliation_basis <- None
 ;;
 
 let set_calendar t (calendar : Journal_calendar.t) =
@@ -320,11 +337,14 @@ let submit t (request : Journal_graph_request.t) =
   match request with
   | Load_feed { before_day; day_limit; blocks_per_day; slot_limit; request_generation } ->
     if day_limit <= 0
-    then reject "The feed day limit must be positive."
+    then feed_failure request_generation "The feed day limit must be positive."
     else if blocks_per_day <= 0
-    then reject "The feed block limit must be positive."
+    then feed_failure request_generation "The feed block limit must be positive."
     else if slot_limit < 2
-    then reject "The feed slot limit must reserve one day and one block."
+    then
+      feed_failure
+        request_generation
+        "The feed slot limit must reserve one day and one block."
     else (
       let day_limit = min day_limit (slot_limit / 2) in
       let blocks_per_day = min Protocol.maximum_page_size blocks_per_day in
@@ -646,33 +666,40 @@ let receive t (protocol_response : Protocol.response) =
     Hashtbl.remove t.pending key;
     (match protocol_response with
      | Failed failure ->
-       (match operation, failure.phase, Error.code failure.error with
-        | Capture_page command, Execute, Not_found ->
-          (match journal_uuid (Journal_time.local_day command.creation_time) with
-           | Error message -> reject message
-           | Ok page_uuid ->
-             let context =
-               Protocol.{ mutation_id = request_uuid t; expected_basis = t.basis }
-             in
-             requests
-               [ mutate
-                   t
-                   (Capture_create_page { command; page_uuid })
-                   (Protocol.Page
-                      (Create_page
-                         { title =
-                             journal_title (Journal_time.local_day command.creation_time)
-                         ; kind =
-                             Create_journal_page
-                               { journal_day =
-                                   Journal_time.local_day command.creation_time
-                               ; supplied_uuid = Some page_uuid
-                               }
-                         ; context
-                         }))
-               ])
-        | _, Open, _ -> responses [ response (Open_failed failure.error) ]
-        | _, Execute, _ -> reject (Error.message failure.error))
+       (match operation with
+        | List_feed_pages { request_generation; _ } ->
+          feed_failure request_generation (Error.message failure.error)
+        | Feed_page_tree { pending; _ } ->
+          feed_failure pending.generation (Error.message failure.error)
+        | _ ->
+          (match operation, failure.phase, Error.code failure.error with
+           | Capture_page command, Execute, Not_found ->
+             (match journal_uuid (Journal_time.local_day command.creation_time) with
+              | Error message -> reject message
+              | Ok page_uuid ->
+                let context =
+                  Protocol.{ mutation_id = request_uuid t; expected_basis = t.basis }
+                in
+                requests
+                  [ mutate
+                      t
+                      (Capture_create_page { command; page_uuid })
+                      (Protocol.Page
+                         (Create_page
+                            { title =
+                                journal_title
+                                  (Journal_time.local_day command.creation_time)
+                            ; kind =
+                                Create_journal_page
+                                  { journal_day =
+                                      Journal_time.local_day command.creation_time
+                                  ; supplied_uuid = Some page_uuid
+                                  }
+                            ; context
+                            }))
+                  ])
+           | _, Open, _ -> responses [ response (Open_failed failure.error) ]
+           | _, Execute, _ -> reject (Error.message failure.error)))
      | Succeeded { basis; success; _ } ->
        t.basis <- Int64.max t.basis basis;
        (match t.reconciliation_basis with
@@ -742,8 +769,8 @@ let receive t (protocol_response : Protocol.response) =
             else (
               match next_feed_page_request t pending with
               | Ok (Some request) -> requests [ request ]
-              | Ok None -> reject "The feed page queue is empty."
-              | Error message -> reject message))
+              | Ok None -> feed_failure request_generation "The feed page queue is empty."
+              | Error message -> feed_failure request_generation message))
         | Feed_page_tree { page; pending; allocated_blocks }, Page_tree_result result ->
           pending.remaining <- pending.remaining - 1;
           let projected_roots =
@@ -756,14 +783,16 @@ let receive t (protocol_response : Protocol.response) =
           if projected_roots > allocated_blocks
           then (
             pending.queued_pages <- [];
-            reject "The Worker page response exceeded its allocated feed budget.")
+            feed_failure
+              pending.generation
+              "The Worker page response exceeded its allocated feed budget.")
           else (
             remember_tree_items t page result.items;
             match projection_time_context t with
-            | Error message -> reject message
+            | Error message -> feed_failure pending.generation message
             | Ok time_context ->
               (match Projection.timeline_entry_page ~page ~basis ~time_context result with
-               | Error message -> reject message
+               | Error message -> feed_failure pending.generation message
                | Ok projected ->
                  remember_entries t page projected.entries;
                  pending.days
@@ -777,8 +806,11 @@ let receive t (protocol_response : Protocol.response) =
                  then (
                    match next_feed_page_request t pending with
                    | Ok (Some request) -> requests [ request ]
-                   | Ok None -> reject "The feed page queue ended before completion."
-                   | Error message -> reject message)
+                   | Ok None ->
+                     feed_failure
+                       pending.generation
+                       "The feed page queue ended before completion."
+                   | Error message -> feed_failure pending.generation message)
                  else (
                    let days =
                      List.sort
@@ -888,7 +920,29 @@ let receive t (protocol_response : Protocol.response) =
                    ; timeline_entry_update = None
                    })
             ]
-        | _, _ -> reject "The Worker returned an unexpected graph response."))
+        | _, _ ->
+          (match operation with
+           | List_feed_pages { request_generation; _ } ->
+             feed_failure
+               request_generation
+               "The Worker returned an unexpected graph response."
+           | Feed_page_tree { pending; _ } ->
+             feed_failure
+               pending.generation
+               "The Worker returned an unexpected graph response."
+           | Graph_info
+           | Day_page_tree _
+           | Detail_block _
+           | Find_block_result
+           | Detail_children _
+           | Capture_page _
+           | Capture_create_page _
+           | Capture_insert _
+           | Capture_status _
+           | Refresh_page_tree _
+           | Mutation_refresh _
+           | Delete_mutation _ ->
+             reject "The Worker returned an unexpected graph response.")))
 ;;
 
 let abandon t (request : Protocol.request) =

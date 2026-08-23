@@ -766,16 +766,25 @@ let test_line_count_drives_exact_scaled_row_extent () =
   check ~scale:3.2 [ 80.; 144.; 208.; 272. ]
 ;;
 
-let header_component ~tokens _handlers _graph =
-  Bonsai.Cont.return
-    (Journal_header.view
-       ~tokens
-       ~text_scale:1.
-       ~device_pixel_ratio:3.
-       ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9"))
+let header_component ~tokens handlers _graph =
+  let on_account_menu =
+    Bonsai_flutter.Driver.Handler.create
+      handlers
+      ~name:"open-account-menu"
+      ~equal:(fun () () -> true)
+      (Bonsai.Cont.return ())
+      ~f:(fun () _ -> Bonsai.Effect.Ignore)
+  in
+  Bonsai.Cont.map on_account_menu ~f:(fun on_account_menu ->
+    Journal_header.view
+      ~tokens
+      ~text_scale:1.
+      ~device_pixel_ratio:3.
+      ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9")
+      ~on_account_menu:(Some on_account_menu))
 ;;
 
-let test_header_shells_and_view_only_date_have_truthful_semantics () =
+let test_header_account_action_and_view_only_date_have_truthful_semantics () =
   let tokens = Tokens.resolve ~high_contrast:false in
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
   let handle =
@@ -789,19 +798,11 @@ let test_header_shells_and_view_only_date_have_truthful_semantics () =
     (fun () ->
        Test.Handle.present handle;
        List.iter
-         (fun label ->
-            require
-              (Option.is_none
-                 (Test.Handle.find handle (Test.Query.semantics_label label)))
-              "%s visual shell exposes actionable semantics"
-              label)
-         [ "Menu"; "More" ];
-       List.iter
          (fun test_id -> ignore (node handle test_id))
-         [ "journal-menu-shell"
-         ; "journal-menu-icon"
-         ; "journal-more-shell"
-         ; "journal-more-icon"
+         [ "journal-header-leading-placeholder"
+         ; "journal-account-menu-target"
+         ; "journal-account-menu-button"
+         ; "journal-account-icon"
          ];
        List.iter
          (fun test_id ->
@@ -817,6 +818,21 @@ let test_header_shells_and_view_only_date_have_truthful_semantics () =
               "%s deferred interaction path still exists"
               test_id)
          [ "journal-menu"; "journal-menu-target"; "journal-more"; "journal-more-target" ];
+       require_semantics handle "Account menu" (fun props ->
+         require (props.role = Ui.Semantics.Role.Button) "account menu is not a button";
+         require
+           (props.hint = Some "Switch graphs, reset the local copy, or sign out")
+           "account menu hint changed";
+         require (props.enabled = Some true) "account menu is disabled";
+         require (props.focusable = Some true) "account menu is not focusable";
+         require
+           (List.exists
+              (function
+                | Ui.Semantics.Action.Tap -> true
+                | _ -> false)
+              props.actions)
+           "account menu has no tap action";
+         require (props.sort_key = Some 3.) "account menu semantic order changed");
        require_semantics handle "Today, Sunday, August 9" (fun props ->
          require (props.role = Ui.Semantics.Role.Generic) "date context is still a button";
          require (props.enabled = None) "view-only date exposes enabled state";
@@ -1099,7 +1115,7 @@ let () =
   test_four_status_rails_replace_timeline_task_controls ();
   test_preview_uses_deterministic_one_to_four_logical_lines ();
   test_line_count_drives_exact_scaled_row_extent ();
-  test_header_shells_and_view_only_date_have_truthful_semantics ();
+  test_header_account_action_and_view_only_date_have_truthful_semantics ();
   test_compact_and_adaptive_shapes_at_required_extremes ();
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();

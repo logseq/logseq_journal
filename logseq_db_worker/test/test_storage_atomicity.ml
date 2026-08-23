@@ -18,7 +18,7 @@ let callbacks ?(storage = Datascript.memory_storage ()) state =
     | Some captured ->
       staged := None;
       let rec encode acc = function
-        | [] -> Ok Storage.{ writes = List.rev acc }
+        | [] -> Ok Storage.{ writes = List.rev acc; sync_metadata = None }
         | (address, payload) :: rest ->
           (match
              Logseq_db_worker__Logseq_sqlite_codec.encode_physical_payload payload
@@ -48,6 +48,7 @@ let callbacks ?(storage = Datascript.memory_storage ()) state =
           if Option.equal String.equal state.fail_address (Some write.address)
           then Error "injected write failure"
           else Ok ())
+    ; upsert_sync_metadata = (fun _ -> Ok ())
     ; commit =
         (fun () ->
           state.events <- state.events @ [ "commit" ];
@@ -83,6 +84,7 @@ let sample_batch =
         ; { address = "0"; payload = "root"; addresses = [] }
         ; { address = "1"; payload = "tail"; addresses = [] }
         ]
+    ; sync_metadata = None
     }
 ;;
 
@@ -239,7 +241,7 @@ let storage_batch_of_db db =
   in
   ignore (find Datascript.Storage.root_address);
   ignore (find Datascript.Storage.tail_address);
-  Storage.{ writes }
+  Storage.{ writes; sync_metadata = None }
 ;;
 
 let batch_write batch address =

@@ -248,7 +248,7 @@ let view
         (fun index line -> text_line ~tokens ~item ~kind:`Supporting ~index line)
         supporting_lines
     in
-    List.map Ui.Widget.Flex.fixed (source_widgets @ supporting_widgets)
+    List.map Ui.Widget.Flex.flexible (source_widgets @ supporting_widgets)
     |> Ui.Widget.Flex.column
     |> test_id ("journal-row-text-stack:" ^ Item.id item)
     |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Top_start

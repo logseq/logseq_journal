@@ -34,6 +34,10 @@ type payload =
       { request_generation : int64
       ; detail : Journal_graph_projection.detail
       }
+  | Feed_failed of
+      { request_generation : int64
+      ; message : string
+      }
   | Open_failed of Logseq_db_worker.Error.t
   | Rejected of string
 
@@ -50,11 +54,13 @@ type output =
   }
 
 val create : unit -> t
+val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
 val submit : t -> Journal_graph_request.t -> output
 val receive : t -> Logseq_db_worker.Protocol.response -> output
 val abandon : t -> Logseq_db_worker.Protocol.request -> unit
+
 val reconcile_invalidation
   :  t
   -> request_generation:int64

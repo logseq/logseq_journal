@@ -17,6 +17,17 @@ const _secondChild = 'Show parent and child preview';
 const _thirdChild = 'Keep bounded virtualization';
 const _dividerColor = Color(0xffe8e9ed);
 
+final class _TestAuth implements JournalAuthCapability {
+  @override
+  Future<String?> currentUserId() async => null;
+
+  @override
+  Future<String> freshIdToken() async => throw StateError('unused');
+
+  @override
+  Future<void> signOut() async => throw StateError('unused');
+}
+
 void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
   if (binding is LiveTestWidgetsFlutterBinding) {
@@ -229,7 +240,6 @@ final class _RuntimeHarness {
             () => Directory.systemTemp.createTemp('journal-golden-'),
           ))!
         : Directory(configuredRoot);
-    late final String snapshotToken;
     if (configuredRoot == null) {
       final fixture = (await tester.runAsync(
         () => Process.run(
@@ -242,13 +252,6 @@ final class _RuntimeHarness {
         0,
         reason: '${fixture.stdout}\n${fixture.stderr}',
       );
-      snapshotToken = fixture.stdout.toString().trim();
-    } else {
-      snapshotToken =
-          Platform.environment['JOURNAL_GOLDEN_SNAPSHOT_TOKEN'] ??
-          (throw StateError(
-            'JOURNAL_GOLDEN_SNAPSHOT_TOKEN is required with JOURNAL_GOLDEN_SUPPORT_ROOT',
-          ));
     }
 
     var generation = 7;
@@ -263,9 +266,13 @@ final class _RuntimeHarness {
     final initialSnapshot = await calendar();
     final adapter = ApplicationHostAdapter(
       applicationSupportDirectory: () async => root,
-      graphTarget: () async => LogseqDbTarget.snapshot(snapshotToken),
+      baseUrl: Uri.parse('https://api.example.test'),
       initialCalendarSnapshot: () async => initialSnapshot,
       liveCalendarSnapshot: calendar,
+      formatJournalDays: ({required snapshot, required days}) async => {
+        for (final day in days) day: day == 20260812 ? 'Wed, Aug 12' : '$day',
+      },
+      auth: _TestAuth(),
     );
     final payload = (await tester.runAsync(adapter.createApplicationPayload))!;
     final config = RuntimeBootstrapConfig(
@@ -286,6 +293,7 @@ final class _RuntimeHarness {
       formatJournalDays: ({required snapshot, required days}) async => {
         for (final day in days) day: day == 20260812 ? 'Wed, Aug 12' : '$day',
       },
+      auth: _TestAuth(),
     );
     await tester.pumpWidget(
       RepaintBoundary(

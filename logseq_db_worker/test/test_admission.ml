@@ -31,13 +31,13 @@ let observed
 ;;
 
 let expect_ok observed () =
-  match Admission.admit observed with
+  match Admission.admit ~target:Local_target observed with
   | Ok _ -> ()
   | Error _ -> T.fail "expected graph admission"
 ;;
 
 let expect_error expected observed () =
-  match Admission.admit observed with
+  match Admission.admit ~target:Local_target observed with
   | Error actual when actual = expected -> ()
   | _ -> T.fail "unexpected admission result"
 ;;

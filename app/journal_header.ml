@@ -51,13 +51,13 @@ let shell ~id child =
   |> test_id id
 ;;
 
-let view ~tokens ~text_scale ~device_pixel_ratio ~context =
+let view ~tokens ~text_scale ~device_pixel_ratio ~context ~on_account_menu =
   let palette = Tokens.palette tokens in
   let scale = Float.max 1. text_scale in
   let content_height = Tokens.header_geometry.content_height *. scale in
-  let menu =
-    glyph ~tokens ~id:"journal-menu-icon" ~code_point:0xe3dc
-    |> shell ~id:"journal-menu-shell"
+  let leading =
+    Ui.Widget.empty ()
+    |> shell ~id:"journal-header-leading-placeholder"
   in
   let title =
     Ui.Widget.text
@@ -86,16 +86,37 @@ let view ~tokens ~text_scale ~device_pixel_ratio ~context =
     |> Ui.Widget.center
     |> test_id "journal-header-center"
   in
-  let more =
-    glyph ~tokens ~id:"journal-more-icon" ~code_point:0xe402
-    |> shell ~id:"journal-more-shell"
+  let account =
+    match on_account_menu with
+    | None ->
+      Ui.Widget.empty ()
+      |> shell ~id:"journal-header-account-placeholder"
+    | Some on_press ->
+      let icon =
+        glyph ~tokens ~id:"journal-account-icon" ~code_point:0xe853
+      in
+      Ui.Material.icon_button ~on_press ~icon ()
+      |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu-button")
+      |> Ui.Widget.semantics
+           ~on_action:on_press
+           ~properties:
+             (Ui.Semantics.create
+                ~label:"Account menu"
+                ~hint:"Switch graphs, reset the local copy, or sign out"
+                ~role:Ui.Semantics.Role.Button
+                ~enabled:true
+                ~focusable:true
+                ~actions:[ Ui.Semantics.Action.Tap ]
+                ~sort_key:3.
+                ())
+      |> shell ~id:"journal-account-menu-target"
   in
   let sides =
     Ui.Widget.Flex.row
       [ Ui.Widget.Flex.expanded
-          (Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start menu)
+          (Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start leading)
       ; Ui.Widget.Flex.expanded
-          (Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_end more)
+          (Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_end account)
       ]
   in
   let stack =

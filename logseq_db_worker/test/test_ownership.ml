@@ -19,6 +19,15 @@ let acquire target graph =
 let write_sentinel graph fields =
   Yojson.Safe.to_file (Filename.concat graph "db-worker.lock") (`Assoc fields)
 
+let stale_sentinel graph =
+  [ "repo", `String (Filename.basename graph)
+  ; "pid", `Int 2_147_483_647
+  ; "lock-id", `String "22222222-2222-4222-8222-222222222222"
+  ; "owner-source", `String "unknown"
+  ; "owner-generation", `String "33333333-3333-4333-8333-333333333333"
+  ; "owner-protocol", `Int 1
+  ]
+
 let owner_database graph =
   Filename.concat graph ".logseq-db-worker.owner.sqlite"
 
@@ -169,6 +178,37 @@ let () =
                   ])
             "provably stale sentinel was retained";
           ignore (Ownership.release owner)))
+    ; T.case "synced owner reclaims a valid dead-PID sentinel" (fun () ->
+        with_graph (fun graph ->
+          create_database graph;
+          write_sentinel graph (stale_sentinel graph);
+          let owner = acquire Ownership.Synced_target graph in
+          Fun.protect
+            ~finally:(fun () -> ignore (Ownership.release owner))
+            (fun () ->
+               T.require
+                 (read_marker graph = Some "native-backup")
+                 "stale synced sentinel recovery changed mirror contents";
+               T.require
+                 (Ownership.revalidate owner = Ok ())
+                 "reclaimed synced ownership did not revalidate")))
+    ; T.case "synced owner preserves mirror data across repeated crash recovery" (fun () ->
+        with_graph (fun graph ->
+          create_database graph;
+          for _ = 1 to 3 do
+            write_sentinel graph (stale_sentinel graph);
+            let owner = acquire Ownership.Synced_target graph in
+            T.require
+              (read_marker graph = Some "native-backup")
+              "repeated synced recovery changed mirror contents";
+            ignore (Ownership.release owner)
+          done))
+    ; T.case "snapshot owner keeps a dead-PID sentinel ambiguous" (fun () ->
+        with_graph (fun graph ->
+          write_sentinel graph (stale_sentinel graph);
+          match Ownership.acquire ~target:Ownership.Snapshot_target ~graph_dir:graph with
+          | Error Ownership.Ambiguous_stale_lock -> ()
+          | _ -> T.fail "snapshot ownership unexpectedly reclaimed a stale sentinel"))
     ; T.case "native backup uses SQLite backup and binds owner generation" (fun () ->
         with_graph (fun graph ->
           create_database graph;

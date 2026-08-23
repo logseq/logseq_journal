@@ -529,15 +529,21 @@ let transit_map_key reader text =
     value)
 ;;
 
-let transit_array_tag reader text =
+type transit_array_head =
+  | Array_tag of string
+  | Array_value of Transit.value
+
+let transit_array_head reader text =
   if transit_cache_reference text
   then (
     match transit_cached reader text with
-    | Cached_tag tag | Cached_value (Transit.String tag) -> tag
-    | Cached_value _ -> invalid_arg ("Transit cache code is not a tag: " ^ text))
-  else (
+    | Cached_tag tag -> Array_tag tag
+    | Cached_value value -> Array_value value)
+  else if String.length text > 2 && String.sub text 0 2 = "~#"
+  then (
     if String.length text > 3 then transit_remember reader (Cached_tag text);
-    text)
+    Array_tag text)
+  else Array_value (transit_string_value reader text)
 ;;
 
 let rec transit_of_yojson reader = function
@@ -554,15 +560,22 @@ let rec transit_of_yojson reader = function
   | `List [ `String "~#'"; value ] -> transit_of_yojson reader value
   | `List (`String "^ " :: entries) -> Transit.Map (transit_map_entries reader entries)
   | `List [ `String raw_tag; value ] ->
-    let tag = transit_array_tag reader raw_tag in
     let value = transit_of_yojson reader value in
-    (match tag, value with
-     | "~#set", Transit.Array values -> Transit.Set values
-     | "~#list", Transit.Array values -> Transit.List values
-     | "~#cmap", Transit.Array values -> Transit.Map (transit_map_values values)
-     | _ when String.length tag > 2 && String.sub tag 0 2 = "~#" ->
-       Transit.Tagged (String.sub tag 2 (String.length tag - 2), value)
-     | _ -> Transit.Array [ transit_string_value reader tag; value ])
+    (match transit_array_head reader raw_tag with
+     | Array_value head -> Transit.Array [ head; value ]
+     | Array_tag "~#set" ->
+       (match value with
+        | Transit.Array values -> Transit.Set values
+        | _ -> Transit.Tagged ("set", value))
+     | Array_tag "~#list" ->
+       (match value with
+        | Transit.Array values -> Transit.List values
+        | _ -> Transit.Tagged ("list", value))
+     | Array_tag "~#cmap" ->
+       (match value with
+        | Transit.Array values -> Transit.Map (transit_map_values values)
+        | _ -> Transit.Tagged ("cmap", value))
+     | Array_tag tag -> Transit.Tagged (String.sub tag 2 (String.length tag - 2), value))
   | `List values -> Transit.Array (List.map (transit_of_yojson reader) values)
   | `Assoc [ (tag, value) ] when String.length tag > 2 && String.sub tag 0 2 = "~#" ->
     let value = transit_of_yojson reader value in
@@ -608,6 +621,14 @@ let transit_of_string content =
   | Yojson.Json_error message -> Error (Malformed_transit message)
   | Invalid_argument message -> Error (Malformed_transit message)
   | exn -> Error (Malformed_transit (Printexc.to_string exn))
+;;
+
+let decode_transit content =
+  match transit_of_string content with
+  | Ok value -> Ok value
+  | Error (Malformed_transit message) -> Error message
+  | Error (Unsupported_tag _ | Out_of_range_number _ | Malformed_storage_payload _) ->
+    Error "invalid Transit value"
 ;;
 
 let int64_fits_int value =

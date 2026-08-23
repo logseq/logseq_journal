@@ -20,20 +20,51 @@ type timeline_notice =
   | Delete_undo
   | Delete_failed
 
+type feed_projection_context =
+  { local_day : int
+  ; time_zone_id : string
+  ; utc_offset_seconds : int
+  }
+
+type feed_refresh_cause =
+  | Calendar_refresh
+  | Sync_refresh
+
+type feed_refresh =
+  { generation : int64
+  ; context : feed_projection_context
+  ; cause : feed_refresh_cause
+  ; graph_generation : int option
+  ; minimum_basis : int64 option
+  }
+
+type formatting_context =
+  { locale : string
+  ; days : int list
+  }
+
 type state =
   { routes : Journal_routes.t
   ; timeline : Journal_timeline_state.t
   ; next_request_generation : int64
   ; next_local_sequence : int64
   ; calendar : Journal_calendar.t option
-  ; formatted_generation : int64 option
+  ; formatted_context : formatting_context option
   ; day_labels : (int * string) list
   ; pending_delete : pending_delete option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
   ; graph_ready : bool
   ; feed_loaded : bool
+  ; presented_feed_context : feed_projection_context option
+  ; feed_refresh : feed_refresh option
   ; graph_error : string option
+  ; sync_error : string option
+  ; manager : Logseq_db_worker.Sync_manager.snapshot option
+  ; bootstrap_progress : Logseq_db_worker.Sync_bootstrap.progress option
+  ; e2ee_password : Journal_capture.t
+  ; cache_reset_confirmation : Logseq_db_worker.Graph_types.Uuid.t option
+  ; account_menu_open : bool
   }
 
 let initial_anchor : Journal_routes.anchor = { block_id = None; first_index = 0 }
@@ -45,14 +76,92 @@ let initial_state =
   ; next_request_generation = 1L
   ; next_local_sequence = 1L
   ; calendar = None
-  ; formatted_generation = None
+  ; formatted_context = None
   ; day_labels = []
   ; pending_delete = None
   ; timeline_notice = None
   ; write_enabled = false
   ; graph_ready = false
   ; feed_loaded = false
+  ; presented_feed_context = None
+  ; feed_refresh = None
   ; graph_error = None
+  ; sync_error = None
+  ; manager = None
+  ; bootstrap_progress = None
+  ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
+  ; cache_reset_confirmation = None
+  ; account_menu_open = false
+  }
+;;
+
+let feed_projection_context (calendar : Journal_calendar.t) =
+  { local_day = calendar.local_day
+  ; time_zone_id = calendar.time_zone_id
+  ; utc_offset_seconds = calendar.utc_offset_seconds
+  }
+;;
+
+let equal_feed_projection_context left right =
+  left.local_day = right.local_day
+  && String.equal left.time_zone_id right.time_zone_id
+  && left.utc_offset_seconds = right.utc_offset_seconds
+;;
+
+let equal_formatting_context left right =
+  String.equal left.locale right.locale && left.days = right.days
+;;
+
+let current_graph_generation state =
+  Option.map
+    (fun (manager : Logseq_db_worker.Sync_manager.snapshot) -> manager.graph_generation)
+    state.manager
+;;
+
+let apply_manager_snapshot state (snapshot : Logseq_db_worker.Sync_manager.snapshot) =
+  let was_awaiting_password =
+    match state.manager with
+    | Some { phase = Awaiting_e2ee_password; _ } -> true
+    | None | Some _ -> false
+  in
+  let is_awaiting_password = snapshot.phase = Awaiting_e2ee_password in
+  let e2ee_password, next_local_sequence =
+    if is_awaiting_password = was_awaiting_password
+    then state.e2ee_password, state.next_local_sequence
+    else
+      ( Journal_capture.create ~session_number:state.next_local_sequence ~source:""
+      , Int64.succ state.next_local_sequence )
+  in
+  let cache_reset_confirmation =
+    match state.cache_reset_confirmation, snapshot.selected_graph with
+    | Some confirmation, Some selected
+      when Logseq_db_worker.Graph_types.Uuid.equal confirmation selected ->
+      Some confirmation
+    | None, _ | Some _, None | Some _, Some _ -> None
+  in
+  { state with
+    manager = Some snapshot
+  ; e2ee_password
+  ; next_local_sequence
+  ; cache_reset_confirmation
+  ; graph_ready =
+      state.graph_ready
+      && Option.is_some snapshot.selected_graph
+      && Option.is_some snapshot.applied_server_t
+  ; sync_error = snapshot.last_error
+  ; graph_error =
+      (match snapshot.phase with
+       | Logseq_db_worker.Sync_manager.Failed -> snapshot.last_error
+       | Signed_out
+       | Awaiting_token _
+       | Loading_catalog
+       | Awaiting_selection
+       | Bootstrapping
+       | Awaiting_e2ee_password
+       | Opening_graph
+       | Graph_open
+       | Sync_paused
+       | Stopping_graph -> None)
   }
 ;;
 
@@ -134,9 +243,16 @@ let terminal_graph_state state message =
   ; write_enabled = false
   ; graph_ready = false
   ; feed_loaded = true
+  ; feed_refresh = None
   ; pending_delete = None
   ; graph_error = Some message
   }
+;;
+
+let fail_feed_transport state message =
+  if state.feed_loaded
+  then { state with feed_refresh = None; sync_error = Some message }
+  else terminal_graph_state state message
 ;;
 
 let journal_day_iso day =
@@ -162,10 +278,16 @@ let distinct_days state =
   List.sort_uniq Int.compare days
 ;;
 
+let formatting_context state =
+  Option.map
+    (fun (calendar : Journal_calendar.t) ->
+       { locale = calendar.locale; days = distinct_days state })
+    state.calendar
+;;
+
 let label_for_day state day =
-  match state.formatted_generation, state.calendar with
-  | Some formatted_generation, Some calendar
-    when Int64.equal formatted_generation calendar.generation ->
+  match state.formatted_context, formatting_context state with
+  | Some formatted, Some current when equal_formatting_context formatted current ->
     Option.value (List.assoc_opt day state.day_labels) ~default:(journal_day_iso day)
   | None, _ | Some _, None | Some _, Some _ -> journal_day_iso day
 ;;
@@ -174,12 +296,12 @@ let today_label state =
   match state.calendar with
   | None -> "Date unavailable"
   | Some calendar ->
-    (match state.formatted_generation with
-     | Some generation when Int64.equal generation calendar.generation ->
+    (match state.formatted_context, formatting_context state with
+     | Some formatted, Some current when equal_formatting_context formatted current ->
        Option.value
          (List.assoc_opt calendar.local_day state.day_labels)
          ~default:"Date unavailable"
-     | None | Some _ -> "Date unavailable")
+     | None, _ | Some _, None | Some _, Some _ -> "Date unavailable")
 ;;
 
 let rtl_languages = [ "ar"; "fa"; "he"; "ur" ]
@@ -215,26 +337,77 @@ let back_state state =
 
 let apply_worker_response state (response : Journal_graph_runtime.response) =
   match response.payload with
-  | Journal_graph_runtime.Graph_ready _ ->
+  | Journal_graph_runtime.Graph_ready info ->
+    ignore info.admission_facts;
     { state with write_enabled = true; graph_ready = true; graph_error = None }
   | Feed_loaded { request_generation; feed } ->
-    let accepted_initial_feed =
-      match Journal_timeline_state.pending_request state.timeline with
-      | Some (expected_generation, Feed { before_day = None }) ->
-        Int64.equal expected_generation request_generation
-      | Some (_, Feed { before_day = Some _ })
-      | Some (_, Day _)
-      | Some (_, Children _)
-      | None -> false
-    in
-    { state with
-      timeline =
-        Journal_timeline_state.apply_feed
-          state.timeline
-          ~generation:request_generation
-          feed
-    ; feed_loaded = state.feed_loaded || accepted_initial_feed
-    }
+    (match state.feed_refresh with
+     | Some refresh when Int64.equal refresh.generation request_generation ->
+       let current_context = Option.map feed_projection_context state.calendar in
+       let current_graph_generation = current_graph_generation state in
+       let basis_is_current =
+         match refresh.minimum_basis, response.basis with
+         | None, _ -> true
+         | Some minimum, Some basis -> Int64.compare basis minimum >= 0
+         | Some _, None -> false
+       in
+       if
+         Option.equal equal_feed_projection_context current_context (Some refresh.context)
+         && current_graph_generation = refresh.graph_generation
+         && basis_is_current
+       then (
+         let today = refresh.context.local_day in
+         let timeline =
+           match refresh.cause with
+           | Calendar_refresh ->
+             Journal_timeline_state.set_today state.timeline ~today
+             |> fun timeline ->
+             Journal_timeline_state.begin_request
+               timeline
+               ~generation:request_generation
+               (Feed { before_day = None })
+           | Sync_refresh ->
+             Journal_timeline_state.empty ~today
+             |> fun timeline ->
+             Journal_timeline_state.begin_request
+               timeline
+               ~generation:request_generation
+               (Feed { before_day = None })
+         in
+         { state with
+           timeline =
+             Journal_timeline_state.apply_feed
+               timeline
+               ~generation:request_generation
+               feed
+         ; feed_loaded = true
+         ; presented_feed_context = Some refresh.context
+         ; feed_refresh = None
+         ; sync_error = None
+         })
+       else state
+     | None | Some _ ->
+       let accepted_initial_feed =
+         match Journal_timeline_state.pending_request state.timeline with
+         | Some (expected_generation, Feed { before_day = None }) ->
+           Int64.equal expected_generation request_generation
+         | Some (_, Feed { before_day = Some _ })
+         | Some (_, Day _)
+         | Some (_, Children _)
+         | None -> false
+       in
+       { state with
+         timeline =
+           Journal_timeline_state.apply_feed
+             state.timeline
+             ~generation:request_generation
+             feed
+       ; feed_loaded = state.feed_loaded || accepted_initial_feed
+       ; presented_feed_context =
+           (if accepted_initial_feed
+            then Option.map feed_projection_context state.calendar
+            else state.presented_feed_context)
+       })
   | Day_blocks_loaded { request_generation; page } ->
     { state with
       timeline =
@@ -254,6 +427,22 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           ~generation:request_generation
           detail
     }
+  | Feed_failed { request_generation; message } ->
+    (match state.feed_refresh with
+     | Some refresh when Int64.equal refresh.generation request_generation ->
+       if state.feed_loaded
+       then { state with feed_refresh = None; sync_error = Some message }
+       else terminal_graph_state state message
+     | None | Some _ ->
+       (match Journal_timeline_state.pending_request state.timeline with
+        | Some (generation, Feed { before_day = None })
+          when Int64.equal generation request_generation ->
+          terminal_graph_state state message
+        | Some (_, Feed { before_day = Some _ })
+        | Some (_, Day _)
+        | Some (_, Children _)
+        | Some (_, Feed { before_day = None })
+        | None -> state))
   | Block_captured { block; timeline_entry_update } ->
     (match Journal_routes.capture state.routes with
      | None -> state
@@ -370,6 +559,7 @@ let styled_text ?size ?weight ?height ?color value =
 let action_target
       ?(enabled = true)
       ?(minimum_target = 44.)
+      ?key
       ~test_id
       ~label
       ~hint
@@ -377,7 +567,7 @@ let action_target
       child
   =
   let button =
-    Ui.Material.text_button ~enabled ~on_press ~child ()
+    Ui.Material.text_button ?key ~enabled ~on_press ~child ()
     |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
   in
   let properties =
@@ -474,6 +664,9 @@ let timeline_page
       ~timeline_state
       ~loading
       ~graph_error
+      ~sync_error
+      ~cache_reset_available
+      ~cache_reset_confirmation
       ~today_subtitle
       ~day_label
       ~reduced_motion
@@ -490,6 +683,15 @@ let timeline_page
       ~on_delete
       ~timeline_notice
       ~on_delete_undo
+      ~on_cache_reset_requested
+      ~on_cache_reset_cancelled
+      ~on_cache_reset_confirmed
+      ~account_menu_available
+      ~account_menu_open
+      ~on_account_menu
+      ~on_account_menu_dismissed
+      ~on_switch_graph
+      ~on_sign_out
   =
   let palette = Journal_visual_tokens.palette tokens in
   let header =
@@ -498,8 +700,9 @@ let timeline_page
       ~text_scale
       ~device_pixel_ratio
       ~context:(Journal_header.Context.today ~subtitle:today_subtitle)
+      ~on_account_menu:(if account_menu_available then Some on_account_menu else None)
   in
-  let capture_button ~id ~tooltip ~position ~visibility ~style label =
+  let capture_button ~id ~tooltip ~position ~visibility ~style code_point =
     Ui.Native_widget.Message_composer.button
       ~id
       ~tooltip
@@ -507,7 +710,12 @@ let timeline_page
       ~visibility
       ~style
       ~child:
-        (styled_text ~size:16. ~color:palette.on_fab label
+        (Ui.Widget.icon
+           ~size:20.
+           ~color:palette.on_fab
+           ~font_family:"MaterialIcons"
+           ~code_point
+           ()
          |> Ui.Widget.with_test_id
               (Ui.Test_id.string
                  (if id = 1
@@ -531,14 +739,14 @@ let timeline_page
             ~position:Ui.Native_widget.Message_composer.Leading
             ~visibility:Always
             ~style:Plain
-            "+"
+            0xe145
         ; capture_button
             ~id:2
             ~tooltip:"Continue Capture"
             ~position:Trailing
             ~visibility:When_non_empty
             ~style:Filled
-            "↑"
+            0xe5d8
         ]
       ~on_event:on_capture_event
       ()
@@ -623,6 +831,137 @@ let timeline_page
         |> Ui.Widget.Stack.positioned ~left ~bottom
       in
       [ overlay; snackbar ]
+  in
+  let overlays =
+    match sync_error with
+    | None -> overlays
+    | Some message ->
+      let message = live_region_text ~color:palette.sheet_error message in
+      let contents =
+        if cache_reset_available
+        then
+          [ Ui.Widget.Flex.expanded message
+          ; Ui.Widget.Flex.fixed
+              (action_target
+                 ~test_id:"request-local-cache-reset"
+                 ~label:"Reset local graph copy"
+                 ~hint:"Delete this local mirror and download it again"
+                 ~on_press:on_cache_reset_requested
+                 (styled_text ~color:palette.sheet_error "Reset local copy"))
+          ]
+        else [ Ui.Widget.Flex.expanded message ]
+      in
+      let banner =
+        Ui.Widget.Flex.row contents
+        |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 12.)
+        |> Ui.Widget.decorated_box
+             ~decoration:
+               (Ui.Style.Decoration.create
+                  ~background:palette.background
+                  ~border_radius:8.
+                  ())
+        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-sync-error")
+        |> Ui.Widget.Stack.positioned ~left:16. ~right:16. ~top:64.
+      in
+      banner :: overlays
+  in
+  let overlays =
+    if not account_menu_open
+    then overlays
+    else (
+      let switch_graph =
+        action_target
+          ~test_id:"journal-account-switch-graph"
+          ~label:"Switch graph"
+          ~hint:"Close the current graph and choose another authorized graph"
+          ~on_press:on_switch_graph
+          (styled_text "Switch graph")
+      in
+      let reset =
+        if not cache_reset_available
+        then []
+        else
+          [ Ui.Widget.Flex.fixed
+              (action_target
+                 ~test_id:"journal-account-reset-local-copy"
+                 ~label:"Reset local graph copy"
+                 ~hint:"Delete this local mirror and download a fresh snapshot"
+                 ~on_press:on_cache_reset_requested
+                 (styled_text "Reset local copy"))
+          ]
+      in
+      let sign_out =
+        action_target
+          ~test_id:"journal-account-sign-out"
+          ~label:"Sign out"
+          ~hint:"Close the current graph and return to sign in"
+          ~on_press:on_sign_out
+          (styled_text ~color:palette.sheet_error "Sign out")
+      in
+      let dismiss =
+        action_target
+          ~test_id:"journal-account-menu-dismiss"
+          ~label:"Close account menu"
+          ~hint:"Return to the journal"
+          ~on_press:on_account_menu_dismissed
+          (styled_text "Cancel")
+      in
+      let menu =
+        Ui.Widget.Flex.column
+          ([ Ui.Widget.Flex.fixed
+               (styled_text ~size:20. ~weight:Ui.Style.Font_weight.Bold "Account")
+           ; Ui.Widget.Flex.fixed switch_graph
+           ]
+           @ reset
+           @ [ Ui.Widget.Flex.fixed sign_out; Ui.Widget.Flex.fixed dismiss ])
+        |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 20.)
+        |> Ui.Material.dialog ~barrier_dismissible:false
+        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu")
+        |> Ui.Widget.Stack.positioned
+      in
+      menu :: overlays)
+  in
+  let overlays =
+    if not cache_reset_confirmation
+    then overlays
+    else (
+      let cancel =
+        action_target
+          ~test_id:"cancel-local-cache-reset"
+          ~label:"Keep local graph copy"
+          ~hint:"Close without deleting local data"
+          ~on_press:on_cache_reset_cancelled
+          (styled_text "Cancel")
+      in
+      let confirm =
+        action_target
+          ~test_id:"confirm-local-cache-reset"
+          ~label:"Delete and redownload local graph copy"
+          ~hint:"Delete the local mirror and download it again"
+          ~on_press:on_cache_reset_confirmed
+          (styled_text ~color:palette.sheet_error "Delete and redownload")
+      in
+      let dialog =
+        Ui.Widget.Flex.column
+          [ Ui.Widget.Flex.fixed
+              (styled_text
+                 ~size:20.
+                 ~weight:Ui.Style.Font_weight.Bold
+                 "Reset local graph copy?")
+          ; Ui.Widget.Flex.fixed
+              (styled_text
+                 "This deletes the local mirror, including pending local changes, then \
+                  downloads a fresh snapshot. The authorized server graph is not changed.")
+          ; Ui.Widget.Flex.fixed
+              (Ui.Widget.Flex.row
+                 [ Ui.Widget.Flex.expanded cancel; Ui.Widget.Flex.expanded confirm ])
+          ]
+        |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 20.)
+        |> Ui.Material.dialog ~barrier_dismissible:false
+        |> Ui.Widget.with_test_id (Ui.Test_id.string "local-cache-reset-dialog")
+        |> Ui.Widget.Stack.positioned
+      in
+      dialog :: overlays)
   in
   let body =
     Ui.Widget.Body.overlay ~base ~overlays ()
@@ -1210,6 +1549,167 @@ let message_page ~page_key ~title dispatch =
   route_page ~page_key ~transition:Ui.Navigation.Fade (Ui.Widget.Body.static content)
 ;;
 
+let manager_page state dispatch =
+  let title_widget title =
+    styled_text ~size:24. ~weight:Ui.Style.Font_weight.Bold title
+    |> Ui.Widget.semantics
+         ~properties:(Ui.Semantics.create ~label:title ~live_region:true ())
+  in
+  let graph_picker snapshot =
+    let refresh =
+      let on_press = bind_action dispatch "refresh-catalog" in
+      let icon =
+        Ui.Widget.icon
+          ~font_family:"MaterialIcons"
+          ~size:22.
+          ~code_point:0xe5d5
+          ()
+        |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-refresh-icon")
+      in
+      Ui.Material.icon_button
+        ~key:(Ui.Key.string "graph-picker-refresh")
+        ~on_press
+        ~icon
+        ()
+      |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-refresh")
+      |> Ui.Widget.semantics
+           ~on_action:on_press
+           ~properties:
+             (Ui.Semantics.create
+                ~label:"Refresh graphs"
+                ~hint:"Refresh the authorized graph catalog"
+                ~role:Ui.Semantics.Role.Button
+                ~enabled:true
+                ~focusable:true
+                ~actions:[ Ui.Semantics.Action.Tap ]
+                ())
+      |> Ui.Widget.sized_box ~width:48. ~height:48.
+    in
+    let toolbar =
+      Ui.Widget.Flex.row
+        [ Ui.Widget.Flex.expanded (title_widget "Choose a graph")
+        ; Ui.Widget.Flex.fixed refresh
+        ]
+      |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-toolbar")
+    in
+    let rows =
+      List.map
+        (fun (graph : Logseq_db_worker.Sync_catalog.graph) ->
+           let graph_id = Logseq_db_worker.Graph_types.Uuid.to_string graph.graph_id in
+           action_target
+             ~key:(Ui.Key.string ("graph-picker:" ^ graph_id))
+             ~test_id:("graph-picker:" ^ graph_id)
+             ~label:("Open " ^ graph.name)
+             ~hint:"Open this authorized graph"
+             ~on_press:(bind_action dispatch ("select-graph:" ^ graph_id))
+             (styled_text graph.name))
+        snapshot.Logseq_db_worker.Sync_manager.catalog
+    in
+    let scroll =
+      Ui.Widget.Scroll_view.vertical
+        ~key:(Ui.Key.string "graph-picker-scroll")
+        ~on_scroll:(Ui.Event.Handler.create ~name:"graph-picker-scroll" (fun _ -> ()))
+        [ Ui.Widget.Sliver.list rows ]
+        ()
+      |> Ui.Widget.Viewport.Vertical.with_test_id
+           (Ui.Test_id.string "graph-picker-scroll")
+      |> Ui.Widget.Viewport.Vertical.padding
+           ~insets:(Ui.Layout.Edge_insets.symmetric ~vertical:8. ())
+    in
+    Ui.Widget.Body.Vertical.create
+      [ Ui.Widget.Body.Vertical.fixed toolbar; Ui.Widget.Body.Vertical.fill scroll ]
+    |> Ui.Widget.Body.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
+    |> Ui.Widget.Body.safe_area
+  in
+  let compact_body () =
+    let title, controls =
+    match state.manager with
+    | None -> "Preparing your account", []
+    | Some snapshot ->
+      (match snapshot.Logseq_db_worker.Sync_manager.phase with
+       | Signed_out -> "Sign in to open a graph", []
+       | Awaiting_token _ -> "Authenticating", []
+       | Loading_catalog -> "Loading your graphs", []
+       | Awaiting_selection -> assert false
+       | Bootstrapping ->
+         let progress_text =
+           match state.bootstrap_progress with
+           | None -> "Preparing the local mirror"
+           | Some progress ->
+             Printf.sprintf
+               "Downloaded %d bytes"
+               progress.Logseq_db_worker.Sync_bootstrap.received_bytes
+         in
+         "Downloading graph", [ Ui.Widget.Flex.fixed (styled_text progress_text) ]
+       | Awaiting_e2ee_password ->
+         let password = state.e2ee_password in
+         let editor =
+           Ui.Material.text_field
+             ~key:(Ui.Key.string "e2ee-password-editor")
+             ~enabled:true
+             ~obscure_text:true
+             ~keyboard_type:Ui.Text_editing.Text
+             ~input_action:Ui.Text_editing.Done
+             ~autofocus:true
+             ~max_utf8_bytes:4096
+             ~session_id:(Journal_capture.session_id password)
+             ~document_revision:(Journal_capture.document_revision password)
+             ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
+             ~update_mode:(Journal_capture.update_mode password)
+             ~value:(Journal_capture.value password)
+             ~on_edit:dispatch
+             ~on_submit:(bind_action dispatch "submit-e2ee-password")
+             ~on_focus_changed:dispatch
+             ~on_limit_reached:dispatch
+             ()
+           |> Ui.Widget.with_test_id (Ui.Test_id.string "e2ee-password-editor")
+         in
+         let submit =
+           action_target
+             ~enabled:(Journal_capture.can_save password)
+             ~test_id:"e2ee-password-submit"
+             ~label:"Unlock encrypted graph"
+             ~hint:"Submit the encryption password"
+             ~on_press:(bind_action dispatch "submit-e2ee-password")
+             (styled_text "Unlock")
+         in
+         ( "Unlock encrypted graph"
+         , [ Ui.Widget.Flex.fixed
+               (styled_text "Enter your encryption password to continue.")
+           ; Ui.Widget.Flex.fixed editor
+           ; Ui.Widget.Flex.fixed submit
+           ] )
+       | Opening_graph -> "Opening graph", []
+       | Graph_open -> "Opening journal", []
+       | Sync_paused -> "Journal available offline", []
+       | Stopping_graph -> "Switching graph", []
+       | Failed ->
+         ( Option.value snapshot.last_error ~default:"Unable to open graph"
+         , [ Ui.Widget.Flex.fixed
+               (action_target
+                  ~test_id:"graph-picker-retry"
+                  ~label:"Retry"
+                  ~hint:"Refresh the graph catalog"
+                  ~on_press:(bind_action dispatch "refresh-catalog")
+                  (styled_text "Retry"))
+           ] ))
+    in
+    Ui.Widget.Flex.column (Ui.Widget.Flex.fixed (title_widget title) :: controls)
+    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
+    |> Ui.Widget.safe_area
+    |> Ui.Widget.Body.static
+  in
+  let body =
+    match state.manager with
+    | Some ({ phase = Awaiting_selection; _ } as snapshot) -> graph_picker snapshot
+    | None | Some _ -> compact_body ()
+  in
+  route_page
+    ~page_key:"sync-manager-route"
+    ~transition:Ui.Navigation.None
+    body
+;;
+
 let identity_sequence = ref 0L
 
 let fresh_identity () =
@@ -1244,6 +1744,12 @@ let component client handlers graph =
   let set_state_ref = ref None in
   let state_ref = ref initial_state in
   let graph_runtime = Journal_graph_runtime.create () in
+  let started_graph_generation = ref None in
+  let send_manager command =
+    Bonsai.Effect.of_thunk (fun () ->
+      ignore
+        (Worker.send client (Graph_service.Manager_command command) : Worker.send_result))
+  in
   let submit request = Journal_graph_runtime.submit graph_runtime request in
   let pending_delete_ref : pending_delete option ref = ref None in
   let clear_delete_command response =
@@ -1254,6 +1760,7 @@ let component client handlers graph =
     | Feed_loaded _
     | Day_blocks_loaded _
     | Detail_loaded _
+    | Feed_failed _
     | Block_captured _
     | Block_updated _
     | Update_conflict _
@@ -1268,7 +1775,7 @@ let component client handlers graph =
     Journal_graph_transport.deliver
       ~runtime:graph_runtime
       ~send:(fun request ->
-        match Worker.send client request with
+        match Worker.send client (Graph_service.Graph_request request) with
         | Accepted _ -> Journal_graph_transport.Accepted
         | Full -> Full
         | Not_ready -> Not_ready
@@ -1352,6 +1859,48 @@ let component client handlers graph =
           Bonsai.Cont.return ()))
   in
   let application_platform = Driver.Handler.application_platform handlers in
+  let sign_out_in_flight = ref false in
+  let termination_in_flight = ref false in
+  let apply_manager_transition set_state manager =
+    let update = set_state (fun state -> apply_manager_snapshot state manager) in
+    let sign_out =
+      if manager.Logseq_db_worker.Sync_manager.phase = Signed_out
+         && !sign_out_in_flight
+      then (
+        sign_out_in_flight := false;
+        Bonsai.Effect.bind
+          (Platform.request application_platform Journal_platform.sign_out_request)
+          ~f:(fun result ->
+            set_state (fun state ->
+              match result with
+              | Ok payload
+                when Result.is_ok (Journal_platform.decode_sign_out_response payload) ->
+                state
+              | Error _ | Ok _ ->
+                { state with
+                  sync_error = Some "Unable to sign out of the authenticated session"
+                })))
+      else Bonsai.Effect.Ignore
+    in
+    let termination_ready =
+      if
+        !termination_in_flight
+        &&
+        match manager.Logseq_db_worker.Sync_manager.phase with
+        | Awaiting_selection | Signed_out -> true
+        | _ -> false
+      then (
+        termination_in_flight := false;
+        Bonsai.Effect.bind
+          (Platform.request
+             application_platform
+             Journal_platform.termination_ready_request)
+          ~f:(fun _ -> Bonsai.Effect.Ignore))
+      else Bonsai.Effect.Ignore
+    in
+    Bonsai.Effect.bind update ~f:(fun () ->
+      Bonsai.Effect.Many [ sign_out; termination_ready ])
+  in
   let registered = ref false in
   let event_subscription =
     Bonsai.Cont.map2 state set_state ~f:(fun snapshot set_state ->
@@ -1372,7 +1921,11 @@ let component client handlers graph =
         Worker.on_event client (fun event ->
           match event with
           | Worker.Push
-              { payload = Logseq_db_worker.Protocol.Graph_invalidated invalidation; _ } ->
+              { payload =
+                  Graph_service.Graph_push
+                    (Logseq_db_worker.Protocol.Graph_invalidated invalidation)
+              ; _
+              } ->
             let snapshot = !state_ref in
             if not snapshot.graph_ready
             then Bonsai.Effect.Ignore
@@ -1392,54 +1945,154 @@ let component client handlers graph =
                     (fun (request : Logseq_db_worker.Protocol.request) ->
                        match request.command with
                        | Read (List_pages _) -> true
-                       | Read _ | Mutate _ -> false)
+                       | _ -> false)
                     output.requests
                 in
-                Bonsai.Effect.bind
-                  (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
-                  ~f:(fun delivery ->
-                    List.iter clear_delete_command delivery.responses;
+                let sent_request = output.requests <> [] in
+                let prepare =
+                  if sent_request && reloads_feed
+                  then
                     set_state (fun state ->
-                      let state = apply_delivery_responses state delivery in
-                      match delivery.error, reloads_feed, state.calendar with
-                      | None, true, Some calendar when state.graph_ready ->
+                      match state.calendar with
+                      | Some calendar when state.graph_ready ->
+                        let context = feed_projection_context calendar in
+                        let minimum_basis =
+                          match state.feed_refresh with
+                          | Some { minimum_basis = Some basis; _ } ->
+                            Some (Int64.max basis invalidation.basis)
+                          | None | Some _ -> Some invalidation.basis
+                        in
                         { state with
-                          timeline =
-                            (Journal_timeline_state.empty ~today:calendar.local_day
-                             |> fun timeline ->
-                             Journal_timeline_state.begin_request
-                               timeline
-                               ~generation
-                               (Feed { before_day = None }))
-                        ; feed_loaded = false
+                          feed_refresh =
+                            Some
+                              { generation
+                              ; context
+                              ; cause = Sync_refresh
+                              ; graph_generation = current_graph_generation state
+                              ; minimum_basis
+                              }
                         ; next_request_generation = Int64.succ generation
                         }
-                      | None, false, _
-                      | None, true, None
-                      | None, true, Some _
-                      | Some _, _, _ -> state))))
+                      | None | Some _ -> state)
+                  else Bonsai.Effect.Ignore
+                in
+                Bonsai.Effect.bind prepare ~f:(fun () ->
+                  Bonsai.Effect.bind
+                    (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+                    ~f:(fun delivery ->
+                      List.iter clear_delete_command delivery.responses;
+                      set_state (fun state ->
+                        let state =
+                          List.fold_left apply_worker_response state delivery.responses
+                        in
+                        match delivery.error with
+                        | Some message -> fail_feed_transport state message
+                        | None -> state)))))
           | Worker.Response
-              { outcome = Worker.Completed (response : Logseq_db_worker.Protocol.response)
-              ; _
-              } ->
+              { outcome = Worker.Completed (Graph_service.Graph_response response); _ } ->
             let output = Journal_graph_runtime.receive graph_runtime response in
             Bonsai.Effect.bind
               (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
               ~f:(fun delivery ->
                 List.iter clear_delete_command delivery.responses;
-                set_state (fun state ->
-                  let state =
-                    List.fold_left apply_worker_response state delivery.responses
-                  in
-                  match delivery.error with
-                  | None -> state
-                  | Some message -> fail_graph_transport state message))
+                let update =
+                  set_state (fun state ->
+                    let state =
+                      List.fold_left apply_worker_response state delivery.responses
+                    in
+                    match delivery.error with
+                    | None -> state
+                    | Some message when Option.is_some state.feed_refresh ->
+                      fail_feed_transport state message
+                    | Some message -> fail_graph_transport state message)
+                in
+                update)
+          | Worker.Response { outcome = Completed (Manager_snapshot snapshot); _ } ->
+            apply_manager_transition set_state snapshot
+          | Worker.Push { payload = Manager_state_changed manager; _ } ->
+            let start_graph =
+              match manager.selected_graph, manager.applied_server_t with
+              | Some _, Some _
+                when !started_graph_generation <> Some manager.graph_generation ->
+                started_graph_generation := Some manager.graph_generation;
+                Journal_graph_runtime.reset graph_runtime;
+                let output =
+                  Journal_graph_runtime.
+                    { requests = [ start graph_runtime ]; responses = [] }
+                in
+                Bonsai.Effect.bind
+                  (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+                  ~f:(fun delivery ->
+                    set_state (fun state ->
+                      apply_delivery_responses
+                        { state with
+                          graph_ready = false
+                        ; feed_loaded = false
+                        ; presented_feed_context = None
+                        ; feed_refresh = None
+                        ; graph_error = None
+                        }
+                        delivery))
+              | Some _, Some _ | Some _, None | None, _ -> Bonsai.Effect.Ignore
+            in
+            Bonsai.Effect.bind
+              (apply_manager_transition set_state manager)
+              ~f:(fun () -> start_graph)
+          | Worker.Push { payload = Need_id_token challenge; _ } ->
+            Bonsai.Effect.bind
+              (Platform.request
+                 application_platform
+                 (Journal_platform.id_token_request challenge))
+              ~f:(function
+                | Error _ ->
+                  send_manager
+                    (Logseq_db_worker.Sync_manager.Token_failed
+                       { challenge_id = challenge.challenge_id })
+                | Ok payload ->
+                  (match
+                     Journal_platform.decode_id_token_response
+                       ~challenge_id:challenge.challenge_id
+                       payload
+                   with
+                   | Error _ ->
+                     send_manager
+                       (Logseq_db_worker.Sync_manager.Token_failed
+                          { challenge_id = challenge.challenge_id })
+                   | Ok token ->
+                     send_manager
+                       (Logseq_db_worker.Sync_manager.Provide_id_token
+                          { challenge_id = challenge.challenge_id
+                          ; user_id = challenge.user_id
+                          ; account_generation = challenge.account_generation
+                          ; graph_generation = challenge.graph_generation
+                          ; connection_generation = challenge.connection_generation
+                          ; token
+                          })))
+          | Worker.Push
+              { payload =
+                  Bootstrap_progress { account_generation; graph_generation; progress }
+              ; _
+              } ->
+            set_state (fun state ->
+              match state.manager with
+              | Some manager
+                when manager.account_generation = account_generation
+                     && manager.graph_generation = graph_generation ->
+                { state with bootstrap_progress = Some progress }
+              | None | Some _ -> state)
           | Worker.Response { outcome = Failed error; _ } ->
             pending_delete_ref := None;
-            set_state (fun state -> fail_active_mutation state error)
+            set_state (fun state ->
+              match state.feed_refresh with
+              | Some _ -> { state with feed_refresh = None; sync_error = Some error }
+              | None -> fail_active_mutation state error)
           | Worker.Response { outcome = Cancelled | Shutdown; _ } ->
             pending_delete_ref := None;
-            set_state (fun state -> fail_active_mutation state "Worker unavailable")
+            set_state (fun state ->
+              match state.feed_refresh with
+              | Some _ ->
+                { state with feed_refresh = None; sync_error = Some "Worker unavailable" }
+              | None -> fail_active_mutation state "Worker unavailable")
           | Worker.Terminal { error; _ } ->
             pending_delete_ref := None;
             set_state (fun state -> terminal_graph_state state error)));
@@ -1456,80 +2109,164 @@ let component client handlers graph =
           | Error _ -> Bonsai.Effect.Ignore
           | Ok event ->
             Journal_graph_runtime.set_calendar graph_runtime event.snapshot;
-            set_state (fun state ->
-              match state.calendar with
-              | Some current
-                when Int64.compare current.generation event.snapshot.generation >= 0 ->
-                state
-              | None | Some _ ->
-                { state with
-                  calendar = Some event.snapshot
-                ; formatted_generation = None
-                ; day_labels = []
-                })
+            let calendar_update =
+              set_state (fun state ->
+                match state.calendar with
+                | Some current
+                  when Int64.compare current.generation event.snapshot.generation >= 0 ->
+                  state
+                | None ->
+                  { state with
+                    calendar = Some event.snapshot
+                  ; formatted_context = None
+                  ; day_labels = []
+                  }
+                | Some current ->
+                  let formatting_changed =
+                    current.local_day <> event.snapshot.local_day
+                    || not (String.equal current.locale event.snapshot.locale)
+                  in
+                  { state with
+                    calendar = Some event.snapshot
+                  ; formatted_context =
+                      (if formatting_changed then None else state.formatted_context)
+                  ; day_labels = (if formatting_changed then [] else state.day_labels)
+                  })
+            in
+            (match event.reason with
+             | Journal_platform.Resumed
+             | Requested
+             | Significant_time_changed
+             | Time_zone_changed
+             | Locale_changed -> calendar_update)
         in
-        Platform.on_event application_platform apply_calendar;
-        Platform.request application_platform Journal_platform.get_calendar_request
-        |> Bonsai.Effect.bind ~f:(function
+        let apply_network_lifecycle payload =
+          match Journal_platform.decode_network_lifecycle payload with
           | Error _ -> Bonsai.Effect.Ignore
-          | Ok payload -> apply_calendar payload)
+          | Ok (Backgrounded { generation }) ->
+            send_manager
+              (Logseq_db_worker.Sync_manager.Backgrounded
+                 { lifecycle_generation = generation })
+          | Ok (Foreground_resumed { generation }) ->
+            send_manager
+              (Logseq_db_worker.Sync_manager.Foreground_resumed
+                 { lifecycle_generation = generation })
+        in
+        let apply_authenticated_user payload =
+          match Journal_platform.decode_authenticated_user payload with
+          | Error _ -> Bonsai.Effect.Ignore
+          | Ok None -> send_manager Logseq_db_worker.Sync_manager.Signed_out_command
+          | Ok (Some user_id) ->
+            send_manager (Logseq_db_worker.Sync_manager.Authenticated_user { user_id })
+        in
+        let apply_platform payload =
+          if Journal_platform.is_prepare_to_terminate_event payload
+          then (
+            termination_in_flight := true;
+            send_manager Logseq_db_worker.Sync_manager.Return_to_graph_picker)
+          else
+            match Journal_platform.decode_network_lifecycle payload with
+            | Ok _ -> apply_network_lifecycle payload
+            | Error _ ->
+              (match Journal_platform.decode_calendar payload with
+               | Ok _ -> apply_calendar payload
+               | Error _ -> apply_authenticated_user payload)
+        in
+        Platform.on_event application_platform apply_platform;
+        Bonsai.Effect.Many
+          [ Platform.request application_platform Journal_platform.get_calendar_request
+            |> Bonsai.Effect.bind ~f:(function
+              | Error _ -> Bonsai.Effect.Ignore
+              | Ok payload -> apply_calendar payload)
+          ; Platform.request
+              application_platform
+              Journal_platform.authenticated_user_request
+            |> Bonsai.Effect.bind ~f:(function
+              | Error _ -> Bonsai.Effect.Ignore
+              | Ok payload -> apply_authenticated_user payload)
+          ]
         |> Bonsai.Effect.Expert.handle);
       ())
   in
   let feed_key =
     Bonsai.Cont.map state ~f:(fun state ->
       match state.graph_ready, state.calendar with
-      | true, Some calendar -> Some (calendar.generation, calendar.local_day)
+      | true, Some calendar ->
+        let context = feed_projection_context calendar in
+        if
+          state.feed_loaded
+          && Option.equal
+               equal_feed_projection_context
+               state.presented_feed_context
+               (Some context)
+        then None
+        else Some context
       | false, _ | true, None -> None)
   in
   let feed_callback =
     Bonsai.Cont.map2 state set_state ~f:(fun snapshot set_state -> function
       | None -> Bonsai.Effect.Ignore
-      | Some (calendar_generation, today) ->
-        (match snapshot.calendar with
-         | Some calendar
-           when snapshot.graph_ready
-                && Int64.equal calendar.generation calendar_generation
-                && calendar.local_day = today ->
-           let generation = snapshot.next_request_generation in
-           let output =
-             submit
-               (Journal_graph_request.Load_feed
-                  { before_day = None
-                  ; day_limit = feed_day_limit
-                  ; blocks_per_day = 64
-                  ; slot_limit = 128
-                  ; request_generation = generation
-                  })
-           in
-           let request = Journal_timeline_state.Feed { before_day = None } in
-           Bonsai.Effect.bind
-             (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
-             ~f:(fun delivery ->
-               List.iter clear_delete_command delivery.responses;
-               set_state (fun state ->
-                 let state = apply_delivery_responses state delivery in
-                 match delivery.error, state.calendar with
-                 | None, Some current
-                   when state.graph_ready
-                        && Int64.equal current.generation calendar_generation
-                        && current.local_day = today ->
-                   { state with
-                     timeline =
-                       (Journal_timeline_state.empty ~today
-                        |> fun timeline ->
-                        Journal_timeline_state.begin_request timeline ~generation request
-                       )
-                   ; feed_loaded = false
-                   ; next_request_generation = Int64.succ generation
-                   }
-                 | Some _, _ | None, None | None, Some _ -> state))
-         | None | Some _ -> Bonsai.Effect.Ignore))
+      | Some context ->
+        let generation = snapshot.next_request_generation in
+        let output =
+          submit
+            (Journal_graph_request.Load_feed
+               { before_day = None
+               ; day_limit = feed_day_limit
+               ; blocks_per_day = 64
+               ; slot_limit = 128
+               ; request_generation = generation
+               })
+        in
+        let request = Journal_timeline_state.Feed { before_day = None } in
+        let prepare =
+          set_state (fun state ->
+            if state.feed_loaded
+            then (
+              let cause, minimum_basis =
+                match state.feed_refresh with
+                | Some { cause = Sync_refresh; minimum_basis; _ } ->
+                  Sync_refresh, minimum_basis
+                | None | Some _ -> Calendar_refresh, None
+              in
+              { state with
+                feed_refresh =
+                  Some
+                    { generation
+                    ; context
+                    ; cause
+                    ; graph_generation = current_graph_generation state
+                    ; minimum_basis
+                    }
+              ; next_request_generation = Int64.succ generation
+              })
+            else
+              { state with
+                timeline =
+                  (Journal_timeline_state.empty ~today:context.local_day
+                   |> fun timeline ->
+                   Journal_timeline_state.begin_request timeline ~generation request)
+              ; feed_loaded = false
+              ; presented_feed_context = None
+              ; feed_refresh = None
+              ; next_request_generation = Int64.succ generation
+              })
+        in
+        Bonsai.Effect.bind prepare ~f:(fun () ->
+          Bonsai.Effect.bind
+            (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+            ~f:(fun delivery ->
+              List.iter clear_delete_command delivery.responses;
+              set_state (fun state ->
+                let state =
+                  List.fold_left apply_worker_response state delivery.responses
+                in
+                match delivery.error with
+                | Some message -> fail_feed_transport state message
+                | None -> state))))
   in
   Bonsai.Cont.Edge.on_change
-    ~equal:
-      (Option.equal (fun (left_generation, left_day) (right_generation, right_day) ->
-         Int64.equal left_generation right_generation && left_day = right_day))
+    ~equal:(Option.equal equal_feed_projection_context)
     feed_key
     ~callback:feed_callback
     graph;
@@ -1585,17 +2322,22 @@ let component client handlers graph =
     graph;
   let format_key =
     Bonsai.Cont.map state ~f:(fun state ->
-      match state.calendar with
-      | Some calendar when state.feed_loaded ->
-        Some (calendar.generation, distinct_days state)
-      | None | Some _ -> None)
+      match state.calendar, formatting_context state with
+      | Some calendar, Some context
+        when state.feed_loaded
+             && not
+                  (Option.equal
+                     equal_formatting_context
+                     state.formatted_context
+                     (Some context)) -> Some (calendar.generation, context)
+      | None, _ | Some _, None | Some _, Some _ -> None)
   in
   let format_callback =
     Bonsai.Cont.map set_state ~f:(fun set_state request_key ->
       match request_key with
       | None -> Bonsai.Effect.Ignore
-      | Some (generation, days) ->
-        (match Journal_platform.format_journal_days_request ~generation days with
+      | Some (generation, context) ->
+        (match Journal_platform.format_journal_days_request ~generation context.days with
          | Error _ -> Bonsai.Effect.Ignore
          | Ok request ->
            Bonsai.Effect.bind
@@ -1610,21 +2352,24 @@ let component client handlers graph =
                     when Int64.equal formatted.generation generation
                          && List.map fst formatted.headings
                             |> List.sort Int.compare
-                            = days ->
+                            = context.days ->
                     set_state (fun state ->
-                      match state.calendar with
-                      | Some calendar when Int64.equal calendar.generation generation ->
+                      match state.calendar, formatting_context state with
+                      | Some calendar, Some current
+                        when Int64.equal calendar.generation generation
+                             && equal_formatting_context current context ->
                         { state with
-                          formatted_generation = Some generation
+                          formatted_context = Some context
                         ; day_labels = formatted.headings
                         }
-                      | None | Some _ -> state)
+                      | None, _ | Some _, None | Some _, Some _ -> state)
                   | Ok _ -> Bonsai.Effect.Ignore))))
   in
   Bonsai.Cont.Edge.on_change
     ~equal:
-      (Option.equal (fun (left_generation, left_days) (right_generation, right_days) ->
-         Int64.equal left_generation right_generation && left_days = right_days))
+      (Option.equal (fun (left_generation, left) (right_generation, right) ->
+         Int64.equal left_generation right_generation
+         && equal_formatting_context left right))
     format_key
     ~callback:format_callback
     graph;
@@ -1698,7 +2443,14 @@ let component client handlers graph =
                     state.routes
                     (Journal_detail.apply_text_edit detail edit)
               }
-            | None, None -> state)
+            | None, None ->
+              (match state.manager with
+               | Some { phase = Awaiting_e2ee_password; _ } ->
+                 { state with
+                   e2ee_password =
+                     Journal_capture.apply_text_edit state.e2ee_password edit
+                 }
+               | None | Some _ -> state))
         | Ui.Event.Payload.Visible_range range ->
           let observe timeline =
             let total_count = Journal_timeline_state.total_count timeline in
@@ -1727,7 +2479,73 @@ let component client handlers graph =
            | None -> Bonsai.Effect.Ignore)
         | Ui.Event.Payload.Route_pop _ -> update back_state
         | Ui.Event.Payload.Text action ->
-          if String.equal action "open-capture"
+          if String.length action > 13 && String.sub action 0 13 = "select-graph:"
+          then (
+            let graph_id = String.sub action 13 (String.length action - 13) in
+            match Logseq_db_worker.Graph_types.Uuid.of_string graph_id with
+            | Error _ -> Bonsai.Effect.Ignore
+            | Ok graph_id ->
+              send_manager (Logseq_db_worker.Sync_manager.Select_graph graph_id))
+          else if String.equal action "refresh-catalog"
+          then send_manager Logseq_db_worker.Sync_manager.Refresh_catalog
+          else if String.equal action "open-account-menu"
+          then update (fun state -> { state with account_menu_open = true })
+          else if String.equal action "close-account-menu"
+          then update (fun state -> { state with account_menu_open = false })
+          else if String.equal action "switch-graph"
+          then
+            Bonsai.Effect.Many
+              [ update (fun state -> { state with account_menu_open = false })
+              ; send_manager Logseq_db_worker.Sync_manager.Return_to_graph_picker
+              ]
+          else if String.equal action "sign-out"
+          then (
+            sign_out_in_flight := true;
+            Bonsai.Effect.Many
+              [ update (fun state ->
+                  { state with account_menu_open = false })
+              ; send_manager Logseq_db_worker.Sync_manager.Signed_out_command
+              ])
+          else if String.equal action "submit-e2ee-password"
+          then (
+            let password = Journal_capture.source snapshot.e2ee_password in
+            if String.equal (String.trim password) ""
+            then Bonsai.Effect.Ignore
+            else
+              Bonsai.Effect.Many
+                [ send_manager
+                    (Logseq_db_worker.Sync_manager.Submit_e2ee_password password)
+                ; update (fun state ->
+                    { state with
+                      e2ee_password =
+                        Journal_capture.create
+                          ~session_number:state.next_local_sequence
+                          ~source:""
+                    ; next_local_sequence = Int64.succ state.next_local_sequence
+                    })
+                ])
+          else if String.equal action "request-local-cache-reset"
+          then
+            update (fun state ->
+              match state.manager with
+              | Some { selected_graph = Some graph_id; _ } ->
+                { state with
+                  cache_reset_confirmation = Some graph_id
+                ; account_menu_open = false
+                }
+              | None | Some _ -> state)
+          else if String.equal action "cancel-local-cache-reset"
+          then update (fun state -> { state with cache_reset_confirmation = None })
+          else if String.equal action "confirm-local-cache-reset"
+          then (
+            match snapshot.cache_reset_confirmation with
+            | None -> Bonsai.Effect.Ignore
+            | Some graph_id ->
+              Bonsai.Effect.Many
+                [ send_manager (Logseq_db_worker.Sync_manager.Delete_local_cache graph_id)
+                ; update (fun state -> { state with cache_reset_confirmation = None })
+                ])
+          else if String.equal action "open-capture"
           then open_capture ""
           else if String.equal action "delete-undo"
           then (
@@ -1998,35 +2816,54 @@ let component client handlers graph =
         ~text_scale:environment.text_scale
     in
     let root =
-      let content_horizontal_inset =
-        Float.max
-          0.
-          ((environment.viewport_width -. Journal_visual_tokens.timeline_max_width) /. 2.)
-      in
-      timeline_page
-        ~tokens
-        ~profile
-        ~text_scale:environment.text_scale
-        ~device_pixel_ratio:environment.device_pixel_ratio
-        ~timeline_state:state.timeline
-        ~loading:(not state.feed_loaded)
-        ~graph_error:state.graph_error
-        ~today_subtitle:(today_label state)
-        ~day_label:(label_for_day state)
-        ~reduced_motion
-        ~rtl:(is_rtl_locale environment.locale)
-        ~safe_bottom:environment.safe_area.bottom
-        ~viewport_width:environment.viewport_width
-        ~content_horizontal_inset
-        ~capture_enabled:(state.write_enabled && Option.is_none state.pending_delete)
-        ~capture_composer_key:state.next_local_sequence
-        ~on_capture_event:dispatch
-        ~on_visible_range:dispatch
-        ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
-        ~delete_enabled:(state.write_enabled && Option.is_none state.pending_delete)
-        ~on_delete:(prefix_action dispatch "timeline-delete:")
-        ~timeline_notice:state.timeline_notice
-        ~on_delete_undo:(bind_action dispatch "delete-undo")
+      match state.graph_ready, state.manager with
+      | false, Some _ -> manager_page state dispatch
+      | false, None | true, _ ->
+        let content_horizontal_inset =
+          Float.max
+            0.
+            ((environment.viewport_width -. Journal_visual_tokens.timeline_max_width)
+             /. 2.)
+        in
+        timeline_page
+          ~tokens
+          ~profile
+          ~text_scale:environment.text_scale
+          ~device_pixel_ratio:environment.device_pixel_ratio
+          ~timeline_state:state.timeline
+          ~loading:(not state.feed_loaded)
+          ~graph_error:state.graph_error
+          ~sync_error:state.sync_error
+          ~cache_reset_available:
+            (match state.manager with
+             | Some { selected_graph = Some _; _ } -> true
+             | None | Some _ -> false)
+          ~cache_reset_confirmation:(Option.is_some state.cache_reset_confirmation)
+          ~today_subtitle:(today_label state)
+          ~day_label:(label_for_day state)
+          ~reduced_motion
+          ~rtl:(is_rtl_locale environment.locale)
+          ~safe_bottom:environment.safe_area.bottom
+          ~viewport_width:environment.viewport_width
+          ~content_horizontal_inset
+          ~capture_enabled:(state.write_enabled && Option.is_none state.pending_delete)
+          ~capture_composer_key:state.next_local_sequence
+          ~on_capture_event:dispatch
+          ~on_visible_range:dispatch
+          ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
+          ~delete_enabled:(state.write_enabled && Option.is_none state.pending_delete)
+          ~on_delete:(prefix_action dispatch "timeline-delete:")
+          ~timeline_notice:state.timeline_notice
+          ~on_delete_undo:(bind_action dispatch "delete-undo")
+          ~on_cache_reset_requested:(bind_action dispatch "request-local-cache-reset")
+          ~on_cache_reset_cancelled:(bind_action dispatch "cancel-local-cache-reset")
+          ~on_cache_reset_confirmed:(bind_action dispatch "confirm-local-cache-reset")
+          ~account_menu_available:(Option.is_some state.manager)
+          ~account_menu_open:state.account_menu_open
+          ~on_account_menu:(bind_action dispatch "open-account-menu")
+          ~on_account_menu_dismissed:(bind_action dispatch "close-account-menu")
+          ~on_switch_graph:(bind_action dispatch "switch-graph")
+          ~on_sign_out:(bind_action dispatch "sign-out")
     in
     let pages =
       match Journal_routes.route state.routes with

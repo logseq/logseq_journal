@@ -292,6 +292,9 @@ let dependencies =
         ; monotonic_ns = (fun () -> 1_000_000L)
         }
     ; cursor_authentication_key = Bytes.make 32 'k'
+    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
+    ; unlock_graph_key =
+        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
     }
 ;;
 
@@ -1196,8 +1199,7 @@ let () =
             Datascript.Lookup_ref ("block/uuid", Datascript.Uuid page_uuid_text)
           in
           let property_class =
-            Datascript.Lookup_ref
-              ("db/ident", Datascript.Keyword "logseq.class/Property")
+            Datascript.Lookup_ref ("db/ident", Datascript.Keyword "logseq.class/Property")
           in
           transact_graph
             graph_dir

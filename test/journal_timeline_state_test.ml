@@ -1053,6 +1053,90 @@ let test_anchor_decisions_replacements_and_route_return () =
     "profile changes must not mutate timeline projection or anchor state"
 ;;
 
+let test_populated_feed_refresh_preserves_position_and_expansion () =
+  let parent = block ~child_count:1 ~order:"m" 42 in
+  let leading =
+    List.init 10 (fun index ->
+      block ~order:(String.make 1 (Char.chr (Char.code 'a' + index))) (43 + index))
+  in
+  let trailing = block ~order:"z" 54 in
+  let initial =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260809 "Today" (leading @ [ parent; trailing ]) ])
+    |> Timeline.expand ~parent_id:(Journal_model.id parent)
+  in
+  let child_request =
+    match Timeline.next_request initial with
+    | Some (Timeline.Children _ as request) -> request
+    | Some (Timeline.Feed _ | Timeline.Day _) | None ->
+      fail "refresh fixture omitted the expanded-parent request"
+  in
+  let child = block ~parent_id:(Journal_model.id parent) 53 in
+  let populated =
+    Timeline.begin_request initial ~generation:2L child_request
+    |> fun state ->
+    Timeline.apply_detail
+      state
+      ~generation:2L
+      { Journal_graph_projection.root = parent
+      ; children = { blocks = [ child ]; continuation = None }
+      }
+    |> Timeline.observe_visible_range ~first_index:8 ~last_exclusive:12
+  in
+  let populated_window = Timeline.current_window populated in
+  let refreshed_parent = block ~child_count:1 ~order:"m" ~revision:2 42 in
+  let refreshed =
+    Timeline.begin_request populated ~generation:3L (Timeline.Feed { before_day = None })
+    |> fun state ->
+    Timeline.apply_feed
+      state
+      ~generation:3L
+      (feed [ day_feed 20260809 "Today" (leading @ [ refreshed_parent; trailing ]) ])
+  in
+  require
+    (Timeline.anchor_decision refreshed = Timeline.Preserve_visible_slot)
+    "calendar refresh reset the visible anchor";
+  require
+    (Timeline.is_expanded refreshed ~block_id:(Journal_model.id parent))
+    "calendar refresh collapsed an expanded parent";
+  require
+    ((Timeline.current_window refreshed).first_index = populated_window.first_index
+     && populated_window.first_index > 0)
+    "calendar refresh moved the retained logical window";
+  require
+    (List.mem ("block:" ^ Journal_model.id child) (slot_keys refreshed))
+    "calendar refresh discarded the loaded child preview"
+;;
+
+let test_initial_feed_refresh_supersedes_pending_pagination () =
+  let first = block 46 in
+  let paging =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed ~more:true 20260809 "Today" [ first ] ])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:2
+  in
+  let day_request =
+    match Timeline.next_request paging with
+    | Some (Timeline.Day _ as request) -> request
+    | Some (Timeline.Feed _ | Timeline.Children _) | None ->
+      fail "refresh supersession fixture omitted pagination"
+  in
+  let refreshing =
+    Timeline.begin_request paging ~generation:2L day_request
+    |> fun state ->
+    Timeline.begin_request state ~generation:3L (Timeline.Feed { before_day = None })
+  in
+  require
+    (Timeline.pending_request refreshing = Some (3L, Timeline.Feed { before_day = None }))
+    "a foreground refresh did not supersede obsolete pagination"
+;;
+
 let test_prepend_first_today_entry_before_older_days () =
   let state =
     Timeline.empty ~today:20260809
@@ -1262,6 +1346,8 @@ let () =
   test_exact_profile_extents_and_final_clearance ();
   test_block_line_counts_are_the_authoritative_sparse_extents ();
   test_anchor_decisions_replacements_and_route_return ();
+  test_populated_feed_refresh_preserves_position_and_expansion ();
+  test_initial_feed_refresh_supersedes_pending_pagination ();
   test_prepend_first_today_entry_before_older_days ();
   test_no_measurement_or_renderer_extension_surface_exists ();
   test_stage_delete_collapsed_expanded_and_exact_undo ();

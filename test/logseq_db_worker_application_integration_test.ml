@@ -211,6 +211,17 @@ let encode_startup config =
     fail "startup encode failed: %s" (Journal_startup.Error.to_string error)
 ;;
 
+let platform_envelope tag payload =
+  let header_size = 32 in
+  let bytes = Bytes.make (header_size + Bytes.length payload) '\000' in
+  Bytes.blit_string "LJP2" 0 bytes 0 4;
+  Bytes.set_uint16_le bytes 4 2;
+  Bytes.set_uint16_le bytes 6 tag;
+  Bytes.set_int32_le bytes 24 (Int32.of_int (Bytes.length payload));
+  Bytes.blit payload 0 bytes header_size (Bytes.length payload);
+  bytes
+;;
+
 let initial_calendar_packet =
   let locale = "en_US" in
   let time_zone_id = "Asia/Shanghai" in
@@ -237,7 +248,7 @@ let initial_calendar_packet =
     bytes
     (header_size + String.length locale)
     (String.length time_zone_id);
-  bytes
+  platform_envelope 2 bytes
 ;;
 
 let initialize_test_calendar handle =
@@ -665,11 +676,19 @@ let set_utc_calendar runtime =
     }
 ;;
 
-let require_rejected_output description (output : Journal_graph_runtime.output) =
+let require_feed_failed_output
+      description
+      ~request_generation
+      (output : Journal_graph_runtime.output)
+  =
   require (output.requests = []) "%s emitted a Worker request" description;
   match output.responses with
-  | [ { Journal_graph_runtime.payload = Rejected _; _ } ] -> ()
-  | _ -> fail "%s did not return one local Rejected response" description
+  | [ { Journal_graph_runtime.payload = Feed_failed failure; _ } ] ->
+    require
+      (Int64.equal failure.request_generation request_generation)
+      "%s lost its request generation"
+      description
+  | _ -> fail "%s did not return one correlated feed failure" description
 ;;
 
 let test_feed_rejects_nonpositive_limits_and_unusable_slot_budget () =
@@ -709,9 +728,21 @@ let test_feed_rejects_nonpositive_limits_and_unusable_slot_budget () =
     ]
   in
   List.iter
-    (fun (description, request) ->
+    (fun (description, (request : Journal_graph_request.t)) ->
+       let request_generation =
+         match request with
+         | Load_feed { request_generation; _ } -> request_generation
+         | Capture _
+         | Create_child _
+         | Update_source _
+         | Set_task_state _
+         | Delete_subtree _
+         | Find_block _
+         | Load_day_blocks _
+         | Load_detail _ -> assert false
+       in
        Journal_graph_runtime.submit (Journal_graph_runtime.create ()) request
-       |> require_rejected_output description)
+       |> require_feed_failed_output description ~request_generation)
     cases
 ;;
 
@@ -921,7 +952,7 @@ let test_feed_rejects_worker_page_response_above_allocated_limit () =
        page_request
        ~basis:9L
        (Page_tree_result { items = oversized; continuation = None }))
-  |> require_rejected_output "oversized Worker page response"
+  |> require_feed_failed_output "oversized Worker page response" ~request_generation:67L
 ;;
 
 let test_child_projection_retains_page_for_later_mutation () =

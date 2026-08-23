@@ -325,7 +325,7 @@ let compact_physical callbacks physical db tail =
     ] )
 ;;
 
-let stage_transact ?tx_meta t tx_ops =
+let stage_transact_batch ?tx_meta t transaction_batches =
   match t.lifecycle with
   | Closed_state -> Error Closed
   | Fatal_state message -> Error (Fatal message)
@@ -334,10 +334,17 @@ let stage_transact ?tx_meta t tx_ops =
        let tx_meta =
          ("skip-store?", Datascript.Bool true) :: Option.value tx_meta ~default:[]
        in
-       let report = Datascript.with_tx ~tx_meta t.db tx_ops in
-       let tail_after =
-         if report.tx_data = [] then t.tail else t.tail @ [ report.tx_data ]
+       let db_after, added_tail, tx_data =
+         List.fold_left
+           (fun (db, tail, all_tx_data) tx_ops ->
+              let report = Datascript.with_tx ~tx_meta db tx_ops in
+              ( report.db_after
+              , (if report.tx_data = [] then tail else tail @ [ report.tx_data ])
+              , all_tx_data @ report.tx_data ))
+           (t.db, [], [])
+           transaction_batches
        in
+       let tail_after = t.tail @ added_tail in
        let compact =
          Datascript.Storage.tail_datom_count tail_after
          > Datascript.Storage.tail_compaction_threshold
@@ -349,7 +356,7 @@ let stage_transact ?tx_meta t tx_ops =
            if compact
            then (
              let physical, entries =
-               compact_physical t.callbacks t.physical report.db_after tail_after
+               compact_physical t.callbacks t.physical db_after tail_after
              in
              Some physical, entries)
            else
@@ -362,8 +369,8 @@ let stage_transact ?tx_meta t tx_ops =
             Error (Stage_failed message)
           | Ok batch ->
             Ok
-              { db_after = report.db_after
-              ; tx_data = report.tx_data
+              { db_after
+              ; tx_data
               ; batch
               ; tail_after = (if compact then [] else tail_after)
               ; physical_after
@@ -373,6 +380,10 @@ let stage_transact ?tx_meta t tx_ops =
      | exn ->
        t.callbacks.abort_staging ();
        Error (Stage_failed (Printexc.to_string exn)))
+;;
+
+let stage_transact ?tx_meta t tx_ops =
+  stage_transact_batch ?tx_meta t [ tx_ops ]
 ;;
 
 let storage_error_message = function
@@ -390,7 +401,7 @@ let terminalize t message =
   Error (Persistence_failed message)
 ;;
 
-let commit_staged t staged =
+let commit_staged_internal t staged sync_metadata =
   match t.lifecycle with
   | Closed_state -> Error Closed
   | Fatal_state message -> Error (Fatal message)
@@ -399,7 +410,8 @@ let commit_staged t staged =
     then Error Already_consumed
     else (
       staged.consumed <- true;
-      match Logseq_sqlite_storage.commit_batch t.callbacks staged.batch with
+      let batch = { staged.batch with Logseq_sqlite_storage.sync_metadata } in
+      match Logseq_sqlite_storage.commit_batch t.callbacks batch with
       | Error error -> terminalize t (storage_error_message error)
       | Ok () ->
         t.db <- staged.db_after;
@@ -424,6 +436,22 @@ let commit_staged t staged =
                 (fun count -> count + new_index_nodes)
                 t.unreachable_address_count;
            Ok ()))
+;;
+
+let commit_staged t staged = commit_staged_internal t staged None
+
+let commit_staged_with_sync_metadata t staged metadata =
+  commit_staged_internal t staged (Some metadata)
+;;
+
+let persist_sync_metadata t metadata =
+  match t.lifecycle with
+  | Closed_state -> Error Closed
+  | Fatal_state message -> Error (Fatal message)
+  | Open ->
+    (match Logseq_sqlite_storage.commit_sync_metadata t.callbacks metadata with
+     | Ok () -> Ok ()
+     | Error error -> terminalize t (storage_error_message error))
 ;;
 
 let garbage_collection_needed t =

@@ -28,6 +28,80 @@ class RunnerTests: XCTestCase {
     )
   }
 
+  func testE2EEPrivateKeyUsesTheAvailableMacOSKeychain() {
+    let query = JournalE2EECrypto.keychainQuery(userID: "test-user")
+
+    XCTAssertNil(query[kSecUseDataProtectionKeychain])
+    XCTAssertEqual(query[kSecAttrService] as? String, "com.logseq.journal.e2ee.private-key")
+    XCTAssertEqual(query[kSecAttrAccount] as? String, "test-user")
+  }
+
+  func testE2EETestMemoryPrivateKeyStorageIsUserScopedAndAvoidsKeychain() throws {
+    let environment = [
+      "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE": "memory"
+    ]
+    let userID = "test-memory-\(UUID().uuidString)"
+    let privateKey = Data([0x01, 0x02, 0x03])
+    JournalE2EECrypto.resetTestMemoryPrivateKeys()
+    defer { JournalE2EECrypto.resetTestMemoryPrivateKeys() }
+
+    try JournalE2EECrypto.savePrivateKey(
+      userID: userID,
+      key: privateKey,
+      environment: environment
+    )
+
+    XCTAssertEqual(
+      try JournalE2EECrypto.loadPrivateKey(
+        userID: userID,
+        environment: environment
+      ),
+      privateKey
+    )
+    XCTAssertNil(
+      try JournalE2EECrypto.loadPrivateKey(
+        userID: "different-\(userID)",
+        environment: environment
+      )
+    )
+    var keychainResult: CFTypeRef?
+    XCTAssertEqual(
+      SecItemCopyMatching(
+        JournalE2EECrypto.keychainQuery(userID: userID) as CFDictionary,
+        &keychainResult
+      ),
+      errSecItemNotFound
+    )
+  }
+
+  func testE2EETestMemoryPrivateKeyStorageReplacesTheSameUsersKey() throws {
+    let environment = [
+      "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE": "memory"
+    ]
+    let userID = "test-memory-\(UUID().uuidString)"
+    JournalE2EECrypto.resetTestMemoryPrivateKeys()
+    defer { JournalE2EECrypto.resetTestMemoryPrivateKeys() }
+
+    try JournalE2EECrypto.savePrivateKey(
+      userID: userID,
+      key: Data([0x01]),
+      environment: environment
+    )
+    try JournalE2EECrypto.savePrivateKey(
+      userID: userID,
+      key: Data([0x02]),
+      environment: environment
+    )
+
+    XCTAssertEqual(
+      try JournalE2EECrypto.loadPrivateKey(
+        userID: userID,
+        environment: environment
+      ),
+      Data([0x02])
+    )
+  }
+
   func testStartupEnvironmentSnapshotIsTypedAndContentFree() throws {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))

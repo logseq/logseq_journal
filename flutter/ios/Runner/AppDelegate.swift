@@ -131,6 +131,11 @@ enum JournalPlatformEnvironment {
           result(try JournalPlatformEnvironment.current())
         case "formatJournalDays":
           result(try JournalPlatformEnvironment.formatJournalDays(arguments: call.arguments))
+        case "e2eeCrypto":
+          guard let request = call.arguments as? [String: Any] else {
+            throw JournalE2EECryptoError.invalidRequest
+          }
+          result(try JournalE2EECrypto.handle(request))
         default:
           result(FlutterMethodNotImplemented)
         }

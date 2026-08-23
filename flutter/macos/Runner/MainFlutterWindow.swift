@@ -123,6 +123,16 @@ class MainFlutterWindow: NSWindow {
   private var journalPlatformChannel: FlutterMethodChannel?
   private var calendarObservers: [NSObjectProtocol] = []
 
+  func prepareToTerminate(completion: @escaping () -> Void) {
+    guard let channel = journalPlatformChannel else {
+      completion()
+      return
+    }
+    channel.invokeMethod("prepareToTerminate", arguments: nil) { _ in
+      completion()
+    }
+  }
+
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
@@ -142,6 +152,11 @@ class MainFlutterWindow: NSWindow {
           result(try JournalPlatformEnvironment.current())
         case "formatJournalDays":
           result(try JournalPlatformEnvironment.formatJournalDays(arguments: call.arguments))
+        case "e2eeCrypto":
+          guard let request = call.arguments as? [String: Any] else {
+            throw JournalE2EECryptoError.invalidRequest
+          }
+          result(try JournalE2EECrypto.handle(request))
         default:
           result(FlutterMethodNotImplemented)
         }

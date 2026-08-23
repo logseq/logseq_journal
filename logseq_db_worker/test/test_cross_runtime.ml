@@ -324,6 +324,9 @@ let dependencies =
         ; monotonic_ns = (fun () -> 1_000_000L)
         }
     ; cursor_authentication_key = Bytes.make 32 'x'
+    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
+    ; unlock_graph_key =
+        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
     }
 ;;
 
@@ -630,9 +633,7 @@ let page_mutation case context =
     Permanently_delete_recycled_page { page = uuid page_uuid; context }
 ;;
 
-let property_selector ident =
-  Logseq_db_worker.Graph_types.Property_by_ident ident
-;;
+let property_selector ident = Logseq_db_worker.Graph_types.Property_by_ident ident
 
 let property_mutation case context =
   let open Logseq_db_worker.Protocol in
@@ -640,14 +641,9 @@ let property_mutation case context =
   match case with
   | Property_upsert ->
     Upsert_property
-      { property =
-          New_property { ident = created_property; title = "Parity Created" }
+      { property = New_property { ident = created_property; title = "Parity Created" }
       ; schema =
-          { property_type = Number
-          ; cardinality = One
-          ; hidden = false
-          ; public = true
-          }
+          { property_type = Number; cardinality = One; hidden = false; public = true }
       ; context
       }
   | Property_set ->
@@ -1217,8 +1213,7 @@ let property_worker_restrictions options =
         (fun context ->
            Upsert_property
              { property =
-                 New_property
-                   { ident = "user.property/internal"; title = "Internal" }
+                 New_property { ident = "user.property/internal"; title = "Internal" }
              ; schema =
                  { property_type = Keyword
                  ; cardinality = One
@@ -1233,10 +1228,7 @@ let property_worker_restrictions options =
         ~mutation_id:(uuid "92000000-0000-4000-8000-000000000002")
         (fun context ->
            Batch_set_property
-             { blocks =
-                 [ uuid parent_uuid
-                 ; uuid "92999999-0000-4000-8000-000000000099"
-                 ]
+             { blocks = [ uuid parent_uuid; uuid "92999999-0000-4000-8000-000000000099" ]
              ; property = property_selector many_property
              ; mode = Append (String_value "missing")
              ; context

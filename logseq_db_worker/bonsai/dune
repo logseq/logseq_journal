@@ -1,4 +1,12 @@
 (library
  (name logseq_db_worker_bonsai)
  (public_name logseq_db_worker.bonsai)
- (libraries bonsai_flutter.driver eio logseq_db_worker mtime.clock.os unix yojson))
+ (libraries
+  bonsai_flutter.driver
+  eio
+  logseq_db_worker
+  melange-transit-native
+  mtime.clock.os
+  unix
+  uri
+  yojson))

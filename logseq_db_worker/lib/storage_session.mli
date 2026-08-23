@@ -26,9 +26,22 @@ val stage_transact
   -> Datascript.tx_op list
   -> (staged, error) result
 
+val stage_transact_batch
+  :  ?tx_meta:Datascript.tx_meta
+  -> t
+  -> Datascript.tx_op list list
+  -> (staged, error) result
+
 val staged_db_after : staged -> Datascript.db
 val staged_tx_data : staged -> Datascript.datom list
 val commit_staged : t -> staged -> (unit, error) result
+val commit_staged_with_sync_metadata
+  :  t
+  -> staged
+  -> Sync_meta.t
+  -> (unit, error) result
+
+val persist_sync_metadata : t -> Sync_meta.t -> (unit, error) result
 val garbage_collection_needed : t -> (bool, error) result
 val collect_garbage : t -> (unit, error) result
 val close : t -> (unit, error) result

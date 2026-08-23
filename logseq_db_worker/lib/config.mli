@@ -1,9 +1,28 @@
 (** Accepts Logseq graph schemas at version 65.33 or newer. *)
 type compatibility_profile = Logseq_65_33_or_newer
 
+type synced_bootstrap =
+  { snapshot_path : string
+  ; applied_server_t : int
+  ; checksum : string option
+  ; expected_rows : int
+  }
+
+type synced_e2ee =
+  { user_id : string
+  ; encrypted_graph_key : string
+  }
+
 type target =
+  | Managed_sync of { base_url : string }
   | Snapshot of { token : Graph_types.Uuid.t }
   | Import_snapshot of { inbox_entry : string }
+  | Synced_graph of
+      { graph_id : Graph_types.Uuid.t
+      ; graph_name : string
+      ; e2ee : synced_e2ee option
+      ; bootstrap : synced_bootstrap option
+      }
   | Native_local_graph of
       { graph_name : string
       ; graph_dir : string

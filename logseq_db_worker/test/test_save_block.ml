@@ -122,34 +122,16 @@ let fixture () =
             page_id
             "a0"
         @ block target_id target_uuid_text "Target" page_id page_id "a1"
-        @ page
-            reference_id
-            reference_uuid_text
-            "Reference Page"
-            "reference page"
+        @ page reference_id reference_uuid_text "Reference Page" "reference page"
         @ page tag_id tag_uuid_text "Tag" "tag"
         @ page journal_id journal_uuid_text "Jan 2nd, 2024" "jan 2nd, 2024"
         @ page old_stub_id old_stub_uuid_text "Old Stub" "old stub"
         @ block built_in_id built_in_uuid_text "Built in" page_id page_id "a2"
-        @ page
-            scheduled_property_id
-            scheduled_property_uuid_text
-            "Scheduled"
-            "scheduled"
-        @ page
-            deadline_property_id
-            deadline_property_uuid_text
-            "Deadline"
-            "deadline"
+        @ page scheduled_property_id scheduled_property_uuid_text "Scheduled" "scheduled"
+        @ page deadline_property_id deadline_property_uuid_text "Deadline" "deadline"
         @ [ Datascript.Add (tag_id, "db/ident", Keyword "user.class/tag")
-          ; Add
-              ( scheduled_property_id
-              , "db/ident"
-              , Keyword "logseq.property/scheduled" )
-          ; Add
-              ( deadline_property_id
-              , "db/ident"
-              , Keyword "logseq.property/deadline" )
+          ; Add (scheduled_property_id, "db/ident", Keyword "logseq.property/scheduled")
+          ; Add (deadline_property_id, "db/ident", Keyword "logseq.property/deadline")
           ; Add (scheduled_property_id, "logseq.property/type", Keyword "datetime")
           ; Add (deadline_property_id, "logseq.property/type", Keyword "datetime")
           ; Add (journal_id, "block/journal-day", Int 20240102)
@@ -198,17 +180,16 @@ let ref_entities db entity attr =
 let context db mutation_id =
   Protocol.
     { mutation_id
-    ; expected_basis =
-        Int64.of_int (Datascript.serializable db).serializable_max_tx
+    ; expected_basis = Int64.of_int (Datascript.serializable db).serializable_max_tx
     }
 ;;
 
-let save ?(block = uuid block_uuid_text) ?(mutation_id = uuid mutation_uuid_text) db title =
+let save ?(block = uuid block_uuid_text) ?(mutation_id = uuid mutation_uuid_text) db title
+  =
   Plan.plan
     ~now_ms
     db
-    (Protocol.Structural
-       (Save_block { block; title; context = context db mutation_id }))
+    (Protocol.Structural (Save_block { block; title; context = context db mutation_id }))
 ;;
 
 let require_plan = function
@@ -219,17 +200,18 @@ let require_plan = function
 let apply db plan = Datascript.with_tx ~tx_meta:plan.Plan.tx_meta db plan.tx_ops
 
 let require_string expected = function
-  | Datascript.String actual -> T.require (String.equal actual expected) "expected %S, got %S" expected actual
+  | Datascript.String actual ->
+    T.require (String.equal actual expected) "expected %S, got %S" expected actual
   | _ -> T.fail "expected string value"
 ;;
 
 let require_int expected = function
-  | Datascript.Int actual -> T.require (actual = expected) "expected %d, got %d" expected actual
+  | Datascript.Int actual ->
+    T.require (actual = expected) "expected %d, got %d" expected actual
   | _ -> T.fail "expected integer value"
 ;;
 
 let contains_uuid values expected = List.exists (Uuid.equal expected) values
-
 let changed_uuids plan = plan.Plan.changed_uuids
 
 let () =
@@ -256,7 +238,10 @@ let () =
         let report = apply db (require_plan (save db "Changed title")) in
         require_string
           "Changed title"
-          (one report.db_after (entity report.db_after (uuid block_uuid_text)) "block/title"))
+          (one
+             report.db_after
+             (entity report.db_after (uuid block_uuid_text))
+             "block/title"))
     ; T.case "unchanged save returns No_change" (fun () ->
         let db = fixture () in
         let title = "Old [[" ^ old_stub_uuid_text ^ "]] title" in
@@ -293,9 +278,7 @@ let () =
              "block/name"))
     ; T.case "block and page references are derived" (fun () ->
         let db = fixture () in
-        let title =
-          "See [[Reference Page]] and ((" ^ target_uuid_text ^ "))"
-        in
+        let title = "See [[Reference Page]] and ((" ^ target_uuid_text ^ "))" in
         let report = apply db (require_plan (save db title)) in
         let block = entity report.db_after (uuid block_uuid_text) in
         let refs = ref_entities report.db_after block "block/refs" in
@@ -354,7 +337,18 @@ let () =
         let report = apply db (require_plan (save db title)) in
         require_string
           title
-          (one report.db_after (entity report.db_after (uuid block_uuid_text)) "block/title"))
+          (one
+             report.db_after
+             (entity report.db_after (uuid block_uuid_text))
+             "block/title"))
+    ; T.case "missing literal Unicode tag is rejected" (fun () ->
+        let db = fixture () in
+        let title = "中文 👩🏽‍💻 e\204\129 #literal @mention" in
+        match save db title with
+        | Error
+            (Plan.Unsupported_semantics "The title references a missing entity: literal")
+          -> ()
+        | _ -> T.fail "missing inline tag was not rejected explicitly")
     ; T.case "title size limit is enforced" (fun () ->
         let title = String.make (Protocol.maximum_title_bytes + 1) 'x' in
         match save (fixture ()) title with
@@ -394,10 +388,7 @@ let () =
           (fun expected_uuid ->
              require_int
                current_tx
-               (one
-                  report.db_after
-                  (entity report.db_after expected_uuid)
-                  "block/tx-id"))
+               (one report.db_after (entity report.db_after expected_uuid) "block/tx-id"))
           [ uuid block_uuid_text; uuid page_uuid_text ];
         T.require
           (contains_uuid (changed_uuids plan) (uuid block_uuid_text))
@@ -406,3 +397,4 @@ let () =
           (contains_uuid (changed_uuids plan) (uuid page_uuid_text))
           "changed UUIDs omit page")
     ]
+;;

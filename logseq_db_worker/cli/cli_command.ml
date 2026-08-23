@@ -83,16 +83,15 @@ let execute_once ~dependencies config request =
 let decode_request_line line =
   if String.length line > Protocol.maximum_request_bytes
   then Error (Local_decode_error "request exceeds the protocol byte budget")
-  else
+  else (
     try
       match Protocol.request_of_yojson (Yojson.Safe.from_string line) with
       | Ok request -> Ok request
       | Error error ->
         Error
-          (Local_decode_error
-             (Logseq_db_worker.Error.message error |> bounded_message))
+          (Local_decode_error (Logseq_db_worker.Error.message error |> bounded_message))
     with
-    | Yojson.Json_error message -> Error (Local_decode_error (bounded_message message))
+    | Yojson.Json_error message -> Error (Local_decode_error (bounded_message message)))
 ;;
 
 let run_ndjson_lines ~dependencies config lines =
@@ -113,7 +112,8 @@ let run_ndjson_lines ~dependencies config lines =
 let create_snapshot ~application_support_directory ~source_graph_dir =
   match Snapshot.create_catalog ~application_support_directory with
   | Error error -> Error (snapshot_error error)
-  | Ok catalog -> Result.map_error snapshot_error (Snapshot.create catalog ~source_graph_dir)
+  | Ok catalog ->
+    Result.map_error snapshot_error (Snapshot.create catalog ~source_graph_dir)
 ;;
 
 let import_snapshot ~application_support_directory ~inbox_entry =
@@ -140,8 +140,8 @@ let random_bytes length =
 
 let random_uuid () =
   let bytes = random_bytes 16 in
-  Bytes.set bytes 6 (Char.chr ((Char.code (Bytes.get bytes 6) land 0x0f) lor 0x40));
-  Bytes.set bytes 8 (Char.chr ((Char.code (Bytes.get bytes 8) land 0x3f) lor 0x80));
+  Bytes.set bytes 6 (Char.chr (Char.code (Bytes.get bytes 6) land 0x0f lor 0x40));
+  Bytes.set bytes 8 (Char.chr (Char.code (Bytes.get bytes 8) land 0x3f lor 0x80));
   let buffer = Buffer.create 36 in
   Bytes.iteri
     (fun index byte ->
@@ -160,6 +160,9 @@ let production_dependencies () =
         ; monotonic_ns = Mtime_clock.elapsed_ns
         }
     ; cursor_authentication_key = random_bytes 32
+    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
+    ; unlock_graph_key =
+        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
     }
 ;;
 
@@ -169,11 +172,11 @@ let rec ensure_directory path =
     if (Unix.stat path).Unix.st_kind = Unix.S_DIR
     then Ok (Unix.realpath path)
     else Error "application-support path is not a directory"
-  else
+  else (
     let parent = Filename.dirname path in
     if String.equal parent path
     then Error "application-support directory has no existing root"
-    else
+    else (
       match ensure_directory parent with
       | Error _ as error -> error
       | Ok _ ->
@@ -181,7 +184,7 @@ let rec ensure_directory path =
            Unix.mkdir path 0o700;
            Ok (Unix.realpath path)
          with
-         | Unix.Unix_error _ -> Error "unable to create application-support directory")
+         | Unix.Unix_error _ -> Error "unable to create application-support directory")))
 ;;
 
 let default_application_support () =
@@ -222,17 +225,14 @@ let target_of_options snapshot_token graph_name inbox_entry =
                (Config.Native_local_graph
                   { graph_name
                   ; graph_dir =
-                      Filename.concat
-                        (Filename.concat canonical_home "logseq")
-                        graph_name
+                      Filename.concat (Filename.concat canonical_home "logseq") graph_name
                   })
            with
            | Unix.Unix_error _ -> Error "HOME cannot be resolved")
         | Error error -> Error (graph_locator_error error)))
   | None, None, Some inbox_entry -> Ok (Config.Import_snapshot { inbox_entry })
   | _ ->
-    Error
-      "select exactly one of --snapshot-token, --graph-name, or --import-inbox-entry"
+    Error "select exactly one of --snapshot-token, --graph-name, or --import-inbox-entry"
 ;;
 
 let build_config application_support_directory snapshot_token graph_name inbox_entry =
@@ -323,7 +323,8 @@ let run_ndjson_channels config =
       let rec loop () =
         match read_bounded_line stdin with
         | End_of_input -> Ok ()
-        | Line_too_long -> Error (Local_decode_error "request exceeds the protocol byte budget")
+        | Line_too_long ->
+          Error (Local_decode_error "request exceeds the protocol byte budget")
         | Line line ->
           (match decode_request_line line with
            | Error _ as error -> error
@@ -344,7 +345,10 @@ open Cmdliner
 
 let support_term =
   let doc = "Application-support directory used for the snapshot catalog." in
-  Arg.(value & opt string (default_application_support ()) & info [ "application-support-directory" ] ~docv:"DIR" ~doc)
+  Arg.(
+    value
+    & opt string (default_application_support ())
+    & info [ "application-support-directory" ] ~docv:"DIR" ~doc)
 ;;
 
 let snapshot_token_term =
@@ -370,9 +374,7 @@ let save_block_request request =
   | _ -> Error "block save requires a structural saveBlock protocol request"
 ;;
 
-let command_path_term =
-  Arg.(value & pos_all string [] & info [] ~docv:"COMMAND")
-;;
+let command_path_term = Arg.(value & pos_all string [] & info [] ~docv:"COMMAND")
 
 let optional_uuid_term =
   Arg.(value & opt (some string) None & info [ "uuid" ] ~docv:"UUID")
@@ -442,7 +444,10 @@ let dispatch
            run_request
              config
              Protocol.
-               { api_version; request_id = random_uuid (); command = Read (Get_block { block }) }))
+               { api_version
+               ; request_id = random_uuid ()
+               ; command = Read (Get_block { block })
+               }))
   | [ "block"; "children" ] ->
     (match require_option "--uuid" uuid with
      | Error message -> report_error Local_error message
@@ -458,7 +463,7 @@ let dispatch
                ; request_id = random_uuid ()
                ; command = Read (Get_children { parent; limit; cursor = None })
                }))
-  | [ "block"; "save" ] | [ "request" ] as command_path ->
+  | ([ "block"; "save" ] | [ "request" ]) as command_path ->
     (match require_option "--request" request_path with
      | Error message -> report_error Local_error message
      | Ok path ->
@@ -475,16 +480,23 @@ let dispatch
             | Error message -> report_error Local_error message
             | Ok () -> run_request config request)))
   | [ "session" ] ->
-    with_target (fun config -> match input with `Ndjson -> run_ndjson_channels config)
+    with_target (fun config ->
+      match input with
+      | `Ndjson -> run_ndjson_channels config)
   | [ "snapshot"; "create" ] ->
     (match require_option "--source-graph-name" source_graph_name with
      | Error message -> report_error Local_error message
      | Ok source_graph_name ->
        (match ensure_directory support, Sys.getenv_opt "HOME" with
         | Error message, _ -> report_error Local_error message
-        | _, None -> report_error Local_error "HOME is required to resolve the source graph"
+        | _, None ->
+          report_error Local_error "HOME is required to resolve the source graph"
         | Ok support, Some home_directory ->
-          (match Graph_locator.resolve (Desktop { home_directory }) ~graph_name:source_graph_name with
+          (match
+             Graph_locator.resolve
+               (Desktop { home_directory })
+               ~graph_name:source_graph_name
+           with
            | Error error -> report_error Execute_error (graph_locator_error error)
            | Ok source ->
              (match
@@ -497,10 +509,10 @@ let dispatch
                 print_endline
                   (Yojson.Safe.to_string
                      (`Assoc
-                        [ "apiVersion", `Int Protocol.api_version
-                        ; ( "snapshotToken"
-                          , `String (Logseq_db_worker.Graph_types.Uuid.to_string token) )
-                        ]));
+                         [ "apiVersion", `Int Protocol.api_version
+                         ; ( "snapshotToken"
+                           , `String (Logseq_db_worker.Graph_types.Uuid.to_string token) )
+                         ]));
                 Cli_output.exit_code Success))))
   | [ "snapshot"; "import" ] ->
     (match require_option "--inbox-entry" inbox_entry with
@@ -515,10 +527,10 @@ let dispatch
              print_endline
                (Yojson.Safe.to_string
                   (`Assoc
-                     [ "apiVersion", `Int Protocol.api_version
-                     ; ( "snapshotToken"
-                       , `String (Logseq_db_worker.Graph_types.Uuid.to_string token) )
-                     ]));
+                      [ "apiVersion", `Int Protocol.api_version
+                      ; ( "snapshotToken"
+                        , `String (Logseq_db_worker.Graph_types.Uuid.to_string token) )
+                      ]));
              Cli_output.exit_code Success)))
   | [] -> report_error Local_error "a command is required"
   | _ -> report_error Local_error "unknown command"
@@ -539,20 +551,21 @@ let command =
        ~version:"0.1.0"
        ~exits
        ~doc:"Read and mutate a local Logseq DB graph through one shared Engine.")
-    Term.
-      (const dispatch
-       $ command_path_term
-       $ support_term
-       $ snapshot_token_term
-       $ graph_name_term
-       $ inbox_target_term
-       $ optional_uuid_term
-       $ optional_request_path_term
-       $ limit_term
-       $ format_term
-       $ input_term
-       $ source_graph_name_term
-       $ inbox_entry_term)
+    Term.(
+      const dispatch
+      $ command_path_term
+      $ support_term
+      $ snapshot_token_term
+      $ graph_name_term
+      $ inbox_target_term
+      $ optional_uuid_term
+      $ optional_request_path_term
+      $ limit_term
+      $ format_term
+      $ input_term
+      $ source_graph_name_term
+      $ inbox_entry_term)
+;;
 
 module For_testing = struct
   let execute_once = execute_once_with

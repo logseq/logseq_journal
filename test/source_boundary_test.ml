@@ -204,6 +204,20 @@ let () =
     ; "app/journal_time.mli"
     ; "app/journal_timeline_state.ml"
     ; "app/journal_timeline_state.mli"
+    ; "logseq_db_worker/lib/sync_auth.ml"
+    ; "logseq_db_worker/lib/sync_auth.mli"
+    ; "logseq_db_worker/lib/sync_bootstrap.ml"
+    ; "logseq_db_worker/lib/sync_bootstrap.mli"
+    ; "logseq_db_worker/lib/sync_catalog.ml"
+    ; "logseq_db_worker/lib/sync_catalog.mli"
+    ; "logseq_db_worker/lib/sync_http.ml"
+    ; "logseq_db_worker/lib/sync_http.mli"
+    ; "logseq_db_worker/lib/sync_e2ee_session.ml"
+    ; "logseq_db_worker/lib/sync_e2ee_session.mli"
+    ; "logseq_db_worker/lib/sync_manager.ml"
+    ; "logseq_db_worker/lib/sync_manager.mli"
+    ; "logseq_db_worker/lib/sync_websocket.ml"
+    ; "logseq_db_worker/lib/sync_websocket.mli"
     ; "flutter/lib/application_host_adapter.dart"
     ; "flutter/lib/main.dart"
     ; "flutter/test/application_host_adapter_test.dart"
@@ -237,11 +251,18 @@ let () =
     ; "app/journal_worker.mli"
     ; "app/journal_process_recovery.ml"
     ; "app/journal_process_recovery.mli"
+    ; "flutter/lib/journal_account_shell.dart"
+    ; "flutter/lib/journal_e2ee.dart"
+    ; "flutter/lib/journal_snapshot_progress.dart"
+    ; "flutter/lib/journal_sync_transport.dart"
     ];
   require_allowed_dart_files
     root
     "flutter/lib"
-    [ "flutter/lib/application_host_adapter.dart"; "flutter/lib/main.dart" ];
+    [ "flutter/lib/application.dart"
+    ; "flutter/lib/application_host_adapter.dart"
+    ; "flutter/lib/main.dart"
+    ];
   require_allowed_dart_files
     root
     "flutter/test"
@@ -373,6 +394,22 @@ let () =
     forbid_text root relative obsolete_product_symbols;
     forbid_text root relative deferred_capability_symbols);
   forbid_text root "app/application.ml" [ "timeline-open:"; "timeline-disclosure:" ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "Sync_receive"
+         ; "websocket_open_request"
+         ; "websocket_send_request"
+         ; "decode_sync_event"
+         ])
+    [ "app/application.ml"
+    ; "app/journal_graph_request.ml"
+    ; "app/journal_graph_request.mli"
+    ; "app/journal_platform.ml"
+    ; "app/journal_platform.mli"
+    ];
   forbid_text root "app/journal_row.ml" [ "Tokens.row_geometry.corner_radius" ];
   forbid_text
     root
@@ -415,7 +452,78 @@ let () =
     ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Scroll_controlled"
     ; "journal-capture-sheet"
     ; "Journal_capture.can_pop"
+    ; "~obscure_text:true"
+    ; "Sync_manager.Submit_e2ee_password"
+    ; "request-local-cache-reset"
+    ; "cancel-local-cache-reset"
+    ; "confirm-local-cache-reset"
+    ; "Sync_manager.Delete_local_cache"
+    ; "Sync_manager.Return_to_graph_picker"
+    ; "journal-account-menu"
+    ; "journal-account-switch-graph"
+    ; "journal-account-sign-out"
+    ; "Ui.Widget.Scroll_view.vertical"
+    ; "graph-picker-scroll"
+    ; "graph-picker-toolbar"
+    ; "graph-picker-refresh-icon"
+    ; "Refresh the authorized graph catalog"
+    ; "pending local changes"
+    ; "download a fresh snapshot"
     ];
+  require_text
+    root
+    "app/journal_platform.ml"
+    [ "sign_out_request"
+    ; "is_prepare_to_terminate_event"
+    ; "termination_ready_request"
+    ];
+  require_text
+    root
+    "flutter/lib/application_host_adapter.dart"
+    [ "Amplify.Auth.signOut()"
+    ; "https://api.logseq.io"
+    ; "prepareToTerminate"
+    ; "prepareToTerminateEvent"
+    ; "terminationReadyRequest"
+    ];
+  forbid_text
+    root
+    "flutter/lib/application_host_adapter.dart"
+    [ "String.fromEnvironment('LOGSEQ_SYNC_BASE_URL')" ];
+  require_file root "flutter/lib/application.dart";
+  require_text
+    root
+    "flutter/lib/application.dart"
+    [ "await JournalAmplify.configure()"
+    ; "runApp"
+    ; "Unable to configure authentication"
+    ; "Retry"
+    ];
+  require_text
+    root
+    "flutter/macos/Runner/AppDelegate.swift"
+    [ "applicationShouldTerminate"
+    ; ".terminateLater"
+    ; "reply(toApplicationShouldTerminate:"
+    ; "Darwin.exit(EXIT_SUCCESS)"
+    ];
+  require_text
+    root
+    "logseq_db_worker/lib/sync_http_eio.ml"
+    [ "Httpun_eio.Client.create_connection"; "Httpun_eio.Client.request" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/sync_http_eio.ml"
+    [ "let start_connection"; "HTTP parser did not consume network input" ];
+  require_text root "logseq_db_worker/lib/dune" [ "httpun-eio" ];
+  require_text
+    root
+    "logseq_db_worker/lib/error.ml"
+    [ "Ownership_recovery"; "ownershipRecovery" ];
+  require_text
+    root
+    "logseq_db_worker/lib/engine.ml"
+    [ "Ownership recovery could not be verified" ];
   forbid_text root "app/application.ml" [ "timeline-task:" ];
   require_text
     root

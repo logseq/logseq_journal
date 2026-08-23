@@ -4,25 +4,25 @@ module Uuid = struct
   let is_hex = function
     | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
     | _ -> false
+  ;;
 
   let of_string value =
     let rec valid_characters index =
       if index = String.length value
       then true
-      else
+      else (
         let valid =
           if List.mem index [ 8; 13; 18; 23 ] then true else is_hex value.[index]
         in
-        valid && valid_characters (index + 1)
+        valid && valid_characters (index + 1))
     in
     let valid =
       String.length value = 36
-      && List.for_all
-           (fun index -> Char.equal value.[index] '-')
-           [ 8; 13; 18; 23 ]
+      && List.for_all (fun index -> Char.equal value.[index] '-') [ 8; 13; 18; 23 ]
       && valid_characters 0
     in
     if valid then Ok (String.lowercase_ascii value) else Error "invalid UUID"
+  ;;
 
   let to_string value = value
   let equal = String.equal
@@ -36,6 +36,8 @@ module Cursor = struct
     if String.length value = 0 || String.length value > 16_384
     then Error "invalid cursor"
     else Ok value
+  ;;
+
   let to_string value = value
 end
 
@@ -53,6 +55,7 @@ type schema_version =
 type graph_mode =
   | Snapshot
   | Native_read_write
+  | Synced_local_first
 
 type admission_fact =
   | Compatible_schema of
@@ -62,7 +65,9 @@ type admission_fact =
   | Local_graph of Uuid.t
   | Remote_flag_absent
   | Remote_flag_false
+  | Remote_flag_true
   | No_rtc_identity
+  | Synced_graph_identity of Uuid.t
   | Lossless_codec
   | Ownership_verified
   | Backup_verified

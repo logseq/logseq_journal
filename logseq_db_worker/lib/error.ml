@@ -3,6 +3,7 @@ type code =
   | Unsupported_api_version
   | Graph_not_found
   | Graph_locked
+  | Ownership_recovery
   | Unsupported_schema
   | Remote_graph
   | Ambiguous_sync_state
@@ -64,6 +65,7 @@ let code_string = function
   | Unsupported_api_version -> "unsupportedApiVersion"
   | Graph_not_found -> "graphNotFound"
   | Graph_locked -> "graphLocked"
+  | Ownership_recovery -> "ownershipRecovery"
   | Unsupported_schema -> "unsupportedSchema"
   | Remote_graph -> "remoteGraph"
   | Ambiguous_sync_state -> "ambiguousSyncState"
@@ -88,6 +90,7 @@ let code_of_string = function
   | "unsupportedApiVersion" -> Some Unsupported_api_version
   | "graphNotFound" -> Some Graph_not_found
   | "graphLocked" -> Some Graph_locked
+  | "ownershipRecovery" -> Some Ownership_recovery
   | "unsupportedSchema" -> Some Unsupported_schema
   | "remoteGraph" -> Some Remote_graph
   | "ambiguousSyncState" -> Some Ambiguous_sync_state

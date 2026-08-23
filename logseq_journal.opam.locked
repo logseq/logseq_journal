@@ -10,6 +10,7 @@ bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
 depends: [
   "abstract_algebra" {= "v0.17.0"}
   "angstrom" {= "0.16.1"}
+  "asn1-combinators" {= "0.3.2"}
   "astring" {= "0.8.5"}
   "async" {= "v0.17.0"}
   "async_durable" {= "v0.17.0"}
@@ -39,6 +40,8 @@ depends: [
   "bonsai" {= "v0.17.0"}
   "bonsai_flutter" {= "0.1.0~dev"}
   "bonsai_flutter_test" {= "0.1.0~dev" & with-test}
+  "bos" {= "0.3.0"}
+  "ca-certs-nss" {= "3.126"}
   "camlp-streams" {= "5.0.1"}
   "capitalization" {= "v0.17.0"}
   "cmdliner" {= "2.1.1"}
@@ -75,11 +78,13 @@ depends: [
   "dune-build-info" {= "3.23.1"}
   "dune-compiledb" {= "0.6.0"}
   "dune-configurator" {= "3.23.1"}
+  "duration" {= "0.3.1"}
   "eio" {= "1.2"}
   "eio_posix" {= "1.2"}
   "eqaf" {= "0.10"}
   "expect_test_helpers_core" {= "v0.17.0"}
   "ezjsonm" {= "1.3.0"}
+  "faraday" {= "0.8.2"}
   "fieldslib" {= "v0.17.0"}
   "fmt" {= "0.11.0"}
   "fpath" {= "0.7.3"}
@@ -87,8 +92,15 @@ depends: [
   "gel" {= "v0.17.0"}
   "gen" {= "1.1"}
   "gen_js_api" {= "1.1.5"}
+  "gluten" {= "0.5.2"}
+  "gluten-eio" {= "0.5.2"}
+  "gmap" {= "0.3.0"}
   "hex" {= "1.5.0"}
   "hmap" {= "0.8.1"}
+  "httpun" {= "0.2.0"}
+  "httpun-eio" {= "0.2.0"}
+  "httpun-types" {= "0.2.0"}
+  "httpun-ws" {= "0.2.0"}
   "incr_dom" {= "v0.17.0"}
   "incr_map" {= "v0.17.0"}
   "incr_select" {= "v0.17.0"}
@@ -106,6 +118,7 @@ depends: [
   "js_of_ocaml_patches" {= "v0.17.0"}
   "jsonm" {= "1.0.2"}
   "jst-config" {= "v0.17.0"}
+  "kdf" {= "1.1.0"}
   "lambdasoup" {= "1.1.1"}
   "legacy_diffable" {= "v0.17.0"}
   "logs" {= "0.10.0"}
@@ -124,6 +137,11 @@ depends: [
   "menhirGLR" {= "20260209"}
   "menhirLib" {= "20260209"}
   "menhirSdk" {= "20260209"}
+  "mirage-crypto" {= "2.2.0"}
+  "mirage-crypto-ec" {= "2.2.0"}
+  "mirage-crypto-pk" {= "2.2.0"}
+  "mirage-crypto-rng" {= "2.2.0"}
+  "mirage-ptime" {= "5.2.0"}
   "mtime" {= "2.1.0"}
   "num" {= "1.6"}
   "ocaml" {= "5.1.1"}
@@ -137,6 +155,7 @@ depends: [
   "ocaml_intrinsics_kernel" {= "v0.17.2"}
   "ocamlbuild" {= "0.16.1"}
   "ocamlfind" {= "1.9.8"}
+  "ohex" {= "0.2.0"}
   "ojs" {= "1.1.5"}
   "optint" {= "0.3.0"}
   "ordinal_abbreviation" {= "v0.17.0"}
@@ -193,6 +212,7 @@ depends: [
   "ptime" {= "1.2.0"}
   "re" {= "1.14.0"}
   "record_builder" {= "v0.17.0"}
+  "rresult" {= "0.7.0"}
   "sedlex" {= "3.4"}
   "seq" {= "base"}
   "sexp_grammar" {= "v0.17.0"}
@@ -212,6 +232,8 @@ depends: [
   "tilde_f" {= "v0.17.0"}
   "time_now" {= "v0.17.0"}
   "timezone" {= "v0.17.0"}
+  "tls" {= "2.1.2"}
+  "tls-eio" {= "2.1.2"}
   "topkg" {= "1.1.1"}
   "typerep" {= "v0.17.1"}
   "tyxml" {= "4.6.0"}
@@ -225,6 +247,7 @@ depends: [
   "variantslib" {= "v0.17.0"}
   "versioned_polling_state_rpc" {= "v0.17.0"}
   "virtual_dom" {= "v0.17.0"}
+  "x509" {= "1.1.1"}
   "yojson" {= "3.0.0"}
   "zarith" {= "1.14"}
   "zarith_stubs_js" {= "v0.17.0"}

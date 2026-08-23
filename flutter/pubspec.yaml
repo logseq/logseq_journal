@@ -19,6 +19,9 @@ hooks:
       # bonsai-flutter:end native-hook
 
 dependencies:
+  amplify_auth_cognito: 2.15.0
+  amplify_authenticator: 2.7.0
+  amplify_flutter: 2.15.0
   # bonsai-flutter:begin packages
   bonsai_flutter:
     path: ../.bonsai-flutter/flutter-packages/bonsai_flutter

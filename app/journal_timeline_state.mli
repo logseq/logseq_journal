@@ -92,6 +92,7 @@ val retained_slot_count : t -> int
 val first_retained_index : t -> int
 val total_count : t -> int
 val today : t -> int
+val set_today : t -> today:int -> t
 val anchor_decision : t -> anchor_decision
 val focus_restore_block_id : t -> string option
 val is_expanded : t -> block_id:string -> bool

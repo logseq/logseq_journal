@@ -4,7 +4,10 @@ type write =
   ; addresses : string list
   }
 
-type batch = { writes : write list }
+type batch =
+  { writes : write list
+  ; sync_metadata : Sync_meta.t option
+  }
 
 type garbage_stats =
   { total_address_count : int
@@ -36,6 +39,7 @@ type callbacks =
   ; abort_staging : unit -> unit
   ; begin_immediate : unit -> (unit, string) result
   ; upsert : write -> (unit, string) result
+  ; upsert_sync_metadata : Sync_meta.t -> (unit, string) result
   ; commit : unit -> (unit, string) result
   ; rollback : unit -> unit
   ; unreachable_address_count : unit -> int
@@ -115,9 +119,22 @@ let commit_batch callbacks batch =
     (match write_all batch.writes with
      | Error _ as error -> error
      | Ok () ->
-       (match callbacks.commit () with
-        | Ok () -> Ok ()
-        | Error message -> rollback (Commit_failed message)))
+       (match batch.sync_metadata with
+        | Some metadata ->
+          (match callbacks.upsert_sync_metadata metadata with
+           | Error message -> rollback (Commit_failed message)
+           | Ok () ->
+             (match callbacks.commit () with
+              | Ok () -> Ok ()
+              | Error message -> rollback (Commit_failed message)))
+        | None ->
+          (match callbacks.commit () with
+           | Ok () -> Ok ()
+           | Error message -> rollback (Commit_failed message))))
+;;
+
+let commit_sync_metadata callbacks metadata =
+  commit_batch callbacks { writes = []; sync_metadata = Some metadata }
 ;;
 
 let unreachable_addresses (callbacks : callbacks) =
@@ -444,6 +461,7 @@ let open_database path =
                           ; addresses = entry.addresses
                           })
                        encoded
+                 ; sync_metadata = None
                  })
         in
         let initial_root_metadata =
@@ -497,6 +515,7 @@ let open_database path =
           ; abort_staging
           ; begin_immediate = exec "BEGIN IMMEDIATE"
           ; upsert
+          ; upsert_sync_metadata = Sync_meta.update_database sqlite
           ; commit = exec "COMMIT"
           ; rollback = (fun () -> ignore (Sqlite3.exec sqlite "ROLLBACK"))
           ; unreachable_address_count =
@@ -564,6 +583,8 @@ let startup_metadata connection =
   | Some _, _ -> corrupt "storage root address 0 has the wrong payload"
   | None, _ -> corrupt "storage root address 0 is missing"
 ;;
+
+let sync_metadata connection = Sync_meta.read_database connection.sqlite
 
 let validate_storage_header connection =
   let corrupt message = Error (Corrupt_storage message) in

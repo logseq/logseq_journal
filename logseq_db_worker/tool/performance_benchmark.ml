@@ -272,6 +272,9 @@ let dependencies =
             (fun () -> Int64.of_float (monotonic_seconds () *. 1_000_000_000.))
         }
     ; cursor_authentication_key = Bytes.of_string "performance-cursor-key-32-bytes!"
+    ; crypto = Worker.Sync_e2ee.unavailable_crypto
+    ; unlock_graph_key =
+        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
     }
 ;;
 

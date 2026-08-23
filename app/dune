@@ -48,9 +48,21 @@
   bonsai_flutter.driver
   bonsai_flutter.native_backend)
  (link_flags
-  (:standard -cclib -L%{env:BONSAI_FLUTTER_APPLE_SDK_ROOT=}/usr/lib))
+  (:standard
+   -cclib
+   -L%{env:BONSAI_FLUTTER_APPLE_SDK_ROOT=}/usr/lib
+   (:include native_static_link_flags.sexp)))
  (modes
   (native object)))
+
+(rule
+ (targets
+  native_static_link_flags.sexp
+  libgmp.a)
+ (action
+  (with-stdout-to
+   native_static_link_flags.sexp
+   (run ../tool/native_static_link_flags.sh libgmp.a))))
 
 ; BEGIN bonsai-flutter native aliases
 

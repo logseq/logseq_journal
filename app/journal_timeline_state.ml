@@ -150,9 +150,12 @@ let cap_retained (state : t) =
 ;;
 
 let begin_request (state : t) ~generation request =
-  match state.pending with
-  | Some _ -> state
-  | None -> { state with pending = Some (generation, request) }
+  match state.pending, request with
+  | Some (pending_generation, _), Feed { before_day = None }
+    when Int64.compare generation pending_generation > 0 ->
+    { state with pending = Some (generation, request) }
+  | Some _, _ -> state
+  | None, _ -> { state with pending = Some (generation, request) }
 ;;
 
 let day_slots ~today (day : Journal_graph_projection.day_feed) =
@@ -280,7 +283,7 @@ let apply_feed (state : t) ~generation feed =
     when Int64.equal expected_generation generation ->
     let projected = feed_slots ~today:state.today feed in
     (match before_day with
-     | None ->
+     | None when state.slots = [] ->
        let slots =
          match projected with
          | [] -> []
@@ -296,6 +299,86 @@ let apply_feed (state : t) ~generation feed =
        ; pending = None
        ; expanded_ids = []
        ; anchor_decision = Reset_to_top
+       }
+       |> cap_retained
+     | None ->
+       let old_slots = state.slots in
+       let owned_slots parent_id =
+         let rec find = function
+           | [] -> []
+           | Top_level entry :: tail
+             when String.equal (Journal_model.id entry.block) parent_id ->
+             let rec take_owned reversed = function
+               | (Child_preview preview as slot) :: tail
+                 when String.equal preview.parent_id parent_id ->
+                 take_owned (slot :: reversed) tail
+               | (Children_loading loading as slot) :: tail
+                 when String.equal loading.parent_id parent_id ->
+                 take_owned (slot :: reversed) tail
+               | (Children_more more as slot) :: tail
+                 when String.equal more.parent_id parent_id ->
+                 take_owned (slot :: reversed) tail
+               | _ -> List.rev reversed
+             in
+             take_owned [] tail
+           | _ :: tail -> find tail
+         in
+         find old_slots
+       in
+       let expanded_ids =
+         List.filter
+           (fun parent_id ->
+              List.exists
+                (function
+                  | Top_level entry ->
+                    String.equal (Journal_model.id entry.block) parent_id
+                  | Day_heading _
+                  | Child_preview _
+                  | Day_continuation _
+                  | Children_loading _
+                  | Children_more _
+                  | Feed_continuation _
+                  | Bottom_clearance -> false)
+                projected)
+           state.expanded_ids
+       in
+       let slots =
+         List.concat_map
+           (function
+             | Top_level entry as slot
+               when List.exists (String.equal (Journal_model.id entry.block)) expanded_ids
+               -> slot :: owned_slots (Journal_model.id entry.block)
+             | slot -> [ slot ])
+           projected
+       in
+       let slots = if slots = [] then [] else slots @ [ Bottom_clearance ] in
+       let anchor_key =
+         let offset = state.visible_first - state.first_retained_index in
+         List.nth_opt old_slots offset |> Option.map slot_key
+       in
+       let rec find_index index key = function
+         | [] -> None
+         | slot :: _ when String.equal (slot_key slot) key -> Some index
+         | _ :: tail -> find_index (index + 1) key tail
+       in
+       let visible_span = state.visible_last_exclusive - state.visible_first in
+       let visible_first =
+         Option.bind anchor_key (fun key -> find_index 0 key slots)
+         |> Option.value ~default:(min state.visible_first (List.length slots))
+       in
+       let visible_last_exclusive =
+         min (List.length slots) (visible_first + visible_span)
+       in
+       { state with
+         slots
+       ; first_retained_index = 0
+       ; total_count = List.length slots
+       ; visible_first
+       ; visible_last_exclusive
+       ; visible_demand = None
+       ; pending = None
+       ; expanded_ids
+       ; anchor_decision = Preserve_visible_slot
        }
        |> cap_retained
      | Some expected_before_day ->
@@ -688,6 +771,7 @@ let retained_slot_count (state : t) = List.length state.slots
 let first_retained_index (state : t) = state.first_retained_index
 let total_count (state : t) = state.total_count
 let today (state : t) = state.today
+let set_today (state : t) ~today = { state with today }
 let anchor_decision (state : t) = state.anchor_decision
 let focus_restore_block_id (state : t) = state.focus_restore_block_id
 

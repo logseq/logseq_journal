@@ -20,7 +20,6 @@ type block_uuid = Uuid.t
 type page_uuid = Uuid.t
 type class_uuid = Uuid.t
 type property_uuid = Uuid.t
-
 type qualified_ident = string
 
 type schema_version =
@@ -31,6 +30,7 @@ type schema_version =
 type graph_mode =
   | Snapshot
   | Native_read_write
+  | Synced_local_first
 
 type admission_fact =
   | Compatible_schema of
@@ -40,7 +40,9 @@ type admission_fact =
   | Local_graph of Uuid.t
   | Remote_flag_absent
   | Remote_flag_false
+  | Remote_flag_true
   | No_rtc_identity
+  | Synced_graph_identity of Uuid.t
   | Lossless_codec
   | Ownership_verified
   | Backup_verified

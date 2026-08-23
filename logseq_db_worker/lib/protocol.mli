@@ -28,9 +28,19 @@ and mutation_context =
 and command =
   | Read of read_command
   | Mutate of mutation
+  | Sync_receive of
+      { transport : sync_transport
+      ; payload : string
+      }
+
+and sync_transport =
+  | Websocket
+  | Http_pull
 
 and read_command =
   | Graph_info
+  | Sync_status
+  | Sync_pending
   | Get_block of { block : block_uuid }
   | Get_page of { page : page_selector }
   | Get_children of
@@ -253,6 +263,39 @@ type mutation_success =
   ; changed_uuids_truncated : bool
   }
 
+type sync_state =
+  | Sync_active
+  | Sync_paused_state
+
+type sync_activity =
+  | Pull_applied
+  | Pull_duplicate
+  | Pull_required
+  | Sync_paused
+  | Sync_submission_blocked
+
+type sync_status =
+  { state : sync_state
+  ; applied_server_t : int
+  ; checksum : string
+  ; last_error : string option
+  }
+
+type sync_pending =
+  { payload : string option
+  ; count : int
+  ; blocked_error : string option
+  }
+
+type sync_success =
+  { activity : sync_activity
+  ; state : sync_state
+  ; applied_server_t : int
+  ; checksum : string
+  ; last_error : string option
+  ; mutation : mutation_success option
+  }
+
 type success =
   | Graph_info_result of graph_info
   | Block_result of block
@@ -267,6 +310,9 @@ type success =
   | Tasks_result of task page_result
   | References_result of reference page_result
   | Mutation_result of mutation_success
+  | Sync_status_result of sync_status
+  | Sync_pending_result of sync_pending
+  | Sync_result of sync_success
 
 type failure_phase =
   | Open

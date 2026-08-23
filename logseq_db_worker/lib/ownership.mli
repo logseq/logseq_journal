@@ -1,6 +1,7 @@
 type target =
   | Snapshot_target
   | Native_target
+  | Synced_target
 
 type t
 

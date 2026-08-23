@@ -4,6 +4,7 @@ module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 
+let send_graph client request = Worker.send client (Service.Graph_request request)
 let epoch = ref 2_000L
 
 let next_epoch () =
@@ -52,7 +53,11 @@ let rec drain_until_responses client expected events =
 let completed_response events request_id =
   List.find_map
     (function
-      | Worker.Response { request_id = actual; outcome = Completed response; _ }
+      | Worker.Response
+          { request_id = actual
+          ; outcome = Completed (Service.Graph_response response)
+          ; _
+          }
         when ID.Worker.Request_id.equal request_id actual -> Some response
       | Response _ | Push _ | Terminal _ -> None)
     events
@@ -87,7 +92,7 @@ let test_serial_service_executes_engine () =
         if (Worker_runtime.For_testing.diagnostics ()).state = Attached then stop client)
       (fun () ->
          let request = F.graph_info_request () in
-         let request_id = Worker.send client request |> accepted in
+         let request_id = send_graph client request |> accepted in
          let response =
            completed_response (drain_until_responses client 1 []) request_id
          in
@@ -119,8 +124,8 @@ let test_open_failed_is_protocol_state () =
          let second =
            F.graph_info_request ~request_id:"10000000-0000-4000-8000-000000000002" ()
          in
-         let first_id = Worker.send client first |> accepted in
-         let second_id = Worker.send client second |> accepted in
+         let first_id = send_graph client first |> accepted in
+         let second_id = send_graph client second |> accepted in
          let events = drain_until_responses client 2 [] in
          List.iter
            (fun (transport_id, (request : P.request)) ->
@@ -166,7 +171,7 @@ let mutation_response events request_id =
 ;;
 
 let graph_basis client =
-  let request_id = Worker.send client (F.graph_info_request ()) |> accepted in
+  let request_id = send_graph client (F.graph_info_request ()) |> accepted in
   match completed_response (drain_until_responses client 1 []) request_id with
   | P.Succeeded { basis; _ } -> basis
   | _ -> T.fail "graph info did not return a basis"
@@ -227,7 +232,7 @@ let test_mutation_push_is_bounded_and_after_response () =
       ~finally:(fun () ->
         if (Worker_runtime.For_testing.diagnostics ()).state = Attached then stop client)
       (fun () ->
-         let info_id = Worker.send client (F.graph_info_request ()) |> accepted in
+         let info_id = send_graph client (F.graph_info_request ()) |> accepted in
          let info_events = drain_until_responses client 1 [] in
          let basis =
            match completed_response info_events info_id with
@@ -244,7 +249,7 @@ let test_mutation_push_is_bounded_and_after_response () =
                ~page_uuid:(Printf.sprintf "40000000-0000-4000-8000-%012d" index)
                ~title:(Printf.sprintf "Worker page %d" index)
            in
-           let request_id = Worker.send client request |> accepted in
+           let request_id = send_graph client request |> accepted in
            await_first_output client;
            let events = drain_mutation_events client request_id in
            let result = mutation_response events request_id in
@@ -261,7 +266,8 @@ let test_mutation_push_is_bounded_and_after_response () =
            let push_index, push =
              List.find_map
                (function
-                 | event_index, Worker.Push { payload; _ } -> Some (event_index, payload)
+                 | event_index, Worker.Push { payload = Service.Graph_push payload; _ } ->
+                   Some (event_index, payload)
                  | _ -> None)
                indexed
              |> function
@@ -317,8 +323,8 @@ let test_latest_wins_push_collapse () =
              ~page_uuid:"41000000-0000-4000-8000-000000000002"
              ~title:"Second collapsed push"
          in
-         let first_id = Worker.send client first |> accepted in
-         let second_id = Worker.send client second |> accepted in
+         let first_id = send_graph client first |> accepted in
+         let second_id = send_graph client second |> accepted in
          await "both mutation handlers before the foreground pump" (fun () ->
            let diagnostics = Worker_runtime.For_testing.diagnostics () in
            diagnostics.queued_requests = 0
@@ -330,8 +336,8 @@ let test_latest_wins_push_collapse () =
          let pushes =
            List.filter_map
              (function
-               | Worker.Push { payload; _ } -> Some payload
-               | Response _ | Terminal _ -> None)
+               | Worker.Push { payload = Service.Graph_push payload; _ } -> Some payload
+               | Push _ | Response _ | Terminal _ -> None)
              events
          in
          (match pushes with
@@ -341,6 +347,68 @@ let test_latest_wins_push_collapse () =
               "latest-wins queue did not retain the newest push"
           | _ ->
             T.fail "one push topic did not collapse to exactly one latest invalidation");
+         stop client))
+;;
+
+let test_pulled_transaction_emits_invalidation_after_response () =
+  F.with_synced (fun fixture ->
+    let payload = F.sync_pull_wire fixture ~title:"Worker Synced Page" in
+    let client =
+      match start fixture.sync_config with
+      | Ok client -> client
+      | Error error -> T.fail "%s" error
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        if (Worker_runtime.For_testing.diagnostics ()).state = Attached then stop client)
+      (fun () ->
+         let request =
+           F.sync_receive_request
+             ~request_id:"21500000-0000-4000-8000-000000000001"
+             ~transport:P.Websocket
+             ~payload
+         in
+         let request_id = send_graph client request |> accepted in
+         let events = drain_mutation_events client request_id in
+         let mutation =
+           match completed_response events request_id with
+           | P.Succeeded
+               { success =
+                   Sync_result { activity = Pull_applied; mutation = Some value; _ }
+               ; _
+               } -> value
+           | _ -> T.fail "pulled transaction did not return applied sync metadata"
+         in
+         let indexed = List.mapi (fun index event -> index, event) events in
+         let response_index =
+           List.find_map
+             (function
+               | index, Worker.Response { request_id = actual; _ }
+                 when ID.Worker.Request_id.equal request_id actual -> Some index
+               | _ -> None)
+             indexed
+           |> Option.get
+         in
+         let push_index, invalidation =
+           List.find_map
+             (function
+               | ( index
+                 , Worker.Push
+                     { payload = Service.Graph_push (P.Graph_invalidated value); _ } ) ->
+                 Some (index, value)
+               | _ -> None)
+             indexed
+           |> function
+           | Some value -> value
+           | None -> T.fail "pulled transaction emitted no Graph_invalidated push"
+         in
+         T.require (response_index < push_index) "sync invalidation preceded its response";
+         T.require
+           (Int64.equal invalidation.basis mutation.basis_after)
+           "sync invalidation basis differs from the atomic commit";
+         T.require
+           (invalidation.changed_uuids = mutation.changed_uuids)
+           "sync invalidation changed UUIDs differ from replay metadata";
          stop client))
 ;;
 
@@ -355,11 +423,11 @@ let test_client_backpressure_and_pump_boundary () =
         fixture.config
     in
     T.require
-      (Worker.send pending_client (F.graph_info_request ()) = Worker.Not_ready)
+      (send_graph pending_client (F.graph_info_request ()) = Worker.Not_ready)
       "a prepared but unstarted client did not return Not_ready";
     Worker.Private.request_stop pending_client;
     T.require
-      (Worker.send pending_client (F.graph_info_request ()) = Worker.Stopping)
+      (send_graph pending_client (F.graph_info_request ()) = Worker.Stopping)
       "a stopped client did not return Stopping";
     let client =
       match start fixture.config with
@@ -375,7 +443,7 @@ let test_client_backpressure_and_pump_boundary () =
            incr observed;
            Bonsai.Effect.return ());
          ignore
-           (Worker.send client (F.graph_info_request ()) |> accepted
+           (send_graph client (F.graph_info_request ()) |> accepted
             : ID.Worker.request_id);
          Worker.For_testing.await_output client;
          T.require (!observed = 0) "Worker output crossed the foreground pump boundary";
@@ -388,7 +456,7 @@ let test_client_backpressure_and_pump_boundary () =
            if remaining = 0
            then false
            else (
-             match Worker.send client (F.graph_info_request ()) with
+             match send_graph client (F.graph_info_request ()) with
              | Full -> true
              | Accepted _ -> fill (remaining - 1)
              | Not_ready | Stopping -> T.fail "ready client changed state while filling")
@@ -452,7 +520,7 @@ let test_cancelled_commit_reconciles_by_basis () =
       (fun () ->
          let basis = graph_basis client in
          let request = insert_tree_request basis in
-         let request_id = Worker.send client request |> accepted in
+         let request_id = send_graph client request |> accepted in
          wait_for_nonempty_file
            (Filename.concat fixture.resolved.graph_dir "db.sqlite-wal");
          Worker.cancel client ~request_id;
@@ -477,7 +545,7 @@ let test_cancelled_commit_reconciles_by_basis () =
                    (Get_block { block = F.uuid "72000000-0000-4000-8000-000000000000" })
              }
          in
-         let read_id = Worker.send client read |> accepted in
+         let read_id = send_graph client read |> accepted in
          (match completed_response (drain_until_responses client 1 []) read_id with
           | P.Succeeded { basis = reconciled_basis; success = Block_result _; _ } ->
             T.require
@@ -545,7 +613,7 @@ let fatal_child () =
         ~page_uuid:"43000000-0000-4000-8000-000000000001"
         ~title:"Fatal Worker write"
     in
-    ignore (Worker.send client request |> accepted : ID.Worker.request_id);
+    ignore (send_graph client request |> accepted : ID.Worker.request_id);
     let events = drain_until_terminal client [] in
     T.require
       (List.exists
@@ -555,7 +623,7 @@ let fatal_child () =
          events)
       "fatal persistence did not terminalize the Worker";
     T.require
-      (Worker.send client (F.graph_info_request ()) = Worker.Stopping)
+      (send_graph client (F.graph_info_request ()) = Worker.Stopping)
       "terminal Worker accepted another request");
   Worker_runtime.For_testing.final_shutdown ()
 ;;
@@ -623,6 +691,9 @@ let () =
           "mutation response precedes bounded push"
           test_mutation_push_is_bounded_and_after_response
       ; T.case "latest-wins invalidations collapse" test_latest_wins_push_collapse
+      ; T.case
+          "pulled transaction response precedes Graph_invalidated"
+          test_pulled_transaction_emits_invalidation_after_response
       ; T.case
           "Full Not_ready Stopping and pump boundary are preserved"
           test_client_backpressure_and_pump_boundary

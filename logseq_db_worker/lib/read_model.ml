@@ -1,5 +1,4 @@
 open Graph_types
-
 module Entity_map = Map.Make (Int)
 module Entity_set = Set.Make (Int)
 
@@ -462,7 +461,7 @@ let page_kind db entity =
   let* built_in = optional_bool db entity "logseq.property/built-in?" in
   if built_in
   then Ok Built_in_page
-  else (
+  else
     let* journal_day = optional_int db entity "block/journal-day" in
     match journal_day with
     | Some journal_day -> Ok (Journal_page { journal_day })
@@ -475,7 +474,7 @@ let page_kind db entity =
       then Ok Class_page
       else if hidden
       then Ok Hidden_page
-      else Ok Ordinary_page)
+      else Ok Ordinary_page
 ;;
 
 let project_page db entity =
@@ -596,9 +595,7 @@ let journal_page_summaries db =
     Entity_map.fold (fun entity _ -> Entity_set.add entity) journal_days Entity_set.empty
   in
   let names = values_by_candidate_entity db candidates "block/name" in
-  let built_ins =
-    values_by_candidate_entity db candidates "logseq.property/built-in?"
-  in
+  let built_ins = values_by_candidate_entity db candidates "logseq.property/built-in?" in
   let deleted_at =
     values_by_candidate_entity db candidates "logseq.property/deleted-at"
   in
@@ -1275,6 +1272,8 @@ let get_references context target direction limit cursor =
 
 let execute context = function
   | Protocol.Graph_info -> Error (invalid_request "Graph_info is handled by the Engine.")
+  | Sync_status -> Error (invalid_request "Sync_status is handled by the Engine.")
+  | Sync_pending -> Error (invalid_request "Sync_pending is handled by the Engine.")
   | Get_block { block } ->
     Result.bind (entity_of_uuid context.db block) (project_block context.db)
     |> Result.map (fun block -> Protocol.Block_result block)

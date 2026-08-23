@@ -1,0 +1,37 @@
+{
+  "captured-at": "2026-08-23",
+  "server": "api.logseq.io",
+  "graph-name": "ocaml-sync-test",
+  "request": {
+    "type": "tx/batch",
+    "t-before": 114,
+    "txs": [
+      {
+        "tx": "[[\"~:db/add\",[\"~:block/uuid\",\"~u6a8a493b-0478-496f-9450-b67f816f62bc\"],\"~:block/updated-at\",1787467610899]]",
+        "tx-id": "10eaff77-c413-4a4e-ad05-3861f1cba40e"
+      }
+    ]
+  },
+  "first-response": {
+    "type": "tx/batch/ok",
+    "t": 115,
+    "checksum": "a57d8ae9dc79e209"
+  },
+  "repeat-response": {
+    "type": "tx/reject",
+    "reason": "stale",
+    "t": 115
+  },
+  "final-pull": {
+    "type": "pull/ok",
+    "t": 115,
+    "checksum": "a57d8ae9dc79e209",
+    "txs": [
+      {
+        "t": 115,
+        "tx": "[[\"~:db/retract\",[\"~:block/uuid\",\"~u6a8a493b-0478-496f-9450-b67f816f62bc\"],\"~:block/updated-at\",1787467434570,536871028],[\"~:db/add\",[\"^1\",\"~u6a8a493b-0478-496f-9450-b67f816f62bc\"],\"^2\",1787467610899,536871028]]",
+        "outliner-op": null
+      }
+    ]
+  }
+}

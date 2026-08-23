@@ -25,7 +25,24 @@
   test_engine_open
   test_cross_runtime
   test_performance
-  test_fixture_generator)
+  test_fixture_generator
+  test_sync_snapshot
+  test_sync_protocol
+  test_sync_e2ee
+  test_sync_tx_checksum
+  test_sync_replay
+  test_sync_pending
+  test_sync_auth
+  test_sync_catalog
+  test_sync_catalog_store
+  test_sync_transport_ownership
+  test_sync_bootstrap_transport
+  test_sync_e2ee_session
+  test_sync_manager
+  test_sync_network_scope
+  test_sync_engine
+  test_synced_config_admission
+  test_sync_mirror)
  (modules
   test_protocol
   test_graph_locator
@@ -47,15 +64,37 @@
   test_engine_open
   test_cross_runtime
   test_performance
-  test_fixture_generator)
+  test_fixture_generator
+  test_sync_snapshot
+  test_sync_protocol
+  test_sync_e2ee
+  test_sync_tx_checksum
+  test_sync_replay
+  test_sync_pending
+  test_sync_auth
+  test_sync_catalog
+  test_sync_catalog_store
+  test_sync_transport_ownership
+  test_sync_bootstrap_transport
+  test_sync_e2ee_session
+  test_sync_manager
+  test_sync_network_scope
+  test_sync_engine
+  test_synced_config_admission
+  test_sync_mirror)
  (libraries
   datascript_ocaml
+  eio_main
+  eio.unix
+  httpun
+  httpun-eio
   logseq_db_worker
   logseq_db_worker_cli
   logseq_db_worker_fixture_generator
   logseq_db_worker_test_support
   sqlite3
   unix
+  uri
   yojson))
 
 (test

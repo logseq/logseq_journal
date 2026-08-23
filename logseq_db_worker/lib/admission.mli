@@ -20,4 +20,20 @@ type error =
   | Unsupported_value
   | Corrupt_storage
 
-val admit : observed -> (Graph_types.admission_fact list, error) result
+type target =
+  | Local_target
+  | Synced_target of Graph_types.Uuid.t
+
+type admitted =
+  { schema : Graph_types.schema_version
+  ; local_graph_uuid : Graph_types.Uuid.t
+  ; admission_facts : Graph_types.admission_fact list
+  }
+
+val admit : target:target -> observed -> (Graph_types.admission_fact list, error) result
+
+val inspect
+  :  target:target
+  -> db:Datascript.db
+  -> storage_schema:Datascript.schema
+  -> (admitted, error) result

@@ -4,6 +4,8 @@ module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Worker_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 
+let send_graph client request = Worker.send client (Worker_service.Graph_request request)
+
 let require_response_equal expected actual =
   let expected = P.response_to_yojson expected |> Yojson.Safe.sort in
   let actual = P.response_to_yojson actual |> Yojson.Safe.sort in
@@ -31,7 +33,7 @@ let worker_once ~epoch config request =
       then Worker_runtime.stop client)
     (fun () ->
        let transport_request_id =
-         match Worker.send client request with
+         match send_graph client request with
          | Accepted request_id -> request_id
          | Full | Not_ready | Stopping -> T.fail "Worker trace request was not accepted"
        in
@@ -40,7 +42,10 @@ let worker_once ~epoch config request =
            Worker.For_testing.drain_events client ~max_events:64
            |> List.find_map (function
              | Worker.Response
-                 { request_id; outcome = Completed response; _ }
+                 { request_id
+                 ; outcome = Completed (Worker_service.Graph_response response)
+                 ; _
+                 }
                when ID.Worker.Request_id.equal transport_request_id request_id ->
                Some response
              | Response _ | Push _ | Terminal _ -> None)
@@ -62,14 +67,17 @@ let test_direct_and_cli_trace_match () =
     let request = F.graph_info_request () in
     let direct =
       match Logseq_db_worker.Engine.open_ ~dependencies:F.dependencies fixture.config with
-      | Error error -> T.fail "direct Engine open failed: %s" (Logseq_db_worker.Error.message error)
+      | Error error ->
+        T.fail "direct Engine open failed: %s" (Logseq_db_worker.Error.message error)
       | Ok engine ->
         Fun.protect
           ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
           (fun () -> Logseq_db_worker.Engine.execute engine request)
     in
     let cli =
-      match Cli_command.execute_once ~dependencies:F.dependencies fixture.config request with
+      match
+        Cli_command.execute_once ~dependencies:F.dependencies fixture.config request
+      with
       | Ok response -> response
       | Error _ -> T.fail "CLI session failed"
     in
@@ -80,7 +88,8 @@ let test_direct_and_cli_trace_match () =
 
 let direct_once config request =
   match Logseq_db_worker.Engine.open_ ~dependencies:F.dependencies config with
-  | Error error -> T.fail "direct trace open failed: %s" (Logseq_db_worker.Error.message error)
+  | Error error ->
+    T.fail "direct trace open failed: %s" (Logseq_db_worker.Error.message error)
   | Ok engine ->
     Fun.protect
       ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
@@ -99,7 +108,9 @@ let test_mutation_and_final_state_match_all_transports () =
     in
     let clone () =
       match
-        Logseq_db_worker__Snapshot.create catalog ~source_graph_dir:fixture.source_graph_dir
+        Logseq_db_worker__Snapshot.create
+          catalog
+          ~source_graph_dir:fixture.source_graph_dir
       with
       | Ok token -> F.config fixture.support token
       | Error _ -> T.fail "unable to clone transport parity snapshot"
@@ -135,9 +146,7 @@ let test_mutation_and_final_state_match_all_transports () =
         ; command =
             Read
               (Get_page
-                 { page =
-                     Page_by_uuid (F.uuid "66000000-0000-4000-8000-000000000001")
-                 })
+                 { page = Page_by_uuid (F.uuid "66000000-0000-4000-8000-000000000001") })
         }
     in
     let direct_final = direct_once fixture.config read in
@@ -158,7 +167,11 @@ let test_open_failure_and_exact_ndjson () =
     let second =
       F.graph_info_request ~request_id:"10000000-0000-4000-8000-000000000002" ()
     in
-    let lines = List.map (fun request -> P.request_to_yojson request |> Yojson.Safe.to_string) [ first; second ] in
+    let lines =
+      List.map
+        (fun request -> P.request_to_yojson request |> Yojson.Safe.to_string)
+        [ first; second ]
+    in
     match Cli_command.run_ndjson_lines ~dependencies:F.dependencies config lines with
     | Error _ -> T.fail "expected graph-open failure terminated NDJSON"
     | Ok outputs ->
@@ -170,7 +183,10 @@ let test_open_failure_and_exact_ndjson () =
            | `Assoc fields ->
              T.require
                (List.assoc_opt "requestId" fields
-                = Some (`String (Logseq_db_worker.Graph_types.Uuid.to_string request.P.request_id)))
+                = Some
+                    (`String
+                        (Logseq_db_worker.Graph_types.Uuid.to_string request.P.request_id))
+               )
                "open failure lost the incoming request ID";
              T.require
                (List.assoc_opt "phase" fields = Some (`String "open"))
@@ -189,7 +205,8 @@ let test_ndjson_rejects_local_decode_errors () =
         [ "{not-json}" ]
     with
     | Error (Cli_command.Local_decode_error _) -> ()
-    | Error (Fatal_lifecycle_error _) -> T.fail "local decode error was classified as fatal"
+    | Error (Fatal_lifecycle_error _) ->
+      T.fail "local decode error was classified as fatal"
     | Ok _ -> T.fail "malformed NDJSON was accepted")
 ;;
 
@@ -253,13 +270,13 @@ let test_snapshot_import_uses_confined_core () =
       (match Logseq_db_worker__Snapshot.resolve catalog token with
        | Ok _ -> ()
        | Error _ -> T.fail "CLI import did not publish a resolvable token");
-      match
-        Cli_command.import_snapshot
-          ~application_support_directory:fixture.support
-          ~inbox_entry:"../escape"
-      with
-      | Error _ -> ()
-      | Ok _ -> T.fail "CLI import accepted an escaping inbox path")
+      (match
+         Cli_command.import_snapshot
+           ~application_support_directory:fixture.support
+           ~inbox_entry:"../escape"
+       with
+       | Error _ -> ()
+       | Ok _ -> T.fail "CLI import accepted an escaping inbox path"))
 ;;
 
 let test_fatal_persistence_is_session_fatal () =
@@ -283,7 +300,9 @@ let test_fatal_persistence_is_session_fatal () =
         ~page_uuid:"50000000-0000-4000-8000-000000000003"
         ~title:"Fatal write"
     in
-    match Cli_command.execute_once ~dependencies:F.dependencies fixture.config mutation with
+    match
+      Cli_command.execute_once ~dependencies:F.dependencies fixture.config mutation
+    with
     | Error (Cli_command.Fatal_lifecycle_error _) -> ()
     | Error (Local_decode_error _) -> T.fail "persistence failure was classified as local"
     | Ok _ -> T.fail "persistence failure left the CLI session reusable")
@@ -314,12 +333,18 @@ let test_desktop_graph_is_derived_from_home () =
     let root = Filename.concat home "logseq" in
     Unix.mkdir root 0o700;
     let graph_dir = F.create_oracle_graph root "notes" |> Unix.realpath in
-    (match Cli_command.resolve_desktop_target ~home_directory:home ~graph_name:"notes" with
+    (match
+       Cli_command.resolve_desktop_target ~home_directory:home ~graph_name:"notes"
+     with
      | Ok (Logseq_db_worker.Config.Native_local_graph target) ->
-       T.require (String.equal target.graph_dir graph_dir) "Desktop graph path was not ~/logseq/notes"
+       T.require
+         (String.equal target.graph_dir graph_dir)
+         "Desktop graph path was not ~/logseq/notes"
      | Ok _ -> T.fail "Desktop graph resolved to a non-native target"
      | Error message -> T.fail "Desktop graph resolution failed: %s" message);
-    match Cli_command.resolve_desktop_target ~home_directory:home ~graph_name:"../escape" with
+    match
+      Cli_command.resolve_desktop_target ~home_directory:home ~graph_name:"../escape"
+    with
     | Error _ -> ()
     | Ok _ -> T.fail "Desktop graph-name escaped ~/logseq")
 ;;
@@ -347,8 +372,12 @@ let test_exit_contract () =
   T.require (Cli_output.exit_code Execute_error = 3) "execute exit changed";
   T.require (Cli_output.exit_code Open_error = 4) "open exit changed";
   T.require (Cli_output.exit_code Fatal_error = 5) "fatal exit changed";
-  T.require (Cli_output.classify_response open_response = Open_error) "open failure classification changed";
-  T.require (Cli_output.classify_response execute_response = Execute_error) "execute failure classification changed"
+  T.require
+    (Cli_output.classify_response open_response = Open_error)
+    "open failure classification changed";
+  T.require
+    (Cli_output.classify_response execute_response = Execute_error)
+    "execute failure classification changed"
 ;;
 
 let test_documented_argument_order_preserves_open_failure () =
@@ -382,17 +411,35 @@ let () =
   T.run
     "CLI"
     [ T.case "CLI and direct Engine traces match" test_direct_and_cli_trace_match
-    ; T.case "mutation and final state match all transports" test_mutation_and_final_state_match_all_transports
-    ; T.case "open failures retain exact NDJSON protocol" test_open_failure_and_exact_ndjson
-    ; T.case "invalid request is a local decode error" test_ndjson_rejects_local_decode_errors
-    ; T.case "oversized NDJSON is rejected before Engine" test_ndjson_rejects_oversized_lines
+    ; T.case
+        "mutation and final state match all transports"
+        test_mutation_and_final_state_match_all_transports
+    ; T.case
+        "open failures retain exact NDJSON protocol"
+        test_open_failure_and_exact_ndjson
+    ; T.case
+        "invalid request is a local decode error"
+        test_ndjson_rejects_local_decode_errors
+    ; T.case
+        "oversized NDJSON is rejected before Engine"
+        test_ndjson_rejects_oversized_lines
     ; T.case "snapshot create uses shared Snapshot core" test_snapshot_create_uses_core
-    ; T.case "snapshot import uses confined Snapshot core" test_snapshot_import_uses_confined_core
-    ; T.case "Desktop graph resolves only under ~/logseq" test_desktop_graph_is_derived_from_home
+    ; T.case
+        "snapshot import uses confined Snapshot core"
+        test_snapshot_import_uses_confined_core
+    ; T.case
+        "Desktop graph resolves only under ~/logseq"
+        test_desktop_graph_is_derived_from_home
     ; T.case "exit codes are disjoint" test_exit_contract
-    ; T.case "documented option order preserves Open failures" test_documented_argument_order_preserves_open_failure
-    ; T.case "fatal persistence terminates the CLI session" test_fatal_persistence_is_session_fatal
-    ; T.case "close failure terminates the CLI session" test_close_failure_is_session_fatal
-    ]
-  ; Worker_runtime.For_testing.final_shutdown ()
+    ; T.case
+        "documented option order preserves Open failures"
+        test_documented_argument_order_preserves_open_failure
+    ; T.case
+        "fatal persistence terminates the CLI session"
+        test_fatal_persistence_is_session_fatal
+    ; T.case
+        "close failure terminates the CLI session"
+        test_close_failure_is_session_fatal
+    ];
+  Worker_runtime.For_testing.final_shutdown ()
 ;;

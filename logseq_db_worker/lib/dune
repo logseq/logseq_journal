@@ -7,11 +7,25 @@
   datascript-ocaml-native
   datascript_ocaml
   digestif
+  ca-certs-nss
+  cstruct
+  domain-name
+  eio
+  eio.unix
+  httpun
+  httpun-eio
+  httpun-ws
   melange-transit-native
+  mirage-crypto-rng.unix
   persistent_sorted_set_ocaml
   sqlite3
   unix
+  uri
+  tls-eio
   uucp
   uunf
-  uutf
-  yojson))
+ uutf
+  yojson)
+ (foreign_stubs
+  (language c)
+  (names sync_platform_crypto_stubs sync_gzip_stubs)))

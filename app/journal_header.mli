@@ -14,4 +14,5 @@ val view
   -> text_scale:float
   -> device_pixel_ratio:float
   -> context:Context.t
+  -> on_account_menu:Bonsai_flutter_ui.Event.Handler.t option
   -> Bonsai_flutter_ui.Widget.t
