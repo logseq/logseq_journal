@@ -55,10 +55,7 @@ let view ~tokens ~text_scale ~device_pixel_ratio ~context ~on_account_menu =
   let palette = Tokens.palette tokens in
   let scale = Float.max 1. text_scale in
   let content_height = Tokens.header_geometry.content_height *. scale in
-  let leading =
-    Ui.Widget.empty ()
-    |> shell ~id:"journal-header-leading-placeholder"
-  in
+  let leading = Ui.Widget.empty () |> shell ~id:"journal-header-leading-placeholder" in
   let title =
     Ui.Widget.text
       ~style:(text_style Tokens.typography.header_title palette.text_primary)
@@ -88,13 +85,9 @@ let view ~tokens ~text_scale ~device_pixel_ratio ~context ~on_account_menu =
   in
   let account =
     match on_account_menu with
-    | None ->
-      Ui.Widget.empty ()
-      |> shell ~id:"journal-header-account-placeholder"
+    | None -> Ui.Widget.empty () |> shell ~id:"journal-header-account-placeholder"
     | Some on_press ->
-      let icon =
-        glyph ~tokens ~id:"journal-account-icon" ~code_point:0xe853
-      in
+      let icon = glyph ~tokens ~id:"journal-account-icon" ~code_point:0xe043 in
       Ui.Material.icon_button ~on_press ~icon ()
       |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu-button")
       |> Ui.Widget.semantics

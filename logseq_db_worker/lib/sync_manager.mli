@@ -136,11 +136,13 @@ type event =
   | Http_pull_loaded of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; payload : string
       }
   | Http_transaction_loaded of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; payload : string
       }
   | Sync_applied of
@@ -153,6 +155,7 @@ type event =
   | Network_failed of
       { account_generation : int
       ; graph_generation : int option
+      ; connection_generation : int option
       ; message : string
       }
 
@@ -243,6 +246,7 @@ type action =
   | Fetch_http_pull of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; graph_id : Graph_types.Uuid.t
       ; since : int
       ; token : string
@@ -250,6 +254,7 @@ type action =
   | Submit_http_transaction of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; graph_id : Graph_types.Uuid.t
       ; payload : string
       ; token : string

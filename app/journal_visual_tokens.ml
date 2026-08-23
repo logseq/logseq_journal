@@ -22,9 +22,6 @@ type palette =
   ; sheet_error : Ui.Style.Color.t
   ; destructive : Ui.Style.Color.t
   ; on_destructive : Ui.Style.Color.t
-  ; snackbar_surface : Ui.Style.Color.t
-  ; snackbar_primary_text : Ui.Style.Color.t
-  ; snackbar_action_text : Ui.Style.Color.t
   }
 
 type interaction =
@@ -74,7 +71,8 @@ type composer_geometry =
   { horizontal_margin : float
   ; bottom_inset : float
   ; minimum_height : float
-  ; reserved_extent : float
+  ; maximum_lines : int
+  ; expanded_vertical_overhead : float
   }
 
 type row_geometry =
@@ -91,14 +89,6 @@ type preview_geometry =
   ; bullet_diameter : float
   ; text_leading : float
   ; narrow_leading_delta : float
-  }
-
-type snackbar_geometry =
-  { margin : float
-  ; maximum_width : float
-  ; minimum_height : float
-  ; corner_radius : float
-  ; vertical_gap : float
   }
 
 type motion =
@@ -159,9 +149,6 @@ let light_palette =
   ; sheet_error = rgb 179 38 30
   ; destructive = rgb 220 77 86
   ; on_destructive = rgb 255 255 255
-  ; snackbar_surface = rgb 24 30 52
-  ; snackbar_primary_text = rgb 252 252 253
-  ; snackbar_action_text = rgb 110 153 255
   }
 ;;
 
@@ -187,9 +174,6 @@ let light_high_contrast_palette =
   ; sheet_error = rgb 128 0 0
   ; destructive = rgb 153 0 0
   ; on_destructive = rgb 255 255 255
-  ; snackbar_surface = rgb 0 0 0
-  ; snackbar_primary_text = rgb 255 255 255
-  ; snackbar_action_text = rgb 153 204 255
   }
 ;;
 
@@ -247,7 +231,8 @@ let composer_geometry =
   { horizontal_margin = 12.
   ; bottom_inset = 12.
   ; minimum_height = 48.
-  ; reserved_extent = 68.
+  ; maximum_lines = 5
+  ; expanded_vertical_overhead = 80.
   }
 ;;
 
@@ -266,15 +251,6 @@ let preview_geometry =
   ; bullet_diameter = 3.
   ; text_leading = 68.
   ; narrow_leading_delta = 8.
-  }
-;;
-
-let snackbar_geometry =
-  { margin = 12.
-  ; maximum_width = 720.
-  ; minimum_height = 52.
-  ; corner_radius = 12.
-  ; vertical_gap = spacing.x3
   }
 ;;
 
@@ -332,7 +308,14 @@ let fixed_extent ~profile ~safe_bottom = function
   | Children_loading | Children_more -> block_extent ~profile ~visible_lines:1
   | Day_heading -> profile.day_header_extent
   | Day_continuation | Feed_continuation -> profile.continuation_extent
-  | Bottom_clearance -> composer_geometry.reserved_extent +. max 0. safe_bottom
+  | Bottom_clearance ->
+    let expanded_height =
+      composer_geometry.expanded_vertical_overhead
+      +. (float_of_int composer_geometry.maximum_lines *. profile.block_line_height)
+    in
+    composer_geometry.bottom_inset
+    +. Float.max composer_geometry.minimum_height expanded_height
+    +. Float.max 0. safe_bottom
 ;;
 
 let status_rail_color t status =

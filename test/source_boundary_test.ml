@@ -169,9 +169,10 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "a6bd9aa9906c0e49f0cc365e5ba33270e89655e6" in
+  let current_bonsai_flutter_revision = "9b345b90fea476391d19092675abd665655e586a" in
   let obsolete_bonsai_flutter_revisions =
-    [ "d5f8d36b5539550cbc2466311acda4d8c609032e"
+    [ "a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"
+    ; "d5f8d36b5539550cbc2466311acda4d8c609032e"
     ; "a51276a09eb1cdf9c87f07ac4c7558ed7c6b2d69"
     ; "26f5bf6c3b4cdd61ccd5c1660f6cf9f72fe523da"
     ; "066179956545cc12871862879fc906f09519788c"
@@ -469,14 +470,42 @@ let () =
     ; "Refresh the authorized graph catalog"
     ; "pending local changes"
     ; "download a fresh snapshot"
+    ; "App.View.create"
+    ; "Ui.Theme.application"
+    ; "Ui.Theme.Light"
+    ; "Ui.Material.alert_dialog"
+    ; "Ui.Navigation.Modal_dialog"
+    ; "Bonsai_flutter.Host_effect.show_snack_bar"
+    ; "Ui.Material.filled_button"
+    ; "Ui.Material.filled_tonal_button"
+    ; "Ui.Material.outlined_button"
+    ; "Ui.Material.text_button"
+    ; "~bottom_sheet"
+    ; "journal-account-dialog-page"
+    ; "local-cache-reset-dialog-page"
+    ; "capture-discard-dialog-page"
+    ; "detail-discard-dialog-page"
     ];
+  forbid_text
+    root
+    "app/application.ml"
+    [ "Ui.Material.dialog"
+    ; "let page_body"
+    ; "timeline_notice_view"
+    ; "journal-delete-snackbar"
+    ; "journal-delete-snackbar-position"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "snackbar_surface"; "snackbar_primary_text"; "snackbar_action_text" ])
+    [ "app/journal_visual_tokens.ml"; "app/journal_visual_tokens.mli" ];
   require_text
     root
     "app/journal_platform.ml"
-    [ "sign_out_request"
-    ; "is_prepare_to_terminate_event"
-    ; "termination_ready_request"
-    ];
+    [ "sign_out_request"; "is_prepare_to_terminate_event"; "termination_ready_request" ];
   require_text
     root
     "flutter/lib/application_host_adapter.dart"
@@ -499,6 +528,7 @@ let () =
     ; "Unable to configure authentication"
     ; "Retry"
     ];
+  require_occurrences root "flutter/lib/application.dart" "MaterialApp(" 1;
   require_text
     root
     "flutter/macos/Runner/AppDelegate.swift"

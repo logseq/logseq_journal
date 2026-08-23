@@ -380,7 +380,12 @@ let test_reconnect_uses_fresh_token_and_frames_enter_serial_owner () =
   T.require
     (M.handle_event
        manager
-       (Http_pull_loaded { account_generation; graph_generation; payload = pull_frame })
+       (Http_pull_loaded
+          { account_generation
+          ; graph_generation
+          ; connection_generation = reconnect_generation
+          ; payload = pull_frame
+          })
      = [ Apply_sync_frame pull_frame ])
     "HTTP pull bypassed the serialized sync decoder";
   let websocket_reconnect =
@@ -468,6 +473,7 @@ let test_network_failure_retries_with_bounded_backoff () =
       (Network_failed
          { account_generation
          ; graph_generation = Some graph_generation
+         ; connection_generation = None
          ; message = "offline"
          })
   in
@@ -482,6 +488,7 @@ let test_network_failure_retries_with_bounded_backoff () =
       (Network_failed
          { account_generation
          ; graph_generation = Some graph_generation
+         ; connection_generation = None
          ; message = "offline"
          })
   in
@@ -507,6 +514,7 @@ let test_preopen_network_failure_is_terminal_for_current_attempt () =
       (Network_failed
          { account_generation = snapshot.account_generation
          ; graph_generation = Some snapshot.graph_generation
+         ; connection_generation = None
          ; message = "bootstrap failed"
          })
   in
@@ -866,7 +874,23 @@ let test_failed_probe_recovers_only_the_uncertain_submission () =
     | [ Close_websocket; Need_id_token challenge ] -> challenge
     | _ -> T.fail "uncertain submission did not enter HTTP fallback"
   in
-  ignore (provide manager challenge "http-pull-token");
+  let connection_generation =
+    match provide manager challenge "http-pull-token" with
+    | [ Fetch_http_pull { connection_generation; _ } ] -> connection_generation
+    | _ -> T.fail "uncertain submission did not start HTTP catch-up"
+  in
+  let pull_response = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  T.require
+    (M.handle_event
+       manager
+       (Http_pull_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation
+          ; payload = pull_response
+          })
+     = [ Apply_sync_frame pull_response ])
+    "uncertain submission catch-up was not serialized";
   T.require
     (M.handle_event
        manager
@@ -882,6 +906,624 @@ let test_failed_probe_recovers_only_the_uncertain_submission () =
        Uuid.equal actual tx_id && reconnect.purpose = Websocket_connect
      | _ -> false)
     "HTTP catch-up did not recover the exact uncertain transaction before reconnect"
+;;
+
+let begin_foreground_probe context lifecycle_generation =
+  ignore (M.handle_command context.manager (Backgrounded { lifecycle_generation }));
+  ignore (M.handle_command context.manager (Foreground_resumed { lifecycle_generation }))
+;;
+
+let require_immediate_probe_fallback context effects message =
+  let challenge =
+    match effects with
+    | [ M.Close_websocket; M.Need_id_token challenge ] -> challenge
+    | _ -> T.fail "%s" message
+  in
+  T.require (challenge.purpose = Http_pull) "%s requested the wrong token" message;
+  T.require
+    ((M.snapshot context.manager).connection_generation > context.connection_generation)
+    "%s did not fence the preserved connection"
+    message
+;;
+
+let test_probe_failures_share_one_immediate_http_fallback () =
+  let malformed = open_live_manager 21 in
+  begin_foreground_probe malformed 12L;
+  require_immediate_probe_fallback
+    malformed
+    (M.handle_event
+       malformed.manager
+       (Websocket_frame
+          { account_generation = malformed.account_generation
+          ; graph_generation = malformed.graph_generation
+          ; connection_generation = malformed.connection_generation
+          ; payload = {|{"type":"pull/ok","t":"invalid","txs":[]}|}
+          }))
+    "malformed foreground probe";
+  let closed = open_live_manager 21 in
+  begin_foreground_probe closed 13L;
+  require_immediate_probe_fallback
+    closed
+    (M.handle_event
+       closed.manager
+       (Websocket_closed
+          { account_generation = closed.account_generation
+          ; graph_generation = closed.graph_generation
+          ; connection_generation = closed.connection_generation
+          ; message = "closed during foreground probe"
+          }))
+    "closed foreground probe";
+  let replay_failed = open_live_manager 21 in
+  begin_foreground_probe replay_failed 14L;
+  require_immediate_probe_fallback
+    replay_failed
+    (M.handle_event
+       replay_failed.manager
+       (Network_failed
+          { account_generation = replay_failed.account_generation
+          ; graph_generation = Some replay_failed.graph_generation
+          ; connection_generation = Some replay_failed.connection_generation
+          ; message = "foreground replay failed"
+          }))
+    "failed foreground replay";
+  let paused = open_live_manager 21 in
+  begin_foreground_probe paused 15L;
+  let paused_pull = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  T.require
+    (M.handle_event
+       paused.manager
+       (Websocket_frame
+          { account_generation = paused.account_generation
+          ; graph_generation = paused.graph_generation
+          ; connection_generation = paused.connection_generation
+          ; payload = paused_pull
+          })
+     = [ Apply_sync_frame paused_pull ])
+    "paused foreground replay did not enter the sync engine";
+  require_immediate_probe_fallback
+    paused
+    (M.handle_event
+       paused.manager
+       (Sync_applied
+          { account_generation = paused.account_generation
+          ; graph_generation = paused.graph_generation
+          ; applied_server_t = 21
+          ; activity = Logseq_db_worker.Protocol.Sync_paused
+          ; pending_payload = None
+          }))
+    "paused foreground replay"
+;;
+
+let test_presence_does_not_fail_foreground_probe () =
+  let context = open_live_manager 21 in
+  begin_foreground_probe context 18L;
+  let before = M.snapshot context.manager in
+  T.require
+    (M.handle_event
+       context.manager
+       (Websocket_frame
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = context.connection_generation
+          ; payload = {|{"type":"online-users","online-users":[]}|}
+          })
+     = [])
+    "presence message triggered a foreground transport effect";
+  T.require
+    (M.snapshot context.manager = before)
+    "presence message failed or completed foreground revalidation"
+;;
+
+let background_during_probe context first_generation second_generation =
+  begin_foreground_probe context first_generation;
+  ignore
+    (M.handle_command
+       context.manager
+       (Backgrounded { lifecycle_generation = second_generation }))
+;;
+
+let require_deferred_http_fallback context lifecycle_generation event message =
+  T.require
+    (M.handle_event context.manager event = [])
+    "%s started transport work while backgrounded"
+    message;
+  let challenge =
+    M.handle_command context.manager (Foreground_resumed { lifecycle_generation })
+    |> need_token
+  in
+  T.require
+    (challenge.purpose = Http_pull)
+    "%s did not resume the deferred HTTP fallback"
+    message
+;;
+
+let test_probe_failures_while_backgrounded_defer_http_fallback () =
+  let closed = open_live_manager 21 in
+  background_during_probe closed 20L 21L;
+  require_deferred_http_fallback
+    closed
+    21L
+    (Websocket_closed
+       { account_generation = closed.account_generation
+       ; graph_generation = closed.graph_generation
+       ; connection_generation = closed.connection_generation
+       ; message = "closed after returning to background"
+       })
+    "backgrounded probe close";
+  let malformed = open_live_manager 21 in
+  background_during_probe malformed 22L 23L;
+  require_deferred_http_fallback
+    malformed
+    23L
+    (Websocket_frame
+       { account_generation = malformed.account_generation
+       ; graph_generation = malformed.graph_generation
+       ; connection_generation = malformed.connection_generation
+       ; payload = {|{"type":"pull/ok","t":"invalid","txs":[]}|}
+       })
+    "backgrounded malformed probe response";
+  let failed = open_live_manager 21 in
+  background_during_probe failed 24L 25L;
+  require_deferred_http_fallback
+    failed
+    25L
+    (Network_failed
+       { account_generation = failed.account_generation
+       ; graph_generation = Some failed.graph_generation
+       ; connection_generation = Some failed.connection_generation
+       ; message = "probe replay failed after returning to background"
+       })
+    "backgrounded probe replay failure";
+  let timed_out = open_live_manager 21 in
+  background_during_probe timed_out 26L 27L;
+  T.require
+    (M.handle_event
+       timed_out.manager
+       (Foreground_probe_timed_out
+          { account_generation = timed_out.account_generation
+          ; graph_generation = timed_out.graph_generation
+          ; connection_generation = timed_out.connection_generation
+          ; lifecycle_generation = 26L
+          })
+     = [])
+    "obsolete probe timeout started fallback while backgrounded";
+  T.require
+    (match
+       M.handle_command
+         timed_out.manager
+         (Foreground_resumed { lifecycle_generation = 27L })
+     with
+     | [ Schedule_foreground_probe { lifecycle_generation = 27L; _ } ] -> true
+     | _ -> false)
+    "foreground did not supersede the obsolete probe deadline"
+;;
+
+let test_backgrounded_http_submission_token_is_deferred () =
+  let context = open_live_manager 21 in
+  ignore
+    (M.handle_event
+       context.manager
+       (Websocket_closed
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = context.connection_generation
+          ; message = "disconnected"
+          }));
+  let outgoing = batch_payload "33000000-0000-4000-8000-000000000014" in
+  let transaction_challenge =
+    M.handle_event context.manager (Pending_batch outgoing) |> need_token
+  in
+  ignore (M.handle_command context.manager (Backgrounded { lifecycle_generation = 28L }));
+  T.require
+    (provide context.manager transaction_challenge "transaction-token" = [])
+    "backgrounded transaction token started network work";
+  let pull_challenge =
+    M.handle_command context.manager (Foreground_resumed { lifecycle_generation = 28L })
+    |> need_token
+  in
+  let connection_generation =
+    match provide context.manager pull_challenge "http-pull-token" with
+    | [ Fetch_http_pull { connection_generation; _ } ] -> connection_generation
+    | _ -> T.fail "foreground did not start authoritative HTTP catch-up"
+  in
+  let catchup = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  ignore
+    (M.handle_event
+       context.manager
+       (Http_pull_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation
+          ; payload = catchup
+          }));
+  let reconnect =
+    M.handle_event
+      context.manager
+      (Sync_applied
+         { account_generation = context.account_generation
+         ; graph_generation = context.graph_generation
+         ; applied_server_t = 21
+         ; activity = Logseq_db_worker.Protocol.Pull_duplicate
+         ; pending_payload = None
+         })
+    |> need_token
+  in
+  ignore (provide context.manager reconnect "websocket-token");
+  let opened_generation = (M.snapshot context.manager).connection_generation in
+  ignore
+    (M.handle_event
+       context.manager
+       (Websocket_opened
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = opened_generation
+          }));
+  let opened_pull = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  ignore
+    (M.handle_event
+       context.manager
+       (Websocket_frame
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = opened_generation
+          ; payload = opened_pull
+          }));
+  T.require
+    (M.handle_event
+       context.manager
+       (Sync_applied
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; applied_server_t = 21
+          ; activity = Logseq_db_worker.Protocol.Pull_duplicate
+          ; pending_payload = None
+          })
+     = [ Send_websocket outgoing ])
+    "transaction waiting for a backgrounded token was lost after catch-up"
+;;
+
+let start_http_catchup context =
+  let reconnect =
+    M.handle_event
+      context.manager
+      (Websocket_closed
+         { account_generation = context.account_generation
+         ; graph_generation = context.graph_generation
+         ; connection_generation = context.connection_generation
+         ; message = "disconnected"
+         })
+  in
+  let timer_generation = (M.snapshot context.manager).connection_generation in
+  let delay =
+    match reconnect with
+    | [ Schedule_reconnect { connection_generation; _ } ] ->
+      T.require
+        (connection_generation = timer_generation)
+        "reconnect timer generation changed";
+      ()
+    | _ -> T.fail "disconnect did not schedule reconnect"
+  in
+  ignore delay;
+  let challenge =
+    M.handle_event
+      context.manager
+      (Reconnect_timer_elapsed
+         { account_generation = context.account_generation
+         ; graph_generation = context.graph_generation
+         ; connection_generation = timer_generation
+         })
+    |> need_token
+  in
+  let effects = provide context.manager challenge "http-pull-token" in
+  T.require
+    (match effects with
+     | [ Fetch_http_pull { since = 21; _ } ] -> true
+     | _ -> false)
+    "reconnect did not start HTTP catch-up";
+  timer_generation
+;;
+
+let require_nonblocking_token_backoff context challenge message =
+  T.require
+    (match
+       M.handle_command
+         context.manager
+         (Token_failed { challenge_id = challenge.A.challenge_id })
+     with
+     | [ Schedule_reconnect { connection_generation; _ } ] ->
+       connection_generation = (M.snapshot context.manager).connection_generation
+     | _ -> false)
+    "%s did not schedule bounded reconnect backoff"
+    message;
+  T.require
+    ((M.snapshot context.manager).phase = Sync_paused)
+    "%s made the populated graph terminal"
+    message
+;;
+
+let test_open_graph_token_failures_are_nonblocking_and_retryable () =
+  let http = open_live_manager 21 in
+  let reconnect =
+    M.handle_event
+      http.manager
+      (Websocket_closed
+         { account_generation = http.account_generation
+         ; graph_generation = http.graph_generation
+         ; connection_generation = http.connection_generation
+         ; message = "disconnected"
+         })
+  in
+  let connection_generation = (M.snapshot http.manager).connection_generation in
+  (match reconnect with
+   | [ Schedule_reconnect _ ] -> ()
+   | _ -> T.fail "disconnect did not schedule the first retry");
+  let http_challenge =
+    M.handle_event
+      http.manager
+      (Reconnect_timer_elapsed
+         { account_generation = http.account_generation
+         ; graph_generation = http.graph_generation
+         ; connection_generation
+         })
+    |> need_token
+  in
+  require_nonblocking_token_backoff http http_challenge "HTTP pull token failure";
+  let websocket = open_live_manager 21 in
+  let http_generation = start_http_catchup websocket in
+  let catchup = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  ignore
+    (M.handle_event
+       websocket.manager
+       (Http_pull_loaded
+          { account_generation = websocket.account_generation
+          ; graph_generation = websocket.graph_generation
+          ; connection_generation = http_generation
+          ; payload = catchup
+          }));
+  let websocket_challenge =
+    M.handle_event
+      websocket.manager
+      (Sync_applied
+         { account_generation = websocket.account_generation
+         ; graph_generation = websocket.graph_generation
+         ; applied_server_t = 21
+         ; activity = Logseq_db_worker.Protocol.Pull_duplicate
+         ; pending_payload = None
+         })
+    |> need_token
+  in
+  require_nonblocking_token_backoff
+    websocket
+    websocket_challenge
+    "WebSocket reconnect token failure"
+;;
+
+let test_backgrounded_token_failure_defers_retry () =
+  let context = open_live_manager 21 in
+  ignore
+    (M.handle_event
+       context.manager
+       (Websocket_closed
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = context.connection_generation
+          ; message = "disconnected"
+          }));
+  let connection_generation = (M.snapshot context.manager).connection_generation in
+  let challenge =
+    M.handle_event
+      context.manager
+      (Reconnect_timer_elapsed
+         { account_generation = context.account_generation
+         ; graph_generation = context.graph_generation
+         ; connection_generation
+         })
+    |> need_token
+  in
+  ignore (M.handle_command context.manager (Backgrounded { lifecycle_generation = 29L }));
+  T.require
+    (M.handle_command
+       context.manager
+       (Token_failed { challenge_id = challenge.A.challenge_id })
+     = [])
+    "backgrounded token failure started retry work";
+  T.require
+    ((M.snapshot context.manager).phase = Sync_paused)
+    "backgrounded token failure made the populated graph terminal";
+  let resumed =
+    M.handle_command context.manager (Foreground_resumed { lifecycle_generation = 29L })
+    |> need_token
+  in
+  T.require
+    (resumed.purpose = Http_pull)
+    "foreground did not resume the deferred token retry"
+;;
+
+let test_background_resume_waits_for_inflight_http_pull () =
+  let context = open_live_manager 21 in
+  let http_generation = start_http_catchup context in
+  ignore (M.handle_command context.manager (Backgrounded { lifecycle_generation = 16L }));
+  T.require
+    (M.handle_command context.manager (Foreground_resumed { lifecycle_generation = 16L })
+     = [])
+    "foreground duplicated the in-flight HTTP pull";
+  let payload = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  T.require
+    (M.handle_event
+       context.manager
+       (Http_pull_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = http_generation
+          ; payload
+          })
+     = [ Apply_sync_frame payload ])
+    "current in-flight HTTP pull was not applied";
+  T.require
+    (http_generation = (M.snapshot context.manager).connection_generation)
+    "waiting for the current HTTP pull changed connection generation"
+;;
+
+let test_http_transaction_completion_does_not_finish_http_catchup () =
+  let context = open_live_manager 21 in
+  ignore
+    (M.handle_event
+       context.manager
+       (Websocket_closed
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = context.connection_generation
+          ; message = "disconnected"
+          }));
+  let connection_generation = (M.snapshot context.manager).connection_generation in
+  let outgoing = batch_payload "33000000-0000-4000-8000-000000000013" in
+  let transaction_challenge =
+    M.handle_event context.manager (Pending_batch outgoing) |> need_token
+  in
+  T.require
+    (match provide context.manager transaction_challenge "transaction-token" with
+     | [ Submit_http_transaction { connection_generation = actual; _ } ] ->
+       actual = connection_generation
+     | _ -> false)
+    "disconnected transaction did not start on the current attempt";
+  ignore (M.handle_command context.manager (Backgrounded { lifecycle_generation = 19L }));
+  let pull_challenge =
+    M.handle_command context.manager (Foreground_resumed { lifecycle_generation = 19L })
+    |> need_token
+  in
+  T.require
+    (match provide context.manager pull_challenge "http-pull-token" with
+     | [ Fetch_http_pull { connection_generation = actual; _ } ] ->
+       actual = connection_generation
+     | _ -> false)
+    "foreground did not preserve the authoritative HTTP catch-up attempt";
+  let transaction_response = {|{"type":"tx/batch/ok","t":22}|} in
+  T.require
+    (M.handle_event
+       context.manager
+       (Http_transaction_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation
+          ; payload = transaction_response
+          })
+     = [ Apply_sync_frame transaction_response ])
+    "current HTTP transaction response was not serialized";
+  T.require
+    (M.handle_event
+       context.manager
+       (Sync_applied
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; applied_server_t = 22
+          ; activity = Logseq_db_worker.Protocol.Pull_required
+          ; pending_payload = None
+          })
+     = [])
+    "HTTP transaction completion incorrectly finished authoritative catch-up";
+  let pull_response = {|{"type":"pull/ok","t":22,"txs":[]}|} in
+  T.require
+    (M.handle_event
+       context.manager
+       (Http_pull_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation
+          ; payload = pull_response
+          })
+     = [ Apply_sync_frame pull_response ])
+    "transaction completion discarded the in-flight HTTP catch-up"
+;;
+
+let test_late_http_completion_is_fenced_by_connection_generation () =
+  let context = open_live_manager 21 in
+  let http_generation = start_http_catchup context in
+  ignore
+    (M.handle_event
+       context.manager
+       (Network_failed
+          { account_generation = context.account_generation
+          ; graph_generation = Some context.graph_generation
+          ; connection_generation = Some http_generation
+          ; message = "HTTP attempt failed"
+          }));
+  let before = M.snapshot context.manager in
+  T.require
+    (M.handle_event
+       context.manager
+       (Http_pull_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation = http_generation
+          ; payload = {|{"type":"pull/ok","t":21,"txs":[]}|}
+          })
+     = [])
+    "late HTTP completion from a fenced attempt was applied";
+  T.require
+    (M.snapshot context.manager = before)
+    "late HTTP completion mutated manager state"
+;;
+
+let test_new_pending_batch_does_not_replace_uncertain_submission () =
+  let context = open_live_manager 21 in
+  let first_id = Uuid.of_string "33000000-0000-4000-8000-000000000011" |> Result.get_ok in
+  let second_id = "33000000-0000-4000-8000-000000000012" in
+  let first = batch_payload (Uuid.to_string first_id) in
+  T.require
+    (M.handle_event context.manager (Pending_batch first) = [ Send_websocket first ])
+    "first batch was not submitted";
+  ignore (M.handle_command context.manager (Backgrounded { lifecycle_generation = 17L }));
+  T.require
+    (M.handle_event context.manager (Pending_batch (batch_payload second_id)) = [])
+    "second background batch started network work";
+  ignore
+    (M.handle_command context.manager (Foreground_resumed { lifecycle_generation = 17L }));
+  let fallback =
+    M.handle_event
+      context.manager
+      (Foreground_probe_timed_out
+         { account_generation = context.account_generation
+         ; graph_generation = context.graph_generation
+         ; connection_generation = context.connection_generation
+         ; lifecycle_generation = 17L
+         })
+  in
+  let challenge =
+    match fallback with
+    | [ Close_websocket; Need_id_token challenge ] -> challenge
+    | _ -> T.fail "uncertain submission did not enter HTTP fallback"
+  in
+  let connection_generation =
+    match provide context.manager challenge "http-pull-token" with
+    | [ Fetch_http_pull { connection_generation; _ } ] -> connection_generation
+    | _ -> T.fail "uncertain submission did not start HTTP catch-up"
+  in
+  let pull_response = {|{"type":"pull/ok","t":21,"txs":[]}|} in
+  T.require
+    (M.handle_event
+       context.manager
+       (Http_pull_loaded
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; connection_generation
+          ; payload = pull_response
+          })
+     = [ Apply_sync_frame pull_response ])
+    "uncertain submission catch-up was not serialized";
+  T.require
+    (M.handle_event
+       context.manager
+       (Sync_applied
+          { account_generation = context.account_generation
+          ; graph_generation = context.graph_generation
+          ; applied_server_t = 21
+          ; activity = Logseq_db_worker.Protocol.Pull_duplicate
+          ; pending_payload = None
+          })
+     |> function
+     | [ Recover_submitted [ actual ]; Need_id_token _ ] -> Uuid.equal actual first_id
+     | _ -> false)
+    "a later pending batch replaced the actual uncertain submission"
 ;;
 
 let test_bootstrap_requests_a_fresh_token_for_each_authenticated_operation () =
@@ -1097,6 +1739,16 @@ let () =
   test_background_disconnect_and_timer_defer_reconnect_until_resume ();
   test_changed_and_tx_ack_are_serialized_around_foreground_probe ();
   test_failed_probe_recovers_only_the_uncertain_submission ();
+  test_probe_failures_share_one_immediate_http_fallback ();
+  test_presence_does_not_fail_foreground_probe ();
+  test_probe_failures_while_backgrounded_defer_http_fallback ();
+  test_backgrounded_http_submission_token_is_deferred ();
+  test_background_resume_waits_for_inflight_http_pull ();
+  test_http_transaction_completion_does_not_finish_http_catchup ();
+  test_open_graph_token_failures_are_nonblocking_and_retryable ();
+  test_backgrounded_token_failure_defers_retry ();
+  test_late_http_completion_is_fenced_by_connection_generation ();
+  test_new_pending_batch_does_not_replace_uncertain_submission ();
   test_bootstrap_requests_a_fresh_token_for_each_authenticated_operation ();
   test_e2ee_endpoint_orchestration_and_password_prompt_are_ocaml_owned ();
   test_managed_sync_startup_has_no_graph_target_or_credential ()

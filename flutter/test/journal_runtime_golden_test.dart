@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 // ignore: implementation_imports
@@ -30,6 +32,7 @@ final class _TestAuth implements JournalAuthCapability {
 
 void main() {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  WidgetsApp.debugAllowBannerOverride = false;
   if (binding is LiveTestWidgetsFlutterBinding) {
     binding.framePolicy = LiveTestWidgetsFlutterBindingFramePolicy.onlyPumps;
   }
@@ -38,6 +41,9 @@ void main() {
     'real runtime matches row, divider, Capture, preview, and swipe contracts',
     (tester) async {
       final harness = await _RuntimeHarness.start(tester);
+      expect(tester.takeException(), isNull);
+      expect(find.byType(MaterialApp), findsOneWidget);
+      expect(find.byType(MessageComposer), findsOneWidget);
       expect(find.text('Today'), findsOneWidget);
       expect(find.text('Wed, Aug 12'), findsOneWidget);
       expect(find.text(_parentSource), findsOneWidget);
@@ -137,7 +143,7 @@ void main() {
       );
       expect(_timelineDividers(tester, devicePixelRatio: 1), hasLength(8));
       await expectLater(
-        find.byKey(harness.boundaryKey),
+        find.byType(Scaffold).first,
         matchesGoldenFile('goldens/journal-reference-alignment.png'),
       );
       await tester.tap(disclosurePressable);
@@ -161,7 +167,7 @@ void main() {
       );
       await tester.pump();
       await expectLater(
-        find.byKey(harness.boundaryKey),
+        find.byType(Scaffold).first,
         matchesGoldenFile('goldens/journal-swipe-delete-threshold.png'),
       );
       await swipeGesture.up(timeStamp: const Duration(milliseconds: 600));
@@ -183,10 +189,51 @@ void main() {
           expect(rect.right, closeTo(390, 0.25));
         }
       }
+      await _expectLastRowAboveComposer(tester, harness);
+      tester.platformDispatcher.textScaleFactorTestValue = 3.2;
+      await harness.pumpUntil(
+        () =>
+            MediaQuery.textScalerOf(
+              tester.element(find.byType(MessageComposer)),
+            ).scale(1) >
+            3,
+        reason: 'large text scale did not reach the composer',
+      );
+      await _expectLastRowAboveComposer(tester, harness);
+      tester.view.viewInsets = const FakeViewPadding(bottom: 320);
+      await tester.pump();
+      await _expectLastRowAboveComposer(tester, harness);
+      tester.view.resetViewInsets();
+      tester.platformDispatcher.clearTextScaleFactorTestValue();
       await harness.dispose();
     },
     skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
     timeout: const Timeout(Duration(seconds: 60)),
+  );
+}
+
+Future<void> _expectLastRowAboveComposer(
+  WidgetTester tester,
+  _RuntimeHarness harness,
+) async {
+  final timelineScroll = find
+      .ancestor(
+        of: find.text('Doing line one'),
+        matching: find.byType(Scrollable),
+      )
+      .last;
+  await tester.drag(timelineScroll, const Offset(0, -4000));
+  await harness.pumpUntil(
+    () => find.text('Todo rail').evaluate().isNotEmpty,
+    reason: 'the final journal row was not retained at the end of the timeline',
+  );
+  await tester.pump(const Duration(milliseconds: 220));
+  final row = tester.getRect(find.text('Todo rail'));
+  final composer = tester.getRect(find.byType(MessageComposer));
+  expect(
+    row.bottom,
+    lessThanOrEqualTo(composer.top + 0.5),
+    reason: 'the final journal row is obscured by the persistent composer',
   );
 }
 
@@ -205,7 +252,6 @@ final class _RuntimeHarness {
     required this.frameEligibility,
     required this.root,
     required this.removeRoot,
-    required this.boundaryKey,
   });
 
   final WidgetTester tester;
@@ -213,7 +259,6 @@ final class _RuntimeHarness {
   final _ControllableFrameEligibilitySource frameEligibility;
   final Directory root;
   final bool removeRoot;
-  final GlobalKey boundaryKey;
   bool _disposed = false;
 
   static Future<_RuntimeHarness> start(
@@ -232,6 +277,8 @@ final class _RuntimeHarness {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
     addTearDown(tester.view.resetPadding);
+    addTearDown(tester.view.resetViewInsets);
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
     await tester.runAsync(_loadGoldenFonts);
 
     final configuredRoot = Platform.environment['JOURNAL_GOLDEN_SUPPORT_ROOT'];
@@ -240,6 +287,7 @@ final class _RuntimeHarness {
             () => Directory.systemTemp.createTemp('journal-golden-'),
           ))!
         : Directory(configuredRoot);
+    late final String snapshotToken;
     if (configuredRoot == null) {
       final fixture = (await tester.runAsync(
         () => Process.run(
@@ -252,6 +300,14 @@ final class _RuntimeHarness {
         0,
         reason: '${fixture.stdout}\n${fixture.stderr}',
       );
+      snapshotToken = (fixture.stdout as String).trim();
+    } else {
+      snapshotToken =
+          Platform.environment['JOURNAL_GOLDEN_SNAPSHOT_TOKEN'] ??
+          (throw StateError(
+            'JOURNAL_GOLDEN_SNAPSHOT_TOKEN is required with '
+            'JOURNAL_GOLDEN_SUPPORT_ROOT',
+          ));
     }
 
     var generation = 7;
@@ -264,17 +320,7 @@ final class _RuntimeHarness {
       generation: generation++,
     );
     final initialSnapshot = await calendar();
-    final adapter = ApplicationHostAdapter(
-      applicationSupportDirectory: () async => root,
-      baseUrl: Uri.parse('https://api.example.test'),
-      initialCalendarSnapshot: () async => initialSnapshot,
-      liveCalendarSnapshot: calendar,
-      formatJournalDays: ({required snapshot, required days}) async => {
-        for (final day in days) day: day == 20260812 ? 'Wed, Aug 12' : '$day',
-      },
-      auth: _TestAuth(),
-    );
-    final payload = (await tester.runAsync(adapter.createApplicationPayload))!;
+    final payload = _snapshotApplicationPayload(root.path, snapshotToken);
     final config = RuntimeBootstrapConfig(
       entrypoint: 'logseq_journal',
       launchPolicy: RuntimeLaunchPolicy.replaceExisting,
@@ -286,7 +332,6 @@ final class _RuntimeHarness {
       ).timeout(const Duration(seconds: 15)),
     ))!;
     final frameEligibility = _ControllableFrameEligibilitySource();
-    final boundaryKey = GlobalKey();
     final platform = JournalApplicationPlatform(
       calendarSnapshot: calendar,
       initialSnapshot: Future.value(initialSnapshot),
@@ -296,21 +341,11 @@ final class _RuntimeHarness {
       auth: _TestAuth(),
     );
     await tester.pumpWidget(
-      RepaintBoundary(
-        key: boundaryKey,
-        child: MaterialApp(
-          debugShowCheckedModeBanner: false,
-          theme: ThemeData(
-            fontFamily: 'Roboto',
-            fontFamilyFallback: const ['Apple Color Emoji'],
-          ),
-          home: BonsaiFlutterRoot(
-            config: config,
-            runtimeStarter: (_) async => runtime,
-            applicationPlatform: platform,
-            frameEligibilitySource: frameEligibility,
-          ),
-        ),
+      BonsaiFlutterRoot(
+        config: config,
+        runtimeStarter: (_) async => runtime,
+        applicationPlatform: platform,
+        frameEligibilitySource: frameEligibility,
       ),
     );
     final harness = _RuntimeHarness(
@@ -319,7 +354,6 @@ final class _RuntimeHarness {
       frameEligibility: frameEligibility,
       root: root,
       removeRoot: configuredRoot == null,
-      boundaryKey: boundaryKey,
     );
     addTearDown(harness.dispose);
     await harness.pumpUntil(
@@ -344,7 +378,14 @@ final class _RuntimeHarness {
       );
       await tester.pump();
     }
-    expect(predicate(), isTrue, reason: reason);
+    if (!predicate()) {
+      final mountedText = tester
+          .widgetList<Text>(find.byType(Text))
+          .map((widget) => widget.data)
+          .whereType<String>()
+          .toList();
+      fail('$reason; mounted text: $mountedText');
+    }
   }
 
   Future<void> dispose() async {
@@ -373,6 +414,23 @@ final class _RuntimeHarness {
       await tester.runAsync(() => root.delete(recursive: true));
     }
   }
+}
+
+Uint8List _snapshotApplicationPayload(String supportRoot, String token) {
+  final json = utf8.encode(
+    jsonEncode(<String, Object>{
+      'applicationSupportDirectory': supportRoot,
+      'target': <String, Object>{'kind': 'snapshot', 'token': token},
+      'compatibilityProfile': 'logseq-65.33-or-newer',
+      'responseBudgetBytes': 262144,
+      'defaultPageSize': 50,
+    }),
+  );
+  final payload = Uint8List(8 + json.length);
+  payload.setRange(0, 4, ascii.encode('LDB1'));
+  ByteData.sublistView(payload).setUint32(4, json.length, Endian.little);
+  payload.setRange(8, payload.length, json);
+  return payload;
 }
 
 Rect _ancestorRectWithHeight(WidgetTester tester, Finder child, double height) {

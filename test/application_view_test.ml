@@ -120,15 +120,17 @@ let initialize_test_calendar ?(packet = initial_calendar_packet) handle =
   Test.Handle.present handle
 ;;
 
-let create_handle startup =
+let create_raw_handle startup =
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
-  let handle =
-    Test.Handle.create_app
-      ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
-      ~time_source
-      Application.app
-      ~application_payload:(encode_startup startup)
-  in
+  Test.Handle.create_app
+    ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
+    ~time_source
+    Application.app
+    ~application_payload:(encode_startup startup)
+;;
+
+let create_handle startup =
+  let handle = create_raw_handle startup in
   initialize_test_calendar handle;
   handle
 ;;
@@ -610,6 +612,53 @@ let node_by_test_id handle test_id =
   | None -> fail "expected test ID %S\n%s" test_id (Test.Handle.show handle)
 ;;
 
+let last_wire handle =
+  let frame =
+    match Test.Handle.last_frame handle with
+    | Some frame -> frame
+    | None -> fail "headless runtime did not emit a frame"
+  in
+  match Protocol.Binary_codec.decode frame.bytes with
+  | Ok wire -> wire
+  | Error error -> fail "application frame did not decode: %s" error.message
+;;
+
+let application_theme_from_initial_frame handle =
+  (last_wire handle).operations
+  |> List.find_map (function
+    | Protocol.Wire_frame.Set_application_theme { title; theme } -> Some (title, theme)
+    | _ -> None)
+  |> function
+  | Some value -> value
+  | None -> fail "initial frame omitted the application theme"
+;;
+
+type snack_bar_request =
+  { request_id : ID.Host.request_id
+  ; message : string
+  ; action_label : string option
+  ; duration_ms : int
+  }
+
+let snack_bar_request_from_last_frame handle =
+  (last_wire handle).operations
+  |> List.find_map (function
+    | Protocol.Wire_frame.Host_request
+        { request_id; payload = Show_snack_bar { message; action_label; duration_ms } } ->
+      Some { request_id; message; action_label; duration_ms }
+    | _ -> None)
+  |> function
+  | Some request -> request
+  | None -> fail "frame omitted the expected show_snack_bar host request"
+;;
+
+let respond_to_snack_bar handle request close_reason =
+  let payload = Bytes.make 1 (Char.chr close_reason) in
+  Test.Handle.present handle;
+  Test.Handle.respond_to_host_effect handle ~request_id:request.request_id payload;
+  Test.Handle.present handle
+;;
+
 let text_field_value handle test_id =
   let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
   match view.node with
@@ -836,9 +885,31 @@ let require_button_enabled handle test_id expected =
   match view.node with
   | Ui.Widget.Private.Material_elevated_button { enabled; _ }
   | Ui.Widget.Private.Material_text_button { enabled; _ }
-  | Ui.Widget.Private.Material_icon_button { enabled; _ } ->
+  | Ui.Widget.Private.Material_icon_button { enabled; _ }
+  | Ui.Widget.Private.Material_filled_button { enabled; _ }
+  | Ui.Widget.Private.Material_filled_tonal_button { enabled; _ }
+  | Ui.Widget.Private.Material_outlined_button { enabled; _ } ->
     require (Bool.equal enabled expected) "%s enabled state differs" test_id
   | _ -> fail "%s is not a Material button" test_id
+;;
+
+type expected_button_kind =
+  | Filled_button
+  | Filled_tonal_button
+  | Outlined_button
+  | Text_button
+
+let require_button_kind handle test_id expected =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  let actual =
+    match view.node with
+    | Ui.Widget.Private.Material_filled_button _ -> Filled_button
+    | Ui.Widget.Private.Material_filled_tonal_button _ -> Filled_tonal_button
+    | Ui.Widget.Private.Material_outlined_button _ -> Outlined_button
+    | Ui.Widget.Private.Material_text_button _ -> Text_button
+    | _ -> fail "%s is not an application Material button" test_id
+  in
+  require (actual = expected) "%s uses the wrong Material button role" test_id
 ;;
 
 let capture_sheet_page_props handle =
@@ -888,16 +959,69 @@ let require_capture_modal_page handle ~can_pop ~enter_ms ~exit_ms =
      | Ui.Navigation.Modal_bottom_sheet.Sizing.Scroll_controlled -> ()
      | Content_bounded | Detented _ ->
        fail "Capture modal is not the fixed-large scroll-controlled sheet")
+  | Modal_dialog _ -> fail "Capture sheet uses the dialog presentation"
 ;;
 
-let require_capture_composer_position handle =
-  let positioned = node_by_test_id handle "journal-capture-composer-safe-area" in
-  match positioned.parent_data with
-  | Ui.Widget.Private.Stack_position { left; right; top; bottom } ->
+let require_capture_composer_bottom_sheet handle =
+  let composer = node_by_test_id handle "journal-capture-composer-safe-area" in
+  (match composer.parent_data with
+   | Ui.Widget.Private.No_parent_data -> ()
+   | Flex_parent_data _ | Stack_position _ ->
+     fail "Capture composer still carries overlay or flex parent data");
+  match Test.Handle.find_all handle (Test.Query.kind "Material_scaffold") with
+  | [ scaffold ] ->
+    let (Av view) = Ui.Widget.Private.view scaffold.widget in
+    (match view.node with
+     | Ui.Widget.Private.Material_scaffold { has_bottom_sheet = true; _ } -> ()
+     | Material_scaffold { has_bottom_sheet = false; _ } ->
+       fail "journal Scaffold does not own the Capture bottom sheet"
+     | _ -> assert false)
+  | [] -> fail "journal view has no Material scaffold"
+  | scaffolds -> fail "journal view has %d Material scaffolds" (List.length scaffolds)
+;;
+
+let require_alert_dialog handle test_id ~action_count =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Material_alert_dialog
+      { has_title = true; has_content = true; action_count = actual; _ } ->
+    require (actual = action_count) "%s action count changed" test_id
+  | Material_alert_dialog _ -> fail "%s omitted title or content" test_id
+  | _ -> fail "%s is not a Material AlertDialog" test_id
+;;
+
+let require_modal_dialog_page handle test_id ~page_key ~transition_ms =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Page
+      { page_key = actual_page_key; presentation; can_pop; restoration_id } ->
     require
-      (top = None && bottom = Some 12. && left = Some 12. && right = Some 12.)
-      "Capture composer does not span the content viewport margins"
-  | _ -> fail "Capture composer is not a positioned overlay child"
+      (String.equal (ID.Navigation.Page_key.to_string actual_page_key) page_key)
+      "%s page key changed"
+      test_id;
+    require (not can_pop) "%s became back-dismissible" test_id;
+    (match restoration_id with
+     | Some id ->
+       require
+         (String.equal (ID.Navigation.Restoration_id.to_string id) page_key)
+         "%s restoration identity changed"
+         test_id
+     | None -> fail "%s has no restoration identity" test_id);
+    (match presentation with
+     | Ui.Navigation.Modal_dialog modal ->
+       let modal = Ui.Navigation.Modal_dialog.Private.view modal in
+       require (not modal.barrier_dismissible) "%s barrier became dismissible" test_id;
+       require modal.use_safe_area "%s does not use SafeArea" test_id;
+       require modal.request_focus "%s does not request focus" test_id;
+       require
+         (modal.transition_duration_ms = transition_ms
+          && modal.reverse_transition_duration_ms = transition_ms)
+         "%s transition policy changed"
+         test_id;
+       require (Option.is_some modal.barrier_label) "%s omitted barrier semantics" test_id
+     | Standard _ | Modal_bottom_sheet _ ->
+       fail "%s is not presented as Modal_dialog" test_id)
+  | _ -> fail "%s is not a Navigator page" test_id
 ;;
 
 let substring_index text needle =
@@ -1010,23 +1134,8 @@ let require_header_geometry handle =
        right
        bottom
    | _ -> fail "journal-header-padding is not Padding");
-  require_sized_size
-    handle
-    "journal-header-leading-placeholder"
-    ~width:44.
-    ~height:44.;
-  require_sized_size
-    handle
-    "journal-header-account-placeholder"
-    ~width:44.
-    ~height:44.
-;;
-
-let require_stack_bottom handle test_id expected =
-  match (node_by_test_id handle test_id).parent_data with
-  | Ui.Widget.Private.Stack_position { left = _; right = _; top = None; bottom } ->
-    require (bottom = Some expected) "%s bottom is not %.1f" test_id expected
-  | _ -> fail "%s is not bottom-positioned" test_id
+  require_sized_size handle "journal-header-leading-placeholder" ~width:44. ~height:44.;
+  require_sized_size handle "journal-header-account-placeholder" ~width:44. ~height:44.
 ;;
 
 let require_content_width_padding handle ~horizontal =
@@ -1047,6 +1156,29 @@ let require_content_width_padding handle ~horizontal =
       bottom
       horizontal
   | _ -> fail "journal-content-width-padding is not Padding"
+;;
+
+let test_application_owns_a_light_material_theme () =
+  with_startup (fun startup ->
+    let handle = create_raw_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         let title, theme = application_theme_from_initial_frame handle in
+         require (title = Some "Logseq Journal") "application title changed";
+         require (theme.mode = Protocol.Wire_frame.Light) "application theme is not Light";
+         require
+           (theme.light.brightness = Protocol.Wire_frame.Light)
+           "light theme data has the wrong brightness";
+         require
+           (theme.dark.brightness = Protocol.Wire_frame.Dark)
+           "dark theme data has the wrong brightness";
+         match theme.high_contrast_light with
+         | Some data ->
+           require
+             (data.brightness = Protocol.Wire_frame.Light)
+             "high-contrast light data has the wrong brightness"
+         | None -> fail "application omitted high-contrast light theme data"))
 ;;
 
 let test_root_is_owned_by_the_ocaml_timeline () =
@@ -1110,6 +1242,7 @@ let test_capture_composer_replaces_the_center_orb_and_prefills_capture () =
                && submit.style = Filled)
               "Capture composer submit button policy changed"
           | _ -> fail "Capture composer must expose plus and submit actions");
+         require_capture_composer_bottom_sheet handle;
          require_no_test_id handle "journal-capture-target";
          require_no_test_id handle "journal-capture-feedback";
          send_capture_composer_button handle ~button_id:2 ~text:"   \n";
@@ -1122,7 +1255,8 @@ let test_capture_composer_replaces_the_center_orb_and_prefills_capture () =
               (Ui.Text_editing.Value.text (text_field_value handle "capture-editor"))
               source)
            "MessageComposer text was not transferred to Capture";
-         require_button_enabled handle "capture-save" true))
+         require_button_enabled handle "capture-save" true;
+         require_button_kind handle "capture-save" Filled_button))
 ;;
 
 let test_capture_is_an_ocaml_contextual_modal_sheet () =
@@ -1145,6 +1279,10 @@ let test_capture_is_an_ocaml_contextual_modal_sheet () =
          require_test_id handle "capture-date-context";
          require_test_id handle "capture-task";
          require_test_id handle "capture-save";
+         require_button_kind handle "capture-close" Text_button;
+         require_button_kind handle "capture-task" Outlined_button;
+         require_button_kind handle "capture-save" Filled_button;
+         require_button_kind handle "capture-add-child" Filled_tonal_button;
          require_test_id handle "capture-status";
          require_test_id handle "capture-action-row";
          require_test_id handle "capture-primary-scroll";
@@ -1261,6 +1399,14 @@ let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
          click_test_id handle "capture-close";
          require_test_id handle "capture-discard-dialog";
          require_no_test_id handle "capture-close";
+         require_alert_dialog handle "capture-discard-dialog" ~action_count:2;
+         require_modal_dialog_page
+           handle
+           "capture-discard-dialog-page"
+           ~page_key:"capture-discard-dialog"
+           ~transition_ms:0;
+         require_button_kind handle "capture-keep-editing" Text_button;
+         require_button_kind handle "capture-discard" Filled_button;
          click_test_id handle "capture-keep-editing";
          require_test_id handle "capture-close";
          require
@@ -1318,7 +1464,7 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
               ((not left) && (not top) && (not right) && bottom)
               "Capture composer safe-area edges changed"
           | _ -> fail "journal-capture-composer-safe-area is not SafeArea");
-         require_capture_composer_position handle;
+         require_capture_composer_bottom_sheet handle;
          require_test_id handle "journal-capture-composer-plus";
          require_test_id handle "journal-capture-composer-submit";
          require_no_visible_text handle "Search"))
@@ -1343,7 +1489,7 @@ let test_header_adapts_without_exposing_deferred_actions () =
          require_no_visible_text handle "Search";
          set_environment handle (environment ~locale:"ar_SA" ());
          pump_worker handle;
-         require_capture_composer_position handle))
+         require_capture_composer_bottom_sheet handle))
 ;;
 
 let test_timeline_content_is_capped_and_centered () =
@@ -1428,9 +1574,9 @@ let test_timeline_uses_exact_sparse_extent_window () =
          require
            (List.exists
               (fun (override : Ui.Widget.Sparse_extent_override.t) ->
-                 override.index = 65 && Float.equal override.extent 102.)
+                 override.index = 65 && Float.equal override.extent 226.)
               props.extent_overrides)
-           "timeline is missing exact final FAB and safe-bottom clearance";
+           "timeline is missing exact expanded-composer and safe-bottom clearance";
          send_visible_range handle ~first_index:58 ~last_exclusive:65;
          pump_until_text handle "Paged journal row 70";
          require_no_visible_text handle "Paged journal row 01";
@@ -1715,6 +1861,12 @@ let test_view_only_date_and_capture_route_own_plain_text_mutation_behavior () =
           | None -> fail "Capture dropped composing state");
          click_test_id handle "capture-close";
          require_test_id handle "capture-discard-dialog";
+         require_alert_dialog handle "capture-discard-dialog" ~action_count:2;
+         require_modal_dialog_page
+           handle
+           "capture-discard-dialog-page"
+           ~page_key:"capture-discard-dialog"
+           ~transition_ms:180;
          click_test_id handle "capture-keep-editing";
          require
            (String.equal
@@ -2501,15 +2653,26 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
          require_test_id handle ("journal-row-swipe:" ^ command.block_id);
          commit_end_swipe handle command.block_id;
          require_no_visible_text handle command.source;
-         require_live_region handle "Block and descendants removed";
-         require_test_id handle "journal-delete-snackbar-position";
-         require_stack_bottom handle "journal-delete-snackbar-position" 106.;
-         require_test_id handle "journal-delete-undo";
-         require_button_enabled handle "journal-delete-undo" true;
-         advance_clock handle monotonic_now_ns 4.9;
-         click_test_id handle "journal-delete-undo";
-         require_visible_text handle command.source;
+         pump_until handle "native deletion snackbar" (fun () ->
+           Test.Handle.pending_host_effect_count handle = 1);
+         let request = snack_bar_request_from_last_frame handle in
+         require
+           (String.equal request.message "Block and descendants removed")
+           "delete snackbar message changed";
+         require (request.action_label = Some "Undo") "delete snackbar action changed";
+         require (request.duration_ms = 5_000) "delete snackbar duration changed";
          require_no_test_id handle "journal-delete-snackbar";
+         for _ = 1 to 16 do
+           pump_worker handle
+         done;
+         require
+           (Test.Handle.pending_host_effect_count handle = 1)
+           "ordinary recomputation replayed or cancelled the snackbar";
+         respond_to_snack_bar handle request 0;
+         pump_until_text handle command.source;
+         require
+           (Test.Handle.pending_host_effect_count handle = 0)
+           "Undo left a pending snackbar host effect";
          advance_clock handle monotonic_now_ns 1.;
          require_visible_text handle command.source));
   with_startup (fun startup ->
@@ -2519,14 +2682,17 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
     pump_until_text handle command.source;
     commit_end_swipe handle command.block_id;
     require_no_visible_text handle command.source;
+    pump_until handle "native commit snackbar" (fun () ->
+      Test.Handle.pending_host_effect_count handle = 1);
+    let request = snack_bar_request_from_last_frame handle in
+    respond_to_snack_bar handle request 5;
     advance_clock handle monotonic_now_ns 5.;
-    pump_until handle "durable subtree delete" (fun () ->
-      Option.is_none
-        (Test.Handle.find handle (Test.Query.test_id "journal-delete-snackbar")));
     for _ = 1 to 64 do
       pump_worker handle
     done;
-    require_no_test_id handle "journal-delete-undo";
+    require
+      (Test.Handle.pending_host_effect_count handle = 0)
+      "timeout close reason retained or replayed Undo";
     Test.Handle.shutdown handle;
     let engine =
       Logseq_db_worker.Engine.open_ ~dependencies:Adapter_fixture.dependencies startup
@@ -2548,6 +2714,38 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
              (Logseq_db_worker.Error.message failure.error)))
 ;;
 
+let test_non_action_snackbar_close_reasons_never_undo () =
+  List.iter
+    (fun close_reason ->
+       with_startup (fun startup ->
+         let command =
+           capture
+             (120 + close_reason)
+             (Printf.sprintf "Non-action close reason %d" close_reason)
+         in
+         seed startup [ command ];
+         let handle = create_handle startup in
+         Fun.protect
+           ~finally:(fun () -> Test.Handle.shutdown handle)
+           (fun () ->
+              pump_until_text handle command.source;
+              commit_end_swipe handle command.block_id;
+              pump_until handle "native deletion snackbar" (fun () ->
+                Test.Handle.pending_host_effect_count handle = 1);
+              let request = snack_bar_request_from_last_frame handle in
+              respond_to_snack_bar handle request close_reason;
+              require_no_visible_text handle command.source;
+              require
+                (Test.Handle.pending_host_effect_count handle = 0)
+                "close reason %d retained the snackbar"
+                close_reason;
+              for _ = 1 to 8 do
+                pump_worker handle
+              done;
+              require_no_visible_text handle command.source)))
+    [ 1; 2; 3; 4; 5 ]
+;;
+
 let test_swipe_delete_accessibility_duration_and_single_mutation_gate () =
   with_startup (fun startup ->
     let first = capture 112 "First delete row" in
@@ -2560,17 +2758,25 @@ let test_swipe_delete_accessibility_duration_and_single_mutation_gate () =
          set_environment handle (environment ~accessible_navigation:true ());
          pump_until_text handle first.source;
          commit_end_swipe handle first.block_id;
+         pump_until handle "accessible deletion snackbar" (fun () ->
+           Test.Handle.pending_host_effect_count handle = 1);
+         let request = snack_bar_request_from_last_frame handle in
+         require
+           (request.duration_ms = 10_000)
+           "accessible snackbar did not use the bounded Undo lifetime";
          require_no_test_id handle ("journal-row-swipe:" ^ second.block_id);
          require_no_semantics handle "Delete block and all descendants";
          advance_clock handle monotonic_now_ns 5.;
-         require_test_id handle "journal-delete-undo";
+         require
+           (Test.Handle.pending_host_effect_count handle = 1)
+           "accessible snackbar ended before the Undo deadline";
          advance_clock handle monotonic_now_ns 5.;
          pump_until handle "accessible delete deadline" (fun () ->
-           Option.is_none
-             (Test.Handle.find handle (Test.Query.test_id "journal-delete-undo")))))
+           Test.Handle.pending_host_effect_count handle = 0)))
 ;;
 
 let () =
+  test_application_owns_a_light_material_theme ();
   test_initial_feed_has_a_truthful_loading_state ();
   test_timeline_content_is_capped_and_centered ();
   test_root_is_owned_by_the_ocaml_timeline ();
@@ -2604,5 +2810,6 @@ let () =
   test_expanded_children_are_static_previews_without_group_separator ();
   test_loading_and_adaptive_environment_surfaces_are_truthful ();
   test_swipe_delete_stages_undoes_and_commits_only_after_deadline ();
+  test_non_action_snackbar_close_reasons_never_undo ();
   test_swipe_delete_accessibility_duration_and_single_mutation_gate ()
 ;;

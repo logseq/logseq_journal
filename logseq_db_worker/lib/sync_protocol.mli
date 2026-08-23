@@ -36,6 +36,7 @@ type server_message =
       }
   | Server_error of { message : string }
   | Pong
+  | Online_users
 
 type outgoing_tx =
   { tx : string

@@ -136,11 +136,13 @@ type event =
   | Http_pull_loaded of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; payload : string
       }
   | Http_transaction_loaded of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; payload : string
       }
   | Sync_applied of
@@ -153,6 +155,7 @@ type event =
   | Network_failed of
       { account_generation : int
       ; graph_generation : int option
+      ; connection_generation : int option
       ; message : string
       }
 
@@ -243,6 +246,7 @@ type action =
   | Fetch_http_pull of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; graph_id : Graph_types.Uuid.t
       ; since : int
       ; token : string
@@ -250,6 +254,7 @@ type action =
   | Submit_http_transaction of
       { account_generation : int
       ; graph_generation : int
+      ; connection_generation : int
       ; graph_id : Graph_types.Uuid.t
       ; payload : string
       ; token : string
@@ -264,31 +269,40 @@ type t =
   ; e2ee_platform : Sync_e2ee_session.platform
   ; mutable e2ee : Sync_e2ee_session.t option
   ; mutable e2ee_continuation : e2ee_continuation
-  ; mutable websocket_open : bool
-  ; mutable websocket_initialized : bool
-  ; mutable reconnect_after_http_pull : bool
-  ; mutable pending_http_submission : string option
+  ; mutable transport : transport_state
   ; mutable reconnect_attempt : int
-  ; mutable lifecycle : lifecycle_state
   ; mutable last_resumed_generation : int64
-  ; mutable revalidating : revalidation option
-  ; mutable pull_in_flight : bool
-  ; mutable pull_requested : bool
-  ; mutable applying_pull : bool
-  ; mutable awaiting_websocket : bool
-  ; mutable http_catchup_applied : bool
+  ; mutable pull : pull_state
+  ; mutable frame_application : frame_application
   ; mutable submission : submission_state
   ; mutable recover_after_http_pull : Graph_types.Uuid.t list
   }
 
-and lifecycle_state =
-  | Foreground
-  | In_background of int64
+and transport_state =
+  | Foreground_transport of foreground_transport
+  | Suspended of
+      { lifecycle_generation : int64
+      ; transport : foreground_transport
+      }
 
-and revalidation =
-  { lifecycle_generation : int64
-  ; connection_generation : int
-  }
+and foreground_transport =
+  | Disconnected
+  | Awaiting_websocket_token
+  | Connecting_websocket
+  | Live_websocket of { initialized : bool }
+  | Revalidating_websocket of
+      { lifecycle_generation : int64
+      ; connection_generation : int
+      ; initialized : bool
+      }
+  | Awaiting_http_pull_token
+  | Http_pull_in_flight
+  | Http_catchup_applied
+  | Backing_off
+
+and pull_state =
+  | Pull_idle
+  | Pull_in_flight of { requested_again : bool }
 
 and submission_state =
   | No_submission
@@ -296,10 +310,20 @@ and submission_state =
       { payload : string
       ; tx_ids : Graph_types.Uuid.t list
       }
+  | Awaiting_http_submission_token of
+      { payload : string
+      ; tx_ids : Graph_types.Uuid.t list
+      }
   | In_flight_submission of
       { payload : string
       ; tx_ids : Graph_types.Uuid.t list
       }
+
+and frame_application =
+  | No_frame_application
+  | Applying_pull
+  | Applying_transaction
+  | Applying_control
 
 and bootstrap_state =
   | Bootstrap_idle
@@ -327,19 +351,11 @@ let create_with_e2ee ~e2ee_platform ~next_challenge_id ~base_url =
   ; e2ee_platform
   ; e2ee = None
   ; e2ee_continuation = No_e2ee_continuation
-  ; websocket_open = false
-  ; websocket_initialized = false
-  ; reconnect_after_http_pull = false
-  ; pending_http_submission = None
+  ; transport = Foreground_transport Disconnected
   ; reconnect_attempt = 0
-  ; lifecycle = Foreground
   ; last_resumed_generation = -1L
-  ; revalidating = None
-  ; pull_in_flight = false
-  ; pull_requested = false
-  ; applying_pull = false
-  ; awaiting_websocket = false
-  ; http_catchup_applied = false
+  ; pull = Pull_idle
+  ; frame_application = No_frame_application
   ; submission = No_submission
   ; recover_after_http_pull = []
   ; snapshot =
@@ -363,26 +379,65 @@ let create ~next_challenge_id ~base_url =
 let snapshot t = t.snapshot
 
 let is_backgrounded t =
-  match t.lifecycle with
-  | Foreground -> false
-  | In_background _ -> true
+  match t.transport with
+  | Foreground_transport _ -> false
+  | Suspended _ -> true
+;;
+
+let current_transport t =
+  match t.transport with
+  | Foreground_transport transport | Suspended { transport; _ } -> transport
+;;
+
+let set_current_transport t transport =
+  t.transport
+  <- (match t.transport with
+      | Foreground_transport _ -> Foreground_transport transport
+      | Suspended suspended -> Suspended { suspended with transport })
+;;
+
+let is_revalidating = function
+  | Revalidating_websocket _ -> true
+  | Disconnected
+  | Awaiting_websocket_token
+  | Connecting_websocket
+  | Live_websocket _
+  | Awaiting_http_pull_token
+  | Http_pull_in_flight
+  | Http_catchup_applied
+  | Backing_off -> false
+;;
+
+let is_http_pull_in_flight = function
+  | Http_pull_in_flight -> true
+  | Disconnected
+  | Awaiting_websocket_token
+  | Connecting_websocket
+  | Live_websocket _
+  | Revalidating_websocket _
+  | Awaiting_http_pull_token
+  | Http_catchup_applied
+  | Backing_off -> false
+;;
+
+let pull_is_idle = function
+  | Pull_idle -> true
+  | Pull_in_flight _ -> false
 ;;
 
 let clear_transport_coordination t =
-  t.revalidating <- None;
-  t.websocket_initialized <- false;
-  t.pull_in_flight <- false;
-  t.pull_requested <- false;
-  t.applying_pull <- false;
-  t.awaiting_websocket <- false;
-  t.http_catchup_applied <- false;
+  set_current_transport t Disconnected;
+  t.pull <- Pull_idle;
+  t.frame_application <- No_frame_application;
   t.submission <- No_submission;
   t.recover_after_http_pull <- []
 ;;
 
 let submission_ids = function
   | No_submission -> []
-  | Deferred_submission { tx_ids; _ } | In_flight_submission { tx_ids; _ } -> tx_ids
+  | Deferred_submission { tx_ids; _ }
+  | Awaiting_http_submission_token { tx_ids; _ }
+  | In_flight_submission { tx_ids; _ } -> tx_ids
 ;;
 
 let remember_uncertain_submission t =
@@ -396,15 +451,22 @@ let pull_payload t =
 ;;
 
 let request_pull t =
-  if t.pull_in_flight
+  if not (pull_is_idle t.pull)
   then (
-    t.pull_requested <- true;
+    t.pull <- Pull_in_flight { requested_again = true };
     [])
-  else if not t.websocket_open
-  then []
   else (
-    t.pull_in_flight <- true;
-    [ Send_websocket (pull_payload t) ])
+    match current_transport t with
+    | Live_websocket _ | Revalidating_websocket _ ->
+      t.pull <- Pull_in_flight { requested_again = false };
+      [ Send_websocket (pull_payload t) ]
+    | Disconnected
+    | Awaiting_websocket_token
+    | Connecting_websocket
+    | Awaiting_http_pull_token
+    | Http_pull_in_flight
+    | Http_catchup_applied
+    | Backing_off -> [])
 ;;
 
 let decode_submission payload =
@@ -422,50 +484,75 @@ let send_submission t payload tx_ids =
 ;;
 
 let challenge t purpose =
-  match t.snapshot.user_id with
-  | None -> []
-  | Some user_id ->
-    (match purpose with
-     | Sync_auth.Websocket_connect -> t.awaiting_websocket <- true
-     | Http_pull -> t.http_catchup_applied <- false
-     | Catalog_discovery | Snapshot_bootstrap | E2ee_key_access | Transaction_submission
-       -> ());
-    let graph_generation, connection_generation =
-      match purpose with
-      | Sync_auth.Catalog_discovery -> None, None
-      | Snapshot_bootstrap | E2ee_key_access | Http_pull | Transaction_submission ->
-        Some t.snapshot.graph_generation, None
-      | Websocket_connect ->
-        Some t.snapshot.graph_generation, Some t.snapshot.connection_generation
-    in
-    let challenge =
-      Sync_auth.issue
-        t.auth
-        ~purpose
-        ~user_id
-        ~account_generation:t.snapshot.account_generation
-        ~graph_generation
-        ~connection_generation
-    in
-    if purpose <> Sync_auth.Catalog_discovery || t.snapshot.selected_graph = None
-    then t.snapshot <- { t.snapshot with phase = Awaiting_token purpose };
-    [ Need_id_token challenge ]
+  if is_backgrounded t
+  then []
+  else if
+    purpose = Sync_auth.Http_pull
+    &&
+    match current_transport t with
+    | Awaiting_http_pull_token | Http_pull_in_flight -> true
+    | Disconnected
+    | Awaiting_websocket_token
+    | Connecting_websocket
+    | Live_websocket _
+    | Revalidating_websocket _
+    | Http_catchup_applied
+    | Backing_off -> false
+  then []
+  else (
+    match t.snapshot.user_id with
+    | None -> []
+    | Some user_id ->
+      (match purpose with
+       | Sync_auth.Websocket_connect -> set_current_transport t Awaiting_websocket_token
+       | Http_pull -> set_current_transport t Awaiting_http_pull_token
+       | Catalog_discovery | Snapshot_bootstrap | E2ee_key_access | Transaction_submission
+         -> ());
+      let graph_generation, connection_generation =
+        match purpose with
+        | Sync_auth.Catalog_discovery -> None, None
+        | Snapshot_bootstrap | E2ee_key_access -> Some t.snapshot.graph_generation, None
+        | Http_pull | Transaction_submission | Websocket_connect ->
+          Some t.snapshot.graph_generation, Some t.snapshot.connection_generation
+      in
+      let challenge =
+        Sync_auth.issue
+          t.auth
+          ~purpose
+          ~user_id
+          ~account_generation:t.snapshot.account_generation
+          ~graph_generation
+          ~connection_generation
+      in
+      if purpose <> Sync_auth.Catalog_discovery || t.snapshot.selected_graph = None
+      then t.snapshot <- { t.snapshot with phase = Awaiting_token purpose };
+      [ Need_id_token challenge ])
 ;;
 
 let route_submission t payload =
-  match decode_submission payload with
-  | Error message ->
-    t.snapshot <- { t.snapshot with phase = Sync_paused; last_error = Some message };
+  match t.submission with
+  | Deferred_submission _ | Awaiting_http_submission_token _ | In_flight_submission _ ->
     []
-  | Ok (payload, tx_ids) ->
-    if is_backgrounded t || Option.is_some t.revalidating || t.awaiting_websocket
-    then defer_submission t payload tx_ids
-    else if t.websocket_open
-    then send_submission t payload tx_ids
-    else (
-      t.submission <- In_flight_submission { payload; tx_ids };
-      t.pending_http_submission <- Some payload;
-      challenge t Sync_auth.Transaction_submission)
+  | No_submission ->
+    (match decode_submission payload with
+     | Error message ->
+       t.snapshot <- { t.snapshot with phase = Sync_paused; last_error = Some message };
+       []
+     | Ok (payload, tx_ids) ->
+       if is_backgrounded t
+       then defer_submission t payload tx_ids
+       else (
+         match current_transport t with
+         | Live_websocket _ -> send_submission t payload tx_ids
+         | Revalidating_websocket _ | Awaiting_websocket_token | Connecting_websocket ->
+           defer_submission t payload tx_ids
+         | Disconnected
+         | Awaiting_http_pull_token
+         | Http_pull_in_flight
+         | Http_catchup_applied
+         | Backing_off ->
+           t.submission <- Awaiting_http_submission_token { payload; tx_ids };
+           challenge t Sync_auth.Transaction_submission))
 ;;
 
 let selected t =
@@ -553,6 +640,29 @@ let schedule_reconnect t =
     | None, _, _ | Some _, None, _ | Some _, Some _, None -> [])
 ;;
 
+let fence_transport t ?last_error () =
+  remember_uncertain_submission t;
+  Sync_auth.cancel_all t.auth;
+  set_current_transport t Backing_off;
+  t.pull <- Pull_idle;
+  t.frame_application <- No_frame_application;
+  t.snapshot
+  <- { t.snapshot with
+       connection_generation = t.snapshot.connection_generation + 1
+     ; last_error
+     }
+;;
+
+let begin_http_fallback t ?last_error () =
+  fence_transport t ?last_error ();
+  if is_backgrounded t then [] else Close_websocket :: challenge t Sync_auth.Http_pull
+;;
+
+let begin_scheduled_reconnect t ~message =
+  fence_transport t ~last_error:message ();
+  schedule_reconnect t
+;;
+
 let provide_token
       t
       ~challenge_id
@@ -588,6 +698,7 @@ let provide_token
        (match t.snapshot.selected_graph with
         | None -> []
         | Some graph_id ->
+          set_current_transport t Connecting_websocket;
           [ Connect_websocket
               { account_generation = t.snapshot.account_generation
               ; graph_generation = t.snapshot.graph_generation
@@ -649,30 +760,40 @@ let provide_token
            | Awaiting_password | Ready | Failed -> [])
         | _, _ -> [])
      | Http_pull ->
-       (match t.snapshot.selected_graph, t.snapshot.applied_server_t with
-        | Some graph_id, Some since ->
+       (match
+          ( t.snapshot.selected_graph
+          , t.snapshot.applied_server_t
+          , challenge.connection_generation
+          , current_transport t )
+        with
+        | Some graph_id, Some since, Some connection_generation, Awaiting_http_pull_token
+          when connection_generation = t.snapshot.connection_generation ->
+          set_current_transport t Http_pull_in_flight;
           [ Fetch_http_pull
               { account_generation = t.snapshot.account_generation
               ; graph_generation = t.snapshot.graph_generation
+              ; connection_generation
               ; graph_id
               ; since
               ; token
               }
           ]
-        | None, _ | Some _, None -> [])
+        | _ -> [])
      | Transaction_submission ->
-       (match t.snapshot.selected_graph, t.pending_http_submission with
-        | Some graph_id, Some payload ->
-          t.pending_http_submission <- None;
+       (match t.snapshot.selected_graph, t.submission with
+        | Some graph_id, Awaiting_http_submission_token { payload; tx_ids } ->
+          t.submission <- In_flight_submission { payload; tx_ids };
           [ Submit_http_transaction
               { account_generation = t.snapshot.account_generation
               ; graph_generation = t.snapshot.graph_generation
+              ; connection_generation = t.snapshot.connection_generation
               ; graph_id
               ; payload
               ; token
               }
           ]
-        | None, _ | Some _, None -> []))
+        | None, _
+        | Some _, (No_submission | Deferred_submission _ | In_flight_submission _) -> []))
 ;;
 
 let handle_command t = function
@@ -681,9 +802,6 @@ let handle_command t = function
     Sync_auth.cancel_all t.auth;
     t.bootstrap <- Bootstrap_idle;
     clear_e2ee t;
-    t.websocket_open <- false;
-    t.reconnect_after_http_pull <- false;
-    t.pending_http_submission <- None;
     t.reconnect_attempt <- 0;
     clear_transport_coordination t;
     t.snapshot
@@ -703,9 +821,6 @@ let handle_command t = function
     Sync_auth.cancel_all t.auth;
     t.bootstrap <- Bootstrap_idle;
     clear_e2ee t;
-    t.websocket_open <- false;
-    t.reconnect_after_http_pull <- false;
-    t.pending_http_submission <- None;
     t.reconnect_attempt <- 0;
     clear_transport_coordination t;
     t.snapshot
@@ -730,8 +845,16 @@ let handle_command t = function
       } ->
     if is_backgrounded t
     then (
-      ignore (Sync_auth.fail t.auth ~challenge_id);
-      t.awaiting_websocket <- false;
+      (match Sync_auth.fail t.auth ~challenge_id with
+       | Ok { purpose = Http_pull | Websocket_connect; _ } ->
+         set_current_transport t Backing_off
+       | Ok { purpose = Transaction_submission; _ } ->
+         (match t.submission with
+          | Awaiting_http_submission_token { payload; tx_ids } ->
+            t.submission <- Deferred_submission { payload; tx_ids }
+          | No_submission | Deferred_submission _ | In_flight_submission _ -> ())
+       | Ok { purpose = Catalog_discovery | Snapshot_bootstrap | E2ee_key_access; _ }
+       | Error _ -> ());
       [])
     else
       provide_token
@@ -746,19 +869,27 @@ let handle_command t = function
     (match Sync_auth.fail t.auth ~challenge_id with
      | Error _ -> []
      | Ok challenge ->
-       (match challenge.Sync_auth.purpose with
-        | Websocket_connect -> t.awaiting_websocket <- false
-        | Catalog_discovery
-        | Snapshot_bootstrap
-        | E2ee_key_access
-        | Http_pull
-        | Transaction_submission -> ());
+       let retryable_transport_failure =
+         match challenge.Sync_auth.purpose with
+         | Websocket_connect | Http_pull ->
+           set_current_transport t Backing_off;
+           true
+         | Transaction_submission ->
+           set_current_transport t Backing_off;
+           (match t.submission with
+            | Awaiting_http_submission_token { payload; tx_ids } ->
+              t.submission <- Deferred_submission { payload; tx_ids }
+            | No_submission | Deferred_submission _ | In_flight_submission _ -> ());
+           true
+         | Catalog_discovery | Snapshot_bootstrap | E2ee_key_access -> false
+       in
+       let populated_graph = Option.is_some t.snapshot.applied_server_t in
        t.snapshot
        <- { t.snapshot with
-            phase = Failed
+            phase = (if populated_graph then Sync_paused else Failed)
           ; last_error = Some "ID token acquisition failed"
           };
-       [])
+       if retryable_transport_failure && populated_graph then schedule_reconnect t else [])
   | Select_graph graph_id ->
     (match
        List.find_opt
@@ -771,9 +902,6 @@ let handle_command t = function
        Sync_auth.cancel_all t.auth;
        t.bootstrap <- Bootstrap_idle;
        clear_e2ee t;
-       t.websocket_open <- false;
-       t.reconnect_after_http_pull <- false;
-       t.pending_http_submission <- None;
        t.reconnect_attempt <- 0;
        clear_transport_coordination t;
        t.snapshot
@@ -800,9 +928,6 @@ let handle_command t = function
        Sync_auth.cancel_all t.auth;
        t.bootstrap <- Bootstrap_idle;
        clear_e2ee t;
-       t.websocket_open <- false;
-       t.reconnect_after_http_pull <- false;
-       t.pending_http_submission <- None;
        t.reconnect_attempt <- 0;
        clear_transport_coordination t;
        t.snapshot
@@ -819,68 +944,66 @@ let handle_command t = function
     if
       Int64.compare lifecycle_generation t.last_resumed_generation <= 0
       ||
-      match t.lifecycle with
-      | In_background generation -> Int64.equal generation lifecycle_generation
-      | Foreground -> false
+      match t.transport with
+      | Suspended suspended ->
+        Int64.equal suspended.lifecycle_generation lifecycle_generation
+      | Foreground_transport _ -> false
     then []
     else (
-      t.lifecycle <- In_background lifecycle_generation;
+      let transport = current_transport t in
+      t.transport <- Suspended { lifecycle_generation; transport };
       [])
   | Foreground_resumed { lifecycle_generation } ->
-    (match t.lifecycle with
-     | Foreground -> []
-     | In_background background_generation
-       when not (Int64.equal background_generation lifecycle_generation) -> []
-     | In_background _ ->
-       t.lifecycle <- Foreground;
+    (match t.transport with
+     | Foreground_transport _ -> []
+     | Suspended suspended
+       when not (Int64.equal suspended.lifecycle_generation lifecycle_generation) -> []
+     | Suspended suspended ->
+       t.transport <- Foreground_transport suspended.transport;
        t.last_resumed_generation <- lifecycle_generation;
        t.reconnect_attempt <- 0;
        t.snapshot <- { t.snapshot with last_error = None };
        (match
           t.snapshot.user_id, t.snapshot.selected_graph, t.snapshot.applied_server_t
         with
-        | Some _, Some _, Some _ when t.websocket_open ->
-          t.revalidating
-          <- Some
-               { lifecycle_generation
-               ; connection_generation = t.snapshot.connection_generation
-               };
-          let hello =
-            if t.websocket_initialized
-            then []
-            else (
-              t.websocket_initialized <- true;
-              [ Send_websocket (Sync_protocol.encode_hello ~client:"logseq-journal") ])
-          in
-          let pull =
-            if t.pull_in_flight
-            then []
-            else (
-              t.pull_in_flight <- true;
-              [ Send_websocket (pull_payload t) ])
-          in
-          hello
-          @ pull
-          @ [ Schedule_foreground_probe
-                { account_generation = t.snapshot.account_generation
-                ; graph_generation = t.snapshot.graph_generation
-                ; connection_generation = t.snapshot.connection_generation
-                ; lifecycle_generation
-                ; delay_seconds = 3.
-                }
-            ]
-        | Some _, Some _, Some _ when t.http_catchup_applied ->
-          t.http_catchup_applied <- false;
-          let recovery =
-            if t.recover_after_http_pull = []
-            then []
-            else [ Recover_submitted t.recover_after_http_pull ]
-          in
-          t.recover_after_http_pull <- [];
-          recovery @ challenge t Sync_auth.Websocket_connect
         | Some _, Some _, Some _ ->
-          t.reconnect_after_http_pull <- true;
-          challenge t Sync_auth.Http_pull
+          (match current_transport t with
+           | Live_websocket { initialized } | Revalidating_websocket { initialized; _ } ->
+             set_current_transport
+               t
+               (Revalidating_websocket
+                  { lifecycle_generation
+                  ; connection_generation = t.snapshot.connection_generation
+                  ; initialized = true
+                  });
+             let hello =
+               if initialized
+               then []
+               else
+                 [ Send_websocket (Sync_protocol.encode_hello ~client:"logseq-journal") ]
+             in
+             let pull = request_pull t in
+             hello
+             @ pull
+             @ [ Schedule_foreground_probe
+                   { account_generation = t.snapshot.account_generation
+                   ; graph_generation = t.snapshot.graph_generation
+                   ; connection_generation = t.snapshot.connection_generation
+                   ; lifecycle_generation
+                   ; delay_seconds = 3.
+                   }
+               ]
+           | Http_catchup_applied ->
+             let recovery =
+               if t.recover_after_http_pull = []
+               then []
+               else [ Recover_submitted t.recover_after_http_pull ]
+             in
+             t.recover_after_http_pull <- [];
+             recovery @ challenge t Sync_auth.Websocket_connect
+           | Awaiting_http_pull_token | Http_pull_in_flight -> []
+           | Awaiting_websocket_token | Connecting_websocket -> []
+           | Disconnected | Backing_off -> challenge t Sync_auth.Http_pull)
         | Some _, None, _ -> challenge t Sync_auth.Catalog_discovery
         | None, _, _ | Some _, Some _, None -> []))
   | Submit_e2ee_password password ->
@@ -901,9 +1024,6 @@ let handle_command t = function
        Sync_auth.cancel_all t.auth;
        t.bootstrap <- Bootstrap_idle;
        clear_e2ee t;
-       t.websocket_open <- false;
-       t.reconnect_after_http_pull <- false;
-       t.pending_http_submission <- None;
        t.reconnect_attempt <- 0;
        clear_transport_coordination t;
        t.snapshot
@@ -955,9 +1075,6 @@ let handle_event t = function
           Sync_auth.cancel_all t.auth;
           t.bootstrap <- Bootstrap_idle;
           clear_e2ee t;
-          t.websocket_open <- false;
-          t.reconnect_after_http_pull <- false;
-          t.pending_http_submission <- None;
           t.reconnect_attempt <- 0;
           let graph_generation = t.snapshot.graph_generation + 1 in
           t.snapshot
@@ -979,9 +1096,6 @@ let handle_event t = function
           Sync_auth.cancel_all t.auth;
           t.bootstrap <- Bootstrap_idle;
           clear_e2ee t;
-          t.websocket_open <- false;
-          t.reconnect_after_http_pull <- false;
-          t.pending_http_submission <- None;
           t.reconnect_attempt <- 0;
           t.snapshot
           <- { t.snapshot with
@@ -1113,15 +1227,14 @@ let handle_event t = function
   | Graph_opened _ -> []
   | Websocket_opened { account_generation; graph_generation; connection_generation }
     when connection_current t account_generation graph_generation connection_generation ->
-    t.websocket_open <- true;
-    t.awaiting_websocket <- false;
+    set_current_transport t (Live_websocket { initialized = false });
     t.reconnect_attempt <- 0;
     t.snapshot <- { t.snapshot with phase = Graph_open; last_error = None };
     if is_backgrounded t
     then []
     else (
-      t.websocket_initialized <- true;
-      t.pull_in_flight <- true;
+      set_current_transport t (Live_websocket { initialized = true });
+      t.pull <- Pull_in_flight { requested_again = false };
       [ Send_websocket (Sync_protocol.encode_hello ~client:"logseq-journal")
       ; Send_websocket (pull_payload t)
       ])
@@ -1132,46 +1245,34 @@ let handle_event t = function
     (match Sync_protocol.decode_server_message payload with
      | Ok (Changed _) -> request_pull t
      | Ok (Pull_ok _) ->
-       t.applying_pull <- true;
+       t.frame_application <- Applying_pull;
        [ Apply_sync_frame payload ]
      | Ok (Tx_batch_ok _ | Tx_reject _) ->
        t.submission <- No_submission;
-       t.applying_pull <- false;
+       t.frame_application <- Applying_transaction;
        [ Apply_sync_frame payload ]
      | Ok (Hello _ | Server_error _ | Pong) ->
-       t.applying_pull <- false;
+       t.frame_application <- Applying_control;
        [ Apply_sync_frame payload ]
+     | Ok Online_users -> []
      | Error message ->
-       t.snapshot <- { t.snapshot with phase = Sync_paused; last_error = Some message };
-       [])
+       if is_revalidating (current_transport t)
+       then begin_http_fallback t ~last_error:message ()
+       else (
+         t.snapshot <- { t.snapshot with phase = Sync_paused; last_error = Some message };
+         []))
   | Websocket_frame _ -> []
   | Websocket_closed
       { account_generation; graph_generation; connection_generation; message }
     when connection_current t account_generation graph_generation connection_generation ->
-    remember_uncertain_submission t;
-    t.websocket_open <- false;
-    t.websocket_initialized <- false;
-    t.awaiting_websocket <- false;
-    t.revalidating <- None;
-    t.pull_in_flight <- false;
-    t.pull_requested <- false;
-    t.applying_pull <- false;
-    t.reconnect_after_http_pull <- true;
-    t.snapshot
-    <- { t.snapshot with
-         connection_generation = t.snapshot.connection_generation + 1
-       ; last_error = Some message
-       };
-    schedule_reconnect t
+    if is_revalidating (current_transport t)
+    then begin_http_fallback t ~last_error:message ()
+    else begin_scheduled_reconnect t ~message
   | Websocket_closed _ -> []
   | Reconnect_timer_elapsed
       { account_generation; graph_generation; connection_generation }
     when connection_current t account_generation graph_generation connection_generation ->
-    if is_backgrounded t
-    then []
-    else (
-      t.reconnect_after_http_pull <- true;
-      challenge t Sync_auth.Http_pull)
+    if is_backgrounded t then [] else challenge t Sync_auth.Http_pull
   | Reconnect_timer_elapsed _ -> []
   | Foreground_probe_timed_out
       { account_generation
@@ -1180,37 +1281,37 @@ let handle_event t = function
       ; lifecycle_generation
       }
     when connection_current t account_generation graph_generation connection_generation ->
-    (match t.revalidating with
-     | Some probe
-       when Int64.equal probe.lifecycle_generation lifecycle_generation
-            && probe.connection_generation = connection_generation ->
-       remember_uncertain_submission t;
-       Sync_auth.cancel_all t.auth;
-       t.websocket_open <- false;
-       t.websocket_initialized <- false;
-       t.revalidating <- None;
-       t.pull_in_flight <- false;
-       t.pull_requested <- false;
-       t.applying_pull <- false;
-       t.reconnect_after_http_pull <- true;
-       t.snapshot
-       <- { t.snapshot with
-            connection_generation = t.snapshot.connection_generation + 1
-          ; last_error = None
-          };
-       Close_websocket :: challenge t Sync_auth.Http_pull
-     | None | Some _ -> [])
+    if is_backgrounded t
+    then []
+    else (
+      match current_transport t with
+      | Revalidating_websocket probe
+        when Int64.equal probe.lifecycle_generation lifecycle_generation
+             && probe.connection_generation = connection_generation ->
+        begin_http_fallback t ()
+      | Revalidating_websocket _
+      | Disconnected
+      | Awaiting_websocket_token
+      | Connecting_websocket
+      | Live_websocket _
+      | Awaiting_http_pull_token
+      | Http_pull_in_flight
+      | Http_catchup_applied
+      | Backing_off -> [])
   | Foreground_probe_timed_out _ -> []
   | Pending_batch payload -> route_submission t payload
-  | Http_pull_loaded { account_generation; graph_generation; payload }
-    when graph_current t account_generation graph_generation ->
-    t.applying_pull <- true;
+  | Http_pull_loaded
+      { account_generation; graph_generation; connection_generation; payload }
+    when connection_current t account_generation graph_generation connection_generation
+         && is_http_pull_in_flight (current_transport t) ->
+    t.frame_application <- Applying_pull;
     [ Apply_sync_frame payload ]
   | Http_pull_loaded _ -> []
-  | Http_transaction_loaded { account_generation; graph_generation; payload }
-    when graph_current t account_generation graph_generation ->
+  | Http_transaction_loaded
+      { account_generation; graph_generation; connection_generation; payload }
+    when connection_current t account_generation graph_generation connection_generation ->
     t.submission <- No_submission;
-    t.applying_pull <- false;
+    t.frame_application <- Applying_transaction;
     [ Apply_sync_frame payload ]
   | Http_transaction_loaded _ -> []
   | Sync_applied
@@ -1222,73 +1323,118 @@ let handle_event t = function
       }
     when graph_current t account_generation graph_generation ->
     t.snapshot <- { t.snapshot with applied_server_t = Some applied_server_t };
-    let completed_pull = t.applying_pull in
-    let requested_again = t.pull_requested in
-    t.applying_pull <- false;
-    if completed_pull
-    then (
-      t.pull_in_flight <- false;
-      t.pull_requested <- false;
-      t.revalidating <- None);
-    if t.reconnect_after_http_pull
-    then (
-      Option.iter
-        (fun payload ->
-           match t.submission, decode_submission payload with
-           | No_submission, Ok (payload, tx_ids) ->
-             t.submission <- Deferred_submission { payload; tx_ids }
-           | No_submission, Error message ->
-             t.snapshot
-             <- { t.snapshot with phase = Sync_paused; last_error = Some message }
-           | (Deferred_submission _ | In_flight_submission _), _ -> ())
-        pending_payload;
-      if is_backgrounded t
-      then (
-        t.http_catchup_applied <- true;
-        [])
-      else (
-        t.reconnect_after_http_pull <- false;
-        let recovery =
-          if t.recover_after_http_pull = []
-          then []
-          else [ Recover_submitted t.recover_after_http_pull ]
-        in
-        t.recover_after_http_pull <- [];
-        recovery @ challenge t Sync_auth.Websocket_connect))
+    let completed_pull = t.frame_application = Applying_pull in
+    let transport_before_application = current_transport t in
+    let failed_probe =
+      completed_pull
+      && activity = Protocol.Sync_paused
+      && is_revalidating transport_before_application
+    in
+    let requested_again =
+      match t.pull with
+      | Pull_idle -> false
+      | Pull_in_flight { requested_again } -> requested_again
+    in
+    t.frame_application <- No_frame_application;
+    if failed_probe
+    then begin_http_fallback t ~last_error:"foreground probe replay failed" ()
     else (
-      let need_pull =
-        requested_again
-        ||
-        match activity with
-        | Protocol.Pull_required -> true
-        | Pull_applied | Pull_duplicate | Sync_paused | Sync_submission_blocked -> false
-      in
-      let pull = if need_pull then request_pull t else [] in
-      let pending =
-        match pending_payload, t.submission with
-        | Some payload, No_submission -> route_submission t payload
-        | Some _, (Deferred_submission _ | In_flight_submission _) | None, _ -> []
-      in
-      let deferred =
-        if
-          completed_pull
-          && (not t.pull_in_flight)
-          && t.websocket_open
-          && not (is_backgrounded t)
+      if completed_pull
+      then (
+        t.pull <- Pull_idle;
+        match transport_before_application with
+        | Revalidating_websocket _ ->
+          set_current_transport t (Live_websocket { initialized = true })
+        | Disconnected
+        | Awaiting_websocket_token
+        | Connecting_websocket
+        | Live_websocket _
+        | Awaiting_http_pull_token
+        | Http_pull_in_flight
+        | Http_catchup_applied
+        | Backing_off -> ());
+      if completed_pull && is_http_pull_in_flight transport_before_application
+      then (
+        Option.iter
+          (fun payload ->
+             match t.submission, decode_submission payload with
+             | No_submission, Ok (payload, tx_ids) ->
+               t.submission <- Deferred_submission { payload; tx_ids }
+             | No_submission, Error message ->
+               t.snapshot
+               <- { t.snapshot with phase = Sync_paused; last_error = Some message }
+             | ( ( Deferred_submission _
+                 | Awaiting_http_submission_token _
+                 | In_flight_submission _ )
+               , _ ) -> ())
+          pending_payload;
+        if is_backgrounded t
         then (
-          match t.submission with
-          | Deferred_submission { payload; tx_ids } -> send_submission t payload tx_ids
-          | No_submission | In_flight_submission _ -> [])
-        else []
-      in
-      pull @ pending @ deferred)
+          set_current_transport t Http_catchup_applied;
+          [])
+        else (
+          let recovery =
+            if t.recover_after_http_pull = []
+            then []
+            else [ Recover_submitted t.recover_after_http_pull ]
+          in
+          t.recover_after_http_pull <- [];
+          recovery @ challenge t Sync_auth.Websocket_connect))
+      else (
+        let need_pull =
+          requested_again
+          ||
+          match activity with
+          | Protocol.Pull_required -> true
+          | Pull_applied | Pull_duplicate | Sync_paused | Sync_submission_blocked -> false
+        in
+        let pull = if need_pull then request_pull t else [] in
+        let pending =
+          match pending_payload, t.submission with
+          | Some payload, No_submission -> route_submission t payload
+          | ( Some _
+            , ( Deferred_submission _
+              | Awaiting_http_submission_token _
+              | In_flight_submission _ ) )
+          | None, _ -> []
+        in
+        let deferred =
+          if
+            completed_pull
+            && pull_is_idle t.pull
+            && (not (is_backgrounded t))
+            &&
+            match current_transport t with
+            | Live_websocket _ -> true
+            | Disconnected
+            | Awaiting_websocket_token
+            | Connecting_websocket
+            | Revalidating_websocket _
+            | Awaiting_http_pull_token
+            | Http_pull_in_flight
+            | Http_catchup_applied
+            | Backing_off -> false
+          then (
+            match t.submission with
+            | Deferred_submission { payload; tx_ids } -> send_submission t payload tx_ids
+            | No_submission | Awaiting_http_submission_token _ | In_flight_submission _ ->
+              [])
+          else []
+        in
+        pull @ pending @ deferred))
   | Sync_applied _ -> []
-  | Network_failed { account_generation; graph_generation; message }
+  | Network_failed
+      { account_generation; graph_generation; connection_generation; message }
     when account_current t account_generation
          &&
          match graph_generation with
          | None -> true
-         | Some generation -> generation = t.snapshot.graph_generation ->
+         | Some generation ->
+           generation = t.snapshot.graph_generation
+           &&
+             (match connection_generation with
+             | None -> true
+             | Some generation -> generation = t.snapshot.connection_generation) ->
     t.snapshot
     <- { t.snapshot with
          phase =
@@ -1296,19 +1442,10 @@ let handle_event t = function
        ; last_error = Some message
        };
     if Option.is_some graph_generation && Option.is_some t.snapshot.applied_server_t
-    then (
-      remember_uncertain_submission t;
-      t.websocket_open <- false;
-      t.websocket_initialized <- false;
-      t.awaiting_websocket <- false;
-      t.revalidating <- None;
-      t.pull_in_flight <- false;
-      t.pull_requested <- false;
-      t.applying_pull <- false;
-      t.reconnect_after_http_pull <- true;
-      t.snapshot
-      <- { t.snapshot with connection_generation = t.snapshot.connection_generation + 1 };
-      schedule_reconnect t)
+    then
+      if is_revalidating (current_transport t)
+      then begin_http_fallback t ~last_error:message ()
+      else begin_scheduled_reconnect t ~message
     else []
   | Network_failed _ -> []
 ;;

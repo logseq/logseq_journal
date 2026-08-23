@@ -2,7 +2,7 @@
 import 'dart:typed_data';
 
 import 'package:bonsai_flutter/bonsai_flutter.dart';
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 
 import 'application_host_adapter.dart' as application;
 
@@ -67,9 +67,12 @@ final class _BonsaiFlutterHostState extends State<BonsaiFlutterHost> {
       final prepared = snapshot.data;
       final Widget home;
       if (snapshot.error case final error?) {
-        home = Center(child: Text('Unable to prepare application: $error'));
+        home = Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(child: Text('Unable to prepare application: $error')),
+        );
       } else if (prepared == null) {
-        home = const Center(child: CircularProgressIndicator());
+        home = const SizedBox.shrink();
       } else {
         home = BonsaiFlutterRoot(
           config: prepared.runtimeConfig,
@@ -78,7 +81,7 @@ final class _BonsaiFlutterHostState extends State<BonsaiFlutterHost> {
       }
       return widget.adapter.buildHost(
         context: context,
-        child: MaterialApp(title: 'logseq_journal', home: home),
+        child: home,
       );
     },
   );

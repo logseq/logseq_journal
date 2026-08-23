@@ -221,7 +221,8 @@ let test_typography_spacing_motion_and_hit_regions () =
     (composer.horizontal_margin = 12.
      && composer.bottom_inset = 12.
      && composer.minimum_height = 48.
-     && composer.reserved_extent = 68.)
+     && composer.maximum_lines = 5
+     && composer.expanded_vertical_overhead = 80.)
     "Capture composer geometry tokens changed";
   let standard = Tokens.motion ~reduced_motion:false in
   let reduced = Tokens.motion ~reduced_motion:true in
@@ -450,7 +451,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ; Tokens.Day_heading, 36.
     ; Tokens.Day_continuation, 48.
     ; Tokens.Feed_continuation, 48.
-    ; Tokens.Bottom_clearance, 102.
+    ; Tokens.Bottom_clearance, 226.
     ];
   check
     ~width:320.
@@ -462,7 +463,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ; Tokens.Day_heading, 101.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
-    ; Tokens.Bottom_clearance, 68.
+    ; Tokens.Bottom_clearance, 412.
     ]
 ;;
 
@@ -492,7 +493,8 @@ let test_header_context_copy_is_pure_product_state () =
 let tests =
   [ "light palette and interaction", test_light_palette_and_interaction_tokens
   ; "light high contrast", test_light_high_contrast_palette_is_explicit
-  ; "exact status rail categories", test_every_exact_status_maps_to_the_decided_rail_category
+  ; ( "exact status rail categories"
+    , test_every_exact_status_maps_to_the_decided_rail_category )
   ; "timestamp contrast", test_timestamp_contrast_meets_small_text_target
   ; "Capture sheet palette and contrast", test_capture_sheet_palette_roles_and_contrast
   ; ( "typography, spacing, motion, and hit regions"

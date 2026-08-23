@@ -1086,7 +1086,7 @@ let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
          "write-disabled row retained swipe wrapper")
 ;;
 
-let test_delete_and_snackbar_tokens_are_explicit_and_accessible () =
+let test_delete_tokens_are_explicit_and_accessible () =
   let normal = Tokens.palette (Tokens.resolve ~high_contrast:false) in
   let high_contrast = Tokens.palette (Tokens.resolve ~high_contrast:true) in
   require
@@ -1096,17 +1096,7 @@ let test_delete_and_snackbar_tokens_are_explicit_and_accessible () =
   require
     (Ui.Style.Color.Private.to_argb32 high_contrast.destructive
      <> Ui.Style.Color.Private.to_argb32 high_contrast.background)
-    "high-contrast destructive surface blends into background";
-  require
-    (Ui.Style.Color.Private.to_argb32 normal.snackbar_surface
-     <> Ui.Style.Color.Private.to_argb32 normal.snackbar_primary_text)
-    "snackbar text lacks contrast";
-  require
-    (Tokens.snackbar_geometry.minimum_height >= 48.)
-    "snackbar cannot contain a 48-point Undo target";
-  require
-    (Tokens.snackbar_geometry.maximum_width <= Tokens.timeline_max_width)
-    "snackbar exceeds timeline maximum width"
+    "high-contrast destructive surface blends into background"
 ;;
 
 let () =
@@ -1120,5 +1110,5 @@ let () =
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();
   test_swipe_delete_wrapper_has_only_square_logical_end_action ();
-  test_delete_and_snackbar_tokens_are_explicit_and_accessible ()
+  test_delete_tokens_are_explicit_and_accessible ()
 ;;

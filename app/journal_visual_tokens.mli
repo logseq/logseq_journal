@@ -22,9 +22,6 @@ type palette =
   ; sheet_error : Ui.Style.Color.t
   ; destructive : Ui.Style.Color.t
   ; on_destructive : Ui.Style.Color.t
-  ; snackbar_surface : Ui.Style.Color.t
-  ; snackbar_primary_text : Ui.Style.Color.t
-  ; snackbar_action_text : Ui.Style.Color.t
   }
 
 type interaction =
@@ -74,7 +71,8 @@ type composer_geometry =
   { horizontal_margin : float
   ; bottom_inset : float
   ; minimum_height : float
-  ; reserved_extent : float
+  ; maximum_lines : int
+  ; expanded_vertical_overhead : float
   }
 
 type row_geometry =
@@ -91,14 +89,6 @@ type preview_geometry =
   ; bullet_diameter : float
   ; text_leading : float
   ; narrow_leading_delta : float
-  }
-
-type snackbar_geometry =
-  { margin : float
-  ; maximum_width : float
-  ; minimum_height : float
-  ; corner_radius : float
-  ; vertical_gap : float
   }
 
 type motion =
@@ -141,7 +131,6 @@ val header_geometry : header_geometry
 val composer_geometry : composer_geometry
 val row_geometry : row_geometry
 val preview_geometry : preview_geometry
-val snackbar_geometry : snackbar_geometry
 val motion : reduced_motion:bool -> motion
 val physical_divider_thickness : device_pixel_ratio:float -> float
 val timeline_max_width : float

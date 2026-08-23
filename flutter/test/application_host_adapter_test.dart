@@ -223,6 +223,11 @@ void main() {
     );
     expect(source, contains('Unable to configure authentication'));
     expect(source, contains('Retry'));
+    expect(RegExp(r'MaterialApp\(').allMatches(source), hasLength(1));
+    expect(
+      source,
+      isNot(contains("child: MaterialApp(title: 'Logseq Journal'")),
+    );
   });
 
   test(

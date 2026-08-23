@@ -36,6 +36,7 @@ type server_message =
       }
   | Server_error of { message : string }
   | Pong
+  | Online_users
 
 type outgoing_tx =
   { tx : string
@@ -208,6 +209,11 @@ let decode_json = function
       | "error" ->
         bind (string "message" fields) (fun message -> Ok (Server_error { message }))
       | "pong" -> Ok Pong
+      | "online-users" ->
+        (match field "online-users" fields with
+         | Some (`List _) -> Ok Online_users
+         | Some _ -> Error "online-users must be an array"
+         | None -> Error "missing field: online-users")
       | message_type -> Error ("unsupported server message: " ^ message_type))
   | _ -> Error "server message must be a JSON object"
 ;;

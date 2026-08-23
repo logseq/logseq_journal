@@ -245,6 +245,7 @@ let terminal_graph_state state message =
   ; feed_loaded = true
   ; feed_refresh = None
   ; pending_delete = None
+  ; timeline_notice = None
   ; graph_error = Some message
   }
 ;;
@@ -543,6 +544,20 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
 
 let color red green blue = Ui.Style.Color.rgb ~red ~green ~blue
 
+let application_theme =
+  let seed = color 24 30 52 in
+  let data brightness contrast_level =
+    Ui.Theme.material
+      ~brightness
+      ~color_scheme:(Ui.Theme.Color_scheme.from_seed ~color:seed ~contrast_level ())
+      ()
+  in
+  let light = data Ui.Style.Brightness.Light 0. in
+  let dark = data Ui.Style.Brightness.Dark 0. in
+  let high_contrast_light = data Ui.Style.Brightness.Light 1. in
+  Ui.Theme.application ~mode:Ui.Theme.Light ~light ~dark ~high_contrast_light ()
+;;
+
 let text_style ?size ?weight ?height ?color () =
   Ui.Style.Text_style.create
     ?font_size:size
@@ -556,10 +571,17 @@ let styled_text ?size ?weight ?height ?color value =
   Ui.Widget.text ~style:(text_style ?size ?weight ?height ?color ()) value
 ;;
 
+type action_role =
+  | Filled
+  | Filled_tonal
+  | Outlined
+  | Text
+
 let action_target
       ?(enabled = true)
       ?(minimum_target = 44.)
       ?key
+      ~role
       ~test_id
       ~label
       ~hint
@@ -567,7 +589,11 @@ let action_target
       child
   =
   let button =
-    Ui.Material.text_button ?key ~enabled ~on_press ~child ()
+    (match role with
+     | Filled -> Ui.Material.filled_button ?key ~enabled ~on_press ~child ()
+     | Filled_tonal -> Ui.Material.filled_tonal_button ?key ~enabled ~on_press ~child ()
+     | Outlined -> Ui.Material.outlined_button ?key ~enabled ~on_press ~child ()
+     | Text -> Ui.Material.text_button ?key ~enabled ~on_press ~child ())
     |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
   in
   let properties =
@@ -609,53 +635,6 @@ let prefix_action handler prefix =
     | _ -> ())
 ;;
 
-let timeline_notice_view ~tokens notice undo =
-  let palette = Journal_visual_tokens.palette tokens in
-  let message, action =
-    match notice with
-    | Delete_undo -> "Block and descendants removed", Some undo
-    | Delete_failed -> "Delete failed. Block restored.", None
-  in
-  let message =
-    live_region_text ~color:palette.snackbar_primary_text message
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-delete-message")
-  in
-  let children =
-    match action with
-    | None -> [ Ui.Widget.Flex.expanded message ]
-    | Some on_press ->
-      let undo =
-        action_target
-          ~minimum_target:48.
-          ~test_id:"journal-delete-undo"
-          ~label:"Undo block deletion"
-          ~hint:"Restore the removed block and descendants"
-          ~on_press
-          (styled_text ~color:palette.snackbar_action_text "Undo")
-      in
-      [ Ui.Widget.Flex.expanded message; Ui.Widget.Flex.fixed undo ]
-  in
-  Ui.Widget.Flex.row children
-  |> Ui.Widget.padding
-       ~insets:
-         (Ui.Layout.Edge_insets.symmetric
-            ~horizontal:Journal_visual_tokens.spacing.x4
-            ~vertical:Journal_visual_tokens.spacing.x1
-            ())
-  |> Ui.Widget.constrained_box
-       ~constraints:
-         (Ui.Layout.Box_constraints.create
-            ~min_height:Journal_visual_tokens.snackbar_geometry.minimum_height
-            ())
-  |> Ui.Widget.decorated_box
-       ~decoration:
-         (Ui.Style.Decoration.create
-            ~background:palette.snackbar_surface
-            ~border_radius:Journal_visual_tokens.snackbar_geometry.corner_radius
-            ())
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-delete-snackbar")
-;;
-
 let timeline_page
       ~tokens
       ~profile
@@ -666,13 +645,11 @@ let timeline_page
       ~graph_error
       ~sync_error
       ~cache_reset_available
-      ~cache_reset_confirmation
       ~today_subtitle
       ~day_label
       ~reduced_motion
       ~rtl
       ~safe_bottom
-      ~viewport_width
       ~content_horizontal_inset
       ~capture_enabled
       ~capture_composer_key
@@ -681,17 +658,9 @@ let timeline_page
       ~on_toggle_children
       ~delete_enabled
       ~on_delete
-      ~timeline_notice
-      ~on_delete_undo
       ~on_cache_reset_requested
-      ~on_cache_reset_cancelled
-      ~on_cache_reset_confirmed
       ~account_menu_available
-      ~account_menu_open
       ~on_account_menu
-      ~on_account_menu_dismissed
-      ~on_switch_graph
-      ~on_sign_out
   =
   let palette = Journal_visual_tokens.palette tokens in
   let header =
@@ -730,7 +699,7 @@ let timeline_page
            ("journal-capture-composer:" ^ Int64.to_string capture_composer_key))
       ~enabled:capture_enabled
       ~autofocus:false
-      ~max_lines:5
+      ~max_lines:Journal_visual_tokens.composer_geometry.maximum_lines
       ~hint_text:"Capture a thought"
       ~buttons:
         [ capture_button
@@ -739,14 +708,14 @@ let timeline_page
             ~position:Ui.Native_widget.Message_composer.Leading
             ~visibility:Always
             ~style:Plain
-            0xe145
+            0xe047
         ; capture_button
             ~id:2
             ~tooltip:"Continue Capture"
             ~position:Trailing
             ~visibility:When_non_empty
             ~style:Filled
-            0xe5d8
+            0xe0a0
         ]
       ~on_event:on_capture_event
       ()
@@ -796,45 +765,20 @@ let timeline_page
     |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-root-surface")
     |> Ui.Widget.Body.safe_area ~left:false ~right:false ~bottom:false
   in
-  let overlay =
+  let bottom_sheet =
     let geometry = Journal_visual_tokens.composer_geometry in
     capture
-    |> Ui.Widget.Stack.positioned
-         ~left:geometry.horizontal_margin
-         ~right:geometry.horizontal_margin
-         ~bottom:geometry.bottom_inset
-  in
-  let overlays =
-    match timeline_notice with
-    | None -> [ overlay ]
-    | Some notice ->
-      let geometry = Journal_visual_tokens.snackbar_geometry in
-      let content_width =
-        Float.max 0. (viewport_width -. (2. *. content_horizontal_inset))
-      in
-      let snackbar_width =
-        Float.min
-          geometry.maximum_width
-          (Float.max 0. (content_width -. (2. *. geometry.margin)))
-      in
-      let left = Float.max 0. ((content_width -. snackbar_width) /. 2.) in
-      let bottom =
-        safe_bottom
-        +. Journal_visual_tokens.composer_geometry.bottom_inset
-        +. Journal_visual_tokens.composer_geometry.minimum_height
-        +. geometry.vertical_gap
-      in
-      let snackbar =
-        timeline_notice_view ~tokens notice on_delete_undo
-        |> Ui.Widget.sized_box ~width:snackbar_width
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-delete-snackbar-position")
-        |> Ui.Widget.Stack.positioned ~left ~bottom
-      in
-      [ overlay; snackbar ]
+    |> Ui.Widget.padding
+         ~insets:
+           (Ui.Layout.Edge_insets.only
+              ~left:(content_horizontal_inset +. geometry.horizontal_margin)
+              ~right:(content_horizontal_inset +. geometry.horizontal_margin)
+              ~bottom:(safe_bottom +. geometry.bottom_inset)
+              ())
   in
   let overlays =
     match sync_error with
-    | None -> overlays
+    | None -> []
     | Some message ->
       let message = live_region_text ~color:palette.sheet_error message in
       let contents =
@@ -843,6 +787,7 @@ let timeline_page
           [ Ui.Widget.Flex.expanded message
           ; Ui.Widget.Flex.fixed
               (action_target
+                 ~role:Filled_tonal
                  ~test_id:"request-local-cache-reset"
                  ~label:"Reset local graph copy"
                  ~hint:"Delete this local mirror and download it again"
@@ -863,105 +808,7 @@ let timeline_page
         |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-sync-error")
         |> Ui.Widget.Stack.positioned ~left:16. ~right:16. ~top:64.
       in
-      banner :: overlays
-  in
-  let overlays =
-    if not account_menu_open
-    then overlays
-    else (
-      let switch_graph =
-        action_target
-          ~test_id:"journal-account-switch-graph"
-          ~label:"Switch graph"
-          ~hint:"Close the current graph and choose another authorized graph"
-          ~on_press:on_switch_graph
-          (styled_text "Switch graph")
-      in
-      let reset =
-        if not cache_reset_available
-        then []
-        else
-          [ Ui.Widget.Flex.fixed
-              (action_target
-                 ~test_id:"journal-account-reset-local-copy"
-                 ~label:"Reset local graph copy"
-                 ~hint:"Delete this local mirror and download a fresh snapshot"
-                 ~on_press:on_cache_reset_requested
-                 (styled_text "Reset local copy"))
-          ]
-      in
-      let sign_out =
-        action_target
-          ~test_id:"journal-account-sign-out"
-          ~label:"Sign out"
-          ~hint:"Close the current graph and return to sign in"
-          ~on_press:on_sign_out
-          (styled_text ~color:palette.sheet_error "Sign out")
-      in
-      let dismiss =
-        action_target
-          ~test_id:"journal-account-menu-dismiss"
-          ~label:"Close account menu"
-          ~hint:"Return to the journal"
-          ~on_press:on_account_menu_dismissed
-          (styled_text "Cancel")
-      in
-      let menu =
-        Ui.Widget.Flex.column
-          ([ Ui.Widget.Flex.fixed
-               (styled_text ~size:20. ~weight:Ui.Style.Font_weight.Bold "Account")
-           ; Ui.Widget.Flex.fixed switch_graph
-           ]
-           @ reset
-           @ [ Ui.Widget.Flex.fixed sign_out; Ui.Widget.Flex.fixed dismiss ])
-        |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 20.)
-        |> Ui.Material.dialog ~barrier_dismissible:false
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu")
-        |> Ui.Widget.Stack.positioned
-      in
-      menu :: overlays)
-  in
-  let overlays =
-    if not cache_reset_confirmation
-    then overlays
-    else (
-      let cancel =
-        action_target
-          ~test_id:"cancel-local-cache-reset"
-          ~label:"Keep local graph copy"
-          ~hint:"Close without deleting local data"
-          ~on_press:on_cache_reset_cancelled
-          (styled_text "Cancel")
-      in
-      let confirm =
-        action_target
-          ~test_id:"confirm-local-cache-reset"
-          ~label:"Delete and redownload local graph copy"
-          ~hint:"Delete the local mirror and download it again"
-          ~on_press:on_cache_reset_confirmed
-          (styled_text ~color:palette.sheet_error "Delete and redownload")
-      in
-      let dialog =
-        Ui.Widget.Flex.column
-          [ Ui.Widget.Flex.fixed
-              (styled_text
-                 ~size:20.
-                 ~weight:Ui.Style.Font_weight.Bold
-                 "Reset local graph copy?")
-          ; Ui.Widget.Flex.fixed
-              (styled_text
-                 "This deletes the local mirror, including pending local changes, then \
-                  downloads a fresh snapshot. The authorized server graph is not changed.")
-          ; Ui.Widget.Flex.fixed
-              (Ui.Widget.Flex.row
-                 [ Ui.Widget.Flex.expanded cancel; Ui.Widget.Flex.expanded confirm ])
-          ]
-        |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 20.)
-        |> Ui.Material.dialog ~barrier_dismissible:false
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "local-cache-reset-dialog")
-        |> Ui.Widget.Stack.positioned
-      in
-      dialog :: overlays)
+      [ banner ]
   in
   let body =
     Ui.Widget.Body.overlay ~base ~overlays ()
@@ -972,7 +819,7 @@ let timeline_page
     |> Ui.Widget.Body.decorated_box
          ~decoration:(Ui.Style.Decoration.create ~background:palette.background ())
   in
-  Ui.Material.scaffold ~body ()
+  Ui.Material.scaffold ~body ~bottom_sheet ()
   |> Ui.Widget.page
        ~key:(Ui.Key.string "journal-timeline")
        ~page_key:(ID.Navigation.Page_key.of_string "journal-timeline")
@@ -981,29 +828,138 @@ let timeline_page
 ;;
 
 let dialog_body ~test_id ~title ~message ~primary ~secondary =
-  Ui.Widget.Flex.column
-    [ Ui.Widget.Flex.fixed
-        (styled_text
-           ~size:20.
-           ~weight:Ui.Style.Font_weight.Bold
-           ~color:(color 13 20 47)
-           title)
-    ; Ui.Widget.Flex.fixed (styled_text ~size:15. ~color:(color 64 70 95) message)
-    ; Ui.Widget.Flex.fixed
-        (Ui.Widget.Flex.row
-           [ Ui.Widget.Flex.expanded primary; Ui.Widget.Flex.expanded secondary ])
-    ]
-  |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 20.)
-  |> Ui.Material.dialog ~barrier_dismissible:false
+  Ui.Material.alert_dialog
+    ~title:
+      (styled_text
+         ~size:20.
+         ~weight:Ui.Style.Font_weight.Bold
+         ~color:(color 13 20 47)
+         title)
+    ~content:(styled_text ~size:15. ~color:(color 64 70 95) message)
+    ~actions:[ primary; secondary ]
+    ()
   |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
 ;;
 
-let page_body ?dialog content =
-  let base = Ui.Widget.Body.static content in
-  match dialog with
-  | None -> base
-  | Some dialog ->
-    Ui.Widget.Body.overlay ~base ~overlays:[ Ui.Widget.Stack.positioned dialog ] ()
+let modal_dialog_page ~tokens ~reduced_motion ~page_key ~test_id ~barrier_label dialog =
+  let palette = Journal_visual_tokens.palette tokens in
+  let transition_ms =
+    (Journal_visual_tokens.motion ~reduced_motion).route_transition_ms
+  in
+  let presentation =
+    Ui.Navigation.Modal_dialog.create
+      ~barrier_dismissible:false
+      ~barrier_color:palette.modal_scrim
+      ~barrier_label
+      ~use_safe_area:true
+      ~request_focus:true
+      ~transition_duration_ms:transition_ms
+      ~reverse_transition_duration_ms:transition_ms
+      ()
+  in
+  dialog
+  |> Ui.Widget.page
+       ~key:(Ui.Key.string page_key)
+       ~page_key:(ID.Navigation.Page_key.of_string page_key)
+       ~presentation:(Ui.Navigation.Modal_dialog presentation)
+       ~can_pop:false
+       ~restoration_id:(ID.Navigation.Restoration_id.of_string page_key)
+  |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
+;;
+
+let account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch =
+  let action ~role ~test_id ~label ~hint ~command text =
+    action_target
+      ~role
+      ~test_id
+      ~label
+      ~hint
+      ~on_press:(bind_action dispatch command)
+      (styled_text text)
+  in
+  let actions =
+    [ action
+        ~role:Outlined
+        ~test_id:"journal-account-switch-graph"
+        ~label:"Switch graph"
+        ~hint:"Close the current graph and choose another authorized graph"
+        ~command:"switch-graph"
+        "Switch graph"
+    ]
+    @ (if cache_reset_available
+       then
+         [ action
+             ~role:Filled_tonal
+             ~test_id:"journal-account-reset-local-copy"
+             ~label:"Reset local graph copy"
+             ~hint:"Delete this local mirror and download a fresh snapshot"
+             ~command:"request-local-cache-reset"
+             "Reset local copy"
+         ]
+       else [])
+    @ [ action
+          ~role:Filled
+          ~test_id:"journal-account-sign-out"
+          ~label:"Sign out"
+          ~hint:"Close the current graph and return to sign in"
+          ~command:"sign-out"
+          "Sign out"
+      ; action
+          ~role:Text
+          ~test_id:"journal-account-menu-dismiss"
+          ~label:"Close account menu"
+          ~hint:"Return to the journal"
+          ~command:"close-account-menu"
+          "Cancel"
+      ]
+  in
+  Ui.Material.alert_dialog
+    ~title:(styled_text ~size:20. ~weight:Ui.Style.Font_weight.Bold "Account")
+    ~content:(styled_text "Manage the current Logseq graph and authenticated session.")
+    ~actions
+    ()
+  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu")
+  |> modal_dialog_page
+       ~tokens
+       ~reduced_motion
+       ~page_key:"journal-account-dialog"
+       ~test_id:"journal-account-dialog-page"
+       ~barrier_label:"Account actions"
+;;
+
+let local_cache_reset_dialog_page ~tokens ~reduced_motion dispatch =
+  let cancel =
+    action_target
+      ~role:Text
+      ~test_id:"cancel-local-cache-reset"
+      ~label:"Keep local graph copy"
+      ~hint:"Close without deleting local data"
+      ~on_press:(bind_action dispatch "cancel-local-cache-reset")
+      (styled_text "Cancel")
+  in
+  let confirm =
+    action_target
+      ~role:Filled
+      ~test_id:"confirm-local-cache-reset"
+      ~label:"Delete and redownload local graph copy"
+      ~hint:"Delete the local mirror and download it again"
+      ~on_press:(bind_action dispatch "confirm-local-cache-reset")
+      (styled_text "Delete and redownload")
+  in
+  dialog_body
+    ~test_id:"local-cache-reset-dialog"
+    ~title:"Reset local graph copy?"
+    ~message:
+      "This deletes the local mirror, including pending local changes, then downloads a \
+       fresh snapshot. The authorized server graph is not changed."
+    ~primary:cancel
+    ~secondary:confirm
+  |> modal_dialog_page
+       ~tokens
+       ~reduced_motion
+       ~page_key:"local-cache-reset-dialog"
+       ~test_id:"local-cache-reset-dialog-page"
+       ~barrier_label:"Reset local graph copy confirmation"
 ;;
 
 let route_page ~page_key ~transition body =
@@ -1090,6 +1046,7 @@ let capture_sheet_page
   let close_target =
     action_target
       ~enabled:(Journal_capture.phase capture <> Journal_capture.Saving)
+      ~role:Text
       ~test_id:"capture-close"
       ~label:"Close new block editor"
       ~hint:"Return to the Journal timeline"
@@ -1137,6 +1094,7 @@ let capture_sheet_page
   let task =
     action_target
       ~enabled:(Journal_capture.phase capture = Journal_capture.Editing)
+      ~role:Outlined
       ~test_id:"capture-task"
       ~label:task_label
       ~hint:"Change optional task state"
@@ -1152,6 +1110,7 @@ let capture_sheet_page
   let add_child =
     action_target
       ~enabled:(Journal_capture.can_add_child capture)
+      ~role:Filled_tonal
       ~test_id:"capture-add-child"
       ~label:"Add direct child"
       ~hint:"Add a direct child to this new block"
@@ -1165,6 +1124,7 @@ let capture_sheet_page
          [ Ui.Widget.Flex.expanded (live_region_text ~color:palette.sheet_error message)
          ; Ui.Widget.Flex.fixed
              (action_target
+                ~role:Filled_tonal
                 ~test_id:"capture-retry"
                 ~label:"Retry saving journal block"
                 ~hint:"Retry the admitted journal mutation"
@@ -1188,6 +1148,7 @@ let capture_sheet_page
     else
       action_target
         ~enabled:(Journal_capture.can_save capture)
+        ~role:Filled
         ~test_id:"capture-save"
         ~label:"Save journal block"
         ~hint:"Persist this journal block"
@@ -1270,41 +1231,6 @@ let capture_sheet_page
     |> Ui.Widget.padding
          ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:content_horizontal_inset ())
   in
-  let dialog =
-    if Journal_capture.phase capture <> Journal_capture.Confirm_discard
-    then None
-    else (
-      let keep =
-        action_target
-          ~test_id:"capture-keep-editing"
-          ~label:"Keep editing"
-          ~hint:"Return to the draft"
-          ~on_press:(bind_action dispatch "keep-editing")
-          (styled_text "Keep editing")
-      in
-      let discard =
-        action_target
-          ~test_id:"capture-discard"
-          ~label:"Discard draft"
-          ~hint:"Discard and return to Timeline"
-          ~on_press:(bind_action dispatch "discard")
-          (styled_text "Discard")
-      in
-      Some
-        (dialog_body
-           ~test_id:"capture-discard-dialog"
-           ~title:"Discard draft?"
-           ~message:"This journal entry has unsaved changes."
-           ~primary:keep
-           ~secondary:discard))
-  in
-  let content =
-    match dialog with
-    | None -> content
-    | Some dialog ->
-      Ui.Widget.Stack.create
-        [ Ui.Widget.Stack.child content; Ui.Widget.Stack.positioned dialog ]
-  in
   let motion = Journal_visual_tokens.motion ~reduced_motion in
   let presentation =
     Ui.Navigation.Modal_bottom_sheet.create
@@ -1325,6 +1251,39 @@ let capture_sheet_page
        ~can_pop:(Journal_capture.can_pop capture)
        ~restoration_id:(ID.Navigation.Restoration_id.of_string "journal-capture-sheet")
   |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-sheet")
+;;
+
+let capture_discard_dialog_page ~tokens ~reduced_motion dispatch =
+  let keep =
+    action_target
+      ~role:Text
+      ~test_id:"capture-keep-editing"
+      ~label:"Keep editing"
+      ~hint:"Return to the draft"
+      ~on_press:(bind_action dispatch "keep-editing")
+      (styled_text "Keep editing")
+  in
+  let discard =
+    action_target
+      ~role:Filled
+      ~test_id:"capture-discard"
+      ~label:"Discard draft"
+      ~hint:"Discard and return to Timeline"
+      ~on_press:(bind_action dispatch "discard")
+      (styled_text "Discard")
+  in
+  dialog_body
+    ~test_id:"capture-discard-dialog"
+    ~title:"Discard draft?"
+    ~message:"This journal entry has unsaved changes."
+    ~primary:keep
+    ~secondary:discard
+  |> modal_dialog_page
+       ~tokens
+       ~reduced_motion
+       ~page_key:"capture-discard-dialog"
+       ~test_id:"capture-discard-dialog-page"
+       ~barrier_label:"Discard Capture draft confirmation"
 ;;
 
 let detail_text_field detail dispatch =
@@ -1383,6 +1342,7 @@ let child_editor detail dispatch =
       ; Ui.Widget.Flex.fixed
           (action_target
              ~enabled:(Journal_capture.can_save capture)
+             ~role:Filled
              ~test_id:"detail-child-save"
              ~label:"Save direct child"
              ~hint:"Persist this direct child"
@@ -1402,6 +1362,7 @@ let detail_page detail dispatch =
   let back =
     action_target
       ~enabled:navigation_enabled
+      ~role:Text
       ~test_id:"detail-back"
       ~label:"Back to Timeline"
       ~hint:"Return to the Timeline anchor"
@@ -1411,6 +1372,7 @@ let detail_page detail dispatch =
   let save =
     action_target
       ~enabled:(Journal_detail.can_save detail)
+      ~role:Filled
       ~test_id:"detail-save"
       ~label:"Save entry changes"
       ~hint:"Persist the complete source"
@@ -1419,6 +1381,7 @@ let detail_page detail dispatch =
   in
   let add_child =
     action_target
+      ~role:Filled_tonal
       ~test_id:"detail-add-child"
       ~label:"Add direct child"
       ~hint:"Create one direct child block"
@@ -1427,6 +1390,7 @@ let detail_page detail dispatch =
   in
   let task =
     action_target
+      ~role:Outlined
       ~test_id:"detail-task"
       ~label:"Toggle task completion"
       ~hint:"Persist task state without leaving Detail"
@@ -1452,6 +1416,7 @@ let detail_page detail dispatch =
             (live_region_text ~color:(color 176 32 32) "A newer version exists")
         ; Ui.Widget.Flex.fixed
             (action_target
+               ~role:Filled_tonal
                ~test_id:"detail-retry"
                ~label:"Retry edit"
                ~hint:"Rebase the local draft on the latest revision"
@@ -1463,6 +1428,7 @@ let detail_page detail dispatch =
         [ Ui.Widget.Flex.expanded (live_region_text ~color:(color 176 32 32) message)
         ; Ui.Widget.Flex.fixed
             (action_target
+               ~role:Filled_tonal
                ~test_id:"detail-retry"
                ~label:"Retry mutation"
                ~hint:"Retry the admitted mutation"
@@ -1494,38 +1460,43 @@ let detail_page detail dispatch =
     |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
     |> Ui.Widget.safe_area
   in
-  let dialog =
-    if Journal_detail.mode detail <> Journal_detail.Confirm_discard
-    then None
-    else (
-      let keep =
-        action_target
-          ~test_id:"detail-keep-editing"
-          ~label:"Keep editing"
-          ~hint:"Return to the local draft"
-          ~on_press:(bind_action dispatch "keep-editing")
-          (styled_text "Keep editing")
-      in
-      let discard =
-        action_target
-          ~test_id:"detail-discard"
-          ~label:"Discard Detail changes"
-          ~hint:"Return to the saved Detail"
-          ~on_press:(bind_action dispatch "discard")
-          (styled_text "Discard")
-      in
-      Some
-        (dialog_body
-           ~test_id:"detail-discard-dialog"
-           ~title:"Discard changes?"
-           ~message:"The edited source has not been saved."
-           ~primary:keep
-           ~secondary:discard))
-  in
   route_page
     ~page_key:"journal-detail-route"
     ~transition:Ui.Navigation.None
-    (page_body ?dialog content)
+    (Ui.Widget.Body.static content)
+;;
+
+let detail_discard_dialog_page ~tokens ~reduced_motion dispatch =
+  let keep =
+    action_target
+      ~role:Text
+      ~test_id:"detail-keep-editing"
+      ~label:"Keep editing"
+      ~hint:"Return to the local draft"
+      ~on_press:(bind_action dispatch "keep-editing")
+      (styled_text "Keep editing")
+  in
+  let discard =
+    action_target
+      ~role:Filled
+      ~test_id:"detail-discard"
+      ~label:"Discard Detail changes"
+      ~hint:"Return to the saved Detail"
+      ~on_press:(bind_action dispatch "discard")
+      (styled_text "Discard")
+  in
+  dialog_body
+    ~test_id:"detail-discard-dialog"
+    ~title:"Discard changes?"
+    ~message:"The edited source has not been saved."
+    ~primary:keep
+    ~secondary:discard
+  |> modal_dialog_page
+       ~tokens
+       ~reduced_motion
+       ~page_key:"detail-discard-dialog"
+       ~test_id:"detail-discard-dialog-page"
+       ~barrier_label:"Discard Detail changes confirmation"
 ;;
 
 let message_page ~page_key ~title dispatch =
@@ -1533,6 +1504,7 @@ let message_page ~page_key ~title dispatch =
     Ui.Widget.Flex.column
       [ Ui.Widget.Flex.fixed
           (action_target
+             ~role:Text
              ~test_id:(page_key ^ "-back")
              ~label:"Back to Timeline"
              ~hint:"Return to the Timeline anchor"
@@ -1559,11 +1531,7 @@ let manager_page state dispatch =
     let refresh =
       let on_press = bind_action dispatch "refresh-catalog" in
       let icon =
-        Ui.Widget.icon
-          ~font_family:"MaterialIcons"
-          ~size:22.
-          ~code_point:0xe5d5
-          ()
+        Ui.Widget.icon ~font_family:"MaterialIcons" ~size:22. ~code_point:0xe514 ()
         |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-refresh-icon")
       in
       Ui.Material.icon_button
@@ -1597,6 +1565,7 @@ let manager_page state dispatch =
         (fun (graph : Logseq_db_worker.Sync_catalog.graph) ->
            let graph_id = Logseq_db_worker.Graph_types.Uuid.to_string graph.graph_id in
            action_target
+             ~role:Text
              ~key:(Ui.Key.string ("graph-picker:" ^ graph_id))
              ~test_id:("graph-picker:" ^ graph_id)
              ~label:("Open " ^ graph.name)
@@ -1623,76 +1592,78 @@ let manager_page state dispatch =
   in
   let compact_body () =
     let title, controls =
-    match state.manager with
-    | None -> "Preparing your account", []
-    | Some snapshot ->
-      (match snapshot.Logseq_db_worker.Sync_manager.phase with
-       | Signed_out -> "Sign in to open a graph", []
-       | Awaiting_token _ -> "Authenticating", []
-       | Loading_catalog -> "Loading your graphs", []
-       | Awaiting_selection -> assert false
-       | Bootstrapping ->
-         let progress_text =
-           match state.bootstrap_progress with
-           | None -> "Preparing the local mirror"
-           | Some progress ->
-             Printf.sprintf
-               "Downloaded %d bytes"
-               progress.Logseq_db_worker.Sync_bootstrap.received_bytes
-         in
-         "Downloading graph", [ Ui.Widget.Flex.fixed (styled_text progress_text) ]
-       | Awaiting_e2ee_password ->
-         let password = state.e2ee_password in
-         let editor =
-           Ui.Material.text_field
-             ~key:(Ui.Key.string "e2ee-password-editor")
-             ~enabled:true
-             ~obscure_text:true
-             ~keyboard_type:Ui.Text_editing.Text
-             ~input_action:Ui.Text_editing.Done
-             ~autofocus:true
-             ~max_utf8_bytes:4096
-             ~session_id:(Journal_capture.session_id password)
-             ~document_revision:(Journal_capture.document_revision password)
-             ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
-             ~update_mode:(Journal_capture.update_mode password)
-             ~value:(Journal_capture.value password)
-             ~on_edit:dispatch
-             ~on_submit:(bind_action dispatch "submit-e2ee-password")
-             ~on_focus_changed:dispatch
-             ~on_limit_reached:dispatch
-             ()
-           |> Ui.Widget.with_test_id (Ui.Test_id.string "e2ee-password-editor")
-         in
-         let submit =
-           action_target
-             ~enabled:(Journal_capture.can_save password)
-             ~test_id:"e2ee-password-submit"
-             ~label:"Unlock encrypted graph"
-             ~hint:"Submit the encryption password"
-             ~on_press:(bind_action dispatch "submit-e2ee-password")
-             (styled_text "Unlock")
-         in
-         ( "Unlock encrypted graph"
-         , [ Ui.Widget.Flex.fixed
-               (styled_text "Enter your encryption password to continue.")
-           ; Ui.Widget.Flex.fixed editor
-           ; Ui.Widget.Flex.fixed submit
-           ] )
-       | Opening_graph -> "Opening graph", []
-       | Graph_open -> "Opening journal", []
-       | Sync_paused -> "Journal available offline", []
-       | Stopping_graph -> "Switching graph", []
-       | Failed ->
-         ( Option.value snapshot.last_error ~default:"Unable to open graph"
-         , [ Ui.Widget.Flex.fixed
-               (action_target
-                  ~test_id:"graph-picker-retry"
-                  ~label:"Retry"
-                  ~hint:"Refresh the graph catalog"
-                  ~on_press:(bind_action dispatch "refresh-catalog")
-                  (styled_text "Retry"))
-           ] ))
+      match state.manager with
+      | None -> "Preparing your account", []
+      | Some snapshot ->
+        (match snapshot.Logseq_db_worker.Sync_manager.phase with
+         | Signed_out -> "Sign in to open a graph", []
+         | Awaiting_token _ -> "Authenticating", []
+         | Loading_catalog -> "Loading your graphs", []
+         | Awaiting_selection -> assert false
+         | Bootstrapping ->
+           let progress_text =
+             match state.bootstrap_progress with
+             | None -> "Preparing the local mirror"
+             | Some progress ->
+               Printf.sprintf
+                 "Downloaded %d bytes"
+                 progress.Logseq_db_worker.Sync_bootstrap.received_bytes
+           in
+           "Downloading graph", [ Ui.Widget.Flex.fixed (styled_text progress_text) ]
+         | Awaiting_e2ee_password ->
+           let password = state.e2ee_password in
+           let editor =
+             Ui.Material.text_field
+               ~key:(Ui.Key.string "e2ee-password-editor")
+               ~enabled:true
+               ~obscure_text:true
+               ~keyboard_type:Ui.Text_editing.Text
+               ~input_action:Ui.Text_editing.Done
+               ~autofocus:true
+               ~max_utf8_bytes:4096
+               ~session_id:(Journal_capture.session_id password)
+               ~document_revision:(Journal_capture.document_revision password)
+               ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
+               ~update_mode:(Journal_capture.update_mode password)
+               ~value:(Journal_capture.value password)
+               ~on_edit:dispatch
+               ~on_submit:(bind_action dispatch "submit-e2ee-password")
+               ~on_focus_changed:dispatch
+               ~on_limit_reached:dispatch
+               ()
+             |> Ui.Widget.with_test_id (Ui.Test_id.string "e2ee-password-editor")
+           in
+           let submit =
+             action_target
+               ~enabled:(Journal_capture.can_save password)
+               ~role:Filled
+               ~test_id:"e2ee-password-submit"
+               ~label:"Unlock encrypted graph"
+               ~hint:"Submit the encryption password"
+               ~on_press:(bind_action dispatch "submit-e2ee-password")
+               (styled_text "Unlock")
+           in
+           ( "Unlock encrypted graph"
+           , [ Ui.Widget.Flex.fixed
+                 (styled_text "Enter your encryption password to continue.")
+             ; Ui.Widget.Flex.fixed editor
+             ; Ui.Widget.Flex.fixed submit
+             ] )
+         | Opening_graph -> "Opening graph", []
+         | Graph_open -> "Opening journal", []
+         | Sync_paused -> "Journal available offline", []
+         | Stopping_graph -> "Switching graph", []
+         | Failed ->
+           ( Option.value snapshot.last_error ~default:"Unable to open graph"
+           , [ Ui.Widget.Flex.fixed
+                 (action_target
+                    ~role:Filled_tonal
+                    ~test_id:"graph-picker-retry"
+                    ~label:"Retry"
+                    ~hint:"Refresh the graph catalog"
+                    ~on_press:(bind_action dispatch "refresh-catalog")
+                    (styled_text "Retry"))
+             ] ))
     in
     Ui.Widget.Flex.column (Ui.Widget.Flex.fixed (title_widget title) :: controls)
     |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
@@ -1704,10 +1675,7 @@ let manager_page state dispatch =
     | Some ({ phase = Awaiting_selection; _ } as snapshot) -> graph_picker snapshot
     | None | Some _ -> compact_body ()
   in
-  route_page
-    ~page_key:"sync-manager-route"
-    ~transition:Ui.Navigation.None
-    body
+  route_page ~page_key:"sync-manager-route" ~transition:Ui.Navigation.None body
 ;;
 
 let identity_sequence = ref 0L
@@ -1859,13 +1827,13 @@ let component client handlers graph =
           Bonsai.Cont.return ()))
   in
   let application_platform = Driver.Handler.application_platform handlers in
+  let host_effects = Driver.Handler.host_effects handlers in
   let sign_out_in_flight = ref false in
   let termination_in_flight = ref false in
   let apply_manager_transition set_state manager =
     let update = set_state (fun state -> apply_manager_snapshot state manager) in
     let sign_out =
-      if manager.Logseq_db_worker.Sync_manager.phase = Signed_out
-         && !sign_out_in_flight
+      if manager.Logseq_db_worker.Sync_manager.phase = Signed_out && !sign_out_in_flight
       then (
         sign_out_in_flight := false;
         Bonsai.Effect.bind
@@ -2035,9 +2003,8 @@ let component client handlers graph =
                         delivery))
               | Some _, Some _ | Some _, None | None, _ -> Bonsai.Effect.Ignore
             in
-            Bonsai.Effect.bind
-              (apply_manager_transition set_state manager)
-              ~f:(fun () -> start_graph)
+            Bonsai.Effect.bind (apply_manager_transition set_state manager) ~f:(fun () ->
+              start_graph)
           | Worker.Push { payload = Need_id_token challenge; _ } ->
             Bonsai.Effect.bind
               (Platform.request
@@ -2164,13 +2131,13 @@ let component client handlers graph =
           then (
             termination_in_flight := true;
             send_manager Logseq_db_worker.Sync_manager.Return_to_graph_picker)
-          else
+          else (
             match Journal_platform.decode_network_lifecycle payload with
             | Ok _ -> apply_network_lifecycle payload
             | Error _ ->
               (match Journal_platform.decode_calendar payload with
                | Ok _ -> apply_calendar payload
-               | Error _ -> apply_authenticated_user payload)
+               | Error _ -> apply_authenticated_user payload))
         in
         Platform.on_event application_platform apply_platform;
         Bonsai.Effect.Many
@@ -2502,8 +2469,7 @@ let component client handlers graph =
           then (
             sign_out_in_flight := true;
             Bonsai.Effect.Many
-              [ update (fun state ->
-                  { state with account_menu_open = false })
+              [ update (fun state -> { state with account_menu_open = false })
               ; send_manager Logseq_db_worker.Sync_manager.Signed_out_command
               ])
           else if String.equal action "submit-e2ee-password"
@@ -2795,9 +2761,67 @@ let component client handlers graph =
                 { state with timeline })
             | None, Some _ -> Bonsai.Effect.Ignore)
           else Bonsai.Effect.Ignore
-        | Unit | Bool _ | Int64 _ | Tap _ | Pointer _ | Key _ | Scroll _ ->
-          Bonsai.Effect.Ignore)
+        | Unit
+        | Bool _
+        | Int64 _
+        | Float _
+        | Float_range _
+        | Tap _
+        | Pointer _
+        | Key _
+        | Scroll _ -> Bonsai.Effect.Ignore)
   in
+  let snack_bar_cancellation : Bonsai_flutter.Host_effect.Cancellation.t option ref =
+    ref None
+  in
+  let snack_bar_key =
+    Bonsai.Cont.map2 state environment ~f:(fun state environment ->
+      ( (if
+           state.graph_ready && Journal_routes.route state.routes = Journal_routes.Timeline
+         then state.timeline_notice
+         else None)
+      , environment.accessible_navigation ))
+  in
+  let snack_bar_callback =
+    Bonsai.Cont.map dispatch ~f:(fun dispatch (notice, accessible_navigation) ->
+      Option.iter Bonsai_flutter.Host_effect.Cancellation.cancel !snack_bar_cancellation;
+      snack_bar_cancellation := None;
+      match notice with
+      | None -> Bonsai.Effect.Ignore
+      | Some notice ->
+        let cancellation = Bonsai_flutter.Host_effect.Cancellation.create () in
+        snack_bar_cancellation := Some cancellation;
+        let message, action_label, duration_ms =
+          match notice with
+          | Delete_undo ->
+            ( "Block and descendants removed"
+            , Some "Undo"
+            , if accessible_navigation then 10_000 else 5_000 )
+          | Delete_failed -> "Delete failed. Block restored.", None, 4_000
+        in
+        Bonsai.Effect.bind
+          (Bonsai_flutter.Host_effect.show_snack_bar
+             ~cancellation
+             ?action_label
+             ~duration_ms
+             host_effects
+             ~message
+             ())
+          ~f:(function
+          | Ok Bonsai_flutter.Host_effect.Action ->
+            Bonsai.Effect.of_thunk (fun () ->
+              Ui.Event.Handler.Private.invoke
+                dispatch
+                (Ui.Event.Payload.Text "delete-undo"))
+          | Ok (Dismiss | Swipe | Hide | Remove | Timeout) | Error _ ->
+            Bonsai.Effect.Ignore))
+  in
+  Bonsai.Cont.Edge.on_change
+    ~equal:(fun (left_notice, left_accessible) (right_notice, right_accessible) ->
+      left_notice = right_notice && Bool.equal left_accessible right_accessible)
+    snack_bar_key
+    ~callback:snack_bar_callback
+    graph;
   let state = Bonsai.Cont.map2 state delete_timer ~f:(fun state () -> state) in
   let state =
     Bonsai.Cont.map3 state event_subscription platform_subscription ~f:(fun state () () ->
@@ -2838,13 +2862,11 @@ let component client handlers graph =
             (match state.manager with
              | Some { selected_graph = Some _; _ } -> true
              | None | Some _ -> false)
-          ~cache_reset_confirmation:(Option.is_some state.cache_reset_confirmation)
           ~today_subtitle:(today_label state)
           ~day_label:(label_for_day state)
           ~reduced_motion
           ~rtl:(is_rtl_locale environment.locale)
           ~safe_bottom:environment.safe_area.bottom
-          ~viewport_width:environment.viewport_width
           ~content_horizontal_inset
           ~capture_enabled:(state.write_enabled && Option.is_none state.pending_delete)
           ~capture_composer_key:state.next_local_sequence
@@ -2853,17 +2875,9 @@ let component client handlers graph =
           ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
           ~delete_enabled:(state.write_enabled && Option.is_none state.pending_delete)
           ~on_delete:(prefix_action dispatch "timeline-delete:")
-          ~timeline_notice:state.timeline_notice
-          ~on_delete_undo:(bind_action dispatch "delete-undo")
           ~on_cache_reset_requested:(bind_action dispatch "request-local-cache-reset")
-          ~on_cache_reset_cancelled:(bind_action dispatch "cancel-local-cache-reset")
-          ~on_cache_reset_confirmed:(bind_action dispatch "confirm-local-cache-reset")
           ~account_menu_available:(Option.is_some state.manager)
-          ~account_menu_open:state.account_menu_open
           ~on_account_menu:(bind_action dispatch "open-account-menu")
-          ~on_account_menu_dismissed:(bind_action dispatch "close-account-menu")
-          ~on_switch_graph:(bind_action dispatch "switch-graph")
-          ~on_sign_out:(bind_action dispatch "sign-out")
     in
     let pages =
       match Journal_routes.route state.routes with
@@ -2882,6 +2896,10 @@ let component client handlers graph =
                capture
                dispatch
            ]
+           @
+           if Journal_capture.phase capture = Journal_capture.Confirm_discard
+           then [ capture_discard_dialog_page ~tokens ~reduced_motion dispatch ]
+           else []
          | None -> [ root ])
       | Detail_loading ->
         [ root
@@ -2889,7 +2907,12 @@ let component client handlers graph =
         ]
       | Detail ->
         (match Journal_routes.detail state.routes with
-         | Some detail -> [ root; detail_page detail dispatch ]
+         | Some detail ->
+           [ root; detail_page detail dispatch ]
+           @
+           if Journal_detail.mode detail = Journal_detail.Confirm_discard
+           then [ detail_discard_dialog_page ~tokens ~reduced_motion dispatch ]
+           else []
          | None -> [ root ])
       | Missing_detail ->
         [ root
@@ -2899,13 +2922,30 @@ let component client handlers graph =
             dispatch
         ]
     in
-    Ui.Widget.navigator
-      ~key:(Ui.Key.string "journal-navigator")
-      ~restoration_scope_id:
-        (ID.Navigation.Restoration_scope_id.of_string "logseq-journal")
-      ~on_pop:dispatch
-      pages
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-navigator"))
+    let pages =
+      match state.cache_reset_confirmation, state.account_menu_open with
+      | Some _, _ ->
+        pages @ [ local_cache_reset_dialog_page ~tokens ~reduced_motion dispatch ]
+      | None, true ->
+        let cache_reset_available =
+          match state.manager with
+          | Some { selected_graph = Some _; _ } -> true
+          | None | Some _ -> false
+        in
+        pages
+        @ [ account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch ]
+      | None, false -> pages
+    in
+    let body =
+      Ui.Widget.navigator
+        ~key:(Ui.Key.string "journal-navigator")
+        ~restoration_scope_id:
+          (ID.Navigation.Restoration_scope_id.of_string "logseq-journal")
+        ~on_pop:dispatch
+        pages
+      |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-navigator")
+    in
+    App.View.create ~theme:application_theme ~body)
 ;;
 
 let decode_config payload =

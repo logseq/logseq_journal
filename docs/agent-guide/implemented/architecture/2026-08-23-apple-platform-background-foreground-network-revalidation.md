@@ -267,6 +267,52 @@ stale rejection prevents that exact old-cursor request from executing twice, but
 does not identify which client transaction was accepted. Correct recovery therefore
 depends on authoritative intent replanning, not error-string classification.
 
+### Implementation status
+
+The shared Apple lifecycle adapter and sync manager now implement the proposed
+pull-first path. The manager keeps an already-open WebSocket across a background
+epoch, sends one foreground pull with a three-second deadline, and preserves the
+connection generation after successful replay. Timeout, close, send failure,
+protocol decode failure, and replay pause use one transport-fencing helper before
+HTTP catch-up. The service no longer closes a WebSocket before the manager selects
+the transport action.
+
+HTTP pull and transaction effects and completions now carry the connection
+generation. A late completion from a fenced attempt is ignored even when account
+and graph generations still match. Transport readiness is represented by one
+closed state machine: `Foreground_transport` or `Suspended` wraps exactly one of
+`Disconnected`, `Awaiting_websocket_token`, `Connecting_websocket`,
+`Live_websocket`, `Revalidating_websocket`, `Awaiting_http_pull_token`,
+`Http_pull_in_flight`, `Http_catchup_applied`, or `Backing_off`. The obsolete
+readiness booleans have been removed. Separate typed pull-ownership and
+frame-application states prevent duplicate pulls and prevent an HTTP transaction
+acknowledgement from being misclassified as completion of authoritative HTTP
+catch-up. ID-token acquisition failure for an already-populated graph now preserves
+the graph in `Sync_paused` and enters bounded reconnect backoff; a failure delivered
+while suspended records deferred retry demand without starting background network
+work.
+
+The manager preserves the first unresolved transaction attempt while later durable
+pending batches remain queued in the engine. After failed-probe HTTP catch-up, only
+the transaction IDs from that uncertain attempt are explicitly returned from
+`Submitted` to `Queued`; the engine remains responsible for semantic replanning and
+stable mutation-ID reuse.
+
+Physical macOS validation also exposed a deployed presence message with type
+`online-users`. The upstream server
+[broadcasts this message when graph presence changes](https://github.com/logseq/logseq/blob/master/deps/db-sync/src/logseq/db_sync/worker/presence.cljs#L35-L37). The
+sync protocol now validates its `online-users` array and the manager ignores the
+presence event without sending it to the authoritative graph engine or changing a
+foreground probe. Malformed presence payloads remain protocol errors.
+
+Deterministic regression coverage now includes immediate fallback for malformed,
+closed, replay-failed, and paused probes; stale HTTP completion fencing; preservation
+of an in-flight HTTP pull across background and foreground; exact uncertain-write
+recovery; prevention of pending-attempt replacement; HTTP transaction and pull
+interleaving; presence interleaving; and manager-only WebSocket shutdown ownership.
+It also covers HTTP-pull and WebSocket-reconnect token failures in foreground and
+background states.
+
 ### Physical-device validation status
 
 On 2026-08-23, a signed physical iPhone completed authenticated catalog discovery,
@@ -277,18 +323,111 @@ populated and no `Multiple exceptions`, `Network_cancelled`,
 `cannot write to closed writer`, authentication, E2EE, or sync protocol error was
 observed after foreground return.
 
-This validates one short preserved-process foreground cycle at the user-visible
-boundary. Deterministic manager tests separately verify that the successful probe
-keeps the same connection generation and avoids HTTP fallback. Physical tests for
-a server-closed socket, network-interface change, offline resume, process
-termination, and the equivalent macOS lifecycle remain outstanding, so this
-architecture decision stays proposed.
+The updated build additionally completed a 45-second iPhone background interval and
+a process-termination test in which the app was backgrounded, terminated, rebuilt,
+and cold-started against the existing durable mirror. No `Multiple exceptions`,
+closed-writer, E2EE response-contract, presence, or sync protocol error was observed
+in the attached Flutter console.
+
+The physical iPhone then completed a genuinely offline foreground cycle while the
+Mac remained connected as an independent USB controller. The running app first
+rendered its populated timeline, entered the background, and had Airplane Mode
+enabled with Wi-Fi disabled before it returned to the foreground. The same process
+remained alive, the timeline stayed readable, and the expected non-blocking
+`Sync_paused` banner appeared without `Multiple exceptions`, `Network_cancelled`,
+closed-writer, or process-termination output. Network restoration used Control
+Center while the app remained foreground-visible, so Flutter traversed only
+`inactive -> resumed`; it did not receive another background epoch with which to
+restart recovery. Bounded retry cleared the banner after 8.44 seconds, and the
+timeline remained accessible. A follow-up Settings probe confirmed that Airplane
+Mode returned to Off. This proves that recovery does not depend on a second
+background-to-foreground transition.
+
+The physical iPhone finally completed a deployed server-originated close test
+against a newly created disposable synced graph named
+`codex-ws-close-test-20260823`. The app selected the graph and rendered its empty
+timeline before deletion. An independent authenticated WebSocket observer connected
+to the same graph, after which the authenticated `DELETE /graphs/:graph-id` request
+returned HTTP `200` with `deleted: true`. The observer received a clean close with
+code `1000` and reason `graph deleted`; the CLI connection to the same graph also
+changed from `open` to `closed`. The iPhone app remained in the same process, kept
+the empty timeline operable, and exposed only the non-blocking
+`sync HTTP request failed with status 403` banner. The `403` is expected because the
+server removes graph access before the close-path HTTP catch-up can run. No
+`Multiple exceptions`, closed-writer, exception, or abnormal process-termination
+output appeared. The remote catalog and the CLI graph list were both checked after
+cleanup and no longer
+contained the disposable graph. The existing `ocaml-sync-test` graph was not
+modified.
+
+The same build completed a visible macOS foreground cycle with its populated
+timeline preserved. The first macOS run exposed the valid `online-users` presence
+message described above; after the protocol fix and rebuild, the foreground cycle
+completed with no visible sync error and no console exception.
+
+A second macOS validation used the already-running local network proxy to terminate
+only connections whose destination host was `api.logseq.io`. The app first entered
+the background, then returned to the foreground while the proxy terminated every
+replacement connection for twelve seconds. Nine sync-endpoint connections were
+terminated, the endpoint had zero live connections at the observation point, and
+the Codex control connection and the rest of the Mac network remained available.
+The populated timeline stayed readable. During the outage the app exposed its
+existing non-blocking `Sync_paused` banner with
+`sync HTTP protocol failed: malformed HTTP response`; it did not delete or reset the
+local mirror. After the endpoint intervention stopped, bounded retry established two
+new connections and cleared the banner without user action or process restart.
+
+An attempt to disable the Mac Ethernet service moved the default route from `en0`
+to `en1`, confirming that the interface change occurred, but the same Mac network is
+also the Codex control plane. A complete interface-switch or system-offline test
+cannot be driven reliably by this task because loss of that route also removes the
+controller that must observe and restore the test. Ethernet and Wi-Fi were restored
+to enabled state and the default route returned to `en0` before continuing. This is
+an automation-environment limitation, not evidence that a genuine system-offline
+resume passed.
+
+Deterministic manager tests separately verify the server-closed, timeout, malformed,
+replay-failed, offline/backoff, and stale-generation branches. The targeted proxy
+test now also verifies real transport loss, foreground endpoint unavailability, and
+automatic recovery on the macOS build without taking the task controller offline.
+The independently controlled iPhone now covers a real interface shutdown, genuine
+offline resume, foreground-only automatic recovery, and a deployed clean server
+close followed by authoritative fallback. Together with the short-background,
+process-termination, and macOS transport-loss tests above, all required physical
+scenarios are covered.
+
+## Decision
+
+Use one lifecycle-aware sync policy on iOS and macOS. Native and Flutter lifecycle
+signals are normalized into semantic epochs: `inactive` never changes network
+state, the first `hidden` or `paused` event suspends new network work, and one
+subsequent `resumed` event revalidates the current transport. Duplicate callbacks in
+the same epoch are coalesced.
+
+Preserve an existing WebSocket across background entry. On foreground return, send
+one sync `pull` from the durable cursor over that socket and allow three seconds for
+the serialized `pull/ok` replay to complete. A successful replay returns the same
+connection generation to `Live`; pending submissions remain deferred until then.
+Do not add a separate application ping/pong capability.
+
+On probe timeout, close, send failure, malformed response, replay pause, or checksum
+failure, fence the old connection generation exactly once, close it through the
+sync manager, perform authoritative HTTP catch-up, recover only unresolved
+`Submitted` transaction IDs through an explicit engine command, and reconnect with
+a fresh token. Replanning against the authoritative database determines whether a
+stable client transaction ID resolves locally as a no-op or needs resubmission.
+
+Represent transport and pull ownership with closed state machines rather than
+independent readiness booleans. The sync manager is the sole graph transport close
+and cancellation owner; the service loop executes its effects but does not
+pre-cancel lifecycle work. Accept and ignore valid deployed `online-users` presence
+messages without allowing them to complete or fail a foreground probe.
 
 ## Alternatives considered
 
 ### Always close, HTTP pull, and reconnect
 
-This is the current behavior. It gives every foreground transition an authoritative
+This was the previous behavior. It gave every foreground transition an authoritative
 HTTP boundary, but performs unnecessary authentication and transport replacement,
 misclassifies `inactive -> resumed`, and creates competing cancellation and close
 paths. Keeping it would require fixing the cancellation race but would not provide
@@ -401,6 +540,27 @@ are outside the current architecture decision.
 - Applying one semantic state machine to iOS and macOS requires platform lifecycle
   adapters to normalize different native callback sequences without changing sync
   policy.
+
+## Consequences
+
+- A short background interval normally reuses the existing WebSocket and needs only
+  one semantic pull, avoiding an HTTP request, a replacement socket, and two fresh
+  token challenges.
+- A silently invalid socket may add up to three seconds before HTTP fallback. Every
+  fallback then uses a new connection generation, so late frames, timers, and HTTP
+  completions cannot mutate the current graph.
+- Background state starts no reconnect, transaction submission, or new pull work.
+  This decision does not add an iOS background-execution entitlement or promise
+  background connectivity.
+- Uncertain durable writes now have a bounded recovery path within one process.
+  Recovery preserves stable client transaction IDs but depends on authoritative
+  semantic replanning rather than server error strings or raw transaction equality.
+- Transport correctness is concentrated in the OCaml sync manager and engine. The
+  additional typed states and generation fields replace competing cancellation
+  paths and obsolete readiness booleans; there is no compatibility fallback.
+- Offline, deleted-graph, authentication, and transport failures remain visible as
+  non-blocking `Sync_paused` banners while the current local mirror stays readable.
+  Bounded retry resumes automatically when the failure is recoverable.
 
 ## Questions
 

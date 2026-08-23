@@ -577,6 +577,27 @@ let test_bonsai_closure_excludes_cmdliner () =
   T.require (not (contains core "cmdliner")) "core library reaches Cmdliner"
 ;;
 
+let test_transport_shutdown_has_one_state_machine_owner () =
+  let source =
+    read_file
+      (Filename.concat
+         T.root
+         "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml")
+  in
+  let forbidden = "| Manager.Websocket_closed _ -> close_websocket runtime" in
+  let contains haystack needle =
+    let length = String.length needle in
+    let rec loop index =
+      index + length <= String.length haystack
+      && (String.equal (String.sub haystack index length) needle || loop (index + 1))
+    in
+    loop 0
+  in
+  T.require
+    (not (contains source forbidden))
+    "the service closes WebSocket before the manager selects a transport action"
+;;
+
 let drain_until_terminal client events =
   let deadline = Unix.gettimeofday () +. 10. in
   let rec loop events =
@@ -701,6 +722,9 @@ let () =
           "cancelled durable commit reconciles by basis"
           test_cancelled_commit_reconciles_by_basis
       ; T.case "Bonsai closure excludes Cmdliner" test_bonsai_closure_excludes_cmdliner
+      ; T.case
+          "manager exclusively owns transport shutdown"
+          test_transport_shutdown_has_one_state_machine_owner
       ];
     Worker_runtime.For_testing.final_shutdown ();
     run_child "--fatal-child";

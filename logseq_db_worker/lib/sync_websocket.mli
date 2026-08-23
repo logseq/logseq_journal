@@ -2,6 +2,7 @@ type t
 
 type incoming =
   | Ignore_late
+  | Ignore_presence
   | Deliver of string
   | Pull_hint of int
 

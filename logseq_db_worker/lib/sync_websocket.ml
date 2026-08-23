@@ -7,6 +7,7 @@ type t =
 
 type incoming =
   | Ignore_late
+  | Ignore_presence
   | Deliver of string
   | Pull_hint of int
 
@@ -36,6 +37,7 @@ let receive t ~account_generation ~graph_generation ~connection_generation paylo
     match Sync_protocol.decode_server_message payload with
     | Error _ as error -> error
     | Ok (Changed { t }) -> Ok (Pull_hint t)
+    | Ok Online_users -> Ok Ignore_presence
     | Ok (Hello _ | Pull_ok _ | Tx_batch_ok _ | Tx_reject _ | Server_error _ | Pong) ->
       Ok (Deliver payload))
 ;;

@@ -506,7 +506,13 @@ let test_direct_children_insert_after_parent_and_collapse () =
       Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
     in
     let geometry = Timeline.extent_geometry loaded ~profile ~safe_bottom:0. in
-    let expected = [ 0, expected_parent; 6, 68. ] in
+    let expected_clearance =
+      Journal_visual_tokens.fixed_extent
+        ~profile
+        ~safe_bottom:0.
+        Journal_visual_tokens.Bottom_clearance
+    in
+    let expected = [ 0, expected_parent; 6, expected_clearance ] in
     List.iter
       (fun (index, extent) ->
          require
@@ -918,14 +924,25 @@ let test_exact_profile_extents_and_final_clearance () =
       geometry.default_extent
       default_extent;
     require
-      (geometry.overrides
+      (let clearance =
+         Journal_visual_tokens.fixed_extent
+           ~profile
+           ~safe_bottom:34.
+           Journal_visual_tokens.Bottom_clearance
+       in
+       geometry.overrides
        = [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent }
-         ; { Ui.Widget.Sparse_extent_override.index = 2; extent = 102. }
+         ; { Ui.Widget.Sparse_extent_override.index = 2; extent = clearance }
          ])
       "profile extent overrides changed";
     require
-      (Float.equal geometry.final_clearance_extent 102.)
-      "final row does not clear 48pt FAB, 20pt spacing, and 34pt safe bottom"
+      (Float.equal
+         geometry.final_clearance_extent
+         (Journal_visual_tokens.fixed_extent
+            ~profile
+            ~safe_bottom:34.
+            Journal_visual_tokens.Bottom_clearance))
+      "final row does not clear the expanded composer and safe bottom"
   in
   check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:48.;
   check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:36.;
@@ -992,8 +1009,8 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
            scale)
       expected
   in
-  check ~scale:1. [ 0, 44.; 1, 96.; 2, 56.; 3, 76.; 4, 96.; 5, 68. ];
-  check ~scale:3.2 [ 0, 80.; 1, 272.; 2, 144.; 3, 208.; 4, 272.; 5, 68. ]
+  check ~scale:1. [ 0, 44.; 1, 96.; 2, 56.; 3, 76.; 4, 96.; 5, 192. ];
+  check ~scale:3.2 [ 0, 80.; 1, 272.; 2, 144.; 3, 208.; 4, 272.; 5, 412. ]
 ;;
 
 let test_anchor_decisions_replacements_and_route_return () =

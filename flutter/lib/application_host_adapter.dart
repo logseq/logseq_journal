@@ -912,11 +912,7 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
         }
         return null;
       },
-      child: MaterialApp(
-        title: 'Logseq Journal',
-        builder: Authenticator.builder(),
-        home: child,
-      ),
+      child: _AuthenticatedJournalHost(child: child),
     );
     final ready = amplifyReady;
     if (ready == null) return authenticatedHost();
@@ -933,6 +929,33 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
       },
     );
   }
+}
+
+final class _AuthenticatedJournalHost extends StatelessWidget {
+  const _AuthenticatedJournalHost({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => MediaQuery.fromView(
+    view: View.of(context),
+    child: Localizations(
+      locale: const Locale('en'),
+      delegates: const [
+        DefaultWidgetsLocalizations.delegate,
+        DefaultMaterialLocalizations.delegate,
+      ],
+      child: Directionality(
+        textDirection: TextDirection.ltr,
+        child: Theme(
+          data: ThemeData.light(),
+          child: Builder(
+            builder: (context) => Authenticator.builder()(context, child),
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 ApplicationHostAdapter createBonsaiFlutterHostAdapter({

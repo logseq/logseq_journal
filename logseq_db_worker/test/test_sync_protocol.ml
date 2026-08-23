@@ -169,6 +169,17 @@ let strict_validation_case () =
   expect_error "Chat SSE event" (Protocol.decode_server_message (wire "chatSseEvent"))
 ;;
 
+let presence_message_case () =
+  ignore
+    (expect_ok
+       "online users presence"
+       (Protocol.decode_server_message
+          {|{"type":"online-users","online-users":[{"user-id":"user-1"}]}|}));
+  expect_error
+    "malformed online users presence"
+    (Protocol.decode_server_message {|{"type":"online-users","online-users":"user-1"}|})
+;;
+
 let transport_parity_case () =
   let ws = expect_ok "WebSocket pull" (Protocol.decode_server_message (wire "pullOk")) in
   let http = expect_ok "HTTP pull" (Protocol.decode_http_pull_response (wire "pullOk")) in
@@ -251,6 +262,7 @@ let cases =
       "preserve deployed duplicate tx-id stale evidence"
       deployed_duplicate_tx_id_case
   ; T.case "reject malformed and Chat-only messages" strict_validation_case
+  ; T.case "accept deployed online-users presence messages" presence_message_case
   ; T.case "keep HTTP pull identical to WebSocket pull" transport_parity_case
   ; T.case "reject cursor gaps and checksum mismatches" cursor_and_checksum_case
   ; T.case "encode upstream client messages" client_encoding_case

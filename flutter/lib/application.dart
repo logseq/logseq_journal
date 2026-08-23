@@ -123,9 +123,15 @@ final class _JournalApplicationHostState extends State<JournalApplicationHost> {
       final prepared = snapshot.data;
       final Widget home;
       if (snapshot.error case final error?) {
-        home = Center(child: Text('Unable to prepare application: $error'));
+        home = Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(child: Text('Unable to prepare application: $error')),
+        );
       } else if (prepared == null) {
-        home = const Center(child: CircularProgressIndicator());
+        home = const Directionality(
+          textDirection: TextDirection.ltr,
+          child: Center(child: CircularProgressIndicator()),
+        );
       } else {
         home = BonsaiFlutterRoot(
           config: prepared.runtimeConfig,
@@ -133,10 +139,7 @@ final class _JournalApplicationHostState extends State<JournalApplicationHost> {
           applicationPlatform: prepared.applicationPlatform,
         );
       }
-      return widget.adapter.buildHost(
-        context: context,
-        child: MaterialApp(title: 'Logseq Journal', home: home),
-      );
+      return widget.adapter.buildHost(context: context, child: home);
     },
   );
 }

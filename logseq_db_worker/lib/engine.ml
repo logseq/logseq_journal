@@ -1670,7 +1670,7 @@ let execute_sync_receive t request_id transport payload =
                      None
                      metadata)
             })
-     | Ok (Server_error _ | Pong) ->
+     | Ok (Server_error _ | Pong | Online_users) ->
        failed "unsupported sync server message for this envelope")
 ;;
 

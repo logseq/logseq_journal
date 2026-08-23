@@ -178,13 +178,27 @@ let graph_failure (request : Protocol.request) message =
 
 let status_ok status = status >= 200 && status < 300
 
-let network_error runtime ~account_generation ?graph_generation message =
+let network_error
+      runtime
+      ~account_generation
+      ?graph_generation
+      ?connection_generation
+      message
+  =
   enqueue
     runtime
-    (Manager.Network_failed { account_generation; graph_generation; message })
+    (Manager.Network_failed
+       { account_generation; graph_generation; connection_generation; message })
 ;;
 
-let fork_network runtime ~name ~account_generation ?graph_generation operation =
+let fork_network
+      runtime
+      ~name
+      ~account_generation
+      ?graph_generation
+      ?connection_generation
+      operation
+  =
   let cancelled, cancel = Eio.Promise.create () in
   let operation_id =
     Network_scope.register
@@ -210,6 +224,7 @@ let fork_network runtime ~name ~account_generation ?graph_generation operation =
              runtime
              ~account_generation
              ?graph_generation
+             ?connection_generation
              (Printexc.to_string exception_)))
 ;;
 
@@ -221,23 +236,44 @@ let cancel_obsolete_network runtime =
     ~graph_generation:snapshot.graph_generation
 ;;
 
-let perform_http runtime ~name request on_success ~account_generation ?graph_generation ()
+let perform_http
+      runtime
+      ~name
+      request
+      on_success
+      ~account_generation
+      ?graph_generation
+      ?connection_generation
+      ()
   =
-  fork_network runtime ~name ~account_generation ?graph_generation (fun sw ->
-    match
-      Db.Sync_http_eio.perform
-        ~sw
-        ~environment:(Worker.Session_context.environment runtime.context)
-        request
-    with
-    | Ok response when status_ok response.status -> on_success response
-    | Ok response ->
-      network_error
-        runtime
-        ~account_generation
-        ?graph_generation
-        (Printf.sprintf "sync HTTP request failed with status %d" response.status)
-    | Error message -> network_error runtime ~account_generation ?graph_generation message)
+  fork_network
+    runtime
+    ~name
+    ~account_generation
+    ?graph_generation
+    ?connection_generation
+    (fun sw ->
+       match
+         Db.Sync_http_eio.perform
+           ~sw
+           ~environment:(Worker.Session_context.environment runtime.context)
+           request
+       with
+       | Ok response when status_ok response.status -> on_success response
+       | Ok response ->
+         network_error
+           runtime
+           ~account_generation
+           ?graph_generation
+           ?connection_generation
+           (Printf.sprintf "sync HTTP request failed with status %d" response.status)
+       | Error message ->
+         network_error
+           runtime
+           ~account_generation
+           ?graph_generation
+           ?connection_generation
+           message)
 ;;
 
 let ensure_private_directory path =
@@ -383,9 +419,6 @@ let cache_mirror_status runtime graph_id status =
 ;;
 
 let rec dispatch_event runtime event =
-  (match event with
-   | Manager.Websocket_closed _ -> close_websocket runtime
-   | _ -> ());
   let cached_selection =
     match event, runtime.catalog_cache with
     | Manager.Catalog_loaded _, Some cache -> Db.Sync_catalog.selected_graph cache
@@ -455,6 +488,7 @@ and process_sync_frame runtime payload =
          runtime
          ~account_generation:snapshot.account_generation
          ~graph_generation:snapshot.graph_generation
+         ~connection_generation:snapshot.connection_generation
          (Db.Error.message failure.error)
      | Succeeded _ -> ())
 
@@ -500,6 +534,7 @@ and process_effect runtime = function
          (Network_failed
             { account_generation
             ; graph_generation = Some graph_generation
+            ; connection_generation = None
             ; message = Db.Sync_mirror.error_message error
             }))
   | Fetch_snapshot_baseline { account_generation; graph_generation; graph; token } ->
@@ -672,6 +707,7 @@ and process_effect runtime = function
          (Network_failed
             { account_generation
             ; graph_generation = Some graph_generation
+            ; connection_generation = None
             ; message = Db.Sync_mirror.error_message error
             }))
   | Fetch_e2ee_graph_key { account_generation; graph_generation; graph; token } ->
@@ -718,7 +754,11 @@ and process_effect runtime = function
        dispatch_event
          runtime
          (Network_failed
-            { account_generation; graph_generation = Some graph_generation; message })
+            { account_generation
+            ; graph_generation = Some graph_generation
+            ; connection_generation = None
+            ; message
+            })
      | Ok config ->
        (match Engine.open_ ~dependencies:runtime.dependencies config with
         | Error error ->
@@ -727,6 +767,7 @@ and process_effect runtime = function
             (Network_failed
                { account_generation
                ; graph_generation = Some graph_generation
+               ; connection_generation = None
                ; message = Db.Error.message error
                })
         | Ok engine ->
@@ -748,6 +789,7 @@ and process_effect runtime = function
                (Network_failed
                   { account_generation
                   ; graph_generation = Some graph_generation
+                  ; connection_generation = None
                   ; message = "opened sync mirror has no durable sync status"
                   }))))
   | Close_graph -> close_engine runtime
@@ -761,10 +803,16 @@ and process_effect runtime = function
       ~name:"sync-websocket"
       ~account_generation
       ~graph_generation
+      ~connection_generation
       (fun sw ->
          match Db.Sync_http.websocket_uri ~base_url:runtime.base_url ~graph_id with
          | Error message ->
-           network_error runtime ~account_generation ~graph_generation message
+           network_error
+             runtime
+             ~account_generation
+             ~graph_generation
+             ~connection_generation
+             message
          | Ok uri ->
            (match
               Db.Sync_websocket_eio.connect
@@ -878,12 +926,20 @@ and process_effect runtime = function
             runtime
             ~account_generation:snapshot.account_generation
             ~graph_generation:snapshot.graph_generation
+            ~connection_generation:snapshot.connection_generation
             message
         | Ok () ->
           Option.iter
             (fun payload -> dispatch_event runtime (Pending_batch payload))
             (pending_payload runtime)))
-  | Fetch_http_pull { account_generation; graph_generation; graph_id; since; token } ->
+  | Fetch_http_pull
+      { account_generation
+      ; graph_generation
+      ; connection_generation
+      ; graph_id
+      ; since
+      ; token
+      } ->
     perform_http
       runtime
       ~name:"sync-http-pull"
@@ -892,12 +948,23 @@ and process_effect runtime = function
          enqueue
            runtime
            (Http_pull_loaded
-              { account_generation; graph_generation; payload = response.body }))
+              { account_generation
+              ; graph_generation
+              ; connection_generation
+              ; payload = response.body
+              }))
       ~account_generation
       ~graph_generation
+      ~connection_generation
       ()
   | Submit_http_transaction
-      { account_generation; graph_generation; graph_id; payload; token } ->
+      { account_generation
+      ; graph_generation
+      ; connection_generation
+      ; graph_id
+      ; payload
+      ; token
+      } ->
     perform_http
       runtime
       ~name:"sync-http-transaction"
@@ -910,9 +977,14 @@ and process_effect runtime = function
          enqueue
            runtime
            (Http_transaction_loaded
-              { account_generation; graph_generation; payload = response.body }))
+              { account_generation
+              ; graph_generation
+              ; connection_generation
+              ; payload = response.body
+              }))
       ~account_generation
       ~graph_generation
+      ~connection_generation
       ()
   | Delete_mirror graph_id ->
     let snapshot = Manager.snapshot runtime.manager in
@@ -937,6 +1009,7 @@ and process_effect runtime = function
          (Network_failed
             { account_generation = snapshot.account_generation
             ; graph_generation = None
+            ; connection_generation = None
             ; message = Db.Sync_mirror.error_message error
             }))
 ;;
