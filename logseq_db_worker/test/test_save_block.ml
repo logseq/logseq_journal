@@ -1,5 +1,6 @@
 module T = Logseq_db_worker_test_support.Test_support
 module Plan = Logseq_db_worker__Mutation_plan
+module Graph_read = Logseq_db_worker__Outliner__Graph_read
 module Protocol = Logseq_db_worker.Protocol
 module Uuid = Logseq_db_worker.Graph_types.Uuid
 
@@ -214,6 +215,33 @@ let require_int expected = function
 let contains_uuid values expected = List.exists (Uuid.equal expected) values
 let changed_uuids plan = plan.Plan.changed_uuids
 
+let graph_read_schema =
+  [ "block/uuid", schema_attr ~indexed:true ()
+  ; "block/parent", schema_attr ~indexed:true ()
+  ; "test/many", schema_attr ~cardinality:Datascript.Many ()
+  ]
+;;
+
+let graph_read_fixture () =
+  let parent = Datascript.Temp_id "graph-read-parent" in
+  let child = Datascript.Temp_id "graph-read-child" in
+  let uuid_entity = Datascript.Temp_id "graph-read-uuid" in
+  let string_entity = Datascript.Temp_id "graph-read-string" in
+  Datascript.empty_db ~schema:graph_read_schema ()
+  |> Datascript.db_with
+       [ Datascript.Add (parent, "block/uuid", Uuid block_uuid_text)
+       ; Add (parent, "block/name", String "parent")
+       ; Add (parent, "test/many", String "first")
+       ; Add (parent, "test/many", String "second")
+       ; Add (parent, "test/ref", Ref_to child)
+       ; Add (parent, "test/enabled", Bool true)
+       ; Add (parent, "block/parent", Ref_to parent)
+       ; Add (child, "block/parent", Ref_to parent)
+       ; Add (uuid_entity, "block/uuid", Uuid target_uuid_text)
+       ; Add (string_entity, "block/uuid", String target_uuid_text)
+       ]
+;;
+
 let () =
   T.run
     "save block"
@@ -247,7 +275,41 @@ let () =
         let title = "Old [[" ^ old_stub_uuid_text ^ "]] title" in
         let plan = require_plan (save db title) in
         T.require (plan.Plan.tx_ops = []) "unchanged save staged a transaction";
-        T.require (plan.changed_uuids = []) "unchanged save reported changes")
+        T.require (plan.changed_uuids = []) "unchanged save reported changes";
+        T.require (plan.status = Protocol.No_change) "unchanged save was not No_change")
+    ; T.case "shared graph reads preserve raw storage invariants" (fun () ->
+        let db = graph_read_fixture () in
+        let parent =
+          match Graph_read.entities_by_uuid db (uuid block_uuid_text) with
+          | [ entity ] -> entity
+          | _ -> T.fail "UUID lookup did not resolve the graph-read parent"
+        in
+        let matching = Graph_read.entities_by_uuid db (uuid target_uuid_text) in
+        T.require (List.length matching = 2) "dual UUID encodings were not both resolved";
+        T.require
+          (matching = List.sort_uniq Int.compare matching)
+          "dual UUID lookup was not sorted and deduplicated";
+        List.iter
+          (fun entity ->
+             match Graph_read.uuid_of_entity db entity with
+             | Ok actual ->
+               T.require (Uuid.equal actual (uuid target_uuid_text)) "entity UUID changed"
+             | Error message -> T.fail "entity UUID was not decoded: %s" message)
+          matching;
+        T.require
+          (Graph_read.one db parent "test/many" = None)
+          "ambiguous cardinality selected a value";
+        T.require
+          (Graph_read.string_value db parent "block/name" = Some "parent")
+          "string selector changed";
+        T.require
+          (Option.is_some (Graph_read.reference_value db parent "test/ref"))
+          "reference selector changed";
+        T.require (Graph_read.has_true db parent "test/enabled") "true selector changed";
+        T.require (Graph_read.is_page db parent) "page detection changed";
+        let children = Graph_read.children db parent in
+        T.require (List.length children = 1) "self-parent datom was returned as a child";
+        T.require (List.hd children <> parent) "child lookup retained its parent")
     ; T.case "updated-at uses injected epoch milliseconds" (fun () ->
         let db = fixture () in
         let report = apply db (require_plan (save db "Changed")) in

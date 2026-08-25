@@ -21,7 +21,7 @@
   journal_timeline_state
   journal_validation
   journal_visual_tokens
-  )
+  material_icon_catalog)
  (libraries
   bonsai_flutter.spec_impl
   base

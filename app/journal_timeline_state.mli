@@ -28,7 +28,6 @@ type slot =
       }
   | Children_more of { parent_id : string }
   | Feed_continuation of { before_day : int }
-  | Bottom_clearance
 
 type anchor_decision =
   | Preserve_visible_slot
@@ -56,7 +55,6 @@ type synthetic_window =
 type extent_geometry =
   { default_extent : float
   ; overrides : Ui.Widget.Sparse_extent_override.t list
-  ; final_clearance_extent : float
   }
 
 val maximum_slots : int
@@ -97,12 +95,7 @@ val anchor_decision : t -> anchor_decision
 val focus_restore_block_id : t -> string option
 val is_expanded : t -> block_id:string -> bool
 val slot_key : slot -> string
-
-val extent_geometry
-  :  t
-  -> profile:Journal_visual_tokens.row_profile
-  -> safe_bottom:float
-  -> extent_geometry
+val extent_geometry : t -> profile:Journal_visual_tokens.row_profile -> extent_geometry
 
 val synthetic_window
   :  total_count:int

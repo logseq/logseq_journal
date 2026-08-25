@@ -1,15 +1,5 @@
-type t =
-  { tx_ops : Datascript.tx_op list
-  ; tx_meta : Datascript.tx_meta
-  ; changed_uuids : Graph_types.Uuid.t list
-  ; status : Protocol.mutation_status
-  }
-
-type error =
-  | Unsupported_semantics of string
-  | Invalid_selection of string
-  | Invalid_tree of string
-  | Built_in_protected
+include Planner_contract
+open Graph_read
 
 module Int_set = Set.Make (Int)
 
@@ -21,52 +11,10 @@ module Uuid_set = Set.Make (struct
 
 let ( let* ) result f = Result.bind result f
 
-let values db entity attr =
-  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.v)
-;;
-
-let one db entity attr =
-  match values db entity attr with
-  | [ value ] -> Some value
-  | [] | _ :: _ :: _ -> None
-;;
-
-let string_value db entity attr =
-  match one db entity attr with
-  | Some (Datascript.String value) -> Some value
-  | Some _ | None -> None
-;;
-
-let reference_value db entity attr =
-  match one db entity attr with
-  | Some (Datascript.Ref value) -> Some value
-  | Some _ | None -> None
-;;
-
 let ident db entity =
   match one db entity "db/ident" with
   | Some (Datascript.Keyword value | String value) -> Some value
   | Some _ | None -> None
-;;
-
-let has_true db entity attr =
-  match one db entity attr with
-  | Some (Datascript.Bool true) -> true
-  | Some _ | None -> false
-;;
-
-let is_page db entity = Option.is_some (string_value db entity "block/name")
-
-let entities_by_uuid db uuid =
-  let text = Graph_types.Uuid.to_string uuid in
-  let find value =
-    Datascript.datoms db Datascript.Avet ~a:"block/uuid" ~v:value ()
-    |> List.of_seq
-    |> List.map (fun datom -> datom.Datascript.e)
-  in
-  find (Datascript.Uuid text) @ find (String text) |> List.sort_uniq Int.compare
 ;;
 
 let require_entity db uuid =
@@ -74,12 +22,6 @@ let require_entity db uuid =
   | [ entity ] -> Ok entity
   | [] -> Error (Invalid_selection "A delete root UUID does not exist.")
   | _ -> Error (Invalid_selection "A delete root UUID is ambiguous.")
-;;
-
-let uuid_of_entity db entity =
-  match one db entity "block/uuid" with
-  | Some (Datascript.Uuid value | String value) -> Graph_types.Uuid.of_string value
-  | Some _ | None -> Error "entity has no UUID"
 ;;
 
 let entities_by_ident db expected =
@@ -90,13 +32,6 @@ let entities_by_ident db expected =
   in
   find (Datascript.Keyword expected) @ find (String expected)
   |> List.sort_uniq Int.compare
-;;
-
-let children db parent =
-  Datascript.datoms db Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref parent) ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.e)
-  |> List.filter (fun entity -> entity <> parent)
 ;;
 
 let rec subtree db entity = entity :: List.concat_map (subtree db) (children db entity)

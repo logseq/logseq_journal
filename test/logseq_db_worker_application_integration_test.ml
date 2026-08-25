@@ -341,39 +341,41 @@ let has_text handle value =
   Option.is_some (Test.Handle.find handle (Test.Query.visible_text value))
 ;;
 
-let capture_composer_enabled handle =
-  match Test.Handle.find handle (Test.Query.test_id "journal-capture-composer") with
+let capture_affordance_enabled handle =
+  match Test.Handle.find handle (Test.Query.test_id "journal-capture-expandable") with
   | Some node ->
     let (Av view) = Ui.Widget.Private.view node.widget in
     (match view.node with
      | Ui.Widget.Private.Native_widget { kind_id; payload; _ }
-       when kind_id = Ui.Native_widget.Message_composer.kind_id ->
-       (Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload).enabled
-     | _ -> fail "Capture composer is not a Message_composer")
-  | None -> fail "Capture composer is not mounted"
+       when kind_id = Ui.Native_widget.Expandable_message_composer.kind_id ->
+       (Ui.Native_widget.Expandable_message_composer.For_testing.decode_props_exn payload)
+         .enabled
+     | _ -> fail "Capture affordance is not an Expandable_message_composer")
+  | None -> fail "Capture affordance is not mounted"
 ;;
 
-let commit_end_swipe handle block_id =
+let press_delete_action handle block_id =
   Test.Handle.present handle;
-  let query = Test.Query.test_id ("journal-row-swipe:" ^ block_id) in
+  let query = Test.Query.test_id ("journal-row-slidable:" ^ block_id) in
   let node =
     match Test.Handle.find handle query with
     | Some node -> node
-    | None -> fail "missing swipe wrapper for %s\n%s" block_id (Test.Handle.show handle)
+    | None ->
+      fail "missing Slidable wrapper for %s\n%s" block_id (Test.Handle.show handle)
   in
   let kind_id =
     let (Av view) = Ui.Widget.Private.view node.widget in
     match view.node with
     | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
-    | _ -> fail "delete wrapper is not a native widget"
+    | _ -> fail "delete Slidable is not a native widget"
   in
   Test.Handle.native_event
     handle
     query
     ~kind_id
-    ~version:2
-    ~event_id:(ID.Native_widget.Event_id.of_int 1)
-    ~payload:(Bytes.make 1 '\001')
+    ~version:3
+    ~event_id:Ui.Native_widget.Slidable.action_pressed_event_id
+    ~payload:(Ui.Native_widget.Slidable.For_testing.encode_action_pressed 1)
 ;;
 
 let advance_clock handle seconds =
@@ -450,7 +452,7 @@ let test_initial_graph_info_drives_headless_application () =
       (fun () ->
          wait_for handle "initial graph feed" (fun () ->
            has_text handle "No journal entries yet");
-         require (capture_composer_enabled handle) "Graph_info did not enable capture"))
+         require (capture_affordance_enabled handle) "Graph_info did not enable capture"))
 ;;
 
 let test_initial_feed_loads_at_most_seven_days () =
@@ -480,7 +482,7 @@ let test_open_failed_renders_without_crashing_worker_runtime () =
          wait_for handle "typed graph open failure" (fun () ->
            has_test_id handle "logseq-graph-open-failed");
          require
-           (not (capture_composer_enabled handle))
+           (not (capture_affordance_enabled handle))
            "Open_failed left graph interaction enabled"))
 ;;
 
@@ -494,12 +496,12 @@ let test_fatal_storage_error_terminalizes_application () =
       (fun () ->
          wait_for handle "seeded graph row" (fun () ->
            has_text handle "Fatal mutation row");
-         commit_end_swipe handle block_id;
+         press_delete_action handle block_id;
          advance_clock handle 5.;
          wait_for handle "terminal fatal graph state" (fun () ->
            has_test_id handle "logseq-graph-open-failed");
          require
-           (not (capture_composer_enabled handle))
+           (not (capture_affordance_enabled handle))
            "fatal storage state allowed another graph mutation"))
 ;;
 

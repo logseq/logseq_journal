@@ -1,17 +1,6 @@
 open Graph_types
-
-type t =
-  { tx_ops : Datascript.tx_op list
-  ; tx_meta : Datascript.tx_meta
-  ; changed_uuids : Uuid.t list
-  ; status : Protocol.mutation_status
-  }
-
-type error =
-  | Unsupported_semantics of string
-  | Invalid_selection of string
-  | Conflict of string
-  | Built_in_protected
+include Planner_contract
+open Graph_read
 
 type property =
   { entity : int
@@ -28,12 +17,6 @@ type resolved_value =
   ; created_uuid : Uuid.t option
   }
 
-let values db entity attr =
-  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.v)
-;;
-
 let one db entity attr =
   match values db entity attr with
   | [] -> Ok None
@@ -41,7 +24,7 @@ let one db entity attr =
   | _ -> Error (Invalid_selection ("Entity has multiple values for " ^ attr ^ "."))
 ;;
 
-let uuid_of_entity db entity =
+let require_uuid db entity =
   match one db entity "block/uuid" with
   | Ok (Some (Datascript.Uuid value)) ->
     (match Uuid.of_string value with
@@ -178,7 +161,7 @@ let cardinality db entity ident =
 ;;
 
 let resolve_property_entity db entity =
-  match uuid_of_entity db entity, one db entity "db/ident" with
+  match require_uuid db entity, one db entity "db/ident" with
   | Ok uuid, Ok (Some (Datascript.Keyword ident | String ident))
     when qualified_ident ident
          && (property_ident ident || has_tag_ident db entity "logseq.class/Property") ->
@@ -196,7 +179,7 @@ let resolve_property_entity db entity =
       }
   | Ok _, Ok (Some (Datascript.Keyword ident | String ident))
     when String.equal ident "logseq.property/status" ->
-    (match uuid_of_entity db entity with
+    (match require_uuid db entity with
      | Error _ as error -> error
      | Ok uuid ->
        Ok

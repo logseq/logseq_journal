@@ -5,14 +5,12 @@ type anchor =
 
 type route =
   | Timeline
-  | Capture
   | Detail_loading
   | Detail
   | Missing_detail
 
 type view =
   | Timeline_view
-  | Capture_view of Journal_capture.t
   | Detail_loading_view of
       { block_id : string
       ; request_generation : int64
@@ -39,7 +37,6 @@ let create ~anchor = { view = Timeline_view; anchor }
 let route t =
   match t.view with
   | Timeline_view -> Timeline
-  | Capture_view _ -> Capture
   | Detail_loading_view _ -> Detail_loading
   | Detail_view _ -> Detail
   | Missing_detail_view _ -> Missing_detail
@@ -47,25 +44,6 @@ let route t =
 
 let anchor_to_restore t = Some t.anchor
 let set_anchor t anchor = { t with anchor }
-
-let open_capture t ~session_number ~source =
-  match t.view with
-  | Capture_view _ -> t
-  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ ->
-    { t with view = Capture_view (Journal_capture.create ~session_number ~source) }
-;;
-
-let capture t =
-  match t.view with
-  | Capture_view capture -> Some capture
-  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ -> None
-;;
-
-let update_capture t capture =
-  match t.view with
-  | Capture_view _ -> { t with view = Capture_view capture }
-  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ -> t
-;;
 
 let open_detail t ~block_id ~request_generation =
   { t with
@@ -80,7 +58,7 @@ let detail_block_id t =
   | Detail_loading_view { block_id; _ }
   | Detail_view { block_id; _ }
   | Missing_detail_view { block_id; _ } -> Some block_id
-  | Timeline_view | Capture_view _ -> None
+  | Timeline_view -> None
 ;;
 
 let detail_request_generation t =
@@ -88,7 +66,7 @@ let detail_request_generation t =
   | Detail_loading_view { request_generation; _ }
   | Detail_view { request_generation; _ }
   | Missing_detail_view { request_generation; _ } -> request_generation
-  | Timeline_view | Capture_view _ -> 0L
+  | Timeline_view -> 0L
 ;;
 
 let apply_detail_response t ~request_generation detail =
@@ -104,11 +82,7 @@ let apply_detail_response t ~request_generation detail =
           ; detail = Journal_detail.create ~session_number:loading.session_number detail
           }
     }
-  | Timeline_view
-  | Capture_view _
-  | Detail_loading_view _
-  | Detail_view _
-  | Missing_detail_view _ -> t
+  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ -> t
 ;;
 
 let apply_missing_detail t ~request_generation =
@@ -118,34 +92,25 @@ let apply_missing_detail t ~request_generation =
     { t with
       view = Missing_detail_view { block_id = loading.block_id; request_generation }
     }
-  | Timeline_view
-  | Capture_view _
-  | Detail_loading_view _
-  | Detail_view _
-  | Missing_detail_view _ -> t
+  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ -> t
 ;;
 
 let detail t =
   match t.view with
   | Detail_view { detail; _ } -> Some detail
-  | Timeline_view | Capture_view _ | Detail_loading_view _ | Missing_detail_view _ -> None
+  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> None
 ;;
 
 let update_detail t detail =
   match t.view with
   | Detail_view view -> { t with view = Detail_view { view with detail } }
-  | Timeline_view | Capture_view _ | Detail_loading_view _ | Missing_detail_view _ -> t
+  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t
 ;;
 
 let back t =
   match t.view with
   | Timeline_view -> t
   | Detail_loading_view _ | Missing_detail_view _ -> { t with view = Timeline_view }
-  | Capture_view capture ->
-    (match Journal_capture.request_dismiss capture with
-     | Close -> { t with view = Timeline_view }
-     | Confirm capture -> { t with view = Capture_view capture }
-     | Block -> t)
   | Detail_view view ->
     (match Journal_detail.request_back view.detail with
      | `Close -> { t with view = Timeline_view }
@@ -154,8 +119,6 @@ let back t =
 
 let keep_editing t =
   match t.view with
-  | Capture_view capture ->
-    { t with view = Capture_view (Journal_capture.keep_editing capture) }
   | Detail_view view ->
     { t with
       view = Detail_view { view with detail = Journal_detail.keep_editing view.detail }
@@ -165,7 +128,6 @@ let keep_editing t =
 
 let discard t =
   match t.view with
-  | Capture_view _ -> { t with view = Timeline_view }
   | Detail_view view ->
     { t with
       view = Detail_view { view with detail = Journal_detail.discard_edit view.detail }
@@ -187,5 +149,5 @@ let runtime_replaced t =
           ; session_number = Int64.succ view.session_number
           }
     }
-  | Timeline_view | Capture_view _ | Detail_loading_view _ | Missing_detail_view _ -> t
+  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t
 ;;

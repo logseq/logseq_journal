@@ -9,15 +9,25 @@ import 'package:bonsai_flutter/src/runtime/foreground_frame_loop.dart';
 import 'package:bonsai_flutter/src/renderer/pressable_host.dart';
 import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/semantics.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+// ignore: depend_on_referenced_packages
+import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 import 'package:flutter_test/flutter_test.dart';
 
 const _parentSource = 'Plan journal redesign';
 const _firstChild = 'Increase block row height';
 const _secondChild = 'Show parent and child preview';
 const _thirdChild = 'Keep bounded virtualization';
-const _dividerColor = Color(0xffe8e9ed);
+
+final _runtimeBrightness =
+    Platform.environment['JOURNAL_GOLDEN_BRIGHTNESS'] == 'dark'
+    ? Brightness.dark
+    : Brightness.light;
+final _runtimeHighContrast =
+    Platform.environment['JOURNAL_GOLDEN_HIGH_CONTRAST'] == '1';
+final _writesReferenceGoldens =
+    _runtimeBrightness == Brightness.light && !_runtimeHighContrast;
 
 final class _TestAuth implements JournalAuthCapability {
   @override
@@ -38,14 +48,91 @@ void main() {
   }
 
   testWidgets(
-    'real runtime matches row, divider, Capture, preview, and swipe contracts',
+    'real runtime matches row, divider, expandable Capture, preview, and swipe contracts',
     (tester) async {
-      final harness = await _RuntimeHarness.start(tester);
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: _runtimeBrightness,
+        highContrast: _runtimeHighContrast,
+      );
       expect(tester.takeException(), isNull);
       expect(find.byType(MaterialApp), findsOneWidget);
-      expect(find.byType(MessageComposer), findsOneWidget);
+      expect(find.byType(fs.SlidableAutoCloseBehavior), findsOneWidget);
+      final materialApp = tester.widget<MaterialApp>(find.byType(MaterialApp));
+      expect(materialApp.themeMode, ThemeMode.system);
+      expect(find.byType(MessageComposer), findsNothing);
+      expect(find.byType(FloatingActionButton), findsOneWidget);
+      _expectMaterialGlyph(
+        find.byType(FloatingActionButton),
+        Icons.add,
+        role: 'Capture FAB',
+      );
+      expect(find.text('Capture'), findsOneWidget);
+      final scaffold = tester.widget<Scaffold>(find.byType(Scaffold).first);
+      expect(scaffold.bottomNavigationBar, isNull);
+      expect(scaffold.bottomSheet, isNull);
+      expect(scaffold.floatingActionButton, isNotNull);
+      final scaffoldRect = tester.getRect(find.byType(Scaffold).first);
+      final bodyRect = tester.getRect(find.byWidget(scaffold.body!));
+      expect(bodyRect.bottom, closeTo(scaffoldRect.bottom, 0.1));
+      final composerRect = tester.getRect(
+        find.byType(ExpandableMessageComposer),
+      );
+      final captureFabRect = tester.getRect(find.byType(FloatingActionButton));
+      expect(composerRect, captureFabRect);
+      expect(captureFabRect.width, lessThan(scaffoldRect.width));
+      expect(find.byType(CustomScrollView), findsOneWidget);
+      expect(find.byType(SliverAppBar), findsOneWidget);
+      var journalAppBar = tester.widget<SliverAppBar>(
+        find.byType(SliverAppBar),
+      );
+      expect(journalAppBar.pinned, isTrue);
+      expect(journalAppBar.floating, isFalse);
+      expect(journalAppBar.snap, isFalse);
+      expect(journalAppBar.stretch, isFalse);
+      expect(journalAppBar.automaticallyImplyLeading, isFalse);
+      expect(journalAppBar.centerTitle, isTrue);
+      expect(journalAppBar.expandedHeight, 97);
+      expect(journalAppBar.collapsedHeight, 57);
+      expect(journalAppBar.toolbarHeight, 56);
+      expect(journalAppBar.elevation, 0);
+      expect(journalAppBar.backgroundColor, isNull);
+      expect(journalAppBar.foregroundColor, isNull);
+      expect(journalAppBar.leading, isNotNull);
+      expect(journalAppBar.flexibleSpace, isNotNull);
+      expect(journalAppBar.bottom, isNull);
+      expect(journalAppBar.actions, isNotEmpty);
       expect(find.text('Today'), findsOneWidget);
       expect(find.text('Wed, Aug 12'), findsOneWidget);
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is Semantics &&
+              widget.properties.label == 'Today, Wed, Aug 12',
+        ),
+        findsOneWidget,
+      );
+      expect(
+        _sliverPaintExtent(tester, find.byType(SliverAppBar)),
+        closeTo(96 + 47 + 1, 0.5),
+      );
+      final journalScroll = tester.state<ScrollableState>(
+        find.descendant(
+          of: find.byType(CustomScrollView),
+          matching: find.byType(Scrollable),
+        ),
+      );
+      journalScroll.position.jumpTo(80);
+      await tester.pump();
+      expect(find.text('Today'), findsOneWidget);
+      expect(find.text('Wed, Aug 12').hitTestable(), findsNothing);
+      expect(
+        _sliverPaintExtent(tester, find.byType(SliverAppBar)),
+        closeTo(56 + 47 + 1, 0.5),
+      );
+      journalScroll.position.jumpTo(0);
+      await tester.pump();
+      expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
       expect(find.text(_parentSource), findsOneWidget);
       expect(find.text(_firstChild), findsOneWidget);
       expect(find.text('21:37'), findsOneWidget);
@@ -67,14 +154,11 @@ void main() {
       for (final status in const ['Todo', 'Doing', 'Done', 'Backlog']) {
         expect(find.bySemanticsLabel(RegExp('status $status')), findsOneWidget);
       }
-      for (final color in const [
-        Color(0xff64748b),
-        Color(0xff2563eb),
-        Color(0xff058e46),
-        Color(0xff7c3aed),
-      ]) {
-        expect(_statusRail(color), findsOneWidget);
-      }
+      _expectSeedOwnedSemanticColors(
+        tester,
+        brightness: _runtimeBrightness,
+        highContrast: _runtimeHighContrast,
+      );
       expect(
         find.bySemanticsLabel(
           '$_parentSource, $_firstChild, $_secondChild, $_thirdChild, created at 21:37',
@@ -93,7 +177,7 @@ void main() {
         greaterThan(tester.getTopRight(find.text(_parentSource)).dx),
       );
       final dividers = _timelineDividers(tester, devicePixelRatio: 1);
-      expect(dividers, hasLength(8));
+      expect(dividers.length, inInclusiveRange(1, 3));
       for (final rect in dividers) {
         expect(rect.left, closeTo(0, 0.25));
         expect(rect.right, closeTo(390, 0.25));
@@ -141,11 +225,16 @@ void main() {
         find.bySemanticsLabel('$_parentSource, created at 21:37'),
         findsOneWidget,
       );
-      expect(_timelineDividers(tester, devicePixelRatio: 1), hasLength(8));
-      await expectLater(
-        find.byType(Scaffold).first,
-        matchesGoldenFile('goldens/journal-reference-alignment.png'),
+      expect(
+        _timelineDividers(tester, devicePixelRatio: 1).length,
+        inInclusiveRange(1, 3),
       );
+      if (_writesReferenceGoldens) {
+        await expectLater(
+          find.byType(Scaffold).first,
+          matchesGoldenFile('goldens/journal-reference-alignment.png'),
+        );
+      }
       await tester.tap(disclosurePressable);
       await tester.pump(const Duration(milliseconds: 80));
       await harness.pumpUntil(
@@ -166,45 +255,266 @@ void main() {
         timeStamp: const Duration(milliseconds: 500),
       );
       await tester.pump();
-      await expectLater(
-        find.byType(Scaffold).first,
-        matchesGoldenFile('goldens/journal-swipe-delete-threshold.png'),
+      final parentSlidable = find.ancestor(
+        of: find.text(_parentSource),
+        matching: find.byType(fs.Slidable),
       );
+      final parentDelete = find.descendant(
+        of: parentSlidable,
+        matching: find.text('Delete'),
+      );
+      expect(parentDelete, findsOneWidget);
+      final deleteAction = tester.widget<fs.CustomSlidableAction>(
+        find.descendant(
+          of: parentSlidable,
+          matching: find.byType(fs.CustomSlidableAction),
+        ),
+      );
+      expect(deleteAction.borderRadius, BorderRadius.zero);
+      final deleteActionFinder = find.descendant(
+        of: parentSlidable,
+        matching: find.byType(fs.CustomSlidableAction),
+      );
+      final actionRect = tester.getRect(deleteActionFinder);
+      final actionDividers = find.descendant(
+        of: deleteActionFinder,
+        matching: find.byType(Divider),
+      );
+      expect(actionDividers, findsNWidgets(2));
+      final dividerRects = actionDividers
+          .evaluate()
+          .map(
+            (element) => tester.getRect(
+              find.byElementPredicate((candidate) => candidate == element),
+            ),
+          )
+          .toList();
+      expect(dividerRects.first.top, closeTo(actionRect.top, 0.1));
+      expect(dividerRects.last.bottom, closeTo(actionRect.bottom, 0.1));
+      for (final dividerRect in dividerRects) {
+        expect(dividerRect.width, closeTo(actionRect.width, 0.1));
+        expect(dividerRect.height, closeTo(1, 0.1));
+      }
+      if (_writesReferenceGoldens) {
+        await expectLater(
+          find.byType(Scaffold).first,
+          matchesGoldenFile('goldens/journal-slidable-open.png'),
+        );
+      }
       await swipeGesture.up(timeStamp: const Duration(milliseconds: 600));
-      await tester.pump(const Duration(milliseconds: 200));
+      await _pumpSlidableMotion(tester);
+      expect(find.text(_parentSource), findsOneWidget);
+      expect(find.text('Block and descendants removed'), findsNothing);
+
+      final parentController = fs.Slidable.of(
+        tester.element(find.text(_parentSource)),
+      )!;
+      expect(parentController.ratio, closeTo(-0.25, 0.01));
+      await tester.tapAt(tester.getCenter(find.text('Doing line one')));
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0, 0.01));
+
+      await tester.drag(find.text(_parentSource), const Offset(-390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(find.text(_parentSource), findsOneWidget);
+      expect(parentController.ratio, closeTo(-0.25, 0.01));
+      expect(find.text('Block and descendants removed'), findsNothing);
+
+      final secondController = fs.Slidable.of(
+        tester.element(find.text('Doing line one')),
+      )!;
+      final secondOpen = secondController.openEndActionPane();
+      await _pumpSlidableMotion(tester);
+      await secondOpen;
+      expect(secondController.ratio, closeTo(-0.25, 0.01));
+      expect(parentController.ratio, closeTo(0, 0.01));
+
+      await tester.tapAt(tester.getCenter(find.text(_parentSource)));
+      await _pumpSlidableMotion(tester);
+      expect(secondController.ratio, closeTo(0, 0.01));
+      final shortestController = fs.Slidable.of(
+        tester.element(find.text('Todo rail')),
+      )!;
+      final shortestOpen = shortestController.openEndActionPane();
+      await _pumpSlidableMotion(tester);
+      await shortestOpen;
+      expect(
+        tester.takeException(),
+        isNull,
+        reason: 'the delete action overflowed the shortest Journal row',
+      );
+      final shortestRow = _ancestorRectWithHeight(
+        tester,
+        find.text('Todo rail'),
+        44,
+      );
+      final shortestAction = find.descendant(
+        of: find.ancestor(
+          of: find.text('Todo rail'),
+          matching: find.byType(fs.Slidable),
+        ),
+        matching: find.byType(fs.CustomSlidableAction),
+      );
+      expect(
+        tester.getRect(shortestAction).height,
+        closeTo(shortestRow.height, 0.1),
+      );
+      await tester.tapAt(tester.getCenter(find.text(_parentSource)));
+      await _pumpSlidableMotion(tester);
+      expect(shortestController.ratio, closeTo(0, 0.01));
 
       for (final dpr in const [2.0, 3.0, 4.0]) {
         tester.view.devicePixelRatio = dpr;
         tester.view.physicalSize = Size(390 * dpr, 844 * dpr);
         tester.view.padding = FakeViewPadding(top: 47 * dpr, bottom: 34 * dpr);
-        await harness.pumpUntil(
-          () => _timelineDividers(tester, devicePixelRatio: dpr).length == 8,
-          reason: 'divider geometry did not settle at ${dpr.toInt()}x',
-        );
+        await harness.pumpUntil(() {
+          final count = _timelineDividers(tester, devicePixelRatio: dpr).length;
+          return count >= 1 && count <= 3;
+        }, reason: 'divider geometry did not settle at ${dpr.toInt()}x');
         final scaledDividers = _timelineDividers(tester, devicePixelRatio: dpr);
-        expect(scaledDividers, hasLength(8));
+        expect(scaledDividers.length, inInclusiveRange(1, 3));
         for (final rect in scaledDividers) {
           expect(rect.height * dpr, closeTo(1, 0.08));
           expect(rect.left, closeTo(0, 0.25));
           expect(rect.right, closeTo(390, 0.25));
         }
       }
-      await _expectLastRowAboveComposer(tester, harness);
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.padding = const FakeViewPadding(top: 47, bottom: 34);
+      await tester.pump();
+      await _expectLastRowAboveCaptureBar(tester, harness);
+
+      final fab = find.byType(FloatingActionButton);
+      await tester.tap(fab);
+      await tester.pump();
+      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(find.byType(MessageComposer), findsOneWidget);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).focusNode!.hasFocus,
+        isTrue,
+        reason: 'Capture input did not focus on the first mounted sheet frame',
+      );
+      await tester.pump(const Duration(milliseconds: 110));
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).focusNode!.hasFocus,
+        isTrue,
+      );
+      await tester.pump(const Duration(milliseconds: 90));
+      await tester.pump();
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).focusNode!.hasFocus,
+        isTrue,
+        reason: 'Capture input lost focus during its standard transition',
+      );
       tester.platformDispatcher.textScaleFactorTestValue = 3.2;
       await harness.pumpUntil(
         () =>
             MediaQuery.textScalerOf(
-              tester.element(find.byType(MessageComposer)),
-            ).scale(1) >
-            3,
+                  tester.element(find.byType(MessageComposer)),
+                ).scale(1) >
+                3 &&
+            tester
+                    .widget<SliverAppBar>(find.byType(SliverAppBar))
+                    .toolbarHeight >
+                100,
         reason: 'large text scale did not reach the composer',
       );
-      await _expectLastRowAboveComposer(tester, harness);
+      journalAppBar = tester.widget<SliverAppBar>(find.byType(SliverAppBar));
+      expect(journalAppBar.collapsedHeight, closeTo(106.6, 0.1));
+      expect(journalAppBar.toolbarHeight, closeTo(105.6, 0.1));
+      expect(journalAppBar.expandedHeight, closeTo(178.6, 0.1));
       tester.view.viewInsets = const FakeViewPadding(bottom: 320);
       await tester.pump();
-      await _expectLastRowAboveComposer(tester, harness);
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(
+        tester.getBottomRight(find.byType(MessageComposer)).dy,
+        lessThanOrEqualTo(844 - 320),
+      );
       tester.view.resetViewInsets();
       tester.platformDispatcher.clearTextScaleFactorTestValue();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 220));
+
+      const stagedDraft = '  Capture 中文 👩🏽‍💻 literal-token  ';
+      await tester.enterText(find.byType(TextField), stagedDraft);
+      await tester.pump();
+      _expectMaterialGlyph(
+        find.byTooltip('Save journal block'),
+        Icons.arrow_upward,
+        role: 'Capture submit',
+      );
+      expect(find.byType(FloatingActionButton), findsNothing);
+      await tester.drag(find.byType(MessageComposer), const Offset(0, 80));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(
+        find.byType(FloatingActionButton),
+        findsOneWidget,
+        reason: 'downward swipe did not restore the Capture FAB',
+      );
+      expect(find.byType(MessageComposer), findsNothing);
+      await tester.tap(find.byType(FloatingActionButton));
+      await harness.pumpUntil(
+        () =>
+            find.byType(TextField).evaluate().isNotEmpty &&
+            tester.widget<TextField>(find.byType(TextField)).controller!.text ==
+                stagedDraft,
+        reason: 'Capture draft was not restored after re-expansion',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump();
+      await tester.enterText(find.byType(TextField), '   \n');
+      await tester.pump();
+      expect(find.byTooltip('Save journal block'), findsNothing);
+      await tester.enterText(find.byType(TextField), stagedDraft);
+      await tester.pump();
+      await tester.tap(find.byTooltip('Save journal block'));
+      await harness.pumpUntil(
+        () =>
+            find.byType(MessageComposer).evaluate().isEmpty &&
+            find.text(stagedDraft).evaluate().isNotEmpty,
+        reason: 'direct Capture did not persist and close after success',
+      );
+      expect(find.text('New block'), findsNothing);
+
+      final timelineScroll = find
+          .ancestor(
+            of: find.text(stagedDraft),
+            matching: find.byType(Scrollable),
+          )
+          .last;
+      await tester.drag(timelineScroll, const Offset(0, 4000));
+      await harness.pumpUntil(
+        () => find.text(_parentSource).evaluate().isNotEmpty,
+        reason: 'parent row did not return for explicit Delete activation',
+      );
+      await tester.drag(find.text(_parentSource), const Offset(-80, 0));
+      await _pumpSlidableMotion(tester);
+      final explicitDelete = find.descendant(
+        of: find.ancestor(
+          of: find.text(_parentSource),
+          matching: find.byType(fs.Slidable),
+        ),
+        matching: find.text('Delete'),
+      );
+      await tester.tap(explicitDelete.hitTestable());
+      await harness.pumpUntil(
+        () =>
+            find.text(_parentSource).evaluate().isEmpty &&
+            find.text('Block and descendants removed').evaluate().isNotEmpty,
+        reason: 'explicit Delete action did not remove the parent row',
+      );
+      expect(find.text('Block and descendants removed'), findsOneWidget);
+      await tester.pump(const Duration(milliseconds: 250));
+      await tester.tap(find.text('Undo'));
+      await harness.pumpUntil(
+        () =>
+            find.text(_parentSource).evaluate().isNotEmpty &&
+            find.text('Block and descendants removed').evaluate().isEmpty,
+        reason: 'Undo did not restore the explicitly deleted parent row',
+      );
       await harness.dispose();
     },
     skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
@@ -212,7 +522,39 @@ void main() {
   );
 }
 
-Future<void> _expectLastRowAboveComposer(
+Future<void> _pumpSlidableMotion(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 250));
+  await tester.pump();
+}
+
+double _sliverPaintExtent(WidgetTester tester, Finder finder) {
+  final renderSliver = tester.renderObject<RenderSliver>(finder);
+  return renderSliver.geometry!.paintExtent;
+}
+
+void _expectMaterialGlyph(
+  Finder scope,
+  IconData expected, {
+  required String role,
+}) {
+  final glyphs = find.descendant(
+    of: scope,
+    matching: find.byWidgetPredicate(
+      (widget) => widget is Text && widget.style?.fontFamily == 'MaterialIcons',
+    ),
+  );
+  expect(glyphs, findsOneWidget, reason: '$role has no Material glyph');
+  final text = (glyphs.evaluate().single.widget as Text).data;
+  expect(text, isNotNull, reason: '$role has no glyph character');
+  expect(
+    text!.runes.single,
+    expected.codePoint,
+    reason: '$role does not render ${expected.codePoint.toRadixString(16)}',
+  );
+}
+
+Future<void> _expectLastRowAboveCaptureBar(
   WidgetTester tester,
   _RuntimeHarness harness,
 ) async {
@@ -229,21 +571,13 @@ Future<void> _expectLastRowAboveComposer(
   );
   await tester.pump(const Duration(milliseconds: 220));
   final row = tester.getRect(find.text('Todo rail'));
-  final composer = tester.getRect(find.byType(MessageComposer));
+  final captureBar = tester.getRect(find.byType(FloatingActionButton));
   expect(
     row.bottom,
-    lessThanOrEqualTo(composer.top + 0.5),
-    reason: 'the final journal row is obscured by the persistent composer',
+    lessThanOrEqualTo(captureBar.top + 0.5),
+    reason: 'the final journal row is obscured by the Capture FAB',
   );
 }
-
-Finder _statusRail(Color color) => find.byWidgetPredicate(
-  (widget) =>
-      widget is DecoratedBox &&
-      widget.decoration is BoxDecoration &&
-      (widget.decoration as BoxDecoration).color == color,
-  description: 'four-point status rail with color $color',
-);
 
 final class _RuntimeHarness {
   _RuntimeHarness({
@@ -264,7 +598,12 @@ final class _RuntimeHarness {
   static Future<_RuntimeHarness> start(
     WidgetTester tester, {
     double devicePixelRatio = 1,
+    Brightness brightness = Brightness.light,
+    bool highContrast = false,
   }) async {
+    tester.platformDispatcher.platformBrightnessTestValue = brightness;
+    tester.platformDispatcher.accessibilityFeaturesTestValue =
+        FakeAccessibilityFeatures(highContrast: highContrast);
     tester.view.devicePixelRatio = devicePixelRatio;
     tester.view.physicalSize = Size(
       390 * devicePixelRatio,
@@ -279,6 +618,8 @@ final class _RuntimeHarness {
     addTearDown(tester.view.resetPadding);
     addTearDown(tester.view.resetViewInsets);
     addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);
+    addTearDown(tester.platformDispatcher.clearAccessibilityFeaturesTestValue);
     await tester.runAsync(_loadGoldenFonts);
 
     final configuredRoot = Platform.environment['JOURNAL_GOLDEN_SUPPORT_ROOT'];
@@ -341,11 +682,15 @@ final class _RuntimeHarness {
       auth: _TestAuth(),
     );
     await tester.pumpWidget(
-      BonsaiFlutterRoot(
-        config: config,
-        runtimeStarter: (_) async => runtime,
-        applicationPlatform: platform,
-        frameEligibilitySource: frameEligibility,
+      fs.SlidableAutoCloseBehavior(
+        closeWhenOpened: true,
+        closeWhenTapped: true,
+        child: BonsaiFlutterRoot(
+          config: config,
+          runtimeStarter: (_) async => runtime,
+          applicationPlatform: platform,
+          frameEligibilitySource: frameEligibility,
+        ),
       ),
     );
     final harness = _RuntimeHarness(
@@ -376,7 +721,11 @@ final class _RuntimeHarness {
       await tester.runAsync(
         () => Future<void>.delayed(const Duration(milliseconds: 10)),
       );
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 10));
+      final exception = tester.takeException();
+      if (exception != null) {
+        fail('$reason; renderer exception: $exception');
+      }
     }
     if (!predicate()) {
       final mountedText = tester
@@ -384,7 +733,14 @@ final class _RuntimeHarness {
           .map((widget) => widget.data)
           .whereType<String>()
           .toList();
-      fail('$reason; mounted text: $mountedText');
+      final runtimeState = await tester.runAsync(runtime.debugSnapshot);
+      fail(
+        '$reason; mounted text: $mountedText; runtime: '
+        'state=${runtimeState?.state} generation=${runtimeState?.liveGeneration} '
+        'eligible=${runtimeState?.eligible} grant=${runtimeState?.hasCoalescedGrant} '
+        'presentation=${runtimeState?.unresolvedPresentationId} '
+        'revision=${runtimeState?.unresolvedRevision} pumps=${runtimeState?.pumpCount}',
+      );
     }
   }
 
@@ -410,8 +766,12 @@ final class _RuntimeHarness {
     }
     frameEligibility.setEligible(false);
     await tester.pumpWidget(const SizedBox.shrink());
-    if (removeRoot && root.existsSync()) {
-      await tester.runAsync(() => root.delete(recursive: true));
+    if (removeRoot) {
+      try {
+        root.deleteSync(recursive: true);
+      } on PathNotFoundException {
+        // Runtime shutdown may remove the support root before test cleanup.
+      }
     }
   }
 }
@@ -452,12 +812,7 @@ List<Rect> _timelineDividers(
 }) {
   final expectedHeight = 1 / devicePixelRatio;
   return find
-      .byWidgetPredicate(
-        (widget) =>
-            widget is DecoratedBox &&
-            widget.decoration is BoxDecoration &&
-            (widget.decoration as BoxDecoration).color == _dividerColor,
-      )
+      .byType(Divider)
       .evaluate()
       .map(
         (element) =>
@@ -465,19 +820,82 @@ List<Rect> _timelineDividers(
       )
       .where(
         (rect) =>
-            rect.top > 110 &&
-            rect.width > 300 &&
-            (rect.height - expectedHeight).abs() < 0.08,
+            rect.width > 300 && (rect.height - expectedHeight).abs() < 0.08,
       )
       .toList();
 }
 
-Finder _directChildText(String source) => find.byWidgetPredicate(
-  (widget) =>
-      widget is Text &&
-      widget.data == source &&
-      widget.style?.color == const Color(0xff0d142f),
+Finder _directChildText(String source) => find.descendant(
+  of: find.bySemanticsLabel(RegExp('^Direct child: ${RegExp.escape(source)}')),
+  matching: find.text(source),
 );
+
+void _expectSeedOwnedSemanticColors(
+  WidgetTester tester, {
+  required Brightness brightness,
+  required bool highContrast,
+}) {
+  final context = tester.element(find.text('Today'));
+  final scheme = Theme.of(context).colorScheme;
+  final expected = ColorScheme.fromSeed(
+    seedColor: const Color(0xff00262f),
+    brightness: brightness,
+    contrastLevel: highContrast ? 1 : 0,
+  );
+  expect(scheme.brightness, brightness);
+  expect(scheme.primary, expected.primary);
+  expect(scheme.surface, expected.surface);
+  expect(scheme.onSurface, expected.onSurface);
+  expect(scheme.error, expected.error);
+  expect(tester.widget<Text>(find.text('Today')).style?.color, isNull);
+  expect(tester.widget<Text>(find.text('Wed, Aug 12')).style?.color, isNull);
+  final railColors = _statusRailColors(tester);
+  expect(railColors, hasLength(4));
+  expect(railColors.toSet(), hasLength(4));
+  for (final color in railColors) {
+    expect(_contrastRatio(color, scheme.surface), greaterThanOrEqualTo(3));
+  }
+  for (final element in find.byType(fs.CustomSlidableAction).evaluate()) {
+    final action = element.widget as fs.CustomSlidableAction;
+    expect(
+      _contrastRatio(action.backgroundColor, scheme.surface),
+      greaterThanOrEqualTo(3),
+    );
+    expect(action.foregroundColor, isNotNull);
+    expect(
+      _contrastRatio(action.foregroundColor!, action.backgroundColor),
+      greaterThanOrEqualTo(4.5),
+    );
+  }
+}
+
+List<Color> _statusRailColors(WidgetTester tester) => find
+    .byWidgetPredicate(
+      (widget) =>
+          widget is DecoratedBox &&
+          widget.decoration is BoxDecoration &&
+          (widget.decoration as BoxDecoration).borderRadius ==
+              BorderRadius.circular(2),
+    )
+    .evaluate()
+    .where((element) {
+      final rect = tester.getRect(find.byElementPredicate((e) => e == element));
+      return (rect.width - 4).abs() < 0.1;
+    })
+    .map(
+      (element) =>
+          ((element.widget as DecoratedBox).decoration as BoxDecoration).color!,
+    )
+    .toList();
+
+double _contrastRatio(Color left, Color right) {
+  final lighter = left.computeLuminance() > right.computeLuminance()
+      ? left
+      : right;
+  final darker = identical(lighter, left) ? right : left;
+  return (lighter.computeLuminance() + 0.05) /
+      (darker.computeLuminance() + 0.05);
+}
 
 Future<void> _loadGoldenFonts() async {
   final materialFonts = _findMaterialFontsDirectory();

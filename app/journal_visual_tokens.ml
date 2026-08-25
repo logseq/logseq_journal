@@ -1,35 +1,47 @@
 module Ui = Bonsai_flutter_ui
 
-type palette =
+type destructive_swipe_action =
   { background : Ui.Style.Color.t
-  ; header : Ui.Style.Color.t
-  ; text_primary : Ui.Style.Color.t
-  ; text_secondary : Ui.Style.Color.t
-  ; text_timestamp : Ui.Style.Color.t
-  ; divider : Ui.Style.Color.t
-  ; neutral_badge : Ui.Style.Color.t
-  ; fab : Ui.Style.Color.t
-  ; on_fab : Ui.Style.Color.t
-  ; status_todo : Ui.Style.Color.t
-  ; status_doing : Ui.Style.Color.t
-  ; status_done : Ui.Style.Color.t
-  ; status_later : Ui.Style.Color.t
-  ; sheet_surface : Ui.Style.Color.t
-  ; sheet_outline : Ui.Style.Color.t
-  ; modal_scrim : Ui.Style.Color.t
-  ; sheet_primary_action : Ui.Style.Color.t
-  ; sheet_secondary_action : Ui.Style.Color.t
-  ; sheet_error : Ui.Style.Color.t
-  ; destructive : Ui.Style.Color.t
-  ; on_destructive : Ui.Style.Color.t
+  ; foreground : Ui.Style.Color.t
   }
 
-type interaction =
-  { pressed : Ui.Style.Color.t
-  ; focused : Ui.Style.Color.t
-  ; disabled : Ui.Style.Color.t
-  ; error : Ui.Style.Color.t
-  }
+module Color_exceptions = struct
+  type presentation =
+    | Normal
+    | High_contrast
+
+  type status_rails =
+    { todo : Ui.Style.Color.t
+    ; doing : Ui.Style.Color.t
+    ; done_ : Ui.Style.Color.t
+    ; later : Ui.Style.Color.t
+    }
+
+  let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue
+
+  let status_rails =
+    { todo = rgb 100 116 139
+    ; doing = rgb 37 99 235
+    ; done_ = rgb 5 142 70
+    ; later = rgb 124 58 237
+    }
+  ;;
+
+  let destructive_swipe = { background = rgb 186 26 26; foreground = rgb 255 255 255 }
+
+  let status_rail_color ~presentation:_ = function
+    | Journal_model.No_status -> None
+    | status ->
+      (match Journal_model.status_category status with
+       | None -> None
+       | Some Todo_category -> Some status_rails.todo
+       | Some Doing_category -> Some status_rails.doing
+       | Some Done_category -> Some status_rails.done_
+       | Some Later_category -> Some status_rails.later)
+  ;;
+
+  let destructive_swipe_action ~presentation:_ = destructive_swipe
+end
 
 type text_token =
   { font_size : float
@@ -69,10 +81,7 @@ type header_geometry =
 
 type composer_geometry =
   { horizontal_margin : float
-  ; bottom_inset : float
-  ; minimum_height : float
   ; maximum_lines : int
-  ; expanded_vertical_overhead : float
   }
 
 type row_geometry =
@@ -94,8 +103,6 @@ type preview_geometry =
 type motion =
   { press_release_ms : int
   ; route_transition_ms : int
-  ; capture_sheet_enter_ms : int
-  ; capture_sheet_exit_ms : int
   }
 
 type profile_kind =
@@ -117,93 +124,12 @@ type fixed_extent_role =
   | Day_heading
   | Day_continuation
   | Feed_continuation
-  | Bottom_clearance
 
-type t =
-  { palette : palette
-  ; interaction : interaction
-  }
-
-let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue
-let argb alpha red green blue = Ui.Style.Color.argb ~alpha ~red ~green ~blue
-
-let light_palette =
-  { background = rgb 253 253 253
-  ; header = rgb 253 253 253
-  ; text_primary = rgb 13 20 47
-  ; text_secondary = rgb 101 107 143
-  ; text_timestamp = rgb 110 115 136
-  ; divider = rgb 232 233 237
-  ; neutral_badge = rgb 241 242 245
-  ; fab = rgb 24 30 52
-  ; on_fab = rgb 252 252 253
-  ; status_todo = rgb 100 116 139
-  ; status_doing = rgb 37 99 235
-  ; status_done = rgb 5 142 70
-  ; status_later = rgb 124 58 237
-  ; sheet_surface = rgb 255 255 255
-  ; sheet_outline = rgb 232 233 237
-  ; modal_scrim = argb 71 13 20 47
-  ; sheet_primary_action = rgb 24 30 52
-  ; sheet_secondary_action = rgb 245 245 246
-  ; sheet_error = rgb 179 38 30
-  ; destructive = rgb 220 77 86
-  ; on_destructive = rgb 255 255 255
-  }
-;;
-
-let light_high_contrast_palette =
-  { background = rgb 255 255 255
-  ; header = rgb 255 255 255
-  ; text_primary = rgb 0 0 0
-  ; text_secondary = rgb 49 49 49
-  ; text_timestamp = rgb 49 49 49
-  ; divider = rgb 102 102 102
-  ; neutral_badge = rgb 238 238 238
-  ; fab = rgb 0 0 0
-  ; on_fab = rgb 255 255 255
-  ; status_todo = rgb 31 41 55
-  ; status_doing = rgb 0 71 171
-  ; status_done = rgb 0 107 51
-  ; status_later = rgb 91 33 182
-  ; sheet_surface = rgb 255 255 255
-  ; sheet_outline = rgb 102 102 102
-  ; modal_scrim = argb 140 0 0 0
-  ; sheet_primary_action = rgb 0 0 0
-  ; sheet_secondary_action = rgb 238 238 238
-  ; sheet_error = rgb 128 0 0
-  ; destructive = rgb 153 0 0
-  ; on_destructive = rgb 255 255 255
-  }
-;;
-
-let light_interaction =
-  { pressed = argb 31 13 20 47
-  ; focused = rgb 49 94 245
-  ; disabled = rgb 165 168 182
-  ; error = rgb 179 38 30
-  }
-;;
-
-let light_high_contrast_interaction =
-  { pressed = argb 51 0 0 0
-  ; focused = rgb 0 56 168
-  ; disabled = rgb 89 89 89
-  ; error = rgb 128 0 0
-  }
-;;
+type t = Color_exceptions.presentation
 
 let resolve ~high_contrast =
-  match high_contrast with
-  | false -> { palette = light_palette; interaction = light_interaction }
-  | true ->
-    { palette = light_high_contrast_palette
-    ; interaction = light_high_contrast_interaction
-    }
+  if high_contrast then Color_exceptions.High_contrast else Color_exceptions.Normal
 ;;
-
-let palette t = t.palette
-let interaction t = t.interaction
 
 let typography =
   { header_title =
@@ -227,14 +153,7 @@ let header_geometry =
   { content_height = 48.; horizontal_inset = 12.; vertical_inset = 4. }
 ;;
 
-let composer_geometry =
-  { horizontal_margin = 12.
-  ; bottom_inset = 12.
-  ; minimum_height = 48.
-  ; maximum_lines = 5
-  ; expanded_vertical_overhead = 80.
-  }
-;;
+let composer_geometry = { horizontal_margin = 12.; maximum_lines = 5 }
 
 let row_geometry =
   { time_slot_base = 52.
@@ -256,18 +175,8 @@ let preview_geometry =
 
 let motion ~reduced_motion =
   if reduced_motion
-  then
-    { press_release_ms = 0
-    ; route_transition_ms = 0
-    ; capture_sheet_enter_ms = 0
-    ; capture_sheet_exit_ms = 0
-    }
-  else
-    { press_release_ms = 80
-    ; route_transition_ms = 180
-    ; capture_sheet_enter_ms = 220
-    ; capture_sheet_exit_ms = 180
-    }
+  then { press_release_ms = 0; route_transition_ms = 0 }
+  else { press_release_ms = 80; route_transition_ms = 180 }
 ;;
 
 let physical_divider_thickness ~device_pixel_ratio = 1. /. Float.max 1. device_pixel_ratio
@@ -304,25 +213,11 @@ let block_extent ~profile ~visible_lines =
        (spacing.x4 +. (float_of_int visible_lines *. profile.block_line_height)))
 ;;
 
-let fixed_extent ~profile ~safe_bottom = function
+let fixed_extent ~profile = function
   | Children_loading | Children_more -> block_extent ~profile ~visible_lines:1
   | Day_heading -> profile.day_header_extent
   | Day_continuation | Feed_continuation -> profile.continuation_extent
-  | Bottom_clearance ->
-    let expanded_height =
-      composer_geometry.expanded_vertical_overhead
-      +. (float_of_int composer_geometry.maximum_lines *. profile.block_line_height)
-    in
-    composer_geometry.bottom_inset
-    +. Float.max composer_geometry.minimum_height expanded_height
-    +. Float.max 0. safe_bottom
 ;;
 
-let status_rail_color t status =
-  match Journal_model.status_category status with
-  | None -> None
-  | Some Todo_category -> Some t.palette.status_todo
-  | Some Doing_category -> Some t.palette.status_doing
-  | Some Done_category -> Some t.palette.status_done
-  | Some Later_category -> Some t.palette.status_later
-;;
+let status_rail_color t status = Color_exceptions.status_rail_color ~presentation:t status
+let destructive_swipe_action t = Color_exceptions.destructive_swipe_action ~presentation:t

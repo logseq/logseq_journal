@@ -9,27 +9,12 @@ type error =
   | Ambiguous_reference of string
   | Invalid_reference of string
 
-let values db entity attr =
-  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.v)
-;;
+open Graph_read
 
 let uuid_text db entity =
   match values db entity "block/uuid" with
   | [ Datascript.Uuid value ] | [ String value ] -> Some value
   | _ -> None
-;;
-
-let entities_by_uuid db uuid =
-  let text = Graph_types.Uuid.to_string uuid in
-  let for_value value =
-    Datascript.datoms db Datascript.Avet ~a:"block/uuid" ~v:value ()
-    |> List.of_seq
-    |> List.map (fun datom -> datom.Datascript.e)
-  in
-  for_value (Datascript.Uuid text) @ for_value (String text)
-  |> List.sort_uniq Int.compare
 ;;
 
 let entities_by_name db name =

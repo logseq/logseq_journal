@@ -487,27 +487,38 @@ let click_test_id handle test_id =
   Test.Handle.present handle
 ;;
 
-let commit_end_swipe handle block_id =
+let send_slidable_event handle block_id ~event_id ~payload =
   Test.Handle.present handle;
-  let query = Test.Query.test_id ("journal-row-swipe:" ^ block_id) in
+  let query = Test.Query.test_id ("journal-row-slidable:" ^ block_id) in
   let node =
     match Test.Handle.find handle query with
     | Some node -> node
-    | None -> fail "missing swipe wrapper for %s\n%s" block_id (Test.Handle.show handle)
+    | None ->
+      fail "missing Slidable wrapper for %s\n%s" block_id (Test.Handle.show handle)
   in
   let kind_id =
     let (Av view) = Ui.Widget.Private.view node.widget in
     match view.node with
     | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
-    | _ -> fail "delete wrapper is not a native widget"
+    | _ -> fail "delete Slidable is not a native widget"
   in
-  Test.Handle.native_event
+  Test.Handle.native_event handle query ~kind_id ~version:3 ~event_id ~payload
+;;
+
+let press_delete_action handle block_id =
+  send_slidable_event
     handle
-    query
-    ~kind_id
-    ~version:2
-    ~event_id:(ID.Native_widget.Event_id.of_int 1)
-    ~payload:(Bytes.make 1 '\001')
+    block_id
+    ~event_id:Ui.Native_widget.Slidable.action_pressed_event_id
+    ~payload:(Ui.Native_widget.Slidable.For_testing.encode_action_pressed 1)
+;;
+
+let emit_unexpected_end_dismissal handle block_id =
+  send_slidable_event
+    handle
+    block_id
+    ~event_id:Ui.Native_widget.Slidable.dismissed_event_id
+    ~payload:(Ui.Native_widget.Slidable.For_testing.encode_dismissed End)
 ;;
 
 let require_visible_text handle text =
@@ -599,10 +610,20 @@ let test_initial_feed_has_a_truthful_loading_state () =
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
          Test.Handle.present handle;
+         require_test_id handle "journal-scroll";
+         require
+           (List.length (Test.Handle.find_all handle (Test.Query.test_id "journal-scroll"))
+            = 1)
+           "loading state has more than one Journal scroll owner";
          require_visible_text handle "Loading journal";
          require_live_region handle "Loading journal";
          require_no_visible_text handle "No journal entries yet";
          pump_until_text handle "No journal entries yet";
+         require_test_id handle "journal-scroll";
+         require
+           (List.length (Test.Handle.find_all handle (Test.Query.test_id "journal-scroll"))
+            = 1)
+           "empty state has more than one Journal scroll owner";
          require_no_visible_text handle "Loading journal"))
 ;;
 
@@ -610,6 +631,29 @@ let node_by_test_id handle test_id =
   match Test.Handle.find handle (Test.Query.test_id test_id) with
   | Some node -> node
   | None -> fail "expected test ID %S\n%s" test_id (Test.Handle.show handle)
+;;
+
+let require_material_icon handle test_id expected_code_point =
+  let rec material_code_points widget =
+    let (Av view) = Ui.Widget.Private.view widget in
+    match view.node with
+    | Ui.Widget.Private.Icon { code_point; font_family = Some "MaterialIcons"; _ } ->
+      [ code_point ]
+    | _ ->
+      Array.to_list view.children
+      |> List.concat_map (fun (child : Ui.Widget.Private.child) ->
+        material_code_points child.widget)
+  in
+  match material_code_points (node_by_test_id handle test_id).widget with
+  | [ code_point ] ->
+    require
+      (code_point = expected_code_point)
+      "%s renders U+%04X instead of U+%04X"
+      test_id
+      code_point
+      expected_code_point
+  | [] -> fail "%s has no Material icon" test_id
+  | code_points -> fail "%s has %d Material icons" test_id (List.length code_points)
 ;;
 
 let last_wire handle =
@@ -659,13 +703,6 @@ let respond_to_snack_bar handle request close_reason =
   Test.Handle.present handle
 ;;
 
-let text_field_value handle test_id =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  match view.node with
-  | Ui.Widget.Private.Text_input { value; _ } -> value
-  | _ -> fail "%s is not a Material text field" test_id
-;;
-
 type timeline_props_record =
   { total_count : int
   ; first_index : int
@@ -675,10 +712,27 @@ type timeline_props_record =
   ; transition : Ui.Widget.Sparse_extent_transition.t option
   }
 
-let timeline_props handle =
+let timeline_list_widget handle = (node_by_test_id handle "journal-timeline-list").widget
+
+let require_timeline_end_padding handle expected =
   let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-timeline").widget
   in
+  match view.node with
+  | Ui.Widget.Private.Sliver_padding { left; top; right; bottom } ->
+    require
+      (Float.equal left 0.
+       && Float.equal top 0.
+       && Float.equal right 0.
+       && Float.equal bottom expected)
+      "timeline end padding is %.1f, expected %.1f"
+      bottom
+      expected
+  | _ -> fail "populated journal timeline has no scroll-content end padding"
+;;
+
+let timeline_props handle =
+  let (Av view) = Ui.Widget.Private.view (timeline_list_widget handle) in
   match view.node with
   | Ui.Widget.Private.Sliver_varied_extent
       { total_count
@@ -699,9 +753,7 @@ let timeline_props handle =
 ;;
 
 let timeline_item_keys handle =
-  let (Av view) =
-    Ui.Widget.Private.view (node_by_test_id handle "journal-timeline").widget
-  in
+  let (Av view) = Ui.Widget.Private.view (timeline_list_widget handle) in
   Array.to_list view.children
   |> List.mapi (fun index (child : Ui.Widget.Private.child) ->
     match Ui.Widget.For_testing.key child.widget with
@@ -723,41 +775,39 @@ let require_unique_timeline_item_keys keys =
   require_unique sorted
 ;;
 
-let capture_composer_props handle =
+let capture_affordance_props handle =
   let (Av view) =
-    Ui.Widget.Private.view (node_by_test_id handle "journal-capture-composer").widget
+    Ui.Widget.Private.view (node_by_test_id handle "journal-capture-expandable").widget
   in
   match view.node with
   | Ui.Widget.Private.Native_widget { kind_id; payload; _ } ->
     require
-      (kind_id = Ui.Native_widget.Message_composer.kind_id)
-      "Capture composer uses the wrong native widget kind";
-    Ui.Native_widget.Message_composer.For_testing.decode_props_exn payload
-  | _ -> fail "journal-capture-composer is not a Message_composer"
+      (kind_id = Ui.Native_widget.Expandable_message_composer.kind_id)
+      "Capture affordance uses the wrong native widget kind";
+    Ui.Native_widget.Expandable_message_composer.For_testing.decode_props_exn payload
+  | _ -> fail "journal-capture-expandable is not an Expandable_message_composer"
 ;;
 
-let send_capture_composer_button handle ~button_id ~text =
+let send_capture_affordance_button handle ~button_id ~text =
   let payload = Bytes.make (4 + String.length text) '\000' in
   Bytes.set_int32_le payload 0 (Int32.of_int button_id);
   Bytes.blit_string text 0 payload 4 (String.length text);
   Test.Handle.present handle;
   Test.Handle.native_event
     handle
-    (Test.Query.test_id "journal-capture-composer")
-    ~kind_id:Ui.Native_widget.Message_composer.kind_id
+    (Test.Query.test_id "journal-capture-expandable")
+    ~kind_id:Ui.Native_widget.Expandable_message_composer.kind_id
     ~version:1
-    ~event_id:Ui.Native_widget.Message_composer.button_pressed_event_id
+    ~event_id:Ui.Native_widget.Expandable_message_composer.button_pressed_event_id
     ~payload;
   Test.Handle.present handle
 ;;
-
-let open_capture handle = send_capture_composer_button handle ~button_id:1 ~text:""
 
 let send_visible_range handle ~first_index ~last_exclusive =
   Test.Handle.present handle;
   Test.Handle.visible_range
     handle
-    (Test.Query.test_id "journal-timeline")
+    (Test.Query.test_id "journal-timeline-list")
     ~first_index:(Int64.of_int first_index)
     ~last_exclusive:(Int64.of_int last_exclusive)
 ;;
@@ -815,29 +865,19 @@ let send_stale_visible_range
     ()
 ;;
 
-let require_decoration handle test_id expected =
+let require_not_colored_decoration handle test_id =
   let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
   match view.node with
-  | Ui.Widget.Private.Decorated_box { background = Some actual; _ } ->
-    require
-      (Int32.equal actual expected)
-      "%s background expected 0x%lx, got 0x%lx"
-      test_id
-      expected
-      actual
-  | _ -> fail "%s is not a colored DecoratedBox" test_id
+  | Ui.Widget.Private.Decorated_box { background = Some _; _ } ->
+    fail "%s still repaints a fixed surface" test_id
+  | _ -> ()
 ;;
 
-let require_decoration_without_shape handle test_id ~background =
+let require_material_divider handle test_id =
   let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
   match view.node with
-  | Ui.Widget.Private.Decorated_box { background = Some actual_background; border_radius }
-    ->
-    require
-      (Int32.equal actual_background background && Float.equal border_radius 0.)
-      "%s must leave outer sheet shape to the Flutter modal route"
-      test_id
-  | _ -> fail "%s is not a colored DecoratedBox" test_id
+  | Ui.Widget.Private.Material_divider _ -> ()
+  | _ -> fail "%s is not a Material Divider" test_id
 ;;
 
 let require_sized_height handle test_id expected =
@@ -864,191 +904,31 @@ let require_sized_size handle test_id ~width ~height =
   | _ -> fail "%s is not a size-constrained SizedBox" test_id
 ;;
 
-let require_horizontal_padding handle test_id ~left ~right =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  match view.node with
-  | Ui.Widget.Private.Padding
-      { left = actual_left; right = actual_right; top = _; bottom = _ } ->
-    require
-      (Float.equal actual_left left && Float.equal actual_right right)
-      "%s horizontal padding is %.1f/%.1f, expected %.1f/%.1f"
-      test_id
-      actual_left
-      actual_right
-      left
-      right
-  | _ -> fail "%s is not Padding" test_id
-;;
-
-let require_button_enabled handle test_id expected =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  match view.node with
-  | Ui.Widget.Private.Material_elevated_button { enabled; _ }
-  | Ui.Widget.Private.Material_text_button { enabled; _ }
-  | Ui.Widget.Private.Material_icon_button { enabled; _ }
-  | Ui.Widget.Private.Material_filled_button { enabled; _ }
-  | Ui.Widget.Private.Material_filled_tonal_button { enabled; _ }
-  | Ui.Widget.Private.Material_outlined_button { enabled; _ } ->
-    require (Bool.equal enabled expected) "%s enabled state differs" test_id
-  | _ -> fail "%s is not a Material button" test_id
-;;
-
-type expected_button_kind =
-  | Filled_button
-  | Filled_tonal_button
-  | Outlined_button
-  | Text_button
-
-let require_button_kind handle test_id expected =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  let actual =
-    match view.node with
-    | Ui.Widget.Private.Material_filled_button _ -> Filled_button
-    | Ui.Widget.Private.Material_filled_tonal_button _ -> Filled_tonal_button
-    | Ui.Widget.Private.Material_outlined_button _ -> Outlined_button
-    | Ui.Widget.Private.Material_text_button _ -> Text_button
-    | _ -> fail "%s is not an application Material button" test_id
-  in
-  require (actual = expected) "%s uses the wrong Material button role" test_id
-;;
-
-let capture_sheet_page_props handle =
-  let (Av view) =
-    Ui.Widget.Private.view (node_by_test_id handle "journal-capture-sheet").widget
-  in
-  match view.node with
-  | Ui.Widget.Private.Page { page_key; presentation; can_pop; restoration_id } ->
-    page_key, presentation, can_pop, restoration_id
-  | _ -> fail "journal-capture-sheet is not a Navigator page"
-;;
-
-let require_capture_modal_page handle ~can_pop ~enter_ms ~exit_ms =
-  let page_key, presentation, actual_can_pop, restoration_id =
-    capture_sheet_page_props handle
-  in
-  require
-    (String.equal (ID.Navigation.Page_key.to_string page_key) "journal-capture-sheet")
-    "Capture sheet page key changed";
-  require (Bool.equal actual_can_pop can_pop) "Capture sheet can_pop differs";
-  (match restoration_id with
-   | Some id ->
-     require
-       (String.equal (ID.Navigation.Restoration_id.to_string id) "journal-capture-sheet")
-       "Capture sheet restoration identity changed"
-   | None -> fail "Capture sheet has no restoration identity");
-  match presentation with
-  | Ui.Navigation.Standard _ -> fail "Capture still uses an opaque standard page"
-  | Modal_bottom_sheet modal ->
-    let modal = Ui.Navigation.Modal_bottom_sheet.Private.view modal in
-    require (not modal.barrier_dismissible) "Capture barrier became dismissible";
-    require modal.use_safe_area "Capture modal does not use the safe area";
-    require modal.request_focus "Capture modal does not request route focus";
-    require
-      (modal.transition_duration_ms = enter_ms
-       && modal.reverse_transition_duration_ms = exit_ms)
-      "Capture modal motion differs";
-    (match modal.barrier_color with
-     | Some color ->
-       require
-         (Int32.equal (Ui.Style.Color.Private.to_argb32 color) 0x470d142fl
-          || Int32.equal (Ui.Style.Color.Private.to_argb32 color) 0x7a000000l
-          || Int32.equal (Ui.Style.Color.Private.to_argb32 color) 0x8c000000l)
-         "Capture modal uses an unknown scrim"
-     | None -> fail "Capture modal did not provide a semantic scrim color");
-    (match modal.sizing with
-     | Ui.Navigation.Modal_bottom_sheet.Sizing.Scroll_controlled -> ()
-     | Content_bounded | Detented _ ->
-       fail "Capture modal is not the fixed-large scroll-controlled sheet")
-  | Modal_dialog _ -> fail "Capture sheet uses the dialog presentation"
-;;
-
-let require_capture_composer_bottom_sheet handle =
-  let composer = node_by_test_id handle "journal-capture-composer-safe-area" in
-  (match composer.parent_data with
+let require_capture_affordance_floating_action_button handle =
+  let affordance = node_by_test_id handle "journal-capture-expandable" in
+  (match affordance.parent_data with
    | Ui.Widget.Private.No_parent_data -> ()
    | Flex_parent_data _ | Stack_position _ ->
-     fail "Capture composer still carries overlay or flex parent data");
+     fail "Capture affordance carries overlay or flex parent data");
   match Test.Handle.find_all handle (Test.Query.kind "Material_scaffold") with
   | [ scaffold ] ->
     let (Av view) = Ui.Widget.Private.view scaffold.widget in
     (match view.node with
-     | Ui.Widget.Private.Material_scaffold { has_bottom_sheet = true; _ } -> ()
-     | Material_scaffold { has_bottom_sheet = false; _ } ->
-       fail "journal Scaffold does not own the Capture bottom sheet"
+     | Ui.Widget.Private.Material_scaffold
+         { has_floating_action_button = true
+         ; floating_action_button_location = End_float
+         ; has_bottom_navigation_bar = false
+         ; has_bottom_sheet = false
+         ; _
+         } -> ()
+     | Material_scaffold _ ->
+       fail "journal Scaffold does not exclusively own Capture as an end-floating FAB"
      | _ -> assert false)
   | [] -> fail "journal view has no Material scaffold"
   | scaffolds -> fail "journal view has %d Material scaffolds" (List.length scaffolds)
 ;;
 
-let require_alert_dialog handle test_id ~action_count =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  match view.node with
-  | Ui.Widget.Private.Material_alert_dialog
-      { has_title = true; has_content = true; action_count = actual; _ } ->
-    require (actual = action_count) "%s action count changed" test_id
-  | Material_alert_dialog _ -> fail "%s omitted title or content" test_id
-  | _ -> fail "%s is not a Material AlertDialog" test_id
-;;
-
-let require_modal_dialog_page handle test_id ~page_key ~transition_ms =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
-  match view.node with
-  | Ui.Widget.Private.Page
-      { page_key = actual_page_key; presentation; can_pop; restoration_id } ->
-    require
-      (String.equal (ID.Navigation.Page_key.to_string actual_page_key) page_key)
-      "%s page key changed"
-      test_id;
-    require (not can_pop) "%s became back-dismissible" test_id;
-    (match restoration_id with
-     | Some id ->
-       require
-         (String.equal (ID.Navigation.Restoration_id.to_string id) page_key)
-         "%s restoration identity changed"
-         test_id
-     | None -> fail "%s has no restoration identity" test_id);
-    (match presentation with
-     | Ui.Navigation.Modal_dialog modal ->
-       let modal = Ui.Navigation.Modal_dialog.Private.view modal in
-       require (not modal.barrier_dismissible) "%s barrier became dismissible" test_id;
-       require modal.use_safe_area "%s does not use SafeArea" test_id;
-       require modal.request_focus "%s does not request focus" test_id;
-       require
-         (modal.transition_duration_ms = transition_ms
-          && modal.reverse_transition_duration_ms = transition_ms)
-         "%s transition policy changed"
-         test_id;
-       require (Option.is_some modal.barrier_label) "%s omitted barrier semantics" test_id
-     | Standard _ | Modal_bottom_sheet _ ->
-       fail "%s is not presented as Modal_dialog" test_id)
-  | _ -> fail "%s is not a Navigator page" test_id
-;;
-
-let substring_index text needle =
-  let rec loop index =
-    if index + String.length needle > String.length text
-    then None
-    else if String.sub text index (String.length needle) = needle
-    then Some index
-    else loop (index + 1)
-  in
-  loop 0
-;;
-
-let require_tree_order handle earlier later =
-  let tree = Test.Handle.show handle in
-  match substring_index tree earlier, substring_index tree later with
-  | Some earlier_index, Some later_index ->
-    require
-      (earlier_index < later_index)
-      "%S must precede %S in the logical tree\n%s"
-      earlier
-      later
-      tree
-  | _ -> fail "missing %S or %S in the logical tree\n%s" earlier later tree
-;;
-
-let require_text_style handle test_id ~size ~line_height ~weight ~color =
+let require_theme_owned_text_style handle test_id ~size ~line_height ~weight =
   let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
   match view.node with
   | Ui.Widget.Private.Text { style = Some style; _ } ->
@@ -1056,7 +936,7 @@ let require_text_style handle test_id ~size ~line_height ~weight ~color =
       (style.font_size = Some size
        && style.line_height = Some line_height
        && style.font_weight = Some weight
-       && style.color = Some color)
+       && Option.is_none style.color)
       "%s has unexpected typography"
       test_id
   | _ -> fail "%s is not styled Text" test_id
@@ -1097,45 +977,127 @@ let require_padding handle test_id ~left ~top ~right ~bottom =
   | _ -> fail "%s is not Padding" test_id
 ;;
 
-let require_header_geometry handle =
-  (let (Av view) =
-     Ui.Widget.Private.view (node_by_test_id handle "journal-header-safe-area").widget
-   in
-   match view.node with
-   | Ui.Widget.Private.Safe_area { top; bottom; _ } ->
-     require (top && not bottom) "header safe-area edges changed"
-   | _ -> fail "journal-header-safe-area is not SafeArea");
-  (let (Av view) =
-     Ui.Widget.Private.view (node_by_test_id handle "journal-header-stack").widget
-   in
-   match view.node with
-   | Ui.Widget.Private.Stack -> ()
-   | _ -> fail "journal-header-stack is not Stack");
-  require_sized_height handle "journal-header-content-height" 48.;
-  (let (Av view) =
-     Ui.Widget.Private.view (node_by_test_id handle "journal-header-center").widget
-   in
-   match view.node with
-   | Ui.Widget.Private.Center _ -> ()
-   | _ -> fail "journal-header-center is not an independent Center");
-  (let (Av view) =
-     Ui.Widget.Private.view (node_by_test_id handle "journal-header-padding").widget
-   in
-   match view.node with
-   | Ui.Widget.Private.Padding { left; right; top; bottom } ->
-     require
-       (Float.equal left 12.
-        && Float.equal right 12.
-        && Float.equal top 4.
-        && Float.equal bottom 4.)
-       "header inset is %.1f/%.1f/%.1f/%.1f, expected 12.0/4.0/12.0/4.0"
-       left
-       top
-       right
-       bottom
-   | _ -> fail "journal-header-padding is not Padding");
+type app_bar_props_record =
+  { pinned : bool
+  ; expanded_height : float option
+  ; collapsed_height : float option
+  ; floating : bool
+  ; snap : bool
+  ; stretch : bool
+  ; toolbar_height : float
+  ; has_leading : bool
+  ; has_flexible_space : bool
+  ; has_bottom : bool
+  ; has_actions : bool
+  ; force_elevated : bool
+  ; automatically_imply_leading : bool
+  ; center_title : bool option
+  ; background_color : int32 option
+  ; foreground_color : int32 option
+  ; elevation : float option
+  }
+
+let app_bar_props handle =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle "journal-header").widget in
+  match view.node with
+  | Ui.Widget.Private.Sliver_app_bar props ->
+    { pinned = props.pinned
+    ; expanded_height = props.expanded_height
+    ; collapsed_height = props.collapsed_height
+    ; floating = props.floating
+    ; snap = props.snap
+    ; stretch = props.stretch
+    ; toolbar_height = props.toolbar_height
+    ; has_leading = props.has_leading
+    ; has_flexible_space = props.has_flexible_space
+    ; has_bottom = props.has_bottom
+    ; has_actions = props.has_actions
+    ; force_elevated = props.force_elevated
+    ; automatically_imply_leading = props.automatically_imply_leading
+    ; center_title = props.center_title
+    ; background_color = props.background_color
+    ; foreground_color = props.foreground_color
+    ; elevation = props.elevation
+    }
+  | _ -> fail "journal header is not a Sliver_app_bar"
+;;
+
+let require_journal_scroll handle ~expanded_height ~collapsed_height =
+  let (Av scroll) = Ui.Widget.Private.view (node_by_test_id handle "journal-scroll").widget in
+  (match scroll.node with
+   | Ui.Widget.Private.Scroll_view { axis = Ui.Layout.Axis.Vertical; _ } -> ()
+   | _ -> fail "Journal root is not one vertical Scroll_view");
+  require
+    (Array.length scroll.children = 2)
+    "Journal scroll has %d slivers, expected app bar plus content"
+    (Array.length scroll.children);
+  require
+    (Ui.Widget.For_testing.test_id scroll.children.(0).widget
+     = Some (Ui.Test_id.string "journal-header"))
+    "Journal app bar is not the first scroll sliver";
+  require
+    (Ui.Widget.For_testing.test_id scroll.children.(1).widget
+     = Some (Ui.Test_id.string "journal-timeline"))
+    "Journal content is not the second scroll sliver";
+  let props = app_bar_props handle in
+  require
+    (props.pinned
+     && not props.floating
+     && not props.snap
+     && not props.stretch
+     && not props.force_elevated
+     && not props.automatically_imply_leading
+     && props.center_title = Some true)
+    "Journal app bar behavior flags changed";
+  let close expected = function
+    | Some actual -> Float.abs (actual -. expected) < 0.001
+    | None -> false
+  in
+  require
+    (close expanded_height props.expanded_height
+     && close collapsed_height props.collapsed_height
+     && Float.abs (props.toolbar_height -. (collapsed_height -. (1. /. 3.))) < 0.001)
+    "Journal app bar extents differ: expanded=%s collapsed=%s toolbar=%.1f"
+    (Option.fold ~none:"none" ~some:string_of_float props.expanded_height)
+    (Option.fold ~none:"none" ~some:string_of_float props.collapsed_height)
+    props.toolbar_height;
+  require
+    (props.has_leading
+     && props.has_flexible_space
+     && not props.has_bottom
+     && props.has_actions)
+    "Journal app bar slot ownership changed";
+  require
+    (props.background_color = None
+     && props.foreground_color = None
+     && props.elevation = Some 0.)
+    "Journal app bar stopped inheriting theme presentation";
   require_sized_size handle "journal-header-leading-placeholder" ~width:44. ~height:44.;
   require_sized_size handle "journal-header-account-placeholder" ~width:44. ~height:44.
+;;
+
+let test_graph_open_error_retains_the_journal_scroll_contract () =
+  Adapter_fixture.with_snapshot (fun fixture ->
+    let token =
+      Graph.Uuid.of_string "ffffffff-ffff-4fff-8fff-ffffffffffff" |> Result.get_ok
+    in
+    let startup =
+      { fixture.Adapter_fixture.config with
+        target = Logseq_db_worker.Config.Snapshot { token }
+      }
+    in
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         set_environment handle (environment ());
+         pump_until handle "graph-open error" (fun () ->
+           Option.is_some
+             (Test.Handle.find handle (Test.Query.test_id "logseq-graph-open-failed")));
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.))))
 ;;
 
 let require_content_width_padding handle ~horizontal =
@@ -1158,7 +1120,7 @@ let require_content_width_padding handle ~horizontal =
   | _ -> fail "journal-content-width-padding is not Padding"
 ;;
 
-let test_application_owns_a_light_material_theme () =
+let test_application_owns_one_system_material_theme () =
   with_startup (fun startup ->
     let handle = create_raw_handle startup in
     Fun.protect
@@ -1166,19 +1128,36 @@ let test_application_owns_a_light_material_theme () =
       (fun () ->
          let title, theme = application_theme_from_initial_frame handle in
          require (title = Some "Logseq Journal") "application title changed";
-         require (theme.mode = Protocol.Wire_frame.Light) "application theme is not Light";
          require
-           (theme.light.brightness = Protocol.Wire_frame.Light)
-           "light theme data has the wrong brightness";
-         require
-           (theme.dark.brightness = Protocol.Wire_frame.Dark)
-           "dark theme data has the wrong brightness";
-         match theme.high_contrast_light with
-         | Some data ->
+           (theme.mode = Protocol.Wire_frame.System)
+           "application theme is not System";
+         let require_data name brightness contrast_level data =
            require
-             (data.brightness = Protocol.Wire_frame.Light)
-             "high-contrast light data has the wrong brightness"
-         | None -> fail "application omitted high-contrast light theme data"))
+             (data.Protocol.Wire_frame.brightness = brightness)
+             "%s brightness differs"
+             name;
+           require
+             (Int32.equal data.color_scheme.seed_argb 0xff00262fl)
+             "%s does not use the one accepted seed"
+             name;
+           require
+             (data.color_scheme.variant = Protocol.Wire_frame.Tonal_spot)
+             "%s dynamic variant differs"
+             name;
+           require
+             (Float.equal data.color_scheme.contrast_level contrast_level)
+             "%s contrast level differs"
+             name
+         in
+         require_data "light" Protocol.Wire_frame.Light 0. theme.light;
+         require_data "dark" Protocol.Wire_frame.Dark 0. theme.dark;
+         (match theme.high_contrast_light with
+          | Some data ->
+            require_data "high-contrast light" Protocol.Wire_frame.Light 1. data
+          | None -> fail "application omitted high-contrast light theme data");
+         match theme.high_contrast_dark with
+         | Some data -> require_data "high-contrast dark" Protocol.Wire_frame.Dark 1. data
+         | None -> fail "application omitted high-contrast dark theme data"))
 ;;
 
 let test_root_is_owned_by_the_ocaml_timeline () =
@@ -1192,7 +1171,8 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_visible_text handle "Today";
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
-         require_test_id handle "journal-capture-composer";
+         require_test_id handle "journal-capture-expandable";
+         require_no_test_id handle "journal-capture-composer";
          require_test_id handle "journal-header";
          require_test_id handle "journal-date-context";
          require_test_id handle "journal-header-leading-placeholder";
@@ -1203,6 +1183,7 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_no_test_id handle "journal-more-target";
          require_no_test_id handle "journal-date-target";
          require_test_id handle "journal-timeline";
+         require_no_test_id handle "journal-bottom-clearance";
          require_no_test_id handle "journal-capture";
          require_no_visible_text handle "Search";
          require_no_visible_text handle "Search journal";
@@ -1213,214 +1194,99 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_no_visible_text handle "Styled token"))
 ;;
 
-let test_capture_composer_replaces_the_center_orb_and_prefills_capture () =
+let test_capture_fab_directly_saves_one_plain_top_level_block () =
   with_startup (fun startup ->
     let handle = create_handle startup in
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
          pump_until_text handle "No journal entries yet";
-         let props = capture_composer_props handle in
-         require props.enabled "Capture composer is disabled after graph startup";
-         require (not props.autofocus) "Capture composer unexpectedly steals focus";
-         require (props.max_lines = 5) "Capture composer max-lines policy changed";
+         let props = capture_affordance_props handle in
+         require props.enabled "Capture FAB is disabled after graph startup";
+         require (String.equal props.fab_label "Capture") "Capture FAB label changed";
+         require
+           (String.equal props.fab_tooltip "Open Capture")
+           "Capture FAB tooltip changed";
+         require
+           (props.animation_duration_ms = 180)
+           "Capture expansion duration differs from the application motion token";
+         require
+           (props.animation_curve = Ui.Animation.Curve.Ease_out)
+           "Capture expansion curve changed";
+         require (props.max_lines = 5) "Capture input max-lines policy changed";
          require
            (String.equal props.hint_text "Capture a thought")
-           "Capture composer hint changed";
+           "Capture input hint changed";
          (match props.buttons with
-          | [ plus; submit ] ->
-            require (plus.id = 1) "Capture composer plus button ID changed";
+          | [ save ] ->
+            require (save.id = 1) "Capture Save button ID changed";
             require
-              (plus.position = Ui.Native_widget.Message_composer.Leading
-               && plus.visibility = Always
-               && plus.style = Plain)
-              "Capture composer plus button policy changed";
-            require (submit.id = 2) "Capture composer submit button ID changed";
+              (String.equal save.tooltip "Save journal block")
+              "Capture Save accessible label changed";
             require
-              (submit.position = Ui.Native_widget.Message_composer.Trailing
-               && submit.visibility = When_non_empty
-               && submit.style = Filled)
-              "Capture composer submit button policy changed"
-          | _ -> fail "Capture composer must expose plus and submit actions");
-         require_capture_composer_bottom_sheet handle;
+              (save.position = Ui.Native_widget.Expandable_message_composer.Trailing
+               && save.visibility = When_non_empty
+               && save.style = Filled
+               && save.enabled)
+              "Capture Save button policy changed"
+          | _ -> fail "Capture input must expose exactly one Save action");
+         require_capture_affordance_floating_action_button handle;
+         require_test_id handle "journal-capture-fab-icon";
+         require_material_icon handle "journal-capture-fab-icon" 0xe047;
+         require_no_test_id handle "journal-capture-composer-plus";
+         require_test_id handle "journal-capture-composer-submit";
+         require_material_icon handle "journal-capture-composer-submit" 0xe0a0;
          require_no_test_id handle "journal-capture-target";
          require_no_test_id handle "journal-capture-feedback";
-         send_capture_composer_button handle ~button_id:2 ~text:"   \n";
+         send_capture_affordance_button handle ~button_id:1 ~text:"   \n";
          require_no_test_id handle "journal-capture-sheet";
-         let source = "Composer 中文 👩🏽‍💻 #literal" in
-         send_capture_composer_button handle ~button_id:2 ~text:source;
-         require_test_id handle "journal-capture-sheet";
+         require_no_visible_text handle "   \n";
+         let source = "Composer 中文 👩🏽‍💻 literal" in
+         send_capture_affordance_button handle ~button_id:1 ~text:source;
+         let saving_props = capture_affordance_props handle in
          require
-           (String.equal
-              (Ui.Text_editing.Value.text (text_field_value handle "capture-editor"))
-              source)
-           "MessageComposer text was not transferred to Capture";
-         require_button_enabled handle "capture-save" true;
-         require_button_kind handle "capture-save" Filled_button))
-;;
-
-let test_capture_is_an_ocaml_contextual_modal_sheet () =
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         set_environment handle (environment ());
-         pump_until_text handle "No journal entries yet";
-         open_capture handle;
-         require_visible_text handle "New block";
-         require_test_id handle "capture-editor";
-         require_test_id handle "capture-sheet-surface";
-         require_decoration_without_shape
-           handle
-           "capture-sheet-surface"
-           ~background:0xffffffffl;
-         require_test_id handle "capture-close";
-         require_test_id handle "capture-date-context";
-         require_test_id handle "capture-task";
-         require_test_id handle "capture-save";
-         require_button_kind handle "capture-close" Text_button;
-         require_button_kind handle "capture-task" Outlined_button;
-         require_button_kind handle "capture-save" Filled_button;
-         require_button_kind handle "capture-add-child" Filled_tonal_button;
-         require_test_id handle "capture-status";
-         require_test_id handle "capture-action-row";
-         require_test_id handle "capture-primary-scroll";
-         require_test_id handle "journal-timeline-page";
-         require_test_id handle "journal-timeline";
-         require_no_test_id handle "journal-capture-route";
-         require_no_test_id handle "capture-toolbar";
-         require_no_test_id handle "capture-cancel";
-         require_no_visible_text handle "New entry";
-         require_no_visible_text handle "Attach";
-         require_capture_modal_page handle ~can_pop:true ~enter_ms:220 ~exit_ms:180;
-         (let (Av view) =
-            Ui.Widget.Private.view
-              (node_by_test_id handle "capture-primary-scroll").widget
-          in
-          match view.node with
-          | Ui.Widget.Private.Scroll_view
-              { axis = Ui.Layout.Axis.Vertical; primary = true; reverse = false; _ } -> ()
-          | _ -> fail "Capture editor region is not the one primary vertical scrollable");
-         (let (Av view) =
-            Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
-          in
-          match view.node with
-          | Ui.Widget.Private.Text_input
-              { keyboard_type = Ui.Text_editing.Multiline
-              ; input_action = Ui.Text_editing.Newline
-              ; autofocus = true
-              ; max_utf8_bytes = Some 65_536
-              ; _
-              } -> ()
-          | _ -> fail "Capture editor lost multiline, autofocus, or byte-limit behavior");
-         require_button_enabled handle "capture-save" false;
-         require_tree_order handle "test_id=capture-close" "test_id=capture-editor";
-         require_tree_order handle "test_id=capture-editor" "test_id=capture-task";
-         require_tree_order handle "test_id=capture-task" "test_id=capture-save";
-         click_test_id handle "capture-close";
-         require_no_test_id handle "journal-capture-sheet";
-         require_test_id handle "journal-timeline-page"))
-;;
-
-let test_capture_sheet_protects_dirty_state_and_reconciles_environment () =
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         set_environment handle (environment ());
-         pump_until_text handle "No journal entries yet";
-         open_capture handle;
-         let original = text_field_value handle "capture-editor" in
-         let original_session =
-           let (Av view) =
-             Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
-           in
-           match view.node with
-           | Ui.Widget.Private.Text_input { session_id; _ } -> session_id
-           | _ -> fail "capture-editor is not TextInput"
-         in
-         let source = "中文 👩🏽‍💻 e\204\129 #literal @mention" in
-         Test.Handle.apply_text_edit
-           handle
-           (Test.Query.test_id "capture-editor")
-           ~local_revision:(ID.Text_input.Local_revision.of_int64 1L)
-           ~base_document_revision:ID.Text_input.Document_revision.zero
-           ~text:source
-           ~selection_start:3
-           ~selection_end:10
-           ~composing_start:0
-           ~composing_end:2
-           ();
-         Test.Handle.present handle;
-         require_button_enabled handle "capture-save" true;
-         require_capture_modal_page handle ~can_pop:false ~enter_ms:220 ~exit_ms:180;
-         click_test_id handle "capture-task";
-         require_visible_text handle "Todo";
-         require_no_visible_text handle "Task: todo";
-         set_environment
-           handle
-           (environment
-              ~keyboard_inset_bottom:320.
-              ~text_scale:2.
-              ~locale:"ar_SA"
-              ~brightness:Environment.Dark
-              ~high_contrast:true
-              ~reduced_motion:true
-              ~accessible_navigation:true
-              ~disable_animations:true
-              ());
-         pump_worker handle;
-         require_capture_modal_page handle ~can_pop:false ~enter_ms:0 ~exit_ms:0;
-         let current = text_field_value handle "capture-editor" in
-         require
-           (String.equal (Ui.Text_editing.Value.text current) source)
-           "environment reconciliation lost Capture source";
-         (match Ui.Text_editing.Value.composing current with
-          | Some range ->
+           (not saving_props.enabled)
+           "direct Capture did not disable its editor while Saving";
+         (match saving_props.buttons with
+          | [ save ] ->
+            require (not save.enabled) "direct Capture did not enter Saving";
             require
-              (Ui.Text_editing.Range.start_utf16 range = 0
-               && Ui.Text_editing.Range.end_utf16 range = 2)
-              "environment reconciliation changed composing range"
-          | None -> fail "environment reconciliation lost composing range");
-         (let (Av view) =
-            Ui.Widget.Private.view (node_by_test_id handle "capture-editor").widget
-          in
-          match view.node with
-          | Ui.Widget.Private.Text_input { session_id; _ } ->
-            require
-              (ID.Text_input.Session_id.equal original_session session_id)
-              "detent reconciliation allocated a new text-input session"
-          | _ -> fail "capture-editor is not TextInput after environment update");
-         require
-           (String.equal (Ui.Text_editing.Value.text original) "")
-           "initial editor fixture was unexpectedly dirty";
-         click_test_id handle "capture-close";
-         require_test_id handle "capture-discard-dialog";
-         require_no_test_id handle "capture-close";
-         require_alert_dialog handle "capture-discard-dialog" ~action_count:2;
-         require_modal_dialog_page
-           handle
-           "capture-discard-dialog-page"
-           ~page_key:"capture-discard-dialog"
-           ~transition_ms:0;
-         require_button_kind handle "capture-keep-editing" Text_button;
-         require_button_kind handle "capture-discard" Filled_button;
-         click_test_id handle "capture-keep-editing";
-         require_test_id handle "capture-close";
-         require
-           (String.equal
-              (Ui.Text_editing.Value.text (text_field_value handle "capture-editor"))
-              source)
-           "Keep Editing lost the complete Capture draft";
-         click_test_id handle "capture-close";
-         click_test_id handle "capture-discard";
+              (String.equal save.tooltip "Saving journal block")
+              "direct Capture did not expose its accessible Saving state"
+          | _ -> fail "Capture action count changed while Saving");
+         pump_until_text handle source;
          require_no_test_id handle "journal-capture-sheet";
-         require_test_id handle "journal-timeline-page"))
+         require_no_visible_text handle "New block";
+         require
+           (List.length (Test.Handle.find_all handle (Test.Query.visible_text source)) = 1)
+           "direct Capture did not persist the exact source exactly once";
+         let props = capture_affordance_props handle in
+         require props.enabled "Capture FAB did not recover after persistence";
+         match props.buttons with
+         | [ save ] -> require save.enabled "Capture Save stayed disabled after success"
+         | _ -> fail "Capture action count changed after success"))
 ;;
 
-let test_header_uses_tokens_safe_area_and_independent_center () =
+let test_capture_fab_honors_reduced_motion_without_changing_its_slot () =
+  with_startup (fun startup ->
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         set_environment handle (environment ~reduced_motion:true ());
+         pump_until_text handle "No journal entries yet";
+         let props = capture_affordance_props handle in
+         require
+           (props.animation_duration_ms = 0)
+           "reduced motion kept a nonzero Capture expansion duration";
+         require
+           (props.animation_curve = Ui.Animation.Curve.Ease_out)
+           "reduced motion changed the Capture curve rather than its duration";
+         require_capture_affordance_floating_action_button handle;
+         require_no_test_id handle "journal-bottom-clearance"))
+;;
+
+let test_header_uses_pinned_theme_owned_sliver_app_bar () =
   with_startup (fun startup ->
     let handle = create_handle startup in
     Fun.protect
@@ -1428,44 +1294,40 @@ let test_header_uses_tokens_safe_area_and_independent_center () =
       (fun () ->
          set_environment handle (environment ());
          pump_until_text handle "No journal entries yet";
-         require_decoration handle "journal-root-surface" 0xfffdfdfdl;
-         require_decoration handle "journal-header-surface" 0xfffdfdfdl;
+         require_not_colored_decoration handle "journal-root-surface";
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
+         require_no_test_id handle "journal-header-surface";
+         require_no_test_id handle "journal-header-safe-area";
+         require_no_test_id handle "journal-header-stack";
          require_no_test_id handle "journal-header-handle";
          require_no_test_id handle "journal-more-surface";
-         require_sized_height handle "journal-header-divider" (1. /. 3.);
-         require_header_geometry handle;
-         require_text_style
+         require_material_divider handle "journal-header-divider";
+         require_no_test_id handle "journal-header-divider-extent";
+         require_theme_owned_text_style
            handle
            "journal-header-title"
            ~size:22.
            ~line_height:(28. /. 22.)
-           ~weight:Ui.Style.Font_weight.Bold
-           ~color:0xff0d142fl;
-         require_text_style
+           ~weight:Ui.Style.Font_weight.Bold;
+         require_theme_owned_text_style
            handle
            "journal-header-subtitle"
            ~size:15.
            ~line_height:(20. /. 15.)
-           ~weight:Ui.Style.Font_weight.Medium
-           ~color:0xff656b8fl;
+           ~weight:Ui.Style.Font_weight.Medium;
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
          require_test_id handle "journal-header-leading-placeholder";
          require_test_id handle "journal-header-account-placeholder";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more-target";
-         (let (Av view) =
-            Ui.Widget.Private.view
-              (node_by_test_id handle "journal-capture-composer-safe-area").widget
-          in
-          match view.node with
-          | Ui.Widget.Private.Safe_area { left; top; right; bottom; _ } ->
-            require
-              ((not left) && (not top) && (not right) && bottom)
-              "Capture composer safe-area edges changed"
-          | _ -> fail "journal-capture-composer-safe-area is not SafeArea");
-         require_capture_composer_bottom_sheet handle;
-         require_test_id handle "journal-capture-composer-plus";
+         require_no_test_id handle "journal-capture-composer-safe-area";
+         require_capture_affordance_floating_action_button handle;
+         require_test_id handle "journal-capture-fab-icon";
+         require_no_test_id handle "journal-capture-composer-plus";
          require_test_id handle "journal-capture-composer-submit";
          require_no_visible_text handle "Search"))
 ;;
@@ -1478,18 +1340,34 @@ let test_header_adapts_without_exposing_deferred_actions () =
       (fun () ->
          set_environment handle (environment ~viewport_width:320. ());
          pump_until_text handle "No journal entries yet";
-         require_header_geometry handle;
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
          set_environment handle (environment ~viewport_width:1_200. ~platform:"macos" ());
          pump_worker handle;
-         require_header_geometry handle;
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
          require_no_visible_text handle "Search";
          set_environment handle (environment ~locale:"ar_SA" ());
          pump_worker handle;
-         require_capture_composer_bottom_sheet handle))
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
+         set_environment handle (environment ~text_scale:3.2 ());
+         pump_worker handle;
+         require_journal_scroll
+           handle
+           ~expanded_height:(177.6 +. (1. /. 3.))
+           ~collapsed_height:(105.6 +. (1. /. 3.));
+         require_capture_affordance_floating_action_button handle))
 ;;
 
 let test_timeline_content_is_capped_and_centered () =
@@ -1510,7 +1388,7 @@ let test_timeline_content_is_capped_and_centered () =
          require_case ~viewport_width:1_200. ~platform:"macos" ~horizontal:240.))
 ;;
 
-let test_header_stays_light_when_the_system_uses_dark_appearance () =
+let test_header_inherits_theme_colors_in_dark_and_high_contrast_appearance () =
   with_startup (fun startup ->
     let handle = create_handle startup in
     Fun.protect
@@ -1518,27 +1396,32 @@ let test_header_stays_light_when_the_system_uses_dark_appearance () =
       (fun () ->
          set_environment handle (environment ~brightness:Environment.Dark ());
          pump_until_text handle "No journal entries yet";
-         require_decoration handle "journal-root-surface" 0xfffdfdfdl;
-         require_decoration handle "journal-header-surface" 0xfffdfdfdl;
-         require_text_style
+         require_not_colored_decoration handle "journal-root-surface";
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
+         require_theme_owned_text_style
            handle
            "journal-header-title"
            ~size:22.
            ~line_height:(28. /. 22.)
-           ~weight:Ui.Style.Font_weight.Bold
-           ~color:0xff0d142fl;
+           ~weight:Ui.Style.Font_weight.Bold;
          set_environment
            handle
            (environment ~brightness:Environment.Dark ~high_contrast:true ());
          pump_worker handle;
-         require_decoration handle "journal-root-surface" 0xffffffffl;
-         require_text_style
+         require_not_colored_decoration handle "journal-root-surface";
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
+         require_theme_owned_text_style
            handle
            "journal-header-title"
            ~size:22.
            ~line_height:(28. /. 22.)
-           ~weight:Ui.Style.Font_weight.Bold
-           ~color:0xff000000l))
+           ~weight:Ui.Style.Font_weight.Bold))
 ;;
 
 let test_timeline_uses_exact_sparse_extent_window () =
@@ -1554,12 +1437,16 @@ let test_timeline_uses_exact_sparse_extent_window () =
       (fun () ->
          set_environment handle (environment ~safe_area_bottom:34. ());
          pump_until_text handle "Paged journal row 01";
+         require_journal_scroll
+           handle
+           ~expanded_height:(96. +. (1. /. 3.))
+           ~collapsed_height:(56. +. (1. /. 3.));
+         require_timeline_end_padding handle 98.;
          require_no_visible_text handle "Paged journal row 70";
-         let node = node_by_test_id handle "journal-timeline" in
          let props = timeline_props handle in
          require
-           (props.total_count = 66)
-           "initial feed count is %d, expected 66"
+           (props.total_count = 65)
+           "initial feed count is %d, expected 65"
            props.total_count;
          require (props.first_index = 0) "initial timeline does not start at zero";
          require
@@ -1567,27 +1454,28 @@ let test_timeline_uses_exact_sparse_extent_window () =
            "timeline default extent is %.1f, expected 44"
            props.default_item_extent;
          require (props.overscan = 4) "timeline overscan is %d, expected 4" props.overscan;
+         let supplied_count = List.length (timeline_item_keys handle) in
          require
-           (Array.length node.children <= Journal_timeline_state.maximum_supplied_rows)
+           (supplied_count <= Journal_timeline_state.maximum_supplied_rows)
            "timeline supplied %d rows"
-           (Array.length node.children);
+           supplied_count;
          require
-           (List.exists
-              (fun (override : Ui.Widget.Sparse_extent_override.t) ->
-                 override.index = 65 && Float.equal override.extent 226.)
-              props.extent_overrides)
-           "timeline is missing exact expanded-composer and safe-bottom clearance";
+           (not
+              (List.exists
+                 (fun (override : Ui.Widget.Sparse_extent_override.t) ->
+                    override.index >= props.total_count)
+                 props.extent_overrides))
+           "timeline retained an extent override beyond its real content";
          send_visible_range handle ~first_index:58 ~last_exclusive:65;
          pump_until_text handle "Paged journal row 70";
          require_no_visible_text handle "Paged journal row 01";
-         let paged_node = node_by_test_id handle "journal-timeline" in
          let paged = timeline_props handle in
-         require (paged.total_count = 71) "paged timeline count is %d" paged.total_count;
+         require (paged.total_count = 70) "paged timeline count is %d" paged.total_count;
+         let paged_supplied_count = List.length (timeline_item_keys handle) in
          require
-           (Array.length paged_node.children
-            <= Journal_timeline_state.maximum_supplied_rows)
+           (paged_supplied_count <= Journal_timeline_state.maximum_supplied_rows)
            "paged timeline supplied %d rows"
-           (Array.length paged_node.children)))
+           paged_supplied_count))
 ;;
 
 let test_timeline_preserves_stable_slot_keys_across_window_shifts () =
@@ -1660,19 +1548,19 @@ let test_one_visible_range_drains_multiple_day_continuations () =
          require_test_id handle "journal-day-continuation:20260806";
          let initial = timeline_props handle in
          require
-           (initial.total_count = 10)
-           "multi-continuation feed has %d slots, expected 10"
+           (initial.total_count = 9)
+           "multi-continuation feed has %d slots, expected 9"
            initial.total_count;
-         send_visible_range handle ~first_index:0 ~last_exclusive:10;
+         send_visible_range handle ~first_index:0 ~last_exclusive:9;
          pump_until handle "all initial visible continuation requests" (fun () ->
-           (timeline_props handle).total_count = 138);
+           (timeline_props handle).total_count = 137);
          require_no_test_id handle "journal-day-continuation:20260807";
          require
-           ((timeline_props handle).total_count = 138)
+           ((timeline_props handle).total_count = 137)
            "one visible range event did not drain both continuation pages"))
 ;;
 
-let test_collapsed_group_divider_is_full_width_and_one_physical_pixel () =
+let test_timeline_does_not_repeat_group_dividers () =
   with_startup (fun startup ->
     let leaf = capture 75 "Full width divider row" in
     seed startup [ leaf ];
@@ -1685,16 +1573,7 @@ let test_collapsed_group_divider_is_full_width_and_one_physical_pixel () =
            (fun device_pixel_ratio ->
               set_environment handle (environment ~device_pixel_ratio ());
               pump_worker handle;
-              require_test_id handle ("journal-group-divider:" ^ leaf.block_id);
-              require_horizontal_padding
-                handle
-                ("journal-group-divider-padding:" ^ leaf.block_id)
-                ~left:0.
-                ~right:0.;
-              require_sized_height
-                handle
-                ("journal-group-divider:" ^ leaf.block_id)
-                (1. /. device_pixel_ratio))
+              require_no_test_id handle ("journal-group-divider:" ^ leaf.block_id))
            [ 1.; 2.; 3.; 4. ]))
 ;;
 
@@ -1818,107 +1697,6 @@ let test_virtualized_timeline_does_not_repeat_time_at_window_boundary () =
          require_no_visible_text handle "10:00"))
 ;;
 
-let test_view_only_date_and_capture_route_own_plain_text_mutation_behavior () =
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         pump_until_text handle "No journal entries yet";
-         require_test_id handle "journal-date-context";
-         require_no_test_id handle "journal-date-target";
-         require_no_test_id handle "journal-date-dialog";
-         require_no_test_id handle "journal-date-selection";
-         open_capture handle;
-         require_test_id handle "capture-editor";
-         require_test_id handle "capture-save";
-         require_test_id handle "capture-task";
-         require_no_test_id handle "capture-attachment";
-         require_no_test_id handle "capture-token-action";
-         let source = "中文 👩🏽‍💻 e\204\129 literal-token @mention" in
-         Test.Handle.apply_text_edit
-           handle
-           (Test.Query.test_id "capture-editor")
-           ~local_revision:(ID.Text_input.Local_revision.of_int64 1L)
-           ~base_document_revision:ID.Text_input.Document_revision.zero
-           ~text:source
-           ~selection_start:3
-           ~selection_end:10
-           ~composing_start:0
-           ~composing_end:2
-           ();
-         Test.Handle.present handle;
-         let value = text_field_value handle "capture-editor" in
-         require
-           (String.equal (Ui.Text_editing.Value.text value) source)
-           "Capture changed literal IME source";
-         (match Ui.Text_editing.Value.composing value with
-          | Some range ->
-            require
-              (Ui.Text_editing.Range.start_utf16 range = 0
-               && Ui.Text_editing.Range.end_utf16 range = 2)
-              "Capture changed composing range"
-          | None -> fail "Capture dropped composing state");
-         click_test_id handle "capture-close";
-         require_test_id handle "capture-discard-dialog";
-         require_alert_dialog handle "capture-discard-dialog" ~action_count:2;
-         require_modal_dialog_page
-           handle
-           "capture-discard-dialog-page"
-           ~page_key:"capture-discard-dialog"
-           ~transition_ms:180;
-         click_test_id handle "capture-keep-editing";
-         require
-           (String.equal
-              (Ui.Text_editing.Value.text (text_field_value handle "capture-editor"))
-              source)
-           "Keep editing discarded the Capture draft";
-         click_test_id handle "capture-save";
-         pump_until_text handle source;
-         require
-           (List.length (Test.Handle.find_all handle (Test.Query.visible_text source)) = 1)
-           "rapid presentation duplicated the captured row"))
-;;
-
-let test_capture_adds_multiple_children_and_persists_them_with_the_parent () =
-  with_startup (fun startup ->
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         pump_until_text handle "No journal entries yet";
-         open_capture handle;
-         Test.Handle.input_text
-           handle
-           (Test.Query.test_id "capture-editor")
-           "Captured parent";
-         Test.Handle.present handle;
-         require_test_id handle "capture-add-child";
-         click_test_id handle "capture-add-child";
-         require_test_id handle "capture-child-editor:0";
-         require_button_enabled handle "capture-save" false;
-         Test.Handle.input_text
-           handle
-           (Test.Query.test_id "capture-child-editor:0")
-           "Captured first child";
-         Test.Handle.present handle;
-         require_button_enabled handle "capture-save" true;
-         click_test_id handle "capture-add-child";
-         require_test_id handle "capture-child-editor:1";
-         require_button_enabled handle "capture-save" false;
-         Test.Handle.input_text
-           handle
-           (Test.Query.test_id "capture-child-editor:1")
-           "Captured second child";
-         Test.Handle.present handle;
-         require_button_enabled handle "capture-save" true;
-         click_test_id handle "capture-save";
-         pump_until_text handle "Captured parent";
-         require_visible_text handle "Captured first child";
-         require_visible_text handle "Captured second child";
-         require_no_test_id handle "journal-capture-sheet"))
-;;
-
 let test_capture_allocates_fresh_block_identity_after_restart () =
   with_startup (fun startup ->
     let persisted : Journal_graph_projection.capture =
@@ -1933,10 +1711,7 @@ let test_capture_allocates_fresh_block_identity_after_restart () =
     in
     seed startup [ persisted ];
     let save_capture handle source =
-      open_capture handle;
-      Test.Handle.input_text handle (Test.Query.test_id "capture-editor") source;
-      Test.Handle.present handle;
-      click_test_id handle "capture-save";
+      send_capture_affordance_button handle ~button_id:1 ~text:source;
       pump_until_text handle source
     in
     let first_source = "Captured after first restart" in
@@ -2381,10 +2156,10 @@ let test_pending_day_response_drains_expanded_parent_without_renderer_input () =
          pump_until_text handle parent.source;
          let initial = timeline_props handle in
          require
-           (initial.total_count = 65)
-           "queued expansion fixture has %d slots, expected 65"
+           (initial.total_count = 64)
+           "queued expansion fixture has %d slots, expected 64"
            initial.total_count;
-         send_visible_range handle ~first_index:30 ~last_exclusive:65;
+         send_visible_range handle ~first_index:30 ~last_exclusive:64;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          require_test_id handle ("journal-children-loading:" ^ parent.block_id);
          pump_until handle "queued child request after accepted day response" (fun () ->
@@ -2408,7 +2183,7 @@ let test_loaded_children_survive_a_stale_ios_visible_range_event () =
          pump_until_text handle parent.source;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          require_test_id handle ("journal-children-loading:" ^ parent.block_id);
-         let stale_binding = capture_native_binding handle "journal-timeline" in
+         let stale_binding = capture_native_binding handle "journal-timeline-list" in
          pump_until handle "loaded iOS direct child" (fun () ->
            Option.is_some
              (Test.Handle.find
@@ -2539,7 +2314,11 @@ let test_expanded_children_are_static_previews_without_group_separator () =
          List.iter
            (fun (child : Journal_graph_projection.create_child) ->
               require_test_id handle ("journal-child-preview:" ^ child.block_id);
-              require_no_test_id handle ("journal-row-swipe:" ^ child.block_id);
+              require_material_icon
+                handle
+                ("journal-child-bullet:" ^ child.block_id)
+                0xe163;
+              require_no_test_id handle ("journal-row-slidable:" ^ child.block_id);
               require_no_test_id handle ("journal-row-task:" ^ child.block_id);
               require_no_test_id handle ("journal-row-toggle-children:" ^ child.block_id))
            [ first; second; third ];
@@ -2640,7 +2419,7 @@ let test_loading_and_adaptive_environment_surfaces_are_truthful () =
          require_no_test_id handle ("journal-row-open:" ^ parent.block_id)))
 ;;
 
-let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
+let test_delete_action_stages_undoes_and_commits_only_after_deadline () =
   with_startup (fun startup ->
     let command = capture 110 "Undoable delete row" in
     seed startup [ command ];
@@ -2650,8 +2429,13 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
       (fun () ->
          set_environment handle (environment ~safe_area_bottom:34. ());
          pump_until_text handle command.source;
-         require_test_id handle ("journal-row-swipe:" ^ command.block_id);
-         commit_end_swipe handle command.block_id;
+         require_test_id handle ("journal-row-slidable:" ^ command.block_id);
+         emit_unexpected_end_dismissal handle command.block_id;
+         require_visible_text handle command.source;
+         require
+           (Test.Handle.pending_host_effect_count handle = 0)
+           "unexpected Slidable dismissal staged deletion";
+         press_delete_action handle command.block_id;
          require_no_visible_text handle command.source;
          pump_until handle "native deletion snackbar" (fun () ->
            Test.Handle.pending_host_effect_count handle = 1);
@@ -2680,7 +2464,7 @@ let test_swipe_delete_stages_undoes_and_commits_only_after_deadline () =
     seed startup [ command ];
     let handle, monotonic_now_ns = create_timed_handle startup in
     pump_until_text handle command.source;
-    commit_end_swipe handle command.block_id;
+    press_delete_action handle command.block_id;
     require_no_visible_text handle command.source;
     pump_until handle "native commit snackbar" (fun () ->
       Test.Handle.pending_host_effect_count handle = 1);
@@ -2729,7 +2513,7 @@ let test_non_action_snackbar_close_reasons_never_undo () =
            ~finally:(fun () -> Test.Handle.shutdown handle)
            (fun () ->
               pump_until_text handle command.source;
-              commit_end_swipe handle command.block_id;
+              press_delete_action handle command.block_id;
               pump_until handle "native deletion snackbar" (fun () ->
                 Test.Handle.pending_host_effect_count handle = 1);
               let request = snack_bar_request_from_last_frame handle in
@@ -2746,7 +2530,7 @@ let test_non_action_snackbar_close_reasons_never_undo () =
     [ 1; 2; 3; 4; 5 ]
 ;;
 
-let test_swipe_delete_accessibility_duration_and_single_mutation_gate () =
+let test_delete_action_accessibility_duration_and_single_mutation_gate () =
   with_startup (fun startup ->
     let first = capture 112 "First delete row" in
     let second = capture 113 "Second delete row" in
@@ -2757,14 +2541,14 @@ let test_swipe_delete_accessibility_duration_and_single_mutation_gate () =
       (fun () ->
          set_environment handle (environment ~accessible_navigation:true ());
          pump_until_text handle first.source;
-         commit_end_swipe handle first.block_id;
+         press_delete_action handle first.block_id;
          pump_until handle "accessible deletion snackbar" (fun () ->
            Test.Handle.pending_host_effect_count handle = 1);
          let request = snack_bar_request_from_last_frame handle in
          require
            (request.duration_ms = 10_000)
            "accessible snackbar did not use the bounded Undo lifetime";
-         require_no_test_id handle ("journal-row-swipe:" ^ second.block_id);
+         require_no_test_id handle ("journal-row-slidable:" ^ second.block_id);
          require_no_semantics handle "Delete block and all descendants";
          advance_clock handle monotonic_now_ns 5.;
          require
@@ -2776,27 +2560,25 @@ let test_swipe_delete_accessibility_duration_and_single_mutation_gate () =
 ;;
 
 let () =
-  test_application_owns_a_light_material_theme ();
+  test_application_owns_one_system_material_theme ();
   test_initial_feed_has_a_truthful_loading_state ();
+  test_graph_open_error_retains_the_journal_scroll_contract ();
   test_timeline_content_is_capped_and_centered ();
   test_root_is_owned_by_the_ocaml_timeline ();
-  test_capture_composer_replaces_the_center_orb_and_prefills_capture ();
-  test_capture_is_an_ocaml_contextual_modal_sheet ();
-  test_capture_sheet_protects_dirty_state_and_reconciles_environment ();
-  test_header_uses_tokens_safe_area_and_independent_center ();
+  test_capture_fab_directly_saves_one_plain_top_level_block ();
+  test_capture_fab_honors_reduced_motion_without_changing_its_slot ();
+  test_header_uses_pinned_theme_owned_sliver_app_bar ();
   test_header_adapts_without_exposing_deferred_actions ();
-  test_header_stays_light_when_the_system_uses_dark_appearance ();
+  test_header_inherits_theme_colors_in_dark_and_high_contrast_appearance ();
   test_timeline_uses_exact_sparse_extent_window ();
   test_timeline_preserves_stable_slot_keys_across_window_shifts ();
   test_one_visible_range_drains_multiple_day_continuations ();
   test_pending_day_response_drains_expanded_parent_without_renderer_input ();
-  test_collapsed_group_divider_is_full_width_and_one_physical_pixel ();
+  test_timeline_does_not_repeat_group_dividers ();
   test_timeline_uses_truthful_fallback_labels_without_duplicate_today ();
   test_timeline_deemphasizes_repeated_and_historical_timestamps ();
   test_timeline_projects_creation_time_across_a_negative_offset_day_boundary ();
   test_virtualized_timeline_does_not_repeat_time_at_window_boundary ();
-  test_view_only_date_and_capture_route_own_plain_text_mutation_behavior ();
-  test_capture_adds_multiple_children_and_persists_them_with_the_parent ();
   test_capture_allocates_fresh_block_identity_after_restart ();
   test_localized_day_request_updates_only_matching_generation ();
   test_locale_event_invalidates_labels_and_rejects_in_flight_response ();
@@ -2809,7 +2591,7 @@ let () =
   test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed ();
   test_expanded_children_are_static_previews_without_group_separator ();
   test_loading_and_adaptive_environment_surfaces_are_truthful ();
-  test_swipe_delete_stages_undoes_and_commits_only_after_deadline ();
+  test_delete_action_stages_undoes_and_commits_only_after_deadline ();
   test_non_action_snackbar_close_reasons_never_undo ();
-  test_swipe_delete_accessibility_duration_and_single_mutation_gate ()
+  test_delete_action_accessibility_duration_and_single_mutation_gate ()
 ;;

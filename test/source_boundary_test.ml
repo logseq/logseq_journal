@@ -169,15 +169,18 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "9b345b90fea476391d19092675abd665655e586a" in
+  let current_bonsai_flutter_revision = "5f8f540e4ccfd1e1807294aec8ac5f229161e2da" in
   let obsolete_bonsai_flutter_revisions =
-    [ "a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"
+    [ "6f2562e09d74d347a50b90541abdb4900e1e23da"
+    ; "9b345b90fea476391d19092675abd665655e586a"
+    ; "a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"
     ; "d5f8d36b5539550cbc2466311acda4d8c609032e"
     ; "a51276a09eb1cdf9c87f07ac4c7558ed7c6b2d69"
     ; "26f5bf6c3b4cdd61ccd5c1660f6cf9f72fe523da"
     ; "066179956545cc12871862879fc906f09519788c"
     ; "f6d27175632d26e759532f6ee81e8d1383490533"
     ; "2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"
+    ; "d182690aeaa82ad0a972756205c62e3b598e3c24"
     ]
   in
   List.iter
@@ -193,6 +196,8 @@ let () =
     (require_file root)
     [ "bonsai-flutter.sexp"
     ; "app/application.ml"
+    ; "app/material_icon_catalog.ml"
+    ; "app/material_icon_catalog.mli"
     ; "app/journal_calendar.ml"
     ; "app/journal_graph_projection.ml"
     ; "app/journal_graph_projection.mli"
@@ -219,11 +224,201 @@ let () =
     ; "logseq_db_worker/lib/sync_manager.mli"
     ; "logseq_db_worker/lib/sync_websocket.ml"
     ; "logseq_db_worker/lib/sync_websocket.mli"
+    ; "logseq_db_worker/lib/outliner/graph_read.ml"
+    ; "logseq_db_worker/lib/outliner/graph_read.mli"
+    ; "logseq_db_worker/lib/outliner/planner_contract.ml"
+    ; "logseq_db_worker/lib/outliner/planner_contract.mli"
     ; "flutter/lib/application_host_adapter.dart"
     ; "flutter/lib/main.dart"
     ; "flutter/test/application_host_adapter_test.dart"
     ; "flutter/test/widget_test.dart"
+    ; "test/test_material_icons_artifact.sh"
+    ; "tool/verify_material_icons_font.sh"
     ];
+  require_text
+    root
+    "logseq_db_worker/lib/outliner/graph_read.mli"
+    [ "val values"
+    ; "val one"
+    ; "val string_value"
+    ; "val reference_value"
+    ; "val has_true"
+    ; "val entities_by_uuid"
+    ; "val uuid_of_entity"
+    ; "val is_page"
+    ; "val children"
+    ];
+  require_text
+    root
+    "logseq_db_worker/lib/outliner/planner_contract.mli"
+    [ "type t ="
+    ; "tx_ops : Datascript.tx_op list"
+    ; "status : Protocol.mutation_status"
+    ; "type error ="
+    ; "Unsupported_semantics of string"
+    ; "Built_in_protected"
+    ];
+  let outliner_planners =
+    [ "save_block"
+    ; "insert_blocks"
+    ; "move_blocks"
+    ; "indent_outdent"
+    ; "delete_blocks"
+    ; "pages"
+    ; "properties"
+    ]
+  in
+  List.iter
+    (fun planner ->
+       List.iter
+         (fun suffix ->
+            forbid_text
+              root
+              ("logseq_db_worker/lib/outliner/" ^ planner ^ suffix)
+              [ "type t =\n  { tx_ops"; "type error =" ])
+         [ ".ml"; ".mli" ])
+    outliner_planners;
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "let values db entity attr ="
+         ; "let string_value db entity attr ="
+         ; "let reference_value db entity attr ="
+         ; "let has_true db entity attr ="
+         ; "let entities_by_uuid db uuid ="
+         ; "let uuid_of_entity db entity ="
+         ; "let is_page db entity ="
+         ; "let children db parent ="
+         ])
+    [ "logseq_db_worker/lib/outliner/delete_blocks.ml"
+    ; "logseq_db_worker/lib/outliner/indent_outdent.ml"
+    ; "logseq_db_worker/lib/outliner/insert_blocks.ml"
+    ; "logseq_db_worker/lib/outliner/move_blocks.ml"
+    ; "logseq_db_worker/lib/outliner/pages.ml"
+    ; "logseq_db_worker/lib/outliner/properties.ml"
+    ; "logseq_db_worker/lib/outliner/references.ml"
+    ; "logseq_db_worker/lib/outliner/save_block.ml"
+    ];
+  List.iter
+    (fun relative -> forbid_text root relative [ "let one db entity attr =" ])
+    [ "logseq_db_worker/lib/outliner/delete_blocks.ml"
+    ; "logseq_db_worker/lib/outliner/indent_outdent.ml"
+    ; "logseq_db_worker/lib/outliner/insert_blocks.ml"
+    ; "logseq_db_worker/lib/outliner/move_blocks.ml"
+    ; "logseq_db_worker/lib/outliner/pages.ml"
+    ; "logseq_db_worker/lib/outliner/save_block.ml"
+    ];
+  require_text
+    root
+    "logseq_db_worker/lib/mutation_plan.ml"
+    [ "include Outliner.Planner_contract" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/mutation_plan.ml"
+    [ "type t ="; "type error ="; "| Ok plan ->" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/mutation_plan.mli"
+    [ "type t ="; "type error =" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/outliner/pages.ml"
+    [ "Save_block.Built_in_protected" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/outliner/indent_outdent.ml"
+    [ "Move_blocks.Unsupported_semantics" ];
+  require_text
+    root
+    "app/material_icon_catalog.mli"
+    [ "type t ="
+    ; "Account_circle"
+    ; "Add"
+    ; "Arrow_upward"
+    ; "Chevron_left"
+    ; "Chevron_right"
+    ; "Circle"
+    ; "Delete"
+    ; "Expand_more"
+    ; "Refresh"
+    ; "val create"
+    ];
+  require_text root "app/material_icon_catalog.ml" [ "MaterialIcons"; "Ui.Widget.icon" ];
+  require_text root "app/dune" [ "material_icon_catalog" ];
+  List.iter
+    (fun relative ->
+       if
+         not
+           (String.equal relative "app/material_icon_catalog.ml"
+            || String.equal relative "app/material_icon_catalog.mli")
+       then forbid_text root relative [ "MaterialIcons"; "Ui.Widget.icon"; "0xe" ])
+    (ocaml_product_files root);
+  require_text
+    root
+    "app/application.ml"
+    [ "Material_icon_catalog.Add"
+    ; "Material_icon_catalog.Arrow_upward"
+    ; "Material_icon_catalog.Refresh"
+    ];
+  require_text root "app/journal_header.ml" [ "Material_icon_catalog.Account_circle" ];
+  require_text
+    root
+    "app/journal_header.ml"
+    [ "Ui.Widget.Sliver.app_bar"
+    ; "~pinned:true"
+    ; "~floating:false"
+    ; "~snap:false"
+    ; "~stretch:false"
+    ; "~automatically_imply_leading:false"
+    ; "~center_title:true"
+    ];
+  forbid_text
+    root
+    "app/journal_header.ml"
+    [ "Ui.Widget.safe_area"
+    ; "journal-header-stack"
+    ; "journal-header-surface"
+    ; "journal-header-content-height"
+    ];
+  require_text
+    root
+    "app/application.ml"
+    [ "Journal_header.sliver"
+    ; "Ui.Widget.Scroll_view.vertical"
+    ; "journal-scroll"
+    ; "~floating_action_button:capture"
+    ; "~floating_action_button_location:Ui.Material.End_float"
+    ];
+  forbid_text
+    root
+    "app/application.ml"
+    [ "Journal_header.view"; "~bottom_navigation_bar"; "let bottom_navigation_bar" ];
+  forbid_text root "app/journal_timeline.ml" [ "Ui.Widget.Scroll_view.vertical" ];
+  require_text root "app/journal_timeline.ml" [ "Ui.Widget.Sliver.padding" ];
+  require_text
+    root
+    "app/journal_row.ml"
+    [ "Material_icon_catalog.Chevron_left"
+    ; "Material_icon_catalog.Chevron_right"
+    ; "Material_icon_catalog.Expand_more"
+    ];
+  require_text
+    root
+    "app/journal_timeline.ml"
+    [ "Material_icon_catalog.Circle"
+    ; "Material_icon_catalog.Delete"
+    ; "Ui.Native_widget.Slidable.action"
+    ; "Ui.Native_widget.Slidable.action_pane"
+    ; "Ui.Native_widget.Slidable.create_with_handler"
+    ; "Ui.Native_widget.Morphing_surface.create"
+    ; "~drag_dismissible:false"
+    ];
+  forbid_text
+    root
+    "app/journal_timeline.ml"
+    [ "Ui.Native_widget.Swipe_action"; "Ui.Native_widget.Slidable.dismissible" ];
   List.iter
     (forbid_path root)
     [ "flutter/lib/app"
@@ -280,6 +475,92 @@ let () =
     ; "flutter/integration_test/logseq_db_worker_runtime_flow_test.dart"
     ; "flutter/integration_test/runtime_flow_fixture.dart"
     ];
+  require_occurrences root "app/application.ml" "Ui.Style.Color.rgb" 1;
+  require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
+  require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.argb" 0;
+  forbid_text root "app/application.ml" [ "let color"; "(color " ];
+  List.iter
+    (fun relative ->
+       if
+         not
+           (String.equal relative "app/application.ml"
+            || String.equal relative "app/journal_visual_tokens.ml")
+       then forbid_text root relative [ "Ui.Style.Color.rgb"; "Ui.Style.Color.argb" ])
+    (ocaml_product_files root);
+  require_text
+    root
+    "app/journal_visual_tokens.ml"
+    [ "module Color_exceptions = struct"
+    ; "type presentation"
+    ; "let status_rail_color"
+    ; "let destructive_swipe_action"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "type palette"
+         ; "type interaction"
+         ; "neutral_badge"
+         ; "sheet_surface"
+         ; "sheet_outline"
+         ; "modal_scrim"
+         ; "sheet_primary_action"
+         ; "sheet_secondary_action"
+         ; "sheet_error"
+         ; "Tokens.palette"
+         ; "Tokens.interaction"
+         ; "Journal_visual_tokens.palette"
+         ; "Journal_visual_tokens.interaction"
+         ])
+    (ocaml_product_files root);
+  require_text
+    root
+    "app/application.ml"
+    [ "Ui.Theme.System"
+    ; "~high_contrast_dark"
+    ; "Ui.Material.list_tile"
+    ; "Ui.Native_widget.Expandable_message_composer"
+    ; "~floating_action_button:capture"
+    ];
+  List.iter
+    (fun relative -> require_text root relative [ "Ui.Material.divider" ])
+    [ "app/journal_header.ml"; "app/journal_timeline.ml" ];
+  forbid_text
+    root
+    "app/journal_timeline.ml"
+    [ "let group_separator"
+    ; "journal-group-divider"
+    ; "Timeline.Bottom_clearance"
+    ; "journal-bottom-clearance"
+    ];
+  List.iter
+    (fun relative -> forbid_text root relative [ "Bottom_clearance"; "safe_bottom" ])
+    [ "app/journal_timeline_state.ml"
+    ; "app/journal_timeline_state.mli"
+    ; "app/journal_timeline.ml"
+    ; "app/journal_timeline.mli"
+    ; "app/journal_visual_tokens.ml"
+    ; "app/journal_visual_tokens.mli"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "bottom_inset"; "minimum_height"; "expanded_vertical_overhead" ])
+    [ "app/journal_visual_tokens.ml"; "app/journal_visual_tokens.mli" ];
+  forbid_text
+    root
+    "app/application.ml"
+    [ "Ui.Theme.Light"
+    ; "~barrier_color"
+    ; "~bottom_sheet"
+    ; "Ui.Native_widget.Message_composer.create_with_handler"
+    ; "journal-capture-composer-safe-area"
+    ];
+  forbid_text root "flutter/ios/Runner/Info.plist" [ "UIUserInterfaceStyle" ];
   let forbidden_dart_text =
     [ "package:logseq_journal/app/"
     ; "package:logseq_journal/core/"
@@ -296,7 +577,6 @@ let () =
     ; "JournalDatabase"
     ; "JournalRepository"
     ; "JournalEntry"
-    ; "CustomScrollView"
     ; "SliverList"
     ; "TextSpan"
     ; "WidgetSpan"
@@ -313,6 +593,8 @@ let () =
   @ dart_files root "flutter/test"
   @ dart_files root "flutter/integration_test"
   |> List.iter (fun relative -> forbid_text root relative forbidden_dart_text);
+  dart_files root "flutter/lib"
+  |> List.iter (fun relative -> forbid_text root relative [ "CustomScrollView" ]);
   forbid_text
     root
     "flutter/pubspec.yaml"
@@ -417,12 +699,24 @@ let () =
     "app/application.ml"
     [ "let capture_page"
     ; "journal-capture-route"
+    ; "journal-capture-sheet"
+    ; "capture-discard-dialog-page"
+    ; "Open full Capture editor"
+    ; "Continue Capture"
+    ; "capture_launch"
+    ; "Journal_routes.open_capture"
+    ; "Journal_routes.capture"
+    ; "Journal_routes.update_capture"
     ; "capture-cancel"
     ; "Cancel journal entry"
     ; "New entry"
     ; "Ui.Navigation.Standard Ui.Navigation.None"
     ];
   forbid_text root "app/journal_capture.ml" [ "request_cancel" ];
+  forbid_text
+    root
+    "app/journal_routes.ml"
+    [ "Capture_view"; "open_capture"; "update_capture" ];
   forbid_text
     root
     "app/application.ml"
@@ -449,10 +743,6 @@ let () =
     "app/application.ml"
     [ "timeline-toggle-children:"
     ; "Journal_model.child_count block > 0"
-    ; "Ui.Navigation.Modal_bottom_sheet"
-    ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Scroll_controlled"
-    ; "journal-capture-sheet"
-    ; "Journal_capture.can_pop"
     ; "~obscure_text:true"
     ; "Sync_manager.Submit_e2ee_password"
     ; "request-local-cache-reset"
@@ -472,7 +762,6 @@ let () =
     ; "download a fresh snapshot"
     ; "App.View.create"
     ; "Ui.Theme.application"
-    ; "Ui.Theme.Light"
     ; "Ui.Material.alert_dialog"
     ; "Ui.Navigation.Modal_dialog"
     ; "Bonsai_flutter.Host_effect.show_snack_bar"
@@ -480,10 +769,8 @@ let () =
     ; "Ui.Material.filled_tonal_button"
     ; "Ui.Material.outlined_button"
     ; "Ui.Material.text_button"
-    ; "~bottom_sheet"
     ; "journal-account-dialog-page"
     ; "local-cache-reset-dialog-page"
-    ; "capture-discard-dialog-page"
     ; "detail-discard-dialog-page"
     ];
   forbid_text
@@ -514,6 +801,7 @@ let () =
     ; "prepareToTerminate"
     ; "prepareToTerminateEvent"
     ; "terminationReadyRequest"
+    ; "SlidableAutoCloseBehavior"
     ];
   forbid_text
     root

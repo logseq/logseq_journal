@@ -5,68 +5,48 @@ let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
 ;;
 
-let argb color = Ui.Style.Color.Private.to_argb32 color
-
-let require_color name expected actual =
-  require
-    (Int32.equal expected (argb actual))
-    "%s expected 0x%lx, got 0x%lx"
-    name
-    expected
-    (argb actual)
-;;
-
-let relative_luminance color =
-  let packed = argb color in
-  let channel shift =
-    let value = Int32.(logand (shift_right_logical packed shift) 0xffl) |> Int32.to_int in
-    let srgb = Float.of_int value /. 255. in
-    if Float.compare srgb 0.04045 <= 0
-    then srgb /. 12.92
-    else Float.pow ((srgb +. 0.055) /. 1.055) 2.4
+let test_material_icon_catalog_matches_flutter_3_44_8 () =
+  let cases =
+    Material_icon_catalog.
+      [ Account_circle, 0xe043
+      ; Add, 0xe047
+      ; Arrow_upward, 0xe0a0
+      ; Chevron_left, 0xe15e
+      ; Chevron_right, 0xe15f
+      ; Circle, 0xe163
+      ; Delete, 0xe1b9
+      ; Expand_more, 0xe246
+      ; Refresh, 0xe514
+      ]
   in
-  (0.2126 *. channel 16) +. (0.7152 *. channel 8) +. (0.0722 *. channel 0)
-;;
-
-let contrast_ratio left right =
-  let left = relative_luminance left in
-  let right = relative_luminance right in
-  (Float.max left right +. 0.05) /. (Float.min left right +. 0.05)
-;;
-
-let test_light_palette_and_interaction_tokens () =
-  let tokens = Tokens.resolve ~high_contrast:false in
-  let palette = Tokens.palette tokens in
-  require_color "background" 0xfffdfdfdl palette.background;
-  require_color "header" 0xfffdfdfdl palette.header;
-  require_color "text primary" 0xff0d142fl palette.text_primary;
-  require_color "text secondary" 0xff656b8fl palette.text_secondary;
-  require_color "timestamp" 0xff6e7388l palette.text_timestamp;
-  require_color "divider" 0xffe8e9edl palette.divider;
-  require_color "FAB" 0xff181e34l palette.fab;
-  require_color "on FAB" 0xfffcfcfdl palette.on_fab;
-  require_color "status todo" 0xff64748bl palette.status_todo;
-  require_color "status doing" 0xff2563ebl palette.status_doing;
-  require_color "status done" 0xff058e46l palette.status_done;
-  require_color "status later" 0xff7c3aedl palette.status_later;
-  let interaction = Tokens.interaction tokens in
-  require_color "pressed" 0x1f0d142fl interaction.pressed;
-  require_color "focused" 0xff315ef5l interaction.focused;
-  require_color "disabled" 0xffa5a8b6l interaction.disabled;
-  require_color "error" 0xffb3261el interaction.error
-;;
-
-let test_light_high_contrast_palette_is_explicit () =
-  let light_high = Tokens.resolve ~high_contrast:true |> Tokens.palette in
-  require_color "light HC background" 0xffffffffl light_high.background;
-  require_color "light HC primary" 0xff000000l light_high.text_primary;
-  require_color "light HC secondary" 0xff313131l light_high.text_secondary;
-  require_color "light HC timestamp" 0xff313131l light_high.text_timestamp;
-  require_color "light HC divider" 0xff666666l light_high.divider;
-  require_color "light HC status todo" 0xff1f2937l light_high.status_todo;
-  require_color "light HC status doing" 0xff0047abl light_high.status_doing;
-  require_color "light HC status done" 0xff006b33l light_high.status_done;
-  require_color "light HC status later" 0xff5b21b6l light_high.status_later
+  List.iter
+    (fun (role, expected_code_point) ->
+       let color = Ui.Style.Color.rgb ~red:17 ~green:34 ~blue:51 in
+       let key = Ui.Key.string (Printf.sprintf "material-icon:%x" expected_code_point) in
+       let widget = Material_icon_catalog.create ~key ~size:19. ~color role in
+       let (Av view) = Ui.Widget.Private.view widget in
+       (match view.node with
+        | Ui.Widget.Private.Icon
+            { code_point; font_family = Some font_family; size; color = Some argb } ->
+          require
+            (code_point = expected_code_point)
+            "catalog role resolved to U+%04X instead of U+%04X"
+            code_point
+            expected_code_point;
+          require
+            (String.equal font_family "MaterialIcons")
+            "catalog role uses font family %S"
+            font_family;
+          require (size = Some 19.) "catalog role did not preserve its requested size";
+          require
+            (Int32.equal argb 0xff112233l)
+            "catalog role did not preserve its requested color"
+        | Icon _ -> failwith "catalog role omitted required icon properties"
+        | _ -> failwith "catalog role did not produce an icon");
+       require
+         (Option.equal Ui.Key.equal (Ui.Widget.For_testing.key widget) (Some key))
+         "catalog role did not preserve its requested key")
+    cases
 ;;
 
 let test_every_exact_status_maps_to_the_decided_rail_category () =
@@ -88,73 +68,6 @@ let test_every_exact_status_maps_to_the_decided_rail_category () =
     ; Waiting, Some Later_category
     ; Later, Some Later_category
     ]
-;;
-
-let test_timestamp_contrast_meets_small_text_target () =
-  let palette = Tokens.resolve ~high_contrast:false |> Tokens.palette in
-  require
-    (Float.compare (contrast_ratio palette.text_timestamp palette.background) 4.5 >= 0)
-    "light timestamp contrast is below 4.5:1"
-;;
-
-let test_capture_sheet_palette_roles_and_contrast () =
-  let cases =
-    [ ( false
-      , "light"
-      , 0xffffffffl
-      , 0xffe8e9edl
-      , 0x470d142fl
-      , 0xff181e34l
-      , 0xfff5f5f6l
-      , 0xffb3261el )
-    ; ( true
-      , "light high contrast"
-      , 0xffffffffl
-      , 0xff666666l
-      , 0x8c000000l
-      , 0xff000000l
-      , 0xffeeeeeel
-      , 0xff800000l )
-    ]
-  in
-  List.iter
-    (fun ( high_contrast
-         , name
-         , sheet_surface
-         , sheet_outline
-         , modal_scrim
-         , sheet_primary_action
-         , sheet_secondary_action
-         , sheet_error ) ->
-       let palette = Tokens.resolve ~high_contrast |> Tokens.palette in
-       require_color (name ^ " sheet surface") sheet_surface palette.sheet_surface;
-       require_color (name ^ " sheet outline") sheet_outline palette.sheet_outline;
-       require_color (name ^ " modal scrim") modal_scrim palette.modal_scrim;
-       require_color
-         (name ^ " sheet primary action")
-         sheet_primary_action
-         palette.sheet_primary_action;
-       require_color
-         (name ^ " sheet secondary action")
-         sheet_secondary_action
-         palette.sheet_secondary_action;
-       require_color (name ^ " sheet error") sheet_error palette.sheet_error;
-       require
-         (Float.compare (contrast_ratio palette.text_primary palette.sheet_surface) 4.5
-          >= 0)
-         "%s sheet primary text contrast is below 4.5:1"
-         name;
-       require
-         (Float.compare (contrast_ratio palette.sheet_error palette.sheet_surface) 4.5
-          >= 0)
-         "%s sheet error contrast is below 4.5:1"
-         name;
-       require
-         (Float.compare (contrast_ratio palette.on_fab palette.sheet_primary_action) 4.5
-          >= 0)
-         "%s sheet action contrast is below 4.5:1"
-         name)
-    cases
 ;;
 
 let test_typography_spacing_motion_and_hit_regions () =
@@ -218,25 +131,15 @@ let test_typography_spacing_motion_and_hit_regions () =
     "preview geometry tokens changed";
   let composer = Tokens.composer_geometry in
   require
-    (composer.horizontal_margin = 12.
-     && composer.bottom_inset = 12.
-     && composer.minimum_height = 48.
-     && composer.maximum_lines = 5
-     && composer.expanded_vertical_overhead = 80.)
-    "Capture composer geometry tokens changed";
+    (composer.horizontal_margin = 12. && composer.maximum_lines = 5)
+    "Capture affordance geometry tokens changed";
   let standard = Tokens.motion ~reduced_motion:false in
   let reduced = Tokens.motion ~reduced_motion:true in
   require
-    (standard.press_release_ms = 80
-     && standard.route_transition_ms = 180
-     && standard.capture_sheet_enter_ms = 220
-     && standard.capture_sheet_exit_ms = 180)
+    (standard.press_release_ms = 80 && standard.route_transition_ms = 180)
     "standard motion tokens changed";
   require
-    (reduced.press_release_ms = 0
-     && reduced.route_transition_ms = 0
-     && reduced.capture_sheet_enter_ms = 0
-     && reduced.capture_sheet_exit_ms = 0)
+    (reduced.press_release_ms = 0 && reduced.route_transition_ms = 0)
     "reduced-motion tokens are not disabled"
 ;;
 
@@ -416,7 +319,7 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
 ;;
 
 let test_every_sparse_role_has_one_authoritative_exact_extent () =
-  let check ~width ~scale ~safe_bottom ~block_extents expected =
+  let check ~width ~scale ~block_extents expected =
     let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
     List.iteri
       (fun index expected ->
@@ -431,7 +334,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
       block_extents;
     List.iter
       (fun (role, extent) ->
-         let actual = Tokens.fixed_extent ~profile ~safe_bottom role in
+         let actual = Tokens.fixed_extent ~profile role in
          require
            (Float.equal actual extent)
            "role extent %.1f, expected %.1f at %.0f/%.1f"
@@ -444,26 +347,22 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
   check
     ~width:390.
     ~scale:1.
-    ~safe_bottom:34.
     ~block_extents:[ 44.; 56.; 76.; 96. ]
     [ Tokens.Children_loading, 44.
     ; Tokens.Children_more, 44.
     ; Tokens.Day_heading, 36.
     ; Tokens.Day_continuation, 48.
     ; Tokens.Feed_continuation, 48.
-    ; Tokens.Bottom_clearance, 226.
     ];
   check
     ~width:320.
     ~scale:3.2
-    ~safe_bottom:0.
     ~block_extents:[ 80.; 144.; 208.; 272. ]
     [ Tokens.Children_loading, 80.
     ; Tokens.Children_more, 80.
     ; Tokens.Day_heading, 101.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
-    ; Tokens.Bottom_clearance, 412.
     ]
 ;;
 
@@ -491,12 +390,10 @@ let test_header_context_copy_is_pure_product_state () =
 ;;
 
 let tests =
-  [ "light palette and interaction", test_light_palette_and_interaction_tokens
-  ; "light high contrast", test_light_high_contrast_palette_is_explicit
+  [ ( "Material icon catalog matches Flutter 3.44.8"
+    , test_material_icon_catalog_matches_flutter_3_44_8 )
   ; ( "exact status rail categories"
     , test_every_exact_status_maps_to_the_decided_rail_category )
-  ; "timestamp contrast", test_timestamp_contrast_meets_small_text_target
-  ; "Capture sheet palette and contrast", test_capture_sheet_palette_roles_and_contrast
   ; ( "typography, spacing, motion, and hit regions"
     , test_typography_spacing_motion_and_hit_regions )
   ; "one-physical-pixel dividers", test_dividers_resolve_to_one_physical_pixel

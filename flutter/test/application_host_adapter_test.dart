@@ -8,6 +8,8 @@ import 'package:bonsai_flutter_logseq_journal_host/main.dart';
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:amplify_authenticator/amplify_authenticator.dart';
 import 'package:flutter/widgets.dart';
+// ignore: depend_on_referenced_packages
+import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 import 'package:flutter_test/flutter_test.dart';
 
 const sampleCalendar = JournalCalendarSnapshot(
@@ -149,6 +151,11 @@ void main() {
       );
 
       expect(find.byType(Authenticator), findsNothing);
+      final autoClose = tester.widget<fs.SlidableAutoCloseBehavior>(
+        find.byType(fs.SlidableAutoCloseBehavior),
+      );
+      expect(autoClose.closeWhenOpened, isTrue);
+      expect(autoClose.closeWhenTapped, isTrue);
     },
   );
 

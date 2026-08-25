@@ -1,26 +1,5 @@
-type t =
-  { tx_ops : Datascript.tx_op list
-  ; tx_meta : Datascript.tx_meta
-  ; changed_uuids : Graph_types.Uuid.t list
-  }
-
-type error =
-  | Unsupported_semantics of string
-  | Invalid_selection of string
-  | Built_in_protected
-
-let values db entity attr =
-  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.v)
-;;
-
-let one db entity attr =
-  match values db entity attr with
-  | [ value ] -> Some value
-  | [] -> None
-  | _ -> None
-;;
+include Planner_contract
+open Graph_read
 
 let reference_values db entity attr =
   values db entity attr
@@ -28,22 +7,6 @@ let reference_values db entity attr =
     | Datascript.Ref entity -> Some entity
     | _ -> None)
   |> List.sort_uniq Int.compare
-;;
-
-let uuid_of_entity db entity =
-  match one db entity "block/uuid" with
-  | Some (Datascript.Uuid value | String value) -> Graph_types.Uuid.of_string value
-  | _ -> Error "entity has no UUID"
-;;
-
-let entities_by_uuid db uuid =
-  let text = Graph_types.Uuid.to_string uuid in
-  let find value =
-    Datascript.datoms db Datascript.Avet ~a:"block/uuid" ~v:value ()
-    |> List.of_seq
-    |> List.map (fun datom -> datom.Datascript.e)
-  in
-  find (Datascript.Uuid text) @ find (String text) |> List.sort_uniq Int.compare
 ;;
 
 let entity_by_ident db ident =
@@ -57,18 +20,6 @@ let entity_by_ident db ident =
   with
   | [ entity ] -> Some entity
   | [] | _ :: _ :: _ -> None
-;;
-
-let has_true db entity attr =
-  match one db entity attr with
-  | Some (Datascript.Bool true) -> true
-  | Some _ | None -> false
-;;
-
-let is_page db entity =
-  match one db entity "block/name" with
-  | Some (Datascript.String _) -> true
-  | Some _ | None -> false
 ;;
 
 let starts_with value prefix =
@@ -205,7 +156,13 @@ let plan ~now_ms db ~block ~title ~context =
       | None -> Error (Invalid_selection "The selected entity has no block title.")
       | Some (Datascript.String old_title) ->
         if String.equal old_title title
-        then Ok { tx_ops = []; tx_meta = tx_meta context; changed_uuids = [] }
+        then
+          Ok
+            { tx_ops = []
+            ; tx_meta = tx_meta context
+            ; changed_uuids = []
+            ; status = Protocol.No_change
+            }
         else (
           let title = if is_page db entity then title else normalize_heading title in
           match References.derive ~db ~self:entity ~title with
@@ -321,6 +278,7 @@ let plan ~now_ms db ~block ~title ~context =
                   @ tx_id_ops
               ; tx_meta = tx_meta context
               ; changed_uuids
+              ; status = Protocol.Applied
               })
       | Some _ -> Error (Invalid_selection "The selected entity has a malformed title."))
 ;;

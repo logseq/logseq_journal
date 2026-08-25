@@ -9,10 +9,10 @@ module Context : sig
   val semantics_label : t -> string
 end
 
-val view
-  :  tokens:Journal_visual_tokens.t
-  -> text_scale:float
+val sliver
+  :  text_scale:float
+  -> top_inset:float
   -> device_pixel_ratio:float
   -> context:Context.t
   -> on_account_menu:Bonsai_flutter_ui.Event.Handler.t option
-  -> Bonsai_flutter_ui.Widget.t
+  -> Bonsai_flutter_ui.Widget.Sliver.t

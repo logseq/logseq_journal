@@ -165,7 +165,6 @@ let test_projection_order_today_suppression_and_continuations () =
     ; "block:" ^ Journal_model.id older_early
     ; "block:" ^ Journal_model.id older_late
     ; "feed-continuation:20260808"
-    ; "bottom-clearance"
     ]
     "timeline ordering or continuation projection changed";
   require
@@ -177,8 +176,7 @@ let test_projection_order_today_suppression_and_continuations () =
          | Timeline.Day_continuation _
          | Timeline.Children_loading _
          | Timeline.Children_more _
-         | Timeline.Feed_continuation _
-         | Timeline.Bottom_clearance -> true)
+         | Timeline.Feed_continuation _ -> true)
        (Timeline.retained_slots state))
     "Today must not render a duplicate day heading"
 ;;
@@ -490,7 +488,6 @@ let test_direct_children_insert_after_parent_and_collapse () =
     ; "block:" ^ Journal_model.id child_b
     ; "children-more:" ^ Journal_model.id parent
     ; "block:" ^ Journal_model.id sibling
-    ; "bottom-clearance"
     ]
     "direct children were not inserted immediately after their parent";
   (match Timeline.retained_slots loaded with
@@ -505,14 +502,8 @@ let test_direct_children_insert_after_parent_and_collapse () =
     let profile =
       Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
     in
-    let geometry = Timeline.extent_geometry loaded ~profile ~safe_bottom:0. in
-    let expected_clearance =
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom:0.
-        Journal_visual_tokens.Bottom_clearance
-    in
-    let expected = [ 0, expected_parent; 6, expected_clearance ] in
+    let geometry = Timeline.extent_geometry loaded ~profile in
+    let expected = [ 0, expected_parent ] in
     List.iter
       (fun (index, extent) ->
          require
@@ -530,10 +521,7 @@ let test_direct_children_insert_after_parent_and_collapse () =
   let collapsed = Timeline.collapse loaded ~parent_id:(Journal_model.id parent) in
   require_equal_string_list
     (slot_keys collapsed)
-    [ "block:" ^ Journal_model.id parent
-    ; "block:" ^ Journal_model.id sibling
-    ; "bottom-clearance"
-    ]
+    [ "block:" ^ Journal_model.id parent; "block:" ^ Journal_model.id sibling ]
     "collapse retained child slots";
   require
     (Timeline.anchor_decision collapsed = Timeline.Preserve_visible_slot)
@@ -570,7 +558,7 @@ let test_collapsed_child_response_releases_the_matching_request () =
     "a child response reopened a disclosure that the user collapsed";
   require_equal_string_list
     (slot_keys settled)
-    [ "block:" ^ Journal_model.id parent; "bottom-clearance" ]
+    [ "block:" ^ Journal_model.id parent ]
     "a collapsed disclosure inserted child rows from its completed request";
   let retry = Timeline.expand settled ~parent_id:(Journal_model.id parent) in
   let retry_request =
@@ -704,10 +692,7 @@ let test_stale_generations_and_page_append () =
   in
   require_equal_string_list
     (slot_keys appended)
-    [ "block:" ^ Journal_model.id first
-    ; "block:" ^ Journal_model.id second
-    ; "bottom-clearance"
-    ]
+    [ "block:" ^ Journal_model.id first; "block:" ^ Journal_model.id second ]
     "day page did not replace its continuation";
   require
     (Timeline.anchor_decision appended = Timeline.Preserve_visible_slot)
@@ -815,7 +800,7 @@ let test_ten_thousand_record_rolling_projection_is_bounded () =
     next_index := !next_index + count;
     generation := Int64.succ !generation
   done;
-  require (Timeline.total_count !state = 10_001) "logical count lost records";
+  require (Timeline.total_count !state = 10_000) "logical count lost records";
   require
     (Timeline.first_retained_index !state > 9_000)
     "rolling cache did not discard old slots";
@@ -846,7 +831,7 @@ let test_fifty_thousand_synthetic_windows_are_bounded () =
 
 let benchmark_visible_range_path ~name ~source =
   let blocks =
-    List.init (Timeline.maximum_slots - 1) (fun index ->
+    List.init Timeline.maximum_slots (fun index ->
       block ~order:(Printf.sprintf "%012d" index) ~source:(source index) index)
   in
   let initial =
@@ -876,7 +861,7 @@ let benchmark_visible_range_path ~name ~source =
         ~last_exclusive:(first_index + 12)
     in
     let window = Timeline.current_window state in
-    let geometry = Timeline.extent_geometry state ~profile ~safe_bottom:0. in
+    let geometry = Timeline.extent_geometry state ~profile in
     let supplied_rows = List.length window.slots in
     supplied_rows_bounded
     := !supplied_rows_bounded && supplied_rows <= Timeline.maximum_supplied_rows;
@@ -904,7 +889,7 @@ let benchmark_continuous_visible_ranges () =
     Printf.sprintf "Benchmark row %03d\nsecond line\nthird line\nfourth line" index)
 ;;
 
-let test_exact_profile_extents_and_final_clearance () =
+let test_exact_profile_extents_have_no_composer_clearance () =
   let older = block ~day:20260808 30 in
   let state =
     Timeline.empty ~today:20260809
@@ -917,32 +902,19 @@ let test_exact_profile_extents_and_final_clearance () =
     let profile =
       Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
     in
-    let geometry = Timeline.extent_geometry state ~profile ~safe_bottom:34. in
+    let geometry = Timeline.extent_geometry state ~profile in
     require
       (Float.equal geometry.default_extent default_extent)
       "profile default extent %.1f, expected %.1f"
       geometry.default_extent
       default_extent;
     require
-      (let clearance =
-         Journal_visual_tokens.fixed_extent
-           ~profile
-           ~safe_bottom:34.
-           Journal_visual_tokens.Bottom_clearance
-       in
-       geometry.overrides
-       = [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent }
-         ; { Ui.Widget.Sparse_extent_override.index = 2; extent = clearance }
-         ])
+      (geometry.overrides
+       = [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent } ])
       "profile extent overrides changed";
     require
-      (Float.equal
-         geometry.final_clearance_extent
-         (Journal_visual_tokens.fixed_extent
-            ~profile
-            ~safe_bottom:34.
-            Journal_visual_tokens.Bottom_clearance))
-      "final row does not clear the expanded composer and safe bottom"
+      (List.length geometry.overrides = 1)
+      "timeline retained an extent override beyond the day heading"
   in
   check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:48.;
   check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:36.;
@@ -988,7 +960,7 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
     let profile =
       Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:scale
     in
-    let geometry = Timeline.extent_geometry state ~profile ~safe_bottom:0. in
+    let geometry = Timeline.extent_geometry state ~profile in
     let extent index =
       match
         List.find_opt
@@ -1009,8 +981,8 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
            scale)
       expected
   in
-  check ~scale:1. [ 0, 44.; 1, 96.; 2, 56.; 3, 76.; 4, 96.; 5, 192. ];
-  check ~scale:3.2 [ 0, 80.; 1, 272.; 2, 144.; 3, 208.; 4, 272.; 5, 412. ]
+  check ~scale:1. [ 0, 44.; 1, 96.; 2, 56.; 3, 76.; 4, 96. ];
+  check ~scale:3.2 [ 0, 80.; 1, 272.; 2, 144.; 3, 208.; 4, 272. ]
 ;;
 
 let test_anchor_decisions_replacements_and_route_return () =
@@ -1056,14 +1028,12 @@ let test_anchor_decisions_replacements_and_route_return () =
       returned
       ~profile:
         (Journal_visual_tokens.select_row_profile ~viewport_width:320. ~text_scale:1.)
-      ~safe_bottom:0.
   in
   let _adaptive =
     Timeline.extent_geometry
       returned
       ~profile:
         (Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:3.2)
-      ~safe_bottom:0.
   in
   require
     (Timeline.current_window returned = before)
@@ -1203,7 +1173,7 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
   in
   require_equal_string_list
     (slot_keys staged_collapsed)
-    [ "block:" ^ Journal_model.id sibling; "bottom-clearance" ]
+    [ "block:" ^ Journal_model.id sibling ]
     "collapsed delete removed unrelated slots";
   require
     (Timeline.total_count staged_collapsed = Timeline.total_count initial - 1)
@@ -1244,7 +1214,7 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
   let staged, backup = require_staged loaded (Journal_model.id parent) in
   require_equal_string_list
     (slot_keys staged)
-    [ "block:" ^ Journal_model.id sibling; "bottom-clearance" ]
+    [ "block:" ^ Journal_model.id sibling ]
     "expanded delete retained projected descendants or removed a sibling";
   require (Timeline.pending_request staged = None) "staging did not fence pending paging";
   require
@@ -1270,14 +1240,12 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
       loaded
       ~profile:
         (Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:1.)
-      ~safe_bottom:34.
   in
   let after_geometry =
     Timeline.extent_geometry
       restored
       ~profile:
         (Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:1.)
-      ~safe_bottom:34.
   in
   require (before_geometry = after_geometry) "Undo changed sparse extent geometry";
   let stale =
@@ -1336,10 +1304,7 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
          (feed [ day_feed 20260808 "Older" [ parent ] ])
   in
   let deleted, _ = require_staged root_only (Journal_model.id parent) in
-  require_equal_string_list
-    (slot_keys deleted)
-    [ "bottom-clearance" ]
-    "last dated row left an orphan heading";
+  require_equal_string_list (slot_keys deleted) [] "last dated row left an orphan heading";
   require
     (Timeline.stage_delete deleted ~block_id:"forged" = None)
     "forged delete ID was staged"
@@ -1360,7 +1325,7 @@ let () =
   test_ten_thousand_record_rolling_projection_is_bounded ();
   test_fifty_thousand_synthetic_windows_are_bounded ();
   benchmark_continuous_visible_ranges ();
-  test_exact_profile_extents_and_final_clearance ();
+  test_exact_profile_extents_have_no_composer_clearance ();
   test_block_line_counts_are_the_authoritative_sparse_extents ();
   test_anchor_decisions_replacements_and_route_return ();
   test_populated_feed_refresh_preserves_position_and_expansion ();

@@ -1,34 +1,8 @@
 module Ui = Bonsai_flutter_ui
 
-type palette =
+type destructive_swipe_action =
   { background : Ui.Style.Color.t
-  ; header : Ui.Style.Color.t
-  ; text_primary : Ui.Style.Color.t
-  ; text_secondary : Ui.Style.Color.t
-  ; text_timestamp : Ui.Style.Color.t
-  ; divider : Ui.Style.Color.t
-  ; neutral_badge : Ui.Style.Color.t
-  ; fab : Ui.Style.Color.t
-  ; on_fab : Ui.Style.Color.t
-  ; status_todo : Ui.Style.Color.t
-  ; status_doing : Ui.Style.Color.t
-  ; status_done : Ui.Style.Color.t
-  ; status_later : Ui.Style.Color.t
-  ; sheet_surface : Ui.Style.Color.t
-  ; sheet_outline : Ui.Style.Color.t
-  ; modal_scrim : Ui.Style.Color.t
-  ; sheet_primary_action : Ui.Style.Color.t
-  ; sheet_secondary_action : Ui.Style.Color.t
-  ; sheet_error : Ui.Style.Color.t
-  ; destructive : Ui.Style.Color.t
-  ; on_destructive : Ui.Style.Color.t
-  }
-
-type interaction =
-  { pressed : Ui.Style.Color.t
-  ; focused : Ui.Style.Color.t
-  ; disabled : Ui.Style.Color.t
-  ; error : Ui.Style.Color.t
+  ; foreground : Ui.Style.Color.t
   }
 
 type text_token =
@@ -69,10 +43,7 @@ type header_geometry =
 
 type composer_geometry =
   { horizontal_margin : float
-  ; bottom_inset : float
-  ; minimum_height : float
   ; maximum_lines : int
-  ; expanded_vertical_overhead : float
   }
 
 type row_geometry =
@@ -94,8 +65,6 @@ type preview_geometry =
 type motion =
   { press_release_ms : int
   ; route_transition_ms : int
-  ; capture_sheet_enter_ms : int
-  ; capture_sheet_exit_ms : int
   }
 
 type profile_kind =
@@ -117,13 +86,10 @@ type fixed_extent_role =
   | Day_heading
   | Day_continuation
   | Feed_continuation
-  | Bottom_clearance
 
 type t
 
 val resolve : high_contrast:bool -> t
-val palette : t -> palette
-val interaction : t -> interaction
 val typography : typography
 val spacing : spacing
 val hit_regions : hit_regions
@@ -136,5 +102,6 @@ val physical_divider_thickness : device_pixel_ratio:float -> float
 val timeline_max_width : float
 val select_row_profile : viewport_width:float -> text_scale:float -> row_profile
 val block_extent : profile:row_profile -> visible_lines:int -> float
-val fixed_extent : profile:row_profile -> safe_bottom:float -> fixed_extent_role -> float
+val fixed_extent : profile:row_profile -> fixed_extent_role -> float
 val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option
+val destructive_swipe_action : t -> destructive_swipe_action

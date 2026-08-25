@@ -87,101 +87,16 @@ let require_range range ~start_utf16 ~end_utf16 label =
     end_utf16
 ;;
 
-let test_capture_plain_ime_dirty_cancel_and_retry () =
-  let capture = Journal_capture.create ~session_number:11L ~source:"" in
-  require (not (Journal_capture.can_save capture)) "blank Capture enabled Save";
-  require (not (Journal_capture.dirty capture)) "new Capture started dirty";
-  require
-    (Journal_capture.request_dismiss capture = Journal_capture.Close)
-    "clean dismiss did not close";
-  require (Journal_capture.can_pop capture) "clean Capture did not allow platform pop";
-  let session_id = Journal_capture.session_id capture in
-  let composed = "中文 👩🏽‍💻 e\204\129 #literal @mention" in
-  let capture =
-    Journal_capture.apply_text_edit
-      capture
-      (edit
-         ~session_id
-         ~local_revision:1L
-         ~base_document_revision:0L
-         ~text:composed
-         ~selection_start:3
-         ~selection_end:10
-         ~composing:(0, 2)
-         ())
-  in
-  require_string composed (Journal_capture.source capture) "composed Capture source";
-  require (Journal_capture.dirty capture) "IME edit did not dirty Capture";
-  require (Journal_capture.can_save capture) "nonblank Capture did not enable Save";
-  let value = Journal_capture.value capture in
-  require_range
-    (Ui.Text_editing.Value.selection value)
-    ~start_utf16:3
-    ~end_utf16:10
-    "Capture selection";
-  (match Ui.Text_editing.Value.composing value with
-   | Some range -> require_range range ~start_utf16:0 ~end_utf16:2 "Capture composing"
-   | None -> fail "Capture lost composing range");
-  let pasted = composed ^ "\n貼り付け" in
-  let capture =
-    Journal_capture.apply_text_edit
-      capture
-      (edit
-         ~session_id
-         ~local_revision:2L
-         ~base_document_revision:1L
-         ~text:pasted
-         ~selection_start:(Ui.Text_editing.Utf16.length pasted)
-         ~selection_end:(Ui.Text_editing.Utf16.length pasted)
-         ())
-  in
-  require_string pasted (Journal_capture.source capture) "pasted Capture source";
-  let capture =
-    Journal_capture.apply_text_edit
-      capture
-      (edit
-         ~session_id
-         ~local_revision:3L
-         ~base_document_revision:2L
-         ~text:composed
-         ~selection_start:10
-         ~selection_end:10
-         ())
-  in
-  require_string composed (Journal_capture.source capture) "undo Capture source";
-  let stale_session = ID.Text_input.Session_id.of_int64 12L in
-  let ignored =
-    Journal_capture.apply_text_edit
-      capture
-      (edit
-         ~session_id:stale_session
-         ~local_revision:4L
-         ~base_document_revision:3L
-         ~text:"stale runtime edit"
-         ~selection_start:0
-         ~selection_end:0
-         ())
-  in
-  require_string composed (Journal_capture.source ignored) "stale-session Capture source";
-  let confirming =
-    match Journal_capture.request_dismiss capture with
-    | Journal_capture.Confirm value -> value
-    | Close -> fail "dirty dismiss closed without confirmation"
-    | Block -> fail "dirty editable Capture blocked explicit dismissal"
-  in
-  require
-    (Journal_capture.phase confirming = Journal_capture.Confirm_discard)
-    "dirty dismiss did not enter confirmation";
-  require (not (Journal_capture.can_pop confirming)) "confirmation allowed platform pop";
-  let capture = Journal_capture.keep_editing confirming in
-  require_string composed (Journal_capture.source capture) "kept Capture draft";
+let test_direct_capture_preserves_source_and_mutation_identity () =
+  let source = "  中文 👩🏽‍💻 e\204\129 #literal @mention  " in
+  let capture = Journal_capture.create ~session_number:11L ~source in
+  require (Journal_capture.can_save capture) "nonblank direct Capture disabled Save";
   let saving, request =
     Journal_capture.admit_save
       capture
       ~mutation_id:"70000000-0000-4000-9000-000000000011"
       ~block_id:"70000000-0000-4000-a000-000000000011"
       ~sibling_order:"000000000011"
-      ~child_identities:[]
       ~calendar_generation:7L
       ~creation_time:(creation_time 541)
   in
@@ -189,16 +104,23 @@ let test_capture_plain_ime_dirty_cancel_and_retry () =
    | Some
        (Journal_graph_request.Capture
           { calendar_generation = 7L
-          ; command = { source; task_state = Journal_model.No_status; _ }
-          }) -> require_string composed source "admitted Capture source"
-   | _ -> fail "Capture did not admit the expected Worker request");
+          ; command =
+              { mutation_id = "70000000-0000-4000-9000-000000000011"
+              ; block_id = "70000000-0000-4000-a000-000000000011"
+              ; sibling_order = "000000000011"
+              ; source = actual_source
+              ; task_state = Journal_model.No_status
+              ; children = []
+              ; _
+              }
+          }) -> require_string source actual_source "admitted direct Capture source"
+   | _ -> fail "direct Capture did not admit one plain top-level Worker request");
   let still_saving, repeated =
     Journal_capture.admit_save
       saving
       ~mutation_id:"70000000-0000-4000-9000-000000000012"
       ~block_id:"70000000-0000-4000-a000-000000000012"
       ~sibling_order:"000000000012"
-      ~child_identities:[]
       ~calendar_generation:7L
       ~creation_time:(creation_time 542)
   in
@@ -206,156 +128,15 @@ let test_capture_plain_ime_dirty_cancel_and_retry () =
   require
     (Journal_capture.phase still_saving = Journal_capture.Saving)
     "rapid repeated Save changed phase";
-  require
-    (Journal_capture.request_dismiss still_saving = Journal_capture.Block)
-    "Saving Capture did not block dismissal";
-  require (not (Journal_capture.can_pop still_saving)) "Saving Capture allowed pop";
   let failed = Journal_capture.fail saving ~message:"storage unavailable" in
+  require_string source (Journal_capture.source failed) "failed direct Capture draft";
   let retrying, retry = Journal_capture.retry failed in
-  require (retry = request) "Capture retry did not reuse the admitted mutation identity";
+  require
+    (retry = request)
+    "unchanged direct Capture retry did not reuse its admitted mutation identity";
   require
     (Journal_capture.phase retrying = Journal_capture.Saving)
-    "Capture retry did not return to Saving"
-;;
-
-let test_capture_dismissal_policy_covers_task_failure () =
-  let clean = Journal_capture.create ~session_number:31L ~source:"" in
-  let task_dirty = Journal_capture.toggle_task clean in
-  require
-    (Journal_capture.task_state task_dirty = Journal_model.Todo)
-    "task fixture did not become Todo";
-  let task_confirming =
-    match Journal_capture.request_dismiss task_dirty with
-    | Journal_capture.Confirm capture -> capture
-    | Close -> fail "task-only dirty Capture closed without confirmation"
-    | Block -> fail "task-only dirty Capture blocked explicit dismissal"
-  in
-  require
-    (Journal_capture.phase task_confirming = Journal_capture.Confirm_discard)
-    "task-only dirty Capture did not enter confirmation";
-  let kept = Journal_capture.keep_editing task_confirming in
-  require
-    (Journal_capture.task_state kept = Journal_model.Todo)
-    "Keep Editing lost the task-only draft";
-  let source = "保留 recovery draft 👩🏽‍💻" in
-  let edited =
-    Journal_capture.apply_text_edit
-      clean
-      (edit
-         ~session_id:(Journal_capture.session_id clean)
-         ~local_revision:1L
-         ~base_document_revision:0L
-         ~text:source
-         ~selection_start:2
-         ~selection_end:8
-         ~composing:(0, 2)
-         ())
-    |> Journal_capture.toggle_task
-  in
-  let saving, _ =
-    Journal_capture.admit_save
-      edited
-      ~mutation_id:"70000000-0000-4000-9000-000000000031"
-      ~block_id:"70000000-0000-4000-a000-000000000031"
-      ~sibling_order:"000000000031"
-      ~child_identities:[]
-      ~calendar_generation:7L
-      ~creation_time:(creation_time 544)
-  in
-  let failed = Journal_capture.fail saving ~message:"storage unavailable" in
-  let require_confirmable label capture =
-    require (not (Journal_capture.can_pop capture)) "%s allowed platform pop" label;
-    match Journal_capture.request_dismiss capture with
-    | Journal_capture.Confirm confirming ->
-      require
-        (Journal_capture.phase confirming = Journal_capture.Confirm_discard)
-        "%s did not enter confirmation"
-        label;
-      require_string source (Journal_capture.source confirming) (label ^ " source");
-      require
-        (Journal_capture.task_state confirming = Journal_model.Todo)
-        "%s lost task state"
-        label;
-      let value = Journal_capture.value confirming in
-      require_range
-        (Ui.Text_editing.Value.selection value)
-        ~start_utf16:2
-        ~end_utf16:8
-        (label ^ " selection");
-      (match Ui.Text_editing.Value.composing value with
-       | Some range ->
-         require_range range ~start_utf16:0 ~end_utf16:2 (label ^ " composing")
-       | None -> fail "%s lost composing state" label)
-    | Close -> fail "%s closed without confirmation" label
-    | Block -> fail "%s blocked explicit confirmed discard" label
-  in
-  require_confirmable "failed Capture" failed;
-  let committed = Journal_capture.commit saving (block ()) in
-  require
-    (Journal_capture.request_dismiss committed = Journal_capture.Block)
-    "Committed Capture exposed a dismissal path"
-;;
-
-let test_capture_route_admission_and_confirmed_dismissal () =
-  let anchor : Journal_routes.anchor = { block_id = None; first_index = 0 } in
-  let routes = Journal_routes.create ~anchor in
-  let clean_opened = Journal_routes.open_capture routes ~session_number:40L ~source:"" in
-  let clean_closed = Journal_routes.back clean_opened in
-  require
-    (Journal_routes.route clean_closed = Journal_routes.Timeline)
-    "clean Capture did not close";
-  let opened =
-    Journal_routes.open_capture
-      routes
-      ~session_number:41L
-      ~source:"Composer-seeded route draft"
-  in
-  let opened_again =
-    Journal_routes.open_capture opened ~session_number:42L ~source:"replacement"
-  in
-  let capture =
-    match Journal_routes.capture opened_again with
-    | Some capture -> capture
-    | None -> fail "Capture route disappeared after duplicate admission"
-  in
-  require
-    (ID.Text_input.Session_id.equal
-       (Journal_capture.session_id capture)
-       (ID.Text_input.Session_id.of_int64 41L))
-    "duplicate MessageComposer activation replaced the Capture session";
-  require_string
-    "Composer-seeded route draft"
-    (Journal_capture.source capture)
-    "Capture route seed";
-  let capture =
-    Journal_capture.apply_text_edit
-      capture
-      (edit
-         ~session_id:(Journal_capture.session_id capture)
-         ~local_revision:1L
-         ~base_document_revision:0L
-         ~text:"Dirty route draft"
-         ~selection_start:17
-         ~selection_end:17
-         ())
-  in
-  let dirty_routes = Journal_routes.update_capture opened_again capture in
-  let confirming_routes = Journal_routes.back dirty_routes in
-  let confirming =
-    match Journal_routes.capture confirming_routes with
-    | Some capture -> capture
-    | None -> fail "dirty explicit Close removed Capture"
-  in
-  require
-    (Journal_capture.phase confirming = Journal_capture.Confirm_discard)
-    "dirty explicit Close did not enter confirmation";
-  let kept_routes = Journal_routes.keep_editing confirming_routes in
-  let kept = Option.get (Journal_routes.capture kept_routes) in
-  require_string "Dirty route draft" (Journal_capture.source kept) "kept route draft";
-  let discarded = Journal_routes.discard confirming_routes in
-  require
-    (Journal_routes.route discarded = Journal_routes.Timeline)
-    "confirmed Discard did not remove the sheet"
+    "direct Capture retry did not return to Saving"
 ;;
 
 let test_detail_task_child_conflict_and_back_order () =
@@ -551,12 +332,8 @@ let test_route_generation_anchor_background_and_runtime_replacement () =
 ;;
 
 let tests =
-  [ ( "Capture plain IME, dirty cancel, and retry"
-    , test_capture_plain_ime_dirty_cancel_and_retry )
-  ; ( "Capture dismissal covers task and failure"
-    , test_capture_dismissal_policy_covers_task_failure )
-  ; ( "Capture route admission and confirmed dismissal"
-    , test_capture_route_admission_and_confirmed_dismissal )
+  [ ( "direct Capture source and mutation identity"
+    , test_direct_capture_preserves_source_and_mutation_identity )
   ; ( "Detail task, child, conflict, and Back order"
     , test_detail_task_child_conflict_and_back_order )
   ; ( "route generation, anchor, background, and runtime replacement"

@@ -9,6 +9,7 @@ import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 
 const _platformChannel = MethodChannel('logseq_journal/platform');
 
@@ -915,18 +916,24 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
       child: _AuthenticatedJournalHost(child: child),
     );
     final ready = amplifyReady;
-    if (ready == null) return authenticatedHost();
-    return FutureBuilder<void>(
-      future: ready,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.done &&
-            snapshot.error == null) {
-          return authenticatedHost();
-        }
-        return const MaterialApp(
-          home: Center(child: CircularProgressIndicator()),
-        );
-      },
+    final host = ready == null
+        ? authenticatedHost()
+        : FutureBuilder<void>(
+            future: ready,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.done &&
+                  snapshot.error == null) {
+                return authenticatedHost();
+              }
+              return const MaterialApp(
+                home: Center(child: CircularProgressIndicator()),
+              );
+            },
+          );
+    return fs.SlidableAutoCloseBehavior(
+      closeWhenOpened: true,
+      closeWhenTapped: true,
+      child: host,
     );
   }
 }

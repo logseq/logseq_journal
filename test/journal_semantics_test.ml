@@ -234,9 +234,9 @@ let require_pressable handle test_id ~release_delay_ms =
   match view.node with
   | Ui.Widget.Private.Pressable { overlay_color; release_delay_ms = actual } ->
     require
-      (Int32.equal (Ui.Style.Color.Private.to_argb32 overlay_color) 0x1f0d142fl
+      (Int32.equal (Ui.Style.Color.Private.to_argb32 overlay_color) 0x00000000l
        && actual = release_delay_ms)
-      "%s pressed feedback differs"
+      "%s retains an application-owned pressed color"
       test_id
   | _ -> fail "%s is not Pressable" test_id
 ;;
@@ -285,31 +285,23 @@ let require_padding handle test_id ~left ~right =
   | _ -> fail "%s is not Padding" test_id
 ;;
 
-let require_icon handle test_id ~code_point ~color =
+let require_icon handle test_id ~code_point ~color:_ =
   let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
   match view.node with
   | Ui.Widget.Private.Icon
-      { code_point = actual_code_point
-      ; font_family = Some "MaterialIcons"
-      ; color = Some actual_color
-      ; _
-      } ->
+      { code_point = actual_code_point; font_family = Some "MaterialIcons"; color; _ } ->
     require
-      (actual_code_point = code_point && Int32.equal actual_color color)
-      "%s icon differs"
+      (actual_code_point = code_point && Option.is_none color)
+      "%s icon differs or overrides its inherited theme color"
       test_id
   | _ -> fail "%s is not a Material icon" test_id
 ;;
 
-let require_decoration handle test_id ~background ~border_radius =
+let require_decoration handle test_id ~background:_ ~border_radius =
   let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
   match view.node with
-  | Ui.Widget.Private.Decorated_box
-      { background = Some actual_background; border_radius = actual_radius } ->
-    require
-      (Int32.equal actual_background background && Float.equal actual_radius border_radius)
-      "%s decoration differs"
-      test_id
+  | Ui.Widget.Private.Decorated_box { background = Some _; border_radius = actual_radius }
+    -> require (Float.equal actual_radius border_radius) "%s decoration differs" test_id
   | _ -> fail "%s is not a colored DecoratedBox" test_id
 ;;
 
@@ -602,16 +594,17 @@ let _test_conditional_task_leading_slot_and_todo_icon () =
 
 let test_four_status_rails_replace_timeline_task_controls () =
   let cases =
-    [ "logseq.property/status.todo", "Todo", 0xff64748bl, 0xff1f2937l
-    ; "logseq.property/status.doing", "Doing", 0xff2563ebl, 0xff0047abl
-    ; "logseq.property/status.done", "Done", 0xff058e46l, 0xff006b33l
-    ; "logseq.property/status.backlog", "Backlog", 0xff7c3aedl, 0xff5b21b6l
+    [ "logseq.property/status.todo", "Todo"
+    ; "logseq.property/status.doing", "Doing"
+    ; "logseq.property/status.done", "Done"
+    ; "logseq.property/status.backlog", "Backlog"
     ]
   in
   List.iter
-    (fun (ident, status_name, normal_color, high_contrast_color) ->
+    (fun high_contrast ->
+       let colors = ref [] in
        List.iter
-         (fun (high_contrast, expected_color) ->
+         (fun (ident, status_name) ->
             let block = projected_block ~status_ident:ident () in
             let item = Journal_row.Item.of_block block in
             let handle, _profile = create_handle ~high_contrast item in
@@ -621,8 +614,16 @@ let test_four_status_rails_replace_timeline_task_controls () =
                  require_decoration
                    handle
                    ("journal-row-status-rail:" ^ block_id)
-                   ~background:expected_color
+                   ~background:0l
                    ~border_radius:2.;
+                 (let (Av view) =
+                    Ui.Widget.Private.view
+                      (node handle ("journal-row-status-rail:" ^ block_id)).widget
+                  in
+                  match view.node with
+                  | Ui.Widget.Private.Decorated_box { background = Some color; _ } ->
+                    colors := color :: !colors
+                  | _ -> assert false);
                  require_sized_width
                    handle
                    ("journal-row-status-rail-size:" ^ block_id)
@@ -647,8 +648,12 @@ let test_four_status_rails_replace_timeline_task_controls () =
                       require
                         (props.actions = [])
                         "status leaf exposes a transparent activation target")))
-         [ false, normal_color; true, high_contrast_color ])
-    cases;
+         cases;
+       require
+         (List.length (List.sort_uniq Int32.compare !colors) = 4)
+         "four status roles are not visually distinguishable in %s presentation"
+         (if high_contrast then "high-contrast" else "normal"))
+    [ false; true ];
   let plain = Journal_row.Item.of_block (projected_block ()) in
   let status =
     Journal_row.Item.of_block
@@ -766,7 +771,7 @@ let test_line_count_drives_exact_scaled_row_extent () =
   check ~scale:3.2 [ 80.; 144.; 208.; 272. ]
 ;;
 
-let header_component ~tokens handlers _graph =
+let header_component handlers _graph =
   let on_account_menu =
     Bonsai_flutter.Driver.Handler.create
       handlers
@@ -776,22 +781,26 @@ let header_component ~tokens handlers _graph =
       ~f:(fun () _ -> Bonsai.Effect.Ignore)
   in
   Bonsai.Cont.map on_account_menu ~f:(fun on_account_menu ->
-    Journal_header.view
-      ~tokens
-      ~text_scale:1.
-      ~device_pixel_ratio:3.
-      ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9")
-      ~on_account_menu:(Some on_account_menu))
+    Ui.Widget.Scroll_view.vertical
+      ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
+      [ Journal_header.sliver
+          ~text_scale:1.
+          ~top_inset:0.
+          ~device_pixel_ratio:3.
+          ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9")
+          ~on_account_menu:(Some on_account_menu)
+      ]
+      ()
+    |> Ui.Widget.Viewport.Vertical.with_height ~height:144.)
 ;;
 
 let test_header_account_action_and_view_only_date_have_truthful_semantics () =
-  let tokens = Tokens.resolve ~high_contrast:false in
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
   let handle =
     Test.Handle.create
       ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_002L)
       ~time_source
-      (header_component ~tokens)
+      header_component
   in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
@@ -804,6 +813,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
          ; "journal-account-menu-button"
          ; "journal-account-icon"
          ];
+       require_icon handle "journal-account-icon" ~code_point:0xe043 ~color:0x00000000l;
        List.iter
          (fun test_id ->
             require
@@ -889,8 +899,15 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
         | Ui.Widget.Private.Flex_row
         | Ui.Widget.Private.Flex_column -> ()
         | _ -> fail "top-level content is not a bounded two-line stack");
-       let (Av view) =
+       let (Av divider_view) =
          Ui.Widget.Private.view (node handle ("journal-row-divider:" ^ block_id)).widget
+       in
+       (match divider_view.node with
+        | Ui.Widget.Private.Material_divider _ -> ()
+        | _ -> fail "row separator is not a Material Divider");
+       let (Av view) =
+         Ui.Widget.Private.view
+           (node handle ("journal-row-divider-extent:" ^ block_id)).widget
        in
        match view.node with
        | Ui.Widget.Private.Sized_box { height = Some height; _ } ->
@@ -1002,26 +1019,27 @@ let delete_timeline_component ~delete_enabled handlers _graph =
         ; has_more_days = false
         }
     in
-    match
-      Journal_timeline.view
+    Ui.Widget.Scroll_view.vertical
+      ~on_scroll:ignored
+      [ Journal_timeline.view
         ~tokens:(Tokens.resolve ~high_contrast:false)
         ~profile:(Tokens.select_row_profile ~viewport_width:390. ~text_scale:1.)
         ~device_pixel_ratio:3.
+        ~end_padding:0.
         ~rtl:false
         ~state
         ~day_label:(fun _ -> "Today")
         ~reduced_motion:false
-        ~safe_bottom:34.
         ~delete_enabled
         ~on_delete:ignored
         ~on_visible_range:ignored
         ~on_toggle_children:ignored
-    with
-    | Journal_timeline.Empty widget -> widget
-    | Populated viewport -> Ui.Widget.Viewport.Vertical.with_height ~height:600. viewport)
+      ]
+      ()
+    |> Ui.Widget.Viewport.Vertical.with_height ~height:600.)
 ;;
 
-let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
+let test_slidable_delete_wrapper_has_only_non_dismissible_logical_end_action () =
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
   let handle =
     Test.Handle.create
@@ -1033,25 +1051,90 @@ let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
        Test.Handle.present handle;
-       let swipe = node handle ("journal-row-swipe:" ^ block_id) in
-       (let (Av view) = Ui.Widget.Private.view swipe.widget in
+       require
+         (Option.is_none
+            (Test.Handle.find handle (Test.Query.test_id "journal-bottom-clearance")))
+         "timeline retained obsolete composer bottom clearance";
+       let slidable = node handle ("journal-row-slidable:" ^ block_id) in
+       (let (Av view) = Ui.Widget.Private.view slidable.widget in
         match view.node with
-        | Ui.Widget.Private.Native_widget { payload; _ } ->
-          require (Bytes.length payload > 44) "swipe payload omitted action label";
-          require (Char.code (Bytes.get payload 0) = 2) "swipe enabled the start action";
-          require (Char.code (Bytes.get payload 2) = 0) "end action is not Dismiss";
+        | Ui.Widget.Private.Native_widget { kind_id; payload; _ }
+          when kind_id = Ui.Native_widget.Slidable.kind_id ->
+          let props = Ui.Native_widget.Slidable.For_testing.decode_props_exn payload in
+          require props.enabled "delete Slidable is disabled";
+          require props.close_on_scroll "delete Slidable remains open while scrolling";
           require
-            (Float.equal (Int64.float_of_bits (Bytes.get_int64_le payload 20)) 0.)
-            "delete action feedback is not square";
-          let start_length = Int32.to_int (Bytes.get_int32_le payload 36) in
-          let end_length = Int32.to_int (Bytes.get_int32_le payload 40) in
-          let label = Bytes.sub_string payload (44 + start_length) end_length in
+            (props.direction = Ui.Layout.Axis.Horizontal)
+            "delete Slidable is not horizontal";
+          require props.use_text_direction "delete Slidable ignores text direction";
           require
-            (String.equal label "Delete block and all descendants")
-            "delete action label changed: %S"
-            label;
-          require (start_length = 0) "start action label is not empty"
-        | _ -> fail "delete wrapper is not native");
+            (Option.equal String.equal props.group_tag (Some "journal-timeline"))
+            "delete Slidable group tag changed";
+          require (Option.is_none props.start_action_pane) "start action pane is enabled";
+          (match props.end_action_pane with
+           | None -> fail "delete Slidable omitted its logical-end pane"
+           | Some pane ->
+             require (Float.equal pane.extent_ratio 0.25) "delete pane extent changed";
+             require (pane.motion = Ui.Native_widget.Slidable.Behind) "delete pane moved";
+             require (Option.is_none pane.dismissible) "swipe can dismiss the row";
+             require (not pane.drag_dismissible) "full-width drag can dismiss the row";
+             require
+               (Option.equal Float.equal pane.open_threshold (Some 0.125))
+               "delete pane open threshold changed";
+             require
+               (Option.equal Float.equal pane.close_threshold (Some 0.125))
+               "delete pane close threshold changed";
+             (match pane.actions with
+              | [ action ] ->
+                let colors =
+                  Tokens.destructive_swipe_action (Tokens.resolve ~high_contrast:false)
+                in
+                let argb = Ui.Style.Color.Private.to_argb32 in
+                require (action.id = 1) "delete action ID changed";
+                require action.enabled "delete action is disabled";
+                require (action.flex = 1) "delete action flex changed";
+                require action.auto_close "delete action does not auto-close";
+                require
+                  (Int32.equal (argb action.background) (argb colors.background))
+                  "delete action background changed";
+                require
+                  (Option.equal
+                     (fun actual expected -> Int32.equal (argb actual) (argb expected))
+                     action.foreground
+                     (Some colors.foreground))
+                  "delete action foreground changed";
+                require
+                  (Float.equal action.border_radius 0.)
+                  "delete action retained rounded corners"
+              | actions -> fail "delete pane has %d actions" (List.length actions)))
+        | _ -> fail "delete wrapper is not a Slidable");
+       List.iter
+         (fun edge ->
+            let (Av view) =
+              Ui.Widget.Private.view
+                (node handle ("journal-row-delete-" ^ edge ^ "-divider:" ^ block_id))
+                  .widget
+            in
+            match view.node with
+            | Ui.Widget.Private.Material_divider { thickness } ->
+              require
+                (Float.equal
+                   thickness
+                   (Tokens.physical_divider_thickness ~device_pixel_ratio:3.))
+                "delete %s divider is not one physical pixel"
+                edge
+            | _ -> fail "delete %s boundary is not a Material divider" edge)
+         [ "top"; "bottom" ];
+       let surface = node handle ("journal-row-slidable-surface:" ^ block_id) in
+       (let (Av view) = Ui.Widget.Private.view surface.widget in
+        match view.node with
+        | Ui.Widget.Private.Native_widget { kind_id; payload; _ }
+          when kind_id = Ui.Native_widget.Morphing_surface.kind_id ->
+          let props =
+            Ui.Native_widget.Morphing_surface.For_testing.decode_props_exn payload
+          in
+          require (not props.expanded) "Slidable foreground changed resting geometry"
+        | _ -> fail "Slidable foreground is not a theme-owned Material surface");
        (let (Av view) =
           Ui.Widget.Private.view
             (node handle ("journal-row-delete-icon:" ^ block_id)).widget
@@ -1061,6 +1144,15 @@ let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
             { code_point = 0xe1b9; font_family = Some "MaterialIcons"; _ } -> ()
         | Icon _ -> fail "delete feedback does not use the Material delete icon"
         | _ -> fail "delete feedback is not an icon");
+       require
+         (Option.is_some (Test.Handle.find handle (Test.Query.visible_text "Delete")))
+         "delete action omitted its visible label";
+       require
+         (Option.is_some
+            (Test.Handle.find
+               handle
+               (Test.Query.semantics_label "Delete block and all descendants")))
+         "delete action omitted subtree accessibility semantics";
        require
          (Option.is_none
             (Test.Handle.find
@@ -1082,21 +1174,8 @@ let test_swipe_delete_wrapper_has_only_square_logical_end_action () =
          (Option.is_none
             (Test.Handle.find
                disabled
-               (Test.Query.test_id ("journal-row-swipe:" ^ block_id))))
-         "write-disabled row retained swipe wrapper")
-;;
-
-let test_delete_tokens_are_explicit_and_accessible () =
-  let normal = Tokens.palette (Tokens.resolve ~high_contrast:false) in
-  let high_contrast = Tokens.palette (Tokens.resolve ~high_contrast:true) in
-  require
-    (Ui.Style.Color.Private.to_argb32 normal.destructive
-     <> Ui.Style.Color.Private.to_argb32 normal.background)
-    "normal destructive surface blends into background";
-  require
-    (Ui.Style.Color.Private.to_argb32 high_contrast.destructive
-     <> Ui.Style.Color.Private.to_argb32 high_contrast.background)
-    "high-contrast destructive surface blends into background"
+               (Test.Query.test_id ("journal-row-slidable:" ^ block_id))))
+         "write-disabled row retained Slidable wrapper")
 ;;
 
 let () =
@@ -1109,6 +1188,5 @@ let () =
   test_compact_and_adaptive_shapes_at_required_extremes ();
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();
-  test_swipe_delete_wrapper_has_only_square_logical_end_action ();
-  test_delete_tokens_are_explicit_and_accessible ()
+  test_slidable_delete_wrapper_has_only_non_dismissible_logical_end_action ()
 ;;

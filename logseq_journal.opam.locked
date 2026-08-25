@@ -256,11 +256,11 @@ build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
   [
   "bonsai_flutter.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#9b345b90fea476391d19092675abd665655e586a"
+  "git+https://github.com/RCmerci/bonsai_flutter.git#5f8f540e4ccfd1e1807294aec8ac5f229161e2da"
 ]
   [
   "bonsai_flutter_test.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#9b345b90fea476391d19092675abd665655e586a"
+  "git+https://github.com/RCmerci/bonsai_flutter.git#5f8f540e4ccfd1e1807294aec8ac5f229161e2da"
 ]
   [
     "datascript-ocaml-native.dev"

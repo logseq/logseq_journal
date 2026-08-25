@@ -28,7 +28,6 @@ type slot =
       }
   | Children_more of { parent_id : string }
   | Feed_continuation of { before_day : int }
-  | Bottom_clearance
 
 type anchor_decision =
   | Preserve_visible_slot
@@ -70,7 +69,6 @@ type synthetic_window =
 type extent_geometry =
   { default_extent : float
   ; overrides : Ui.Widget.Sparse_extent_override.t list
-  ; final_clearance_extent : float
   }
 
 let maximum_slots = 512
@@ -114,7 +112,6 @@ let slot_key = function
     Printf.sprintf "children-loading:%s:%Ld" parent_id epoch
   | Children_more { parent_id } -> "children-more:" ^ parent_id
   | Feed_continuation { before_day } -> "feed-continuation:" ^ string_of_int before_day
-  | Bottom_clearance -> "bottom-clearance"
 ;;
 
 let drop count values =
@@ -196,8 +193,7 @@ let request_of_slot = function
   | Children_loading { parent_id; epoch } -> Some (Children { parent_id; epoch })
   | Day_continuation { day; after } -> Some (Day { day; after })
   | Feed_continuation { before_day } -> Some (Feed { before_day = Some before_day })
-  | Day_heading _ | Top_level _ | Child_preview _ | Children_more _ | Bottom_clearance ->
-    None
+  | Day_heading _ | Top_level _ | Child_preview _ | Children_more _ -> None
 ;;
 
 let request_is_retained (state : t) request =
@@ -284,17 +280,12 @@ let apply_feed (state : t) ~generation feed =
     let projected = feed_slots ~today:state.today feed in
     (match before_day with
      | None when state.slots = [] ->
-       let slots =
-         match projected with
-         | [] -> []
-         | _ -> projected @ [ Bottom_clearance ]
-       in
        { state with
-         slots
+         slots = projected
        ; first_retained_index = 0
-       ; total_count = List.length slots
+       ; total_count = List.length projected
        ; visible_first = 0
-       ; visible_last_exclusive = min maximum_supplied_rows (List.length slots)
+       ; visible_last_exclusive = min maximum_supplied_rows (List.length projected)
        ; visible_demand = None
        ; pending = None
        ; expanded_ids = []
@@ -337,8 +328,7 @@ let apply_feed (state : t) ~generation feed =
                   | Day_continuation _
                   | Children_loading _
                   | Children_more _
-                  | Feed_continuation _
-                  | Bottom_clearance -> false)
+                  | Feed_continuation _ -> false)
                 projected)
            state.expanded_ids
        in
@@ -351,7 +341,6 @@ let apply_feed (state : t) ~generation feed =
              | slot -> [ slot ])
            projected
        in
-       let slots = if slots = [] then [] else slots @ [ Bottom_clearance ] in
        let anchor_key =
          let offset = state.visible_first - state.first_retained_index in
          List.nth_opt old_slots offset |> Option.map slot_key
@@ -616,7 +605,7 @@ let prepend_timeline_entry (state : t) entry =
       ->
       ( List.rev_append reversed (Top_level entry :: slot :: tail)
       , state.first_retained_index + List.length reversed )
-    | ((Feed_continuation _ | Bottom_clearance) as slot) :: tail ->
+    | (Feed_continuation _ as slot) :: tail ->
       ( List.rev_append reversed (Top_level entry :: slot :: tail)
       , state.first_retained_index + List.length reversed )
     | slot :: tail -> insert (slot :: reversed) tail
@@ -632,7 +621,7 @@ let prepend_timeline_entry (state : t) entry =
 
 let remove_orphan_day_headings ~today slots =
   let rec has_day_content day = function
-    | [] | Day_heading _ :: _ | Feed_continuation _ :: _ | Bottom_clearance :: _ -> false
+    | [] | Day_heading _ :: _ | Feed_continuation _ :: _ -> false
     | Top_level entry :: _ -> Journal_model.journal_day entry.block = day
     | Day_continuation continuation :: _ -> continuation.day = day
     | Child_preview _ :: tail | Children_loading _ :: tail | Children_more _ :: tail ->
@@ -685,8 +674,7 @@ let stage_delete (state : t) ~block_id =
           | Day_continuation _
           | Children_loading _
           | Children_more _
-          | Feed_continuation _
-          | Bottom_clearance -> None)
+          | Feed_continuation _ -> None)
         slots
     in
     Some
@@ -779,8 +767,7 @@ let is_expanded (state : t) ~block_id =
   List.exists (String.equal block_id) state.expanded_ids
 ;;
 
-let extent_geometry (state : t) ~profile ~safe_bottom =
-  let safe_bottom = max 0. safe_bottom in
+let extent_geometry (state : t) ~profile =
   let default_extent = Journal_visual_tokens.block_extent ~profile ~visible_lines:1 in
   let extent = function
     | Top_level entry ->
@@ -799,37 +786,16 @@ let extent_geometry (state : t) ~profile ~safe_bottom =
              (Journal_row.Item.of_block block)
              ~expanded:true)
     | Children_loading _ ->
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom
-        Journal_visual_tokens.Children_loading
+      Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Children_loading
     | Children_more _ ->
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom
-        Journal_visual_tokens.Children_more
+      Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Children_more
     | Day_heading _ ->
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom
-        Journal_visual_tokens.Day_heading
+      Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Day_heading
     | Day_continuation _ ->
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom
-        Journal_visual_tokens.Day_continuation
+      Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Day_continuation
     | Feed_continuation _ ->
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom
-        Journal_visual_tokens.Feed_continuation
-    | Bottom_clearance ->
-      Journal_visual_tokens.fixed_extent
-        ~profile
-        ~safe_bottom
-        Journal_visual_tokens.Bottom_clearance
+      Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Feed_continuation
   in
-  let final_clearance_extent = extent Bottom_clearance in
   let overrides =
     List.mapi
       (fun offset slot ->
@@ -841,5 +807,5 @@ let extent_geometry (state : t) ~profile ~safe_bottom =
       state.slots
     |> List.filter_map Fun.id
   in
-  { default_extent; overrides; final_clearance_extent }
+  { default_extent; overrides }
 ;;

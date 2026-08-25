@@ -1,57 +1,10 @@
-type t =
-  { tx_ops : Datascript.tx_op list
-  ; tx_meta : Datascript.tx_meta
-  ; changed_uuids : Graph_types.Uuid.t list
-  ; status : Protocol.mutation_status
-  }
-
-type error =
-  | Unsupported_semantics of string
-  | Invalid_selection of string
-  | Invalid_order of string
-  | Conflict of string
-  | Built_in_protected
-
-let values db entity attr =
-  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.v)
-;;
-
-let one db entity attr =
-  match values db entity attr with
-  | [ value ] -> Some value
-  | [] | _ :: _ :: _ -> None
-;;
-
-let string_value db entity attr =
-  match one db entity attr with
-  | Some (Datascript.String value) -> Some value
-  | Some _ | None -> None
-;;
+include Planner_contract
+open Graph_read
 
 let int_value db entity attr =
   match one db entity attr with
   | Some (Datascript.Int value) -> Some value
   | Some _ | None -> None
-;;
-
-let reference_value db entity attr =
-  match one db entity attr with
-  | Some (Datascript.Ref value) -> Some value
-  | Some _ | None -> None
-;;
-
-let has_true db entity attr = one db entity attr = Some (Datascript.Bool true)
-
-let entities_by_uuid db uuid =
-  let text = Graph_types.Uuid.to_string uuid in
-  let find value =
-    Datascript.datoms db Datascript.Avet ~a:"block/uuid" ~v:value ()
-    |> List.of_seq
-    |> List.map (fun datom -> datom.Datascript.e)
-  in
-  find (Datascript.Uuid text) @ find (String text) |> List.sort_uniq Int.compare
 ;;
 
 let entities_by_name db name =
@@ -72,12 +25,6 @@ let entity_by_ident db ident =
   with
   | [ entity ] -> Some entity
   | [] | _ :: _ :: _ -> None
-;;
-
-let uuid_of_entity db entity =
-  match one db entity "block/uuid" with
-  | Some (Datascript.Uuid value | String value) -> Graph_types.Uuid.of_string value
-  | Some _ | None -> Error "entity has no UUID"
 ;;
 
 let require_page db uuid =
@@ -316,10 +263,7 @@ let rename_page ~now_ms db ~page ~title ~context =
         | _ :: _ -> Error (Conflict "page title already exists")
         | [] ->
           (match Save_block.plan ~now_ms db ~block:page ~title ~context with
-           | Error Save_block.Built_in_protected -> Error Built_in_protected
-           | Error (Unsupported_semantics message) ->
-             Error (Unsupported_semantics message)
-           | Error (Invalid_selection message) -> Error (Invalid_selection message)
+           | Error _ as error -> error
            | Ok saved ->
              let old_title =
                Option.value (string_value db entity "block/title") ~default:""
@@ -368,13 +312,7 @@ let rename_page ~now_ms db ~page ~title ~context =
                })))
 ;;
 
-let children db parent =
-  Datascript.datoms db Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref parent) ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.e)
-  |> List.filter (fun entity -> entity <> parent)
-  |> List.sort_uniq Int.compare
-;;
+let page_children db parent = children db parent |> List.sort_uniq Int.compare
 
 let blocks_on_page db page =
   Datascript.datoms db Datascript.Avet ~a:"block/page" ~v:(Datascript.Ref page) ()
@@ -383,7 +321,7 @@ let blocks_on_page db page =
   |> List.sort_uniq Int.compare
 ;;
 
-let rec subtree db entity = entity :: List.concat_map (subtree db) (children db entity)
+let rec subtree db entity = entity :: List.concat_map (subtree db) (page_children db entity)
 
 let page_tree db page =
   List.sort_uniq Int.compare (subtree db page @ blocks_on_page db page)
@@ -406,7 +344,7 @@ let recycle_page db =
 ;;
 
 let next_recycle_order db recycle =
-  children db recycle
+  page_children db recycle
   |> List.filter_map (fun child -> string_value db child "block/order")
   |> List.sort String.compare
   |> List.rev
@@ -504,7 +442,7 @@ let is_recycled db entity =
 ;;
 
 let sibling_order_collision db ~entity ~parent order =
-  children db parent
+  page_children db parent
   |> List.exists (fun sibling ->
     sibling <> entity && string_value db sibling "block/order" = Some order)
 ;;

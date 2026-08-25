@@ -94,12 +94,11 @@ end
 
 let test_id value widget = Ui.Widget.with_test_id (Ui.Test_id.string value) widget
 
-let text_style (token : Tokens.text_token) color =
+let text_style (token : Tokens.text_token) =
   Ui.Style.Text_style.create
     ~font_size:token.font_size
     ~font_weight:token.weight
     ~line_height:(token.line_height /. token.font_size)
-    ~color
     ()
 ;;
 
@@ -113,24 +112,9 @@ let minimum_target child =
     child
 ;;
 
-let pressable
-      ~tokens
-      ~reduced_motion
-      ~control_id
-      ~label
-      ~hint
-      ~value
-      ~sort_key
-      ~on_press
-      child
-  =
+let pressable ~reduced_motion ~control_id ~label ~hint ~value ~sort_key ~on_press child =
   let motion = Tokens.motion ~reduced_motion in
-  Ui.Widget.pressable
-    ~overlay_color:(Tokens.interaction tokens).pressed
-    ~release_delay_ms:motion.press_release_ms
-    ~on_press
-    ~child
-    ()
+  Ui.Widget.pressable ~release_delay_ms:motion.press_release_ms ~on_press ~child ()
   |> test_id control_id
   |> Ui.Widget.semantics
        ~on_action:on_press
@@ -147,16 +131,17 @@ let pressable
             ())
 ;;
 
-let disclosure_indicator ~tokens ~rtl ~expanded item =
+let disclosure_indicator ~rtl ~expanded item =
   if item.Item.child_count = 0
   then None
   else
-    Ui.Widget.icon
-      ~font_family:"MaterialIcons"
+    Material_icon_catalog.create
       ~size:Tokens.row_geometry.disclosure_visual
-      ~color:(Tokens.palette tokens).text_secondary
-      ~code_point:(if expanded then 0xe246 else if rtl then 0xe15e else 0xe15f)
-      ()
+      (if expanded
+       then Material_icon_catalog.Expand_more
+       else if rtl
+       then Material_icon_catalog.Chevron_left
+       else Material_icon_catalog.Chevron_right)
     |> test_id ("journal-row-disclosure-icon:" ^ Item.id item)
     |> Ui.Widget.center
     |> Ui.Widget.sized_box ~width:Tokens.row_geometry.disclosure_visual
@@ -164,15 +149,14 @@ let disclosure_indicator ~tokens ~rtl ~expanded item =
     |> Option.some
 ;;
 
-let text_line ~tokens ~item ~kind ~index source =
-  let token, color, prefix =
+let text_line ~item ~kind ~index source =
+  let token, prefix =
     match kind with
-    | `Source -> Tokens.typography.entry, (Tokens.palette tokens).text_primary, "source"
-    | `Supporting ->
-      Tokens.typography.supporting, (Tokens.palette tokens).text_secondary, "supporting"
+    | `Source -> Tokens.typography.entry, "source"
+    | `Supporting -> Tokens.typography.supporting, "supporting"
   in
   Ui.Widget.text
-    ~style:(text_style token color)
+    ~style:(text_style token)
     ~max_lines:1
     ~overflow:Ui.Style.Text_overflow.Ellipsis
     ~text_align:Ui.Style.Text_align.Start
@@ -180,14 +164,13 @@ let text_line ~tokens ~item ~kind ~index source =
   |> test_id (Printf.sprintf "journal-row-%s:%s:%d" prefix (Item.id item) index)
 ;;
 
-let time_slot tokens profile item ~show_timestamp =
+let time_slot profile item ~show_timestamp =
   let child =
     match item.Item.time, show_timestamp with
     | None, _ | Some _, false -> Ui.Widget.empty ()
     | Some time, true ->
       Ui.Widget.text
-        ~style:
-          (text_style Tokens.typography.timestamp (Tokens.palette tokens).text_timestamp)
+        ~style:(text_style Tokens.typography.timestamp)
         ~max_lines:1
         ~text_align:Ui.Style.Text_align.End
         time
@@ -239,13 +222,11 @@ let view
   let row_extent = Tokens.block_extent ~profile ~visible_lines in
   let source =
     let source_widgets =
-      List.mapi
-        (fun index line -> text_line ~tokens ~item ~kind:`Source ~index line)
-        source_lines
+      List.mapi (fun index line -> text_line ~item ~kind:`Source ~index line) source_lines
     in
     let supporting_widgets =
       List.mapi
-        (fun index line -> text_line ~tokens ~item ~kind:`Supporting ~index line)
+        (fun index line -> text_line ~item ~kind:`Supporting ~index line)
         supporting_lines
     in
     List.map Ui.Widget.Flex.flexible (source_widgets @ supporting_widgets)
@@ -261,8 +242,8 @@ let view
               ())
     |> test_id ("journal-row-source-gap:" ^ Item.id item)
   in
-  let disclosure = disclosure_indicator ~tokens ~rtl ~expanded item in
-  let time = time_slot tokens profile item ~show_timestamp in
+  let disclosure = disclosure_indicator ~rtl ~expanded item in
+  let time = time_slot profile item ~show_timestamp in
   let fixed_options widgets = List.filter_map (Option.map Ui.Widget.Flex.fixed) widgets in
   let inline =
     Ui.Widget.Flex.row
@@ -314,7 +295,6 @@ let view
     then
       content
       |> pressable
-           ~tokens
            ~reduced_motion
            ~control_id:("journal-row-toggle-children:" ^ Item.id item)
            ~label:(Item.semantic_label_for_state item ~expanded)
@@ -352,13 +332,11 @@ let view
   if show_divider
   then (
     let divider =
-      Ui.Widget.empty ()
-      |> Ui.Widget.decorated_box
-           ~decoration:
-             (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
-      |> Ui.Widget.sized_box
-           ~height:(Tokens.physical_divider_thickness ~device_pixel_ratio)
+      let thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
+      Ui.Material.divider ~thickness ()
       |> test_id ("journal-row-divider:" ^ Item.id item)
+      |> Ui.Widget.sized_box ~height:thickness
+      |> test_id ("journal-row-divider-extent:" ^ Item.id item)
       |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:0. ~right:0. ())
       |> test_id ("journal-row-divider-padding:" ^ Item.id item)
     in
@@ -367,9 +345,6 @@ let view
   Ui.Widget.Stack.create (List.rev !children)
   |> Ui.Widget.sized_box ~height:row_extent
   |> test_id ("journal-row-extent:" ^ Item.id item)
-  |> Ui.Widget.decorated_box
-       ~decoration:
-         (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).background ())
   |> Ui.Widget.environment_boundary
   |> test_id ("journal-row:" ^ Item.id item)
 ;;

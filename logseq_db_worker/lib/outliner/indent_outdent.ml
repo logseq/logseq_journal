@@ -1,17 +1,5 @@
-type t =
-  { tx_ops : Datascript.tx_op list
-  ; tx_meta : Datascript.tx_meta
-  ; changed_uuids : Graph_types.Uuid.t list
-  ; status : Protocol.mutation_status
-  }
-
-type error =
-  | Unsupported_semantics of string
-  | Invalid_selection of string
-  | Invalid_tree of string
-  | Invalid_order of string
-  | Invalid_position of string
-  | Built_in_protected
+include Planner_contract
+open Graph_read
 
 type selection =
   { roots : int list
@@ -32,48 +20,6 @@ module Uuid_set = Set.Make (struct
 
 let ( let* ) result f = Result.bind result f
 
-let values db entity attr =
-  Datascript.datoms db Datascript.Eavt ~e:entity ~a:attr ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.v)
-;;
-
-let one db entity attr =
-  match values db entity attr with
-  | [ value ] -> Some value
-  | [] | _ :: _ :: _ -> None
-;;
-
-let string_value db entity attr =
-  match one db entity attr with
-  | Some (Datascript.String value) -> Some value
-  | Some _ | None -> None
-;;
-
-let reference_value db entity attr =
-  match one db entity attr with
-  | Some (Datascript.Ref value) -> Some value
-  | Some _ | None -> None
-;;
-
-let has_true db entity attr =
-  match one db entity attr with
-  | Some (Datascript.Bool true) -> true
-  | Some _ | None -> false
-;;
-
-let is_page db entity = Option.is_some (string_value db entity "block/name")
-
-let entities_by_uuid db uuid =
-  let text = Graph_types.Uuid.to_string uuid in
-  let find value =
-    Datascript.datoms db Datascript.Avet ~a:"block/uuid" ~v:value ()
-    |> List.of_seq
-    |> List.map (fun datom -> datom.Datascript.e)
-  in
-  find (Datascript.Uuid text) @ find (String text) |> List.sort_uniq Int.compare
-;;
-
 let require_entity db uuid =
   match entities_by_uuid db uuid with
   | [ entity ] -> Ok entity
@@ -81,21 +27,8 @@ let require_entity db uuid =
   | _ -> Error (Invalid_selection "An indent/outdent block UUID is ambiguous.")
 ;;
 
-let uuid_of_entity db entity =
-  match one db entity "block/uuid" with
-  | Some (Datascript.Uuid value | String value) -> Graph_types.Uuid.of_string value
-  | Some _ | None -> Error "entity has no UUID"
-;;
-
 let page_for db entity =
   if is_page db entity then Some entity else reference_value db entity "block/page"
-;;
-
-let children db parent =
-  Datascript.datoms db Datascript.Avet ~a:"block/parent" ~v:(Datascript.Ref parent) ()
-  |> List.of_seq
-  |> List.map (fun datom -> datom.Datascript.e)
-  |> List.filter (fun entity -> entity <> parent)
 ;;
 
 let ordered_children db parent =
@@ -196,15 +129,6 @@ let resolve_selection db root_uuids =
          Error (Invalid_tree "An indent/outdent root has no structural parent or page.")))
 ;;
 
-let map_move_error = function
-  | Move_blocks.Unsupported_semantics message -> Error (Unsupported_semantics message)
-  | Invalid_selection message -> Error (Invalid_selection message)
-  | Invalid_tree message -> Error (Invalid_tree message)
-  | Invalid_order message -> Error (Invalid_order message)
-  | Invalid_position message -> Error (Invalid_position message)
-  | Built_in_protected -> Error Built_in_protected
-;;
-
 let roots_as_uuids db roots =
   let rec loop result = function
     | [] -> Ok (List.rev result)
@@ -259,7 +183,7 @@ let indent ~now_ms db selection ~context =
     match
       Move_blocks.plan ~now_ms db ~roots ~position:(Last_child left_uuid) ~context
     with
-    | Error error -> map_move_error error
+    | Error _ as error -> error
     | Ok move_plan ->
       let expand = had_children && has_true db left "block/collapsed?" in
       let next_tx = (Datascript.serializable db).serializable_max_tx + 1 in
@@ -295,7 +219,7 @@ let direct_outdent ~now_ms db selection ~context =
       | Error _ -> Error (Invalid_position "The outdent parent has no UUID.")
     in
     match Move_blocks.plan ~now_ms db ~roots ~position:(After parent_uuid) ~context with
-    | Error error -> map_move_error error
+    | Error _ as error -> error
     | Ok move_plan ->
       let right_siblings =
         List.filter_map

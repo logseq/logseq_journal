@@ -2,31 +2,18 @@ module Tokens = Journal_visual_tokens
 module Timeline = Journal_timeline_state
 module Ui = Bonsai_flutter_ui
 
-type content =
-  | Empty of Ui.Widget.t
-  | Populated of Ui.Widget.Viewport.Vertical.t
-
-let text_style token color =
+let text_style token =
   Ui.Style.Text_style.create
     ~font_size:token.Tokens.font_size
     ~font_weight:token.weight
     ~line_height:(token.line_height /. token.font_size)
-    ~color
     ()
 ;;
 
-let day_heading
-      ~tokens
-      ~profile
-      ~rtl
-      ~sort_key
-      ~label
-      (page : Journal_graph_projection.page)
-  =
+let day_heading ~profile ~rtl ~sort_key ~label (page : Journal_graph_projection.page) =
   Ui.Widget.text
     ~key:(Ui.Key.string ("journal-day-heading:" ^ string_of_int page.day))
-    ~style:
-      (text_style Tokens.typography.supporting (Tokens.palette tokens).text_secondary)
+    ~style:(text_style Tokens.typography.supporting)
     ~max_lines:1
     ~overflow:Ui.Style.Text_overflow.Ellipsis
     label
@@ -49,11 +36,10 @@ let day_heading
        (Ui.Test_id.string ("journal-day-heading:" ^ string_of_int page.day))
 ;;
 
-let continuation ~tokens ~key ~label =
+let continuation ~key ~label =
   Ui.Widget.text
     ~key:(Ui.Key.string key)
-    ~style:
-      (text_style Tokens.typography.supporting (Tokens.palette tokens).text_secondary)
+    ~style:(text_style Tokens.typography.supporting)
     ~max_lines:1
     label
   |> Ui.Widget.center
@@ -68,32 +54,88 @@ let for_block handler block_id =
     | _ -> ())
 ;;
 
-let for_swipe handler block_id =
+let delete_action_id = 1
+
+let for_slidable handler block_id =
   Ui.Event.Handler.create ~name:("journal-delete:" ^ block_id) (fun payload ->
-    match Ui.Native_widget.Swipe_action.direction_of_payload payload with
-    | Some Ui.Native_widget.Swipe_action.End_to_start ->
+    match Ui.Native_widget.Slidable.event_of_payload payload with
+    | Some (Ui.Native_widget.Slidable.Action_pressed action_id)
+      when action_id = delete_action_id ->
       Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text block_id)
-    | Some Start_to_end | None -> ())
+    | Some
+        ( Ui.Native_widget.Slidable.Action_pressed _
+        | Ui.Native_widget.Slidable.Dismissed _ )
+    | None -> ())
 ;;
 
-let delete_feedback ~tokens block =
-  Ui.Widget.icon
-    ~font_family:"MaterialIcons"
-    ~size:24.
-    ~color:(Tokens.palette tokens).on_destructive
-    ~code_point:0xe1b9
-    ()
+let delete_feedback ~foreground block =
+  Material_icon_catalog.create ~size:16. ~color:foreground Material_icon_catalog.Delete
   |> Ui.Widget.with_test_id
        (Ui.Test_id.string ("journal-row-delete-icon:" ^ Journal_model.id block))
 ;;
 
-let delete_action ~tokens block =
-  Ui.Native_widget.Swipe_action.action
-    ~label:"Delete block and all descendants"
-    ~background:(Tokens.palette tokens).destructive
+let delete_action_divider ~device_pixel_ratio ~edge block =
+  let thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
+  Ui.Material.divider ~thickness ()
+  |> Ui.Widget.with_test_id
+       (Ui.Test_id.string
+          ("journal-row-delete-" ^ edge ^ "-divider:" ^ Journal_model.id block))
+  |> Ui.Widget.sized_box ~height:thickness
+;;
+
+let delete_action ~tokens ~device_pixel_ratio block =
+  let colors = Tokens.destructive_swipe_action tokens in
+  let label =
+    Ui.Widget.text
+      ~style:(text_style Tokens.typography.supporting)
+      ~max_lines:1
+      ~text_align:Ui.Style.Text_align.Center
+      "Delete"
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string ("journal-row-delete-label:" ^ Journal_model.id block))
+  in
+  let feedback =
+    Ui.Widget.column [ delete_feedback ~foreground:colors.foreground block; label ]
+    |> Ui.Widget.center
+  in
+  let child =
+    Ui.Widget.Stack.create
+      [ Ui.Widget.Stack.child feedback
+      ; Ui.Widget.Stack.positioned
+          ~left:0.
+          ~top:0.
+          ~right:0.
+          (delete_action_divider ~device_pixel_ratio ~edge:"top" block)
+      ; Ui.Widget.Stack.positioned
+          ~left:0.
+          ~right:0.
+          ~bottom:0.
+          (delete_action_divider ~device_pixel_ratio ~edge:"bottom" block)
+      ]
+    |> Ui.Widget.semantics
+         ~properties:
+           (Ui.Semantics.create
+              ~label:"Delete block and all descendants"
+              ~role:Ui.Semantics.Role.Button
+              ())
+  in
+  Ui.Native_widget.Slidable.action
+    ~id:delete_action_id
+    ~foreground:colors.foreground
+    ~background:colors.background
     ~border_radius:0.
-    ~disposition:Ui.Native_widget.Swipe_action.Dismiss
-    ~icon:(delete_feedback ~tokens block)
+    ~child
+    ()
+;;
+
+let delete_action_pane ~tokens ~device_pixel_ratio block =
+  Ui.Native_widget.Slidable.action_pane
+    ~extent_ratio:0.25
+    ~motion:Ui.Native_widget.Slidable.Behind
+    ~drag_dismissible:false
+    ~open_threshold:0.125
+    ~close_threshold:0.125
+    ~actions:[ delete_action ~tokens ~device_pixel_ratio block ]
     ()
 ;;
 
@@ -120,28 +162,7 @@ let should_show_timestamp ~today ~previous_slot = function
   | Timeline.Day_continuation _
   | Timeline.Children_loading _
   | Timeline.Children_more _
-  | Timeline.Feed_continuation _
-  | Timeline.Bottom_clearance -> false
-;;
-
-let group_separator ~tokens ~device_pixel_ratio ~owner_id ~extent content =
-  let thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
-  let divider =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
-    |> Ui.Widget.sized_box ~height:thickness
-    |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-group-divider:" ^ owner_id))
-    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:0. ~right:0. ())
-    |> Ui.Widget.with_test_id
-         (Ui.Test_id.string ("journal-group-divider-padding:" ^ owner_id))
-  in
-  Ui.Widget.Stack.create
-    [ Ui.Widget.Stack.child content
-    ; Ui.Widget.Stack.positioned ~left:0. ~right:0. ~bottom:0. divider
-    ]
-  |> Ui.Widget.sized_box ~height:extent
+  | Timeline.Feed_continuation _ -> false
 ;;
 
 let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
@@ -163,22 +184,19 @@ let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
   let visible_lines = Int.max 1 (List.length lines) in
   let extent = Tokens.block_extent ~profile ~visible_lines in
   let connector =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create ~background:(Tokens.palette tokens).divider ())
-    |> Ui.Widget.sized_box ~width:1. ~height:extent
+    Ui.Material.divider ~thickness:1. ()
+    |> Ui.Widget.sized_box ~width:extent ~height:1.
+    |> Ui.Widget.transform
+         ~transform:
+           (Ui.Style.Transform.matrix4
+              [| 0.; 1.; 0.; 0.; -1.; 0.; 0.; 0.; 0.; 0.; 1.; 0.; 1.; 0.; 0.; 1. |])
     |> Ui.Widget.with_test_id
          (Ui.Test_id.string ("journal-child-connector:" ^ Journal_model.id block))
   in
   let bullet =
-    Ui.Widget.empty ()
-    |> Ui.Widget.decorated_box
-         ~decoration:
-           (Ui.Style.Decoration.create
-              ~background:(Tokens.palette tokens).divider
-              ~border_radius:(geometry.bullet_diameter /. 2.)
-              ())
+    Material_icon_catalog.create
+      ~size:geometry.bullet_diameter
+      Material_icon_catalog.Circle
     |> Ui.Widget.sized_box
          ~width:geometry.bullet_diameter
          ~height:geometry.bullet_diameter
@@ -189,10 +207,7 @@ let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
     List.mapi
       (fun index line ->
          Ui.Widget.text
-           ~style:
-             (text_style
-                Tokens.typography.supporting
-                (Tokens.palette tokens).text_primary)
+           ~style:(text_style Tokens.typography.supporting)
            ~max_lines:1
            ~overflow:Ui.Style.Text_overflow.Ellipsis
            ~text_align:Ui.Style.Text_align.Start
@@ -288,27 +303,6 @@ let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
        (Ui.Test_id.string ("journal-child-preview:" ^ Journal_model.id block))
 ;;
 
-let matching_child_owner parent_id = function
-  | Timeline.Child_preview candidate -> String.equal candidate.parent_id parent_id
-  | Timeline.Children_loading candidate -> String.equal candidate.parent_id parent_id
-  | Timeline.Children_more candidate -> String.equal candidate.parent_id parent_id
-  | _ -> false
-;;
-
-let ends_group ~known_end slot next =
-  match slot with
-  | Timeline.Top_level entry ->
-    (match next with
-     | Some next -> not (matching_child_owner (Journal_model.id entry.block) next)
-     | None -> known_end)
-  | Timeline.Child_preview preview ->
-    (match next with
-     | Some next -> not (matching_child_owner preview.parent_id next)
-     | None -> known_end)
-  | Timeline.Children_loading _ | Timeline.Children_more _ -> true
-  | Day_heading _ | Day_continuation _ | Feed_continuation _ | Bottom_clearance -> false
-;;
-
 let render_slot
       ~tokens
       ~profile
@@ -322,10 +316,9 @@ let render_slot
       ~delete_enabled
       ~on_delete
       ~sort_base
-      ~ends_group
   = function
   | Timeline.Day_heading page ->
-    day_heading ~tokens ~profile ~rtl ~sort_key:sort_base ~label:(day_label page.day) page
+    day_heading ~profile ~rtl ~sort_key:sort_base ~label:(day_label page.day) page
   | Timeline.Top_level entry ->
     let block = entry.block in
     let id = Journal_model.id block in
@@ -346,14 +339,25 @@ let render_slot
     in
     let row =
       if delete_enabled
-      then
-        Ui.Native_widget.Swipe_action.create_with_handler
-          ~key:(Ui.Key.string ("journal-row-swipe:" ^ id))
-          ~end_action:(delete_action ~tokens block)
-          ~content:row
-          ~on_commit:(for_swipe on_delete id)
+      then (
+        let surface =
+          Ui.Native_widget.Morphing_surface.create
+            ~key:(Ui.Key.string ("journal-row-slidable-surface:" ^ id))
+            ~expanded:false
+            ~compact_content:row
+            ~expanded_content:(Ui.Widget.empty ())
+            ()
+          |> Ui.Widget.with_test_id
+               (Ui.Test_id.string ("journal-row-slidable-surface:" ^ id))
+        in
+        Ui.Native_widget.Slidable.create_with_handler
+          ~key:(Ui.Key.string ("journal-row-slidable:" ^ id))
+          ~group_tag:"journal-timeline"
+          ~end_action_pane:(delete_action_pane ~tokens ~device_pixel_ratio block)
+          ~content:surface
+          ~on_event:(for_slidable on_delete id)
           ()
-        |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-swipe:" ^ id))
+        |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-slidable:" ^ id)))
       else row
     in
     let extent =
@@ -371,58 +375,29 @@ let render_slot
          ~on_focus_changed:
            (Ui.Event.Handler.create ~name:("journal-row-focus-change:" ^ id) (fun _ -> ()))
     |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-focus:" ^ id))
-    |> fun row ->
-    if ends_group
-    then group_separator ~tokens ~device_pixel_ratio ~owner_id:id ~extent row
-    else row
   | Timeline.Child_preview { block; _ } ->
-    let row = child_preview ~tokens ~profile ~rtl ~block ~sort_key:sort_base in
-    let extent =
-      Tokens.block_extent
-        ~profile
-        ~visible_lines:
-          (Journal_row.Item.visible_line_count
-             (Journal_row.Item.of_block block)
-             ~expanded:true)
-    in
-    if ends_group
-    then
-      group_separator
-        ~tokens
-        ~device_pixel_ratio
-        ~owner_id:(Journal_model.id block)
-        ~extent
-        row
-    else row
+    child_preview ~tokens ~profile ~rtl ~block ~sort_key:sort_base
   | Timeline.Day_continuation { day; _ } ->
     continuation
-      ~tokens
       ~key:("journal-day-continuation:" ^ string_of_int day)
       ~label:"Loading more journal entries"
     |> Ui.Widget.sized_box ~height:profile.continuation_extent
   | Timeline.Children_loading { parent_id; _ } ->
     continuation
-      ~tokens
       ~key:("journal-children-loading:" ^ parent_id)
       ~label:"Loading direct child blocks"
-    |> Ui.Widget.sized_box
-         ~height:(Tokens.fixed_extent ~profile ~safe_bottom:0. Tokens.Children_loading)
+    |> Ui.Widget.sized_box ~height:(Tokens.fixed_extent ~profile Tokens.Children_loading)
   | Timeline.Children_more { parent_id } ->
-    continuation ~tokens ~key:("journal-children-more:" ^ parent_id) ~label:"More"
+    continuation ~key:("journal-children-more:" ^ parent_id) ~label:"More"
     |> Ui.Widget.semantics
          ~properties:
            (Ui.Semantics.create ~label:"More direct child blocks are not shown" ())
-    |> Ui.Widget.sized_box
-         ~height:(Tokens.fixed_extent ~profile ~safe_bottom:0. Tokens.Children_more)
+    |> Ui.Widget.sized_box ~height:(Tokens.fixed_extent ~profile Tokens.Children_more)
   | Timeline.Feed_continuation { before_day } ->
     continuation
-      ~tokens
       ~key:("journal-feed-continuation:" ^ string_of_int before_day)
       ~label:"Loading older journal days"
     |> Ui.Widget.sized_box ~height:profile.continuation_extent
-  | Timeline.Bottom_clearance ->
-    Ui.Widget.empty ~key:(Ui.Key.string "journal-bottom-clearance") ()
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-bottom-clearance")
 ;;
 
 let transition ~reduced_motion:_ =
@@ -433,38 +408,30 @@ let transition ~reduced_motion:_ =
     ()
 ;;
 
-let empty_view tokens =
-  Ui.Widget.text
-    ~style:
-      (text_style Tokens.typography.supporting (Tokens.palette tokens).text_secondary)
-    "No journal entries yet"
+let empty_view () =
+  Ui.Widget.text ~style:(text_style Tokens.typography.supporting) "No journal entries yet"
   |> Ui.Widget.center
   |> Ui.Widget.semantics
        ~properties:
          (Ui.Semantics.create ~label:"No journal entries yet" ~live_region:true ())
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-timeline")
 ;;
 
-let loading_view tokens =
-  Ui.Widget.text
-    ~style:
-      (text_style Tokens.typography.supporting (Tokens.palette tokens).text_secondary)
-    "Loading journal"
+let loading_view () =
+  Ui.Widget.text ~style:(text_style Tokens.typography.supporting) "Loading journal"
   |> Ui.Widget.center
   |> Ui.Widget.semantics
        ~properties:(Ui.Semantics.create ~label:"Loading journal" ~live_region:true ())
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-timeline")
 ;;
 
 let view
       ~tokens
       ~profile
       ~device_pixel_ratio
+      ~end_padding
       ~rtl
       ~state
       ~day_label
       ~reduced_motion
-      ~safe_bottom
       ~on_visible_range
       ~on_toggle_children
       ~delete_enabled
@@ -472,9 +439,11 @@ let view
   =
   let window = Timeline.current_window state in
   match window.slots with
-  | [] -> Empty (empty_view tokens)
+  | [] ->
+    Ui.Widget.Sliver.fill (empty_view ())
+    |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
   | slots ->
-    let geometry = Timeline.extent_geometry state ~profile ~safe_bottom in
+    let geometry = Timeline.extent_geometry state ~profile in
     let today = Timeline.today state in
     let retained_offset = window.first_index - Timeline.first_retained_index state in
     let previous_slot =
@@ -483,7 +452,6 @@ let view
       else List.nth_opt (Timeline.retained_slots state) (retained_offset - 1)
     in
     let items =
-      let supplied_end = window.first_index + List.length slots in
       let rec render offset previous_slot = function
         | [] -> []
         | slot :: rest ->
@@ -502,13 +470,6 @@ let view
               ~delete_enabled
               ~on_delete
               ~sort_base
-              ~ends_group:
-                (ends_group
-                   ~known_end:(rest = [] && supplied_end >= window.total_count)
-                   slot
-                   (match rest with
-                    | [] -> None
-                    | next :: _ -> Some next))
               slot
             |> Ui.Widget.Keyed.create ~key:(Ui.Key.string (Timeline.slot_key slot))
           in
@@ -516,21 +477,19 @@ let view
       in
       render 0 previous_slot slots
     in
-    Ui.Widget.Scroll_view.vertical
-      ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
-      [ Ui.Widget.Sliver.varied_extent
-          ~key:(Ui.Key.string "journal-timeline-list")
-          ~total_count:window.total_count
-          ~first_index:window.first_index
-          ~default_item_extent:geometry.default_extent
-          ~extent_overrides:geometry.overrides
-          ~overscan:Timeline.overscan
-          ~transition:(transition ~reduced_motion)
-          ~items
-          ~on_visible_range
-          ()
-        |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
-      ]
+    Ui.Widget.Sliver.varied_extent
+      ~key:(Ui.Key.string "journal-timeline-list")
+      ~total_count:window.total_count
+      ~first_index:window.first_index
+      ~default_item_extent:geometry.default_extent
+      ~extent_overrides:geometry.overrides
+      ~overscan:Timeline.overscan
+      ~transition:(transition ~reduced_motion)
+      ~items
+      ~on_visible_range
       ()
-    |> fun list -> Populated list
+    |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline-list")
+    |> Ui.Widget.Sliver.padding
+         ~insets:(Ui.Layout.Edge_insets.only ~bottom:end_padding ())
+    |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
 ;;
