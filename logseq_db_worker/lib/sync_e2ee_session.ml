@@ -6,43 +6,41 @@ type phase =
   | Failed
 
 type platform =
-  { has_private_key : user_id:string -> bool
+  { has_private_key : managed_sync_origin:Uri.t -> user_id:string -> bool
   ; unlock_private_key :
-      user_id:string
+      managed_sync_origin:Uri.t
+      -> user_id:string
       -> password:string
       -> private_key_package:string
       -> (unit, string) result
-  ; decrypt_graph_key :
-      user_id:string -> encrypted_graph_key:string -> (string, string) result
   }
 
 type t =
   { platform : platform
+  ; managed_sync_origin : Uri.t
   ; user_id : string
   ; graph_id : Graph_types.Uuid.t
   ; graph_name : string
   ; mutable phase : phase
   ; mutable encrypted_graph_key : string option
   ; mutable private_key_package : string option
-  ; mutable graph_key : string option
   }
 
-let create ~platform ~user_id ~graph_id ~graph_name =
+let create ~platform ~managed_sync_origin ~user_id ~graph_id ~graph_name =
   { platform
+  ; managed_sync_origin
   ; user_id
   ; graph_id
   ; graph_name
   ; phase = Fetching_graph_key
   ; encrypted_graph_key = None
   ; private_key_package = None
-  ; graph_key = None
   }
 ;;
 
 let phase t = t.phase
 let graph_name t = t.graph_name
 let encrypted_graph_key t = t.encrypted_graph_key
-let graph_key t = t.graph_key
 
 let bounded_string field = function
   | `String value
@@ -91,27 +89,21 @@ let user_keys_response source =
   | Yojson.Json_error _ -> Error "E2EE response must be valid JSON"
 ;;
 
-let install_graph_key t encrypted_graph_key =
-  match t.platform.decrypt_graph_key ~user_id:t.user_id ~encrypted_graph_key with
-  | Ok graph_key when String.length graph_key = 32 ->
-    t.graph_key <- Some graph_key;
-    t.phase <- Ready;
-    Ok ()
-  | Ok _ -> Error "platform returned an invalid graph key"
-  | Error _ as error -> error
-;;
-
 let accept_graph_key_response t source =
   ignore t.graph_id;
   match graph_key_response source with
   | Error _ as error -> error
   | Ok encrypted_graph_key ->
-    t.encrypted_graph_key <- Some encrypted_graph_key;
-    if t.platform.has_private_key ~user_id:t.user_id
-    then install_graph_key t encrypted_graph_key
-    else (
-      t.phase <- Fetching_user_keys;
-      Ok ())
+    (match Sync_action.wrapped_graph_key_of_string encrypted_graph_key with
+     | None -> Error "E2EE graph-key response contains invalid wrapped ciphertext"
+     | Some _ ->
+       t.encrypted_graph_key <- Some encrypted_graph_key;
+       if
+         t.platform.has_private_key
+           ~managed_sync_origin:t.managed_sync_origin
+           ~user_id:t.user_id
+       then t.phase <- Ready else t.phase <- Fetching_user_keys;
+       Ok ())
 ;;
 
 let accept_user_keys_response t source =
@@ -139,16 +131,22 @@ let submit_password t password =
     match t.private_key_package, t.encrypted_graph_key with
     | Some private_key_package, Some encrypted_graph_key ->
       (match
-         t.platform.unlock_private_key ~user_id:t.user_id ~password ~private_key_package
+         t.platform.unlock_private_key
+           ~managed_sync_origin:t.managed_sync_origin
+           ~user_id:t.user_id
+           ~password
+           ~private_key_package
        with
        | Error _ as error -> error
-       | Ok () -> install_graph_key t encrypted_graph_key)
+       | Ok () ->
+         ignore encrypted_graph_key;
+         t.phase <- Ready;
+         Ok ())
     | Some _, None | None, Some _ | None, None -> Error "E2EE session is incomplete")
 ;;
 
 let clear t =
   t.encrypted_graph_key <- None;
   t.private_key_package <- None;
-  t.graph_key <- None;
   t.phase <- Failed
 ;;

@@ -274,7 +274,8 @@ let dependencies =
     ; cursor_authentication_key = Bytes.of_string "performance-cursor-key-32-bytes!"
     ; crypto = Worker.Sync_e2ee.unavailable_crypto
     ; unlock_graph_key =
-        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
+        (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+          Error "crypto unavailable")
     }
 ;;
 

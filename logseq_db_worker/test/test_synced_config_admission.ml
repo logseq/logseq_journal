@@ -21,9 +21,10 @@ let config () =
          { graph_id
          ; graph_name = "团队 / Notes"
          ; e2ee =
-             Some
-               { user_id = "cognito-user-1"
-               ; encrypted_graph_key = {|["~#'","wrapped-graph-key"]|}
+           Some
+             { managed_sync_origin = Uri.of_string "https://api.logseq.io"
+             ; user_id = "cognito-user-1"
+             ; encrypted_graph_key = {|["~#'","wrapped-graph-key"]|}
                }
          ; bootstrap =
              Some

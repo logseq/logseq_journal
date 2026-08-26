@@ -117,6 +117,7 @@ let component ~tokens ~profile ~rtl ~item ~expanded handlers graph =
       [ Ui.Widget.Flex.fixed
           (Journal_row.view
              ~tokens
+             ~typography:(Tokens.typography Tokens.Balanced)
              ~profile
              ~device_pixel_ratio:3.
              ~rtl
@@ -142,7 +143,12 @@ let create_handle
       item
   =
   let tokens = Tokens.resolve ~high_contrast in
-  let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
+  let profile =
+    Tokens.select_row_profile
+      ~preset:Tokens.Balanced
+      ~viewport_width:width
+      ~text_scale:scale
+  in
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
   let handle =
     Test.Handle.create
@@ -712,7 +718,7 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
          (Option.is_none
             (Test.Handle.find handle (Test.Query.visible_text "Child three")))
          "collapsed preview exceeded its four-line budget";
-       require_sized_height handle ("journal-row-extent:" ^ block_id) 96.);
+       require_sized_height handle ("journal-row-extent:" ^ block_id) 104.);
   let expanded, _profile = create_handle ~expanded:true item in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown expanded)
@@ -729,7 +735,7 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
          (Option.is_none
             (Test.Handle.find expanded (Test.Query.visible_text "Child one")))
          "expanded parent retained collapsed child summaries";
-       require_sized_height expanded ("journal-row-extent:" ^ block_id) 56.);
+       require_sized_height expanded ("journal-row-extent:" ^ block_id) 60.);
   let five_lines =
     Journal_row.Item.of_block (block ~source:"One\nTwo\nThree\nFour\nFive" ())
   in
@@ -747,7 +753,7 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
        require
          (Option.is_none (Test.Handle.find clamped (Test.Query.visible_text "Five")))
          "source preview exceeded four logical lines";
-       require_sized_height clamped ("journal-row-extent:" ^ block_id) 96.)
+       require_sized_height clamped ("journal-row-extent:" ^ block_id) 104.)
 ;;
 
 let test_line_count_drives_exact_scaled_row_extent () =
@@ -767,8 +773,8 @@ let test_line_count_drives_exact_scaled_row_extent () =
               require_sized_height handle ("journal-row-extent:" ^ block_id) extent))
       expected
   in
-  check ~scale:1. [ 44.; 56.; 76.; 96. ];
-  check ~scale:3.2 [ 80.; 144.; 208.; 272. ]
+  check ~scale:1. [ 44.; 60.; 82.; 104. ];
+  check ~scale:3.2 [ 87.; 157.; 228.; 298. ]
 ;;
 
 let header_component handlers _graph =
@@ -784,6 +790,7 @@ let header_component handlers _graph =
     Ui.Widget.Scroll_view.vertical
       ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
       [ Journal_header.sliver
+          ~typography:(Tokens.typography Tokens.Balanced)
           ~text_scale:1.
           ~top_inset:0.
           ~device_pixel_ratio:3.
@@ -921,8 +928,8 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
 let test_compact_and_adaptive_shapes_at_required_extremes () =
   require_row_shape 390. 1. "journal-row-compact" 44. 52.;
   require_row_shape 320. 1. "journal-row-adaptive" 44. 52.;
-  require_row_shape 744. 2. "journal-row-adaptive" 56. 104.;
-  require_row_shape 1_200. 3.2 "journal-row-adaptive" 80. 167.
+  require_row_shape 744. 2. "journal-row-adaptive" 60. 104.;
+  require_row_shape 1_200. 3.2 "journal-row-adaptive" 87. 167.
 ;;
 
 let test_rtl_row_geometry_uses_logical_edges () =
@@ -1022,18 +1029,23 @@ let delete_timeline_component ~delete_enabled handlers _graph =
     Ui.Widget.Scroll_view.vertical
       ~on_scroll:ignored
       [ Journal_timeline.view
-        ~tokens:(Tokens.resolve ~high_contrast:false)
-        ~profile:(Tokens.select_row_profile ~viewport_width:390. ~text_scale:1.)
-        ~device_pixel_ratio:3.
-        ~end_padding:0.
-        ~rtl:false
-        ~state
-        ~day_label:(fun _ -> "Today")
-        ~reduced_motion:false
-        ~delete_enabled
-        ~on_delete:ignored
-        ~on_visible_range:ignored
-        ~on_toggle_children:ignored
+          ~tokens:(Tokens.resolve ~high_contrast:false)
+          ~typography:(Tokens.typography Tokens.Balanced)
+          ~profile:
+            (Tokens.select_row_profile
+               ~preset:Tokens.Balanced
+               ~viewport_width:390.
+               ~text_scale:1.)
+          ~device_pixel_ratio:3.
+          ~end_padding:0.
+          ~rtl:false
+          ~state
+          ~day_label:(fun _ -> "Today")
+          ~reduced_motion:false
+          ~delete_enabled
+          ~on_delete:ignored
+          ~on_visible_range:ignored
+          ~on_toggle_children:ignored
       ]
       ()
     |> Ui.Widget.Viewport.Vertical.with_height ~height:600.)

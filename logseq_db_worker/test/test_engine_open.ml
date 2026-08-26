@@ -294,7 +294,8 @@ let dependencies =
     ; cursor_authentication_key = Bytes.make 32 'k'
     ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
     ; unlock_graph_key =
-        (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
+        (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+          Error "crypto unavailable")
     }
 ;;
 

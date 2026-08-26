@@ -5,6 +5,7 @@ module ID = Bonsai_flutter_spec.Id
 module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 
 let send_graph client request = Worker.send client (Service.Graph_request request)
+let send_manager client command = Worker.send client (Service.Manager_command command)
 let epoch = ref 2_000L
 
 let next_epoch () =
@@ -64,6 +65,30 @@ let completed_response events request_id =
   |> function
   | Some response -> response
   | None -> T.fail "missing completed Worker response"
+;;
+
+let completed_manager_snapshot events request_id =
+  List.find_map
+    (function
+      | Worker.Response
+          { request_id = actual
+          ; outcome = Completed (Service.Manager_snapshot snapshot)
+          ; _
+          }
+        when ID.Worker.Request_id.equal request_id actual -> Some snapshot
+      | Response _ | Push _ | Terminal _ -> None)
+    events
+  |> function
+  | Some snapshot -> snapshot
+  | None -> T.fail "missing completed manager response"
+;;
+
+let has_auth_push events =
+  List.exists
+    (function
+      | Worker.Push { payload = Service.Need_id_token _; _ } -> true
+      | Push _ | Response _ | Terminal _ -> false)
+    events
 ;;
 
 let await ?(timeout = 10.) description predicate =
@@ -693,11 +718,160 @@ let run_child mode =
     T.fail "%s child stopped on signal %d" mode signal
 ;;
 
+let test_encrypted_warm_start_reaches_timeline_without_network_lane () =
+  F.with_synced (fun fixture ->
+    let base_url = "https://api.logseq.io" in
+    let user_id = "user-1" in
+    let graph =
+      Logseq_db_worker.Sync_catalog.
+        { graph_id = fixture.graph_id
+        ; name = "Encrypted local graph"
+        ; schema = { major = 65; minor = 33; exact = true }
+        ; encrypted = true
+        }
+    in
+    let cache =
+      Logseq_db_worker.Sync_catalog.create_cache
+        ~user_id
+        ~base_url
+        ~graphs:[ graph ]
+        ~selected_graph:(Some fixture.graph_id)
+    in
+    (match
+       Logseq_db_worker.Sync_catalog_store.save
+         ~application_support_directory:fixture.sync_support
+         cache
+     with
+     | Ok () -> ()
+     | Error message -> T.fail "unable to save encrypted catalog fixture: %s" message);
+    let wrapped = {|["~#'","~bZ3JhcGgta2V5"]|} in
+    let local_loads = ref 0 in
+    let local_secrets =
+      Service.
+        { load_and_verify_wrapped_graph_key =
+            (fun ~managed_sync_origin ~user_id:actual_user ~graph_id ->
+              incr local_loads;
+              T.require
+                (Uri.to_string managed_sync_origin = base_url)
+                "wrapped-key lookup changed the managed sync origin";
+              T.require
+                (String.equal actual_user user_id)
+                "wrapped-key lookup changed the user scope";
+              T.require
+                (Logseq_db_worker.Graph_types.Uuid.equal graph_id fixture.graph_id)
+                "wrapped-key lookup changed the graph scope";
+              Ok wrapped)
+        ; verify_and_save_wrapped_graph_key =
+            (fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+              T.fail "offline cache hit attempted a wrapped-key save")
+        ; delete_wrapped_graph_key =
+            (fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Ok ())
+        ; delete_account_secrets =
+            (fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
+        }
+    in
+    let dependencies =
+      { F.dependencies with
+        unlock_graph_key =
+          (fun ~managed_sync_origin ~user_id:actual_user ~encrypted_graph_key ->
+            T.require
+              (Uri.to_string managed_sync_origin = base_url)
+              "Engine unwrap changed the managed sync origin";
+            T.require
+              (String.equal actual_user user_id && String.equal encrypted_graph_key wrapped)
+              "Engine unwrap changed the verified wrapped-key scope";
+            Logseq_db_worker.Sync_graph_key.of_string (String.make 32 'g'))
+      }
+    in
+    let config =
+      match
+        Logseq_db_worker.Config.create
+          ~application_support_directory:fixture.sync_support
+          ~target:(Managed_sync { base_url })
+          ~compatibility_profile:Logseq_65_33_or_newer
+          ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+          ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      with
+      | Ok config -> config
+      | Error message -> T.fail "invalid managed encrypted fixture: %s" message
+    in
+    let client =
+      match
+        Worker_runtime.start
+          ~runtime_epoch:(next_epoch ())
+          (Service.create_with_local_secrets ~local_secrets ~dependencies)
+          config
+      with
+      | Ok client -> client
+      | Error message -> T.fail "encrypted service failed to start: %s" message
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        if (Worker_runtime.For_testing.diagnostics ()).state = Attached
+        then Worker.Private.request_stop client)
+      (fun () ->
+         let restore_id =
+           send_manager
+             client
+             (Restore_local_account { user_id; managed_sync_origin = base_url })
+           |> accepted
+         in
+         let pre_timeline_events = drain_until_responses client 1 [] in
+         let snapshot = completed_manager_snapshot pre_timeline_events restore_id in
+         T.require (!local_loads = 1) "encrypted warm start skipped local key verification";
+         T.require
+           (snapshot.applied_server_t = Some 40)
+           "encrypted warm start did not open the retained mirror";
+         T.require
+           (not (has_auth_push pre_timeline_events))
+           "encrypted warm start entered the network lane before Timeline";
+         let feed_id =
+           send_manager
+             client
+             (Local_feed_ready
+                { account_generation = snapshot.account_generation
+                ; graph_generation = snapshot.graph_generation
+                ; presentation_generation = snapshot.presentation_generation
+                })
+           |> accepted
+         in
+         ignore (drain_until_responses client 1 [] |> fun events ->
+           completed_manager_snapshot events feed_id);
+         let timeline_id =
+           send_manager
+             client
+             (Timeline_presented
+                { account_generation = snapshot.account_generation
+                ; graph_generation = snapshot.graph_generation
+                ; presentation_generation = snapshot.presentation_generation
+                })
+           |> accepted
+         in
+         let post_timeline_events = drain_until_responses client 1 [] in
+         ignore (completed_manager_snapshot post_timeline_events timeline_id);
+         T.require
+           (has_auth_push post_timeline_events)
+           "Timeline presentation did not release network reconciliation";
+         Unix.sleepf 0.05;
+         let fence_id =
+           send_manager client (Backgrounded { lifecycle_generation = 1L }) |> accepted
+         in
+         ignore (drain_until_responses client 1 [] |> fun events ->
+           completed_manager_snapshot events fence_id);
+         Worker.Private.request_stop client;
+         await
+           ~timeout:2.
+           "encrypted worker shutdown"
+           (fun () -> (Worker_runtime.For_testing.diagnostics ()).state = Idle)))
+;;
+
 let () =
   if Array.length Sys.argv > 1 && String.equal Sys.argv.(1) "--fatal-child"
   then fatal_child ()
   else if Array.length Sys.argv > 1 && String.equal Sys.argv.(1) "--close-failure-child"
   then close_failure_child ()
+  else if Array.length Sys.argv > 1 && String.equal Sys.argv.(1) "--encrypted-warm-start"
+  then test_encrypted_warm_start_reaches_timeline_without_network_lane ()
   else (
     T.run
       "bonsai service"
@@ -725,6 +899,9 @@ let () =
       ; T.case
           "manager exclusively owns transport shutdown"
           test_transport_shutdown_has_one_state_machine_owner
+      ; T.case
+          "encrypted warm start reaches Timeline before network lane"
+          test_encrypted_warm_start_reaches_timeline_without_network_lane
       ];
     Worker_runtime.For_testing.final_shutdown ();
     run_child "--fatal-child";

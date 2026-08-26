@@ -25,6 +25,7 @@ type payload =
   | Feed_loaded of
       { request_generation : int64
       ; feed : Journal_graph_projection.feed
+      ; complete : bool
       }
   | Day_blocks_loaded of
       { request_generation : int64

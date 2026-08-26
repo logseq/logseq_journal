@@ -5,6 +5,8 @@ import Security
 enum JournalE2EECryptoError: Error {
   case invalidRequest
   case operationFailed
+  case wrappedGraphKeyUnavailable
+  case localPrivateKeyUnavailable
 }
 
 private struct JournalDERReader {
@@ -44,12 +46,16 @@ private struct JournalDERReader {
 }
 
 enum JournalE2EECrypto {
-  private static let keychainService = "com.logseq.journal.e2ee.private-key"
+  private static let privateKeyService = "com.logseq.journal.e2ee.private-key"
+  private static let wrappedGraphKeyService = "com.logseq.journal.e2ee.wrapped-graph-key"
   private static let passwordIterations = 600_000
+  private static let maximumWrappedGraphKeyBytes = 131_072
   private static let testPrivateKeyStorageEnvironment =
     "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE"
+  private static let testWrappedKeyStorageEnvironment =
+    "LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE"
 
-  private enum PrivateKeyStorage {
+  private enum SecretStorage {
     case keychain
 #if DEBUG
     case testMemory
@@ -57,9 +63,138 @@ enum JournalE2EECrypto {
   }
 
 #if DEBUG
-  private static let testMemoryPrivateKeysLock = NSLock()
+  private static let testMemorySecretsLock = NSLock()
   private static var testMemoryPrivateKeys: [String: Data] = [:]
+  private static var testMemoryWrappedGraphKeys: [String: Data] = [:]
 #endif
+
+  private struct SecretIdentity: Equatable {
+    let origin: String
+    let userID: String
+    let graphID: String?
+
+    var accountDigest: Data {
+      Data(SHA256.hash(data: canonicalData(includeGraph: false)))
+    }
+
+    var accountDigestHex: String { JournalE2EECrypto.hex(accountDigest) }
+
+    var graphDigestHex: String {
+      precondition(graphID != nil)
+      return JournalE2EECrypto.hex(
+        Data(SHA256.hash(data: canonicalData(includeGraph: true)))
+      )
+    }
+
+    private func canonicalData(includeGraph: Bool) -> Data {
+      var data = Data([1])
+      JournalE2EECrypto.appendLengthDelimited(origin, to: &data)
+      JournalE2EECrypto.appendLengthDelimited(userID, to: &data)
+      if includeGraph, let graphID {
+        JournalE2EECrypto.appendLengthDelimited(graphID, to: &data)
+      }
+      return data
+    }
+  }
+
+  private static func appendLengthDelimited(_ value: String, to data: inout Data) {
+    let bytes = Data(value.utf8)
+    var length = UInt32(bytes.count).bigEndian
+    withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+    data.append(bytes)
+  }
+
+  private static func readLengthDelimited(_ data: Data, offset: inout Int) throws -> String {
+    guard offset + 4 <= data.count else { throw JournalE2EECryptoError.invalidRequest }
+    let length = data[offset..<(offset + 4)].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    offset += 4
+    guard length <= UInt32(maximumWrappedGraphKeyBytes) else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+    let end = offset + Int(length)
+    guard end <= data.count, let value = String(data: data[offset..<end], encoding: .utf8) else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+    offset = end
+    return value
+  }
+
+  private static func normalizedOrigin(_ value: Any?) throws -> String {
+    guard
+      let value = value as? String,
+      !value.isEmpty,
+      value.utf8.count <= 2_048,
+      !value.contains("\0"),
+      let components = URLComponents(string: value),
+      components.scheme?.lowercased() == "https",
+      let host = components.host?.lowercased(),
+      !host.isEmpty,
+      components.user == nil,
+      components.password == nil,
+      components.query == nil,
+      components.fragment == nil,
+      components.path.isEmpty || components.path == "/"
+    else { throw JournalE2EECryptoError.invalidRequest }
+    var normalized = URLComponents()
+    normalized.scheme = "https"
+    normalized.host = host
+    if components.port != 443 { normalized.port = components.port }
+    guard let result = normalized.string else { throw JournalE2EECryptoError.invalidRequest }
+    return result
+  }
+
+  private static func canonicalGraphID(_ value: Any?) throws -> String {
+    guard let value = value as? String, let uuid = UUID(uuidString: value) else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+    let canonical = uuid.uuidString.lowercased()
+    guard value == canonical else { throw JournalE2EECryptoError.invalidRequest }
+    return canonical
+  }
+
+  private static func identity(_ request: [String: Any], includeGraph: Bool) throws
+    -> SecretIdentity
+  {
+    SecretIdentity(
+      origin: try normalizedOrigin(request["origin"]),
+      userID: try boundedUserID(request["userId"]),
+      graphID: includeGraph ? try canonicalGraphID(request["graphId"]) : nil
+    )
+  }
+
+  private static func wrappedCiphertext(_ encryptedGraphKey: String) throws -> Data {
+    guard
+      !encryptedGraphKey.isEmpty,
+      encryptedGraphKey.utf8.count <= 65_536,
+      !encryptedGraphKey.contains("\0"),
+      let data = encryptedGraphKey.data(using: .utf8),
+      let value = try JSONSerialization.jsonObject(with: data) as? [Any],
+      value.count == 2,
+      value[0] as? String == "~#'",
+      let encoded = value[1] as? String,
+      encoded.hasPrefix("~b"),
+      let ciphertext = Data(base64Encoded: String(encoded.dropFirst(2))),
+      !ciphertext.isEmpty,
+      ciphertext.count <= 65_536
+    else { throw JournalE2EECryptoError.invalidRequest }
+    return ciphertext
+  }
+
+  private static func encodeWrappedGraphKey(
+    identity: SecretIdentity,
+    encryptedGraphKey: String
+  ) throws -> Data {
+    guard let graphID = identity.graphID else { throw JournalE2EECryptoError.invalidRequest }
+    var data = Data([1])
+    appendLengthDelimited(identity.origin, to: &data)
+    appendLengthDelimited(identity.userID, to: &data)
+    appendLengthDelimited(graphID, to: &data)
+    appendLengthDelimited(encryptedGraphKey, to: &data)
+    guard data.count <= maximumWrappedGraphKeyBytes else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+    return data
+  }
 
   private static func boundedUserID(_ value: Any?) throws -> String {
     guard
@@ -164,18 +299,71 @@ enum JournalE2EECrypto {
     return plaintext as Data
   }
 
-  static func keychainQuery(userID: String) -> [CFString: Any] {
-    [
-      kSecClass: kSecClassGenericPassword,
-      kSecAttrService: keychainService,
-      kSecAttrAccount: userID,
-    ]
+  private static func decodeWrappedGraphKey(_ data: Data) throws
+    -> (identity: SecretIdentity, encryptedGraphKey: String)
+  {
+    guard data.count <= maximumWrappedGraphKeyBytes, data.first == 1 else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+    var offset = 1
+    let origin = try readLengthDelimited(data, offset: &offset)
+    let userID = try readLengthDelimited(data, offset: &offset)
+    let graphID = try readLengthDelimited(data, offset: &offset)
+    let encryptedGraphKey = try readLengthDelimited(data, offset: &offset)
+    guard offset == data.count else { throw JournalE2EECryptoError.invalidRequest }
+    let identity = try self.identity(
+      ["origin": origin, "userId": userID, "graphId": graphID],
+      includeGraph: true
+    )
+    _ = try wrappedCiphertext(encryptedGraphKey)
+    return (identity, encryptedGraphKey)
   }
 
-  private static func privateKeyStorage(
+  private static func dataProtectionQuery(_ query: inout [CFString: Any]) {
+#if os(macOS)
+    query[kSecUseDataProtectionKeychain] = true
+#endif
+  }
+
+  static func privateKeyQuery(origin: String, userID: String) throws -> [CFString: Any] {
+    let identity = try self.identity(
+      ["origin": origin, "userId": userID],
+      includeGraph: false
+    )
+    var query: [CFString: Any] = [
+      kSecClass: kSecClassGenericPassword,
+      kSecAttrService: privateKeyService,
+      kSecAttrAccount: identity.accountDigestHex,
+    ]
+    dataProtectionQuery(&query)
+    return query
+  }
+
+  static func wrappedGraphKeyQuery(
+    origin: String,
+    userID: String,
+    graphID: String
+  ) throws -> [CFString: Any] {
+    let identity = try self.identity(
+      ["origin": origin, "userId": userID, "graphId": graphID],
+      includeGraph: true
+    )
+    var query: [CFString: Any] = [
+      kSecClass: kSecClassGenericPassword,
+      kSecAttrService: wrappedGraphKeyService,
+      kSecAttrAccount: identity.graphDigestHex,
+      kSecAttrGeneric: identity.accountDigest,
+      kSecAttrSynchronizable: false,
+    ]
+    dataProtectionQuery(&query)
+    return query
+  }
+
+  private static func secretStorage(
+    environmentVariable: String,
     environment: [String: String]
-  ) throws -> PrivateKeyStorage {
-    guard let configured = environment[testPrivateKeyStorageEnvironment] else {
+  ) throws -> SecretStorage {
+    guard let configured = environment[environmentVariable] else {
       return .keychain
     }
 #if DEBUG
@@ -190,22 +378,30 @@ enum JournalE2EECrypto {
   }
 
   static func savePrivateKey(
+    origin: String,
     userID: String,
     key: Data,
     environment: [String: String] = ProcessInfo.processInfo.environment
   ) throws {
-    switch try privateKeyStorage(environment: environment) {
+    let identity = try self.identity(
+      ["origin": origin, "userId": userID],
+      includeGraph: false
+    )
+    switch try secretStorage(
+      environmentVariable: testPrivateKeyStorageEnvironment,
+      environment: environment
+    ) {
 #if DEBUG
     case .testMemory:
-      testMemoryPrivateKeysLock.lock()
-      defer { testMemoryPrivateKeysLock.unlock() }
-      testMemoryPrivateKeys[userID] = key
+      testMemorySecretsLock.lock()
+      defer { testMemorySecretsLock.unlock() }
+      testMemoryPrivateKeys[identity.accountDigestHex] = key
       return
 #endif
     case .keychain:
       break
     }
-    var query = keychainQuery(userID: userID)
+    var query = try privateKeyQuery(origin: origin, userID: userID)
     let status = SecItemUpdate(query as CFDictionary, [kSecValueData: key] as CFDictionary)
     if status == errSecItemNotFound {
       query[kSecValueData] = key
@@ -219,20 +415,28 @@ enum JournalE2EECrypto {
   }
 
   static func loadPrivateKey(
+    origin: String,
     userID: String,
     environment: [String: String] = ProcessInfo.processInfo.environment
   ) throws -> Data? {
-    switch try privateKeyStorage(environment: environment) {
+    let identity = try self.identity(
+      ["origin": origin, "userId": userID],
+      includeGraph: false
+    )
+    switch try secretStorage(
+      environmentVariable: testPrivateKeyStorageEnvironment,
+      environment: environment
+    ) {
 #if DEBUG
     case .testMemory:
-      testMemoryPrivateKeysLock.lock()
-      defer { testMemoryPrivateKeysLock.unlock() }
-      return testMemoryPrivateKeys[userID]
+      testMemorySecretsLock.lock()
+      defer { testMemorySecretsLock.unlock() }
+      return testMemoryPrivateKeys[identity.accountDigestHex]
 #endif
     case .keychain:
       break
     }
-    var query = keychainQuery(userID: userID)
+    var query = try privateKeyQuery(origin: origin, userID: userID)
     query[kSecReturnData] = true
     query[kSecMatchLimit] = kSecMatchLimitOne
     var result: CFTypeRef?
@@ -244,17 +448,245 @@ enum JournalE2EECrypto {
     return data
   }
 
+  private static func saveWrappedGraphKey(
+    identity: SecretIdentity,
+    encryptedGraphKey: String,
+    environment: [String: String]
+  ) throws {
+    let encoded = try encodeWrappedGraphKey(
+      identity: identity,
+      encryptedGraphKey: encryptedGraphKey
+    )
+    switch try secretStorage(
+      environmentVariable: testWrappedKeyStorageEnvironment,
+      environment: environment
+    ) {
 #if DEBUG
+    case .testMemory:
+      testMemorySecretsLock.lock()
+      defer { testMemorySecretsLock.unlock() }
+      testMemoryWrappedGraphKeys[identity.graphDigestHex] = encoded
+      return
+#endif
+    case .keychain:
+      break
+    }
+    guard let graphID = identity.graphID else { throw JournalE2EECryptoError.invalidRequest }
+    var query = try wrappedGraphKeyQuery(
+      origin: identity.origin,
+      userID: identity.userID,
+      graphID: graphID
+    )
+    let status = SecItemUpdate(query as CFDictionary, [kSecValueData: encoded] as CFDictionary)
+    if status == errSecItemNotFound {
+      query[kSecValueData] = encoded
+      query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+      guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
+        throw JournalE2EECryptoError.operationFailed
+      }
+    } else if status != errSecSuccess {
+      throw JournalE2EECryptoError.operationFailed
+    }
+  }
+
+  private static func deleteWrappedGraphKey(
+    identity: SecretIdentity,
+    environment: [String: String]
+  ) throws {
+    switch try secretStorage(
+      environmentVariable: testWrappedKeyStorageEnvironment,
+      environment: environment
+    ) {
+#if DEBUG
+    case .testMemory:
+      testMemorySecretsLock.lock()
+      defer { testMemorySecretsLock.unlock() }
+      testMemoryWrappedGraphKeys.removeValue(forKey: identity.graphDigestHex)
+      return
+#endif
+    case .keychain:
+      break
+    }
+    guard let graphID = identity.graphID else { throw JournalE2EECryptoError.invalidRequest }
+    let query = try wrappedGraphKeyQuery(
+      origin: identity.origin,
+      userID: identity.userID,
+      graphID: graphID
+    )
+    let status = SecItemDelete(query as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw JournalE2EECryptoError.operationFailed
+    }
+  }
+
+  private static func loadWrappedGraphKey(
+    identity: SecretIdentity,
+    environment: [String: String]
+  ) throws -> String? {
+    let encoded: Data?
+    switch try secretStorage(
+      environmentVariable: testWrappedKeyStorageEnvironment,
+      environment: environment
+    ) {
+#if DEBUG
+    case .testMemory:
+      testMemorySecretsLock.lock()
+      encoded = testMemoryWrappedGraphKeys[identity.graphDigestHex]
+      testMemorySecretsLock.unlock()
+#endif
+    case .keychain:
+      guard let graphID = identity.graphID else {
+        throw JournalE2EECryptoError.invalidRequest
+      }
+      var query = try wrappedGraphKeyQuery(
+        origin: identity.origin,
+        userID: identity.userID,
+        graphID: graphID
+      )
+      query[kSecReturnData] = true
+      query[kSecMatchLimit] = kSecMatchLimitOne
+      var result: CFTypeRef?
+      let status = SecItemCopyMatching(query as CFDictionary, &result)
+      if status == errSecItemNotFound { encoded = nil }
+      else if status == errSecSuccess, let data = result as? Data { encoded = data }
+      else { throw JournalE2EECryptoError.operationFailed }
+    }
+    guard let encoded else { return nil }
+    do {
+      let decoded = try decodeWrappedGraphKey(encoded)
+      guard decoded.identity == identity else { throw JournalE2EECryptoError.invalidRequest }
+      return decoded.encryptedGraphKey
+    } catch {
+      try? deleteWrappedGraphKey(identity: identity, environment: environment)
+      throw JournalE2EECryptoError.operationFailed
+    }
+  }
+
+  private static func deleteAccountSecrets(
+    identity: SecretIdentity,
+    environment: [String: String]
+  ) throws {
+    switch try secretStorage(
+      environmentVariable: testWrappedKeyStorageEnvironment,
+      environment: environment
+    ) {
+#if DEBUG
+    case .testMemory:
+      testMemorySecretsLock.lock()
+      testMemoryWrappedGraphKeys = testMemoryWrappedGraphKeys.filter { _, value in
+        guard let decoded = try? decodeWrappedGraphKey(value) else { return false }
+        return decoded.identity.accountDigest != identity.accountDigest
+      }
+      testMemorySecretsLock.unlock()
+#endif
+    case .keychain:
+      var query: [CFString: Any] = [
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrService: wrappedGraphKeyService,
+        kSecAttrGeneric: identity.accountDigest,
+      ]
+      dataProtectionQuery(&query)
+      let status = SecItemDelete(query as CFDictionary)
+      guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw JournalE2EECryptoError.operationFailed
+      }
+    }
+    switch try secretStorage(
+      environmentVariable: testPrivateKeyStorageEnvironment,
+      environment: environment
+    ) {
+#if DEBUG
+    case .testMemory:
+      testMemorySecretsLock.lock()
+      testMemoryPrivateKeys.removeValue(forKey: identity.accountDigestHex)
+      testMemorySecretsLock.unlock()
+#endif
+    case .keychain:
+      let query = try privateKeyQuery(origin: identity.origin, userID: identity.userID)
+      let status = SecItemDelete(query as CFDictionary)
+      guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw JournalE2EECryptoError.operationFailed
+      }
+    }
+  }
+
+#if DEBUG
+  static func testFixtureStorageIsIsolated(environment: [String: String]) -> Bool {
+    environment[testPrivateKeyStorageEnvironment] == "memory"
+      && environment[testWrappedKeyStorageEnvironment] == "memory"
+  }
+
   static func resetTestMemoryPrivateKeys() {
-    testMemoryPrivateKeysLock.lock()
-    defer { testMemoryPrivateKeysLock.unlock() }
+    testMemorySecretsLock.lock()
+    defer { testMemorySecretsLock.unlock() }
     testMemoryPrivateKeys.removeAll(keepingCapacity: false)
+    testMemoryWrappedGraphKeys.removeAll(keepingCapacity: false)
+  }
+
+  static func removeTestMemoryPrivateKey(origin: String, userID: String) throws {
+    let identity = try self.identity(
+      ["origin": origin, "userId": userID],
+      includeGraph: false
+    )
+    testMemorySecretsLock.lock()
+    defer { testMemorySecretsLock.unlock() }
+    testMemoryPrivateKeys.removeValue(forKey: identity.accountDigestHex)
+  }
+
+  static func probeIsolatedRealWrappedKeychainItem(
+    origin: String,
+    userID: String,
+    graphID: String
+  ) throws -> [CFString: Any] {
+    var item = try wrappedGraphKeyQuery(
+      origin: origin,
+      userID: userID,
+      graphID: graphID
+    )
+    let service = "\(wrappedGraphKeyService).test.\(UUID().uuidString.lowercased())"
+    item[kSecAttrService] = service
+    item[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    item[kSecValueData] = Data([1, 0, 0, 0, 0])
+    let addStatus = SecItemAdd(item as CFDictionary, nil)
+    guard addStatus == errSecSuccess else {
+      throw JournalE2EECryptoError.operationFailed
+    }
+
+    var lookup = try wrappedGraphKeyQuery(
+      origin: origin,
+      userID: userID,
+      graphID: graphID
+    )
+    lookup[kSecAttrService] = service
+    let deletionQuery = lookup
+    lookup[kSecReturnAttributes] = true
+    lookup[kSecMatchLimit] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let readStatus = SecItemCopyMatching(lookup as CFDictionary, &result)
+    let deleteStatus = SecItemDelete(deletionQuery as CFDictionary)
+    var deletedResult: CFTypeRef?
+    let deletedReadStatus = SecItemCopyMatching(lookup as CFDictionary, &deletedResult)
+    guard
+      readStatus == errSecSuccess,
+      let attributes = result as? [CFString: Any],
+      deleteStatus == errSecSuccess,
+      deletedReadStatus == errSecItemNotFound
+    else {
+      _ = SecItemDelete(deletionQuery as CFDictionary)
+      throw JournalE2EECryptoError.operationFailed
+    }
+    return attributes
   }
 #endif
 
   private static func decryptedGraphKey(_ request: [String: Any]) throws -> Data {
-    let userID = try boundedUserID(request["userId"])
-    guard let privateKey = try loadPrivateKey(userID: userID) else {
+    let identity = try self.identity(request, includeGraph: false)
+    guard
+      let privateKey = try loadPrivateKey(
+        origin: identity.origin,
+        userID: identity.userID
+      )
+    else {
       throw JournalE2EECryptoError.operationFailed
     }
     let graphKey = try rsaOAEPDecrypt(
@@ -265,17 +697,39 @@ enum JournalE2EECrypto {
     return graphKey
   }
 
+  private static func verifyWrappedGraphKey(
+    identity: SecretIdentity,
+    encryptedGraphKey: String,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) throws {
+    guard
+      let privateKey = try loadPrivateKey(
+        origin: identity.origin,
+        userID: identity.userID,
+        environment: environment
+      )
+    else { throw JournalE2EECryptoError.localPrivateKeyUnavailable }
+    let graphKey = try rsaOAEPDecrypt(
+      privateKeyData: privateKey,
+      ciphertext: try wrappedCiphertext(encryptedGraphKey)
+    )
+    guard graphKey.count == 32 else { throw JournalE2EECryptoError.operationFailed }
+  }
+
   static func handle(_ request: [String: Any]) throws -> [String: Any] {
     guard let operation = request["operation"] as? String else {
       throw JournalE2EECryptoError.invalidRequest
     }
     switch operation {
     case "hasPrivateKey":
-      let userID = try boundedUserID(request["userId"])
-      return ["ok": true, "value": try loadPrivateKey(userID: userID) != nil]
+      let identity = try self.identity(request, includeGraph: false)
+      return [
+        "ok": true,
+        "value": try loadPrivateKey(origin: identity.origin, userID: identity.userID) != nil,
+      ]
 
     case "unlockPrivateKey":
-      let userID = try boundedUserID(request["userId"])
+      let identity = try self.identity(request, includeGraph: false)
       guard
         let password = request["password"] as? String,
         !password.isEmpty,
@@ -293,14 +747,119 @@ enum JournalE2EECrypto {
         ciphertextAndTag: try hexData(request["ciphertext"])
       )
       _ = try rsaPrivateKey(privateKey)
-      try savePrivateKey(userID: userID, key: privateKey)
+      try savePrivateKey(origin: identity.origin, userID: identity.userID, key: privateKey)
       return ["ok": true]
 
-    case "verifyGraphKey":
-      _ = try decryptedGraphKey(request)
+#if DEBUG
+    case "installTestWrappedGraphKeyFixture":
+      guard testFixtureStorageIsIsolated(environment: ProcessInfo.processInfo.environment) else {
+        throw JournalE2EECryptoError.invalidRequest
+      }
+      let identity = try self.identity(request, includeGraph: true)
+      let attributes: [CFString: Any] = [
+        kSecAttrKeyType: kSecAttrKeyTypeRSA,
+        kSecAttrKeySizeInBits: 4096,
+      ]
+      var keyError: Unmanaged<CFError>?
+      guard
+        let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &keyError),
+        let publicKey = SecKeyCopyPublicKey(privateKey),
+        let privateKeyData = SecKeyCopyExternalRepresentation(privateKey, &keyError) as Data?,
+        let ciphertext = SecKeyCreateEncryptedData(
+          publicKey,
+          .rsaEncryptionOAEPSHA256,
+          Data(repeating: 0x5a, count: 32) as CFData,
+          &keyError
+        ) as Data?,
+        let transit = String(
+          data: try JSONSerialization.data(
+            withJSONObject: ["~#'", "~b\(ciphertext.base64EncodedString())"]
+          ),
+          encoding: .utf8
+        )
+      else { throw JournalE2EECryptoError.operationFailed }
+      try savePrivateKey(
+        origin: identity.origin,
+        userID: identity.userID,
+        key: privateKeyData
+      )
+      try verifyWrappedGraphKey(identity: identity, encryptedGraphKey: transit)
+      try saveWrappedGraphKey(
+        identity: identity,
+        encryptedGraphKey: transit,
+        environment: ProcessInfo.processInfo.environment
+      )
+      return [
+        "ok": true,
+        "encryptedGraphKey": transit,
+        "ciphertext": hex(ciphertext),
+      ]
+
+    case "installTestPrivateKey":
+      let identity = try self.identity(request, includeGraph: false)
+      try savePrivateKey(
+        origin: identity.origin,
+        userID: identity.userID,
+        key: try hexData(request["privateKey"])
+      )
+      return ["ok": true]
+#endif
+
+    case "loadAndVerifyWrappedGraphKey":
+      let identity = try self.identity(request, includeGraph: true)
+      guard
+        let encryptedGraphKey = try loadWrappedGraphKey(
+          identity: identity,
+          environment: ProcessInfo.processInfo.environment
+        )
+      else { throw JournalE2EECryptoError.wrappedGraphKeyUnavailable }
+      do {
+        try verifyWrappedGraphKey(identity: identity, encryptedGraphKey: encryptedGraphKey)
+      } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
+        try? deleteWrappedGraphKey(
+          identity: identity,
+          environment: ProcessInfo.processInfo.environment
+        )
+        throw JournalE2EECryptoError.localPrivateKeyUnavailable
+      } catch {
+        try? deleteWrappedGraphKey(
+          identity: identity,
+          environment: ProcessInfo.processInfo.environment
+        )
+        throw JournalE2EECryptoError.wrappedGraphKeyUnavailable
+      }
+      return ["ok": true, "value": encryptedGraphKey]
+
+    case "verifyAndSaveWrappedGraphKey":
+      let identity = try self.identity(request, includeGraph: true)
+      guard let encryptedGraphKey = request["encryptedGraphKey"] as? String else {
+        throw JournalE2EECryptoError.invalidRequest
+      }
+      try verifyWrappedGraphKey(identity: identity, encryptedGraphKey: encryptedGraphKey)
+      try saveWrappedGraphKey(
+        identity: identity,
+        encryptedGraphKey: encryptedGraphKey,
+        environment: ProcessInfo.processInfo.environment
+      )
       return ["ok": true]
 
-    case "decryptGraphKeyForUser":
+    case "deleteWrappedGraphKey":
+      let identity = try self.identity(request, includeGraph: true)
+      try deleteWrappedGraphKey(
+        identity: identity,
+        environment: ProcessInfo.processInfo.environment
+      )
+      return ["ok": true]
+
+    case "deleteAccountSecrets":
+      let identity = try self.identity(request, includeGraph: false)
+      try deleteAccountSecrets(
+        identity: identity,
+        environment: ProcessInfo.processInfo.environment
+      )
+      return ["ok": true, "wrappedKeysDeleted": true, "privateKeyDeleted": true]
+
+    case "unwrapGraphKeyForEngine":
       return ["ok": true, "value": hex(try decryptedGraphKey(request))]
 
     case "encryptAES":
@@ -336,8 +895,12 @@ public func logseqJournalCryptoJSON(
       let request = try JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { throw JournalE2EECryptoError.invalidRequest }
     response = try JournalE2EECrypto.handle(request)
+  } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
+    response = ["ok": false, "error": "localPrivateKeyUnavailable"]
+  } catch JournalE2EECryptoError.wrappedGraphKeyUnavailable {
+    response = ["ok": false, "error": "wrappedGraphKeyUnavailable"]
   } catch {
-    response = ["ok": false, "error": "crypto operation failed"]
+    response = ["ok": false, "error": "cryptoOperationFailed"]
   }
   guard
     let data = try? JSONSerialization.data(withJSONObject: response),

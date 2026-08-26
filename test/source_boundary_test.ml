@@ -169,7 +169,7 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "5f8f540e4ccfd1e1807294aec8ac5f229161e2da" in
+  let current_bonsai_flutter_revision = "1755441c24d718206a3d61af0882c0727f810d46" in
   let obsolete_bonsai_flutter_revisions =
     [ "6f2562e09d74d347a50b90541abdb4900e1e23da"
     ; "9b345b90fea476391d19092675abd665655e586a"
@@ -181,6 +181,8 @@ let () =
     ; "f6d27175632d26e759532f6ee81e8d1383490533"
     ; "2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"
     ; "d182690aeaa82ad0a972756205c62e3b598e3c24"
+    ; "5f8f540e4ccfd1e1807294aec8ac5f229161e2da"
+    ; "fcde784654ee5b8557afc3c966d840f2b1331912"
     ]
   in
   List.iter
@@ -318,10 +320,7 @@ let () =
     root
     "logseq_db_worker/lib/mutation_plan.ml"
     [ "type t ="; "type error ="; "| Ok plan ->" ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/mutation_plan.mli"
-    [ "type t ="; "type error =" ];
+  forbid_text root "logseq_db_worker/lib/mutation_plan.mli" [ "type t ="; "type error =" ];
   forbid_text
     root
     "logseq_db_worker/lib/outliner/pages.ml"
@@ -455,10 +454,7 @@ let () =
   require_allowed_dart_files
     root
     "flutter/lib"
-    [ "flutter/lib/application.dart"
-    ; "flutter/lib/application_host_adapter.dart"
-    ; "flutter/lib/main.dart"
-    ];
+    [ "flutter/lib/application_host_adapter.dart"; "flutter/lib/main.dart" ];
   require_allowed_dart_files
     root
     "flutter/test"
@@ -470,11 +466,20 @@ let () =
   require_allowed_dart_files
     root
     "flutter/integration_test"
-    [ "flutter/integration_test/journal_runtime_flow_test.dart"
-    ; "flutter/integration_test/logseq_db_worker_ios_device_test.dart"
-    ; "flutter/integration_test/logseq_db_worker_runtime_flow_test.dart"
-    ; "flutter/integration_test/runtime_flow_fixture.dart"
+    [ "flutter/integration_test/encrypted_offline_warm_start_test.dart" ];
+  require_file root "flutter/integration_test/encrypted_offline_warm_start_test.dart";
+  require_text
+    root
+    "logseq_db_worker/tool/test_macos_runtime_flow.sh"
+    [ "encrypted-offline-warm-start"
+    ; "integration_test/encrypted_offline_warm_start_test.dart"
+    ; "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE=memory"
+    ; "LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE=memory"
     ];
+  forbid_text
+    root
+    "logseq_db_worker/tool/test_macos_runtime_flow.sh"
+    [ "logseq_db_worker_runtime_flow_test.dart" ];
   require_occurrences root "app/application.ml" "Ui.Style.Color.rgb" 1;
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.argb" 0;
@@ -807,16 +812,27 @@ let () =
     root
     "flutter/lib/application_host_adapter.dart"
     [ "String.fromEnvironment('LOGSEQ_SYNC_BASE_URL')" ];
-  require_file root "flutter/lib/application.dart";
+  require_text root "bonsai-flutter.sexp" [ "(mode custom)"; "(main lib/main.dart)" ];
+  forbid_text root "bonsai-flutter.sexp" [ "(mode managed_adapter)" ];
+  require_file root "flutter/lib/main.dart";
   require_text
     root
-    "flutter/lib/application.dart"
-    [ "await JournalAmplify.configure()"
+    "flutter/lib/main.dart"
+    [ "JournalAmplify.configure()"
+    ; "amplifyReady: amplifyReady"
     ; "runApp"
     ; "Unable to configure authentication"
     ; "Retry"
     ];
-  require_occurrences root "flutter/lib/application.dart" "MaterialApp(" 1;
+  require_occurrences root "flutter/lib/main.dart" "MaterialApp(" 1;
+  forbid_path root "flutter/lib/application.dart";
+  List.iter
+    (fun relative -> forbid_text root relative [ "FLUTTER_TARGET" ])
+    [ "flutter/macos/Flutter/Flutter-Debug.xcconfig"
+    ; "flutter/macos/Flutter/Flutter-Release.xcconfig"
+    ; "flutter/ios/Flutter/Debug.xcconfig"
+    ; "flutter/ios/Flutter/Release.xcconfig"
+    ];
   require_text
     root
     "flutter/macos/Runner/AppDelegate.swift"
@@ -876,6 +892,46 @@ let () =
   files_with_suffixes root "logseq_db_worker" [ ".ml"; ".mli" ]
   |> List.iter (fun relative ->
     forbid_text root relative [ "Datascript.from_serializable" ]);
+  require_text
+    root
+    "spec/dune"
+    [ "(virtual_modules sync_action sync_startup_phase)"
+    ; "(default_implementation logseq_db_worker_sync_impl)"
+    ];
+  require_text
+    root
+    "logseq_db_worker/lib/dune"
+    [ "(implements logseq_db_worker_sync_spec)"
+    ; "(modules sync_action sync_startup_phase)"
+    ; "logseq_db_worker.sync_spec"
+    ];
+  require_file root "logseq_db_worker/lib/sync_action.ml";
+  require_file root "logseq_db_worker/lib/sync_startup_phase.ml";
+  forbid_path root "logseq_db_worker/lib/sync_action.mli";
+  forbid_path root "logseq_db_worker/lib/sync_startup_phase.mli";
+  require_text
+    root
+    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "interpret_local_action"
+    ; "interpret_network_action"
+    ; "Sync_startup_phase.Local_completion.mirror_failed"
+    ; "Sync_startup_phase.Local_completion.wrapped_graph_key_failed"
+    ; "Sync_startup_phase.Local_completion.local_private_key_failed"
+    ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/sync_manager.ml"
+    [ "Sync_startup_phase.Local_completion" ];
+  require_text
+    root
+    "logseq_db_worker/lib/sync_manager.ml"
+    [ "let open_selected_graph_local"
+    ; ": Sync_action.local Sync_action.t list"
+    ];
+  forbid_text
+    root
+    "spec/sync_action.mli"
+    [ "Sync_catalog"; "Sync_auth"; "Sync_bootstrap" ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"
   | failures ->

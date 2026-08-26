@@ -19,6 +19,11 @@ type network_lifecycle =
   | Backgrounded of { generation : int64 }
   | Foreground_resumed of { generation : int64 }
 
+type local_account_binding =
+  { user_id : string
+  ; managed_sync_origin : string
+  }
+
 let envelope_header_size = 32
 let maximum_envelope_payload_bytes = 256 * 1024
 
@@ -276,6 +281,23 @@ let decode_formatted_journal_days bytes =
 ;;
 
 let authenticated_user_request = encode_envelope 6 Bytes.empty |> Result.get_ok
+let local_account_binding_request = encode_envelope 20 Bytes.empty |> Result.get_ok
+
+let timeline_presented_request
+      ~account_generation
+      ~graph_generation
+      ~presentation_generation
+  =
+  Yojson.Safe.to_string
+    (`Assoc
+        [ "accountGeneration", `Int account_generation
+        ; "graphGeneration", `Int graph_generation
+        ; "presentationGeneration", `Int presentation_generation
+        ])
+  |> Bytes.of_string
+  |> encode_envelope 22
+  |> Result.get_ok
+;;
 
 let decode_json_object label bytes f =
   try
@@ -295,12 +317,107 @@ let bounded_string maximum = function
   | _ -> Error "platform auth text is invalid"
 ;;
 
+let secure_origin = function
+  | `String value ->
+    let uri = Uri.of_string value in
+    (match Uri.scheme uri, Uri.host uri with
+     | Some "https", Some _ when String.length value <= 2048 -> Ok value
+     | _ -> Error "managed-sync origin must be one bounded HTTPS origin")
+  | _ -> Error "managed-sync origin is invalid"
+;;
+
+let decode_local_account_binding bytes =
+  Result.bind (decode_envelope [ 21 ] bytes) (fun payload ->
+    decode_json_object "local-account-binding response" payload (fun fields ->
+      if List.length fields <> 2
+      then Error "local-account-binding response fields are invalid"
+      else (
+        match
+          List.assoc_opt "userId" fields, List.assoc_opt "managedSyncOrigin" fields
+        with
+        | Some `Null, Some `Null -> Ok None
+        | Some user_id, Some origin ->
+          Result.bind (bounded_string 512 user_id) (fun user_id ->
+            Result.map
+              (fun managed_sync_origin -> Some { user_id; managed_sync_origin })
+              (secure_origin origin))
+        | _ -> Error "local-account-binding response fields are invalid")))
+;;
+
+let decode_timeline_presented
+      ~account_generation
+      ~graph_generation
+      ~presentation_generation
+      bytes
+  =
+  Result.bind (decode_envelope [ 23 ] bytes) (fun payload ->
+    decode_json_object "Timeline-presented response" payload (fun fields ->
+      let integer name =
+        match List.assoc_opt name fields with
+        | Some (`Int value) when value >= 0 -> Some value
+        | _ -> None
+      in
+      if
+        List.length fields = 4
+        && integer "accountGeneration" = Some account_generation
+        && integer "graphGeneration" = Some graph_generation
+        && integer "presentationGeneration" = Some presentation_generation
+        && List.assoc_opt "presented" fields = Some (`Bool true)
+      then Ok ()
+      else Error "Timeline-presented response is stale or malformed"))
+;;
+
 let decode_authenticated_user bytes =
   Result.bind (decode_envelope [ 7 ] bytes) (fun payload ->
     decode_json_object "authenticated-user response" payload (function
       | [ ("userId", `Null) ] -> Ok None
       | [ ("userId", value) ] -> Result.map Option.some (bounded_string 512 value)
       | _ -> Error "authenticated-user response fields are invalid"))
+;;
+
+let typography_preset_preference_key = "typographyPreset"
+
+let typography_preset_preference_request =
+  Yojson.Safe.to_string (`Assoc [ "key", `String typography_preset_preference_key ])
+  |> Bytes.of_string
+  |> encode_envelope 16
+  |> Result.get_ok
+;;
+
+let decode_typography_preset_preference bytes =
+  Result.bind (decode_envelope [ 17 ] bytes) (fun payload ->
+    decode_json_object "typography-preset preference response" payload (function
+      | [ ("key", `String key); ("value", `Null) ]
+      | [ ("value", `Null); ("key", `String key) ]
+        when String.equal key typography_preset_preference_key -> Ok None
+      | [ ("key", `String key); ("value", value) ]
+      | [ ("value", value); ("key", `String key) ]
+        when String.equal key typography_preset_preference_key ->
+        Result.map Option.some (bounded_string 64 value)
+      | _ -> Error "typography-preset preference response fields are invalid"))
+;;
+
+let set_typography_preset_preference_request value =
+  if
+    not
+      (String.equal value "dense"
+       || String.equal value "balanced"
+       || String.equal value "comfortable")
+  then invalid_arg "typography preset preference is invalid";
+  Yojson.Safe.to_string
+    (`Assoc [ "key", `String typography_preset_preference_key; "value", `String value ])
+  |> Bytes.of_string
+  |> encode_envelope 18
+  |> Result.get_ok
+;;
+
+let decode_set_typography_preset_preference bytes =
+  Result.bind (decode_envelope [ 19 ] bytes) (fun payload ->
+    decode_json_object "set typography-preset preference response" payload (function
+      | [ ("key", `String key); ("stored", `Bool true) ]
+      | [ ("stored", `Bool true); ("key", `String key) ]
+        when String.equal key typography_preset_preference_key -> Ok ()
+      | _ -> Error "set typography-preset preference response fields are invalid"))
 ;;
 
 let purpose = function

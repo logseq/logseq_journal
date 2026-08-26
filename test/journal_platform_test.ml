@@ -281,6 +281,71 @@ let test_sign_out_capability_is_bounded_and_acknowledged () =
     "failed sign-out acknowledgement was accepted"
 ;;
 
+let test_local_account_binding_is_bounded_and_origin_scoped () =
+  require
+    (Bytes.length Journal_platform.local_account_binding_request = 32
+     && Bytes.get_uint16_le Journal_platform.local_account_binding_request 6 = 20)
+    "local-account-binding request envelope changed";
+  let binding =
+    envelope
+      21
+      (Bytes.of_string
+         {|{"userId":"cognito-user-1","managedSyncOrigin":"https://api.logseq.io"}|})
+    |> Journal_platform.decode_local_account_binding
+    |> require_ok
+  in
+  (match binding with
+   | Some binding ->
+     require (String.equal binding.user_id "cognito-user-1") "binding user changed";
+     require
+       (String.equal binding.managed_sync_origin "https://api.logseq.io")
+       "binding origin changed"
+   | None -> fail "valid local account binding decoded as absent");
+  require
+    (Journal_platform.decode_local_account_binding
+       (envelope 21 (Bytes.of_string {|{"userId":null,"managedSyncOrigin":null}|}))
+     = Ok None)
+    "absent local account binding was rejected";
+  require
+    (Result.is_error
+       (Journal_platform.decode_local_account_binding
+          (envelope
+             21
+             (Bytes.of_string
+                {|{"userId":"cognito-user-1","managedSyncOrigin":"http://api.logseq.io"}|}))))
+    "insecure managed-sync origin was accepted"
+;;
+
+let test_timeline_presentation_handshake_is_generation_fenced () =
+  let request =
+    Journal_platform.timeline_presented_request
+      ~account_generation:3
+      ~graph_generation:5
+      ~presentation_generation:7
+  in
+  require (Bytes.get_uint16_le request 6 = 22) "Timeline request tag changed";
+  envelope
+    23
+    (Bytes.of_string
+       {|{"accountGeneration":3,"graphGeneration":5,"presentationGeneration":7,"presented":true}|})
+  |> Journal_platform.decode_timeline_presented
+       ~account_generation:3
+       ~graph_generation:5
+       ~presentation_generation:7
+  |> require_ok;
+  require
+    (Result.is_error
+       (Journal_platform.decode_timeline_presented
+          ~account_generation:3
+          ~graph_generation:5
+          ~presentation_generation:8
+          (envelope
+             23
+             (Bytes.of_string
+                {|{"accountGeneration":3,"graphGeneration":5,"presentationGeneration":7,"presented":true}|}))))
+    "stale Timeline presentation acknowledgement was accepted"
+;;
+
 let test_termination_handshake_is_bounded_and_acknowledged () =
   require
     (Journal_platform.is_prepare_to_terminate_event (envelope 12 Bytes.empty))
@@ -336,6 +401,9 @@ let tests =
   ; ( "bounded auth capability"
     , test_auth_capability_envelopes_are_bounded_and_protocol_free )
   ; "sign-out capability", test_sign_out_capability_is_bounded_and_acknowledged
+  ; "local account binding", test_local_account_binding_is_bounded_and_origin_scoped
+  ; ( "Timeline presentation handshake"
+    , test_timeline_presentation_handshake_is_generation_fenced )
   ; "termination handshake", test_termination_handshake_is_bounded_and_acknowledged
   ; "network lifecycle epochs", test_network_lifecycle_epochs_are_bounded_and_typed
   ]

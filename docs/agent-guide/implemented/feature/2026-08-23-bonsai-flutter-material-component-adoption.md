@@ -83,11 +83,11 @@ allow framework Material widgets to become dark while custom journal surfaces
 remain light.
 
 Remove the outer `MaterialApp` around `BonsaiFlutterRoot` in
-`flutter/lib/application.dart`. The standalone authentication-configuration
+`flutter/lib/main.dart`. The standalone authentication-configuration
 failure application may keep its own `MaterialApp` because no Bonsai runtime
-root exists in that branch. Regenerate the managed host with
-`bonsai-flutter sync-host`, then preserve the custom `application.dart`
-entrypoint selected by the Apple platform xcconfig files.
+root exists in that branch. Select the bonsai_flutter_tool custom-host mode so
+`bonsai-flutter sync-host` validates but never rewrites the application-owned
+`main.dart` entrypoint.
 
 Update exhaustive `page_presentation` matches to handle `Modal_dialog`
 explicitly. Do not add wildcard matches that would hide later navigation API
@@ -277,8 +277,8 @@ implementations.
   Authentication configuration failure remains renderable before a runtime is
   created, and the configured application still starts only after Amplify
   preparation succeeds.
-- Generated host synchronization succeeds with no diff, while Apple platform
-  builds continue to use the custom `flutter/lib/application.dart` entrypoint.
+- Host synchronization succeeds with no diff, while every Flutter and Apple
+  platform build uses the custom `flutter/lib/main.dart` entrypoint.
 - No source or test references `Ui.Material.dialog` or the removed generic
   material dialog node. Every account, reset, Capture-discard, and
   Detail-discard surface is an `AlertDialog` presented by `Modal_dialog` with

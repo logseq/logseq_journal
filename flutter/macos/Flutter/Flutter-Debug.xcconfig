@@ -1,2 +1,1 @@
 #include "ephemeral/Flutter-Generated.xcconfig"
-FLUTTER_TARGET=lib/application.dart

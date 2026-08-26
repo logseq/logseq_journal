@@ -66,45 +66,59 @@ let initial_calendar_packet =
   platform_envelope 2 bytes
 ;;
 
-let initialize_test_calendar ?(packet = initial_calendar_packet) handle =
-  (match Journal_platform.decode_calendar packet with
-   | Ok _ -> ()
-   | Error message -> fail "initial calendar fixture is invalid: %s" message);
-  let rec wait_for_request remaining =
+let preference_response_packet stored_value =
+  let value =
+    match stored_value with
+    | None -> "null"
+    | Some value -> Printf.sprintf "%S" value
+  in
+  Bytes.of_string (Printf.sprintf "{\"key\":\"typographyPreset\",\"value\":%s}" value)
+  |> platform_envelope 17
+;;
+
+let startup_request_ids handle =
+  let rec wait_for_requests remaining calendar preference =
     if remaining = 0
-    then fail "timed out waiting for the initial calendar request"
+    then fail "timed out waiting for the initial calendar and typography requests"
     else (
       Test.Handle.present handle;
-      let request =
+      let calendar, preference =
         match Test.Handle.last_frame handle with
-        | None -> None
+        | None -> calendar, preference
         | Some frame ->
           (match Protocol.Binary_codec.decode frame.bytes with
            | Error error -> fail "application frame did not decode: %s" error.message
            | Ok wire ->
-             List.find_map
-               (function
-                 | Protocol.Wire_frame.Application_request { request_id; payload }
-                   when Bytes.equal payload Journal_platform.get_calendar_request ->
-                   Some request_id
-                 | _ -> None)
+             List.fold_left
+               (fun (calendar, preference) -> function
+                  | Protocol.Wire_frame.Application_request { request_id; payload }
+                    when Bytes.length payload >= 8 ->
+                    (match Bytes.get_uint16_le payload 6 with
+                     | 1 -> Some request_id, preference
+                     | 16 -> calendar, Some request_id
+                     | _ -> calendar, preference)
+                  | _ -> calendar, preference)
+               (calendar, preference)
                wire.operations)
       in
-      match request with
-      | Some request_id -> request_id
-      | None ->
+      match calendar, preference with
+      | Some calendar, Some preference -> calendar, preference
+      | _ ->
         Test.Handle.pump_next handle ();
-        wait_for_request (remaining - 1))
+        wait_for_requests (remaining - 1) calendar preference)
   in
-  let request_id = wait_for_request 500 in
+  wait_for_requests 500 None None
+;;
+
+let respond_to_application_request handle ~sequence ~request_id payload =
   let event =
     Protocol.Inbound_event.
-      { sequence = ID.Runtime.Event_sequence.of_int64 1L
+      { sequence = ID.Runtime.Event_sequence.of_int64 sequence
       ; displayed_revision = Test.Handle.revision handle
       ; node_id = ID.Ui.Node_id.zero
       ; handler_id = ID.Ui.Handler_id.zero
       ; event_tag = Protocol.Generated_protocol.Event_tag.application_response
-      ; payload = Application_response { request_id; payload = packet }
+      ; payload = Application_response { request_id; payload }
       }
   in
   Test.Handle.pump_next
@@ -112,7 +126,25 @@ let initialize_test_calendar ?(packet = initial_calendar_packet) handle =
     ~events:
       Protocol.Inbound_event.
         { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
-    ();
+    ()
+;;
+
+let initialize_test_platform
+      ?(packet = initial_calendar_packet)
+      ?(stored_preset = Some "balanced")
+      handle
+  =
+  (match Journal_platform.decode_calendar packet with
+   | Ok _ -> ()
+   | Error message -> fail "initial calendar fixture is invalid: %s" message);
+  let calendar_request, preference_request = startup_request_ids handle in
+  respond_to_application_request handle ~sequence:1L ~request_id:calendar_request packet;
+  Test.Handle.present handle;
+  respond_to_application_request
+    handle
+    ~sequence:2L
+    ~request_id:preference_request
+    (preference_response_packet stored_preset);
   Test.Handle.present handle;
   Test.Handle.resize handle ~width:390. ~height:844.;
   Test.Handle.present handle;
@@ -131,7 +163,13 @@ let create_raw_handle startup =
 
 let create_handle startup =
   let handle = create_raw_handle startup in
-  initialize_test_calendar handle;
+  initialize_test_platform handle;
+  handle
+;;
+
+let create_handle_with_preference startup stored_preset =
+  let handle = create_raw_handle startup in
+  initialize_test_platform ~stored_preset handle;
   handle
 ;;
 
@@ -144,7 +182,7 @@ let create_handle_with_calendar startup packet =
       Application.app
       ~application_payload:(encode_startup startup)
   in
-  initialize_test_calendar ~packet handle;
+  initialize_test_platform ~packet handle;
   handle
 ;;
 
@@ -157,7 +195,7 @@ let create_timed_handle startup =
       Application.app
       ~application_payload:(encode_startup startup)
   in
-  initialize_test_calendar handle;
+  initialize_test_platform handle;
   handle, ref 0L
 ;;
 
@@ -307,7 +345,8 @@ let seed startup captures =
          ; cursor_authentication_key = Bytes.make 32 'a'
          ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
          ; unlock_graph_key =
-             (fun ~user_id:_ ~encrypted_graph_key:_ -> Error "crypto unavailable")
+             (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+               Error "crypto unavailable")
          }
        in
        let engine =
@@ -487,6 +526,80 @@ let click_test_id handle test_id =
   Test.Handle.present handle
 ;;
 
+let choice_event_sequence = ref 8_000L
+
+let change_choice_chip handle test_id selected =
+  Test.Handle.present handle;
+  let node =
+    match Test.Handle.find handle (Test.Query.test_id test_id) with
+    | Some node -> node
+    | None -> fail "missing ChoiceChip %s\n%s" test_id (Test.Handle.show handle)
+  in
+  let binding =
+    Array.find_opt
+      (fun (binding : Runtime.Mounted_tree.Mounted_binding.t) ->
+         Ui.Event.Tag.equal binding.event_tag Ui.Event.Tag.Value_changed)
+      node.event_bindings
+    |> function
+    | Some binding -> binding
+    | None -> fail "%s does not bind value changes" test_id
+  in
+  let event =
+    choice_event_sequence := Int64.succ !choice_event_sequence;
+    Protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 !choice_event_sequence
+      ; displayed_revision = Test.Handle.revision handle
+      ; node_id = node.node_id
+      ; handler_id = binding.handler_id
+      ; event_tag = Protocol.Generated_protocol.Event_tag.value_changed
+      ; payload = Bool selected
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
+    ();
+  Test.Handle.present handle
+;;
+
+let press_after_choice_events handle test_id =
+  Test.Handle.present handle;
+  let node =
+    match Test.Handle.find handle (Test.Query.test_id test_id) with
+    | Some node -> node
+    | None -> fail "missing action %s\n%s" test_id (Test.Handle.show handle)
+  in
+  let binding =
+    Array.find_opt
+      (fun (binding : Runtime.Mounted_tree.Mounted_binding.t) ->
+         Ui.Event.Tag.equal binding.event_tag Ui.Event.Tag.Press)
+      node.event_bindings
+    |> function
+    | Some binding -> binding
+    | None -> fail "%s does not bind press events" test_id
+  in
+  choice_event_sequence := Int64.succ !choice_event_sequence;
+  let event =
+    Protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 !choice_event_sequence
+      ; displayed_revision = Test.Handle.revision handle
+      ; node_id = node.node_id
+      ; handler_id = binding.handler_id
+      ; event_tag = Protocol.Generated_protocol.Event_tag.press
+      ; payload = Unit
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
+    ();
+  Test.Handle.present handle
+;;
+
 let send_slidable_event handle block_id ~event_id ~payload =
   Test.Handle.present handle;
   let query = Test.Query.test_id ("journal-row-slidable:" ^ block_id) in
@@ -612,7 +725,8 @@ let test_initial_feed_has_a_truthful_loading_state () =
          Test.Handle.present handle;
          require_test_id handle "journal-scroll";
          require
-           (List.length (Test.Handle.find_all handle (Test.Query.test_id "journal-scroll"))
+           (List.length
+              (Test.Handle.find_all handle (Test.Query.test_id "journal-scroll"))
             = 1)
            "loading state has more than one Journal scroll owner";
          require_visible_text handle "Loading journal";
@@ -621,7 +735,8 @@ let test_initial_feed_has_a_truthful_loading_state () =
          pump_until_text handle "No journal entries yet";
          require_test_id handle "journal-scroll";
          require
-           (List.length (Test.Handle.find_all handle (Test.Query.test_id "journal-scroll"))
+           (List.length
+              (Test.Handle.find_all handle (Test.Query.test_id "journal-scroll"))
             = 1)
            "empty state has more than one Journal scroll owner";
          require_no_visible_text handle "Loading journal"))
@@ -675,6 +790,28 @@ let application_theme_from_initial_frame handle =
   |> function
   | Some value -> value
   | None -> fail "initial frame omitted the application theme"
+;;
+
+let application_theme_from_last_frame handle =
+  (last_wire handle).operations
+  |> List.find_map (function
+    | Protocol.Wire_frame.Set_application_theme { theme; _ } -> Some theme
+    | _ -> None)
+  |> function
+  | Some theme -> theme
+  | None -> fail "frame omitted the expected application theme update"
+;;
+
+let require_protocol_text_style name expected_size expected_height expected_weight
+  = function
+  | Some style ->
+    require
+      (style.Protocol.Wire_frame.font_size = Some expected_size
+       && style.line_height = Some expected_height
+       && style.font_weight = Some expected_weight)
+      "%s theme typography differs"
+      name
+  | None -> fail "%s theme typography is missing" name
 ;;
 
 type snack_bar_request =
@@ -788,6 +925,30 @@ let capture_affordance_props handle =
   | _ -> fail "journal-capture-expandable is not an Expandable_message_composer"
 ;;
 
+let require_choice_chip handle test_id ~selected =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Material_choice_chip props ->
+    require props.enabled "%s is disabled" test_id;
+    require
+      (Bool.equal props.selected selected)
+      "%s selected=%b, expected %b"
+      test_id
+      props.selected
+      selected;
+    require props.has_on_selected "%s has no selection callback" test_id
+  | _ -> fail "%s is not a Material ChoiceChip" test_id
+;;
+
+let application_request_from_last_frame handle expected_tag =
+  (last_wire handle).operations
+  |> List.find_map (function
+    | Protocol.Wire_frame.Application_request { request_id; payload }
+      when Bytes.length payload >= 8 && Bytes.get_uint16_le payload 6 = expected_tag ->
+      Some (request_id, payload)
+    | _ -> None)
+;;
+
 let send_capture_affordance_button handle ~button_id ~text =
   let payload = Bytes.make (4 + String.length text) '\000' in
   Bytes.set_int32_le payload 0 (Int32.of_int button_id);
@@ -797,9 +958,41 @@ let send_capture_affordance_button handle ~button_id ~text =
     handle
     (Test.Query.test_id "journal-capture-expandable")
     ~kind_id:Ui.Native_widget.Expandable_message_composer.kind_id
-    ~version:1
+    ~version:2
     ~event_id:Ui.Native_widget.Expandable_message_composer.button_pressed_event_id
     ~payload;
+  Test.Handle.present handle
+;;
+
+let send_journal_scroll handle ~pixels ~delta =
+  Test.Handle.present handle;
+  let node = node_by_test_id handle "journal-scroll" in
+  let binding =
+    Array.find_opt
+      (fun (binding : Runtime.Mounted_tree.Mounted_binding.t) ->
+         Ui.Event.Tag.equal binding.event_tag Ui.Event.Tag.Scroll_notification)
+      node.event_bindings
+    |> function
+    | Some binding -> binding
+    | None -> fail "journal scroll does not bind scroll notifications"
+  in
+  choice_event_sequence := Int64.succ !choice_event_sequence;
+  let event =
+    Protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 !choice_event_sequence
+      ; displayed_revision = Test.Handle.revision handle
+      ; node_id = node.node_id
+      ; handler_id = binding.handler_id
+      ; event_tag = Protocol.Generated_protocol.Event_tag.scroll_notification
+      ; payload = Scroll { pixels; delta }
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
+    ();
   Test.Handle.present handle
 ;;
 
@@ -998,7 +1191,9 @@ type app_bar_props_record =
   }
 
 let app_bar_props handle =
-  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle "journal-header").widget in
+  let (Av view) =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-header").widget
+  in
   match view.node with
   | Ui.Widget.Private.Sliver_app_bar props ->
     { pinned = props.pinned
@@ -1023,7 +1218,9 @@ let app_bar_props handle =
 ;;
 
 let require_journal_scroll handle ~expanded_height ~collapsed_height =
-  let (Av scroll) = Ui.Widget.Private.view (node_by_test_id handle "journal-scroll").widget in
+  let (Av scroll) =
+    Ui.Widget.Private.view (node_by_test_id handle "journal-scroll").widget
+  in
   (match scroll.node with
    | Ui.Widget.Private.Scroll_view { axis = Ui.Layout.Axis.Vertical; _ } -> ()
    | _ -> fail "Journal root is not one vertical Scroll_view");
@@ -1042,11 +1239,11 @@ let require_journal_scroll handle ~expanded_height ~collapsed_height =
   let props = app_bar_props handle in
   require
     (props.pinned
-     && not props.floating
-     && not props.snap
-     && not props.stretch
-     && not props.force_elevated
-     && not props.automatically_imply_leading
+     && (not props.floating)
+     && (not props.snap)
+     && (not props.stretch)
+     && (not props.force_elevated)
+     && (not props.automatically_imply_leading)
      && props.center_title = Some true)
     "Journal app bar behavior flags changed";
   let close expected = function
@@ -1064,7 +1261,7 @@ let require_journal_scroll handle ~expanded_height ~collapsed_height =
   require
     (props.has_leading
      && props.has_flexible_space
-     && not props.has_bottom
+     && (not props.has_bottom)
      && props.has_actions)
     "Journal app bar slot ownership changed";
   require
@@ -1073,7 +1270,7 @@ let require_journal_scroll handle ~expanded_height ~collapsed_height =
      && props.elevation = Some 0.)
     "Journal app bar stopped inheriting theme presentation";
   require_sized_size handle "journal-header-leading-placeholder" ~width:44. ~height:44.;
-  require_sized_size handle "journal-header-account-placeholder" ~width:44. ~height:44.
+  require_sized_size handle "journal-account-menu-target" ~width:44. ~height:44.
 ;;
 
 let test_graph_open_error_retains_the_journal_scroll_contract () =
@@ -1176,7 +1373,8 @@ let test_root_is_owned_by_the_ocaml_timeline () =
          require_test_id handle "journal-header";
          require_test_id handle "journal-date-context";
          require_test_id handle "journal-header-leading-placeholder";
-         require_test_id handle "journal-header-account-placeholder";
+         require_test_id handle "journal-account-menu-target";
+         require_test_id handle "journal-account-menu-button";
          require_no_test_id handle "journal-menu";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more";
@@ -1203,6 +1401,9 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
          pump_until_text handle "No journal entries yet";
          let props = capture_affordance_props handle in
          require props.enabled "Capture FAB is disabled after graph startup";
+         require
+           (props.fab_presentation = Ui.Native_widget.Expandable_message_composer.Extended)
+           "Capture FAB did not begin extended";
          require (String.equal props.fab_label "Capture") "Capture FAB label changed";
          require
            (String.equal props.fab_tooltip "Open Capture")
@@ -1267,6 +1468,94 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
          | _ -> fail "Capture action count changed after success"))
 ;;
 
+let test_capture_fab_uses_directional_threshold_without_replacing_the_composer () =
+  with_startup (fun startup ->
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle "No journal entries yet";
+         let initial_node = node_by_test_id handle "journal-capture-expandable" in
+         let initial_props = capture_affordance_props handle in
+         let require_same_node label =
+           let current = node_by_test_id handle "journal-capture-expandable" in
+           require
+             (ID.Ui.Node_id.equal initial_node.node_id current.node_id)
+             "%s replaced the mounted Capture composer"
+             label
+         in
+         let require_presentation expected label =
+           let props = capture_affordance_props handle in
+           require
+             (props.fab_presentation = expected)
+             "%s produced the wrong Capture FAB presentation"
+             label;
+           require_same_node label;
+           props
+         in
+         send_journal_scroll handle ~pixels:20. ~delta:20.;
+         send_journal_scroll handle ~pixels:23.9 ~delta:3.9;
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Extended
+              "sub-threshold downward travel");
+         require
+           (capture_affordance_props handle = initial_props)
+           "sub-threshold travel changed Capture props";
+         send_journal_scroll handle ~pixels:23.9 ~delta:0.;
+         require
+           (capture_affordance_props handle = initial_props)
+           "zero scroll delta changed Capture props";
+         send_journal_scroll handle ~pixels:19.9 ~delta:(-4.);
+         send_journal_scroll handle ~pixels:39.9 ~delta:20.;
+         send_journal_scroll handle ~pixels:43.8 ~delta:3.9;
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Extended
+              "reversed sub-threshold downward travel");
+         send_journal_scroll handle ~pixels:43.9 ~delta:0.1;
+         let compact_props =
+           require_presentation
+             Ui.Native_widget.Expandable_message_composer.Compact
+             "downward threshold"
+         in
+         require
+           ({ compact_props with
+              fab_presentation = Ui.Native_widget.Expandable_message_composer.Extended
+            }
+            = initial_props)
+           "presentation transition changed unrelated Capture props";
+         send_journal_scroll handle ~pixels:143.9 ~delta:100.;
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Compact
+              "large downward travel while compact");
+         require
+           (capture_affordance_props handle = compact_props)
+           "non-transitioning compact travel changed Capture props";
+         send_journal_scroll handle ~pixels:123.9 ~delta:(-20.);
+         send_journal_scroll handle ~pixels:120. ~delta:(-3.9);
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Compact
+              "sub-threshold upward travel");
+         send_journal_scroll handle ~pixels:119.9 ~delta:(-0.1);
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Extended
+              "upward threshold");
+         send_journal_scroll handle ~pixels:200. ~delta:80.1;
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Compact
+              "large single downward event");
+         send_journal_scroll handle ~pixels:0. ~delta:(-200.);
+         ignore
+           (require_presentation
+              Ui.Native_widget.Expandable_message_composer.Extended
+              "top boundary reset")))
+;;
+
 let test_capture_fab_honors_reduced_motion_without_changing_its_slot () =
   with_startup (fun startup ->
     let handle = create_handle startup in
@@ -1311,7 +1600,7 @@ let test_header_uses_pinned_theme_owned_sliver_app_bar () =
            "journal-header-title"
            ~size:22.
            ~line_height:(28. /. 22.)
-           ~weight:Ui.Style.Font_weight.Bold;
+           ~weight:Ui.Style.Font_weight.Semi_bold;
          require_theme_owned_text_style
            handle
            "journal-header-subtitle"
@@ -1321,7 +1610,8 @@ let test_header_uses_pinned_theme_owned_sliver_app_bar () =
          require_no_semantics handle "Menu";
          require_no_semantics handle "More";
          require_test_id handle "journal-header-leading-placeholder";
-         require_test_id handle "journal-header-account-placeholder";
+         require_test_id handle "journal-account-menu-target";
+         require_test_id handle "journal-account-menu-button";
          require_no_test_id handle "journal-menu-target";
          require_no_test_id handle "journal-more-target";
          require_no_test_id handle "journal-capture-composer-safe-area";
@@ -1406,7 +1696,7 @@ let test_header_inherits_theme_colors_in_dark_and_high_contrast_appearance () =
            "journal-header-title"
            ~size:22.
            ~line_height:(28. /. 22.)
-           ~weight:Ui.Style.Font_weight.Bold;
+           ~weight:Ui.Style.Font_weight.Semi_bold;
          set_environment
            handle
            (environment ~brightness:Environment.Dark ~high_contrast:true ());
@@ -1421,7 +1711,203 @@ let test_header_inherits_theme_colors_in_dark_and_high_contrast_appearance () =
            "journal-header-title"
            ~size:22.
            ~line_height:(28. /. 22.)
-           ~weight:Ui.Style.Font_weight.Bold))
+           ~weight:Ui.Style.Font_weight.Semi_bold))
+;;
+
+let test_typography_waits_for_the_persisted_preset_without_flashing_balanced () =
+  with_startup (fun startup ->
+    let entry = capture 140 "Comfortable startup typography" in
+    seed startup [ entry ];
+    let handle = create_raw_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         let calendar_request, preference_request = startup_request_ids handle in
+         require_no_visible_text handle "Today";
+         require_no_visible_text handle entry.source;
+         respond_to_application_request
+           handle
+           ~sequence:20L
+           ~request_id:calendar_request
+           initial_calendar_packet;
+         for _ = 1 to 8 do
+           pump_worker handle
+         done;
+         require_no_visible_text handle "Today";
+         require_no_visible_text handle entry.source;
+         Test.Handle.present handle;
+         respond_to_application_request
+           handle
+           ~sequence:21L
+           ~request_id:preference_request
+           (preference_response_packet (Some "comfortable"));
+         Test.Handle.present handle;
+         Test.Handle.resize handle ~width:390. ~height:844.;
+         pump_until_text handle entry.source;
+         require_theme_owned_text_style
+           handle
+           "journal-header-title"
+           ~size:24.
+           ~line_height:(32. /. 24.)
+           ~weight:Ui.Style.Font_weight.Semi_bold;
+         require_theme_owned_text_style
+           handle
+           ("journal-row-source:" ^ entry.block_id ^ ":0")
+           ~size:17.
+           ~line_height:(24. /. 17.)
+           ~weight:Ui.Style.Font_weight.Normal))
+;;
+
+let test_missing_and_invalid_typography_preferences_select_balanced () =
+  let require_balanced stored_preset suffix =
+    with_startup (fun startup ->
+      let entry = capture (141 + suffix) (Printf.sprintf "Balanced fallback %d" suffix) in
+      seed startup [ entry ];
+      let handle = create_handle_with_preference startup stored_preset in
+      Fun.protect
+        ~finally:(fun () -> Test.Handle.shutdown handle)
+        (fun () ->
+           pump_until_text handle entry.source;
+           require_theme_owned_text_style
+             handle
+             "journal-header-title"
+             ~size:22.
+             ~line_height:(28. /. 22.)
+             ~weight:Ui.Style.Font_weight.Semi_bold;
+           require_theme_owned_text_style
+             handle
+             ("journal-row-source:" ^ entry.block_id ^ ":0")
+             ~size:16.
+             ~line_height:(22. /. 16.)
+             ~weight:Ui.Style.Font_weight.Normal))
+  in
+  require_balanced None 0;
+  require_balanced (Some "legacy-large") 1
+;;
+
+let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
+  with_startup (fun startup ->
+    let entry = capture 143 "First line\nSecond line\nThird line" in
+    seed startup [ entry ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until handle "the Account action" (fun () ->
+           Option.is_some
+             (Test.Handle.find handle (Test.Query.test_id "journal-account-menu-button")));
+         pump_until_text handle "First line";
+         let capture_before = node_by_test_id handle "journal-capture-expandable" in
+         click_test_id handle "journal-account-menu-button";
+         require_test_id handle "journal-account-dialog-page";
+         require_no_test_id handle "journal-settings-dialog-page";
+         require_test_id handle "journal-account-settings";
+         click_test_id handle "journal-account-settings";
+         require_no_test_id handle "journal-account-dialog-page";
+         require_test_id handle "journal-settings-dialog-page";
+         require_visible_text handle "Typography";
+         require_visible_text handle "Choose the reading density used throughout the app.";
+         require_semantics handle "Settings";
+         require_choice_chip handle "typography-preset-dense" ~selected:false;
+         require_choice_chip handle "typography-preset-balanced" ~selected:true;
+         require_choice_chip handle "typography-preset-comfortable" ~selected:false;
+         require_semantics handle "Typography preset";
+         require_semantics handle "A Dense";
+         require_semantics handle "B Balanced";
+         require_semantics handle "C Comfortable";
+         require_visible_text handle "Entry 16/22 Normal";
+         change_choice_chip handle "typography-preset-comfortable" true;
+         require_choice_chip handle "typography-preset-dense" ~selected:false;
+         require_choice_chip handle "typography-preset-balanced" ~selected:false;
+         require_choice_chip handle "typography-preset-comfortable" ~selected:true;
+         require_visible_text handle "Entry 17/24 Normal";
+         require_visible_text handle "Manager title 28/34 SemiBold";
+         require_theme_owned_text_style
+           handle
+           "journal-header-title"
+           ~size:24.
+           ~line_height:(32. /. 24.)
+           ~weight:Ui.Style.Font_weight.Semi_bold;
+         require_theme_owned_text_style
+           handle
+           ("journal-row-source:" ^ entry.block_id ^ ":0")
+           ~size:17.
+           ~line_height:(24. /. 17.)
+           ~weight:Ui.Style.Font_weight.Normal;
+         let theme = application_theme_from_last_frame handle in
+         let typography = theme.light.typography in
+         require_protocol_text_style
+           "bodyLarge"
+           16.
+           (24. /. 16.)
+           Protocol.Wire_frame.Normal
+           typography.body_large;
+         require_protocol_text_style
+           "labelLarge"
+           15.
+           (20. /. 15.)
+           Protocol.Wire_frame.Medium
+           typography.label_large;
+         (match application_request_from_last_frame handle 18 with
+          | None -> fail "preset selection did not persist through the platform"
+          | Some (_, payload) ->
+            let json = Bytes.sub_string payload 32 (Bytes.length payload - 32) in
+            require
+              (String.equal
+                 json
+                 "{\"key\":\"typographyPreset\",\"value\":\"comfortable\"}")
+              "set-preference payload differs: %S"
+              json);
+         let capture_after = node_by_test_id handle "journal-capture-expandable" in
+         require
+           (ID.Ui.Node_id.equal capture_before.node_id capture_after.node_id)
+           "preset selection recreated the mounted Capture composer";
+         let revision_before_reselection = Test.Handle.revision handle in
+         change_choice_chip handle "typography-preset-comfortable" false;
+         require_choice_chip handle "typography-preset-comfortable" ~selected:true;
+         require
+           (ID.Runtime.Renderer_revision.equal
+              revision_before_reselection
+              (Test.Handle.revision handle))
+           "reselecting the active preset produced an observable revision";
+         change_choice_chip handle "typography-preset-dense" true;
+         require_choice_chip handle "typography-preset-dense" ~selected:true;
+         require_choice_chip handle "typography-preset-balanced" ~selected:false;
+         require_choice_chip handle "typography-preset-comfortable" ~selected:false;
+         require_visible_text handle "Entry 15/20 Normal";
+         require_visible_text handle "Manager title 24/32 SemiBold";
+         require_theme_owned_text_style
+           handle
+           "journal-header-title"
+           ~size:22.
+           ~line_height:(28. /. 22.)
+           ~weight:Ui.Style.Font_weight.Semi_bold;
+         require_theme_owned_text_style
+           handle
+           ("journal-row-source:" ^ entry.block_id ^ ":0")
+           ~size:15.
+           ~line_height:(20. /. 15.)
+           ~weight:Ui.Style.Font_weight.Normal;
+         (match application_request_from_last_frame handle 18 with
+          | None -> fail "Dense selection did not persist"
+          | Some (_, payload) ->
+            let json = Bytes.sub_string payload 32 (Bytes.length payload - 32) in
+            require
+              (String.equal json "{\"key\":\"typographyPreset\",\"value\":\"dense\"}")
+              "Dense set-preference payload differs: %S"
+              json);
+         List.iter
+           (fun (viewport_width, text_scale) ->
+              set_environment handle (environment ~viewport_width ~text_scale ());
+              pump_worker handle;
+              require_choice_chip handle "typography-preset-dense" ~selected:true;
+              require_choice_chip handle "typography-preset-balanced" ~selected:false;
+              require_choice_chip handle "typography-preset-comfortable" ~selected:false)
+           [ 320., 1.; 390., 1.3; 744., 2.; 1_200., 3.2 ];
+         press_after_choice_events handle "journal-settings-close";
+         require_no_test_id handle "journal-settings-dialog-page";
+         require_test_id handle "journal-timeline-page";
+         require_visible_text handle "First line"))
 ;;
 
 let test_timeline_uses_exact_sparse_extent_window () =
@@ -1544,8 +2030,15 @@ let test_one_visible_range_drains_multiple_day_continuations () =
       (fun () ->
          set_environment handle (environment ~platform:"macos" ());
          pump_until_text handle "Demand day seven row 01";
-         require_test_id handle "journal-day-continuation:20260807";
-         require_test_id handle "journal-day-continuation:20260806";
+         pump_until handle "progressive initial day continuations" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.test_id "journal-day-continuation:20260807"))
+           && Option.is_some
+                (Test.Handle.find
+                   handle
+                   (Test.Query.test_id "journal-day-continuation:20260806")));
          let initial = timeline_props handle in
          require
            (initial.total_count = 9)
@@ -2346,7 +2839,7 @@ let test_expanded_children_are_static_previews_without_group_separator () =
          require_no_test_id handle ("journal-group-divider:" ^ first.block_id);
          require_no_test_id handle ("journal-group-divider:" ^ second.block_id);
          require_no_test_id handle ("journal-group-divider:" ^ parent.block_id);
-         require_sized_height handle ("journal-row-extent:" ^ parent.block_id) 56.;
+         require_sized_height handle ("journal-row-extent:" ^ parent.block_id) 60.;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "preview collapse" (fun () ->
            Option.is_none
@@ -2382,6 +2875,7 @@ let test_loading_and_adaptive_environment_surfaces_are_truthful () =
               pump_worker handle;
               let expected =
                 Journal_visual_tokens.select_row_profile
+                  ~preset:Journal_visual_tokens.Balanced
                   ~viewport_width:width
                   ~text_scale:scale
               in
@@ -2566,10 +3060,14 @@ let () =
   test_timeline_content_is_capped_and_centered ();
   test_root_is_owned_by_the_ocaml_timeline ();
   test_capture_fab_directly_saves_one_plain_top_level_block ();
+  test_capture_fab_uses_directional_threshold_without_replacing_the_composer ();
   test_capture_fab_honors_reduced_motion_without_changing_its_slot ();
   test_header_uses_pinned_theme_owned_sliver_app_bar ();
   test_header_adapts_without_exposing_deferred_actions ();
   test_header_inherits_theme_colors_in_dark_and_high_contrast_appearance ();
+  test_typography_waits_for_the_persisted_preset_without_flashing_balanced ();
+  test_missing_and_invalid_typography_preferences_select_balanced ();
+  test_settings_choice_group_applies_and_persists_one_atomic_preset ();
   test_timeline_uses_exact_sparse_extent_window ();
   test_timeline_preserves_stable_slot_keys_across_window_shifts ();
   test_one_visible_range_drains_multiple_day_continuations ();

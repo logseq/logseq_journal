@@ -30,6 +30,7 @@ type payload =
   | Feed_loaded of
       { request_generation : int64
       ; feed : Projection.feed
+      ; complete : bool
       }
   | Day_blocks_loaded of
       { request_generation : int64
@@ -54,8 +55,10 @@ type response =
 type feed_pending =
   { generation : int64
   ; mutable remaining : int
-  ; mutable queued_pages : (Projection.page * int) list
   ; mutable days : Projection.day_feed list
+  ; ordered_page_ids : string list
+  ; mutable resolved_page_ids : string list
+  ; mutable published : bool
   ; has_more_days : bool
   }
 
@@ -324,13 +327,64 @@ let page_tree t operation page ?cursor limit =
          (Protocol.Get_page_tree { page = page_uuid; maximum_depth = 1; limit; cursor }))
 ;;
 
-let next_feed_page_request t pending =
-  match pending.queued_pages with
-  | [] -> Ok None
-  | (page, allocated_blocks) :: rest ->
-    pending.queued_pages <- rest;
-    page_tree t (Feed_page_tree { page; pending; allocated_blocks }) page allocated_blocks
-    |> Result.map Option.some
+let feed_page_id (page : Projection.page) = page.id
+
+let feed_can_publish pending =
+  if pending.published
+  then true
+  else (
+    match pending.days with
+    | [] -> false
+    | days ->
+      let newest =
+        List.fold_left
+          (fun newest (day : Projection.day_feed) -> Int.max newest day.page.day)
+          min_int
+          days
+      in
+      let rec newer_pages_resolved = function
+        | [] -> true
+        | page_id :: rest ->
+          let day =
+            List.find_map
+              (fun (day : Projection.day_feed) ->
+                 if String.equal day.page.id page_id then Some day.page.day else None)
+              days
+          in
+          (match day with
+           | Some day when day = newest -> true
+           | Some _ -> newer_pages_resolved rest
+           | None ->
+             List.exists (String.equal page_id) pending.resolved_page_ids
+             && newer_pages_resolved rest)
+      in
+      newer_pages_resolved pending.ordered_page_ids)
+;;
+
+let feed_progress ?basis pending =
+  if not (feed_can_publish pending)
+  then []
+  else (
+    pending.published <- true;
+    let days =
+      List.sort
+        (fun left right -> Int.compare right.Projection.page.day left.page.day)
+        pending.days
+    in
+    let slot_count =
+      List.fold_left
+        (fun total (day : Projection.day_feed) -> total + 1 + List.length day.entries)
+        0
+        days
+    in
+    [ response
+        ?basis
+        (Feed_loaded
+           { request_generation = pending.generation
+           ; feed = { days; slot_count; has_more_days = pending.has_more_days }
+           ; complete = pending.remaining = 0
+           })
+    ])
 ;;
 
 let submit t (request : Journal_graph_request.t) =
@@ -669,8 +723,19 @@ let receive t (protocol_response : Protocol.response) =
        (match operation with
         | List_feed_pages { request_generation; _ } ->
           feed_failure request_generation (Error.message failure.error)
-        | Feed_page_tree { pending; _ } ->
-          feed_failure pending.generation (Error.message failure.error)
+        | Feed_page_tree { pending; page; _ } ->
+          pending.remaining <- pending.remaining - 1;
+          pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids;
+          { requests = []
+          ; responses =
+              feed_progress pending
+              @ [ response
+                    (Feed_failed
+                       { request_generation = pending.generation
+                       ; message = Error.message failure.error
+                       })
+                ]
+          }
         | _ ->
           (match operation, failure.phase, Error.code failure.error with
            | Capture_page command, Execute, Not_found ->
@@ -751,8 +816,11 @@ let receive t (protocol_response : Protocol.response) =
             let pending =
               { generation = request_generation
               ; remaining = List.length queued_pages
-              ; queued_pages
               ; days = []
+              ; ordered_page_ids =
+                  List.map (fun (page, _) -> feed_page_id page) queued_pages
+              ; resolved_page_ids = []
+              ; published = false
               ; has_more_days
               }
             in
@@ -764,15 +832,27 @@ let receive t (protocol_response : Protocol.response) =
                     (Feed_loaded
                        { request_generation
                        ; feed = { days = []; slot_count = 0; has_more_days }
+                       ; complete = true
                        })
                 ]
             else (
-              match next_feed_page_request t pending with
-              | Ok (Some request) -> requests [ request ]
-              | Ok None -> feed_failure request_generation "The feed page queue is empty."
-              | Error message -> feed_failure request_generation message))
+              let rec enqueue reversed = function
+                | [] -> requests (List.rev reversed)
+                | (page, allocated_blocks) :: rest ->
+                  (match
+                     page_tree
+                       t
+                       (Feed_page_tree { page; pending; allocated_blocks })
+                       page
+                       allocated_blocks
+                   with
+                   | Ok request -> enqueue (request :: reversed) rest
+                   | Error message -> feed_failure request_generation message)
+              in
+              enqueue [] queued_pages))
         | Feed_page_tree { page; pending; allocated_blocks }, Page_tree_result result ->
           pending.remaining <- pending.remaining - 1;
+          pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids;
           let projected_roots =
             List.fold_left
               (fun count (item : Graph.block_tree_item) ->
@@ -781,11 +861,10 @@ let receive t (protocol_response : Protocol.response) =
               result.items
           in
           if projected_roots > allocated_blocks
-          then (
-            pending.queued_pages <- [];
+          then
             feed_failure
               pending.generation
-              "The Worker page response exceeded its allocated feed budget.")
+              "The Worker page response exceeded its allocated feed budget."
           else (
             remember_tree_items t page result.items;
             match projection_time_context t with
@@ -802,41 +881,7 @@ let receive t (protocol_response : Protocol.response) =
                     ; continuation = projected.continuation
                     }
                     :: pending.days;
-                 if pending.remaining > 0
-                 then (
-                   match next_feed_page_request t pending with
-                   | Ok (Some request) -> requests [ request ]
-                   | Ok None ->
-                     feed_failure
-                       pending.generation
-                       "The feed page queue ended before completion."
-                   | Error message -> feed_failure pending.generation message)
-                 else (
-                   let days =
-                     List.sort
-                       (fun left right ->
-                          Int.compare right.Projection.page.day left.page.day)
-                       pending.days
-                   in
-                   let slot_count =
-                     List.fold_left
-                       (fun total (day : Projection.day_feed) ->
-                          total + 1 + List.length day.entries)
-                       0
-                       days
-                   in
-                   responses
-                     [ response
-                         ~basis
-                         (Feed_loaded
-                            { request_generation = pending.generation
-                            ; feed =
-                                { days
-                                ; slot_count
-                                ; has_more_days = pending.has_more_days
-                                }
-                            })
-                     ])))
+                 { requests = []; responses = feed_progress ~basis pending }))
         | Day_page_tree { page; generation }, Page_tree_result result ->
           remember_tree_items t page result.items;
           (match projection_time_context t with

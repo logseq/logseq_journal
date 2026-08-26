@@ -9,6 +9,15 @@ type generated =
   ; graph_dir : string
   }
 
+type managed_generated =
+  { support_root : string
+  ; graph_id : Logseq_db_worker.Graph_types.Uuid.t
+  ; graph_dir : string
+  ; user_id : string
+  ; base_url : string
+  ; expected_timeline_text : string
+  }
+
 module Snapshot = Logseq_db_worker__Snapshot
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 
@@ -161,12 +170,132 @@ let create ~support_root ~mode =
   | Failure message -> Error message
 ;;
 
-let to_yojson generated =
+let create_encrypted_warm_start ~support_root =
+  try
+    if Filename.is_relative support_root
+    then Error "support root must be absolute"
+    else if not (Sys.file_exists support_root && Sys.is_directory support_root)
+    then Error "support root must be an existing directory"
+    else (
+      let support_root = Unix.realpath support_root in
+      let graph_id_text = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" in
+      let graph_id = uuid graph_id_text in
+      let graph_dir =
+        Logseq_db_worker.Sync_mirror.graph_directory
+          ~application_support_directory:support_root
+          ~graph_id
+      in
+      if Sys.file_exists graph_dir
+      then Error "encrypted warm-start mirror already exists"
+      else (
+        let root = Filename.dirname graph_dir in
+        Adapter_fixture.make_directory root;
+        let created = Adapter_fixture.create_oracle_graph root graph_id_text in
+        if not (String.equal created graph_dir)
+        then failwith "encrypted warm-start mirror path changed";
+        seed_pagination_graph ~support_root ~graph_dir;
+        Adapter_fixture.add_remote_identity graph_dir graph_id_text;
+        let database_path = Filename.concat graph_dir "db.sqlite" in
+        let module Storage = Logseq_db_worker__Logseq_sqlite_storage in
+        let connection =
+          match Storage.open_database database_path with
+          | Ok value -> value
+          | Error _ -> failwith "unable to reopen encrypted warm-start fixture"
+        in
+        let db =
+          match Storage.restore_database connection with
+          | Ok value -> value
+          | Error _ -> failwith "unable to restore encrypted warm-start fixture"
+        in
+        let checksum = Logseq_db_worker.Sync_checksum.recompute ~e2ee:false db in
+        (match Storage.close (Storage.connection_callbacks connection) with
+         | Ok () -> ()
+         | Error _ -> failwith "unable to close encrypted warm-start fixture");
+        let metadata =
+          match
+            Logseq_db_worker__Sync_meta.create
+              ~graph_id
+              ~schema:Logseq_db_worker.Graph_types.{ major = 65; minor = 33 }
+              ~applied_server_t:40
+              ~checksum
+          with
+          | Ok value -> value
+          | Error message -> failwith message
+        in
+        let sqlite = Sqlite3.db_open database_path in
+        (match Logseq_db_worker__Sync_meta.initialize_database sqlite metadata with
+         | Ok () -> ()
+         | Error message ->
+           failwith ("unable to initialize encrypted warm-start fixture: " ^ message));
+        if not (Sqlite3.db_close sqlite)
+        then failwith "unable to close encrypted warm-start metadata";
+        let base_url = "https://api.logseq.io" in
+        let user_id = "macos-integration-" ^ Digest.to_hex (Digest.string support_root) in
+        let graph =
+          Logseq_db_worker.Sync_catalog.
+            { graph_id
+            ; name = "Encrypted Offline Notes"
+            ; schema = { major = 65; minor = 33; exact = true }
+            ; encrypted = true
+            }
+        in
+        let cache =
+          Logseq_db_worker.Sync_catalog.create_cache
+            ~user_id
+            ~base_url
+            ~graphs:[ graph ]
+            ~selected_graph:(Some graph_id)
+          |> fun cache ->
+          Logseq_db_worker.Sync_catalog.set_mirror_status
+            cache
+            graph_id
+            Logseq_db_worker.Sync_catalog.Ready
+        in
+        (match
+           Logseq_db_worker.Sync_catalog_store.save
+             ~application_support_directory:support_root
+             cache
+         with
+         | Ok () -> ()
+         | Error message -> failwith ("unable to save encrypted fixture catalog: " ^ message));
+        Ok
+          { support_root
+          ; graph_id
+          ; graph_dir
+          ; user_id
+          ; base_url
+          ; expected_timeline_text = "Pagination today row 01"
+          }))
+  with
+  | Unix.Unix_error (error, operation, path) ->
+    Error
+      (Printf.sprintf
+         "fixture filesystem operation failed: %s(%s): %s"
+         operation
+         path
+         (Unix.error_message error))
+  | Failure message -> Error message
+;;
+
+let to_yojson (generated : generated) =
   `Assoc
     [ "formatVersion", `Int 1
     ; "supportRoot", `String generated.support_root
     ; ( "snapshotToken"
       , `String (Logseq_db_worker.Graph_types.Uuid.to_string generated.snapshot_token) )
     ; "graphDir", `String generated.graph_dir
+    ]
+;;
+
+let managed_to_yojson (generated : managed_generated) =
+  `Assoc
+    [ "formatVersion", `Int 1
+    ; "supportRoot", `String generated.support_root
+    ; "baseUrl", `String generated.base_url
+    ; "userId", `String generated.user_id
+    ; ( "graphId"
+      , `String (Logseq_db_worker.Graph_types.Uuid.to_string generated.graph_id) )
+    ; "graphDir", `String generated.graph_dir
+    ; "expectedTimelineText", `String generated.expected_timeline_text
     ]
 ;;

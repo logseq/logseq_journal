@@ -35,6 +35,15 @@ type anchor_decision =
 
 type extent_strategy = Known_profile_extents
 
+type capture_fab_presentation =
+  | Extended
+  | Compact
+
+type capture_fab_scroll =
+  { presentation : capture_fab_presentation
+  ; accumulated_travel : float
+  }
+
 type t =
   { today : int
   ; slots : slot list
@@ -76,6 +85,32 @@ let maximum_supplied_rows = 40
 let overscan = 4
 let extent_strategy = Known_profile_extents
 let renderer_event_surface = [ `Visible_range ]
+let initial_capture_fab_scroll = { presentation = Extended; accumulated_travel = 0. }
+let capture_fab_presentation state = state.presentation
+let capture_fab_accumulated_travel state = state.accumulated_travel
+
+let update_capture_fab_scroll state ~pixels ~delta =
+  if Float.compare pixels 0. <= 0
+  then initial_capture_fab_scroll
+  else if Float.equal delta 0.
+  then state
+  else (
+    let same_direction =
+      (Float.compare state.accumulated_travel 0. > 0 && Float.compare delta 0. > 0)
+      || (Float.compare state.accumulated_travel 0. < 0 && Float.compare delta 0. < 0)
+    in
+    let accumulated_travel =
+      if Float.equal state.accumulated_travel 0. || same_direction
+      then state.accumulated_travel +. delta
+      else delta
+    in
+    match state.presentation with
+    | Extended when Float.compare accumulated_travel 24. >= 0 ->
+      { presentation = Compact; accumulated_travel = 0. }
+    | Compact when Float.compare accumulated_travel (-24.) <= 0 ->
+      { presentation = Extended; accumulated_travel = 0. }
+    | Extended | Compact -> { state with accumulated_travel })
+;;
 
 let empty ~today =
   { today

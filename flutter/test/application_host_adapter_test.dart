@@ -7,6 +7,7 @@ import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart
 import 'package:bonsai_flutter_logseq_journal_host/main.dart';
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:amplify_authenticator/amplify_authenticator.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 // ignore: depend_on_referenced_packages
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
@@ -24,11 +25,15 @@ const sampleCalendar = JournalCalendarSnapshot(
 final class _Auth implements JournalAuthCapability {
   final String? userId = 'cognito-user-1';
   final String token = 'fresh-id-token';
+  int currentUserRequests = 0;
   int tokenRequests = 0;
   int signOutRequests = 0;
 
   @override
-  Future<String?> currentUserId() async => userId;
+  Future<String?> currentUserId() async {
+    currentUserRequests += 1;
+    return userId;
+  }
 
   @override
   Future<String> freshIdToken() async {
@@ -40,6 +45,16 @@ final class _Auth implements JournalAuthCapability {
   Future<void> signOut() async {
     signOutRequests += 1;
   }
+}
+
+Future<String?> _readBalancedPreference(String key) async {
+  expect(key, 'typographyPreset');
+  return 'balanced';
+}
+
+Future<void> _writePreference(String key, String value) async {
+  expect(key, 'typographyPreset');
+  expect(value, anyOf('dense', 'balanced', 'comfortable'));
 }
 
 final class _PendingHostAdapter implements BonsaiFlutterHostAdapter {
@@ -85,6 +100,18 @@ Uint8List rawRequest(int tag) {
   return value;
 }
 
+Uint8List rawJsonRequest(int tag, Map<String, Object?> payload) {
+  final json = utf8.encode(jsonEncode(payload));
+  final value = Uint8List(32 + json.length);
+  value.setRange(0, 4, ascii.encode('LJP2'));
+  final data = ByteData.sublistView(value);
+  data.setUint16(4, 2, Endian.little);
+  data.setUint16(6, tag, Endian.little);
+  data.setUint32(24, json.length, Endian.little);
+  value.setRange(32, value.length, json);
+  return value;
+}
+
 int rawEventTag(Uint8List event) =>
     ByteData.sublistView(event).getUint16(6, Endian.little);
 
@@ -109,6 +136,8 @@ void main() {
         liveCalendarSnapshot: () async => sampleCalendar,
         formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
       );
       final payload = await adapter.createApplicationPayload();
       final decoded =
@@ -138,6 +167,8 @@ void main() {
         liveCalendarSnapshot: () async => sampleCalendar,
         formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
         amplifyReady: configuration.future,
       );
 
@@ -159,6 +190,42 @@ void main() {
     },
   );
 
+  testWidgets(
+    'local binding presents the application while Amplify configuration is pending',
+    (tester) async {
+      final configuration = Completer<void>();
+      final adapter = ApplicationHostAdapter(
+        applicationSupportDirectory: () async => Directory.systemTemp,
+        baseUrl: Uri.parse('https://api.example.test'),
+        initialCalendarSnapshot: () async => sampleCalendar,
+        liveCalendarSnapshot: () async => sampleCalendar,
+        formatJournalDays: ({required snapshot, required days}) async => {},
+        auth: _Auth(),
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
+        readLocalAccountBinding: () async => (
+          userId: 'local-user-1',
+          managedSyncOrigin: 'https://api.example.test',
+        ),
+        amplifyReady: configuration.future,
+      );
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (context) => adapter.buildHost(
+            context: context,
+            child: const Text('Local Timeline'),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('Local Timeline'), findsOneWidget);
+      expect(find.byType(Authenticator), findsNothing);
+      expect(configuration.isCompleted, isFalse);
+    },
+  );
+
   test(
     'application platform signs out through the authenticated host',
     () async {
@@ -167,6 +234,8 @@ void main() {
         calendarSnapshot: () async => sampleCalendar,
         formatJournalDays: ({required snapshot, required days}) async => {},
         auth: auth,
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
       );
       addTearDown(platform.dispose);
 
@@ -178,6 +247,74 @@ void main() {
   );
 
   test(
+    'typography reads the retained startup preference and writes through native storage',
+    () async {
+      final calls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('logseq_journal/platform'),
+            (call) async {
+              calls.add(call);
+              switch (call.method) {
+                case 'getStartupEnvironment':
+                  return <String, Object?>{
+                    'applicationSupportPath': Directory.systemTemp.path,
+                    'instantUnixMilliseconds':
+                        sampleCalendar.instantUnixMilliseconds,
+                    'localDay': sampleCalendar.localDay,
+                    'locale': sampleCalendar.locale,
+                    'timeZoneId': sampleCalendar.timeZoneId,
+                    'utcOffsetSeconds': sampleCalendar.utcOffsetSeconds,
+                    'generation': sampleCalendar.generation,
+                    'typographyPreset': 'dense',
+                    'localAccountBinding': null,
+                  };
+                case 'setPreference':
+                  expect(call.arguments, {
+                    'key': 'typographyPreset',
+                    'value': 'comfortable',
+                  });
+                  return null;
+              }
+              throw StateError('unexpected native call ${call.method}');
+            },
+          );
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('logseq_journal/platform'),
+              null,
+            ),
+      );
+
+      final adapter = createBonsaiFlutterHostAdapter(
+        baseUrl: Uri.parse('https://api.example.test'),
+      );
+      final platform = adapter.createApplicationPlatform();
+      addTearDown((platform as JournalApplicationPlatform).dispose);
+
+      final loaded = await platform.handleRequest(
+        rawJsonRequest(16, {'key': 'typographyPreset'}),
+      );
+      expect(ByteData.sublistView(loaded).getUint16(6, Endian.little), 17);
+      expect(responseJson(loaded), {
+        'key': 'typographyPreset',
+        'value': 'dense',
+      });
+
+      final stored = await platform.handleRequest(
+        rawJsonRequest(18, {'key': 'typographyPreset', 'value': 'comfortable'}),
+      );
+      expect(ByteData.sublistView(stored).getUint16(6, Endian.little), 19);
+      expect(responseJson(stored), {'key': 'typographyPreset', 'stored': true});
+      expect(calls.map((call) => call.method), [
+        'getStartupEnvironment',
+        'setPreference',
+      ]);
+    },
+  );
+
+  test(
     'termination waits for native graph cleanup before runtime shutdown',
     () async {
       var runtimeShutdowns = 0;
@@ -185,6 +322,8 @@ void main() {
         calendarSnapshot: () async => sampleCalendar,
         formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
         prepareToTerminate: () async {
           runtimeShutdowns += 1;
         },
@@ -220,14 +359,12 @@ void main() {
   });
 
   test('production entrypoint owns ordered Amplify startup and retry UI', () {
-    final entrypoint = File('lib/application.dart');
+    final entrypoint = File('lib/main.dart');
     expect(entrypoint.existsSync(), isTrue);
     if (!entrypoint.existsSync()) return;
     final source = entrypoint.readAsStringSync();
-    expect(
-      source.indexOf('await JournalAmplify.configure()'),
-      lessThan(source.indexOf('runApp')),
-    );
+    expect(source, isNot(contains('await JournalAmplify.configure()')));
+    expect(source, contains('amplifyReady: amplifyReady'));
     expect(source, contains('Unable to configure authentication'));
     expect(source, contains('Retry'));
     expect(RegExp(r'MaterialApp\(').allMatches(source), hasLength(1));
@@ -235,6 +372,10 @@ void main() {
       source,
       isNot(contains("child: MaterialApp(title: 'Logseq Journal'")),
     );
+    final project = File('../bonsai-flutter.sexp').readAsStringSync();
+    expect(project, contains('(mode custom)'));
+    expect(project, contains('(main lib/main.dart)'));
+    expect(File('lib/application.dart').existsSync(), isFalse);
   });
 
   test(
@@ -252,6 +393,8 @@ void main() {
         ),
         formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
       );
       addTearDown(platform.dispose);
       final events = <Uint8List>[];
@@ -288,6 +431,8 @@ void main() {
       ),
       formatJournalDays: ({required snapshot, required days}) async => {},
       auth: _Auth(),
+      readPreference: _readBalancedPreference,
+      writePreference: _writePreference,
     );
     addTearDown(platform.dispose);
     final events = <Uint8List>[];
@@ -323,7 +468,12 @@ void main() {
     tester,
   ) async {
     final adapter = _PendingHostAdapter();
-    await tester.pumpWidget(BonsaiFlutterHost(adapter: adapter));
+    await tester.pumpWidget(
+      JournalApplicationHost(
+        adapter: adapter,
+        runtimeOwner: JournalRuntimeOwner(),
+      ),
+    );
     expect(adapter.payloadRequests, 1);
 
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
@@ -342,6 +492,8 @@ void main() {
         calendarSnapshot: () async => sampleCalendar,
         formatJournalDays: ({required snapshot, required days}) async => {},
         auth: auth,
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
       );
       addTearDown(platform.dispose);
 
@@ -361,6 +513,151 @@ void main() {
         'token': 'fresh-id-token',
       });
       expect(auth.tokenRequests, 1);
+    },
+  );
+
+  test(
+    'local account binding starts the local lane without consulting Amplify',
+    () async {
+      final auth = _Auth();
+      var frameWaits = 0;
+      final platform = JournalApplicationPlatform(
+        calendarSnapshot: () async => sampleCalendar,
+        formatJournalDays: ({required snapshot, required days}) async => {},
+        auth: auth,
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
+        managedSyncOrigin: 'https://api.example.test',
+        readLocalAccountBinding: () async => (
+          userId: 'local-user-1',
+          managedSyncOrigin: 'https://api.example.test',
+        ),
+        waitForPresentationFrame: () async {
+          frameWaits += 1;
+        },
+      );
+      addTearDown(platform.dispose);
+
+      final local = await platform.handleRequest(rawRequest(20));
+      expect(responseJson(local), {
+        'userId': 'local-user-1',
+        'managedSyncOrigin': 'https://api.example.test',
+      });
+      expect(auth.currentUserRequests, 0);
+      expect(auth.tokenRequests, 0);
+
+      final presented = await platform.handleRequest(
+        rawJsonRequest(22, {
+          'accountGeneration': 3,
+          'graphGeneration': 5,
+          'presentationGeneration': 7,
+        }),
+      );
+      expect(responseJson(presented), {
+        'accountGeneration': 3,
+        'graphGeneration': 5,
+        'presentationGeneration': 7,
+        'presented': true,
+      });
+      expect(frameWaits, 1);
+    },
+  );
+
+  test(
+    'authenticated reconciliation persists and explicit sign-out clears the binding',
+    () async {
+      final auth = _Auth();
+      final persisted = <JournalLocalAccountBinding>[];
+      var clears = 0;
+      final platform = JournalApplicationPlatform(
+        calendarSnapshot: () async => sampleCalendar,
+        formatJournalDays: ({required snapshot, required days}) async => {},
+        auth: auth,
+        readPreference: _readBalancedPreference,
+        writePreference: _writePreference,
+        managedSyncOrigin: 'https://api.example.test',
+        persistLocalAccountBinding: (binding) async => persisted.add(binding),
+        clearLocalAccountBinding: () async {
+          clears += 1;
+        },
+      );
+      addTearDown(platform.dispose);
+
+      final user = await platform.handleRequest(rawRequest(6));
+      expect(responseJson(user), {'userId': 'cognito-user-1'});
+      expect(persisted, [
+        (
+          userId: 'cognito-user-1',
+          managedSyncOrigin: 'https://api.example.test',
+        ),
+      ]);
+
+      await platform.handleRequest(rawRequest(10));
+      expect(clears, 1);
+    },
+  );
+
+  test(
+    'production startup facts retain calendar typography and local binding in one call',
+    () async {
+      final calls = <MethodCall>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('logseq_journal/platform'),
+            (call) async {
+              calls.add(call);
+              if (call.method == 'getStartupEnvironment') {
+                return <String, Object?>{
+                  'applicationSupportPath': Directory.systemTemp.path,
+                  'instantUnixMilliseconds':
+                      sampleCalendar.instantUnixMilliseconds,
+                  'localDay': sampleCalendar.localDay,
+                  'locale': sampleCalendar.locale,
+                  'timeZoneId': sampleCalendar.timeZoneId,
+                  'utcOffsetSeconds': sampleCalendar.utcOffsetSeconds,
+                  'generation': sampleCalendar.generation,
+                  'typographyPreset': 'comfortable',
+                  'localAccountBinding': <String, Object>{
+                    'version': 1,
+                    'userId': 'local-user-1',
+                    'managedSyncOrigin': 'https://api.example.test',
+                  },
+                };
+              }
+              throw StateError('unexpected native call ${call.method}');
+            },
+          );
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('logseq_journal/platform'),
+              null,
+            ),
+      );
+
+      final adapter = createBonsaiFlutterHostAdapter(
+        baseUrl: Uri.parse('https://api.example.test'),
+      );
+      await adapter.createApplicationPayload();
+      final platform =
+          adapter.createApplicationPlatform() as JournalApplicationPlatform;
+      addTearDown(platform.dispose);
+
+      final calendar = await platform.handleRequest(rawRequest(1));
+      expect(rawEventTag(calendar), 2);
+      final typography = await platform.handleRequest(
+        rawJsonRequest(16, {'key': 'typographyPreset'}),
+      );
+      expect(responseJson(typography), {
+        'key': 'typographyPreset',
+        'value': 'comfortable',
+      });
+      final binding = await platform.handleRequest(rawRequest(20));
+      expect(responseJson(binding), {
+        'userId': 'local-user-1',
+        'managedSyncOrigin': 'https://api.example.test',
+      });
+      expect(calls.map((call) => call.method), ['getStartupEnvironment']);
     },
   );
 

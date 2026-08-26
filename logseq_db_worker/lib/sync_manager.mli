@@ -4,12 +4,19 @@ type phase =
   | Loading_catalog
   | Awaiting_selection
   | Bootstrapping
+  | Recovering_online of Sync_startup_phase.recovery_reason
   | Awaiting_e2ee_password
   | Opening_graph
   | Graph_open
   | Sync_paused
   | Stopping_graph
   | Failed
+
+type startup_presentation =
+  | Restoring_local
+  | Local_feed_ready
+  | Timeline_presented
+  | Reconciled
 
 type snapshot =
   { phase : phase
@@ -21,9 +28,29 @@ type snapshot =
   ; selected_graph : Graph_types.Uuid.t option
   ; applied_server_t : int option
   ; last_error : string option
+  ; presentation_generation : int
+  ; startup_presentation : startup_presentation
   }
 
 type command =
+  | Restore_local_account of
+      { user_id : string
+      ; managed_sync_origin : string
+      }
+  | Reconcile_authenticated_user of
+      { user_id : string option
+      ; managed_sync_origin : string
+      }
+  | Local_feed_ready of
+      { account_generation : int
+      ; graph_generation : int
+      ; presentation_generation : int
+      }
+  | Timeline_presented of
+      { account_generation : int
+      ; graph_generation : int
+      ; presentation_generation : int
+      }
   | Authenticated_user of { user_id : string }
   | Signed_out_command
   | Provide_id_token of
@@ -38,12 +65,23 @@ type command =
   | Select_graph of Graph_types.Uuid.t
   | Return_to_graph_picker
   | Refresh_catalog
+  | Begin_online_recovery
   | Backgrounded of { lifecycle_generation : int64 }
   | Foreground_resumed of { lifecycle_generation : int64 }
   | Submit_e2ee_password of string
   | Delete_local_cache of Graph_types.Uuid.t
 
+type local_secret_failure_receipt =
+  | Wrapped_key_failure_receipt of
+      Sync_startup_phase.wrapped_graph_key Sync_startup_phase.failure_receipt
+  | Private_key_failure_receipt of
+      Sync_startup_phase.local_private_key Sync_startup_phase.failure_receipt
+
 type event =
+  | Cached_catalog_loaded of
+      { account_generation : int
+      ; graphs : Sync_catalog.graph list
+      }
   | Catalog_loaded of
       { account_generation : int
       ; graphs : Sync_catalog.graph list
@@ -61,6 +99,30 @@ type event =
       { account_generation : int
       ; graph_generation : int
       ; graph_id : Graph_types.Uuid.t
+      ; receipt : Sync_startup_phase.mirror Sync_startup_phase.failure_receipt
+      }
+  | Wrapped_graph_key_loaded of
+      { account_generation : int
+      ; graph_generation : int
+      ; graph_id : Graph_types.Uuid.t
+      ; encrypted_graph_key : string
+      }
+  | Wrapped_graph_key_load_failed of
+      { account_generation : int
+      ; graph_generation : int
+      ; graph_id : Graph_types.Uuid.t
+      ; diagnostic : string
+      ; receipt : local_secret_failure_receipt
+      }
+  | Wrapped_graph_key_saved of
+      { account_generation : int
+      ; graph_generation : int
+      ; graph_id : Graph_types.Uuid.t
+      ; diagnostic : string option
+      }
+  | Local_secret_cleanup_finished of
+      { account_generation : int
+      ; diagnostic : string option
       }
   | Local_cache_deleted of
       { account_generation : int
@@ -159,108 +221,6 @@ type event =
       ; message : string
       }
 
-type action =
-  | Need_id_token of Sync_auth.challenge
-  | Fetch_catalog of
-      { account_generation : int
-      ; base_url : Uri.t
-      ; token : string
-      }
-  | Inspect_mirror of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      }
-  | Fetch_snapshot_baseline of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      ; token : string
-      }
-  | Fetch_snapshot_metadata of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      ; token : string
-      }
-  | Download_snapshot_artifact of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      ; baseline : Sync_bootstrap.baseline
-      ; metadata : Sync_bootstrap.snapshot_metadata
-      ; token : string
-      }
-  | Activate_snapshot of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      ; server_t : int
-      ; snapshot_path : string
-      ; expected_rows : int
-      ; graph_key : string option
-      }
-  | Fetch_e2ee_graph_key of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      ; token : string
-      }
-  | Fetch_e2ee_user_keys of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph_id : Graph_types.Uuid.t
-      ; token : string
-      }
-  | Open_graph of
-      { account_generation : int
-      ; graph_generation : int
-      ; graph : Sync_catalog.graph
-      ; encrypted_graph_key : string option
-      }
-  | Close_graph
-  | Connect_websocket of
-      { account_generation : int
-      ; graph_generation : int
-      ; connection_generation : int
-      ; graph_id : Graph_types.Uuid.t
-      ; token : string
-      }
-  | Close_websocket
-  | Send_websocket of string
-  | Schedule_reconnect of
-      { account_generation : int
-      ; graph_generation : int
-      ; connection_generation : int
-      ; delay_seconds : float
-      }
-  | Schedule_foreground_probe of
-      { account_generation : int
-      ; graph_generation : int
-      ; connection_generation : int
-      ; lifecycle_generation : int64
-      ; delay_seconds : float
-      }
-  | Apply_sync_frame of string
-  | Recover_submitted of Graph_types.Uuid.t list
-  | Fetch_http_pull of
-      { account_generation : int
-      ; graph_generation : int
-      ; connection_generation : int
-      ; graph_id : Graph_types.Uuid.t
-      ; since : int
-      ; token : string
-      }
-  | Submit_http_transaction of
-      { account_generation : int
-      ; graph_generation : int
-      ; connection_generation : int
-      ; graph_id : Graph_types.Uuid.t
-      ; payload : string
-      ; token : string
-      }
-  | Delete_mirror of Graph_types.Uuid.t
-
 type t
 
 val create : next_challenge_id:(unit -> string) -> base_url:Uri.t -> t
@@ -272,6 +232,6 @@ val create_with_e2ee
   -> t
 
 val snapshot : t -> snapshot
-val handle_command : t -> command -> action list
-val handle_event : t -> event -> action list
+val handle_command : t -> command -> Sync_action.packed list
+val handle_event : t -> event -> Sync_action.packed list
 val diagnostics : t -> string

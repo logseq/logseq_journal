@@ -10,7 +10,10 @@ type dependencies =
   ; cursor_authentication_key : bytes
   ; crypto : Sync_e2ee.crypto
   ; unlock_graph_key :
-      user_id:string -> encrypted_graph_key:string -> (string, string) result
+      managed_sync_origin:Uri.t
+      -> user_id:string
+      -> encrypted_graph_key:string
+      -> (Sync_graph_key.t, string) result
   }
 
 exception Fatal_storage_error of string

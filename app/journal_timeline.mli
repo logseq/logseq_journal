@@ -1,9 +1,10 @@
 module Ui = Bonsai_flutter_ui
 
-val loading_view : unit -> Ui.Widget.t
+val loading_view : typography:Journal_visual_tokens.typography -> unit -> Ui.Widget.t
 
 val view
   :  tokens:Journal_visual_tokens.t
+  -> typography:Journal_visual_tokens.typography
   -> profile:Journal_visual_tokens.row_profile
   -> device_pixel_ratio:float
   -> end_padding:float

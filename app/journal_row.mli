@@ -11,6 +11,7 @@ end
 
 val view
   :  tokens:Journal_visual_tokens.t
+  -> typography:Journal_visual_tokens.typography
   -> profile:Journal_visual_tokens.row_profile
   -> device_pixel_ratio:float
   -> rtl:bool

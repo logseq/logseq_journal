@@ -23,7 +23,7 @@ The production styling corpus is split across several ownership boundaries:
   `app/journal_timeline.ml` consume the custom palette for text, icons,
   backgrounds, dividers, press overlays, task-status rails, child connectors,
   and swipe-delete feedback.
-- `flutter/lib/application.dart` owns the pre-runtime configuration failure and
+- `flutter/lib/main.dart` owns the pre-runtime configuration failure and
   runtime-preparation states. `flutter/lib/application_host_adapter.dart` owns
   the Amplify authentication shell and currently supplies `ThemeData.light()`
   before the authenticated Bonsai application appears.

@@ -48,6 +48,447 @@ void main() {
   }
 
   testWidgets(
+    'real runtime renders all typography presets at 390 x 844',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: Brightness.light,
+        highContrast: false,
+      );
+      expect(tester.takeException(), isNull);
+
+      Future<void> expectPresetGolden(String preset) async {
+        final scrollable = find.descendant(
+          of: find.byType(CustomScrollView),
+          matching: find.byType(Scrollable),
+        );
+        final position = tester.state<ScrollableState>(scrollable).position;
+        position.jumpTo(1);
+        await tester.pump();
+        position.jumpTo(0);
+        await tester.pump(const Duration(milliseconds: 220));
+        await expectLater(
+          find.byType(Scaffold).first,
+          matchesGoldenFile('goldens/journal-typography-$preset.png'),
+        );
+      }
+
+      Future<void> selectPreset(String label, String storedValue) async {
+        await tester.tap(find.bySemanticsLabel('Account menu'));
+        await harness.pumpUntil(
+          () => find.text('Settings').evaluate().isNotEmpty,
+          reason: 'the Account dialog did not expose Settings',
+        );
+        await tester.tap(find.text('Settings').last);
+        await harness.pumpUntil(
+          () => find.text(label).evaluate().isNotEmpty,
+          reason: 'the typography choice group did not open',
+        );
+        await tester.tap(find.text(label));
+        await harness.pumpUntil(() {
+          final chip = find.ancestor(
+            of: find.text(label),
+            matching: find.byType(ChoiceChip),
+          );
+          return chip.evaluate().isNotEmpty &&
+              tester.widget<ChoiceChip>(chip).selected;
+        }, reason: 'the $storedValue preset did not become selected');
+        await tester.tap(find.text('Close'));
+        await harness.pumpUntil(
+          () => find.byType(ChoiceChip).evaluate().isEmpty,
+          reason: 'Settings did not close after selecting $storedValue',
+        );
+        await tester.pump(const Duration(milliseconds: 220));
+      }
+
+      await expectPresetGolden('balanced');
+      await selectPreset('A Dense', 'dense');
+      await expectPresetGolden('dense');
+      await selectPreset('C Comfortable', 'comfortable');
+      await expectPresetGolden('comfortable');
+    },
+    skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
+  );
+
+  testWidgets(
+    'real runtime morphs Capture FAB with standard motion',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: Brightness.light,
+        highContrast: false,
+      );
+      tester.view.physicalSize = const Size(390, 600);
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      final composer = find.byType(ExpandableMessageComposer);
+      final floatingActionButton = find.byType(FloatingActionButton);
+      final scrollable = find.descendant(
+        of: find.byType(CustomScrollView),
+        matching: find.byType(Scrollable),
+      );
+      final position = tester.state<ScrollableState>(scrollable).position;
+      expect(position.maxScrollExtent, greaterThan(24));
+      final extendedWidth = tester.getSize(floatingActionButton).width;
+      final extendedRect = tester.getRect(floatingActionButton);
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.text('Doing line one')),
+      );
+      await gesture.moveBy(const Offset(0, -19));
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -23));
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(position.pixels, closeTo(23, 0.1));
+      expect(
+        tester.widget<ExpandableMessageComposer>(composer).fabPresentation,
+        ExpandableMessageComposerFabPresentation.extended,
+      );
+
+      await gesture.moveBy(const Offset(0, -1));
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.compact,
+        reason: '24 points of downward travel did not compact Capture',
+      );
+      expect(tester.getSize(floatingActionButton).width, extendedWidth);
+      expect(tester.getRect(floatingActionButton).right, extendedRect.right);
+      expect(find.text('Capture'), findsOneWidget);
+
+      await tester.pump(const Duration(milliseconds: 90));
+      expect(
+        tester.getSize(floatingActionButton).width,
+        allOf(greaterThan(56), lessThan(extendedWidth)),
+        reason:
+            'standard motion did not animate FAB width from the trailing edge',
+      );
+      final labelOpacity = tester.widget<Opacity>(
+        find.ancestor(of: find.text('Capture'), matching: find.byType(Opacity)),
+      );
+      expect(labelOpacity.opacity, inExclusiveRange(0, 1));
+      expect(
+        tester.getRect(floatingActionButton).right,
+        closeTo(extendedRect.right, 0.01),
+      );
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(tester.getSize(floatingActionButton), const Size(56, 56));
+      expect(find.text('Capture'), findsNothing);
+      await gesture.up();
+      await harness.dispose();
+    },
+    skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
+    timeout: const Timeout(Duration(seconds: 60)),
+  );
+
+  testWidgets(
+    'real runtime renders compact Capture in RTL at large text',
+    (tester) async {
+      addTearDown(tester.binding.platformDispatcher.clearLocalesTestValue);
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: Brightness.light,
+        highContrast: false,
+      );
+      tester.view.physicalSize = const Size(390, 600);
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      final composer = find.byType(ExpandableMessageComposer);
+      final scrollable = find.descendant(
+        of: find.byType(CustomScrollView),
+        matching: find.byType(Scrollable),
+      );
+      final position = tester.state<ScrollableState>(scrollable).position;
+      expect(position.maxScrollExtent, greaterThan(24));
+      position.jumpTo(24);
+      await _dispatchScrollUpdate(tester, scrollable, 24);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.compact,
+        reason: 'Capture did not settle compact before RTL coverage',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(find.text('Capture'), findsNothing);
+      expect(
+        tester.getSize(find.byType(FloatingActionButton)),
+        const Size(56, 56),
+      );
+
+      tester.binding.platformDispatcher.localesTestValue = const [
+        Locale('ar', 'SA'),
+      ];
+      tester.platformDispatcher.textScaleFactorTestValue = 3.2;
+      await tester.pump();
+      await harness.pumpUntil(
+        () =>
+            Directionality.of(tester.element(composer)) == TextDirection.rtl &&
+            MediaQuery.textScalerOf(tester.element(composer)).scale(1) > 3,
+        reason: 'RTL large-text environment did not reach compact Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(find.text('Capture'), findsNothing);
+      expect(
+        tester.getSize(find.byType(FloatingActionButton)),
+        const Size(56, 56),
+      );
+      await expectLater(
+        find.byType(Scaffold).first,
+        matchesGoldenFile('goldens/journal-capture-compact-rtl-large-text.png'),
+      );
+      await harness.dispose();
+    },
+    skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
+    timeout: const Timeout(Duration(seconds: 60)),
+  );
+
+  testWidgets(
+    'real runtime preserves Capture behavior across directional presentation changes',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: Brightness.light,
+        highContrast: false,
+      );
+      tester.view.physicalSize = const Size(390, 600);
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      final composer = find.byType(ExpandableMessageComposer);
+      final floatingActionButton = find.byType(FloatingActionButton);
+      final scrollable = find.descendant(
+        of: find.byType(CustomScrollView),
+        matching: find.byType(Scrollable),
+      );
+      final position = tester.state<ScrollableState>(scrollable).position;
+      expect(position.maxScrollExtent, greaterThan(24));
+      final composerState = tester.state(composer);
+      expect(
+        tester.widget<ExpandableMessageComposer>(composer).fabPresentation,
+        ExpandableMessageComposerFabPresentation.extended,
+      );
+      expect(
+        tester.widget<FloatingActionButton>(floatingActionButton).isExtended,
+        isTrue,
+      );
+      expect(find.text('Capture'), findsOneWidget);
+
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.text('Doing line one')),
+      );
+      await gesture.moveBy(const Offset(0, -19));
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -23));
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(position.pixels, closeTo(23, 0.1));
+      expect(
+        tester.widget<ExpandableMessageComposer>(composer).fabPresentation,
+        ExpandableMessageComposerFabPresentation.extended,
+        reason: 'sub-threshold downward travel compacted Capture',
+      );
+      expect(tester.state(composer), same(composerState));
+
+      await gesture.moveBy(const Offset(0, -1));
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.compact,
+        reason: '24 points of downward travel did not compact Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 180));
+      await gesture.up();
+      expect(tester.state(composer), same(composerState));
+      final compactFab = tester.widget<FloatingActionButton>(
+        floatingActionButton,
+      );
+      expect(compactFab.isExtended, isFalse);
+      expect(compactFab.mini, isFalse);
+      expect(tester.getSize(floatingActionButton), const Size(56, 56));
+      expect(find.text('Capture'), findsNothing);
+      expect(find.bySemanticsLabel('Open Capture'), findsOneWidget);
+      _expectMaterialGlyph(
+        floatingActionButton,
+        Icons.add,
+        role: 'compact FAB',
+      );
+
+      position.jumpTo(124);
+      await _dispatchScrollUpdate(tester, scrollable, 100);
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(
+        tester.widget<ExpandableMessageComposer>(composer).fabPresentation,
+        ExpandableMessageComposerFabPresentation.compact,
+        reason: 'downward travel while compact toggled the FAB',
+      );
+      await tester.tap(floatingActionButton);
+      await tester.pump();
+      const draft = '  retained while scrolling 👩🏽‍💻  ';
+      await tester.enterText(find.byType(TextField), draft);
+      await tester.pump();
+      final textField = tester.widget<TextField>(find.byType(TextField));
+      final controller = textField.controller;
+      final focusNode = textField.focusNode;
+      final route = ModalRoute.of(tester.element(find.byType(MessageComposer)));
+      expect(route, isNotNull);
+      expect(focusNode!.hasFocus, isTrue);
+
+      position.jumpTo(101);
+      await _dispatchScrollUpdate(tester, scrollable, -23);
+      await tester.pump(const Duration(milliseconds: 120));
+      expect(
+        tester.widget<ExpandableMessageComposer>(composer).fabPresentation,
+        ExpandableMessageComposerFabPresentation.compact,
+        reason: '23 points of upward travel extended Capture',
+      );
+      position.jumpTo(100);
+      await _dispatchScrollUpdate(tester, scrollable, -1);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.extended,
+        reason: '24 points of upward travel did not extend Capture',
+      );
+      expect(tester.state(composer), same(composerState));
+      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(
+        ModalRoute.of(tester.element(find.byType(MessageComposer))),
+        same(route),
+      );
+      final updatedTextField = tester.widget<TextField>(find.byType(TextField));
+      expect(updatedTextField.controller, same(controller));
+      expect(updatedTextField.focusNode, same(focusNode));
+      expect(updatedTextField.controller!.text, draft);
+      expect(updatedTextField.focusNode!.hasFocus, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await harness.pumpUntil(
+        () => find.byType(BottomSheet).evaluate().isEmpty,
+        reason: 'Escape did not dismiss Capture after presentation changes',
+      );
+      expect(find.text('Capture'), findsOneWidget);
+
+      position.jumpTo(200);
+      await _dispatchScrollUpdate(tester, scrollable, 100);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.compact,
+        reason: 'one large downward event did not compact Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(tester.state(composer), same(composerState));
+      position.jumpTo(0);
+      await _dispatchScrollUpdate(tester, scrollable, -200);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.extended,
+        reason: 'the top boundary did not restore extended Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+
+      await expectLater(
+        find.byType(Scaffold).first,
+        matchesGoldenFile('goldens/journal-capture-extended-light.png'),
+      );
+      position.jumpTo(24);
+      await _dispatchScrollUpdate(tester, scrollable, 24);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.compact,
+        reason: 'Capture did not settle compact for golden coverage',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await expectLater(
+        find.byType(Scaffold).first,
+        matchesGoldenFile('goldens/journal-capture-compact-light.png'),
+      );
+
+      tester.platformDispatcher.platformBrightnessTestValue = Brightness.dark;
+      await tester.pump();
+      await harness.pumpUntil(
+        () => Theme.of(tester.element(composer)).brightness == Brightness.dark,
+        reason: 'dark appearance did not reach compact Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await expectLater(
+        find.byType(Scaffold).first,
+        matchesGoldenFile('goldens/journal-capture-compact-dark.png'),
+      );
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(highContrast: true);
+      await tester.pump();
+      await harness.pumpUntil(
+        () => MediaQuery.highContrastOf(tester.element(composer)),
+        reason: 'high contrast did not reach compact Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await expectLater(
+        find.byType(Scaffold).first,
+        matchesGoldenFile(
+          'goldens/journal-capture-compact-high-contrast-dark.png',
+        ),
+      );
+      tester.platformDispatcher.platformBrightnessTestValue = Brightness.light;
+      await tester.pump();
+      await harness.pumpUntil(
+        () => Theme.of(tester.element(composer)).brightness == Brightness.light,
+        reason: 'high-contrast light appearance did not reach compact Capture',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await expectLater(
+        find.byType(Scaffold).first,
+        matchesGoldenFile(
+          'goldens/journal-capture-compact-high-contrast-light.png',
+        ),
+      );
+      tester.platformDispatcher.accessibilityFeaturesTestValue =
+          const FakeAccessibilityFeatures(
+            disableAnimations: true,
+            accessibleNavigation: true,
+          );
+      await tester.pump();
+      tester.state<ScrollableState>(scrollable).position.jumpTo(0);
+      await _dispatchScrollUpdate(tester, scrollable, -24);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .animationDuration ==
+            Duration.zero,
+        reason: 'Reduced Motion did not remove Capture transition duration',
+      );
+      tester.state<ScrollableState>(scrollable).position.jumpTo(24);
+      await _dispatchScrollUpdate(tester, scrollable, 24);
+      await harness.pumpUntil(
+        () =>
+            tester
+                .widget<ExpandableMessageComposer>(composer)
+                .fabPresentation ==
+            ExpandableMessageComposerFabPresentation.compact,
+        reason: 'Reduced Motion did not apply compact presentation',
+      );
+      expect(tester.getSize(floatingActionButton), const Size(56, 56));
+      await harness.dispose();
+    },
+    skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
+    timeout: const Timeout(Duration(seconds: 60)),
+  );
+
+  testWidgets(
     'real runtime matches row, divider, expandable Capture, preview, and swipe contracts',
     (tester) async {
       final harness = await _RuntimeHarness.start(
@@ -169,7 +610,7 @@ void main() {
       final rowRect = _ancestorRectWithHeight(
         tester,
         find.text(_parentSource),
-        96,
+        104,
       );
       expect(rowRect.width, closeTo(390, 0.5));
       expect(
@@ -522,6 +963,20 @@ void main() {
   );
 }
 
+Future<void> _dispatchScrollUpdate(
+  WidgetTester tester,
+  Finder scrollable,
+  double delta,
+) async {
+  await tester.pump();
+  final state = tester.state<ScrollableState>(scrollable);
+  ScrollUpdateNotification(
+    metrics: state.position,
+    context: tester.element(scrollable),
+    scrollDelta: delta,
+  ).dispatch(tester.element(scrollable));
+}
+
 Future<void> _pumpSlidableMotion(WidgetTester tester) async {
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 250));
@@ -600,6 +1055,7 @@ final class _RuntimeHarness {
     double devicePixelRatio = 1,
     Brightness brightness = Brightness.light,
     bool highContrast = false,
+    String typographyPreset = 'balanced',
   }) async {
     tester.platformDispatcher.platformBrightnessTestValue = brightness;
     tester.platformDispatcher.accessibilityFeaturesTestValue =
@@ -680,6 +1136,8 @@ final class _RuntimeHarness {
         for (final day in days) day: day == 20260812 ? 'Wed, Aug 12' : '$day',
       },
       auth: _TestAuth(),
+      readPreference: (_) async => typographyPreset,
+      writePreference: (_, _) async {},
     );
     await tester.pumpWidget(
       fs.SlidableAutoCloseBehavior(

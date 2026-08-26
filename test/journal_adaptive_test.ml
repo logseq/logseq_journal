@@ -71,15 +71,15 @@ let test_every_exact_status_maps_to_the_decided_rail_category () =
 ;;
 
 let test_typography_spacing_motion_and_hit_regions () =
-  let typography = Tokens.typography in
+  let typography = Tokens.typography Tokens.Balanced in
   require
     (typography.header_title.font_size = 22.
      && typography.header_title.line_height = 28.
-     && typography.header_title.weight = Ui.Style.Font_weight.Bold)
+     && typography.header_title.weight = Ui.Style.Font_weight.Semi_bold)
     "header title typography changed";
   require
-    (typography.entry.font_size = 15.
-     && typography.entry.line_height = 20.
+    (typography.entry.font_size = 16.
+     && typography.entry.line_height = 22.
      && typography.entry.weight = Ui.Style.Font_weight.Normal)
     "entry typography changed";
   require
@@ -88,15 +88,19 @@ let test_typography_spacing_motion_and_hit_regions () =
      && typography.supporting.weight = Ui.Style.Font_weight.Normal)
     "supporting typography changed";
   require
-    (typography.disclosure.font_size = 11.
-     && typography.disclosure.line_height = 16.
-     && typography.disclosure.weight = Ui.Style.Font_weight.Medium)
-    "disclosure typography changed";
-  require
     (typography.timestamp.font_size = 13.
      && typography.timestamp.line_height = 18.
      && typography.timestamp.weight = Ui.Style.Font_weight.Normal)
     "timestamp typography changed";
+  List.iter
+    (fun preset ->
+       let input = (Tokens.typography preset).input in
+       require
+         (input.font_size = 16.
+          && input.line_height = 24.
+          && input.weight = Ui.Style.Font_weight.Normal)
+         "text input typography changed")
+    [ Tokens.Dense; Balanced; Comfortable ];
   let spacing = Tokens.spacing in
   require
     ([ spacing.x1
@@ -167,7 +171,12 @@ let require_profile
       ~content_leading
       ~time_slot_width
   =
-  let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
+  let profile =
+    Tokens.select_row_profile
+      ~preset:Tokens.Balanced
+      ~viewport_width:width
+      ~text_scale:scale
+  in
   require (profile.kind = kind) "profile kind changed at %.0f/%.2f" width scale;
   require
     (profile.block_line_height = block_line_height)
@@ -201,7 +210,7 @@ let test_known_row_profile_selection () =
     ~width:360.
     ~scale:1.3
     ~kind:Tokens.Compact
-    ~block_line_height:26.
+    ~block_line_height:28.6
     ~continuation_extent:54.
     ~day_header_extent:36.
     ~content_leading:32.
@@ -210,16 +219,16 @@ let test_known_row_profile_selection () =
     ~width:359.
     ~scale:1.
     ~kind:Tokens.Adaptive
-    ~block_line_height:20.
+    ~block_line_height:22.
     ~continuation_extent:48.
-    ~day_header_extent:48.
+    ~day_header_extent:44.
     ~content_leading:24.
     ~time_slot_width:52.;
   require_profile
     ~width:390.
     ~scale:1.3
     ~kind:Tokens.Compact
-    ~block_line_height:26.
+    ~block_line_height:28.6
     ~continuation_extent:54.
     ~day_header_extent:36.
     ~content_leading:32.
@@ -228,40 +237,40 @@ let test_known_row_profile_selection () =
     ~width:744.
     ~scale:2.
     ~kind:Tokens.Adaptive
-    ~block_line_height:40.
+    ~block_line_height:44.
     ~continuation_extent:68.
-    ~day_header_extent:72.
+    ~day_header_extent:64.
     ~content_leading:32.
     ~time_slot_width:104.;
   require_profile
     ~width:1_200.
     ~scale:3.2
     ~kind:Tokens.Adaptive
-    ~block_line_height:64.
+    ~block_line_height:70.4
     ~continuation_extent:92.
-    ~day_header_extent:101.
+    ~day_header_extent:88.
     ~content_leading:32.
     ~time_slot_width:167.
 ;;
 
 let test_row_profiles_cover_required_width_and_scale_matrix () =
   let cases =
-    [ 320., 1., Tokens.Adaptive, 20., 48., 48., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 26., 54., 56., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 40., 68., 72., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 64., 92., 101., 24., 167.
-    ; 390., 1., Tokens.Compact, 20., 48., 36., 32., 52.
-    ; 390., 1.3, Tokens.Compact, 26., 54., 36., 32., 52.
-    ; 390., 2., Tokens.Adaptive, 40., 68., 72., 32., 104.
-    ; 390., 3.2, Tokens.Adaptive, 64., 92., 101., 32., 167.
-    ; 744., 1., Tokens.Compact, 20., 48., 36., 32., 52.
-    ; 744., 1.3, Tokens.Compact, 26., 54., 36., 32., 52.
-    ; 744., 2., Tokens.Adaptive, 40., 68., 72., 32., 104.
-    ; 744., 3.2, Tokens.Adaptive, 64., 92., 101., 32., 167.
-    ; 1_200., 1., Tokens.Compact, 20., 48., 36., 32., 52.
-    ; 1_200., 1.3, Tokens.Compact, 26., 54., 36., 32., 52.
-    ; 1_200., 2., Tokens.Adaptive, 40., 68., 72., 32., 104.
-    ; 1_200., 3.2, Tokens.Adaptive, 64., 92., 101., 32., 167.
+    [ 320., 1., Tokens.Adaptive, 22., 48., 44., 24., 52.
+    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 50., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 44., 68., 64., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 88., 24., 167.
+    ; 390., 1., Tokens.Compact, 22., 48., 36., 32., 52.
+    ; 390., 1.3, Tokens.Compact, 28.6, 54., 36., 32., 52.
+    ; 390., 2., Tokens.Adaptive, 44., 68., 64., 32., 104.
+    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 88., 32., 167.
+    ; 744., 1., Tokens.Compact, 22., 48., 36., 32., 52.
+    ; 744., 1.3, Tokens.Compact, 28.6, 54., 36., 32., 52.
+    ; 744., 2., Tokens.Adaptive, 44., 68., 64., 32., 104.
+    ; 744., 3.2, Tokens.Adaptive, 70.4, 92., 88., 32., 167.
+    ; 1_200., 1., Tokens.Compact, 22., 48., 36., 32., 52.
+    ; 1_200., 1.3, Tokens.Compact, 28.6, 54., 36., 32., 52.
+    ; 1_200., 2., Tokens.Adaptive, 44., 68., 64., 32., 104.
+    ; 1_200., 3.2, Tokens.Adaptive, 70.4, 92., 88., 32., 167.
     ]
   in
   List.iter
@@ -290,15 +299,19 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     ~width:0.
     ~scale:0.
     ~kind:Tokens.Adaptive
-    ~block_line_height:20.
+    ~block_line_height:22.
     ~continuation_extent:48.
-    ~day_header_extent:48.
+    ~day_header_extent:44.
     ~content_leading:24.
     ~time_slot_width:52.;
   let scales = [ 1.; 1.3; 2.; 3.2 ] in
   let profiles =
     List.map
-      (fun text_scale -> Tokens.select_row_profile ~viewport_width:320. ~text_scale)
+      (fun text_scale ->
+         Tokens.select_row_profile
+           ~preset:Tokens.Balanced
+           ~viewport_width:320.
+           ~text_scale)
       scales
   in
   let rec require_monotonic (profiles : Tokens.row_profile list) =
@@ -320,7 +333,12 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
 
 let test_every_sparse_role_has_one_authoritative_exact_extent () =
   let check ~width ~scale ~block_extents expected =
-    let profile = Tokens.select_row_profile ~viewport_width:width ~text_scale:scale in
+    let profile =
+      Tokens.select_row_profile
+        ~preset:Tokens.Balanced
+        ~viewport_width:width
+        ~text_scale:scale
+    in
     List.iteri
       (fun index expected ->
          require
@@ -347,7 +365,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
   check
     ~width:390.
     ~scale:1.
-    ~block_extents:[ 44.; 56.; 76.; 96. ]
+    ~block_extents:[ 44.; 60.; 82.; 104. ]
     [ Tokens.Children_loading, 44.
     ; Tokens.Children_more, 44.
     ; Tokens.Day_heading, 36.
@@ -357,10 +375,10 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
   check
     ~width:320.
     ~scale:3.2
-    ~block_extents:[ 80.; 144.; 208.; 272. ]
-    [ Tokens.Children_loading, 80.
-    ; Tokens.Children_more, 80.
-    ; Tokens.Day_heading, 101.
+    ~block_extents:[ 87.; 157.; 228.; 298. ]
+    [ Tokens.Children_loading, 87.
+    ; Tokens.Children_more, 87.
+    ; Tokens.Day_heading, 88.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
     ]

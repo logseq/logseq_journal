@@ -251,7 +251,8 @@ let encrypted_pull_unlocks_and_decrypts_in_memory_case () =
               { target with
                 e2ee =
                   Some
-                    { user_id = "cognito-user-1"
+                    { managed_sync_origin = Uri.of_string "https://api.logseq.io"
+                    ; user_id = "cognito-user-1"
                     ; encrypted_graph_key = "wrapped-key-transit"
                     }
               }
@@ -276,9 +277,9 @@ let encrypted_pull_unlocks_and_decrypts_in_memory_case () =
       { F.dependencies with
         crypto
       ; unlock_graph_key =
-          (fun ~user_id ~encrypted_graph_key ->
+          (fun ~managed_sync_origin:_ ~user_id ~encrypted_graph_key ->
             unlocks := (user_id, encrypted_graph_key) :: !unlocks;
-            Ok (String.make 32 'g'))
+            Logseq_db_worker.Sync_graph_key.of_string (String.make 32 'g'))
       }
     in
     let engine =

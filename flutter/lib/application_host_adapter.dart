@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -12,6 +13,34 @@ import 'package:flutter/services.dart';
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 
 const _platformChannel = MethodChannel('logseq_journal/platform');
+
+enum JournalStartupMilestone {
+  dartEntrypointStarted,
+  amplifyConfigurationComplete,
+  nativeStartupFactsAvailable,
+  runtimeStarted,
+  localAccountBindingLoaded,
+  firstIdTokenRequested,
+  timelineFramePresented,
+}
+
+abstract final class JournalStartupTimeline {
+  static final Stopwatch _clock = Stopwatch()..start();
+  static final Map<JournalStartupMilestone, int> _elapsedMicroseconds = {};
+
+  static void mark(JournalStartupMilestone milestone) {
+    if (_elapsedMicroseconds.containsKey(milestone)) return;
+    final elapsed = _clock.elapsedMicroseconds;
+    _elapsedMicroseconds[milestone] = elapsed;
+    developer.Timeline.instantSync(
+      'logseq_journal.${milestone.name}',
+      arguments: <String, Object>{'elapsedMicroseconds': elapsed},
+    );
+  }
+
+  static Map<JournalStartupMilestone, int> snapshot() =>
+      Map<JournalStartupMilestone, int>.unmodifiable(_elapsedMicroseconds);
+}
 
 final class JournalCalendarSnapshot {
   const JournalCalendarSnapshot({
@@ -101,7 +130,15 @@ enum JournalPlatformTag {
   prepareToTerminateEvent(12),
   terminationReadyRequest(13),
   terminationReadyResponse(14),
-  networkLifecycleEvent(15);
+  networkLifecycleEvent(15),
+  preferenceGetRequest(16),
+  preferenceGetResponse(17),
+  preferenceSetRequest(18),
+  preferenceSetResponse(19),
+  localAccountBindingRequest(20),
+  localAccountBindingResponse(21),
+  timelinePresentedRequest(22),
+  timelinePresentedResponse(23);
 
   const JournalPlatformTag(this.wireId);
   final int wireId;
@@ -242,6 +279,24 @@ typedef JournalDayHeadingFormatter =
       required JournalCalendarSnapshot snapshot,
       required List<int> days,
     });
+typedef JournalPreferenceReader = Future<String?> Function(String key);
+typedef JournalPreferenceWriter =
+    Future<void> Function(String key, String value);
+typedef JournalLocalAccountBinding = ({
+  String userId,
+  String managedSyncOrigin,
+});
+typedef JournalLocalAccountBindingReader =
+    Future<JournalLocalAccountBinding?> Function();
+typedef JournalLocalAccountBindingWriter =
+    Future<void> Function(JournalLocalAccountBinding binding);
+typedef JournalLocalAccountBindingClearer = Future<void> Function();
+
+Future<JournalLocalAccountBinding?> _noLocalAccountBinding() async => null;
+Future<void> _ignoreLocalAccountBinding(JournalLocalAccountBinding _) async {}
+Future<void> _ignoreLocalAccountBindingClear() async {}
+Future<void> _waitForFlutterPresentationFrame() =>
+    WidgetsBinding.instance.endOfFrame;
 
 abstract final class JournalPlatformCodec {
   static int requestTag(Uint8List request) =>
@@ -252,6 +307,21 @@ abstract final class JournalPlatformCodec {
     if (envelope.tag != tag || envelope.payload.isNotEmpty) {
       throw const FormatException('invalid empty platform request');
     }
+  }
+
+  static Map<String, dynamic> decodeJsonRequest(
+    Uint8List request,
+    JournalPlatformTag tag,
+  ) {
+    final envelope = JournalPlatformEnvelopeCodec.decode(request);
+    if (envelope.tag != tag || envelope.payload.isEmpty) {
+      throw const FormatException('invalid JSON platform request');
+    }
+    final value = jsonDecode(utf8.decode(envelope.payload));
+    if (value is! Map<String, dynamic>) {
+      throw const FormatException('platform request must be a JSON object');
+    }
+    return value;
   }
 
   static Uint8List encodeCalendar(
@@ -516,14 +586,24 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
     required this.calendarSnapshot,
     required this.formatJournalDays,
     required this.auth,
+    required this.readPreference,
+    required this.writePreference,
+    this.managedSyncOrigin = 'https://api.logseq.io',
+    this.readLocalAccountBinding = _noLocalAccountBinding,
+    this.persistLocalAccountBinding = _ignoreLocalAccountBinding,
+    this.clearLocalAccountBinding = _ignoreLocalAccountBindingClear,
+    this.waitForPresentationFrame = _waitForFlutterPresentationFrame,
     this.prepareToTerminate,
     Future<JournalCalendarSnapshot>? initialSnapshot,
   }) {
     WidgetsBinding.instance.addObserver(this);
     _platformChannel.setMethodCallHandler(_handleNativeSignal);
     _initialization = initialSnapshot == null
-        ? Future<void>.value()
-        : initialSnapshot.then(_rememberSnapshot);
+        ? Future<JournalCalendarSnapshot?>.value()
+        : initialSnapshot.then((snapshot) {
+            _rememberSnapshot(snapshot);
+            return snapshot;
+          });
     _authEvents = Amplify.Hub.listen<AuthUser, AuthHubEvent>(HubChannel.Auth, (
       _,
     ) {
@@ -534,11 +614,18 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
   final CalendarSnapshotProvider calendarSnapshot;
   final JournalDayHeadingFormatter formatJournalDays;
   final JournalAuthCapability auth;
+  final JournalPreferenceReader readPreference;
+  final JournalPreferenceWriter writePreference;
+  final String managedSyncOrigin;
+  final JournalLocalAccountBindingReader readLocalAccountBinding;
+  final JournalLocalAccountBindingWriter persistLocalAccountBinding;
+  final JournalLocalAccountBindingClearer clearLocalAccountBinding;
+  final Future<void> Function() waitForPresentationFrame;
   final Future<void> Function()? prepareToTerminate;
   final StreamController<Uint8List> _events =
       StreamController<Uint8List>.broadcast(sync: true);
   final Map<int, JournalCalendarSnapshot> _snapshots = {};
-  late final Future<void> _initialization;
+  late final Future<JournalCalendarSnapshot?> _initialization;
   StreamSubscription<AuthHubEvent>? _authEvents;
   Completer<void>? _terminationReady;
   Future<void>? _termination;
@@ -546,6 +633,7 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
   int _lifecycleGeneration = 0;
   bool _backgrounded = false;
   bool _disposed = false;
+  bool _initialSnapshotConsumed = false;
 
   @override
   Stream<Uint8List> get events => _events.stream;
@@ -557,7 +645,11 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
   }
 
   Future<JournalCalendarSnapshot> _freshSnapshot() async {
-    await _initialization;
+    final initial = await _initialization;
+    if (!_initialSnapshotConsumed && initial != null) {
+      _initialSnapshotConsumed = true;
+      return initial;
+    }
     final snapshot = await calendarSnapshot();
     _CalendarFacts.localMinuteOfDay(snapshot);
     if (snapshot.generation <= _lastGeneration) {
@@ -575,9 +667,24 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
     );
   }
 
+  Future<Uint8List> _currentAuthenticatedUserResponse() async {
+    final userId = await auth.currentUserId();
+    if (userId != null) {
+      try {
+        await persistLocalAccountBinding((
+          userId: userId,
+          managedSyncOrigin: managedSyncOrigin,
+        ));
+      } catch (_) {
+        // Advisory warm-start state must not block online reconciliation.
+      }
+    }
+    return _authenticatedUserResponse(userId);
+  }
+
   Future<void> _emitAuthenticatedUser() async {
     if (_disposed) return;
-    final response = _authenticatedUserResponse(await auth.currentUserId());
+    final response = await _currentAuthenticatedUserResponse();
     if (!_disposed) _events.add(response);
   }
 
@@ -618,9 +725,12 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
           request,
           JournalPlatformTag.authenticatedUserRequest,
         );
-        return _authenticatedUserResponse(await auth.currentUserId());
+        return _currentAuthenticatedUserResponse();
       case 8:
         final decoded = JournalPlatformCodec.decodeIdTokenRequest(request);
+        JournalStartupTimeline.mark(
+          JournalStartupMilestone.firstIdTokenRequested,
+        );
         return JournalPlatformCodec.encodeJson(
           JournalPlatformTag.idTokenResponse,
           <String, Object>{
@@ -634,6 +744,7 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
           JournalPlatformTag.signOutRequest,
         );
         await auth.signOut();
+        await clearLocalAccountBinding();
         return JournalPlatformCodec.encodeJson(
           JournalPlatformTag.signOutResponse,
           <String, Object>{'signedOut': true},
@@ -648,6 +759,90 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
         return JournalPlatformCodec.encodeJson(
           JournalPlatformTag.terminationReadyResponse,
           <String, Object>{'ready': true},
+        );
+      case 16:
+        final decoded = JournalPlatformCodec.decodeJsonRequest(
+          request,
+          JournalPlatformTag.preferenceGetRequest,
+        );
+        if (decoded.length != 1 || decoded['key'] != 'typographyPreset') {
+          throw const FormatException('preference-get request is invalid');
+        }
+        final value = await readPreference('typographyPreset');
+        if (value != null &&
+            (value.isEmpty || utf8.encode(value).length > 64)) {
+          throw const FormatException('stored preference value is invalid');
+        }
+        return JournalPlatformCodec.encodeJson(
+          JournalPlatformTag.preferenceGetResponse,
+          <String, Object?>{'key': 'typographyPreset', 'value': value},
+        );
+      case 18:
+        final decoded = JournalPlatformCodec.decodeJsonRequest(
+          request,
+          JournalPlatformTag.preferenceSetRequest,
+        );
+        final value = decoded['value'];
+        if (decoded.length != 2 ||
+            decoded['key'] != 'typographyPreset' ||
+            (value != 'dense' &&
+                value != 'balanced' &&
+                value != 'comfortable')) {
+          throw const FormatException('preference-set request is invalid');
+        }
+        await writePreference('typographyPreset', value! as String);
+        return JournalPlatformCodec.encodeJson(
+          JournalPlatformTag.preferenceSetResponse,
+          <String, Object>{'key': 'typographyPreset', 'stored': true},
+        );
+      case 20:
+        JournalPlatformCodec.validateEmpty(
+          request,
+          JournalPlatformTag.localAccountBindingRequest,
+        );
+        final binding = await readLocalAccountBinding();
+        JournalStartupTimeline.mark(
+          JournalStartupMilestone.localAccountBindingLoaded,
+        );
+        if (binding != null &&
+            (binding.userId.isEmpty ||
+                utf8.encode(binding.userId).length > 512 ||
+                binding.managedSyncOrigin != managedSyncOrigin)) {
+          throw const FormatException('local account binding is invalid');
+        }
+        return JournalPlatformCodec.encodeJson(
+          JournalPlatformTag.localAccountBindingResponse,
+          <String, Object?>{
+            'userId': binding?.userId,
+            'managedSyncOrigin': binding?.managedSyncOrigin,
+          },
+        );
+      case 22:
+        final decoded = JournalPlatformCodec.decodeJsonRequest(
+          request,
+          JournalPlatformTag.timelinePresentedRequest,
+        );
+        const generationKeys = <String>{
+          'accountGeneration',
+          'graphGeneration',
+          'presentationGeneration',
+        };
+        if (decoded.keys.toSet().difference(generationKeys).isNotEmpty ||
+            decoded.length != generationKeys.length ||
+            generationKeys.any(
+              (key) => decoded[key] is! int || (decoded[key]! as int) < 0,
+            )) {
+          throw const FormatException(
+            'Timeline presentation request is invalid',
+          );
+        }
+        await waitForPresentationFrame();
+        JournalStartupTimeline.mark(
+          JournalStartupMilestone.timelineFramePresented,
+        );
+        return JournalPlatformCodec.encodeJson(
+          JournalPlatformTag.timelinePresentedResponse,
+          <String, Object>{...decoded, 'presented': true},
         );
       default:
         throw const FormatException('unsupported application platform request');
@@ -770,6 +965,9 @@ final class _NativeStartupEnvironment {
         if (value == null) {
           throw const FormatException('native startup environment is missing');
         }
+        JournalStartupTimeline.mark(
+          JournalStartupMilestone.nativeStartupFactsAvailable,
+        );
         return value;
       });
 
@@ -819,6 +1017,54 @@ final class _NativeStartupEnvironment {
     return headings;
   }
 
+  Future<String?> readPreference(String key) async {
+    if (key != 'typographyPreset') {
+      throw const FormatException('native preference key is invalid');
+    }
+    final value = (await _load())['typographyPreset'];
+    if (value != null && value is! String) {
+      throw const FormatException('native preference value is invalid');
+    }
+    return value as String?;
+  }
+
+  Future<JournalLocalAccountBinding?> readLocalAccountBinding() async {
+    final value = (await _load())['localAccountBinding'];
+    if (value == null) return null;
+    if (value is! Map ||
+        value.length != 3 ||
+        value['version'] != 1 ||
+        value['userId'] is! String ||
+        value['managedSyncOrigin'] is! String) {
+      throw const FormatException('native local account binding is invalid');
+    }
+    return (
+      userId: value['userId']! as String,
+      managedSyncOrigin: value['managedSyncOrigin']! as String,
+    );
+  }
+
+  Future<void> persistLocalAccountBinding(JournalLocalAccountBinding binding) =>
+      _platformChannel.invokeMethod<void>('setLocalAccountBinding', {
+        'version': 1,
+        'userId': binding.userId,
+        'managedSyncOrigin': binding.managedSyncOrigin,
+      });
+
+  Future<void> clearLocalAccountBinding() =>
+      _platformChannel.invokeMethod<void>('clearLocalAccountBinding');
+
+  Future<void> writePreference(String key, String value) async {
+    if (key != 'typographyPreset' ||
+        (value != 'dense' && value != 'balanced' && value != 'comfortable')) {
+      throw const FormatException('native preference write is invalid');
+    }
+    await _platformChannel.invokeMethod<void>('setPreference', <String, Object>{
+      'key': key,
+      'value': value,
+    });
+  }
+
   JournalCalendarSnapshot _calendarSnapshot(Map<Object?, Object?> value) {
     int integer(String key) {
       final result = value[key];
@@ -855,7 +1101,13 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
     required this.liveCalendarSnapshot,
     required this.formatJournalDays,
     required this.auth,
+    required this.readPreference,
+    required this.writePreference,
+    this.readLocalAccountBinding = _noLocalAccountBinding,
+    this.persistLocalAccountBinding = _ignoreLocalAccountBinding,
+    this.clearLocalAccountBinding = _ignoreLocalAccountBindingClear,
     this.amplifyReady,
+    this.authenticationFailureBuilder,
     this.prepareToTerminate,
   });
 
@@ -865,10 +1117,28 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   final CalendarSnapshotProvider liveCalendarSnapshot;
   final JournalDayHeadingFormatter formatJournalDays;
   final JournalAuthCapability auth;
+  final JournalPreferenceReader readPreference;
+  final JournalPreferenceWriter writePreference;
+  final JournalLocalAccountBindingReader readLocalAccountBinding;
+  final JournalLocalAccountBindingWriter persistLocalAccountBinding;
+  final JournalLocalAccountBindingClearer clearLocalAccountBinding;
   final Future<void>? amplifyReady;
+  final Widget Function()? authenticationFailureBuilder;
   final Future<void> Function()? prepareToTerminate;
   late final Future<JournalCalendarSnapshot> _initialSnapshot =
       initialCalendarSnapshot();
+  final ValueNotifier<bool?> _localBindingAvailable = ValueNotifier(null);
+  late final Future<JournalLocalAccountBinding?> _initialLocalAccountBinding =
+      readLocalAccountBinding().then(
+        (binding) {
+          _localBindingAvailable.value = binding != null;
+          return binding;
+        },
+        onError: (Object _) {
+          _localBindingAvailable.value = false;
+          return null;
+        },
+      );
 
   @override
   Future<Uint8List> createApplicationPayload() async {
@@ -887,12 +1157,22 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
         calendarSnapshot: liveCalendarSnapshot,
         formatJournalDays: formatJournalDays,
         auth: auth,
+        readPreference: readPreference,
+        writePreference: writePreference,
+        managedSyncOrigin: baseUrl.toString(),
+        readLocalAccountBinding: () => _initialLocalAccountBinding,
+        persistLocalAccountBinding: persistLocalAccountBinding,
+        clearLocalAccountBinding: () async {
+          await clearLocalAccountBinding();
+          _localBindingAvailable.value = false;
+        },
         prepareToTerminate: prepareToTerminate,
         initialSnapshot: _initialSnapshot,
       );
 
   @override
   Widget buildHost({required BuildContext context, required Widget child}) {
+    unawaited(_initialLocalAccountBinding);
     Widget authenticatedHost() => Authenticator(
       authenticatorBuilder: (context, state) {
         if (state.currentStep == AuthenticatorStep.signIn ||
@@ -915,21 +1195,41 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
       },
       child: _AuthenticatedJournalHost(child: child),
     );
-    final ready = amplifyReady;
-    final host = ready == null
-        ? authenticatedHost()
-        : FutureBuilder<void>(
-            future: ready,
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.done &&
-                  snapshot.error == null) {
-                return authenticatedHost();
-              }
-              return const MaterialApp(
-                home: Center(child: CircularProgressIndicator()),
-              );
-            },
+    Widget onlineAuthenticationGate() {
+      final ready = amplifyReady;
+      if (ready == null) return authenticatedHost();
+      return FutureBuilder<void>(
+        future: ready,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.done &&
+              snapshot.error == null) {
+            return authenticatedHost();
+          }
+          if (snapshot.error != null) {
+            return authenticationFailureBuilder?.call() ??
+                const MaterialApp(
+                  home: Center(
+                    child: Text('Unable to configure authentication'),
+                  ),
+                );
+          }
+          return const MaterialApp(
+            home: Center(child: CircularProgressIndicator()),
           );
+        },
+      );
+    }
+
+    final host = ValueListenableBuilder<bool?>(
+      valueListenable: _localBindingAvailable,
+      builder: (context, available, _) {
+        if (available == true) return _JournalHostEnvironment(child: child);
+        if (available == false) return onlineAuthenticationGate();
+        return const MaterialApp(
+          home: Center(child: CircularProgressIndicator()),
+        );
+      },
+    );
     return fs.SlidableAutoCloseBehavior(
       closeWhenOpened: true,
       closeWhenTapped: true,
@@ -938,8 +1238,8 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   }
 }
 
-final class _AuthenticatedJournalHost extends StatelessWidget {
-  const _AuthenticatedJournalHost({required this.child});
+final class _JournalHostEnvironment extends StatelessWidget {
+  const _JournalHostEnvironment({required this.child});
 
   final Widget child;
 
@@ -954,19 +1254,29 @@ final class _AuthenticatedJournalHost extends StatelessWidget {
       ],
       child: Directionality(
         textDirection: TextDirection.ltr,
-        child: Theme(
-          data: ThemeData.light(),
-          child: Builder(
-            builder: (context) => Authenticator.builder()(context, child),
-          ),
-        ),
+        child: Theme(data: ThemeData.light(), child: child),
       ),
+    ),
+  );
+}
+
+final class _AuthenticatedJournalHost extends StatelessWidget {
+  const _AuthenticatedJournalHost({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => _JournalHostEnvironment(
+    child: Builder(
+      builder: (context) => Authenticator.builder()(context, child),
     ),
   );
 }
 
 ApplicationHostAdapter createBonsaiFlutterHostAdapter({
   Uri? baseUrl,
+  Future<void>? amplifyReady,
+  Widget Function()? authenticationFailureBuilder,
   Future<void> Function()? prepareToTerminate,
 }) {
   final environment = _NativeStartupEnvironment();
@@ -977,6 +1287,13 @@ ApplicationHostAdapter createBonsaiFlutterHostAdapter({
     liveCalendarSnapshot: environment.currentCalendarSnapshot,
     formatJournalDays: environment.formatJournalDays,
     auth: JournalAmplifySession(),
+    readPreference: environment.readPreference,
+    writePreference: environment.writePreference,
+    readLocalAccountBinding: environment.readLocalAccountBinding,
+    persistLocalAccountBinding: environment.persistLocalAccountBinding,
+    clearLocalAccountBinding: environment.clearLocalAccountBinding,
+    amplifyReady: amplifyReady,
+    authenticationFailureBuilder: authenticationFailureBuilder,
     prepareToTerminate: prepareToTerminate,
   );
 }

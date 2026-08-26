@@ -34,6 +34,12 @@ type anchor_decision =
   | Reset_to_top
 
 type extent_strategy = Known_profile_extents
+
+type capture_fab_presentation =
+  | Extended
+  | Compact
+
+type capture_fab_scroll
 type t
 
 type staged_delete =
@@ -62,6 +68,16 @@ val maximum_supplied_rows : int
 val overscan : int
 val extent_strategy : extent_strategy
 val renderer_event_surface : [ `Visible_range ] list
+val initial_capture_fab_scroll : capture_fab_scroll
+val capture_fab_presentation : capture_fab_scroll -> capture_fab_presentation
+val capture_fab_accumulated_travel : capture_fab_scroll -> float
+
+val update_capture_fab_scroll
+  :  capture_fab_scroll
+  -> pixels:float
+  -> delta:float
+  -> capture_fab_scroll
+
 val empty : today:int -> t
 val begin_request : t -> generation:int64 -> request -> t
 val apply_feed : t -> generation:int64 -> Journal_graph_projection.feed -> t

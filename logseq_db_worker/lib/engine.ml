@@ -21,7 +21,7 @@ type t =
   ; mutable write_session : active_write_session option
   ; mutable graph_info : Graph_types.graph_info
   ; mutable sync_metadata : Sync_meta.t option
-  ; graph_key : string option
+  ; graph_key : Sync_graph_key.t option
   ; crypto : Sync_e2ee.crypto
   ; pending : Sync_pending.t option
   ; mutable projected_db : Datascript.db
@@ -43,7 +43,10 @@ type dependencies =
   ; cursor_authentication_key : bytes
   ; crypto : Sync_e2ee.crypto
   ; unlock_graph_key :
-      user_id:string -> encrypted_graph_key:string -> (string, string) result
+      managed_sync_origin:Uri.t
+      -> user_id:string
+      -> encrypted_graph_key:string
+      -> (Sync_graph_key.t, string) result
   }
 
 exception Fatal_storage_error of string
@@ -179,7 +182,7 @@ let db_basis db = db.Datascript.max_tx |> Int64.of_int
 let decrypt_protected crypto graph_key =
   Option.map
     (fun graph_key ~attribute:_ ciphertext ->
-       Sync_e2ee.decrypt_value ~crypto ~graph_key ciphertext)
+       Sync_graph_key.decrypt_value ~crypto graph_key ciphertext)
     graph_key
 ;;
 
@@ -213,7 +216,7 @@ type resolved_target =
   ; database_path : string
   ; catalog : Snapshot.catalog
   ; kind : [ `Snapshot of Graph_types.Uuid.t | `Native | `Synced of Sync_mirror.metadata ]
-  ; graph_key : string option
+  ; graph_key : Sync_graph_key.t option
   }
 
 let sync_mirror_error = function
@@ -274,11 +277,12 @@ let resolve_target dependencies config =
          | Some e2ee ->
            (match
               dependencies.unlock_graph_key
+                ~managed_sync_origin:e2ee.managed_sync_origin
                 ~user_id:e2ee.user_id
                 ~encrypted_graph_key:e2ee.encrypted_graph_key
             with
-            | Ok key when String.length key = 32 -> Ok (Some key)
-            | Ok _ | Error _ ->
+            | Ok key -> Ok (Some key)
+            | Error _ ->
               Error
                 (error
                    Error.Invalid_request
@@ -312,9 +316,9 @@ let resolve_target dependencies config =
                       (Option.map
                          (fun graph_key ciphertext ->
                             Result.bind
-                              (Sync_e2ee.decrypt_value
+                              (Sync_graph_key.decrypt_value
                                  ~crypto:dependencies.crypto
-                                 ~graph_key
+                                 graph_key
                                  ciphertext)
                               (function
                               | Transit_core.Json.String plaintext -> Ok plaintext
@@ -1147,9 +1151,9 @@ let execute_synced_mutation t request_id mutation =
               let encrypt_protected =
                 Option.map
                   (fun graph_key plaintext ->
-                     Sync_e2ee.encrypt_value
+                     Sync_graph_key.encrypt_value
                        ~crypto:t.crypto
-                       ~graph_key
+                       graph_key
                        (Transit_core.Json.String plaintext))
                   t.graph_key
               in
@@ -1238,9 +1242,9 @@ let encode_synced_tx (t : t) db operations =
   let encrypt_protected =
     Option.map
       (fun graph_key plaintext ->
-         Sync_e2ee.encrypt_value
+         Sync_graph_key.encrypt_value
            ~crypto:t.crypto
-           ~graph_key
+           graph_key
            (Transit_core.Json.String plaintext))
       t.graph_key
   in
@@ -1480,7 +1484,7 @@ let execute_sync_receive t request_id transport payload =
             ?decrypt_protected:
               (Option.map
                  (fun graph_key ~attribute:_ ciphertext ->
-                    Sync_e2ee.decrypt_value ~crypto:t.crypto ~graph_key ciphertext)
+                    Sync_graph_key.decrypt_value ~crypto:t.crypto graph_key ciphertext)
                  t.graph_key)
             ~before_commit:(fun () ->
               match Ownership.revalidate t.owner with
@@ -1740,7 +1744,8 @@ let execute t (request : Protocol.request) =
         failed Error.Response_too_large "The response exceeds the configured byte budget.")
 ;;
 
-let close t =
+let close (t : t) =
+  Option.iter Sync_graph_key.clear t.graph_key;
   match t.lifecycle with
   | Closed -> Ok ()
   | Fatal message -> Error message

@@ -251,34 +251,38 @@ let initial_calendar_packet =
   platform_envelope 2 bytes
 ;;
 
-let initialize_test_calendar handle =
-  let rec wait_for_request remaining =
+let initialize_test_platform handle =
+  let rec wait_for_requests remaining calendar preference =
     if remaining = 0
     then fail "timed out waiting for the initial calendar request"
     else (
       Test.Handle.present handle;
-      let request =
+      let calendar, preference =
         match Test.Handle.last_frame handle with
-        | None -> None
+        | None -> calendar, preference
         | Some frame ->
           (match Host_protocol.Binary_codec.decode frame.bytes with
            | Error error -> fail "application frame did not decode: %s" error.message
            | Ok wire ->
-             List.find_map
-               (function
-                 | Host_protocol.Wire_frame.Application_request { request_id; payload }
-                   when Bytes.equal payload Journal_platform.get_calendar_request ->
-                   Some request_id
-                 | _ -> None)
+             List.fold_left
+               (fun (calendar, preference) -> function
+                  | Host_protocol.Wire_frame.Application_request { request_id; payload }
+                    when Bytes.length payload >= 8 ->
+                    (match Bytes.get_uint16_le payload 6 with
+                     | 1 -> Some request_id, preference
+                     | 16 -> calendar, Some request_id
+                     | _ -> calendar, preference)
+                  | _ -> calendar, preference)
+               (calendar, preference)
                wire.operations)
       in
-      match request with
-      | Some request_id -> request_id
-      | None ->
+      match calendar, preference with
+      | Some calendar, Some preference -> calendar, preference
+      | None, None | Some _, None | None, Some _ ->
         Test.Handle.pump_next handle ();
-        wait_for_request (remaining - 1))
+        wait_for_requests (remaining - 1) calendar preference)
   in
-  let request_id = wait_for_request 500 in
+  let calendar_request, preference_request = wait_for_requests 500 None None in
   let event =
     Host_protocol.Inbound_event.
       { sequence = ID.Runtime.Event_sequence.of_int64 1L
@@ -286,7 +290,9 @@ let initialize_test_calendar handle =
       ; node_id = ID.Ui.Node_id.zero
       ; handler_id = ID.Ui.Handler_id.zero
       ; event_tag = Host_protocol.Generated_protocol.Event_tag.application_response
-      ; payload = Application_response { request_id; payload = initial_calendar_packet }
+      ; payload =
+          Application_response
+            { request_id = calendar_request; payload = initial_calendar_packet }
       }
   in
   Test.Handle.pump_next
@@ -294,6 +300,31 @@ let initialize_test_calendar handle =
     ~events:
       Host_protocol.Inbound_event.
         { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ event ] }
+    ();
+  Test.Handle.present handle;
+  let preference_payload =
+    Bytes.of_string "{\"key\":\"typographyPreset\",\"value\":\"balanced\"}"
+    |> platform_envelope 17
+  in
+  let preference_event =
+    Host_protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 2L
+      ; displayed_revision = Test.Handle.revision handle
+      ; node_id = ID.Ui.Node_id.zero
+      ; handler_id = ID.Ui.Handler_id.zero
+      ; event_tag = Host_protocol.Generated_protocol.Event_tag.application_response
+      ; payload =
+          Application_response
+            { request_id = preference_request; payload = preference_payload }
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Host_protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L
+        ; events = [ preference_event ]
+        }
     ();
   Test.Handle.present handle;
   Test.Handle.resize handle ~width:390. ~height:844.;
@@ -310,7 +341,7 @@ let create_handle config =
       Application.app
       ~application_payload:(encode_startup config)
   in
-  initialize_test_calendar handle;
+  initialize_test_platform handle;
   handle
 ;;
 
@@ -462,8 +493,11 @@ let test_initial_feed_loads_at_most_seven_days () =
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         wait_for handle "seven-day startup feed" (fun () ->
-           has_text handle "Startup feed day 1");
+         wait_for handle "seven-day progressive startup feed" (fun () ->
+           has_text handle "Startup feed day 7");
+         require
+           (has_text handle "Startup feed day 1")
+           "startup feed omitted its most recent day";
          require
            (has_text handle "Startup feed day 7")
            "startup feed omitted its seventh day";
@@ -780,17 +814,13 @@ let respond_to_bounded_page runtime request block_offset =
     (succeeded request ~basis:9L (Page_tree_result { items; continuation = None }))
 ;;
 
-let rec complete_sequential_feed runtime next_offset limits output =
-  match output.Journal_graph_runtime.requests with
-  | [] -> List.rev limits, output
-  | [ request ] ->
-    let _, limit = page_tree_limit request in
-    complete_sequential_feed
-      runtime
-      (next_offset + 10)
-      (limit :: limits)
-      (respond_to_bounded_page runtime request next_offset)
-  | _ -> fail "feed emitted concurrent page-tree requests"
+let complete_concurrent_feed runtime requests =
+  List.mapi
+    (fun index request ->
+       let output = respond_to_bounded_page runtime request ((index + 1) * 10) in
+       require (output.requests = []) "page-tree response serialized another page read";
+       output)
+    requests
 ;;
 
 let test_feed_allocates_page_requests_within_slot_budget () =
@@ -808,7 +838,7 @@ let test_feed_allocates_page_requests_within_slot_budget () =
          })
     |> fun output -> only output.requests
   in
-  let first_page =
+  let queued =
     Journal_graph_runtime.receive
       runtime
       (succeeded
@@ -816,7 +846,9 @@ let test_feed_allocates_page_requests_within_slot_budget () =
          ~basis:9L
          (Pages_result { items = budget_pages; continuation = None }))
   in
-  let limits, final = complete_sequential_feed runtime 10 [] first_page in
+  let requests = queued.requests in
+  require (queued.responses = []) "page discovery presented before a local page resolved";
+  let limits = List.map (fun request -> page_tree_limit request |> snd) requests in
   let request_count = List.length limits in
   require (request_count = 3) "slot budget unexpectedly dropped a journal day";
   require
@@ -825,8 +857,23 @@ let test_feed_allocates_page_requests_within_slot_budget () =
   require
     (request_count + List.fold_left ( + ) 0 limits <= 7)
     "page requests can project beyond the seven-slot budget";
+  let newest, middle, oldest =
+    match requests with
+    | [ newest; middle; oldest ] -> newest, middle, oldest
+    | _ -> fail "feed did not enqueue all three bounded page reads"
+  in
+  let oldest_output = respond_to_bounded_page runtime oldest 30 in
+  require
+    (oldest_output.responses = [])
+    "older day presented while a more recent day was unresolved";
+  let first_chunk = respond_to_bounded_page runtime newest 10 in
+  (match first_chunk.responses with
+   | [ { payload = Feed_loaded { feed; complete = false; _ }; _ } ] ->
+     require (List.length feed.days = 2) "first progressive chunk lost resolved days"
+   | _ -> fail "most recent day did not present the first progressive chunk");
+  let final = respond_to_bounded_page runtime middle 20 in
   match final.responses with
-  | [ { payload = Feed_loaded { feed; _ }; _ } ] ->
+  | [ { payload = Feed_loaded { feed; complete = true; _ }; _ } ] ->
     let entry_count =
       List.fold_left
         (fun total (day : Journal_graph_projection.day_feed) ->
@@ -844,7 +891,7 @@ let test_feed_allocates_page_requests_within_slot_budget () =
   | _ -> fail "bounded feed did not complete"
 ;;
 
-let test_large_feed_emits_one_worker_request_at_a_time () =
+let test_large_feed_enqueues_bounded_page_reads_without_response_chaining () =
   let runtime = Journal_graph_runtime.create () in
   set_utc_calendar runtime;
   let list_request =
@@ -865,7 +912,7 @@ let test_large_feed_emits_one_worker_request_at_a_time () =
         ~day:(20260831 - index)
         (Printf.sprintf "96100000-0000-4000-8000-%012d" (index + 1)))
   in
-  let first_page =
+  let queued =
     Journal_graph_runtime.receive
       runtime
       (succeeded
@@ -873,14 +920,15 @@ let test_large_feed_emits_one_worker_request_at_a_time () =
          ~basis:9L
          (Pages_result { items = pages; continuation = None }))
   in
-  let limits, final = complete_sequential_feed runtime 100 [] first_page in
-  require (List.length limits = 31) "large feed did not load all journal days";
+  require (List.length queued.requests = 31) "large feed did not enqueue all journal days";
+  let outputs = complete_concurrent_feed runtime queued.requests in
+  let final = List.hd (List.rev outputs) in
   match final.responses with
-  | [ { payload = Feed_loaded { feed; _ }; _ } ] ->
+  | [ { payload = Feed_loaded { feed; complete = true; _ }; _ } ] ->
     require
       (List.length feed.days = 31)
-      "large sequential feed returned the wrong day count"
-  | _ -> fail "large sequential feed did not complete"
+      "large progressive feed returned the wrong day count"
+  | _ -> fail "large progressive feed did not complete"
 ;;
 
 let test_feed_caps_days_when_each_day_cannot_receive_one_block () =
@@ -898,7 +946,7 @@ let test_feed_caps_days_when_each_day_cannot_receive_one_block () =
          })
     |> fun output -> only output.requests
   in
-  let first_page =
+  let queued =
     Journal_graph_runtime.receive
       runtime
       (succeeded
@@ -906,10 +954,12 @@ let test_feed_caps_days_when_each_day_cannot_receive_one_block () =
          ~basis:9L
          (Pages_result { items = budget_pages; continuation = None }))
   in
-  let limits, final = complete_sequential_feed runtime 40 [] first_page in
+  let limits = List.map (fun request -> page_tree_limit request |> snd) queued.requests in
   require (List.length limits = 2) "four slots must retain exactly two journal days";
+  let outputs = complete_concurrent_feed runtime queued.requests in
+  let final = List.hd (List.rev outputs) in
   match final.responses with
-  | [ { payload = Feed_loaded { feed; _ }; _ } ] ->
+  | [ { payload = Feed_loaded { feed; complete = true; _ }; _ } ] ->
     require
       feed.has_more_days
       "dropped journal days were not exposed through continuation";
@@ -1446,7 +1496,9 @@ let () =
     "feed rejects invalid budgets"
     test_feed_rejects_nonpositive_limits_and_unusable_slot_budget;
   run "feed slot allocation" test_feed_allocates_page_requests_within_slot_budget;
-  run "feed serial backpressure" test_large_feed_emits_one_worker_request_at_a_time;
+  run
+    "feed progressive page reads"
+    test_large_feed_enqueues_bounded_page_reads_without_response_chaining;
   run "feed day cap" test_feed_caps_days_when_each_day_cannot_receive_one_block;
   run
     "feed rejects oversized page response"

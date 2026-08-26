@@ -44,28 +44,33 @@ let shell ~id child =
   |> test_id id
 ;;
 
-let extents ~text_scale ~divider_height =
+let extents ~typography ~text_scale ~divider_height =
   let scale = Float.max 1. text_scale in
-  let title_height = Tokens.typography.header_title.line_height *. scale in
-  let subtitle_height = Tokens.typography.header_subtitle.line_height *. scale in
+  let title_height = typography.Tokens.header_title.line_height *. scale in
+  let subtitle_height = typography.header_subtitle.line_height *. scale in
   let toolbar_height = Float.max 56. (title_height +. 16.) in
-  let expanded_content_height =
-    Float.max 96. (title_height +. subtitle_height +. 24.)
-  in
+  let expanded_content_height = Float.max 96. (title_height +. subtitle_height +. 24.) in
   let expanded_height = expanded_content_height +. divider_height in
   let collapsed_height = toolbar_height +. divider_height in
   toolbar_height, collapsed_height, expanded_height, subtitle_height
 ;;
 
-let sliver ~text_scale ~top_inset ~device_pixel_ratio ~context ~on_account_menu =
+let sliver
+      ~typography
+      ~text_scale
+      ~top_inset
+      ~device_pixel_ratio
+      ~context
+      ~on_account_menu
+  =
   let thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
   let toolbar_height, collapsed_height, expanded_height, subtitle_height =
-    extents ~text_scale ~divider_height:thickness
+    extents ~typography ~text_scale ~divider_height:thickness
   in
   let leading = Ui.Widget.empty () |> shell ~id:"journal-header-leading-placeholder" in
   let title =
     Ui.Widget.text
-      ~style:(text_style Tokens.typography.header_title)
+      ~style:(text_style typography.header_title)
       ~max_lines:1
       ~overflow:Ui.Style.Text_overflow.Clip
       (Context.title context)
@@ -77,7 +82,7 @@ let sliver ~text_scale ~top_inset ~device_pixel_ratio ~context ~on_account_menu 
   in
   let subtitle =
     Ui.Widget.text
-      ~style:(text_style Tokens.typography.header_subtitle)
+      ~style:(text_style typography.header_subtitle)
       ~max_lines:1
       ~text_align:Ui.Style.Text_align.Center
       ~overflow:Ui.Style.Text_overflow.Clip

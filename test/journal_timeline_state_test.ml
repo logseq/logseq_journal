@@ -500,7 +500,10 @@ let test_direct_children_insert_after_parent_and_collapse () =
    | _ -> fail "explicit top-level and child-preview roles changed");
   let require_role_extents ~width ~scale ~expected_parent =
     let profile =
-      Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
+      Journal_visual_tokens.select_row_profile
+        ~viewport_width:width
+        ~text_scale:scale
+        ~preset:Journal_visual_tokens.Balanced
     in
     let geometry = Timeline.extent_geometry loaded ~profile in
     let expected = [ 0, expected_parent ] in
@@ -516,8 +519,8 @@ let test_direct_children_insert_after_parent_and_collapse () =
            extent)
       expected
   in
-  require_role_extents ~width:390. ~scale:1. ~expected_parent:56.;
-  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:144.;
+  require_role_extents ~width:390. ~scale:1. ~expected_parent:60.;
+  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:157.;
   let collapsed = Timeline.collapse loaded ~parent_id:(Journal_model.id parent) in
   require_equal_string_list
     (slot_keys collapsed)
@@ -846,7 +849,10 @@ let benchmark_visible_range_path ~name ~source =
     "benchmark fixture retained %d slots"
     (Timeline.retained_slot_count initial);
   let profile =
-    Journal_visual_tokens.select_row_profile ~viewport_width:1_200. ~text_scale:1.
+    Journal_visual_tokens.select_row_profile
+      ~preset:Journal_visual_tokens.Balanced
+      ~viewport_width:1_200.
+      ~text_scale:1.
   in
   let iterations = 5_000 in
   let checksum = ref 0 in
@@ -900,7 +906,10 @@ let test_exact_profile_extents_have_no_composer_clearance () =
   in
   let check ~width ~scale ~default_extent ~day_extent =
     let profile =
-      Journal_visual_tokens.select_row_profile ~viewport_width:width ~text_scale:scale
+      Journal_visual_tokens.select_row_profile
+        ~preset:Journal_visual_tokens.Balanced
+        ~viewport_width:width
+        ~text_scale:scale
     in
     let geometry = Timeline.extent_geometry state ~profile in
     require
@@ -908,18 +917,20 @@ let test_exact_profile_extents_have_no_composer_clearance () =
       "profile default extent %.1f, expected %.1f"
       geometry.default_extent
       default_extent;
+    let expected_overrides =
+      if Float.equal day_extent default_extent
+      then []
+      else [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent } ]
+    in
+    require (geometry.overrides = expected_overrides) "profile extent overrides changed";
     require
-      (geometry.overrides
-       = [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent } ])
-      "profile extent overrides changed";
-    require
-      (List.length geometry.overrides = 1)
+      (List.length geometry.overrides = List.length expected_overrides)
       "timeline retained an extent override beyond the day heading"
   in
-  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:48.;
+  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:44.;
   check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:36.;
-  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:72.;
-  check ~width:1_200. ~scale:3.2 ~default_extent:80. ~day_extent:101.
+  check ~width:390. ~scale:2. ~default_extent:60. ~day_extent:64.;
+  check ~width:1_200. ~scale:3.2 ~default_extent:87. ~day_extent:88.
 ;;
 
 let test_block_line_counts_are_the_authoritative_sparse_extents () =
@@ -958,7 +969,10 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
   in
   let check ~scale expected =
     let profile =
-      Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:scale
+      Journal_visual_tokens.select_row_profile
+        ~preset:Journal_visual_tokens.Balanced
+        ~viewport_width:390.
+        ~text_scale:scale
     in
     let geometry = Timeline.extent_geometry state ~profile in
     let extent index =
@@ -981,8 +995,8 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
            scale)
       expected
   in
-  check ~scale:1. [ 0, 44.; 1, 96.; 2, 56.; 3, 76.; 4, 96. ];
-  check ~scale:3.2 [ 0, 80.; 1, 272.; 2, 144.; 3, 208.; 4, 272. ]
+  check ~scale:1. [ 0, 44.; 1, 104.; 2, 60.; 3, 82.; 4, 104. ];
+  check ~scale:3.2 [ 0, 87.; 1, 298.; 2, 157.; 3, 228.; 4, 298. ]
 ;;
 
 let test_anchor_decisions_replacements_and_route_return () =
@@ -1027,13 +1041,19 @@ let test_anchor_decisions_replacements_and_route_return () =
     Timeline.extent_geometry
       returned
       ~profile:
-        (Journal_visual_tokens.select_row_profile ~viewport_width:320. ~text_scale:1.)
+        (Journal_visual_tokens.select_row_profile
+           ~preset:Journal_visual_tokens.Balanced
+           ~viewport_width:320.
+           ~text_scale:1.)
   in
   let _adaptive =
     Timeline.extent_geometry
       returned
       ~profile:
-        (Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:3.2)
+        (Journal_visual_tokens.select_row_profile
+           ~preset:Journal_visual_tokens.Balanced
+           ~viewport_width:390.
+           ~text_scale:3.2)
   in
   require
     (Timeline.current_window returned = before)
@@ -1239,13 +1259,19 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
     Timeline.extent_geometry
       loaded
       ~profile:
-        (Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:1.)
+        (Journal_visual_tokens.select_row_profile
+           ~preset:Journal_visual_tokens.Balanced
+           ~viewport_width:390.
+           ~text_scale:1.)
   in
   let after_geometry =
     Timeline.extent_geometry
       restored
       ~profile:
-        (Journal_visual_tokens.select_row_profile ~viewport_width:390. ~text_scale:1.)
+        (Journal_visual_tokens.select_row_profile
+           ~preset:Journal_visual_tokens.Balanced
+           ~viewport_width:390.
+           ~text_scale:1.)
   in
   require (before_geometry = after_geometry) "Undo changed sparse extent geometry";
   let stale =
@@ -1310,6 +1336,111 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
     "forged delete ID was staged"
 ;;
 
+let require_capture_fab_state state ~presentation ~travel label =
+  require
+    (Timeline.capture_fab_presentation state = presentation)
+    "%s presentation changed"
+    label;
+  require
+    (Float.equal (Timeline.capture_fab_accumulated_travel state) travel)
+    "%s accumulated travel is %.3f, expected %.3f"
+    label
+    (Timeline.capture_fab_accumulated_travel state)
+    travel
+;;
+
+let apply_capture_fab_scroll state ~pixels ~delta =
+  Timeline.update_capture_fab_scroll state ~pixels ~delta
+;;
+
+let test_capture_fab_scroll_threshold_direction_reversal_and_top_reset () =
+  let initial = Timeline.initial_capture_fab_scroll in
+  require_capture_fab_state initial ~presentation:Timeline.Extended ~travel:0. "initial";
+  let below =
+    initial
+    |> apply_capture_fab_scroll ~pixels:20. ~delta:20.
+    |> apply_capture_fab_scroll ~pixels:23.5 ~delta:3.5
+  in
+  require_capture_fab_state
+    below
+    ~presentation:Timeline.Extended
+    ~travel:23.5
+    "below down";
+  let compact = apply_capture_fab_scroll below ~pixels:24. ~delta:0.5 in
+  require_capture_fab_state
+    compact
+    ~presentation:Timeline.Compact
+    ~travel:0.
+    "down threshold";
+  let wrong_direction = compact |> apply_capture_fab_scroll ~pixels:124. ~delta:100. in
+  require_capture_fab_state
+    wrong_direction
+    ~presentation:Timeline.Compact
+    ~travel:100.
+    "compact down";
+  let below_up =
+    wrong_direction
+    |> apply_capture_fab_scroll ~pixels:104. ~delta:(-20.)
+    |> apply_capture_fab_scroll ~pixels:100.1 ~delta:(-3.9)
+  in
+  require_capture_fab_state
+    below_up
+    ~presentation:Timeline.Compact
+    ~travel:(-23.9)
+    "below up";
+  let extended = apply_capture_fab_scroll below_up ~pixels:100. ~delta:(-0.1) in
+  require_capture_fab_state
+    extended
+    ~presentation:Timeline.Extended
+    ~travel:0.
+    "up threshold";
+  let reversed =
+    initial
+    |> apply_capture_fab_scroll ~pixels:20. ~delta:20.
+    |> apply_capture_fab_scroll ~pixels:16. ~delta:(-4.)
+    |> apply_capture_fab_scroll ~pixels:36. ~delta:20.
+  in
+  require_capture_fab_state
+    reversed
+    ~presentation:Timeline.Extended
+    ~travel:20.
+    "down reversal";
+  let still_extended = apply_capture_fab_scroll reversed ~pixels:39.9 ~delta:3.9 in
+  require_capture_fab_state
+    still_extended
+    ~presentation:Timeline.Extended
+    ~travel:23.9
+    "reversal below threshold";
+  let compact_again = apply_capture_fab_scroll still_extended ~pixels:40. ~delta:0.1 in
+  require_capture_fab_state
+    compact_again
+    ~presentation:Timeline.Compact
+    ~travel:0.
+    "reversal threshold";
+  let zero_delta = apply_capture_fab_scroll compact_again ~pixels:40. ~delta:0. in
+  require_capture_fab_state
+    zero_delta
+    ~presentation:Timeline.Compact
+    ~travel:0.
+    "zero delta";
+  let top = apply_capture_fab_scroll compact_again ~pixels:0. ~delta:(-1.) in
+  require_capture_fab_state top ~presentation:Timeline.Extended ~travel:0. "top reset";
+  let beyond_top =
+    compact_again |> apply_capture_fab_scroll ~pixels:(-12.) ~delta:(-52.)
+  in
+  require_capture_fab_state
+    beyond_top
+    ~presentation:Timeline.Extended
+    ~travel:0.
+    "overscroll reset";
+  let large_delta = apply_capture_fab_scroll initial ~pixels:80. ~delta:80. in
+  require_capture_fab_state
+    large_delta
+    ~presentation:Timeline.Compact
+    ~travel:0.
+    "large down event"
+;;
+
 let () =
   test_projection_order_today_suppression_and_continuations ();
   test_visible_range_demand_drains_in_order_without_another_event ();
@@ -1333,5 +1464,6 @@ let () =
   test_prepend_first_today_entry_before_older_days ();
   test_no_measurement_or_renderer_extension_surface_exists ();
   test_stage_delete_collapsed_expanded_and_exact_undo ();
-  test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading ()
+  test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading ();
+  test_capture_fab_scroll_threshold_direction_reversal_and_top_reset ()
 ;;

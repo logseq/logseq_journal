@@ -4,32 +4,31 @@ set -eu
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 flutter_root="$repository_root/flutter"
 generator="$repository_root/_build/default/logseq_db_worker/tool/generate_fixtures.exe"
-container_tmp="$HOME/Library/Containers/com.example.bonsaiFlutterLogseqJournalHost/Data/tmp"
+container_tmp=${TMPDIR:-/tmp}
 
-if [ ! -x "$generator" ]; then
-  printf '%s\n' "Build logseq_db_worker/tool/generate_fixtures.exe before this test." >&2
-  exit 1
-fi
+cd "$repository_root"
+opam exec -- dune build logseq_db_worker/tool/generate_fixtures.exe
 
-normal_one=$(mktemp -d "$container_tmp/logseq-runtime-flow-normal-one.XXXXXX")
-normal_two=$(mktemp -d "$container_tmp/logseq-runtime-flow-normal-two.XXXXXX")
-failure_one=$(mktemp -d "$container_tmp/logseq-runtime-flow-failure.XXXXXX")
+valid=$(mktemp -d "$container_tmp/logseq-encrypted-warm-valid.XXXXXX")
+missing_wrapped_key=$(mktemp -d "$container_tmp/logseq-encrypted-warm-missing.XXXXXX")
 
 cleanup() {
-  /bin/rm -rf -- "$normal_one" "$normal_two" "$failure_one"
+  /bin/rm -rf -- "$valid" "$missing_wrapped_key"
 }
 trap cleanup EXIT HUP INT TERM
 
-normal_one_json=$($generator runtime-flow --support-root "$normal_one")
-normal_two_json=$($generator runtime-flow --support-root "$normal_two")
-failure_one_json=$($generator runtime-flow-failure --support-root "$failure_one")
-fixtures_json=$(printf '{"normal":[%s,%s],"persistenceFailure":[%s]}' \
-  "$normal_one_json" \
-  "$normal_two_json" \
-  "$failure_one_json")
+valid_json=$("$generator" encrypted-offline-warm-start --support-root "$valid")
+missing_wrapped_key_json=$(
+  "$generator" encrypted-offline-warm-start --support-root "$missing_wrapped_key"
+)
+fixtures_json=$(printf '{"valid":%s,"missingWrappedKey":%s}' \
+  "$valid_json" \
+  "$missing_wrapped_key_json")
 
 cd "$flutter_root"
-LOGSEQ_DB_WORKER_RUNTIME_FIXTURES_JSON="$fixtures_json" \
+LOGSEQ_JOURNAL_ENCRYPTED_WARM_FIXTURES_JSON="$fixtures_json" \
+LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE=memory \
+LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE=memory \
   opam exec -- bonsai-flutter exec --profile=debug -- \
   flutter test --no-pub -d macos \
-  integration_test/logseq_db_worker_runtime_flow_test.dart "$@"
+  integration_test/encrypted_offline_warm_start_test.dart "$@"

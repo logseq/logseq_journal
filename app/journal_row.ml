@@ -149,11 +149,11 @@ let disclosure_indicator ~rtl ~expanded item =
     |> Option.some
 ;;
 
-let text_line ~item ~kind ~index source =
+let text_line ~typography ~item ~kind ~index source =
   let token, prefix =
     match kind with
-    | `Source -> Tokens.typography.entry, "source"
-    | `Supporting -> Tokens.typography.supporting, "supporting"
+    | `Source -> typography.Tokens.entry, "source"
+    | `Supporting -> typography.supporting, "supporting"
   in
   Ui.Widget.text
     ~style:(text_style token)
@@ -164,13 +164,13 @@ let text_line ~item ~kind ~index source =
   |> test_id (Printf.sprintf "journal-row-%s:%s:%d" prefix (Item.id item) index)
 ;;
 
-let time_slot profile item ~show_timestamp =
+let time_slot typography profile item ~show_timestamp =
   let child =
     match item.Item.time, show_timestamp with
     | None, _ | Some _, false -> Ui.Widget.empty ()
     | Some time, true ->
       Ui.Widget.text
-        ~style:(text_style Tokens.typography.timestamp)
+        ~style:(text_style typography.Tokens.timestamp)
         ~max_lines:1
         ~text_align:Ui.Style.Text_align.End
         time
@@ -206,6 +206,7 @@ let status_rail ~tokens ~profile item ~visible_lines =
 
 let view
       ~tokens
+      ~typography
       ~profile
       ~device_pixel_ratio
       ~rtl
@@ -222,11 +223,13 @@ let view
   let row_extent = Tokens.block_extent ~profile ~visible_lines in
   let source =
     let source_widgets =
-      List.mapi (fun index line -> text_line ~item ~kind:`Source ~index line) source_lines
+      List.mapi
+        (fun index line -> text_line ~typography ~item ~kind:`Source ~index line)
+        source_lines
     in
     let supporting_widgets =
       List.mapi
-        (fun index line -> text_line ~item ~kind:`Supporting ~index line)
+        (fun index line -> text_line ~typography ~item ~kind:`Supporting ~index line)
         supporting_lines
     in
     List.map Ui.Widget.Flex.flexible (source_widgets @ supporting_widgets)
@@ -243,7 +246,7 @@ let view
     |> test_id ("journal-row-source-gap:" ^ Item.id item)
   in
   let disclosure = disclosure_indicator ~rtl ~expanded item in
-  let time = time_slot profile item ~show_timestamp in
+  let time = time_slot typography profile item ~show_timestamp in
   let fixed_options widgets = List.filter_map (Option.map Ui.Widget.Flex.fixed) widgets in
   let inline =
     Ui.Widget.Flex.row

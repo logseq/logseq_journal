@@ -21,7 +21,7 @@ let with_temp_directory prefix run =
   Fun.protect ~finally:(fun () -> remove_tree path) (fun () -> run path)
 ;;
 
-let engine generated =
+let engine (generated : F.generated) =
   let config =
     Logseq_db_worker.Config.create
       ~application_support_directory:generated.F.support_root
@@ -153,6 +153,59 @@ let test_generator_refuses_to_replace_existing_source () =
     | Ok _ -> T.fail "fixture generator replaced an existing source")
 ;;
 
+let test_encrypted_warm_start_fixture_has_a_selected_ready_mirror () =
+  with_temp_directory "logseq-encrypted-warm-fixture-" (fun support ->
+    let generated =
+      match F.create_encrypted_warm_start ~support_root:support with
+      | Ok generated -> generated
+      | Error message -> T.fail "encrypted fixture generation failed: %s" message
+    in
+    T.require
+      (String.equal generated.support_root (Unix.realpath support))
+      "encrypted fixture did not return its canonical support root";
+    let cache =
+      match
+        Logseq_db_worker.Sync_catalog_store.load
+          ~application_support_directory:generated.support_root
+          ~user_id:generated.user_id
+          ~base_url:generated.base_url
+      with
+      | Ok (Some cache) -> cache
+      | Ok None -> T.fail "encrypted fixture omitted the catalog cache"
+      | Error message -> T.fail "encrypted fixture catalog failed to load: %s" message
+    in
+    let graphs = Logseq_db_worker.Sync_catalog.graphs cache in
+    T.require (List.length graphs = 1) "encrypted fixture catalog is not scoped to one graph";
+    let graph = List.hd graphs in
+    T.require graph.encrypted "encrypted fixture graph lost its encryption flag";
+    T.require
+      (Logseq_db_worker.Graph_types.Uuid.equal graph.graph_id generated.graph_id)
+      "encrypted fixture catalog changed the graph identity";
+    T.require
+      (Logseq_db_worker.Sync_catalog.selected_graph cache = Some generated.graph_id)
+      "encrypted fixture graph is not selected";
+    T.require
+      (Logseq_db_worker.Sync_catalog.mirror_status cache generated.graph_id
+       = Logseq_db_worker.Sync_catalog.Ready)
+      "encrypted fixture mirror is not marked ready";
+    match
+      Logseq_db_worker.Sync_mirror.resolve
+        ~application_support_directory:generated.support_root
+        ~graph_id:generated.graph_id
+    with
+    | Ok resolved ->
+      T.require
+        (String.equal resolved.graph_dir generated.graph_dir)
+        "encrypted fixture returned a different mirror path";
+      T.require
+        (Sys.file_exists resolved.database_path)
+        "encrypted fixture mirror has no database"
+    | Error error ->
+      T.fail
+        "encrypted fixture mirror failed admission: %s"
+        (Logseq_db_worker.Sync_mirror.error_message error))
+;;
+
 let () =
   T.run
     "fixture-generator"
@@ -166,5 +219,8 @@ let () =
     ; T.case
         "existing fixture is not replaced"
         test_generator_refuses_to_replace_existing_source
+    ; T.case
+        "encrypted warm-start fixture has selected ready mirror"
+        test_encrypted_warm_start_fixture_has_a_selected_ready_mirror
     ]
 ;;

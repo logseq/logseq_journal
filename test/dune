@@ -98,6 +98,17 @@
   (progn
    (run
     sh
-    %{dep:test_native_static_gmp.sh}
-    %{dep:../tool/native_static_link_flags.sh})
+   %{dep:test_native_static_gmp.sh}
+   %{dep:../tool/native_static_link_flags.sh})
    (run sh %{dep:test_material_icons_artifact.sh} %{workspace_root}))))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (= %{system} macosx))
+ (deps
+  test_wrapped_graph_key_crypto.sh
+  wrapped_graph_key_crypto_test.swift
+  ../flutter/JournalE2EECrypto.swift)
+ (action
+  (run sh %{dep:test_wrapped_graph_key_crypto.sh} %{workspace_root})))

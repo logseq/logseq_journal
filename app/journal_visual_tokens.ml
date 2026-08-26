@@ -54,9 +54,17 @@ type typography =
   ; header_subtitle : text_token
   ; entry : text_token
   ; supporting : text_token
-  ; disclosure : text_token
   ; timestamp : text_token
+  ; input : text_token
+  ; button_label : text_token
+  ; dialog_title : text_token
+  ; manager_title : text_token
   }
+
+type typography_preset =
+  | Dense
+  | Balanced
+  | Comfortable
 
 type spacing =
   { x1 : float
@@ -131,19 +139,55 @@ let resolve ~high_contrast =
   if high_contrast then Color_exceptions.High_contrast else Color_exceptions.Normal
 ;;
 
-let typography =
-  { header_title =
-      { font_size = 22.; line_height = 28.; weight = Ui.Style.Font_weight.Bold }
-  ; header_subtitle =
-      { font_size = 15.; line_height = 20.; weight = Ui.Style.Font_weight.Medium }
-  ; entry = { font_size = 15.; line_height = 20.; weight = Ui.Style.Font_weight.Normal }
-  ; supporting =
-      { font_size = 14.; line_height = 20.; weight = Ui.Style.Font_weight.Normal }
-  ; disclosure =
-      { font_size = 11.; line_height = 16.; weight = Ui.Style.Font_weight.Medium }
-  ; timestamp =
-      { font_size = 13.; line_height = 18.; weight = Ui.Style.Font_weight.Normal }
-  }
+let text_token font_size line_height weight = { font_size; line_height; weight }
+
+let typography = function
+  | Dense ->
+    { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
+    ; entry = text_token 15. 20. Ui.Style.Font_weight.Normal
+    ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
+    ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
+    ; input = text_token 16. 24. Ui.Style.Font_weight.Normal
+    ; button_label = text_token 14. 20. Ui.Style.Font_weight.Medium
+    ; dialog_title = text_token 20. 26. Ui.Style.Font_weight.Semi_bold
+    ; manager_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
+    }
+  | Balanced ->
+    { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
+    ; entry = text_token 16. 22. Ui.Style.Font_weight.Normal
+    ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
+    ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
+    ; input = text_token 16. 24. Ui.Style.Font_weight.Normal
+    ; button_label = text_token 14. 20. Ui.Style.Font_weight.Medium
+    ; dialog_title = text_token 20. 26. Ui.Style.Font_weight.Semi_bold
+    ; manager_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
+    }
+  | Comfortable ->
+    { header_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
+    ; header_subtitle = text_token 16. 22. Ui.Style.Font_weight.Medium
+    ; entry = text_token 17. 24. Ui.Style.Font_weight.Normal
+    ; supporting = text_token 15. 22. Ui.Style.Font_weight.Normal
+    ; timestamp = text_token 14. 20. Ui.Style.Font_weight.Normal
+    ; input = text_token 16. 24. Ui.Style.Font_weight.Normal
+    ; button_label = text_token 15. 20. Ui.Style.Font_weight.Medium
+    ; dialog_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    ; manager_title = text_token 28. 34. Ui.Style.Font_weight.Semi_bold
+    }
+;;
+
+let typography_preset_of_stored_value = function
+  | Some "dense" -> Dense
+  | Some "balanced" -> Balanced
+  | Some "comfortable" -> Comfortable
+  | None | Some _ -> Balanced
+;;
+
+let stored_value_of_typography_preset = function
+  | Dense -> "dense"
+  | Balanced -> "balanced"
+  | Comfortable -> "comfortable"
 ;;
 
 let spacing = { x1 = 4.; x2 = 8.; x3 = 12.; x4 = 16.; x5 = 20.; x6 = 24.; x7 = 28. }
@@ -182,24 +226,27 @@ let motion ~reduced_motion =
 let physical_divider_thickness ~device_pixel_ratio = 1. /. Float.max 1. device_pixel_ratio
 let timeline_max_width = 720.
 
-let select_row_profile ~viewport_width ~text_scale =
+let select_row_profile ~preset ~viewport_width ~text_scale =
+  let typography = typography preset in
   let narrow = Float.compare viewport_width 360. < 0 in
   let content_leading = if narrow then 24. else 32. in
   let scale = Float.max 1. text_scale in
+  let block_line_height = typography.entry.line_height *. scale in
+  let supporting_line_height = typography.supporting.line_height *. scale in
   if (not narrow) && Float.compare scale 1.3 <= 0
   then
     { kind = Compact
-    ; block_line_height = 20. *. scale
-    ; continuation_extent = Float.ceil (28. +. (20. *. scale))
+    ; block_line_height
+    ; continuation_extent = Float.ceil (28. +. supporting_line_height)
     ; day_header_extent = 36.
     ; content_leading
     ; time_slot_width = row_geometry.time_slot_base
     }
   else
     { kind = Adaptive
-    ; block_line_height = 20. *. scale
-    ; continuation_extent = Float.ceil (28. +. (20. *. scale))
-    ; day_header_extent = Float.ceil (24. +. (24. *. scale))
+    ; block_line_height
+    ; continuation_extent = Float.ceil (28. +. supporting_line_height)
+    ; day_header_extent = Float.ceil (24. +. supporting_line_height)
     ; content_leading
     ; time_slot_width = Float.ceil (row_geometry.time_slot_base *. scale)
     }

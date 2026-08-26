@@ -1,8 +1,338 @@
 module T = Logseq_db_worker_test_support.Test_support
-module M = Logseq_db_worker.Sync_manager
+module Raw_manager = Logseq_db_worker.Sync_manager
 module A = Logseq_db_worker.Sync_auth
 module C = Logseq_db_worker.Sync_catalog
 module Uuid = Logseq_db_worker.Graph_types.Uuid
+module Typed_action = Logseq_db_worker.Sync_action
+module Startup_phase = Logseq_db_worker.Sync_startup_phase
+
+module M = struct
+  include Raw_manager
+
+  let latest_mirror_request = ref None
+  let latest_wrapped_key_request = ref None
+  let latest_private_key_request = ref None
+
+  type action =
+    | Need_id_token of A.challenge
+    | Fetch_catalog of
+        { account_generation : int
+        ; base_url : Uri.t
+        ; token : string
+        }
+    | Inspect_mirror of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        }
+    | Fetch_snapshot_baseline of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        ; token : string
+        }
+    | Fetch_snapshot_metadata of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        ; token : string
+        }
+    | Download_snapshot_artifact of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        ; baseline : Logseq_db_worker.Sync_bootstrap.baseline
+        ; metadata : Logseq_db_worker.Sync_bootstrap.snapshot_metadata
+        ; token : string
+        }
+    | Activate_snapshot of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        ; server_t : int
+        ; snapshot_path : string
+        ; expected_rows : int
+        ; graph_key : string option
+        }
+    | Fetch_e2ee_graph_key of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        ; token : string
+        }
+    | Fetch_e2ee_user_keys of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph_id : Uuid.t
+        ; token : string
+        }
+    | Open_graph of
+        { account_generation : int
+        ; graph_generation : int
+        ; graph : C.graph
+        ; encrypted_graph_key : string option
+        }
+    | Close_graph
+    | Connect_websocket of
+        { account_generation : int
+        ; graph_generation : int
+        ; connection_generation : int
+        ; graph_id : Uuid.t
+        ; token : string
+        }
+    | Close_websocket
+    | Send_websocket of string
+    | Schedule_reconnect of
+        { account_generation : int
+        ; graph_generation : int
+        ; connection_generation : int
+        ; delay_seconds : float
+        }
+    | Schedule_foreground_probe of
+        { account_generation : int
+        ; graph_generation : int
+        ; connection_generation : int
+        ; lifecycle_generation : int64
+        ; delay_seconds : float
+        }
+    | Apply_sync_frame of string
+    | Recover_submitted of Uuid.t list
+    | Fetch_http_pull of
+        { account_generation : int
+        ; graph_generation : int
+        ; connection_generation : int
+        ; graph_id : Uuid.t
+        ; since : int
+        ; token : string
+        }
+    | Submit_http_transaction of
+        { account_generation : int
+        ; graph_generation : int
+        ; connection_generation : int
+        ; graph_id : Uuid.t
+        ; payload : string
+        ; token : string
+        }
+    | Delete_mirror of Uuid.t
+    | Load_wrapped_graph_key
+    | Save_wrapped_graph_key
+    | Delete_wrapped_graph_key
+    | Delete_account_secrets
+
+  let graph_of_contract (graph : Typed_action.graph) =
+    C.
+      { graph_id = Uuid.of_string graph.graph_id |> Result.get_ok
+      ; name = graph.name
+      ; schema =
+          { major = graph.schema_major
+          ; minor = graph.schema_minor
+          ; exact = graph.schema_exact
+          }
+      ; encrypted = graph.encrypted
+      }
+  ;;
+
+  let challenge_of_scoped (challenge : Typed_action.scoped_challenge) =
+    let account, graph_generation, connection_generation =
+      match challenge.scope with
+      | Account_scope account -> account, None, None
+      | Graph_scope graph -> graph.account, Some graph.graph_generation, None
+      | Connection_scope connection ->
+        ( connection.graph.account
+        , Some connection.graph.graph_generation
+        , Some connection.connection_generation )
+    in
+    let purpose =
+      match challenge.purpose with
+      | Catalog_discovery_name -> A.Catalog_discovery
+      | Snapshot_bootstrap_name -> Snapshot_bootstrap
+      | E2ee_key_access_name -> E2ee_key_access
+      | Http_pull_name -> Http_pull
+      | Transaction_submission_name -> Transaction_submission
+      | Websocket_connect_name -> Websocket_connect
+    in
+    A.
+      { challenge_id = challenge.challenge_id
+      ; purpose
+      ; user_id = account.user_id
+      ; account_generation = account.account_generation
+      ; graph_generation
+      ; connection_generation
+      }
+  ;;
+
+  let graph_scope_of_request request =
+    Startup_phase.local_request_graph_scope request |> Startup_phase.graph_scope_view
+  ;;
+
+  let view (Typed_action.Pack action) =
+    match action with
+    | Typed_action.Need_id_token challenge ->
+      Need_id_token (challenge_of_scoped challenge)
+    | Fetch_catalog { scope; token } ->
+      Fetch_catalog
+        { account_generation = scope.account_generation
+        ; base_url = scope.managed_sync_origin
+        ; token
+        }
+    | Inspect_mirror { request; graph } ->
+      latest_mirror_request := Some request;
+      let scope = graph_scope_of_request request in
+      Inspect_mirror
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        }
+    | Load_and_verify_wrapped_graph_key
+        { wrapped_key_request; private_key_request } ->
+      latest_wrapped_key_request := Some wrapped_key_request;
+      latest_private_key_request := Some private_key_request;
+      Load_wrapped_graph_key
+    | Verify_and_save_wrapped_graph_key _ -> Save_wrapped_graph_key
+    | Delete_wrapped_graph_key _ -> Delete_wrapped_graph_key
+    | Delete_account_secrets _ -> Delete_account_secrets
+    | Open_graph { request; graph; encrypted_graph_key } ->
+      let scope = graph_scope_of_request request in
+      Open_graph
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        ; encrypted_graph_key =
+            Option.map Typed_action.wrapped_graph_key_to_string encrypted_graph_key
+        }
+    | Close_graph -> Close_graph
+    | Delete_mirror { scope } ->
+      Delete_mirror (Uuid.of_string scope.graph_id |> Result.get_ok)
+    | Fetch_snapshot_baseline { scope; graph; token } ->
+      Fetch_snapshot_baseline
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        ; token
+        }
+    | Fetch_snapshot_metadata { scope; graph; token } ->
+      Fetch_snapshot_metadata
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        ; token
+        }
+    | Download_snapshot_artifact { scope; graph; baseline; metadata; token } ->
+      Download_snapshot_artifact
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        ; baseline = { server_t = baseline.server_t }
+        ; metadata =
+            { key = metadata.key
+            ; url = metadata.url
+            ; content_encoding = Some metadata.content_encoding
+            }
+        ; token
+        }
+    | Activate_snapshot
+        { scope; graph; server_t; snapshot_path; expected_rows; encrypted_graph_key } ->
+      Activate_snapshot
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        ; server_t
+        ; snapshot_path
+        ; expected_rows
+        ; graph_key =
+            Option.map Typed_action.wrapped_graph_key_to_string encrypted_graph_key
+        }
+    | Fetch_e2ee_graph_key { scope; graph; token } ->
+      Fetch_e2ee_graph_key
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph = graph_of_contract graph
+        ; token
+        }
+    | Fetch_e2ee_user_keys { scope; token } ->
+      Fetch_e2ee_user_keys
+        { account_generation = scope.account.account_generation
+        ; graph_generation = scope.graph_generation
+        ; graph_id = Uuid.of_string scope.graph_id |> Result.get_ok
+        ; token
+        }
+    | Connect_websocket { scope; token } ->
+      Connect_websocket
+        { account_generation = scope.graph.account.account_generation
+        ; graph_generation = scope.graph.graph_generation
+        ; connection_generation = scope.connection_generation
+        ; graph_id = Uuid.of_string scope.graph.graph_id |> Result.get_ok
+        ; token
+        }
+    | Close_websocket -> Close_websocket
+    | Send_websocket { payload; _ } -> Send_websocket payload
+    | Schedule_reconnect { scope; delay_seconds } ->
+      Schedule_reconnect
+        { account_generation = scope.graph.account.account_generation
+        ; graph_generation = scope.graph.graph_generation
+        ; connection_generation = scope.connection_generation
+        ; delay_seconds
+        }
+    | Schedule_foreground_probe { scope; delay_seconds } ->
+      Schedule_foreground_probe
+        { account_generation = scope.graph.account.account_generation
+        ; graph_generation = scope.graph.graph_generation
+        ; connection_generation = scope.connection_generation
+        ; lifecycle_generation = scope.lifecycle_generation
+        ; delay_seconds
+        }
+    | Apply_sync_frame { frame; _ } -> Apply_sync_frame frame
+    | Recover_submitted { transaction_ids; _ } ->
+      Recover_submitted
+        (List.map (fun id -> Uuid.of_string id |> Result.get_ok) transaction_ids)
+    | Fetch_http_pull { scope; since; token } ->
+      Fetch_http_pull
+        { account_generation = scope.graph.account.account_generation
+        ; graph_generation = scope.graph.graph_generation
+        ; connection_generation = scope.connection_generation
+        ; graph_id = Uuid.of_string scope.graph.graph_id |> Result.get_ok
+        ; since
+        ; token
+        }
+    | Submit_http_transaction { scope; payload; token } ->
+      Submit_http_transaction
+        { account_generation = scope.graph.account.account_generation
+        ; graph_generation = scope.graph.graph_generation
+        ; connection_generation = scope.connection_generation
+        ; graph_id = Uuid.of_string scope.graph.graph_id |> Result.get_ok
+        ; payload
+        ; token
+        }
+  ;;
+
+  let handle_command manager command =
+    Raw_manager.handle_command manager command |> List.map view
+  ;;
+
+  let handle_event manager event = Raw_manager.handle_event manager event |> List.map view
+
+  let mirror_failure_receipt diagnostic =
+    match !latest_mirror_request with
+    | Some request -> Startup_phase.Local_completion.mirror_failed request ~diagnostic
+    | None -> T.fail "no mirror request is available for a failure receipt"
+  ;;
+
+  let wrapped_key_failure_receipt diagnostic =
+    match !latest_wrapped_key_request with
+    | Some request ->
+      Raw_manager.Wrapped_key_failure_receipt
+        (Startup_phase.Local_completion.wrapped_graph_key_failed request ~diagnostic)
+    | None -> T.fail "no wrapped-key request is available for a failure receipt"
+  ;;
+
+  let private_key_failure_receipt diagnostic =
+    match !latest_private_key_request with
+    | Some request ->
+      Raw_manager.Private_key_failure_receipt
+        (Startup_phase.Local_completion.local_private_key_failed request ~diagnostic)
+    | None -> T.fail "no private-key request is available for a failure receipt"
+  ;;
+end
 
 let contains text needle =
   let rec loop offset =
@@ -64,6 +394,253 @@ let provide manager challenge token =
        })
 ;;
 
+let restore_local_catalog manager =
+  let effects =
+    M.handle_command
+      manager
+      (Restore_local_account
+         { user_id = "user-1"; managed_sync_origin = "https://api.logseq.io" })
+  in
+  T.require (effects = []) "local account restore emitted online work";
+  let snapshot = M.snapshot manager in
+  T.require
+    (snapshot.user_id = Some "user-1" && snapshot.startup_presentation = Restoring_local)
+    "local account restore did not enter the local startup lane";
+  let effects =
+    M.handle_event
+      manager
+      (Cached_catalog_loaded
+         { account_generation = snapshot.account_generation
+         ; graphs = [ graph graph_id "First"; graph other_graph_id "Second" ]
+         })
+  in
+  T.require (effects = []) "cached catalog restore emitted online work";
+  ignore (M.handle_command manager (Select_graph graph_id))
+;;
+
+let open_restored_graph manager cursor =
+  restore_local_catalog manager;
+  let snapshot = M.snapshot manager in
+  let open_effects =
+    M.handle_event
+      manager
+      (Mirror_ready
+         { account_generation = snapshot.account_generation
+         ; graph_generation = snapshot.graph_generation
+         ; graph_id
+         })
+  in
+  T.require
+    (match open_effects with
+     | [ Open_graph _ ] -> true
+     | _ -> false)
+    "restored mirror did not open locally";
+  let before_graph_open = M.snapshot manager in
+  let graph_opened =
+    M.handle_event
+      manager
+      (Graph_opened
+         { account_generation = before_graph_open.account_generation
+         ; graph_generation = before_graph_open.graph_generation
+         ; graph_id
+         ; applied_server_t = cursor
+         })
+  in
+  T.require
+    (graph_opened = [])
+    "offline-ready graph open constructed network work before Timeline presentation";
+  T.require
+    ((M.snapshot manager).phase = before_graph_open.phase)
+    "local graph open changed the startup presentation phase"
+;;
+
+let present_restored_timeline manager =
+  let snapshot = M.snapshot manager in
+  let account_generation = snapshot.account_generation in
+  let graph_generation = snapshot.graph_generation in
+  let presentation_generation = snapshot.presentation_generation in
+  T.require
+    (M.handle_command
+       manager
+       (Local_feed_ready { account_generation; graph_generation; presentation_generation })
+     = [])
+    "local feed readiness emitted online work";
+  M.handle_command
+    manager
+    (Timeline_presented { account_generation; graph_generation; presentation_generation })
+;;
+
+let test_local_restore_is_independent_from_authentication_and_network () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  open_restored_graph manager 41;
+  let snapshot = M.snapshot manager in
+  T.require
+    (snapshot.applied_server_t = Some 41
+     && snapshot.startup_presentation = Restoring_local)
+    "local graph open waited for online reconciliation";
+  let catalog_challenge =
+    let effects =
+      M.handle_command
+        manager
+        (Reconcile_authenticated_user
+           { user_id = Some "user-1"; managed_sync_origin = "https://api.logseq.io" })
+    in
+    T.require
+      (effects = [])
+      "authenticated reconciliation constructed network work before Timeline presentation";
+    present_restored_timeline manager |> need_token
+  in
+  T.require
+    (catalog_challenge.purpose = Catalog_discovery)
+    "online reconciliation requested the wrong token";
+  ignore
+    (M.handle_command
+       manager
+       (Token_failed { challenge_id = catalog_challenge.challenge_id }));
+  let failed = M.snapshot manager in
+  T.require
+    (failed.applied_server_t = Some 41
+     && failed.selected_graph = Some graph_id
+     && failed.startup_presentation = Reconciled)
+    "network failure preempted the restored graph"
+;;
+
+let test_offline_eof_does_not_preempt_local_timeline () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  open_restored_graph manager 41;
+  let before = M.snapshot manager in
+  ignore
+    (M.handle_event
+       manager
+       (Network_failed
+          { account_generation = before.account_generation
+          ; graph_generation = Some before.graph_generation
+          ; connection_generation = Some before.connection_generation
+          ; message = "End_of_file"
+          }));
+  let offline = M.snapshot manager in
+  T.require
+    (offline.phase = before.phase
+     && offline.selected_graph = Some graph_id
+     && offline.applied_server_t = Some 41
+     && offline.startup_presentation = Restoring_local)
+    "offline EOF changed the local startup route before Timeline presentation";
+  T.require
+    (offline.last_error = Some "Network unavailable")
+    "offline EOF exposed an internal exception name";
+  ignore (present_restored_timeline manager);
+  T.require
+    ((M.snapshot manager).selected_graph = Some graph_id)
+    "offline EOF removed the local graph after Timeline presentation"
+;;
+
+let test_online_reconciliation_is_fenced_until_timeline_presentation () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  open_restored_graph manager 41;
+  let snapshot = M.snapshot manager in
+  let revoked =
+    M.handle_event
+      manager
+      (Catalog_loaded
+         { account_generation = snapshot.account_generation
+         ; graphs = [ graph other_graph_id "Second" ]
+         })
+  in
+  T.require (revoked = []) "catalog revocation closed the graph before presentation";
+  T.require
+    ((M.snapshot manager).selected_graph = Some graph_id)
+    "catalog revocation cleared the restored selection before presentation";
+  let effects = present_restored_timeline manager in
+  T.require
+    (match effects with
+     | [ Close_websocket; Close_graph ] -> true
+     | _ -> false)
+    "pending catalog revocation was not applied after presentation";
+  T.require
+    ((M.snapshot manager).startup_presentation = Reconciled
+     && (M.snapshot manager).selected_graph = None)
+    "post-presentation reconciliation retained the revoked graph"
+;;
+
+let test_account_replacement_is_fenced_until_timeline_presentation () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  open_restored_graph manager 41;
+  let before = M.snapshot manager in
+  let effects =
+    M.handle_command
+      manager
+      (Reconcile_authenticated_user
+         { user_id = Some "user-2"; managed_sync_origin = "https://api.logseq.io" })
+  in
+  T.require (effects = []) "account replacement closed the graph before presentation";
+  T.require
+    ((M.snapshot manager).account_generation = before.account_generation)
+    "account replacement fenced the local lane too early";
+  let effects = present_restored_timeline manager in
+  T.require
+    (match effects with
+     | [ Close_websocket; Close_graph; Delete_account_secrets; Need_id_token challenge ] ->
+       String.equal challenge.user_id "user-2"
+     | _ -> false)
+    "account replacement was not applied after presentation"
+;;
+
+let test_websocket_pull_waits_for_timeline_presentation () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  restore_local_catalog manager;
+  let snapshot = M.snapshot manager in
+  ignore
+    (M.handle_event
+       manager
+       (Mirror_ready
+          { account_generation = snapshot.account_generation
+          ; graph_generation = snapshot.graph_generation
+          ; graph_id
+          }));
+  let opened =
+    M.handle_event
+      manager
+      (Graph_opened
+         { account_generation = snapshot.account_generation
+         ; graph_generation = snapshot.graph_generation
+         ; graph_id
+         ; applied_server_t = 41
+         })
+  in
+  T.require
+    (opened = [])
+    "graph open constructed WebSocket authentication before Timeline presentation";
+  let challenge = present_restored_timeline manager |> need_token in
+  ignore (provide manager challenge "websocket-token");
+  let connected = M.snapshot manager in
+  let handshake =
+    M.handle_event
+      manager
+      (Websocket_opened
+         { account_generation = connected.account_generation
+         ; graph_generation = connected.graph_generation
+         ; connection_generation = connected.connection_generation
+         })
+  in
+  T.require
+    (handshake
+     = [ Send_websocket
+           (Logseq_db_worker.Sync_protocol.encode_hello ~client:"logseq-journal")
+       ; Send_websocket (Logseq_db_worker.Sync_protocol.encode_pull ~since:41)
+       ])
+    "post-presentation WebSocket handshake did not request hello and initial pull"
+;;
+
 let authenticate_and_load_catalog manager =
   let challenge =
     M.handle_command manager (Authenticated_user { user_id = "user-1" }) |> need_token
@@ -82,6 +659,40 @@ let authenticate_and_load_catalog manager =
           { account_generation = (M.snapshot manager).account_generation
           ; graphs = [ graph graph_id "First"; graph other_graph_id "Second" ]
           }))
+;;
+
+let test_mirror_inspection_precedes_truthful_bootstrap_phase () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  restore_local_catalog manager;
+  let inspecting = M.snapshot manager in
+  T.require
+    (inspecting.phase = Opening_graph)
+    "local mirror inspection was presented as a graph download";
+  let local_failure =
+    M.handle_event
+      manager
+      (Mirror_missing
+         { account_generation = inspecting.account_generation
+         ; graph_generation = inspecting.graph_generation
+         ; graph_id
+         ; receipt = M.mirror_failure_receipt "mirror missing"
+         })
+  in
+  T.require
+    (local_failure = [])
+    "a confirmed missing mirror emitted network work in its local transition";
+  T.require
+    ((M.snapshot manager).phase = Recovering_online Startup_phase.Mirror_unavailable)
+    "a confirmed missing mirror did not enter explicit online recovery";
+  let challenge = M.handle_command manager Begin_online_recovery |> need_token in
+  T.require
+    ((M.snapshot manager).phase = Bootstrapping)
+    "consuming mirror recovery did not enter the graph download phase";
+  T.require
+    (challenge.purpose = Snapshot_bootstrap)
+    "a confirmed missing mirror requested the wrong authenticated operation"
 ;;
 
 type live_context =
@@ -103,13 +714,14 @@ let open_live_manager cursor =
     (M.handle_event
        manager
        (Mirror_ready { account_generation; graph_generation; graph_id }));
-  let challenge =
+  let graph_opened =
     M.handle_event
       manager
       (Graph_opened
          { account_generation; graph_generation; graph_id; applied_server_t = cursor })
-    |> need_token
   in
+  T.require (graph_opened = []) "graph open bypassed Timeline presentation";
+  let challenge = present_restored_timeline manager |> need_token in
   ignore (provide manager challenge "websocket-token");
   let connection_generation = (M.snapshot manager).connection_generation in
   ignore
@@ -168,13 +780,14 @@ let test_long_lived_lifecycle_and_foreground_handshake () =
      | [ Open_graph _ ] -> true
      | _ -> false)
     "ready mirror did not request serialized engine open";
-  let token_challenge =
+  let graph_opened =
     M.handle_event
       manager
       (Graph_opened
          { account_generation; graph_generation; graph_id; applied_server_t = 41 })
-    |> need_token
   in
+  T.require (graph_opened = []) "graph open bypassed Timeline presentation";
+  let token_challenge = present_restored_timeline manager |> need_token in
   T.require
     (token_challenge.purpose = Websocket_connect)
     "graph open requested wrong token";
@@ -245,7 +858,7 @@ let test_graph_switch_signout_and_late_event_fences () =
   let signout = M.handle_command manager Signed_out_command in
   T.require
     (match signout with
-     | [ Close_websocket; Close_graph ] -> true
+     | [ Close_websocket; Close_graph; Delete_account_secrets ] -> true
      | _ -> false)
     "sign-out did not close network before engine";
   let signed_out = M.snapshot manager in
@@ -267,7 +880,7 @@ let test_authenticated_account_replacement_closes_graph_first () =
   let actions = M.handle_command manager (Authenticated_user { user_id = "user-2" }) in
   T.require
     (match actions with
-     | [ Close_websocket; Close_graph; Need_id_token challenge ] ->
+     | [ Close_websocket; Close_graph; Delete_account_secrets; Need_id_token challenge ] ->
        challenge.purpose = Catalog_discovery && String.equal challenge.user_id "user-2"
      | _ -> false)
     "authenticated account replacement did not close the old graph before discovery";
@@ -285,7 +898,7 @@ let test_confirmed_local_cache_reset_immediately_redownloads () =
   let actions = M.handle_command manager (Delete_local_cache graph_id) in
   T.require
     (match actions with
-     | [ Close_websocket; Close_graph; Delete_mirror deleted ] ->
+     | [ Close_websocket; Close_graph; Delete_wrapped_graph_key; Delete_mirror deleted ] ->
        Uuid.equal deleted graph_id
      | _ -> false)
     "confirmed cache reset did not close the graph before deletion";
@@ -323,13 +936,14 @@ let test_reconnect_uses_fresh_token_and_frames_enter_serial_owner () =
     (M.handle_event
        manager
        (Mirror_ready { account_generation; graph_generation; graph_id }));
-  let first =
+  let graph_opened =
     M.handle_event
       manager
       (Graph_opened
          { account_generation; graph_generation; graph_id; applied_server_t = 12 })
-    |> need_token
   in
+  T.require (graph_opened = []) "graph open bypassed Timeline presentation";
+  let first = present_restored_timeline manager |> need_token in
   ignore (provide manager first "first-websocket-token");
   let old_connection = (M.snapshot manager).connection_generation in
   let reconnect_timer =
@@ -467,6 +1081,7 @@ let test_network_failure_retries_with_bounded_backoff () =
        manager
        (Graph_opened
           { account_generation; graph_generation; graph_id; applied_server_t = 12 }));
+  ignore (present_restored_timeline manager);
   let first =
     M.handle_event
       manager
@@ -553,13 +1168,14 @@ let test_pending_batch_uses_authenticated_http_when_socket_is_unavailable () =
     (M.handle_event
        manager
        (Mirror_ready { account_generation; graph_generation; graph_id }));
-  let websocket =
+  let graph_opened =
     M.handle_event
       manager
       (Graph_opened
          { account_generation; graph_generation; graph_id; applied_server_t = 4 })
-    |> need_token
   in
+  T.require (graph_opened = []) "graph open bypassed Timeline presentation";
+  let websocket = present_restored_timeline manager |> need_token in
   ignore (provide manager websocket "websocket-token");
   let connection_generation = (M.snapshot manager).connection_generation in
   ignore
@@ -597,13 +1213,14 @@ let test_catalog_refresh_preserves_offline_graph_and_revokes_removed_selection (
     (M.handle_event
        manager
        (Mirror_ready { account_generation; graph_generation; graph_id }));
-  let websocket =
+  let graph_opened =
     M.handle_event
       manager
       (Graph_opened
          { account_generation; graph_generation; graph_id; applied_server_t = 9 })
-    |> need_token
   in
+  T.require (graph_opened = []) "graph open bypassed Timeline presentation";
+  let websocket = present_restored_timeline manager |> need_token in
   ignore (provide manager websocket "websocket-token");
   let connection_generation = (M.snapshot manager).connection_generation in
   ignore
@@ -1534,11 +2151,19 @@ let test_bootstrap_requests_a_fresh_token_for_each_authenticated_operation () =
   ignore (M.handle_command manager (Select_graph graph_id));
   let account_generation = (M.snapshot manager).account_generation in
   let graph_generation = (M.snapshot manager).graph_generation in
+  T.require
+    (M.handle_event
+       manager
+       (Mirror_missing
+          { account_generation
+          ; graph_generation
+          ; graph_id
+          ; receipt = M.mirror_failure_receipt "mirror missing"
+          })
+     = [])
+    "mirror failure emitted bootstrap network work in the local transition";
   let baseline_challenge =
-    M.handle_event
-      manager
-      (Mirror_missing { account_generation; graph_generation; graph_id })
-    |> need_token
+    M.handle_command manager Begin_online_recovery |> need_token
   in
   let baseline_effects = provide manager baseline_challenge "baseline-token" in
   T.require
@@ -1614,17 +2239,14 @@ let test_e2ee_endpoint_orchestration_and_password_prompt_are_ocaml_owned () =
   let unlocked = ref false in
   let e2ee_platform =
     Logseq_db_worker.Sync_e2ee_session.
-      { has_private_key = (fun ~user_id:_ -> !unlocked)
+      { has_private_key = (fun ~managed_sync_origin:_ ~user_id:_ -> !unlocked)
       ; unlock_private_key =
-          (fun ~user_id:_ ~password ~private_key_package:_ ->
+          (fun ~managed_sync_origin:_ ~user_id:_ ~password ~private_key_package:_ ->
             if String.equal password "secret"
             then (
               unlocked := true;
               Ok ())
             else Error "wrong password")
-      ; decrypt_graph_key =
-          (fun ~user_id:_ ~encrypted_graph_key:_ ->
-            if !unlocked then Ok (String.make 32 'k') else Error "locked")
       }
   in
   let manager =
@@ -1645,11 +2267,28 @@ let test_e2ee_endpoint_orchestration_and_password_prompt_are_ocaml_owned () =
           { account_generation; graphs = [ encrypted_graph graph_id "Secrets" ] }));
   ignore (M.handle_command manager (Select_graph graph_id));
   let graph_generation = (M.snapshot manager).graph_generation in
-  let graph_key_challenge =
+  let local_key_lookup =
     M.handle_event
       manager
       (Mirror_ready { account_generation; graph_generation; graph_id })
-    |> need_token
+  in
+  T.require
+    (local_key_lookup = [ Load_wrapped_graph_key ])
+    "encrypted mirror did not inspect local wrapped-key state first";
+  T.require
+    (M.handle_event
+       manager
+       (Wrapped_graph_key_load_failed
+          { account_generation
+          ; graph_generation
+          ; graph_id
+          ; diagnostic = "cache miss"
+          ; receipt = M.wrapped_key_failure_receipt "cache miss"
+          })
+     = [])
+    "wrapped-key cache miss emitted network work in the local transition";
+  let graph_key_challenge =
+    M.handle_command manager Begin_online_recovery |> need_token
   in
   T.require
     (graph_key_challenge.purpose = E2ee_key_access)
@@ -1694,11 +2333,171 @@ let test_e2ee_endpoint_orchestration_and_password_prompt_are_ocaml_owned () =
     ((M.snapshot manager).phase = Awaiting_e2ee_password)
     "OCaml manager did not own the E2EE password prompt";
   T.require
-    (match M.handle_command manager (Submit_e2ee_password "secret") with
+    (M.handle_command manager (Submit_e2ee_password "secret")
+     = [ Save_wrapped_graph_key ])
+    "verified online key was not staged for local persistence";
+  T.require
+    (match
+       M.handle_event
+         manager
+         (Wrapped_graph_key_saved
+            { account_generation; graph_generation; graph_id; diagnostic = None })
+     with
      | [ Open_graph { encrypted_graph_key = Some actual; _ } ] ->
        String.equal actual wrapped
      | _ -> false)
     "unlocked E2EE graph did not enter serialized engine open"
+;;
+
+let test_encrypted_offline_cache_hit_opens_before_any_network_work () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  T.require
+    (M.handle_command
+       manager
+       (Restore_local_account
+          { user_id = "user-1"; managed_sync_origin = "https://api.logseq.io" })
+     = [])
+    "encrypted local account restore emitted network work";
+  let account_generation = (M.snapshot manager).account_generation in
+  ignore
+    (M.handle_event
+       manager
+       (Cached_catalog_loaded
+          { account_generation; graphs = [ encrypted_graph graph_id "Secrets" ] }));
+  T.require
+    (match M.handle_command manager (Select_graph graph_id) with
+     | [ Inspect_mirror _ ] -> true
+     | _ -> false)
+    "encrypted local selection did not inspect its mirror";
+  let graph_generation = (M.snapshot manager).graph_generation in
+  T.require
+    (M.handle_event
+       manager
+       (Mirror_ready { account_generation; graph_generation; graph_id })
+     = [ Load_wrapped_graph_key ])
+    "encrypted mirror did not request only local key verification";
+  let wrapped = {|["~#'","~bZ3JhcGgta2V5"]|} in
+  T.require
+    (match
+       M.handle_event
+         manager
+         (Wrapped_graph_key_loaded
+            { account_generation; graph_generation; graph_id; encrypted_graph_key = wrapped })
+     with
+     | [ Open_graph { encrypted_graph_key = Some actual; _ } ] ->
+       String.equal actual wrapped
+     | _ -> false)
+    "verified local wrapped key did not open the encrypted mirror";
+  T.require
+    (M.handle_event
+       manager
+       (Graph_opened
+          { account_generation; graph_generation; graph_id; applied_server_t = 41 })
+     = [])
+    "encrypted local graph open emitted network work before Timeline presentation";
+  let challenge = present_restored_timeline manager |> need_token in
+  T.require
+    (challenge.purpose = Websocket_connect)
+    "encrypted local graph did not release reconciliation after presentation"
+;;
+
+let test_encrypted_cache_failure_mints_only_matching_recovery () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  ignore
+    (M.handle_command
+       manager
+       (Restore_local_account
+          { user_id = "user-1"; managed_sync_origin = "https://api.logseq.io" }));
+  let account_generation = (M.snapshot manager).account_generation in
+  ignore
+    (M.handle_event
+       manager
+       (Cached_catalog_loaded
+          { account_generation; graphs = [ encrypted_graph graph_id "Secrets" ] }));
+  ignore (M.handle_command manager (Select_graph graph_id));
+  let graph_generation = (M.snapshot manager).graph_generation in
+  ignore
+    (M.handle_event
+       manager
+       (Mirror_ready { account_generation; graph_generation; graph_id }));
+  T.require
+    (M.handle_event
+       manager
+       (Wrapped_graph_key_load_failed
+          { account_generation
+          ; graph_generation
+          ; graph_id
+          ; diagnostic = "corrupt item"
+          ; receipt = M.wrapped_key_failure_receipt "corrupt item"
+          })
+     = [])
+    "matching wrapped-key failure emitted network work in its local transition";
+  T.require
+    ((M.snapshot manager).phase
+     = Recovering_online Startup_phase.Wrapped_graph_key_unavailable)
+    "matching wrapped-key failure did not expose its scoped recovery state";
+  let challenge = M.handle_command manager Begin_online_recovery |> need_token in
+  T.require
+    (challenge.purpose = E2ee_key_access)
+    "matching wrapped-key failure did not enter explicit E2EE recovery";
+  T.require
+    (M.handle_command manager Begin_online_recovery = [])
+    "the manager reused a consumed recovery ticket";
+  T.require
+    (M.handle_event
+       manager
+       (Wrapped_graph_key_load_failed
+          { account_generation
+          ; graph_generation = graph_generation - 1
+          ; graph_id
+          ; diagnostic = "stale completion"
+          ; receipt = M.wrapped_key_failure_receipt "stale completion"
+          })
+     = [])
+    "stale wrapped-key failure produced recovery authority"
+;;
+
+let test_missing_private_key_has_a_distinct_recovery_state () =
+  let manager =
+    M.create ~next_challenge_id ~base_url:(Uri.of_string "https://api.logseq.io")
+  in
+  ignore
+    (M.handle_command
+       manager
+       (Restore_local_account
+          { user_id = "user-1"; managed_sync_origin = "https://api.logseq.io" }));
+  let account_generation = (M.snapshot manager).account_generation in
+  ignore
+    (M.handle_event
+       manager
+       (Cached_catalog_loaded
+          { account_generation; graphs = [ encrypted_graph graph_id "Secrets" ] }));
+  ignore (M.handle_command manager (Select_graph graph_id));
+  let graph_generation = (M.snapshot manager).graph_generation in
+  ignore
+    (M.handle_event
+       manager
+       (Mirror_ready { account_generation; graph_generation; graph_id }));
+  T.require
+    (M.handle_event
+       manager
+       (Wrapped_graph_key_load_failed
+          { account_generation
+          ; graph_generation
+          ; graph_id
+          ; diagnostic = "local private key is unavailable"
+          ; receipt = M.private_key_failure_receipt "local private key is unavailable"
+          })
+     = [])
+    "missing private-key recovery emitted network work in its local transition";
+  T.require
+    ((M.snapshot manager).phase
+     = Recovering_online Startup_phase.Local_private_key_unavailable)
+    "missing private key was reported as a wrapped-key cache miss"
 ;;
 
 let test_managed_sync_startup_has_no_graph_target_or_credential () =
@@ -1725,6 +2524,12 @@ let test_managed_sync_startup_has_no_graph_target_or_credential () =
 ;;
 
 let () =
+  test_local_restore_is_independent_from_authentication_and_network ();
+  test_offline_eof_does_not_preempt_local_timeline ();
+  test_online_reconciliation_is_fenced_until_timeline_presentation ();
+  test_account_replacement_is_fenced_until_timeline_presentation ();
+  test_websocket_pull_waits_for_timeline_presentation ();
+  test_mirror_inspection_precedes_truthful_bootstrap_phase ();
   test_long_lived_lifecycle_and_foreground_handshake ();
   test_graph_switch_signout_and_late_event_fences ();
   test_authenticated_account_replacement_closes_graph_first ();
@@ -1751,5 +2556,8 @@ let () =
   test_new_pending_batch_does_not_replace_uncertain_submission ();
   test_bootstrap_requests_a_fresh_token_for_each_authenticated_operation ();
   test_e2ee_endpoint_orchestration_and_password_prompt_are_ocaml_owned ();
+  test_encrypted_offline_cache_hit_opens_before_any_network_work ();
+  test_encrypted_cache_failure_mints_only_matching_recovery ();
+  test_missing_private_key_has_a_distinct_recovery_state ();
   test_managed_sync_startup_has_no_graph_target_or_credential ()
 ;;

@@ -7,6 +7,36 @@ module ID = Bonsai_flutter_spec.Id
 
 exception Network_cancelled
 
+type local_secrets =
+  { load_and_verify_wrapped_graph_key :
+      managed_sync_origin:Uri.t
+      -> user_id:string
+      -> graph_id:Db.Graph_types.Uuid.t
+      -> (string, Db.Sync_platform_crypto.wrapped_key_load_failure) result
+  ; verify_and_save_wrapped_graph_key :
+      managed_sync_origin:Uri.t
+      -> user_id:string
+      -> graph_id:Db.Graph_types.Uuid.t
+      -> encrypted_graph_key:string
+      -> (unit, string) result
+  ; delete_wrapped_graph_key :
+      managed_sync_origin:Uri.t
+      -> user_id:string
+      -> graph_id:Db.Graph_types.Uuid.t
+      -> (unit, string) result
+  ; delete_account_secrets :
+      managed_sync_origin:Uri.t -> user_id:string -> (unit, string) result
+  }
+
+let production_local_secrets =
+  { load_and_verify_wrapped_graph_key =
+      Db.Sync_platform_crypto.load_and_verify_wrapped_graph_key
+  ; verify_and_save_wrapped_graph_key =
+      Db.Sync_platform_crypto.verify_and_save_wrapped_graph_key
+  ; delete_wrapped_graph_key = Db.Sync_platform_crypto.delete_wrapped_graph_key
+  ; delete_account_secrets = Db.Sync_platform_crypto.delete_account_secrets
+  }
+
 type request =
   | Manager_command of Manager.command
   | Graph_request of Protocol.request
@@ -45,7 +75,14 @@ let production_dependencies () =
         }
     ; cursor_authentication_key = random_key ()
     ; crypto = Db.Sync_platform_crypto.crypto
-    ; unlock_graph_key = Db.Sync_platform_crypto.unlock_graph_key
+    ; unlock_graph_key =
+        (fun ~managed_sync_origin ~user_id ~encrypted_graph_key ->
+          Result.bind
+            (Db.Sync_platform_crypto.unlock_graph_key
+               ~managed_sync_origin
+               ~user_id
+               ~encrypted_graph_key)
+            Db.Sync_graph_key.of_string)
     }
 ;;
 
@@ -94,7 +131,7 @@ type message =
   | Handle of request * (response, string) result Eio.Promise.u
   | Internal of Manager.event
   | Network_finished of Network_scope.operation_id
-  | Stop of unit Eio.Promise.u
+  | Catalog_flush_finished of Db.Sync_catalog.cache * (unit, string) result
 
 type managed =
   { context : push Worker.Session_context.t
@@ -106,8 +143,11 @@ type managed =
   ; mutable engine : Engine.t option
   ; mutable websocket : websocket_control Eio.Stream.t option
   ; mutable catalog_cache : Db.Sync_catalog.cache option
+  ; mutable catalog_dirty : bool
+  ; mutable catalog_flush_in_flight : bool
   ; network_scope : Network_scope.t
   ; mutable request_sequence : int
+  ; local_secrets : local_secrets
   }
 
 type invalidation_dispatcher =
@@ -337,7 +377,9 @@ let config_for_graph runtime graph encrypted_graph_key =
   let e2ee =
     match encrypted_graph_key, (Manager.snapshot runtime.manager).user_id with
     | Some encrypted_graph_key, Some user_id ->
-      Some Db.Config.{ user_id; encrypted_graph_key }
+      Some
+        Db.Config.
+          { managed_sync_origin = runtime.base_url; user_id; encrypted_graph_key }
     | Some _, None | None, _ -> None
   in
   Db.Config.create
@@ -354,6 +396,50 @@ let config_for_graph runtime graph encrypted_graph_key =
     ~default_page_size:runtime.config.default_page_size
 ;;
 
+let uuid_exn value = Db.Graph_types.Uuid.of_string value |> Result.get_ok
+
+let catalog_graph (graph : Db.Sync_action.graph) =
+  Db.Sync_catalog.
+    { graph_id = uuid_exn graph.graph_id
+    ; name = graph.name
+    ; schema =
+        { major = graph.schema_major
+        ; minor = graph.schema_minor
+        ; exact = graph.schema_exact
+        }
+    ; encrypted = graph.encrypted
+    }
+;;
+
+let challenge_from_scoped (challenge : Db.Sync_action.scoped_challenge) =
+  let account, graph_generation, connection_generation =
+    match challenge.scope with
+    | Account_scope account -> account, None, None
+    | Graph_scope graph -> graph.account, Some graph.graph_generation, None
+    | Connection_scope connection ->
+      ( connection.graph.account
+      , Some connection.graph.graph_generation
+      , Some connection.connection_generation )
+  in
+  let purpose =
+    match challenge.purpose with
+    | Catalog_discovery_name -> Db.Sync_auth.Catalog_discovery
+    | Snapshot_bootstrap_name -> Snapshot_bootstrap
+    | E2ee_key_access_name -> E2ee_key_access
+    | Http_pull_name -> Http_pull
+    | Transaction_submission_name -> Transaction_submission
+    | Websocket_connect_name -> Websocket_connect
+  in
+  Db.Sync_auth.
+    { challenge_id = challenge.challenge_id
+    ; purpose
+    ; user_id = account.user_id
+    ; account_generation = account.account_generation
+    ; graph_generation
+    ; connection_generation
+    }
+;;
+
 let pending_payload runtime =
   match runtime.engine with
   | None -> None
@@ -365,7 +451,7 @@ let pending_payload runtime =
 
 let catalog_base_url runtime = Uri.to_string runtime.base_url
 
-let persist_catalog_cache runtime =
+let persist_catalog_cache_now runtime =
   match runtime.catalog_cache with
   | None -> ()
   | Some cache ->
@@ -385,49 +471,99 @@ let load_catalog_cache runtime user_id =
           ~base_url:(catalog_base_url runtime)
       with
       | Ok cache -> cache
-      | Error _ -> None)
+      | Error _ -> None);
+  runtime.catalog_dirty <- false
+;;
+
+let replace_catalog_cache runtime cache =
+  if runtime.catalog_cache = cache
+  then ()
+  else (
+    runtime.catalog_cache <- cache;
+    runtime.catalog_dirty <- true)
 ;;
 
 let cache_catalog runtime graphs =
   let snapshot = Manager.snapshot runtime.manager in
-  runtime.catalog_cache
-  <- (match runtime.catalog_cache, snapshot.user_id with
-      | Some cache, _ -> Some (Db.Sync_catalog.merge cache graphs)
-      | None, Some user_id ->
-        Some
-          (Db.Sync_catalog.create_cache
-             ~user_id
-             ~base_url:(catalog_base_url runtime)
-             ~graphs
-             ~selected_graph:snapshot.selected_graph)
-      | None, None -> None)
+  replace_catalog_cache
+    runtime
+    (match runtime.catalog_cache, snapshot.user_id with
+     | Some cache, _ -> Some (Db.Sync_catalog.merge cache graphs)
+     | None, Some user_id ->
+       Some
+         (Db.Sync_catalog.create_cache
+            ~user_id
+            ~base_url:(catalog_base_url runtime)
+            ~graphs
+            ~selected_graph:snapshot.selected_graph)
+     | None, None -> None)
 ;;
 
 let cache_selection runtime graph_id =
-  runtime.catalog_cache
-  <- Option.bind runtime.catalog_cache (fun cache ->
+  replace_catalog_cache
+    runtime
+    (Option.bind runtime.catalog_cache (fun cache ->
        match Db.Sync_catalog.select cache graph_id with
        | Ok cache -> Some cache
-       | Error _ -> Some cache)
+       | Error _ -> Some cache))
 ;;
 
 let cache_mirror_status runtime graph_id status =
-  runtime.catalog_cache
-  <- Option.map
+  replace_catalog_cache
+    runtime
+    (Option.map
        (fun cache -> Db.Sync_catalog.set_mirror_status cache graph_id status)
-       runtime.catalog_cache
+       runtime.catalog_cache)
+;;
+
+let schedule_catalog_flush runtime =
+  let snapshot = Manager.snapshot runtime.manager in
+  let presentation_allows_flush =
+    match snapshot.startup_presentation with
+    | Manager.Timeline_presented | Reconciled -> true
+    | Restoring_local | Local_feed_ready -> false
+  in
+  match
+    ( runtime.catalog_dirty
+    , runtime.catalog_flush_in_flight
+    , presentation_allows_flush
+    , runtime.catalog_cache )
+  with
+  | true, false, true, Some cache ->
+    runtime.catalog_flush_in_flight <- true;
+    Worker.Session_context.fork_daemon
+      runtime.context
+      ~name:"sync-catalog-flush"
+      (fun () ->
+         let result =
+           try
+             Db.Sync_catalog_store.save
+               ~application_support_directory:runtime.config.application_support_directory
+               cache
+           with
+           | exception_ -> Error (Printexc.to_string exception_)
+         in
+         Eio.Stream.add runtime.messages (Catalog_flush_finished (cache, result)))
+  | false, _, _, _ | true, true, _, _ | true, false, false, _ | true, false, true, None ->
+    ()
 ;;
 
 let rec dispatch_event runtime event =
   let cached_selection =
     match event, runtime.catalog_cache with
-    | Manager.Catalog_loaded _, Some cache -> Db.Sync_catalog.selected_graph cache
+    | (Manager.Catalog_loaded _ | Cached_catalog_loaded _), Some cache ->
+      Db.Sync_catalog.selected_graph cache
     | _ -> None
   in
   let effects = Manager.handle_event runtime.manager event in
   cancel_obsolete_network runtime;
   (match event with
    | Catalog_loaded { graphs; _ } -> cache_catalog runtime graphs
+   | Cached_catalog_loaded _ -> ()
+   | Wrapped_graph_key_loaded _
+   | Wrapped_graph_key_load_failed _
+   | Wrapped_graph_key_saved _
+   | Local_secret_cleanup_finished _ -> ()
    | Mirror_ready { graph_id; _ } ->
      cache_mirror_status runtime graph_id Db.Sync_catalog.Ready
    | Mirror_missing { graph_id; _ } ->
@@ -452,13 +588,13 @@ let rec dispatch_event runtime event =
    | Network_failed _ -> ());
   let effects =
     match event, cached_selection, (Manager.snapshot runtime.manager).selected_graph with
-    | Catalog_loaded _, Some graph_id, None ->
+    | (Catalog_loaded _ | Cached_catalog_loaded _), Some graph_id, None ->
       effects @ Manager.handle_command runtime.manager (Select_graph graph_id)
     | _ -> effects
   in
-  persist_catalog_cache runtime;
   publish_manager runtime;
-  process_effects runtime effects
+  process_effects runtime effects;
+  schedule_catalog_flush runtime
 
 and process_sync_frame runtime payload =
   match runtime.engine with
@@ -498,22 +634,19 @@ and process_effects runtime = function
     process_effect runtime next_effect;
     process_effects runtime rest
 
-and process_effect runtime = function
-  | Manager.Need_id_token challenge ->
-    emit runtime ~topic:auth_topic (Need_id_token challenge)
-  | Fetch_catalog { account_generation; base_url; token } ->
-    perform_http
-      runtime
-      ~name:"sync-catalog"
-      (Db.Sync_http.catalog ~base_url ~token)
-      (fun response ->
-         match Db.Sync_catalog.decode response.body with
-         | Ok graphs -> enqueue runtime (Catalog_loaded { account_generation; graphs })
-         | Error message ->
-           enqueue runtime (Catalog_failed { account_generation; message }))
-      ~account_generation
-      ()
-  | Inspect_mirror { account_generation; graph_generation; graph } ->
+and process_effect runtime action =
+  match Db.Sync_action.classify action with
+  | Local_action action -> interpret_local_action runtime action
+  | Network_action action -> interpret_network_action runtime action
+
+and interpret_local_action runtime : Db.Sync_action.local Db.Sync_action.t -> unit =
+  function
+  | Inspect_mirror { request; graph } ->
+    let scope =
+      Db.Sync_startup_phase.local_request_graph_scope request
+      |> Db.Sync_startup_phase.graph_scope_view
+    in
+    let graph = catalog_graph graph in
     (match
        Db.Sync_mirror.resolve
          ~application_support_directory:runtime.config.application_support_directory
@@ -522,22 +655,217 @@ and process_effect runtime = function
      | Ok _ ->
        dispatch_event
          runtime
-         (Mirror_ready { account_generation; graph_generation; graph_id = graph.graph_id })
-     | Error Db.Sync_mirror.Mirror_missing ->
+         (Mirror_ready
+            { account_generation = scope.account.account_generation
+            ; graph_generation = scope.graph_generation
+            ; graph_id = graph.graph_id
+            })
+     | Error _ ->
+       let receipt =
+         Db.Sync_startup_phase.Local_completion.mirror_failed
+           request
+           ~diagnostic:"mirror missing"
+       in
        dispatch_event
          runtime
          (Mirror_missing
-            { account_generation; graph_generation; graph_id = graph.graph_id })
+            { account_generation = scope.account.account_generation
+            ; graph_generation = scope.graph_generation
+            ; graph_id = graph.graph_id
+            ; receipt
+            }))
+  | Load_and_verify_wrapped_graph_key { wrapped_key_request; private_key_request } ->
+    let scope =
+      Db.Sync_startup_phase.local_request_graph_scope wrapped_key_request
+      |> Db.Sync_startup_phase.graph_scope_view
+    in
+    let graph_id = uuid_exn scope.graph_id in
+    (match
+       runtime.local_secrets.load_and_verify_wrapped_graph_key
+         ~managed_sync_origin:scope.account.managed_sync_origin
+         ~user_id:scope.account.user_id
+         ~graph_id
+     with
+     | Ok encrypted_graph_key ->
+       dispatch_event
+         runtime
+         (Wrapped_graph_key_loaded
+            { account_generation = scope.account.account_generation
+            ; graph_generation = scope.graph_generation
+            ; graph_id
+            ; encrypted_graph_key
+            })
+     | Error failure ->
+       let diagnostic, receipt =
+         match failure with
+         | Db.Sync_platform_crypto.Wrapped_graph_key_unavailable diagnostic ->
+           ( diagnostic
+           , Manager.Wrapped_key_failure_receipt
+               (Db.Sync_startup_phase.Local_completion.wrapped_graph_key_failed
+                  wrapped_key_request
+                  ~diagnostic) )
+         | Local_private_key_unavailable diagnostic ->
+           ( diagnostic
+           , Manager.Private_key_failure_receipt
+               (Db.Sync_startup_phase.Local_completion.local_private_key_failed
+                  private_key_request
+                  ~diagnostic) )
+       in
+       dispatch_event
+         runtime
+         (Wrapped_graph_key_load_failed
+            { account_generation = scope.account.account_generation
+            ; graph_generation = scope.graph_generation
+            ; graph_id
+            ; diagnostic
+            ; receipt
+            }))
+  | Verify_and_save_wrapped_graph_key { scope; encrypted_graph_key } ->
+    let graph_id = uuid_exn scope.graph_id in
+    let result =
+      runtime.local_secrets.verify_and_save_wrapped_graph_key
+        ~managed_sync_origin:scope.account.managed_sync_origin
+        ~user_id:scope.account.user_id
+        ~graph_id
+        ~encrypted_graph_key:
+          (Db.Sync_action.wrapped_graph_key_to_string encrypted_graph_key)
+    in
+    dispatch_event
+      runtime
+      (Wrapped_graph_key_saved
+         { account_generation = scope.account.account_generation
+         ; graph_generation = scope.graph_generation
+         ; graph_id
+         ; diagnostic = Result.fold ~ok:(fun () -> None) ~error:(fun message -> Some message) result
+         })
+  | Delete_wrapped_graph_key { scope } ->
+    let graph_id = uuid_exn scope.graph_id in
+    let result =
+      runtime.local_secrets.delete_wrapped_graph_key
+        ~managed_sync_origin:scope.account.managed_sync_origin
+        ~user_id:scope.account.user_id
+        ~graph_id
+    in
+    dispatch_event
+      runtime
+      (Local_secret_cleanup_finished
+         { account_generation = scope.account.account_generation
+         ; diagnostic = Result.fold ~ok:(fun () -> None) ~error:(fun message -> Some message) result
+         })
+  | Delete_account_secrets { scope } ->
+    let result =
+      runtime.local_secrets.delete_account_secrets
+        ~managed_sync_origin:scope.managed_sync_origin
+        ~user_id:scope.user_id
+    in
+    dispatch_event
+      runtime
+      (Local_secret_cleanup_finished
+         { account_generation = scope.account_generation
+         ; diagnostic = Result.fold ~ok:(fun () -> None) ~error:(fun message -> Some message) result
+         })
+  | Open_graph { request; graph; encrypted_graph_key } ->
+    let scope =
+      Db.Sync_startup_phase.local_request_graph_scope request
+      |> Db.Sync_startup_phase.graph_scope_view
+    in
+    let graph = catalog_graph graph in
+    let encrypted_graph_key =
+      Option.map Db.Sync_action.wrapped_graph_key_to_string encrypted_graph_key
+    in
+    close_engine runtime;
+    (match config_for_graph runtime graph encrypted_graph_key with
+     | Error message ->
+       dispatch_event
+         runtime
+         (Network_failed
+            { account_generation = scope.account.account_generation
+            ; graph_generation = Some scope.graph_generation
+            ; connection_generation = None
+            ; message
+            })
+     | Ok config ->
+       (match Engine.open_ ~dependencies:runtime.dependencies config with
+        | Error error ->
+          dispatch_event
+            runtime
+            (Network_failed
+               { account_generation = scope.account.account_generation
+               ; graph_generation = Some scope.graph_generation
+               ; connection_generation = None
+               ; message = Db.Error.message error
+               })
+        | Ok engine ->
+          runtime.engine <- Some engine;
+          (match Engine.execute engine (internal_request runtime (Read Sync_status)) with
+           | Succeeded { success = Sync_status_result status; _ } ->
+             dispatch_event
+               runtime
+               (Graph_opened
+                  { account_generation = scope.account.account_generation
+                  ; graph_generation = scope.graph_generation
+                  ; graph_id = graph.graph_id
+                  ; applied_server_t = status.applied_server_t
+                  })
+           | Succeeded _ | Failed _ ->
+             close_engine runtime;
+             dispatch_event
+               runtime
+               (Network_failed
+                  { account_generation = scope.account.account_generation
+                  ; graph_generation = Some scope.graph_generation
+                  ; connection_generation = None
+                  ; message = "opened sync mirror has no durable sync status"
+                  }))))
+  | Close_graph -> close_engine runtime
+  | Delete_mirror { scope } ->
+    let graph_id = uuid_exn scope.graph_id in
+    (match
+       Db.Sync_mirror.delete
+         ~application_support_directory:runtime.config.application_support_directory
+         ~graph_id
+     with
+     | Ok () ->
+       cache_mirror_status runtime graph_id Db.Sync_catalog.Missing;
+       dispatch_event
+         runtime
+         (Local_cache_deleted
+            { account_generation = scope.account.account_generation
+            ; graph_generation = scope.graph_generation
+            ; graph_id
+            })
      | Error error ->
        dispatch_event
          runtime
          (Network_failed
-            { account_generation
-            ; graph_generation = Some graph_generation
+            { account_generation = scope.account.account_generation
+            ; graph_generation = None
             ; connection_generation = None
             ; message = Db.Sync_mirror.error_message error
             }))
-  | Fetch_snapshot_baseline { account_generation; graph_generation; graph; token } ->
+  | _ -> invalid_arg "network action reached the local interpreter"
+
+and interpret_network_action runtime : Db.Sync_action.network Db.Sync_action.t -> unit =
+  function
+  | Need_id_token challenge ->
+    emit runtime ~topic:auth_topic (Need_id_token (challenge_from_scoped challenge))
+  | Fetch_catalog { scope; token } ->
+    let account_generation = scope.account_generation in
+    perform_http
+      runtime
+      ~name:"sync-catalog"
+      (Db.Sync_http.catalog ~base_url:scope.managed_sync_origin ~token)
+      (fun response ->
+         match Db.Sync_catalog.decode response.body with
+         | Ok graphs -> enqueue runtime (Catalog_loaded { account_generation; graphs })
+         | Error message ->
+           enqueue runtime (Catalog_failed { account_generation; message }))
+      ~account_generation
+      ()
+  | Fetch_snapshot_baseline { scope; graph; token } ->
+    let account_generation = scope.account.account_generation in
+    let graph_generation = scope.graph_generation in
+    let graph = catalog_graph graph in
     perform_http
       runtime
       ~name:"sync-snapshot-baseline"
@@ -562,7 +890,10 @@ and process_effect runtime = function
       ~account_generation
       ~graph_generation
       ()
-  | Fetch_snapshot_metadata { account_generation; graph_generation; graph; token } ->
+  | Fetch_snapshot_metadata { scope; graph; token } ->
+    let account_generation = scope.account.account_generation in
+    let graph_generation = scope.graph_generation in
+    let graph = catalog_graph graph in
     perform_http
       runtime
       ~name:"sync-snapshot-metadata"
@@ -587,7 +918,10 @@ and process_effect runtime = function
       ~graph_generation
       ()
   | Download_snapshot_artifact
-      { account_generation; graph_generation; graph; baseline = _; metadata; token } ->
+      { scope; graph; baseline = _; metadata; token } ->
+    let account_generation = scope.account.account_generation in
+    let graph_generation = scope.graph_generation in
+    let graph = catalog_graph graph in
     fork_network
       runtime
       ~name:"sync-snapshot-artifact"
@@ -662,21 +996,36 @@ and process_effect runtime = function
               Db.Sync_bootstrap.cleanup (artifact :: snapshot :: temporary_paths);
               network_error runtime ~account_generation ~graph_generation message))
   | Activate_snapshot
-      { account_generation
-      ; graph_generation
+      { scope
       ; graph
       ; server_t
       ; snapshot_path
       ; expected_rows
-      ; graph_key
+      ; encrypted_graph_key
       } ->
+    let account_generation = scope.account.account_generation in
+    let graph_generation = scope.graph_generation in
+    let graph = catalog_graph graph in
+    let graph_key =
+      Option.map
+        (fun encrypted_graph_key ->
+           Result.bind
+             (Db.Sync_platform_crypto.unlock_graph_key
+                ~managed_sync_origin:scope.account.managed_sync_origin
+                ~user_id:scope.account.user_id
+                ~encrypted_graph_key:
+                  (Db.Sync_action.wrapped_graph_key_to_string encrypted_graph_key))
+             Db.Sync_graph_key.of_string
+           |> Result.get_ok)
+        encrypted_graph_key
+    in
     let decrypt_protected =
       Option.map
         (fun graph_key ciphertext ->
            Result.bind
-             (Db.Sync_e2ee.decrypt_value
+             (Db.Sync_graph_key.decrypt_value
                 ~crypto:runtime.dependencies.crypto
-                ~graph_key
+                graph_key
                 ciphertext)
              (function
              | Transit_core.Json.String plaintext -> Ok plaintext
@@ -685,7 +1034,9 @@ and process_effect runtime = function
     in
     let result =
       Fun.protect
-        ~finally:(fun () -> remove_if_exists snapshot_path)
+        ~finally:(fun () ->
+          Option.iter Db.Sync_graph_key.clear graph_key;
+          remove_if_exists snapshot_path)
         (fun () ->
            Db.Sync_mirror.bootstrap
              ~application_support_directory:runtime.config.application_support_directory
@@ -710,7 +1061,10 @@ and process_effect runtime = function
             ; connection_generation = None
             ; message = Db.Sync_mirror.error_message error
             }))
-  | Fetch_e2ee_graph_key { account_generation; graph_generation; graph; token } ->
+  | Fetch_e2ee_graph_key { scope; graph; token } ->
+    let account_generation = scope.account.account_generation in
+    let graph_generation = scope.graph_generation in
+    let graph = catalog_graph graph in
     let request =
       Db.Sync_http.e2ee_graph_key
         ~base_url:runtime.base_url
@@ -733,7 +1087,10 @@ and process_effect runtime = function
       ~account_generation
       ~graph_generation
       ()
-  | Fetch_e2ee_user_keys { account_generation; graph_generation; graph_id; token } ->
+  | Fetch_e2ee_user_keys { scope; token } ->
+    let account_generation = scope.account.account_generation in
+    let graph_generation = scope.graph_generation in
+    let graph_id = uuid_exn scope.graph_id in
     let request = Db.Sync_http.e2ee_user_keys ~base_url:runtime.base_url ~token in
     perform_http
       runtime
@@ -747,54 +1104,11 @@ and process_effect runtime = function
       ~account_generation
       ~graph_generation
       ()
-  | Open_graph { account_generation; graph_generation; graph; encrypted_graph_key } ->
-    close_engine runtime;
-    (match config_for_graph runtime graph encrypted_graph_key with
-     | Error message ->
-       dispatch_event
-         runtime
-         (Network_failed
-            { account_generation
-            ; graph_generation = Some graph_generation
-            ; connection_generation = None
-            ; message
-            })
-     | Ok config ->
-       (match Engine.open_ ~dependencies:runtime.dependencies config with
-        | Error error ->
-          dispatch_event
-            runtime
-            (Network_failed
-               { account_generation
-               ; graph_generation = Some graph_generation
-               ; connection_generation = None
-               ; message = Db.Error.message error
-               })
-        | Ok engine ->
-          runtime.engine <- Some engine;
-          (match Engine.execute engine (internal_request runtime (Read Sync_status)) with
-           | Succeeded { success = Sync_status_result status; _ } ->
-             dispatch_event
-               runtime
-               (Graph_opened
-                  { account_generation
-                  ; graph_generation
-                  ; graph_id = graph.graph_id
-                  ; applied_server_t = status.applied_server_t
-                  })
-           | Succeeded _ | Failed _ ->
-             close_engine runtime;
-             dispatch_event
-               runtime
-               (Network_failed
-                  { account_generation
-                  ; graph_generation = Some graph_generation
-                  ; connection_generation = None
-                  ; message = "opened sync mirror has no durable sync status"
-                  }))))
-  | Close_graph -> close_engine runtime
-  | Connect_websocket
-      { account_generation; graph_generation; connection_generation; graph_id; token } ->
+  | Connect_websocket { scope; token } ->
+    let account_generation = scope.graph.account.account_generation in
+    let graph_generation = scope.graph.graph_generation in
+    let connection_generation = scope.connection_generation in
+    let graph_id = uuid_exn scope.graph.graph_id in
     close_websocket runtime;
     let controls = Eio.Stream.create 64 in
     runtime.websocket <- Some controls;
@@ -873,12 +1187,15 @@ and process_effect runtime = function
               in
               control_loop ()))
   | Close_websocket -> close_websocket runtime
-  | Send_websocket payload ->
+  | Send_websocket { payload; _ } ->
     Option.iter
       (fun controls -> Eio.Stream.add controls (Websocket_send payload))
       runtime.websocket
   | Schedule_reconnect
-      { account_generation; graph_generation; connection_generation; delay_seconds } ->
+      { scope; delay_seconds } ->
+    let account_generation = scope.graph.account.account_generation in
+    let graph_generation = scope.graph.graph_generation in
+    let connection_generation = scope.connection_generation in
     close_websocket runtime;
     Network_scope.cancel_graph runtime.network_scope ~account_generation ~graph_generation;
     fork_network
@@ -893,12 +1210,11 @@ and process_effect runtime = function
            (Reconnect_timer_elapsed
               { account_generation; graph_generation; connection_generation }))
   | Schedule_foreground_probe
-      { account_generation
-      ; graph_generation
-      ; connection_generation
-      ; lifecycle_generation
-      ; delay_seconds
-      } ->
+      { scope; delay_seconds } ->
+    let account_generation = scope.graph.account.account_generation in
+    let graph_generation = scope.graph.graph_generation in
+    let connection_generation = scope.connection_generation in
+    let lifecycle_generation = scope.lifecycle_generation in
     fork_network
       runtime
       ~name:"sync-foreground-probe-timer"
@@ -914,8 +1230,9 @@ and process_effect runtime = function
               ; connection_generation
               ; lifecycle_generation
               }))
-  | Apply_sync_frame payload -> process_sync_frame runtime payload
-  | Recover_submitted mutation_ids ->
+  | Apply_sync_frame { frame; _ } -> process_sync_frame runtime frame
+  | Recover_submitted { transaction_ids; _ } ->
+    let mutation_ids = List.map uuid_exn transaction_ids in
     (match runtime.engine with
      | None -> ()
      | Some engine ->
@@ -933,13 +1250,11 @@ and process_effect runtime = function
             (fun payload -> dispatch_event runtime (Pending_batch payload))
             (pending_payload runtime)))
   | Fetch_http_pull
-      { account_generation
-      ; graph_generation
-      ; connection_generation
-      ; graph_id
-      ; since
-      ; token
-      } ->
+      { scope; since; token } ->
+    let account_generation = scope.graph.account.account_generation in
+    let graph_generation = scope.graph.graph_generation in
+    let connection_generation = scope.connection_generation in
+    let graph_id = uuid_exn scope.graph.graph_id in
     perform_http
       runtime
       ~name:"sync-http-pull"
@@ -958,13 +1273,11 @@ and process_effect runtime = function
       ~connection_generation
       ()
   | Submit_http_transaction
-      { account_generation
-      ; graph_generation
-      ; connection_generation
-      ; graph_id
-      ; payload
-      ; token
-      } ->
+      { scope; payload; token } ->
+    let account_generation = scope.graph.account.account_generation in
+    let graph_generation = scope.graph.graph_generation in
+    let connection_generation = scope.connection_generation in
+    let graph_id = uuid_exn scope.graph.graph_id in
     perform_http
       runtime
       ~name:"sync-http-transaction"
@@ -986,32 +1299,7 @@ and process_effect runtime = function
       ~graph_generation
       ~connection_generation
       ()
-  | Delete_mirror graph_id ->
-    let snapshot = Manager.snapshot runtime.manager in
-    (match
-       Db.Sync_mirror.delete
-         ~application_support_directory:runtime.config.application_support_directory
-         ~graph_id
-     with
-     | Ok () ->
-       cache_mirror_status runtime graph_id Db.Sync_catalog.Missing;
-       persist_catalog_cache runtime;
-       dispatch_event
-         runtime
-         (Local_cache_deleted
-            { account_generation = snapshot.account_generation
-            ; graph_generation = snapshot.graph_generation
-            ; graph_id
-            })
-     | Error error ->
-       dispatch_event
-         runtime
-         (Network_failed
-            { account_generation = snapshot.account_generation
-            ; graph_generation = None
-            ; connection_generation = None
-            ; message = Db.Sync_mirror.error_message error
-            }))
+  | _ -> invalid_arg "local action reached the network interpreter"
 ;;
 
 let execute_graph_request runtime request =
@@ -1044,19 +1332,53 @@ let rec manager_loop runtime =
   | Network_finished operation_id ->
     Network_scope.complete runtime.network_scope operation_id;
     manager_loop runtime
+  | Catalog_flush_finished (saved, result) ->
+    runtime.catalog_flush_in_flight <- false;
+    (match result with
+     | Ok () when runtime.catalog_cache = Some saved -> runtime.catalog_dirty <- false
+     | Ok () | Error _ -> ());
+    schedule_catalog_flush runtime;
+    manager_loop runtime
   | Handle (Manager_command command, resolve) ->
     let effects = Manager.handle_command runtime.manager command in
     cancel_obsolete_network runtime;
     let actions =
       match command with
-      | Manager.Authenticated_user { user_id } ->
-        process_effects runtime effects;
+      | Manager.Restore_local_account { user_id; _ } ->
         load_catalog_cache runtime user_id;
         Option.iter
           (fun cache ->
              dispatch_event
                runtime
-               (Catalog_loaded
+               (Cached_catalog_loaded
+                  { account_generation =
+                      (Manager.snapshot runtime.manager).account_generation
+                  ; graphs = Db.Sync_catalog.graphs cache
+                  }))
+          runtime.catalog_cache;
+        []
+      | Reconcile_authenticated_user { user_id = Some user_id; _ } ->
+        load_catalog_cache runtime user_id;
+        Option.iter
+          (fun cache ->
+             dispatch_event
+               runtime
+               (Cached_catalog_loaded
+                  { account_generation =
+                      (Manager.snapshot runtime.manager).account_generation
+                  ; graphs = Db.Sync_catalog.graphs cache
+                  }))
+          runtime.catalog_cache;
+        effects
+      | Reconcile_authenticated_user { user_id = None; _ }
+      | Local_feed_ready _ | Timeline_presented _ -> effects
+      | Manager.Authenticated_user { user_id } ->
+        load_catalog_cache runtime user_id;
+        Option.iter
+          (fun cache ->
+             dispatch_event
+               runtime
+               (Cached_catalog_loaded
                   { account_generation =
                       (Manager.snapshot runtime.manager).account_generation
                   ; graphs = Db.Sync_catalog.graphs cache
@@ -1065,36 +1387,31 @@ let rec manager_loop runtime =
         []
       | Select_graph graph_id ->
         cache_selection runtime graph_id;
-        persist_catalog_cache runtime;
         effects
       | Return_to_graph_picker -> effects
       | Delete_local_cache graph_id ->
         cache_mirror_status runtime graph_id Db.Sync_catalog.Missing;
-        persist_catalog_cache runtime;
         effects
       | Signed_out_command
       | Provide_id_token _
       | Token_failed _
       | Refresh_catalog
+      | Begin_online_recovery
       | Backgrounded _
       | Foreground_resumed _
       | Submit_e2ee_password _ -> effects
     in
     publish_manager runtime;
     process_effects runtime actions;
+    schedule_catalog_flush runtime;
     Eio.Promise.resolve resolve (Ok (Manager_snapshot (Manager.snapshot runtime.manager)));
     manager_loop runtime
   | Handle (Graph_request request, resolve) ->
     Eio.Promise.resolve resolve (Ok (execute_graph_request runtime request));
     manager_loop runtime
-  | Stop resolve ->
-    Network_scope.cancel_all runtime.network_scope;
-    close_websocket runtime;
-    close_engine runtime;
-    Eio.Promise.resolve resolve ()
 ;;
 
-let create_with_dependencies dependencies =
+let create_with_dependencies dependencies local_secrets =
   Worker.Service.create
     ~push_topic_count:4
     ~concurrency:Worker.Service.Serial
@@ -1126,8 +1443,11 @@ let create_with_dependencies dependencies =
              ; engine = None
              ; websocket = None
              ; catalog_cache = None
+             ; catalog_dirty = false
+             ; catalog_flush_in_flight = false
              ; network_scope = Network_scope.create ()
              ; request_sequence = 0
+             ; local_secrets
              }
            in
            Worker.Session_context.fork_daemon context ~name:"sync-manager" (fun () ->
@@ -1178,9 +1498,11 @@ let create_with_dependencies dependencies =
            Ok (Graph_response response)))
     ~shutdown:(function
       | Managed runtime ->
-        let stopped, resolve = Eio.Promise.create () in
-        Eio.Stream.add runtime.messages (Stop resolve);
-        Eio.Promise.await stopped
+        Network_scope.cancel_all runtime.network_scope;
+        close_websocket runtime;
+        close_engine runtime;
+        runtime.catalog_flush_in_flight <- false;
+        if runtime.catalog_dirty then persist_catalog_cache_now runtime
       | Graph_bound { engine = None; _ } -> ()
       | Graph_bound { engine = Some engine; _ } ->
         (match Engine.close engine with
@@ -1189,5 +1511,12 @@ let create_with_dependencies dependencies =
     ()
 ;;
 
-let create ~dependencies = create_with_dependencies (fun () -> dependencies)
-let service = create_with_dependencies production_dependencies
+let create ~dependencies =
+  create_with_dependencies (fun () -> dependencies) production_local_secrets
+;;
+
+let create_with_local_secrets ~dependencies ~local_secrets =
+  create_with_dependencies (fun () -> dependencies) local_secrets
+;;
+
+let service = create_with_dependencies production_dependencies production_local_secrets

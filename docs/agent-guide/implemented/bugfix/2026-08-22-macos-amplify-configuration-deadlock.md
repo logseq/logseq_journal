@@ -23,21 +23,24 @@ or Cognito availability.
 ## Decision
 
 Make Amplify configuration a prerequisite for mounting any Authenticator widget.
-This application will own a non-generated production entrypoint that awaits
-JournalAmplify.configure before calling runApp. Configuration failure must produce
-a bounded, actionable error instead of an infinite spinner.
+This application will own a non-generated production entrypoint that starts
+JournalAmplify.configure before calling runApp. The host may present a locally
+bound Timeline while configuration is pending, but it must await configuration
+before constructing Authenticator. Configuration failure must produce a bounded,
+actionable error instead of an infinite spinner.
 
 Keep exactly one configuration owner. Do not retain the current concurrent adapter
 payload and Authenticator initialization paths.
 
 ### Implementation outcome
 
-Production now builds `lib/application.dart`, an application-owned entrypoint that
-initializes Flutter, awaits `JournalAmplify.configure`, and only then constructs
-the host. Configuration failure renders a stable error surface whose Retry action
-starts a fresh configuration attempt; failed configuration futures are not cached.
-The generated adapter no longer owns configuration or builds an `Authenticator`
-while a supplied readiness future is pending.
+Production now uses `lib/main.dart` as its application-owned custom host entrypoint.
+It initializes Flutter, starts `JournalAmplify.configure`, and passes the readiness
+future into the host before calling `runApp`. A valid local account binding can
+present the local Timeline while configuration is pending; a cold signed-out path
+does not construct `Authenticator` until the future succeeds. Configuration
+failure renders a stable error surface whose Retry action starts a fresh
+configuration attempt; failed configuration futures are not cached.
 
 macOS Debug, Profile, and Release builds all use the owned entrypoint. A real
 signed-in launch reached the Journal timeline without the previous loading
@@ -64,8 +67,9 @@ that this application can own explicitly in its non-generated entrypoint.
 
 ## Acceptance criteria
 
-- The non-generated application entrypoint configures Amplify before calling
-  runApp or constructing Authenticator in signed macOS Debug and Release builds.
+- The non-generated application entrypoint starts Amplify configuration before
+  calling runApp and completes it before constructing Authenticator in signed
+  macOS Debug and Release builds.
 - A persisted Cognito session restores and reaches graph discovery without an
   Amplify configuration warning.
 - A signed-out account renders the sign-in form without an indefinite loading
@@ -81,7 +85,7 @@ that this application can own explicitly in its non-generated entrypoint.
   Authenticator against an unconfigured Amplify singleton.
 - A failed configuration remains visible and retryable instead of leaving an
   indefinite loading frame.
-- The application-owned entrypoint must remain the configured Flutter build target.
+- The application-owned `lib/main.dart` must remain the custom Flutter host.
 
 ## Risks
 

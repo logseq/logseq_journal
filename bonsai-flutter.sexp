@@ -6,10 +6,8 @@
  (native_target app/native_embed.exe.o)
  (features sqlite)
  (host
-  (mode managed_adapter)
-  (adapter lib/application_host_adapter.dart)
-  (entrypoint logseq_journal)
-  (launch_policy replace_existing))
+  (mode custom)
+  (main lib/main.dart))
  (macos
   (minimum_version 26.0)
   (architectures arm64))

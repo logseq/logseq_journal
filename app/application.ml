@@ -43,6 +43,12 @@ type formatting_context =
   ; days : int list
   }
 
+type modal =
+  | No_modal
+  | Account
+  | Settings
+  | Cache_reset_confirmation of Logseq_db_worker.Graph_types.Uuid.t
+
 type state =
   { routes : Journal_routes.t
   ; timeline : Journal_timeline_state.t
@@ -54,6 +60,7 @@ type state =
   ; pending_delete : pending_delete option
   ; direct_capture : Journal_capture.t option
   ; capture_affordance_key : int64
+  ; capture_fab_scroll : Journal_timeline_state.capture_fab_scroll
   ; capture_error : string option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
@@ -66,8 +73,8 @@ type state =
   ; manager : Logseq_db_worker.Sync_manager.snapshot option
   ; bootstrap_progress : Logseq_db_worker.Sync_bootstrap.progress option
   ; e2ee_password : Journal_capture.t
-  ; cache_reset_confirmation : Logseq_db_worker.Graph_types.Uuid.t option
-  ; account_menu_open : bool
+  ; typography_preset : Journal_visual_tokens.typography_preset option
+  ; modal : modal
   }
 
 let initial_anchor : Journal_routes.anchor = { block_id = None; first_index = 0 }
@@ -84,6 +91,7 @@ let initial_state =
   ; pending_delete = None
   ; direct_capture = None
   ; capture_affordance_key = 1L
+  ; capture_fab_scroll = Journal_timeline_state.initial_capture_fab_scroll
   ; capture_error = None
   ; timeline_notice = None
   ; write_enabled = false
@@ -96,8 +104,8 @@ let initial_state =
   ; manager = None
   ; bootstrap_progress = None
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
-  ; cache_reset_confirmation = None
-  ; account_menu_open = false
+  ; typography_preset = None
+  ; modal = No_modal
   }
 ;;
 
@@ -125,6 +133,16 @@ let current_graph_generation state =
 ;;
 
 let apply_manager_snapshot state (snapshot : Logseq_db_worker.Sync_manager.snapshot) =
+  let graph_context_changed =
+    match state.manager with
+    | None -> Option.is_some snapshot.selected_graph
+    | Some previous ->
+      not
+        (Option.equal
+           Logseq_db_worker.Graph_types.Uuid.equal
+           previous.selected_graph
+           snapshot.selected_graph)
+  in
   let was_awaiting_password =
     match state.manager with
     | Some { phase = Awaiting_e2ee_password; _ } -> true
@@ -138,18 +156,22 @@ let apply_manager_snapshot state (snapshot : Logseq_db_worker.Sync_manager.snaps
       ( Journal_capture.create ~session_number:state.next_local_sequence ~source:""
       , Int64.succ state.next_local_sequence )
   in
-  let cache_reset_confirmation =
-    match state.cache_reset_confirmation, snapshot.selected_graph with
-    | Some confirmation, Some selected
-      when Logseq_db_worker.Graph_types.Uuid.equal confirmation selected ->
-      Some confirmation
-    | None, _ | Some _, None | Some _, Some _ -> None
+  let modal =
+    match state.modal, snapshot.selected_graph with
+    | Cache_reset_confirmation confirmation, Some selected
+      when Logseq_db_worker.Graph_types.Uuid.equal confirmation selected -> state.modal
+    | (No_modal | Account | Settings), _ -> state.modal
+    | Cache_reset_confirmation _, (None | Some _) -> No_modal
   in
   { state with
     manager = Some snapshot
   ; e2ee_password
   ; next_local_sequence
-  ; cache_reset_confirmation
+  ; modal
+  ; capture_fab_scroll =
+      (if graph_context_changed
+       then Journal_timeline_state.initial_capture_fab_scroll
+       else state.capture_fab_scroll)
   ; graph_ready =
       state.graph_ready
       && Option.is_some snapshot.selected_graph
@@ -163,6 +185,7 @@ let apply_manager_snapshot state (snapshot : Logseq_db_worker.Sync_manager.snaps
        | Loading_catalog
        | Awaiting_selection
        | Bootstrapping
+       | Recovering_online _
        | Awaiting_e2ee_password
        | Opening_graph
        | Graph_open
@@ -343,7 +366,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
   | Journal_graph_runtime.Graph_ready info ->
     ignore info.admission_facts;
     { state with write_enabled = true; graph_ready = true; graph_error = None }
-  | Feed_loaded { request_generation; feed } ->
+  | Feed_loaded { request_generation; feed; complete } ->
     (match state.feed_refresh with
      | Some refresh when Int64.equal refresh.generation request_generation ->
        let current_context = Option.map feed_projection_context state.calendar in
@@ -377,15 +400,23 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
                ~generation:request_generation
                (Feed { before_day = None })
          in
-         { state with
-           timeline =
-             Journal_timeline_state.apply_feed
+         let timeline =
+           Journal_timeline_state.apply_feed timeline ~generation:request_generation feed
+         in
+         let timeline =
+           if complete
+           then timeline
+           else
+             Journal_timeline_state.begin_request
                timeline
                ~generation:request_generation
-               feed
+               (Feed { before_day = None })
+         in
+         { state with
+           timeline
          ; feed_loaded = true
          ; presented_feed_context = Some refresh.context
-         ; feed_refresh = None
+         ; feed_refresh = (if complete then None else state.feed_refresh)
          ; sync_error = None
          })
        else state
@@ -399,12 +430,23 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
          | Some (_, Children _)
          | None -> false
        in
-       { state with
-         timeline =
-           Journal_timeline_state.apply_feed
-             state.timeline
+       let timeline =
+         Journal_timeline_state.apply_feed
+           state.timeline
+           ~generation:request_generation
+           feed
+       in
+       let timeline =
+         if complete || not accepted_initial_feed
+         then timeline
+         else
+           Journal_timeline_state.begin_request
+             timeline
              ~generation:request_generation
-             feed
+             (Feed { before_day = None })
+       in
+       { state with
+         timeline
        ; feed_loaded = state.feed_loaded || accepted_initial_feed
        ; presented_feed_context =
            (if accepted_initial_feed
@@ -434,13 +476,15 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
     (match state.feed_refresh with
      | Some refresh when Int64.equal refresh.generation request_generation ->
        if state.feed_loaded
-       then { state with feed_refresh = None; sync_error = Some message }
+       then { state with sync_error = Some message }
        else terminal_graph_state state message
      | None | Some _ ->
        (match Journal_timeline_state.pending_request state.timeline with
         | Some (generation, Feed { before_day = None })
           when Int64.equal generation request_generation ->
-          terminal_graph_state state message
+          if state.feed_loaded
+          then { state with sync_error = Some message }
+          else terminal_graph_state state message
         | Some (_, Feed { before_day = Some _ })
         | Some (_, Day _)
         | Some (_, Children _)
@@ -540,7 +584,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
   | Rejected message -> fail_active_mutation state message
 ;;
 
-let application_theme =
+let application_theme preset =
   let seed = Ui.Style.Color.rgb ~red:0 ~green:38 ~blue:47 in
   let theme_text_style (token : Journal_visual_tokens.text_token) =
     Ui.Style.Text_style.create
@@ -549,13 +593,16 @@ let application_theme =
       ~line_height:(token.line_height /. token.font_size)
       ()
   in
+  let app_typography = Journal_visual_tokens.typography preset in
   let typography =
     Ui.Theme.Typography.material
-      ~title_large:(theme_text_style Journal_visual_tokens.typography.header_title)
-      ~title_medium:(theme_text_style Journal_visual_tokens.typography.header_subtitle)
-      ~body_medium:(theme_text_style Journal_visual_tokens.typography.entry)
-      ~body_small:(theme_text_style Journal_visual_tokens.typography.supporting)
-      ~label_medium:(theme_text_style Journal_visual_tokens.typography.timestamp)
+      ~title_large:(theme_text_style app_typography.dialog_title)
+      ~title_medium:(theme_text_style app_typography.header_subtitle)
+      ~body_large:(theme_text_style app_typography.input)
+      ~body_medium:(theme_text_style app_typography.supporting)
+      ~body_small:(theme_text_style app_typography.timestamp)
+      ~label_large:(theme_text_style app_typography.button_label)
+      ~label_medium:(theme_text_style app_typography.timestamp)
       ()
   in
   let shape = Ui.Theme.Shape.create ~small:8. ~medium:12. ~large:16. () in
@@ -580,12 +627,18 @@ let application_theme =
     ()
 ;;
 
-let text_style ?size ?weight ?height () =
-  Ui.Style.Text_style.create ?font_size:size ?font_weight:weight ?line_height:height ()
+let text_style (token : Journal_visual_tokens.text_token) =
+  Ui.Style.Text_style.create
+    ~font_size:token.font_size
+    ~font_weight:token.weight
+    ~line_height:(token.line_height /. token.font_size)
+    ()
 ;;
 
-let styled_text ?size ?weight ?height value =
-  Ui.Widget.text ~style:(text_style ?size ?weight ?height ()) value
+let styled_text ?token value =
+  match token with
+  | None -> Ui.Widget.text value
+  | Some token -> Ui.Widget.text ~style:(text_style token) value
 ;;
 
 type action_role =
@@ -654,6 +707,7 @@ let prefix_action handler prefix =
 
 let timeline_page
       ~tokens
+      ~typography
       ~profile
       ~text_scale
       ~top_inset
@@ -673,7 +727,9 @@ let timeline_page
       ~capture_save_enabled
       ~capture_saving
       ~capture_affordance_key
+      ~capture_fab_presentation
       ~on_capture_event
+      ~on_scroll
       ~on_visible_range
       ~on_toggle_children
       ~delete_enabled
@@ -684,6 +740,7 @@ let timeline_page
   =
   let header =
     Journal_header.sliver
+      ~typography
       ~text_scale
       ~top_inset
       ~device_pixel_ratio
@@ -713,6 +770,11 @@ let timeline_page
         (Ui.Key.string
            ("journal-capture-expandable:" ^ Int64.to_string capture_affordance_key))
       ~enabled:capture_enabled
+      ~fab_presentation:
+        (match capture_fab_presentation with
+         | Journal_timeline_state.Extended ->
+           Ui.Native_widget.Expandable_message_composer.Extended
+         | Compact -> Compact)
       ~fab_label:"Capture"
       ~fab_tooltip:"Open Capture"
       ~fab_icon:
@@ -749,11 +811,12 @@ let timeline_page
          |> Ui.Widget.with_test_id (Ui.Test_id.string "logseq-graph-open-failed"))
       |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
     | None when loading ->
-      Ui.Widget.Sliver.fill (Journal_timeline.loading_view ())
+      Ui.Widget.Sliver.fill (Journal_timeline.loading_view ~typography ())
       |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
     | None ->
       Journal_timeline.view
         ~tokens
+        ~typography
         ~profile
         ~device_pixel_ratio
         ~end_padding:(64. +. bottom_inset)
@@ -769,7 +832,7 @@ let timeline_page
   let timeline =
     Ui.Widget.Scroll_view.vertical
       ~key:(Ui.Key.string "journal-scroll")
-      ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
+      ~on_scroll
       [ header; timeline ]
       ()
     |> Ui.Widget.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-scroll")
@@ -826,10 +889,10 @@ let timeline_page
   |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-timeline-page")
 ;;
 
-let dialog_body ~test_id ~title ~message ~primary ~secondary =
+let dialog_body ~typography ~test_id ~title ~message ~primary ~secondary =
   Ui.Material.alert_dialog
-    ~title:(styled_text ~size:20. ~weight:Ui.Style.Font_weight.Bold title)
-    ~content:(styled_text ~size:15. message)
+    ~title:(styled_text ~token:typography.Journal_visual_tokens.dialog_title title)
+    ~content:(styled_text ~token:typography.supporting message)
     ~actions:[ primary; secondary ]
     ()
   |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
@@ -859,7 +922,13 @@ let modal_dialog_page ~tokens:_ ~reduced_motion ~page_key ~test_id ~barrier_labe
   |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
 ;;
 
-let account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch =
+let account_dialog_page
+      ~tokens
+      ~(typography : Journal_visual_tokens.typography)
+      ~reduced_motion
+      ~cache_reset_available
+      dispatch
+  =
   let action ~role ~test_id ~label ~hint ~command text =
     action_target
       ~role
@@ -871,6 +940,13 @@ let account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch 
   in
   let actions =
     [ action
+        ~role:Outlined
+        ~test_id:"journal-account-settings"
+        ~label:"Settings"
+        ~hint:"Open application presentation settings"
+        ~command:"open-settings"
+        "Settings"
+    ; action
         ~role:Outlined
         ~test_id:"journal-account-switch-graph"
         ~label:"Switch graph"
@@ -906,8 +982,11 @@ let account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch 
       ]
   in
   Ui.Material.alert_dialog
-    ~title:(styled_text ~size:20. ~weight:Ui.Style.Font_weight.Bold "Account")
-    ~content:(styled_text "Manage the current Logseq graph and authenticated session.")
+    ~title:(styled_text ~token:typography.dialog_title "Account")
+    ~content:
+      (styled_text
+         ~token:typography.supporting
+         "Manage the current Logseq graph and authenticated session.")
     ~actions
     ()
   |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu")
@@ -919,7 +998,133 @@ let account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch 
        ~barrier_label:"Account actions"
 ;;
 
-let local_cache_reset_dialog_page ~tokens ~reduced_motion dispatch =
+let typography_metrics preset =
+  match preset with
+  | Journal_visual_tokens.Dense ->
+    [ "Header title 22/28 SemiBold"
+    ; "Entry 15/20 Normal"
+    ; "Supporting text 14/20 Normal"
+    ; "Button label 14/20 Medium"
+    ; "Manager title 24/32 SemiBold"
+    ]
+  | Balanced ->
+    [ "Header title 22/28 SemiBold"
+    ; "Entry 16/22 Normal"
+    ; "Supporting text 14/20 Normal"
+    ; "Button label 14/20 Medium"
+    ; "Manager title 24/32 SemiBold"
+    ]
+  | Comfortable ->
+    [ "Header title 24/32 SemiBold"
+    ; "Entry 17/24 Normal"
+    ; "Supporting text 15/22 Normal"
+    ; "Button label 15/20 Medium"
+    ; "Manager title 28/34 SemiBold"
+    ]
+;;
+
+let settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch =
+  let chip option label command test_id =
+    let selected = preset = option in
+    let on_selected = bind_action dispatch command in
+    Ui.Material.choice_chip
+      ~key:(Ui.Key.string test_id)
+      ~selected
+      ~on_selected
+      ~label:(styled_text ~token:typography.Journal_visual_tokens.button_label label)
+      ()
+    |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
+    |> Ui.Widget.semantics
+         ~on_action:on_selected
+         ~properties:
+           (Ui.Semantics.create
+              ~label
+              ~role:Ui.Semantics.Role.Button
+              ~enabled:true
+              ~selected
+              ~focusable:true
+              ~actions:[ Ui.Semantics.Action.Tap ]
+              ())
+  in
+  let choices =
+    Ui.Widget.Flex.row
+      [ Ui.Widget.Flex.expanded
+          (chip
+             Journal_visual_tokens.Dense
+             "A Dense"
+             "select-typography:dense"
+             "typography-preset-dense")
+      ; Ui.Widget.Flex.expanded
+          (chip
+             Balanced
+             "B Balanced"
+             "select-typography:balanced"
+             "typography-preset-balanced")
+      ; Ui.Widget.Flex.expanded
+          (chip
+             Comfortable
+             "C Comfortable"
+             "select-typography:comfortable"
+             "typography-preset-comfortable")
+      ]
+    |> Ui.Widget.semantics
+         ~properties:
+           (Ui.Semantics.create
+              ~label:"Typography preset"
+              ~value:(Journal_visual_tokens.stored_value_of_typography_preset preset)
+              ())
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "typography-preset-group")
+  in
+  let metrics =
+    typography_metrics preset
+    |> List.map (fun metric ->
+      styled_text ~token:typography.supporting metric |> Ui.Widget.Flex.fixed)
+    |> Ui.Widget.Flex.column
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "typography-preset-metrics")
+  in
+  let content =
+    Ui.Widget.Flex.column
+      [ Ui.Widget.Flex.fixed (styled_text ~token:typography.dialog_title "Typography")
+      ; Ui.Widget.Flex.fixed
+          (styled_text
+             ~token:typography.supporting
+             "Choose the reading density used throughout the app.")
+      ; Ui.Widget.Flex.fixed choices
+      ; Ui.Widget.Flex.fixed metrics
+      ]
+  in
+  let close =
+    action_target
+      ~role:Text
+      ~test_id:"journal-settings-close"
+      ~label:"Close Settings"
+      ~hint:"Return to the journal"
+      ~on_press:(bind_action dispatch "close-settings")
+      (styled_text "Close")
+  in
+  Ui.Material.alert_dialog
+    ~title:
+      (styled_text ~token:typography.dialog_title "Settings"
+       |> Ui.Widget.semantics
+            ~properties:
+              (Ui.Semantics.create
+                 ~label:"Settings"
+                 ~role:Ui.Semantics.Role.Header
+                 ~heading_level:1
+                 ()))
+    ~content
+    ~actions:[ close ]
+    ()
+  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-settings")
+  |> modal_dialog_page
+       ~tokens
+       ~reduced_motion
+       ~page_key:"journal-settings-dialog"
+       ~test_id:"journal-settings-dialog-page"
+       ~barrier_label:"Settings"
+;;
+
+let local_cache_reset_dialog_page ~tokens ~typography ~reduced_motion dispatch =
   let cancel =
     action_target
       ~role:Text
@@ -939,6 +1144,7 @@ let local_cache_reset_dialog_page ~tokens ~reduced_motion dispatch =
       (styled_text "Delete and redownload")
   in
   dialog_body
+    ~typography
     ~test_id:"local-cache-reset-dialog"
     ~title:"Reset local graph copy?"
     ~message:
@@ -964,9 +1170,12 @@ let route_page ~page_key ~transition body =
   |> Ui.Widget.with_test_id (Ui.Test_id.string page_key)
 ;;
 
-let detail_text_field detail dispatch =
+let detail_text_field ~typography detail dispatch =
   match Journal_detail.editor_value detail with
-  | None -> styled_text (Journal_model.source (Journal_detail.root detail))
+  | None ->
+    styled_text
+      ~token:typography.Journal_visual_tokens.entry
+      (Journal_model.source (Journal_detail.root detail))
   | Some value ->
     Ui.Material.text_field
       ~key:(Ui.Key.string "detail-editor")
@@ -1029,7 +1238,7 @@ let child_editor detail dispatch =
       ]
 ;;
 
-let detail_page detail dispatch =
+let detail_page ~(typography : Journal_visual_tokens.typography) detail dispatch =
   let root = Journal_detail.root detail in
   let navigation_enabled =
     match Journal_detail.mode detail with
@@ -1082,7 +1291,7 @@ let detail_page detail dispatch =
   let children =
     Journal_detail.children detail
     |> List.map (fun child ->
-      styled_text (Journal_model.source child)
+      styled_text ~token:typography.supporting (Journal_model.source child)
       |> Ui.Widget.with_test_id
            (Ui.Test_id.string ("detail-child:" ^ Journal_model.id child)))
   in
@@ -1121,14 +1330,17 @@ let detail_page detail dispatch =
           (Ui.Widget.Flex.row
              [ Ui.Widget.Flex.expanded back
              ; Ui.Widget.Flex.fixed
-                 (styled_text ~size:22. ~weight:Ui.Style.Font_weight.Bold "Entry detail")
+                 (styled_text
+                    ~token:typography.Journal_visual_tokens.dialog_title
+                    "Entry detail")
              ; Ui.Widget.Flex.expanded save
              ])
-      ; Ui.Widget.Flex.fixed (styled_text (Journal_model.source root))
+      ; Ui.Widget.Flex.fixed
+          (styled_text ~token:typography.entry (Journal_model.source root))
       ; Ui.Widget.Flex.fixed
           (Ui.Widget.Flex.row
              [ Ui.Widget.Flex.expanded task; Ui.Widget.Flex.expanded add_child ])
-      ; Ui.Widget.Flex.expanded (detail_text_field detail dispatch)
+      ; Ui.Widget.Flex.expanded (detail_text_field ~typography detail dispatch)
       ; Ui.Widget.Flex.fixed
           (Ui.Widget.Flex.column (List.map Ui.Widget.Flex.fixed children))
       ; Ui.Widget.Flex.fixed (child_editor detail dispatch)
@@ -1143,7 +1355,7 @@ let detail_page detail dispatch =
     (Ui.Widget.Body.static content)
 ;;
 
-let detail_discard_dialog_page ~tokens ~reduced_motion dispatch =
+let detail_discard_dialog_page ~tokens ~typography ~reduced_motion dispatch =
   let keep =
     action_target
       ~role:Text
@@ -1163,6 +1375,7 @@ let detail_discard_dialog_page ~tokens ~reduced_motion dispatch =
       (styled_text "Discard")
   in
   dialog_body
+    ~typography
     ~test_id:"detail-discard-dialog"
     ~title:"Discard changes?"
     ~message:"The edited source has not been saved."
@@ -1176,7 +1389,7 @@ let detail_discard_dialog_page ~tokens ~reduced_motion dispatch =
        ~barrier_label:"Discard Detail changes confirmation"
 ;;
 
-let message_page ~page_key ~title dispatch =
+let message_page ~typography ~page_key ~title dispatch =
   let content =
     Ui.Widget.Flex.column
       [ Ui.Widget.Flex.fixed
@@ -1188,7 +1401,7 @@ let message_page ~page_key ~title dispatch =
              ~on_press:(bind_action dispatch "back")
              (styled_text "Back"))
       ; Ui.Widget.Flex.expanded
-          (styled_text ~size:20. ~weight:Ui.Style.Font_weight.Bold title
+          (styled_text ~token:typography.Journal_visual_tokens.dialog_title title
            |> Ui.Widget.center
            |> Ui.Widget.semantics
                 ~properties:(Ui.Semantics.create ~label:title ~live_region:true ()))
@@ -1198,9 +1411,9 @@ let message_page ~page_key ~title dispatch =
   route_page ~page_key ~transition:Ui.Navigation.Fade (Ui.Widget.Body.static content)
 ;;
 
-let manager_page state dispatch =
+let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch =
   let title_widget title =
-    styled_text ~size:24. ~weight:Ui.Style.Font_weight.Bold title
+    styled_text ~token:typography.Journal_visual_tokens.manager_title title
     |> Ui.Widget.semantics
          ~properties:(Ui.Semantics.create ~label:title ~live_region:true ())
   in
@@ -1245,7 +1458,7 @@ let manager_page state dispatch =
            Ui.Material.list_tile
              ~key:(Ui.Key.string ("graph-picker:" ^ graph_id))
              ~on_press
-             ~title:(styled_text graph.name)
+             ~title:(styled_text ~token:typography.entry graph.name)
              ()
            |> Ui.Widget.with_test_id (Ui.Test_id.string ("graph-picker:" ^ graph_id))
            |> Ui.Widget.semantics
@@ -1296,7 +1509,21 @@ let manager_page state dispatch =
                  "Downloaded %d bytes"
                  progress.Logseq_db_worker.Sync_bootstrap.received_bytes
            in
-           "Downloading graph", [ Ui.Widget.Flex.fixed (styled_text progress_text) ]
+           ( "Downloading graph"
+           , [ Ui.Widget.Flex.fixed
+                 (styled_text ~token:typography.supporting progress_text)
+             ] )
+         | Recovering_online _ ->
+           ( Option.value snapshot.last_error ~default:"Online recovery is required"
+           , [ Ui.Widget.Flex.fixed
+                 (action_target
+                    ~role:Filled
+                    ~test_id:"begin-online-recovery"
+                    ~label:"Continue online"
+                    ~hint:"Authenticate and recover the local graph"
+                    ~on_press:(bind_action dispatch "begin-online-recovery")
+                    (styled_text "Continue online"))
+             ] )
          | Awaiting_e2ee_password ->
            let password = state.e2ee_password in
            let editor =
@@ -1332,7 +1559,9 @@ let manager_page state dispatch =
            in
            ( "Unlock encrypted graph"
            , [ Ui.Widget.Flex.fixed
-                 (styled_text "Enter your encryption password to continue.")
+                 (styled_text
+                    ~token:typography.supporting
+                    "Enter your encryption password to continue.")
              ; Ui.Widget.Flex.fixed editor
              ; Ui.Widget.Flex.fixed submit
              ] )
@@ -1366,6 +1595,8 @@ let manager_page state dispatch =
 ;;
 
 let identity_sequence = ref 0L
+let managed_sync_startup = ref true
+let managed_sync_origin = ref "https://api.logseq.io"
 
 let fresh_identity () =
   identity_sequence := Int64.succ !identity_sequence;
@@ -1564,15 +1795,17 @@ let component client handlers graph =
       if not !registered
       then (
         registered := true;
-        let startup_delivery =
-          deliver_output
-            Journal_graph_runtime.{ requests = [ start graph_runtime ]; responses = [] }
-        in
-        (match startup_delivery.error with
-         | None -> ()
-         | Some message ->
-           set_state (fun state -> fail_graph_transport state message)
-           |> Bonsai.Effect.Expert.handle);
+        if not !managed_sync_startup
+        then (
+          let startup_delivery =
+            deliver_output
+              Journal_graph_runtime.{ requests = [ start graph_runtime ]; responses = [] }
+          in
+          match startup_delivery.error with
+          | None -> ()
+          | Some message ->
+            set_state (fun state -> fail_graph_transport state message)
+            |> Bonsai.Effect.Expert.handle);
         Worker.on_event client (fun event ->
           match event with
           | Worker.Push
@@ -1671,23 +1904,59 @@ let component client handlers graph =
                 when !started_graph_generation <> Some manager.graph_generation ->
                 started_graph_generation := Some manager.graph_generation;
                 Journal_graph_runtime.reset graph_runtime;
+                let current = !state_ref in
+                let graph_info = Journal_graph_runtime.start graph_runtime in
+                let feed_generation = current.next_request_generation in
+                let feed_output =
+                  match current.calendar with
+                  | None -> Journal_graph_runtime.{ requests = []; responses = [] }
+                  | Some _ ->
+                    submit
+                      (Journal_graph_request.Load_feed
+                         { before_day = None
+                         ; day_limit = feed_day_limit
+                         ; blocks_per_day = 64
+                         ; slot_limit = 128
+                         ; request_generation = feed_generation
+                         })
+                in
                 let output =
                   Journal_graph_runtime.
-                    { requests = [ start graph_runtime ]; responses = [] }
+                    { requests = graph_info :: feed_output.requests
+                    ; responses = feed_output.responses
+                    }
                 in
-                Bonsai.Effect.bind
-                  (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
-                  ~f:(fun delivery ->
-                    set_state (fun state ->
-                      apply_delivery_responses
-                        { state with
-                          graph_ready = false
-                        ; feed_loaded = false
-                        ; presented_feed_context = None
-                        ; feed_refresh = None
-                        ; graph_error = None
-                        }
-                        delivery))
+                let prepare =
+                  set_state (fun state ->
+                    let state =
+                      { state with
+                        graph_ready = false
+                      ; feed_loaded = false
+                      ; presented_feed_context = None
+                      ; feed_refresh = None
+                      ; graph_error = None
+                      }
+                    in
+                    match state.calendar with
+                    | None -> state
+                    | Some calendar ->
+                      let context = feed_projection_context calendar in
+                      { state with
+                        timeline =
+                          (Journal_timeline_state.empty ~today:context.local_day
+                           |> fun timeline ->
+                           Journal_timeline_state.begin_request
+                             timeline
+                             ~generation:feed_generation
+                             (Feed { before_day = None }))
+                      ; next_request_generation = Int64.succ feed_generation
+                      })
+                in
+                Bonsai.Effect.bind prepare ~f:(fun () ->
+                  Bonsai.Effect.bind
+                    (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
+                    ~f:(fun delivery ->
+                      set_state (fun state -> apply_delivery_responses state delivery)))
               | Some _, Some _ | Some _, None | None, _ -> Bonsai.Effect.Ignore
             in
             Bonsai.Effect.bind (apply_manager_transition set_state manager) ~f:(fun () ->
@@ -1809,9 +2078,40 @@ let component client handlers graph =
         let apply_authenticated_user payload =
           match Journal_platform.decode_authenticated_user payload with
           | Error _ -> Bonsai.Effect.Ignore
-          | Ok None -> send_manager Logseq_db_worker.Sync_manager.Signed_out_command
-          | Ok (Some user_id) ->
-            send_manager (Logseq_db_worker.Sync_manager.Authenticated_user { user_id })
+          | Ok user_id ->
+            (match user_id with
+             | None -> sign_out_in_flight := true
+             | Some _ -> ());
+            send_manager
+              (Logseq_db_worker.Sync_manager.Reconcile_authenticated_user
+                 { user_id; managed_sync_origin = !managed_sync_origin })
+        in
+        let apply_local_account_binding result =
+          match result with
+          | Error _ -> Bonsai.Effect.Ignore
+          | Ok payload ->
+            (match Journal_platform.decode_local_account_binding payload with
+             | Error _ | Ok None -> Bonsai.Effect.Ignore
+             | Ok (Some binding) ->
+               send_manager
+                 (Logseq_db_worker.Sync_manager.Restore_local_account
+                    { user_id = binding.user_id
+                    ; managed_sync_origin = binding.managed_sync_origin
+                    }))
+        in
+        let apply_typography_preference result =
+          let stored_value =
+            match result with
+            | Ok payload ->
+              (match Journal_platform.decode_typography_preset_preference payload with
+               | Ok value -> value
+               | Error _ -> None)
+            | Error _ -> None
+          in
+          let preset =
+            Journal_visual_tokens.typography_preset_of_stored_value stored_value
+          in
+          set_state (fun state -> { state with typography_preset = Some preset })
         in
         let apply_platform payload =
           if Journal_platform.is_prepare_to_terminate_event payload
@@ -1827,17 +2127,33 @@ let component client handlers graph =
                | Error _ -> apply_authenticated_user payload))
         in
         Platform.on_event application_platform apply_platform;
+        let managed_startup =
+          if not !managed_sync_startup
+          then Bonsai.Effect.Ignore
+          else
+            Bonsai.Effect.bind
+              (Platform.request
+                 application_platform
+                 Journal_platform.local_account_binding_request)
+              ~f:(fun binding ->
+                Bonsai.Effect.bind (apply_local_account_binding binding) ~f:(fun () ->
+                  Platform.request
+                    application_platform
+                    Journal_platform.authenticated_user_request
+                  |> Bonsai.Effect.bind ~f:(function
+                    | Error _ -> Bonsai.Effect.Ignore
+                    | Ok payload -> apply_authenticated_user payload)))
+        in
         Bonsai.Effect.Many
           [ Platform.request application_platform Journal_platform.get_calendar_request
             |> Bonsai.Effect.bind ~f:(function
               | Error _ -> Bonsai.Effect.Ignore
               | Ok payload -> apply_calendar payload)
+          ; managed_startup
           ; Platform.request
               application_platform
-              Journal_platform.authenticated_user_request
-            |> Bonsai.Effect.bind ~f:(function
-              | Error _ -> Bonsai.Effect.Ignore
-              | Ok payload -> apply_authenticated_user payload)
+              Journal_platform.typography_preset_preference_request
+            |> Bonsai.Effect.bind ~f:apply_typography_preference
           ]
         |> Bonsai.Effect.Expert.handle);
       ())
@@ -1853,6 +2169,14 @@ let component client handlers graph =
                equal_feed_projection_context
                state.presented_feed_context
                (Some context)
+        then None
+        else if
+          match Journal_timeline_state.pending_request state.timeline with
+          | Some (_, Feed { before_day = None }) -> true
+          | Some (_, Feed { before_day = Some _ })
+          | Some (_, Day _)
+          | Some (_, Children _)
+          | None -> false
         then None
         else Some context
       | false, _ | true, None -> None)
@@ -1923,6 +2247,61 @@ let component client handlers graph =
     ~equal:(Option.equal equal_feed_projection_context)
     feed_key
     ~callback:feed_callback
+    graph;
+  let timeline_presentation_key =
+    Bonsai.Cont.map state ~f:(fun state ->
+      match state.feed_loaded, state.manager with
+      | true, Some manager ->
+        (match manager.Logseq_db_worker.Sync_manager.startup_presentation with
+         | Restoring_local | Local_feed_ready ->
+           Some
+             ( manager.account_generation
+             , manager.graph_generation
+             , manager.presentation_generation )
+         | Timeline_presented | Reconciled -> None)
+      | false, _ | true, None -> None)
+  in
+  let timeline_presentation_callback =
+    Bonsai.Cont.map timeline_presentation_key ~f:(fun current -> function
+      | None -> Bonsai.Effect.Ignore
+      | Some (account_generation, graph_generation, presentation_generation) as key ->
+        if current <> key
+        then Bonsai.Effect.Ignore
+        else
+          Bonsai.Effect.bind
+            (send_manager
+               (Logseq_db_worker.Sync_manager.Local_feed_ready
+                  { account_generation; graph_generation; presentation_generation }))
+            ~f:(fun () ->
+              Platform.request
+                application_platform
+                (Journal_platform.timeline_presented_request
+                   ~account_generation
+                   ~graph_generation
+                   ~presentation_generation)
+              |> Bonsai.Effect.bind ~f:(function
+                | Error _ -> Bonsai.Effect.Ignore
+                | Ok payload ->
+                  (match
+                     Journal_platform.decode_timeline_presented
+                       ~account_generation
+                       ~graph_generation
+                       ~presentation_generation
+                       payload
+                   with
+                   | Error _ -> Bonsai.Effect.Ignore
+                   | Ok () ->
+                     send_manager
+                       (Logseq_db_worker.Sync_manager.Timeline_presented
+                          { account_generation
+                          ; graph_generation
+                          ; presentation_generation
+                          })))))
+  in
+  Bonsai.Cont.Edge.on_change
+    ~equal:(Option.equal (fun (la, lg, lp) (ra, rg, rp) -> la = ra && lg = rg && lp = rp))
+    timeline_presentation_key
+    ~callback:timeline_presentation_callback
     graph;
   let timeline_drain_key =
     Bonsai.Cont.map state ~f:(fun state ->
@@ -2157,6 +2536,17 @@ let component client handlers graph =
               ~last_exclusive
           in
           update (fun state -> { state with timeline = observe state.timeline })
+        | Ui.Event.Payload.Scroll { pixels; delta } ->
+          update (fun state ->
+            let capture_fab_scroll =
+              Journal_timeline_state.update_capture_fab_scroll
+                state.capture_fab_scroll
+                ~pixels
+                ~delta
+            in
+            if capture_fab_scroll = state.capture_fab_scroll
+            then state
+            else { state with capture_fab_scroll })
         | Ui.Event.Payload.Native_event _ as payload ->
           (match
              Ui.Native_widget.Expandable_message_composer.event_of_payload payload
@@ -2185,21 +2575,56 @@ let component client handlers graph =
               send_manager (Logseq_db_worker.Sync_manager.Select_graph graph_id))
           else if String.equal action "refresh-catalog"
           then send_manager Logseq_db_worker.Sync_manager.Refresh_catalog
+          else if String.equal action "begin-online-recovery"
+          then send_manager Logseq_db_worker.Sync_manager.Begin_online_recovery
           else if String.equal action "open-account-menu"
-          then update (fun state -> { state with account_menu_open = true })
+          then update (fun state -> { state with modal = Account })
           else if String.equal action "close-account-menu"
-          then update (fun state -> { state with account_menu_open = false })
+          then update (fun state -> { state with modal = No_modal })
+          else if String.equal action "open-settings"
+          then update (fun state -> { state with modal = Settings })
+          else if String.equal action "close-settings"
+          then update (fun state -> { state with modal = No_modal })
+          else if
+            String.length action > 18 && String.sub action 0 18 = "select-typography:"
+          then (
+            let stored_value = String.sub action 18 (String.length action - 18) in
+            let preset =
+              Journal_visual_tokens.typography_preset_of_stored_value (Some stored_value)
+            in
+            if
+              (not
+                 (String.equal
+                    stored_value
+                    (Journal_visual_tokens.stored_value_of_typography_preset preset)))
+              || snapshot.typography_preset = Some preset
+            then Bonsai.Effect.Ignore
+            else
+              Bonsai.Effect.Many
+                [ update (fun state -> { state with typography_preset = Some preset })
+                ; Platform.request
+                    application_platform
+                    (Journal_platform.set_typography_preset_preference_request
+                       stored_value)
+                  |> Bonsai.Effect.bind ~f:(fun result ->
+                    match result with
+                    | Ok payload
+                      when Result.is_ok
+                             (Journal_platform.decode_set_typography_preset_preference
+                                payload) -> Bonsai.Effect.Ignore
+                    | Error _ | Ok _ -> Bonsai.Effect.Ignore)
+                ])
           else if String.equal action "switch-graph"
           then
             Bonsai.Effect.Many
-              [ update (fun state -> { state with account_menu_open = false })
+              [ update (fun state -> { state with modal = No_modal })
               ; send_manager Logseq_db_worker.Sync_manager.Return_to_graph_picker
               ]
           else if String.equal action "sign-out"
           then (
             sign_out_in_flight := true;
             Bonsai.Effect.Many
-              [ update (fun state -> { state with account_menu_open = false })
+              [ update (fun state -> { state with modal = No_modal })
               ; send_manager Logseq_db_worker.Sync_manager.Signed_out_command
               ])
           else if String.equal action "submit-e2ee-password"
@@ -2225,21 +2650,18 @@ let component client handlers graph =
             update (fun state ->
               match state.manager with
               | Some { selected_graph = Some graph_id; _ } ->
-                { state with
-                  cache_reset_confirmation = Some graph_id
-                ; account_menu_open = false
-                }
+                { state with modal = Cache_reset_confirmation graph_id }
               | None | Some _ -> state)
           else if String.equal action "cancel-local-cache-reset"
-          then update (fun state -> { state with cache_reset_confirmation = None })
+          then update (fun state -> { state with modal = No_modal })
           else if String.equal action "confirm-local-cache-reset"
           then (
-            match snapshot.cache_reset_confirmation with
-            | None -> Bonsai.Effect.Ignore
-            | Some graph_id ->
+            match snapshot.modal with
+            | No_modal | Account | Settings -> Bonsai.Effect.Ignore
+            | Cache_reset_confirmation graph_id ->
               Bonsai.Effect.Many
                 [ send_manager (Logseq_db_worker.Sync_manager.Delete_local_cache graph_id)
-                ; update (fun state -> { state with cache_reset_confirmation = None })
+                ; update (fun state -> { state with modal = No_modal })
                 ])
           else if String.equal action "delete-undo"
           then (
@@ -2414,12 +2836,13 @@ let component client handlers graph =
         | Unit
         | Bool _
         | Int64 _
+        | Int64_list _
         | Float _
         | Float_range _
         | Tap _
         | Pointer _
-        | Key _
-        | Scroll _ -> Bonsai.Effect.Ignore)
+        | Key _ ->
+          Bonsai.Effect.Ignore)
   in
   let snack_bar_cancellation : Bonsai_flutter.Host_effect.Cancellation.t option ref =
     ref None
@@ -2489,9 +2912,14 @@ let component client handlers graph =
       || environment.disable_animations
       || environment.accessible_navigation
     in
+    let preset =
+      Option.value state.typography_preset ~default:Journal_visual_tokens.Balanced
+    in
+    let typography = Journal_visual_tokens.typography preset in
     let tokens = Journal_visual_tokens.resolve ~high_contrast:environment.high_contrast in
     let profile =
       Journal_visual_tokens.select_row_profile
+        ~preset
         ~viewport_width:environment.viewport_width
         ~text_scale:environment.text_scale
     in
@@ -2502,7 +2930,7 @@ let component client handlers graph =
     in
     let root =
       match state.graph_ready, state.manager with
-      | false, Some _ -> manager_page state dispatch
+      | false, Some _ -> manager_page ~typography state dispatch
       | false, None | true, _ ->
         let content_horizontal_inset =
           Float.max
@@ -2512,6 +2940,7 @@ let component client handlers graph =
         in
         timeline_page
           ~tokens
+          ~typography
           ~profile
           ~text_scale:environment.text_scale
           ~top_inset:environment.safe_area.top
@@ -2540,13 +2969,16 @@ let component client handlers graph =
              && not capture_saving)
           ~capture_saving
           ~capture_affordance_key:state.capture_affordance_key
+          ~capture_fab_presentation:
+            (Journal_timeline_state.capture_fab_presentation state.capture_fab_scroll)
           ~on_capture_event:dispatch
+          ~on_scroll:dispatch
           ~on_visible_range:dispatch
           ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
           ~delete_enabled:(state.write_enabled && Option.is_none state.pending_delete)
           ~on_delete:(prefix_action dispatch "timeline-delete:")
           ~on_cache_reset_requested:(bind_action dispatch "request-local-cache-reset")
-          ~account_menu_available:(Option.is_some state.manager)
+          ~account_menu_available:true
           ~on_account_menu:(bind_action dispatch "open-account-menu")
     in
     let pages =
@@ -2554,54 +2986,82 @@ let component client handlers graph =
       | Journal_routes.Timeline -> [ root ]
       | Detail_loading ->
         [ root
-        ; message_page ~page_key:"journal-detail-loading" ~title:"Loading entry" dispatch
+        ; message_page
+            ~typography
+            ~page_key:"journal-detail-loading"
+            ~title:"Loading entry"
+            dispatch
         ]
       | Detail ->
         (match Journal_routes.detail state.routes with
          | Some detail ->
-           [ root; detail_page detail dispatch ]
+           [ root; detail_page ~typography detail dispatch ]
            @
            if Journal_detail.mode detail = Journal_detail.Confirm_discard
-           then [ detail_discard_dialog_page ~tokens ~reduced_motion dispatch ]
+           then
+             [ detail_discard_dialog_page ~tokens ~typography ~reduced_motion dispatch ]
            else []
          | None -> [ root ])
       | Missing_detail ->
         [ root
         ; message_page
+            ~typography
             ~page_key:"journal-detail-missing"
             ~title:"Entry unavailable"
             dispatch
         ]
     in
     let pages =
-      match state.cache_reset_confirmation, state.account_menu_open with
-      | Some _, _ ->
-        pages @ [ local_cache_reset_dialog_page ~tokens ~reduced_motion dispatch ]
-      | None, true ->
+      match state.modal with
+      | Cache_reset_confirmation _ ->
+        pages
+        @ [ local_cache_reset_dialog_page ~tokens ~typography ~reduced_motion dispatch ]
+      | Account ->
         let cache_reset_available =
           match state.manager with
           | Some { selected_graph = Some _; _ } -> true
           | None | Some _ -> false
         in
         pages
-        @ [ account_dialog_page ~tokens ~reduced_motion ~cache_reset_available dispatch ]
-      | None, false -> pages
+        @ [ account_dialog_page
+              ~tokens
+              ~typography
+              ~reduced_motion
+              ~cache_reset_available
+              dispatch
+          ]
+      | Settings ->
+        pages
+        @ [ settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch ]
+      | No_modal -> pages
     in
     let body =
-      Ui.Widget.navigator
-        ~key:(Ui.Key.string "journal-navigator")
-        ~restoration_scope_id:
-          (ID.Navigation.Restoration_scope_id.of_string "logseq-journal")
-        ~on_pop:dispatch
-        pages
-      |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-navigator")
+      match state.typography_preset with
+      | None ->
+        Ui.Widget.empty ()
+        |> Ui.Widget.with_test_id (Ui.Test_id.string "typography-preference-loading")
+      | Some _ ->
+        Ui.Widget.navigator
+          ~key:(Ui.Key.string "journal-navigator")
+          ~restoration_scope_id:
+            (ID.Navigation.Restoration_scope_id.of_string "logseq-journal")
+          ~on_pop:dispatch
+          pages
+        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-navigator")
     in
-    App.View.create ~theme:application_theme ~body)
+    App.View.create ~theme:(application_theme preset) ~body)
 ;;
 
 let decode_config payload =
   match Journal_startup.decode payload with
-  | Ok startup -> Ok startup
+  | Ok startup ->
+    (match startup.Logseq_db_worker.Config.target with
+     | Managed_sync { base_url } ->
+       managed_sync_startup := true;
+       managed_sync_origin := base_url
+     | Snapshot _ | Import_snapshot _ | Synced_graph _ | Native_local_graph _ ->
+       managed_sync_startup := false);
+    Ok startup
   | Error error -> Error (Journal_startup.Error.to_string error)
 ;;
 

@@ -10,10 +10,17 @@ let text_style token =
     ()
 ;;
 
-let day_heading ~profile ~rtl ~sort_key ~label (page : Journal_graph_projection.page) =
+let day_heading
+      ~typography
+      ~profile
+      ~rtl
+      ~sort_key
+      ~label
+      (page : Journal_graph_projection.page)
+  =
   Ui.Widget.text
     ~key:(Ui.Key.string ("journal-day-heading:" ^ string_of_int page.day))
-    ~style:(text_style Tokens.typography.supporting)
+    ~style:(text_style typography.Tokens.supporting)
     ~max_lines:1
     ~overflow:Ui.Style.Text_overflow.Ellipsis
     label
@@ -36,10 +43,10 @@ let day_heading ~profile ~rtl ~sort_key ~label (page : Journal_graph_projection.
        (Ui.Test_id.string ("journal-day-heading:" ^ string_of_int page.day))
 ;;
 
-let continuation ~key ~label =
+let continuation ~typography ~key ~label =
   Ui.Widget.text
     ~key:(Ui.Key.string key)
-    ~style:(text_style Tokens.typography.supporting)
+    ~style:(text_style typography.Tokens.supporting)
     ~max_lines:1
     label
   |> Ui.Widget.center
@@ -83,11 +90,11 @@ let delete_action_divider ~device_pixel_ratio ~edge block =
   |> Ui.Widget.sized_box ~height:thickness
 ;;
 
-let delete_action ~tokens ~device_pixel_ratio block =
+let delete_action ~tokens ~typography ~device_pixel_ratio block =
   let colors = Tokens.destructive_swipe_action tokens in
   let label =
     Ui.Widget.text
-      ~style:(text_style Tokens.typography.supporting)
+      ~style:(text_style typography.Tokens.supporting)
       ~max_lines:1
       ~text_align:Ui.Style.Text_align.Center
       "Delete"
@@ -128,14 +135,14 @@ let delete_action ~tokens ~device_pixel_ratio block =
     ()
 ;;
 
-let delete_action_pane ~tokens ~device_pixel_ratio block =
+let delete_action_pane ~tokens ~typography ~device_pixel_ratio block =
   Ui.Native_widget.Slidable.action_pane
     ~extent_ratio:0.25
     ~motion:Ui.Native_widget.Slidable.Behind
     ~drag_dismissible:false
     ~open_threshold:0.125
     ~close_threshold:0.125
-    ~actions:[ delete_action ~tokens ~device_pixel_ratio block ]
+    ~actions:[ delete_action ~tokens ~typography ~device_pixel_ratio block ]
     ()
 ;;
 
@@ -165,7 +172,7 @@ let should_show_timestamp ~today ~previous_slot = function
   | Timeline.Feed_continuation _ -> false
 ;;
 
-let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
+let child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key =
   let geometry = Tokens.preview_geometry in
   let leading_delta =
     if profile.Tokens.content_leading < 32. then geometry.narrow_leading_delta else 0.
@@ -207,7 +214,7 @@ let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
     List.mapi
       (fun index line ->
          Ui.Widget.text
-           ~style:(text_style Tokens.typography.supporting)
+           ~style:(text_style typography.Tokens.supporting)
            ~max_lines:1
            ~overflow:Ui.Style.Text_overflow.Ellipsis
            ~text_align:Ui.Style.Text_align.Start
@@ -305,6 +312,7 @@ let child_preview ~tokens ~profile ~rtl ~block ~sort_key =
 
 let render_slot
       ~tokens
+      ~typography
       ~profile
       ~device_pixel_ratio
       ~rtl
@@ -318,7 +326,13 @@ let render_slot
       ~sort_base
   = function
   | Timeline.Day_heading page ->
-    day_heading ~profile ~rtl ~sort_key:sort_base ~label:(day_label page.day) page
+    day_heading
+      ~typography
+      ~profile
+      ~rtl
+      ~sort_key:sort_base
+      ~label:(day_label page.day)
+      page
   | Timeline.Top_level entry ->
     let block = entry.block in
     let id = Journal_model.id block in
@@ -326,6 +340,7 @@ let render_slot
     let row =
       Journal_row.view
         ~tokens
+        ~typography
         ~profile
         ~device_pixel_ratio
         ~rtl
@@ -353,7 +368,8 @@ let render_slot
         Ui.Native_widget.Slidable.create_with_handler
           ~key:(Ui.Key.string ("journal-row-slidable:" ^ id))
           ~group_tag:"journal-timeline"
-          ~end_action_pane:(delete_action_pane ~tokens ~device_pixel_ratio block)
+          ~end_action_pane:
+            (delete_action_pane ~tokens ~typography ~device_pixel_ratio block)
           ~content:surface
           ~on_event:(for_slidable on_delete id)
           ()
@@ -376,25 +392,28 @@ let render_slot
            (Ui.Event.Handler.create ~name:("journal-row-focus-change:" ^ id) (fun _ -> ()))
     |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-focus:" ^ id))
   | Timeline.Child_preview { block; _ } ->
-    child_preview ~tokens ~profile ~rtl ~block ~sort_key:sort_base
+    child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key:sort_base
   | Timeline.Day_continuation { day; _ } ->
     continuation
+      ~typography
       ~key:("journal-day-continuation:" ^ string_of_int day)
       ~label:"Loading more journal entries"
     |> Ui.Widget.sized_box ~height:profile.continuation_extent
   | Timeline.Children_loading { parent_id; _ } ->
     continuation
+      ~typography
       ~key:("journal-children-loading:" ^ parent_id)
       ~label:"Loading direct child blocks"
     |> Ui.Widget.sized_box ~height:(Tokens.fixed_extent ~profile Tokens.Children_loading)
   | Timeline.Children_more { parent_id } ->
-    continuation ~key:("journal-children-more:" ^ parent_id) ~label:"More"
+    continuation ~typography ~key:("journal-children-more:" ^ parent_id) ~label:"More"
     |> Ui.Widget.semantics
          ~properties:
            (Ui.Semantics.create ~label:"More direct child blocks are not shown" ())
     |> Ui.Widget.sized_box ~height:(Tokens.fixed_extent ~profile Tokens.Children_more)
   | Timeline.Feed_continuation { before_day } ->
     continuation
+      ~typography
       ~key:("journal-feed-continuation:" ^ string_of_int before_day)
       ~label:"Loading older journal days"
     |> Ui.Widget.sized_box ~height:profile.continuation_extent
@@ -408,16 +427,16 @@ let transition ~reduced_motion:_ =
     ()
 ;;
 
-let empty_view () =
-  Ui.Widget.text ~style:(text_style Tokens.typography.supporting) "No journal entries yet"
+let empty_view ~typography () =
+  Ui.Widget.text ~style:(text_style typography.Tokens.supporting) "No journal entries yet"
   |> Ui.Widget.center
   |> Ui.Widget.semantics
        ~properties:
          (Ui.Semantics.create ~label:"No journal entries yet" ~live_region:true ())
 ;;
 
-let loading_view () =
-  Ui.Widget.text ~style:(text_style Tokens.typography.supporting) "Loading journal"
+let loading_view ~typography () =
+  Ui.Widget.text ~style:(text_style typography.Tokens.supporting) "Loading journal"
   |> Ui.Widget.center
   |> Ui.Widget.semantics
        ~properties:(Ui.Semantics.create ~label:"Loading journal" ~live_region:true ())
@@ -425,6 +444,7 @@ let loading_view () =
 
 let view
       ~tokens
+      ~typography
       ~profile
       ~device_pixel_ratio
       ~end_padding
@@ -440,7 +460,7 @@ let view
   let window = Timeline.current_window state in
   match window.slots with
   | [] ->
-    Ui.Widget.Sliver.fill (empty_view ())
+    Ui.Widget.Sliver.fill (empty_view ~typography ())
     |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
   | slots ->
     let geometry = Timeline.extent_geometry state ~profile in
@@ -459,6 +479,7 @@ let view
           let item =
             render_slot
               ~tokens
+              ~typography
               ~profile
               ~device_pixel_ratio
               ~rtl

@@ -16,9 +16,17 @@ type typography =
   ; header_subtitle : text_token
   ; entry : text_token
   ; supporting : text_token
-  ; disclosure : text_token
   ; timestamp : text_token
+  ; input : text_token
+  ; button_label : text_token
+  ; dialog_title : text_token
+  ; manager_title : text_token
   }
+
+type typography_preset =
+  | Dense
+  | Balanced
+  | Comfortable
 
 type spacing =
   { x1 : float
@@ -90,7 +98,9 @@ type fixed_extent_role =
 type t
 
 val resolve : high_contrast:bool -> t
-val typography : typography
+val typography : typography_preset -> typography
+val typography_preset_of_stored_value : string option -> typography_preset
+val stored_value_of_typography_preset : typography_preset -> string
 val spacing : spacing
 val hit_regions : hit_regions
 val header_geometry : header_geometry
@@ -100,7 +110,13 @@ val preview_geometry : preview_geometry
 val motion : reduced_motion:bool -> motion
 val physical_divider_thickness : device_pixel_ratio:float -> float
 val timeline_max_width : float
-val select_row_profile : viewport_width:float -> text_scale:float -> row_profile
+
+val select_row_profile
+  :  preset:typography_preset
+  -> viewport_width:float
+  -> text_scale:float
+  -> row_profile
+
 val block_extent : profile:row_profile -> visible_lines:int -> float
 val fixed_extent : profile:row_profile -> fixed_extent_role -> float
 val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option

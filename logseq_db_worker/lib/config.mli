@@ -9,7 +9,8 @@ type synced_bootstrap =
   }
 
 type synced_e2ee =
-  { user_id : string
+  { managed_sync_origin : Uri.t
+  ; user_id : string
   ; encrypted_graph_key : string
   }
 

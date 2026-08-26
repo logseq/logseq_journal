@@ -8,7 +8,8 @@ type synced_bootstrap =
   }
 
 type synced_e2ee =
-  { user_id : string
+  { managed_sync_origin : Uri.t
+  ; user_id : string
   ; encrypted_graph_key : string
   }
 
@@ -78,8 +79,10 @@ let valid_display_name value =
 
 let valid_e2ee = function
   | None -> true
-  | Some { user_id; encrypted_graph_key } ->
-    valid_display_name user_id
+  | Some { managed_sync_origin; user_id; encrypted_graph_key } ->
+    Uri.scheme managed_sync_origin = Some "https"
+    && Option.is_some (Uri.host managed_sync_origin)
+    && valid_display_name user_id
     && String.length encrypted_graph_key > 0
     && String.length encrypted_graph_key <= 65_536
     && String.is_valid_utf_8 encrypted_graph_key
@@ -189,6 +192,7 @@ let target_to_yojson = function
           | Some e2ee ->
             `Assoc
               [ "encryptedGraphKey", `String e2ee.encrypted_graph_key
+              ; "managedSyncOrigin", `String (Uri.to_string e2ee.managed_sync_origin)
               ; "userId", `String e2ee.user_id
               ] )
       ; "kind", `String "syncedGraph"
@@ -264,13 +268,22 @@ let target_of_yojson = function
        let e2ee =
          match e2ee with
          | Some `Null -> Ok None
-         | Some (`Assoc fields) when exact_fields [ "encryptedGraphKey"; "userId" ] fields
-           ->
+         | Some (`Assoc fields)
+           when exact_fields [ "encryptedGraphKey"; "managedSyncOrigin"; "userId" ] fields ->
            (match
-              List.assoc_opt "userId" fields, List.assoc_opt "encryptedGraphKey" fields
+              ( List.assoc_opt "managedSyncOrigin" fields
+              , List.assoc_opt "userId" fields
+              , List.assoc_opt "encryptedGraphKey" fields )
             with
-            | Some (`String user_id), Some (`String encrypted_graph_key) ->
-              Ok (Some { user_id; encrypted_graph_key })
+            | ( Some (`String managed_sync_origin)
+              , Some (`String user_id)
+              , Some (`String encrypted_graph_key) ) ->
+              Ok
+                (Some
+                   { managed_sync_origin = Uri.of_string managed_sync_origin
+                   ; user_id
+                   ; encrypted_graph_key
+                   })
             | _ -> Error "invalid synced E2EE configuration")
          | _ -> Error "invalid synced E2EE configuration"
        in

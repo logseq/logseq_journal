@@ -10,7 +10,8 @@ module Context : sig
 end
 
 val sliver
-  :  text_scale:float
+  :  typography:Journal_visual_tokens.typography
+  -> text_scale:float
   -> top_inset:float
   -> device_pixel_ratio:float
   -> context:Context.t
