@@ -1,7 +1,0 @@
-(library
- (name logseq_db_worker_sync_spec)
- (public_name logseq_db_worker.sync_spec)
- (wrapped false)
- (virtual_modules sync_action sync_startup_phase)
- (default_implementation logseq_db_worker_sync_impl)
- (libraries uri yojson))

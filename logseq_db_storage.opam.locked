@@ -1,0 +1,51 @@
+opam-version: "2.0"
+name: "logseq_db_storage"
+version: "0.1.0"
+synopsis: "Logseq DataScript and SQLite storage"
+maintainer: "application authors"
+authors: "application authors"
+license: "MIT"
+homepage: "https://github.com/RCmerci/logseq_journal"
+bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
+depends: [
+  "datascript-ocaml-native" {= "dev"}
+  "datascript_ocaml" {= "dev"}
+  "dune" {= "3.23.1"}
+  "logseq_db_types" {= "0.1.0"}
+  "melange-transit-native" {= "0.1.0"}
+  "ocaml" {= "5.1.1"}
+  "persistent_sorted_set_ocaml" {= "dev"}
+  "sqlite3" {= "5.4.0"}
+  "yojson" {= "3.0.0"}
+]
+build: ["dune" "build" "-p" name "-j" jobs]
+pin-depends: [
+  [
+    "datascript-ocaml-native.dev"
+    "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"
+  ]
+  [
+    "datascript_ocaml.dev"
+    "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"
+  ]
+  [
+    "melange-edn-core.0.5.0"
+    "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
+  ]
+  [
+    "melange-edn-native.0.5.0"
+    "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
+  ]
+  [
+    "melange-transit-core.0.1.0"
+    "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"
+  ]
+  [
+    "melange-transit-native.0.1.0"
+    "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"
+  ]
+  [
+    "persistent_sorted_set_ocaml.dev"
+    "git+https://github.com/logseq/persistent-sorted-set-ocaml.git#4016dae1cdf4304207d8277ff9957656cdd8b177"
+  ]
+]

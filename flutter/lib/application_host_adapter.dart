@@ -472,8 +472,6 @@ abstract final class JournalPlatformCodec {
           'catalogDiscovery',
           'snapshotBootstrap',
           'e2eeKeyAccess',
-          'httpPull',
-          'transactionSubmission',
           'websocketConnect',
         }).contains(decoded['purpose'])) {
       throw const FormatException('invalid ID-token request');
@@ -731,12 +729,16 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
         JournalStartupTimeline.mark(
           JournalStartupMilestone.firstIdTokenRequested,
         );
+        late final String token;
+        try {
+          token = await auth.freshIdToken();
+        } on SignedOutException {
+          await clearLocalAccountBinding();
+          rethrow;
+        }
         return JournalPlatformCodec.encodeJson(
           JournalPlatformTag.idTokenResponse,
-          <String, Object>{
-            'challengeId': decoded.challengeId,
-            'token': await auth.freshIdToken(),
-          },
+          <String, Object>{'challengeId': decoded.challengeId, 'token': token},
         );
       case 10:
         JournalPlatformCodec.validateEmpty(
@@ -818,31 +820,17 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
           },
         );
       case 22:
-        final decoded = JournalPlatformCodec.decodeJsonRequest(
+        JournalPlatformCodec.validateEmpty(
           request,
           JournalPlatformTag.timelinePresentedRequest,
         );
-        const generationKeys = <String>{
-          'accountGeneration',
-          'graphGeneration',
-          'presentationGeneration',
-        };
-        if (decoded.keys.toSet().difference(generationKeys).isNotEmpty ||
-            decoded.length != generationKeys.length ||
-            generationKeys.any(
-              (key) => decoded[key] is! int || (decoded[key]! as int) < 0,
-            )) {
-          throw const FormatException(
-            'Timeline presentation request is invalid',
-          );
-        }
         await waitForPresentationFrame();
         JournalStartupTimeline.mark(
           JournalStartupMilestone.timelineFramePresented,
         );
         return JournalPlatformCodec.encodeJson(
           JournalPlatformTag.timelinePresentedResponse,
-          <String, Object>{...decoded, 'presented': true},
+          <String, Object>{'presented': true},
         );
       default:
         throw const FormatException('unsupported application platform request');

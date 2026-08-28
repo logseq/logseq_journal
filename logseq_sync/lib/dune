@@ -1,0 +1,91 @@
+(include_subdirs unqualified)
+
+(library
+ (name logseq_sync_impl)
+ (public_name logseq_sync.impl)
+ (implements logseq_sync)
+ (modules
+  action
+  artifact_decoder
+  auth
+  bootstrap
+  catalog
+  catalog_store
+  checksum
+  api
+  e2ee
+  e2ee_session
+  graph_key
+  http
+  http_eio
+  manager
+  mirror
+  network_scope
+  pending
+  platform_crypto
+  protocol
+  replay
+  snapshot
+  startup_phase
+  state
+  tx
+  tx_encoder
+  websocket
+  websocket_eio)
+ (private_modules
+  action
+  artifact_decoder
+  auth
+  bootstrap
+  catalog
+  catalog_store
+  checksum
+  e2ee
+  e2ee_session
+  graph_key
+  http
+  http_eio
+  manager
+  mirror
+  network_scope
+  pending
+  platform_crypto
+  protocol
+  replay
+  snapshot
+  startup_phase
+  state
+  tx
+  tx_encoder
+  websocket
+  websocket_eio)
+ (libraries
+  bigstringaf
+  ca-certs-nss
+  cstruct
+  datascript-ocaml-native
+  datascript_ocaml
+  digestif
+  domain-name
+  eio
+  eio.unix
+  faraday
+  httpun
+  httpun-eio
+  httpun-ws
+  logseq_db_storage
+  logseq_db_types
+  melange-transit-native
+  mirage-crypto-rng
+  mirage-crypto-rng.unix
+  sqlite3
+  tls-eio
+  unix
+  uri
+  uutf
+  yojson)
+ (flags
+  (:standard -open Logseq_db_types -open Logseq_db_storage))
+ (foreign_stubs
+  (language c)
+  (names platform_crypto_stubs gzip_stubs)))

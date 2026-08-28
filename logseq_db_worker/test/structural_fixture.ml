@@ -1,5 +1,5 @@
 module T = Test_support
-module Uuid = Logseq_db_worker.Graph_types.Uuid
+module Uuid = Logseq_db_types.Graph_types.Uuid
 
 let page_one = "10000000-0000-4000-8000-000000000001"
 let page_two = "10000000-0000-4000-8000-000000000002"
@@ -80,8 +80,7 @@ let schema =
     , schema_attr ~indexed:true ~value_type:Datascript.RefType () )
   ; ( "block/closed-value-property"
     , schema_attr ~indexed:true ~value_type:Datascript.RefType () )
-  ; ( "user.property/example"
-    , schema_attr ~indexed:true ~value_type:Datascript.RefType () )
+  ; "user.property/example", schema_attr ~indexed:true ~value_type:Datascript.RefType ()
   ]
 ;;
 
@@ -181,9 +180,8 @@ let integer db entity attr =
 ;;
 
 let context db =
-  Logseq_db_worker.Protocol.
+  Logseq_db_types.Mutation.
     { mutation_id = uuid mutation
-    ; expected_basis =
-        Int64.of_int (Datascript.serializable db).serializable_max_tx
+    ; expected_basis = Int64.of_int (Datascript.serializable db).serializable_max_tx
     }
 ;;

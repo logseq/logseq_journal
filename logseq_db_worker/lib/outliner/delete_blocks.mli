@@ -4,5 +4,5 @@ val plan
   :  now_ms:int64
   -> Datascript.db
   -> roots:Graph_types.block_uuid list
-  -> context:Protocol.mutation_context
+  -> context:Logseq_db_types.Mutation.context
   -> (t, error) result

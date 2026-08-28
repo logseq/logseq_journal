@@ -1,5 +1,5 @@
 module T = Logseq_db_worker_test_support.Test_support
-module Codec = Logseq_db_worker__Logseq_sqlite_codec
+module Codec = Logseq_db_storage.Logseq_sqlite_codec
 
 let oracle_root_content () =
   let open Yojson.Safe.Util in

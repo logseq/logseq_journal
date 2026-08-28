@@ -2,9 +2,43 @@ import Cocoa
 import Darwin
 import FlutterMacOS
 
+protocol JournalApplicationActivationTarget {
+  func activateIgnoringOtherApps()
+  func makeMainWindowKeyAndVisible()
+}
+
+struct JournalCocoaApplicationActivationTarget: JournalApplicationActivationTarget {
+  let application: NSApplication
+
+  func activateIgnoringOtherApps() {
+    application.activate(ignoringOtherApps: true)
+  }
+
+  func makeMainWindowKeyAndVisible() {
+    application.windows
+      .compactMap { $0 as? MainFlutterWindow }
+      .first?
+      .makeKeyAndOrderFront(nil)
+  }
+}
+
+enum JournalApplicationStartup {
+  static func activate(_ target: JournalApplicationActivationTarget) {
+    target.activateIgnoringOtherApps()
+    target.makeMainWindowKeyAndVisible()
+  }
+}
+
 @main
 class AppDelegate: FlutterAppDelegate {
   private var terminationPending = false
+
+  override func applicationDidFinishLaunching(_ notification: Notification) {
+    super.applicationDidFinishLaunching(notification)
+    JournalApplicationStartup.activate(
+      JournalCocoaApplicationActivationTarget(application: NSApplication.shared)
+    )
+  }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     return true

@@ -1,4 +1,4 @@
-module Graph = Logseq_db_worker.Graph_types
+module Graph = Logseq_db_types.Graph_types
 
 type page =
   { id : string

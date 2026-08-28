@@ -7,6 +7,7 @@ import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart
 import 'package:bonsai_flutter_logseq_journal_host/main.dart';
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:amplify_authenticator/amplify_authenticator.dart';
+import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 // ignore: depend_on_referenced_packages
@@ -47,6 +48,21 @@ final class _Auth implements JournalAuthCapability {
   }
 }
 
+final class _TokenFailureAuth implements JournalAuthCapability {
+  _TokenFailureAuth(this.error);
+
+  final Object error;
+
+  @override
+  Future<String?> currentUserId() async => 'cognito-user-1';
+
+  @override
+  Future<String> freshIdToken() async => throw error;
+
+  @override
+  Future<void> signOut() async {}
+}
+
 Future<String?> _readBalancedPreference(String key) async {
   expect(key, 'typographyPreset');
   return 'balanced';
@@ -56,6 +72,25 @@ Future<void> _writePreference(String key, String value) async {
   expect(key, 'typographyPreset');
   expect(value, anyOf('dense', 'balanced', 'comfortable'));
 }
+
+ApplicationHostAdapter _localBindingAdapter({
+  required JournalAuthCapability auth,
+  required Future<void> amplifyReady,
+  required Future<void> Function() clearLocalAccountBinding,
+}) => ApplicationHostAdapter(
+  applicationSupportDirectory: () async => Directory.systemTemp,
+  baseUrl: Uri.parse('https://api.example.test'),
+  initialCalendarSnapshot: () async => sampleCalendar,
+  liveCalendarSnapshot: () async => sampleCalendar,
+  formatJournalDays: ({required snapshot, required days}) async => {},
+  auth: auth,
+  readPreference: _readBalancedPreference,
+  writePreference: _writePreference,
+  readLocalAccountBinding: () async =>
+      (userId: 'local-user-1', managedSyncOrigin: 'https://api.example.test'),
+  clearLocalAccountBinding: clearLocalAccountBinding,
+  amplifyReady: amplifyReady,
+);
 
 final class _PendingHostAdapter implements BonsaiFlutterHostAdapter {
   final Completer<Uint8List> payload = Completer<Uint8List>();
@@ -220,6 +255,97 @@ void main() {
       );
       await tester.pump();
 
+      expect(find.text('Local Timeline'), findsOneWidget);
+      expect(find.byType(Authenticator), findsNothing);
+      expect(configuration.isCompleted, isFalse);
+    },
+  );
+
+  testWidgets(
+    'signed-out token request clears stale binding and restores the authentication gate',
+    (tester) async {
+      final configuration = Completer<void>();
+      var clears = 0;
+      final adapter = _localBindingAdapter(
+        auth: _TokenFailureAuth(
+          const SignedOutException('Authentication is required'),
+        ),
+        amplifyReady: configuration.future,
+        clearLocalAccountBinding: () async {
+          clears += 1;
+        },
+      );
+      final platform =
+          adapter.createApplicationPlatform() as JournalApplicationPlatform;
+      addTearDown(platform.dispose);
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (context) => adapter.buildHost(
+            context: context,
+            child: const Text('Local Timeline'),
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(find.text('Local Timeline'), findsOneWidget);
+
+      await expectLater(
+        platform.handleRequest(
+          request(JournalPlatformTag.idTokenRequest, {
+            'challengeId': 'challenge-1',
+            'purpose': 'e2eeKeyAccess',
+          }),
+        ),
+        throwsA(isA<SignedOutException>()),
+      );
+      await tester.pump();
+
+      expect(clears, 1);
+      expect(find.text('Local Timeline'), findsNothing);
+      expect(find.byType(Authenticator), findsNothing);
+      expect(configuration.isCompleted, isFalse);
+    },
+  );
+
+  testWidgets(
+    'non-auth token failure preserves the offline binding and local application',
+    (tester) async {
+      final configuration = Completer<void>();
+      var clears = 0;
+      final adapter = _localBindingAdapter(
+        auth: _TokenFailureAuth(StateError('temporary token failure')),
+        amplifyReady: configuration.future,
+        clearLocalAccountBinding: () async {
+          clears += 1;
+        },
+      );
+      final platform =
+          adapter.createApplicationPlatform() as JournalApplicationPlatform;
+      addTearDown(platform.dispose);
+
+      await tester.pumpWidget(
+        Builder(
+          builder: (context) => adapter.buildHost(
+            context: context,
+            child: const Text('Local Timeline'),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      await expectLater(
+        platform.handleRequest(
+          request(JournalPlatformTag.idTokenRequest, {
+            'challengeId': 'challenge-1',
+            'purpose': 'e2eeKeyAccess',
+          }),
+        ),
+        throwsA(isA<StateError>()),
+      );
+      await tester.pump();
+
+      expect(clears, 0);
       expect(find.text('Local Timeline'), findsOneWidget);
       expect(find.byType(Authenticator), findsNothing);
       expect(configuration.isCompleted, isFalse);
@@ -546,19 +672,8 @@ void main() {
       expect(auth.currentUserRequests, 0);
       expect(auth.tokenRequests, 0);
 
-      final presented = await platform.handleRequest(
-        rawJsonRequest(22, {
-          'accountGeneration': 3,
-          'graphGeneration': 5,
-          'presentationGeneration': 7,
-        }),
-      );
-      expect(responseJson(presented), {
-        'accountGeneration': 3,
-        'graphGeneration': 5,
-        'presentationGeneration': 7,
-        'presented': true,
-      });
+      final presented = await platform.handleRequest(rawRequest(22));
+      expect(responseJson(presented), {'presented': true});
       expect(frameWaits, 1);
     },
   );

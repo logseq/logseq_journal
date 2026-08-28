@@ -1,10 +1,10 @@
 module Worker = Logseq_db_worker
 module Protocol = Worker.Protocol
 module Engine = Worker.Engine
-module Uuid = Worker.Graph_types.Uuid
+module Uuid = Logseq_db_types.Graph_types.Uuid
 module Snapshot = Logseq_db_worker__Snapshot
-module Storage = Logseq_db_worker__Logseq_sqlite_storage
-module Session = Logseq_db_worker__Storage_session
+module Storage = Logseq_db_storage.Logseq_sqlite_storage
+module Session = Logseq_db_storage.Storage_session
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 
 let block_count = 100_000
@@ -272,10 +272,6 @@ let dependencies =
             (fun () -> Int64.of_float (monotonic_seconds () *. 1_000_000_000.))
         }
     ; cursor_authentication_key = Bytes.of_string "performance-cursor-key-32-bytes!"
-    ; crypto = Worker.Sync_e2ee.unavailable_crypto
-    ; unlock_graph_key =
-        (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-          Error "crypto unavailable")
     }
 ;;
 
@@ -384,7 +380,7 @@ let boundedness engine =
     with
     | Succeeded { success = Page_tree_result page; _ } ->
       List.exists
-        (fun (item : Worker.Graph_types.block_tree_item) -> item.depth = 63)
+        (fun (item : Logseq_db_types.Graph_types.block_tree_item) -> item.depth = 63)
         page.items
     | _ -> false
   in

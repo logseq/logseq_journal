@@ -3,9 +3,7 @@
   "responses": [
     {"type":"succeeded","requestId":"00000000-0000-4000-8000-000000000001","basis":"100","success":{"type":"mutation","status":"applied","basisBefore":"99","basisAfter":"100","changedUuids":["10000000-0000-4000-8000-000000000001"],"changedUuidsTruncated":false}},
     {"type":"failed","requestId":"00000000-0000-4000-8000-000000000002","phase":"open","basis":null,"error":{"code":"unsupportedSchema","message":"Graph schema is older than 65.33.","details":[{"name":"minimum","value":{"type":"string","value":"65.33"}},{"name":"actual","value":{"type":"string","value":"65.32"}}]}},
-    {"type":"failed","requestId":"00000000-0000-4000-8000-000000000003","phase":"execute","basis":"100","error":{"code":"conflict","message":"The graph basis changed.","details":[{"name":"expectedBasis","value":{"type":"int64","value":"99"}},{"name":"actualBasis","value":{"type":"int64","value":"100"}}]}},
-    {"type":"succeeded","requestId":"00000000-0000-4000-8000-000000000004","basis":"101","success":{"type":"syncStatus","state":"active","appliedServerT":41,"checksum":"0123456789abcdef","lastError":null}},
-    {"type":"succeeded","requestId":"00000000-0000-4000-8000-000000000005","basis":"101","success":{"type":"sync","activity":"pullApplied","state":"active","appliedServerT":41,"checksum":"0123456789abcdef","lastError":null,"mutation":{"type":"mutation","status":"applied","basisBefore":"100","basisAfter":"101","changedUuids":["10000000-0000-4000-8000-000000000001"],"changedUuidsTruncated":false}}}
+    {"type":"failed","requestId":"00000000-0000-4000-8000-000000000003","phase":"execute","basis":"100","error":{"code":"conflict","message":"The graph basis changed.","details":[{"name":"expectedBasis","value":{"type":"int64","value":"99"}},{"name":"actualBasis","value":{"type":"int64","value":"100"}}]}}
   ],
   "pushes": [
     {"type":"graphInvalidated","basis":"100","changedUuids":["10000000-0000-4000-8000-000000000001"],"changedUuidsTruncated":false,"invalidateGraphInfo":false,"invalidatePages":false,"invalidateTags":false,"invalidateProperties":false,"invalidateTasks":false,"invalidateReferences":true}

@@ -26,13 +26,13 @@ let flatten roots =
   then Error Empty_roots
   else if List.length roots > Protocol.maximum_roots
   then Error Too_many_roots
-  else
+  else (
     let seen = ref Uuid_set.empty in
     let count = ref 0 in
     let rec visit parent_uuid depth sibling_index tree acc =
       if depth > Protocol.maximum_tree_depth
       then Error Too_deep
-      else if Uuid_set.mem tree.Protocol.uuid !seen
+      else if Uuid_set.mem tree.Logseq_db_types.Mutation.uuid !seen
       then Error (Duplicate_uuid tree.uuid)
       else (
         incr count;
@@ -41,12 +41,7 @@ let flatten roots =
         else (
           seen := Uuid_set.add tree.uuid !seen;
           let node =
-            { uuid = tree.uuid
-            ; title = tree.title
-            ; parent_uuid
-            ; depth
-            ; sibling_index
-            }
+            { uuid = tree.uuid; title = tree.title; parent_uuid; depth; sibling_index }
           in
           visit_children (Some tree.uuid) (depth + 1) 0 tree.children (node :: acc)))
     and visit_children parent_uuid depth sibling_index children acc =
@@ -59,5 +54,5 @@ let flatten roots =
     in
     match visit_children None 1 0 roots [] with
     | Error _ as error -> error
-    | Ok reversed -> Ok (List.rev reversed)
+    | Ok reversed -> Ok (List.rev reversed))
 ;;

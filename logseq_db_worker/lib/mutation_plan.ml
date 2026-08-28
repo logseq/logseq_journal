@@ -1,7 +1,7 @@
 include Outliner.Planner_contract
 
 let plan ~now_ms db = function
-  | Protocol.Structural (Save_block { block; title; context }) ->
+  | Logseq_db_types.Mutation.Structural (Save_block { block; title; context }) ->
     Outliner.Save_block.plan ~now_ms db ~block ~title ~context
   | Structural (Insert_blocks { roots; position; context }) ->
     Outliner.Insert_blocks.plan ~now_ms db ~roots ~position ~context

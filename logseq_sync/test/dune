@@ -1,0 +1,4 @@
+(test
+ (name test_sync)
+ (modules test_sync api_contract)
+ (libraries alcotest eio_main eio.unix logseq_db_types logseq_sync unix uri))

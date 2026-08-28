@@ -35,8 +35,8 @@ let random_uuid_string () =
       ~finally:(fun () -> close_in_noerr channel)
       (fun () -> really_input_string channel 16 |> Bytes.of_string)
   in
-  Bytes.set bytes 6 (Char.chr ((Char.code (Bytes.get bytes 6) land 0x0f) lor 0x40));
-  Bytes.set bytes 8 (Char.chr ((Char.code (Bytes.get bytes 8) land 0x3f) lor 0x80));
+  Bytes.set bytes 6 (Char.chr (Char.code (Bytes.get bytes 6) land 0x0f lor 0x40));
+  Bytes.set bytes 8 (Char.chr (Char.code (Bytes.get bytes 8) land 0x3f lor 0x80));
   let buffer = Buffer.create 36 in
   Bytes.iteri
     (fun index byte ->
@@ -57,12 +57,12 @@ let read_lock path =
     match Yojson.Safe.from_file path with
     | `Assoc fields when List.length fields = 6 ->
       (match
-         List.assoc_opt "repo" fields,
-         List.assoc_opt "pid" fields,
-         List.assoc_opt "lock-id" fields,
-         List.assoc_opt "owner-source" fields,
-         List.assoc_opt "owner-generation" fields,
-         List.assoc_opt "owner-protocol" fields
+         ( List.assoc_opt "repo" fields
+         , List.assoc_opt "pid" fields
+         , List.assoc_opt "lock-id" fields
+         , List.assoc_opt "owner-source" fields
+         , List.assoc_opt "owner-generation" fields
+         , List.assoc_opt "owner-protocol" fields )
        with
        | ( Some (`String repo)
          , Some (`Int pid)
@@ -105,13 +105,13 @@ let write_all fd value =
 let sentinel ~graph_name ~lock_id ~generation =
   Yojson.Safe.to_string
     (`Assoc
-       [ "repo", `String graph_name
-       ; "pid", `Int (Unix.getpid ())
-       ; "lock-id", `String lock_id
-       ; "owner-source", `String "unknown"
-       ; "owner-generation", `String generation
-       ; "owner-protocol", `Int 1
-       ])
+        [ "repo", `String graph_name
+        ; "pid", `Int (Unix.getpid ())
+        ; "lock-id", `String lock_id
+        ; "owner-source", `String "unknown"
+        ; "owner-generation", `String generation
+        ; "owner-protocol", `Int 1
+        ])
 ;;
 
 let release_owner_db owner_db =
@@ -157,7 +157,7 @@ let acquire ~target ~graph_dir =
     let graph_stat = Unix.stat graph_dir in
     if graph_stat.st_kind <> Unix.S_DIR
     then Error Identity_changed
-    else
+    else (
       match acquire_owner_db graph_dir with
       | Error _ as error -> error
       | Ok owner_db ->
@@ -170,7 +170,7 @@ let acquire ~target ~graph_dir =
         let inspect_existing () =
           if not (Sys.file_exists lock_path)
           then Ok ()
-          else
+          else (
             match read_lock lock_path with
             | None -> Error Invalid_sentinel
             | Some lock when not (String.equal lock.repo graph_name) ->
@@ -189,7 +189,7 @@ let acquire ~target ~graph_dir =
                    Unix.unlink lock_path;
                    Ok ())
                with
-               | Unix.Unix_error _ -> Error Ambiguous_stale_lock)
+               | Unix.Unix_error _ -> Error Ambiguous_stale_lock))
         in
         (match inspect_existing () with
          | Error error -> fail error
@@ -197,13 +197,10 @@ let acquire ~target ~graph_dir =
            let lock_id = random_uuid_string () in
            let generation = random_uuid_string () in
            (try
-              let fd =
-                Unix.openfile lock_path [ Unix.O_CREAT; O_EXCL; O_WRONLY ] 0o600
-              in
+              let fd = Unix.openfile lock_path [ Unix.O_CREAT; O_EXCL; O_WRONLY ] 0o600 in
               Fun.protect
                 ~finally:(fun () -> Unix.close fd)
-                (fun () ->
-                   write_all fd (sentinel ~graph_name ~lock_id ~generation));
+                (fun () -> write_all fd (sentinel ~graph_name ~lock_id ~generation));
               Ok
                 { graph_dir
                 ; lock_path
@@ -216,7 +213,7 @@ let acquire ~target ~graph_dir =
                 }
             with
             | Unix.Unix_error (Unix.EEXIST, _, _) -> fail Ambiguous_stale_lock
-            | Unix.Unix_error _ -> fail Identity_changed))
+            | Unix.Unix_error _ -> fail Identity_changed)))
   with
   | Unix.Unix_error _ -> Error Identity_changed
 ;;
@@ -224,30 +221,32 @@ let acquire ~target ~graph_dir =
 let revalidate owner =
   if owner.released
   then Error Not_owner
-  else
+  else (
     try
       let stat = Unix.stat owner.graph_dir in
       if stat.st_dev <> owner.graph_device || stat.st_ino <> owner.graph_inode
       then Error Identity_changed
-      else
+      else (
         match read_lock owner.lock_path with
         | Some lock
           when lock.pid = Unix.getpid ()
                && String.equal lock.repo (Filename.basename owner.graph_dir)
                && String.equal lock.lock_id owner.lock_id
                && String.equal lock.generation owner.generation ->
-          (match Sqlite3.exec owner.owner_db "SELECT protocol FROM owner_primitive LIMIT 1" with
+          (match
+             Sqlite3.exec owner.owner_db "SELECT protocol FROM owner_primitive LIMIT 1"
+           with
            | rc when Sqlite3.Rc.is_success rc -> Ok ()
            | _ -> Error Identity_changed)
-        | _ -> Error Identity_changed
+        | _ -> Error Identity_changed)
     with
-    | Unix.Unix_error _ | Sqlite3.SqliteError _ -> Error Identity_changed
+    | Unix.Unix_error _ | Sqlite3.SqliteError _ -> Error Identity_changed)
 ;;
 
 let release owner =
   if owner.released
   then Error Not_owner
-  else
+  else (
     let validation = revalidate owner in
     let unlink_result =
       match validation with
@@ -266,7 +265,7 @@ let release owner =
     in
     release_owner_db owner.owner_db;
     owner.released <- true;
-    unlink_result
+    unlink_result)
 ;;
 
 let generation owner = owner.generation

@@ -26,9 +26,7 @@ let create ~graph_dir ~owner =
      | Unix.Unix_error _ -> Error Io_error)
 ;;
 
-let marker_path t =
-  Filename.concat t.graph_dir ".logseq-db-worker.derived-sidecars.json"
-;;
+let marker_path t = Filename.concat t.graph_dir ".logseq-db-worker.derived-sidecars.json"
 
 let valid_generation generation =
   match Graph_types.Uuid.of_string generation with
@@ -45,9 +43,9 @@ let generation = function
 let parse_marker = function
   | `Assoc fields when List.length fields = 3 ->
     (match
-       List.assoc_opt "formatVersion" fields,
-       List.assoc_opt "ftsRequiredGeneration" fields,
-       List.assoc_opt "vectorRequiredGeneration" fields
+       ( List.assoc_opt "formatVersion" fields
+       , List.assoc_opt "ftsRequiredGeneration" fields
+       , List.assoc_opt "vectorRequiredGeneration" fields )
      with
      | Some (`Int 1), Some fts, Some vector ->
        (match generation fts, generation vector with
@@ -62,14 +60,14 @@ let read_marker t =
   let path = marker_path t in
   if not (Sys.file_exists path)
   then Ok { fts_generation = None; vector_generation = None }
-  else
+  else (
     try
       let stat = Unix.lstat path in
       if stat.st_kind <> Unix.S_REG || stat.st_nlink <> 1
       then Error Invalid_marker
       else parse_marker (Yojson.Safe.from_file path)
     with
-    | Unix.Unix_error _ | Sys_error _ | Yojson.Json_error _ -> Error Invalid_marker
+    | Unix.Unix_error _ | Sys_error _ | Yojson.Json_error _ -> Error Invalid_marker)
 ;;
 
 let status t =
@@ -85,8 +83,8 @@ let random_uuid_string () =
       ~finally:(fun () -> close_in_noerr channel)
       (fun () -> really_input_string channel 16 |> Bytes.of_string)
   in
-  Bytes.set bytes 6 (Char.chr ((Char.code (Bytes.get bytes 6) land 0x0f) lor 0x40));
-  Bytes.set bytes 8 (Char.chr ((Char.code (Bytes.get bytes 8) land 0x3f) lor 0x80));
+  Bytes.set bytes 6 (Char.chr (Char.code (Bytes.get bytes 6) land 0x0f lor 0x40));
+  Bytes.set bytes 8 (Char.chr (Char.code (Bytes.get bytes 8) land 0x3f lor 0x80));
   let buffer = Buffer.create 36 in
   Bytes.iteri
     (fun index byte ->
@@ -99,16 +97,16 @@ let random_uuid_string () =
 let marker_json status =
   Yojson.Safe.to_string
     (`Assoc
-       [ "formatVersion", `Int 1
-       ; ( "ftsRequiredGeneration"
-         , match status.fts_generation with
-           | None -> `Null
-           | Some generation -> `String generation )
-       ; ( "vectorRequiredGeneration"
-         , match status.vector_generation with
-           | None -> `Null
-           | Some generation -> `String generation )
-       ])
+        [ "formatVersion", `Int 1
+        ; ( "ftsRequiredGeneration"
+          , match status.fts_generation with
+            | None -> `Null
+            | Some generation -> `String generation )
+        ; ( "vectorRequiredGeneration"
+          , match status.vector_generation with
+            | None -> `Null
+            | Some generation -> `String generation )
+        ])
   ^ "\n"
 ;;
 
@@ -141,14 +139,14 @@ let write_marker t value =
              try Unix.close fd with
              | Unix.Unix_error _ -> ())
            (fun () -> write_all fd (Bytes.of_string (marker_json value)));
-         (match Ownership.revalidate t.owner with
-          | Error error -> Error (Ownership_error error)
-          | Ok () ->
-            Unix.rename temporary path;
-            fsync_directory t.graph_dir;
-            (match Ownership.revalidate t.owner with
-             | Ok () -> Ok ()
-             | Error error -> Error (Ownership_error error)))
+         match Ownership.revalidate t.owner with
+         | Error error -> Error (Ownership_error error)
+         | Ok () ->
+           Unix.rename temporary path;
+           fsync_directory t.graph_dir;
+           (match Ownership.revalidate t.owner with
+            | Ok () -> Ok ()
+            | Error error -> Error (Ownership_error error))
        with
        | Unix.Unix_error _ | Sys_error _ -> Error Io_error)
 ;;

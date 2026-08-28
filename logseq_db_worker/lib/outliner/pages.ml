@@ -55,7 +55,8 @@ let is_property db entity = has_tag_ident db entity "logseq.class/Property"
 
 let tx_meta context operation =
   [ ( "db-sync/tx-id"
-    , Datascript.Uuid (Graph_types.Uuid.to_string context.Protocol.mutation_id) )
+    , Datascript.Uuid
+        (Graph_types.Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   ; "outliner-op", Datascript.Keyword operation
   ; "local-tx?", Datascript.Bool true
   ]
@@ -84,13 +85,15 @@ let journal_uuid journal_day =
 let next_tx db = (Datascript.serializable db).serializable_max_tx + 1
 
 let tag_for_kind db = function
-  | Protocol.Create_ordinary_page _ -> entity_by_ident db "logseq.class/Page"
+  | Logseq_db_types.Mutation.Create_ordinary_page _ ->
+    entity_by_ident db "logseq.class/Page"
   | Create_journal_page _ -> entity_by_ident db "logseq.class/Journal"
   | Create_class_page _ -> entity_by_ident db "logseq.class/Tag"
 ;;
 
 let uuid_for_kind = function
-  | Protocol.Create_ordinary_page { uuid } | Create_class_page { uuid } -> Ok uuid
+  | Logseq_db_types.Mutation.Create_ordinary_page { uuid } | Create_class_page { uuid } ->
+    Ok uuid
   | Create_journal_page { journal_day; supplied_uuid } ->
     if journal_day <= 0 || journal_day > 99_991_231
     then Error (Unsupported_semantics "journal day is invalid")
@@ -163,7 +166,7 @@ let create_page ~now_ms db ~title ~kind ~context =
              let block_tags = entity_by_ident db "block/tags" in
              let class_effects =
                match kind with
-               | Protocol.Create_class_page _ ->
+               | Logseq_db_types.Mutation.Create_class_page _ ->
                  (match
                     ( entity_by_ident db "logseq.class/Root"
                     , entity_by_ident db "logseq.property.class/extends" )
@@ -203,7 +206,7 @@ let create_page ~now_ms db ~title ~kind ~context =
                 in
                 let kind_ops =
                   match kind with
-                  | Protocol.Create_journal_page { journal_day; _ } ->
+                  | Logseq_db_types.Mutation.Create_journal_page { journal_day; _ } ->
                     [ Datascript.Add (id, "block/journal-day", Int journal_day) ]
                   | Create_class_page _ | Create_ordinary_page _ -> []
                 in
@@ -211,7 +214,7 @@ let create_page ~now_ms db ~title ~kind ~context =
                   { tx_ops = base_ops @ kind_ops @ class_effects
                   ; tx_meta = tx_meta context "create-page"
                   ; changed_uuids = [ uuid ]
-                  ; status = Protocol.Applied
+                  ; status = Logseq_db_types.Mutation.Applied
                   }))))
 ;;
 
@@ -321,7 +324,9 @@ let blocks_on_page db page =
   |> List.sort_uniq Int.compare
 ;;
 
-let rec subtree db entity = entity :: List.concat_map (subtree db) (page_children db entity)
+let rec subtree db entity =
+  entity :: List.concat_map (subtree db) (page_children db entity)
+;;
 
 let page_tree db page =
   List.sort_uniq Int.compare (subtree db page @ blocks_on_page db page)
@@ -373,7 +378,7 @@ let delete_page ~now_ms db ~page ~context =
           { tx_ops = List.map (fun item -> Datascript.RetractEntity (Entity_id item)) tree
           ; tx_meta = tx_meta context "delete-page"
           ; changed_uuids = changed_uuids db tree
-          ; status = Protocol.Applied
+          ; status = Logseq_db_types.Mutation.Applied
           }
       else if today
       then (
@@ -383,7 +388,8 @@ let delete_page ~now_ms db ~page ~context =
               List.map (fun item -> Datascript.RetractEntity (Entity_id item)) descendants
           ; tx_meta = tx_meta context "delete-page"
           ; changed_uuids = changed_uuids db (entity :: descendants)
-          ; status = (if descendants = [] then Protocol.No_change else Applied)
+          ; status =
+              (if descendants = [] then Logseq_db_types.Mutation.No_change else Applied)
           })
       else (
         match recycle_page db with
@@ -433,7 +439,7 @@ let delete_page ~now_ms db ~page ~context =
                 @ original_order
             ; tx_meta = tx_meta context "delete-page"
             ; changed_uuids = [ page ]
-            ; status = Protocol.Applied
+            ; status = Logseq_db_types.Mutation.Applied
             }))
 ;;
 
@@ -505,7 +511,7 @@ let restore_page ~now_ms db ~page ~context =
                ]
          ; tx_meta = tx_meta context "restore-recycled"
          ; changed_uuids = [ page ]
-         ; status = Protocol.Applied
+         ; status = Logseq_db_types.Mutation.Applied
          })
 ;;
 
@@ -520,12 +526,12 @@ let permanent_delete db ~page ~context =
       { tx_ops = List.map (fun item -> Datascript.RetractEntity (Entity_id item)) tree
       ; tx_meta = tx_meta context "recycle-delete-permanently"
       ; changed_uuids = changed_uuids db tree
-      ; status = Protocol.Applied
+      ; status = Logseq_db_types.Mutation.Applied
       }
 ;;
 
 let plan ~now_ms db = function
-  | Protocol.Create_page { title; kind; context } ->
+  | Logseq_db_types.Mutation.Create_page { title; kind; context } ->
     create_page ~now_ms db ~title ~kind ~context
   | Rename_page { page; title; context } -> rename_page ~now_ms db ~page ~title ~context
   | Delete_page { page; context } -> delete_page ~now_ms db ~page ~context

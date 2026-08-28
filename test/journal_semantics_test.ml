@@ -2,7 +2,7 @@ module ID = Bonsai_flutter_spec.Id
 module Test = Bonsai_flutter_test
 module Tokens = Journal_visual_tokens
 module Ui = Bonsai_flutter_ui
-module Graph = Logseq_db_worker.Graph_types
+module Graph = Logseq_db_types.Graph_types
 
 let fail format = Printf.ksprintf failwith format
 
@@ -718,7 +718,7 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
          (Option.is_none
             (Test.Handle.find handle (Test.Query.visible_text "Child three")))
          "collapsed preview exceeded its four-line budget";
-       require_sized_height handle ("journal-row-extent:" ^ block_id) 104.);
+       require_sized_height handle ("journal-row-extent:" ^ block_id) 100.);
   let expanded, _profile = create_handle ~expanded:true item in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown expanded)
@@ -735,7 +735,7 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
          (Option.is_none
             (Test.Handle.find expanded (Test.Query.visible_text "Child one")))
          "expanded parent retained collapsed child summaries";
-       require_sized_height expanded ("journal-row-extent:" ^ block_id) 60.);
+       require_sized_height expanded ("journal-row-extent:" ^ block_id) 56.);
   let five_lines =
     Journal_row.Item.of_block (block ~source:"One\nTwo\nThree\nFour\nFive" ())
   in
@@ -753,7 +753,7 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
        require
          (Option.is_none (Test.Handle.find clamped (Test.Query.visible_text "Five")))
          "source preview exceeded four logical lines";
-       require_sized_height clamped ("journal-row-extent:" ^ block_id) 104.)
+       require_sized_height clamped ("journal-row-extent:" ^ block_id) 100.)
 ;;
 
 let test_line_count_drives_exact_scaled_row_extent () =
@@ -773,8 +773,8 @@ let test_line_count_drives_exact_scaled_row_extent () =
               require_sized_height handle ("journal-row-extent:" ^ block_id) extent))
       expected
   in
-  check ~scale:1. [ 44.; 60.; 82.; 104. ];
-  check ~scale:3.2 [ 87.; 157.; 228.; 298. ]
+  check ~scale:1. [ 44.; 56.; 78.; 100. ];
+  check ~scale:3.2 [ 83.; 153.; 224.; 294. ]
 ;;
 
 let header_component handlers _graph =
@@ -928,8 +928,8 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
 let test_compact_and_adaptive_shapes_at_required_extremes () =
   require_row_shape 390. 1. "journal-row-compact" 44. 52.;
   require_row_shape 320. 1. "journal-row-adaptive" 44. 52.;
-  require_row_shape 744. 2. "journal-row-adaptive" 60. 104.;
-  require_row_shape 1_200. 3.2 "journal-row-adaptive" 87. 167.
+  require_row_shape 744. 2. "journal-row-adaptive" 56. 104.;
+  require_row_shape 1_200. 3.2 "journal-row-adaptive" 83. 167.
 ;;
 
 let test_rtl_row_geometry_uses_logical_edges () =

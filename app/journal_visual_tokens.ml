@@ -52,6 +52,7 @@ type text_token =
 type typography =
   { header_title : text_token
   ; header_subtitle : text_token
+  ; day_heading : text_token
   ; entry : text_token
   ; supporting : text_token
   ; timestamp : text_token
@@ -95,6 +96,9 @@ type composer_geometry =
 type row_geometry =
   { time_slot_base : float
   ; trailing_inset : float
+  ; day_heading_before : float
+  ; day_heading_after : float
+  ; entry_vertical_padding : float
   ; disclosure_visual : float
   ; status_rail_width : float
   ; status_rail_radius : float
@@ -145,6 +149,7 @@ let typography = function
   | Dense ->
     { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
+    ; day_heading = text_token 13. 18. Ui.Style.Font_weight.Semi_bold
     ; entry = text_token 15. 20. Ui.Style.Font_weight.Normal
     ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
@@ -156,6 +161,7 @@ let typography = function
   | Balanced ->
     { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
+    ; day_heading = text_token 13. 18. Ui.Style.Font_weight.Semi_bold
     ; entry = text_token 16. 22. Ui.Style.Font_weight.Normal
     ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
@@ -167,6 +173,7 @@ let typography = function
   | Comfortable ->
     { header_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 16. 22. Ui.Style.Font_weight.Medium
+    ; day_heading = text_token 14. 20. Ui.Style.Font_weight.Semi_bold
     ; entry = text_token 17. 24. Ui.Style.Font_weight.Normal
     ; supporting = text_token 15. 22. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 14. 20. Ui.Style.Font_weight.Normal
@@ -202,6 +209,9 @@ let composer_geometry = { horizontal_margin = 12.; maximum_lines = 5 }
 let row_geometry =
   { time_slot_base = 52.
   ; trailing_inset = 24.
+  ; day_heading_before = 20.
+  ; day_heading_after = 4.
+  ; entry_vertical_padding = 6.
   ; disclosure_visual = 14.
   ; status_rail_width = 4.
   ; status_rail_radius = 2.
@@ -233,12 +243,19 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
   let scale = Float.max 1. text_scale in
   let block_line_height = typography.entry.line_height *. scale in
   let supporting_line_height = typography.supporting.line_height *. scale in
+  let day_heading_line_height = typography.day_heading.line_height *. scale in
+  let day_header_extent =
+    Float.ceil
+      (row_geometry.day_heading_before
+       +. day_heading_line_height
+       +. row_geometry.day_heading_after)
+  in
   if (not narrow) && Float.compare scale 1.3 <= 0
   then
     { kind = Compact
     ; block_line_height
     ; continuation_extent = Float.ceil (28. +. supporting_line_height)
-    ; day_header_extent = 36.
+    ; day_header_extent
     ; content_leading
     ; time_slot_width = row_geometry.time_slot_base
     }
@@ -246,7 +263,7 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
     { kind = Adaptive
     ; block_line_height
     ; continuation_extent = Float.ceil (28. +. supporting_line_height)
-    ; day_header_extent = Float.ceil (24. +. supporting_line_height)
+    ; day_header_extent
     ; content_leading
     ; time_slot_width = Float.ceil (row_geometry.time_slot_base *. scale)
     }
@@ -257,7 +274,8 @@ let block_extent ~profile ~visible_lines =
   Float.ceil
     (Float.max
        hit_regions.minimum_target
-       (spacing.x4 +. (float_of_int visible_lines *. profile.block_line_height)))
+       ((2. *. row_geometry.entry_vertical_padding)
+        +. (float_of_int visible_lines *. profile.block_line_height)))
 ;;
 
 let fixed_extent ~profile = function

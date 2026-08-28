@@ -143,7 +143,8 @@ let roots_as_uuids db roots =
 let replace_operation_meta context tx_meta =
   ("outliner-op", Datascript.Keyword "indent-outdent-blocks")
   :: ( "db-sync/tx-id"
-     , Datascript.Uuid (Graph_types.Uuid.to_string context.Protocol.mutation_id) )
+     , Datascript.Uuid
+         (Graph_types.Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   :: ("local-tx?", Datascript.Bool true)
   :: List.filter
        (fun (attr, _) ->
@@ -204,7 +205,7 @@ let indent ~now_ms db selection ~context =
         { tx_ops = move_plan.tx_ops @ extra_ops
         ; tx_meta = replace_operation_meta context move_plan.tx_meta
         ; changed_uuids
-        ; status = Protocol.Applied
+        ; status = Logseq_db_types.Mutation.Applied
         })
 ;;
 
@@ -267,13 +268,13 @@ let direct_outdent ~now_ms db selection ~context =
         { tx_ops = move_plan.tx_ops @ right_ops
         ; tx_meta = replace_operation_meta context move_plan.tx_meta
         ; changed_uuids
-        ; status = Protocol.Applied
+        ; status = Logseq_db_types.Mutation.Applied
         }
 ;;
 
 let plan ~now_ms db ~roots ~direction ~context =
   let* selection = resolve_selection db roots in
   match direction with
-  | Protocol.Indent -> indent ~now_ms db selection ~context
+  | Logseq_db_types.Mutation.Indent -> indent ~now_ms db selection ~context
   | Direct_outdent -> direct_outdent ~now_ms db selection ~context
 ;;

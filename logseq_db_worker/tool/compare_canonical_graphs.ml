@@ -1,4 +1,10 @@
-let fail format = Printf.ksprintf (fun message -> prerr_endline message; exit 1) format
+let fail format =
+  Printf.ksprintf
+    (fun message ->
+       prerr_endline message;
+       exit 1)
+    format
+;;
 
 type mode =
   | Pair of
@@ -11,7 +17,7 @@ let parse_args () =
   let rec loop expected actual fixtures index =
     if index >= Array.length Sys.argv
     then expected, actual, fixtures
-    else
+    else (
       match Sys.argv.(index) with
       | "--expected" when index + 1 < Array.length Sys.argv ->
         loop (Some Sys.argv.(index + 1)) actual fixtures (index + 2)
@@ -19,7 +25,7 @@ let parse_args () =
         loop expected (Some Sys.argv.(index + 1)) fixtures (index + 2)
       | "--fixtures" when index + 1 < Array.length Sys.argv ->
         loop expected actual (Some Sys.argv.(index + 1)) (index + 2)
-      | argument -> fail "Unknown argument: %s" argument
+      | argument -> fail "Unknown argument: %s" argument)
   in
   match loop None None None 1 with
   | Some expected, Some actual, None -> Pair { expected; actual }
@@ -50,10 +56,7 @@ let projection path =
   | _ -> fail "%s is not a canonical graph object" path
 ;;
 
-let difference left right =
-  List.filter (fun value -> not (List.mem value right)) left
-;;
-
+let difference left right = List.filter (fun value -> not (List.mem value right)) left
 let json_list values = Yojson.Safe.pretty_to_string (`List values)
 
 let compare_pair expected_path actual_path =
@@ -123,3 +126,4 @@ let () =
   match parse_args () with
   | Pair { expected; actual } -> compare_pair expected actual
   | Fixtures directory -> validate_fixtures directory
+;;

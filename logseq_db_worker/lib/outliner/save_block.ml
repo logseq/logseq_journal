@@ -113,7 +113,8 @@ let without values removed =
 
 let tx_meta context =
   [ ( "db-sync/tx-id"
-    , Datascript.Uuid (Graph_types.Uuid.to_string context.Protocol.mutation_id) )
+    , Datascript.Uuid
+        (Graph_types.Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   ; "outliner-op", Datascript.Keyword "save-block"
   ; "local-tx?", Datascript.Bool true
   ]
@@ -161,7 +162,7 @@ let plan ~now_ms db ~block ~title ~context =
             { tx_ops = []
             ; tx_meta = tx_meta context
             ; changed_uuids = []
-            ; status = Protocol.No_change
+            ; status = Logseq_db_types.Mutation.No_change
             }
         else (
           let title = if is_page db entity then title else normalize_heading title in
@@ -278,7 +279,7 @@ let plan ~now_ms db ~block ~title ~context =
                   @ tx_id_ops
               ; tx_meta = tx_meta context
               ; changed_uuids
-              ; status = Protocol.Applied
+              ; status = Logseq_db_types.Mutation.Applied
               })
       | Some _ -> Error (Invalid_selection "The selected entity has a malformed title."))
 ;;

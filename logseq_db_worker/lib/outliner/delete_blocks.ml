@@ -1,6 +1,5 @@
 include Planner_contract
 open Graph_read
-
 module Int_set = Set.Make (Int)
 
 module Uuid_set = Set.Make (struct
@@ -163,7 +162,8 @@ let page_of db entity =
 
 let tx_meta context =
   [ ( "db-sync/tx-id"
-    , Datascript.Uuid (Graph_types.Uuid.to_string context.Protocol.mutation_id) )
+    , Datascript.Uuid
+        (Graph_types.Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   ; "outliner-op", Datascript.Keyword "delete-blocks"
   ; "local-tx?", Datascript.Bool true
   ]
@@ -237,7 +237,7 @@ let default_property_path ~now_ms db root ~context =
                { tx_ops = holder_ops @ touch_ops ~now ~next_tx pages
                ; tx_meta = tx_meta context
                ; changed_uuids
-               ; status = Protocol.Applied
+               ; status = Logseq_db_types.Mutation.Applied
                })
         | [] -> Error (Unsupported_semantics "The empty property placeholder is missing.")
         | _ -> Error (Invalid_tree "The empty property placeholder is ambiguous."))
@@ -309,7 +309,7 @@ let hard_delete ~now_ms db roots ~context =
     { tx_ops = reference_ops @ delete_ops @ touch_ops ~now ~next_tx pages
     ; tx_meta = tx_meta context
     ; changed_uuids
-    ; status = Protocol.Applied
+    ; status = Logseq_db_types.Mutation.Applied
     }
 ;;
 

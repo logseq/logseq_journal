@@ -1,29 +1,36 @@
 module Config = Config
 module Error = Error
-module Graph_types = Graph_types
 module Protocol = Protocol
 module Engine = Engine
-module Sync_snapshot = Sync_snapshot
-module Sync_protocol = Sync_protocol
-module Sync_e2ee = Sync_e2ee
-module Sync_graph_key = Sync_graph_key
-module Sync_platform_crypto = Sync_platform_crypto
-module Sync_mirror = Sync_mirror
-module Sync_tx = Sync_tx
-module Sync_tx_encoder = Sync_tx_encoder
-module Sync_checksum = Sync_checksum
-module Sync_auth = Sync_auth
-module Sync_bootstrap = Sync_bootstrap
-module Sync_catalog = Sync_catalog
-module Sync_catalog_store = Sync_catalog_store
-module Sync_http = Sync_http
-module Sync_http_eio = Sync_http_eio
-module Sync_e2ee_session = Sync_e2ee_session
-module Sync_action = Sync_action
-module Sync_startup_phase = Sync_startup_phase
-module Sync_manager = Sync_manager
-module Sync_network_scope = Sync_network_scope
-module Sync_websocket = Sync_websocket
-module Sync_websocket_eio = Sync_websocket_eio
-module Sync_replay = Sync_replay
-module Sync_pending = Sync_pending
+
+type graph_phase =
+  | Graph_closed
+  | Graph_opening
+  | Graph_open
+  | Graph_closing
+  | Graph_failed
+
+type graph_state =
+  { generation : int
+  ; graph_id : Logseq_db_types.Graph_types.Uuid.t option
+  ; phase : graph_phase
+  ; error : string option
+  }
+
+module Graph_lifecycle : sig
+  type t
+
+  val create : unit -> t
+  val state : t -> graph_state
+
+  val begin_open
+    :  t
+    -> generation:int
+    -> graph_id:Logseq_db_types.Graph_types.Uuid.t option
+    -> unit
+
+  val opened : t -> generation:int -> unit
+  val failed : t -> generation:int -> message:string -> unit
+  val begin_close : t -> generation:int -> unit
+  val closed : t -> generation:int -> unit
+end

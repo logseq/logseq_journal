@@ -62,8 +62,7 @@ let starts_with value prefix =
 
 let is_class db entity =
   match ident db entity with
-  | Some value ->
-    starts_with value "logseq.class/" || starts_with value "user.class/"
+  | Some value -> starts_with value "logseq.class/" || starts_with value "user.class/"
   | None -> false
 ;;
 
@@ -85,7 +84,9 @@ let simple_tag_end title start =
     | _ -> false
   in
   let rec loop index =
-    if index >= String.length title || delimiter title.[index] then index else loop (index + 1)
+    if index >= String.length title || delimiter title.[index]
+    then index
+    else loop (index + 1)
   in
   loop start
 ;;
@@ -128,43 +129,41 @@ let derive ~db ~self ~title =
         ; content_refs = List.sort_uniq Int.compare !refs
         ; inline_tags = List.sort_uniq Int.compare !tags
         }
-    else if index + 3 <= String.length title
-            && String.sub title index 3 = "#[["
-    then
-      (match find_substring title ~start:(index + 3) "]]" with
-       | None -> Error (Invalid_reference "unterminated tag reference")
-       | Some finish ->
-         let token = String.sub title (index + 3) (finish - index - 3) in
-         let* () = resolve_and_add ~tag:true token in
-         parse (finish + 2))
-    else if index + 2 <= String.length title
-            && String.sub title index 2 = "[["
-    then
-      (match find_substring title ~start:(index + 2) "]]" with
-       | None -> Error (Invalid_reference "unterminated page reference")
-       | Some finish ->
-         let token = String.sub title (index + 2) (finish - index - 2) in
-         let* () = resolve_and_add ~tag:false token in
-         parse (finish + 2))
-    else if index + 2 <= String.length title
-            && String.sub title index 2 = "(("
-    then
-      (match find_substring title ~start:(index + 2) "))" with
-       | None -> Error (Invalid_reference "unterminated block reference")
-       | Some finish ->
-         let token = String.sub title (index + 2) (finish - index - 2) in
-         let* entity = resolve_uuid db token in
-         let* () = add_reference ~tag:false entity in
-         parse (finish + 2))
-    else if title.[index] = '#'
-            && tag_boundary title index
-            && index + 1 < String.length title
-            && not (Char.equal title.[index + 1] ' ')
-    then
+    else if index + 3 <= String.length title && String.sub title index 3 = "#[["
+    then (
+      match find_substring title ~start:(index + 3) "]]" with
+      | None -> Error (Invalid_reference "unterminated tag reference")
+      | Some finish ->
+        let token = String.sub title (index + 3) (finish - index - 3) in
+        let* () = resolve_and_add ~tag:true token in
+        parse (finish + 2))
+    else if index + 2 <= String.length title && String.sub title index 2 = "[["
+    then (
+      match find_substring title ~start:(index + 2) "]]" with
+      | None -> Error (Invalid_reference "unterminated page reference")
+      | Some finish ->
+        let token = String.sub title (index + 2) (finish - index - 2) in
+        let* () = resolve_and_add ~tag:false token in
+        parse (finish + 2))
+    else if index + 2 <= String.length title && String.sub title index 2 = "(("
+    then (
+      match find_substring title ~start:(index + 2) "))" with
+      | None -> Error (Invalid_reference "unterminated block reference")
+      | Some finish ->
+        let token = String.sub title (index + 2) (finish - index - 2) in
+        let* entity = resolve_uuid db token in
+        let* () = add_reference ~tag:false entity in
+        parse (finish + 2))
+    else if
+      title.[index] = '#'
+      && tag_boundary title index
+      && index + 1 < String.length title
+      && not (Char.equal title.[index + 1] ' ')
+    then (
       let finish = simple_tag_end title (index + 1) in
       let token = String.sub title (index + 1) (finish - index - 1) in
       let* () = resolve_and_add ~tag:true token in
-      parse finish
+      parse finish)
     else (
       Buffer.add_char buffer title.[index];
       parse (index + 1))

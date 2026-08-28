@@ -9,17 +9,6 @@ let require_ok = function
   | Error message -> fail "unexpected platform error: %s" message
 ;;
 
-let contains text fragment =
-  let rec loop index =
-    if index + String.length fragment > String.length text
-    then false
-    else if String.sub text index (String.length fragment) = fragment
-    then true
-    else loop (index + 1)
-  in
-  loop 0
-;;
-
 let envelope ?(runtime_generation = 0L) ?(graph_generation = 0L) tag payload =
   let bytes = Bytes.make (32 + Bytes.length payload) '\000' in
   Bytes.blit_string "LJP2" 0 bytes 0 4;
@@ -241,21 +230,6 @@ let test_auth_capability_envelopes_are_bounded_and_protocol_free () =
     |> require_ok
   in
   require (authenticated = Some "cognito-user-1") "authenticated-user response changed";
-  let challenge =
-    Logseq_db_worker.Sync_auth.
-      { challenge_id = "challenge-1"
-      ; purpose = Websocket_connect
-      ; user_id = "cognito-user-1"
-      ; account_generation = 3
-      ; graph_generation = Some 4
-      ; connection_generation = Some 5
-      }
-  in
-  let request = Journal_platform.id_token_request challenge in
-  require (Bytes.get_uint16_le request 6 = 8) "ID-token request tag differs";
-  require
-    (not (contains (Bytes.to_string request) "/sync/"))
-    "auth capability request contains sync protocol knowledge";
   let token =
     envelope
       9
@@ -316,34 +290,18 @@ let test_local_account_binding_is_bounded_and_origin_scoped () =
     "insecure managed-sync origin was accepted"
 ;;
 
-let test_timeline_presentation_handshake_is_generation_fenced () =
-  let request =
-    Journal_platform.timeline_presented_request
-      ~account_generation:3
-      ~graph_generation:5
-      ~presentation_generation:7
-  in
+let test_timeline_presentation_handshake_is_bounded () =
+  let request = Journal_platform.timeline_presented_request in
   require (Bytes.get_uint16_le request 6 = 22) "Timeline request tag changed";
-  envelope
-    23
-    (Bytes.of_string
-       {|{"accountGeneration":3,"graphGeneration":5,"presentationGeneration":7,"presented":true}|})
+  require (Bytes.length request = 32) "Timeline request payload is not empty";
+  envelope 23 (Bytes.of_string {|{"presented":true}|})
   |> Journal_platform.decode_timeline_presented
-       ~account_generation:3
-       ~graph_generation:5
-       ~presentation_generation:7
   |> require_ok;
   require
     (Result.is_error
        (Journal_platform.decode_timeline_presented
-          ~account_generation:3
-          ~graph_generation:5
-          ~presentation_generation:8
-          (envelope
-             23
-             (Bytes.of_string
-                {|{"accountGeneration":3,"graphGeneration":5,"presentationGeneration":7,"presented":true}|}))))
-    "stale Timeline presentation acknowledgement was accepted"
+          (envelope 23 (Bytes.of_string {|{"presented":false}|}))))
+    "negative Timeline presentation acknowledgement was accepted"
 ;;
 
 let test_termination_handshake_is_bounded_and_acknowledged () =
@@ -402,8 +360,7 @@ let tests =
     , test_auth_capability_envelopes_are_bounded_and_protocol_free )
   ; "sign-out capability", test_sign_out_capability_is_bounded_and_acknowledged
   ; "local account binding", test_local_account_binding_is_bounded_and_origin_scoped
-  ; ( "Timeline presentation handshake"
-    , test_timeline_presentation_handshake_is_generation_fenced )
+  ; "Timeline presentation handshake", test_timeline_presentation_handshake_is_bounded
   ; "termination handshake", test_termination_handshake_is_bounded_and_acknowledged
   ; "network lifecycle epochs", test_network_lifecycle_epochs_are_bounded_and_typed
   ]

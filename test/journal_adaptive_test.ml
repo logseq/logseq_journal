@@ -87,6 +87,15 @@ let test_typography_spacing_motion_and_hit_regions () =
      && typography.supporting.line_height = 20.
      && typography.supporting.weight = Ui.Style.Font_weight.Normal)
     "supporting typography changed";
+  List.iter
+    (fun (preset, font_size, line_height) ->
+       let typography = Tokens.typography preset in
+       require
+         (typography.day_heading.font_size = font_size
+          && typography.day_heading.line_height = line_height
+          && typography.day_heading.weight = Ui.Style.Font_weight.Semi_bold)
+         "day heading typography changed")
+    [ Tokens.Dense, 13., 18.; Balanced, 13., 18.; Comfortable, 14., 20. ];
   require
     (typography.timestamp.font_size = 13.
      && typography.timestamp.line_height = 18.
@@ -120,6 +129,9 @@ let test_typography_spacing_motion_and_hit_regions () =
   let row = Tokens.row_geometry in
   require
     (row.time_slot_base = 52.
+     && row.day_heading_before = 20.
+     && row.day_heading_after = 4.
+     && row.entry_vertical_padding = 6.
      && row.disclosure_visual = 14.
      && row.status_rail_width = 4.
      && row.status_rail_radius = 2.
@@ -212,7 +224,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Compact
     ~block_line_height:28.6
     ~continuation_extent:54.
-    ~day_header_extent:36.
+    ~day_header_extent:48.
     ~content_leading:32.
     ~time_slot_width:52.;
   require_profile
@@ -221,7 +233,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Adaptive
     ~block_line_height:22.
     ~continuation_extent:48.
-    ~day_header_extent:44.
+    ~day_header_extent:42.
     ~content_leading:24.
     ~time_slot_width:52.;
   require_profile
@@ -230,7 +242,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Compact
     ~block_line_height:28.6
     ~continuation_extent:54.
-    ~day_header_extent:36.
+    ~day_header_extent:48.
     ~content_leading:32.
     ~time_slot_width:52.;
   require_profile
@@ -239,7 +251,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Adaptive
     ~block_line_height:44.
     ~continuation_extent:68.
-    ~day_header_extent:64.
+    ~day_header_extent:60.
     ~content_leading:32.
     ~time_slot_width:104.;
   require_profile
@@ -248,29 +260,29 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Adaptive
     ~block_line_height:70.4
     ~continuation_extent:92.
-    ~day_header_extent:88.
+    ~day_header_extent:82.
     ~content_leading:32.
     ~time_slot_width:167.
 ;;
 
 let test_row_profiles_cover_required_width_and_scale_matrix () =
   let cases =
-    [ 320., 1., Tokens.Adaptive, 22., 48., 44., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 50., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 44., 68., 64., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 88., 24., 167.
-    ; 390., 1., Tokens.Compact, 22., 48., 36., 32., 52.
-    ; 390., 1.3, Tokens.Compact, 28.6, 54., 36., 32., 52.
-    ; 390., 2., Tokens.Adaptive, 44., 68., 64., 32., 104.
-    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 88., 32., 167.
-    ; 744., 1., Tokens.Compact, 22., 48., 36., 32., 52.
-    ; 744., 1.3, Tokens.Compact, 28.6, 54., 36., 32., 52.
-    ; 744., 2., Tokens.Adaptive, 44., 68., 64., 32., 104.
-    ; 744., 3.2, Tokens.Adaptive, 70.4, 92., 88., 32., 167.
-    ; 1_200., 1., Tokens.Compact, 22., 48., 36., 32., 52.
-    ; 1_200., 1.3, Tokens.Compact, 28.6, 54., 36., 32., 52.
-    ; 1_200., 2., Tokens.Adaptive, 44., 68., 64., 32., 104.
-    ; 1_200., 3.2, Tokens.Adaptive, 70.4, 92., 88., 32., 167.
+    [ 320., 1., Tokens.Adaptive, 22., 48., 42., 24., 52.
+    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 48., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 44., 68., 60., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 82., 24., 167.
+    ; 390., 1., Tokens.Compact, 22., 48., 42., 32., 52.
+    ; 390., 1.3, Tokens.Compact, 28.6, 54., 48., 32., 52.
+    ; 390., 2., Tokens.Adaptive, 44., 68., 60., 32., 104.
+    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 82., 32., 167.
+    ; 744., 1., Tokens.Compact, 22., 48., 42., 32., 52.
+    ; 744., 1.3, Tokens.Compact, 28.6, 54., 48., 32., 52.
+    ; 744., 2., Tokens.Adaptive, 44., 68., 60., 32., 104.
+    ; 744., 3.2, Tokens.Adaptive, 70.4, 92., 82., 32., 167.
+    ; 1_200., 1., Tokens.Compact, 22., 48., 42., 32., 52.
+    ; 1_200., 1.3, Tokens.Compact, 28.6, 54., 48., 32., 52.
+    ; 1_200., 2., Tokens.Adaptive, 44., 68., 60., 32., 104.
+    ; 1_200., 3.2, Tokens.Adaptive, 70.4, 92., 82., 32., 167.
     ]
   in
   List.iter
@@ -301,7 +313,7 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     ~kind:Tokens.Adaptive
     ~block_line_height:22.
     ~continuation_extent:48.
-    ~day_header_extent:44.
+    ~day_header_extent:42.
     ~content_leading:24.
     ~time_slot_width:52.;
   let scales = [ 1.; 1.3; 2.; 3.2 ] in
@@ -365,20 +377,20 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
   check
     ~width:390.
     ~scale:1.
-    ~block_extents:[ 44.; 60.; 82.; 104. ]
+    ~block_extents:[ 44.; 56.; 78.; 100. ]
     [ Tokens.Children_loading, 44.
     ; Tokens.Children_more, 44.
-    ; Tokens.Day_heading, 36.
+    ; Tokens.Day_heading, 42.
     ; Tokens.Day_continuation, 48.
     ; Tokens.Feed_continuation, 48.
     ];
   check
     ~width:320.
     ~scale:3.2
-    ~block_extents:[ 87.; 157.; 228.; 298. ]
-    [ Tokens.Children_loading, 87.
-    ; Tokens.Children_more, 87.
-    ; Tokens.Day_heading, 88.
+    ~block_extents:[ 83.; 153.; 224.; 294. ]
+    [ Tokens.Children_loading, 83.
+    ; Tokens.Children_more, 83.
+    ; Tokens.Day_heading, 82.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
     ]

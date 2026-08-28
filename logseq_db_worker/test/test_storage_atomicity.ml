@@ -1,6 +1,6 @@
 module T = Logseq_db_worker_test_support.Test_support
-module Storage = Logseq_db_worker__Logseq_sqlite_storage
-module Session = Logseq_db_worker__Storage_session
+module Storage = Logseq_db_storage.Logseq_sqlite_storage
+module Session = Logseq_db_storage.Storage_session
 
 type callback_state =
   { mutable events : string list
@@ -18,10 +18,11 @@ let callbacks ?(storage = Datascript.memory_storage ()) state =
     | Some captured ->
       staged := None;
       let rec encode acc = function
-        | [] -> Ok Storage.{ writes = List.rev acc; sync_metadata = None }
+        | [] ->
+          Ok Storage.{ writes = List.rev acc; sync_metadata = None; sync_outbox = None }
         | (address, payload) :: rest ->
           (match
-             Logseq_db_worker__Logseq_sqlite_codec.encode_physical_payload payload
+             Logseq_db_storage.Logseq_sqlite_codec.encode_physical_payload payload
            with
            | Error _ -> Error "unable to encode staged batch"
            | Ok (payload, addresses) ->
@@ -48,7 +49,16 @@ let callbacks ?(storage = Datascript.memory_storage ()) state =
           if Option.equal String.equal state.fail_address (Some write.address)
           then Error "injected write failure"
           else Ok ())
-    ; upsert_sync_metadata = (fun _ -> Ok ())
+    ; upsert_sync_metadata =
+        (fun _ ->
+          state.events <- state.events @ [ "metadata" ];
+          Ok ())
+    ; load_sync_outbox = (fun () -> Ok [])
+    ; replace_sync_outbox =
+        (fun records ->
+          state.events
+          <- state.events @ [ "outbox:" ^ string_of_int (List.length records) ];
+          Ok ())
     ; commit =
         (fun () ->
           state.events <- state.events @ [ "commit" ];
@@ -85,6 +95,7 @@ let sample_batch =
         ; { address = "1"; payload = "tail"; addresses = [] }
         ]
     ; sync_metadata = None
+    ; sync_outbox = None
     }
 ;;
 
@@ -220,13 +231,13 @@ let storage_batch_of_db db =
   in
   Datascript.store ~storage:capture db;
   let writes =
-    match Logseq_db_worker__Logseq_sqlite_codec.encode_physical_batch !entries with
+    match Logseq_db_storage.Logseq_sqlite_codec.encode_physical_batch !entries with
     | Error _ -> T.fail "unable to encode physical storage batch"
     | Ok entries ->
       List.map
         (fun entry ->
            Storage.
-             { address = entry.Logseq_db_worker__Logseq_sqlite_codec.address
+             { address = entry.Logseq_db_storage.Logseq_sqlite_codec.address
              ; payload = entry.content
              ; addresses = entry.addresses
              })
@@ -241,7 +252,7 @@ let storage_batch_of_db db =
   in
   ignore (find Datascript.Storage.root_address);
   ignore (find Datascript.Storage.tail_address);
-  Storage.{ writes; sync_metadata = None }
+  Storage.{ writes; sync_metadata = None; sync_outbox = None }
 ;;
 
 let batch_write batch address =
@@ -309,9 +320,7 @@ let attached_session_defers_unreachable_address_count_until_gc_check () =
   let source =
     Datascript.empty_db ()
     |> Datascript.db_with
-         [ Datascript.Add
-             (Temp_id "lazy-gc", "block/title", String "Lazy GC baseline")
-         ]
+         [ Datascript.Add (Temp_id "lazy-gc", "block/title", String "Lazy GC baseline") ]
   in
   Datascript.store ~storage source;
   let restored =
@@ -855,6 +864,51 @@ let () =
         match Session.commit_staged session staged with
         | Error Session.Already_consumed -> ()
         | _ -> T.fail "staged value was reusable")
+    ; T.case "outbox replacement has one durable transaction" (fun () ->
+        let state = state () in
+        let session =
+          Session.create
+            ~db:(Datascript.empty_db ())
+            ~tail:[]
+            ~callbacks:(callbacks state)
+        in
+        (match Session.commit_sync_outbox_insert session [ "record-1"; "record-2" ] with
+         | Ok () -> ()
+         | Error _ -> T.fail "outbox replacement failed");
+        T.require
+          (state.events = [ "begin"; "outbox:2"; "commit" ])
+          "outbox replacement escaped its single transaction")
+    ; T.case "authoritative data checkpoint and outbox commit atomically" (fun () ->
+        let state = state () in
+        let session, staged = staged_session state in
+        let checkpoint =
+          Logseq_db_types.Sync_checkpoint.create
+            ~graph_id:
+              (Logseq_db_types.Graph_types.Uuid.of_string
+                 "10000000-0000-4000-8000-000000000001"
+               |> Result.get_ok)
+            ~schema:{ major = 65; minor = 33 }
+            ~applied_server_t:1
+            ~checksum:"0123456789abcdef"
+          |> Result.get_ok
+        in
+        (match
+           Session.commit_staged_with_sync_metadata_and_outbox
+             session
+             staged
+             checkpoint
+             [ "record" ]
+         with
+         | Ok () -> ()
+         | Error _ -> T.fail "authoritative atomic commit failed");
+        T.require
+          (List.filter (String.equal "begin") state.events |> List.length = 1)
+          "authoritative commit opened more than one transaction";
+        T.require (List.mem "metadata" state.events) "checkpoint was not committed";
+        T.require (List.mem "outbox:1" state.events) "outbox was not committed";
+        T.require
+          (List.hd (List.rev state.events) = "commit")
+          "authoritative atomic transaction did not commit last")
     ; T.case "mutation persistence failure terminalizes session" (fun () ->
         let state = state () in
         state.fail_commit <- true;

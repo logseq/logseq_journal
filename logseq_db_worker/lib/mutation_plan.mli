@@ -1,3 +1,7 @@
 include module type of Outliner.Planner_contract
 
-val plan : now_ms:int64 -> Datascript.db -> Protocol.mutation -> (t, error) result
+val plan
+  :  now_ms:int64
+  -> Datascript.db
+  -> Logseq_db_types.Mutation.t
+  -> (t, error) result

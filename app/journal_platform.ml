@@ -282,22 +282,7 @@ let decode_formatted_journal_days bytes =
 
 let authenticated_user_request = encode_envelope 6 Bytes.empty |> Result.get_ok
 let local_account_binding_request = encode_envelope 20 Bytes.empty |> Result.get_ok
-
-let timeline_presented_request
-      ~account_generation
-      ~graph_generation
-      ~presentation_generation
-  =
-  Yojson.Safe.to_string
-    (`Assoc
-        [ "accountGeneration", `Int account_generation
-        ; "graphGeneration", `Int graph_generation
-        ; "presentationGeneration", `Int presentation_generation
-        ])
-  |> Bytes.of_string
-  |> encode_envelope 22
-  |> Result.get_ok
-;;
+let timeline_presented_request = encode_envelope 22 Bytes.empty |> Result.get_ok
 
 let decode_json_object label bytes f =
   try
@@ -344,27 +329,12 @@ let decode_local_account_binding bytes =
         | _ -> Error "local-account-binding response fields are invalid")))
 ;;
 
-let decode_timeline_presented
-      ~account_generation
-      ~graph_generation
-      ~presentation_generation
-      bytes
-  =
+let decode_timeline_presented bytes =
   Result.bind (decode_envelope [ 23 ] bytes) (fun payload ->
     decode_json_object "Timeline-presented response" payload (fun fields ->
-      let integer name =
-        match List.assoc_opt name fields with
-        | Some (`Int value) when value >= 0 -> Some value
-        | _ -> None
-      in
-      if
-        List.length fields = 4
-        && integer "accountGeneration" = Some account_generation
-        && integer "graphGeneration" = Some graph_generation
-        && integer "presentationGeneration" = Some presentation_generation
-        && List.assoc_opt "presented" fields = Some (`Bool true)
+      if List.length fields = 1 && List.assoc_opt "presented" fields = Some (`Bool true)
       then Ok ()
-      else Error "Timeline-presented response is stale or malformed"))
+      else Error "Timeline-presented response is malformed"))
 ;;
 
 let decode_authenticated_user bytes =
@@ -421,19 +391,17 @@ let decode_set_typography_preset_preference bytes =
 ;;
 
 let purpose = function
-  | Logseq_db_worker.Sync_auth.Catalog_discovery -> "catalogDiscovery"
+  | Logseq_sync.Api.Catalog_discovery -> "catalogDiscovery"
   | Snapshot_bootstrap -> "snapshotBootstrap"
   | E2ee_key_access -> "e2eeKeyAccess"
-  | Http_pull -> "httpPull"
-  | Transaction_submission -> "transactionSubmission"
   | Websocket_connect -> "websocketConnect"
 ;;
 
-let id_token_request (challenge : Logseq_db_worker.Sync_auth.challenge) =
+let id_token_request (challenge : Logseq_sync.Api.token_request) =
   Yojson.Safe.to_string
     (`Assoc
-        [ "challengeId", `String challenge.challenge_id
-        ; "purpose", `String (purpose challenge.purpose)
+        [ "challengeId", `String (Logseq_sync.Api.token_request_id challenge)
+        ; "purpose", `String (purpose (Logseq_sync.Api.token_request_purpose challenge))
         ])
   |> Bytes.of_string
   |> encode_envelope 8

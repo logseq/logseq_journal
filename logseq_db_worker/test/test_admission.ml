@@ -1,9 +1,9 @@
 module T = Logseq_db_worker_test_support.Test_support
-module Admission = Logseq_db_worker__Admission
+module Admission = Logseq_db_storage.Admission
 
 let uuid =
   match
-    Logseq_db_worker.Graph_types.Uuid.of_string "11111111-1111-4111-8111-111111111111"
+    Logseq_db_types.Graph_types.Uuid.of_string "11111111-1111-4111-8111-111111111111"
   with
   | Ok uuid -> uuid
   | Error message -> failwith message
@@ -20,7 +20,7 @@ let observed
       ()
   =
   Admission.
-    { schema = Logseq_db_worker.Graph_types.{ major; minor }
+    { schema = Logseq_db_types.Graph_types.{ major; minor }
     ; local_graph_uuid = Some uuid
     ; remote_flag
     ; rtc_graph_uuid

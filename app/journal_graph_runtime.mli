@@ -1,5 +1,5 @@
 type payload =
-  | Graph_ready of Logseq_db_worker.Graph_types.graph_info
+  | Graph_ready of Logseq_db_types.Graph_types.graph_info
   | Block_captured of
       { block : Journal_graph_projection.block
       ; timeline_entry_update : Journal_graph_projection.timeline_entry option

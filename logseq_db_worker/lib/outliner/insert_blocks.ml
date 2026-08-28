@@ -104,7 +104,8 @@ let relative_placement db relation uuid =
 ;;
 
 let placement db roots = function
-  | Protocol.Relative (Before uuid) -> relative_placement db Sibling_before uuid
+  | Logseq_db_types.Mutation.Relative (Before uuid) ->
+    relative_placement db Sibling_before uuid
   | Relative (After uuid) -> relative_placement db Sibling_after uuid
   | Relative (First_child uuid) -> relative_placement db Child_first uuid
   | Relative (Last_child uuid) -> relative_placement db Child_last uuid
@@ -116,7 +117,8 @@ let placement db roots = function
     then Error (Invalid_position "A page cannot be replaced as an empty block.")
     else if List.length roots <> 1
     then Error (Invalid_tree "Replace_empty requires exactly one root.")
-    else if not (Graph_types.Uuid.equal (List.hd roots).Protocol.uuid uuid)
+    else if
+      not (Graph_types.Uuid.equal (List.hd roots).Logseq_db_types.Mutation.uuid uuid)
     then Error (Invalid_position "The replacement root UUID must equal the target UUID.")
     else if
       Option.value (string_value db target "block/title") ~default:"not-empty"
@@ -298,7 +300,9 @@ let existing_children_uuids db entity =
 
 let roots_are_at_position db roots position =
   let root_entities =
-    List.map (fun root -> List.hd (entities_by_uuid db root.Protocol.uuid)) roots
+    List.map
+      (fun root -> List.hd (entities_by_uuid db root.Logseq_db_types.Mutation.uuid))
+      roots
   in
   let slice_matches values offset expected =
     let rec loop values offset expected =
@@ -312,7 +316,7 @@ let roots_are_at_position db roots position =
     loop values offset expected
   in
   match position with
-  | Protocol.Replace_empty uuid ->
+  | Logseq_db_types.Mutation.Replace_empty uuid ->
     (match roots with
      | [ root ] -> Graph_types.Uuid.equal root.uuid uuid
      | [] | _ :: _ :: _ -> false)
@@ -452,7 +456,8 @@ let orders_by_parent nodes placement =
 
 let tx_meta context =
   [ ( "db-sync/tx-id"
-    , Datascript.Uuid (Graph_types.Uuid.to_string context.Protocol.mutation_id) )
+    , Datascript.Uuid
+        (Graph_types.Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   ; "outliner-op", Datascript.Keyword "insert-blocks"
   ; "local-tx?", Datascript.Bool true
   ]
@@ -563,13 +568,13 @@ let plan ~now_ms db ~roots ~position ~context =
       { tx_ops = []
       ; tx_meta = tx_meta context
       ; changed_uuids = []
-      ; status = Protocol.Already_applied
+      ; status = Logseq_db_types.Mutation.Already_applied
       }
   else
     let* placement = placement db roots position in
     let replacement =
       Option.map
-        (fun entity -> entity, (List.hd roots).Protocol.uuid)
+        (fun entity -> entity, (List.hd roots).Logseq_db_types.Mutation.uuid)
         placement.replacement
     in
     let* () = ensure_new_uuids db nodes replacement in
@@ -625,6 +630,6 @@ let plan ~now_ms db ~roots ~position ~context =
       { tx_ops = node_ops @ stub_ops @ page_ops
       ; tx_meta = tx_meta context
       ; changed_uuids
-      ; status = Protocol.Applied
+      ; status = Logseq_db_types.Mutation.Applied
       }
 ;;

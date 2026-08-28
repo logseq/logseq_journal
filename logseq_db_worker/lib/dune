@@ -3,37 +3,21 @@
 (library
  (name logseq_db_worker)
  (public_name logseq_db_worker)
- (modules (:standard \ sync_action sync_startup_phase))
  (libraries
   datascript-ocaml-native
   datascript_ocaml
   digestif
-  ca-certs-nss
-  cstruct
-  domain-name
-  eio
-  eio.unix
-  httpun
-  httpun-eio
-  httpun-ws
+  logseq_db_storage
+  logseq_db_types
+  logseq_sync
   melange-transit-native
-  mirage-crypto-rng.unix
   persistent_sorted_set_ocaml
   sqlite3
   unix
   uri
-  tls-eio
   uucp
   uunf
   uutf
-  yojson
-  logseq_db_worker.sync_spec)
- (foreign_stubs
-  (language c)
-  (names sync_platform_crypto_stubs sync_gzip_stubs)))
-
-(library
- (name logseq_db_worker_sync_impl)
- (public_name logseq_db_worker.sync_impl)
- (modules sync_action sync_startup_phase)
- (implements logseq_db_worker_sync_spec))
+  yojson)
+ (flags
+  (:standard -open Logseq_db_types -open Logseq_db_storage)))

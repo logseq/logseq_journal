@@ -278,8 +278,8 @@ let view
                 (if rtl
                  then profile.content_leading
                  else Tokens.row_geometry.trailing_inset)
-              ~top:Tokens.spacing.x2
-              ~bottom:Tokens.spacing.x2
+              ~top:Tokens.row_geometry.entry_vertical_padding
+              ~bottom:Tokens.row_geometry.entry_vertical_padding
               ())
     |> test_id ("journal-row-body-padding:" ^ Item.id item)
     |> Ui.Widget.sized_box
@@ -329,8 +329,16 @@ let view
      let offset = profile.Tokens.content_leading -. Tokens.spacing.x3 in
      children
      := (if rtl
-         then Ui.Widget.Stack.positioned ~right:offset ~top:Tokens.spacing.x2 rail
-         else Ui.Widget.Stack.positioned ~left:offset ~top:Tokens.spacing.x2 rail)
+         then
+           Ui.Widget.Stack.positioned
+             ~right:offset
+             ~top:Tokens.row_geometry.entry_vertical_padding
+             rail
+         else
+           Ui.Widget.Stack.positioned
+             ~left:offset
+             ~top:Tokens.row_geometry.entry_vertical_padding
+             rail)
         :: !children);
   if show_divider
   then (

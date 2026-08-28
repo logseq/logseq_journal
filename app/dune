@@ -31,8 +31,10 @@
   bonsai_flutter.driver
   core
   incr_dom.ui_incr
+  logseq_db_types
   logseq_db_worker
   logseq_db_worker.bonsai
+  logseq_sync
   threads
   unix
   virtual_dom.ui_effect))
@@ -56,9 +58,7 @@
   (native object)))
 
 (rule
- (targets
-  native_static_link_flags.sexp
-  libgmp.a)
+ (targets native_static_link_flags.sexp libgmp.a)
  (action
   (with-stdout-to
    native_static_link_flags.sexp

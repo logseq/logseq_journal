@@ -15,7 +15,7 @@ let envelope tag payload =
 ;;
 
 let token =
-  Logseq_db_worker.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000000001"
+  Logseq_db_types.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000000001"
   |> Result.get_ok
 ;;
 
@@ -66,9 +66,9 @@ let test_exact_codec_and_round_trip () =
   match decoded.target with
   | Snapshot { token = decoded } ->
     require
-      (Logseq_db_worker.Graph_types.Uuid.equal token decoded)
+      (Logseq_db_types.Graph_types.Uuid.equal token decoded)
       "snapshot token changed"
-  | Managed_sync _ | Import_snapshot _ | Native_local_graph _ | Synced_graph _ ->
+  | Managed_sync _ | Import_snapshot _ | Native_local_graph _ | Synced_mirror _ ->
     fail "snapshot target changed"
 ;;
 
@@ -120,8 +120,144 @@ let test_application_platform_calendar_codec () =
     require (Int64.equal decoded.snapshot.generation 8L) "calendar generation changed"
 ;;
 
+let graph_id =
+  Logseq_db_types.Graph_types.Uuid.of_string "20000000-0000-4000-8000-000000000002"
+  |> Result.get_ok
+;;
+
+let startup_snapshot
+      ?(sync_phase = Logseq_sync.Api.Offline)
+      ?(authenticated = true)
+      ?(catalog_loading = false)
+      ?(awaiting_selection = false)
+      ?(restoring_local = false)
+      ?(bootstrapping = false)
+      ?(awaiting_e2ee_password = false)
+      ?failure
+      ?(graph_generation = 7)
+      ?(timeline_presentation_pending = false)
+      ()
+  =
+  Logseq_sync.Api.
+    { sync_phase
+    ; catalog = []
+    ; selected_graph = Some graph_id
+    ; applied_server_t = Some 11
+    ; timeline_presentation_pending
+    ; startup =
+        { authenticated
+        ; catalog_loading
+        ; awaiting_selection
+        ; restoring_local
+        ; bootstrapping
+        ; awaiting_e2ee_password
+        ; failure
+        ; account_generation = 3
+        ; graph_generation
+        ; presentation_generation = 5
+        }
+    ; last_error = Option.map (fun _ -> "startup failed") failure
+    }
+;;
+
+let graph_state ?(generation = 7) ?(phase = Logseq_db_worker.Graph_open) ?error () =
+  Logseq_db_worker.{ generation; graph_id = Some graph_id; phase; error }
+;;
+
+let require_startup_phase expected snapshot graph message =
+  let actual = Journal_startup.derive ~snapshot ~graph in
+  require (actual.Journal_startup.phase = expected) "%s" message;
+  actual
+;;
+
+let test_startup_phase_is_owned_by_ui_domain () =
+  ignore
+    (require_startup_phase
+       Journal_startup.Signed_out
+       (startup_snapshot ~authenticated:false ())
+       (graph_state ~phase:Graph_closed ())
+       "signed-out startup was not derived");
+  ignore
+    (require_startup_phase
+       Loading_catalog
+       (startup_snapshot ~catalog_loading:true ())
+       (graph_state ~phase:Graph_closed ())
+       "catalog startup was not derived");
+  ignore
+    (require_startup_phase
+       Awaiting_selection
+       (startup_snapshot ~awaiting_selection:true ())
+       (graph_state ~phase:Graph_closed ())
+       "selection startup was not derived");
+  ignore
+    (require_startup_phase
+       Restoring_local
+       (startup_snapshot ~restoring_local:true ~timeline_presentation_pending:true ())
+       (graph_state ())
+       "local restore startup was not derived");
+  ignore
+    (require_startup_phase
+       Bootstrapping
+       (startup_snapshot ~bootstrapping:true ())
+       (graph_state ~phase:Graph_closed ())
+       "bootstrap startup was not derived");
+  ignore
+    (require_startup_phase
+       Awaiting_e2ee_password
+       (startup_snapshot ~awaiting_e2ee_password:true ())
+       (graph_state ~phase:Graph_closed ())
+       "E2EE startup was not derived")
+;;
+
+let test_ready_is_independent_of_sync_activity () =
+  List.iter
+    (fun sync_phase ->
+       ignore
+         (require_startup_phase
+            Journal_startup.Ready
+            (startup_snapshot ~sync_phase ())
+            (graph_state ())
+            "open presented graph did not remain ready"))
+    Logseq_sync.Api.[ Offline; Connecting; Pulling; Submitting; Current; Paused ];
+  ignore
+    (require_startup_phase
+       Journal_startup.Restoring_local
+       (startup_snapshot ~sync_phase:Current ())
+       (graph_state ~phase:Graph_closed ())
+       "Current sync incorrectly implied an open graph");
+  ignore
+    (require_startup_phase
+       Journal_startup.Restoring_local
+       (startup_snapshot ~sync_phase:Current ~timeline_presentation_pending:true ())
+       (graph_state ())
+       "Current sync incorrectly bypassed presentation")
+;;
+
+let test_stale_graph_generation_and_structured_failures () =
+  ignore
+    (require_startup_phase
+       Journal_startup.Restoring_local
+       (startup_snapshot ())
+       (graph_state ~generation:6 ())
+       "stale graph generation made startup ready");
+  let state =
+    require_startup_phase
+      Journal_startup.Failed
+      (startup_snapshot ())
+      (graph_state ~phase:Graph_failed ~error:"engine unavailable" ())
+      "graph failure did not fail startup"
+  in
+  match state.error with
+  | Some { owner = Journal_startup.Graph; message; recovery = Some Retry_graph_open } ->
+    require (String.equal message "engine unavailable") "graph error message changed"
+  | None | Some _ -> fail "graph failure did not expose structured recovery"
+;;
+
 let () =
   test_exact_codec_and_round_trip ();
   test_bounded_rejection ();
-  test_application_platform_calendar_codec ()
+  test_application_platform_calendar_codec ();
+  test_startup_phase_is_owned_by_ui_domain ();
+  test_ready_is_independent_of_sync_activity ();
+  test_stale_graph_generation_and_structured_failures ()
 ;;

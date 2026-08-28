@@ -519,8 +519,8 @@ let test_direct_children_insert_after_parent_and_collapse () =
            extent)
       expected
   in
-  require_role_extents ~width:390. ~scale:1. ~expected_parent:60.;
-  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:157.;
+  require_role_extents ~width:390. ~scale:1. ~expected_parent:56.;
+  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:153.;
   let collapsed = Timeline.collapse loaded ~parent_id:(Journal_model.id parent) in
   require_equal_string_list
     (slot_keys collapsed)
@@ -927,10 +927,10 @@ let test_exact_profile_extents_have_no_composer_clearance () =
       (List.length geometry.overrides = List.length expected_overrides)
       "timeline retained an extent override beyond the day heading"
   in
-  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:44.;
-  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:36.;
-  check ~width:390. ~scale:2. ~default_extent:60. ~day_extent:64.;
-  check ~width:1_200. ~scale:3.2 ~default_extent:87. ~day_extent:88.
+  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:42.;
+  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:42.;
+  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:60.;
+  check ~width:1_200. ~scale:3.2 ~default_extent:83. ~day_extent:82.
 ;;
 
 let test_block_line_counts_are_the_authoritative_sparse_extents () =
@@ -995,8 +995,8 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
            scale)
       expected
   in
-  check ~scale:1. [ 0, 44.; 1, 104.; 2, 60.; 3, 82.; 4, 104. ];
-  check ~scale:3.2 [ 0, 87.; 1, 298.; 2, 157.; 3, 228.; 4, 298. ]
+  check ~scale:1. [ 0, 44.; 1, 100.; 2, 56.; 3, 78.; 4, 100. ];
+  check ~scale:3.2 [ 0, 83.; 1, 294.; 2, 153.; 3, 224.; 4, 294. ]
 ;;
 
 let test_anchor_decisions_replacements_and_route_return () =

@@ -207,7 +207,8 @@ let resolve_property db = function
 ;;
 
 let tx_meta context operation =
-  [ "db-sync/tx-id", Datascript.Uuid (Uuid.to_string context.Protocol.mutation_id)
+  [ ( "db-sync/tx-id"
+    , Datascript.Uuid (Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   ; "outliner-op", Datascript.Keyword operation
   ; "local-tx?", Datascript.Bool true
   ]
@@ -219,7 +220,7 @@ let plan_result context operation tx_ops changed_uuids =
   { tx_ops
   ; tx_meta = tx_meta context operation
   ; changed_uuids = unique_uuids changed_uuids
-  ; status = (if tx_ops = [] then Protocol.No_change else Applied)
+  ; status = (if tx_ops = [] then Logseq_db_types.Mutation.No_change else Applied)
   }
 ;;
 
@@ -302,9 +303,7 @@ let murmur_fmix hash length =
   Int32.logxor hash (Int32.shift_right_logical hash 13)
   |> fun hash ->
   Int32.mul hash (Int32.of_int (-1028477387))
-  |> fun hash ->
-  Int32.logxor hash (Int32.shift_right_logical hash 16)
-  |> fun hash -> hash
+  |> fun hash -> Int32.logxor hash (Int32.shift_right_logical hash 16) |> fun hash -> hash
 ;;
 
 let murmur3_hash_unencoded_chars text =
@@ -364,7 +363,7 @@ let derived_value_uuid context block ident ordinal content =
   let seed =
     String.concat
       "\000"
-      [ Uuid.to_string context.Protocol.mutation_id
+      [ Uuid.to_string context.Logseq_db_types.Mutation.mutation_id
       ; Uuid.to_string block
       ; ident
       ; string_of_int ordinal
@@ -660,22 +659,19 @@ let touch_ops ~now_ms db entity =
 let property_reference_source property =
   (String.starts_with ~prefix:"user.property/" property.ident
    && not property.schema.hidden)
-  || List.mem
-       property.ident
-       [ "logseq.property/scheduled"; "logseq.property/deadline" ]
+  || List.mem property.ident [ "logseq.property/scheduled"; "logseq.property/deadline" ]
 ;;
 
 let add_property_refs block property resolved =
   if not (property_reference_source property)
   then []
   else
-    Datascript.Add
-      (Entity_id block, "block/refs", Ref_to (Entity_id property.entity))
+    Datascript.Add (Entity_id block, "block/refs", Ref_to (Entity_id property.entity))
     ::
-    match ref_entity resolved.stored_value with
-    | Some entity when entity <> block ->
-      [ Datascript.Add (Entity_id block, "block/refs", Ref_to (Entity_id entity)) ]
-    | Some _ | None -> []
+    (match ref_entity resolved.stored_value with
+     | Some entity when entity <> block ->
+       [ Datascript.Add (Entity_id block, "block/refs", Ref_to (Entity_id entity)) ]
+     | Some _ | None -> [])
 ;;
 
 let retract_property_refs block property existing =
@@ -683,9 +679,7 @@ let retract_property_refs block property existing =
   then []
   else
     Datascript.Retract
-      ( Entity_id block
-      , "block/refs"
-      , Some (Ref_to (Entity_id property.entity)) )
+      (Entity_id block, "block/refs", Some (Ref_to (Entity_id property.entity)))
     :: (existing
         |> List.filter_map ref_entity
         |> List.sort_uniq Int.compare
@@ -778,8 +772,7 @@ let plan_remove ~now_ms db block_uuid selector context =
     then (
       let task = entity_of_ident db "logseq.class/Task" in
       let tx_ops =
-        [ Datascript.RetractAttr (Entity_id block, property.ident)
-        ]
+        [ Datascript.RetractAttr (Entity_id block, property.ident) ]
         @ retract_property_refs block property existing
         @ touch_ops ~now_ms db block
         @
@@ -850,7 +843,7 @@ let plan_batch_set ~now_ms db blocks selector mode context =
      | Ok targets ->
        let input_values, replace =
          match mode with
-         | Protocol.Append value -> [ value ], false
+         | Logseq_db_types.Mutation.Append value -> [ value ], false
          | Replace values -> values, true
        in
        if List.length input_values > Protocol.maximum_property_values
@@ -898,10 +891,7 @@ let plan_batch_set ~now_ms db blocks selector mode context =
                 let fresh =
                   List.filter
                     (fun value ->
-                       not
-                         (List.exists
-                            (equal_stored_value value.stored_value)
-                            existing))
+                       not (List.exists (equal_stored_value value.stored_value) existing))
                     resolved
                 in
                 let tx_ops =
@@ -956,8 +946,7 @@ let plan_batch_remove ~now_ms db blocks selector context =
            if existing = []
            then []
            else
-             [ Datascript.RetractAttr (Entity_id block, property.ident)
-             ]
+             [ Datascript.RetractAttr (Entity_id block, property.ident) ]
              @ retract_property_refs block property existing
              @ touch_ops ~now_ms db block
              @ (existing
@@ -1056,7 +1045,7 @@ let plan_upsert ~now_ms db identity schema context =
   then Error (Invalid_selection "Checkbox properties cannot have many values.")
   else (
     match identity with
-    | Protocol.New_property { ident; title } ->
+    | Logseq_db_types.Mutation.New_property { ident; title } ->
       if not (qualified_ident ident)
       then Error (Invalid_selection "New property ident must be qualified.")
       else if not (String.starts_with ~prefix:"user.property/" ident)
@@ -1084,7 +1073,8 @@ let plan_upsert ~now_ms db identity schema context =
               let title = normalize_title title in
               let order = next_property_order db property_class in
               let reference_targets =
-                property_class :: Option.to_list (Result.to_option (entity_of_ident db "block/tags"))
+                property_class
+                :: Option.to_list (Result.to_option (entity_of_ident db "block/tags"))
               in
               let tx_ops =
                 [ Datascript.Add (temp, "block/uuid", Uuid (Uuid.to_string uuid))
@@ -1113,8 +1103,7 @@ let plan_upsert ~now_ms db identity schema context =
                 ]
                 @ List.map
                     (fun target ->
-                       Datascript.Add
-                         (temp, "block/refs", Ref_to (Entity_id target)))
+                       Datascript.Add (temp, "block/refs", Ref_to (Entity_id target)))
                     reference_targets
                 @
                 if ref_property_type schema.property_type
@@ -1182,7 +1171,7 @@ let plan_closed_values ~now_ms db selector action context =
   | Ok property ->
     let content_attr = value_content_attr property.schema.property_type in
     (match action with
-     | Protocol.Add_closed_value { value_uuid; value; icon } ->
+     | Logseq_db_types.Mutation.Add_closed_value { value_uuid; value; icon } ->
        (match entity_of_uuid db value_uuid, closed_content property value with
         | Ok _, _ -> Error (Conflict "Closed value UUID already exists.")
         | _, (Error _ as error) -> error
@@ -1236,8 +1225,7 @@ let plan_closed_values ~now_ms db selector action context =
           then Error (Invalid_selection "Closed value belongs to another property.")
           else (
             let tx_ops =
-              [ Datascript.Add (Entity_id entity, content_attr, content)
-              ]
+              [ Datascript.Add (Entity_id entity, content_attr, content) ]
               @ touch_ops ~now_ms db entity
               @ touch_ops ~now_ms db property.entity
               @ property_definition_ref_ops db property.entity
@@ -1297,8 +1285,7 @@ let plan_closed_values ~now_ms db selector action context =
           else (
             let tx_ops =
               inbound_ref_retractions db entity
-              @ [ Datascript.RetractEntity (Entity_id entity)
-                ]
+              @ [ Datascript.RetractEntity (Entity_id entity) ]
               @ touch_ops ~now_ms db property.entity
               @ property_definition_ref_ops db property.entity
             in
@@ -1340,16 +1327,13 @@ let plan_class_property ~now_ms db class_uuid selector action context =
       in
       let retract_relation_refs =
         Datascript.Retract
-          ( Entity_id class_entity
-          , "block/refs"
-          , Some (Ref_to (Entity_id property.entity)) )
+          (Entity_id class_entity, "block/refs", Some (Ref_to (Entity_id property.entity)))
         :: (relation_entity
             |> Option.to_list
             |> List.map (fun entity ->
               Datascript.Retract
-                ( Entity_id class_entity
-                , "block/refs"
-                , Some (Ref_to (Entity_id entity)) )))
+                (Entity_id class_entity, "block/refs", Some (Ref_to (Entity_id entity))))
+           )
       in
       let present =
         List.exists
@@ -1359,7 +1343,7 @@ let plan_class_property ~now_ms db class_uuid selector action context =
           (values db class_entity relation)
       in
       match action with
-      | Protocol.Remove_class_property ->
+      | Logseq_db_types.Mutation.Remove_class_property ->
         let tx_ops =
           if present
           then
@@ -1421,7 +1405,7 @@ let plan_class_property ~now_ms db class_uuid selector action context =
 ;;
 
 let plan ~now_ms db = function
-  | Protocol.Upsert_property { property; schema; context } ->
+  | Logseq_db_types.Mutation.Upsert_property { property; schema; context } ->
     plan_upsert ~now_ms db property schema context
   | Set_property { block; property; value; context } ->
     plan_set ~now_ms db block property value context

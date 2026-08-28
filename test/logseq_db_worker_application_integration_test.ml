@@ -1,5 +1,6 @@
+open Logseq_db_types.Mutation
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
-module Graph = Logseq_db_worker.Graph_types
+module Graph = Logseq_db_types.Graph_types
 module Host_protocol = Bonsai_flutter_protocol
 module ID = Bonsai_flutter_spec.Id
 module Protocol = Logseq_db_worker.Protocol
@@ -102,7 +103,7 @@ let seed_fatal_test_block (fixture : Adapter_fixture.t) =
       fail "fatal test seed failed: %s" (Logseq_db_worker.Error.message failure.error)
   in
   let context mutation_id =
-    Protocol.
+    Logseq_db_types.Mutation.
       { mutation_id = uuid mutation_id
       ; expected_basis = Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
       }
@@ -122,7 +123,7 @@ let seed_fatal_test_block (fixture : Adapter_fixture.t) =
     (Structural
        (Insert_blocks
           { roots =
-              [ { Protocol.uuid = block_uuid
+              [ { Logseq_db_types.Mutation.uuid = block_uuid
                 ; title = "Fatal mutation row"
                 ; children = []
                 }
@@ -154,7 +155,7 @@ let seed_startup_feed_days (fixture : Adapter_fixture.t) count =
       fail "startup feed seed failed: %s" (Logseq_db_worker.Error.message failure.error)
   in
   let context serial =
-    Protocol.
+    Logseq_db_types.Mutation.
       { mutation_id =
           uuid (Printf.sprintf "97000000-0000-4000-a000-%012d" (serial + 2_000))
       ; expected_basis = Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
@@ -191,7 +192,7 @@ let seed_startup_feed_days (fixture : Adapter_fixture.t) count =
       (Structural
          (Insert_blocks
             { roots =
-                [ { Protocol.uuid = block_uuid
+                [ { Logseq_db_types.Mutation.uuid = block_uuid
                   ; title = Printf.sprintf "Startup feed day %d" (index + 1)
                   ; children = []
                   }

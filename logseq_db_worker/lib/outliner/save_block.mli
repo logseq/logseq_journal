@@ -5,5 +5,5 @@ val plan
   -> Datascript.db
   -> block:Graph_types.block_uuid
   -> title:string
-  -> context:Protocol.mutation_context
+  -> context:Logseq_db_types.Mutation.context
   -> (t, error) result

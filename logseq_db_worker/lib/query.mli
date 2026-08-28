@@ -15,11 +15,7 @@ type error =
 
 val validate_limit : int -> (unit, error) result
 val fingerprint : Yojson.Safe.t -> string
-
-val encode_cursor
-  :  key:bytes
-  -> cursor_payload
-  -> (Graph_types.Cursor.t, error) result
+val encode_cursor : key:bytes -> cursor_payload -> (Graph_types.Cursor.t, error) result
 
 val decode_cursor
   :  key:bytes

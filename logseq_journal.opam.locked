@@ -122,6 +122,8 @@ depends: [
   "lambdasoup" {= "1.1.1"}
   "legacy_diffable" {= "v0.17.0"}
   "logs" {= "0.10.0"}
+  "logseq_db_types" {= "0.1.0"}
+  "logseq_sync" {= "0.1.0"}
   "logseq_db_worker" {= "0.1.0"}
   "lwt-dllist" {= "1.1.0"}
   "macaddr" {= "5.6.2"}
@@ -256,11 +258,11 @@ build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
   [
   "bonsai_flutter.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#1755441c24d718206a3d61af0882c0727f810d46"
+  "git+https://github.com/RCmerci/bonsai_flutter.git#f4377637a33cdc450204734d033bbcbb861e06bb"
 ]
   [
   "bonsai_flutter_test.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#1755441c24d718206a3d61af0882c0727f810d46"
+  "git+https://github.com/RCmerci/bonsai_flutter.git#f4377637a33cdc450204734d033bbcbb861e06bb"
 ]
   [
     "datascript-ocaml-native.dev"

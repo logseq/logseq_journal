@@ -13,4 +13,4 @@ type error =
   | Too_deep
   | Duplicate_uuid of Graph_types.block_uuid
 
-val flatten : Protocol.block_tree list -> (node list, error) result
+val flatten : Logseq_db_types.Mutation.block_tree list -> (node list, error) result

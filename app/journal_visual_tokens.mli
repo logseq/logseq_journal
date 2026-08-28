@@ -14,6 +14,7 @@ type text_token =
 type typography =
   { header_title : text_token
   ; header_subtitle : text_token
+  ; day_heading : text_token
   ; entry : text_token
   ; supporting : text_token
   ; timestamp : text_token
@@ -57,6 +58,9 @@ type composer_geometry =
 type row_geometry =
   { time_slot_base : float
   ; trailing_inset : float
+  ; day_heading_before : float
+  ; day_heading_after : float
+  ; entry_vertical_padding : float
   ; disclosure_visual : float
   ; status_rail_width : float
   ; status_rail_radius : float

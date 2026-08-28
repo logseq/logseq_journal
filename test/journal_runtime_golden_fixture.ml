@@ -1,8 +1,8 @@
+open Logseq_db_types.Mutation
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 module Engine = Logseq_db_worker.Engine
-module Graph = Logseq_db_worker.Graph_types
+module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
-module Snapshot = Logseq_db_worker__Snapshot
 
 let fail format = Printf.ksprintf failwith format
 let uuid value = Graph.Uuid.of_string value |> Result.get_ok
@@ -22,10 +22,6 @@ let with_engine config ~epoch_ms run =
   let dependencies : Engine.dependencies =
     { clocks = { epoch_ms = (fun () -> epoch_ms); monotonic_ns = (fun () -> 1_000_000L) }
     ; cursor_authentication_key = Bytes.make 32 'g'
-    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
-    ; unlock_graph_key =
-        (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-          Error "crypto unavailable")
     }
   in
   let engine = Engine.open_ ~dependencies config |> Result.get_ok in
@@ -38,28 +34,47 @@ let with_engine config ~epoch_ms run =
 ;;
 
 let context engine mutation_id =
-  Protocol.
+  Logseq_db_types.Mutation.
     { mutation_id = uuid mutation_id
     ; expected_basis = Option.value (Engine.basis engine) ~default:0L
     }
 ;;
 
 let journal_page = uuid "00000001-2026-0812-0000-000000000000"
+let historical_journal_page = uuid "00000001-2026-0811-0000-000000000000"
+
+let ensure_journal_page engine ~day ~page ~request_id ~mutation_id =
+  ignore
+    (execute
+       engine
+       ~request_id
+       (Page
+          (Create_page
+             { title =
+                 Printf.sprintf
+                   "%04d-%02d-%02d"
+                   (day / 10_000)
+                   (day / 100 mod 100)
+                   (day mod 100)
+             ; kind = Create_journal_page { journal_day = day; supplied_uuid = Some page }
+             ; context = context engine mutation_id
+             })))
+;;
 
 let ensure_journal config =
   with_engine config ~epoch_ms:1_786_485_600_000L (fun engine ->
-    ignore
-      (execute
-         engine
-         ~request_id:"90000000-0000-4000-8000-000000000000"
-         (Page
-            (Create_page
-               { title = "2026-08-12"
-               ; kind =
-                   Create_journal_page
-                     { journal_day = 20260812; supplied_uuid = Some journal_page }
-               ; context = context engine "90000000-0000-4000-9000-000000000000"
-               }))))
+    ensure_journal_page
+      engine
+      ~day:20260812
+      ~page:journal_page
+      ~request_id:"90000000-0000-4000-8000-000000000000"
+      ~mutation_id:"90000000-0000-4000-9000-000000000000";
+    ensure_journal_page
+      engine
+      ~day:20260811
+      ~page:historical_journal_page
+      ~request_id:"90000000-0000-4000-8000-000000000001"
+      ~mutation_id:"90000000-0000-4000-9000-000000000001")
 ;;
 
 let block_uuid index = uuid (Printf.sprintf "90000000-0000-4000-a000-%012d" index)
@@ -104,24 +119,18 @@ let () =
   let sources = Filename.concat support_root "sources" in
   Unix.mkdir sources 0o700;
   let source_graph_dir = Adapter_fixture.create_oracle_graph sources "golden-source" in
-  let catalog =
-    match Snapshot.create_catalog ~application_support_directory:support_root with
-    | Ok catalog -> catalog
-    | Error _ -> fail "unable to create golden snapshot catalog"
-  in
   let token =
-    match Snapshot.create catalog ~source_graph_dir with
+    match
+      Cli_command.create_snapshot
+        ~application_support_directory:support_root
+        ~source_graph_dir
+    with
     | Ok token -> token
-    | Error _ -> fail "unable to publish golden snapshot"
+    | Error message -> fail "unable to publish golden snapshot: %s" message
   in
   let config = Adapter_fixture.config support_root token in
   ensure_journal config;
-  insert
-    config
-    ~index:1
-    ~minute:1_297
-    ~parent:journal_page
-    ~source:"Plan journal redesign";
+  insert config ~index:1 ~minute:1_297 ~parent:journal_page ~source:"混合脚本 Journal 2026 条目";
   insert
     config
     ~index:2
@@ -195,5 +204,11 @@ let () =
     ~source:
       "Later line one\nLater line two\nLater line three\nLater line four\nLater line five";
   set_status config ~index:14 ~minute:903 "Backlog";
+  insert
+    config
+    ~index:15
+    ~minute:840
+    ~parent:historical_journal_page
+    ~source:"Historical hierarchy row";
   print_endline (Graph.Uuid.to_string token)
 ;;

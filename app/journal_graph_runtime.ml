@@ -1,4 +1,4 @@
-module Graph = Logseq_db_worker.Graph_types
+module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
 module Projection = Journal_graph_projection
@@ -260,7 +260,8 @@ let parse_uuid field value =
 
 let mutation_context (t : t) mutation_id =
   Result.map
-    (fun mutation_id -> Protocol.{ mutation_id; expected_basis = t.basis })
+    (fun mutation_id ->
+       Logseq_db_types.Mutation.{ mutation_id; expected_basis = t.basis })
     (parse_uuid "mutation ID" mutation_id)
 ;;
 
@@ -468,8 +469,9 @@ let submit t (request : Journal_graph_request.t) =
                 t
                 (Mutation_refresh
                    { page; refresh = Updated { block_id = command.block_id } })
-                (Protocol.Structural
-                   (Protocol.Save_block { block; title = command.source; context }))
+                (Logseq_db_types.Mutation.Structural
+                   (Logseq_db_types.Mutation.Save_block
+                      { block; title = command.source; context }))
             ])
      | Error message, _ | _, Error message -> reject message)
   | Set_task_state command ->
@@ -484,7 +486,7 @@ let submit t (request : Journal_graph_request.t) =
           let mutation =
             match command.task_state with
             | Journal_model.No_status ->
-              Protocol.Remove_property { block; property; context }
+              Logseq_db_types.Mutation.Remove_property { block; property; context }
             | status ->
               Set_property
                 { block
@@ -500,7 +502,7 @@ let submit t (request : Journal_graph_request.t) =
                 t
                 (Mutation_refresh
                    { page; refresh = Updated { block_id = command.block_id } })
-                (Protocol.Property mutation)
+                (Logseq_db_types.Mutation.Property mutation)
             ])
      | Error message, _ | _, Error message -> reject message)
   | Create_child command ->
@@ -513,7 +515,7 @@ let submit t (request : Journal_graph_request.t) =
        (match page_by_block t command.parent_block_id with
         | None -> reject "The parent page is not retained."
         | Some page ->
-          let tree : Protocol.block_tree =
+          let tree : Logseq_db_types.Mutation.block_tree =
             { uuid = child; title = command.source; children = [] }
           in
           requests
@@ -527,7 +529,7 @@ let submit t (request : Journal_graph_request.t) =
                          ; parent_id = command.parent_block_id
                          }
                    })
-                (Protocol.Structural
+                (Logseq_db_types.Mutation.Structural
                    (Insert_blocks
                       { roots = [ tree ]
                       ; position = Relative (Last_child parent)
@@ -544,7 +546,8 @@ let submit t (request : Journal_graph_request.t) =
          [ mutate
              t
              (Delete_mutation command)
-             (Protocol.Structural (Delete_blocks { roots = [ block ]; context }))
+             (Logseq_db_types.Mutation.Structural
+                (Delete_blocks { roots = [ block ]; context }))
          ]
      | Error message, _ | _, Error message -> reject message)
 ;;
@@ -573,7 +576,7 @@ let capture_tree (command : Projection.capture) =
   let project (child : Projection.capture_child) =
     match parse_uuid "child UUID" child.block_id with
     | Error _ as error -> error
-    | Ok uuid -> Ok Protocol.{ uuid; title = child.source; children = [] }
+    | Ok uuid -> Ok Logseq_db_types.Mutation.{ uuid; title = child.source; children = [] }
   in
   match parse_uuid "block UUID" command.Projection.block_id with
   | Error _ as error -> error
@@ -586,7 +589,8 @@ let capture_tree (command : Projection.capture) =
          | Ok child -> children (child :: reversed) rest)
     in
     Result.map
-      (fun children -> Protocol.{ uuid; title = command.source; children })
+      (fun children ->
+         Logseq_db_types.Mutation.{ uuid; title = command.source; children })
       (children [] command.children)
 ;;
 
@@ -601,7 +605,7 @@ let capture_insert t (command : Projection.capture) page =
       [ mutate
           t
           (Capture_insert { command; page })
-          (Protocol.Structural
+          (Logseq_db_types.Mutation.Structural
              (Insert_blocks
                 { roots = [ tree ]; position = Relative (Last_child page_uuid); context }))
       ]
@@ -626,7 +630,7 @@ let capture_status t (command : Projection.capture) page =
          [ mutate
              t
              (Capture_status { command; page })
-             (Protocol.Property
+             (Logseq_db_types.Mutation.Property
                 (Set_property
                    { block
                    ; property = Property_by_ident "logseq.property/status"
@@ -743,13 +747,14 @@ let receive t (protocol_response : Protocol.response) =
               | Error message -> reject message
               | Ok page_uuid ->
                 let context =
-                  Protocol.{ mutation_id = request_uuid t; expected_basis = t.basis }
+                  Logseq_db_types.Mutation.
+                    { mutation_id = request_uuid t; expected_basis = t.basis }
                 in
                 requests
                   [ mutate
                       t
                       (Capture_create_page { command; page_uuid })
-                      (Protocol.Page
+                      (Logseq_db_types.Mutation.Page
                          (Create_page
                             { title =
                                 journal_title

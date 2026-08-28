@@ -1,7 +1,16 @@
 (library
  (name logseq_db_worker_fixture_generator)
  (modules fixture_generator)
- (libraries logseq_db_worker logseq_db_worker_test_support sqlite3 unix yojson))
+ (libraries
+  datascript_ocaml
+  digestif
+  logseq_db_storage
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker_test_support
+  sqlite3
+  unix
+  yojson))
 
 (executable
  (name generate_fixtures)

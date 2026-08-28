@@ -20,17 +20,23 @@ let day_heading
   =
   Ui.Widget.text
     ~key:(Ui.Key.string ("journal-day-heading:" ^ string_of_int page.day))
-    ~style:(text_style typography.Tokens.supporting)
+    ~style:(text_style typography.Tokens.day_heading)
     ~max_lines:1
     ~overflow:Ui.Style.Text_overflow.Ellipsis
     label
-  |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
+  |> Ui.Widget.with_test_id
+       (Ui.Test_id.string ("journal-day-heading-label:" ^ string_of_int page.day))
+  |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Bottom_start
   |> Ui.Widget.padding
        ~insets:
          (Ui.Layout.Edge_insets.only
             ~left:(if rtl then Tokens.spacing.x4 else profile.Tokens.content_leading)
             ~right:(if rtl then profile.Tokens.content_leading else Tokens.spacing.x4)
+            ~top:Tokens.row_geometry.day_heading_before
+            ~bottom:Tokens.row_geometry.day_heading_after
             ())
+  |> Ui.Widget.with_test_id
+       (Ui.Test_id.string ("journal-day-heading-padding:" ^ string_of_int page.day))
   |> Ui.Widget.semantics
        ~properties:
          (Ui.Semantics.create
@@ -289,12 +295,12 @@ let child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key =
          then
            Ui.Widget.Stack.positioned
              ~right:(text_leading -. Tokens.spacing.x3)
-             ~top:Tokens.spacing.x2
+             ~top:Tokens.row_geometry.entry_vertical_padding
              rail
          else
            Ui.Widget.Stack.positioned
              ~left:(text_leading -. Tokens.spacing.x3)
-             ~top:Tokens.spacing.x2
+             ~top:Tokens.row_geometry.entry_vertical_padding
              rail)
         :: !children);
   Ui.Widget.Stack.create (List.rev !children)

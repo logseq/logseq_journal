@@ -38,18 +38,18 @@ let test_graph_info_reports_admission_and_mode () =
          let basis, graph = graph_info engine in
          T.require (basis >= 0L) "Engine reported a negative basis";
          T.require
-           (graph.Logseq_db_worker.Graph_types.mode = Snapshot)
+           (graph.Logseq_db_types.Graph_types.mode = Snapshot)
            "snapshot Engine did not report exclusive snapshot mode";
          T.require
-           (List.mem
-              Logseq_db_worker.Graph_types.Ownership_verified
-              graph.admission_facts)
+           (List.mem Logseq_db_types.Graph_types.Ownership_verified graph.admission_facts)
            "Engine omitted verified ownership from admission facts";
          T.require
            (List.exists
               (function
-                | Logseq_db_worker.Graph_types.Compatible_schema
-                    { minimum = { major = 65; minor = 33 }; actual = { major = 65; minor } }
+                | Logseq_db_types.Graph_types.Compatible_schema
+                    { minimum = { major = 65; minor = 33 }
+                    ; actual = { major = 65; minor }
+                    }
                   when minor >= 33 -> true
                 | _ -> false)
               graph.admission_facts)
@@ -65,12 +65,7 @@ let test_basis_conflict_is_typed_and_non_mutating () =
          let basis, _ = graph_info engine in
          let request = mutation (Int64.pred basis) in
          (match Engine.execute engine request with
-          | P.Failed
-              { phase = Execute
-              ; basis = Some actual
-              ; error
-              ; _
-              } ->
+          | P.Failed { phase = Execute; basis = Some actual; error; _ } ->
             T.require (Int64.equal actual basis) "conflict omitted current basis";
             T.require
               (Logseq_db_worker.Error.code error = Conflict)
@@ -97,7 +92,9 @@ let test_live_mutation_cache_is_idempotent () =
 ;;
 
 let snapshot_entries fixture =
-  let directory = Filename.concat (Filename.concat fixture.F.support "logseq-db-worker") "snapshots" in
+  let directory =
+    Filename.concat (Filename.concat fixture.F.support "logseq-db-worker") "snapshots"
+  in
   Sys.readdir directory
   |> Array.to_list
   |> List.filter (fun name -> not (String.starts_with ~prefix:"." name))
@@ -105,14 +102,16 @@ let snapshot_entries fixture =
 
 let test_first_mutation_creates_backup_and_reopens () =
   F.with_snapshot (fun fixture ->
-    T.require (List.length (snapshot_entries fixture) = 1) "fixture started with extra snapshots";
+    T.require
+      (List.length (snapshot_entries fixture) = 1)
+      "fixture started with extra snapshots";
     let engine = open_engine fixture in
     let basis, _ = graph_info engine in
     let result = Engine.execute engine (mutation basis) |> mutation_result in
     T.require (result.status = Applied) "mutation did not commit";
     let _, graph = graph_info engine in
     T.require
-      (List.mem Logseq_db_worker.Graph_types.Backup_verified graph.admission_facts)
+      (List.mem Logseq_db_types.Graph_types.Backup_verified graph.admission_facts)
       "committed mutation omitted Backup_verified";
     (match Engine.close engine with
      | Ok () -> ()
@@ -132,8 +131,7 @@ let test_first_mutation_creates_backup_and_reopens () =
                  Read
                    (Get_page
                       { page =
-                          Page_by_uuid
-                            (F.uuid "63000000-0000-4000-8000-000000000001")
+                          Page_by_uuid (F.uuid "63000000-0000-4000-8000-000000000001")
                       })
              }
          in
@@ -183,26 +181,38 @@ let test_close_failure_releases_internal_resources () =
      | Error _ -> ()
      | Ok () -> T.fail "ownership identity change was not diagnosed");
     Unix.unlink lock_path;
-    match
-      Logseq_db_worker__Ownership.acquire
-        ~target:Snapshot_target
-        ~graph_dir:fixture.resolved.graph_dir
-    with
-    | Error _ -> T.fail "failed close retained the owner primitive or SQLite handle"
-    | Ok owner ->
-      (match Logseq_db_worker__Ownership.release owner with
+    match Engine.open_ ~dependencies:F.dependencies fixture.config with
+    | Error error ->
+      T.fail
+        "failed close retained the owner primitive or SQLite handle: %s"
+        (Logseq_db_worker.Error.message error)
+    | Ok replacement ->
+      (match Engine.close replacement with
        | Ok () -> ()
-       | Error _ -> T.fail "replacement ownership did not release"))
+       | Error message -> T.fail "replacement Engine did not close: %s" message))
 ;;
 
 let () =
   T.run
     "engine"
-    [ T.case "Graph_info reports admission facts and target mode" test_graph_info_reports_admission_and_mode
-    ; T.case "expected basis conflict is typed and non-mutating" test_basis_conflict_is_typed_and_non_mutating
+    [ T.case
+        "Graph_info reports admission facts and target mode"
+        test_graph_info_reports_admission_and_mode
+    ; T.case
+        "expected basis conflict is typed and non-mutating"
+        test_basis_conflict_is_typed_and_non_mutating
     ; T.case "live mutation ID cache deduplicates" test_live_mutation_cache_is_idempotent
-    ; T.case "first mutation creates backup and reopens" test_first_mutation_creates_backup_and_reopens
-    ; T.case "fatal persistence terminalizes Engine" test_fatal_persistence_terminalizes_engine
-    ; T.case "closed Engine returns typed failure" test_closed_engine_returns_typed_failure
-    ; T.case "close failure releases internal resources" test_close_failure_releases_internal_resources
+    ; T.case
+        "first mutation creates backup and reopens"
+        test_first_mutation_creates_backup_and_reopens
+    ; T.case
+        "fatal persistence terminalizes Engine"
+        test_fatal_persistence_terminalizes_engine
+    ; T.case
+        "closed Engine returns typed failure"
+        test_closed_engine_returns_typed_failure
+    ; T.case
+        "close failure releases internal resources"
+        test_close_failure_releases_internal_resources
     ]
+;;

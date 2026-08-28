@@ -10,7 +10,52 @@
 
 (test
  (name source_boundary_test)
- (modules source_boundary_test))
+ (modules source_boundary_test)
+ (deps
+  (source_tree .)
+  (source_tree ../app)
+  (source_tree ../flutter/integration_test)
+  (source_tree ../flutter/lib)
+  (source_tree ../flutter/test)
+  (source_tree ../logseq_db_storage)
+  (source_tree ../logseq_db_types)
+  (source_tree ../logseq_db_worker)
+  (source_tree ../logseq_sync/lib/core)
+  (source_tree ../logseq_sync/lib/eio)
+  (source_tree ../logseq_sync/lib/platform)
+  (source_tree ../logseq_sync/lib/storage)
+  (source_tree ../logseq_sync/spec)
+  (source_tree ../logseq_sync/test)
+  (source_tree ../tool)
+  ../bonsai-flutter.sexp
+  ../dune-project
+  ../flutter/ios/Flutter/Debug.xcconfig
+  ../flutter/ios/Flutter/Release.xcconfig
+  ../flutter/ios/Runner/Info.plist
+  ../flutter/macos/Flutter/Flutter-Debug.xcconfig
+  ../flutter/macos/Flutter/Flutter-Release.xcconfig
+  ../flutter/macos/Flutter/GeneratedPluginRegistrant.swift
+  ../flutter/macos/Runner/AppDelegate.swift
+  ../flutter/macos/Runner/DebugProfile.entitlements
+  ../flutter/macos/Runner/Release.entitlements
+  ../flutter/pubspec.yaml
+  ../logseq_db_storage.opam
+  ../logseq_db_storage.opam.locked
+  ../logseq_db_types.opam
+  ../logseq_db_types.opam.locked
+  ../logseq_db_worker.opam
+  ../logseq_db_worker.opam.locked
+  ../logseq_journal.opam
+  ../logseq_journal.opam.locked
+  ../logseq_sync/lib/api.ml
+  ../logseq_sync/lib/dune
+  ../logseq_sync/spec/api.mli
+  ../logseq_sync/spec/dune
+  ../logseq_sync.install
+  ../logseq_sync.opam
+  ../logseq_sync.opam.locked)
+ (action
+  (run %{test} %{workspace_root} %{dep:../logseq_sync.install})))
 
 (test
  (name application_view_test)
@@ -24,8 +69,10 @@
   bonsai_flutter.ui
   bonsai_flutter_test
   core
+  logseq_db_types
   logseq_db_worker
   logseq_db_worker_test_support
+  logseq_sync
   unix))
 
 (test
@@ -54,7 +101,14 @@
 (executable
  (name journal_runtime_golden_fixture)
  (modules journal_runtime_golden_fixture)
- (libraries app logseq_db_worker logseq_db_worker_test_support unix))
+ (libraries
+  app
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker_cli
+  logseq_db_worker_test_support
+  logseq_sync
+  unix))
 
 (test
  (name journal_time_test)
@@ -83,8 +137,10 @@
   bonsai_flutter.ui
   bonsai_flutter_test
   core
+  logseq_db_types
   logseq_db_worker
   logseq_db_worker_test_support
+  logseq_sync
   unix))
 
 (rule
@@ -98,8 +154,8 @@
   (progn
    (run
     sh
-   %{dep:test_native_static_gmp.sh}
-   %{dep:../tool/native_static_link_flags.sh})
+    %{dep:test_native_static_gmp.sh}
+    %{dep:../tool/native_static_link_flags.sh})
    (run sh %{dep:test_material_icons_artifact.sh} %{workspace_root}))))
 
 (rule

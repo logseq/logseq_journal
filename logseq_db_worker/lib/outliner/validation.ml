@@ -54,10 +54,7 @@ let remove_boundary_slashes value =
 ;;
 
 let page_name value =
-  value
-  |> case_map Uucp.Case.Map.to_lower
-  |> remove_boundary_slashes
-  |> normalize_nfc
+  value |> case_map Uucp.Case.Map.to_lower |> remove_boundary_slashes |> normalize_nfc
 ;;
 
 let contains value needle =

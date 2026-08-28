@@ -1,3 +1,5 @@
+open Logseq_db_types.Mutation
+
 type mode =
   | Runtime_flow
   | Runtime_flow_with_pagination
@@ -5,13 +7,13 @@ type mode =
 
 type generated =
   { support_root : string
-  ; snapshot_token : Logseq_db_worker.Graph_types.Uuid.t
+  ; snapshot_token : Logseq_db_types.Graph_types.Uuid.t
   ; graph_dir : string
   }
 
 type managed_generated =
   { support_root : string
-  ; graph_id : Logseq_db_worker.Graph_types.Uuid.t
+  ; graph_id : Logseq_db_types.Graph_types.Uuid.t
   ; graph_dir : string
   ; user_id : string
   ; base_url : string
@@ -22,7 +24,7 @@ module Snapshot = Logseq_db_worker__Snapshot
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 
 let uuid value =
-  match Logseq_db_worker.Graph_types.Uuid.of_string value with
+  match Logseq_db_types.Graph_types.Uuid.of_string value with
   | Ok uuid -> uuid
   | Error message -> failwith message
 ;;
@@ -170,6 +172,71 @@ let create ~support_root ~mode =
   | Failure message -> Error message
 ;;
 
+let rec ensure_directory_tree path =
+  if Sys.file_exists path
+  then ()
+  else (
+    ensure_directory_tree (Filename.dirname path);
+    Unix.mkdir path 0o700)
+;;
+
+let add_remote_identity graph_dir graph_id_text =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let connection =
+    Storage.open_database (Filename.concat graph_dir "db.sqlite") |> Result.get_ok
+  in
+  let storage = Storage.datascript_storage connection in
+  let db = Storage.restore_database connection |> Result.get_ok in
+  let session =
+    Session.create
+      ~db
+      ~tail:(Datascript.Storage.restore_tail_groups storage)
+      ~callbacks:(Storage.connection_callbacks connection)
+  in
+  let entity id ident value =
+    Datascript.Entity
+      { db_id = Some (Temp_id id)
+      ; attrs = [ "db/ident", One_value (Keyword ident); "kv/value", One_value value ]
+      }
+  in
+  let staged =
+    Session.stage_transact
+      session
+      [ entity "remote-flag" "logseq.kv/graph-remote?" (Bool true)
+      ; entity "remote-uuid" "logseq.kv/graph-uuid" (Uuid graph_id_text)
+      ]
+    |> Result.get_ok
+  in
+  Session.commit_staged session staged |> Result.get_ok;
+  Session.close session |> Result.get_ok
+;;
+
+let install_catalog_fixture ~support_root ~user_id ~base_url ~graph_id =
+  let root = Filename.concat support_root "logseq-db-worker/sync-catalogs" in
+  ensure_directory_tree root;
+  let digest =
+    Digestif.SHA256.digest_string (user_id ^ "\000" ^ base_url) |> Digestif.SHA256.to_hex
+  in
+  let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
+  let rec instantiate = function
+    | `String "__BASE_URL__" -> `String base_url
+    | `String "__GRAPH_ID__" -> `String graph_id
+    | `String "__USER_ID__" -> `String user_id
+    | `Assoc fields ->
+      `Assoc (List.map (fun (name, value) -> name, instantiate value) fields)
+    | `List values -> `List (List.map instantiate values)
+    | (`Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _) as value -> value
+  in
+  let json =
+    Logseq_db_worker_test_support.Test_support.fixture
+      "sync/encrypted-catalog-template.json"
+    |> Yojson.Safe.from_file
+    |> instantiate
+  in
+  Yojson.Safe.to_file (Filename.concat root (digest ^ ".json")) json
+;;
+
 let create_encrypted_warm_start ~support_root =
   try
     if Filename.is_relative support_root
@@ -181,49 +248,36 @@ let create_encrypted_warm_start ~support_root =
       let graph_id_text = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" in
       let graph_id = uuid graph_id_text in
       let graph_dir =
-        Logseq_db_worker.Sync_mirror.graph_directory
-          ~application_support_directory:support_root
-          ~graph_id
+        Filename.concat
+          support_root
+          (Filename.concat "logseq-db-worker/synced-graphs" graph_id_text)
       in
       if Sys.file_exists graph_dir
       then Error "encrypted warm-start mirror already exists"
       else (
         let root = Filename.dirname graph_dir in
-        Adapter_fixture.make_directory root;
+        ensure_directory_tree root;
         let created = Adapter_fixture.create_oracle_graph root graph_id_text in
         if not (String.equal created graph_dir)
         then failwith "encrypted warm-start mirror path changed";
         seed_pagination_graph ~support_root ~graph_dir;
-        Adapter_fixture.add_remote_identity graph_dir graph_id_text;
+        add_remote_identity graph_dir graph_id_text;
         let database_path = Filename.concat graph_dir "db.sqlite" in
-        let module Storage = Logseq_db_worker__Logseq_sqlite_storage in
-        let connection =
-          match Storage.open_database database_path with
-          | Ok value -> value
-          | Error _ -> failwith "unable to reopen encrypted warm-start fixture"
-        in
-        let db =
-          match Storage.restore_database connection with
-          | Ok value -> value
-          | Error _ -> failwith "unable to restore encrypted warm-start fixture"
-        in
-        let checksum = Logseq_db_worker.Sync_checksum.recompute ~e2ee:false db in
-        (match Storage.close (Storage.connection_callbacks connection) with
-         | Ok () -> ()
-         | Error _ -> failwith "unable to close encrypted warm-start fixture");
         let metadata =
           match
-            Logseq_db_worker__Sync_meta.create
+            Logseq_db_types.Sync_checkpoint.create
               ~graph_id
-              ~schema:Logseq_db_worker.Graph_types.{ major = 65; minor = 33 }
+              ~schema:Logseq_db_types.Graph_types.{ major = 65; minor = 33 }
               ~applied_server_t:40
-              ~checksum
+              ~checksum:"0000000000000000"
           with
           | Ok value -> value
           | Error message -> failwith message
         in
         let sqlite = Sqlite3.db_open database_path in
-        (match Logseq_db_worker__Sync_meta.initialize_database sqlite metadata with
+        (match
+           Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite metadata
+         with
          | Ok () -> ()
          | Error message ->
            failwith ("unable to initialize encrypted warm-start fixture: " ^ message));
@@ -231,33 +285,7 @@ let create_encrypted_warm_start ~support_root =
         then failwith "unable to close encrypted warm-start metadata";
         let base_url = "https://api.logseq.io" in
         let user_id = "macos-integration-" ^ Digest.to_hex (Digest.string support_root) in
-        let graph =
-          Logseq_db_worker.Sync_catalog.
-            { graph_id
-            ; name = "Encrypted Offline Notes"
-            ; schema = { major = 65; minor = 33; exact = true }
-            ; encrypted = true
-            }
-        in
-        let cache =
-          Logseq_db_worker.Sync_catalog.create_cache
-            ~user_id
-            ~base_url
-            ~graphs:[ graph ]
-            ~selected_graph:(Some graph_id)
-          |> fun cache ->
-          Logseq_db_worker.Sync_catalog.set_mirror_status
-            cache
-            graph_id
-            Logseq_db_worker.Sync_catalog.Ready
-        in
-        (match
-           Logseq_db_worker.Sync_catalog_store.save
-             ~application_support_directory:support_root
-             cache
-         with
-         | Ok () -> ()
-         | Error message -> failwith ("unable to save encrypted fixture catalog: " ^ message));
+        install_catalog_fixture ~support_root ~user_id ~base_url ~graph_id;
         Ok
           { support_root
           ; graph_id
@@ -282,7 +310,7 @@ let to_yojson (generated : generated) =
     [ "formatVersion", `Int 1
     ; "supportRoot", `String generated.support_root
     ; ( "snapshotToken"
-      , `String (Logseq_db_worker.Graph_types.Uuid.to_string generated.snapshot_token) )
+      , `String (Logseq_db_types.Graph_types.Uuid.to_string generated.snapshot_token) )
     ; "graphDir", `String generated.graph_dir
     ]
 ;;
@@ -293,8 +321,7 @@ let managed_to_yojson (generated : managed_generated) =
     ; "supportRoot", `String generated.support_root
     ; "baseUrl", `String generated.base_url
     ; "userId", `String generated.user_id
-    ; ( "graphId"
-      , `String (Logseq_db_worker.Graph_types.Uuid.to_string generated.graph_id) )
+    ; "graphId", `String (Logseq_db_types.Graph_types.Uuid.to_string generated.graph_id)
     ; "graphDir", `String generated.graph_dir
     ; "expectedTimelineText", `String generated.expected_timeline_text
     ]

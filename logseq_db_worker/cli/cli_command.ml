@@ -148,7 +148,7 @@ let random_uuid () =
        if List.mem index [ 4; 6; 8; 10 ] then Buffer.add_char buffer '-';
        Buffer.add_string buffer (Printf.sprintf "%02x" (Char.code byte)))
     bytes;
-  match Logseq_db_worker.Graph_types.Uuid.of_string (Buffer.contents buffer) with
+  match Logseq_db_types.Graph_types.Uuid.of_string (Buffer.contents buffer) with
   | Ok uuid -> uuid
   | Error message -> failwith message
 ;;
@@ -160,10 +160,6 @@ let production_dependencies () =
         ; monotonic_ns = Mtime_clock.elapsed_ns
         }
     ; cursor_authentication_key = random_bytes 32
-    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
-    ; unlock_graph_key =
-        (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-          Error "crypto unavailable")
     }
 ;;
 
@@ -199,7 +195,7 @@ let target_of_options snapshot_token graph_name inbox_entry =
   | Some token, None, None ->
     Result.map
       (fun token -> Config.Snapshot { token })
-      (Logseq_db_worker.Graph_types.Uuid.of_string token)
+      (Logseq_db_types.Graph_types.Uuid.of_string token)
   | None, Some graph_name, None ->
     (match Sys.getenv_opt "HOME" with
      | None -> Error "HOME is required to resolve ~/logseq/<graph-name>"
@@ -439,7 +435,7 @@ let dispatch
      | Error message -> report_error Local_error message
      | Ok uuid ->
        with_target (fun config ->
-         match Logseq_db_worker.Graph_types.Uuid.of_string uuid with
+         match Logseq_db_types.Graph_types.Uuid.of_string uuid with
          | Error message -> report_error Local_error message
          | Ok block ->
            run_request
@@ -454,7 +450,7 @@ let dispatch
      | Error message -> report_error Local_error message
      | Ok uuid ->
        with_target (fun config ->
-         match Logseq_db_worker.Graph_types.Uuid.of_string uuid with
+         match Logseq_db_types.Graph_types.Uuid.of_string uuid with
          | Error message -> report_error Local_error message
          | Ok parent ->
            run_request
@@ -512,7 +508,7 @@ let dispatch
                      (`Assoc
                          [ "apiVersion", `Int Protocol.api_version
                          ; ( "snapshotToken"
-                           , `String (Logseq_db_worker.Graph_types.Uuid.to_string token) )
+                           , `String (Logseq_db_types.Graph_types.Uuid.to_string token) )
                          ]));
                 Cli_output.exit_code Success))))
   | [ "snapshot"; "import" ] ->
@@ -530,7 +526,7 @@ let dispatch
                   (`Assoc
                       [ "apiVersion", `Int Protocol.api_version
                       ; ( "snapshotToken"
-                        , `String (Logseq_db_worker.Graph_types.Uuid.to_string token) )
+                        , `String (Logseq_db_types.Graph_types.Uuid.to_string token) )
                       ]));
              Cli_output.exit_code Success)))
   | [] -> report_error Local_error "a command is required"

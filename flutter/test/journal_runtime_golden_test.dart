@@ -15,7 +15,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 import 'package:flutter_test/flutter_test.dart';
 
-const _parentSource = 'Plan journal redesign';
+const _parentSource = '混合脚本 Journal 2026 条目';
 const _firstChild = 'Increase block row height';
 const _secondChild = 'Show parent and child preview';
 const _thirdChild = 'Keep bounded virtualization';
@@ -63,10 +63,22 @@ void main() {
           matching: find.byType(Scrollable),
         );
         final position = tester.state<ScrollableState>(scrollable).position;
-        position.jumpTo(1);
+        position.jumpTo(80);
         await tester.pump();
+        expect(
+          _sliverPaintExtent(tester, find.byType(SliverAppBar)),
+          closeTo(56 + 47 + 1, 0.5),
+        );
         position.jumpTo(0);
         await tester.pump(const Duration(milliseconds: 220));
+        _expectTimelineStartsBelowHeader(tester);
+        expect(find.text(_parentSource), findsOneWidget);
+        expect(
+          DefaultTextStyle.of(
+            tester.element(find.text(_parentSource)),
+          ).style.fontFamily,
+          'PingFang SC',
+        );
         await expectLater(
           find.byType(Scaffold).first,
           matchesGoldenFile('goldens/journal-typography-$preset.png'),
@@ -610,7 +622,7 @@ void main() {
       final rowRect = _ancestorRectWithHeight(
         tester,
         find.text(_parentSource),
-        104,
+        100,
       );
       expect(rowRect.width, closeTo(390, 0.5));
       expect(
@@ -656,7 +668,7 @@ void main() {
       final secondChildTop = tester
           .getTopLeft(_directChildText(_secondChild))
           .dy;
-      expect(firstChildTop - parentTop, closeTo(36, 0.1));
+      expect(firstChildTop - parentTop, closeTo(38, 0.1));
       expect(secondChildTop - firstChildTop, closeTo(44, 0.1));
       expect(
         tester.getTopLeft(find.text(_parentSource)).dy,
@@ -981,6 +993,28 @@ Future<void> _pumpSlidableMotion(WidgetTester tester) async {
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 250));
   await tester.pump();
+}
+
+void _expectTimelineStartsBelowHeader(WidgetTester tester) {
+  const topInset = 47.0;
+  final appBar = find.byType(SliverAppBar);
+  final paintBoundary =
+      tester.getRect(find.byType(CustomScrollView)).top +
+      _sliverPaintExtent(tester, appBar);
+  expect(
+    tester.getRect(find.text('Today')).top,
+    greaterThanOrEqualTo(topInset),
+  );
+  expect(
+    tester.getRect(find.bySemanticsLabel('Account menu')).top,
+    greaterThanOrEqualTo(topInset),
+  );
+  expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
+  expect(
+    tester.getRect(find.text(_parentSource)).top,
+    greaterThanOrEqualTo(paintBoundary - 0.5),
+    reason: 'the first timeline slot paints underneath the expanded app bar',
+  );
 }
 
 double _sliverPaintExtent(WidgetTester tester, Finder finder) {
@@ -1361,6 +1395,15 @@ Future<void> _loadGoldenFonts() async {
     await File('${materialFonts.path}/$name').readAsBytes(),
   );
   await (FontLoader('Roboto')..addFont(load('Roboto-Regular.ttf'))).load();
+  // FontLoader cannot select a face from the system PingFang TTC collection.
+  // Register one deterministic mixed-script test face under the production
+  // family name; protocol assertions separately verify the published chain.
+  await (FontLoader('PingFang SC')..addFont(
+        File(
+          '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+        ).readAsBytes().then(ByteData.sublistView),
+      ))
+      .load();
   await (FontLoader('Apple Color Emoji')..addFont(
         File(
           '/System/Library/Fonts/Apple Color Emoji.ttc',

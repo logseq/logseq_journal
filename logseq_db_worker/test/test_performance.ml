@@ -31,8 +31,7 @@ let require_sha256 name value =
   String.iter
     (fun character ->
        T.require
-         ((character >= '0' && character <= '9')
-          || (character >= 'a' && character <= 'f'))
+         ((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))
          "%s is not a lowercase SHA-256 digest"
          name)
     value
@@ -55,10 +54,7 @@ let require_fixture_identity () =
 ;;
 
 let samples metric = int "samples" (result () |> field "latency" |> field metric)
-
-let p95_ms metric =
-  float "p95Milliseconds" (result () |> field "latency" |> field metric)
-;;
+let p95_ms metric = float "p95Milliseconds" (result () |> field "latency" |> field metric)
 
 let cases =
   [ T.case "fixture hash and benchmark environment are recorded" (fun () ->
@@ -90,8 +86,7 @@ let cases =
   ; T.case "peak RSS is below 1.5 GiB" (fun () ->
       require_fixture_identity ();
       T.require
-        (int "peakRssBytes" (field "measurements" (result ()))
-         < 1_610_612_736)
+        (int "peakRssBytes" (field "measurements" (result ())) < 1_610_612_736)
         "peak RSS reached or exceeded 1.5 GiB")
   ; T.case "warm Get_block p95 is below 20 ms" (fun () ->
       require_fixture_identity ();
@@ -144,8 +139,7 @@ let cases =
       require_fixture_identity ();
       let throughput = result () |> field "throughput" in
       List.iter
-        (fun name ->
-           T.require (float name throughput > 0.) "%s was not reported" name)
+        (fun name -> T.require (float name throughput > 0.) "%s was not reported" name)
         [ "snapshotBytesPerSecond"; "firstBackupBytesPerSecond" ])
   ]
 ;;

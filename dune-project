@@ -5,12 +5,66 @@
 (license MIT)
 
 (package
+ (name logseq_db_types)
+ (allow_empty)
+ (depends
+  (ocaml (= 5.1.1))
+  (dune (= 3.23.1))
+  (yojson (= 3.0.0))))
+
+(package
+ (name logseq_db_storage)
+ (allow_empty)
+ (depends
+  (ocaml (= 5.1.1))
+  (dune (= 3.23.1))
+  (logseq_db_types (= 0.1.0))
+  (datascript_ocaml (= dev))
+  (datascript-ocaml-native (= dev))
+  (melange-transit-native (= 0.1.0))
+  (persistent_sorted_set_ocaml (= dev))
+  (sqlite3 (= 5.4.0))
+  (yojson (= 3.0.0))))
+
+(package
+ (name logseq_sync)
+ (allow_empty)
+ (depends
+  (ocaml (= 5.1.1))
+  (dune (= 3.23.1))
+  (alcotest (and :with-test (= 1.7.0)))
+  (logseq_db_types (= 0.1.0))
+  (logseq_db_storage (= 0.1.0))
+  (bigstringaf (= 0.10.0))
+  (ca-certs-nss (= 3.126))
+  (cstruct (= 6.2.0))
+  (datascript_ocaml (= dev))
+  (datascript-ocaml-native (= dev))
+  (digestif (= 1.3.1))
+  (domain-name (= 0.5.0))
+  (eio (= 1.2))
+  (faraday (= 0.8.2))
+  (httpun (= 0.2.0))
+  (httpun-eio (= 0.2.0))
+  (httpun-ws (= 0.2.0))
+  (melange-transit-native (= 0.1.0))
+  (mirage-crypto-rng (= 2.2.0))
+  (sqlite3 (= 5.4.0))
+  (tls (= 2.1.2))
+  (tls-eio (= 2.1.2))
+  (uri (= 4.4.0))
+  (uutf (= 1.0.4))
+  (yojson (= 3.0.0))))
+
+(package
  (name logseq_journal)
  (allow_empty)
  (depends
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
   (logseq_db_worker (= 0.1.0))
+  (logseq_db_types (= 0.1.0))
+  (logseq_sync (= 0.1.0))
   (bonsai_flutter (= 0.1.0~dev))
   (bonsai_flutter_test (= 0.1.0~dev))
   (base (= v0.17.3))
@@ -36,6 +90,9 @@
  (depends
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
+  (logseq_db_types (= 0.1.0))
+  (logseq_db_storage (= 0.1.0))
+  (logseq_sync (= 0.1.0))
   (base (= v0.17.3))
   (bonsai (= v0.17.0))
   (bonsai_flutter (= 0.1.0~dev))
@@ -53,4 +110,5 @@
   (uucp (= 17.0.0))
   (uunf (= 17.0.0))
   (uutf (= 1.0.4))
+  (uri (= 4.4.0))
   (yojson (= 3.0.0))))

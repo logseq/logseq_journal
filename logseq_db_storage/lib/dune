@@ -1,0 +1,14 @@
+(library
+ (name logseq_db_storage)
+ (public_name logseq_db_storage)
+ (libraries
+  datascript-ocaml-native
+  datascript_ocaml
+  logseq_db_types
+  melange-transit-native
+  persistent_sorted_set_ocaml
+  sqlite3
+  unix
+  yojson)
+ (flags
+  (:standard -open Logseq_db_types)))

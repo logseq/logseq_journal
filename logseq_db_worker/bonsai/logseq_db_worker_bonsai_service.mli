@@ -1,54 +1,54 @@
+type client_command =
+  | Restore_local_account of { user_id : string }
+  | Reconcile_authenticated_user of { user_id : string option }
+  | Acknowledge_local_feed
+  | Acknowledge_timeline_presented
+  | Provide_token of
+      { request : Logseq_sync.Api.token_request
+      ; token : string
+      }
+  | Reject_token of Logseq_sync.Api.token_request
+  | Select_graph of Logseq_sync.Api.graph_id
+  | Return_to_graph_picker
+  | Refresh_catalog
+  | Begin_online_recovery
+  | Submit_e2ee_password of string
+  | Delete_local_cache of Logseq_sync.Api.graph_id
+  | Set_foreground of bool
+
 type request =
-  | Manager_command of Logseq_db_worker.Sync_manager.command
+  | Client_command of client_command
   | Graph_request of Logseq_db_worker.Protocol.request
+  | Get_graph_state
 
 type response =
-  | Manager_snapshot of Logseq_db_worker.Sync_manager.snapshot
+  | Client_state of Logseq_sync.Api.state
   | Graph_response of Logseq_db_worker.Protocol.response
+  | Graph_state of Logseq_db_worker.graph_state
 
 type push =
   | Graph_push of Logseq_db_worker.Protocol.push
-  | Manager_state_changed of Logseq_db_worker.Sync_manager.snapshot
-  | Need_id_token of Logseq_db_worker.Sync_auth.challenge
-  | Bootstrap_progress of
-      { account_generation : int
-      ; graph_generation : int
-      ; progress : Logseq_db_worker.Sync_bootstrap.progress
-      }
-
-type local_secrets =
-  { load_and_verify_wrapped_graph_key :
-      managed_sync_origin:Uri.t
-      -> user_id:string
-      -> graph_id:Logseq_db_worker.Graph_types.Uuid.t
-      -> (string, Logseq_db_worker.Sync_platform_crypto.wrapped_key_load_failure) result
-  ; verify_and_save_wrapped_graph_key :
-      managed_sync_origin:Uri.t
-      -> user_id:string
-      -> graph_id:Logseq_db_worker.Graph_types.Uuid.t
-      -> encrypted_graph_key:string
-      -> (unit, string) result
-  ; delete_wrapped_graph_key :
-      managed_sync_origin:Uri.t
-      -> user_id:string
-      -> graph_id:Logseq_db_worker.Graph_types.Uuid.t
-      -> (unit, string) result
-  ; delete_account_secrets :
-      managed_sync_origin:Uri.t -> user_id:string -> (unit, string) result
-  }
+  | Client_state_changed of Logseq_sync.Api.state
+  | Need_id_token of Logseq_sync.Api.token_request
+  | Bootstrap_progress of Logseq_sync.Api.bootstrap_progress
+  | Graph_state_changed of Logseq_db_worker.graph_state
 
 val invalidation_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
 val manager_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
 val auth_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
 val bootstrap_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
+val graph_state_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
+
+type dependencies
+
+val dependencies
+  :  engine:Logseq_db_worker.Engine.dependencies
+  -> secrets:Logseq_sync.Api.secrets
+  -> crypto:Logseq_sync.Api.crypto
+  -> dependencies
 
 val create
-  :  dependencies:Logseq_db_worker.Engine.dependencies
-  -> (Logseq_db_worker.Config.t, request, response, push) Worker.Service.t
-
-val create_with_local_secrets
-  :  dependencies:Logseq_db_worker.Engine.dependencies
-  -> local_secrets:local_secrets
+  :  dependencies:dependencies
   -> (Logseq_db_worker.Config.t, request, response, push) Worker.Service.t
 
 val service : (Logseq_db_worker.Config.t, request, response, push) Worker.Service.t

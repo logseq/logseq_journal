@@ -30,6 +30,13 @@ void main() {
 
       await _deleteAccountSecrets(fixtures.valid);
       await _deleteAccountSecrets(fixtures.missingWrappedKey);
+      final obsoletePending = File(
+        '${fixtures.valid.graphDirectory.path}/pending-intents-v1.json',
+      );
+      await obsoletePending.writeAsString(
+        '{"version":1,"entries":[{"secret":"obsolete"}]}',
+        flush: true,
+      );
       addTearDown(() async {
         await _deleteAccountSecrets(fixtures.valid);
         await _deleteAccountSecrets(fixtures.missingWrappedKey);
@@ -70,6 +77,11 @@ void main() {
           validAuth.requestedBeforeTimeline,
           isFalse,
           reason: 'network authentication started before Timeline presentation',
+        );
+        expect(
+          await obsoletePending.exists(),
+          isFalse,
+          reason: 'compiled startup retained obsolete pending data',
         );
       } finally {
         await valid.dispose(tester);
@@ -139,6 +151,7 @@ final class _Fixture {
     required this.baseUrl,
     required this.userId,
     required this.graphId,
+    required this.graphDirectory,
     required this.expectedTimelineText,
   });
 
@@ -146,6 +159,7 @@ final class _Fixture {
   final Uri baseUrl;
   final String userId;
   final String graphId;
+  final Directory graphDirectory;
   final String expectedTimelineText;
 
   Map<String, Object> get identity => <String, Object>{
@@ -163,6 +177,7 @@ final class _Fixture {
       baseUrl: Uri.parse(value['baseUrl']! as String),
       userId: value['userId']! as String,
       graphId: value['graphId']! as String,
+      graphDirectory: Directory(value['graphDir']! as String),
       expectedTimelineText: value['expectedTimelineText']! as String,
     );
   }

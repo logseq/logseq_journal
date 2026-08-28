@@ -3,6 +3,42 @@ module F = Logseq_db_worker_test_support.Adapter_fixture
 module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Worker_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Api = Logseq_sync.Api
+
+let worker_dependencies =
+  let crypto =
+    Api.crypto
+      ~decrypt_private_key:(fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
+        Error "unavailable")
+      ~decrypt_graph_key:(fun ~private_key:_ ~ciphertext:_ -> Error "unavailable")
+      ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "unavailable")
+      ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "unavailable")
+    |> Result.get_ok
+  in
+  let secrets =
+    Api.secrets
+      ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> false)
+      ~unlock_private_key:
+        (fun
+          ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
+        Error "unavailable")
+      ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+        Error "unavailable")
+      ~load_and_verify_wrapped_graph_key:
+        (fun
+          ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+        Error (Api.Wrapped_graph_key_unavailable "unavailable"))
+      ~verify_and_save_wrapped_graph_key:
+        (fun
+          ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+        Error "unavailable")
+      ~delete_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+        Ok ())
+      ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
+    |> Result.get_ok
+  in
+  Worker_service.dependencies ~engine:F.dependencies ~secrets ~crypto
+;;
 
 let send_graph client request = Worker.send client (Worker_service.Graph_request request)
 
@@ -21,7 +57,7 @@ let worker_once ~epoch config request =
     match
       Worker_runtime.start
         ~runtime_epoch:(ID.Runtime.Epoch.of_int64 epoch)
-        (Worker_service.create ~dependencies:F.dependencies)
+        (Worker_service.create ~dependencies:worker_dependencies)
         config
     with
     | Ok client -> client
@@ -98,22 +134,14 @@ let direct_once config request =
 
 let test_mutation_and_final_state_match_all_transports () =
   F.with_snapshot (fun fixture ->
-    let catalog =
-      match
-        Logseq_db_worker__Snapshot.create_catalog
-          ~application_support_directory:fixture.support
-      with
-      | Ok catalog -> catalog
-      | Error _ -> T.fail "unable to create transport parity catalog"
-    in
     let clone () =
       match
-        Logseq_db_worker__Snapshot.create
-          catalog
+        Cli_command.create_snapshot
+          ~application_support_directory:fixture.support
           ~source_graph_dir:fixture.source_graph_dir
       with
       | Ok token -> F.config fixture.support token
-      | Error _ -> T.fail "unable to clone transport parity snapshot"
+      | Error message -> T.fail "unable to clone transport parity snapshot: %s" message
     in
     let cli_config = clone () in
     let worker_config = clone () in
@@ -185,7 +213,7 @@ let test_open_failure_and_exact_ndjson () =
                (List.assoc_opt "requestId" fields
                 = Some
                     (`String
-                        (Logseq_db_worker.Graph_types.Uuid.to_string request.P.request_id))
+                        (Logseq_db_types.Graph_types.Uuid.to_string request.P.request_id))
                )
                "open failure lost the incoming request ID";
              T.require
@@ -232,17 +260,19 @@ let test_snapshot_create_uses_core () =
     with
     | Error message -> T.fail "CLI snapshot create failed: %s" message
     | Ok token ->
-      let catalog =
-        match
-          Logseq_db_worker__Snapshot.create_catalog
-            ~application_support_directory:fixture.support
-        with
-        | Ok catalog -> catalog
-        | Error _ -> T.fail "unable to reopen snapshot catalog"
-      in
-      (match Logseq_db_worker__Snapshot.resolve catalog token with
-       | Ok _ -> ()
-       | Error _ -> T.fail "CLI snapshot token was not published by Snapshot core"))
+      (match
+         Logseq_db_worker.Engine.open_
+           ~dependencies:F.dependencies
+           (F.config fixture.support token)
+       with
+       | Error error ->
+         T.fail
+           "CLI snapshot token did not open through Engine: %s"
+           (Logseq_db_worker.Error.message error)
+       | Ok engine ->
+         (match Logseq_db_worker.Engine.close engine with
+          | Ok () -> ()
+          | Error message -> T.fail "CLI-created snapshot did not close: %s" message)))
 ;;
 
 let test_snapshot_import_uses_confined_core () =
@@ -259,17 +289,19 @@ let test_snapshot_import_uses_confined_core () =
     | Error message -> T.fail "CLI snapshot import failed: %s" message
     | Ok token ->
       T.require (not (Sys.file_exists source)) "CLI import did not consume inbox entry";
-      let catalog =
-        match
-          Logseq_db_worker__Snapshot.create_catalog
-            ~application_support_directory:fixture.support
-        with
-        | Ok catalog -> catalog
-        | Error _ -> T.fail "unable to reopen imported snapshot catalog"
-      in
-      (match Logseq_db_worker__Snapshot.resolve catalog token with
-       | Ok _ -> ()
-       | Error _ -> T.fail "CLI import did not publish a resolvable token");
+      (match
+         Logseq_db_worker.Engine.open_
+           ~dependencies:F.dependencies
+           (F.config fixture.support token)
+       with
+       | Error error ->
+         T.fail
+           "CLI import did not publish an Engine-readable token: %s"
+           (Logseq_db_worker.Error.message error)
+       | Ok engine ->
+         (match Logseq_db_worker.Engine.close engine with
+          | Ok () -> ()
+          | Error message -> T.fail "CLI-imported snapshot did not close: %s" message));
       (match
          Cli_command.import_snapshot
            ~application_support_directory:fixture.support

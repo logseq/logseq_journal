@@ -201,7 +201,7 @@ let index_of entity values =
 let destination db selection position =
   let target_uuid, mode =
     match position with
-    | Protocol.Before uuid -> uuid, `Before
+    | Logseq_db_types.Mutation.Before uuid -> uuid, `Before
     | After uuid -> uuid, `After
     | First_child uuid -> uuid, `First
     | Last_child uuid -> uuid, `Last
@@ -288,7 +288,8 @@ let order_bounds destination =
 
 let tx_meta context operation =
   [ ( "db-sync/tx-id"
-    , Datascript.Uuid (Graph_types.Uuid.to_string context.Protocol.mutation_id) )
+    , Datascript.Uuid
+        (Graph_types.Uuid.to_string context.Logseq_db_types.Mutation.mutation_id) )
   ; "outliner-op", Datascript.Keyword operation
   ; "local-tx?", Datascript.Bool true
   ]
@@ -391,7 +392,7 @@ let plan_resolved ~now_ms db selection destination ~context ~operation =
       { tx_ops = root_ops @ descendant_ops @ page_ops
       ; tx_meta = tx_meta context operation
       ; changed_uuids
-      ; status = Protocol.Applied
+      ; status = Logseq_db_types.Mutation.Applied
       })
 ;;
 
@@ -410,7 +411,7 @@ let no_change context =
     { tx_ops = []
     ; tx_meta = tx_meta context "move-blocks-up-down"
     ; changed_uuids = []
-    ; status = Protocol.No_change
+    ; status = Logseq_db_types.Mutation.No_change
     }
 ;;
 
@@ -435,7 +436,7 @@ let plan_up_down ~now_ms db ~roots ~direction ~context =
       ~operation:"move-blocks-up-down"
   in
   match direction with
-  | Protocol.Up ->
+  | Logseq_db_types.Mutation.Up ->
     if first_index > 0
     then (
       let _, target = List.nth selection.source_siblings (first_index - 1) in

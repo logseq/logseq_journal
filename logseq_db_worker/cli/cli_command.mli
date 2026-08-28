@@ -17,12 +17,12 @@ val run_ndjson_lines
 val create_snapshot
   :  application_support_directory:string
   -> source_graph_dir:string
-  -> (Logseq_db_worker.Graph_types.Uuid.t, string) result
+  -> (Logseq_db_types.Graph_types.Uuid.t, string) result
 
 val import_snapshot
   :  application_support_directory:string
   -> inbox_entry:string
-  -> (Logseq_db_worker.Graph_types.Uuid.t, string) result
+  -> (Logseq_db_types.Graph_types.Uuid.t, string) result
 
 val resolve_desktop_target
   :  home_directory:string

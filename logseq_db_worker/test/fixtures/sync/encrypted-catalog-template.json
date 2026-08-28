@@ -1,0 +1,17 @@
+{
+  "baseUrl": "__BASE_URL__",
+  "graphs": [
+    {
+      "encrypted": true,
+      "graphId": "__GRAPH_ID__",
+      "name": "Encrypted Offline Notes",
+      "schema": { "exact": true, "major": 65, "minor": 33 }
+    }
+  ],
+  "mirrors": [
+    { "graphId": "__GRAPH_ID__", "status": "ready" }
+  ],
+  "selectedGraph": "__GRAPH_ID__",
+  "userId": "__USER_ID__",
+  "version": 1
+}

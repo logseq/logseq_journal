@@ -23,17 +23,23 @@ let request_round_trip () =
   List.iter
     (fun expected ->
        match P.request_of_yojson expected with
-       | Error error -> T.fail "request decode failed: %s" (Logseq_db_worker.Error.message error)
+       | Error error ->
+         T.fail "request decode failed: %s" (Logseq_db_worker.Error.message error)
        | Ok request ->
          T.require
-           (Yojson.Safe.equal (Yojson.Safe.sort expected) (Yojson.Safe.sort (P.request_to_yojson request)))
+           (Yojson.Safe.equal
+              (Yojson.Safe.sort expected)
+              (Yojson.Safe.sort (P.request_to_yojson request)))
            "request changed during round trip")
     (command_catalog_requests ())
 ;;
 
 let outcome_field name =
   match T.read_json (T.fixture "protocol/v1-outcome-catalog.json") with
-  | `Assoc fields -> (match List.assoc_opt name fields with Some (`List values) -> values | _ -> T.fail "missing %s" name)
+  | `Assoc fields ->
+    (match List.assoc_opt name fields with
+     | Some (`List values) -> values
+     | _ -> T.fail "missing %s" name)
   | _ -> T.fail "invalid outcome catalog"
 ;;
 
@@ -42,7 +48,12 @@ let response_round_trip () =
     (fun expected ->
        match P.response_of_yojson expected with
        | Error message -> T.fail "response decode failed: %s" message
-       | Ok response -> T.require (Yojson.Safe.equal (Yojson.Safe.sort expected) (Yojson.Safe.sort (P.response_to_yojson response))) "response changed")
+       | Ok response ->
+         T.require
+           (Yojson.Safe.equal
+              (Yojson.Safe.sort expected)
+              (Yojson.Safe.sort (P.response_to_yojson response)))
+           "response changed")
     (outcome_field "responses")
 ;;
 
@@ -51,7 +62,12 @@ let push_round_trip () =
     (fun expected ->
        match P.push_of_yojson expected with
        | Error message -> T.fail "push decode failed: %s" message
-       | Ok push -> T.require (Yojson.Safe.equal (Yojson.Safe.sort expected) (Yojson.Safe.sort (P.push_to_yojson push))) "push changed")
+       | Ok push ->
+         T.require
+           (Yojson.Safe.equal
+              (Yojson.Safe.sort expected)
+              (Yojson.Safe.sort (P.push_to_yojson push)))
+           "push changed")
     (outcome_field "pushes")
 ;;
 
@@ -95,22 +111,39 @@ let () =
             ; "command", `Assoc [ "type", `String "graphInfo" ]
             ]
         in
-        match P.request_of_yojson invalid with Error _ -> () | Ok _ -> T.fail "invalid UUID accepted")
+        match P.request_of_yojson invalid with
+        | Error _ -> ()
+        | Ok _ -> T.fail "invalid UUID accepted")
     ; T.case "reject oversized envelope before Engine" (fun () ->
         let request =
           `Assoc
             [ "apiVersion", `Int 1
             ; "requestId", `String "00000000-0000-4000-8000-000000000001"
-            ; "command", `Assoc [ "type", `String "getPage"; "page", `Assoc [ "type", `String "name"; "name", `String (String.make P.maximum_request_bytes 'x'); "kind", `String "any" ] ]
+            ; ( "command"
+              , `Assoc
+                  [ "type", `String "getPage"
+                  ; ( "page"
+                    , `Assoc
+                        [ "type", `String "name"
+                        ; "name", `String (String.make P.maximum_request_bytes 'x')
+                        ; "kind", `String "any"
+                        ] )
+                  ] )
             ]
         in
-        match P.request_of_yojson request with Error _ -> () | Ok _ -> T.fail "oversized request accepted")
+        match P.request_of_yojson request with
+        | Error _ -> ()
+        | Ok _ -> T.fail "oversized request accepted")
     ; T.case "never expose numeric entity IDs" (fun () ->
         List.iter
           (fun json ->
              let encoded = Yojson.Safe.to_string json in
-             T.require (not (String.starts_with ~prefix:"dbId" encoded)) "numeric storage identity exposed";
-             match P.request_of_yojson json with Error _ -> T.fail "catalog request rejected" | Ok _ -> ())
+             T.require
+               (not (String.starts_with ~prefix:"dbId" encoded))
+               "numeric storage identity exposed";
+             match P.request_of_yojson json with
+             | Error _ -> T.fail "catalog request rejected"
+             | Ok _ -> ())
           (command_catalog_requests ()))
     ; T.case "schema profile accepts 65.33 or newer" (fun () ->
         match Logseq_db_worker.Config.Logseq_65_33_or_newer with
@@ -119,7 +152,14 @@ let () =
         let directory = Filename.temp_file "logseq-db-worker-config-" "" in
         Sys.remove directory;
         Unix.mkdir directory 0o700;
-        let token = match Logseq_db_worker.Graph_types.Uuid.of_string "40000000-0000-4000-8000-000000000001" with Ok token -> token | Error message -> T.fail "%s" message in
+        let token =
+          match
+            Logseq_db_types.Graph_types.Uuid.of_string
+              "40000000-0000-4000-8000-000000000001"
+          with
+          | Ok token -> token
+          | Error message -> T.fail "%s" message
+        in
         let config =
           match
             Logseq_db_worker.Config.create
@@ -134,9 +174,14 @@ let () =
         in
         let json = Logseq_db_worker.Config.to_yojson config in
         (match json with
-         | `Assoc fields -> T.require (List.assoc_opt "accessMode" fields = None) "access mode leaked into config"
+         | `Assoc fields ->
+           T.require
+             (List.assoc_opt "accessMode" fields = None)
+             "access mode leaked into config"
          | _ -> T.fail "config is not an object");
-        match Logseq_db_worker.Config.of_yojson json with Ok _ -> () | Error message -> T.fail "%s" message)
+        match Logseq_db_worker.Config.of_yojson json with
+        | Ok _ -> ()
+        | Error message -> T.fail "%s" message)
     ; T.case "config decoding performs no filesystem access" (fun () ->
         let missing =
           Filename.concat
@@ -161,5 +206,7 @@ let () =
           T.require
             (String.equal config.application_support_directory missing)
             "bounded decode changed the startup capability"
-        | Error message -> T.fail "bounded config decode touched the filesystem: %s" message)
+        | Error message ->
+          T.fail "bounded config decode touched the filesystem: %s" message)
     ]
+;;

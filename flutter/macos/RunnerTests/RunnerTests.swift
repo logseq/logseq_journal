@@ -6,6 +6,15 @@ import XCTest
 @testable import bonsai_flutter_logseq_journal_host
 
 class RunnerTests: XCTestCase {
+  func testStartupActivatesApplicationAndMakesMainWindowKey() {
+    let target = ApplicationActivationTargetSpy()
+
+    JournalApplicationStartup.activate(target)
+
+    XCTAssertTrue(target.didActivateIgnoringOtherApps)
+    XCTAssertTrue(target.didMakeMainWindowKeyAndVisible)
+  }
+
   func testMacOSHostIsNotSandboxedForFixedGraphDirectory() throws {
     let task = try XCTUnwrap(SecTaskCreateFromSelf(nil))
     let sandboxValue =
@@ -423,5 +432,18 @@ class RunnerTests: XCTestCase {
     XCTAssertTrue(reordered.contains("8月7日"))
     XCTAssertTrue(reordered.contains("周五"))
     XCTAssertFalse(reordered.contains("2026"))
+  }
+}
+
+private final class ApplicationActivationTargetSpy: JournalApplicationActivationTarget {
+  private(set) var didActivateIgnoringOtherApps = false
+  private(set) var didMakeMainWindowKeyAndVisible = false
+
+  func activateIgnoringOtherApps() {
+    didActivateIgnoringOtherApps = true
+  }
+
+  func makeMainWindowKeyAndVisible() {
+    didMakeMainWindowKeyAndVisible = true
   }
 }

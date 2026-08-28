@@ -23,7 +23,10 @@ let rec repository_root directory =
 ;;
 
 let root = repository_root (Sys.getcwd ())
-let fixture relative = Filename.concat root (Filename.concat "logseq_db_worker/test/fixtures" relative)
+
+let fixture relative =
+  Filename.concat root (Filename.concat "logseq_db_worker/test/fixtures" relative)
+;;
 
 let run suite cases =
   let failures =

@@ -2,7 +2,7 @@ type t =
   { tx_ops : Datascript.tx_op list
   ; tx_meta : Datascript.tx_meta
   ; changed_uuids : Graph_types.Uuid.t list
-  ; status : Protocol.mutation_status
+  ; status : Logseq_db_types.Mutation.status
   }
 
 type error =

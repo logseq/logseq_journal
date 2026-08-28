@@ -1,101 +1,49 @@
 (library
  (name logseq_db_worker_test_support)
  (modules test_support structural_fixture adapter_fixture)
- (libraries datascript_ocaml logseq_db_worker sqlite3 unix yojson))
+ (libraries
+  datascript_ocaml
+  logseq_db_storage
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker_cli
+  logseq_sync
+  sqlite3
+  unix
+  yojson))
 
 (tests
  (names
   test_protocol
-  test_graph_locator
   test_codec
   test_storage_atomicity
   test_admission
-  test_ownership
-  test_snapshot
-  test_query
-  test_order
-  test_save_block
-  test_insert_blocks
-  test_move_blocks
-  test_indent_outdent
-  test_delete_blocks
-  test_pages
-  test_properties
   test_engine
   test_engine_open
-  test_cross_runtime
   test_performance
   test_fixture_generator
-  test_sync_snapshot
-  test_sync_protocol
-  test_sync_e2ee
-  test_sync_graph_key
-  test_sync_tx_checksum
-  test_sync_replay
-  test_sync_pending
-  test_sync_auth
-  test_sync_catalog
-  test_sync_catalog_store
-  test_sync_transport_ownership
-  test_sync_bootstrap_transport
-  test_sync_e2ee_session
-  test_sync_manager
-  test_sync_capabilities
-  test_sync_network_scope
-  test_sync_engine
-  test_synced_config_admission
-  test_sync_mirror)
+  test_synced_config_admission)
  (modules
   test_protocol
-  test_graph_locator
   test_codec
   test_storage_atomicity
   test_admission
-  test_ownership
-  test_snapshot
-  test_query
-  test_order
-  test_save_block
-  test_insert_blocks
-  test_move_blocks
-  test_indent_outdent
-  test_delete_blocks
-  test_pages
-  test_properties
   test_engine
   test_engine_open
-  test_cross_runtime
   test_performance
   test_fixture_generator
-  test_sync_snapshot
-  test_sync_protocol
-  test_sync_e2ee
-  test_sync_graph_key
-  test_sync_tx_checksum
-  test_sync_replay
-  test_sync_pending
-  test_sync_auth
-  test_sync_catalog
-  test_sync_catalog_store
-  test_sync_transport_ownership
-  test_sync_bootstrap_transport
-  test_sync_e2ee_session
-  test_sync_manager
-  test_sync_capabilities
-  test_sync_network_scope
-  test_sync_engine
-  test_synced_config_admission
-  test_sync_mirror)
+  test_synced_config_admission)
  (libraries
   datascript_ocaml
   eio_main
   eio.unix
-  httpun
-  httpun-eio
+  logseq_db_storage
+  logseq_db_types
   logseq_db_worker
   logseq_db_worker_cli
   logseq_db_worker_fixture_generator
   logseq_db_worker_test_support
+  logseq_sync
   sqlite3
   unix
   uri
@@ -110,6 +58,7 @@
   logseq_db_worker.bonsai
   logseq_db_worker_cli
   logseq_db_worker_test_support
+  logseq_sync
   sqlite3
   unix
   yojson))
@@ -126,15 +75,17 @@
 
 (rule
  (alias runtest)
- (deps
-  test_ios_device_harness.sh
-  ../tool/test_ios_device.sh)
+ (deps test_ios_device_harness.sh ../tool/test_ios_device.sh)
  (action
-  (run sh %{dep:test_ios_device_harness.sh} %{dep:../tool/test_ios_device.sh})))
+  (run
+   sh
+   %{dep:test_ios_device_harness.sh}
+   %{dep:../tool/test_ios_device.sh})))
 
 (rule
  (alias runtest)
- (deps (source_tree fixtures/expected))
+ (deps
+  (source_tree fixtures/expected))
  (action
   (run
    %{exe:../tool/compare_canonical_graphs.exe}

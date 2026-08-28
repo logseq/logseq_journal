@@ -4,6 +4,6 @@ val plan
   :  now_ms:int64
   -> Datascript.db
   -> roots:Graph_types.block_uuid list
-  -> direction:Protocol.indent_direction
-  -> context:Protocol.mutation_context
+  -> direction:Logseq_db_types.Mutation.indent_direction
+  -> context:Logseq_db_types.Mutation.context
   -> (t, error) result

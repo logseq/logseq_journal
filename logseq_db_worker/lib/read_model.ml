@@ -1272,8 +1272,6 @@ let get_references context target direction limit cursor =
 
 let execute context = function
   | Protocol.Graph_info -> Error (invalid_request "Graph_info is handled by the Engine.")
-  | Sync_status -> Error (invalid_request "Sync_status is handled by the Engine.")
-  | Sync_pending -> Error (invalid_request "Sync_pending is handled by the Engine.")
   | Get_block { block } ->
     Result.bind (entity_of_uuid context.db block) (project_block context.db)
     |> Result.map (fun block -> Protocol.Block_result block)

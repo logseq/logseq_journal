@@ -1,9 +1,10 @@
+open Logseq_db_types.Mutation
 module T = Logseq_db_worker_test_support.Test_support
 module Engine = Logseq_db_worker.Engine
-module Snapshot = Logseq_db_worker__Snapshot
-module Storage = Logseq_db_worker__Logseq_sqlite_storage
-module Session = Logseq_db_worker__Storage_session
-module Query = Logseq_db_worker__Query
+module Storage = Logseq_db_storage.Logseq_sqlite_storage
+module Session = Logseq_db_storage.Storage_session
+
+type resolved = { graph_dir : string }
 
 let page_uuid_text = "11111111-1111-4111-8111-111111111111"
 let parent_uuid_text = "22222222-2222-4222-8222-222222222222"
@@ -227,13 +228,10 @@ let create_native_graph support =
 ;;
 
 let create_inbox_graph support graph_name =
-  let catalog =
-    match Snapshot.create_catalog ~application_support_directory:support with
-    | Ok catalog -> catalog
-    | Error _ -> T.fail "unable to create native fallback catalog"
-  in
-  ignore catalog;
-  let inbox = Filename.concat support "logseq-db-worker/inbox" in
+  let root = Filename.concat support "logseq-db-worker" in
+  if not (Sys.file_exists root) then Unix.mkdir root 0o700;
+  let inbox = Filename.concat root "inbox" in
+  if not (Sys.file_exists inbox) then Unix.mkdir inbox 0o700;
   let graph = create_oracle_graph inbox graph_name in
   seed_read_graph graph;
   graph
@@ -292,10 +290,6 @@ let dependencies =
         ; monotonic_ns = (fun () -> 1_000_000L)
         }
     ; cursor_authentication_key = Bytes.make 32 'k'
-    ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
-    ; unlock_graph_key =
-        (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-          Error "crypto unavailable")
     }
 ;;
 
@@ -328,9 +322,8 @@ let remove_storage_tail graph =
 
 type engine_harness =
   { engine : Engine.t
-  ; resolved : Snapshot.resolved
-  ; token : Logseq_db_worker.Graph_types.Uuid.t
-  ; catalog : Snapshot.catalog
+  ; resolved : resolved
+  ; token : Logseq_db_types.Graph_types.Uuid.t
   ; support : string
   }
 
@@ -356,20 +349,21 @@ let with_snapshot_engine_context
     seed_read_graph source;
     if fail_mutation_writes then install_mutation_write_failure source;
     prepare_source source;
-    let catalog =
-      match Snapshot.create_catalog ~application_support_directory:support with
-      | Ok catalog -> catalog
-      | Error _ -> T.fail "unable to create engine snapshot catalog"
-    in
     let token =
-      match Snapshot.create catalog ~source_graph_dir:source with
+      match
+        Cli_command.create_snapshot
+          ~application_support_directory:support
+          ~source_graph_dir:source
+      with
       | Ok token -> token
-      | Error _ -> T.fail "unable to create engine snapshot"
+      | Error message -> T.fail "unable to create engine snapshot: %s" message
     in
     let resolved =
-      match Snapshot.resolve catalog token with
-      | Ok resolved -> resolved
-      | Error _ -> T.fail "unable to resolve engine snapshot"
+      { graph_dir =
+          Filename.concat
+            (Filename.concat support "logseq-db-worker/snapshots")
+            (Logseq_db_types.Graph_types.Uuid.to_string token)
+      }
     in
     let engine =
       match Engine.open_ ~dependencies (config support token) with
@@ -382,7 +376,7 @@ let with_snapshot_engine_context
     in
     Fun.protect
       ~finally:(fun () -> ignore (Engine.close engine))
-      (fun () -> f { engine; resolved; token; catalog; support }))
+      (fun () -> f { engine; resolved; token; support }))
 ;;
 
 let with_snapshot_engine f =
@@ -391,14 +385,14 @@ let with_snapshot_engine f =
 
 let request_id =
   match
-    Logseq_db_worker.Graph_types.Uuid.of_string "33333333-3333-4333-8333-333333333333"
+    Logseq_db_types.Graph_types.Uuid.of_string "33333333-3333-4333-8333-333333333333"
   with
   | Ok uuid -> uuid
   | Error message -> T.fail "%s" message
 ;;
 
 let uuid value =
-  match Logseq_db_worker.Graph_types.Uuid.of_string value with
+  match Logseq_db_types.Graph_types.Uuid.of_string value with
   | Ok uuid -> uuid
   | Error message -> T.fail "%s" message
 ;;
@@ -577,8 +571,7 @@ let () =
     [ T.case "snapshot open owns the graph before SQLite use" (fun () ->
         with_snapshot_engine (fun _engine resolved ->
           T.require
-            (Sys.file_exists
-               (Filename.concat resolved.Snapshot.graph_dir "db-worker.lock"))
+            (Sys.file_exists (Filename.concat resolved.graph_dir "db-worker.lock"))
             "snapshot owner sentinel is missing"))
     ; T.case "missing iOS native graph imports its same-name inbox entry" (fun () ->
         with_temp_directory (fun support ->
@@ -605,7 +598,7 @@ let () =
                match execute_read engine Graph_info with
                | Succeeded { success = Graph_info_result info; _ } ->
                  T.require
-                   (info.mode = Logseq_db_worker.Graph_types.Native_read_write)
+                   (info.mode = Logseq_db_types.Graph_types.Native_read_write)
                    "imported native fallback opened in snapshot mode";
                  T.require
                    (String.equal info.graph_dir (Unix.realpath graph))
@@ -634,7 +627,7 @@ let () =
                match execute_read engine Graph_info with
                | Succeeded { success = Graph_info_result info; _ } ->
                  T.require
-                   (info.mode = Logseq_db_worker.Graph_types.Native_read_write)
+                   (info.mode = Logseq_db_types.Graph_types.Native_read_write)
                    "replacement graph opened in snapshot mode"
                | _ -> T.fail "replacement native Graph_info failed")))
     ; T.case "valid iOS native graph ignores a pending inbox entry" (fun () ->
@@ -703,13 +696,10 @@ let () =
           let graph_name = "logseq_journal" in
           let graph = create_ios_native_graph support graph_name in
           remove_storage_tail graph;
-          let catalog =
-            match Snapshot.create_catalog ~application_support_directory:support with
-            | Ok catalog -> catalog
-            | Error _ -> T.fail "unable to create invalid inbox catalog"
-          in
-          ignore catalog;
-          let inbox = Filename.concat support "logseq-db-worker/inbox" in
+          let root = Filename.concat support "logseq-db-worker" in
+          Unix.mkdir root 0o700;
+          let inbox = Filename.concat root "inbox" in
+          Unix.mkdir inbox 0o700;
           Unix.symlink
             (Filename.concat support "outside-inbox")
             (Filename.concat inbox graph_name);
@@ -745,7 +735,7 @@ let () =
                   match execute_read engine Graph_info with
                   | Succeeded { success = Graph_info_result info; _ } ->
                     T.require
-                      (info.mode = Logseq_db_worker.Graph_types.Native_read_write)
+                      (info.mode = Logseq_db_types.Graph_types.Native_read_write)
                       "native graph reported the wrong mode";
                     T.require
                       (String.equal info.graph_dir (Unix.realpath graph))
@@ -993,7 +983,7 @@ let () =
             T.require (basis = info.basis && basis > 0L) "wrong graph basis";
             T.require
               (List.mem
-                 Logseq_db_worker.Graph_types.Ownership_verified
+                 Logseq_db_types.Graph_types.Ownership_verified
                  info.admission_facts)
               "ownership admission fact is missing"
           | _ -> T.fail "Graph_info did not succeed"))
@@ -1003,7 +993,7 @@ let () =
             match execute_read engine (Get_page { page = selector }) with
             | Succeeded { success = Page_result page; _ } ->
               T.require
-                (Logseq_db_worker.Graph_types.Uuid.equal page.uuid (uuid page_uuid_text))
+                (Logseq_db_types.Graph_types.Uuid.equal page.uuid (uuid page_uuid_text))
                 "Get_page returned the wrong UUID";
               T.require
                 (String.equal page.name "oracle page")
@@ -1024,15 +1014,15 @@ let () =
               (String.equal block.title "Parent")
               "Get_block returned the wrong title";
             T.require
-              (Logseq_db_worker.Graph_types.Uuid.equal block.parent (uuid page_uuid_text))
+              (Logseq_db_types.Graph_types.Uuid.equal block.parent (uuid page_uuid_text))
               "Get_block returned the wrong parent";
             T.require
-              (Logseq_db_worker.Graph_types.Uuid.equal block.page (uuid page_uuid_text))
+              (Logseq_db_types.Graph_types.Uuid.equal block.page (uuid page_uuid_text))
               "Get_block returned the wrong page";
             T.require (String.equal block.order "a0") "Get_block returned the wrong order";
             T.require
               (List.exists
-                 (fun (property : Logseq_db_worker.Graph_types.property_summary) ->
+                 (fun (property : Logseq_db_types.Graph_types.property_summary) ->
                     String.equal property.ident property_ident
                     && property.values = [ Default_value "Read value" ])
                  block.properties)
@@ -1071,7 +1061,7 @@ let () =
              | _ -> T.fail "wrong second child page size");
             T.require (page.continuation = None) "terminal page returned a cursor"
           | _ -> T.fail "second Get_children page did not succeed"))
-    ; T.case "collection cursors bind query fingerprint and basis" (fun () ->
+    ; T.case "collection cursors bind the public query fingerprint" (fun () ->
         with_snapshot_engine (fun engine _resolved ->
           let cursor =
             match
@@ -1083,47 +1073,17 @@ let () =
               -> cursor
             | _ -> T.fail "unable to obtain a collection cursor"
           in
-          (match
-             execute_read
-               engine
-               (Get_siblings
-                  { block = uuid first_child_uuid_text; limit = 1; cursor = Some cursor })
-           with
-           | Failed failure ->
-             T.require
-               (Logseq_db_worker.Error.code failure.error = Conflict)
-               "filter-changed cursor returned the wrong error"
-           | _ -> T.fail "cursor crossed query fingerprints");
-          let payload =
-            match
-              Query.decode_cursor
-                ~key:dependencies.cursor_authentication_key
-                ~now_ms:(dependencies.clocks.epoch_ms ())
-                cursor
-            with
-            | Ok payload -> payload
-            | Error _ -> T.fail "unable to decode generated cursor"
-          in
-          let stale =
-            match
-              Query.encode_cursor
-                ~key:dependencies.cursor_authentication_key
-                { payload with basis = Int64.pred payload.basis }
-            with
-            | Ok cursor -> cursor
-            | Error _ -> T.fail "unable to encode stale-basis cursor"
-          in
           match
             execute_read
               engine
-              (Get_children
-                 { parent = uuid page_uuid_text; limit = 1; cursor = Some stale })
+              (Get_siblings
+                 { block = uuid first_child_uuid_text; limit = 1; cursor = Some cursor })
           with
           | Failed failure ->
             T.require
               (Logseq_db_worker.Error.code failure.error = Conflict)
-              "stale-basis cursor returned the wrong error"
-          | _ -> T.fail "stale-basis cursor was accepted"))
+              "filter-changed cursor returned the wrong error"
+          | _ -> T.fail "cursor crossed query fingerprints"))
     ; T.case "Get_page_tree returns bounded preorder depths" (fun () ->
         with_snapshot_engine (fun engine _resolved ->
           match
@@ -1139,7 +1099,7 @@ let () =
           | Succeeded { success = Page_tree_result page; _ } ->
             let actual =
               List.map
-                (fun (item : Logseq_db_worker.Graph_types.block_tree_item) ->
+                (fun (item : Logseq_db_types.Graph_types.block_tree_item) ->
                    item.block.title, item.depth)
                 page.items
             in
@@ -1168,7 +1128,7 @@ let () =
             T.require (result.current_index = 1) "wrong sibling position";
             T.require
               (List.map
-                 (fun (block : Logseq_db_worker.Graph_types.block) -> block.title)
+                 (fun (block : Logseq_db_types.Graph_types.block) -> block.title)
                  result.siblings.items
                = [ "First child"; "Second child" ])
               "wrong sibling order"
@@ -1183,8 +1143,8 @@ let () =
           | Succeeded { success = Pages_result page; _ } ->
             T.require
               (List.exists
-                 (fun (summary : Logseq_db_worker.Graph_types.page_summary) ->
-                    Logseq_db_worker.Graph_types.Uuid.equal
+                 (fun (summary : Logseq_db_types.Graph_types.page_summary) ->
+                    Logseq_db_types.Graph_types.Uuid.equal
                       summary.uuid
                       (uuid page_uuid_text)
                     && String.equal summary.title "Oracle Page"
@@ -1224,7 +1184,7 @@ let () =
           with
           | Succeeded { success = Pages_result { items = [ journal ]; _ }; _ } ->
             T.require
-              (Logseq_db_worker.Graph_types.Uuid.equal
+              (Logseq_db_types.Graph_types.Uuid.equal
                  journal.uuid
                  (uuid journal_uuid_text))
               "List_pages returned the wrong journal"
@@ -1237,8 +1197,8 @@ let () =
            | Succeeded { success = Tags_result page; _ } ->
              T.require
                (List.exists
-                  (fun (tag : Logseq_db_worker.Graph_types.tag_summary) ->
-                     Logseq_db_worker.Graph_types.Uuid.equal
+                  (fun (tag : Logseq_db_types.Graph_types.tag_summary) ->
+                     Logseq_db_types.Graph_types.Uuid.equal
                        tag.uuid
                        (uuid class_uuid_text)
                      && String.equal tag.title "Oracle Class")
@@ -1252,8 +1212,8 @@ let () =
             | Succeeded { success = Properties_result page; _ } ->
               T.require
                 (List.exists
-                   (fun (property : Logseq_db_worker.Graph_types.property_definition) ->
-                      Logseq_db_worker.Graph_types.Uuid.equal
+                   (fun (property : Logseq_db_types.Graph_types.property_definition) ->
+                      Logseq_db_types.Graph_types.Uuid.equal
                         property.uuid
                         (uuid property_uuid_text)
                       && String.equal property.ident property_ident
@@ -1268,7 +1228,7 @@ let () =
     ; T.case "List_tasks uses typed task relations and filters" (fun () ->
         with_snapshot_engine (fun engine _resolved ->
           let filter =
-            Logseq_db_worker.Graph_types.
+            Logseq_db_types.Graph_types.
               { states = [ Todo ]
               ; page = Some (uuid page_uuid_text)
               ; scheduled_from = None
@@ -1300,11 +1260,11 @@ let () =
             | Succeeded { success = References_result page; _ } ->
               T.require
                 (List.exists
-                   (fun (reference : Logseq_db_worker.Graph_types.reference) ->
-                      Logseq_db_worker.Graph_types.Uuid.equal
+                   (fun (reference : Logseq_db_types.Graph_types.reference) ->
+                      Logseq_db_types.Graph_types.Uuid.equal
                         reference.source
                         expected_source
-                      && Logseq_db_worker.Graph_types.Uuid.equal
+                      && Logseq_db_types.Graph_types.Uuid.equal
                            reference.target
                            expected_target
                       && reference.kind = Block_reference)
@@ -1347,7 +1307,7 @@ let () =
                    "mutation basis did not advance exactly once";
                  T.require
                    (List.exists
-                      (Logseq_db_worker.Graph_types.Uuid.equal (uuid parent_uuid_text))
+                      (Logseq_db_types.Graph_types.Uuid.equal (uuid parent_uuid_text))
                       changed_uuids)
                    "mutation omitted the changed block UUID";
                  basis
@@ -1379,10 +1339,6 @@ let () =
                   (Sys.file_exists
                      (Filename.concat harness.resolved.graph_dir "write-session.json")))
                "clean close retained the pending write marker";
-             ignore
-               (match Snapshot.resolve harness.catalog harness.token with
-                | Ok resolved -> resolved
-                | Error _ -> T.fail "cleanly finalized snapshot did not resolve");
              let reopened =
                match
                  Engine.open_ ~dependencies (config harness.support harness.token)
@@ -1457,9 +1413,7 @@ let () =
           (match execute_read harness.engine (Get_block { block = inserted }) with
            | Succeeded { success = Block_result block; _ } ->
              T.require
-               (Logseq_db_worker.Graph_types.Uuid.equal
-                  block.parent
-                  (uuid page_uuid_text))
+               (Logseq_db_types.Graph_types.Uuid.equal block.parent (uuid page_uuid_text))
                "insert did not create a page root"
            | _ -> T.fail "inserted block was not readable");
           let basis2 =
@@ -1496,7 +1450,7 @@ let () =
           (match execute_read harness.engine (Get_block { block = inserted }) with
            | Succeeded { success = Block_result block; _ } ->
              T.require
-               (Logseq_db_worker.Graph_types.Uuid.equal
+               (Logseq_db_types.Graph_types.Uuid.equal
                   block.parent
                   (uuid parent_uuid_text))
                "indent did not reparent beneath the left sibling"
@@ -1822,20 +1776,21 @@ let () =
           let source_root = Filename.concat support "sources" in
           Unix.mkdir source_root 0o700;
           let source = create_oracle_graph source_root "oracle-graph" in
-          let catalog =
-            match Snapshot.create_catalog ~application_support_directory:support with
-            | Ok catalog -> catalog
-            | Error _ -> T.fail "unable to create catalog"
-          in
           let token =
-            match Snapshot.create catalog ~source_graph_dir:source with
+            match
+              Cli_command.create_snapshot
+                ~application_support_directory:support
+                ~source_graph_dir:source
+            with
             | Ok token -> token
-            | Error _ -> T.fail "unable to create snapshot"
+            | Error message -> T.fail "unable to create snapshot: %s" message
           in
           let resolved =
-            match Snapshot.resolve catalog token with
-            | Ok resolved -> resolved
-            | Error _ -> T.fail "unable to resolve snapshot"
+            { graph_dir =
+                Filename.concat
+                  (Filename.concat support "logseq-db-worker/snapshots")
+                  (Logseq_db_types.Graph_types.Uuid.to_string token)
+            }
           in
           let engine =
             match Engine.open_ ~dependencies (config support token) with
@@ -1853,7 +1808,7 @@ let () =
         with_temp_directory (fun support ->
           let token =
             match
-              Logseq_db_worker.Graph_types.Uuid.of_string
+              Logseq_db_types.Graph_types.Uuid.of_string
                 "44444444-4444-4444-8444-444444444444"
             with
             | Ok token -> token

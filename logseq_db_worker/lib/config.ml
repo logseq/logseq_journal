@@ -1,27 +1,15 @@
 type compatibility_profile = Logseq_65_33_or_newer
 
-type synced_bootstrap =
-  { snapshot_path : string
-  ; applied_server_t : int
-  ; checksum : string option
-  ; expected_rows : int
-  }
-
-type synced_e2ee =
-  { managed_sync_origin : Uri.t
-  ; user_id : string
-  ; encrypted_graph_key : string
-  }
-
 type target =
   | Managed_sync of { base_url : string }
   | Snapshot of { token : Graph_types.Uuid.t }
   | Import_snapshot of { inbox_entry : string }
-  | Synced_graph of
+  | Synced_mirror of
       { graph_id : Graph_types.Uuid.t
       ; graph_name : string
-      ; e2ee : synced_e2ee option
-      ; bootstrap : synced_bootstrap option
+      ; graph_dir : string
+      ; database_path : string
+      ; checkpoint : Sync_checkpoint.t
       }
   | Native_local_graph of
       { graph_name : string
@@ -77,55 +65,34 @@ let valid_display_name value =
   && not (String.contains value '\000')
 ;;
 
-let valid_e2ee = function
-  | None -> true
-  | Some { managed_sync_origin; user_id; encrypted_graph_key } ->
-    Uri.scheme managed_sync_origin = Some "https"
-    && Option.is_some (Uri.host managed_sync_origin)
-    && valid_display_name user_id
-    && String.length encrypted_graph_key > 0
-    && String.length encrypted_graph_key <= 65_536
-    && String.is_valid_utf_8 encrypted_graph_key
-    && not (String.contains encrypted_graph_key '\000')
-;;
-
-let valid_checksum value =
-  String.length value = 16
-  && String.for_all
-       (function
-         | '0' .. '9' | 'a' .. 'f' -> true
-         | _ -> false)
-       value
-;;
-
-let validate_bootstrap = function
-  | None -> Ok ()
-  | Some bootstrap ->
-    if not (canonical_absolute_path bootstrap.snapshot_path)
-    then Error "snapshot_path must be a bounded canonical absolute path"
-    else if bootstrap.applied_server_t < 0
-    then Error "bootstrap applied_server_t must be nonnegative"
-    else if bootstrap.expected_rows <= 0
-    then Error "bootstrap expected_rows must be positive"
-    else if
-      match bootstrap.checksum with
-      | Some checksum -> not (valid_checksum checksum)
-      | None -> false
-    then Error "bootstrap checksum must be 16 lowercase hexadecimal characters"
-    else Ok ()
-;;
-
 let validate_target = function
-  | Managed_sync { base_url } -> Sync_http.validate_base_url (Uri.of_string base_url)
+  | Managed_sync { base_url } ->
+    let uri = Uri.of_string base_url in
+    (match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
+     | Some "https", Some host, None, None
+       when String.length host > 0
+            && (Uri.path uri = "" || Uri.path uri = "/")
+            && Uri.query uri = [] -> Ok ()
+     | Some _, Some _, _, _ | Some _, None, _, _ | None, _, _, _ ->
+       Error "sync base URL must be one HTTPS origin without credentials or fragments")
   | Snapshot _ -> Ok ()
   | Import_snapshot { inbox_entry } ->
     if valid_component inbox_entry
     then Ok ()
     else Error "inbox_entry must be one bounded UTF-8 path component"
-  | Synced_graph { graph_name; e2ee; bootstrap; _ } ->
-    if valid_display_name graph_name && valid_e2ee e2ee
-    then validate_bootstrap bootstrap
-    else Error "graph_name must be bounded non-empty UTF-8 display text"
+  | Synced_mirror { graph_name; graph_dir; database_path; checkpoint; _ } ->
+    if not (valid_display_name graph_name)
+    then Error "graph_name must be bounded non-empty UTF-8 display text"
+    else if not (canonical_absolute_path graph_dir)
+    then Error "graph_dir must be a bounded canonical absolute path"
+    else if
+      not
+        (canonical_absolute_path database_path
+         && String.equal (Filename.dirname database_path) graph_dir)
+    then Error "database_path must be a canonical file inside graph_dir"
+    else if checkpoint.format_version <> Sync_checkpoint.format_version
+    then Error "checkpoint format version is unsupported"
+    else Ok ()
   | Native_local_graph { graph_name; graph_dir } ->
     if not (valid_component graph_name)
     then Error "graph_name must be one bounded UTF-8 path component"
@@ -170,34 +137,30 @@ let target_to_yojson = function
       [ "kind", `String "snapshot"; "token", `String (Graph_types.Uuid.to_string token) ]
   | Import_snapshot { inbox_entry } ->
     `Assoc [ "kind", `String "importSnapshot"; "inboxEntry", `String inbox_entry ]
-  | Synced_graph { graph_id; graph_name; e2ee; bootstrap } ->
+  | Synced_mirror { graph_id; graph_name; graph_dir; database_path; checkpoint } ->
     `Assoc
-      [ ( "bootstrap"
-        , match bootstrap with
-          | None -> `Null
-          | Some bootstrap ->
-            `Assoc
-              [ "appliedServerT", `Int bootstrap.applied_server_t
-              ; ( "checksum"
-                , Option.fold
-                    ~none:`Null
-                    ~some:(fun value -> `String value)
-                    bootstrap.checksum )
-              ; "expectedRows", `Int bootstrap.expected_rows
-              ; "snapshotPath", `String bootstrap.snapshot_path
-              ] )
-      ; ( "e2ee"
-        , match e2ee with
-          | None -> `Null
-          | Some e2ee ->
-            `Assoc
-              [ "encryptedGraphKey", `String e2ee.encrypted_graph_key
-              ; "managedSyncOrigin", `String (Uri.to_string e2ee.managed_sync_origin)
-              ; "userId", `String e2ee.user_id
-              ] )
-      ; "kind", `String "syncedGraph"
+      [ "kind", `String "syncedMirror"
       ; "graphId", `String (Graph_types.Uuid.to_string graph_id)
       ; "graphName", `String graph_name
+      ; "graphDir", `String graph_dir
+      ; "databasePath", `String database_path
+      ; ( "checkpoint"
+        , `Assoc
+            [ "appliedServerT", `Int checkpoint.applied_server_t
+            ; "checksum", `String checkpoint.checksum
+            ; "schemaMajor", `Int checkpoint.schema.major
+            ; "schemaMinor", `Int checkpoint.schema.minor
+            ; ( "status"
+              , `String
+                  (match checkpoint.status with
+                   | Active -> "active"
+                   | Paused -> "paused") )
+            ; ( "lastError"
+              , Option.fold
+                  ~none:`Null
+                  ~some:(fun value -> `String value)
+                  checkpoint.last_error )
+            ] )
       ]
   | Native_local_graph { graph_name; graph_dir } ->
     `Assoc
@@ -252,80 +215,74 @@ let target_of_yojson = function
        , Some (`String graph_dir) ) -> Ok (Native_local_graph { graph_name; graph_dir })
      | _ -> Error "invalid native target")
   | `Assoc fields
-    when exact_fields [ "bootstrap"; "e2ee"; "graphId"; "graphName"; "kind" ] fields ->
+    when exact_fields
+           [ "checkpoint"; "databasePath"; "graphDir"; "graphId"; "graphName"; "kind" ]
+           fields ->
     (match
-       ( List.assoc_opt "bootstrap" fields
-       , List.assoc_opt "e2ee" fields
-       , List.assoc_opt "kind" fields
+       ( List.assoc_opt "kind" fields
        , List.assoc_opt "graphId" fields
-       , List.assoc_opt "graphName" fields )
+       , List.assoc_opt "graphName" fields
+       , List.assoc_opt "graphDir" fields
+       , List.assoc_opt "databasePath" fields
+       , List.assoc_opt "checkpoint" fields )
      with
-     | ( bootstrap
-       , e2ee
-       , Some (`String "syncedGraph")
+     | ( Some (`String "syncedMirror")
        , Some (`String graph_id)
-       , Some (`String graph_name) ) ->
-       let e2ee =
-         match e2ee with
-         | Some `Null -> Ok None
-         | Some (`Assoc fields)
-           when exact_fields [ "encryptedGraphKey"; "managedSyncOrigin"; "userId" ] fields ->
-           (match
-              ( List.assoc_opt "managedSyncOrigin" fields
-              , List.assoc_opt "userId" fields
-              , List.assoc_opt "encryptedGraphKey" fields )
-            with
-            | ( Some (`String managed_sync_origin)
-              , Some (`String user_id)
-              , Some (`String encrypted_graph_key) ) ->
-              Ok
-                (Some
-                   { managed_sync_origin = Uri.of_string managed_sync_origin
-                   ; user_id
-                   ; encrypted_graph_key
-                   })
-            | _ -> Error "invalid synced E2EE configuration")
-         | _ -> Error "invalid synced E2EE configuration"
-       in
-       let bootstrap =
-         match bootstrap with
-         | Some `Null -> Ok None
-         | Some (`Assoc fields)
-           when exact_fields
-                  [ "appliedServerT"; "checksum"; "expectedRows"; "snapshotPath" ]
-                  fields ->
-           (match
-              ( List.assoc_opt "snapshotPath" fields
-              , List.assoc_opt "appliedServerT" fields
-              , List.assoc_opt "checksum" fields
-              , List.assoc_opt "expectedRows" fields )
-            with
-            | ( Some (`String snapshot_path)
-              , Some (`Int applied_server_t)
-              , Some (`String checksum)
-              , Some (`Int expected_rows) ) ->
-              Ok
-                (Some
-                   { snapshot_path
-                   ; applied_server_t
-                   ; checksum = Some checksum
-                   ; expected_rows
-                   })
-            | ( Some (`String snapshot_path)
-              , Some (`Int applied_server_t)
-              , Some `Null
-              , Some (`Int expected_rows) ) ->
-              Ok
-                (Some { snapshot_path; applied_server_t; checksum = None; expected_rows })
-            | _ -> Error "invalid synced bootstrap")
-         | _ -> Error "invalid synced bootstrap"
-       in
-       Result.bind e2ee (fun e2ee ->
-         Result.bind bootstrap (fun bootstrap ->
-           Result.map
-             (fun graph_id -> Synced_graph { graph_id; graph_name; e2ee; bootstrap })
-             (Graph_types.Uuid.of_string graph_id)))
-     | _ -> Error "invalid synced target")
+       , Some (`String graph_name)
+       , Some (`String graph_dir)
+       , Some (`String database_path)
+       , Some (`Assoc checkpoint_fields) )
+       when exact_fields
+              [ "appliedServerT"
+              ; "checksum"
+              ; "lastError"
+              ; "schemaMajor"
+              ; "schemaMinor"
+              ; "status"
+              ]
+              checkpoint_fields ->
+       Result.bind (Graph_types.Uuid.of_string graph_id) (fun graph_id ->
+         match
+           ( List.assoc_opt "appliedServerT" checkpoint_fields
+           , List.assoc_opt "checksum" checkpoint_fields
+           , List.assoc_opt "schemaMajor" checkpoint_fields
+           , List.assoc_opt "schemaMinor" checkpoint_fields
+           , List.assoc_opt "status" checkpoint_fields
+           , List.assoc_opt "lastError" checkpoint_fields )
+         with
+         | ( Some (`Int applied_server_t)
+           , Some (`String checksum)
+           , Some (`Int major)
+           , Some (`Int minor)
+           , Some (`String status)
+           , Some last_error ) ->
+           let status =
+             match status with
+             | "active" -> Ok Sync_checkpoint.Active
+             | "paused" -> Ok Paused
+             | _ -> Error "invalid synced checkpoint status"
+           in
+           let last_error =
+             match last_error with
+             | `Null -> Ok None
+             | `String value -> Ok (Some value)
+             | _ -> Error "invalid synced checkpoint error"
+           in
+           Result.bind status (fun status ->
+             Result.bind last_error (fun last_error ->
+               Result.map
+                 (fun checkpoint ->
+                    Synced_mirror
+                      { graph_id; graph_name; graph_dir; database_path; checkpoint })
+                 (Sync_checkpoint.create_full
+                    ~graph_id
+                    ~schema:{ major; minor }
+                    ~applied_server_t
+                    ~checksum
+                    ~status
+                    ~last_error)))
+         | _ -> Error "invalid synced checkpoint")
+     | _ -> Error "invalid synced mirror target")
   | _ -> Error "invalid target"
 ;;
 

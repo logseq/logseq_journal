@@ -1,3 +1,4 @@
+open Logseq_db_types.Mutation
 module ID = Bonsai_flutter_spec.Id
 module Environment = Bonsai_flutter.Environment
 module Protocol = Bonsai_flutter_protocol
@@ -12,8 +13,9 @@ let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
 ;;
 
-module Graph = Logseq_db_worker.Graph_types
+module Graph = Logseq_db_types.Graph_types
 module Graph_protocol = Logseq_db_worker.Protocol
+module Mutation = Logseq_db_types.Mutation
 
 let with_startup test =
   Adapter_fixture.with_snapshot (fun fixture -> test fixture.Adapter_fixture.config)
@@ -263,7 +265,7 @@ let execute engine command =
 ;;
 
 let context engine mutation_id =
-  Graph_protocol.
+  Logseq_db_types.Mutation.
     { mutation_id = uuid mutation_id
     ; expected_basis = Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
     }
@@ -343,10 +345,6 @@ let seed startup captures =
          { clocks =
              { epoch_ms = (fun () -> epoch_ms); monotonic_ns = (fun () -> 1_000_000L) }
          ; cursor_authentication_key = Bytes.make 32 'a'
-         ; crypto = Logseq_db_worker.Sync_e2ee.unavailable_crypto
-         ; unlock_graph_key =
-             (fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
-               Error "crypto unavailable")
          }
        in
        let engine =
@@ -361,13 +359,13 @@ let seed startup captures =
             let page =
               ensure_journal engine (Journal_time.local_day command.creation_time)
             in
-            let tree : Graph_protocol.block_tree =
+            let tree : Mutation.block_tree =
               { uuid = uuid command.block_id
               ; title = command.source
               ; children =
                   List.map
                     (fun (child : Journal_graph_projection.capture_child) ->
-                       { Graph_protocol.uuid = uuid child.block_id
+                       { Mutation.uuid = uuid child.block_id
                        ; title = child.source
                        ; children = []
                        })
@@ -1344,6 +1342,12 @@ let test_application_owns_one_system_material_theme () =
            require
              (Float.equal data.color_scheme.contrast_level contrast_level)
              "%s contrast level differs"
+             name;
+           require
+             (data.typography.font_family = Some "PingFang SC"
+              && data.typography.font_family_fallback
+                 = [ "CupertinoSystemText"; "Apple Color Emoji" ])
+             "%s does not use the selected mixed-script font chain"
              name
          in
          require_data "light" Protocol.Wire_frame.Light 0. theme.light;
@@ -1910,6 +1914,66 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
          require_visible_text handle "First line"))
 ;;
 
+let test_sync_diagnostics_is_scrollable_read_only_and_display_safe () =
+  with_startup (fun startup ->
+    let entry = capture 144 "Diagnostics entry" in
+    seed startup [ entry ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle entry.source;
+         click_test_id handle "journal-account-menu-button";
+         require_test_id handle "journal-account-sync-diagnostics";
+         click_test_id handle "journal-account-sync-diagnostics";
+         require_no_test_id handle "journal-account-dialog-page";
+         require_test_id handle "journal-sync-diagnostics-dialog-page";
+         require_test_id handle "journal-sync-diagnostics-scroll";
+         require_visible_text handle "Sync diagnostics";
+         require_visible_text handle "Manager";
+         require_visible_text handle "Transport";
+         require_visible_text handle "Recent transitions";
+         require_visible_text handle "Not available";
+         require_no_test_id handle "journal-sync-diagnostics-copy";
+         require_no_test_id handle "journal-sync-diagnostics-export";
+         require_no_semantics handle "Copy diagnostics";
+         require_no_semantics handle "Export diagnostics";
+         click_test_id handle "journal-sync-diagnostics-close";
+         require_no_test_id handle "journal-sync-diagnostics-dialog-page";
+         require_test_id handle "journal-timeline-page"));
+  let graph_id = "71000000-0000-4000-8000-000000000144" in
+  let long_error =
+    String.concat " " (List.init 40 (fun index -> Printf.sprintf "failure-%d" index))
+  in
+  let diagnostics : Logseq_sync.Api.diagnostics =
+    { groups =
+        [ { title = "Manager"
+          ; entries = [ "Phase", "Graph open"; "Last error", long_error ]
+          }
+        ; { title = "Graph"; entries = [ "Selected graph", graph_id ] }
+        ; { title = "Pull"; entries = [ "Pull", "In flight (requested again)" ] }
+        ; { title = "Submission"
+          ; entries = [ "Submission", "Deferred (2 transactions)" ]
+          }
+        ]
+    ; history = [ "#12 Transport: Connecting -> Live" ]
+    }
+  in
+  let rows = Application.sync_diagnostic_rows diagnostics in
+  require
+    (List.assoc "Selected graph" rows = graph_id)
+    "diagnostic rows do not show the full current graph UUID";
+  require
+    (List.assoc "Last error" rows = long_error)
+    "diagnostic rows truncate or replace the current sanitized error";
+  require
+    (List.assoc "Pull" rows = "In flight (requested again)")
+    "diagnostic rows do not preserve pull coalescing state";
+  require
+    (List.assoc "Submission" rows = "Deferred (2 transactions)")
+    "diagnostic rows do not preserve deferred submission count"
+;;
+
 let test_timeline_uses_exact_sparse_extent_window () =
   with_startup (fun startup ->
     seed
@@ -2081,6 +2145,19 @@ let test_timeline_uses_truthful_fallback_labels_without_duplicate_today () =
          require_semantics_view handle "2026-08-08" (fun view ->
            require (view.role = Ui.Semantics.Role.Header) "day heading role changed";
            require (view.heading_level = Some 2) "day heading level changed");
+         require_theme_owned_text_style
+           handle
+           "journal-day-heading-label:20260808"
+           ~size:13.
+           ~line_height:(18. /. 13.)
+           ~weight:Ui.Style.Font_weight.Semi_bold;
+         require_padding
+           handle
+           "journal-day-heading-padding:20260808"
+           ~left:24.
+           ~top:20.
+           ~right:16.
+           ~bottom:4.;
          require
            (List.length (Test.Handle.find_all handle (Test.Query.visible_text "Today"))
             = 1)
@@ -2839,7 +2916,7 @@ let test_expanded_children_are_static_previews_without_group_separator () =
          require_no_test_id handle ("journal-group-divider:" ^ first.block_id);
          require_no_test_id handle ("journal-group-divider:" ^ second.block_id);
          require_no_test_id handle ("journal-group-divider:" ^ parent.block_id);
-         require_sized_height handle ("journal-row-extent:" ^ parent.block_id) 60.;
+         require_sized_height handle ("journal-row-extent:" ^ parent.block_id) 56.;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "preview collapse" (fun () ->
            Option.is_none
@@ -3068,6 +3145,7 @@ let () =
   test_typography_waits_for_the_persisted_preset_without_flashing_balanced ();
   test_missing_and_invalid_typography_preferences_select_balanced ();
   test_settings_choice_group_applies_and_persists_one_atomic_preset ();
+  test_sync_diagnostics_is_scrollable_read_only_and_display_safe ();
   test_timeline_uses_exact_sparse_extent_window ();
   test_timeline_preserves_stable_slot_keys_across_window_shifts ();
   test_one_visible_range_drains_multiple_day_continuations ();

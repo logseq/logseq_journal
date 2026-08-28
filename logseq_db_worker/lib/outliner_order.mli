@@ -4,4 +4,9 @@ type error =
 
 val is_valid : string -> bool
 val between : lower:string option -> upper:string option -> (string, error) result
-val sequence_between : lower:string option -> upper:string option -> int -> (string list, error) result
+
+val sequence_between
+  :  lower:string option
+  -> upper:string option
+  -> int
+  -> (string list, error) result
