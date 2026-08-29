@@ -67,11 +67,6 @@ let request_headers uri headers =
   Httpun.Headers.of_list (("host", host) :: ("connection", "close") :: headers)
 ;;
 
-let method_ = function
-  | Http.Get -> `GET
-  | Post -> `POST
-;;
-
 let protocol_error_message context = function
   | `Malformed_response _ -> context ^ ": malformed HTTP response"
   | `Invalid_response_body_length _ -> context ^ ": invalid HTTP response body length"
@@ -132,13 +127,12 @@ let request_once ~sw ~network request =
     let descriptor =
       Httpun.Request.create
         ~headers:(request_headers request.uri request.headers)
-        (method_ request.meth)
+        `GET
         target
     in
     let writer =
       Httpun_eio.Client.request client descriptor ~error_handler ~response_handler
     in
-    Option.iter (Httpun.Body.Writer.write_string writer) request.body;
     Httpun.Body.Writer.close writer;
     Eio.Promise.await result)
 ;;
@@ -234,13 +228,12 @@ let download_once ~sw ~network ~request ~destination ~maximum_bytes ~on_progress
     let descriptor =
       Httpun.Request.create
         ~headers:(request_headers request.uri request.headers)
-        (method_ request.meth)
+        `GET
         target
     in
     let writer =
       Httpun_eio.Client.request client descriptor ~error_handler ~response_handler
     in
-    Option.iter (Httpun.Body.Writer.write_string writer) request.body;
     Httpun.Body.Writer.close writer;
     Eio.Promise.await result)
 ;;

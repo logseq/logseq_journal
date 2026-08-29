@@ -3,11 +3,11 @@ module F = Logseq_db_worker_test_support.Adapter_fixture
 module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Worker_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
-module Api = Logseq_sync.Api
+module Runner = Logseq_sync.Effect_runner
 
 let worker_dependencies =
   let crypto =
-    Api.crypto
+    Runner.crypto
       ~decrypt_private_key:(fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
         Error "unavailable")
       ~decrypt_graph_key:(fun ~private_key:_ ~ciphertext:_ -> Error "unavailable")
@@ -16,7 +16,7 @@ let worker_dependencies =
     |> Result.get_ok
   in
   let secrets =
-    Api.secrets
+    Runner.secrets
       ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> false)
       ~unlock_private_key:
         (fun
@@ -24,10 +24,8 @@ let worker_dependencies =
         Error "unavailable")
       ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
         Error "unavailable")
-      ~load_and_verify_wrapped_graph_key:
-        (fun
-          ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-        Error (Api.Wrapped_graph_key_unavailable "unavailable"))
+      ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+        Error (Runner.Wrapped_graph_key_unavailable "unavailable"))
       ~verify_and_save_wrapped_graph_key:
         (fun
           ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->

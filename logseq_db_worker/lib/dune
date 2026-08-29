@@ -10,6 +10,7 @@
   logseq_db_storage
   logseq_db_types
   logseq_sync
+  logseq_sync.impl.pure_core
   melange-transit-native
   persistent_sorted_set_ocaml
   sqlite3

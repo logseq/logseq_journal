@@ -1,3 +1,9 @@
+module Checksum = Logseq_sync_pure_core.Checksum
+module Snapshot = Synced_snapshot_parser
+module Admission = Logseq_db_storage.Admission
+
+let protected_attributes = [ "block/title"; "block/name" ]
+
 type metadata = Sync_checkpoint.t
 
 type resolved =
@@ -230,7 +236,7 @@ let plaintext_snapshot_db decrypt db =
     | [] ->
       (try Ok (Datascript.init_db ~schema:db.Datascript.schema (List.rev datoms)) with
        | error -> Error (Printexc.to_string error))
-    | datom :: rest when List.mem datom.Datascript.a E2ee.protected_attributes ->
+    | datom :: rest when List.mem datom.Datascript.a protected_attributes ->
       (match datom.v with
        | Datascript.String ciphertext ->
          (match decrypt ciphertext with
@@ -386,7 +392,11 @@ let validate_staged database_path metadata =
        fail (Invalid_snapshot "staged graph storage is corrupt"))
 ;;
 
-let finalize_computed_checksum ?expected_checksum database_path metadata =
+let finalize_computed_checksum
+      ?expected_checksum
+      database_path
+      (metadata : Sync_checkpoint.t)
+  =
   match Logseq_sqlite_storage.open_database database_path with
   | Error _ -> Error (Invalid_snapshot "staged SQLite graph could not be reopened")
   | Ok connection ->
@@ -408,7 +418,13 @@ let finalize_computed_checksum ?expected_checksum database_path metadata =
        then finish (Error (Invalid_snapshot "snapshot checksum does not match metadata"))
        else (
          match
-           State.advance metadata ~applied_server_t:metadata.applied_server_t ~checksum
+           Sync_checkpoint.create_full
+             ~graph_id:metadata.graph_id
+             ~schema:metadata.schema
+             ~applied_server_t:metadata.applied_server_t
+             ~checksum
+             ~status:Sync_checkpoint.Active
+             ~last_error:None
          with
          | Error message -> finish (Error (Invalid_metadata message))
          | Ok metadata ->

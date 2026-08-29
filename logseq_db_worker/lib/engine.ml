@@ -938,7 +938,7 @@ let execute_mutation t request_id mutation =
       ~phase:Execute
       ~basis:(Some t.graph_info.basis)
       (unsupported_semantics
-         "Managed graph mutations must enter through Logseq_sync.Api.")
+         "Managed graph mutations must enter through Logseq_sync.Core.")
   | Snapshot_write_target _ | Native_write_target _ ->
     execute_local_mutation t request_id mutation
 ;;

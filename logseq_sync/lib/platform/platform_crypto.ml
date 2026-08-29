@@ -92,7 +92,21 @@ let unlock_private_key ~managed_sync_origin ~user_id ~password ~private_key_pack
       (fun _ -> Ok ()))
 ;;
 
-let crypto : E2ee.crypto =
+type crypto =
+  { decrypt_private_key :
+      password:string
+      -> iterations:int
+      -> salt:string
+      -> iv:string
+      -> ciphertext:string
+      -> (string, string) result
+  ; decrypt_graph_key : private_key:string -> ciphertext:string -> (string, string) result
+  ; encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
+  ; decrypt_aes_gcm :
+      key:string -> iv:string -> ciphertext:string -> (string, string) result
+  }
+
+let crypto =
   { decrypt_private_key =
       (fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
         Error "password unlock is owned by the platform account shell")
@@ -144,7 +158,7 @@ type wrapped_key_load_failure =
   | Wrapped_graph_key_unavailable of string
   | Local_private_key_unavailable of string
 
-let load_and_verify_wrapped_graph_key ~managed_sync_origin ~user_id ~graph_id =
+let load_wrapped_graph_key ~managed_sync_origin ~user_id ~graph_id =
   match
     invoke
       "loadAndVerifyWrappedGraphKey"

@@ -1,5 +1,6 @@
 module Db = Logseq_db_worker
-module Api = Logseq_sync.Api
+module Core = Logseq_sync.Core
+module Effect_runner = Logseq_sync.Effect_runner
 module Engine = Db.Engine
 module Protocol = Db.Protocol
 module ID = Bonsai_flutter_spec.Id
@@ -10,16 +11,16 @@ type client_command =
   | Acknowledge_local_feed
   | Acknowledge_timeline_presented
   | Provide_token of
-      { request : Api.token_request
+      { request : Core.token_request
       ; token : string
       }
-  | Reject_token of Api.token_request
-  | Select_graph of Api.graph_id
+  | Reject_token of Core.token_request
+  | Select_graph of Core.graph_id
   | Return_to_graph_picker
   | Refresh_catalog
   | Begin_online_recovery
   | Submit_e2ee_password of string
-  | Delete_local_cache of Api.graph_id
+  | Delete_local_cache of Core.graph_id
   | Set_foreground of bool
 
 type request =
@@ -28,15 +29,15 @@ type request =
   | Get_graph_state
 
 type response =
-  | Client_state of Api.state
+  | Client_state of Core.state
   | Graph_response of Protocol.response
   | Graph_state of Db.graph_state
 
 type push =
   | Graph_push of Protocol.push
-  | Client_state_changed of Api.state
-  | Need_id_token of Api.token_request
-  | Bootstrap_progress of Api.bootstrap_progress
+  | Client_state_changed of Core.state
+  | Need_id_token of Core.token_request
+  | Bootstrap_progress of Core.bootstrap_progress
   | Graph_state_changed of Db.graph_state
 
 let invalidation_topic = ID.Worker.Push_topic.of_int 0
@@ -54,8 +55,8 @@ let random_key () =
 
 type dependencies =
   { engine : Engine.dependencies
-  ; secrets : Api.secrets
-  ; crypto : Api.crypto
+  ; secrets : Effect_runner.secrets
+  ; crypto : Effect_runner.crypto
   }
 
 let dependencies ~engine ~secrets ~crypto = { engine; secrets; crypto }
@@ -70,8 +71,8 @@ let production_dependencies () =
       ; cursor_authentication_key = random_key ()
       }
   in
-  let secrets = Api.apple_secrets () |> Result.get_ok in
-  let crypto = Api.apple_crypto () |> Result.get_ok in
+  let secrets = Effect_runner.apple_secrets () |> Result.get_ok in
+  let crypto = Effect_runner.apple_crypto () |> Result.get_ok in
   { engine; secrets; crypto }
 ;;
 
@@ -84,7 +85,7 @@ let take count values =
   loop count [] values
 ;;
 
-let protocol_invalidation (invalidation : Api.invalidation) =
+let protocol_invalidation (invalidation : Core.invalidation) =
   let rec fit limit =
     let changed_uuids = take limit invalidation.changed_uuids in
     let push =
@@ -113,7 +114,7 @@ let protocol_invalidation (invalidation : Api.invalidation) =
 ;;
 
 let mutation_invalidation (success : Logseq_db_types.Mutation.success) =
-  Api.
+  Core.
     { basis = success.basis_after
     ; changed_uuids = success.changed_uuids
     ; changed_uuids_truncated = success.changed_uuids_truncated
@@ -127,17 +128,16 @@ let graph_failure (request : Protocol.request) message =
   Protocol.failed ~request_id:request.request_id ~phase:Execute ~basis:None error
 ;;
 
-let config_for_graph config request =
-  let graph = Api.graph_open_request_graph request in
+let config_for_graph config (request : Core.graph_open_request) =
   Db.Config.create
     ~application_support_directory:config.Db.Config.application_support_directory
     ~target:
       (Synced_mirror
-         { graph_id = graph.graph_id
-         ; graph_name = graph.name
-         ; graph_dir = Api.graph_open_request_graph_directory request
-         ; database_path = Api.graph_open_request_database_path request
-         ; checkpoint = Api.graph_open_request_checkpoint request
+         { graph_id = request.graph.graph_id
+         ; graph_name = request.graph.name
+         ; graph_dir = request.graph_directory
+         ; database_path = request.database_path
+         ; checkpoint = request.checkpoint
          })
     ~compatibility_profile:config.compatibility_profile
     ~response_budget_bytes:config.response_budget_bytes
@@ -152,32 +152,28 @@ let publish_graph_state context lifecycle =
 ;;
 
 module Managed_coordinator = struct
+  type pending_mutation =
+    { prepared : Engine.prepared_managed_mutation
+    ; result : (Logseq_db_types.Mutation.success, string) result Eio.Promise.u
+    }
+
   type t =
-    { client : Api.t
-    ; local_store : Api.local_store
+    { mutable core : Core.t
+    ; runner : Effect_runner.t
     ; mutable engine : Engine.t option
     ; context : push Worker.Session_context.t
     ; graph_lifecycle : Db.Graph_lifecycle.t
     ; engine_dependencies : Engine.dependencies
     ; config : Db.Config.t
-    ; post_effect : Api.sync_effect -> unit
     ; lock : Eio.Mutex.t
-    ; mutable account_generation : int
-    ; mutable graph_generation : int
-    ; mutable presentation_generation : int
-    ; mutable connection_generation : int
     ; mutable lifecycle_generation : int64
+    ; mutable attached_scope : Core.graph_scope option
+    ; pending_mutations : (string, pending_mutation) Hashtbl.t
     }
 
+  let current_graph_generation t = (Core.state t.core).snapshot.startup.graph_generation
+
   let publish_state t state =
-    let startup = state.Api.snapshot.startup in
-    if
-      t.account_generation <> startup.account_generation
-      || t.graph_generation <> startup.graph_generation
-    then t.connection_generation <- 0;
-    t.account_generation <- startup.account_generation;
-    t.graph_generation <- startup.graph_generation;
-    t.presentation_generation <- startup.presentation_generation;
     Worker.Session_context.emit
       t.context
       ~topic:manager_topic
@@ -189,6 +185,7 @@ module Managed_coordinator = struct
     | None -> ()
     | Some engine ->
       t.engine <- None;
+      t.attached_scope <- None;
       Db.Graph_lifecycle.begin_close t.graph_lifecycle ~generation;
       publish_graph_state t.context t.graph_lifecycle;
       (match Engine.close engine with
@@ -200,76 +197,266 @@ module Managed_coordinator = struct
          publish_graph_state t.context t.graph_lifecycle)
   ;;
 
-  let attach_graph t request =
-    let account_generation = Api.graph_open_request_account_generation request in
-    let graph_generation = Api.graph_open_request_generation request in
-    if account_generation = t.account_generation && graph_generation = t.graph_generation
+  let scope_error scope message =
+    Core.Graph_attachment_failed { scope = Core.effect_scope_of_graph scope; message }
+  ;;
+
+  let close_attached_engine t =
+    match t.attached_scope with
+    | Some scope -> close_engine t scope.graph_generation
+    | None ->
+      (match t.engine with
+       | Some _ -> close_engine t (current_graph_generation t)
+       | None -> ())
+  ;;
+
+  let rec attach_graph t (request : Core.graph_open_request) =
+    let scope = request.scope in
+    if scope.graph_generation = current_graph_generation t
     then (
-      close_engine t graph_generation;
-      let graph_id = Some (Api.graph_open_request_graph request).graph_id in
+      close_attached_engine t;
       Db.Graph_lifecycle.begin_open
         t.graph_lifecycle
-        ~generation:graph_generation
-        ~graph_id;
+        ~generation:scope.graph_generation
+        ~graph_id:(Some request.graph.graph_id);
       publish_graph_state t.context t.graph_lifecycle;
       match config_for_graph t.config request with
       | Error message ->
-        Db.Graph_lifecycle.failed t.graph_lifecycle ~generation:graph_generation ~message;
+        Db.Graph_lifecycle.failed
+          t.graph_lifecycle
+          ~generation:scope.graph_generation
+          ~message;
         publish_graph_state t.context t.graph_lifecycle;
-        Api.handle
-          t.client
-          (Graph_attachment_failed { account_generation; graph_generation; message })
-        |> List.iter t.post_effect
+        handle_event_unlocked t (scope_error scope message)
       | Ok graph_config ->
         (match Engine.open_ ~dependencies:t.engine_dependencies graph_config with
          | Error error ->
            let message = Db.Error.message error in
            Db.Graph_lifecycle.failed
              t.graph_lifecycle
-             ~generation:graph_generation
+             ~generation:scope.graph_generation
              ~message;
            publish_graph_state t.context t.graph_lifecycle;
-           Api.handle
-             t.client
-             (Graph_attachment_failed { account_generation; graph_generation; message })
-           |> List.iter t.post_effect
+           handle_event_unlocked t (scope_error scope message)
          | Ok engine ->
            t.engine <- Some engine;
+           t.attached_scope <- Some scope;
            let restored =
              Result.bind (Engine.sync_checkpoint engine) (fun checkpoint ->
-               Result.bind (Engine.managed_outbox_records engine) (fun outbox_records ->
-                 Result.bind (Engine.projected_database engine) (fun database ->
-                   Result.bind
-                     (Api.restore_outbox_projection t.client ~database ~outbox_records)
-                     (fun transactions ->
-                        Result.map
-                          (fun _ -> checkpoint, outbox_records)
-                          (Engine.restore_managed_outbox engine transactions)))))
+               Result.map
+                 (fun outbox_records -> checkpoint, outbox_records)
+                 (Engine.managed_outbox_records engine))
            in
            (match restored with
             | Error message ->
-              close_engine t graph_generation;
-              Db.Graph_lifecycle.failed
-                t.graph_lifecycle
-                ~generation:graph_generation
-                ~message;
-              publish_graph_state t.context t.graph_lifecycle;
-              Api.handle
-                t.client
-                (Graph_attachment_failed { account_generation; graph_generation; message })
-              |> List.iter t.post_effect
+              close_engine t scope.graph_generation;
+              handle_event_unlocked t (scope_error scope message)
             | Ok (checkpoint, outbox_records) ->
-              Db.Graph_lifecycle.opened t.graph_lifecycle ~generation:graph_generation;
+              Db.Graph_lifecycle.opened
+                t.graph_lifecycle
+                ~generation:scope.graph_generation;
               publish_graph_state t.context t.graph_lifecycle;
-              Api.handle
-                t.client
-                (Graph_attached
-                   { account_generation; graph_generation; checkpoint; outbox_records })
-              |> List.iter t.post_effect)))
-  ;;
+              handle_event_unlocked
+                t
+                (Core.Graph_attached { scope; checkpoint; outbox_records }))))
 
-  let rec handle_effect_unlocked t = function
-    | Api.State_changed state -> publish_state t state
+  and inspect_mirror t (request : Core.mirror_request) =
+    let graph_id = request.graph.graph_id in
+    match
+      Db.Synced_mirror.resolve
+        ~application_support_directory:t.config.application_support_directory
+        ~graph_id
+    with
+    | Error Db.Synced_mirror.Mirror_missing ->
+      handle_event_unlocked t (Core.Mirror_inspected (Mirror_absent request.scope))
+    | Error error ->
+      handle_event_unlocked
+        t
+        (Core.Graph_attachment_failed
+           { scope = Core.effect_scope_of_graph request.scope
+           ; message = Db.Synced_mirror.error_message error
+           })
+    | Ok resolved ->
+      handle_event_unlocked
+        t
+        (Core.Mirror_inspected
+           (Mirror_available
+              { graph = request.graph
+              ; graph_directory = resolved.graph_dir
+              ; database_path = resolved.database_path
+              ; checkpoint = resolved.metadata
+              ; scope = request.scope
+              }))
+
+  and activate_snapshot t (request : Core.snapshot_activation_request) =
+    if request.scope.graph_generation = current_graph_generation t
+    then (
+      let decrypt_protected =
+        Option.map
+          (fun key -> Effect_runner.decrypt_protected_value t.runner key)
+          request.key
+      in
+      match
+        Db.Synced_mirror.bootstrap
+          ~application_support_directory:t.config.application_support_directory
+          ~graph_id:request.scope.graph_id
+          ~applied_server_t:request.applied_server_t
+          ~expected_rows:(Core.staged_artifact_expected_rows request.artifact)
+          ~snapshot_path:(Core.staged_artifact_path request.artifact)
+          ?decrypt_protected
+          ()
+      with
+      | Ok _ ->
+        handle_event_unlocked t (Core.Snapshot_activated { scope = request.scope })
+      | Error error ->
+        handle_event_unlocked
+          t
+          (Core.Snapshot_activation_failed
+             { scope = Core.effect_scope_of_graph request.scope
+             ; message = Db.Synced_mirror.error_message error
+             }))
+
+  and delete_mirror t (request : Core.mirror_deletion) =
+    (match t.attached_scope with
+     | Some scope
+       when Logseq_db_types.Graph_types.Uuid.equal scope.graph_id request.graph_id ->
+       close_attached_engine t
+     | Some _ | None -> ());
+    ignore
+      (Db.Synced_mirror.delete
+         ~application_support_directory:t.config.application_support_directory
+         ~graph_id:request.graph_id)
+
+  and handle_worker_effect t = function
+    | Core.Inspect_mirror request -> inspect_mirror t request
+    | Activate_snapshot request -> activate_snapshot t request
+    | Delete_mirror request -> delete_mirror t request
+    | Attach_graph request -> attach_graph t request
+    | Detach_graph { graph_generation } ->
+      (match t.attached_scope with
+       | Some scope when scope.graph_generation = graph_generation ->
+         close_attached_engine t
+       | Some _ | None -> ())
+    | Commit_local_batch request ->
+      let operation_id =
+        Logseq_db_types.Graph_types.Uuid.to_string request.operation_id
+      in
+      (match Hashtbl.find_opt t.pending_mutations operation_id, t.engine with
+       | Some pending, Some engine ->
+         Hashtbl.remove t.pending_mutations operation_id;
+         let committed =
+           Engine.commit_managed_mutation
+             engine
+             pending.prepared
+             ~outbox_records:request.outbox_records
+         in
+         Eio.Promise.resolve pending.result committed;
+         (match committed with
+          | Error _ -> ()
+          | Ok _ ->
+            handle_event_unlocked
+              t
+              (Core.Local_batch_committed
+                 { scope = request.scope; outbox_records = request.outbox_records }))
+       | Some pending, None ->
+         Hashtbl.remove t.pending_mutations operation_id;
+         Eio.Promise.resolve pending.result (Error "managed graph is unavailable")
+       | None, Some _ | None, None -> ())
+    | Commit_outbox_transition transition ->
+      (match t.engine with
+       | None -> ()
+       | Some engine ->
+         (match
+            Engine.commit_outbox_transition
+              engine
+              ~expected:transition.expected_outbox_records
+              transition.outbox_records
+          with
+          | Ok () ->
+            handle_event_unlocked
+              t
+              (Core.Outbox_transition_committed
+                 { scope = transition.scope
+                 ; outbox_records = transition.outbox_records
+                 ; pending_payload = transition.pending_payload
+                 })
+          | Error message ->
+            let outbox_records =
+              Engine.managed_outbox_records engine
+              |> Result.fold ~ok:Fun.id ~error:(fun _ ->
+                transition.expected_outbox_records)
+            in
+            handle_event_unlocked
+              t
+              (Core.Outbox_transition_rejected
+                 { scope = transition.scope; outbox_records; message })))
+    | Inspect_authoritative_batch batch ->
+      (match t.engine, t.attached_scope with
+       | Some engine, Some scope when scope = batch.scope.graph ->
+         let context =
+           Result.bind (Engine.sync_checkpoint engine) (fun checkpoint ->
+             Result.bind (Engine.authoritative_database engine) (fun database ->
+               Result.map
+                 (fun outbox_records ->
+                    Core.{ batch; checkpoint; database; outbox_records })
+                 (Engine.managed_outbox_records engine)))
+         in
+         (match context with
+          | Ok context ->
+            handle_event_unlocked t (Core.Authoritative_batch_inspected context)
+          | Error message ->
+            handle_event_unlocked
+              t
+              (Core.Authoritative_batch_failed
+                 { scope = Core.effect_scope_of_graph scope; message }))
+       | Some _, Some _ | Some _, None | None, Some _ | None, None -> ())
+    | Apply_authoritative_batch request ->
+      (match t.engine, t.attached_scope with
+       | Some engine, Some scope when scope = request.scope ->
+         (match
+            Engine.apply_authoritative
+              engine
+              request.transactions
+              ~checkpoint:request.checkpoint
+              ~outbox_records:request.outbox_records
+          with
+          | Error message ->
+            handle_event_unlocked
+              t
+              (Core.Authoritative_batch_failed
+                 { scope = Core.effect_scope_of_graph scope; message })
+          | Ok (_basis_before, basis_after, changed_uuids, _database) ->
+            (match
+               Engine.restore_managed_outbox engine request.projection_transactions
+             with
+             | Error message ->
+               handle_event_unlocked
+                 t
+                 (Core.Authoritative_batch_failed
+                    { scope = Core.effect_scope_of_graph scope; message })
+             | Ok outbox_records ->
+               let changed_uuids_truncated = List.length changed_uuids > 4096 in
+               let changed_uuids = take 4096 changed_uuids in
+               let invalidation =
+                 if request.transactions = []
+                 then None
+                 else
+                   Some
+                     Core.{ basis = basis_after; changed_uuids; changed_uuids_truncated }
+               in
+               handle_event_unlocked
+                 t
+                 (Core.Authoritative_batch_applied
+                    { scope
+                    ; checkpoint = request.checkpoint
+                    ; outbox_records
+                    ; activity = request.activity
+                    ; invalidation
+                    })))
+       | Some _, Some _ | Some _, None | None, Some _ | None, None -> ())
+
+  and handle_output t = function
+    | Core.State_changed state -> publish_state t state
     | Token_requested request ->
       Worker.Session_context.emit t.context ~topic:auth_topic (Need_id_token request)
     | Bootstrap_progressed progress ->
@@ -282,245 +469,153 @@ module Managed_coordinator = struct
         t.context
         ~topic:invalidation_topic
         (Graph_push (protocol_invalidation invalidation))
-    | Attach_graph request -> attach_graph t request
-    | Detach_graph { graph_generation } ->
-      if graph_generation = t.graph_generation then close_engine t graph_generation
-    | Apply_authoritative_batch batch ->
-      let ( account_generation
-          , graph_generation
-          , connection_generation
-          , presentation_generation
-          , lifecycle_generation )
-        =
-        Api.authoritative_batch_scope batch
-      in
-      if
-        account_generation = t.account_generation
-        && graph_generation = t.graph_generation
-        && connection_generation >= t.connection_generation
-        && presentation_generation = t.presentation_generation
-        && lifecycle_generation = t.lifecycle_generation
-      then (
-        match t.engine with
-        | None -> ()
-        | Some engine ->
-          t.connection_generation <- connection_generation;
-          let planned =
-            Result.bind (Engine.sync_checkpoint engine) (fun checkpoint ->
-              Result.bind (Engine.authoritative_database engine) (fun database ->
-                Result.bind (Engine.managed_outbox_records engine) (fun outbox_records ->
-                  Api.plan_authoritative_batch
-                    t.client
-                    batch
-                    ~checkpoint
-                    ~database
-                    ~outbox_records)))
-          in
-          (match planned with
-           | Error message ->
-             handle_event_unlocked
-               t
-               (Api.Authoritative_batch_failed
-                  { account_generation; graph_generation; message })
-           | Ok (No_authoritative_commit { checkpoint; outbox_records; activity }) ->
-             handle_event_unlocked
-               t
-               (Api.Authoritative_batch_applied
-                  { account_generation
-                  ; graph_generation
-                  ; checkpoint
-                  ; outbox_records
-                  ; activity
-                  ; invalidation = None
-                  })
-           | Ok
-               (Commit_authoritative
-                  { transactions; checkpoint; outbox_records; activity }) ->
-             (match
-                Result.bind
-                  (Engine.apply_authoritative
-                     engine
-                     transactions
-                     ~checkpoint
-                     ~outbox_records)
-                  (fun (basis_before, _basis_after, changed_uuids, database) ->
-                     Result.bind
-                       (Api.restore_outbox_projection t.client ~database ~outbox_records)
-                       (fun projected_transactions ->
-                          Result.map
-                            (fun _ ->
-                               let basis_after =
-                                 Engine.basis engine |> Option.value ~default:basis_before
-                               in
-                               basis_before, basis_after, changed_uuids, database)
-                            (Engine.restore_managed_outbox engine projected_transactions)))
-              with
-              | Error message ->
-                handle_event_unlocked
-                  t
-                  (Api.Authoritative_batch_failed
-                     { account_generation; graph_generation; message })
-              | Ok (_basis_before, basis_after, changed_uuids, _database) ->
-                let changed_uuids_truncated = List.length changed_uuids > 4096 in
-                let changed_uuids = take 4096 changed_uuids in
-                handle_event_unlocked
-                  t
-                  (Api.Authoritative_batch_applied
-                     { account_generation
-                     ; graph_generation
-                     ; checkpoint
-                     ; outbox_records
-                     ; activity
-                     ; invalidation =
-                         (if transactions = []
-                          then None
-                          else
-                            Some
-                              { basis = basis_after
-                              ; changed_uuids
-                              ; changed_uuids_truncated
-                              })
-                     }))))
-    | Commit_outbox_transition transition ->
-      let ( account_generation
-          , graph_generation
-          , presentation_generation
-          , lifecycle_generation )
-        =
-        Api.outbox_transition_scope transition
-      in
-      if
-        account_generation = t.account_generation
-        && graph_generation = t.graph_generation
-        && presentation_generation = t.presentation_generation
-        && lifecycle_generation = t.lifecycle_generation
-      then (
-        match t.engine with
-        | None -> ()
-        | Some engine ->
-          let outbox_records = Api.outbox_transition_records transition in
-          let expected = Api.outbox_transition_expected_records transition in
-          (match Engine.commit_outbox_transition engine ~expected outbox_records with
-           | Error message ->
-             let current =
-               Engine.managed_outbox_records engine
-               |> Result.fold ~ok:Fun.id ~error:(fun _ -> expected)
-             in
-             handle_event_unlocked
-               t
-               (Api.Outbox_transition_rejected { outbox_records = current; message })
-           | Ok () ->
-             handle_event_unlocked
-               t
-               (Api.Outbox_transition_committed
-                  { outbox_records
-                  ; pending_payload = Api.outbox_transition_pending_payload transition
-                  })))
-    | Run_local_operation operation ->
-      Api.run_local_operation t.client t.local_store operation
-      |> List.iter (handle_effect_unlocked t)
-    | Resume completion ->
-      Api.resume t.client completion |> List.iter (handle_effect_unlocked t)
+
+  and handle_effect_unlocked t = function
+    | Core.Publish output -> handle_output t output
+    | Run instruction -> Effect_runner.submit t.runner instruction
+    | Delegate instruction -> handle_worker_effect t instruction
 
   and handle_event_unlocked t event =
-    (match event with
-     | Api.Foreground_changed false ->
-       t.lifecycle_generation <- Int64.succ t.lifecycle_generation
-     | Restore_local_account _
-     | Account_authenticated _
-     | Local_feed_acknowledged
-     | Timeline_presented
-     | Token_provided _
-     | Token_rejected _
-     | Graph_selected _
-     | Graph_picker_requested
-     | Catalog_refresh_requested
-     | Online_recovery_requested
-     | E2ee_password_submitted _
-     | Local_cache_deletion_requested _
-     | Foreground_changed true
-     | Graph_attached _
-     | Graph_attachment_failed _
-     | Local_batch_committed _
-     | Authoritative_batch_applied _
-     | Authoritative_batch_failed _
-     | Outbox_transition_committed _
-     | Outbox_transition_rejected _
-     | Shutdown -> ());
-    ignore (t.presentation_generation, t.lifecycle_generation);
-    Api.handle t.client event |> List.iter (handle_effect_unlocked t)
+    let transition = Core.step t.core event in
+    t.core <- transition.next;
+    List.iter (handle_effect_unlocked t) transition.effects
   ;;
 
   let handle t event =
     Eio.Mutex.use_rw ~protect:true t.lock (fun () -> handle_event_unlocked t event)
   ;;
 
-  let dispatch_effect t output =
-    Eio.Mutex.use_rw ~protect:true t.lock (fun () -> handle_effect_unlocked t output)
+  let handle_command t = function
+    | Restore_local_account { user_id } ->
+      handle t (Core.Restore_local_account { user_id })
+    | Reconcile_authenticated_user { user_id } ->
+      handle t (Core.Account_authenticated { user_id })
+    | Acknowledge_local_feed -> handle t Core.Local_feed_acknowledged
+    | Acknowledge_timeline_presented -> handle t Core.Timeline_presented
+    | Provide_token { request; token } -> handle t (Core.Token_provided (request, token))
+    | Reject_token request -> handle t (Core.Token_rejected request)
+    | Select_graph graph_id -> handle t (Core.Graph_selected graph_id)
+    | Return_to_graph_picker -> handle t Core.Graph_picker_requested
+    | Refresh_catalog -> handle t Core.Catalog_refresh_requested
+    | Begin_online_recovery -> handle t Core.Online_recovery_requested
+    | Submit_e2ee_password password -> handle t (Core.E2ee_password_submitted password)
+    | Delete_local_cache graph_id ->
+      handle t (Core.Local_cache_deletion_requested graph_id)
+    | Set_foreground foreground ->
+      t.lifecycle_generation <- Int64.succ t.lifecycle_generation;
+      handle
+        t
+        (Core.Foreground_changed
+           { foreground; lifecycle_generation = t.lifecycle_generation })
   ;;
 
-  let mutation_failure (request : Protocol.request) engine code message =
-    let error = Db.Error.create ~code ~message ~details:[] |> Result.get_ok in
+  type graph_execution =
+    | Immediate of Protocol.response
+    | Await_mutation of
+        (Logseq_db_types.Mutation.success, string) result Eio.Promise.t
+        * Protocol.request
+        * Engine.t
+
+  let mutation_failure (request : Protocol.request) engine message =
+    let error =
+      Db.Error.create ~code:Db.Error.Unsupported_semantics ~message ~details:[]
+      |> Result.get_ok
+    in
     Protocol.failed
-      ~request_id:request.Protocol.request_id
+      ~request_id:request.request_id
       ~phase:Execute
       ~basis:(Engine.basis engine)
       error
   ;;
 
-  let mutate t engine mutation =
+  let mutation_response (request : Protocol.request) success =
+    Protocol.Succeeded
+      { request_id = request.request_id
+      ; basis = success.Logseq_db_types.Mutation.basis_after
+      ; success = Mutation_result success
+      }
+  ;;
+
+  let begin_mutation t request engine mutation =
     let mutation_id = (Logseq_db_types.Mutation.context mutation).mutation_id in
     let mutation_fingerprint =
       Logseq_db_types.Mutation.to_yojson mutation |> Yojson.Safe.to_string
     in
-    Result.bind (Engine.managed_outbox_records engine) (fun encoded_outbox ->
-      Result.bind (Api.decode_outbox_records encoded_outbox) (fun outbox ->
-        match
-          List.find_opt
-            (fun record ->
-               Logseq_db_types.Graph_types.Uuid.equal
-                 (Api.outbox_record_mutation_id record)
-                 mutation_id)
-            outbox
-        with
-        | Some record
-          when String.equal (Api.outbox_record_fingerprint record) mutation_fingerprint ->
-          Engine.duplicate_managed_mutation engine mutation
-        | Some _ ->
-          Error "The mutation ID is already used by another durable outbox record."
-        | None ->
-          Result.bind (Engine.prepare_managed_mutation engine mutation) (fun prepared ->
-            let commit records =
-              Result.bind (Api.encode_outbox_records records) (fun outbox_records ->
-                Result.bind
-                  (Engine.commit_managed_mutation engine prepared ~outbox_records)
-                  (fun success ->
-                     handle_event_unlocked
-                       t
-                       (Api.Local_batch_committed { outbox_records });
-                     Ok success))
-            in
-            if Engine.prepared_mutation_operations prepared = []
-            then commit outbox
-            else
-              Result.bind
-                (Api.prepare_local_batch
-                   t.client
-                   ~outbox
-                   ~mutation_id
-                   ~mutation_payload:(Engine.prepared_mutation_payload prepared)
-                   ~mutation_fingerprint
-                   ~outliner_op:(Engine.prepared_mutation_outliner_op prepared)
-                   ~database:(Engine.prepared_mutation_database prepared)
-                   ~operations:(Engine.prepared_mutation_operations prepared))
-                commit)))
+    match Engine.managed_outbox_records engine with
+    | Error message -> Immediate (mutation_failure request engine message)
+    | Ok encoded_outbox ->
+      (match Core.decode_outbox_records encoded_outbox with
+       | Error message -> Immediate (mutation_failure request engine message)
+       | Ok outbox ->
+         (match
+            List.find_opt
+              (fun record ->
+                 Logseq_db_types.Graph_types.Uuid.equal
+                   (Core.outbox_record_mutation_id record)
+                   mutation_id)
+              outbox
+          with
+          | Some record
+            when String.equal (Core.outbox_record_fingerprint record) mutation_fingerprint
+            ->
+            (match Engine.duplicate_managed_mutation engine mutation with
+             | Ok success -> Immediate (mutation_response request success)
+             | Error message -> Immediate (mutation_failure request engine message))
+          | Some _ ->
+            Immediate
+              (mutation_failure
+                 request
+                 engine
+                 "The mutation ID is already used by another durable outbox record.")
+          | None ->
+            (match t.attached_scope with
+             | None ->
+               Immediate (mutation_failure request engine "managed graph scope is absent")
+             | Some scope ->
+               (match Engine.prepare_managed_mutation engine mutation with
+                | Error message -> Immediate (mutation_failure request engine message)
+                | Ok prepared ->
+                  (match
+                     Core.local_batch_input
+                       ~scope
+                       ~key:None
+                       ~outbox_records:encoded_outbox
+                       ~mutation_id
+                       ~mutation_payload:(Engine.prepared_mutation_payload prepared)
+                       ~mutation_fingerprint
+                       ~outliner_op:(Engine.prepared_mutation_outliner_op prepared)
+                       ~database:(Engine.prepared_mutation_database prepared)
+                       ~operations:(Engine.prepared_mutation_operations prepared)
+                   with
+                   | Error message -> Immediate (mutation_failure request engine message)
+                   | Ok input ->
+                     let result, resolve = Eio.Promise.create () in
+                     Hashtbl.add
+                       t.pending_mutations
+                       (Logseq_db_types.Graph_types.Uuid.to_string mutation_id)
+                       { prepared; result = resolve };
+                     handle_event_unlocked t (Core.Local_batch_prepared input);
+                     Await_mutation (result, request, engine))))))
   ;;
 
   let execute_graph_request_unlocked t request =
-    match request.Protocol.command, t.engine with
-    | _, None -> graph_failure request "no graph is open"
-    | Mutate mutation, Some engine ->
-      (match mutate t engine mutation with
+    match t.engine with
+    | None -> Immediate (graph_failure request "no graph is open")
+    | Some engine ->
+      (match request.Protocol.command with
+       | Read _ -> Immediate (Engine.execute engine request)
+       | Mutate mutation -> begin_mutation t request engine mutation)
+  ;;
+
+  let execute_graph_request t request =
+    match
+      Eio.Mutex.use_rw ~protect:true t.lock (fun () ->
+        execute_graph_request_unlocked t request)
+    with
+    | Immediate response -> response
+    | Await_mutation (result, request, engine) ->
+      (match Eio.Promise.await result with
+       | Error message -> mutation_failure request engine message
        | Ok success ->
          if success.Logseq_db_types.Mutation.status = Applied
          then
@@ -528,19 +623,7 @@ module Managed_coordinator = struct
              t.context
              ~topic:invalidation_topic
              (Graph_push (protocol_invalidation (mutation_invalidation success)));
-         Succeeded
-           { request_id = request.request_id
-           ; basis = success.basis_after
-           ; success = Mutation_result success
-           }
-       | Error message ->
-         mutation_failure request engine Db.Error.Unsupported_semantics message)
-    | Read _, Some engine -> Engine.execute engine request
-  ;;
-
-  let execute_graph_request t request =
-    Eio.Mutex.use_rw ~protect:true t.lock (fun () ->
-      execute_graph_request_unlocked t request)
+         mutation_response request success)
   ;;
 end
 
@@ -579,32 +662,20 @@ let rec dispatch_invalidations context dispatcher =
   dispatch_invalidations context dispatcher
 ;;
 
-let client_event = function
-  | Restore_local_account { user_id } -> Api.Restore_local_account { user_id }
-  | Reconcile_authenticated_user { user_id } -> Api.Account_authenticated { user_id }
-  | Acknowledge_local_feed -> Api.Local_feed_acknowledged
-  | Acknowledge_timeline_presented -> Api.Timeline_presented
-  | Provide_token { request; token } -> Api.Token_provided (request, token)
-  | Reject_token request -> Api.Token_rejected request
-  | Select_graph graph_id -> Api.Graph_selected graph_id
-  | Return_to_graph_picker -> Api.Graph_picker_requested
-  | Refresh_catalog -> Api.Catalog_refresh_requested
-  | Begin_online_recovery -> Api.Online_recovery_requested
-  | Submit_e2ee_password password -> Api.E2ee_password_submitted password
-  | Delete_local_cache graph_id -> Api.Local_cache_deletion_requested graph_id
-  | Set_foreground foreground -> Api.Foreground_changed foreground
-;;
-
 let dependency_error_message = function
-  | Api.Invalid_dependency message -> message
+  | Effect_runner.Invalid_dependency message -> message
 ;;
 
 let config_error_message = function
-  | Api.Invalid_config message -> message
+  | Core.Invalid_config message -> message
 ;;
 
-let create_error_message = function
-  | Api.Invalid_create message -> message
+let core_create_error_message = function
+  | Core.Invalid_create message -> message
+;;
+
+let runner_create_error_message = function
+  | Effect_runner.Invalid_create message -> message
 ;;
 
 let create ~(dependencies : dependencies) =
@@ -618,47 +689,45 @@ let create ~(dependencies : dependencies) =
       | Some _ ->
         (match config.Db.Config.target with
          | Managed_sync { base_url } ->
-           let graph_lifecycle = Db.Graph_lifecycle.create () in
-           let effects = Eio.Stream.create 256 in
            let environment = Worker.Session_context.environment context in
            let clock = Eio.Stdenv.clock environment in
+           let sw = Worker.Session_context.switch context in
+           let events = Eio.Stream.create 256 in
            let construct =
              Result.bind
-               (Api.runtime
+               (Effect_runner.runtime
                   ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
                   ~sleep:(Eio.Time.sleep clock)
                   ~monotonic_ns:Mtime_clock.elapsed_ns)
                (fun runtime ->
                   Result.bind
-                    (Api.transport ~network:(Eio.Stdenv.net environment) ~clock)
+                    (Effect_runner.transport ~network:(Eio.Stdenv.net environment) ~clock)
                     (fun transport ->
                        Result.bind
-                         (Api.local_store
+                         (Effect_runner.local_store
                             ~application_support_directory:
                               config.application_support_directory)
                          (fun local_store ->
                             Result.bind
-                              (Api.artifact_store
+                              (Effect_runner.artifact_store
                                  ~staging_directory:
                                    (Filename.concat
                                       config.application_support_directory
                                       "sync-staging"))
                               (fun artifact_store ->
-                                 Result.map
-                                   (fun api_dependencies -> local_store, api_dependencies)
-                                   (Api.dependencies
-                                      ~runtime
-                                      ~transport
-                                      ~artifact_store
-                                      ~secrets:dependencies.secrets
-                                      ~crypto:dependencies.crypto
-                                      ~on_effect:(Eio.Stream.add effects))))))
+                                 Effect_runner.dependencies
+                                   ~runtime
+                                   ~transport
+                                   ~local_store
+                                   ~artifact_store
+                                   ~secrets:dependencies.secrets
+                                   ~crypto:dependencies.crypto))))
            in
            (match construct with
             | Error error -> Error (dependency_error_message error)
-            | Ok (local_store, api_dependencies) ->
+            | Ok runner_dependencies ->
               (match
-                 Api.limits
+                 Core.limits
                    ~maximum_response_bytes:config.response_budget_bytes
                    ~maximum_artifact_bytes:(1024 * 1024 * 1024)
                    ~submission_batch_size:32
@@ -666,49 +735,49 @@ let create ~(dependencies : dependencies) =
                | Error error -> Error (config_error_message error)
                | Ok limits ->
                  (match
-                    Api.config ~managed_sync_origin:(Uri.of_string base_url) ~limits
+                    Core.config ~managed_sync_origin:(Uri.of_string base_url) ~limits
                   with
                   | Error error -> Error (config_error_message error)
-                  | Ok api_config ->
-                    (match
-                       Api.create
-                         ~sw:(Worker.Session_context.switch context)
-                         api_config
-                         api_dependencies
-                     with
-                     | Error error -> Error (create_error_message error)
-                     | Ok client ->
-                       let startup = (Api.state client).snapshot.startup in
-                       let coordinator =
-                         Managed_coordinator.
-                           { client
-                           ; local_store
-                           ; engine = None
-                           ; context
-                           ; graph_lifecycle
-                           ; engine_dependencies = dependencies.engine
-                           ; config
-                           ; post_effect = Eio.Stream.add effects
-                           ; lock = Eio.Mutex.create ()
-                           ; account_generation = startup.account_generation
-                           ; graph_generation = startup.graph_generation
-                           ; presentation_generation = startup.presentation_generation
-                           ; connection_generation = 0
-                           ; lifecycle_generation = 0L
-                           }
-                       in
-                       Worker.Session_context.fork_daemon
-                         context
-                         ~name:"managed-sync-effects"
-                         (fun () ->
-                            let rec loop () =
-                              Managed_coordinator.dispatch_effect
-                                coordinator
-                                (Eio.Stream.take effects);
-                              loop ()
-                            in
-                            loop ());
-                       Ok (Managed coordinator)))))
+                  | Ok core_config ->
+                    (match Core.initial core_config with
+                     | Error error -> Error (core_create_error_message error)
+                     | Ok core ->
+                       (match
+                          Effect_runner.create
+                            ~sw
+                            runner_dependencies
+                            ~post:(Eio.Stream.add events)
+                        with
+                        | Error error -> Error (runner_create_error_message error)
+                        | Ok runner ->
+                          let graph_lifecycle = Db.Graph_lifecycle.create () in
+                          let coordinator =
+                            Managed_coordinator.
+                              { core
+                              ; runner
+                              ; engine = None
+                              ; context
+                              ; graph_lifecycle
+                              ; engine_dependencies = dependencies.engine
+                              ; config
+                              ; lock = Eio.Mutex.create ()
+                              ; lifecycle_generation = 0L
+                              ; attached_scope = None
+                              ; pending_mutations = Hashtbl.create 32
+                              }
+                          in
+                          Worker.Session_context.fork_daemon
+                            context
+                            ~name:"managed-sync-completions"
+                            (fun () ->
+                               let rec loop () =
+                                 Managed_coordinator.handle
+                                   coordinator
+                                   (Eio.Stream.take events);
+                                 loop ()
+                               in
+                               loop ());
+                          Ok (Managed coordinator))))))
          | Snapshot _ | Import_snapshot _ | Synced_mirror _ | Native_local_graph _ ->
            let invalidations = { wake = Eio.Condition.create (); pending = None } in
            let graph_lifecycle = Db.Graph_lifecycle.create () in
@@ -748,8 +817,8 @@ let create ~(dependencies : dependencies) =
          | Get_graph_state ->
            Ok (Graph_state (Db.Graph_lifecycle.state managed.graph_lifecycle))
          | Client_command command ->
-           Managed_coordinator.handle managed (client_event command);
-           Ok (Client_state (Api.state managed.client))
+           Managed_coordinator.handle_command managed command;
+           Ok (Client_state (Core.state managed.core))
          | Graph_request request ->
            Ok (Graph_response (Managed_coordinator.execute_graph_request managed request)))
       | Graph_bound { engine; open_error; invalidations; graph_lifecycle; _ } ->
@@ -782,8 +851,11 @@ let create ~(dependencies : dependencies) =
            Ok (Graph_response response)))
     ~shutdown:(function
       | Managed managed ->
-        Managed_coordinator.handle managed Api.Shutdown;
-        Managed_coordinator.close_engine managed managed.graph_generation
+        Managed_coordinator.handle managed Core.Shutdown;
+        Effect_runner.shutdown managed.runner;
+        Managed_coordinator.close_engine
+          managed
+          (Managed_coordinator.current_graph_generation managed)
       | Graph_bound { engine = None; _ } -> ()
       | Graph_bound { engine = Some engine; graph_lifecycle; context; _ } ->
         let generation = (Db.Graph_lifecycle.state graph_lifecycle).generation in

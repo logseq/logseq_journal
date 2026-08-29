@@ -1,16 +1,10 @@
-type meth =
-  | Get
-  | Post
-
 type expected_content_type =
   | Structured_response
   | Snapshot_artifact
 
 type request =
-  { meth : meth
-  ; uri : Uri.t
+  { uri : Uri.t
   ; headers : (string * string) list
-  ; body : string option
   ; maximum_response_bytes : int
   ; expected_content_type : expected_content_type
   }
@@ -38,9 +32,7 @@ let authorization token =
 ;;
 
 let create
-      ?body
       ?(maximum_response_bytes = Limits.maximum_response_bytes)
-      ~meth
       ~base_url
       ~path
       ~query
@@ -49,15 +41,8 @@ let create
   =
   require_base_url base_url;
   let uri = Uri.with_path base_url path |> fun uri -> Uri.with_query' uri query in
-  let headers =
-    match body with
-    | None -> authorization token
-    | Some _ -> ("content-type", "application/json") :: authorization token
-  in
-  { meth
-  ; uri
-  ; headers
-  ; body
+  { uri
+  ; headers = authorization token
   ; maximum_response_bytes
   ; expected_content_type = Structured_response
   }
@@ -67,13 +52,10 @@ let graph_path graph_id suffix =
   Printf.sprintf "/sync/%s/%s" (Graph_types.Uuid.to_string graph_id) suffix
 ;;
 
-let catalog ~base_url ~token =
-  create ~meth:Get ~base_url ~path:"/graphs" ~query:[] ~token ()
-;;
+let catalog ~base_url ~token = create ~base_url ~path:"/graphs" ~query:[] ~token ()
 
 let snapshot_baseline ~base_url ~graph_id ~token =
   create
-    ~meth:Get
     ~base_url
     ~path:(graph_path graph_id "pull")
     ~query:[]
@@ -83,18 +65,11 @@ let snapshot_baseline ~base_url ~graph_id ~token =
 ;;
 
 let snapshot_metadata ~base_url ~graph_id ~token =
-  create
-    ~meth:Get
-    ~base_url
-    ~path:(graph_path graph_id "snapshot/download")
-    ~query:[]
-    ~token
-    ()
+  create ~base_url ~path:(graph_path graph_id "snapshot/download") ~query:[] ~token ()
 ;;
 
 let e2ee_graph_key ~base_url ~graph_id ~token =
   create
-    ~meth:Get
     ~base_url
     ~path:(Printf.sprintf "/e2ee/graphs/%s/aes-key" (Graph_types.Uuid.to_string graph_id))
     ~query:[]
@@ -103,7 +78,7 @@ let e2ee_graph_key ~base_url ~graph_id ~token =
 ;;
 
 let e2ee_user_keys ~base_url ~token =
-  create ~meth:Get ~base_url ~path:"/e2ee/user-keys" ~query:[] ~token ()
+  create ~base_url ~path:"/e2ee/user-keys" ~query:[] ~token ()
 ;;
 
 let valid_artifact uri =
@@ -114,10 +89,8 @@ let valid_artifact uri =
 
 let artifact ~uri ~token =
   if not (valid_artifact uri) then invalid_arg "snapshot artifact URL is unsafe";
-  { meth = Get
-  ; uri
+  { uri
   ; headers = authorization token
-  ; body = None
   ; maximum_response_bytes = max_int
   ; expected_content_type = Snapshot_artifact
   }
@@ -167,31 +140,4 @@ let validate_response_content_type request headers =
     if accepted
     then Ok ()
     else Error (Printf.sprintf "sync HTTP response has unsupported Content-Type %s" value)
-;;
-
-let websocket_uri ~base_url ~graph_id =
-  match validate_base_url base_url with
-  | Error _ as error -> error
-  | Ok () ->
-    let uri =
-      Uri.with_scheme base_url (Some "wss")
-      |> fun uri ->
-      Uri.with_path uri (Printf.sprintf "/sync/%s" (Graph_types.Uuid.to_string graph_id))
-    in
-    Ok uri
-;;
-
-let redacted request =
-  let meth =
-    match request.meth with
-    | Get -> "GET"
-    | Post -> "POST"
-  in
-  let uri = Uri.with_query' request.uri [] in
-  Printf.sprintf
-    "%s %s body-bytes=%d max-response-bytes=%d"
-    meth
-    (Uri.to_string uri)
-    (Option.fold ~none:0 ~some:String.length request.body)
-    request.maximum_response_bytes
 ;;

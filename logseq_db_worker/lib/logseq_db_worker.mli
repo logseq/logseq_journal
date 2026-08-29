@@ -2,6 +2,7 @@ module Config = Config
 module Error = Error
 module Protocol = Protocol
 module Engine = Engine
+module Synced_mirror = Synced_mirror
 
 type graph_phase =
   | Graph_closed

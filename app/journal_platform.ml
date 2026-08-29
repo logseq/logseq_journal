@@ -391,17 +391,17 @@ let decode_set_typography_preset_preference bytes =
 ;;
 
 let purpose = function
-  | Logseq_sync.Api.Catalog_discovery -> "catalogDiscovery"
+  | Logseq_sync.Core.Catalog_discovery -> "catalogDiscovery"
   | Snapshot_bootstrap -> "snapshotBootstrap"
   | E2ee_key_access -> "e2eeKeyAccess"
   | Websocket_connect -> "websocketConnect"
 ;;
 
-let id_token_request (challenge : Logseq_sync.Api.token_request) =
+let id_token_request (challenge : Logseq_sync.Core.token_request) =
   Yojson.Safe.to_string
     (`Assoc
-        [ "challengeId", `String (Logseq_sync.Api.token_request_id challenge)
-        ; "purpose", `String (purpose (Logseq_sync.Api.token_request_purpose challenge))
+        [ "challengeId", `String (Logseq_sync.Core.token_request_id challenge)
+        ; "purpose", `String (purpose (Logseq_sync.Core.token_request_purpose challenge))
         ])
   |> Bytes.of_string
   |> encode_envelope 8

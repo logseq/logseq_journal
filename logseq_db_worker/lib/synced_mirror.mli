@@ -12,7 +12,7 @@ type error =
   | Mirror_exists
   | Invalid_snapshot of string
   | Invalid_metadata of string
-  | Admission_failed of Admission.error
+  | Admission_failed of Logseq_db_storage.Admission.error
   | Activation_failed of string
   | Deletion_failed of string
 

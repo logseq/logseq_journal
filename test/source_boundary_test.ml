@@ -187,7 +187,8 @@ let test_public_api_only_test_boundaries root =
     test_roots
   |> List.iter (fun relative ->
     forbid_text root relative [ ".objs/byte"; ".objs/native" ]);
-  require_file root "logseq_sync/test/api_contract.ml";
+  require_file root "logseq_sync/test/core_contract.ml";
+  require_file root "logseq_sync/test/runner_contract.ml";
   forbid_path root "logseq_sync/test/test_support.ml"
 ;;
 
@@ -247,13 +248,13 @@ let test_logseq_sync_package_boundary root =
     ; "logseq_db_storage/lib/sync_checkpoint_store.ml"
     ; "logseq_db_storage/lib/sync_checkpoint_store.mli"
     ; "logseq_sync/lib/dune"
-    ; "logseq_sync/lib/core/manager.ml"
-    ; "logseq_sync/lib/core/action.ml"
-    ; "logseq_sync/lib/storage/pending.ml"
-    ; "logseq_sync/lib/eio/websocket_eio.ml"
+    ; "logseq_sync/lib/pure_core.ml"
+    ; "logseq_sync/lib/core.ml"
+    ; "logseq_sync/lib/effect_runner.ml"
     ; "logseq_sync/lib/platform/platform_crypto.ml"
     ; "logseq_sync/spec/dune"
-    ; "logseq_sync/spec/api.mli"
+    ; "logseq_sync/spec/core.mli"
+    ; "logseq_sync/spec/effect_runner.mli"
     ];
   List.iter
     (forbid_path root)
@@ -263,6 +264,8 @@ let test_logseq_sync_package_boundary root =
     ; "logseq_sync/spec/client.mli"
     ; "logseq_sync/spec/action.mli"
     ; "logseq_sync/spec/startup_phase.mli"
+    ; "logseq_sync/spec/api.mli"
+    ; "logseq_sync/lib/api.ml"
     ; "logseq_db_worker/lib/graph_types.ml"
     ; "logseq_db_worker/lib/graph_types.mli"
     ; "logseq_db_worker/lib/admission.ml"
@@ -331,23 +334,6 @@ let test_logseq_sync_package_boundary root =
     ; "and page_mutation ="
     ; "and property_mutation ="
     ];
-  require_text
-    root
-    "logseq_sync/lib/storage/pending.mli"
-    [ "mutation_payload : string"
-    ; "mutation_fingerprint : string"
-    ; "encoded_tx : string"
-    ; "outliner_op : string"
-    ; "state : state"
-    ];
-  forbid_text
-    root
-    "logseq_sync/lib/storage/pending.mli"
-    [ "Protocol.request"; "request :" ];
-  require_text
-    root
-    "logseq_sync/lib/storage/pending.ml"
-    [ "let encode entries"; "let decode records" ];
   List.iter
     (fun relative ->
        forbid_text
@@ -380,217 +366,103 @@ let test_injected_logseq_sync_api_boundary root =
   List.iter
     (require_file root)
     [ "logseq_sync/spec/dune"
-    ; "logseq_sync/spec/api.mli"
+    ; "logseq_sync/spec/core.mli"
+    ; "logseq_sync/spec/effect_runner.mli"
+    ; "logseq_sync/lib/pure_core.ml"
+    ; "logseq_sync/lib/core.ml"
+    ; "logseq_sync/lib/effect_runner.ml"
+    ; "logseq_sync/test/core_contract.ml"
+    ; "logseq_sync/test/runner_contract.ml"
+    ];
+  List.iter
+    (forbid_path root)
+    [ "logseq_sync/spec/api.mli"
     ; "logseq_sync/lib/api.ml"
     ; "logseq_sync/test/api_contract.ml"
     ];
-  forbid_path root "logseq_sync/lib/logseq_sync.ml";
-  forbid_path root "logseq_sync/spec/client.mli";
   require_text
     root
     "logseq_sync/spec/dune"
     [ "(name logseq_sync)"
     ; "(public_name logseq_sync)"
-    ; "(modules api)"
-    ; "(virtual_modules api)"
+    ; "(modules core effect_runner)"
+    ; "(virtual_modules core effect_runner)"
     ; "(default_implementation logseq_sync_impl)"
     ];
   require_text
     root
-    "logseq_sync/lib/dune"
-    [ "(name logseq_sync_impl)"
-    ; "(public_name logseq_sync.impl)"
-    ; "(implements logseq_sync)"
-    ];
-  forbid_text
-    root
-    "logseq_sync/lib/dune"
-    [ "(rule"
-    ; "(copy"
-    ; "../spec/"
-    ; "(public_name logseq_sync.core)"
-    ; "(public_name logseq_sync.storage)"
-    ; "(public_name logseq_sync.eio)"
-    ; "(public_name logseq_sync.platform)"
-    ; "(public_name logseq_sync.spec)"
-    ];
-  require_text
-    root
-    "logseq_sync/spec/api.mli"
+    "logseq_sync/spec/core.mli"
     [ "type t"
-    ; "type runtime"
-    ; "type transport"
-    ; "type local_store"
-    ; "type artifact_store"
-    ; "type secrets"
-    ; "type crypto"
-    ; "type dependencies"
     ; "type event ="
-    ; "type sync_effect ="
-    ; "type outbox_record"
-    ; "type token_request"
-    ; "type graph_open_request"
-    ; "val config"
-    ; "val runtime"
-    ; "val transport"
-    ; "val local_store"
-    ; "val artifact_store"
-    ; "val secrets"
-    ; "val crypto"
-    ; "val dependencies"
+    ; "type runner_effect"
+    ; "type worker_effect"
+    ; "type instruction ="
+    ; "val initial : config -> (t, create_error) result"
+    ; "val step : t -> event -> transition"
+    ; "| Run of runner_effect"
+    ; "| Delegate of worker_effect"
+    ; "| Publish of output"
+    ];
+  forbid_text root "logseq_sync/spec/core.mli" [ "type effect ="; "val effect :" ];
+  require_text
+    root
+    "logseq_sync/spec/effect_runner.mli"
+    [ "type t"
     ; "val create"
-    ; "val handle"
+    ; "post:(Core.event -> unit)"
+    ; "val submit : t -> Core.runner_effect -> unit"
+    ; "val shutdown : t -> unit"
     ];
-  require_text
-    root
-    "logseq_sync/spec/api.mli"
-    [ "sync_phase : sync_phase"
-    ; "timeline_presentation_pending : bool"
-    ; "type diagnostic_group ="
-    ; "groups : diagnostic_group list"
-    ; "history : string list"
-    ];
-  forbid_text
-    root
-    "logseq_sync/spec/api.mli"
-    [ "Manager.event"
-    ; "Action.t"
-    ; "Protocol."
-    ; "Websocket_eio"
-    ; "Pending."
-    ; "Replay."
-    ; "type startup_presentation"
-    ; "type diagnostic_transport_scope"
-    ; "type diagnostic_transport"
-    ; "type diagnostic_pull"
-    ; "type diagnostic_submission"
-    ; "type diagnostic_serialization"
-    ; "type diagnostic_change_category"
-    ; "type diagnostic_change"
-    ; "type diagnostic_history_entry"
-    ; "connection_generation : int"
-    ; "val phase_name"
-    ; "val startup_presentation_name"
-    ; "val diagnostic_"
-    ; "val backend_error_message"
-    ; "default_platform"
-    ; "Eio_unix.Stdenv"
-    ; "environment:"
-    ; "pending_batch"
-    ; "apply_authoritative"
-    ; "authoritative_request_payload"
-    ; "val create_error_message"
-    ; "val snapshot"
-    ];
-  require_text
-    root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "Logseq_sync.Api"; "Api.create"; "Api.handle" ];
-  require_text
-    root
-    "app/application.ml"
-    [ "String.equal binding.managed_sync_origin !managed_sync_origin" ];
-  forbid_text
-    root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "interpret_local_action"
-    ; "interpret_network_action"
-    ; "Manager.handle_event"
-    ; "Manager.handle_command"
-    ; "Websocket_eio"
-    ; "Catalog_store"
-    ; "Activate_snapshot"
-    ; "Recover_submitted"
-    ; "notify_local_change"
-    ; "default_platform"
-    ];
+  let pure_source = read_file (path root "logseq_sync/lib/pure_core.ml") in
   List.iter
-    (fun relative ->
-       forbid_text
-         root
-         relative
-         [ "Logseq_sync.Client"
-         ; "Logseq_sync.Manager"
-         ; "Logseq_sync.Action"
-         ; "Logseq_sync.Protocol"
-         ; "Logseq_sync.Http"
-         ; "Logseq_sync.Websocket_eio"
-         ; "Logseq_sync.Mirror"
-         ; "Logseq_sync.Pending"
-         ; "Logseq_sync.Replay"
-         ; "Logseq_sync.Graph_key"
-         ; "Logseq_sync.Platform_crypto"
-         ])
-    (ocaml_product_files root);
+    (fun forbidden ->
+       if contains pure_source forbidden
+       then fail "pure core contains forbidden infrastructure or mutation: %s" forbidden)
+    [ "mutable"; " := "; "Effect.perform"; "Eio"; "Unix"; "Sys."; "Logseq_db_worker" ];
+  require_text
+    root
+    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "module Core = Logseq_sync.Core"
+    ; "module Effect_runner = Logseq_sync.Effect_runner"
+    ; "let transition = Core.step t.core event"
+    ; "Effect_runner.submit t.runner instruction"
+    ; "~post:(Eio.Stream.add events)"
+    ];
+  forbid_text
+    root
+    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "Logseq_sync.Api"; "Core.handle"; "Core.resume" ];
   let worker_files =
     files_with_suffixes root "logseq_db_worker" [ ".ml"; ".mli"; "dune" ]
   in
   List.iter
     (fun relative ->
-       forbid_text
-         root
-         relative
-         [ "Logseq_sync__"
-         ; ".logseq_sync_impl.objs"
-         ; "Logseq_sync.E2ee"
-         ; "Logseq_sync.Graph_key"
-         ; "Logseq_sync.Mirror"
-         ; "Logseq_sync.Pending"
-         ; "Logseq_sync.Platform_crypto"
-         ; "Logseq_sync.Protocol"
-         ; "Logseq_sync.Replay"
-         ; "Logseq_sync.Tx"
-         ; "Logseq_sync.Tx_encoder"
-         ])
-    worker_files;
-  forbid_text
-    root
-    "logseq_db_worker/lib/engine.mli"
-    [ "type crypto"
-    ; "crypto : crypto"
-    ; "unlock_graph_key"
-    ; "default_crypto"
-    ; "unavailable_crypto"
-    ; "requeue_submitted"
-    ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/protocol.mli"
-    [ "Sync_pending"; "Sync_receive"; "Websocket"; "payload : string" ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/dune"
-    [ "logseq_sync.impl"; ".logseq_sync_impl.objs" ];
-  forbid_text
-    root
-    "logseq_db_worker/bonsai/dune"
-    [ "logseq_sync.impl"; ".logseq_sync_impl.objs" ];
-  forbid_text
-    root
-    "logseq_db_worker/test/dune"
-    [ "logseq_sync.impl"; ".logseq_sync_impl.objs" ];
-  forbid_text
-    root
-    "logseq_db_worker/tool/dune"
-    [ "logseq_sync.impl"; ".logseq_sync_impl.objs" ]
+       forbid_text root relative [ "Logseq_sync__"; ".logseq_sync_impl.objs" ])
+    worker_files
+;;
+
+let test_bonsai_flutter_dune_closure_names root =
+  let public_dependency = "\n  logseq_sync.impl.pure_core\n" in
+  require_text root "logseq_sync/lib/dune" [ public_dependency ];
+  require_text root "logseq_db_worker/lib/dune" [ public_dependency ];
+  require_occurrences root "logseq_sync/lib/dune" "logseq_sync_pure_core" 1;
+  forbid_text root "logseq_db_worker/lib/dune" [ "logseq_sync_pure_core" ]
 ;;
 
 let test_worker_owned_managed_sync_orchestration root =
   require_text
     root
-    "logseq_sync/spec/api.mli"
+    "logseq_sync/spec/core.mli"
     [ "type event ="
-    ; "type sync_effect ="
-    ; "type completion"
-    ; "type outbox_record"
-    ; "val handle : t -> event -> sync_effect list"
-    ; "val resume : t -> completion -> sync_effect list"
-    ; "| Resume of completion"
-    ; "| Run_local_operation of local_operation"
+    ; "type runner_completion"
+    ; "type worker_effect ="
+    ; "| Commit_local_batch of local_batch_commit_request"
+    ; "| Apply_authoritative_batch of authoritative_commit_request"
+    ; "| Commit_outbox_transition of outbox_transition"
     ];
   forbid_text
     root
-    "logseq_sync/spec/api.mli"
+    "logseq_sync/spec/core.mli"
     [ "graph_backend"
     ; "open_graph:"
     ; "close_graph:"
@@ -604,17 +476,6 @@ let test_worker_owned_managed_sync_orchestration root =
     ; "persist_checkpoint:"
     ; "type ('graph, 'mutation, 'mutation_result) t"
     ; "val mutate"
-    ; "-> local_store:local_store"
-    ];
-  forbid_text
-    root
-    "logseq_sync/lib/api.ml"
-    [ "graph_backend"
-    ; "mutable engine"
-    ; "runtime.engine"
-    ; "Pending.open_"
-    ; "replace_pending"
-    ; "append_pending"
     ];
   let sync_files = files_with_suffixes root "logseq_sync" [ ".ml"; ".mli" ] in
   List.iter
@@ -629,23 +490,15 @@ let test_worker_owned_managed_sync_orchestration root =
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
     [ "module Managed_coordinator"
     ; "Managed_coordinator.handle"
-    ; "Api.handle"
-    ; "Api.resume"
-    ; "Api.run_local_operation"
+    ; "Core.step"
+    ; "Effect_runner.submit"
     ; "Engine.open_"
     ; "Engine.close"
-    ; "Engine.commit_managed_mutation"
-    ; "Engine.apply_authoritative"
-    ; "local_store : Api.local_store"
     ];
   forbid_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "Api.graph_backend"; "Api.mutate" ];
-  forbid_text
-    root
-    "logseq_sync/lib/api.ml"
-    [ "Eio.Stream.add runtime.messages (Internal event)"; "| Internal of Manager.event" ];
+    [ "Core.graph_backend"; "Core.mutate"; "Core.Engine" ];
   require_text
     root
     "logseq_db_worker/lib/engine.mli"
@@ -670,36 +523,31 @@ let test_worker_owned_managed_sync_orchestration root =
     ; "val commit_sync_outbox_insert"
     ; "val commit_staged_with_sync_metadata_and_outbox"
     ];
-  forbid_text
-    root
-    "logseq_sync/lib/storage/pending.ml"
-    [ "open_in_bin"; "open_out_gen"; "Unix.rename"; "Unix.fsync"; "pending-intents-v" ];
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "account_generation"
-    ; "graph_generation"
-    ; "presentation_generation"
-    ; "lifecycle_generation"
-    ]
+    [ "graph_generation"; "lifecycle_generation" ]
 ;;
 
 let test_logseq_sync_install_manifest filename =
   let contents = read_file filename in
   if not (contains contents {|"_build/install/default/lib/logseq_sync/logseq_sync.cmi"|})
   then fail "installed logseq_sync package is missing its public root interface";
-  if
-    not
-      (contains
-         contents
-         {|"_build/install/default/lib/logseq_sync/logseq_sync__Api.cmi"|})
-  then fail "installed logseq_sync package is missing its public virtual Api interface";
-  if
-    not
-      (contains
-         contents
-         {|"_build/install/default/lib/logseq_sync/impl/.private/logseq_sync__logseq_sync_impl__Manager.cmi"|})
-  then fail "installed sync implementation modules are not package-private";
+  List.iter
+    (fun module_name ->
+       if
+         not
+           (contains
+              contents
+              (Printf.sprintf
+                 {|"_build/install/default/lib/logseq_sync/logseq_sync__%s.cmi"|}
+                 module_name))
+       then fail "installed logseq_sync package is missing public %s" module_name)
+    [ "Core"; "Effect_runner" ];
+  if contains contents "/logseq_sync__Api.cmi"
+  then fail "obsolete Logseq_sync.Api remains installed";
+  if contains contents "logseq_sync__logseq_sync_impl__Manager.cmi"
+  then fail "obsolete mutable sync Manager remains installed";
   String.split_on_char '\n' contents
   |> List.iter (fun line ->
     if
@@ -756,14 +604,7 @@ let test_sync_transport_is_websocket_only root =
   in
   List.iter
     (fun relative -> forbid_text root relative obsolete_symbols)
-    [ "logseq_sync/lib/core/action.ml"
-    ; "logseq_sync/lib/core/auth.ml"
-    ; "logseq_sync/lib/core/auth.mli"
-    ; "logseq_sync/lib/core/manager.ml"
-    ; "logseq_sync/lib/core/manager.mli"
-    ; "logseq_sync/lib/core/protocol.ml"
-    ; "logseq_sync/lib/core/protocol.mli"
-    ; "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
     ; "app/journal_platform.ml"
     ; "flutter/lib/application_host_adapter.dart"
     ];
@@ -781,7 +622,7 @@ let has_exact_dependency contents ~package ~version =
 let test_startup_phase_ownership root =
   require_text
     root
-    "logseq_sync/spec/api.mli"
+    "logseq_sync/spec/core.mli"
     [ "type sync_phase ="
     ; "| Offline"
     ; "| Connecting"
@@ -793,7 +634,7 @@ let test_startup_phase_ownership root =
     ];
   forbid_text
     root
-    "logseq_sync/spec/api.mli"
+    "logseq_sync/spec/core.mli"
     [ "type phase ="
     ; "| Signed_out"
     ; "| Loading_catalog"
@@ -837,7 +678,7 @@ let test_startup_phase_ownership root =
   forbid_text
     root
     "app/application.ml"
-    [ "Logseq_sync.Api.phase"; "snapshot.Logseq_sync.Api.phase" ]
+    [ "Logseq_sync.Core.phase"; "snapshot.Logseq_sync.Core.phase" ]
 ;;
 
 let require_exact_dependency root relative ~package ~version =
@@ -874,6 +715,7 @@ let () =
   test_logseq_sync_suite_boundary root;
   test_logseq_sync_package_boundary root;
   test_injected_logseq_sync_api_boundary root;
+  test_bonsai_flutter_dune_closure_names root;
   test_worker_owned_managed_sync_orchestration root;
   test_startup_phase_ownership root;
   test_repository_local_runtime_tests root;
@@ -927,20 +769,12 @@ let () =
     ; "app/journal_time.mli"
     ; "app/journal_timeline_state.ml"
     ; "app/journal_timeline_state.mli"
-    ; "logseq_sync/lib/core/auth.ml"
-    ; "logseq_sync/lib/core/auth.mli"
     ; "logseq_sync/lib/storage/bootstrap.ml"
     ; "logseq_sync/lib/storage/bootstrap.mli"
     ; "logseq_sync/lib/core/catalog.ml"
     ; "logseq_sync/lib/core/catalog.mli"
     ; "logseq_sync/lib/eio/http.ml"
     ; "logseq_sync/lib/eio/http.mli"
-    ; "logseq_sync/lib/core/e2ee_session.ml"
-    ; "logseq_sync/lib/core/e2ee_session.mli"
-    ; "logseq_sync/lib/core/manager.ml"
-    ; "logseq_sync/lib/core/manager.mli"
-    ; "logseq_sync/lib/core/websocket.ml"
-    ; "logseq_sync/lib/core/websocket.mli"
     ; "logseq_db_worker/lib/outliner/graph_read.ml"
     ; "logseq_db_worker/lib/outliner/graph_read.mli"
     ; "logseq_db_worker/lib/outliner/planner_contract.ml"
@@ -1608,33 +1442,34 @@ let () =
   @ files_with_suffixes root "logseq_db_storage" [ ".ml"; ".mli" ]
   |> List.iter (fun relative ->
     forbid_text root relative [ "Datascript.from_serializable" ]);
-  require_file root "logseq_sync/lib/core/action.ml";
-  require_file root "logseq_sync/lib/core/startup_phase.ml";
-  forbid_path root "logseq_sync/lib/core/action.mli";
-  forbid_path root "logseq_sync/lib/core/startup_phase.mli";
+  List.iter
+    (forbid_path root)
+    [ "logseq_sync/lib/core/action.ml"
+    ; "logseq_sync/lib/core/auth.ml"
+    ; "logseq_sync/lib/core/e2ee_session.ml"
+    ; "logseq_sync/lib/core/manager.ml"
+    ; "logseq_sync/lib/core/network_scope.ml"
+    ; "logseq_sync/lib/core/protocol.ml"
+    ; "logseq_sync/lib/core/startup_phase.ml"
+    ; "logseq_sync/lib/core/state.ml"
+    ; "logseq_sync/lib/core/websocket.ml"
+    ; "logseq_sync/lib/storage/pending.ml"
+    ; "logseq_sync/lib/storage/replay.ml"
+    ; "logseq_sync/lib/storage/tx.ml"
+    ];
   forbid_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
     [ "interpret_local_action"; "interpret_network_action"; "Local_completion" ];
-  forbid_text root "logseq_sync/lib/core/manager.ml" [ "Startup_phase.Local_completion" ];
   require_text
     root
-    "logseq_sync/lib/core/manager.ml"
-    [ "let open_selected_graph_local"; ": Action.local Action.t list" ];
-  require_text
-    root
-    "logseq_sync/lib/core/manager.mli"
-    [ "type diagnostics"
-    ; "type state ="
-    ; "val state : t -> state"
-    ; "diagnostic_history_entry list"
-    ];
-  forbid_text root "logseq_sync/lib/core/manager.mli" [ "val diagnostics : t -> string" ];
+    "logseq_sync/lib/pure_core.ml"
+    [ "type diagnostics"; "type state ="; "let state core = core.public_state" ];
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.mli"
-    [ "Client_state of Logseq_sync.Api.state"
-    ; "Client_state_changed of Logseq_sync.Api.state"
+    [ "Client_state of Logseq_sync.Core.state"
+    ; "Client_state_changed of Logseq_sync.Core.state"
     ];
   forbid_text
     root

@@ -3,10 +3,10 @@ module F = Logseq_db_worker_test_support.Adapter_fixture
 module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
-module Api = Logseq_sync.Api
+module Runner = Logseq_sync.Effect_runner
 
 let crypto =
-  Api.crypto
+  Runner.crypto
     ~decrypt_private_key:(fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
       Error "crypto unavailable")
     ~decrypt_graph_key:(fun ~private_key:_ ~ciphertext:_ -> Error "crypto unavailable")
@@ -16,7 +16,7 @@ let crypto =
 ;;
 
 let secrets =
-  Api.secrets
+  Runner.secrets
     ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> false)
     ~unlock_private_key:
       (fun
@@ -24,10 +24,8 @@ let secrets =
       Error "secrets unavailable")
     ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
       Error "secrets unavailable")
-    ~load_and_verify_wrapped_graph_key:
-      (fun
-        ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-      Error (Api.Wrapped_graph_key_unavailable "secrets unavailable"))
+    ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+      Error (Runner.Wrapped_graph_key_unavailable "secrets unavailable"))
     ~verify_and_save_wrapped_graph_key:
       (fun
         ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
@@ -210,21 +208,21 @@ let sole_public_sync_composition () =
     in
     loop 0
   in
-  T.require (contains "Logseq_sync.Api") "Service does not use the public sync API";
-  T.require (contains "Api.create") "Service does not create the public sync client";
+  T.require (contains "Logseq_sync.Core") "Service does not use the pure sync core";
+  T.require
+    (contains "Logseq_sync.Effect_runner")
+    "Service does not use the public effect runner";
+  T.require (contains "Core.initial") "Service does not create the pure sync core";
   T.require (contains "module Managed_coordinator") "Service has no managed coordinator";
   T.require
     (contains "Managed_coordinator.handle")
     "Managed events bypass the coordinator";
-  T.require (contains "Api.handle") "Worker does not drive the sync reducer";
+  T.require (contains "Core.step") "Worker does not drive the sync reducer";
   T.require
-    (contains "Engine.commit_managed_mutation")
-    "Worker does not own managed mutation commits";
-  T.require
-    (contains "Engine.apply_authoritative")
-    "Worker does not own authoritative application";
-  T.require (not (contains "Api.graph_backend")) "Sync still receives an Engine backend";
-  T.require (not (contains "Api.mutate")) "Sync still owns the managed mutation path"
+    (contains "Effect_runner.submit")
+    "Worker does not submit runner-owned effects";
+  T.require (not (contains "Core.graph_backend")) "Sync still receives an Engine backend";
+  T.require (not (contains "Core.mutate")) "Sync still owns the managed mutation path"
 ;;
 
 let () =

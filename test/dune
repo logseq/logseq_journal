@@ -47,9 +47,12 @@
   ../logseq_db_worker.opam.locked
   ../logseq_journal.opam
   ../logseq_journal.opam.locked
-  ../logseq_sync/lib/api.ml
+  ../logseq_sync/lib/core.ml
+  ../logseq_sync/lib/effect_runner.ml
+  ../logseq_sync/lib/pure_core.ml
   ../logseq_sync/lib/dune
-  ../logseq_sync/spec/api.mli
+  ../logseq_sync/spec/core.mli
+  ../logseq_sync/spec/effect_runner.mli
   ../logseq_sync/spec/dune
   ../logseq_sync.install
   ../logseq_sync.opam
