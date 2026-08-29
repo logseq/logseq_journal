@@ -91,6 +91,128 @@ let test_live_mutation_cache_is_idempotent () =
            "idempotent replay advanced Engine basis"))
 ;;
 
+let test_live_mutation_cache_rejects_reused_id_for_different_content () =
+  F.with_snapshot (fun fixture ->
+    let engine = open_engine fixture in
+    Fun.protect
+      ~finally:(fun () -> ignore (Engine.close engine))
+      (fun () ->
+         let basis, _ = graph_info engine in
+         let first = Engine.execute engine (mutation basis) |> mutation_result in
+         let changed =
+           F.create_page_request
+             ~basis
+             ~request_id:"61000000-0000-4000-8000-000000000002"
+             ~mutation_id:"62000000-0000-4000-8000-000000000001"
+             ~page_uuid:"63000000-0000-4000-8000-000000000001"
+             ~title:"Different Engine lifecycle page"
+         in
+         (match Engine.execute engine changed with
+          | P.Failed { phase = Execute; error; _ } ->
+            T.require
+              (Logseq_db_worker.Error.code error = Conflict)
+              "reused mutation ID returned the wrong error"
+          | _ -> T.fail "reused mutation ID with different content was accepted");
+         T.require
+           (Engine.basis engine = Some first.basis_after)
+           "rejected mutation ID reuse advanced Engine basis"))
+;;
+
+let managed_scope graph_id =
+  let account : Logseq_sync.Core.account_scope =
+    { managed_sync_origin = Uri.of_string "https://api.logseq.io"
+    ; user_id = "user-1"
+    ; account_generation = 1
+    ; presentation_generation = 1
+    ; lifecycle_generation = 1L
+    }
+  in
+  Logseq_sync.Core.{ account; graph_id; graph_generation = 1 }
+;;
+
+let test_capture_managed_outbox_uses_shared_identity_and_round_trips () =
+  F.with_synced_mirror (fun fixture ->
+    let engine = open_engine fixture in
+    Fun.protect
+      ~finally:(fun () -> ignore (Engine.close engine))
+      (fun () ->
+         let basis, _ = graph_info engine in
+         let mutation =
+           Logseq_db_types.Mutation.Structural
+             (Insert_blocks
+                { roots =
+                    [ { uuid = F.uuid "64000000-0000-4000-8000-000000000001"
+                      ; title = "Captured source"
+                      ; children = []
+                      }
+                    ]
+                ; position =
+                    Relative (Last_child (F.uuid "11111111-1111-4111-8111-111111111111"))
+                ; context =
+                    { mutation_id = F.uuid "62000000-0000-4000-8000-000000000011"
+                    ; expected_basis = basis
+                    }
+                })
+         in
+         let identity = Logseq_db_types.Mutation.identify mutation in
+         let prepared =
+           match Engine.prepare_managed_mutation engine ~identity mutation with
+           | Ok prepared -> prepared
+           | Error message -> T.fail "Capture preparation failed: %s" message
+         in
+         T.require
+           (String.equal
+              (Engine.prepared_mutation_payload prepared)
+              (Logseq_db_types.Mutation.identity_payload identity))
+           "Engine preparation did not retain the shared identity payload";
+         let checkpoint = Engine.sync_checkpoint engine |> Result.get_ok in
+         let scope = managed_scope checkpoint.graph_id in
+         let key = Logseq_sync.Core.graph_key_handle ~id:"test-key" ~scope in
+         let input =
+           Logseq_sync.Core.local_batch_input
+             ~scope
+             ~key:(Some key)
+             ~outbox_records:[]
+             ~mutation_id:(Logseq_db_types.Mutation.context mutation).mutation_id
+             ~mutation_payload:(Engine.prepared_mutation_payload prepared)
+             ~mutation_fingerprint:
+               (Logseq_db_types.Mutation.identity_fingerprint identity)
+             ~outliner_op:(Engine.prepared_mutation_outliner_op prepared)
+             ~database:(Engine.prepared_mutation_database prepared)
+             ~operations:(Engine.prepared_mutation_operations prepared)
+           |> Result.get_ok
+         in
+         let plan = Logseq_sync.Core.begin_local_batch input |> Result.get_ok in
+         let encrypted_values =
+           match Logseq_sync.Core.local_batch_crypto_request plan with
+           | None -> None
+           | Some request ->
+             Some (List.map (fun _ -> "iv", "ciphertext") request.plaintexts)
+         in
+         let record =
+           Logseq_sync.Core.finish_local_batch plan encrypted_values |> Result.get_ok
+         in
+         let encoded =
+           Logseq_sync.Core.encode_outbox_records [ record ] |> Result.get_ok
+         in
+         let result =
+           Engine.commit_managed_mutation engine prepared ~outbox_records:encoded
+         in
+         T.require (Result.is_ok result) "Capture outbox commit failed";
+         let durable = Engine.managed_outbox_records engine |> Result.get_ok in
+         let decoded = Logseq_sync.Core.decode_outbox_records durable |> Result.get_ok in
+         T.require (List.length decoded = 1) "Capture durable outbox record was lost";
+         let durable_record = List.hd decoded in
+         T.require
+           (String.equal
+              (Logseq_sync.Core.outbox_record_fingerprint durable_record)
+              (Logseq_db_types.Mutation.identity_fingerprint identity))
+           "Capture durable outbox fingerprint drifted from the shared identity";
+         T.require
+           (String.length (Logseq_sync.Core.outbox_record_fingerprint durable_record) = 64)
+           "Capture durable outbox fingerprint exceeded its bounded digest"))
+;;
+
 let snapshot_entries fixture =
   let directory =
     Filename.concat (Filename.concat fixture.F.support "logseq-db-worker") "snapshots"
@@ -202,6 +324,12 @@ let () =
         "expected basis conflict is typed and non-mutating"
         test_basis_conflict_is_typed_and_non_mutating
     ; T.case "live mutation ID cache deduplicates" test_live_mutation_cache_is_idempotent
+    ; T.case
+        "live mutation ID cache rejects different content"
+        test_live_mutation_cache_rejects_reused_id_for_different_content
+    ; T.case
+        "Capture managed outbox shares identity and round-trips"
+        test_capture_managed_outbox_uses_shared_identity_and_round_trips
     ; T.case
         "first mutation creates backup and reopens"
         test_first_mutation_creates_backup_and_reopens

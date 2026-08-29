@@ -34,3 +34,13 @@
   sqlite3
   unix
   yojson))
+
+(executable
+ (name mutation_identity_benchmark)
+ (modules mutation_identity_benchmark)
+ (libraries
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker_test_support
+  mtime.clock.os
+  uri))

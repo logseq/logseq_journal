@@ -617,13 +617,6 @@ let session_error_message = function
   | Storage_session.Already_consumed -> "staged transaction was already consumed"
 ;;
 
-let mutation_fingerprint mutation =
-  mutation
-  |> (fun value -> Marshal.to_string value [ Marshal.No_sharing ])
-  |> Digestif.SHA256.digest_string
-  |> Digestif.SHA256.to_hex
-;;
-
 let rec find_cached_mutation mutation_id = function
   | [] -> None
   | (cached_id, fingerprint, result) :: rest ->
@@ -759,8 +752,9 @@ let validate_tree_for_mutation mutation db =
 
 let execute_local_mutation t request_id mutation =
   let basis_before = t.graph_info.basis in
-  let context = Logseq_db_types.Mutation.context mutation in
-  let fingerprint = mutation_fingerprint mutation in
+  let context = Mutation.context mutation in
+  let identity = Mutation.identify mutation in
+  let fingerprint = Mutation.identity_fingerprint identity in
   let succeeded result =
     Protocol.Succeeded
       { request_id
@@ -989,7 +983,7 @@ let prepared_mutation_outliner_op prepared = prepared.outliner_op
 let prepared_mutation_database prepared = prepared.database
 let prepared_mutation_operations prepared = prepared.operations
 
-let prepare_managed_mutation t mutation =
+let prepare_managed_mutation t ~identity mutation =
   let context = Logseq_db_types.Mutation.context mutation in
   let basis_before = t.graph_info.basis in
   match ensure_managed_target t, managed_outliner_op mutation with
@@ -1014,9 +1008,6 @@ let prepare_managed_mutation t mutation =
         | Ok projected when not (validate_tree_for_mutation mutation projected) ->
           Error "The mutation would violate graph structure."
         | Ok projected ->
-          let mutation_payload =
-            Logseq_db_types.Mutation.to_yojson mutation |> Yojson.Safe.to_string
-          in
           let basis_after = db_basis projected in
           let changed_uuids = take Protocol.maximum_changed_uuids plan.changed_uuids in
           let result =
@@ -1031,8 +1022,8 @@ let prepare_managed_mutation t mutation =
           in
           Ok
             { mutation_id = context.mutation_id
-            ; mutation_fingerprint = mutation_fingerprint mutation
-            ; mutation_payload
+            ; mutation_fingerprint = Mutation.identity_fingerprint identity
+            ; mutation_payload = Mutation.identity_payload identity
             ; outliner_op
             ; database = t.projected_db
             ; operations = plan.tx_ops

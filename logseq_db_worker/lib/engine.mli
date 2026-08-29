@@ -27,6 +27,7 @@ type prepared_managed_mutation
 
 val prepare_managed_mutation
   :  t
+  -> identity:Logseq_db_types.Mutation.identity
   -> Logseq_db_types.Mutation.t
   -> (prepared_managed_mutation, string) result
 

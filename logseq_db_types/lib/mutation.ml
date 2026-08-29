@@ -179,6 +179,11 @@ type success =
   ; changed_uuids_truncated : bool
   }
 
+type identity =
+  { payload : string
+  ; fingerprint : string
+  }
+
 let context = function
   | Structural (Save_block { context; _ })
   | Structural (Insert_blocks { context; _ })
@@ -772,6 +777,15 @@ let to_yojson = function
       ]
       context
 ;;
+
+let identify mutation =
+  let payload = to_yojson mutation |> Yojson.Safe.to_string in
+  let fingerprint = Digestif.SHA256.(to_hex (digest_string payload)) in
+  { payload; fingerprint }
+;;
+
+let identity_payload identity = identity.payload
+let identity_fingerprint identity = identity.fingerprint
 
 let of_yojson_kind kind json =
   let f names = exact_assoc ("type" :: "context" :: names) json in

@@ -179,9 +179,14 @@ type success =
   ; changed_uuids_truncated : bool
   }
 
+type identity
+
 val context : t -> context
 val to_yojson : t -> Yojson.Safe.t
 val of_yojson : Yojson.Safe.t -> (t, string) result
+val identify : t -> identity
+val identity_payload : identity -> string
+val identity_fingerprint : identity -> string
 val property_selector_to_yojson : property_selector -> Yojson.Safe.t
 val property_selector_of_yojson : Yojson.Safe.t -> (property_selector, string) result
 val property_schema_to_yojson : property_schema -> Yojson.Safe.t

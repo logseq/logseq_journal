@@ -10,6 +10,7 @@
  (depends
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
+  (digestif (= 1.3.1))
   (yojson (= 3.0.0))))
 
 (package

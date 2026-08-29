@@ -221,6 +221,82 @@ let graph ?(encrypted = false) () : Core.graph =
   }
 ;;
 
+let other_graph () : Core.graph =
+  { graph_id = other_graph_id ()
+  ; name = "Other Journal"
+  ; schema = { major = 1; minor = 0; exact = true }
+  ; encrypted = false
+  }
+;;
+
+let graph_id_equal = Logseq_db_types.Graph_types.Uuid.equal
+
+let save_catalog_cache effects =
+  List.find_map
+    (function
+      | Core.Run (Core.Request (_, Core.Save_catalog cache)) -> Some cache
+      | Run _ | Delegate _ | Publish _ -> None)
+    effects
+  |> function
+  | Some cache -> cache
+  | None -> fail "transition did not save the catalog cache"
+;;
+
+let load_catalog_completion effects (cache : Core.catalog_cache option) =
+  List.find_map
+    (function
+      | Core.Run (Core.Request (ticket, Core.Load_catalog _)) ->
+        Some (Core.Runner_completed (Core.Completion (ticket, Ok cache)))
+      | Run _ | Delegate _ | Publish _ -> None)
+    effects
+  |> function
+  | Some completion -> completion
+  | None -> fail "transition did not load the catalog cache"
+;;
+
+let complete_save_catalog transition (result : (unit, Core.effect_error) result) =
+  List.find_map
+    (function
+      | Core.Run (Core.Request (ticket, Core.Save_catalog _)) ->
+        Some
+          (Core.step
+             transition.Core.next
+             (Runner_completed (Completion (ticket, result))))
+      | Run _ | Delegate _ | Publish _ -> None)
+    transition.Core.effects
+  |> function
+  | Some completed -> completed
+  | None -> fail "transition did not save the catalog cache"
+;;
+
+let inspect_mirror_request effects =
+  List.find_map
+    (function
+      | Core.Delegate (Core.Inspect_mirror request) -> Some request
+      | Run _ | Delegate _ | Publish _ -> None)
+    effects
+  |> function
+  | Some request -> request
+  | None -> fail "transition did not inspect the selected graph mirror"
+;;
+
+let has_graph_open_work effects =
+  List.exists
+    (function
+      | Core.Delegate (Core.Inspect_mirror _) -> true
+      | Core.Delegate (Core.Attach_graph _) -> true
+      | Core.Delegate (Core.Activate_snapshot _) -> true
+      | Run _ | Delegate _ | Publish _ -> false)
+    effects
+;;
+
+let refresh_catalog core graphs =
+  let requested = Core.step core Core.Catalog_refresh_requested in
+  let token = token_request requested.effects in
+  let authorized = Core.step requested.next (Token_provided (token, "refresh-token")) in
+  Core.step authorized.next (fetch_catalog_completion authorized.effects graphs)
+;;
+
 let checkpoint graph_id =
   Logseq_db_types.Sync_checkpoint.create
     ~graph_id
@@ -557,7 +633,307 @@ let test_graph_selection_delegates_mirror_authority () =
          | Core.Delegate (Core.Inspect_mirror request) ->
            Logseq_db_types.Graph_types.Uuid.equal request.graph.graph_id graph.graph_id
          | Run _ | Delegate _ | Publish _ -> false)
-       selected.effects)
+       selected.effects);
+  let saved = save_catalog_cache selected.effects in
+  Alcotest.check
+    Alcotest.bool
+    "selected graph is persisted in the catalog cache"
+    true
+    (match Core.catalog_cache_selected_graph saved with
+     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
+     | None -> false)
+;;
+
+let test_selected_graph_survives_picker_and_codec_restart () =
+  let graph = graph () in
+  let selected, _ = select_catalog_graph graph in
+  let persisted = save_catalog_cache selected.effects in
+  let persisted =
+    persisted |> Core.encode_catalog_cache |> Core.decode_catalog_cache |> Result.get_ok
+  in
+  let picker = Core.step selected.next Core.Graph_picker_requested in
+  Alcotest.check
+    Alcotest.bool
+    "picker clears only the current process selection"
+    true
+    ((Core.state picker.next).snapshot.selected_graph = None
+     && (Core.state picker.next).snapshot.startup.awaiting_selection);
+  Alcotest.check
+    Alcotest.bool
+    "returning to the picker does not overwrite the durable selection"
+    true
+    (not
+       (List.exists
+          (function
+            | Core.Run (Core.Request (_, Core.Save_catalog _)) -> true
+            | Run _ | Delegate _ | Publish _ -> false)
+          picker.effects));
+  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
+  let generation_before = (Core.state restoring.next).snapshot.startup.graph_generation in
+  let restored =
+    Core.step restoring.next (load_catalog_completion restoring.effects (Some persisted))
+  in
+  let snapshot = (Core.state restored.next).snapshot in
+  Alcotest.check
+    Alcotest.bool
+    "fresh core restores the codec-round-tripped selected graph"
+    true
+    (match snapshot.selected_graph with
+     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
+     | None -> false);
+  Alcotest.check
+    Alcotest.bool
+    "warm restore advances generation and bypasses the picker"
+    true
+    ((not snapshot.startup.awaiting_selection)
+     && snapshot.startup.graph_generation > generation_before);
+  let request = inspect_mirror_request restored.effects in
+  Alcotest.check
+    Alcotest.bool
+    "warm restore delegates mirror inspection in the restored scope"
+    true
+    (graph_id_equal request.graph.graph_id graph.graph_id
+     && request.scope.graph_generation = snapshot.startup.graph_generation);
+  Alcotest.check
+    Alcotest.bool
+    "loading a catalog cache does not immediately rewrite it"
+    true
+    (not
+       (List.exists
+          (function
+            | Core.Run (Core.Request (_, Core.Save_catalog _)) -> true
+            | Run _ | Delegate _ | Publish _ -> false)
+          restored.effects))
+;;
+
+let check_invalid_cached_selection label cache =
+  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
+  let restored =
+    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
+  in
+  let snapshot = (Core.state restored.next).snapshot in
+  Alcotest.check
+    Alcotest.bool
+    (label ^ " awaits selection")
+    true
+    (snapshot.startup.awaiting_selection && snapshot.selected_graph = None);
+  Alcotest.check
+    Alcotest.bool
+    (label ^ " starts no graph work")
+    false
+    (has_graph_open_work restored.effects)
+;;
+
+let test_absent_stale_and_malformed_cached_selections_fail_closed () =
+  let graph = graph () in
+  let absent =
+    Core.catalog_cache ~user_id:"user-1" ~graphs:[ graph ] ~selected_graph:None
+  in
+  check_invalid_cached_selection "absent cached selection" absent;
+  let stale =
+    Core.catalog_cache
+      ~user_id:"user-1"
+      ~graphs:[ graph ]
+      ~selected_graph:(Some (other_graph_id ()))
+  in
+  check_invalid_cached_selection "stale cached selection" stale;
+  let malformed =
+    Core.encode_catalog_cache absent
+    |> Yojson.Safe.from_string
+    |> function
+    | `Assoc fields ->
+      `Assoc (("selectedGraph", `String "not-a-graph-uuid") :: fields)
+      |> Yojson.Safe.to_string
+      |> Core.decode_catalog_cache
+      |> Result.get_ok
+    | _ -> fail "encoded catalog cache was not an object"
+  in
+  check_invalid_cached_selection "malformed cached selection" malformed
+;;
+
+let test_catalog_refresh_preserves_admitted_selection () =
+  let graph = graph () in
+  let selected, _ = select_catalog_graph graph in
+  let before = (Core.state selected.next).snapshot in
+  let refreshed = refresh_catalog selected.next [ graph; other_graph () ] in
+  let after = (Core.state refreshed.next).snapshot in
+  Alcotest.check
+    Alcotest.bool
+    "refresh preserves the admitted selected graph"
+    true
+    (match after.selected_graph with
+     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
+     | None -> false);
+  Alcotest.check
+    Alcotest.bool
+    "refresh keeps the active graph generation and bypasses the picker"
+    true
+    (after.startup.graph_generation = before.startup.graph_generation
+     && not after.startup.awaiting_selection);
+  let saved = save_catalog_cache refreshed.effects in
+  Alcotest.check
+    Alcotest.bool
+    "refresh persists the admitted selected graph"
+    true
+    (match Core.catalog_cache_selected_graph saved with
+     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
+     | None -> false)
+;;
+
+let test_catalog_refresh_removes_unadmitted_selection () =
+  let graph = graph () in
+  let selected, _ = select_catalog_graph graph in
+  let before = (Core.state selected.next).snapshot in
+  let refreshed = refresh_catalog selected.next [ other_graph () ] in
+  let after = (Core.state refreshed.next).snapshot in
+  Alcotest.check
+    Alcotest.bool
+    "refresh clears a graph omitted by the authoritative catalog"
+    true
+    (after.selected_graph = None && after.startup.awaiting_selection);
+  Alcotest.check
+    Alcotest.bool
+    "refresh fences the removed graph generation"
+    true
+    (after.startup.graph_generation > before.startup.graph_generation);
+  Alcotest.check
+    Alcotest.bool
+    "refresh detaches the removed graph"
+    true
+    (List.exists
+       (function
+         | Core.Delegate (Core.Detach_graph _) -> true
+         | Run _ | Delegate _ | Publish _ -> false)
+       refreshed.effects);
+  Alcotest.check
+    Alcotest.bool
+    "refresh starts no work for the removed graph"
+    false
+    (has_graph_open_work refreshed.effects);
+  let saved = save_catalog_cache refreshed.effects in
+  Alcotest.check
+    (Alcotest.option Alcotest.string)
+    "refresh persists no removed selection"
+    None
+    (Core.catalog_cache_selected_graph saved
+     |> Option.map Logseq_db_types.Graph_types.Uuid.to_string)
+;;
+
+let test_catalog_save_failure_keeps_selected_graph_usable () =
+  let graph = graph () in
+  let selected, mirror_request = select_catalog_graph graph in
+  let failed =
+    complete_save_catalog selected (Error (Core.Effect_failed "disk unavailable"))
+  in
+  Alcotest.check
+    Alcotest.bool
+    "advisory save failure preserves the selected graph state"
+    true
+    (Core.state failed.next = Core.state selected.next);
+  let available = open_request graph mirror_request.scope "save-failure" in
+  let inspected =
+    Core.step failed.next (Core.Mirror_inspected (Core.Mirror_available available))
+  in
+  Alcotest.check
+    Alcotest.bool
+    "mirror opening continues after advisory save failure"
+    true
+    (List.exists
+       (function
+         | Core.Delegate (Core.Attach_graph request) ->
+           request.scope = mirror_request.scope
+         | Run _ | Delegate _ | Publish _ -> false)
+       inspected.effects)
+;;
+
+let test_same_account_reconciliation_preserves_warm_restore () =
+  let graph = graph () in
+  let selected, _ = select_catalog_graph graph in
+  let cache = save_catalog_cache selected.effects in
+  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
+  let restored =
+    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
+  in
+  let restored_snapshot = (Core.state restored.next).snapshot in
+  let reconciled =
+    Core.step restored.next (Account_authenticated { user_id = Some "user-1" })
+  in
+  let reconciled_snapshot = (Core.state reconciled.next).snapshot in
+  Alcotest.check
+    Alcotest.bool
+    "same-account authentication retains the warm selected graph"
+    true
+    (reconciled_snapshot.selected_graph = restored_snapshot.selected_graph
+     && reconciled_snapshot.startup.graph_generation
+        = restored_snapshot.startup.graph_generation
+     && not reconciled_snapshot.startup.awaiting_selection);
+  Alcotest.check
+    Alcotest.bool
+    "same-account authentication does not detach the warm graph"
+    false
+    (List.exists
+       (function
+         | Core.Delegate (Core.Detach_graph _) -> true
+         | Run _ | Delegate _ | Publish _ -> false)
+       reconciled.effects);
+  let catalog_token = token_request reconciled.effects in
+  let authorized =
+    Core.step reconciled.next (Token_provided (catalog_token, "catalog-token"))
+  in
+  let refreshed =
+    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
+  in
+  let saved = save_catalog_cache refreshed.effects in
+  Alcotest.check
+    Alcotest.bool
+    "same-account catalog reconciliation persists the warm selection"
+    true
+    (match Core.catalog_cache_selected_graph saved with
+     | Some graph_id -> graph_id_equal graph_id graph.graph_id
+     | None -> false)
+;;
+
+let test_auth_and_remote_catalog_before_cache_load_do_not_erase_selection () =
+  let graph = graph () in
+  let cache =
+    Core.catalog_cache
+      ~user_id:"user-1"
+      ~graphs:[ graph ]
+      ~selected_graph:(Some graph.graph_id)
+  in
+  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
+  let reconciled =
+    Core.step restoring.next (Account_authenticated { user_id = Some "user-1" })
+  in
+  let catalog_token = token_request reconciled.effects in
+  let authorized =
+    Core.step reconciled.next (Token_provided (catalog_token, "catalog-token"))
+  in
+  let fetched =
+    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
+  in
+  Alcotest.check
+    Alcotest.bool
+    "remote catalog does not overwrite a catalog cache that is still loading"
+    false
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Save_catalog _)) -> true
+         | Run _ | Delegate _ | Publish _ -> false)
+       fetched.effects);
+  let restored =
+    Core.step fetched.next (load_catalog_completion restoring.effects (Some cache))
+  in
+  let snapshot = (Core.state restored.next).snapshot in
+  Alcotest.check
+    Alcotest.bool
+    "late local cache completion restores the selected graph"
+    true
+    (match snapshot.selected_graph with
+     | Some graph_id ->
+       graph_id_equal graph_id graph.graph_id && not snapshot.startup.awaiting_selection
+     | None -> false);
+  ignore (inspect_mirror_request restored.effects)
 ;;
 
 let test_snapshot_activation_reinspects_worker_mirror () =
@@ -1327,6 +1703,14 @@ let test_submission_waits_for_durable_outbox_transition () =
       opened.effects
     |> Option.get
   in
+  (match Core.decode_outbox_records transition.outbox_records with
+   | Ok records ->
+     Alcotest.(check int)
+       "submitted durable outbox remains decodable"
+       1
+       (List.length records)
+   | Error message ->
+     Alcotest.failf "submitted durable outbox failed to decode: %s" message);
   Alcotest.check
     Alcotest.bool
     "WebSocket send is absent before durable transition"
@@ -1541,6 +1925,34 @@ let scenarios =
       "graph selection delegates mirror authority"
       `Quick
       test_graph_selection_delegates_mirror_authority
+  ; Alcotest.test_case
+      "selected graph survives picker and codec restart"
+      `Quick
+      test_selected_graph_survives_picker_and_codec_restart
+  ; Alcotest.test_case
+      "invalid cached selections fail closed"
+      `Quick
+      test_absent_stale_and_malformed_cached_selections_fail_closed
+  ; Alcotest.test_case
+      "catalog refresh preserves admitted selection"
+      `Quick
+      test_catalog_refresh_preserves_admitted_selection
+  ; Alcotest.test_case
+      "catalog refresh removes unadmitted selection"
+      `Quick
+      test_catalog_refresh_removes_unadmitted_selection
+  ; Alcotest.test_case
+      "catalog save failure keeps selected graph usable"
+      `Quick
+      test_catalog_save_failure_keeps_selected_graph_usable
+  ; Alcotest.test_case
+      "same-account reconciliation preserves warm restore"
+      `Quick
+      test_same_account_reconciliation_preserves_warm_restore
+  ; Alcotest.test_case
+      "early auth and remote catalog preserve pending cache restore"
+      `Quick
+      test_auth_and_remote_catalog_before_cache_load_do_not_erase_selection
   ; Alcotest.test_case
       "snapshot activation re-inspects mirror"
       `Quick

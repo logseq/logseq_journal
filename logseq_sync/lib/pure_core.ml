@@ -305,7 +305,8 @@ let outbox_state_of_json = function
   | `Assoc fields when exact_fields [ "type" ] fields ->
     (match List.assoc_opt "type" fields with
      | Some (`String "queued") -> Ok Queued
-     | _ -> Error "invalid queued outbox state")
+     | Some (`String "submitted") -> Ok Submitted
+     | _ -> Error "invalid queued or submitted outbox state")
   | `Assoc fields when exact_fields [ "serverT"; "type" ] fields ->
     (match List.assoc_opt "type" fields, List.assoc_opt "serverT" fields with
      | Some (`String "accepted"), Some (`Int value) when value >= 0 -> Ok (Accepted value)
@@ -316,10 +317,7 @@ let outbox_state_of_json = function
        when String.length message > 0 && String.length message <= 4096 ->
        Ok (Blocked message)
      | _ -> Error "invalid blocked outbox state")
-  | `Assoc fields ->
-    (match fields with
-     | [ ("type", `String "submitted") ] -> Ok Submitted
-     | _ -> Error "invalid submitted outbox state")
+  | `Assoc _ -> Error "invalid outbox state"
   | _ -> Error "invalid outbox state"
 ;;
 
@@ -1555,6 +1553,9 @@ type t =
   ; pending_effects : pending_effect list
   ; pending_local_batches : (effect_id * local_batch_plan) list
   ; graph_key : graph_key_handle option
+  ; catalog_cache_loading : bool
+  ; early_fetched_catalog : graph list option
+  ; cached_selected_graph : graph_id option
   ; selected_graph_value : graph option
   ; current_graph_scope : graph_scope option
   ; connection_generation : connection_generation
@@ -1608,6 +1609,9 @@ let initial config =
     ; pending_effects = []
     ; pending_local_batches = []
     ; graph_key = None
+    ; catalog_cache_loading = false
+    ; early_fetched_catalog = None
+    ; cached_selected_graph = None
     ; selected_graph_value = None
     ; current_graph_scope = None
     ; connection_generation = 0
@@ -1744,7 +1748,7 @@ let e2ee_failed core message =
   { next; effects = [ publish_state next ] }
 ;;
 
-let authenticate core user_id =
+let authenticate_new_account core user_id =
   let account_generation = core.public_state.snapshot.startup.account_generation + 1 in
   let presentation_generation =
     core.public_state.snapshot.startup.presentation_generation + 1
@@ -1783,6 +1787,9 @@ let authenticate core user_id =
     ; pending_effects = []
     ; pending_local_batches = []
     ; graph_key = None
+    ; catalog_cache_loading = false
+    ; early_fetched_catalog = None
+    ; cached_selected_graph = None
     ; selected_graph_value = None
     ; current_graph_scope = None
     ; connection_generation = 0
@@ -1799,6 +1806,31 @@ let authenticate core user_id =
     }
   in
   { next; effects = [ publish_state next; Publish (Token_requested request) ] }
+;;
+
+let authenticate core user_id =
+  match core.user_id with
+  | Some current_user_id when String.equal current_user_id user_id ->
+    let account_generation = core.public_state.snapshot.startup.account_generation in
+    let request =
+      { request_id = Printf.sprintf "catalog-%d-%d" account_generation core.next_effect_id
+      ; purpose = Catalog_discovery
+      ; account_generation
+      ; graph_generation = None
+      ; connection_generation = None
+      }
+    in
+    let startup =
+      { core.public_state.snapshot.startup with
+        authenticated = true
+      ; catalog_loading = true
+      ; failure = None
+      }
+    in
+    let snapshot = { core.public_state.snapshot with startup; last_error = None } in
+    let next = { (set_snapshot core snapshot) with pending_token = Some request } in
+    { next; effects = [ publish_state next; Publish (Token_requested request) ] }
+  | Some _ | None -> authenticate_new_account core user_id
 ;;
 
 let sign_out core =
@@ -1827,6 +1859,9 @@ let sign_out core =
     ; pending_effects = []
     ; pending_local_batches = []
     ; graph_key = None
+    ; catalog_cache_loading = false
+    ; early_fetched_catalog = None
+    ; cached_selected_graph = None
     ; selected_graph_value = None
     ; current_graph_scope = None
     ; connection_generation = 0
@@ -1968,6 +2003,9 @@ let restore_local core user_id =
     { (set_snapshot core snapshot) with
       user_id = Some user_id
     ; selected_graph_value = None
+    ; catalog_cache_loading = true
+    ; early_fetched_catalog = None
+    ; cached_selected_graph = None
     ; current_graph_scope = None
     ; graph_key = None
     ; connection_generation = 0
@@ -2161,6 +2199,189 @@ let authoritative_finished core plan decrypted_values =
     { next = core; effects = [ Delegate (Apply_authoritative_batch request) ] }
 ;;
 
+let graph_in_catalog graphs graph_id =
+  List.find_opt
+    (fun (graph : graph) ->
+       Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id)
+    graphs
+;;
+
+let select_graph_transition core ~persist graph_id =
+  match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
+  | None, _ | Some _, None -> unchanged core
+  | Some user_id, Some graph ->
+    let previous_generation = core.public_state.snapshot.startup.graph_generation in
+    let graph_generation = previous_generation + 1 in
+    let startup =
+      { core.public_state.snapshot.startup with
+        awaiting_selection = false
+      ; bootstrapping = true
+      ; awaiting_e2ee_password = false
+      ; failure = None
+      ; graph_generation
+      }
+    in
+    let snapshot =
+      { core.public_state.snapshot with
+        sync_phase = Offline
+      ; selected_graph = Some graph_id
+      ; applied_server_t = None
+      ; startup
+      ; last_error = None
+      }
+    in
+    let next = set_snapshot core snapshot in
+    let scope = { account = account_scope next user_id; graph_id; graph_generation } in
+    let next =
+      { next with
+        cached_selected_graph = Some graph_id
+      ; selected_graph_value = Some graph
+      ; current_graph_scope = Some scope
+      ; graph_key = None
+      ; pending_effects = []
+      ; pending_local_batches = []
+      ; connection_generation = 0
+      ; active_graph_token = None
+      ; snapshot_server_t = None
+      ; pending_graph_open = None
+      ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
+      ; e2ee_authenticated = None
+      ; encrypted_graph_key = None
+      ; private_key_package = None
+      ; pending_authoritative_batches = []
+      ; outbox_records = []
+      ; websocket_live = false
+      }
+    in
+    let replacement_effects =
+      match core.current_graph_scope with
+      | None -> []
+      | Some previous ->
+        [ Run (Cancel_effects (effect_scope_of_graph previous))
+        ; Delegate (Detach_graph { graph_generation = previous.graph_generation })
+        ]
+    in
+    let next, persistence_effects =
+      if persist
+      then (
+        let cache =
+          catalog_cache ~user_id ~graphs:snapshot.catalog ~selected_graph:(Some graph_id)
+        in
+        let next, runner_instruction = issue_request next (Save_catalog cache) in
+        next, [ Run runner_instruction ])
+      else next, []
+    in
+    { next
+    ; effects =
+        replacement_effects
+        @ [ Delegate (Inspect_mirror { graph; scope }); publish_state next ]
+        @ persistence_effects
+    }
+;;
+
+let clear_selected_graph_for_catalog core graphs =
+  let previous = core.current_graph_scope in
+  let startup =
+    { core.public_state.snapshot.startup with
+      catalog_loading = false
+    ; restoring_local = false
+    ; awaiting_selection = true
+    ; bootstrapping = false
+    ; awaiting_e2ee_password = false
+    ; failure = None
+    ; graph_generation = core.public_state.snapshot.startup.graph_generation + 1
+    }
+  in
+  let snapshot =
+    { core.public_state.snapshot with
+      sync_phase = Offline
+    ; catalog = graphs
+    ; selected_graph = None
+    ; applied_server_t = None
+    ; startup
+    ; last_error = None
+    }
+  in
+  let next =
+    { (set_snapshot core snapshot) with
+      cached_selected_graph = None
+    ; selected_graph_value = None
+    ; current_graph_scope = None
+    ; graph_key = None
+    ; pending_token = None
+    ; pending_effects = []
+    ; pending_local_batches = []
+    ; pending_graph_open = None
+    ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
+    ; e2ee_authenticated = None
+    ; encrypted_graph_key = None
+    ; private_key_package = None
+    ; pending_authoritative_batches = []
+    ; active_graph_token = None
+    ; snapshot_server_t = None
+    ; outbox_records = []
+    ; websocket_live = false
+    }
+  in
+  let closing =
+    Option.fold
+      ~none:[]
+      ~some:(fun scope ->
+        [ Run (Cancel_effects (effect_scope_of_graph scope))
+        ; Delegate (Detach_graph { graph_generation = scope.graph_generation })
+        ])
+      previous
+  in
+  { next; effects = closing @ [ publish_state next ] }
+;;
+
+let catalog_refreshed core graphs =
+  let admitted_cached_selection =
+    Option.bind core.cached_selected_graph (fun graph_id ->
+      Option.map (fun graph -> graph_id, graph) (graph_in_catalog graphs graph_id))
+  in
+  match core.public_state.snapshot.selected_graph with
+  | Some selected_graph ->
+    (match graph_in_catalog graphs selected_graph with
+     | None -> clear_selected_graph_for_catalog core graphs
+     | Some graph ->
+       let startup =
+         { core.public_state.snapshot.startup with
+           catalog_loading = false
+         ; restoring_local = false
+         ; awaiting_selection = false
+         ; failure = None
+         }
+       in
+       let snapshot =
+         { core.public_state.snapshot with catalog = graphs; startup; last_error = None }
+       in
+       let next =
+         { (set_snapshot core snapshot) with
+           cached_selected_graph = Some selected_graph
+         ; selected_graph_value = Some graph
+         }
+       in
+       { next; effects = [ publish_state next ] })
+  | None ->
+    let loaded = catalog_loaded core graphs in
+    let cached_selected_graph = Option.map fst admitted_cached_selection in
+    let next = { loaded.next with cached_selected_graph } in
+    { next; effects = [ publish_state next ] }
+;;
+
+let apply_fetched_catalog core graphs =
+  let refreshed = catalog_refreshed core graphs in
+  match refreshed.next.user_id with
+  | None -> refreshed
+  | Some user_id ->
+    let cache =
+      catalog_cache ~user_id ~graphs ~selected_graph:refreshed.next.cached_selected_graph
+    in
+    let next, runner_instruction = issue_request refreshed.next (Save_catalog cache) in
+    { next; effects = refreshed.effects @ [ Run runner_instruction ] }
+;;
+
 let consume_completion
   : type a. t -> a effect_ticket -> (a, effect_error) result -> transition
   =
@@ -2173,16 +2394,34 @@ let consume_completion
     in
     match ticket.kind, result with
     | Load_catalog_kind, Ok cache ->
-      catalog_loaded core (Option.fold ~none:[] ~some:catalog_cache_graphs cache)
+      let early_fetched_catalog = core.early_fetched_catalog in
+      let core =
+        { core with catalog_cache_loading = false; early_fetched_catalog = None }
+      in
+      let restored =
+        match cache with
+        | None -> catalog_loaded core []
+        | Some cache ->
+          let graphs = catalog_cache_graphs cache in
+          let loaded = catalog_loaded core graphs in
+          (match catalog_cache_selected_graph cache with
+           | Some graph_id when Option.is_some (graph_in_catalog graphs graph_id) ->
+             select_graph_transition loaded.next ~persist:false graph_id
+           | Some _ | None -> loaded)
+      in
+      (match early_fetched_catalog with
+       | None -> restored
+       | Some graphs ->
+         let refreshed = apply_fetched_catalog restored.next graphs in
+         { next = refreshed.next; effects = restored.effects @ refreshed.effects })
     | Fetch_catalog_kind, Ok graphs ->
-      let loaded = catalog_loaded core graphs in
-      (match loaded.next.user_id with
-       | None -> loaded
-       | Some user_id ->
-         let cache = catalog_cache ~user_id ~graphs ~selected_graph:None in
-         let next, runner_instruction = issue_request loaded.next (Save_catalog cache) in
-         { next; effects = loaded.effects @ [ Run runner_instruction ] })
-    | Load_catalog_kind, Error (Effect_failed message)
+      if core.catalog_cache_loading
+      then { next = { core with early_fetched_catalog = Some graphs }; effects = [] }
+      else apply_fetched_catalog core graphs
+    | Load_catalog_kind, Error (Effect_failed message) ->
+      catalog_failed
+        { core with catalog_cache_loading = false; early_fetched_catalog = None }
+        message
     | Fetch_catalog_kind, Error (Effect_failed message) -> catalog_failed core message
     | Save_catalog_kind, (Ok () | Error _) -> unchanged core
     | Fetch_snapshot_baseline_kind, Ok source ->
@@ -2543,72 +2782,7 @@ let start_authoritative_batch core (context : authoritative_context) =
        | [], None -> authoritative_finished core plan None))
 ;;
 
-let select_graph core graph_id =
-  match
-    ( core.user_id
-    , List.find_opt
-        (fun (graph : graph) ->
-           Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id)
-        core.public_state.snapshot.catalog )
-  with
-  | None, _ | Some _, None -> unchanged core
-  | Some user_id, Some graph ->
-    let previous_generation = core.public_state.snapshot.startup.graph_generation in
-    let graph_generation = previous_generation + 1 in
-    let startup =
-      { core.public_state.snapshot.startup with
-        awaiting_selection = false
-      ; bootstrapping = true
-      ; awaiting_e2ee_password = false
-      ; failure = None
-      ; graph_generation
-      }
-    in
-    let snapshot =
-      { core.public_state.snapshot with
-        sync_phase = Offline
-      ; selected_graph = Some graph_id
-      ; applied_server_t = None
-      ; startup
-      ; last_error = None
-      }
-    in
-    let next = set_snapshot core snapshot in
-    let scope = { account = account_scope next user_id; graph_id; graph_generation } in
-    let next =
-      { next with
-        selected_graph_value = Some graph
-      ; current_graph_scope = Some scope
-      ; graph_key = None
-      ; pending_effects = []
-      ; pending_local_batches = []
-      ; connection_generation = 0
-      ; active_graph_token = None
-      ; snapshot_server_t = None
-      ; pending_graph_open = None
-      ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
-      ; e2ee_authenticated = None
-      ; encrypted_graph_key = None
-      ; private_key_package = None
-      ; pending_authoritative_batches = []
-      ; outbox_records = []
-      ; websocket_live = false
-      }
-    in
-    let replacement_effects =
-      match core.current_graph_scope with
-      | None -> []
-      | Some previous ->
-        [ Run (Cancel_effects (effect_scope_of_graph previous))
-        ; Delegate (Detach_graph { graph_generation = previous.graph_generation })
-        ]
-    in
-    { next
-    ; effects =
-        replacement_effects
-        @ [ Delegate (Inspect_mirror { graph; scope }); publish_state next ]
-    }
-;;
+let select_graph core graph_id = select_graph_transition core ~persist:true graph_id
 
 let mirror_inspected core = function
   | Mirror_available request when graph_scope_is_current core request.scope ->

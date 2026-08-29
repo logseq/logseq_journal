@@ -2,6 +2,7 @@ module Db = Logseq_db_worker
 module Core = Logseq_sync.Core
 module Effect_runner = Logseq_sync.Effect_runner
 module Engine = Db.Engine
+module Mutation = Logseq_db_types.Mutation
 module Protocol = Db.Protocol
 module ID = Bonsai_flutter_spec.Id
 
@@ -537,10 +538,9 @@ module Managed_coordinator = struct
   ;;
 
   let begin_mutation t request engine mutation =
-    let mutation_id = (Logseq_db_types.Mutation.context mutation).mutation_id in
-    let mutation_fingerprint =
-      Logseq_db_types.Mutation.to_yojson mutation |> Yojson.Safe.to_string
-    in
+    let mutation_id = (Mutation.context mutation).mutation_id in
+    let identity = Mutation.identify mutation in
+    let mutation_fingerprint = Mutation.identity_fingerprint identity in
     match Engine.managed_outbox_records engine with
     | Error message -> Immediate (mutation_failure request engine message)
     | Ok encoded_outbox ->
@@ -572,7 +572,7 @@ module Managed_coordinator = struct
              | None ->
                Immediate (mutation_failure request engine "managed graph scope is absent")
              | Some scope ->
-               (match Engine.prepare_managed_mutation engine mutation with
+               (match Engine.prepare_managed_mutation engine ~identity mutation with
                 | Error message -> Immediate (mutation_failure request engine message)
                 | Ok prepared ->
                   (match

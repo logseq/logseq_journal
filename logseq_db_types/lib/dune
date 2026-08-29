@@ -1,4 +1,4 @@
 (library
  (name logseq_db_types)
  (public_name logseq_db_types)
- (libraries yojson))
+ (libraries digestif yojson))

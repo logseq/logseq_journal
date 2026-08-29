@@ -111,6 +111,117 @@ let with_snapshot ?(fail_mutation_writes = false) f =
     f { support; source_graph_dir; token; config = config support token; resolved })
 ;;
 
+let with_synced_mirror f =
+  with_snapshot (fun fixture ->
+    let snapshot_engine =
+      let dependencies =
+        Logseq_db_worker.Engine.
+          { clocks =
+              { epoch_ms = (fun () -> 1_704_067_200_000L)
+              ; monotonic_ns = (fun () -> 1_000_000L)
+              }
+          ; cursor_authentication_key = Bytes.make 32 'a'
+          }
+      in
+      match Logseq_db_worker.Engine.open_ ~dependencies fixture.config with
+      | Ok engine -> engine
+      | Error error ->
+        T.fail
+          "unable to inspect synced mirror fixture: %s"
+          (Logseq_db_worker.Error.message error)
+    in
+    let graph_info =
+      let request =
+        Logseq_db_worker.Protocol.
+          { api_version
+          ; request_id =
+              Logseq_db_types.Graph_types.Uuid.of_string
+                "10000000-0000-4000-8000-000000000001"
+              |> Result.get_ok
+          ; command = Read Graph_info
+          }
+      in
+      match Logseq_db_worker.Engine.execute snapshot_engine request with
+      | Logseq_db_worker.Protocol.Succeeded { success = Graph_info_result graph_info; _ }
+        -> graph_info
+      | _ -> T.fail "unable to read synced mirror fixture graph info"
+    in
+    ignore (Logseq_db_worker.Engine.close snapshot_engine);
+    let remote_graph_id =
+      Logseq_db_types.Graph_types.Uuid.of_string "60000000-0000-4000-8000-000000000001"
+      |> Result.get_ok
+    in
+    let database_path = Filename.concat fixture.resolved.graph_dir "db.sqlite" in
+    let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+    let module Session = Logseq_db_storage.Storage_session in
+    let connection = Storage.open_database database_path |> Result.get_ok in
+    let storage = Storage.datascript_storage connection in
+    let database = Storage.restore_database connection |> Result.get_ok in
+    let session =
+      Session.create
+        ~db:database
+        ~tail:(Datascript.Storage.restore_tail_groups storage)
+        ~callbacks:(Storage.connection_callbacks connection)
+    in
+    let entity id ident value =
+      Datascript.Entity
+        { db_id = Some (Temp_id id)
+        ; attrs = [ "db/ident", One_value (Keyword ident); "kv/value", One_value value ]
+        }
+    in
+    let staged =
+      Session.stage_transact
+        session
+        [ entity "remote-flag" "logseq.kv/graph-remote?" (Bool true)
+        ; entity
+            "remote-uuid"
+            "logseq.kv/graph-uuid"
+            (Uuid (Logseq_db_types.Graph_types.Uuid.to_string remote_graph_id))
+        ]
+      |> Result.get_ok
+    in
+    Session.commit_staged session staged |> Result.get_ok;
+    Session.close session |> Result.get_ok;
+    let checkpoint =
+      Logseq_db_types.Sync_checkpoint.create
+        ~graph_id:remote_graph_id
+        ~schema:graph_info.schema
+        ~applied_server_t:0
+        ~checksum:"0000000000000000"
+      |> Result.get_ok
+    in
+    let sqlite = Sqlite3.db_open database_path in
+    Fun.protect
+      ~finally:(fun () ->
+        T.require (Sqlite3.db_close sqlite) "fixture SQLite close failed")
+      (fun () ->
+         (match
+            Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint
+          with
+          | Ok () -> ()
+          | Error message -> T.fail "unable to initialize sync checkpoint: %s" message);
+         match Logseq_db_storage.Sync_outbox_store.initialize_database sqlite with
+         | Ok () -> ()
+         | Error message -> T.fail "unable to initialize sync outbox: %s" message);
+    let config =
+      Logseq_db_worker.Config.create
+        ~application_support_directory:fixture.support
+        ~target:
+          (Synced_mirror
+             { graph_id = remote_graph_id
+             ; graph_name = graph_info.graph_name
+             ; graph_dir = fixture.resolved.graph_dir
+             ; database_path
+             ; checkpoint
+             })
+        ~compatibility_profile:Logseq_65_33_or_newer
+        ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+        ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      |> Result.get_ok
+    in
+    f { fixture with config })
+;;
+
 let clone_with_mutation_write_failure fixture =
   install_mutation_write_failure fixture.resolved.graph_dir;
   let token =

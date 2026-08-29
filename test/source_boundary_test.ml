@@ -518,6 +518,18 @@ let test_worker_owned_managed_sync_orchestration root =
     ];
   require_text
     root
+    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "Mutation.identify mutation"
+    ; "Mutation.identity_fingerprint identity"
+    ; "Engine.prepare_managed_mutation engine ~identity mutation"
+    ];
+  forbid_text
+    root
+    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "Mutation.to_yojson mutation" ];
+  forbid_text root "logseq_db_worker/lib/engine.ml" [ "Marshal.to_string" ];
+  require_text
+    root
     "logseq_db_storage/lib/storage_session.mli"
     [ "val load_sync_outbox"
     ; "val commit_sync_outbox_insert"
