@@ -24,16 +24,15 @@ let host_name host =
     | Error _ -> Error (`Msg "WSS host is not a valid DNS name"))
 ;;
 
-let tls_config host =
-  bind (Ca_certs_nss.authenticator ()) (fun authenticator ->
-    bind (host_name host) (fun peer_name ->
-      Tls.Config.client ~authenticator ~peer_name ()))
+let tls_config authenticator host =
+  bind (host_name host) (fun peer_name ->
+    Tls.Config.client ~authenticator ~peer_name ~alpn_protocols:[ "http/1.1" ] ())
 ;;
 
-let open_flow ~sw ~network uri =
+let open_flow ~sw ~authenticator ~network uri =
   match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
   | Some "wss", Some host, None, None ->
-    (match tls_config host with
+    (match tls_config authenticator host with
      | Error (`Msg message) -> Error message
      | Ok config ->
        let port = Option.value (Uri.port uri) ~default:443 in
@@ -142,12 +141,22 @@ let read_payload ~maximum payload =
   Eio.Promise.await completed
 ;;
 
-let connect ~sw ~network ~clock ~uri ~token ~maximum_frame_bytes ~on_message ~on_close =
+let connect
+      ~sw
+      ~authenticator
+      ~network
+      ~clock
+      ~uri
+      ~token
+      ~maximum_frame_bytes
+      ~on_message
+      ~on_close
+  =
   initialize_rng ();
   if maximum_frame_bytes <= 0
   then Error "WebSocket frame bound must be positive"
   else
-    bind (open_flow ~sw ~network uri) (fun flow ->
+    bind (open_flow ~sw ~authenticator ~network uri) (fun flow ->
       let opened, resolve_opened = Eio.Promise.create () in
       let fragments = Buffer.create 4096 in
       let close_once =

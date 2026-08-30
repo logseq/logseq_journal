@@ -1,5 +1,5 @@
-module Core = Logseq_sync.Core
-module Runner = Logseq_sync.Effect_runner
+module Core = Logseq_sync_pure_reducer.Core
+module Runner = Logseq_sync_effect_runner.Effect_runner
 
 let fail format = Printf.ksprintf (fun message -> Alcotest.fail message) format
 
@@ -86,6 +86,7 @@ let dependencies ?secrets_dependency ?crypto_dependency ~environment ~support ~f
   in
   let transport =
     Runner.transport
+      ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
       ~network:(Eio.Stdenv.net environment)
       ~clock:(Eio.Stdenv.clock environment)
     |> Result.get_ok

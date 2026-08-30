@@ -1,4 +1,4 @@
-module Checksum = Logseq_sync_pure_core.Checksum
+module Core = Logseq_sync_pure_reducer.Core
 module Snapshot = Synced_snapshot_parser
 module Admission = Logseq_db_storage.Admission
 
@@ -410,7 +410,7 @@ let finalize_computed_checksum
     (match Logseq_sqlite_storage.restore_database connection with
      | Error _ -> finish (Error (Invalid_snapshot "staged graph could not restore"))
      | Ok db ->
-       let checksum = Checksum.recompute ~e2ee:(Checksum.graph_e2ee db) db in
+       let checksum = Core.recompute_checksum db in
        if
          match expected_checksum with
          | Some expected -> not (String.equal expected checksum)

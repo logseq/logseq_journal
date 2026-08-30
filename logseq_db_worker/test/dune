@@ -7,7 +7,6 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker_cli
-  logseq_sync
   sqlite3
   unix
   yojson))
@@ -43,7 +42,7 @@
   logseq_db_worker_cli
   logseq_db_worker_fixture_generator
   logseq_db_worker_test_support
-  logseq_sync
+  logseq_sync.pure_reducer
   sqlite3
   unix
   uri
@@ -58,7 +57,7 @@
   logseq_db_worker.bonsai
   logseq_db_worker_cli
   logseq_db_worker_test_support
-  logseq_sync
+  logseq_sync.effect_runner
   sqlite3
   unix
   yojson))
@@ -71,7 +70,43 @@
   bonsai_flutter_test
   logseq_db_worker
   logseq_db_worker.bonsai
-  logseq_db_worker_test_support))
+  logseq_db_worker_test_support
+  logseq_sync.effect_runner))
+
+(library
+ (name managed_sync_e2e_support)
+ (wrapped false)
+ (modules managed_sync_e2e_support)
+ (libraries logseq_db_types unix yojson))
+
+(test
+ (name test_managed_sync_e2e_support)
+ (modules test_managed_sync_e2e_support)
+ (libraries
+  logseq_db_types
+  logseq_db_worker_test_support
+  managed_sync_e2e_support))
+
+(executable
+ (name test_managed_sync_e2e)
+ (modules test_managed_sync_e2e)
+ (libraries
+  bonsai_flutter.driver
+  logseq_db_storage
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker.bonsai
+  logseq_db_worker_test_support
+  logseq_sync.pure_reducer
+  managed_sync_e2e_support
+  sqlite3
+  unix))
+
+(rule
+ (alias managed-sync-online-e2e)
+ (deps test_managed_sync_e2e.exe ../tool/cognito_e2e_login.sh)
+ (action
+  (run ./test_managed_sync_e2e.exe)))
 
 (rule
  (alias runtest)

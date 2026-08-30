@@ -1,4 +1,4 @@
-(** Eio-native interpreter for [Core.runner_effect]. *)
+(** Eio-native interpreter for [Logseq_sync_pure_reducer.Core.runner_effect]. *)
 
 type t
 type dependency_error = Invalid_dependency of string
@@ -12,9 +12,14 @@ val runtime
   -> (runtime, dependency_error) result
 
 type transport
+type tls_authenticator
+
+val tls_authenticator : X509.Authenticator.t -> tls_authenticator
+val system_tls_authenticator : unit -> (tls_authenticator, dependency_error) result
 
 val transport
-  :  network:_ Eio.Net.t
+  :  tls_authenticator:tls_authenticator
+  -> network:_ Eio.Net.t
   -> clock:_ Eio.Time.clock
   -> (transport, dependency_error) result
 
@@ -50,18 +55,18 @@ val secrets
   -> load_wrapped_graph_key:
        (managed_sync_origin:Uri.t
         -> user_id:string
-        -> graph_id:Core.graph_id
+        -> graph_id:Logseq_sync_pure_reducer.Core.graph_id
         -> (string, wrapped_key_load_error) result)
   -> verify_and_save_wrapped_graph_key:
        (managed_sync_origin:Uri.t
         -> user_id:string
-        -> graph_id:Core.graph_id
+        -> graph_id:Logseq_sync_pure_reducer.Core.graph_id
         -> encrypted_graph_key:string
         -> (unit, string) result)
   -> delete_wrapped_graph_key:
        (managed_sync_origin:Uri.t
         -> user_id:string
-        -> graph_id:Core.graph_id
+        -> graph_id:Logseq_sync_pure_reducer.Core.graph_id
         -> (unit, string) result)
   -> delete_account_secrets:
        (managed_sync_origin:Uri.t -> user_id:string -> (unit, string) result)
@@ -101,14 +106,14 @@ val dependencies
 val create
   :  sw:Eio.Switch.t
   -> dependencies
-  -> post:(Core.event -> unit)
+  -> post:(Logseq_sync_pure_reducer.Core.event -> unit)
   -> (t, create_error) result
 
-val submit : t -> Core.runner_effect -> unit
+val submit : t -> Logseq_sync_pure_reducer.Core.runner_effect -> unit
 
 val decrypt_protected_value
   :  t
-  -> Core.graph_key_handle
+  -> Logseq_sync_pure_reducer.Core.graph_key_handle
   -> string
   -> (string, string) result
 

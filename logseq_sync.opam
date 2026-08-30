@@ -25,19 +25,20 @@ depends: [
   "httpun" {= "0.2.0"}
   "httpun-eio" {= "0.2.0"}
   "httpun-ws" {= "0.2.0"}
-  "melange-transit-native" {= "0.1.0"}
+  "melange-transit-native" {= "0.1.1"}
   "mirage-crypto-rng" {= "2.2.0"}
   "sqlite3" {= "5.4.0"}
   "tls" {= "2.1.2"}
   "tls-eio" {= "2.1.2"}
   "uri" {= "4.4.0"}
   "uutf" {= "1.0.4"}
+  "x509" {= "1.1.1"}
   "yojson" {= "3.0.0"}
 ]
 depexts: ["zlib"]
 pin-depends: [
-  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
-  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
-  ["melange-transit-native.0.1.0" "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"]
+  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"]
+  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"]
+  ["melange-transit-native.0.1.1" "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"]
 ]
 build: [["dune" "build" "-p" name "-j" jobs]]

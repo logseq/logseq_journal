@@ -34,7 +34,7 @@ type feed_refresh =
   { generation : int64
   ; context : feed_projection_context
   ; cause : feed_refresh_cause
-  ; graph_generation : Logseq_sync.Core.graph_id option
+  ; graph_generation : Logseq_sync_pure_reducer.Core.graph_id option
   ; minimum_basis : int64 option
   }
 
@@ -71,10 +71,10 @@ type state =
   ; feed_refresh : feed_refresh option
   ; graph_error : string option
   ; sync_error : string option
-  ; manager : Logseq_sync.Core.snapshot option
+  ; manager : Logseq_sync_pure_reducer.Core.snapshot option
   ; graph_state : Logseq_db_worker.graph_state
-  ; sync_diagnostics : Logseq_sync.Core.diagnostics option
-  ; bootstrap_progress : Logseq_sync.Core.bootstrap_progress option
+  ; sync_diagnostics : Logseq_sync_pure_reducer.Core.diagnostics option
+  ; bootstrap_progress : Logseq_sync_pure_reducer.Core.bootstrap_progress option
   ; e2ee_password : Journal_capture.t
   ; typography_preset : Journal_visual_tokens.typography_preset option
   ; modal : modal
@@ -133,12 +133,12 @@ let equal_formatting_context left right =
 
 let current_graph_generation state =
   Option.map
-    (fun (manager : Logseq_sync.Core.snapshot) -> manager.selected_graph)
+    (fun (manager : Logseq_sync_pure_reducer.Core.snapshot) -> manager.selected_graph)
     state.manager
   |> Option.join
 ;;
 
-let apply_manager_state state (manager_state : Logseq_sync.Core.state) =
+let apply_manager_state state (manager_state : Logseq_sync_pure_reducer.Core.state) =
   let snapshot = manager_state.snapshot in
   let graph_context_changed =
     match state.manager with
@@ -1125,9 +1125,9 @@ let settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch =
        ~barrier_label:"Settings"
 ;;
 
-let sync_diagnostic_rows (diagnostics : Logseq_sync.Core.diagnostics) =
+let sync_diagnostic_rows (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) =
   List.concat_map
-    (fun (group : Logseq_sync.Core.diagnostic_group) -> group.entries)
+    (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) -> group.entries)
     diagnostics.groups
 ;;
 
@@ -1152,16 +1152,16 @@ let diagnostic_groups diagnostics =
     ; "Serialization", unavailable [ "Serialization" ]
     ; "Authorization", unavailable [ "Pending token challenges" ]
     ]
-  | Some (diagnostics : Logseq_sync.Core.diagnostics) ->
+  | Some (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) ->
     List.map
-      (fun (group : Logseq_sync.Core.diagnostic_group) -> group.title, group.entries)
+      (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) -> group.title, group.entries)
       diagnostics.groups
 ;;
 
 let diagnostic_history_lines = function
   | None -> [ "No transitions" ]
-  | Some ({ history = []; _ } : Logseq_sync.Core.diagnostics) -> [ "No transitions" ]
-  | Some ({ history; _ } : Logseq_sync.Core.diagnostics) -> history
+  | Some ({ history = []; _ } : Logseq_sync_pure_reducer.Core.diagnostics) -> [ "No transitions" ]
+  | Some ({ history; _ } : Logseq_sync_pure_reducer.Core.diagnostics) -> history
 ;;
 
 let sync_diagnostics_page
@@ -1573,7 +1573,7 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
     in
     let rows =
       List.map
-        (fun (graph : Logseq_sync.Core.graph) ->
+        (fun (graph : Logseq_sync_pure_reducer.Core.graph) ->
            let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
            let on_press = bind_action dispatch ("select-graph:" ^ graph_id) in
            Ui.Material.list_tile
@@ -1593,7 +1593,7 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
                      ~focusable:true
                      ~actions:[ Ui.Semantics.Action.Tap ]
                      ()))
-        snapshot.Logseq_sync.Core.catalog
+        snapshot.Logseq_sync_pure_reducer.Core.catalog
     in
     let scroll =
       Ui.Widget.Scroll_view.vertical
@@ -1629,7 +1629,7 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
              | Some progress ->
                Printf.sprintf
                  "Downloaded %Ld bytes"
-                 progress.Logseq_sync.Core.received_bytes
+                 progress.Logseq_sync_pure_reducer.Core.received_bytes
            in
            ( "Downloading graph"
            , [ Ui.Widget.Flex.fixed
@@ -1957,10 +1957,10 @@ let component client handlers graph =
   let sign_out_in_flight = ref false in
   let termination_in_flight = ref false in
   let apply_manager_transition set_state manager_state =
-    let manager = manager_state.Logseq_sync.Core.snapshot in
+    let manager = manager_state.Logseq_sync_pure_reducer.Core.snapshot in
     let update = set_state (fun state -> apply_manager_state state manager_state) in
     let sign_out =
-      if (not manager.Logseq_sync.Core.startup.authenticated) && !sign_out_in_flight
+      if (not manager.Logseq_sync_pure_reducer.Core.startup.authenticated) && !sign_out_in_flight
       then (
         sign_out_in_flight := false;
         Bonsai.Effect.bind
@@ -1980,7 +1980,7 @@ let component client handlers graph =
     let termination_ready =
       if
         !termination_in_flight
-        && (manager.Logseq_sync.Core.startup.awaiting_selection
+        && (manager.Logseq_sync_pure_reducer.Core.startup.awaiting_selection
             || not manager.startup.authenticated)
       then (
         termination_in_flight := false;
@@ -2107,7 +2107,7 @@ let component client handlers graph =
               ~f:(function
                 | Error _ -> send_manager (Graph_service.Reject_token challenge)
                 | Ok payload ->
-                  let challenge_id = Logseq_sync.Core.token_request_id challenge in
+                  let challenge_id = Logseq_sync_pure_reducer.Core.token_request_id challenge in
                   (match
                      Journal_platform.decode_id_token_response ~challenge_id payload
                    with

@@ -126,7 +126,7 @@ let graph_id =
 ;;
 
 let startup_snapshot
-      ?(sync_phase = Logseq_sync.Core.Offline)
+      ?(sync_phase = Logseq_sync_pure_reducer.Core.Offline)
       ?(authenticated = true)
       ?(catalog_loading = false)
       ?(awaiting_selection = false)
@@ -138,7 +138,7 @@ let startup_snapshot
       ?(timeline_presentation_pending = false)
       ()
   =
-  Logseq_sync.Core.
+  Logseq_sync_pure_reducer.Core.
     { sync_phase
     ; catalog = []
     ; selected_graph = Some graph_id
@@ -218,7 +218,8 @@ let test_ready_is_independent_of_sync_activity () =
             (startup_snapshot ~sync_phase ())
             (graph_state ())
             "open presented graph did not remain ready"))
-    Logseq_sync.Core.[ Offline; Connecting; Pulling; Submitting; Current; Paused ];
+    Logseq_sync_pure_reducer.Core.
+      [ Offline; Connecting; Pulling; Submitting; Current; Paused ];
   ignore
     (require_startup_phase
        Journal_startup.Restoring_local

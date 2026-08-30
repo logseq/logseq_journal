@@ -191,6 +191,9 @@ val encode_outbox_records : outbox_record list -> (string list, string) result
 val outbox_record_mutation_id : outbox_record -> graph_id
 val outbox_record_fingerprint : outbox_record -> string
 
+(** Recompute the canonical entity checksum for a graph database. *)
+val recompute_checksum : Datascript.db -> string
+
 val local_batch_input
   :  scope:graph_scope
   -> key:graph_key_handle option
@@ -264,7 +267,7 @@ type websocket_request =
 
 type websocket_send =
   { scope : connection_scope
-  ; payload : string
+  ; message : Sync_protocol.Client.message
   }
 
 type timer_id
@@ -326,7 +329,7 @@ type local_batch_commit_request =
   }
 
 type authoritative_batch =
-  { payload : string
+  { message : Sync_protocol.Server.message
   ; scope : connection_scope
   ; presentation_generation : presentation_generation
   ; lifecycle_generation : lifecycle_generation
@@ -367,7 +370,7 @@ type outbox_transition =
   ; lifecycle_generation : lifecycle_generation
   ; expected_outbox_records : string list
   ; outbox_records : string list
-  ; pending_payload : string option
+  ; pending_message : Sync_protocol.Client.message option
   }
 
 type worker_effect =
@@ -422,7 +425,7 @@ type authoritative_commit_result =
 type outbox_transition_commit =
   { scope : graph_scope
   ; outbox_records : string list
-  ; pending_payload : string option
+  ; pending_message : Sync_protocol.Client.message option
   }
 
 type outbox_transition_rejection =
@@ -465,7 +468,8 @@ type event =
   | Runner_completed of runner_completion
   | Snapshot_download_progress of bootstrap_progress
   | Websocket_opened of connection_scope
-  | Websocket_frame of connection_scope * string
+  | Websocket_message of connection_scope * Sync_protocol.Server.message
+  | Websocket_protocol_error of connection_scope * Sync_protocol.codec_error
   | Websocket_closed of connection_scope * string option
   | Timer_elapsed of timer_id
   | Shutdown

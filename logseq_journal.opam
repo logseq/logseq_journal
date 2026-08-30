@@ -33,8 +33,8 @@ depends: [
   "httpun-ws" {= "0.2.0"}
   "melange-edn-core" {= "0.5.0"}
   "melange-edn-native" {= "0.5.0"}
-  "melange-transit-core" {= "0.1.0"}
-  "melange-transit-native" {= "0.1.0"}
+  "melange-transit-core" {= "0.1.1"}
+  "melange-transit-native" {= "0.1.1"}
   "persistent_sorted_set_ocaml" {= "dev"}
   "mirage-crypto-rng" {= "2.2.0"}
   "sqlite3" {= "5.4.0"}
@@ -47,15 +47,15 @@ depends: [
   "virtual_dom" {= "v0.17.0"}
 ]
 pin-depends: [
-  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#f4377637a33cdc450204734d033bbcbb861e06bb"]
-  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#f4377637a33cdc450204734d033bbcbb861e06bb"]
-  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
-  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"]
+  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#de1196c2663b43388ebf04bd0612c5050edef753"]
+  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#de1196c2663b43388ebf04bd0612c5050edef753"]
+  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"]
+  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"]
   ["persistent_sorted_set_ocaml.dev" "git+https://github.com/logseq/persistent-sorted-set-ocaml.git#4016dae1cdf4304207d8277ff9957656cdd8b177"]
   ["melange-edn-core.0.5.0" "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"]
   ["melange-edn-native.0.5.0" "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"]
-  ["melange-transit-core.0.1.0" "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"]
-  ["melange-transit-native.0.1.0" "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"]
+  ["melange-transit-core.0.1.1" "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"]
+  ["melange-transit-native.0.1.1" "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"]
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]

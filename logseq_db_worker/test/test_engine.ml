@@ -119,7 +119,7 @@ let test_live_mutation_cache_rejects_reused_id_for_different_content () =
 ;;
 
 let managed_scope graph_id =
-  let account : Logseq_sync.Core.account_scope =
+  let account : Logseq_sync_pure_reducer.Core.account_scope =
     { managed_sync_origin = Uri.of_string "https://api.logseq.io"
     ; user_id = "user-1"
     ; account_generation = 1
@@ -127,7 +127,7 @@ let managed_scope graph_id =
     ; lifecycle_generation = 1L
     }
   in
-  Logseq_sync.Core.{ account; graph_id; graph_generation = 1 }
+  Logseq_sync_pure_reducer.Core.{ account; graph_id; graph_generation = 1 }
 ;;
 
 let test_capture_managed_outbox_uses_shared_identity_and_round_trips () =
@@ -167,9 +167,9 @@ let test_capture_managed_outbox_uses_shared_identity_and_round_trips () =
            "Engine preparation did not retain the shared identity payload";
          let checkpoint = Engine.sync_checkpoint engine |> Result.get_ok in
          let scope = managed_scope checkpoint.graph_id in
-         let key = Logseq_sync.Core.graph_key_handle ~id:"test-key" ~scope in
+         let key = Logseq_sync_pure_reducer.Core.graph_key_handle ~id:"test-key" ~scope in
          let input =
-           Logseq_sync.Core.local_batch_input
+           Logseq_sync_pure_reducer.Core.local_batch_input
              ~scope
              ~key:(Some key)
              ~outbox_records:[]
@@ -182,34 +182,41 @@ let test_capture_managed_outbox_uses_shared_identity_and_round_trips () =
              ~operations:(Engine.prepared_mutation_operations prepared)
            |> Result.get_ok
          in
-         let plan = Logseq_sync.Core.begin_local_batch input |> Result.get_ok in
+         let plan =
+           Logseq_sync_pure_reducer.Core.begin_local_batch input |> Result.get_ok
+         in
          let encrypted_values =
-           match Logseq_sync.Core.local_batch_crypto_request plan with
+           match Logseq_sync_pure_reducer.Core.local_batch_crypto_request plan with
            | None -> None
            | Some request ->
              Some (List.map (fun _ -> "iv", "ciphertext") request.plaintexts)
          in
          let record =
-           Logseq_sync.Core.finish_local_batch plan encrypted_values |> Result.get_ok
+           Logseq_sync_pure_reducer.Core.finish_local_batch plan encrypted_values
+           |> Result.get_ok
          in
          let encoded =
-           Logseq_sync.Core.encode_outbox_records [ record ] |> Result.get_ok
+           Logseq_sync_pure_reducer.Core.encode_outbox_records [ record ] |> Result.get_ok
          in
          let result =
            Engine.commit_managed_mutation engine prepared ~outbox_records:encoded
          in
          T.require (Result.is_ok result) "Capture outbox commit failed";
          let durable = Engine.managed_outbox_records engine |> Result.get_ok in
-         let decoded = Logseq_sync.Core.decode_outbox_records durable |> Result.get_ok in
+         let decoded =
+           Logseq_sync_pure_reducer.Core.decode_outbox_records durable |> Result.get_ok
+         in
          T.require (List.length decoded = 1) "Capture durable outbox record was lost";
          let durable_record = List.hd decoded in
          T.require
            (String.equal
-              (Logseq_sync.Core.outbox_record_fingerprint durable_record)
+              (Logseq_sync_pure_reducer.Core.outbox_record_fingerprint durable_record)
               (Logseq_db_types.Mutation.identity_fingerprint identity))
            "Capture durable outbox fingerprint drifted from the shared identity";
          T.require
-           (String.length (Logseq_sync.Core.outbox_record_fingerprint durable_record) = 64)
+           (String.length
+              (Logseq_sync_pure_reducer.Core.outbox_record_fingerprint durable_record)
+            = 64)
            "Capture durable outbox fingerprint exceeded its bounded digest"))
 ;;
 

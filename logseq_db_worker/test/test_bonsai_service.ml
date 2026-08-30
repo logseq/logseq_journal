@@ -3,7 +3,7 @@ module F = Logseq_db_worker_test_support.Adapter_fixture
 module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
-module Runner = Logseq_sync.Effect_runner
+module Runner = Logseq_sync_effect_runner.Effect_runner
 
 let crypto =
   Runner.crypto
@@ -35,7 +35,14 @@ let secrets =
   |> Result.get_ok
 ;;
 
-let dependencies = Service.dependencies ~engine:F.dependencies ~secrets ~crypto
+let dependencies =
+  Service.dependencies
+    ~engine:F.dependencies
+    ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
+    ~secrets
+    ~crypto
+;;
+
 let epoch = ref 2_000L
 
 let next_epoch () =
@@ -208,9 +215,11 @@ let sole_public_sync_composition () =
     in
     loop 0
   in
-  T.require (contains "Logseq_sync.Core") "Service does not use the pure sync core";
   T.require
-    (contains "Logseq_sync.Effect_runner")
+    (contains "Logseq_sync_pure_reducer.Core")
+    "Service does not use the pure sync core";
+  T.require
+    (contains "Logseq_sync_effect_runner.Effect_runner")
     "Service does not use the public effect runner";
   T.require (contains "Core.initial") "Service does not create the pure sync core";
   T.require (contains "module Managed_coordinator") "Service has no managed coordinator";

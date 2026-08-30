@@ -34,7 +34,7 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.bonsai
-  logseq_sync
+  logseq_sync.pure_reducer
   threads
   unix
   virtual_dom.ui_effect))

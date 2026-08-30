@@ -197,7 +197,7 @@ let resolve_target config =
        Error
          (error
             Error.Invalid_request
-            "Managed sync startup must be opened by Logseq_sync.Manager.")
+            "Managed sync startup must be opened by the managed sync service.")
      | Config.Snapshot { token } ->
        (match Snapshot.resolve catalog token with
         | Ok resolved ->
@@ -932,7 +932,7 @@ let execute_mutation t request_id mutation =
       ~phase:Execute
       ~basis:(Some t.graph_info.basis)
       (unsupported_semantics
-         "Managed graph mutations must enter through Logseq_sync.Core.")
+         "Managed graph mutations must enter through Logseq_sync_pure_reducer.Core.")
   | Snapshot_write_target _ | Native_write_target _ ->
     execute_local_mutation t request_id mutation
 ;;

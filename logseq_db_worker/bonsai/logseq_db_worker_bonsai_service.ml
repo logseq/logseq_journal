@@ -1,6 +1,6 @@
 module Db = Logseq_db_worker
-module Core = Logseq_sync.Core
-module Effect_runner = Logseq_sync.Effect_runner
+module Core = Logseq_sync_pure_reducer.Core
+module Effect_runner = Logseq_sync_effect_runner.Effect_runner
 module Engine = Db.Engine
 module Mutation = Logseq_db_types.Mutation
 module Protocol = Db.Protocol
@@ -56,11 +56,14 @@ let random_key () =
 
 type dependencies =
   { engine : Engine.dependencies
+  ; tls_authenticator : Effect_runner.tls_authenticator
   ; secrets : Effect_runner.secrets
   ; crypto : Effect_runner.crypto
   }
 
-let dependencies ~engine ~secrets ~crypto = { engine; secrets; crypto }
+let dependencies ~engine ~tls_authenticator ~secrets ~crypto =
+  { engine; tls_authenticator; secrets; crypto }
+;;
 
 let production_dependencies () =
   let engine =
@@ -74,7 +77,8 @@ let production_dependencies () =
   in
   let secrets = Effect_runner.apple_secrets () |> Result.get_ok in
   let crypto = Effect_runner.apple_crypto () |> Result.get_ok in
-  { engine; secrets; crypto }
+  let tls_authenticator = Effect_runner.system_tls_authenticator () |> Result.get_ok in
+  { engine; tls_authenticator; secrets; crypto }
 ;;
 
 let take count values =
@@ -379,7 +383,7 @@ module Managed_coordinator = struct
               (Core.Outbox_transition_committed
                  { scope = transition.scope
                  ; outbox_records = transition.outbox_records
-                 ; pending_payload = transition.pending_payload
+                 ; pending_message = transition.pending_message
                  })
           | Error message ->
             let outbox_records =
@@ -701,7 +705,10 @@ let create ~(dependencies : dependencies) =
                   ~monotonic_ns:Mtime_clock.elapsed_ns)
                (fun runtime ->
                   Result.bind
-                    (Effect_runner.transport ~network:(Eio.Stdenv.net environment) ~clock)
+                    (Effect_runner.transport
+                       ~tls_authenticator:dependencies.tls_authenticator
+                       ~network:(Eio.Stdenv.net environment)
+                       ~clock)
                     (fun transport ->
                        Result.bind
                          (Effect_runner.local_store

@@ -1,4 +1,5 @@
-module Core = Logseq_sync.Core
+module Core = Logseq_sync_pure_reducer.Core
+module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
 
 let fail format = Printf.ksprintf (fun message -> Alcotest.fail message) format
 
@@ -512,16 +513,10 @@ let encrypted_authoritative_context (connection : Core.connection_scope) =
              ]
          ])
   in
-  let payload =
-    Yojson.Safe.to_string
-      (`Assoc
-          [ "type", `String "pull/ok"
-          ; "t", `Int 1
-          ; "txs", `List [ `Assoc [ "t", `Int 1; "tx", `String wire ] ]
-          ])
-  in
   let batch : Core.authoritative_batch =
-    { payload
+    { message =
+        Sync_protocol.Server.Pull_ok
+          { t = 1; checksum = None; txs = [ { t = 1; tx = wire; outliner_op = None } ] }
     ; scope = connection
     ; presentation_generation = connection.graph.account.presentation_generation
     ; lifecycle_generation = connection.graph.account.lifecycle_generation
@@ -1546,50 +1541,58 @@ let test_authoritative_decryption_failure_is_fail_closed () =
     ((Core.state failed.next).snapshot.startup.failure = Some Core.During_e2ee)
 ;;
 
-let authoritative_context ~server_t ~transaction_t =
+let remote_add_operation () =
   let module Transit = Transit_core.Json in
-  let module Codec = Transit_native.Transit.Json in
+  Transit.Array
+    [ Transit.Keyword "db/add"
+    ; Transit.String "remote-block"
+    ; Transit.Keyword "block/uuid"
+    ; Transit.Uuid "22222222-2222-4222-8222-222222222222"
+    ]
+;;
+
+let transit_wire value =
+  Transit_native.Transit.Json.to_string ~mode:Transit_native.Transit.Json.Verbose value
+;;
+
+let authoritative_context
+      ?(checkpoint_t = 0)
+      ?wire
+      ?(outbox_records = [])
+      ~server_t
+      ~transaction_t
+      ()
+  =
+  let module Transit = Transit_core.Json in
   let wire =
-    Codec.to_string
-      ~mode:Codec.Verbose
-      (Transit.Array
-         [ Transit.Array
-             [ Transit.Keyword "db/add"
-             ; Transit.String "remote-block"
-             ; Transit.Keyword "block/uuid"
-             ; Transit.Uuid "22222222-2222-4222-8222-222222222222"
-             ]
-         ])
-  in
-  let payload =
-    Yojson.Safe.to_string
-      (`Assoc
-          [ "type", `String "pull/ok"
-          ; "t", `Int server_t
-          ; "txs", `List [ `Assoc [ "t", `Int transaction_t; "tx", `String wire ] ]
-          ])
+    Option.value wire ~default:(transit_wire (Transit.Array [ remote_add_operation () ]))
   in
   let checkpoint =
     Logseq_db_types.Sync_checkpoint.create
       ~graph_id:(graph_id ())
       ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
-      ~applied_server_t:0
+      ~applied_server_t:checkpoint_t
       ~checksum:"0000000000000000"
     |> Result.get_ok
   in
   let batch : Core.authoritative_batch =
-    { payload
+    { message =
+        Sync_protocol.Server.Pull_ok
+          { t = server_t
+          ; checksum = None
+          ; txs = [ { t = transaction_t; tx = wire; outliner_op = None } ]
+          }
     ; scope = { graph = graph_scope (); connection_generation = 1 }
     ; presentation_generation = 1
     ; lifecycle_generation = 1L
     }
   in
-  Core.{ batch; checkpoint; database = Datascript.empty_db (); outbox_records = [] }
+  Core.{ batch; checkpoint; database = Datascript.empty_db (); outbox_records }
 ;;
 
 let test_authoritative_pull_is_pure_and_advances_checkpoint () =
   let plan =
-    authoritative_context ~server_t:1 ~transaction_t:1
+    authoritative_context ~server_t:1 ~transaction_t:1 ()
     |> Core.begin_authoritative_batch
     |> Result.get_ok
   in
@@ -1613,9 +1616,209 @@ let test_authoritative_pull_is_pure_and_advances_checkpoint () =
 
 let test_authoritative_pull_rejects_cursor_gaps () =
   let result =
-    authoritative_context ~server_t:2 ~transaction_t:2 |> Core.begin_authoritative_batch
+    authoritative_context ~server_t:2 ~transaction_t:2 ()
+    |> Core.begin_authoritative_batch
   in
   Alcotest.check Alcotest.bool "cursor gap is rejected" true (Result.is_error result)
+;;
+
+let test_authoritative_pull_accepts_transit_list_collection () =
+  let module Transit = Transit_core.Json in
+  let wire = transit_wire (Transit.List [ remote_add_operation () ]) in
+  let request =
+    authoritative_context ~wire ~server_t:1 ~transaction_t:1 ()
+    |> Core.begin_authoritative_batch
+    |> Result.get_ok
+    |> fun plan -> Core.finish_authoritative_batch plan None |> Result.get_ok
+  in
+  Alcotest.(check int)
+    "Transit list contributes one transaction"
+    1
+    (List.length request.transactions);
+  Alcotest.(check int)
+    "Transit list advances the checkpoint"
+    1
+    request.checkpoint.applied_server_t
+;;
+
+let test_authoritative_pull_rejects_empty_or_non_array_operations () =
+  let module Transit = Transit_core.Json in
+  let empty_list = transit_wire (Transit.List []) in
+  let list_operation =
+    transit_wire
+      (Transit.Array
+         [ Transit.List
+             [ Transit.Keyword "db/add"
+             ; Transit.String "remote-block"
+             ; Transit.Keyword "block/uuid"
+             ; Transit.Uuid "22222222-2222-4222-8222-222222222222"
+             ]
+         ])
+  in
+  List.iter
+    (fun wire ->
+       let result =
+         authoritative_context ~wire ~server_t:1 ~transaction_t:1 ()
+         |> Core.begin_authoritative_batch
+       in
+       Alcotest.check
+         Alcotest.bool
+         "invalid transaction shape is rejected"
+         true
+         (Result.is_error result))
+    [ empty_list; list_operation ]
+;;
+
+let queued_outbox_records () =
+  let record =
+    local_batch_input
+      [ Datascript.Add
+          ( Datascript.Temp_id "queued-duplicate"
+          , "block/uuid"
+          , Datascript.Uuid "33333333-3333-4333-8333-333333333333" )
+      ]
+    |> Core.begin_local_batch
+    |> Result.get_ok
+    |> fun plan -> Core.finish_local_batch plan None |> Result.get_ok
+  in
+  Core.encode_outbox_records [ record ] |> Result.get_ok
+;;
+
+let accepted_outbox_records server_t =
+  queued_outbox_records ()
+  |> List.map (fun source ->
+    match Yojson.Safe.from_string source with
+    | `Assoc fields ->
+      `Assoc
+        (List.map
+           (fun (name, value) ->
+              if String.equal name "state"
+              then name, `Assoc [ "type", `String "accepted"; "serverT", `Int server_t ]
+              else name, value)
+           fields)
+      |> Yojson.Safe.to_string
+    | _ -> fail "encoded outbox record must be an object")
+;;
+
+let test_duplicate_pull_skips_authoritative_transaction_bodies () =
+  let plan =
+    authoritative_context
+      ~checkpoint_t:1
+      ~wire:"not transit"
+      ~server_t:1
+      ~transaction_t:1
+      ()
+    |> Core.begin_authoritative_batch
+    |> Result.get_ok
+  in
+  Alcotest.check
+    Alcotest.bool
+    "duplicate malformed transaction requests no crypto"
+    true
+    (Core.authoritative_crypto_request plan = None);
+  let request = Core.finish_authoritative_batch plan None |> Result.get_ok in
+  Alcotest.check
+    Alcotest.bool
+    "duplicate is classified without decoding its body"
+    true
+    (request.activity = Logseq_db_types.Sync_status.Pull_duplicate);
+  Alcotest.(check int)
+    "duplicate applies no authoritative transactions"
+    0
+    (List.length request.transactions)
+;;
+
+let test_duplicate_pull_preserves_outbox_processing () =
+  let queued = queued_outbox_records () in
+  let projected =
+    authoritative_context
+      ~checkpoint_t:1
+      ~wire:"not transit"
+      ~outbox_records:queued
+      ~server_t:1
+      ~transaction_t:1
+      ()
+    |> Core.begin_authoritative_batch
+    |> Result.get_ok
+    |> fun plan -> Core.finish_authoritative_batch plan None |> Result.get_ok
+  in
+  Alcotest.(check int)
+    "queued outbox is still projected"
+    1
+    (List.length projected.projection_transactions);
+  Alcotest.(check int)
+    "queued outbox remains durable"
+    1
+    (List.length projected.outbox_records);
+  let accepted = accepted_outbox_records 1 in
+  let cleaned =
+    authoritative_context
+      ~checkpoint_t:1
+      ~wire:"not transit"
+      ~outbox_records:accepted
+      ~server_t:1
+      ~transaction_t:1
+      ()
+    |> Core.begin_authoritative_batch
+    |> Result.get_ok
+    |> fun plan -> Core.finish_authoritative_batch plan None |> Result.get_ok
+  in
+  Alcotest.(check int)
+    "acknowledged outbox is removed"
+    0
+    (List.length cleaned.outbox_records)
+;;
+
+let test_duplicate_pull_still_rejects_future_transaction_cursor () =
+  let result =
+    authoritative_context
+      ~checkpoint_t:1
+      ~wire:"not transit"
+      ~server_t:1
+      ~transaction_t:2
+      ()
+    |> Core.begin_authoritative_batch
+  in
+  Alcotest.check
+    Alcotest.bool
+    "duplicate future cursor is rejected before body inspection"
+    true
+    (Result.is_error result)
+;;
+
+let test_typed_websocket_messages_reach_policy_without_raw_json () =
+  let core, connection = encrypted_open_graph () in
+  let pong = Core.step core (Websocket_message (connection, Sync_protocol.Server.Pong)) in
+  Alcotest.check
+    Alcotest.bool
+    "application pong is a typed non-authoritative no-op"
+    true
+    (Core.state pong.next = Core.state core && pong.effects = []);
+  let presence =
+    Core.step
+      pong.next
+      (Websocket_message
+         ( connection
+         , Sync_protocol.Server.Presence
+             { user_id = "user-2"; editing_block_uuid = Some "block-2" } ))
+  in
+  Alcotest.check
+    Alcotest.bool
+    "presence is a typed non-authoritative no-op"
+    true
+    (Core.state presence.next = Core.state pong.next && presence.effects = []);
+  let message = Sync_protocol.Server.Changed { t = 1 } in
+  let changed = Core.step presence.next (Websocket_message (connection, message)) in
+  Alcotest.check
+    Alcotest.bool
+    "authoritative typed message is delegated without re-encoding"
+    true
+    (List.exists
+       (function
+         | Core.Delegate (Core.Inspect_authoritative_batch batch) ->
+           batch.message = message
+         | Run _ | Delegate _ | Publish _ -> false)
+       changed.effects)
 ;;
 
 let test_submission_waits_for_durable_outbox_transition () =
@@ -1695,12 +1898,48 @@ let test_submission_waits_for_durable_outbox_transition () =
     |> Option.get
   in
   let opened = Core.step connecting.next (Websocket_opened connection) in
+  Alcotest.check
+    Alcotest.bool
+    "opening WebSocket waits for the authoritative pull"
+    true
+    ((Core.state opened.next).snapshot.sync_phase = Core.Pulling);
+  Alcotest.check
+    Alcotest.bool
+    "opening WebSocket sends the checkpoint pull"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Send_websocket { message; _ }) ->
+           message = Sync_protocol.Client.Pull { since = Some 0 }
+         | Run _ | Delegate _ | Publish _ -> false)
+       opened.effects);
+  Alcotest.check
+    Alcotest.bool
+    "queued submission waits for the opening pull"
+    true
+    (not
+       (List.exists
+          (function
+            | Core.Delegate (Core.Commit_outbox_transition _) -> true
+            | Run _ | Delegate _ | Publish _ -> false)
+          opened.effects));
+  let current =
+    Core.step
+      opened.next
+      (Authoritative_batch_applied
+         { scope = open_request.scope
+         ; checkpoint
+         ; outbox_records = queued_records
+         ; activity = Logseq_db_types.Sync_status.Pull_duplicate
+         ; invalidation = None
+         })
+  in
   let transition =
     List.find_map
       (function
         | Core.Delegate (Core.Commit_outbox_transition transition) -> Some transition
         | Run _ | Delegate _ | Publish _ -> None)
-      opened.effects
+      current.effects
     |> Option.get
   in
   (match Core.decode_outbox_records transition.outbox_records with
@@ -1720,14 +1959,14 @@ let test_submission_waits_for_durable_outbox_transition () =
           (function
             | Core.Run (Core.Send_websocket _) -> true
             | Run _ | Delegate _ | Publish _ -> false)
-          opened.effects));
+          current.effects));
   let committed =
     Core.step
-      opened.next
+      current.next
       (Outbox_transition_committed
          { scope = transition.scope
          ; outbox_records = transition.outbox_records
-         ; pending_payload = transition.pending_payload
+         ; pending_message = transition.pending_message
          })
   in
   Alcotest.check
@@ -2001,6 +2240,30 @@ let scenarios =
       "authoritative pull rejects cursor gaps"
       `Quick
       test_authoritative_pull_rejects_cursor_gaps
+  ; Alcotest.test_case
+      "authoritative pull accepts Transit list collection"
+      `Quick
+      test_authoritative_pull_accepts_transit_list_collection
+  ; Alcotest.test_case
+      "authoritative pull rejects invalid collection entries"
+      `Quick
+      test_authoritative_pull_rejects_empty_or_non_array_operations
+  ; Alcotest.test_case
+      "duplicate pull skips authoritative transaction bodies"
+      `Quick
+      test_duplicate_pull_skips_authoritative_transaction_bodies
+  ; Alcotest.test_case
+      "duplicate pull preserves outbox processing"
+      `Quick
+      test_duplicate_pull_preserves_outbox_processing
+  ; Alcotest.test_case
+      "duplicate pull rejects future transaction cursor"
+      `Quick
+      test_duplicate_pull_still_rejects_future_transaction_cursor
+  ; Alcotest.test_case
+      "typed WebSocket messages reach sync policy"
+      `Quick
+      test_typed_websocket_messages_reach_policy_without_raw_json
   ; Alcotest.test_case
       "submission waits for durable outbox transition"
       `Quick

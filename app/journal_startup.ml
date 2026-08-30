@@ -43,7 +43,7 @@ type startup_state =
 let startup_error stage message =
   let owner, recovery =
     match stage with
-    | Logseq_sync.Core.During_authentication -> Authentication, Some Sign_in
+    | Logseq_sync_pure_reducer.Core.During_authentication -> Authentication, Some Sign_in
     | During_catalog -> Catalog, Some Refresh_catalog
     | During_local_restore -> Local_restore, Some Begin_online_recovery
     | During_bootstrap -> Bootstrap, Some Begin_online_recovery
@@ -53,7 +53,7 @@ let startup_error stage message =
 ;;
 
 let graph_matches snapshot (graph : Logseq_db_worker.graph_state) =
-  graph.generation = snapshot.Logseq_sync.Core.startup.graph_generation
+  graph.generation = snapshot.Logseq_sync_pure_reducer.Core.startup.graph_generation
   && Option.equal
        Logseq_db_types.Graph_types.Uuid.equal
        graph.graph_id
@@ -61,7 +61,7 @@ let graph_matches snapshot (graph : Logseq_db_worker.graph_state) =
 ;;
 
 let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
-  let facts = snapshot.Logseq_sync.Core.startup in
+  let facts = snapshot.Logseq_sync_pure_reducer.Core.startup in
   let graph_is_current = graph_matches snapshot graph in
   let ready =
     facts.authenticated

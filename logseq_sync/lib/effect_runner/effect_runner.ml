@@ -1,4 +1,5 @@
-module Pure = Logseq_sync_pure_core.Pure_core
+module Core = Logseq_sync_pure_reducer.Core
+module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
 
 type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
@@ -32,13 +33,25 @@ type transport =
   ; close_websocket : Websocket_eio.t -> unit
   }
 
-let transport ~network ~clock =
+type tls_authenticator = X509.Authenticator.t
+
+let tls_authenticator authenticator = authenticator
+
+let system_tls_authenticator () =
+  Ca_certs_nss.authenticator ()
+  |> Result.map_error (fun (`Msg message) -> Invalid_dependency message)
+;;
+
+let transport ~tls_authenticator ~network ~clock =
   Ok
-    { perform_http = (fun ~sw request -> Http_eio.perform ~sw ~network ~clock request)
+    { perform_http =
+        (fun ~sw request ->
+          Http_eio.perform ~sw ~authenticator:tls_authenticator ~network ~clock request)
     ; download =
         (fun ~sw ~request ~destination ~maximum_bytes ~on_progress ->
           Http_eio.download
             ~sw
+            ~authenticator:tls_authenticator
             ~network
             ~clock
             ~request
@@ -49,6 +62,7 @@ let transport ~network ~clock =
         (fun ~sw ~uri ~token ~maximum_frame_bytes ~on_message ~on_close ->
           Websocket_eio.connect
             ~sw
+            ~authenticator:tls_authenticator
             ~network
             ~clock
             ~uri
@@ -611,7 +625,12 @@ let submit t instruction =
             ~token:request.token
             ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
             ~on_message:(fun payload ->
-              if not t.closed then t.post (Core.Websocket_frame (request.scope, payload)))
+              if not t.closed
+              then (
+                match Sync_protocol.decode_server_message payload with
+                | Ok message -> t.post (Core.Websocket_message (request.scope, message))
+                | Error error ->
+                  t.post (Core.Websocket_protocol_error (request.scope, error))))
             ~on_close:(fun message ->
               Hashtbl.remove t.websockets key;
               if not t.closed then t.post (Core.Websocket_closed (request.scope, message)))
@@ -623,11 +642,14 @@ let submit t instruction =
           Hashtbl.replace t.websockets key (request.scope, websocket);
           if not t.closed then t.post (Core.Websocket_opened request.scope))
     | Send_websocket request ->
-      Hashtbl.iter
-        (fun _ (scope, websocket) ->
-           if scope = request.scope
-           then ignore (t.dependencies.transport.send_websocket websocket request.payload))
-        t.websockets
+      (match Sync_protocol.encode_client_message request.message with
+       | Error error -> t.post (Core.Websocket_protocol_error (request.scope, error))
+       | Ok payload ->
+         Hashtbl.iter
+           (fun _ (scope, websocket) ->
+              if scope = request.scope
+              then ignore (t.dependencies.transport.send_websocket websocket payload))
+           t.websockets)
     | Close_websocket scope ->
       Hashtbl.filter_map_inplace
         (fun _ (actual, websocket) ->

@@ -24,10 +24,9 @@ let host_name host =
     | Error _ -> Error (`Msg "HTTPS host is not a valid DNS name"))
 ;;
 
-let tls_config host =
-  bind (Ca_certs_nss.authenticator ()) (fun authenticator ->
-    bind (host_name host) (fun peer_name ->
-      Tls.Config.client ~authenticator ~peer_name ()))
+let tls_config authenticator host =
+  bind (host_name host) (fun peer_name ->
+    Tls.Config.client ~authenticator ~peer_name ~alpn_protocols:[ "http/1.1" ] ())
 ;;
 
 let first_address ~network ~host ~port =
@@ -38,11 +37,11 @@ let first_address ~network ~host ~port =
 
 let port uri = Option.value (Uri.port uri) ~default:443
 
-let open_flow ~sw ~network uri =
+let open_flow ~sw ~authenticator ~network uri =
   match Uri.host uri with
   | None -> Error "HTTPS request host is missing"
   | Some host ->
-    (match tls_config host with
+    (match tls_config authenticator host with
      | Error (`Msg message) -> Error message
      | Ok config ->
        bind
@@ -68,9 +67,10 @@ let request_headers uri headers =
 ;;
 
 let protocol_error_message context = function
-  | `Malformed_response _ -> context ^ ": malformed HTTP response"
+  | `Malformed_response message -> context ^ ": malformed HTTP response: " ^ message
   | `Invalid_response_body_length _ -> context ^ ": invalid HTTP response body length"
-  | `Exn _ -> context ^ ": HTTP transport exception"
+  | `Exn exception_ ->
+    context ^ ": HTTP transport exception: " ^ Printexc.to_string exception_
 ;;
 
 let tls_stream_socket flow =
@@ -89,8 +89,8 @@ let tls_stream_socket flow =
   Eio.Resource.T (flow, Eio.Net.Pi.stream_socket (module Socket))
 ;;
 
-let request_once ~sw ~network request =
-  bind (open_flow ~sw ~network request.Http.uri) (fun flow ->
+let request_once ~sw ~authenticator ~network request =
+  bind (open_flow ~sw ~authenticator ~network request.Http.uri) (fun flow ->
     let client = Httpun_eio.Client.create_connection ~sw (tls_stream_socket flow) in
     let result, resolve_result = Eio.Promise.create () in
     let resolve value = ignore (Eio.Promise.try_resolve resolve_result value : bool) in
@@ -155,8 +155,16 @@ let remove_if_exists path =
   | Sys_error _ -> ()
 ;;
 
-let download_once ~sw ~network ~request ~destination ~maximum_bytes ~on_progress =
-  bind (open_flow ~sw ~network request.Http.uri) (fun flow ->
+let download_once
+      ~sw
+      ~authenticator
+      ~network
+      ~request
+      ~destination
+      ~maximum_bytes
+      ~on_progress
+  =
+  bind (open_flow ~sw ~authenticator ~network request.Http.uri) (fun flow ->
     let client = Httpun_eio.Client.create_connection ~sw (tls_stream_socket flow) in
     let result, resolve_result = Eio.Promise.create () in
     let resolve value = ignore (Eio.Promise.try_resolve resolve_result value : bool) in
@@ -257,10 +265,10 @@ let location headers =
     if String.equal (String.lowercase_ascii name) "location" then Some value else None)
 ;;
 
-let perform ~sw ~network ~clock request =
+let perform ~sw ~authenticator ~network ~clock request =
   initialize_rng ();
   let rec follow remaining request =
-    match request_once ~sw ~network request with
+    match request_once ~sw ~authenticator ~network request with
     | Error _ as error -> error
     | Ok response when redirect_status response.status ->
       if remaining = 0
@@ -287,7 +295,16 @@ let perform ~sw ~network ~clock request =
   | exception_ -> Error (Printexc.to_string exception_)
 ;;
 
-let download ~sw ~network ~clock ~request ~destination ~maximum_bytes ~on_progress =
+let download
+      ~sw
+      ~authenticator
+      ~network
+      ~clock
+      ~request
+      ~destination
+      ~maximum_bytes
+      ~on_progress
+  =
   initialize_rng ();
   if maximum_bytes <= 0
   then Error "snapshot artifact bound must be positive"
@@ -295,7 +312,14 @@ let download ~sw ~network ~clock ~request ~destination ~maximum_bytes ~on_progre
     let rec follow remaining request =
       remove_if_exists destination;
       match
-        download_once ~sw ~network ~request ~destination ~maximum_bytes ~on_progress
+        download_once
+          ~sw
+          ~authenticator
+          ~network
+          ~request
+          ~destination
+          ~maximum_bytes
+          ~on_progress
       with
       | Error _ as error ->
         remove_if_exists destination;

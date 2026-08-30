@@ -6,6 +6,7 @@ type response =
 
 val perform
   :  sw:Eio.Switch.t
+  -> authenticator:X509.Authenticator.t
   -> network:_ Eio.Net.t
   -> clock:_ Eio.Time.clock
   -> Http.request
@@ -13,6 +14,7 @@ val perform
 
 val download
   :  sw:Eio.Switch.t
+  -> authenticator:X509.Authenticator.t
   -> network:_ Eio.Net.t
   -> clock:_ Eio.Time.clock
   -> request:Http.request

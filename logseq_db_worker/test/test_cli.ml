@@ -3,7 +3,7 @@ module F = Logseq_db_worker_test_support.Adapter_fixture
 module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Worker_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
-module Runner = Logseq_sync.Effect_runner
+module Runner = Logseq_sync_effect_runner.Effect_runner
 
 let worker_dependencies =
   let crypto =
@@ -35,7 +35,11 @@ let worker_dependencies =
       ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
     |> Result.get_ok
   in
-  Worker_service.dependencies ~engine:F.dependencies ~secrets ~crypto
+  Worker_service.dependencies
+    ~engine:F.dependencies
+    ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
+    ~secrets
+    ~crypto
 ;;
 
 let send_graph client request = Worker.send client (Worker_service.Graph_request request)

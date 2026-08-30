@@ -65,6 +65,7 @@ type limits =
   ; maximum_artifact_bytes : int
   ; submission_batch_size : int
   }
+[@@warning "-69"]
 
 type config =
   { managed_sync_origin : Uri.t
@@ -105,6 +106,7 @@ type token_request =
   ; graph_generation : graph_generation option
   ; connection_generation : connection_generation option
   }
+[@@warning "-69"]
 
 let token_request_id request = request.request_id
 let token_request_purpose request = request.purpose
@@ -172,6 +174,7 @@ type staged_artifact =
   ; artifact_path : string
   ; artifact_expected_rows : int
   }
+[@@warning "-69"]
 
 type catalog_cache =
   { cache_user_id : string
@@ -289,6 +292,10 @@ type outbox_record =
 
 let outbox_record_mutation_id record = record.mutation_id
 let outbox_record_fingerprint record = record.mutation_fingerprint
+
+let recompute_checksum database =
+  Checksum.recompute ~e2ee:(Checksum.graph_e2ee database) database
+;;
 
 let outbox_state_to_json = function
   | Queued -> `Assoc [ "type", `String "queued" ]
@@ -823,7 +830,7 @@ type websocket_request =
 
 type websocket_send =
   { scope : connection_scope
-  ; payload : string
+  ; message : Sync_protocol.Client.message
   }
 
 type timer_id = int
@@ -938,10 +945,7 @@ let runner_effect_diagnostic = function
   | Start_websocket request ->
     "start_websocket:" ^ scope_diagnostic (effect_scope_of_connection request.scope)
   | Send_websocket request ->
-    Printf.sprintf
-      "send_websocket:%s:%d"
-      (scope_diagnostic (effect_scope_of_connection request.scope))
-      (String.length request.payload)
+    "send_websocket:" ^ scope_diagnostic (effect_scope_of_connection request.scope)
   | Close_websocket scope ->
     "close_websocket:" ^ scope_diagnostic (effect_scope_of_connection scope)
   | Schedule_timer request ->
@@ -1057,7 +1061,7 @@ type local_batch_commit_request =
   }
 
 type authoritative_batch =
-  { payload : string
+  { message : Sync_protocol.Server.message
   ; scope : connection_scope
   ; presentation_generation : presentation_generation
   ; lifecycle_generation : lifecycle_generation
@@ -1070,18 +1074,9 @@ type authoritative_context =
   ; outbox_records : string list
   }
 
-type authoritative_message =
-  | Authoritative_pull of
-      { server_t : int
-      ; checksum : string option
-      ; transactions : (int * string) list
-      }
-  | Authoritative_cursor of { server_t : int }
-  | Authoritative_submission_accepted of { server_t : int }
-
 type authoritative_plan =
   { authoritative_context : authoritative_context
-  ; authoritative_message : authoritative_message
+  ; authoritative_wires : string list
   ; authoritative_outbox : outbox_record list
   ; authoritative_protected_values : (string * string) list
   ; authoritative_key : graph_key_handle option
@@ -1095,70 +1090,6 @@ type authoritative_commit_request =
   ; outbox_records : string list
   ; activity : Logseq_db_types.Sync_status.activity
   }
-
-let json_field name fields = List.assoc_opt name fields
-
-let json_non_negative_int name fields =
-  match json_field name fields with
-  | Some (`Int value) when value >= 0 -> Ok value
-  | Some _ | None -> Error (name ^ " must be a non-negative integer")
-;;
-
-let json_optional_checksum fields =
-  match json_field "checksum" fields with
-  | None | Some `Null -> Ok None
-  | Some (`String value)
-    when String.length value = 16
-         && String.for_all
-              (function
-                | '0' .. '9' | 'a' .. 'f' -> true
-                | _ -> false)
-              value -> Ok (Some value)
-  | Some _ -> Error "checksum is invalid"
-;;
-
-let parse_authoritative_message source =
-  try
-    match Yojson.Safe.from_string source with
-    | `Assoc fields ->
-      (match json_field "type" fields with
-       | Some (`String "pull/ok") ->
-         Result.bind (json_non_negative_int "t" fields) (fun server_t ->
-           Result.bind (json_optional_checksum fields) (fun checksum ->
-             match json_field "txs" fields with
-             | Some (`List values) ->
-               let rec decode transactions = function
-                 | [] ->
-                   Ok
-                     (Authoritative_pull
-                        { server_t; checksum; transactions = List.rev transactions })
-                 | `Assoc transaction :: rest ->
-                   (match json_field "t" transaction, json_field "tx" transaction with
-                    | Some (`Int transaction_t), Some (`String wire)
-                      when transaction_t >= 0 && String.length wire > 0 ->
-                      decode ((transaction_t, wire) :: transactions) rest
-                    | _ -> Error "pull transaction is invalid")
-                 | _ :: _ -> Error "pull transaction must be an object"
-               in
-               decode [] values
-             | Some _ | None -> Error "pull response must contain transactions"))
-       | Some (`String ("hello" | "changed")) ->
-         Result.map
-           (fun server_t -> Authoritative_cursor { server_t })
-           (json_non_negative_int "t" fields)
-       | Some (`String "tx/batch/ok") ->
-         Result.map
-           (fun server_t -> Authoritative_submission_accepted { server_t })
-           (json_non_negative_int "t" fields)
-       | Some (`String ("pong" | "online-users")) ->
-         Error "non-authoritative WebSocket message"
-       | Some (`String message_type) ->
-         Error ("unsupported authoritative message: " ^ message_type)
-       | Some _ | None -> Error "authoritative message type is invalid")
-    | _ -> Error "authoritative message must be an object"
-  with
-  | Yojson.Json_error message -> Error message
-;;
 
 let protected_envelope source =
   try
@@ -1193,7 +1124,8 @@ let validate_pull_continuity applied_server_t server_t transactions =
   then
     if
       List.for_all
-        (fun (transaction_t, _) -> transaction_t <= applied_server_t)
+        (fun (transaction : Sync_protocol.Server.pull_transaction) ->
+           transaction.t <= applied_server_t)
         transactions
     then Ok ()
     else Error "duplicate pull contains a future transaction"
@@ -1203,8 +1135,8 @@ let validate_pull_continuity applied_server_t server_t transactions =
         if expected - 1 = server_t
         then Ok ()
         else Error "pull response cursor does not match its final transaction"
-      | (transaction_t, _) :: rest ->
-        if transaction_t = expected
+      | (transaction : Sync_protocol.Server.pull_transaction) :: rest ->
+        if transaction.t = expected
         then loop (expected + 1) rest
         else Error "pull response contains a server cursor gap"
     in
@@ -1213,56 +1145,55 @@ let validate_pull_continuity applied_server_t server_t transactions =
 
 let begin_authoritative_batch (context : authoritative_context) =
   Result.bind (decode_outbox_records context.outbox_records) (fun outbox ->
-    Result.bind
-      (parse_authoritative_message context.batch.payload)
-      (fun authoritative_message ->
-         let wires, outbox =
-           match authoritative_message with
-           | Authoritative_pull { server_t; transactions; _ } ->
-             ( List.map snd transactions
-             , List.filter
-                 (fun record ->
-                    match record.outbox_state with
-                    | Accepted accepted_t -> accepted_t > server_t
-                    | Queued | Submitted | Blocked _ -> true)
-                 outbox )
-           | Authoritative_cursor _ -> [], outbox
-           | Authoritative_submission_accepted { server_t } ->
-             ( []
-             , List.map
-                 (fun record ->
-                    match record.outbox_state with
-                    | Submitted -> { record with outbox_state = Accepted server_t }
-                    | Queued | Accepted _ | Blocked _ -> record)
-                 outbox )
-         in
-         let projection_wires = List.map (fun record -> record.encoded_tx) outbox in
-         Result.bind
-           (collect_protected_values (wires @ projection_wires))
-           (fun values ->
-              match authoritative_message with
-              | Authoritative_pull { server_t; transactions; _ } ->
-                Result.bind
-                  (validate_pull_continuity
-                     context.checkpoint.applied_server_t
-                     server_t
-                     transactions)
-                  (fun () ->
-                     Ok
-                       { authoritative_context = context
-                       ; authoritative_message
-                       ; authoritative_outbox = outbox
-                       ; authoritative_protected_values = values
-                       ; authoritative_key = None
-                       })
-              | Authoritative_cursor _ | Authoritative_submission_accepted _ ->
-                Ok
-                  { authoritative_context = context
-                  ; authoritative_message
-                  ; authoritative_outbox = outbox
-                  ; authoritative_protected_values = values
-                  ; authoritative_key = None
-                  })))
+    let message = context.batch.message in
+    let prepared =
+      match message with
+      | Sync_protocol.Server.Pull_ok { t; txs; _ } ->
+        Result.bind
+          (validate_pull_continuity context.checkpoint.applied_server_t t txs)
+          (fun () ->
+             let wires =
+               if t = context.checkpoint.applied_server_t
+               then []
+               else
+                 List.map
+                   (fun (transaction : Sync_protocol.Server.pull_transaction) ->
+                      transaction.tx)
+                   txs
+             in
+             Ok
+               ( wires
+               , List.filter
+                   (fun record ->
+                      match record.outbox_state with
+                      | Accepted accepted_t -> accepted_t > t
+                      | Queued | Submitted | Blocked _ -> true)
+                   outbox ))
+      | Sync_protocol.Server.Hello _ | Changed _ -> Ok ([], outbox)
+      | Sync_protocol.Server.Tx_batch_ok { t; _ } ->
+        Ok
+          ( []
+          , List.map
+              (fun record ->
+                 match record.outbox_state with
+                 | Submitted -> { record with outbox_state = Accepted t }
+                 | Queued | Accepted _ | Blocked _ -> record)
+              outbox )
+      | Sync_protocol.Server.Online_users _ | Presence _ | Tx_reject _ | Pong | Error _ ->
+        Error "server message is not authoritative"
+    in
+    Result.bind prepared (fun (wires, outbox) ->
+      let projection_wires = List.map (fun record -> record.encoded_tx) outbox in
+      Result.bind
+        (collect_protected_values (wires @ projection_wires))
+        (fun values ->
+           Ok
+             { authoritative_context = context
+             ; authoritative_wires = wires
+             ; authoritative_outbox = outbox
+             ; authoritative_protected_values = values
+             ; authoritative_key = None
+             })))
 ;;
 
 let authoritative_crypto_request plan =
@@ -1336,76 +1267,83 @@ let finish_authoritative_batch plan decrypted_values =
   Result.bind decrypted_values (fun decrypted ->
     let context = plan.authoritative_context in
     let authoritative_wires =
-      match plan.authoritative_message with
-      | Authoritative_pull { transactions; _ } -> List.map snd transactions
-      | Authoritative_cursor _ | Authoritative_submission_accepted _ -> []
+      match context.batch.message with
+      | Sync_protocol.Server.Pull_ok _ -> Ok plan.authoritative_wires
+      | Sync_protocol.Server.Hello _ | Changed _ | Tx_batch_ok _ -> Ok []
+      | Sync_protocol.Server.Online_users _ | Presence _ | Tx_reject _ | Pong | Error _ ->
+        Error "server message is not authoritative"
     in
-    Result.bind
-      (decode_authoritative_transactions context.database authoritative_wires decrypted)
-      (fun (transactions, database_after, decrypted) ->
-         let projection_wires =
-           List.map (fun record -> record.encoded_tx) plan.authoritative_outbox
-         in
-         Result.bind
-           (decode_authoritative_transactions database_after projection_wires decrypted)
-           (fun (projection_transactions, _projected, remaining) ->
-              if remaining <> []
-              then Error "decrypted value count does not match protected values"
-              else
-                Result.bind
-                  (encode_outbox_records plan.authoritative_outbox)
-                  (fun outbox_records ->
-                     let checkpoint, activity, transactions =
-                       match plan.authoritative_message with
-                       | Authoritative_pull { server_t; checksum = _; _ }
-                         when server_t = context.checkpoint.applied_server_t ->
-                         ( context.checkpoint
-                         , Logseq_db_types.Sync_status.Pull_duplicate
-                         , [] )
-                       | Authoritative_pull { server_t; checksum; _ } ->
-                         let local_checksum =
-                           Checksum.recompute
-                             ~e2ee:(Checksum.graph_e2ee database_after)
-                             database_after
-                         in
-                         (match checksum with
-                          | Some remote when not (String.equal remote local_checksum) ->
-                            let message =
-                              Printf.sprintf
-                                "Entity checksum mismatch at server t %d (local %s, \
-                                 remote %s)."
-                                server_t
-                                local_checksum
-                                remote
-                            in
-                            ( checkpoint_paused context.checkpoint message |> Result.get_ok
-                            , Logseq_db_types.Sync_status.Sync_paused
-                            , [] )
-                          | None | Some _ ->
-                            ( checkpoint_advanced
-                                context.checkpoint
-                                server_t
-                                (Option.value checksum ~default:local_checksum)
-                              |> Result.get_ok
-                            , Logseq_db_types.Sync_status.Pull_applied
-                            , transactions ))
-                       | Authoritative_cursor { server_t } ->
-                         ( context.checkpoint
-                         , (if server_t > context.checkpoint.applied_server_t
-                            then Logseq_db_types.Sync_status.Pull_required
-                            else Pull_duplicate)
-                         , [] )
-                       | Authoritative_submission_accepted _ ->
-                         context.checkpoint, Logseq_db_types.Sync_status.Pull_required, []
-                     in
-                     Ok
-                       { scope = context.batch.scope.graph
-                       ; transactions
-                       ; projection_transactions
-                       ; checkpoint
-                       ; outbox_records
-                       ; activity
-                       }))))
+    Result.bind authoritative_wires (fun authoritative_wires ->
+      Result.bind
+        (decode_authoritative_transactions context.database authoritative_wires decrypted)
+        (fun (transactions, database_after, decrypted) ->
+           let projection_wires =
+             List.map (fun record -> record.encoded_tx) plan.authoritative_outbox
+           in
+           Result.bind
+             (decode_authoritative_transactions database_after projection_wires decrypted)
+             (fun (projection_transactions, _projected, remaining) ->
+                if remaining <> []
+                then Error "decrypted value count does not match protected values"
+                else
+                  Result.bind
+                    (encode_outbox_records plan.authoritative_outbox)
+                    (fun outbox_records ->
+                       let outcome =
+                         match context.batch.message with
+                         | Sync_protocol.Server.Pull_ok { t; checksum = _; _ }
+                           when t = context.checkpoint.applied_server_t ->
+                           Ok
+                             ( context.checkpoint
+                             , Logseq_db_types.Sync_status.Pull_duplicate
+                             , [] )
+                         | Sync_protocol.Server.Pull_ok { t; checksum; _ } ->
+                           let local_checksum = recompute_checksum database_after in
+                           (match checksum with
+                            | Some remote when not (String.equal remote local_checksum) ->
+                              let message =
+                                Printf.sprintf
+                                  "Entity checksum mismatch at server t %d (local %s, \
+                                   remote %s)."
+                                  t
+                                  local_checksum
+                                  remote
+                              in
+                              Ok
+                                ( checkpoint_paused context.checkpoint message
+                                  |> Result.get_ok
+                                , Logseq_db_types.Sync_status.Sync_paused
+                                , [] )
+                            | None | Some _ ->
+                              Ok
+                                ( checkpoint_advanced
+                                    context.checkpoint
+                                    t
+                                    (Option.value checksum ~default:local_checksum)
+                                  |> Result.get_ok
+                                , Logseq_db_types.Sync_status.Pull_applied
+                                , transactions ))
+                         | Sync_protocol.Server.Hello _ | Changed _ | Tx_batch_ok _ ->
+                           Ok
+                             ( context.checkpoint
+                             , Logseq_db_types.Sync_status.Pull_required
+                             , [] )
+                         | Sync_protocol.Server.Online_users _
+                         | Presence _
+                         | Tx_reject _
+                         | Pong
+                         | Error _ -> Error "server message is not authoritative"
+                       in
+                       Result.map
+                         (fun (checkpoint, activity, transactions) ->
+                            { scope = context.batch.scope.graph
+                            ; transactions
+                            ; projection_transactions
+                            ; checkpoint
+                            ; outbox_records
+                            ; activity
+                            })
+                         outcome)))))
 ;;
 
 type outbox_transition =
@@ -1414,7 +1352,7 @@ type outbox_transition =
   ; lifecycle_generation : lifecycle_generation
   ; expected_outbox_records : string list
   ; outbox_records : string list
-  ; pending_payload : string option
+  ; pending_message : Sync_protocol.Client.message option
   }
 
 type worker_effect =
@@ -1484,7 +1422,7 @@ type authoritative_commit_result =
 type outbox_transition_commit =
   { scope : graph_scope
   ; outbox_records : string list
-  ; pending_payload : string option
+  ; pending_message : Sync_protocol.Client.message option
   }
 
 type outbox_transition_rejection =
@@ -1527,7 +1465,8 @@ type event =
   | Runner_completed of runner_completion
   | Snapshot_download_progress of bootstrap_progress
   | Websocket_opened of connection_scope
-  | Websocket_frame of connection_scope * string
+  | Websocket_message of connection_scope * Sync_protocol.Server.message
+  | Websocket_protocol_error of connection_scope * Sync_protocol.codec_error
   | Websocket_closed of connection_scope * string option
   | Timer_elapsed of timer_id
   | Shutdown
@@ -2652,24 +2591,19 @@ let take_values count values =
   loop count [] values
 ;;
 
-let submission_payload applied_server_t records =
-  let transactions =
-    List.map
-      (fun record ->
-         `Assoc
-           [ "tx", `String record.encoded_tx
-           ; ( "tx-id"
-             , `String (Logseq_db_types.Graph_types.Uuid.to_string record.mutation_id) )
-           ; "outliner-op", `String record.outliner_op
-           ])
-      records
-  in
-  Yojson.Safe.to_string
-    (`Assoc
-        [ "type", `String "tx/batch"
-        ; "t-before", `Int applied_server_t
-        ; "txs", `List transactions
-        ])
+let submission_message applied_server_t records =
+  Sync_protocol.Client.Tx_batch
+    { client_revision = None
+    ; t_before = applied_server_t
+    ; txs =
+        List.map
+          (fun record : Sync_protocol.Client.transaction ->
+             { tx = record.encoded_tx
+             ; tx_id = Some record.mutation_id
+             ; outliner_op = Some record.outliner_op
+             })
+          records
+    }
 ;;
 
 let plan_submission core =
@@ -2707,7 +2641,7 @@ let plan_submission core =
          match encode_outbox_records transitioned with
          | Error message -> catalog_failed core message
          | Ok outbox_records ->
-           let payload = submission_payload applied_server_t queued in
+           let message = submission_message applied_server_t queued in
            let transition =
              { scope
              ; presentation_generation =
@@ -2715,7 +2649,7 @@ let plan_submission core =
              ; lifecycle_generation = core.lifecycle_generation
              ; expected_outbox_records = core.outbox_records
              ; outbox_records
-             ; pending_payload = Some payload
+             ; pending_message = Some message
              }
            in
            { next = core; effects = [ Delegate (Commit_outbox_transition transition) ] }))
@@ -2733,14 +2667,14 @@ let outbox_transition_committed core (commit : outbox_transition_commit) =
   then unchanged core
   else (
     let core = { core with outbox_records = commit.outbox_records } in
-    match commit.pending_payload, core.current_graph_scope with
-    | Some payload, Some graph when core.websocket_live ->
+    match commit.pending_message, core.current_graph_scope with
+    | Some message, Some graph when core.websocket_live ->
       let connection = { graph; connection_generation = core.connection_generation } in
       let snapshot = { core.public_state.snapshot with sync_phase = Submitting } in
       let next = set_snapshot core snapshot in
       { next
       ; effects =
-          [ Run (Send_websocket { scope = connection; payload }); publish_state next ]
+          [ Run (Send_websocket { scope = connection; message }); publish_state next ]
       }
     | Some _, (None | Some _) | None, _ -> unchanged core)
 ;;
@@ -2761,7 +2695,6 @@ let start_authoritative_batch core (context : authoritative_context) =
   then unchanged core
   else (
     match begin_authoritative_batch context with
-    | Error "non-authoritative WebSocket message" -> unchanged core
     | Error message -> catalog_failed core message
     | Ok plan ->
       let plan = { plan with authoritative_key = core.graph_key } in
@@ -2834,31 +2767,72 @@ let connection_is_current core (connection : connection_scope) =
   && connection.connection_generation = core.connection_generation
 ;;
 
+let pull_effect core =
+  match core.current_graph_scope, core.public_state.snapshot.applied_server_t with
+  | Some graph, Some applied_server_t when core.websocket_live ->
+    let scope = { graph; connection_generation = core.connection_generation } in
+    Some
+      (Run
+         (Send_websocket
+            { scope
+            ; message = Sync_protocol.Client.Pull { since = Some applied_server_t }
+            }))
+  | _ -> None
+;;
+
 let websocket_opened core (connection : connection_scope) =
   if not (connection_is_current core connection)
   then unchanged core
   else (
     let snapshot =
-      { core.public_state.snapshot with sync_phase = Current; last_error = None }
+      { core.public_state.snapshot with sync_phase = Pulling; last_error = None }
     in
     let next = set_snapshot { core with websocket_live = true } snapshot in
-    let submission = plan_submission next in
-    { next = submission.next; effects = publish_state next :: submission.effects })
+    let effects =
+      match pull_effect next with
+      | Some instruction -> [ publish_state next; instruction ]
+      | None -> [ publish_state next ]
+    in
+    { next; effects })
 ;;
 
-let websocket_frame core (connection : connection_scope) payload =
+let rejection_reason_name = function
+  | Sync_protocol.Stale -> "stale"
+  | Db_transact_failed -> "db transact failed"
+  | Empty_tx_data -> "empty tx data"
+  | Invalid_tx -> "invalid tx"
+  | Invalid_t_before -> "invalid t-before"
+  | Snapshot_upload_in_progress -> "snapshot upload in progress"
+;;
+
+let websocket_message core (connection : connection_scope) message =
   if not (connection_is_current core connection)
   then unchanged core
   else (
-    let batch =
-      { payload
-      ; scope = connection
-      ; presentation_generation =
-          core.public_state.snapshot.startup.presentation_generation
-      ; lifecycle_generation = core.lifecycle_generation
-      }
-    in
-    { next = core; effects = [ Delegate (Inspect_authoritative_batch batch) ] })
+    match message with
+    | Sync_protocol.Server.Hello _ | Pull_ok _ | Changed _ | Tx_batch_ok _ ->
+      let batch =
+        { message
+        ; scope = connection
+        ; presentation_generation =
+            core.public_state.snapshot.startup.presentation_generation
+        ; lifecycle_generation = core.lifecycle_generation
+        }
+      in
+      { next = core; effects = [ Delegate (Inspect_authoritative_batch batch) ] }
+    | Sync_protocol.Server.Tx_reject rejection ->
+      catalog_failed
+        core
+        ("transaction rejected: " ^ rejection_reason_name rejection.reason)
+    | Sync_protocol.Server.Error { message } ->
+      catalog_failed core ("sync server error: " ^ message)
+    | Sync_protocol.Server.Online_users _ | Presence _ | Pong -> unchanged core)
+;;
+
+let websocket_protocol_error core (connection : connection_scope) error =
+  if not (connection_is_current core connection)
+  then unchanged core
+  else catalog_failed core (Sync_protocol.error_to_string error)
 ;;
 
 let websocket_closed core (connection : connection_scope) message =
@@ -2876,10 +2850,11 @@ let authoritative_applied core (result : authoritative_commit_result) =
   if not (graph_scope_is_current core result.scope)
   then unchanged core
   else (
-    let sync_phase =
+    let sync_phase, should_pull =
       match result.activity with
-      | Logseq_db_types.Sync_status.Sync_paused | Sync_submission_blocked -> Paused
-      | Pull_applied | Pull_duplicate | Pull_required -> Current
+      | Logseq_db_types.Sync_status.Sync_paused | Sync_submission_blocked -> Paused, false
+      | Pull_applied | Pull_duplicate -> Current, false
+      | Pull_required -> Pulling, core.public_state.snapshot.sync_phase <> Pulling
     in
     let snapshot =
       { core.public_state.snapshot with
@@ -2903,7 +2878,13 @@ let authoritative_applied core (result : authoritative_commit_result) =
       | Current -> plan_submission next
       | Offline | Connecting | Pulling | Submitting | Paused | Failed -> unchanged next
     in
-    { next = submission.next; effects = published @ submission.effects })
+    let pull =
+      if should_pull
+      then
+        Option.fold ~none:[] ~some:(fun instruction -> [ instruction ]) (pull_effect next)
+      else []
+    in
+    { next = submission.next; effects = published @ pull @ submission.effects })
 ;;
 
 let snapshot_activated core (activation : snapshot_activation) =
@@ -3108,7 +3089,9 @@ let step core event =
     | Mirror_inspected result -> mirror_inspected core result
     | Graph_attached attachment -> graph_attached core attachment
     | Websocket_opened connection -> websocket_opened core connection
-    | Websocket_frame (connection, payload) -> websocket_frame core connection payload
+    | Websocket_message (connection, message) -> websocket_message core connection message
+    | Websocket_protocol_error (connection, error) ->
+      websocket_protocol_error core connection error
     | Websocket_closed (connection, message) -> websocket_closed core connection message
     | Authoritative_batch_applied result -> authoritative_applied core result
     | Snapshot_activated activation -> snapshot_activated core activation

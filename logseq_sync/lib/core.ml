@@ -1,1 +1,0 @@
-include Logseq_sync_pure_core.Pure_core

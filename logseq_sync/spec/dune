@@ -1,7 +1,0 @@
-(library
- (name logseq_sync)
- (public_name logseq_sync)
- (modules core effect_runner)
- (virtual_modules core effect_runner)
- (default_implementation logseq_sync_impl)
- (libraries datascript_ocaml eio logseq_db_types uri))

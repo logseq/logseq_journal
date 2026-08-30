@@ -4,16 +4,16 @@ type client_command =
   | Acknowledge_local_feed
   | Acknowledge_timeline_presented
   | Provide_token of
-      { request : Logseq_sync.Core.token_request
+      { request : Logseq_sync_pure_reducer.Core.token_request
       ; token : string
       }
-  | Reject_token of Logseq_sync.Core.token_request
-  | Select_graph of Logseq_sync.Core.graph_id
+  | Reject_token of Logseq_sync_pure_reducer.Core.token_request
+  | Select_graph of Logseq_sync_pure_reducer.Core.graph_id
   | Return_to_graph_picker
   | Refresh_catalog
   | Begin_online_recovery
   | Submit_e2ee_password of string
-  | Delete_local_cache of Logseq_sync.Core.graph_id
+  | Delete_local_cache of Logseq_sync_pure_reducer.Core.graph_id
   | Set_foreground of bool
 
 type request =
@@ -22,15 +22,15 @@ type request =
   | Get_graph_state
 
 type response =
-  | Client_state of Logseq_sync.Core.state
+  | Client_state of Logseq_sync_pure_reducer.Core.state
   | Graph_response of Logseq_db_worker.Protocol.response
   | Graph_state of Logseq_db_worker.graph_state
 
 type push =
   | Graph_push of Logseq_db_worker.Protocol.push
-  | Client_state_changed of Logseq_sync.Core.state
-  | Need_id_token of Logseq_sync.Core.token_request
-  | Bootstrap_progress of Logseq_sync.Core.bootstrap_progress
+  | Client_state_changed of Logseq_sync_pure_reducer.Core.state
+  | Need_id_token of Logseq_sync_pure_reducer.Core.token_request
+  | Bootstrap_progress of Logseq_sync_pure_reducer.Core.bootstrap_progress
   | Graph_state_changed of Logseq_db_worker.graph_state
 
 val invalidation_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
@@ -43,8 +43,9 @@ type dependencies
 
 val dependencies
   :  engine:Logseq_db_worker.Engine.dependencies
-  -> secrets:Logseq_sync.Effect_runner.secrets
-  -> crypto:Logseq_sync.Effect_runner.crypto
+  -> tls_authenticator:Logseq_sync_effect_runner.Effect_runner.tls_authenticator
+  -> secrets:Logseq_sync_effect_runner.Effect_runner.secrets
+  -> crypto:Logseq_sync_effect_runner.Effect_runner.crypto
   -> dependencies
 
 val create

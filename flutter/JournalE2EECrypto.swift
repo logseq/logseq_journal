@@ -9,6 +9,18 @@ enum JournalE2EECryptoError: Error {
   case localPrivateKeyUnavailable
 }
 
+#if DEBUG && os(macOS)
+@_silgen_name("SecKeychainCreate")
+private func JournalSecKeychainCreate(
+  _ pathName: UnsafePointer<CChar>,
+  _ passwordLength: UInt32,
+  _ password: UnsafeRawPointer,
+  _ promptUser: Bool,
+  _ initialAccess: SecAccess?,
+  _ keychain: UnsafeMutablePointer<SecKeychain?>
+) -> OSStatus
+#endif
+
 private struct JournalDERReader {
   let bytes: [UInt8]
   var offset = 0
@@ -54,10 +66,13 @@ enum JournalE2EECrypto {
     "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE"
   private static let testWrappedKeyStorageEnvironment =
     "LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE"
+  private static let testFileKeychainEnvironment =
+    "LOGSEQ_JOURNAL_E2EE_TEST_FILE_KEYCHAIN"
 
   private enum SecretStorage {
     case keychain
 #if DEBUG
+    case testFileKeychain(SecKeychain)
     case testMemory
 #endif
   }
@@ -66,6 +81,8 @@ enum JournalE2EECrypto {
   private static let testMemorySecretsLock = NSLock()
   private static var testMemoryPrivateKeys: [String: Data] = [:]
   private static var testMemoryWrappedGraphKeys: [String: Data] = [:]
+  private static let testFileKeychainsLock = NSLock()
+  private static var testFileKeychains: [String: SecKeychain] = [:]
 #endif
 
   private struct SecretIdentity: Equatable {
@@ -363,7 +380,21 @@ enum JournalE2EECrypto {
     environmentVariable: String,
     environment: [String: String]
   ) throws -> SecretStorage {
-    guard let configured = environment[environmentVariable] else {
+    let configured = environment[environmentVariable]
+    let testFileKeychainPath = environment[testFileKeychainEnvironment]
+    guard configured == nil || testFileKeychainPath == nil else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+#if DEBUG
+    if let path = testFileKeychainPath {
+      return .testFileKeychain(try testFileKeychain(path: path))
+    }
+#else
+    if testFileKeychainPath != nil {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+#endif
+    guard let configured else {
       return .keychain
     }
 #if DEBUG
@@ -377,6 +408,74 @@ enum JournalE2EECrypto {
 #endif
   }
 
+#if DEBUG
+  private static func testFileKeychain(path: String) throws -> SecKeychain {
+    guard
+      path.hasPrefix("/"),
+      !path.contains("\0"),
+      !path.isEmpty,
+      path.utf8.count <= 4_096
+    else { throw JournalE2EECryptoError.invalidRequest }
+    testFileKeychainsLock.lock()
+    defer { testFileKeychainsLock.unlock() }
+    if let keychain = testFileKeychains[path] { return keychain }
+    guard !FileManager.default.fileExists(atPath: path) else {
+      throw JournalE2EECryptoError.invalidRequest
+    }
+    let password = UUID().uuidString
+    var keychain: SecKeychain?
+    let status = password.withCString { passwordPointer in
+      JournalSecKeychainCreate(
+        path,
+        UInt32(strlen(passwordPointer)),
+        passwordPointer,
+        false,
+        nil,
+        &keychain
+      )
+    }
+    guard status == errSecSuccess, let keychain else {
+      throw JournalE2EECryptoError.operationFailed
+    }
+    testFileKeychains[path] = keychain
+    return keychain
+  }
+#endif
+
+  private static func searchQuery(
+    _ query: inout [CFString: Any],
+    storage: SecretStorage
+  ) throws {
+    switch storage {
+    case .keychain:
+      break
+#if DEBUG
+    case .testFileKeychain(let keychain):
+      query.removeValue(forKey: kSecUseDataProtectionKeychain)
+      query[kSecMatchSearchList] = [keychain]
+    case .testMemory:
+      throw JournalE2EECryptoError.invalidRequest
+#endif
+    }
+  }
+
+  private static func additionQuery(
+    _ query: inout [CFString: Any],
+    storage: SecretStorage
+  ) throws {
+    switch storage {
+    case .keychain:
+      break
+#if DEBUG
+    case .testFileKeychain(let keychain):
+      query.removeValue(forKey: kSecUseDataProtectionKeychain)
+      query[kSecUseKeychain] = keychain
+    case .testMemory:
+      throw JournalE2EECryptoError.invalidRequest
+#endif
+    }
+  }
+
   static func savePrivateKey(
     origin: String,
     userID: String,
@@ -387,23 +486,29 @@ enum JournalE2EECrypto {
       ["origin": origin, "userId": userID],
       includeGraph: false
     )
-    switch try secretStorage(
+    let storage = try secretStorage(
       environmentVariable: testPrivateKeyStorageEnvironment,
       environment: environment
-    ) {
+    )
+    switch storage {
 #if DEBUG
     case .testMemory:
       testMemorySecretsLock.lock()
       defer { testMemorySecretsLock.unlock() }
       testMemoryPrivateKeys[identity.accountDigestHex] = key
       return
+    case .testFileKeychain:
+      break
 #endif
     case .keychain:
       break
     }
     var query = try privateKeyQuery(origin: origin, userID: userID)
+    try searchQuery(&query, storage: storage)
     let status = SecItemUpdate(query as CFDictionary, [kSecValueData: key] as CFDictionary)
     if status == errSecItemNotFound {
+      query = try privateKeyQuery(origin: origin, userID: userID)
+      try additionQuery(&query, storage: storage)
       query[kSecValueData] = key
       query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
       guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
@@ -423,20 +528,24 @@ enum JournalE2EECrypto {
       ["origin": origin, "userId": userID],
       includeGraph: false
     )
-    switch try secretStorage(
+    let storage = try secretStorage(
       environmentVariable: testPrivateKeyStorageEnvironment,
       environment: environment
-    ) {
+    )
+    switch storage {
 #if DEBUG
     case .testMemory:
       testMemorySecretsLock.lock()
       defer { testMemorySecretsLock.unlock() }
       return testMemoryPrivateKeys[identity.accountDigestHex]
+    case .testFileKeychain:
+      break
 #endif
     case .keychain:
       break
     }
     var query = try privateKeyQuery(origin: origin, userID: userID)
+    try searchQuery(&query, storage: storage)
     query[kSecReturnData] = true
     query[kSecMatchLimit] = kSecMatchLimitOne
     var result: CFTypeRef?
@@ -457,16 +566,19 @@ enum JournalE2EECrypto {
       identity: identity,
       encryptedGraphKey: encryptedGraphKey
     )
-    switch try secretStorage(
+    let storage = try secretStorage(
       environmentVariable: testWrappedKeyStorageEnvironment,
       environment: environment
-    ) {
+    )
+    switch storage {
 #if DEBUG
     case .testMemory:
       testMemorySecretsLock.lock()
       defer { testMemorySecretsLock.unlock() }
       testMemoryWrappedGraphKeys[identity.graphDigestHex] = encoded
       return
+    case .testFileKeychain:
+      break
 #endif
     case .keychain:
       break
@@ -477,8 +589,15 @@ enum JournalE2EECrypto {
       userID: identity.userID,
       graphID: graphID
     )
+    try searchQuery(&query, storage: storage)
     let status = SecItemUpdate(query as CFDictionary, [kSecValueData: encoded] as CFDictionary)
     if status == errSecItemNotFound {
+      query = try wrappedGraphKeyQuery(
+        origin: identity.origin,
+        userID: identity.userID,
+        graphID: graphID
+      )
+      try additionQuery(&query, storage: storage)
       query[kSecValueData] = encoded
       query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
       guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
@@ -493,26 +612,30 @@ enum JournalE2EECrypto {
     identity: SecretIdentity,
     environment: [String: String]
   ) throws {
-    switch try secretStorage(
+    let storage = try secretStorage(
       environmentVariable: testWrappedKeyStorageEnvironment,
       environment: environment
-    ) {
+    )
+    switch storage {
 #if DEBUG
     case .testMemory:
       testMemorySecretsLock.lock()
       defer { testMemorySecretsLock.unlock() }
       testMemoryWrappedGraphKeys.removeValue(forKey: identity.graphDigestHex)
       return
+    case .testFileKeychain:
+      break
 #endif
     case .keychain:
       break
     }
     guard let graphID = identity.graphID else { throw JournalE2EECryptoError.invalidRequest }
-    let query = try wrappedGraphKeyQuery(
+    var query = try wrappedGraphKeyQuery(
       origin: identity.origin,
       userID: identity.userID,
       graphID: graphID
     )
+    try searchQuery(&query, storage: storage)
     let status = SecItemDelete(query as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
       throw JournalE2EECryptoError.operationFailed
@@ -523,18 +646,11 @@ enum JournalE2EECrypto {
     identity: SecretIdentity,
     environment: [String: String]
   ) throws -> String? {
-    let encoded: Data?
-    switch try secretStorage(
+    let storage = try secretStorage(
       environmentVariable: testWrappedKeyStorageEnvironment,
       environment: environment
-    ) {
-#if DEBUG
-    case .testMemory:
-      testMemorySecretsLock.lock()
-      encoded = testMemoryWrappedGraphKeys[identity.graphDigestHex]
-      testMemorySecretsLock.unlock()
-#endif
-    case .keychain:
+    )
+    func loadFromKeychain() throws -> Data? {
       guard let graphID = identity.graphID else {
         throw JournalE2EECryptoError.invalidRequest
       }
@@ -543,13 +659,29 @@ enum JournalE2EECrypto {
         userID: identity.userID,
         graphID: graphID
       )
+      try searchQuery(&query, storage: storage)
       query[kSecReturnData] = true
       query[kSecMatchLimit] = kSecMatchLimitOne
       var result: CFTypeRef?
       let status = SecItemCopyMatching(query as CFDictionary, &result)
-      if status == errSecItemNotFound { encoded = nil }
-      else if status == errSecSuccess, let data = result as? Data { encoded = data }
-      else { throw JournalE2EECryptoError.operationFailed }
+      if status == errSecItemNotFound { return nil }
+      guard status == errSecSuccess, let data = result as? Data else {
+        throw JournalE2EECryptoError.operationFailed
+      }
+      return data
+    }
+    let encoded: Data?
+    switch storage {
+#if DEBUG
+    case .testMemory:
+      testMemorySecretsLock.lock()
+      encoded = testMemoryWrappedGraphKeys[identity.graphDigestHex]
+      testMemorySecretsLock.unlock()
+    case .testFileKeychain:
+      encoded = try loadFromKeychain()
+#endif
+    case .keychain:
+      encoded = try loadFromKeychain()
     }
     guard let encoded else { return nil }
     do {
@@ -566,10 +698,24 @@ enum JournalE2EECrypto {
     identity: SecretIdentity,
     environment: [String: String]
   ) throws {
-    switch try secretStorage(
+    func deleteWrappedFromKeychain(_ storage: SecretStorage) throws {
+      var query: [CFString: Any] = [
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrService: wrappedGraphKeyService,
+        kSecAttrGeneric: identity.accountDigest,
+      ]
+      dataProtectionQuery(&query)
+      try searchQuery(&query, storage: storage)
+      let status = SecItemDelete(query as CFDictionary)
+      guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw JournalE2EECryptoError.operationFailed
+      }
+    }
+    let wrappedStorage = try secretStorage(
       environmentVariable: testWrappedKeyStorageEnvironment,
       environment: environment
-    ) {
+    )
+    switch wrappedStorage {
 #if DEBUG
     case .testMemory:
       testMemorySecretsLock.lock()
@@ -578,35 +724,35 @@ enum JournalE2EECrypto {
         return decoded.identity.accountDigest != identity.accountDigest
       }
       testMemorySecretsLock.unlock()
+    case .testFileKeychain:
+      try deleteWrappedFromKeychain(wrappedStorage)
 #endif
     case .keychain:
-      var query: [CFString: Any] = [
-        kSecClass: kSecClassGenericPassword,
-        kSecAttrService: wrappedGraphKeyService,
-        kSecAttrGeneric: identity.accountDigest,
-      ]
-      dataProtectionQuery(&query)
+      try deleteWrappedFromKeychain(wrappedStorage)
+    }
+    func deletePrivateFromKeychain(_ storage: SecretStorage) throws {
+      var query = try privateKeyQuery(origin: identity.origin, userID: identity.userID)
+      try searchQuery(&query, storage: storage)
       let status = SecItemDelete(query as CFDictionary)
       guard status == errSecSuccess || status == errSecItemNotFound else {
         throw JournalE2EECryptoError.operationFailed
       }
     }
-    switch try secretStorage(
+    let privateStorage = try secretStorage(
       environmentVariable: testPrivateKeyStorageEnvironment,
       environment: environment
-    ) {
+    )
+    switch privateStorage {
 #if DEBUG
     case .testMemory:
       testMemorySecretsLock.lock()
       testMemoryPrivateKeys.removeValue(forKey: identity.accountDigestHex)
       testMemorySecretsLock.unlock()
+    case .testFileKeychain:
+      try deletePrivateFromKeychain(privateStorage)
 #endif
     case .keychain:
-      let query = try privateKeyQuery(origin: identity.origin, userID: identity.userID)
-      let status = SecItemDelete(query as CFDictionary)
-      guard status == errSecSuccess || status == errSecItemNotFound else {
-        throw JournalE2EECryptoError.operationFailed
-      }
+      try deletePrivateFromKeychain(privateStorage)
     }
   }
 

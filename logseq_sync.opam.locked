@@ -67,8 +67,8 @@ depends: [
   "melange" {= "5.1.0-51"}
   "melange-edn-core" {= "0.5.0"}
   "melange-edn-native" {= "0.5.0"}
-  "melange-transit-core" {= "0.1.0"}
-  "melange-transit-native" {= "0.1.0"}
+  "melange-transit-core" {= "0.1.1"}
+  "melange-transit-native" {= "0.1.1"}
   "menhir" {= "20260209"}
   "menhirCST" {= "20260209"}
   "menhirGLR" {= "20260209"}
@@ -121,11 +121,11 @@ depexts: "zlib"
 pin-depends: [
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"
+    "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#b1029d6a7210baae15aa2189293bd126b746bad4"
+    "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"
   ]
   [
     "melange-edn-core.0.5.0"
@@ -136,12 +136,12 @@ pin-depends: [
     "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
   ]
   [
-    "melange-transit-core.0.1.0"
-    "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"
+    "melange-transit-core.0.1.1"
+    "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"
   ]
   [
-    "melange-transit-native.0.1.0"
-    "git+https://github.com/RCmerci/melange-transit.git#b298260eb67d96710cb26eaad96a40c81b1af21b"
+    "melange-transit-native.0.1.1"
+    "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"
   ]
   [
     "persistent_sorted_set_ocaml.dev"

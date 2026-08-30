@@ -1945,7 +1945,7 @@ let test_sync_diagnostics_is_scrollable_read_only_and_display_safe () =
   let long_error =
     String.concat " " (List.init 40 (fun index -> Printf.sprintf "failure-%d" index))
   in
-  let diagnostics : Logseq_sync.Core.diagnostics =
+  let diagnostics : Logseq_sync_pure_reducer.Core.diagnostics =
     { groups =
         [ { title = "Manager"
           ; entries = [ "Phase", "Graph open"; "Last error", long_error ]

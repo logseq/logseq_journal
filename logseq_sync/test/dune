@@ -1,12 +1,13 @@
 (test
  (name test_sync)
- (modules test_sync core_contract runner_contract)
+ (modules test_sync core_contract runner_contract sync_protocol_contract)
  (libraries
   alcotest
   eio_main
   eio.unix
   logseq_db_types
-  logseq_sync
+  logseq_sync.effect_runner
+  logseq_sync.pure_reducer
   melange-transit-native
   unix
   uri

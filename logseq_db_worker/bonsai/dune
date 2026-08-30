@@ -7,7 +7,8 @@
   logseq_db_worker
   logseq_db_storage
   logseq_db_types
-  logseq_sync
+  logseq_sync.effect_runner
+  logseq_sync.pure_reducer
   melange-transit-native
   mtime.clock.os
   unix

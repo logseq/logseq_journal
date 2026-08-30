@@ -165,9 +165,9 @@ let decode_operation ~db operation plaintexts =
 let parse source =
   try
     match Codec.of_string source with
-    | Transit.Array [] -> Error "normalized transaction must not be empty"
-    | Array operations -> Ok operations
-    | _ -> Error "normalized transaction must be a Transit array"
+    | Transit.Array [] | List [] -> Error "normalized transaction must not be empty"
+    | Array operations | List operations -> Ok operations
+    | _ -> Error "normalized transaction must be a Transit array or list"
   with
   | Transit.Decode_error message
   | Yojson.Json_error message

@@ -20,12 +20,7 @@
   (source_tree ../logseq_db_storage)
   (source_tree ../logseq_db_types)
   (source_tree ../logseq_db_worker)
-  (source_tree ../logseq_sync/lib/core)
-  (source_tree ../logseq_sync/lib/eio)
-  (source_tree ../logseq_sync/lib/platform)
-  (source_tree ../logseq_sync/lib/storage)
-  (source_tree ../logseq_sync/spec)
-  (source_tree ../logseq_sync/test)
+  (source_tree ../logseq_sync)
   (source_tree ../tool)
   ../bonsai-flutter.sexp
   ../dune-project
@@ -47,13 +42,6 @@
   ../logseq_db_worker.opam.locked
   ../logseq_journal.opam
   ../logseq_journal.opam.locked
-  ../logseq_sync/lib/core.ml
-  ../logseq_sync/lib/effect_runner.ml
-  ../logseq_sync/lib/pure_core.ml
-  ../logseq_sync/lib/dune
-  ../logseq_sync/spec/core.mli
-  ../logseq_sync/spec/effect_runner.mli
-  ../logseq_sync/spec/dune
   ../logseq_sync.install
   ../logseq_sync.opam
   ../logseq_sync.opam.locked)
@@ -75,7 +63,7 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker_test_support
-  logseq_sync
+  logseq_sync.pure_reducer
   unix))
 
 (test
@@ -110,7 +98,7 @@
   logseq_db_worker
   logseq_db_worker_cli
   logseq_db_worker_test_support
-  logseq_sync
+  logseq_sync.pure_reducer
   unix))
 
 (test
@@ -143,7 +131,7 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker_test_support
-  logseq_sync
+  logseq_sync.pure_reducer
   unix))
 
 (rule

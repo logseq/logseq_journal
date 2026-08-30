@@ -41,7 +41,7 @@ type startup_state =
   }
 
 val derive
-  :  snapshot:Logseq_sync.Core.snapshot
+  :  snapshot:Logseq_sync_pure_reducer.Core.snapshot
   -> graph:Logseq_db_worker.graph_state
   -> startup_state
 
