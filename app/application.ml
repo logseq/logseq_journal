@@ -47,7 +47,7 @@ type modal =
   | No_modal
   | Account
   | Settings
-  | Sync_diagnostics
+  | Diagnostics
   | Cache_reset_confirmation of Logseq_db_types.Graph_types.Uuid.t
 
 type state =
@@ -73,7 +73,7 @@ type state =
   ; sync_error : string option
   ; manager : Logseq_sync_pure_reducer.Core.snapshot option
   ; graph_state : Logseq_db_worker.graph_state
-  ; sync_diagnostics : Logseq_sync_pure_reducer.Core.diagnostics option
+  ; diagnostics : Logseq_sync_pure_reducer.Core.diagnostics option
   ; bootstrap_progress : Logseq_sync_pure_reducer.Core.bootstrap_progress option
   ; e2ee_password : Journal_capture.t
   ; typography_preset : Journal_visual_tokens.typography_preset option
@@ -106,7 +106,7 @@ let initial_state =
   ; sync_error = None
   ; manager = None
   ; graph_state = { generation = -1; graph_id = None; phase = Graph_closed; error = None }
-  ; sync_diagnostics = None
+  ; diagnostics = None
   ; bootstrap_progress = None
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
   ; typography_preset = None
@@ -167,12 +167,12 @@ let apply_manager_state state (manager_state : Logseq_sync_pure_reducer.Core.sta
     match state.modal, snapshot.selected_graph with
     | Cache_reset_confirmation confirmation, Some selected
       when Logseq_db_types.Graph_types.Uuid.equal confirmation selected -> state.modal
-    | (No_modal | Account | Settings | Sync_diagnostics), _ -> state.modal
+    | (No_modal | Account | Settings | Diagnostics), _ -> state.modal
     | Cache_reset_confirmation _, (None | Some _) -> No_modal
   in
   { state with
     manager = Some snapshot
-  ; sync_diagnostics = Some manager_state.diagnostics
+  ; diagnostics = Some manager_state.diagnostics
   ; e2ee_password
   ; next_local_sequence
   ; modal
@@ -942,11 +942,11 @@ let account_dialog_page
         "Settings"
     ; action
         ~role:Outlined
-        ~test_id:"journal-account-sync-diagnostics"
-        ~label:"Sync diagnostics"
-        ~hint:"Open read-only sync state diagnostics"
-        ~command:"open-sync-diagnostics"
-        "Sync diagnostics"
+        ~test_id:"journal-account-diagnostics"
+        ~label:"Diagnostics"
+        ~hint:"Open read-only application diagnostics"
+        ~command:"open-diagnostics"
+        "Diagnostics"
     ; action
         ~role:Outlined
         ~test_id:"journal-account-switch-graph"
@@ -1125,17 +1125,71 @@ let settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch =
        ~barrier_label:"Settings"
 ;;
 
-let sync_diagnostic_rows (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) =
+let obsolete_diagnostic_row = function
+  | "Phase" | "Startup presentation" -> true
+  | _ -> false
+;;
+
+let current_diagnostic_rows rows =
+  List.filter (fun (label, _) -> not (obsolete_diagnostic_row label)) rows
+;;
+
+let diagnostic_rows (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) =
   List.concat_map
-    (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) -> group.entries)
+    (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) ->
+       current_diagnostic_rows group.entries)
     diagnostics.groups
+;;
+
+let sync_phase_name : Logseq_sync_pure_reducer.Core.sync_phase -> string = function
+  | Offline -> "Offline"
+  | Connecting -> "Connecting"
+  | Pulling -> "Pulling"
+  | Submitting -> "Submitting"
+  | Current -> "Current"
+  | Paused -> "Paused"
+  | Failed -> "Failed"
+;;
+
+let startup_phase_name : Journal_startup.startup_phase -> string = function
+  | Signed_out -> "Signed out"
+  | Loading_catalog -> "Loading catalog"
+  | Awaiting_selection -> "Awaiting selection"
+  | Restoring_local -> "Restoring local"
+  | Bootstrapping -> "Bootstrapping"
+  | Awaiting_e2ee_password -> "Awaiting E2EE password"
+  | Ready -> "Ready"
+  | Failed -> "Failed"
+;;
+
+let graph_phase_name : Logseq_db_worker.graph_phase -> string = function
+  | Graph_closed -> "Closed"
+  | Graph_opening -> "Opening"
+  | Graph_open -> "Open"
+  | Graph_closing -> "Closing"
+  | Graph_failed -> "Failed"
+;;
+
+let diagnostic_phase_rows ~snapshot ~(graph : Logseq_db_worker.graph_state) =
+  match snapshot with
+  | None ->
+    [ "Sync phase", "Not available"
+    ; "Startup phase", "Not available"
+    ; "Graph phase", graph_phase_name graph.phase
+    ]
+  | Some snapshot ->
+    let startup = Journal_startup.derive ~snapshot ~graph in
+    [ "Sync phase", sync_phase_name snapshot.sync_phase
+    ; "Startup phase", startup_phase_name startup.phase
+    ; "Graph phase", graph_phase_name graph.phase
+    ]
 ;;
 
 let diagnostic_groups diagnostics =
   let unavailable labels = List.map (fun label -> label, "Not available") labels in
   match diagnostics with
   | None ->
-    [ "Manager", unavailable [ "Phase"; "Startup presentation"; "Last error" ]
+    [ "Manager", unavailable [ "Last error" ]
     ; ( "Scope fences"
       , unavailable
           [ "Account generation"
@@ -1153,31 +1207,35 @@ let diagnostic_groups diagnostics =
     ; "Authorization", unavailable [ "Pending token challenges" ]
     ]
   | Some (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) ->
-    List.map
-      (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) -> group.title, group.entries)
-      diagnostics.groups
+    diagnostics.groups
+    |> List.filter_map (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) ->
+      let entries = current_diagnostic_rows group.entries in
+      if entries = [] then None else Some (group.title, entries))
 ;;
 
 let diagnostic_history_lines = function
   | None -> [ "No transitions" ]
-  | Some ({ history = []; _ } : Logseq_sync_pure_reducer.Core.diagnostics) -> [ "No transitions" ]
+  | Some ({ history = []; _ } : Logseq_sync_pure_reducer.Core.diagnostics) ->
+    [ "No transitions" ]
   | Some ({ history; _ } : Logseq_sync_pure_reducer.Core.diagnostics) -> history
 ;;
 
-let sync_diagnostics_page
+let diagnostics_page
       ~tokens
       ~(typography : Journal_visual_tokens.typography)
       ~reduced_motion
+      ~snapshot
+      ~graph
       diagnostics
       dispatch
   =
   let close =
     action_target
       ~role:Text
-      ~test_id:"journal-sync-diagnostics-close"
-      ~label:"Close Sync diagnostics"
-      ~hint:"Return to the journal"
-      ~on_press:(bind_action dispatch "close-sync-diagnostics")
+      ~test_id:"journal-diagnostics-close"
+      ~label:"Close Diagnostics"
+      ~hint:"Return to the previous screen"
+      ~on_press:(bind_action dispatch "close-diagnostics")
       (styled_text "Close")
   in
   let heading title =
@@ -1194,11 +1252,12 @@ let sync_diagnostics_page
          ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:16. ~vertical:6. ())
   in
   let current =
-    diagnostic_groups diagnostics
-    |> List.concat_map (fun (title, rows) -> heading title :: List.map row rows)
+    (heading "Phases" :: List.map row (diagnostic_phase_rows ~snapshot ~graph))
+    @ (diagnostic_groups diagnostics
+       |> List.concat_map (fun (title, rows) -> heading title :: List.map row rows))
   in
   let history =
-    heading "Recent transitions"
+    heading "Recent sync transitions"
     :: List.map
          (fun line ->
             styled_text ~token:typography.supporting line
@@ -1208,22 +1267,22 @@ let sync_diagnostics_page
   in
   let scroll =
     Ui.Widget.Scroll_view.vertical
-      ~key:(Ui.Key.string "journal-sync-diagnostics-scroll")
+      ~key:(Ui.Key.string "journal-diagnostics-scroll")
       ~on_scroll:
-        (Ui.Event.Handler.create ~name:"journal-sync-diagnostics-scroll" (fun _ -> ()))
+        (Ui.Event.Handler.create ~name:"journal-diagnostics-scroll" (fun _ -> ()))
       [ Ui.Widget.Sliver.list (current @ history) ]
       ()
     |> Ui.Widget.Viewport.Vertical.with_test_id
-         (Ui.Test_id.string "journal-sync-diagnostics-scroll")
+         (Ui.Test_id.string "journal-diagnostics-scroll")
   in
   let header =
     Ui.Widget.Flex.row
       [ Ui.Widget.Flex.expanded
-          (styled_text ~token:typography.manager_title "Sync diagnostics"
+          (styled_text ~token:typography.manager_title "Diagnostics"
            |> Ui.Widget.semantics
                 ~properties:
                   (Ui.Semantics.create
-                     ~label:"Sync diagnostics"
+                     ~label:"Diagnostics"
                      ~role:Ui.Semantics.Role.Header
                      ~heading_level:1
                      ()))
@@ -1240,9 +1299,9 @@ let sync_diagnostics_page
   |> modal_dialog_page
        ~tokens
        ~reduced_motion
-       ~page_key:"journal-sync-diagnostics-dialog"
-       ~test_id:"journal-sync-diagnostics-dialog-page"
-       ~barrier_label:"Sync diagnostics"
+       ~page_key:"journal-diagnostics-dialog"
+       ~test_id:"journal-diagnostics-dialog-page"
+       ~barrier_label:"Diagnostics"
 ;;
 
 let local_cache_reset_dialog_page ~tokens ~typography ~reduced_motion dispatch =
@@ -1538,6 +1597,17 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
     |> Ui.Widget.semantics
          ~properties:(Ui.Semantics.create ~label:title ~live_region:true ())
   in
+  let diagnostics_entry () =
+    action_target
+      ~role:Outlined
+      ~test_id:"journal-startup-diagnostics"
+      ~label:"Diagnostics"
+      ~hint:"Open read-only application diagnostics"
+      ~on_press:(bind_action dispatch "open-diagnostics")
+      (styled_text "Diagnostics")
+    |> Ui.Widget.padding
+         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:24. ~vertical:12. ())
+  in
   let graph_picker snapshot =
     let refresh =
       let on_press = bind_action dispatch "refresh-catalog" in
@@ -1607,7 +1677,10 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
            ~insets:(Ui.Layout.Edge_insets.symmetric ~vertical:8. ())
     in
     Ui.Widget.Body.Vertical.create
-      [ Ui.Widget.Body.Vertical.fixed toolbar; Ui.Widget.Body.Vertical.fill scroll ]
+      [ Ui.Widget.Body.Vertical.fixed toolbar
+      ; Ui.Widget.Body.Vertical.fill scroll
+      ; Ui.Widget.Body.Vertical.fixed (diagnostics_entry ())
+      ]
     |> Ui.Widget.Body.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
     |> Ui.Widget.Body.safe_area
   in
@@ -1705,7 +1778,9 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
                     (styled_text "Retry"))
              ] ))
     in
-    Ui.Widget.Flex.column (Ui.Widget.Flex.fixed (title_widget title) :: controls)
+    Ui.Widget.Flex.column
+      ((Ui.Widget.Flex.fixed (title_widget title) :: controls)
+       @ [ Ui.Widget.Flex.fixed (diagnostics_entry ()) ])
     |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
     |> Ui.Widget.safe_area
     |> Ui.Widget.Body.static
@@ -1960,7 +2035,9 @@ let component client handlers graph =
     let manager = manager_state.Logseq_sync_pure_reducer.Core.snapshot in
     let update = set_state (fun state -> apply_manager_state state manager_state) in
     let sign_out =
-      if (not manager.Logseq_sync_pure_reducer.Core.startup.authenticated) && !sign_out_in_flight
+      if
+        (not manager.Logseq_sync_pure_reducer.Core.startup.authenticated)
+        && !sign_out_in_flight
       then (
         sign_out_in_flight := false;
         Bonsai.Effect.bind
@@ -2107,7 +2184,9 @@ let component client handlers graph =
               ~f:(function
                 | Error _ -> send_manager (Graph_service.Reject_token challenge)
                 | Ok payload ->
-                  let challenge_id = Logseq_sync_pure_reducer.Core.token_request_id challenge in
+                  let challenge_id =
+                    Logseq_sync_pure_reducer.Core.token_request_id challenge
+                  in
                   (match
                      Journal_platform.decode_id_token_response ~challenge_id payload
                    with
@@ -2671,9 +2750,9 @@ let component client handlers graph =
           then update (fun state -> { state with modal = Settings })
           else if String.equal action "close-settings"
           then update (fun state -> { state with modal = No_modal })
-          else if String.equal action "open-sync-diagnostics"
-          then update (fun state -> { state with modal = Sync_diagnostics })
-          else if String.equal action "close-sync-diagnostics"
+          else if String.equal action "open-diagnostics"
+          then update (fun state -> { state with modal = Diagnostics })
+          else if String.equal action "close-diagnostics"
           then update (fun state -> { state with modal = No_modal })
           else if
             String.length action > 18 && String.sub action 0 18 = "select-typography:"
@@ -2747,7 +2826,7 @@ let component client handlers graph =
           else if String.equal action "confirm-local-cache-reset"
           then (
             match snapshot.modal with
-            | No_modal | Account | Settings | Sync_diagnostics -> Bonsai.Effect.Ignore
+            | No_modal | Account | Settings | Diagnostics -> Bonsai.Effect.Ignore
             | Cache_reset_confirmation graph_id ->
               Bonsai.Effect.Many
                 [ send_manager (Graph_service.Delete_local_cache graph_id)
@@ -3122,13 +3201,15 @@ let component client handlers graph =
       | Settings ->
         pages
         @ [ settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch ]
-      | Sync_diagnostics ->
+      | Diagnostics ->
         pages
-        @ [ sync_diagnostics_page
+        @ [ diagnostics_page
               ~tokens
               ~typography
               ~reduced_motion
-              state.sync_diagnostics
+              ~snapshot:state.manager
+              ~graph:state.graph_state
+              state.diagnostics
               dispatch
           ]
       | No_modal -> pages

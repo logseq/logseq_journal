@@ -1914,7 +1914,272 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
          require_visible_text handle "First line"))
 ;;
 
-let test_sync_diagnostics_is_scrollable_read_only_and_display_safe () =
+let diagnostic_snapshot
+      ?(sync_phase = Logseq_sync_pure_reducer.Core.Current)
+      ?(authenticated = true)
+      ?(catalog_loading = false)
+      ?(awaiting_selection = false)
+      ?(restoring_local = false)
+      ?(bootstrapping = false)
+      ?(awaiting_e2ee_password = false)
+      ?failure
+      ?(timeline_presentation_pending = false)
+      ()
+  : Logseq_sync_pure_reducer.Core.snapshot
+  =
+  let graph_id = uuid "71000000-0000-4000-8000-000000000144" in
+  { sync_phase
+  ; catalog = []
+  ; selected_graph = Some graph_id
+  ; applied_server_t = Some 12
+  ; timeline_presentation_pending
+  ; startup =
+      { authenticated
+      ; catalog_loading
+      ; awaiting_selection
+      ; restoring_local
+      ; bootstrapping
+      ; awaiting_e2ee_password
+      ; failure
+      ; account_generation = 7
+      ; graph_generation = 42
+      ; presentation_generation = 9
+      }
+  ; last_error = Option.map (fun _ -> "Startup failed") failure
+  }
+;;
+
+let diagnostic_graph ?(phase = Logseq_db_worker.Graph_open) ?error ()
+  : Logseq_db_worker.graph_state
+  =
+  { generation = 42
+  ; graph_id = Some (uuid "71000000-0000-4000-8000-000000000144")
+  ; phase
+  ; error
+  }
+;;
+
+let wait_for_application_request_tag handle expected_tag =
+  let rec loop attempts =
+    if attempts = 0
+    then fail "timed out waiting for application request tag %d" expected_tag
+    else (
+      Test.Handle.present handle;
+      match application_request_from_last_frame handle expected_tag with
+      | Some request -> request
+      | None ->
+        Test.Handle.pump_next handle ();
+        loop (attempts - 1))
+  in
+  loop 500
+;;
+
+let initialize_managed_test_platform handle =
+  let rec collect attempts calendar preference binding =
+    if attempts = 0
+    then fail "timed out waiting for managed startup platform requests"
+    else (
+      Test.Handle.present handle;
+      let calendar, preference, binding =
+        match Test.Handle.last_frame handle with
+        | None -> calendar, preference, binding
+        | Some _ ->
+          let find tag current =
+            match application_request_from_last_frame handle tag with
+            | Some (request_id, _) -> Some request_id
+            | None -> current
+          in
+          find 1 calendar, find 16 preference, find 20 binding
+      in
+      match calendar, preference, binding with
+      | Some calendar, Some preference, Some binding -> calendar, preference, binding
+      | _ ->
+        Test.Handle.pump_next handle ();
+        collect (attempts - 1) calendar preference binding)
+  in
+  let calendar, preference, binding = collect 500 None None None in
+  respond_to_application_request
+    handle
+    ~sequence:31L
+    ~request_id:calendar
+    initial_calendar_packet;
+  Test.Handle.present handle;
+  respond_to_application_request
+    handle
+    ~sequence:32L
+    ~request_id:preference
+    (preference_response_packet (Some "balanced"));
+  Test.Handle.present handle;
+  respond_to_application_request
+    handle
+    ~sequence:33L
+    ~request_id:binding
+    (platform_envelope 21 (Bytes.of_string {|{"userId":null,"managedSyncOrigin":null}|}));
+  Test.Handle.present handle;
+  Test.Handle.resize handle ~width:390. ~height:844.;
+  Test.Handle.present handle
+;;
+
+let test_diagnostics_is_reachable_from_incomplete_and_failed_startup () =
+  with_startup (fun startup ->
+    let managed =
+      { startup with
+        Logseq_db_worker.Config.target =
+          Managed_sync { base_url = "https://diagnostics.invalid" }
+      }
+    in
+    let run authenticated_user expected_phase =
+      let handle = create_raw_handle managed in
+      Fun.protect
+        ~finally:(fun () -> Test.Handle.shutdown handle)
+        (fun () ->
+           initialize_managed_test_platform handle;
+           let authentication, _ = wait_for_application_request_tag handle 6 in
+           respond_to_application_request
+             handle
+             ~sequence:34L
+             ~request_id:authentication
+             (platform_envelope 7 (Bytes.of_string authenticated_user));
+           let token_request =
+             if String.equal expected_phase "Signed out"
+             then None
+             else Some (wait_for_application_request_tag handle 8)
+           in
+           (match token_request with
+            | None -> ()
+            | Some (request_id, _) ->
+              respond_to_application_request
+                handle
+                ~sequence:35L
+                ~request_id
+                (platform_envelope 9 (Bytes.of_string {|{"error":"unavailable"}|})));
+           pump_until handle "startup Diagnostics entry" (fun () ->
+             Option.is_some
+               (Test.Handle.find
+                  handle
+                  (Test.Query.test_id "journal-startup-diagnostics")));
+           press_after_choice_events handle "journal-startup-diagnostics";
+           pump_until handle "startup Diagnostics dialog" (fun () ->
+             Option.is_some
+               (Test.Handle.find
+                  handle
+                  (Test.Query.test_id "journal-diagnostics-dialog-page")));
+           require_test_id handle "journal-diagnostics-dialog-page";
+           require_visible_text handle "Startup phase";
+           pump_until handle ("startup phase " ^ expected_phase) (fun () ->
+             Option.is_some
+               (Test.Handle.find handle (Test.Query.visible_text expected_phase)));
+           require_visible_text handle expected_phase;
+           press_after_choice_events handle "journal-diagnostics-close";
+           require_no_test_id handle "journal-diagnostics-dialog-page";
+           require_test_id handle "journal-startup-diagnostics")
+    in
+    run {|{"userId":null}|} "Signed out";
+    run {|{"userId":"diagnostics-user"}|} "Failed")
+;;
+
+let require_rows expected actual message =
+  let rendered =
+    actual
+    |> List.map (fun (label, value) -> Printf.sprintf "%s=%s" label value)
+    |> String.concat ", "
+  in
+  require (actual = expected) "%s: %s" message rendered
+;;
+
+let test_diagnostic_phase_renderers_are_exhaustive_and_readable () =
+  List.iter
+    (fun (phase, expected) ->
+       require
+         (String.equal (Application.sync_phase_name phase) expected)
+         "sync phase rendered as something other than %S"
+         expected)
+    [ Logseq_sync_pure_reducer.Core.Offline, "Offline"
+    ; Connecting, "Connecting"
+    ; Pulling, "Pulling"
+    ; Submitting, "Submitting"
+    ; Current, "Current"
+    ; Paused, "Paused"
+    ; Failed, "Failed"
+    ];
+  List.iter
+    (fun (phase, expected) ->
+       require
+         (String.equal (Application.startup_phase_name phase) expected)
+         "startup phase rendered as something other than %S"
+         expected)
+    [ Journal_startup.Signed_out, "Signed out"
+    ; Loading_catalog, "Loading catalog"
+    ; Awaiting_selection, "Awaiting selection"
+    ; Restoring_local, "Restoring local"
+    ; Bootstrapping, "Bootstrapping"
+    ; Awaiting_e2ee_password, "Awaiting E2EE password"
+    ; Ready, "Ready"
+    ; Failed, "Failed"
+    ];
+  List.iter
+    (fun (phase, expected) ->
+       require
+         (String.equal (Application.graph_phase_name phase) expected)
+         "graph phase rendered as something other than %S"
+         expected)
+    [ Logseq_db_worker.Graph_closed, "Closed"
+    ; Graph_opening, "Opening"
+    ; Graph_open, "Open"
+    ; Graph_closing, "Closing"
+    ; Graph_failed, "Failed"
+    ]
+;;
+
+let test_diagnostic_phase_rows_compose_canonical_independent_state () =
+  let graph = diagnostic_graph () in
+  let connecting = diagnostic_snapshot ~sync_phase:Connecting () in
+  let offline = diagnostic_snapshot ~sync_phase:Offline () in
+  require_rows
+    [ "Sync phase", "Connecting"; "Startup phase", "Ready"; "Graph phase", "Open" ]
+    (Application.diagnostic_phase_rows ~snapshot:(Some connecting) ~graph)
+    "connecting/ready/open phases were coerced";
+  require_rows
+    [ "Sync phase", "Offline"; "Startup phase", "Ready"; "Graph phase", "Open" ]
+    (Application.diagnostic_phase_rows ~snapshot:(Some offline) ~graph)
+    "offline/ready/open phases were coerced";
+  require_rows
+    [ "Sync phase", "Not available"
+    ; "Startup phase", "Not available"
+    ; "Graph phase", "Closed"
+    ]
+    (Application.diagnostic_phase_rows
+       ~snapshot:None
+       ~graph:(diagnostic_graph ~phase:Graph_closed ()))
+    "missing sync state was replaced with real phases";
+  List.iter
+    (fun snapshot ->
+       let expected =
+         Journal_startup.derive ~snapshot ~graph
+         |> fun startup -> Application.startup_phase_name startup.phase
+       in
+       let actual =
+         Application.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph
+         |> List.assoc "Startup phase"
+       in
+       require
+         (String.equal actual expected)
+         "diagnostics startup phase %S differs from Journal_startup.derive %S"
+         actual
+         expected)
+    [ diagnostic_snapshot ~sync_phase:Pulling ()
+    ; diagnostic_snapshot ~sync_phase:Submitting ()
+    ; diagnostic_snapshot ~sync_phase:Paused ()
+    ; diagnostic_snapshot ~catalog_loading:true ()
+    ; diagnostic_snapshot ~awaiting_selection:true ()
+    ; diagnostic_snapshot ~restoring_local:true ~timeline_presentation_pending:true ()
+    ; diagnostic_snapshot ~bootstrapping:true ()
+    ; diagnostic_snapshot ~awaiting_e2ee_password:true ()
+    ; diagnostic_snapshot ~failure:Logseq_sync_pure_reducer.Core.During_bootstrap ()
+    ]
+;;
+
+let test_diagnostics_is_scrollable_read_only_and_display_safe () =
   with_startup (fun startup ->
     let entry = capture 144 "Diagnostics entry" in
     seed startup [ entry ];
@@ -1924,22 +2189,29 @@ let test_sync_diagnostics_is_scrollable_read_only_and_display_safe () =
       (fun () ->
          pump_until_text handle entry.source;
          click_test_id handle "journal-account-menu-button";
-         require_test_id handle "journal-account-sync-diagnostics";
-         click_test_id handle "journal-account-sync-diagnostics";
+         require_test_id handle "journal-account-diagnostics";
+         click_test_id handle "journal-account-diagnostics";
          require_no_test_id handle "journal-account-dialog-page";
-         require_test_id handle "journal-sync-diagnostics-dialog-page";
-         require_test_id handle "journal-sync-diagnostics-scroll";
-         require_visible_text handle "Sync diagnostics";
+         require_test_id handle "journal-diagnostics-dialog-page";
+         require_test_id handle "journal-diagnostics-scroll";
+         require_visible_text handle "Diagnostics";
+         require_semantics handle "Diagnostics";
+         require_visible_text handle "Phases";
+         require_visible_text handle "Sync phase";
+         require_visible_text handle "Startup phase";
+         require_visible_text handle "Graph phase";
+         require_visible_text handle "Open";
          require_visible_text handle "Manager";
          require_visible_text handle "Transport";
-         require_visible_text handle "Recent transitions";
+         require_visible_text handle "Recent sync transitions";
          require_visible_text handle "Not available";
-         require_no_test_id handle "journal-sync-diagnostics-copy";
-         require_no_test_id handle "journal-sync-diagnostics-export";
+         require_no_visible_text handle "Startup presentation";
+         require_no_test_id handle "journal-diagnostics-copy";
+         require_no_test_id handle "journal-diagnostics-export";
          require_no_semantics handle "Copy diagnostics";
          require_no_semantics handle "Export diagnostics";
-         click_test_id handle "journal-sync-diagnostics-close";
-         require_no_test_id handle "journal-sync-diagnostics-dialog-page";
+         click_test_id handle "journal-diagnostics-close";
+         require_no_test_id handle "journal-diagnostics-dialog-page";
          require_test_id handle "journal-timeline-page"));
   let graph_id = "71000000-0000-4000-8000-000000000144" in
   let long_error =
@@ -1959,7 +2231,7 @@ let test_sync_diagnostics_is_scrollable_read_only_and_display_safe () =
     ; history = [ "#12 Transport: Connecting -> Live" ]
     }
   in
-  let rows = Application.sync_diagnostic_rows diagnostics in
+  let rows = Application.diagnostic_rows diagnostics in
   require
     (List.assoc "Selected graph" rows = graph_id)
     "diagnostic rows do not show the full current graph UUID";
@@ -3145,7 +3417,10 @@ let () =
   test_typography_waits_for_the_persisted_preset_without_flashing_balanced ();
   test_missing_and_invalid_typography_preferences_select_balanced ();
   test_settings_choice_group_applies_and_persists_one_atomic_preset ();
-  test_sync_diagnostics_is_scrollable_read_only_and_display_safe ();
+  test_diagnostic_phase_renderers_are_exhaustive_and_readable ();
+  test_diagnostic_phase_rows_compose_canonical_independent_state ();
+  test_diagnostics_is_reachable_from_incomplete_and_failed_startup ();
+  test_diagnostics_is_scrollable_read_only_and_display_safe ();
   test_timeline_uses_exact_sparse_extent_window ();
   test_timeline_preserves_stable_slot_keys_across_window_shifts ();
   test_one_visible_range_drains_multiple_day_continuations ();

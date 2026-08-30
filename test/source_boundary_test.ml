@@ -1791,7 +1791,25 @@ let () =
   forbid_text
     root
     "app/application.ml"
-    [ "phase=%d"; "journal-sync-diagnostics-copy"; "journal-sync-diagnostics-export" ];
+    [ "phase=%d"
+    ; "Sync_diagnostics"
+    ; "sync_diagnostics"
+    ; "sync-diagnostics"
+    ; "Sync diagnostics"
+    ; "journal-diagnostics-copy"
+    ; "journal-diagnostics-export"
+    ];
+  forbid_text root "app/application.mli" [ "sync_diagnostic"; "Sync_diagnostic" ];
+  require_text
+    root
+    "app/application.ml"
+    [ "open-diagnostics"
+    ; "close-diagnostics"
+    ; "journal-account-diagnostics"
+    ; "journal-startup-diagnostics"
+    ; "journal-diagnostics-dialog-page"
+    ; "Recent sync transitions"
+    ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"
   | failures ->
