@@ -1541,6 +1541,7 @@ type submission_owner =
   { mutation_ids : graph_id list
   ; t_before : int
   ; message : Sync_protocol.Client.message
+  ; reserved_outbox_records : string list
   ; connection : connection_scope
   ; presentation_generation : presentation_generation
   ; lifecycle_generation : lifecycle_generation
@@ -1553,11 +1554,13 @@ type t =
   ; user_id : string option
   ; lifecycle_generation : lifecycle_generation
   ; next_effect_id : int
+  ; next_graph_token_id : int
   ; pending_token : token_request option
   ; deferred_catalog_reconciliation : bool
   ; local_presentation_barrier : bool
   ; pending_effects : pending_effect list
   ; pending_local_batches : (effect_id * local_batch_plan) list
+  ; pending_local_commits : local_batch_commit list
   ; graph_key : graph_key_handle option
   ; catalog_cache_loading : bool
   ; early_fetched_catalog : graph list option
@@ -1567,7 +1570,9 @@ type t =
   ; connection_generation : connection_generation
   ; active_graph_token : string option
   ; snapshot_server_t : int option
+  ; pending_mirror_inspection : mirror_request option
   ; pending_graph_open : graph_open_request option
+  ; pending_graph_attachment : graph_open_request option
   ; snapshot_bootstrap_phase : snapshot_bootstrap_phase
   ; e2ee_authenticated : authenticated_account_scope option
   ; encrypted_graph_key : string option
@@ -1614,11 +1619,13 @@ let initial config =
     ; user_id = None
     ; lifecycle_generation = 0L
     ; next_effect_id = 0
+    ; next_graph_token_id = 0
     ; pending_token = None
     ; deferred_catalog_reconciliation = false
     ; local_presentation_barrier = false
     ; pending_effects = []
     ; pending_local_batches = []
+    ; pending_local_commits = []
     ; graph_key = None
     ; catalog_cache_loading = false
     ; early_fetched_catalog = None
@@ -1628,7 +1635,9 @@ let initial config =
     ; connection_generation = 0
     ; active_graph_token = None
     ; snapshot_server_t = None
+    ; pending_mirror_inspection = None
     ; pending_graph_open = None
+    ; pending_graph_attachment = None
     ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
     ; e2ee_authenticated = None
     ; encrypted_graph_key = None
@@ -1720,6 +1729,14 @@ let reject_pending_local_batches core kind message =
   List.map
     (fun (_, plan) -> reject_local_batch plan.local_input kind message)
     core.pending_local_batches
+;;
+
+let delegate_local_commit core (request : local_batch_completion_request) outbox_records =
+  let pending_commit = { scope = request.scope; outbox_records } in
+  { next =
+      { core with pending_local_commits = pending_commit :: core.pending_local_commits }
+  ; effects = [ Delegate (Complete_local_batch request) ]
+  }
 ;;
 
 let catalog_loaded core graphs =
@@ -1863,6 +1880,7 @@ let authenticate_new_account core user_id =
     ; local_presentation_barrier = false
     ; pending_effects = []
     ; pending_local_batches = []
+    ; pending_local_commits = []
     ; graph_key = None
     ; catalog_cache_loading = false
     ; early_fetched_catalog = None
@@ -1872,7 +1890,9 @@ let authenticate_new_account core user_id =
     ; connection_generation = 0
     ; active_graph_token = None
     ; snapshot_server_t = None
+    ; pending_mirror_inspection = None
     ; pending_graph_open = None
+    ; pending_graph_attachment = None
     ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
     ; e2ee_authenticated = None
     ; encrypted_graph_key = None
@@ -1985,6 +2005,7 @@ let sign_out core =
     ; local_presentation_barrier = false
     ; pending_effects = []
     ; pending_local_batches = []
+    ; pending_local_commits = []
     ; graph_key = None
     ; catalog_cache_loading = false
     ; early_fetched_catalog = None
@@ -1994,7 +2015,9 @@ let sign_out core =
     ; connection_generation = 0
     ; active_graph_token = None
     ; snapshot_server_t = None
+    ; pending_mirror_inspection = None
     ; pending_graph_open = None
+    ; pending_graph_attachment = None
     ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
     ; e2ee_authenticated = None
     ; encrypted_graph_key = None
@@ -2132,6 +2155,10 @@ let restore_local core user_id =
   let core =
     { (set_snapshot core snapshot) with
       user_id = Some user_id
+    ; pending_token = None
+    ; pending_effects = []
+    ; pending_local_batches = []
+    ; pending_local_commits = []
     ; selected_graph_value = None
     ; catalog_cache_loading = true
     ; early_fetched_catalog = None
@@ -2143,7 +2170,9 @@ let restore_local core user_id =
     ; connection_generation = 0
     ; active_graph_token = None
     ; snapshot_server_t = None
+    ; pending_mirror_inspection = None
     ; pending_graph_open = None
+    ; pending_graph_attachment = None
     ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
     ; e2ee_authenticated = None
     ; encrypted_graph_key = None
@@ -2230,24 +2259,32 @@ let decode_e2ee_private_key_package source =
 let challenge_graph_token core purpose =
   match core.user_id, core.current_graph_scope with
   | Some _, Some scope ->
+    let challenge_id = core.next_graph_token_id in
+    let request_id =
+      Printf.sprintf
+        "%s-%d-%d"
+        (match purpose with
+         | Snapshot_bootstrap -> "snapshot"
+         | E2ee_key_access -> "e2ee"
+         | Websocket_connect -> "websocket"
+         | Catalog_discovery -> "catalog")
+        scope.account.account_generation
+        scope.graph_generation
+    in
     let request =
       { request_id =
-          Printf.sprintf
-            "%s-%d-%d"
-            (match purpose with
-             | Snapshot_bootstrap -> "snapshot"
-             | E2ee_key_access -> "e2ee"
-             | Websocket_connect -> "websocket"
-             | Catalog_discovery -> "catalog")
-            scope.account.account_generation
-            scope.graph_generation
+          (if challenge_id = 0
+           then request_id
+           else Printf.sprintf "%s-%d" request_id challenge_id)
       ; purpose
       ; account_generation = scope.account.account_generation
       ; graph_generation = Some scope.graph_generation
       ; connection_generation = None
       }
     in
-    let next = { core with pending_token = Some request } in
+    let next =
+      { core with next_graph_token_id = challenge_id + 1; pending_token = Some request }
+    in
     { next; effects = [ Publish (Token_requested request) ] }
   | None, None | None, Some _ | Some _, None -> unchanged core
 ;;
@@ -2338,6 +2375,7 @@ let graph_key_loaded core handle =
          { core with
            graph_key = Some handle
          ; pending_graph_open = None
+         ; pending_graph_attachment = Some request
          ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
          ; encrypted_graph_key = None
          ; private_key_package = None
@@ -2420,6 +2458,7 @@ let select_graph_transition core ~persist graph_id =
     in
     let next = set_snapshot core snapshot in
     let scope = { account = account_scope next user_id; graph_id; graph_generation } in
+    let mirror_request = { graph; scope } in
     let next =
       { next with
         cached_selected_graph = Some graph_id
@@ -2428,10 +2467,13 @@ let select_graph_transition core ~persist graph_id =
       ; graph_key = None
       ; pending_effects = []
       ; pending_local_batches = []
+      ; pending_local_commits = []
       ; connection_generation = 0
       ; active_graph_token = None
       ; snapshot_server_t = None
+      ; pending_mirror_inspection = Some mirror_request
       ; pending_graph_open = None
+      ; pending_graph_attachment = None
       ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
       ; e2ee_authenticated = None
       ; encrypted_graph_key = None
@@ -2467,7 +2509,7 @@ let select_graph_transition core ~persist graph_id =
     { next
     ; effects =
         replacement_effects
-        @ [ Delegate (Inspect_mirror { graph; scope }); publish_state next ]
+        @ [ Delegate (Inspect_mirror mirror_request); publish_state next ]
         @ persistence_effects
     }
 ;;
@@ -2504,7 +2546,10 @@ let clear_selected_graph_for_catalog core graphs =
     ; pending_token = None
     ; pending_effects = []
     ; pending_local_batches = []
+    ; pending_local_commits = []
+    ; pending_mirror_inspection = None
     ; pending_graph_open = None
+    ; pending_graph_attachment = None
     ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
     ; e2ee_authenticated = None
     ; encrypted_graph_key = None
@@ -2806,7 +2851,7 @@ let consume_completion
                  ; action = Commit { outbox_records }
                  }
                in
-               { next = core; effects = [ Delegate (Complete_local_batch request) ] })))
+               delegate_local_commit core request outbox_records)))
     | ( Encrypt_protected_values_kind
       , Error
           (Effect_failed message | Crypto_failed (Crypto_provider_unavailable, message)) )
@@ -2947,7 +2992,7 @@ let start_local_batch core input =
                  ; action = Commit { outbox_records }
                  }
                in
-               { next = core; effects = [ Delegate (Complete_local_batch request) ] }))))
+               delegate_local_commit core request outbox_records))))
 ;;
 
 let take_values count values =
@@ -3038,6 +3083,7 @@ let plan_submission core =
              { mutation_ids = List.map (fun record -> record.mutation_id) queued
              ; t_before = applied_server_t
              ; message
+             ; reserved_outbox_records = outbox_records
              ; connection
              ; presentation_generation =
                  core.public_state.snapshot.startup.presentation_generation
@@ -3051,28 +3097,48 @@ let plan_submission core =
   | Some _, Some _ | Some _, None | None, Some _ | None, None -> unchanged core
 ;;
 
+let rec remove_first value = function
+  | [] -> []
+  | candidate :: rest when candidate = value -> rest
+  | candidate :: rest -> candidate :: remove_first value rest
+;;
+
 let local_batch_committed core (commit : local_batch_commit) =
-  if not (graph_scope_is_current core commit.scope)
+  if
+    (not (graph_scope_is_current core commit.scope))
+    || not (List.mem commit core.pending_local_commits)
   then unchanged core
-  else plan_submission { core with outbox_records = commit.outbox_records }
+  else
+    plan_submission
+      { core with
+        pending_local_commits = remove_first commit core.pending_local_commits
+      ; outbox_records = commit.outbox_records
+      }
 ;;
 
 let outbox_transition_committed core (commit : outbox_transition_commit) =
   if not (graph_scope_is_current core commit.scope)
   then unchanged core
   else (
-    let core = { core with outbox_records = commit.outbox_records } in
     match commit.pending_message, core.submission_owner with
     | Some message, Some owner
       when core.websocket_live
            && owner.phase = Submission_reserving
            && owner.message = message
+           && owner.reserved_outbox_records = commit.outbox_records
            && owner.connection.graph = commit.scope
            && Some owner.t_before = core.public_state.snapshot.applied_server_t
            && connection_is_current core owner.connection ->
       let snapshot = { core.public_state.snapshot with sync_phase = Submitting } in
       let owner = { owner with phase = Submission_dispatched } in
-      let next = set_snapshot { core with submission_owner = Some owner } snapshot in
+      let next =
+        set_snapshot
+          { core with
+            outbox_records = commit.outbox_records
+          ; submission_owner = Some owner
+          }
+          snapshot
+      in
       { next
       ; effects =
           [ Run (Send_websocket { scope = owner.connection; message })
@@ -3144,10 +3210,16 @@ let start_authoritative_batch core (context : authoritative_context) =
 let select_graph core graph_id = select_graph_transition core ~persist:true graph_id
 
 let mirror_inspected core = function
-  | Mirror_available request when graph_scope_is_current core request.scope ->
+  | Mirror_available request
+    when graph_scope_is_current core request.scope
+         && core.pending_mirror_inspection
+            = Some { graph = request.graph; scope = request.scope } ->
+    let core = { core with pending_mirror_inspection = None } in
     (match core.selected_graph_value with
      | Some graph when graph.encrypted && Option.is_some core.graph_key ->
-       { next = core; effects = [ Delegate (Attach_graph request) ] }
+       { next = { core with pending_graph_attachment = Some request }
+       ; effects = [ Delegate (Attach_graph request) ]
+       }
      | Some graph when graph.encrypted ->
        let next, runner_instruction =
          issue_request core (Load_and_unlock_graph_key request.scope)
@@ -3155,16 +3227,31 @@ let mirror_inspected core = function
        { next = { next with pending_graph_open = Some request }
        ; effects = [ Run runner_instruction ]
        }
-     | Some _ | None -> { next = core; effects = [ Delegate (Attach_graph request) ] })
-  | Mirror_absent scope when graph_scope_is_current core scope ->
-    request_snapshot_bootstrap core
+     | Some _ | None ->
+       { next = { core with pending_graph_attachment = Some request }
+       ; effects = [ Delegate (Attach_graph request) ]
+       })
+  | Mirror_absent scope
+    when graph_scope_is_current core scope
+         && Option.fold
+              ~none:false
+              ~some:(fun (request : mirror_request) -> request.scope = scope)
+              core.pending_mirror_inspection ->
+    request_snapshot_bootstrap { core with pending_mirror_inspection = None }
   | Mirror_available _ | Mirror_absent _ -> unchanged core
 ;;
 
 let graph_attached core (attachment : graph_attachment) =
-  if not (graph_scope_is_current core attachment.scope)
+  if
+    (not (graph_scope_is_current core attachment.scope))
+    || not
+         (Option.fold
+            ~none:false
+            ~some:(fun (request : graph_open_request) -> request.scope = attachment.scope)
+            core.pending_graph_attachment)
   then unchanged core
   else (
+    let core = { core with pending_graph_attachment = None } in
     let startup =
       { core.public_state.snapshot.startup with
         restoring_local = false
@@ -3205,7 +3292,7 @@ let pull_effect core =
 ;;
 
 let websocket_opened core (connection : connection_scope) =
-  if not (connection_is_current core connection)
+  if (not (connection_is_current core connection)) || core.websocket_live
   then unchanged core
   else (
     let snapshot =
@@ -3240,7 +3327,7 @@ let enqueue_authoritative_batch core batch =
 ;;
 
 let websocket_message core (connection : connection_scope) message =
-  if not (connection_is_current core connection)
+  if (not (connection_is_current core connection)) || not core.websocket_live
   then unchanged core
   else (
     match message with
@@ -3282,7 +3369,7 @@ let websocket_message core (connection : connection_scope) message =
 ;;
 
 let websocket_protocol_error core (connection : connection_scope) error =
-  if not (connection_is_current core connection)
+  if (not (connection_is_current core connection)) || not core.websocket_live
   then unchanged core
   else catalog_failed core (Sync_protocol.error_to_string error)
 ;;
@@ -3309,7 +3396,13 @@ let websocket_closed core (connection : connection_scope) message =
 ;;
 
 let authoritative_applied core (result : authoritative_commit_result) =
-  if not (graph_scope_is_current core result.scope)
+  if
+    (not (graph_scope_is_current core result.scope))
+    || not
+         (Option.fold
+            ~none:false
+            ~some:(fun (batch : authoritative_batch) -> batch.scope.graph = result.scope)
+            core.active_authoritative_batch)
   then unchanged core
   else (
     let queued_authoritative_batch = core.queued_authoritative_batch in
@@ -3377,8 +3470,13 @@ let authoritative_applied core (result : authoritative_commit_result) =
 let snapshot_activated core (activation : snapshot_activation) =
   match core.selected_graph_value with
   | Some graph when graph_scope_is_current core activation.scope ->
-    { next = { core with snapshot_bootstrap_phase = Snapshot_bootstrap_idle }
-    ; effects = [ Delegate (Inspect_mirror { graph; scope = activation.scope }) ]
+    let request = { graph; scope = activation.scope } in
+    { next =
+        { core with
+          snapshot_bootstrap_phase = Snapshot_bootstrap_idle
+        ; pending_mirror_inspection = Some request
+        }
+    ; effects = [ Delegate (Inspect_mirror request) ]
     }
   | Some _ | None -> unchanged core
 ;;
@@ -3419,7 +3517,10 @@ let return_to_graph_picker core =
       ; local_presentation_barrier = false
       ; pending_effects = []
       ; pending_local_batches = []
+      ; pending_local_commits = []
+      ; pending_mirror_inspection = None
       ; pending_graph_open = None
+      ; pending_graph_attachment = None
       ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
       ; e2ee_authenticated = None
       ; encrypted_graph_key = None
@@ -3499,7 +3600,10 @@ let delete_local_cache core graph_id =
       ; pending_token = None
       ; pending_effects = []
       ; pending_local_batches = []
+      ; pending_local_commits = []
+      ; pending_mirror_inspection = None
       ; pending_graph_open = None
+      ; pending_graph_attachment = None
       ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
       ; e2ee_authenticated = None
       ; encrypted_graph_key = None
@@ -3576,7 +3680,11 @@ let step core event =
     | Runner_completed (Completion (ticket, result)) ->
       consume_completion core ticket result
     | Snapshot_download_progress progress ->
-      { next = core; effects = [ Publish (Bootstrap_progressed progress) ] }
+      (match core.current_graph_scope, core.snapshot_bootstrap_phase with
+       | Some scope, Snapshot_bootstrap_downloading
+         when Logseq_db_types.Graph_types.Uuid.equal scope.graph_id progress.graph_id ->
+         { next = core; effects = [ Publish (Bootstrap_progressed progress) ] }
+       | (Some _ | None), _ -> unchanged core)
     | Local_batch_prepared input -> start_local_batch core input
     | Local_batch_committed commit -> local_batch_committed core commit
     | Authoritative_batch_inspected context -> start_authoritative_batch core context
@@ -3656,6 +3764,10 @@ let step core event =
           ; deferred_catalog_reconciliation = false
           ; local_presentation_barrier = false
           ; pending_local_batches = []
+          ; pending_local_commits = []
+          ; pending_mirror_inspection = None
+          ; pending_graph_open = None
+          ; pending_graph_attachment = None
           }
       ; effects =
           [ Run (Cancel_effects scope) ]

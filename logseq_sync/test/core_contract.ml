@@ -1532,18 +1532,9 @@ let test_encrypted_warm_mirror_waits_for_a_scoped_graph_key () =
   in
   Alcotest.check
     Alcotest.bool
-    "a valid scoped key attaches without redundant key or snapshot requests"
+    "a duplicate mirror inspection is ignored after attachment is delegated"
     true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Attach_graph request) ->
-           request.scope = mirror_request.scope
-         | Run _ | Delegate _ | Publish _ -> false)
-       already_keyed.effects
-     && Option.is_none (graph_key_load_scope already_keyed.effects)
-     && not
-          (has_snapshot_token_request already_keyed.effects
-           || has_snapshot_work already_keyed.effects));
+    (already_keyed.effects = []);
   let wrong_scope =
     { mirror_request.scope with
       graph_id = other_graph_id ()
@@ -1815,14 +1806,19 @@ let test_authoritative_pull_rejects_empty_or_non_array_operations () =
     [ empty_list; list_operation ]
 ;;
 
+let queued_local_batch_input ?(scope = graph_scope ()) () =
+  local_batch_input
+    ~scope
+    [ Datascript.Add
+        ( Datascript.Temp_id "queued-duplicate"
+        , "block/uuid"
+        , Datascript.Uuid "33333333-3333-4333-8333-333333333333" )
+    ]
+;;
+
 let queued_outbox_records () =
   let record =
-    local_batch_input
-      [ Datascript.Add
-          ( Datascript.Temp_id "queued-duplicate"
-          , "block/uuid"
-          , Datascript.Uuid "33333333-3333-4333-8333-333333333333" )
-      ]
+    queued_local_batch_input ()
     |> Core.begin_local_batch
     |> Result.get_ok
     |> fun plan -> Core.finish_local_batch plan None |> Result.get_ok
@@ -1996,28 +1992,86 @@ let opened_graph_with_outbox outbox_records =
   opened, request, connection
 ;;
 
+let complete_opening_pull
+      (opened : Core.transition)
+      (request : Core.graph_open_request)
+      (connection : Core.connection_scope)
+      outbox_records
+  =
+  let message =
+    Sync_protocol.Server.Pull_ok
+      { t = request.checkpoint.applied_server_t; checksum = None; txs = [] }
+  in
+  let inspection = Core.step opened.next (Websocket_message (connection, message)) in
+  let batch =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Inspect_authoritative_batch batch) -> Some batch
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspection.effects
+    |> function
+    | Some batch -> batch
+    | None -> fail "opening pull did not request authoritative inspection"
+  in
+  let context : Core.authoritative_context =
+    { batch
+    ; precondition = "opening-pull-precondition"
+    ; checkpoint = request.checkpoint
+    ; database = Datascript.empty_db ()
+    ; outbox_records
+    }
+  in
+  let inspected = Core.step inspection.next (Authoritative_batch_inspected context) in
+  let apply_request =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Apply_authoritative_batch request) -> Some request
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspected.effects
+    |> function
+    | Some request -> request
+    | None -> fail "opening pull inspection did not request authoritative apply"
+  in
+  Core.step
+    inspected.next
+    (Authoritative_batch_applied
+       { scope = apply_request.scope
+       ; checkpoint = apply_request.checkpoint
+       ; outbox_records = apply_request.outbox_records
+       ; activity = apply_request.activity
+       ; invalidation = None
+       })
+;;
+
 let current_graph_with_outbox outbox_records =
   let opened, request, connection = opened_graph_with_outbox outbox_records in
-  let current =
-    Core.step
-      opened.next
-      (Authoritative_batch_applied
-         { scope = request.scope
-         ; checkpoint = request.checkpoint
-         ; outbox_records
-         ; activity = Logseq_db_types.Sync_status.Pull_duplicate
-         ; invalidation = None
-         })
-  in
+  let current = complete_opening_pull opened request connection outbox_records in
   current, request, connection
 ;;
 
 let test_submission_owner_is_reserved_before_durable_transition () =
-  let queued = queued_outbox_records () in
   let current, request, _ = current_graph_with_outbox [] in
-  let first =
+  let prepared =
     Core.step
       current.next
+      (Local_batch_prepared (queued_local_batch_input ~scope:request.scope ()))
+  in
+  let queued =
+    List.find_map
+      (function
+        | Core.Delegate
+            (Core.Complete_local_batch { action = Core.Commit { outbox_records }; _ }) ->
+          Some outbox_records
+        | Delegate (Complete_local_batch { action = Reject _; _ })
+        | Run _ | Delegate _ | Publish _ -> None)
+      prepared.effects
+    |> function
+    | Some outbox_records -> outbox_records
+    | None -> fail "local batch preparation did not request a durable commit"
+  in
+  let first =
+    Core.step
+      prepared.next
       (Local_batch_committed { scope = request.scope; outbox_records = queued })
   in
   let transition =
@@ -2216,17 +2270,7 @@ let test_submission_waits_for_durable_outbox_transition () =
             | Core.Delegate (Core.Commit_outbox_transition _) -> true
             | Run _ | Delegate _ | Publish _ -> false)
           opened.effects));
-  let current =
-    Core.step
-      opened.next
-      (Authoritative_batch_applied
-         { scope = open_request.scope
-         ; checkpoint
-         ; outbox_records = queued_records
-         ; activity = Logseq_db_types.Sync_status.Pull_duplicate
-         ; invalidation = None
-         })
-  in
+  let current = complete_opening_pull opened open_request connection queued_records in
   let transition =
     List.find_map
       (function

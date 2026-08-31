@@ -12,3 +12,23 @@
   unix
   uri
   yojson))
+
+(tests
+ (names
+  test_pure_reducer_bad_case_01_unowned_snapshot_progress
+  test_pure_reducer_bad_case_02_duplicate_mirror_inspection
+  test_pure_reducer_bad_case_03_duplicate_graph_attachment
+  test_pure_reducer_bad_case_04_duplicate_websocket_open
+  test_pure_reducer_bad_case_05_message_after_websocket_close
+  test_pure_reducer_bad_case_06_unsolicited_authoritative_apply
+  test_pure_reducer_bad_case_07_restore_accepts_old_catalog
+  test_pure_reducer_bad_case_08_reused_graph_token_challenge
+  test_pure_reducer_bad_case_09_unsolicited_local_commit
+  test_pure_reducer_bad_case_10_mismatched_outbox_commit)
+ (libraries
+  alcotest
+  datascript-ocaml-native
+  datascript_ocaml
+  logseq_db_types
+  logseq_sync.pure_reducer
+  uri))
