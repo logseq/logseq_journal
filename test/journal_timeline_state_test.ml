@@ -520,7 +520,7 @@ let test_direct_children_insert_after_parent_and_collapse () =
       expected
   in
   require_role_extents ~width:390. ~scale:1. ~expected_parent:56.;
-  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:153.;
+  require_role_extents ~width:320. ~scale:3.2 ~expected_parent:224.;
   let collapsed = Timeline.collapse loaded ~parent_id:(Journal_model.id parent) in
   require_equal_string_list
     (slot_keys collapsed)
@@ -904,7 +904,7 @@ let test_exact_profile_extents_have_no_composer_clearance () =
          ~before_day:None
          (feed [ day_feed 20260808 "Saturday, August 8" [ older ] ])
   in
-  let check ~width ~scale ~default_extent ~day_extent =
+  let check ~width ~scale ~default_extent ~day_extent ~row_extent =
     let profile =
       Journal_visual_tokens.select_row_profile
         ~preset:Journal_visual_tokens.Balanced
@@ -918,19 +918,21 @@ let test_exact_profile_extents_have_no_composer_clearance () =
       geometry.default_extent
       default_extent;
     let expected_overrides =
-      if Float.equal day_extent default_extent
-      then []
-      else [ { Ui.Widget.Sparse_extent_override.index = 0; extent = day_extent } ]
+      [ 0, day_extent; 1, row_extent ]
+      |> List.filter_map (fun (index, extent) ->
+        if Float.equal extent default_extent
+        then None
+        else Some { Ui.Widget.Sparse_extent_override.index; extent })
     in
     require (geometry.overrides = expected_overrides) "profile extent overrides changed";
     require
       (List.length geometry.overrides = List.length expected_overrides)
       "timeline retained an extent override beyond the day heading"
   in
-  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:42.;
-  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:42.;
-  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:60.;
-  check ~width:1_200. ~scale:3.2 ~default_extent:83. ~day_extent:82.
+  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:52. ~row_extent:44.;
+  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:52. ~row_extent:44.;
+  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:80. ~row_extent:100.;
+  check ~width:1_200. ~scale:3.2 ~default_extent:83. ~day_extent:114. ~row_extent:83.
 ;;
 
 let test_block_line_counts_are_the_authoritative_sparse_extents () =
@@ -938,12 +940,13 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
   let two = block ~order:"b" ~source:"One\nTwo" 601 in
   let three = block ~order:"c" ~source:"One\nTwo\nThree" 602 in
   let four = block ~order:"d" ~source:"One\nTwo\nThree\nFour\nFive" 603 in
+  let wrapping = block ~order:"e" ~source:(String.make 240 'W') 605 in
   let expanded =
     Timeline.empty ~today:20260809
     |> begin_and_apply_feed
          ~generation:1L
          ~before_day:None
-         (feed [ day_feed 20260809 "Today" [ parent; two; three; four ] ])
+         (feed [ day_feed 20260809 "Today" [ parent; two; three; four; wrapping ] ])
     |> fun state -> Timeline.expand state ~parent_id:(Journal_model.id parent)
   in
   let child_request =
@@ -995,8 +998,45 @@ let test_block_line_counts_are_the_authoritative_sparse_extents () =
            scale)
       expected
   in
-  check ~scale:1. [ 0, 44.; 1, 100.; 2, 56.; 3, 78.; 4, 100. ];
-  check ~scale:3.2 [ 0, 83.; 1, 294.; 2, 153.; 3, 224.; 4, 294. ]
+  check ~scale:1. [ 0, 44.; 1, 78.; 2, 56.; 3, 78.; 4, 78.; 5, 78. ];
+  check ~scale:3.2 [ 0, 83.; 1, 224.; 2, 153.; 3, 224.; 4, 224.; 5, 224. ]
+;;
+
+let test_collapsed_supporting_gap_is_part_of_the_sparse_extent () =
+  let parent = block ~source:"Parent" ~child_count:3 606 in
+  let child source suffix : Journal_graph_projection.child_summary =
+    { block_id = id "block" suffix; source }
+  in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed_entries
+                20260809
+                "Today"
+                [ entry
+                    ~child_summaries:
+                      [ child "Child one" 607
+                      ; child "Child two" 608
+                      ; child "Child three" 609
+                      ]
+                    parent
+                ]
+            ])
+  in
+  let profile =
+    Journal_visual_tokens.select_row_profile
+      ~preset:Journal_visual_tokens.Balanced
+      ~viewport_width:390.
+      ~text_scale:1.
+  in
+  let geometry = Timeline.extent_geometry state ~profile in
+  match geometry.overrides with
+  | [ { Ui.Widget.Sparse_extent_override.index = 0; extent } ] ->
+    require (Float.equal extent 82.) "collapsed supporting extent is %.1f" extent
+  | _ -> fail "collapsed supporting row did not publish one exact sparse override"
 ;;
 
 let test_anchor_decisions_replacements_and_route_return () =
@@ -1458,6 +1498,7 @@ let () =
   benchmark_continuous_visible_ranges ();
   test_exact_profile_extents_have_no_composer_clearance ();
   test_block_line_counts_are_the_authoritative_sparse_extents ();
+  test_collapsed_supporting_gap_is_part_of_the_sparse_extent ();
   test_anchor_decisions_replacements_and_route_return ();
   test_populated_feed_refresh_preserves_position_and_expansion ();
   test_initial_feed_refresh_supersedes_pending_pagination ();

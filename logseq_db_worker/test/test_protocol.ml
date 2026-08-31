@@ -71,6 +71,223 @@ let push_round_trip () =
     (outcome_field "pushes")
 ;;
 
+let causal_error_json ~contexts ~origin ~truncated =
+  `Assoc
+    [ "code", `String "corruptStorage"
+    ; "message", `String "The graph storage is corrupt or incomplete."
+    ; "details", `List []
+    ; ( "trace"
+      , `Assoc
+          [ "contexts", `List contexts; "origin", origin; "truncated", `Bool truncated ] )
+    ]
+;;
+
+let cause_json ~component ~operation ~code ~message =
+  `Assoc
+    [ "component", `String component
+    ; "operation", `String operation
+    ; "code", Option.fold ~none:`Null ~some:(fun value -> `String value) code
+    ; "message", `String message
+    ]
+;;
+
+let causal_error_round_trip () =
+  let json =
+    causal_error_json
+      ~contexts:
+        [ cause_json
+            ~component:"engine"
+            ~operation:"openGraph"
+            ~code:(Some "corruptStorage")
+            ~message:"The graph storage is corrupt or incomplete."
+        ; cause_json
+            ~component:"storageSession"
+            ~operation:"restoreDatabase"
+            ~code:(Some "SQLITE_CORRUPT")
+            ~message:"SQLite rejected the database image."
+        ]
+      ~origin:
+        (cause_json
+           ~component:"sqlite"
+           ~operation:"readPage"
+           ~code:(Some "SQLITE_CORRUPT")
+           ~message:"Database page validation failed.")
+      ~truncated:false
+  in
+  match Logseq_db_worker.Error.of_yojson json with
+  | Error message -> T.fail "causal error decode failed: %s" message
+  | Ok error ->
+    T.require
+      (Yojson.Safe.equal
+         (Yojson.Safe.sort json)
+         (Yojson.Safe.sort (Logseq_db_worker.Error.to_yojson error)))
+      "causal error changed during round trip"
+;;
+
+let cause_or_fallback_preserves_valid_cause () =
+  let expected =
+    Logseq_db_worker.Error.create_cause
+      ~component:Logseq_db_worker.Error.Storage
+      ~operation:"restoreDatabase"
+      ~code:(Some "SQLITE_CORRUPT")
+      ~message:"SQLite rejected the database image."
+    |> Result.get_ok
+  in
+  let actual =
+    Logseq_db_worker.Error.create_cause_or_fallback
+      ~component:Logseq_db_worker.Error.Storage
+      ~operation:"restoreDatabase"
+      ~code:(Some "SQLITE_CORRUPT")
+      ~message:"SQLite rejected the database image."
+      ~fallback_message:"The storage operation returned an unsafe failure."
+  in
+  T.require (actual = expected) "valid cause construction changed"
+;;
+
+let cause_or_fallback_replaces_rejected_messages () =
+  let fallback_message = "The storage operation returned an unsafe failure." in
+  let rejected_messages =
+    [ ""
+    ; String.make (Logseq_db_worker.Error.maximum_message_bytes + 1) 'x'
+    ; "cannot open /Users/alice/private-graph/logseq.sqlite"
+    ]
+  in
+  List.iter
+    (fun message ->
+       let cause =
+         Logseq_db_worker.Error.create_cause_or_fallback
+           ~component:Logseq_db_worker.Error.Storage_session
+           ~operation:"openDatabase"
+           ~code:(Some "SQLITE_CANTOPEN")
+           ~message
+           ~fallback_message
+       in
+       T.require
+         (cause.component = Logseq_db_worker.Error.Storage_session)
+         "fallback cause component changed";
+       T.require
+         (String.equal cause.operation "openDatabase")
+         "fallback cause operation changed";
+       T.require (cause.code = Some "SQLITE_CANTOPEN") "fallback cause code changed";
+       T.require
+         (String.equal cause.message fallback_message)
+         "fallback cause message changed")
+    rejected_messages
+;;
+
+let cause_or_fallback_preserves_absent_code () =
+  let cause =
+    Logseq_db_worker.Error.create_cause_or_fallback
+      ~component:Logseq_db_worker.Error.Dependency
+      ~operation:"loadDependency"
+      ~code:None
+      ~message:"Bearer secret"
+      ~fallback_message:"The dependency returned an unsafe failure."
+  in
+  T.require (cause.code = None) "fallback cause introduced a code"
+;;
+
+let cause_or_fallback_rejects_invalid_fallback () =
+  match
+    Logseq_db_worker.Error.create_cause_or_fallback
+      ~component:Logseq_db_worker.Error.Operating_system
+      ~operation:"openFile"
+      ~code:(Some "openFailed")
+      ~message:"password=secret"
+      ~fallback_message:""
+  with
+  | _ -> T.fail "invalid fallback did not raise an invariant failure"
+  | exception Invalid_argument _ -> ()
+;;
+
+let direct_errors_create_complete_origins () =
+  let codes =
+    Logseq_db_worker.Error.
+      [ Invalid_request
+      ; Unsupported_api_version
+      ; Graph_not_found
+      ; Graph_locked
+      ; Ownership_recovery
+      ; Unsupported_schema
+      ; Remote_graph
+      ; Ambiguous_sync_state
+      ; Unsupported_value
+      ; Unsupported_semantics
+      ; Corrupt_storage
+      ; Not_found
+      ; Ambiguous_selector
+      ; Duplicate_selector
+      ; Built_in_protected
+      ; Invalid_tree
+      ; Invalid_order
+      ; Invalid_position
+      ; Conflict
+      ; Response_too_large
+      ; Storage_busy
+      ; Closed_session
+      ]
+  in
+  List.iter
+    (fun code ->
+       let code_string = Logseq_db_worker.Error.code_string code in
+       let message = "Safe direct worker error" in
+       let error =
+         Logseq_db_worker.Error.create ~code ~message ~details:[] |> Result.get_ok
+       in
+       match Logseq_db_worker.Error.to_yojson error with
+       | `Assoc fields ->
+         (match List.assoc_opt "trace" fields with
+          | Some
+              (`Assoc
+                 [ ("contexts", `List [])
+                 ; ( "origin"
+                   , `Assoc
+                       [ ("component", `String "logseqDbWorker")
+                       ; ("operation", `String operation)
+                       ; ("code", `String origin_code)
+                       ; ("message", `String origin_message)
+                       ] )
+                 ; ("truncated", `Bool false)
+                 ]) ->
+            T.require
+              (String.equal operation code_string)
+              "direct origin operation changed";
+            T.require (String.equal origin_code code_string) "direct origin code changed";
+            T.require
+              (String.equal origin_message message)
+              "direct origin message changed"
+          | _ -> T.fail "%s has no complete direct causal origin" code_string)
+       | _ -> T.fail "%s did not encode as an object" code_string)
+    codes
+;;
+
+let causal_error_rejects_legacy_and_unsafe_values () =
+  let legacy =
+    `Assoc
+      [ "code", `String "corruptStorage"
+      ; "message", `String "Legacy flat error"
+      ; "details", `List []
+      ]
+  in
+  (match Logseq_db_worker.Error.of_yojson legacy with
+   | Error _ -> ()
+   | Ok _ -> T.fail "legacy string-only error envelope was accepted");
+  let unsafe =
+    causal_error_json
+      ~contexts:[]
+      ~origin:
+        (cause_json
+           ~component:"sqlite"
+           ~operation:"openDatabase"
+           ~code:(Some "SQLITE_CANTOPEN")
+           ~message:"cannot open /Users/alice/private-graph/logseq.sqlite")
+      ~truncated:false
+  in
+  match Logseq_db_worker.Error.of_yojson unsafe with
+  | Error _ -> ()
+  | Ok _ -> T.fail "unsafe complete home-directory path was accepted"
+;;
+
 let () =
   T.run
     "protocol"
@@ -92,6 +309,23 @@ let () =
     ; T.case "request JSON round trip" request_round_trip
     ; T.case "response JSON round trip" response_round_trip
     ; T.case "push JSON round trip" push_round_trip
+    ; T.case "causal error JSON round trip" causal_error_round_trip
+    ; T.case
+        "cause fallback preserves valid construction"
+        cause_or_fallback_preserves_valid_cause
+    ; T.case
+        "cause fallback replaces rejected messages"
+        cause_or_fallback_replaces_rejected_messages
+    ; T.case
+        "cause fallback preserves absent code"
+        cause_or_fallback_preserves_absent_code
+    ; T.case
+        "cause fallback rejects an invalid fallback"
+        cause_or_fallback_rejects_invalid_fallback
+    ; T.case "direct errors create complete origins" direct_errors_create_complete_origins
+    ; T.case
+        "causal errors reject legacy and unsafe values"
+        causal_error_rejects_legacy_and_unsafe_values
     ; T.case "reject unknown and trailing fields" (fun () ->
         let invalid =
           `Assoc

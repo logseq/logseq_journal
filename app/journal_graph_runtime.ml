@@ -3,6 +3,15 @@ module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
 module Projection = Journal_graph_projection
 
+type worker_failure =
+  { operation : string
+  ; failure : Protocol.failure
+  }
+
+type failure_source =
+  | Worker_failure of worker_failure
+  | Projection_failure of string
+
 type payload =
   | Graph_ready of Graph.graph_info
   | Block_captured of
@@ -42,10 +51,10 @@ type payload =
       }
   | Feed_failed of
       { request_generation : int64
-      ; message : string
+      ; failure : failure_source
       }
-  | Open_failed of Error.t
-  | Rejected of string
+  | Open_failed of worker_failure
+  | Rejected of failure_source
 
 type response =
   { basis : int64 option
@@ -71,6 +80,7 @@ type feed_spec =
 type refresh =
   | Captured of { block_id : string }
   | Updated of { block_id : string }
+  | Update_conflict_refresh of { block_id : string }
   | Child_created_refresh of
       { child_id : string
       ; parent_id : string
@@ -150,7 +160,9 @@ let response ?basis payload = { basis; payload }
 let responses values = { empty with responses = values }
 
 let feed_failure request_generation message =
-  responses [ response (Feed_failed { request_generation; message }) ]
+  responses
+    [ response (Feed_failed { request_generation; failure = Projection_failure message })
+    ]
 ;;
 
 let create () =
@@ -278,7 +290,7 @@ let journal_title day =
   Printf.sprintf "%04d-%02d-%02d" (day / 10_000) (day / 100 mod 100) (day mod 100)
 ;;
 
-let reject message = responses [ response (Rejected message) ]
+let reject message = responses [ response (Rejected (Projection_failure message)) ]
 
 let take count values =
   let rec loop remaining reversed = function
@@ -481,6 +493,26 @@ let submit t (request : Journal_graph_request.t) =
      | Ok context, Ok block ->
        (match page_by_block t command.block_id with
         | None -> reject "The block page is not retained."
+        | Some page
+          when command.expected_revision
+               <>
+               if Int64.compare t.basis 1L < 0
+               then 1
+               else if Int64.compare t.basis (Int64.of_int max_int) > 0
+               then max_int
+               else Int64.to_int t.basis ->
+          (match
+             page_tree
+               t
+               (Refresh_page_tree
+                  { page
+                  ; refresh = Update_conflict_refresh { block_id = command.block_id }
+                  })
+               page
+               Protocol.maximum_page_size
+           with
+           | Ok request -> requests [ request ]
+           | Error message -> reject message)
         | Some page ->
           let property = Graph.Property_by_ident "logseq.property/status" in
           let mutation =
@@ -675,6 +707,10 @@ let refresh_response t page refresh basis result =
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
            | None -> reject "The updated block was not visible after commit.")
+        | Update_conflict_refresh { block_id } ->
+          (match find block_id with
+           | Some entry -> responses [ response ~basis (Update_conflict entry.block) ]
+           | None -> reject "The conflicted block was not visible during reconciliation.")
         | Child_created_refresh { child_id; parent_id } ->
           (match find parent_id with
            | None -> reject "The parent block was not visible after child creation."
@@ -722,11 +758,33 @@ let receive t (protocol_response : Protocol.response) =
   | None -> empty
   | Some operation ->
     Hashtbl.remove t.pending key;
+    let operation_name =
+      match operation with
+      | Graph_info -> "graphInfo"
+      | List_feed_pages _ -> "listFeedPages"
+      | Feed_page_tree _ -> "loadFeedPageTree"
+      | Day_page_tree _ -> "loadDayPageTree"
+      | Detail_block _ -> "loadDetailBlock"
+      | Find_block_result -> "findBlock"
+      | Detail_children _ -> "loadDetailChildren"
+      | Capture_page _ -> "findCapturePage"
+      | Capture_create_page _ -> "createCapturePage"
+      | Capture_insert _ -> "insertCaptureBlock"
+      | Capture_status _ -> "setCaptureStatus"
+      | Refresh_page_tree _ -> "refreshPageTree"
+      | Mutation_refresh _ -> "refreshMutation"
+      | Delete_mutation _ -> "deleteSubtree"
+    in
     (match protocol_response with
      | Failed failure ->
+       let worker_failure = { operation = operation_name; failure } in
        (match operation with
         | List_feed_pages { request_generation; _ } ->
-          feed_failure request_generation (Error.message failure.error)
+          responses
+            [ response
+                (Feed_failed
+                   { request_generation; failure = Worker_failure worker_failure })
+            ]
         | Feed_page_tree { pending; page; _ } ->
           pending.remaining <- pending.remaining - 1;
           pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids;
@@ -736,7 +794,7 @@ let receive t (protocol_response : Protocol.response) =
               @ [ response
                     (Feed_failed
                        { request_generation = pending.generation
-                       ; message = Error.message failure.error
+                       ; failure = Worker_failure worker_failure
                        })
                 ]
           }
@@ -768,8 +826,11 @@ let receive t (protocol_response : Protocol.response) =
                             ; context
                             }))
                   ])
-           | _, Open, _ -> responses [ response (Open_failed failure.error) ]
-           | _, Execute, _ -> reject (Error.message failure.error)))
+           | Mutation_refresh { page; refresh = Updated { block_id } }, Execute, Conflict
+             -> request_refresh t page (Update_conflict_refresh { block_id })
+           | _, Open, _ -> responses [ response (Open_failed worker_failure) ]
+           | _, Execute, _ ->
+             responses [ response (Rejected (Worker_failure worker_failure)) ]))
      | Succeeded { basis; success; _ } ->
        t.basis <- Int64.max t.basis basis;
        (match t.reconciliation_basis with

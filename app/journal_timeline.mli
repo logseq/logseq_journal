@@ -15,5 +15,7 @@ val view
   -> on_visible_range:Ui.Event.Handler.t
   -> on_toggle_children:Ui.Event.Handler.t
   -> delete_enabled:bool
+  -> actions_enabled:bool
+  -> on_status:Ui.Event.Handler.t
   -> on_delete:Ui.Event.Handler.t
   -> Ui.Widget.Sliver.t

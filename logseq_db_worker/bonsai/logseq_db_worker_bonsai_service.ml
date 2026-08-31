@@ -30,7 +30,7 @@ type request =
   | Get_graph_state
 
 type response =
-  | Client_state of Core.state
+  | Client_command_completed
   | Graph_response of Protocol.response
   | Graph_state of Db.graph_state
 
@@ -127,8 +127,21 @@ let mutation_invalidation (success : Logseq_db_types.Mutation.success) =
 ;;
 
 let graph_failure (request : Protocol.request) message =
+  let origin =
+    Db.Error.create_cause_or_fallback
+      ~component:Db.Error.Worker_service
+      ~operation:"executeGraphRequest"
+      ~code:(Some "graphUnavailable")
+      ~message
+      ~fallback_message:"The graph service is unavailable."
+  in
   let error =
-    Db.Error.create ~code:Db.Error.Closed_session ~message ~details:[] |> Result.get_ok
+    Db.Error.create_with_origin
+      ~code:Db.Error.Closed_session
+      ~message:"The graph service is unavailable."
+      ~details:[]
+      ~origin
+    |> Result.get_ok
   in
   Protocol.failed ~request_id:request.request_id ~phase:Execute ~basis:None error
 ;;
@@ -156,10 +169,43 @@ let publish_graph_state context lifecycle =
     (Graph_state_changed (Db.Graph_lifecycle.state lifecycle))
 ;;
 
+let service_error ~operation ~code ~public_message lower_message =
+  let origin =
+    Db.Error.create_cause_or_fallback
+      ~component:Db.Error.Worker_service
+      ~operation
+      ~code:(Some "serviceFailure")
+      ~message:lower_message
+      ~fallback_message:"Worker service reported a display-unsafe failure."
+  in
+  Db.Error.create_with_origin ~code ~message:public_message ~details:[] ~origin
+  |> Result.get_ok
+;;
+
+let contextualize_error ~operation error =
+  let code = Db.Error.code error in
+  let message = Db.Error.message error in
+  let context =
+    Db.Error.create_cause
+      ~component:Db.Error.Worker_service
+      ~operation
+      ~code:(Some (Db.Error.code_string code))
+      ~message
+    |> Result.get_ok
+  in
+  Db.Error.wrap ~code ~message ~details:(Db.Error.details error) ~context error
+  |> Result.get_ok
+;;
+
 module Managed_coordinator = struct
   type pending_mutation =
     { prepared : Engine.prepared_managed_mutation
-    ; result : (Logseq_db_types.Mutation.success, string) result Eio.Promise.u
+    ; scope : Core.graph_scope
+    ; engine : Engine.t
+    ; admission_id : string
+    ; result :
+        (Logseq_db_types.Mutation.success, Core.local_batch_failure_kind * string) result
+          Eio.Promise.u
     }
 
   type t =
@@ -171,7 +217,9 @@ module Managed_coordinator = struct
     ; engine_dependencies : Engine.dependencies
     ; config : Db.Config.t
     ; lock : Eio.Mutex.t
+    ; graph_request_lock : Eio.Mutex.t
     ; mutable lifecycle_generation : int64
+    ; mutable next_mutation_admission : int64
     ; mutable attached_scope : Core.graph_scope option
     ; pending_mutations : (string, pending_mutation) Hashtbl.t
     }
@@ -185,12 +233,25 @@ module Managed_coordinator = struct
       (Client_state_changed state)
   ;;
 
-  let close_engine t generation =
+  let resolve_pending pending outcome = Eio.Promise.resolve pending.result outcome
+
+  let retire_pending_where t predicate kind message =
+    Hashtbl.to_seq t.pending_mutations
+    |> List.of_seq
+    |> List.iter (fun (operation_id, pending) ->
+      if predicate pending
+      then (
+        Hashtbl.remove t.pending_mutations operation_id;
+        resolve_pending pending (Error (kind, message))))
+  ;;
+
+  let close_engine t generation kind message =
     match t.engine with
-    | None -> ()
+    | None -> retire_pending_where t (fun _ -> true) kind message
     | Some engine ->
       t.engine <- None;
       t.attached_scope <- None;
+      retire_pending_where t (fun pending -> pending.engine == engine) kind message;
       Db.Graph_lifecycle.begin_close t.graph_lifecycle ~generation;
       publish_graph_state t.context t.graph_lifecycle;
       (match Engine.close engine with
@@ -198,7 +259,14 @@ module Managed_coordinator = struct
          Db.Graph_lifecycle.closed t.graph_lifecycle ~generation;
          publish_graph_state t.context t.graph_lifecycle
        | Error message ->
-         Db.Graph_lifecycle.failed t.graph_lifecycle ~generation ~message;
+         let error =
+           service_error
+             ~operation:"closeGraph"
+             ~code:Db.Error.Closed_session
+             ~public_message:"The graph storage session could not close."
+             message
+         in
+         Db.Graph_lifecycle.failed t.graph_lifecycle ~generation ~error;
          publish_graph_state t.context t.graph_lifecycle)
   ;;
 
@@ -206,12 +274,12 @@ module Managed_coordinator = struct
     Core.Graph_attachment_failed { scope = Core.effect_scope_of_graph scope; message }
   ;;
 
-  let close_attached_engine t =
+  let close_attached_engine t kind message =
     match t.attached_scope with
-    | Some scope -> close_engine t scope.graph_generation
+    | Some scope -> close_engine t scope.graph_generation kind message
     | None ->
       (match t.engine with
-       | Some _ -> close_engine t (current_graph_generation t)
+       | Some _ -> close_engine t (current_graph_generation t) kind message
        | None -> ())
   ;;
 
@@ -219,7 +287,7 @@ module Managed_coordinator = struct
     let scope = request.scope in
     if scope.graph_generation = current_graph_generation t
     then (
-      close_attached_engine t;
+      close_attached_engine t Scope_closed "managed graph attachment was replaced";
       Db.Graph_lifecycle.begin_open
         t.graph_lifecycle
         ~generation:scope.graph_generation
@@ -227,20 +295,28 @@ module Managed_coordinator = struct
       publish_graph_state t.context t.graph_lifecycle;
       match config_for_graph t.config request with
       | Error message ->
+        let error =
+          service_error
+            ~operation:"configureGraph"
+            ~code:Db.Error.Invalid_request
+            ~public_message:"The managed graph configuration is invalid."
+            message
+        in
         Db.Graph_lifecycle.failed
           t.graph_lifecycle
           ~generation:scope.graph_generation
-          ~message;
+          ~error;
         publish_graph_state t.context t.graph_lifecycle;
         handle_event_unlocked t (scope_error scope message)
       | Ok graph_config ->
         (match Engine.open_ ~dependencies:t.engine_dependencies graph_config with
          | Error error ->
            let message = Db.Error.message error in
+           let error = contextualize_error ~operation:"openManagedGraph" error in
            Db.Graph_lifecycle.failed
              t.graph_lifecycle
              ~generation:scope.graph_generation
-             ~message;
+             ~error;
            publish_graph_state t.context t.graph_lifecycle;
            handle_event_unlocked t (scope_error scope message)
          | Ok engine ->
@@ -254,7 +330,11 @@ module Managed_coordinator = struct
            in
            (match restored with
             | Error message ->
-              close_engine t scope.graph_generation;
+              close_engine
+                t
+                scope.graph_generation
+                Engine_unavailable
+                "managed graph restoration failed";
               handle_event_unlocked t (scope_error scope message)
             | Ok (checkpoint, outbox_records) ->
               Db.Graph_lifecycle.opened
@@ -325,48 +405,239 @@ module Managed_coordinator = struct
     (match t.attached_scope with
      | Some scope
        when Logseq_db_types.Graph_types.Uuid.equal scope.graph_id request.graph_id ->
-       close_attached_engine t
+       close_attached_engine t Scope_closed "managed local cache was removed"
      | Some _ | None -> ());
     ignore
       (Db.Synced_mirror.delete
          ~application_support_directory:t.config.application_support_directory
          ~graph_id:request.graph_id)
 
+  and decode_replan_mutation record =
+    let payload = Core.outbox_record_mutation_payload record in
+    let mutation =
+      try Mutation.of_yojson (Yojson.Safe.from_string payload) with
+      | Yojson.Json_error _ -> Error "The durable mutation payload is corrupt."
+    in
+    Result.bind mutation (fun mutation ->
+      let identity = Mutation.identify mutation in
+      let context = Mutation.context mutation in
+      if
+        not
+          (Logseq_db_types.Graph_types.Uuid.equal
+             context.mutation_id
+             (Core.outbox_record_mutation_id record))
+      then Error "The durable mutation ID does not match its semantic payload."
+      else if
+        not
+          (String.equal
+             (Mutation.identity_payload identity)
+             (Core.outbox_record_mutation_payload record))
+      then Error "The durable mutation payload is not canonical."
+      else if
+        not
+          (String.equal
+             (Mutation.identity_fingerprint identity)
+             (Core.outbox_record_fingerprint record))
+      then Error "The durable mutation fingerprint does not match its payload."
+      else Ok mutation)
+
+  and encode_replanned_record
+        t
+        (request : Core.authoritative_commit_request)
+        database
+        record
+        (replan : Engine.managed_replan)
+    =
+    if
+      not (String.equal replan.Engine.outliner_op (Core.outbox_record_outliner_op record))
+    then Error "The durable outliner operation does not match its semantic payload."
+    else
+      Result.bind
+        (Core.local_batch_input
+           ~scope:request.scope
+           ~admission_id:
+             ("replan-"
+              ^ Logseq_db_types.Graph_types.Uuid.to_string
+                  (Core.outbox_record_mutation_id record))
+           ~key:request.key
+           ~outbox_records:[]
+           ~mutation_id:(Core.outbox_record_mutation_id record)
+           ~mutation_payload:(Core.outbox_record_mutation_payload record)
+           ~mutation_fingerprint:(Core.outbox_record_fingerprint record)
+           ~outliner_op:(Core.outbox_record_outliner_op record)
+           ~database
+           ~operations:replan.operations)
+        (fun input ->
+           Result.bind (Core.begin_local_batch input) (fun plan ->
+             let encrypted =
+               match Core.local_batch_crypto_request plan with
+               | None -> Ok None
+               | Some crypto_request ->
+                 Result.map
+                   Option.some
+                   (Effect_runner.encrypt_protected_values
+                      t.runner
+                      crypto_request.key
+                      crypto_request.plaintexts)
+             in
+             Result.bind encrypted (fun encrypted ->
+               Core.finish_local_batch plan encrypted)))
+
+  and replan_authoritative_outbox t engine (request : Core.authoritative_commit_request) =
+    let current_precondition = Engine.authoritative_precondition engine in
+    match current_precondition with
+    | Error message -> Error (`Failed message)
+    | Ok current when not (String.equal current request.precondition) -> Error `Conflict
+    | Ok _ ->
+      (match Engine.authoritative_database engine with
+       | Error message -> Error (`Failed message)
+       | Ok authoritative_before ->
+         let authoritative_after =
+           try
+             Ok
+               (List.fold_left
+                  (fun database operations -> Datascript.db_with operations database)
+                  authoritative_before
+                  request.transactions)
+           with
+           | _ -> Error "The authoritative transactions cannot be staged."
+         in
+         Result.bind authoritative_after (fun authoritative_after ->
+           Result.bind (Core.decode_outbox_records request.outbox_records) (fun records ->
+             let rec block_suffix blocked = function
+               | [] -> List.rev blocked
+               | record :: rest ->
+                 block_suffix
+                   (Core.block_outbox_record
+                      record
+                      "Blocked by an earlier durable intent."
+                    :: blocked)
+                   rest
+             in
+             let rec loop database encoded projection = function
+               | [] ->
+                 Result.map
+                   (fun outbox_records ->
+                      List.rev projection, outbox_records, request.activity)
+                   (Core.encode_outbox_records (List.rev encoded))
+               | record :: rest ->
+                 let retry_state =
+                   match Core.outbox_record_state record with
+                   | Core.Accepted server_t -> Core.Accepted server_t
+                   | Queued | Submitted | Blocked _ -> Queued
+                 in
+                 let replanned =
+                   Result.bind (decode_replan_mutation record) (fun mutation ->
+                     Result.map
+                       (fun replan -> mutation, replan)
+                       (Engine.replan_managed_mutation engine ~database mutation))
+                 in
+                 (match replanned with
+                  | Error _message ->
+                    let blocked =
+                      List.rev encoded
+                      @ (Core.block_outbox_record
+                           record
+                           "The durable intent could not be replanned."
+                         :: block_suffix [] rest)
+                    in
+                    Result.map
+                      (fun outbox_records ->
+                         ( List.rev projection
+                         , outbox_records
+                         , Logseq_db_types.Sync_status.Sync_submission_blocked ))
+                      (Core.encode_outbox_records blocked)
+                  | Ok (_mutation, replan)
+                    when replan.status = Logseq_db_types.Mutation.No_change
+                         || replan.status = Already_applied ->
+                    (match retry_state with
+                     | Core.Accepted _ ->
+                       loop
+                         database
+                         (Core.clear_outbox_transport record retry_state :: encoded)
+                         projection
+                         rest
+                     | Queued | Submitted | Blocked _ ->
+                       loop database encoded projection rest)
+                  | Ok (_mutation, replan) ->
+                    (match encode_replanned_record t request database record replan with
+                     | Error _message ->
+                       let blocked =
+                         List.rev encoded
+                         @ (Core.block_outbox_record
+                              record
+                              "The durable intent could not be encoded."
+                            :: block_suffix [] rest)
+                       in
+                       Result.map
+                         (fun outbox_records ->
+                            ( List.rev projection
+                            , outbox_records
+                            , Logseq_db_types.Sync_status.Sync_submission_blocked ))
+                         (Core.encode_outbox_records blocked)
+                     | Ok replanned_record ->
+                       loop
+                         replan.projected_database
+                         (Core.outbox_record_with_state replanned_record retry_state
+                          :: encoded)
+                         (replan.operations :: projection)
+                         rest))
+             in
+             loop authoritative_after [] [] records))
+         |> Result.map_error (fun message -> `Failed message))
+
   and handle_worker_effect t = function
     | Core.Inspect_mirror request -> inspect_mirror t request
     | Activate_snapshot request -> activate_snapshot t request
     | Delete_mirror request -> delete_mirror t request
     | Attach_graph request -> attach_graph t request
-    | Detach_graph { graph_generation } ->
+    | Detach_graph detached_scope ->
       (match t.attached_scope with
-       | Some scope when scope.graph_generation = graph_generation ->
-         close_attached_engine t
+       | Some scope when scope = detached_scope ->
+         close_attached_engine t Scope_closed "managed graph was detached"
        | Some _ | None -> ())
-    | Commit_local_batch request ->
+    | Reset_managed_account account ->
+      (match t.attached_scope with
+       | Some scope when scope.account = account ->
+         close_attached_engine t Scope_closed "managed account was reset"
+       | Some _ | None ->
+         retire_pending_where
+           t
+           (fun pending -> pending.scope.account = account)
+           Scope_closed
+           "managed account was reset")
+    | Complete_local_batch request ->
       let operation_id =
         Logseq_db_types.Graph_types.Uuid.to_string request.operation_id
       in
-      (match Hashtbl.find_opt t.pending_mutations operation_id, t.engine with
-       | Some pending, Some engine ->
+      (match Hashtbl.find_opt t.pending_mutations operation_id with
+       | Some pending
+         when pending.scope <> request.scope
+              || not (String.equal pending.admission_id request.admission_id) -> ()
+       | Some pending ->
          Hashtbl.remove t.pending_mutations operation_id;
-         let committed =
-           Engine.commit_managed_mutation
-             engine
-             pending.prepared
-             ~outbox_records:request.outbox_records
-         in
-         Eio.Promise.resolve pending.result committed;
-         (match committed with
-          | Error _ -> ()
-          | Ok _ ->
-            handle_event_unlocked
-              t
-              (Core.Local_batch_committed
-                 { scope = request.scope; outbox_records = request.outbox_records }))
-       | Some pending, None ->
-         Hashtbl.remove t.pending_mutations operation_id;
-         Eio.Promise.resolve pending.result (Error "managed graph is unavailable")
-       | None, Some _ | None, None -> ())
+         (match request.action with
+          | Reject { kind; message } -> resolve_pending pending (Error (kind, message))
+          | Commit { outbox_records } ->
+            (match t.engine, t.attached_scope with
+             | Some engine, Some scope
+               when engine == pending.engine && scope = pending.scope ->
+               let committed =
+                 Engine.commit_managed_mutation engine pending.prepared ~outbox_records
+               in
+               (match committed with
+                | Error message ->
+                  resolve_pending pending (Error (Persistence_failed, message))
+                | Ok success ->
+                  resolve_pending pending (Ok success);
+                  handle_event_unlocked
+                    t
+                    (Core.Local_batch_committed { scope = request.scope; outbox_records }))
+             | Some _, Some _ | Some _, None | None, Some _ | None, None ->
+               resolve_pending
+                 pending
+                 (Error (Engine_unavailable, "managed graph is unavailable"))))
+       | None -> ())
     | Commit_outbox_transition transition ->
       (match t.engine with
        | None -> ()
@@ -399,12 +670,13 @@ module Managed_coordinator = struct
       (match t.engine, t.attached_scope with
        | Some engine, Some scope when scope = batch.scope.graph ->
          let context =
-           Result.bind (Engine.sync_checkpoint engine) (fun checkpoint ->
-             Result.bind (Engine.authoritative_database engine) (fun database ->
-               Result.map
-                 (fun outbox_records ->
-                    Core.{ batch; checkpoint; database; outbox_records })
-                 (Engine.managed_outbox_records engine)))
+           Result.bind (Engine.authoritative_precondition engine) (fun precondition ->
+             Result.bind (Engine.sync_checkpoint engine) (fun checkpoint ->
+               Result.bind (Engine.authoritative_database engine) (fun database ->
+                 Result.map
+                   (fun outbox_records ->
+                      Core.{ batch; precondition; checkpoint; database; outbox_records })
+                   (Engine.managed_outbox_records engine))))
          in
          (match context with
           | Ok context ->
@@ -418,28 +690,32 @@ module Managed_coordinator = struct
     | Apply_authoritative_batch request ->
       (match t.engine, t.attached_scope with
        | Some engine, Some scope when scope = request.scope ->
-         (match
-            Engine.apply_authoritative
-              engine
-              request.transactions
-              ~checkpoint:request.checkpoint
-              ~outbox_records:request.outbox_records
-          with
-          | Error message ->
+         (match replan_authoritative_outbox t engine request with
+          | Error `Conflict ->
+            handle_event_unlocked t (Core.Authoritative_batch_conflicted request.batch)
+          | Error (`Failed message) ->
             handle_event_unlocked
               t
               (Core.Authoritative_batch_failed
                  { scope = Core.effect_scope_of_graph scope; message })
-          | Ok (_basis_before, basis_after, changed_uuids, _database) ->
+          | Ok (projection_transactions, outbox_records, activity) ->
             (match
-               Engine.restore_managed_outbox engine request.projection_transactions
+               Engine.apply_authoritative
+                 engine
+                 ~expected_precondition:request.precondition
+                 request.transactions
+                 ~projection_transactions
+                 ~checkpoint:request.checkpoint
+                 ~outbox_records
              with
-             | Error message ->
+             | Error Engine.Authoritative_conflict ->
+               handle_event_unlocked t (Core.Authoritative_batch_conflicted request.batch)
+             | Error (Engine.Authoritative_apply_failed message) ->
                handle_event_unlocked
                  t
                  (Core.Authoritative_batch_failed
                     { scope = Core.effect_scope_of_graph scope; message })
-             | Ok outbox_records ->
+             | Ok (_basis_before, basis_after, changed_uuids, _database) ->
                let changed_uuids_truncated = List.length changed_uuids > 4096 in
                let changed_uuids = take 4096 changed_uuids in
                let invalidation =
@@ -455,7 +731,7 @@ module Managed_coordinator = struct
                     { scope
                     ; checkpoint = request.checkpoint
                     ; outbox_records
-                    ; activity = request.activity
+                    ; activity
                     ; invalidation
                     })))
        | Some _, Some _ | Some _, None | None, Some _ | None, None -> ())
@@ -517,14 +793,49 @@ module Managed_coordinator = struct
   type graph_execution =
     | Immediate of Protocol.response
     | Await_mutation of
-        (Logseq_db_types.Mutation.success, string) result Eio.Promise.t
+        (Logseq_db_types.Mutation.success, Core.local_batch_failure_kind * string) result
+          Eio.Promise.t
         * Protocol.request
         * Engine.t
 
-  let mutation_failure (request : Protocol.request) engine message =
+  let mutation_failure
+        (request : Protocol.request)
+        engine
+        (kind : Core.local_batch_failure_kind)
+        lower_message
+    =
+    let code, message =
+      match kind with
+      | Scope_closed | Engine_unavailable ->
+        ( Db.Error.Closed_session
+        , "The managed graph session closed before the mutation committed." )
+      | Persistence_failed ->
+        Storage_busy, "The mutation could not be committed to local storage."
+      | Planning_failed ->
+        Unsupported_semantics, "The mutation could not be planned for this graph."
+      | Encryption_failed -> Unsupported_semantics, "The mutation could not be encrypted."
+      | Encoding_failed ->
+        Unsupported_semantics, "The mutation could not be encoded for synchronization."
+    in
+    let origin_code =
+      match kind with
+      | Scope_closed -> "scopeClosed"
+      | Engine_unavailable -> "engineUnavailable"
+      | Persistence_failed -> "persistenceFailed"
+      | Planning_failed -> "planningFailed"
+      | Encryption_failed -> "encryptionFailed"
+      | Encoding_failed -> "encodingFailed"
+    in
+    let origin =
+      Db.Error.create_cause_or_fallback
+        ~component:Db.Error.Managed_sync
+        ~operation:"commitManagedMutation"
+        ~code:(Some origin_code)
+        ~message:lower_message
+        ~fallback_message:"Managed sync reported a display-unsafe failure."
+    in
     let error =
-      Db.Error.create ~code:Db.Error.Unsupported_semantics ~message ~details:[]
-      |> Result.get_ok
+      Db.Error.create_with_origin ~code ~message ~details:[] ~origin |> Result.get_ok
     in
     Protocol.failed
       ~request_id:request.request_id
@@ -546,10 +857,12 @@ module Managed_coordinator = struct
     let identity = Mutation.identify mutation in
     let mutation_fingerprint = Mutation.identity_fingerprint identity in
     match Engine.managed_outbox_records engine with
-    | Error message -> Immediate (mutation_failure request engine message)
+    | Error message ->
+      Immediate (mutation_failure request engine Persistence_failed message)
     | Ok encoded_outbox ->
       (match Core.decode_outbox_records encoded_outbox with
-       | Error message -> Immediate (mutation_failure request engine message)
+       | Error message ->
+         Immediate (mutation_failure request engine Encoding_failed message)
        | Ok outbox ->
          (match
             List.find_opt
@@ -564,24 +877,35 @@ module Managed_coordinator = struct
             ->
             (match Engine.duplicate_managed_mutation engine mutation with
              | Ok success -> Immediate (mutation_response request success)
-             | Error message -> Immediate (mutation_failure request engine message))
+             | Error message ->
+               Immediate (mutation_failure request engine Planning_failed message))
           | Some _ ->
             Immediate
               (mutation_failure
                  request
                  engine
+                 Planning_failed
                  "The mutation ID is already used by another durable outbox record.")
           | None ->
             (match t.attached_scope with
              | None ->
-               Immediate (mutation_failure request engine "managed graph scope is absent")
+               Immediate
+                 (mutation_failure
+                    request
+                    engine
+                    Scope_closed
+                    "managed graph scope is absent")
              | Some scope ->
+               let admission_id = Int64.to_string t.next_mutation_admission in
+               t.next_mutation_admission <- Int64.succ t.next_mutation_admission;
                (match Engine.prepare_managed_mutation engine ~identity mutation with
-                | Error message -> Immediate (mutation_failure request engine message)
+                | Error message ->
+                  Immediate (mutation_failure request engine Planning_failed message)
                 | Ok prepared ->
                   (match
                      Core.local_batch_input
                        ~scope
+                       ~admission_id
                        ~key:None
                        ~outbox_records:encoded_outbox
                        ~mutation_id
@@ -591,43 +915,46 @@ module Managed_coordinator = struct
                        ~database:(Engine.prepared_mutation_database prepared)
                        ~operations:(Engine.prepared_mutation_operations prepared)
                    with
-                   | Error message -> Immediate (mutation_failure request engine message)
+                   | Error message ->
+                     Immediate (mutation_failure request engine Planning_failed message)
                    | Ok input ->
                      let result, resolve = Eio.Promise.create () in
                      Hashtbl.add
                        t.pending_mutations
                        (Logseq_db_types.Graph_types.Uuid.to_string mutation_id)
-                       { prepared; result = resolve };
+                       { prepared; scope; engine; admission_id; result = resolve };
                      handle_event_unlocked t (Core.Local_batch_prepared input);
                      Await_mutation (result, request, engine))))))
   ;;
 
   let execute_graph_request_unlocked t request =
-    match t.engine with
-    | None -> Immediate (graph_failure request "no graph is open")
-    | Some engine ->
+    match t.engine, t.attached_scope, Core.admitted_graph_scope t.core with
+    | Some engine, Some attached, Some admitted when attached = admitted ->
       (match request.Protocol.command with
        | Read _ -> Immediate (Engine.execute engine request)
        | Mutate mutation -> begin_mutation t request engine mutation)
+    | Some _, Some _, Some _ | Some _, Some _, None | Some _, None, _ | None, _, _ ->
+      Immediate (graph_failure request "no admitted managed graph is open")
   ;;
 
   let execute_graph_request t request =
-    match
-      Eio.Mutex.use_rw ~protect:true t.lock (fun () ->
-        execute_graph_request_unlocked t request)
-    with
-    | Immediate response -> response
-    | Await_mutation (result, request, engine) ->
-      (match Eio.Promise.await result with
-       | Error message -> mutation_failure request engine message
-       | Ok success ->
-         if success.Logseq_db_types.Mutation.status = Applied
-         then
-           Worker.Session_context.emit
-             t.context
-             ~topic:invalidation_topic
-             (Graph_push (protocol_invalidation (mutation_invalidation success)));
-         mutation_response request success)
+    Eio.Mutex.use_rw ~protect:true t.graph_request_lock (fun () ->
+      match
+        Eio.Mutex.use_rw ~protect:true t.lock (fun () ->
+          execute_graph_request_unlocked t request)
+      with
+      | Immediate response -> response
+      | Await_mutation (result, request, engine) ->
+        (match Eio.Promise.await result with
+         | Error (kind, message) -> mutation_failure request engine kind message
+         | Ok success ->
+           if success.Logseq_db_types.Mutation.status = Applied
+           then
+             Worker.Session_context.emit
+               t.context
+               ~topic:invalidation_topic
+               (Graph_push (protocol_invalidation (mutation_invalidation success)));
+           mutation_response request success))
   ;;
 end
 
@@ -685,7 +1012,7 @@ let runner_create_error_message = function
 let create ~(dependencies : dependencies) =
   Worker.Service.create
     ~push_topic_count:5
-    ~concurrency:Worker.Service.Serial
+    ~concurrency:(Worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
     ~init:(fun context config ->
       match Worker.Session_context.data_dir context with
@@ -768,7 +1095,9 @@ let create ~(dependencies : dependencies) =
                               ; engine_dependencies = dependencies.engine
                               ; config
                               ; lock = Eio.Mutex.create ()
+                              ; graph_request_lock = Eio.Mutex.create ()
                               ; lifecycle_generation = 0L
+                              ; next_mutation_admission = 0L
                               ; attached_scope = None
                               ; pending_mutations = Hashtbl.create 32
                               }
@@ -805,10 +1134,8 @@ let create ~(dependencies : dependencies) =
                    ; context
                    })
             | Error error ->
-              Db.Graph_lifecycle.failed
-                graph_lifecycle
-                ~generation:0
-                ~message:(Db.Error.message error);
+              let error = contextualize_error ~operation:"openGraph" error in
+              Db.Graph_lifecycle.failed graph_lifecycle ~generation:0 ~error;
               Ok
                 (Graph_bound
                    { engine = None
@@ -825,10 +1152,27 @@ let create ~(dependencies : dependencies) =
            Ok (Graph_state (Db.Graph_lifecycle.state managed.graph_lifecycle))
          | Client_command command ->
            Managed_coordinator.handle_command managed command;
-           Ok (Client_state (Core.state managed.core))
+           Ok Client_command_completed
          | Graph_request request ->
-           Ok (Graph_response (Managed_coordinator.execute_graph_request managed request)))
-      | Graph_bound { engine; open_error; invalidations; graph_lifecycle; _ } ->
+           (try
+              Ok
+                (Graph_response
+                   (Managed_coordinator.execute_graph_request managed request))
+            with
+            | Engine.Fatal_storage_error error ->
+              let generation =
+                (Db.Graph_lifecycle.state managed.graph_lifecycle).generation
+              in
+              Db.Graph_lifecycle.failed managed.graph_lifecycle ~generation ~error;
+              publish_graph_state managed.context managed.graph_lifecycle;
+              Ok
+                (Graph_response
+                   (Protocol.failed
+                      ~request_id:request.request_id
+                      ~phase:Execute
+                      ~basis:None
+                      error))))
+      | Graph_bound { engine; open_error; invalidations; graph_lifecycle; context } ->
         (match request with
          | Get_graph_state -> Ok (Graph_state (Db.Graph_lifecycle.state graph_lifecycle))
          | Client_command _ ->
@@ -837,7 +1181,20 @@ let create ~(dependencies : dependencies) =
            let response =
              match engine, open_error with
              | Some engine, _ ->
-               let response = Engine.execute engine request in
+               let response =
+                 try Engine.execute engine request with
+                 | Engine.Fatal_storage_error error ->
+                   let generation =
+                     (Db.Graph_lifecycle.state graph_lifecycle).generation
+                   in
+                   Db.Graph_lifecycle.failed graph_lifecycle ~generation ~error;
+                   publish_graph_state context graph_lifecycle;
+                   Protocol.failed
+                     ~request_id:request.request_id
+                     ~phase:Execute
+                     ~basis:(Engine.basis engine)
+                     error
+               in
                (match response with
                 | Succeeded
                     { success = Mutation_result ({ status = Applied; _ } as success); _ }
@@ -863,6 +1220,8 @@ let create ~(dependencies : dependencies) =
         Managed_coordinator.close_engine
           managed
           (Managed_coordinator.current_graph_generation managed)
+          Core.Scope_closed
+          "managed service shut down"
       | Graph_bound { engine = None; _ } -> ()
       | Graph_bound { engine = Some engine; graph_lifecycle; context; _ } ->
         let generation = (Db.Graph_lifecycle.state graph_lifecycle).generation in
@@ -873,7 +1232,14 @@ let create ~(dependencies : dependencies) =
            Db.Graph_lifecycle.closed graph_lifecycle ~generation;
            publish_graph_state context graph_lifecycle
          | Error message ->
-           Db.Graph_lifecycle.failed graph_lifecycle ~generation ~message;
+           let error =
+             service_error
+               ~operation:"closeGraph"
+               ~code:Db.Error.Closed_session
+               ~public_message:"The graph storage session could not close."
+               message
+           in
+           Db.Graph_lifecycle.failed graph_lifecycle ~generation ~error;
            publish_graph_state context graph_lifecycle;
            failwith ("logseq-db-worker close failed: " ^ message)))
     ()

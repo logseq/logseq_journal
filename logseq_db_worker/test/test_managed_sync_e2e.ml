@@ -237,9 +237,7 @@ let handle_event context = function
   | Worker.Push { payload; _ } ->
     handle_push context payload;
     None
-  | Response { outcome = Completed (Service.Client_state state); _ } ->
-    handle_public_state context state;
-    None
+  | Response { outcome = Completed Service.Client_command_completed; _ } -> None
   | Response { outcome = Completed (Service.Graph_state state); _ } ->
     handle_graph_state context state;
     None

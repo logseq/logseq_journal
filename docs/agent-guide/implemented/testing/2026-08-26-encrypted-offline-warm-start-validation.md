@@ -316,6 +316,18 @@ local/network interpreter split. `dune runtest`, Flutter analyze and tests, the
 standalone native harness, macOS RunnerTests, macOS real-Keychain opt-in test, iOS
 app build, and iOS RunnerTests build-for-testing all passed on 2026-08-26.
 
+The compiled macOS lane was rerun on 2026-08-30 with a generated encrypted mirror
+and both cache-hit and missing-key fixtures. That run aligned catalog persistence
+with the fixture's origin-and-account SHA-256 path, removed the obsolete
+`pending-intents-v1.json` file when opening a managed mirror, held catalog and
+WebSocket authentication behind local Timeline presentation, and made missing-key
+recovery an explicit user action. A late same-account authentication result cannot
+clear that recovery state, and client command acknowledgements no longer carry a
+staleable state snapshot. The Flutter harness explicitly resumes the test lifecycle
+when the macOS test launcher cannot foreground the app. The cleaned compiled lane
+reached Timeline locally with zero pre-presentation token requests and reached the
+explicit recovery UI with zero token requests in the missing-key case.
+
 No new physical-profile TTFT numbers are claimed by this implementation. The
 three-launch procedure and tolerance remain the required artifact format for a
 future hardware performance claim; the prior iPhone baseline in the Problem

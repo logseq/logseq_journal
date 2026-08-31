@@ -807,19 +807,15 @@ let extent_geometry (state : t) ~profile =
   let extent = function
     | Top_level entry ->
       let item = Journal_row.Item.of_timeline_entry entry in
-      Journal_visual_tokens.block_extent
+      Journal_row.Item.visible_extent
+        item
         ~profile
-        ~visible_lines:
-          (Journal_row.Item.visible_line_count
-             item
-             ~expanded:(is_expanded state ~block_id:(Journal_model.id entry.block)))
+        ~expanded:(is_expanded state ~block_id:(Journal_model.id entry.block))
     | Child_preview { block; _ } ->
-      Journal_visual_tokens.block_extent
+      Journal_row.Item.visible_extent
+        (Journal_row.Item.of_block block)
         ~profile
-        ~visible_lines:
-          (Journal_row.Item.visible_line_count
-             (Journal_row.Item.of_block block)
-             ~expanded:true)
+        ~expanded:true
     | Children_loading _ ->
       Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Children_loading
     | Children_more _ ->

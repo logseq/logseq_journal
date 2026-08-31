@@ -79,7 +79,11 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     ; error =
         Some
           { owner = Graph
-          ; message = Option.value graph.error ~default:"Graph open failed."
+          ; message =
+              Option.fold
+                ~none:"Graph open failed."
+                ~some:Logseq_db_worker.Error.message
+                graph.error
           ; recovery = Some Retry_graph_open
           }
     }

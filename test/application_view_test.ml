@@ -616,6 +616,45 @@ let send_slidable_event handle block_id ~event_id ~payload =
   Test.Handle.native_event handle query ~kind_id ~version:3 ~event_id ~payload
 ;;
 
+let slidable_props handle block_id =
+  let node =
+    match
+      Test.Handle.find handle (Test.Query.test_id ("journal-row-slidable:" ^ block_id))
+    with
+    | Some node -> node
+    | None ->
+      fail "missing Slidable wrapper for %s\n%s" block_id (Test.Handle.show handle)
+  in
+  let (Av view) = Ui.Widget.Private.view node.widget in
+  match view.node with
+  | Ui.Widget.Private.Native_widget { kind_id; payload; _ } ->
+    require
+      (kind_id = Ui.Native_widget.Slidable.kind_id)
+      "row %s uses the wrong native widget kind"
+      block_id;
+    Ui.Native_widget.Slidable.For_testing.decode_props_exn payload
+  | _ -> fail "row %s is not a Slidable native widget" block_id
+;;
+
+let status_action_id = function
+  | Journal_model.No_status -> 2
+  | Todo -> 3
+  | Doing -> 4
+  | Done -> 5
+  | In_review | Now | Canceled | Backlog | Waiting | Later ->
+    invalid_arg "status_action_id only accepts quick-action states"
+;;
+
+let press_status_action handle block_id task_state =
+  send_slidable_event
+    handle
+    block_id
+    ~event_id:Ui.Native_widget.Slidable.action_pressed_event_id
+    ~payload:
+      (Ui.Native_widget.Slidable.For_testing.encode_action_pressed
+         (status_action_id task_state))
+;;
+
 let press_delete_action handle block_id =
   send_slidable_event
     handle
@@ -1141,6 +1180,22 @@ let require_text_max_lines handle test_id expected =
   | _ -> fail "%s is not Text" test_id
 ;;
 
+let require_text_overflow handle test_id expected =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Text { overflow; _ } ->
+    require (overflow = expected) "%s text overflow differs" test_id
+  | _ -> fail "%s is not Text" test_id
+;;
+
+let require_opacity handle test_id expected =
+  let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Opacity { opacity } ->
+    require (Float.equal opacity expected) "%s opacity is %.2f" test_id opacity
+  | _ -> fail "%s is not Opacity" test_id
+;;
+
 let require_padding handle test_id ~left ~top ~right ~bottom =
   let (Av view) = Ui.Widget.Private.view (node_by_test_id handle test_id).widget in
   match view.node with
@@ -1295,6 +1350,45 @@ let test_graph_open_error_retains_the_journal_scroll_contract () =
            ~collapsed_height:(56. +. (1. /. 3.))))
 ;;
 
+let test_error_info_action_and_page_follow_worker_error_ledger () =
+  with_startup (fun startup ->
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle "No journal entries yet";
+         require_no_test_id handle "journal-error-info-button";
+         require_no_semantics handle "Error info"));
+  Adapter_fixture.with_snapshot (fun fixture ->
+    let token =
+      Graph.Uuid.of_string "ffffffff-ffff-4fff-8fff-ffffffffffff" |> Result.get_ok
+    in
+    let startup =
+      { fixture.Adapter_fixture.config with
+        target = Logseq_db_worker.Config.Snapshot { token }
+      }
+    in
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until handle "Error info action" (fun () ->
+           Option.is_some
+             (Test.Handle.find handle (Test.Query.test_id "journal-error-info-button")));
+         require_semantics handle "Error info";
+         click_test_id handle "journal-error-info-button";
+         require_test_id handle "journal-error-info-page";
+         require_visible_text handle "Error info";
+         require_visible_text handle "graphNotFound";
+         require_visible_text handle "The graph target does not exist.";
+         require_visible_text handle "Active";
+         require_visible_text handle "Occurrence 1";
+         require_semantics handle "Back from Error info";
+         click_test_id handle "journal-error-info-back";
+         require_no_test_id handle "journal-error-info-page";
+         require_test_id handle "logseq-graph-open-failed"))
+;;
+
 let require_content_width_padding handle ~horizontal =
   let (Av view) =
     Ui.Widget.Private.view (node_by_test_id handle "journal-content-width-padding").widget
@@ -1423,7 +1517,17 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
            (String.equal props.hint_text "Capture a thought")
            "Capture input hint changed";
          (match props.buttons with
-          | [ save ] ->
+          | [ task; save ] ->
+            require (task.id = 2) "Capture task button ID changed";
+            require
+              (String.equal task.tooltip "Capture as task, off")
+              "Capture task accessible state changed";
+            require
+              (task.position = Ui.Native_widget.Expandable_message_composer.Leading
+               && task.visibility = Always
+               && task.style = Plain
+               && task.enabled)
+              "Capture unchecked task button policy changed";
             require (save.id = 1) "Capture Save button ID changed";
             require
               (String.equal save.tooltip "Save journal block")
@@ -1434,13 +1538,15 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
                && save.style = Filled
                && save.enabled)
               "Capture Save button policy changed"
-          | _ -> fail "Capture input must expose exactly one Save action");
+          | _ -> fail "Capture input must expose one task action and one Save action");
          require_capture_affordance_floating_action_button handle;
          require_test_id handle "journal-capture-fab-icon";
          require_material_icon handle "journal-capture-fab-icon" 0xe047;
          require_no_test_id handle "journal-capture-composer-plus";
          require_test_id handle "journal-capture-composer-submit";
          require_material_icon handle "journal-capture-composer-submit" 0xe0a0;
+         require_test_id handle "journal-capture-composer-task";
+         require_material_icon handle "journal-capture-composer-task" 0xe158;
          require_no_test_id handle "journal-capture-target";
          require_no_test_id handle "journal-capture-feedback";
          send_capture_affordance_button handle ~button_id:1 ~text:"   \n";
@@ -1453,7 +1559,11 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
            (not saving_props.enabled)
            "direct Capture did not disable its editor while Saving";
          (match saving_props.buttons with
-          | [ save ] ->
+          | [ task; save ] ->
+            require (not task.enabled) "direct Capture task action stayed enabled";
+            require
+              (task.style = Plain && String.equal task.tooltip "Capture as task, off")
+              "plain Capture changed task intent while Saving";
             require (not save.enabled) "direct Capture did not enter Saving";
             require
               (String.equal save.tooltip "Saving journal block")
@@ -1468,8 +1578,66 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
          let props = capture_affordance_props handle in
          require props.enabled "Capture FAB did not recover after persistence";
          match props.buttons with
-         | [ save ] -> require save.enabled "Capture Save stayed disabled after success"
+         | [ task; save ] ->
+           require
+             (task.enabled
+              && task.style = Plain
+              && String.equal task.tooltip "Capture as task, off")
+             "Capture task intent did not reset after success";
+           require save.enabled "Capture Save stayed disabled after success"
          | _ -> fail "Capture action count changed after success"))
+;;
+
+let test_capture_task_icon_preserves_intent_and_persists_todo () =
+  with_startup (fun startup ->
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle "No journal entries yet";
+         let composer = node_by_test_id handle "journal-capture-expandable" in
+         send_capture_affordance_button handle ~button_id:2 ~text:"";
+         let selected = capture_affordance_props handle in
+         (match selected.buttons with
+          | [ task; save ] ->
+            require
+              (task.id = 2
+               && task.position = Ui.Native_widget.Expandable_message_composer.Leading
+               && task.visibility = Always
+               && task.style = Filled
+               && task.enabled)
+              "Capture task action did not become checked";
+            require
+              (String.equal task.tooltip "Capture as task, on")
+              "checked Capture task action did not announce its state";
+            require (save.id = 1) "Capture Save ID changed after task selection"
+          | _ -> fail "Capture task selection changed the composer action set");
+         require_material_icon handle "journal-capture-composer-task" 0xe646;
+         require
+           (ID.Ui.Node_id.equal
+              composer.node_id
+              (node_by_test_id handle "journal-capture-expandable").node_id)
+           "task selection replaced the mounted composer";
+         let source = "  Todo Capture 中文 👩🏽‍💻 literal  " in
+         send_capture_affordance_button handle ~button_id:1 ~text:source;
+         let saving = capture_affordance_props handle in
+         (match saving.buttons with
+          | [ task; save ] ->
+            require
+              ((not task.enabled) && task.style = Filled)
+              "checked task action was not gated while Saving";
+            require (not save.enabled) "Todo Save stayed enabled while Saving"
+          | _ -> fail "Todo Saving changed the composer action set");
+         send_capture_affordance_button handle ~button_id:2 ~text:source;
+         pump_until_text handle source;
+         require_semantics handle "Current status Todo";
+         let reset = capture_affordance_props handle in
+         match reset.buttons with
+         | [ task; _ ] ->
+           require
+             (task.style = Plain && String.equal task.tooltip "Capture as task, off")
+             "successful Todo persistence did not reset task intent"
+         | _ -> fail "Todo success changed the composer action set"))
 ;;
 
 let test_capture_fab_uses_directional_threshold_without_replacing_the_composer () =
@@ -1756,7 +1924,7 @@ let test_typography_waits_for_the_persisted_preset_without_flashing_balanced () 
            ~weight:Ui.Style.Font_weight.Semi_bold;
          require_theme_owned_text_style
            handle
-           ("journal-row-source:" ^ entry.block_id ^ ":0")
+           ("journal-row-source:" ^ entry.block_id)
            ~size:17.
            ~line_height:(24. /. 17.)
            ~weight:Ui.Style.Font_weight.Normal))
@@ -1780,7 +1948,7 @@ let test_missing_and_invalid_typography_preferences_select_balanced () =
              ~weight:Ui.Style.Font_weight.Semi_bold;
            require_theme_owned_text_style
              handle
-             ("journal-row-source:" ^ entry.block_id ^ ":0")
+             ("journal-row-source:" ^ entry.block_id)
              ~size:16.
              ~line_height:(22. /. 16.)
              ~weight:Ui.Style.Font_weight.Normal))
@@ -1800,7 +1968,7 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
          pump_until handle "the Account action" (fun () ->
            Option.is_some
              (Test.Handle.find handle (Test.Query.test_id "journal-account-menu-button")));
-         pump_until_text handle "First line";
+         pump_until_text handle entry.source;
          let capture_before = node_by_test_id handle "journal-capture-expandable" in
          click_test_id handle "journal-account-menu-button";
          require_test_id handle "journal-account-dialog-page";
@@ -1834,7 +2002,7 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
            ~weight:Ui.Style.Font_weight.Semi_bold;
          require_theme_owned_text_style
            handle
-           ("journal-row-source:" ^ entry.block_id ^ ":0")
+           ("journal-row-source:" ^ entry.block_id)
            ~size:17.
            ~line_height:(24. /. 17.)
            ~weight:Ui.Style.Font_weight.Normal;
@@ -1888,7 +2056,7 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
            ~weight:Ui.Style.Font_weight.Semi_bold;
          require_theme_owned_text_style
            handle
-           ("journal-row-source:" ^ entry.block_id ^ ":0")
+           ("journal-row-source:" ^ entry.block_id)
            ~size:15.
            ~line_height:(20. /. 15.)
            ~weight:Ui.Style.Font_weight.Normal;
@@ -1911,7 +2079,7 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
          press_after_choice_events handle "journal-settings-close";
          require_no_test_id handle "journal-settings-dialog-page";
          require_test_id handle "journal-timeline-page";
-         require_visible_text handle "First line"))
+         require_visible_text handle entry.source))
 ;;
 
 let diagnostic_snapshot
@@ -2420,8 +2588,8 @@ let test_timeline_uses_truthful_fallback_labels_without_duplicate_today () =
          require_theme_owned_text_style
            handle
            "journal-day-heading-label:20260808"
-           ~size:13.
-           ~line_height:(18. /. 13.)
+           ~size:22.
+           ~line_height:(28. /. 22.)
            ~weight:Ui.Style.Font_weight.Semi_bold;
          require_padding
            handle
@@ -2951,20 +3119,129 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
          pump_until_text handle "周六，8月8日"))
 ;;
 
-let test_timeline_status_rail_has_no_task_action () =
+let require_quick_status_pane
+      (props : Ui.Native_widget.Slidable.For_testing.props)
+      ~current
+  =
+  require props.enabled "row Slidable is disabled without a pending mutation";
+  require props.close_on_scroll "row Slidable no longer closes on scroll";
+  require
+    (props.direction = Ui.Layout.Axis.Horizontal && props.use_text_direction)
+    "row Slidable lost logical horizontal direction handling";
+  require
+    (props.group_tag = Some "journal-timeline")
+    "row Slidable left the shared auto-close group";
+  (match props.start_action_pane with
+   | None -> fail "mutation-enabled row has no logical-start status pane"
+   | Some pane ->
+     require
+       (pane.motion = Ui.Native_widget.Slidable.Behind
+        && pane.dismissible = None
+        && not pane.drag_dismissible)
+       "status pane changed its stationary non-dismissible policy";
+     require
+       (Float.compare pane.extent_ratio 0.6 >= 0
+        && Float.compare pane.extent_ratio 1. <= 0)
+       "status pane extent %.3f is not bounded for four targets"
+       pane.extent_ratio;
+     require
+       (List.map
+          (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) -> action.id)
+          pane.actions
+        = [ 2; 3; 4; 5 ])
+       "status action IDs or order changed";
+     List.iter2
+       (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) task_state ->
+          require
+            (Bool.equal action.enabled (task_state <> current))
+            "quick status action %d enabled=%b for current state %s"
+            action.id
+            action.enabled
+            (Journal_model.status_name current);
+          require action.auto_close "quick status action %d does not auto-close" action.id)
+       pane.actions
+       [ Journal_model.No_status; Todo; Doing; Done ]);
+  match props.end_action_pane with
+  | Some { actions = [ delete ]; _ } ->
+    require (delete.id = 1) "Delete action ID changed or collided with status IDs"
+  | None | Some _ -> fail "row lost its single logical-end Delete action"
+;;
+
+let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
   with_startup (fun startup ->
     let parent = capture ~task_state:Journal_model.Todo 90 "Parent task source" in
-    seed startup [ parent ];
+    let other = capture ~task_state:Journal_model.Backlog 92 "Backlog task source" in
+    seed startup [ parent; other ];
     let child = seed_child startup ~parent 91 "Existing direct child" in
     let handle = create_handle startup in
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
          pump_until_text handle parent.source;
-         require_no_test_id handle ("journal-row-task:" ^ parent.block_id);
-         require_no_test_id handle ("journal-row-task-target:" ^ parent.block_id);
-         require_no_test_id handle ("journal-row-task-icon:" ^ parent.block_id);
+         require_quick_status_pane
+           (slidable_props handle parent.block_id)
+           ~current:Journal_model.Todo;
+         require_quick_status_pane
+           (slidable_props handle other.block_id)
+           ~current:Journal_model.Backlog;
+         List.iter
+           (fun label -> require_visible_text handle label)
+           [ "No status"; "Todo"; "Doing"; "Done" ];
+         require_semantics handle "Set status to No status";
+         require_semantics handle "Current status Todo";
+         require_semantics handle "Set status to Doing";
+         require_semantics handle "Set status to Done";
          require_test_id handle ("journal-row-status-rail:" ^ parent.block_id);
+         press_status_action handle parent.block_id Journal_model.Todo;
+         Test.Handle.present handle;
+         require
+           (slidable_props handle parent.block_id).enabled
+           "current-status no-op entered the mutation gate";
+         press_status_action handle parent.block_id Journal_model.Doing;
+         Test.Handle.present handle;
+         let pending = slidable_props handle parent.block_id in
+         require (not pending.enabled) "pending status mutation left Slidable enabled";
+         press_status_action handle parent.block_id Journal_model.Done;
+         press_delete_action handle parent.block_id;
+         pump_until handle "authoritative Doing status" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.semantics_label
+                   "Parent task source, status Doing, created at 01:30"))
+           || Test.Handle.pending_host_effect_count handle > 0
+           || (slidable_props handle parent.block_id).enabled);
+         if Test.Handle.pending_host_effect_count handle > 0
+         then (
+           let request = snack_bar_request_from_last_frame handle in
+           fail "status mutation failed: %s" request.message);
+         require_no_semantics handle "Current status Todo";
+         require_semantics handle "Current status Doing";
+         require_visible_text handle parent.source;
+         require_quick_status_pane
+           (slidable_props handle parent.block_id)
+           ~current:Journal_model.Doing;
+         press_status_action handle other.block_id Journal_model.No_status;
+         pump_until handle "status conflict snackbar" (fun () ->
+           Test.Handle.pending_host_effect_count handle = 1);
+         let conflict = snack_bar_request_from_last_frame handle in
+         require
+           (String.equal
+              conflict.message
+              "Unable to change status: Status changed elsewhere. Try again.")
+           "status conflict snackbar changed: %S"
+           conflict.message;
+         require_quick_status_pane
+           (slidable_props handle other.block_id)
+           ~current:Journal_model.Backlog;
+         respond_to_snack_bar handle conflict 0;
+         press_status_action handle other.block_id Journal_model.No_status;
+         pump_until handle "authoritative No status replacement" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.semantics_label "Current status No status")));
+         require_no_test_id handle ("journal-row-status-rail:" ^ other.block_id);
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "direct child preview" (fun () ->
            Option.is_some
@@ -2973,6 +3250,7 @@ let test_timeline_status_rail_has_no_task_action () =
                 (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))));
          require_no_test_id handle ("journal-row-open:" ^ parent.block_id);
          require_no_test_id handle ("journal-row-disclosure:" ^ parent.block_id);
+         require_no_test_id handle ("journal-row-slidable:" ^ child.block_id);
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "row-body collapse" (fun () ->
            Option.is_none
@@ -3060,60 +3338,51 @@ let test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed () =
          require_no_semantics handle ("Direct child: " ^ child.source)))
 ;;
 
-let _test_collapsed_rows_share_three_lines_between_parent_and_child_content () =
+let test_collapsed_rows_keep_three_title_lines_plus_two_tail_faded_child_lines () =
   with_startup (fun startup ->
-    let two_line_parent = capture 123 "Parent line one\nParent line two" in
-    let one_line_parent = capture 126 "Single parent line" in
-    let three_line_parent = capture 131 "Line one\nLine two\nLine three\nLine four" in
-    seed startup [ two_line_parent; one_line_parent; three_line_parent ];
-    let first_for_two =
-      seed_child startup ~parent:two_line_parent 124 "Two-line child one"
-    in
-    let second_for_two =
-      seed_child startup ~parent:two_line_parent 125 "Two-line child two"
-    in
-    let first_for_one =
-      seed_child startup ~parent:one_line_parent 127 "One-line child one"
-    in
-    let second_for_one =
-      seed_child startup ~parent:one_line_parent 128 "One-line child two"
-    in
-    let third_for_one =
-      seed_child startup ~parent:one_line_parent 129 "One-line child three"
-    in
-    let hidden_for_three =
-      seed_child startup ~parent:three_line_parent 132 "Three-line hidden child"
-    in
+    let parent = capture 123 "Line one\nLine two\nLine three\nLine four" in
+    seed startup [ parent ];
+    let first = seed_child startup ~parent 124 "Child summary one" in
+    let second = seed_child startup ~parent 125 "Child summary two" in
+    let third = seed_child startup ~parent 126 "Child summary three" in
     let handle = create_handle startup in
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         pump_until_text handle one_line_parent.source;
-         require_text_max_lines
+         set_environment handle (environment ~viewport_width:390. ());
+         pump_until_text handle parent.source;
+         require_text_max_lines handle ("journal-row-source:" ^ parent.block_id) 3;
+         require_text_overflow
            handle
-           ("journal-row-source:" ^ two_line_parent.block_id)
-           2;
-         require_visible_text handle first_for_two.source;
-         require_no_visible_text handle second_for_two.source;
-         require_text_max_lines
+           ("journal-row-source:" ^ parent.block_id)
+           Ui.Style.Text_overflow.Clip;
+         require_test_id handle ("journal-row-source-tail-fade:" ^ parent.block_id);
+         require_no_visible_text handle third.source;
+         List.iteri
+           (fun index (child : Journal_graph_projection.create_child) ->
+              let text_id =
+                Printf.sprintf "journal-row-supporting:%s:%d" parent.block_id index
+              in
+              require_text_max_lines handle text_id 1;
+              require_text_overflow handle text_id Ui.Style.Text_overflow.Clip;
+              require_opacity
+                handle
+                (Printf.sprintf
+                   "journal-row-supporting-opacity:%s:%d"
+                   parent.block_id
+                   index)
+                0.65;
+              require_visible_text handle child.source)
+           [ first; second ];
+         require_no_test_id
            handle
-           ("journal-row-source:" ^ one_line_parent.block_id)
-           1;
-         require_visible_text handle first_for_one.source;
-         require_visible_text handle second_for_one.source;
-         require_no_visible_text handle third_for_one.source;
-         require_text_max_lines
+           ("journal-row-supporting-tail-fade:" ^ parent.block_id ^ ":0");
+         require_test_id
            handle
-           ("journal-row-source:" ^ three_line_parent.block_id)
-           3;
-         require_no_visible_text handle hidden_for_three.source;
-         require_padding
-           handle
-           ("journal-row-body-padding:" ^ one_line_parent.block_id)
-           ~left:32.
-           ~top:8.
-           ~right:24.
-           ~bottom:8.))
+           ("journal-row-supporting-tail-fade:" ^ parent.block_id ^ ":1");
+         require_sized_height handle ("journal-row-supporting-gap:" ^ parent.block_id) 4.;
+         require_test_id handle ("journal-row-metadata-align:" ^ parent.block_id);
+         require_sized_height handle ("journal-row-extent:" ^ parent.block_id) 126.))
 ;;
 
 let test_expanded_children_are_static_previews_without_group_separator () =
@@ -3125,7 +3394,9 @@ let test_expanded_children_are_static_previews_without_group_separator () =
         "Bounded preview parent\nSecond parent line"
     in
     seed startup [ parent ];
-    let first = seed_child startup ~parent 131 "Preview child one" in
+    let first =
+      seed_child startup ~parent 131 "Preview child one\nSecond\nThird\nFourth"
+    in
     let second =
       seed_child startup ~parent ~task_state:Journal_model.Todo 132 "Preview task child"
     in
@@ -3141,7 +3412,8 @@ let test_expanded_children_are_static_previews_without_group_separator () =
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         pump_until_text handle "Bounded preview parent";
+         set_environment handle (environment ~viewport_width:390. ());
+         pump_until_text handle parent.source;
          require_visible_text_count handle first.source 1;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "three child previews and static More" (fun () ->
@@ -3169,6 +3441,13 @@ let test_expanded_children_are_static_previews_without_group_separator () =
          require_no_test_id handle ("journal-child-status-rail:" ^ third.block_id);
          require_no_visible_text handle fourth.source;
          require_no_visible_text handle "Nested child must not appear";
+         require_text_max_lines handle ("journal-child-source:" ^ first.block_id) 3;
+         require_text_overflow
+           handle
+           ("journal-child-source:" ^ first.block_id)
+           Ui.Style.Text_overflow.Clip;
+         require_test_id handle ("journal-child-source-tail-fade:" ^ first.block_id);
+         require_opacity handle ("journal-child-source-opacity:" ^ first.block_id) 0.65;
          require_semantics handle ("Direct child: " ^ first.source);
          require_semantics handle ("Direct child: " ^ second.source ^ ", status Todo");
          require_semantics handle ("Direct child: " ^ third.source);
@@ -3196,7 +3475,7 @@ let test_expanded_children_are_static_previews_without_group_separator () =
                 handle
                 (Test.Query.test_id ("journal-child-preview:" ^ third.block_id))));
          require_visible_text_count handle first.source 1;
-         require_visible_text_count handle second.source 1;
+         require_no_visible_text handle second.source;
          require_no_visible_text handle third.source))
 ;;
 
@@ -3391,8 +3670,20 @@ let test_delete_action_accessibility_duration_and_single_mutation_gate () =
          require
            (request.duration_ms = 10_000)
            "accessible snackbar did not use the bounded Undo lifetime";
-         require_no_test_id handle ("journal-row-slidable:" ^ second.block_id);
-         require_no_semantics handle "Delete block and all descendants";
+         let gated = slidable_props handle second.block_id in
+         require (not gated.enabled) "pending Delete left sibling Slidable enabled";
+         let all_actions_disabled
+               (pane : Ui.Native_widget.Slidable.For_testing.action_pane_props)
+           =
+           List.for_all
+             (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) ->
+                not action.enabled)
+             pane.actions
+         in
+         require
+           (Option.fold ~none:false ~some:all_actions_disabled gated.start_action_pane
+            && Option.fold ~none:false ~some:all_actions_disabled gated.end_action_pane)
+           "pending Delete did not gate status and Delete actions together";
          advance_clock handle monotonic_now_ns 5.;
          require
            (Test.Handle.pending_host_effect_count handle = 1)
@@ -3406,9 +3697,11 @@ let () =
   test_application_owns_one_system_material_theme ();
   test_initial_feed_has_a_truthful_loading_state ();
   test_graph_open_error_retains_the_journal_scroll_contract ();
+  test_error_info_action_and_page_follow_worker_error_ledger ();
   test_timeline_content_is_capped_and_centered ();
   test_root_is_owned_by_the_ocaml_timeline ();
   test_capture_fab_directly_saves_one_plain_top_level_block ();
+  test_capture_task_icon_preserves_intent_and_persists_todo ();
   test_capture_fab_uses_directional_threshold_without_replacing_the_composer ();
   test_capture_fab_honors_reduced_motion_without_changing_its_slot ();
   test_header_uses_pinned_theme_owned_sliver_app_bar ();
@@ -3437,9 +3730,10 @@ let () =
   test_locale_only_change_reformats_without_reloading ();
   test_day_rollover_refreshes_without_blanking_content ();
   test_time_zone_refresh_reprojects_without_blanking_content ();
-  test_timeline_status_rail_has_no_task_action ();
+  test_timeline_status_pane_routes_exact_actions_and_gates_mutations ();
   test_loaded_children_survive_a_stale_ios_visible_range_event ();
   test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed ();
+  test_collapsed_rows_keep_three_title_lines_plus_two_tail_faded_child_lines ();
   test_expanded_children_are_static_previews_without_group_separator ();
   test_loading_and_adaptive_environment_surfaces_are_truthful ();
   test_delete_action_stages_undoes_and_commits_only_after_deadline ();

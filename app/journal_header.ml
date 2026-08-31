@@ -61,6 +61,7 @@ let sliver
       ~top_inset
       ~device_pixel_ratio
       ~context
+      ~on_error_info
       ~on_account_menu
   =
   let thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
@@ -125,9 +126,33 @@ let sliver
                 ~enabled:true
                 ~focusable:true
                 ~actions:[ Ui.Semantics.Action.Tap ]
-                ~sort_key:3.
+                ~sort_key:4.
                 ())
       |> shell ~id:"journal-account-menu-target"
+  in
+  let error_info =
+    match on_error_info with
+    | None -> None
+    | Some on_press ->
+      let icon =
+        glyph ~id:"journal-error-info-icon" Material_icon_catalog.Error_outline
+      in
+      Some
+        (Ui.Material.icon_button ~on_press ~icon ()
+         |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-error-info-button")
+         |> Ui.Widget.semantics
+              ~on_action:on_press
+              ~properties:
+                (Ui.Semantics.create
+                   ~label:"Error info"
+                   ~hint:"Review Logseq DB worker errors"
+                   ~role:Ui.Semantics.Role.Button
+                   ~enabled:true
+                   ~focusable:true
+                   ~actions:[ Ui.Semantics.Action.Tap ]
+                   ~sort_key:3.
+                   ())
+         |> shell ~id:"journal-error-info-target")
   in
   Ui.Widget.Sliver.app_bar
     ~key:(Ui.Key.string "journal-header-app-bar")
@@ -144,7 +169,7 @@ let sliver
     ~elevation:0.
     ~leading
     ~flexible_space
-    ~actions:[ account ]
+    ~actions:(Option.to_list error_info @ [ account ])
     ~title
     ()
   |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-header")

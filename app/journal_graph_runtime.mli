@@ -1,3 +1,12 @@
+type worker_failure =
+  { operation : string
+  ; failure : Logseq_db_worker.Protocol.failure
+  }
+
+type failure_source =
+  | Worker_failure of worker_failure
+  | Projection_failure of string
+
 type payload =
   | Graph_ready of Logseq_db_types.Graph_types.graph_info
   | Block_captured of
@@ -37,10 +46,10 @@ type payload =
       }
   | Feed_failed of
       { request_generation : int64
-      ; message : string
+      ; failure : failure_source
       }
-  | Open_failed of Logseq_db_worker.Error.t
-  | Rejected of string
+  | Open_failed of worker_failure
+  | Rejected of failure_source
 
 type response =
   { basis : int64 option

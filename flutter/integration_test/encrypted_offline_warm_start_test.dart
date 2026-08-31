@@ -285,6 +285,7 @@ final class _RuntimeHarness {
   Future<void> show(WidgetTester tester) async {
     tester.view.physicalSize = const Size(800, 632);
     tester.view.devicePixelRatio = 1;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     final root = BonsaiFlutterRoot(
       config: config,
       runtimeStarter: (_) async => runtime,
@@ -308,6 +309,7 @@ final class _RuntimeHarness {
       await tester.runAsync(
         () => Future<void>.delayed(const Duration(milliseconds: 10)),
       );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pump(const Duration(milliseconds: 10));
       final exception = tester.takeException();
       if (exception != null) fail('$reason; renderer exception: $exception');
@@ -319,7 +321,16 @@ final class _RuntimeHarness {
           .whereType<String>()
           .toList(growable: false);
       final snapshot = await tester.runAsync(runtime.debugSnapshot);
-      fail('$reason; mounted text: $text; runtime: ${snapshot?.state}');
+      fail(
+        '$reason; mounted text: $text; '
+        'runtime: state=${snapshot?.state} '
+        'generation=${snapshot?.liveGeneration} '
+        'eligible=${snapshot?.eligible} '
+        'pumpCount=${snapshot?.pumpCount} '
+        'coalesced=${snapshot?.hasCoalescedGrant} '
+        'presentation=${snapshot?.unresolvedPresentationId} '
+        'revision=${snapshot?.unresolvedRevision}',
+      );
     }
   }
 
@@ -342,6 +353,7 @@ final class _RuntimeHarness {
       });
     }
     frameEligibility.setEligible(false);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.runAsync(
       () => runtime.dispose().timeout(const Duration(seconds: 20)),

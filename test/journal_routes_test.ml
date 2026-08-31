@@ -139,6 +139,82 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
     "direct Capture retry did not return to Saving"
 ;;
 
+let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
+  let source = "  Todo 中文 👩🏽‍💻 exact  " in
+  let capture = Journal_capture.create ~session_number:12L ~source in
+  let task_capture = Journal_capture.toggle_task_intent capture in
+  require
+    (Journal_capture.task_state task_capture = Journal_model.Todo)
+    "Capture task intent did not toggle to Todo";
+  require_string
+    source
+    (Journal_capture.source task_capture)
+    "Capture task toggle changed the exact draft";
+  let edited_source = source ^ "!" in
+  let edited =
+    Journal_capture.apply_text_edit
+      task_capture
+      (edit
+         ~session_id:(Journal_capture.session_id task_capture)
+         ~local_revision:1L
+         ~base_document_revision:0L
+         ~text:edited_source
+         ~selection_start:(Ui.Text_editing.Utf16.length edited_source)
+         ~selection_end:(Ui.Text_editing.Utf16.length edited_source)
+         ())
+  in
+  require
+    (Journal_capture.task_state edited = Journal_model.Todo)
+    "text edit cleared Capture task intent";
+  let saving, request =
+    Journal_capture.admit_save
+      edited
+      ~mutation_id:"70000000-0000-4000-9000-000000000012"
+      ~block_id:"70000000-0000-4000-a000-000000000012"
+      ~sibling_order:"000000000012"
+      ~calendar_generation:7L
+      ~creation_time:(creation_time 542)
+  in
+  (match request with
+   | Some
+       (Journal_graph_request.Capture
+          { command = { source; task_state = Journal_model.Todo; _ }; _ }) ->
+     require_string edited_source source "Todo Capture admitted source"
+   | _ -> fail "checked Capture did not admit one Todo request");
+  let gated = Journal_capture.toggle_task_intent saving in
+  require
+    (Journal_capture.task_state gated = Journal_model.Todo)
+    "Saving Capture accepted a contradictory task toggle";
+  let failed = Journal_capture.fail saving ~message:"storage unavailable" in
+  require
+    (Journal_capture.task_state failed = Journal_model.Todo)
+    "failed Capture lost task intent";
+  let retrying, retry = Journal_capture.retry failed in
+  require (retry = request) "Todo retry did not reuse the admitted request";
+  require
+    (Journal_capture.task_state retrying = Journal_model.Todo)
+    "Todo retry lost task intent";
+  let replacement = Journal_capture.toggle_task_intent failed in
+  require
+    (Journal_capture.task_state replacement = Journal_model.No_status
+     && Journal_capture.phase replacement = Journal_capture.Editing)
+    "task change after terminal failure did not replace the failed attempt";
+  let _, replacement_request =
+    Journal_capture.admit_save
+      replacement
+      ~mutation_id:"70000000-0000-4000-9000-000000000013"
+      ~block_id:"70000000-0000-4000-a000-000000000013"
+      ~sibling_order:"000000000013"
+      ~calendar_generation:7L
+      ~creation_time:(creation_time 543)
+  in
+  match replacement_request with
+  | Some
+      (Journal_graph_request.Capture
+         { command = { task_state = Journal_model.No_status; _ }; _ }) -> ()
+  | _ -> fail "replacement Capture reused stale Todo intent"
+;;
+
 let test_detail_task_child_conflict_and_back_order () =
   let original = block () in
   let detail_state =
@@ -334,6 +410,8 @@ let test_route_generation_anchor_background_and_runtime_replacement () =
 let tests =
   [ ( "direct Capture source and mutation identity"
     , test_direct_capture_preserves_source_and_mutation_identity )
+  ; ( "direct Capture task intent lifecycle"
+    , test_direct_capture_task_intent_survives_edit_failure_and_retry )
   ; ( "Detail task, child, conflict, and Back order"
     , test_detail_task_child_conflict_and_back_order )
   ; ( "route generation, anchor, background, and runtime replacement"

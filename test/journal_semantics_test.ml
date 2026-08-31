@@ -263,17 +263,71 @@ let require_sized_height handle test_id expected =
   | _ -> fail "%s is not a height-constrained SizedBox" test_id
 ;;
 
-let require_single_line_start_text handle test_id expected =
+let require_clipped_text handle test_id ~expected ~max_lines =
   let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
   match view.node with
   | Ui.Widget.Private.Text
       { value
-      ; max_lines = Some 1
-      ; overflow = Ui.Style.Text_overflow.Ellipsis
+      ; max_lines = Some actual_max_lines
+      ; overflow = Ui.Style.Text_overflow.Clip
       ; text_align = Ui.Style.Text_align.Start
       ; _
-      } -> require (String.equal value expected) "%s text changed" test_id
-  | _ -> fail "%s is not one-line, ellipsized, start-aligned Text" test_id
+      } ->
+    require
+      (String.equal value expected && actual_max_lines = max_lines)
+      "%s text or max-lines changed"
+      test_id
+  | _ -> fail "%s is not clipped, start-aligned Text" test_id
+;;
+
+let require_tail_fade handle test_id ~line_height ~fade_width =
+  let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Native_widget { kind_id; version; capabilities; payload } ->
+    require
+      (Bonsai_flutter_spec.Id.Native_widget.Kind_id.to_int kind_id = 1001)
+      "%s uses native widget kind %d"
+      test_id
+      (Bonsai_flutter_spec.Id.Native_widget.Kind_id.to_int kind_id);
+    require (version = 1 && Int64.equal capabilities 0L) "%s protocol changed" test_id;
+    require
+      (Bytes.length payload = 16)
+      "%s payload has %d bytes"
+      test_id
+      (Bytes.length payload);
+    require
+      (Float.equal (Int64.float_of_bits (Bytes.get_int64_le payload 0)) line_height
+       && Float.equal (Int64.float_of_bits (Bytes.get_int64_le payload 8)) fade_width)
+      "%s fade geometry changed"
+      test_id
+  | _ -> fail "%s is not the native trailing-edge fade" test_id
+;;
+
+let require_alignment handle test_id expected =
+  let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Align { alignment } ->
+    require (alignment = expected) "%s alignment changed" test_id
+  | _ -> fail "%s is not Align" test_id
+;;
+
+let require_opacity handle test_id expected =
+  let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Opacity { opacity } ->
+    require (Float.equal opacity expected) "%s opacity is %.2f" test_id opacity
+  | _ -> fail "%s is not Opacity" test_id
+;;
+
+let require_text_style handle test_id ~font_size ~line_height =
+  let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
+  match view.node with
+  | Ui.Widget.Private.Text { style = Some style; _ } ->
+    require
+      (style.font_size = Some font_size && style.line_height = Some line_height)
+      "%s typography changed"
+      test_id
+  | _ -> fail "%s is not styled Text" test_id
 ;;
 
 let require_padding handle test_id ~left ~right =
@@ -338,14 +392,13 @@ let test_literal_source_time_completion_and_full_access () =
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
        (let (Av view) =
-          Ui.Widget.Private.view
-            (node handle ("journal-row-source:" ^ block_id ^ ":0")).widget
+          Ui.Widget.Private.view (node handle ("journal-row-source:" ^ block_id)).widget
         in
         match view.node with
         | Ui.Widget.Private.Text
-            { value; max_lines = Some 1; overflow = Ui.Style.Text_overflow.Ellipsis; _ }
-          -> require (String.equal value source) "literal source was parsed or changed"
-        | _ -> fail "Timeline source is not one-line ellipsized Text");
+            { value; max_lines = Some 3; overflow = Ui.Style.Text_overflow.Clip; _ } ->
+          require (String.equal value source) "literal source was parsed or changed"
+        | _ -> fail "Timeline source is not three-line clipped Text");
        require_text handle ("journal-row-time:" ^ block_id) "09:05";
        require_target handle ("journal-row-toggle-children-target:" ^ block_id);
        require
@@ -383,7 +436,17 @@ let test_long_source_and_corrupt_surfaces () =
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown long_handle)
     (fun () ->
-       require_text long_handle ("journal-row-source:" ^ block_id ^ ":0") long_source;
+       require_clipped_text
+         long_handle
+         ("journal-row-source:" ^ block_id)
+         ~expected:long_source
+         ~max_lines:3;
+       require_tail_fade
+         long_handle
+         ("journal-row-source-tail-fade:" ^ block_id)
+         ~line_height:22.
+         ~fade_width:24.;
+       require_sized_height long_handle ("journal-row-extent:" ^ block_id) 78.;
        require
          (Journal_row.Item.source_for_detail long_item = Some long_source)
          "long Detail source was truncated";
@@ -398,7 +461,7 @@ let test_long_source_and_corrupt_surfaces () =
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown missing_handle)
     (fun () ->
-       require_text missing_handle "journal-row-source:corrupt-time:0" "Recovered source";
+       require_text missing_handle "journal-row-source:corrupt-time" "Recovered source";
        require
          (Journal_row.Item.source_for_detail missing_time = Some "Recovered source")
          "recoverable source was discarded";
@@ -415,7 +478,7 @@ let test_long_source_and_corrupt_surfaces () =
     (fun () ->
        require_text
          corrupt_handle
-         "journal-row-source:corrupt-source:0"
+         "journal-row-source:corrupt-source"
          "Unavailable journal entry";
        require
          (Journal_row.Item.source_for_detail corrupt = None)
@@ -680,16 +743,15 @@ let test_four_status_rails_replace_timeline_task_controls () =
   require_common_leading status
 ;;
 
-let test_preview_uses_deterministic_one_to_four_logical_lines () =
-  let source = "Source one\nSource two" in
+let test_title_and_children_have_independent_bounded_tail_fade_previews () =
+  let source = "Source one\nSource two\nSource three\nSource four" in
   let parent = block ~source () in
   let entry : Journal_graph_projection.timeline_entry =
     { block = parent
     ; child_summaries =
-        [ { block_id = "20000000-0000-4000-a000-000000000101"
-          ; source = "Child one\nChild two"
-          }
-        ; { block_id = "20000000-0000-4000-a000-000000000102"; source = "Child three" }
+        [ { block_id = "20000000-0000-4000-a000-000000000101"; source = "Child one" }
+        ; { block_id = "20000000-0000-4000-a000-000000000102"; source = "Child two" }
+        ; { block_id = "20000000-0000-4000-a000-000000000103"; source = "Child three" }
         ]
     }
   in
@@ -698,62 +760,107 @@ let test_preview_uses_deterministic_one_to_four_logical_lines () =
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
-       require_single_line_start_text
+       require_clipped_text
          handle
-         ("journal-row-source:" ^ block_id ^ ":0")
-         "Source one";
-       require_single_line_start_text
+         ("journal-row-source:" ^ block_id)
+         ~expected:source
+         ~max_lines:3;
+       require_tail_fade
          handle
-         ("journal-row-source:" ^ block_id ^ ":1")
-         "Source two";
-       require_single_line_start_text
+         ("journal-row-source-tail-fade:" ^ block_id)
+         ~line_height:22.
+         ~fade_width:24.;
+       require_clipped_text
          handle
          ("journal-row-supporting:" ^ block_id ^ ":0")
-         "Child one";
-       require_single_line_start_text
+         ~expected:"Child one"
+         ~max_lines:1;
+       require_clipped_text
          handle
          ("journal-row-supporting:" ^ block_id ^ ":1")
-         "Child two";
+         ~expected:"Child two"
+         ~max_lines:1;
+       require_tail_fade
+         handle
+         ("journal-row-supporting-tail-fade:" ^ block_id ^ ":1")
+         ~line_height:20.
+         ~fade_width:21.;
+       require_opacity handle ("journal-row-supporting-opacity:" ^ block_id ^ ":0") 0.65;
+       require_opacity handle ("journal-row-supporting-opacity:" ^ block_id ^ ":1") 0.65;
+       require_text_style
+         handle
+         ("journal-row-supporting:" ^ block_id ^ ":0")
+         ~font_size:14.
+         ~line_height:(20. /. 14.);
        require
          (Option.is_none
             (Test.Handle.find handle (Test.Query.visible_text "Child three")))
-         "collapsed preview exceeded its four-line budget";
-       require_sized_height handle ("journal-row-extent:" ^ block_id) 100.);
+         "collapsed preview exceeded its two child-line budget";
+       require_sized_height handle ("journal-row-supporting-gap:" ^ block_id) 4.;
+       require_alignment
+         handle
+         ("journal-row-metadata-align:" ^ block_id)
+         Ui.Layout.Alignment.Top_end;
+       require_sized_height handle ("journal-row-extent:" ^ block_id) 126.);
   let expanded, _profile = create_handle ~expanded:true item in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown expanded)
     (fun () ->
-       require_single_line_start_text
+       require_clipped_text
          expanded
-         ("journal-row-source:" ^ block_id ^ ":0")
-         "Source one";
-       require_single_line_start_text
-         expanded
-         ("journal-row-source:" ^ block_id ^ ":1")
-         "Source two";
+         ("journal-row-source:" ^ block_id)
+         ~expected:source
+         ~max_lines:3;
        require
          (Option.is_none
             (Test.Handle.find expanded (Test.Query.visible_text "Child one")))
          "expanded parent retained collapsed child summaries";
-       require_sized_height expanded ("journal-row-extent:" ^ block_id) 56.);
-  let five_lines =
-    Journal_row.Item.of_block (block ~source:"One\nTwo\nThree\nFour\nFive" ())
+       require_sized_height expanded ("journal-row-extent:" ^ block_id) 78.)
+;;
+
+let test_wrapping_estimate_bounds_latin_cjk_emoji_and_explicit_lines () =
+  let cases =
+    [ String.make 240 'W'
+    ; String.concat "" (List.init 80 (fun _ -> "你"))
+    ; String.concat "" (List.init 80 (fun _ -> "🙂"))
+    ; "One\nTwo\nThree\nFour\nFive"
+    ]
   in
-  let clamped, _profile = create_handle five_lines in
+  List.iter
+    (fun source ->
+       let item = Journal_row.Item.of_block (block ~source ()) in
+       let handle, _profile = create_handle ~width:320. item in
+       Fun.protect
+         ~finally:(fun () -> Test.Handle.shutdown handle)
+         (fun () ->
+            require_clipped_text
+              handle
+              ("journal-row-source:" ^ block_id)
+              ~expected:source
+              ~max_lines:3;
+            require_tail_fade
+              handle
+              ("journal-row-source-tail-fade:" ^ block_id)
+              ~line_height:22.
+              ~fade_width:24.;
+            require_sized_height handle ("journal-row-extent:" ^ block_id) 78.))
+    cases;
+  let exact = Journal_row.Item.of_block (block ~source:"One\nTwo\nThree" ()) in
+  let exact_handle, _profile = create_handle ~width:320. exact in
   Fun.protect
-    ~finally:(fun () -> Test.Handle.shutdown clamped)
+    ~finally:(fun () -> Test.Handle.shutdown exact_handle)
     (fun () ->
-       List.iteri
-         (fun index expected ->
-            require_single_line_start_text
-              clamped
-              (Printf.sprintf "journal-row-source:%s:%d" block_id index)
-              expected)
-         [ "One"; "Two"; "Three"; "Four" ];
+       require_clipped_text
+         exact_handle
+         ("journal-row-source:" ^ block_id)
+         ~expected:"One\nTwo\nThree"
+         ~max_lines:3;
        require
-         (Option.is_none (Test.Handle.find clamped (Test.Query.visible_text "Five")))
-         "source preview exceeded four logical lines";
-       require_sized_height clamped ("journal-row-extent:" ^ block_id) 100.)
+         (Option.is_none
+            (Test.Handle.find
+               exact_handle
+               (Test.Query.test_id ("journal-row-source-tail-fade:" ^ block_id))))
+         "an exactly three-line title incorrectly advertises hidden content")
 ;;
 
 let test_line_count_drives_exact_scaled_row_extent () =
@@ -773,8 +880,8 @@ let test_line_count_drives_exact_scaled_row_extent () =
               require_sized_height handle ("journal-row-extent:" ^ block_id) extent))
       expected
   in
-  check ~scale:1. [ 44.; 56.; 78.; 100. ];
-  check ~scale:3.2 [ 83.; 153.; 224.; 294. ]
+  check ~scale:1. [ 44.; 56.; 78.; 78. ];
+  check ~scale:3.2 [ 153.; 224.; 224.; 224. ]
 ;;
 
 let header_component handlers _graph =
@@ -795,6 +902,7 @@ let header_component handlers _graph =
           ~top_inset:0.
           ~device_pixel_ratio:3.
           ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9")
+          ~on_error_info:None
           ~on_account_menu:(Some on_account_menu)
       ]
       ()
@@ -849,7 +957,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
                 | _ -> false)
               props.actions)
            "account menu has no tap action";
-         require (props.sort_key = Some 3.) "account menu semantic order changed");
+         require (props.sort_key = Some 4.) "account menu semantic order changed");
        require_semantics handle "Today, Sunday, August 9" (fun props ->
          require (props.role = Ui.Semantics.Role.Generic) "date context is still a button";
          require (props.enabled = None) "view-only date exposes enabled state";
@@ -859,7 +967,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
 ;;
 
 let require_row_shape width scale expected_kind expected_extent expected_time_width =
-  let item = Journal_row.Item.of_block (block ()) in
+  let item = Journal_row.Item.of_block (block ~source:"Short" ()) in
   let handle, profile = create_handle ~width ~scale item in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
@@ -905,7 +1013,7 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
         | Ui.Widget.Private.Column
         | Ui.Widget.Private.Flex_row
         | Ui.Widget.Private.Flex_column -> ()
-        | _ -> fail "top-level content is not a bounded two-line stack");
+        | _ -> fail "top-level content is not a bounded preview stack");
        let (Av divider_view) =
          Ui.Widget.Private.view (node handle ("journal-row-divider:" ^ block_id)).widget
        in
@@ -949,6 +1057,10 @@ let test_rtl_row_geometry_uses_logical_edges () =
          ~left:24.
          ~right:32.;
        require_padding handle ("journal-row-source-gap:" ^ block_id) ~left:8. ~right:0.;
+       require_alignment
+         handle
+         ("journal-row-metadata-align:" ^ block_id)
+         Ui.Layout.Alignment.Top_start;
        require_padding
          handle
          ("journal-row-divider-padding:" ^ block_id)
@@ -1043,6 +1155,8 @@ let delete_timeline_component ~delete_enabled handlers _graph =
           ~day_label:(fun _ -> "Today")
           ~reduced_motion:false
           ~delete_enabled
+          ~actions_enabled:delete_enabled
+          ~on_status:ignored
           ~on_delete:ignored
           ~on_visible_range:ignored
           ~on_toggle_children:ignored
@@ -1051,7 +1165,7 @@ let delete_timeline_component ~delete_enabled handlers _graph =
     |> Ui.Widget.Viewport.Vertical.with_height ~height:600.)
 ;;
 
-let test_slidable_delete_wrapper_has_only_non_dismissible_logical_end_action () =
+let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
   let handle =
     Test.Handle.create
@@ -1082,7 +1196,29 @@ let test_slidable_delete_wrapper_has_only_non_dismissible_logical_end_action () 
           require
             (Option.equal String.equal props.group_tag (Some "journal-timeline"))
             "delete Slidable group tag changed";
-          require (Option.is_none props.start_action_pane) "start action pane is enabled";
+          (match props.start_action_pane with
+           | None -> fail "status Slidable omitted its logical-start pane"
+           | Some pane ->
+             require (Float.equal pane.extent_ratio 0.8) "status pane extent changed";
+             require (pane.motion = Ui.Native_widget.Slidable.Behind) "status pane moved";
+             require (Option.is_none pane.dismissible) "status swipe can dismiss the row";
+             require
+               (not pane.drag_dismissible)
+               "full-width status drag can dismiss the row";
+             require
+               (List.map
+                  (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) ->
+                     action.id)
+                  pane.actions
+                = [ 2; 3; 4; 5 ])
+               "status action IDs or order changed";
+             List.iter
+               (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) ->
+                  require
+                    (Bool.equal action.enabled (action.id <> 5))
+                    "current Done status action state changed";
+                  require action.auto_close "status action does not auto-close")
+               pane.actions);
           (match props.end_action_pane with
            | None -> fail "delete Slidable omitted its logical-end pane"
            | Some pane ->
@@ -1128,7 +1264,7 @@ let test_slidable_delete_wrapper_has_only_non_dismissible_logical_end_action () 
                   .widget
             in
             match view.node with
-            | Ui.Widget.Private.Material_divider { thickness } ->
+            | Ui.Widget.Private.Material_divider { thickness; _ } ->
               require
                 (Float.equal
                    thickness
@@ -1194,11 +1330,12 @@ let () =
   test_literal_source_time_completion_and_full_access ();
   test_long_source_and_corrupt_surfaces ();
   test_four_status_rails_replace_timeline_task_controls ();
-  test_preview_uses_deterministic_one_to_four_logical_lines ();
+  test_title_and_children_have_independent_bounded_tail_fade_previews ();
+  test_wrapping_estimate_bounds_latin_cjk_emoji_and_explicit_lines ();
   test_line_count_drives_exact_scaled_row_extent ();
   test_header_account_action_and_view_only_date_have_truthful_semantics ();
   test_compact_and_adaptive_shapes_at_required_extremes ();
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();
-  test_slidable_delete_wrapper_has_only_non_dismissible_logical_end_action ()
+  test_slidable_has_quick_status_and_non_dismissible_delete_actions ()
 ;;

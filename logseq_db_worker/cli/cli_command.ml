@@ -17,6 +17,25 @@ let bounded_message message =
   if String.length message <= maximum then message else String.sub message 0 maximum
 ;;
 
+let fatal_error_json ~component ~operation message =
+  let origin =
+    Logseq_db_worker.Error.create_cause_or_fallback
+      ~component
+      ~operation
+      ~code:(Some "fatalFailure")
+      ~message:(bounded_message message)
+      ~fallback_message:"The CLI received a display-unsafe fatal failure."
+  in
+  Logseq_db_worker.Error.create_with_origin
+    ~code:Logseq_db_worker.Error.Closed_session
+    ~message:"The Logseq DB worker session terminated."
+    ~details:[]
+    ~origin
+  |> Result.get_ok
+  |> Logseq_db_worker.Error.to_yojson
+  |> Yojson.Safe.to_string
+;;
+
 let snapshot_error = function
   | Snapshot.Invalid_catalog_root -> "invalid snapshot catalog root"
   | Invalid_inbox_entry -> "invalid snapshot inbox entry"
@@ -60,11 +79,26 @@ let close_session = function
 let protect_session session operation =
   let result =
     try operation () with
-    | Engine.Fatal_storage_error message -> Error (Fatal_lifecycle_error message)
-    | Sys_error message -> Error (Fatal_lifecycle_error (bounded_message message))
+    | Engine.Fatal_storage_error error ->
+      Error
+        (Fatal_lifecycle_error
+           (Logseq_db_worker.Error.to_yojson error |> Yojson.Safe.to_string))
+    | Sys_error message ->
+      Error
+        (Fatal_lifecycle_error
+           (fatal_error_json
+              ~component:Logseq_db_worker.Error.Operating_system
+              ~operation:"runCliSession"
+              message))
   in
   match close_session session with
-  | Error message -> Error (Fatal_lifecycle_error (bounded_message message))
+  | Error message ->
+    Error
+      (Fatal_lifecycle_error
+         (fatal_error_json
+            ~component:Logseq_db_worker.Error.Engine
+            ~operation:"closeCliSession"
+            message))
   | Ok () -> result
 ;;
 

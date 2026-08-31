@@ -100,7 +100,7 @@ let with_client config f =
     (fun () -> f client)
 ;;
 
-let serial_service_executes_engine () =
+let control_plane_lane_preserves_graph_execution () =
   F.with_snapshot (fun fixture ->
     with_client fixture.config (fun client ->
       let request = F.graph_info_request () in
@@ -113,8 +113,8 @@ let serial_service_executes_engine () =
        | _ -> T.fail "Worker did not delegate graph info to Engine");
       let diagnostics = Worker_runtime.For_testing.diagnostics () in
       T.require
-        (diagnostics.configured_concurrency_limit = Some 1)
-        "Logseq Worker service is not Serial"))
+        (diagnostics.configured_concurrency_limit = Some 2)
+        "Logseq Worker service has no independent account control-plane lane"))
 ;;
 
 let open_failure_stays_in_protocol () =
@@ -137,6 +137,13 @@ let graph_lifecycle_is_generation_fenced () =
     |> Result.get_ok
   in
   let lifecycle = Lifecycle.create () in
+  let error message =
+    Logseq_db_worker.Error.create
+      ~code:Logseq_db_worker.Error.Closed_session
+      ~message
+      ~details:[]
+    |> Result.get_ok
+  in
   let require_phase expected message =
     T.require ((Lifecycle.state lifecycle).phase = expected) "%s" message
   in
@@ -145,7 +152,7 @@ let graph_lifecycle_is_generation_fenced () =
   require_phase Graph_opening "graph did not enter opening";
   Lifecycle.opened lifecycle ~generation:1;
   require_phase Graph_open "graph did not enter open";
-  Lifecycle.failed lifecycle ~generation:0 ~message:"stale failure";
+  Lifecycle.failed lifecycle ~generation:0 ~error:(error "stale failure");
   require_phase Graph_open "stale generation changed graph state";
   Lifecycle.begin_close lifecycle ~generation:1;
   require_phase Graph_closing "graph did not enter closing";
@@ -153,10 +160,12 @@ let graph_lifecycle_is_generation_fenced () =
   require_phase Graph_closed "graph did not close";
   Lifecycle.begin_open lifecycle ~generation:2 ~graph_id:(Some graph_id);
   require_phase Graph_opening "graph switch did not reopen";
-  Lifecycle.failed lifecycle ~generation:2 ~message:"open failed";
+  Lifecycle.failed lifecycle ~generation:2 ~error:(error "open failed");
   let failed = Lifecycle.state lifecycle in
   require_phase Graph_failed "graph failure was not published";
-  T.require (failed.error = Some "open failed") "graph failure detail was discarded"
+  T.require
+    (Option.map Logseq_db_worker.Error.message failed.error = Some "open failed")
+    "graph failure detail was discarded"
 ;;
 
 let await_graph_state client =
@@ -191,6 +200,39 @@ let service_publishes_initial_graph_state () =
       T.require
         (state.Logseq_db_worker.phase = Graph_failed)
         "worker graph open failure was not published"))
+;;
+
+let client_commands_do_not_return_state_snapshots () =
+  F.with_snapshot (fun fixture ->
+    let config =
+      { fixture.config with
+        Logseq_db_worker.Config.target =
+          Managed_sync { base_url = "https://sync-command-response.invalid" }
+      }
+    in
+    with_client config (fun client ->
+      let request_id =
+        Worker.send
+          client
+          (Service.Client_command (Restore_local_account { user_id = "user-1" }))
+        |> accepted
+      in
+      let rec await () =
+        match
+          Worker.For_testing.drain_events client ~max_events:64
+          |> List.find_map (function
+            | Worker.Response { request_id = actual; outcome = Completed response; _ }
+              when ID.Worker.Request_id.equal request_id actual -> Some response
+            | Response _ | Push _ | Terminal _ -> None)
+        with
+        | Some Client_command_completed -> ()
+        | Some (Graph_response _ | Graph_state _) ->
+          T.fail "Client command returned the wrong response kind"
+        | None ->
+          Worker.For_testing.await_output client;
+          await ()
+      in
+      await ()))
 ;;
 
 let sole_public_sync_composition () =
@@ -237,10 +279,15 @@ let sole_public_sync_composition () =
 let () =
   T.run
     "bonsai service"
-    [ T.case "Serial service delegates to Engine" serial_service_executes_engine
+    [ T.case
+        "Control-plane lane preserves Graph execution"
+        control_plane_lane_preserves_graph_execution
     ; T.case "Open failure remains protocol state" open_failure_stays_in_protocol
     ; T.case "Graph lifecycle is generation fenced" graph_lifecycle_is_generation_fenced
     ; T.case "Service publishes initial graph state" service_publishes_initial_graph_state
+    ; T.case
+        "Client commands do not return state snapshots"
+        client_commands_do_not_return_state_snapshots
     ; T.case
         "Public sync API is the sole composition boundary"
         sole_public_sync_composition

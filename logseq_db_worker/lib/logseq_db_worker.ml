@@ -15,7 +15,7 @@ type graph_state =
   { generation : int
   ; graph_id : Logseq_db_types.Graph_types.Uuid.t option
   ; phase : graph_phase
-  ; error : string option
+  ; error : Error.t option
   }
 
 module Graph_lifecycle = struct
@@ -37,9 +37,9 @@ module Graph_lifecycle = struct
     then t.state <- { t.state with phase = Graph_open; error = None }
   ;;
 
-  let failed t ~generation ~message =
+  let failed t ~generation ~error =
     if generation = t.state.generation
-    then t.state <- { t.state with phase = Graph_failed; error = Some message }
+    then t.state <- { t.state with phase = Graph_failed; error = Some error }
   ;;
 
   let begin_close t ~generation =

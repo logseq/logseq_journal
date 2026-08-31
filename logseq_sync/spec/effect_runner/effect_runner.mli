@@ -117,4 +117,10 @@ val decrypt_protected_value
   -> string
   -> (string, string) result
 
+val encrypt_protected_values
+  :  t
+  -> Logseq_sync_pure_reducer.Core.graph_key_handle
+  -> string list
+  -> ((string * string) list, string) result
+
 val shutdown : t -> unit

@@ -33,8 +33,8 @@ depends: [
   "httpun-ws" {= "0.2.0"}
   "melange-edn-core" {= "0.5.0"}
   "melange-edn-native" {= "0.5.0"}
-  "melange-transit-core" {= "0.1.1"}
-  "melange-transit-native" {= "0.1.1"}
+  "melange-transit-core" {= "0.1.2"}
+  "melange-transit-native" {= "0.1.2"}
   "persistent_sorted_set_ocaml" {= "dev"}
   "mirage-crypto-rng" {= "2.2.0"}
   "sqlite3" {= "5.4.0"}
@@ -54,8 +54,8 @@ pin-depends: [
   ["persistent_sorted_set_ocaml.dev" "git+https://github.com/logseq/persistent-sorted-set-ocaml.git#4016dae1cdf4304207d8277ff9957656cdd8b177"]
   ["melange-edn-core.0.5.0" "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"]
   ["melange-edn-native.0.5.0" "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"]
-  ["melange-transit-core.0.1.1" "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"]
-  ["melange-transit-native.0.1.1" "git+https://github.com/RCmerci/melange-transit.git#a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"]
+  ["melange-transit-core.0.1.2" "git+https://github.com/RCmerci/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"]
+  ["melange-transit-native.0.1.2" "git+https://github.com/RCmerci/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"]
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]

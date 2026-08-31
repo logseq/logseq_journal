@@ -161,7 +161,14 @@ type effect_scope =
   }
 
 type effect_id = int
-type effect_error = Effect_failed of string
+
+type crypto_failure_kind =
+  | Invalid_key_material
+  | Crypto_provider_unavailable
+
+type effect_error =
+  | Effect_failed of string
+  | Crypto_failed of crypto_failure_kind * string
 
 type graph_key_handle =
   { handle_id : string
@@ -292,6 +299,21 @@ type outbox_record =
 
 let outbox_record_mutation_id record = record.mutation_id
 let outbox_record_fingerprint record = record.mutation_fingerprint
+let outbox_record_mutation_payload record = record.mutation_payload
+let outbox_record_outliner_op record = record.outliner_op
+let outbox_record_state record = record.outbox_state
+let outbox_record_with_state record outbox_state = { record with outbox_state }
+
+let clear_outbox_transport record outbox_state =
+  { record with outbox_state; encoded_tx = "[]" }
+;;
+
+let block_outbox_record record message =
+  let message =
+    if String.length message <= 4096 then message else String.sub message 0 4096
+  in
+  { record with outbox_state = Blocked message; encoded_tx = "[]" }
+;;
 
 let recompute_checksum database =
   Checksum.recompute ~e2ee:(Checksum.graph_e2ee database) database
@@ -656,6 +678,7 @@ let replace_protected_values operations encrypted =
 
 type local_batch_input =
   { local_scope : graph_scope
+  ; local_admission_id : string
   ; local_key : graph_key_handle option
   ; local_outbox : outbox_record list
   ; local_mutation_id : graph_id
@@ -673,6 +696,7 @@ type local_batch_plan =
 
 let local_batch_input
       ~scope
+      ~admission_id
       ~key
       ~outbox_records
       ~mutation_id
@@ -682,7 +706,9 @@ let local_batch_input
       ~database
       ~operations
   =
-  if String.length mutation_payload = 0
+  if String.length admission_id = 0 || String.length admission_id > 256
+  then Error "mutation admission ID must contain 1..256 bytes"
+  else if String.length mutation_payload = 0
   then Error "mutation payload must not be empty"
   else if String.length mutation_fingerprint = 0
   then Error "mutation fingerprint must not be empty"
@@ -692,6 +718,7 @@ let local_batch_input
     Result.map
       (fun local_outbox ->
          { local_scope = scope
+         ; local_admission_id = admission_id
          ; local_key = key
          ; local_outbox
          ; local_mutation_id = mutation_id
@@ -784,7 +811,11 @@ type private_key_unlock =
 
 type _ runner_request =
   | Load_catalog : account_scope -> catalog_cache option runner_request
-  | Save_catalog : catalog_cache -> unit runner_request
+  | Save_catalog :
+      { account : account_scope
+      ; cache : catalog_cache
+      }
+      -> unit runner_request
   | Fetch_catalog : authenticated_account_scope -> graph list runner_request
   | Fetch_snapshot_baseline : authorized_graph_scope -> snapshot_baseline runner_request
   | Fetch_snapshot_metadata : authorized_graph_scope -> snapshot_metadata runner_request
@@ -875,13 +906,7 @@ let effect_scope_of_connection (connection : connection_scope) =
 
 let scope_of_request : type a. a runner_request -> effect_scope = function
   | Load_catalog account -> effect_scope_of_account account
-  | Save_catalog _ ->
-    { account_generation = None
-    ; graph_generation = None
-    ; connection_generation = None
-    ; presentation_generation = None
-    ; lifecycle_generation = None
-    }
+  | Save_catalog { account; _ } -> effect_scope_of_account account
   | Fetch_catalog authenticated -> effect_scope_of_account authenticated.account
   | Fetch_snapshot_baseline authorized | Fetch_snapshot_metadata authorized ->
     effect_scope_of_graph authorized.graph
@@ -961,7 +986,9 @@ let equal_runner_request : type a b. a runner_request -> b runner_request -> boo
   fun left right ->
   match left, right with
   | Load_catalog left, Load_catalog right -> left = right
-  | Save_catalog left, Save_catalog right -> left = right
+  | ( Save_catalog { account = left_account; cache = left_cache }
+    , Save_catalog { account = right_account; cache = right_cache } ) ->
+    left_account = right_account && left_cache = right_cache
   | Fetch_catalog left, Fetch_catalog right -> left = right
   | Fetch_snapshot_baseline left, Fetch_snapshot_baseline right -> left = right
   | Fetch_snapshot_metadata left, Fetch_snapshot_metadata right -> left = right
@@ -1054,10 +1081,26 @@ type mirror_inspection =
   | Mirror_available of graph_open_request
   | Mirror_absent of graph_scope
 
-type local_batch_commit_request =
+type local_batch_failure_kind =
+  | Planning_failed
+  | Encryption_failed
+  | Encoding_failed
+  | Scope_closed
+  | Engine_unavailable
+  | Persistence_failed
+
+type local_batch_action =
+  | Commit of { outbox_records : string list }
+  | Reject of
+      { kind : local_batch_failure_kind
+      ; message : string
+      }
+
+type local_batch_completion_request =
   { operation_id : graph_id
-  ; outbox_records : string list
+  ; admission_id : string
   ; scope : graph_scope
+  ; action : local_batch_action
   }
 
 type authoritative_batch =
@@ -1069,6 +1112,7 @@ type authoritative_batch =
 
 type authoritative_context =
   { batch : authoritative_batch
+  ; precondition : string
   ; checkpoint : Logseq_db_types.Sync_checkpoint.t
   ; database : Datascript.db
   ; outbox_records : string list
@@ -1083,7 +1127,10 @@ type authoritative_plan =
   }
 
 type authoritative_commit_request =
-  { scope : graph_scope
+  { batch : authoritative_batch
+  ; precondition : string
+  ; scope : graph_scope
+  ; key : graph_key_handle option
   ; transactions : Datascript.tx_op list list
   ; projection_transactions : Datascript.tx_op list list
   ; checkpoint : Logseq_db_types.Sync_checkpoint.t
@@ -1143,7 +1190,10 @@ let validate_pull_continuity applied_server_t server_t transactions =
     loop (applied_server_t + 1) transactions)
 ;;
 
-let begin_authoritative_batch (context : authoritative_context) =
+let begin_authoritative_batch
+      ?(acknowledged_mutation_ids = [])
+      (context : authoritative_context)
+  =
   Result.bind (decode_outbox_records context.outbox_records) (fun outbox ->
     let message = context.batch.message in
     let prepared =
@@ -1175,25 +1225,28 @@ let begin_authoritative_batch (context : authoritative_context) =
           ( []
           , List.map
               (fun record ->
-                 match record.outbox_state with
-                 | Submitted -> { record with outbox_state = Accepted t }
-                 | Queued | Accepted _ | Blocked _ -> record)
+                 if
+                   List.exists
+                     (Logseq_db_types.Graph_types.Uuid.equal record.mutation_id)
+                     acknowledged_mutation_ids
+                 then (
+                   match record.outbox_state with
+                   | Submitted -> { record with outbox_state = Accepted t }
+                   | Queued | Accepted _ | Blocked _ -> record)
+                 else record)
               outbox )
       | Sync_protocol.Server.Online_users _ | Presence _ | Tx_reject _ | Pong | Error _ ->
         Error "server message is not authoritative"
     in
     Result.bind prepared (fun (wires, outbox) ->
-      let projection_wires = List.map (fun record -> record.encoded_tx) outbox in
-      Result.bind
-        (collect_protected_values (wires @ projection_wires))
-        (fun values ->
-           Ok
-             { authoritative_context = context
-             ; authoritative_wires = wires
-             ; authoritative_outbox = outbox
-             ; authoritative_protected_values = values
-             ; authoritative_key = None
-             })))
+      Result.bind (collect_protected_values wires) (fun values ->
+        Ok
+          { authoritative_context = context
+          ; authoritative_wires = wires
+          ; authoritative_outbox = outbox
+          ; authoritative_protected_values = values
+          ; authoritative_key = None
+          })))
 ;;
 
 let authoritative_crypto_request plan =
@@ -1277,73 +1330,67 @@ let finish_authoritative_batch plan decrypted_values =
       Result.bind
         (decode_authoritative_transactions context.database authoritative_wires decrypted)
         (fun (transactions, database_after, decrypted) ->
-           let projection_wires =
-             List.map (fun record -> record.encoded_tx) plan.authoritative_outbox
-           in
-           Result.bind
-             (decode_authoritative_transactions database_after projection_wires decrypted)
-             (fun (projection_transactions, _projected, remaining) ->
-                if remaining <> []
-                then Error "decrypted value count does not match protected values"
-                else
-                  Result.bind
-                    (encode_outbox_records plan.authoritative_outbox)
-                    (fun outbox_records ->
-                       let outcome =
-                         match context.batch.message with
-                         | Sync_protocol.Server.Pull_ok { t; checksum = _; _ }
-                           when t = context.checkpoint.applied_server_t ->
-                           Ok
-                             ( context.checkpoint
-                             , Logseq_db_types.Sync_status.Pull_duplicate
-                             , [] )
-                         | Sync_protocol.Server.Pull_ok { t; checksum; _ } ->
-                           let local_checksum = recompute_checksum database_after in
-                           (match checksum with
-                            | Some remote when not (String.equal remote local_checksum) ->
-                              let message =
-                                Printf.sprintf
-                                  "Entity checksum mismatch at server t %d (local %s, \
-                                   remote %s)."
-                                  t
-                                  local_checksum
-                                  remote
-                              in
-                              Ok
-                                ( checkpoint_paused context.checkpoint message
-                                  |> Result.get_ok
-                                , Logseq_db_types.Sync_status.Sync_paused
-                                , [] )
-                            | None | Some _ ->
-                              Ok
-                                ( checkpoint_advanced
-                                    context.checkpoint
-                                    t
-                                    (Option.value checksum ~default:local_checksum)
-                                  |> Result.get_ok
-                                , Logseq_db_types.Sync_status.Pull_applied
-                                , transactions ))
-                         | Sync_protocol.Server.Hello _ | Changed _ | Tx_batch_ok _ ->
-                           Ok
-                             ( context.checkpoint
-                             , Logseq_db_types.Sync_status.Pull_required
-                             , [] )
-                         | Sync_protocol.Server.Online_users _
-                         | Presence _
-                         | Tx_reject _
-                         | Pong
-                         | Error _ -> Error "server message is not authoritative"
-                       in
-                       Result.map
-                         (fun (checkpoint, activity, transactions) ->
-                            { scope = context.batch.scope.graph
-                            ; transactions
-                            ; projection_transactions
-                            ; checkpoint
-                            ; outbox_records
-                            ; activity
-                            })
-                         outcome)))))
+           if decrypted <> []
+           then Error "decrypted value count does not match protected values"
+           else
+             Result.bind
+               (encode_outbox_records plan.authoritative_outbox)
+               (fun outbox_records ->
+                  let outcome =
+                    match context.batch.message with
+                    | Sync_protocol.Server.Pull_ok { t; checksum = _; _ }
+                      when t = context.checkpoint.applied_server_t ->
+                      Ok
+                        ( context.checkpoint
+                        , Logseq_db_types.Sync_status.Pull_duplicate
+                        , [] )
+                    | Sync_protocol.Server.Pull_ok { t; checksum; _ } ->
+                      let local_checksum = recompute_checksum database_after in
+                      (match checksum with
+                       | Some remote when not (String.equal remote local_checksum) ->
+                         let message =
+                           Printf.sprintf
+                             "Entity checksum mismatch at server t %d (local %s, remote \
+                              %s)."
+                             t
+                             local_checksum
+                             remote
+                         in
+                         Ok
+                           ( checkpoint_paused context.checkpoint message |> Result.get_ok
+                           , Logseq_db_types.Sync_status.Sync_paused
+                           , [] )
+                       | None | Some _ ->
+                         Ok
+                           ( checkpoint_advanced
+                               context.checkpoint
+                               t
+                               (Option.value checksum ~default:local_checksum)
+                             |> Result.get_ok
+                           , Logseq_db_types.Sync_status.Pull_applied
+                           , transactions ))
+                    | Sync_protocol.Server.Hello _ | Changed _ | Tx_batch_ok _ ->
+                      Ok
+                        (context.checkpoint, Logseq_db_types.Sync_status.Pull_required, [])
+                    | Sync_protocol.Server.Online_users _
+                    | Presence _
+                    | Tx_reject _
+                    | Pong
+                    | Error _ -> Error "server message is not authoritative"
+                  in
+                  Result.map
+                    (fun (checkpoint, activity, transactions) ->
+                       { batch = context.batch
+                       ; precondition = context.precondition
+                       ; scope = context.batch.scope.graph
+                       ; key = plan.authoritative_key
+                       ; transactions
+                       ; projection_transactions = []
+                       ; checkpoint
+                       ; outbox_records
+                       ; activity
+                       })
+                    outcome))))
 ;;
 
 type outbox_transition =
@@ -1360,8 +1407,9 @@ type worker_effect =
   | Activate_snapshot of snapshot_activation_request
   | Delete_mirror of mirror_deletion
   | Attach_graph of graph_open_request
-  | Detach_graph of { graph_generation : graph_generation }
-  | Commit_local_batch of local_batch_commit_request
+  | Detach_graph of graph_scope
+  | Reset_managed_account of account_scope
+  | Complete_local_batch of local_batch_completion_request
   | Inspect_authoritative_batch of authoritative_batch
   | Apply_authoritative_batch of authoritative_commit_request
   | Commit_outbox_transition of outbox_transition
@@ -1457,6 +1505,7 @@ type event =
   | Local_batch_committed of local_batch_commit
   | Authoritative_batch_inspected of authoritative_context
   | Authoritative_batch_applied of authoritative_commit_result
+  | Authoritative_batch_conflicted of authoritative_batch
   | Authoritative_batch_failed of scoped_error
   | Outbox_transition_committed of outbox_transition_commit
   | Outbox_transition_rejected of outbox_transition_rejection
@@ -1482,6 +1531,22 @@ type snapshot_bootstrap_phase =
   | Snapshot_bootstrap_downloading
   | Snapshot_bootstrap_activating
 
+type submission_phase =
+  | Submission_reserving
+  | Submission_dispatched
+  | Submission_applying_ack of int
+  | Submission_awaiting_pull of int
+
+type submission_owner =
+  { mutation_ids : graph_id list
+  ; t_before : int
+  ; message : Sync_protocol.Client.message
+  ; connection : connection_scope
+  ; presentation_generation : presentation_generation
+  ; lifecycle_generation : lifecycle_generation
+  ; phase : submission_phase
+  }
+
 type t =
   { config : config
   ; public_state : state
@@ -1489,6 +1554,8 @@ type t =
   ; lifecycle_generation : lifecycle_generation
   ; next_effect_id : int
   ; pending_token : token_request option
+  ; deferred_catalog_reconciliation : bool
+  ; local_presentation_barrier : bool
   ; pending_effects : pending_effect list
   ; pending_local_batches : (effect_id * local_batch_plan) list
   ; graph_key : graph_key_handle option
@@ -1506,7 +1573,10 @@ type t =
   ; encrypted_graph_key : string option
   ; private_key_package : string option
   ; pending_authoritative_batches : (effect_id * authoritative_plan) list
+  ; active_authoritative_batch : authoritative_batch option
+  ; queued_authoritative_batch : authoritative_batch option
   ; outbox_records : string list
+  ; submission_owner : submission_owner option
   ; websocket_live : bool
   ; closed : bool
   }
@@ -1545,6 +1615,8 @@ let initial config =
     ; lifecycle_generation = 0L
     ; next_effect_id = 0
     ; pending_token = None
+    ; deferred_catalog_reconciliation = false
+    ; local_presentation_barrier = false
     ; pending_effects = []
     ; pending_local_batches = []
     ; graph_key = None
@@ -1562,13 +1634,28 @@ let initial config =
     ; encrypted_graph_key = None
     ; private_key_package = None
     ; pending_authoritative_batches = []
+    ; active_authoritative_batch = None
+    ; queued_authoritative_batch = None
     ; outbox_records = []
+    ; submission_owner = None
     ; websocket_live = false
     ; closed = false
     }
 ;;
 
 let state core = core.public_state
+let admitted_graph_scope core = core.current_graph_scope
+
+let graph_scope_is_current core scope =
+  match core.current_graph_scope with
+  | Some current -> current = scope
+  | None -> false
+;;
+
+let connection_is_current core (connection : connection_scope) =
+  graph_scope_is_current core connection.graph
+  && connection.connection_generation = core.connection_generation
+;;
 
 type transition =
   { next : t
@@ -1613,6 +1700,26 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
 
 let set_snapshot core snapshot =
   { core with public_state = { core.public_state with snapshot } }
+;;
+
+let complete_local_batch input action =
+  Delegate
+    (Complete_local_batch
+       { operation_id = input.local_mutation_id
+       ; admission_id = input.local_admission_id
+       ; scope = input.local_scope
+       ; action
+       })
+;;
+
+let reject_local_batch input kind message =
+  complete_local_batch input (Reject { kind; message })
+;;
+
+let reject_pending_local_batches core kind message =
+  List.map
+    (fun (_, plan) -> reject_local_batch plan.local_input kind message)
+    core.pending_local_batches
 ;;
 
 let catalog_loaded core graphs =
@@ -1687,7 +1794,36 @@ let e2ee_failed core message =
   { next; effects = [ publish_state next ] }
 ;;
 
+let local_restore_failed core =
+  let startup =
+    { core.public_state.snapshot.startup with
+      catalog_loading = false
+    ; restoring_local = false
+    ; bootstrapping = false
+    ; awaiting_e2ee_password = false
+    ; failure = Some During_local_restore
+    }
+  in
+  let snapshot =
+    { core.public_state.snapshot with
+      sync_phase = Failed
+    ; startup
+    ; last_error = Some "Online recovery is required"
+    }
+  in
+  let next =
+    { (set_snapshot core snapshot) with
+      pending_token = None
+    ; snapshot_bootstrap_phase = Snapshot_bootstrap_idle
+    ; active_graph_token = None
+    ; snapshot_server_t = None
+    }
+  in
+  { next; effects = [ publish_state next ] }
+;;
+
 let authenticate_new_account core user_id =
+  let previous_account = Option.map (account_scope core) core.user_id in
   let account_generation = core.public_state.snapshot.startup.account_generation + 1 in
   let presentation_generation =
     core.public_state.snapshot.startup.presentation_generation + 1
@@ -1723,6 +1859,8 @@ let authenticate_new_account core user_id =
     { (set_snapshot core snapshot) with
       user_id = Some user_id
     ; pending_token = Some request
+    ; deferred_catalog_reconciliation = false
+    ; local_presentation_barrier = false
     ; pending_effects = []
     ; pending_local_batches = []
     ; graph_key = None
@@ -1740,8 +1878,46 @@ let authenticate_new_account core user_id =
     ; encrypted_graph_key = None
     ; private_key_package = None
     ; pending_authoritative_batches = []
+    ; active_authoritative_batch = None
+    ; queued_authoritative_batch = None
     ; outbox_records = []
+    ; submission_owner = None
     ; websocket_live = false
+    }
+  in
+  let teardown =
+    match previous_account with
+    | None -> []
+    | Some account ->
+      (Run (Cancel_effects (effect_scope_of_account account))
+       :: reject_pending_local_batches core Scope_closed "managed account was replaced")
+      @ [ Delegate (Reset_managed_account account) ]
+  in
+  { next; effects = teardown @ [ publish_state next; Publish (Token_requested request) ] }
+;;
+
+let request_catalog_reconciliation core =
+  let account_generation = core.public_state.snapshot.startup.account_generation in
+  let request =
+    { request_id = Printf.sprintf "catalog-%d-%d" account_generation core.next_effect_id
+    ; purpose = Catalog_discovery
+    ; account_generation
+    ; graph_generation = None
+    ; connection_generation = None
+    }
+  in
+  let startup =
+    { core.public_state.snapshot.startup with
+      authenticated = true
+    ; catalog_loading = true
+    ; failure = None
+    }
+  in
+  let snapshot = { core.public_state.snapshot with startup; last_error = None } in
+  let next =
+    { (set_snapshot core snapshot) with
+      pending_token = Some request
+    ; deferred_catalog_reconciliation = false
     }
   in
   { next; effects = [ publish_state next; Publish (Token_requested request) ] }
@@ -1750,29 +1926,39 @@ let authenticate_new_account core user_id =
 let authenticate core user_id =
   match core.user_id with
   | Some current_user_id when String.equal current_user_id user_id ->
-    let account_generation = core.public_state.snapshot.startup.account_generation in
-    let request =
-      { request_id = Printf.sprintf "catalog-%d-%d" account_generation core.next_effect_id
-      ; purpose = Catalog_discovery
-      ; account_generation
-      ; graph_generation = None
-      ; connection_generation = None
-      }
+    let local_recovery_pending =
+      core.public_state.snapshot.startup.failure = Some During_local_restore
     in
-    let startup =
-      { core.public_state.snapshot.startup with
-        authenticated = true
-      ; catalog_loading = true
-      ; failure = None
-      }
-    in
-    let snapshot = { core.public_state.snapshot with startup; last_error = None } in
-    let next = { (set_snapshot core snapshot) with pending_token = Some request } in
-    { next; effects = [ publish_state next; Publish (Token_requested request) ] }
+    if core.local_presentation_barrier || local_recovery_pending
+    then (
+      let startup =
+        { core.public_state.snapshot.startup with
+          authenticated = true
+        ; failure =
+            (if local_recovery_pending
+             then core.public_state.snapshot.startup.failure
+             else None)
+        }
+      in
+      let snapshot =
+        { core.public_state.snapshot with
+          startup
+        ; last_error =
+            (if local_recovery_pending
+             then core.public_state.snapshot.last_error
+             else None)
+        }
+      in
+      let next =
+        { (set_snapshot core snapshot) with deferred_catalog_reconciliation = true }
+      in
+      { next; effects = [ publish_state next ] })
+    else request_catalog_reconciliation core
   | Some _ | None -> authenticate_new_account core user_id
 ;;
 
 let sign_out core =
+  let previous_account = Option.map (account_scope core) core.user_id in
   let startup =
     { initial_startup with
       account_generation = core.public_state.snapshot.startup.account_generation + 1
@@ -1795,6 +1981,8 @@ let sign_out core =
     { (set_snapshot core snapshot) with
       user_id = None
     ; pending_token = None
+    ; deferred_catalog_reconciliation = false
+    ; local_presentation_barrier = false
     ; pending_effects = []
     ; pending_local_batches = []
     ; graph_key = None
@@ -1812,19 +2000,22 @@ let sign_out core =
     ; encrypted_graph_key = None
     ; private_key_package = None
     ; pending_authoritative_batches = []
+    ; active_authoritative_batch = None
+    ; queued_authoritative_batch = None
     ; outbox_records = []
+    ; submission_owner = None
     ; websocket_live = false
     }
   in
-  let cancel_scope =
-    { account_generation = None
-    ; graph_generation = None
-    ; connection_generation = None
-    ; presentation_generation = None
-    ; lifecycle_generation = None
-    }
+  let teardown =
+    match previous_account with
+    | None -> []
+    | Some account ->
+      (Run (Cancel_effects (effect_scope_of_account account))
+       :: reject_pending_local_batches core Scope_closed "managed account signed out")
+      @ [ Delegate (Reset_managed_account account) ]
   in
-  { next; effects = [ Run (Cancel_effects cancel_scope); publish_state next ] }
+  { next; effects = teardown @ [ publish_state next ] }
 ;;
 
 let token_is_current core request =
@@ -1944,6 +2135,8 @@ let restore_local core user_id =
     ; selected_graph_value = None
     ; catalog_cache_loading = true
     ; early_fetched_catalog = None
+    ; deferred_catalog_reconciliation = false
+    ; local_presentation_barrier = true
     ; cached_selected_graph = None
     ; current_graph_scope = None
     ; graph_key = None
@@ -1956,7 +2149,10 @@ let restore_local core user_id =
     ; encrypted_graph_key = None
     ; private_key_package = None
     ; pending_authoritative_batches = []
+    ; active_authoritative_batch = None
+    ; queued_authoritative_batch = None
     ; outbox_records = []
+    ; submission_owner = None
     ; websocket_live = false
     }
   in
@@ -2056,6 +2252,17 @@ let challenge_graph_token core purpose =
   | None, None | None, Some _ | Some _, None -> unchanged core
 ;;
 
+let challenge_websocket_if_ready core =
+  match
+    ( core.pending_token
+    , core.websocket_live
+    , core.current_graph_scope
+    , core.public_state.snapshot.applied_server_t )
+  with
+  | None, false, Some _, Some _ -> challenge_graph_token core Websocket_connect
+  | _ -> unchanged core
+;;
+
 let request_snapshot_authorization core =
   let requested = challenge_graph_token core Snapshot_bootstrap in
   match requested.effects with
@@ -2097,6 +2304,28 @@ let request_snapshot_bootstrap core =
     , _ ) -> unchanged core
 ;;
 
+let begin_online_recovery core =
+  match core.public_state.snapshot.startup.failure, core.selected_graph_value with
+  | Some During_local_restore, Some graph when graph.encrypted ->
+    let startup =
+      { core.public_state.snapshot.startup with bootstrapping = true; failure = None }
+    in
+    let snapshot =
+      { core.public_state.snapshot with
+        sync_phase = Connecting
+      ; startup
+      ; last_error = None
+      }
+    in
+    let next =
+      { (set_snapshot core snapshot) with
+        snapshot_bootstrap_phase = Snapshot_bootstrap_waiting_for_key
+      }
+    in
+    challenge_graph_token next E2ee_key_access
+  | _ -> request_snapshot_bootstrap core
+;;
+
 let graph_key_loaded core handle =
   match core.current_graph_scope with
   | Some scope when handle.handle_scope <> scope ->
@@ -2131,11 +2360,31 @@ let graph_key_loaded core handle =
          | Snapshot_bootstrap_activating ) ) -> unchanged core)
 ;;
 
+let authoritative_batch_is_current core (batch : authoritative_batch) =
+  connection_is_current core batch.scope
+  && batch.presentation_generation
+     = core.public_state.snapshot.startup.presentation_generation
+  && batch.lifecycle_generation = core.lifecycle_generation
+;;
+
 let authoritative_finished core plan decrypted_values =
-  match finish_authoritative_batch plan decrypted_values with
-  | Error message -> catalog_failed core message
-  | Ok request ->
-    { next = core; effects = [ Delegate (Apply_authoritative_batch request) ] }
+  if not (authoritative_batch_is_current core plan.authoritative_context.batch)
+  then unchanged { core with active_authoritative_batch = None }
+  else (
+    match finish_authoritative_batch plan decrypted_values with
+    | Error message ->
+      catalog_failed { core with active_authoritative_batch = None } message
+    | Ok request ->
+      { next = core; effects = [ Delegate (Apply_authoritative_batch request) ] })
+;;
+
+let authoritative_conflicted core batch =
+  match core.active_authoritative_batch with
+  | Some active when active = batch && authoritative_batch_is_current core batch ->
+    { next = core; effects = [ Delegate (Inspect_authoritative_batch batch) ] }
+  | Some active when active = batch ->
+    unchanged { core with active_authoritative_batch = None }
+  | Some _ | None -> unchanged core
 ;;
 
 let graph_in_catalog graphs graph_id =
@@ -2188,7 +2437,10 @@ let select_graph_transition core ~persist graph_id =
       ; encrypted_graph_key = None
       ; private_key_package = None
       ; pending_authoritative_batches = []
+      ; active_authoritative_batch = None
+      ; queued_authoritative_batch = None
       ; outbox_records = []
+      ; submission_owner = None
       ; websocket_live = false
       }
     in
@@ -2197,7 +2449,7 @@ let select_graph_transition core ~persist graph_id =
       | None -> []
       | Some previous ->
         [ Run (Cancel_effects (effect_scope_of_graph previous))
-        ; Delegate (Detach_graph { graph_generation = previous.graph_generation })
+        ; Delegate (Detach_graph previous)
         ]
     in
     let next, persistence_effects =
@@ -2206,7 +2458,9 @@ let select_graph_transition core ~persist graph_id =
         let cache =
           catalog_cache ~user_id ~graphs:snapshot.catalog ~selected_graph:(Some graph_id)
         in
-        let next, runner_instruction = issue_request next (Save_catalog cache) in
+        let next, runner_instruction =
+          issue_request next (Save_catalog { account = scope.account; cache })
+        in
         next, [ Run runner_instruction ])
       else next, []
     in
@@ -2256,9 +2510,12 @@ let clear_selected_graph_for_catalog core graphs =
     ; encrypted_graph_key = None
     ; private_key_package = None
     ; pending_authoritative_batches = []
+    ; active_authoritative_batch = None
+    ; queued_authoritative_batch = None
     ; active_graph_token = None
     ; snapshot_server_t = None
     ; outbox_records = []
+    ; submission_owner = None
     ; websocket_live = false
     }
   in
@@ -2267,7 +2524,7 @@ let clear_selected_graph_for_catalog core graphs =
       ~none:[]
       ~some:(fun scope ->
         [ Run (Cancel_effects (effect_scope_of_graph scope))
-        ; Delegate (Detach_graph { graph_generation = scope.graph_generation })
+        ; Delegate (Detach_graph scope)
         ])
       previous
   in
@@ -2317,7 +2574,10 @@ let apply_fetched_catalog core graphs =
     let cache =
       catalog_cache ~user_id ~graphs ~selected_graph:refreshed.next.cached_selected_graph
     in
-    let next, runner_instruction = issue_request refreshed.next (Save_catalog cache) in
+    let account = account_scope refreshed.next user_id in
+    let next, runner_instruction =
+      issue_request refreshed.next (Save_catalog { account; cache })
+    in
     { next; effects = refreshed.effects @ [ Run runner_instruction ] }
 ;;
 
@@ -2348,15 +2608,40 @@ let consume_completion
              select_graph_transition loaded.next ~persist:false graph_id
            | Some _ | None -> loaded)
       in
-      (match early_fetched_catalog with
-       | None -> restored
-       | Some graphs ->
-         let refreshed = apply_fetched_catalog restored.next graphs in
-         { next = refreshed.next; effects = restored.effects @ refreshed.effects })
+      let completed =
+        match early_fetched_catalog with
+        | None -> restored
+        | Some graphs ->
+          let refreshed = apply_fetched_catalog restored.next graphs in
+          { next = refreshed.next; effects = restored.effects @ refreshed.effects }
+      in
+      let completed =
+        match completed.next.current_graph_scope with
+        | None ->
+          { completed with
+            next = { completed.next with local_presentation_barrier = false }
+          }
+        | Some _ -> completed
+      in
+      (match
+         ( completed.next.deferred_catalog_reconciliation
+         , completed.next.current_graph_scope
+         , completed.next.user_id )
+       with
+       | true, None, Some _ ->
+         let requested = request_catalog_reconciliation completed.next in
+         { next = requested.next; effects = completed.effects @ requested.effects }
+       | _ -> completed)
     | Fetch_catalog_kind, Ok graphs ->
       if core.catalog_cache_loading
       then { next = { core with early_fetched_catalog = Some graphs }; effects = [] }
-      else apply_fetched_catalog core graphs
+      else (
+        let refreshed = apply_fetched_catalog core graphs in
+        if refreshed.next.public_state.snapshot.timeline_presentation_pending
+        then refreshed
+        else (
+          let websocket = challenge_websocket_if_ready refreshed.next in
+          { next = websocket.next; effects = refreshed.effects @ websocket.effects }))
     | Load_catalog_kind, Error (Effect_failed message) ->
       catalog_failed
         { core with catalog_cache_loading = false; early_fetched_catalog = None }
@@ -2459,8 +2744,7 @@ let consume_completion
          { next; effects = [ publish_state next ] })
     | Load_and_unlock_graph_key_kind, Ok handle -> graph_key_loaded core handle
     | Fetch_and_unlock_graph_key_kind, Ok handle -> graph_key_loaded core handle
-    | Load_and_unlock_graph_key_kind, Error _ ->
-      challenge_graph_token core E2ee_key_access
+    | Load_and_unlock_graph_key_kind, Error _ -> local_restore_failed core
     | Fetch_and_unlock_graph_key_kind, Error _ ->
       (match core.e2ee_authenticated with
        | None -> catalog_failed core "E2EE account authorization is unavailable"
@@ -2503,26 +2787,72 @@ let consume_completion
            }
          in
          (match finish_local_batch plan (Some encrypted) with
-          | Error message -> catalog_failed core message
+          | Error message ->
+            { next = core
+            ; effects = [ reject_local_batch plan.local_input Encoding_failed message ]
+            }
           | Ok record ->
             let records = plan.local_input.local_outbox @ [ record ] in
             (match encode_outbox_records records with
-             | Error message -> catalog_failed core message
+             | Error message ->
+               { next = core
+               ; effects = [ reject_local_batch plan.local_input Encoding_failed message ]
+               }
              | Ok outbox_records ->
                let request =
                  { operation_id = plan.local_input.local_mutation_id
-                 ; outbox_records
+                 ; admission_id = plan.local_input.local_admission_id
                  ; scope = plan.local_input.local_scope
+                 ; action = Commit { outbox_records }
                  }
                in
-               { next = core; effects = [ Delegate (Commit_local_batch request) ] })))
-    | Encrypt_protected_values_kind, Error (Effect_failed message) ->
-      let core =
-        { core with
-          pending_local_batches = List.remove_assoc ticket.id core.pending_local_batches
-        }
-      in
-      catalog_failed core message
+               { next = core; effects = [ Delegate (Complete_local_batch request) ] })))
+    | ( Encrypt_protected_values_kind
+      , Error
+          (Effect_failed message | Crypto_failed (Crypto_provider_unavailable, message)) )
+      ->
+      (match List.assoc_opt ticket.id core.pending_local_batches with
+       | None -> unchanged core
+       | Some plan ->
+         let snapshot =
+           { core.public_state.snapshot with
+             sync_phase = Paused
+           ; last_error = Some "Local encryption is temporarily unavailable."
+           }
+         in
+         let next =
+           set_snapshot
+             { core with
+               pending_local_batches =
+                 List.remove_assoc ticket.id core.pending_local_batches
+             }
+             snapshot
+         in
+         { next
+         ; effects =
+             [ reject_local_batch plan.local_input Encryption_failed message
+             ; publish_state next
+             ]
+         })
+    | Encrypt_protected_values_kind, Error (Crypto_failed (Invalid_key_material, message))
+      ->
+      (match List.assoc_opt ticket.id core.pending_local_batches with
+       | None -> unchanged core
+       | Some plan ->
+         let core =
+           { core with
+             pending_local_batches =
+               List.remove_assoc ticket.id core.pending_local_batches
+           }
+         in
+         let failed =
+           e2ee_failed core "The graph encryption key is unavailable or invalid."
+         in
+         { failed with
+           effects =
+             reject_local_batch plan.local_input Encryption_failed message
+             :: failed.effects
+         })
     | Decrypt_protected_values_kind, Ok decrypted ->
       (match List.assoc_opt ticket.id core.pending_authoritative_batches with
        | None -> unchanged core
@@ -2541,45 +2871,83 @@ let consume_completion
             List.remove_assoc ticket.id core.pending_authoritative_batches
         }
       in
-      e2ee_failed core message)
-;;
-
-let graph_scope_is_current core scope =
-  match core.current_graph_scope with
-  | Some current -> current = scope
-  | None -> false
+      e2ee_failed core message
+    | Decrypt_protected_values_kind, Error (Crypto_failed (Invalid_key_material, _)) ->
+      let core =
+        { core with
+          pending_authoritative_batches =
+            List.remove_assoc ticket.id core.pending_authoritative_batches
+        ; active_authoritative_batch = None
+        }
+      in
+      e2ee_failed core "The graph encryption key is unavailable or invalid."
+    | ( Decrypt_protected_values_kind
+      , Error (Crypto_failed (Crypto_provider_unavailable, _)) ) ->
+      let snapshot =
+        { core.public_state.snapshot with
+          sync_phase = Paused
+        ; last_error = Some "Authoritative decryption is temporarily unavailable."
+        }
+      in
+      let next =
+        set_snapshot
+          { core with
+            pending_authoritative_batches =
+              List.remove_assoc ticket.id core.pending_authoritative_batches
+          ; active_authoritative_batch = None
+          }
+          snapshot
+      in
+      { next; effects = [ publish_state next ] }
+    | _, Error (Crypto_failed (_, message)) -> catalog_failed core message)
 ;;
 
 let start_local_batch core input =
   let input = { input with local_key = core.graph_key } in
-  match begin_local_batch input with
-  | Error message -> catalog_failed core message
-  | Ok plan ->
-    (match local_batch_crypto_request plan with
-     | Some request ->
-       let next, runner_instruction =
-         issue_request core (Encrypt_protected_values request)
-       in
-       let id = next.next_effect_id - 1 in
-       { next =
-           { next with pending_local_batches = (id, plan) :: next.pending_local_batches }
-       ; effects = [ Run runner_instruction ]
-       }
-     | None ->
-       (match finish_local_batch plan None with
-        | Error message -> catalog_failed core message
-        | Ok record ->
-          let records = plan.local_input.local_outbox @ [ record ] in
-          (match encode_outbox_records records with
-           | Error message -> catalog_failed core message
-           | Ok outbox_records ->
-             let request =
-               { operation_id = plan.local_input.local_mutation_id
-               ; outbox_records
-               ; scope = plan.local_input.local_scope
+  if not (graph_scope_is_current core input.local_scope)
+  then
+    { next = core
+    ; effects = [ reject_local_batch input Scope_closed "managed graph scope is closed" ]
+    }
+  else (
+    match begin_local_batch input with
+    | Error message ->
+      { next = core; effects = [ reject_local_batch input Planning_failed message ] }
+    | Ok plan ->
+      (match local_batch_crypto_request plan with
+       | Some request ->
+         let next, runner_instruction =
+           issue_request core (Encrypt_protected_values request)
+         in
+         let id = next.next_effect_id - 1 in
+         { next =
+             { next with
+               pending_local_batches = (id, plan) :: next.pending_local_batches
+             }
+         ; effects = [ Run runner_instruction ]
+         }
+       | None ->
+         (match finish_local_batch plan None with
+          | Error message ->
+            { next = core
+            ; effects = [ reject_local_batch plan.local_input Encoding_failed message ]
+            }
+          | Ok record ->
+            let records = plan.local_input.local_outbox @ [ record ] in
+            (match encode_outbox_records records with
+             | Error message ->
+               { next = core
+               ; effects = [ reject_local_batch plan.local_input Encoding_failed message ]
                }
-             in
-             { next = core; effects = [ Delegate (Commit_local_batch request) ] })))
+             | Ok outbox_records ->
+               let request =
+                 { operation_id = plan.local_input.local_mutation_id
+                 ; admission_id = plan.local_input.local_admission_id
+                 ; scope = plan.local_input.local_scope
+                 ; action = Commit { outbox_records }
+                 }
+               in
+               { next = core; effects = [ Delegate (Complete_local_batch request) ] }))))
 ;;
 
 let take_values count values =
@@ -2608,10 +2976,21 @@ let submission_message applied_server_t records =
 
 let plan_submission core =
   match core.current_graph_scope, core.public_state.snapshot.applied_server_t with
-  | Some scope, Some applied_server_t ->
+  | Some scope, Some applied_server_t
+    when core.websocket_live
+         && core.public_state.snapshot.sync_phase = Current
+         && Option.is_none core.submission_owner ->
     (match decode_outbox_records core.outbox_records with
      | Error message -> catalog_failed core message
      | Ok records ->
+       let has_uncertain_attempt =
+         List.exists
+           (fun record ->
+              match record.outbox_state with
+              | Submitted | Accepted _ -> true
+              | Queued | Blocked _ -> false)
+           records
+       in
        let queued =
          List.filter
            (fun record ->
@@ -2621,7 +3000,7 @@ let plan_submission core =
            records
          |> take_values core.config.limits.submission_batch_size
        in
-       if queued = [] || not core.websocket_live
+       if queued = [] || has_uncertain_attempt
        then unchanged core
        else (
          let selected mutation_id =
@@ -2652,8 +3031,24 @@ let plan_submission core =
              ; pending_message = Some message
              }
            in
-           { next = core; effects = [ Delegate (Commit_outbox_transition transition) ] }))
-  | Some _, None | None, Some _ | None, None -> unchanged core
+           let connection =
+             { graph = scope; connection_generation = core.connection_generation }
+           in
+           let owner =
+             { mutation_ids = List.map (fun record -> record.mutation_id) queued
+             ; t_before = applied_server_t
+             ; message
+             ; connection
+             ; presentation_generation =
+                 core.public_state.snapshot.startup.presentation_generation
+             ; lifecycle_generation = core.lifecycle_generation
+             ; phase = Submission_reserving
+             }
+           in
+           { next = { core with submission_owner = Some owner }
+           ; effects = [ Delegate (Commit_outbox_transition transition) ]
+           }))
+  | Some _, Some _ | Some _, None | None, Some _ | None, None -> unchanged core
 ;;
 
 let local_batch_committed core (commit : local_batch_commit) =
@@ -2667,34 +3062,65 @@ let outbox_transition_committed core (commit : outbox_transition_commit) =
   then unchanged core
   else (
     let core = { core with outbox_records = commit.outbox_records } in
-    match commit.pending_message, core.current_graph_scope with
-    | Some message, Some graph when core.websocket_live ->
-      let connection = { graph; connection_generation = core.connection_generation } in
+    match commit.pending_message, core.submission_owner with
+    | Some message, Some owner
+      when core.websocket_live
+           && owner.phase = Submission_reserving
+           && owner.message = message
+           && owner.connection.graph = commit.scope
+           && Some owner.t_before = core.public_state.snapshot.applied_server_t
+           && connection_is_current core owner.connection ->
       let snapshot = { core.public_state.snapshot with sync_phase = Submitting } in
-      let next = set_snapshot core snapshot in
+      let owner = { owner with phase = Submission_dispatched } in
+      let next = set_snapshot { core with submission_owner = Some owner } snapshot in
       { next
       ; effects =
-          [ Run (Send_websocket { scope = connection; message }); publish_state next ]
+          [ Run (Send_websocket { scope = owner.connection; message })
+          ; publish_state next
+          ]
       }
     | Some _, (None | Some _) | None, _ -> unchanged core)
 ;;
 
+let outbox_transition_rejected core (rejection : outbox_transition_rejection) =
+  if not (graph_scope_is_current core rejection.scope)
+  then unchanged core
+  else
+    plan_submission
+      { core with outbox_records = rejection.outbox_records; submission_owner = None }
+;;
+
 let start_authoritative_batch core (context : authoritative_context) =
   let connection = context.batch.scope in
+  let owner_matches =
+    match core.active_authoritative_batch with
+    | None -> true
+    | Some active -> active = context.batch
+  in
   let graph_is_current =
     match core.current_graph_scope with
     | Some graph -> graph = connection.graph
     | None -> false
   in
   if
-    (not graph_is_current)
+    (not owner_matches)
+    || (not graph_is_current)
     || connection.connection_generation <> core.connection_generation
     || context.batch.presentation_generation
        <> core.public_state.snapshot.startup.presentation_generation
     || context.batch.lifecycle_generation <> core.lifecycle_generation
   then unchanged core
   else (
-    match begin_authoritative_batch context with
+    let core = { core with active_authoritative_batch = Some context.batch } in
+    let acknowledged_mutation_ids =
+      match context.batch.message, core.submission_owner with
+      | Sync_protocol.Server.Tx_batch_ok _, Some owner ->
+        (match owner.phase with
+         | Submission_applying_ack _ -> owner.mutation_ids
+         | Submission_reserving | Submission_dispatched | Submission_awaiting_pull _ -> [])
+      | _, (Some _ | None) -> []
+    in
+    match begin_authoritative_batch ~acknowledged_mutation_ids context with
     | Error message -> catalog_failed core message
     | Ok plan ->
       let plan = { plan with authoritative_key = core.graph_key } in
@@ -2758,13 +3184,11 @@ let graph_attached core (attachment : graph_attachment) =
     let next =
       set_snapshot { core with outbox_records = attachment.outbox_records } snapshot
     in
-    let token = challenge_graph_token next Websocket_connect in
-    { next = token.next; effects = publish_state next :: token.effects })
-;;
-
-let connection_is_current core (connection : connection_scope) =
-  graph_scope_is_current core connection.graph
-  && connection.connection_generation = core.connection_generation
+    if next.local_presentation_barrier
+    then { next; effects = [ publish_state next ] }
+    else (
+      let token = challenge_graph_token next Websocket_connect in
+      { next = token.next; effects = publish_state next :: token.effects }))
 ;;
 
 let pull_effect core =
@@ -2805,12 +3229,40 @@ let rejection_reason_name = function
   | Snapshot_upload_in_progress -> "snapshot upload in progress"
 ;;
 
+let enqueue_authoritative_batch core batch =
+  match core.active_authoritative_batch with
+  | None ->
+    { next = { core with active_authoritative_batch = Some batch }
+    ; effects = [ Delegate (Inspect_authoritative_batch batch) ]
+    }
+  | Some _ ->
+    { next = { core with queued_authoritative_batch = Some batch }; effects = [] }
+;;
+
 let websocket_message core (connection : connection_scope) message =
   if not (connection_is_current core connection)
   then unchanged core
   else (
     match message with
-    | Sync_protocol.Server.Hello _ | Pull_ok _ | Changed _ | Tx_batch_ok _ ->
+    | Sync_protocol.Server.Tx_batch_ok { t; _ } ->
+      (match core.submission_owner with
+       | Some owner
+         when owner.phase = Submission_dispatched
+              && owner.connection = connection
+              && owner.presentation_generation
+                 = core.public_state.snapshot.startup.presentation_generation
+              && owner.lifecycle_generation = core.lifecycle_generation ->
+         let batch =
+           { message
+           ; scope = connection
+           ; presentation_generation = owner.presentation_generation
+           ; lifecycle_generation = owner.lifecycle_generation
+           }
+         in
+         let owner = { owner with phase = Submission_applying_ack t } in
+         enqueue_authoritative_batch { core with submission_owner = Some owner } batch
+       | Some _ | None -> unchanged core)
+    | Sync_protocol.Server.Hello _ | Pull_ok _ | Changed _ ->
       let batch =
         { message
         ; scope = connection
@@ -2819,7 +3271,7 @@ let websocket_message core (connection : connection_scope) message =
         ; lifecycle_generation = core.lifecycle_generation
         }
       in
-      { next = core; effects = [ Delegate (Inspect_authoritative_batch batch) ] }
+      enqueue_authoritative_batch core batch
     | Sync_protocol.Server.Tx_reject rejection ->
       catalog_failed
         core
@@ -2842,7 +3294,17 @@ let websocket_closed core (connection : connection_scope) message =
     let snapshot =
       { core.public_state.snapshot with sync_phase = Offline; last_error = message }
     in
-    let next = set_snapshot { core with websocket_live = false } snapshot in
+    let next =
+      set_snapshot
+        { core with
+          websocket_live = false
+        ; submission_owner = None
+        ; pending_authoritative_batches = []
+        ; active_authoritative_batch = None
+        ; queued_authoritative_batch = None
+        }
+        snapshot
+    in
     { next; effects = [ publish_state next ] })
 ;;
 
@@ -2850,6 +3312,10 @@ let authoritative_applied core (result : authoritative_commit_result) =
   if not (graph_scope_is_current core result.scope)
   then unchanged core
   else (
+    let queued_authoritative_batch = core.queued_authoritative_batch in
+    let core =
+      { core with active_authoritative_batch = None; queued_authoritative_batch = None }
+    in
     let sync_phase, should_pull =
       match result.activity with
       | Logseq_db_types.Sync_status.Sync_paused | Sync_submission_blocked -> Paused, false
@@ -2863,8 +3329,22 @@ let authoritative_applied core (result : authoritative_commit_result) =
       ; last_error = result.checkpoint.last_error
       }
     in
+    let submission_owner =
+      match core.submission_owner with
+      | Some owner ->
+        (match owner.phase with
+         | Submission_applying_ack accepted_t ->
+           Some { owner with phase = Submission_awaiting_pull accepted_t }
+         | Submission_awaiting_pull accepted_t
+           when result.checkpoint.applied_server_t >= accepted_t -> None
+         | Submission_reserving | Submission_dispatched | Submission_awaiting_pull _ ->
+           Some owner)
+      | None -> None
+    in
     let next =
-      set_snapshot { core with outbox_records = result.outbox_records } snapshot
+      set_snapshot
+        { core with outbox_records = result.outbox_records; submission_owner }
+        snapshot
     in
     let published =
       publish_state next
@@ -2884,7 +3364,14 @@ let authoritative_applied core (result : authoritative_commit_result) =
         Option.fold ~none:[] ~some:(fun instruction -> [ instruction ]) (pull_effect next)
       else []
     in
-    { next = submission.next; effects = published @ pull @ submission.effects })
+    let next, queued =
+      match queued_authoritative_batch with
+      | Some batch when authoritative_batch_is_current submission.next batch ->
+        ( { submission.next with active_authoritative_batch = Some batch }
+        , [ Delegate (Inspect_authoritative_batch batch) ] )
+      | Some _ | None -> submission.next, []
+    in
+    { next; effects = published @ pull @ submission.effects @ queued })
 ;;
 
 let snapshot_activated core (activation : snapshot_activation) =
@@ -2928,6 +3415,8 @@ let return_to_graph_picker core =
       ; current_graph_scope = None
       ; graph_key = None
       ; pending_token = None
+      ; deferred_catalog_reconciliation = false
+      ; local_presentation_barrier = false
       ; pending_effects = []
       ; pending_local_batches = []
       ; pending_graph_open = None
@@ -2936,9 +3425,12 @@ let return_to_graph_picker core =
       ; encrypted_graph_key = None
       ; private_key_package = None
       ; pending_authoritative_batches = []
+      ; active_authoritative_batch = None
+      ; queued_authoritative_batch = None
       ; active_graph_token = None
       ; snapshot_server_t = None
       ; outbox_records = []
+      ; submission_owner = None
       ; websocket_live = false
       }
     in
@@ -2947,7 +3439,7 @@ let return_to_graph_picker core =
         ~none:[]
         ~some:(fun scope ->
           [ Run (Cancel_effects (effect_scope_of_graph scope))
-          ; Delegate (Detach_graph { graph_generation = scope.graph_generation })
+          ; Delegate (Detach_graph scope)
           ])
         previous
     in
@@ -3013,9 +3505,12 @@ let delete_local_cache core graph_id =
       ; encrypted_graph_key = None
       ; private_key_package = None
       ; pending_authoritative_batches = []
+      ; active_authoritative_batch = None
+      ; queued_authoritative_batch = None
       ; active_graph_token = None
       ; snapshot_server_t = None
       ; outbox_records = []
+      ; submission_owner = None
       ; websocket_live = false
       }
     in
@@ -3023,7 +3518,7 @@ let delete_local_cache core graph_id =
     { next = bootstrap.next
     ; effects =
         [ Run (Cancel_effects (effect_scope_of_graph previous))
-        ; Delegate (Detach_graph { graph_generation = previous.graph_generation })
+        ; Delegate (Detach_graph previous)
         ; Delegate (Delete_mirror { graph_id; scope = effect_scope_of_graph previous })
         ; publish_state next
         ]
@@ -3094,13 +3589,24 @@ let step core event =
       websocket_protocol_error core connection error
     | Websocket_closed (connection, message) -> websocket_closed core connection message
     | Authoritative_batch_applied result -> authoritative_applied core result
+    | Authoritative_batch_conflicted batch -> authoritative_conflicted core batch
     | Snapshot_activated activation -> snapshot_activated core activation
     | Outbox_transition_committed commit -> outbox_transition_committed core commit
+    | Outbox_transition_rejected rejection -> outbox_transition_rejected core rejection
     | Foreground_changed { lifecycle_generation; _ }
       when Int64.compare lifecycle_generation core.lifecycle_generation <= 0 ->
       unchanged core
     | Foreground_changed { foreground = false; lifecycle_generation } ->
-      let core = { core with lifecycle_generation; websocket_live = false } in
+      let core =
+        { core with
+          lifecycle_generation
+        ; websocket_live = false
+        ; submission_owner = None
+        ; pending_authoritative_batches = []
+        ; active_authoritative_batch = None
+        ; queued_authoritative_batch = None
+        }
+      in
       (match core.current_graph_scope with
        | None -> unchanged core
        | Some graph ->
@@ -3117,8 +3623,16 @@ let step core event =
       let snapshot =
         { core.public_state.snapshot with timeline_presentation_pending = false }
       in
-      let next = set_snapshot core snapshot in
-      { next; effects = [ publish_state next ] }
+      let next =
+        { (set_snapshot core snapshot) with local_presentation_barrier = false }
+      in
+      (match next.deferred_catalog_reconciliation, next.user_id with
+       | true, Some _ ->
+         let requested = request_catalog_reconciliation next in
+         { next = requested.next; effects = publish_state next :: requested.effects }
+       | _ ->
+         let websocket = challenge_websocket_if_ready next in
+         { next = websocket.next; effects = publish_state next :: websocket.effects })
     | Shutdown ->
       let scope =
         { account_generation = None
@@ -3128,22 +3642,40 @@ let step core event =
         ; lifecycle_generation = None
         }
       in
-      { next = { core with closed = true; pending_effects = []; pending_token = None }
-      ; effects = [ Run (Cancel_effects scope) ]
+      let reset =
+        match core.user_id with
+        | None -> []
+        | Some user_id ->
+          [ Delegate (Reset_managed_account (account_scope core user_id)) ]
+      in
+      { next =
+          { core with
+            closed = true
+          ; pending_effects = []
+          ; pending_token = None
+          ; deferred_catalog_reconciliation = false
+          ; local_presentation_barrier = false
+          ; pending_local_batches = []
+          }
+      ; effects =
+          [ Run (Cancel_effects scope) ]
+          @ reject_pending_local_batches core Scope_closed "managed service shut down"
+          @ reset
       }
-    | Graph_attachment_failed error
-    | Authoritative_batch_failed error
-    | Snapshot_activation_failed error
+    | Authoritative_batch_failed error when current_scoped_error core error ->
+      catalog_failed
+        { core with active_authoritative_batch = None; queued_authoritative_batch = None }
+        error.message
+    | (Graph_attachment_failed error | Snapshot_activation_failed error)
       when current_scoped_error core error -> catalog_failed core error.message
     | Graph_picker_requested -> return_to_graph_picker core
     | Catalog_refresh_requested -> request_catalog_refresh core
-    | Online_recovery_requested -> request_snapshot_bootstrap core
+    | Online_recovery_requested -> begin_online_recovery core
     | Local_cache_deletion_requested graph_id -> delete_local_cache core graph_id
     | E2ee_password_submitted password -> submit_e2ee_password core password
     | Local_feed_acknowledged
     | Graph_attachment_failed _
     | Authoritative_batch_failed _
-    | Outbox_transition_rejected _
     | Snapshot_activation_failed _
     | Timer_elapsed _ -> unchanged core)
 ;;

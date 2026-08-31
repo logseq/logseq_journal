@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' show Tristate;
 
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 // ignore: implementation_imports
@@ -8,6 +9,7 @@ import 'package:bonsai_flutter/src/runtime/foreground_frame_loop.dart';
 // ignore: implementation_imports
 import 'package:bonsai_flutter/src/renderer/pressable_host.dart';
 import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
+import 'package:bonsai_flutter_logseq_journal_host/journal_widget_registry.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -145,7 +147,7 @@ void main() {
       final extendedRect = tester.getRect(floatingActionButton);
 
       final gesture = await tester.startGesture(
-        tester.getCenter(find.text('Doing line one')),
+        tester.getCenter(find.text(_parentSource)),
       );
       await gesture.moveBy(const Offset(0, -19));
       await tester.pump();
@@ -248,6 +250,40 @@ void main() {
         tester.getSize(find.byType(FloatingActionButton)),
         const Size(56, 56),
       );
+      final rtlStatusRow = find.text(_parentSource);
+      final rtlSlidable = find.ancestor(
+        of: rtlStatusRow,
+        matching: find.byType(fs.Slidable),
+      );
+      await tester.drag(rtlStatusRow, const Offset(-390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(tester.takeException(), isNull);
+      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
+        final actionLabel = find.descendant(
+          of: rtlSlidable,
+          matching: find.text(label),
+        );
+        expect(actionLabel, findsOneWidget);
+        expect(
+          tester
+              .getRect(
+                find.ancestor(
+                  of: actionLabel,
+                  matching: find.byType(fs.CustomSlidableAction),
+                ),
+              )
+              .width,
+          greaterThanOrEqualTo(44),
+        );
+      }
+      expect(
+        fs.Slidable.of(tester.element(rtlStatusRow))!.ratio,
+        closeTo(-0.8, 0.01),
+        reason: 'RTL did not mirror logical-start status actions',
+      );
+      final rtlClose = fs.Slidable.of(tester.element(rtlStatusRow))!.close();
+      await _pumpSlidableMotion(tester);
+      await rtlClose;
       await expectLater(
         find.byType(Scaffold).first,
         matchesGoldenFile('goldens/journal-capture-compact-rtl-large-text.png'),
@@ -289,7 +325,7 @@ void main() {
       expect(find.text('Capture'), findsOneWidget);
 
       final gesture = await tester.startGesture(
-        tester.getCenter(find.text('Doing line one')),
+        tester.getCenter(find.text(_parentSource)),
       );
       await gesture.moveBy(const Offset(0, -19));
       await tester.pump();
@@ -501,6 +537,149 @@ void main() {
   );
 
   testWidgets(
+    'real runtime preserves Capture task intent and applies explicit row status actions',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: Brightness.light,
+        highContrast: false,
+      );
+      expect(tester.takeException(), isNull);
+
+      final parentRow = find.text(_parentSource);
+      final parentSlidable = find.ancestor(
+        of: parentRow,
+        matching: find.byType(fs.Slidable),
+      );
+      final parentController = fs.Slidable.of(tester.element(parentRow))!;
+      await tester.drag(parentRow, const Offset(390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0.8, 0.01));
+      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
+        final actionLabel = find.descendant(
+          of: parentSlidable,
+          matching: find.text(label),
+        );
+        expect(actionLabel, findsOneWidget);
+        expect(
+          tester
+              .getRect(
+                find.ancestor(
+                  of: actionLabel,
+                  matching: find.byType(fs.CustomSlidableAction),
+                ),
+              )
+              .width,
+          greaterThanOrEqualTo(44),
+        );
+      }
+      final currentNoStatus = tester.widget<fs.CustomSlidableAction>(
+        find.ancestor(
+          of: find.descendant(
+            of: parentSlidable,
+            matching: find.text('No status'),
+          ),
+          matching: find.byType(fs.CustomSlidableAction),
+        ),
+      );
+      expect(currentNoStatus.onPressed, isNull);
+      expect(
+        tester
+            .getSemantics(find.bySemanticsLabel('Current status No status'))
+            .getSemanticsData()
+            .flagsCollection
+            .isSelected,
+        Tristate.isTrue,
+      );
+      final parentClose = parentController.close();
+      await _pumpSlidableMotion(tester);
+      await parentClose;
+      await tester.drag(parentRow, const Offset(390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0.8, 0.01));
+      expect(
+        find.bySemanticsLabel(RegExp('$_parentSource.*status ')),
+        findsNothing,
+        reason: 'a full-width drag changed status without an explicit tap',
+      );
+      await tester.tap(
+        find.descendant(of: parentSlidable, matching: find.text('Doing')),
+      );
+      await harness.pumpUntil(
+        () => find
+            .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
+            .evaluate()
+            .isNotEmpty,
+        reason: 'the Doing action did not reconcile through the Worker',
+      );
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0, 0.01));
+
+      await tester.tap(find.byType(FloatingActionButton));
+      await harness.pumpUntil(
+        () => find.byType(MessageComposer).evaluate().isNotEmpty,
+        reason: 'Capture composer did not open',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      const draft = '  Capture task 中文 👩🏽‍💻 exact  ';
+      await tester.enterText(find.byType(TextField), draft);
+      await tester.pump();
+      _expectMaterialGlyph(
+        find.byTooltip('Capture as task, off'),
+        Icons.check_box_outline_blank,
+        role: 'unchecked Capture task action',
+      );
+      await tester.tap(find.byTooltip('Capture as task, off').hitTestable());
+      await harness.pumpUntil(
+        () => find.byTooltip('Capture as task, on').evaluate().isNotEmpty,
+        reason: 'Capture task action did not become checked',
+      );
+      _expectMaterialGlyph(
+        find.byTooltip('Capture as task, on'),
+        Icons.task_alt,
+        role: 'checked Capture task action',
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        draft,
+      );
+      await tester.drag(find.byType(MessageComposer), const Offset(0, 80));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(find.byType(MessageComposer), findsNothing);
+      await tester.tap(find.byType(FloatingActionButton));
+      await harness.pumpUntil(
+        () =>
+            find.byType(TextField).evaluate().isNotEmpty &&
+            tester.widget<TextField>(find.byType(TextField)).controller!.text ==
+                draft &&
+            find.byTooltip('Capture as task, on').evaluate().isNotEmpty,
+        reason: 'dismissed Capture draft and task intent were not restored',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.tap(find.byTooltip('Save journal block').hitTestable());
+      await harness.pumpUntil(
+        () =>
+            find.byType(MessageComposer).evaluate().isEmpty &&
+            find
+                .bySemanticsLabel(RegExp('Capture task 中文.*status Todo'))
+                .evaluate()
+                .isNotEmpty,
+        reason: 'checked Capture did not persist Todo and close',
+      );
+      await tester.tap(find.byType(FloatingActionButton));
+      await harness.pumpUntil(
+        () => find.byTooltip('Capture as task, off').evaluate().isNotEmpty,
+        reason: 'successful Capture did not reset task intent',
+      );
+      await harness.dispose();
+    },
+    skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
+    timeout: const Timeout(Duration(seconds: 60)),
+  );
+
+  testWidgets(
     'real runtime matches row, divider, expandable Capture, preview, and swipe contracts',
     (tester) async {
       final harness = await _RuntimeHarness.start(
@@ -589,24 +768,8 @@ void main() {
       expect(find.text(_parentSource), findsOneWidget);
       expect(find.text(_firstChild), findsOneWidget);
       expect(find.text('21:37'), findsOneWidget);
-      for (final line in const [
-        'Todo rail',
-        'Doing line one',
-        'Doing line two',
-        'Done line one',
-        'Done line two',
-        'Done line three',
-        'Later line one',
-        'Later line two',
-        'Later line three',
-        'Later line four',
-      ]) {
-        expect(find.text(line), findsOneWidget);
-      }
-      expect(find.text('Later line five'), findsNothing);
-      for (final status in const ['Todo', 'Doing', 'Done', 'Backlog']) {
-        expect(find.bySemanticsLabel(RegExp('status $status')), findsOneWidget);
-      }
+      expect(find.text('Todo rail'), findsOneWidget);
+      expect(find.bySemanticsLabel(RegExp('status Todo')), findsOneWidget);
       _expectSeedOwnedSemanticColors(
         tester,
         brightness: _runtimeBrightness,
@@ -614,7 +777,7 @@ void main() {
       );
       expect(
         find.bySemanticsLabel(
-          '$_parentSource, $_firstChild, $_secondChild, $_thirdChild, created at 21:37',
+          RegExp('^${RegExp.escape(_parentSource)}.*created at 21:37'),
         ),
         findsOneWidget,
       );
@@ -639,7 +802,7 @@ void main() {
 
       final disclosureSemantics = tester.getSemantics(
         find.bySemanticsLabel(
-          '$_parentSource, $_firstChild, $_secondChild, $_thirdChild, created at 21:37',
+          RegExp('^${RegExp.escape(_parentSource)}.*created at 21:37'),
         ),
       );
       expect(
@@ -675,7 +838,9 @@ void main() {
         closeTo(collapsedParentTop, 0.1),
       );
       expect(
-        find.bySemanticsLabel('$_parentSource, created at 21:37'),
+        find.bySemanticsLabel(
+          RegExp('^${RegExp.escape(_parentSource)}.*created at 21:37'),
+        ),
         findsOneWidget,
       );
       expect(
@@ -700,6 +865,61 @@ void main() {
         closeTo(collapsedParentTop, 0.1),
       );
 
+      final parentSlidable = find.ancestor(
+        of: find.text(_parentSource),
+        matching: find.byType(fs.Slidable),
+      );
+      final parentController = fs.Slidable.of(
+        tester.element(find.text(_parentSource)),
+      )!;
+      await tester.drag(find.text(_parentSource), const Offset(390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0.8, 0.01));
+      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
+        expect(
+          find.descendant(of: parentSlidable, matching: find.text(label)),
+          findsOneWidget,
+        );
+      }
+      final currentNoStatus = tester.widget<fs.CustomSlidableAction>(
+        find.ancestor(
+          of: find.descendant(
+            of: parentSlidable,
+            matching: find.text('No status'),
+          ),
+          matching: find.byType(fs.CustomSlidableAction),
+        ),
+      );
+      expect(currentNoStatus.onPressed, isNull);
+      expect(
+        tester
+            .getSemantics(find.bySemanticsLabel('Current status No status'))
+            .getSemanticsData()
+            .flagsCollection
+            .isSelected,
+        Tristate.isTrue,
+      );
+      await tester.drag(find.text(_parentSource), const Offset(390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0.8, 0.01));
+      expect(
+        find.bySemanticsLabel(RegExp('$_parentSource.*status ')),
+        findsNothing,
+        reason: 'a full-width status drag mutated the block',
+      );
+      await tester.tap(
+        find.descendant(of: parentSlidable, matching: find.text('Doing')),
+      );
+      await harness.pumpUntil(
+        () => find
+            .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
+            .evaluate()
+            .isNotEmpty,
+        reason: 'explicit Doing action did not reconcile through the runtime',
+      );
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0, 0.01));
+
       final swipeGesture = await tester.startGesture(
         tester.getCenter(find.text(_parentSource)),
       );
@@ -708,24 +928,20 @@ void main() {
         timeStamp: const Duration(milliseconds: 500),
       );
       await tester.pump();
-      final parentSlidable = find.ancestor(
-        of: find.text(_parentSource),
-        matching: find.byType(fs.Slidable),
-      );
       final parentDelete = find.descendant(
         of: parentSlidable,
         matching: find.text('Delete'),
       );
       expect(parentDelete, findsOneWidget);
       final deleteAction = tester.widget<fs.CustomSlidableAction>(
-        find.descendant(
-          of: parentSlidable,
+        find.ancestor(
+          of: parentDelete,
           matching: find.byType(fs.CustomSlidableAction),
         ),
       );
       expect(deleteAction.borderRadius, BorderRadius.zero);
-      final deleteActionFinder = find.descendant(
-        of: parentSlidable,
+      final deleteActionFinder = find.ancestor(
+        of: parentDelete,
         matching: find.byType(fs.CustomSlidableAction),
       );
       final actionRect = tester.getRect(deleteActionFinder);
@@ -759,11 +975,8 @@ void main() {
       expect(find.text(_parentSource), findsOneWidget);
       expect(find.text('Block and descendants removed'), findsNothing);
 
-      final parentController = fs.Slidable.of(
-        tester.element(find.text(_parentSource)),
-      )!;
       expect(parentController.ratio, closeTo(-0.25, 0.01));
-      await tester.tapAt(tester.getCenter(find.text('Doing line one')));
+      await tester.tapAt(tester.getCenter(find.text('Todo rail')));
       await _pumpSlidableMotion(tester);
       expect(parentController.ratio, closeTo(0, 0.01));
 
@@ -774,7 +987,7 @@ void main() {
       expect(find.text('Block and descendants removed'), findsNothing);
 
       final secondController = fs.Slidable.of(
-        tester.element(find.text('Doing line one')),
+        tester.element(find.text('Todo rail')),
       )!;
       final secondOpen = secondController.openEndActionPane();
       await _pumpSlidableMotion(tester);
@@ -801,11 +1014,16 @@ void main() {
         find.text('Todo rail'),
         44,
       );
-      final shortestAction = find.descendant(
-        of: find.ancestor(
-          of: find.text('Todo rail'),
-          matching: find.byType(fs.Slidable),
-        ),
+      final shortestSlidable = find.ancestor(
+        of: find.text('Todo rail'),
+        matching: find.byType(fs.Slidable),
+      );
+      final shortestDelete = find.descendant(
+        of: shortestSlidable,
+        matching: find.text('Delete'),
+      );
+      final shortestAction = find.ancestor(
+        of: shortestDelete,
         matching: find.byType(fs.CustomSlidableAction),
       );
       expect(
@@ -893,6 +1111,26 @@ void main() {
       await tester.enterText(find.byType(TextField), stagedDraft);
       await tester.pump();
       _expectMaterialGlyph(
+        find.byTooltip('Capture as task, off'),
+        Icons.check_box_outline_blank,
+        role: 'unchecked Capture task action',
+      );
+      await tester.tap(find.byTooltip('Capture as task, off'));
+      await harness.pumpUntil(
+        () => find.byTooltip('Capture as task, on').evaluate().isNotEmpty,
+        reason: 'Capture task action did not become checked',
+      );
+      _expectMaterialGlyph(
+        find.byTooltip('Capture as task, on'),
+        Icons.task_alt,
+        role: 'checked Capture task action',
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        stagedDraft,
+        reason: 'task selection changed the exact Capture draft',
+      );
+      _expectMaterialGlyph(
         find.byTooltip('Save journal block'),
         Icons.arrow_upward,
         role: 'Capture submit',
@@ -916,6 +1154,11 @@ void main() {
                 stagedDraft,
         reason: 'Capture draft was not restored after re-expansion',
       );
+      expect(
+        find.byTooltip('Capture as task, on'),
+        findsOneWidget,
+        reason: 'Capture task intent was not restored after re-expansion',
+      );
       await tester.pump(const Duration(milliseconds: 220));
       await tester.pump();
       await tester.enterText(find.byType(TextField), '   \n');
@@ -930,7 +1173,19 @@ void main() {
             find.text(stagedDraft).evaluate().isNotEmpty,
         reason: 'direct Capture did not persist and close after success',
       );
+      expect(
+        find.bySemanticsLabel(RegExp('Capture 中文.*status Todo')),
+        findsOneWidget,
+        reason: 'checked Capture did not persist Todo',
+      );
       expect(find.text('New block'), findsNothing);
+      await tester.tap(find.byType(FloatingActionButton));
+      await harness.pumpUntil(
+        () => find.byTooltip('Capture as task, off').evaluate().isNotEmpty,
+        reason: 'successful Capture did not reset task intent',
+      );
+      await tester.drag(find.byType(MessageComposer), const Offset(0, 80));
+      await tester.pump(const Duration(milliseconds: 440));
 
       final timelineScroll = find
           .ancestor(
@@ -1048,10 +1303,7 @@ Future<void> _expectLastRowAboveCaptureBar(
   _RuntimeHarness harness,
 ) async {
   final timelineScroll = find
-      .ancestor(
-        of: find.text('Doing line one'),
-        matching: find.byType(Scrollable),
-      )
+      .ancestor(of: find.text('Todo rail'), matching: find.byType(Scrollable))
       .last;
   await tester.drag(timelineScroll, const Offset(0, -4000));
   await harness.pumpUntil(
@@ -1182,6 +1434,7 @@ final class _RuntimeHarness {
           runtimeStarter: (_) async => runtime,
           applicationPlatform: platform,
           frameEligibilitySource: frameEligibility,
+          registry: createJournalWidgetRegistry(),
         ),
       ),
     );

@@ -16,9 +16,17 @@ type pending_delete =
   ; phase : delete_phase
   }
 
+type pending_status =
+  { mutation_id : string
+  ; block_id : string
+  ; expected_revision : int
+  ; task_state : Journal_model.task_state
+  }
+
 type timeline_notice =
   | Delete_undo
   | Delete_failed
+  | Status_failed of string
 
 type feed_projection_context =
   { local_day : int
@@ -48,7 +56,38 @@ type modal =
   | Account
   | Settings
   | Diagnostics
+  | Error_info
   | Cache_reset_confirmation of Logseq_db_types.Graph_types.Uuid.t
+
+type worker_error_occurrence =
+  { sequence : int64
+  ; error : Logseq_db_worker.Error.t
+  ; request_id : Logseq_db_types.Graph_types.Uuid.t option
+  ; phase : Logseq_db_worker.Protocol.failure_phase option
+  ; basis : int64 option
+  ; graph_generation : int
+  ; graph_id : Logseq_db_types.Graph_types.Uuid.t option
+  ; operation : string
+  ; occurred_at_label : string option
+  ; active : bool
+  }
+
+type graph_error =
+  | Worker_graph_error of worker_error_occurrence
+  | Transport_graph_error of string
+
+type capture_failure =
+  | Worker_capture_failure of worker_error_occurrence
+  | Local_capture_failure of string
+
+type sync_failure =
+  | Worker_sync_failure of worker_error_occurrence
+  | Non_worker_sync_failure of string
+
+type sync_error_notice =
+  { sequence : int64
+  ; failure : sync_failure
+  }
 
 type state =
   { routes : Journal_routes.t
@@ -59,22 +98,26 @@ type state =
   ; formatted_context : formatting_context option
   ; day_labels : (int * string) list
   ; pending_delete : pending_delete option
+  ; pending_status : pending_status option
   ; direct_capture : Journal_capture.t option
   ; capture_affordance_key : int64
   ; capture_fab_scroll : Journal_timeline_state.capture_fab_scroll
-  ; capture_error : string option
+  ; capture_error : capture_failure option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
   ; graph_ready : bool
   ; feed_loaded : bool
   ; presented_feed_context : feed_projection_context option
   ; feed_refresh : feed_refresh option
-  ; graph_error : string option
-  ; sync_error : string option
+  ; graph_error : graph_error option
+  ; sync_error : sync_error_notice option
   ; manager : Logseq_sync_pure_reducer.Core.snapshot option
   ; graph_state : Logseq_db_worker.graph_state
   ; diagnostics : Logseq_sync_pure_reducer.Core.diagnostics option
   ; bootstrap_progress : Logseq_sync_pure_reducer.Core.bootstrap_progress option
+  ; next_worker_error_sequence : int64
+  ; worker_errors : worker_error_occurrence list
+  ; next_sync_error_sequence : int64
   ; e2ee_password : Journal_capture.t
   ; typography_preset : Journal_visual_tokens.typography_preset option
   ; modal : modal
@@ -82,6 +125,7 @@ type state =
 
 let initial_anchor : Journal_routes.anchor = { block_id = None; first_index = 0 }
 let feed_day_limit = 7
+let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5.
 
 let initial_state =
   { routes = Journal_routes.create ~anchor:initial_anchor
@@ -92,6 +136,7 @@ let initial_state =
   ; formatted_context = None
   ; day_labels = []
   ; pending_delete = None
+  ; pending_status = None
   ; direct_capture = None
   ; capture_affordance_key = 1L
   ; capture_fab_scroll = Journal_timeline_state.initial_capture_fab_scroll
@@ -108,6 +153,9 @@ let initial_state =
   ; graph_state = { generation = -1; graph_id = None; phase = Graph_closed; error = None }
   ; diagnostics = None
   ; bootstrap_progress = None
+  ; next_worker_error_sequence = 1L
+  ; worker_errors = []
+  ; next_sync_error_sequence = 1L
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
   ; typography_preset = None
   ; modal = No_modal
@@ -131,6 +179,13 @@ let equal_formatting_context left right =
   String.equal left.locale right.locale && left.days = right.days
 ;;
 
+let show_sync_error state failure =
+  { state with
+    sync_error = Some { sequence = state.next_sync_error_sequence; failure }
+  ; next_sync_error_sequence = Int64.succ state.next_sync_error_sequence
+  }
+;;
+
 let current_graph_generation state =
   Option.map
     (fun (manager : Logseq_sync_pure_reducer.Core.snapshot) -> manager.selected_graph)
@@ -140,6 +195,9 @@ let current_graph_generation state =
 
 let apply_manager_state state (manager_state : Logseq_sync_pure_reducer.Core.state) =
   let snapshot = manager_state.snapshot in
+  let previous_sync_error =
+    Option.bind state.manager (fun manager -> manager.last_error)
+  in
   let graph_context_changed =
     match state.manager with
     | None -> Option.is_some snapshot.selected_graph
@@ -167,23 +225,28 @@ let apply_manager_state state (manager_state : Logseq_sync_pure_reducer.Core.sta
     match state.modal, snapshot.selected_graph with
     | Cache_reset_confirmation confirmation, Some selected
       when Logseq_db_types.Graph_types.Uuid.equal confirmation selected -> state.modal
-    | (No_modal | Account | Settings | Diagnostics), _ -> state.modal
+    | (No_modal | Account | Settings | Diagnostics | Error_info), _ -> state.modal
     | Cache_reset_confirmation _, (None | Some _) -> No_modal
   in
-  { state with
-    manager = Some snapshot
-  ; diagnostics = Some manager_state.diagnostics
-  ; e2ee_password
-  ; next_local_sequence
-  ; modal
-  ; capture_fab_scroll =
-      (if graph_context_changed
-       then Journal_timeline_state.initial_capture_fab_scroll
-       else state.capture_fab_scroll)
-  ; graph_ready = state.graph_ready && not graph_context_changed
-  ; sync_error = snapshot.last_error
-  ; graph_error = state.graph_error
-  }
+  let state =
+    { state with
+      manager = Some snapshot
+    ; diagnostics = Some manager_state.diagnostics
+    ; e2ee_password
+    ; next_local_sequence
+    ; modal
+    ; capture_fab_scroll =
+        (if graph_context_changed
+         then Journal_timeline_state.initial_capture_fab_scroll
+         else state.capture_fab_scroll)
+    ; graph_ready = state.graph_ready && not graph_context_changed
+    ; graph_error = state.graph_error
+    }
+  in
+  match snapshot.last_error with
+  | Some message when previous_sync_error <> Some message ->
+    show_sync_error state (Non_worker_sync_failure message)
+  | None | Some _ -> state
 ;;
 
 let worker_request generation = function
@@ -232,7 +295,13 @@ let open_detail_state state detail request_generation =
   { state with routes }
 ;;
 
-let fail_active_mutation state message =
+let capture_failure_message = function
+  | Worker_capture_failure occurrence -> Logseq_db_worker.Error.message occurrence.error
+  | Local_capture_failure message -> message
+;;
+
+let fail_active_mutation state failure =
+  let message = capture_failure_message failure in
   match state.pending_delete with
   | Some pending_delete ->
     { state with
@@ -241,21 +310,30 @@ let fail_active_mutation state message =
     ; timeline_notice = Some Delete_failed
     }
   | None ->
-    (match state.direct_capture, Journal_routes.detail state.routes with
-     | Some capture, _ ->
+    (match state.pending_status with
+     | Some _ ->
        { state with
-         direct_capture = Some (Journal_capture.fail capture ~message)
-       ; capture_error = Some message
+         pending_status = None
+       ; timeline_notice = Some (Status_failed message)
        }
-     | None, Some detail ->
-       { state with
-         routes =
-           Journal_routes.update_detail state.routes (Journal_detail.fail detail ~message)
-       }
-     | None, None -> state)
+     | None ->
+       (match state.direct_capture, Journal_routes.detail state.routes with
+        | Some capture, _ ->
+          { state with
+            direct_capture = Some (Journal_capture.fail capture ~message)
+          ; capture_error = Some failure
+          }
+        | None, Some detail ->
+          { state with
+            routes =
+              Journal_routes.update_detail
+                state.routes
+                (Journal_detail.fail detail ~message)
+          }
+        | None, None -> state))
 ;;
 
-let terminal_graph_state state message =
+let terminal_graph_state state graph_error =
   { state with
     routes = Journal_routes.graph_unavailable state.routes
   ; write_enabled = false
@@ -263,15 +341,121 @@ let terminal_graph_state state message =
   ; feed_loaded = true
   ; feed_refresh = None
   ; pending_delete = None
+  ; pending_status = None
   ; timeline_notice = None
-  ; graph_error = Some message
+  ; graph_error = Some graph_error
   }
+;;
+
+let newest_first_worker_errors state = state.worker_errors
+
+let latest_worker_error state =
+  match state.worker_errors with
+  | occurrence :: _ -> occurrence
+  | [] -> invalid_arg "worker error ledger is empty"
+;;
+
+let graph_error_message = function
+  | Worker_graph_error occurrence -> Logseq_db_worker.Error.message occurrence.error
+  | Transport_graph_error message -> message
+;;
+
+let sync_failure_message = function
+  | Worker_sync_failure occurrence -> Logseq_db_worker.Error.message occurrence.error
+  | Non_worker_sync_failure message -> message
+;;
+
+let record_worker_error state ~operation ?request_id ?phase ?basis error =
+  let occurrence =
+    { sequence = state.next_worker_error_sequence
+    ; error
+    ; request_id
+    ; phase
+    ; basis
+    ; graph_generation = state.graph_state.generation
+    ; graph_id = state.graph_state.graph_id
+    ; operation
+    ; occurred_at_label =
+        Option.map
+          (fun calendar ->
+             Printf.sprintf
+               "%04d-%02d-%02d %02d:%02d %s"
+               (calendar.Journal_calendar.local_day / 10_000)
+               (calendar.local_day / 100 mod 100)
+               (calendar.local_day mod 100)
+               (calendar.local_minute_of_day / 60)
+               (calendar.local_minute_of_day mod 60)
+               calendar.time_zone_id)
+          state.calendar
+    ; active = true
+    }
+  in
+  { state with
+    next_worker_error_sequence = Int64.succ state.next_worker_error_sequence
+  ; worker_errors = occurrence :: state.worker_errors
+  }
+;;
+
+let record_runtime_worker_failure
+      state
+      (worker_failure : Journal_graph_runtime.worker_failure)
+  =
+  let failure = worker_failure.failure in
+  record_worker_error
+    state
+    ~operation:worker_failure.operation
+    ~request_id:failure.request_id
+    ~phase:failure.phase
+    ?basis:failure.basis
+    failure.error
+;;
+
+let failure_source_message = function
+  | Journal_graph_runtime.Worker_failure worker_failure ->
+    Logseq_db_worker.Error.message worker_failure.failure.error
+  | Projection_failure message -> message
+;;
+
+let record_failure_source state = function
+  | Journal_graph_runtime.Worker_failure worker_failure ->
+    record_runtime_worker_failure state worker_failure
+  | Projection_failure _ -> state
+;;
+
+let resolve_worker_errors state =
+  { state with
+    worker_errors =
+      List.map (fun occurrence -> { occurrence with active = false }) state.worker_errors
+  }
+;;
+
+let service_error ~operation message =
+  let origin =
+    Logseq_db_worker.Error.create_cause_or_fallback
+      ~component:Logseq_db_worker.Error.Worker_service
+      ~operation
+      ~code:(Some "serviceFailure")
+      ~message
+      ~fallback_message:"Worker service reported a display-unsafe failure."
+  in
+  Logseq_db_worker.Error.create_with_origin
+    ~code:Logseq_db_worker.Error.Closed_session
+    ~message:"The Logseq DB worker service is unavailable."
+    ~details:[]
+    ~origin
+  |> Result.get_ok
+;;
+
+let graph_lifecycle_owns_publication error =
+  let trace = Logseq_db_worker.Error.trace error in
+  not (String.equal trace.origin.operation "terminalStorageFailure")
 ;;
 
 let fail_feed_transport state message =
   if state.feed_loaded
-  then { state with feed_refresh = None; sync_error = Some message }
-  else terminal_graph_state state message
+  then
+    show_sync_error { state with feed_refresh = None } (Non_worker_sync_failure message)
+  else terminal_graph_state state (Transport_graph_error message)
 ;;
 
 let journal_day_iso day =
@@ -357,6 +541,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
   match response.payload with
   | Journal_graph_runtime.Graph_ready info ->
     ignore info.admission_facts;
+    let state = resolve_worker_errors state in
     { state with write_enabled = true; graph_ready = true; graph_error = None }
   | Feed_loaded { request_generation; feed; complete } ->
     (match state.feed_refresh with
@@ -409,7 +594,6 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
          ; feed_loaded = true
          ; presented_feed_context = Some refresh.context
          ; feed_refresh = (if complete then None else state.feed_refresh)
-         ; sync_error = None
          })
        else state
      | None | Some _ ->
@@ -464,19 +648,33 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           ~generation:request_generation
           detail
     }
-  | Feed_failed { request_generation; message } ->
+  | Feed_failed { request_generation; failure } ->
+    let state = record_failure_source state failure in
+    let message = failure_source_message failure in
+    let terminal_failure state =
+      match failure with
+      | Journal_graph_runtime.Worker_failure _ ->
+        terminal_graph_state state (Worker_graph_error (latest_worker_error state))
+      | Projection_failure _ -> terminal_graph_state state (Transport_graph_error message)
+    in
+    let sync_failure =
+      match failure with
+      | Journal_graph_runtime.Worker_failure _ ->
+        Worker_sync_failure (latest_worker_error state)
+      | Projection_failure _ -> Non_worker_sync_failure message
+    in
     (match state.feed_refresh with
      | Some refresh when Int64.equal refresh.generation request_generation ->
        if state.feed_loaded
-       then { state with sync_error = Some message }
-       else terminal_graph_state state message
+       then show_sync_error state sync_failure
+       else terminal_failure state
      | None | Some _ ->
        (match Journal_timeline_state.pending_request state.timeline with
         | Some (generation, Feed { before_day = None })
           when Int64.equal generation request_generation ->
           if state.feed_loaded
-          then { state with sync_error = Some message }
-          else terminal_graph_state state message
+          then show_sync_error state sync_failure
+          else terminal_failure state
         | Some (_, Feed { before_day = Some _ })
         | Some (_, Day _)
         | Some (_, Children _)
@@ -495,6 +693,16 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           timeline_entry_update
     }
   | Block_updated { block; timeline_entry_update } ->
+    let pending_status, timeline_notice =
+      match state.pending_status with
+      | Some pending when String.equal pending.block_id (Journal_model.id block) ->
+        ( None
+        , if Journal_model.task_state block = pending.task_state
+          then None
+          else
+            Some (Status_failed "The stored status did not match the requested status.") )
+      | None | Some _ -> state.pending_status, state.timeline_notice
+    in
     let routes =
       match Journal_routes.detail state.routes with
       | None -> state.routes
@@ -505,6 +713,8 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
     in
     { state with
       routes
+    ; pending_status
+    ; timeline_notice
     ; timeline =
         Option.fold
           ~none:(Journal_timeline_state.replace_block state.timeline block)
@@ -512,15 +722,23 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           timeline_entry_update
     }
   | Update_conflict latest ->
-    (match Journal_routes.detail state.routes with
-     | None -> state
-     | Some detail ->
+    (match state.pending_status with
+     | Some pending when String.equal pending.block_id (Journal_model.id latest) ->
        { state with
-         routes =
-           Journal_routes.update_detail
-             state.routes
-             (Journal_detail.apply_conflict detail latest)
-       })
+         timeline = Journal_timeline_state.replace_block state.timeline latest
+       ; pending_status = None
+       ; timeline_notice = Some (Status_failed "Status changed elsewhere. Try again.")
+       }
+     | None | Some _ ->
+       (match Journal_routes.detail state.routes with
+        | None -> state
+        | Some detail ->
+          { state with
+            routes =
+              Journal_routes.update_detail
+                state.routes
+                (Journal_detail.apply_conflict detail latest)
+          }))
   | Child_created { child; parent_revision; timeline_entry_update } ->
     (match Journal_routes.detail state.routes with
      | None -> state
@@ -565,15 +783,27 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        ; pending_delete = None
        ; timeline_notice = Some Delete_failed
        })
-  | Open_failed error -> terminal_graph_state state (Logseq_db_worker.Error.message error)
-  | Rejected _ when Journal_routes.route state.routes = Journal_routes.Detail_loading ->
+  | Open_failed worker_failure ->
+    let state = record_runtime_worker_failure state worker_failure in
+    terminal_graph_state state (Worker_graph_error (latest_worker_error state))
+  | Rejected failure
+    when Journal_routes.route state.routes = Journal_routes.Detail_loading ->
+    let state = record_failure_source state failure in
     { state with
       routes =
         Journal_routes.apply_missing_detail
           state.routes
           ~request_generation:(Journal_routes.detail_request_generation state.routes)
     }
-  | Rejected message -> fail_active_mutation state message
+  | Rejected failure ->
+    let state = record_failure_source state failure in
+    let capture_failure =
+      match failure with
+      | Journal_graph_runtime.Worker_failure _ ->
+        Worker_capture_failure (latest_worker_error state)
+      | Projection_failure message -> Local_capture_failure message
+    in
+    fail_active_mutation state capture_failure
 ;;
 
 let application_theme preset =
@@ -711,7 +941,6 @@ let timeline_page
       ~loading
       ~graph_error
       ~sync_error
-      ~cache_reset_available
       ~today_subtitle
       ~day_label
       ~reduced_motion
@@ -720,6 +949,7 @@ let timeline_page
       ~capture_enabled
       ~capture_save_enabled
       ~capture_saving
+      ~capture_task_selected
       ~capture_affordance_key
       ~capture_fab_presentation
       ~on_capture_event
@@ -727,8 +957,11 @@ let timeline_page
       ~on_visible_range
       ~on_toggle_children
       ~delete_enabled
+      ~actions_enabled
+      ~on_status
       ~on_delete
-      ~on_cache_reset_requested
+      ~error_info_available
+      ~on_error_info
       ~account_menu_available
       ~on_account_menu
   =
@@ -739,9 +972,10 @@ let timeline_page
       ~top_inset
       ~device_pixel_ratio
       ~context:(Journal_header.Context.today ~subtitle:today_subtitle)
+      ~on_error_info:(if error_info_available then Some on_error_info else None)
       ~on_account_menu:(if account_menu_available then Some on_account_menu else None)
   in
-  let capture_button ~id ~tooltip ~position ~visibility ~style ~enabled icon =
+  let capture_button ~id ~test_id ~tooltip ~position ~visibility ~style ~enabled icon =
     Ui.Native_widget.Expandable_message_composer.button
       ~id
       ~tooltip
@@ -754,7 +988,7 @@ let timeline_page
            ~key:(Ui.Key.string ("journal-capture-action-icon:" ^ string_of_int id))
            ~size:20.
            icon
-         |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-composer-submit"))
+         |> Ui.Widget.with_test_id (Ui.Test_id.string test_id))
       ()
   in
   let capture_motion = Journal_visual_tokens.motion ~reduced_motion in
@@ -783,7 +1017,22 @@ let timeline_page
       ~hint_text:"Capture a thought"
       ~buttons:
         [ capture_button
+            ~id:2
+            ~test_id:"journal-capture-composer-task"
+            ~tooltip:
+              (if capture_task_selected
+               then "Capture as task, on"
+               else "Capture as task, off")
+            ~position:Ui.Native_widget.Expandable_message_composer.Leading
+            ~visibility:Always
+            ~style:(if capture_task_selected then Filled else Plain)
+            ~enabled:capture_enabled
+            (if capture_task_selected
+             then Material_icon_catalog.Task_alt
+             else Check_box_outline_blank)
+        ; capture_button
             ~id:1
+            ~test_id:"journal-capture-composer-submit"
             ~tooltip:
               (if capture_saving then "Saving journal block" else "Save journal block")
             ~position:Ui.Native_widget.Expandable_message_composer.Trailing
@@ -819,6 +1068,8 @@ let timeline_page
         ~day_label
         ~reduced_motion
         ~delete_enabled
+        ~actions_enabled
+        ~on_status
         ~on_delete
         ~on_visible_range
         ~on_toggle_children
@@ -839,24 +1090,8 @@ let timeline_page
     match sync_error with
     | None -> []
     | Some message ->
-      let message = live_region_text message in
-      let contents =
-        if cache_reset_available
-        then
-          [ Ui.Widget.Flex.expanded message
-          ; Ui.Widget.Flex.fixed
-              (action_target
-                 ~role:Filled_tonal
-                 ~test_id:"request-local-cache-reset"
-                 ~label:"Reset local graph copy"
-                 ~hint:"Delete this local mirror and download it again"
-                 ~on_press:on_cache_reset_requested
-                 (styled_text "Reset local copy"))
-          ]
-        else [ Ui.Widget.Flex.expanded message ]
-      in
       let banner =
-        Ui.Widget.Flex.row contents
+        live_region_text message
         |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 12.)
         |> Ui.Material.card ~elevation:2.
         |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-sync-error")
@@ -884,7 +1119,7 @@ let timeline_page
 ;;
 
 let dialog_body ~typography ~test_id ~title ~message ~primary ~secondary =
-  Ui.Material.alert_dialog
+  Ui.Material.Dialog.alert
     ~title:(styled_text ~token:typography.Journal_visual_tokens.dialog_title title)
     ~content:(styled_text ~token:typography.supporting message)
     ~actions:[ primary; secondary ]
@@ -982,7 +1217,7 @@ let account_dialog_page
           "Cancel"
       ]
   in
-  Ui.Material.alert_dialog
+  Ui.Material.Dialog.alert
     ~title:(styled_text ~token:typography.dialog_title "Account")
     ~content:
       (styled_text
@@ -1103,7 +1338,7 @@ let settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch =
       ~on_press:(bind_action dispatch "close-settings")
       (styled_text "Close")
   in
-  Ui.Material.alert_dialog
+  Ui.Material.Dialog.alert
     ~title:
       (styled_text ~token:typography.dialog_title "Settings"
        |> Ui.Widget.semantics
@@ -1218,6 +1453,174 @@ let diagnostic_history_lines = function
   | Some ({ history = []; _ } : Logseq_sync_pure_reducer.Core.diagnostics) ->
     [ "No transitions" ]
   | Some ({ history; _ } : Logseq_sync_pure_reducer.Core.diagnostics) -> history
+;;
+
+let worker_error_detail_value = function
+  | Logseq_db_worker.Error.Detail_string value -> value
+  | Detail_int value -> Int64.to_string value
+  | Detail_bool value -> string_of_bool value
+  | Detail_uuid value -> Logseq_db_types.Graph_types.Uuid.to_string value
+  | Detail_strings values -> String.concat ", " values
+  | Detail_uuids values ->
+    values |> List.map Logseq_db_types.Graph_types.Uuid.to_string |> String.concat ", "
+;;
+
+let error_info_page ~(typography : Journal_visual_tokens.typography) occurrences dispatch =
+  let back =
+    action_target
+      ~role:Text
+      ~test_id:"journal-error-info-back"
+      ~label:"Back from Error info"
+      ~hint:"Return to the previous page"
+      ~on_press:(bind_action dispatch "close-error-info")
+      (styled_text "Back")
+  in
+  let header =
+    Ui.Widget.Flex.row
+      [ Ui.Widget.Flex.fixed back
+      ; Ui.Widget.Flex.expanded
+          (styled_text ~token:typography.manager_title "Error info"
+           |> Ui.Widget.semantics
+                ~properties:
+                  (Ui.Semantics.create
+                     ~label:"Error info"
+                     ~role:Ui.Semantics.Role.Header
+                     ~heading_level:1
+                     ()))
+      ]
+    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
+  in
+  let labeled_row label value =
+    Ui.Widget.Flex.column
+      [ Ui.Widget.Flex.fixed (styled_text ~token:typography.button_label label)
+      ; Ui.Widget.Flex.fixed (styled_text ~token:typography.supporting value)
+      ]
+    |> Ui.Widget.padding
+         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:12. ~vertical:4. ())
+  in
+  let cause_row depth label (cause : Logseq_db_worker.Error.cause) =
+    let code = Option.fold ~none:"" ~some:(fun value -> " · " ^ value) cause.code in
+    Ui.Widget.Flex.column
+      [ Ui.Widget.Flex.fixed
+          (styled_text
+             ~token:typography.button_label
+             (Printf.sprintf
+                "%s · %s%s"
+                (Logseq_db_worker.Error.component_string cause.component)
+                cause.operation
+                code))
+      ; Ui.Widget.Flex.fixed (styled_text ~token:typography.supporting cause.message)
+      ]
+    |> Ui.Widget.padding
+         ~insets:
+           (Ui.Layout.Edge_insets.only
+              ~left:(12. +. (Float.of_int depth *. 12.))
+              ~right:12.
+              ~top:4.
+              ~bottom:4.
+              ())
+    |> Ui.Widget.semantics
+         ~properties:
+           (Ui.Semantics.create
+              ~label:
+                (Printf.sprintf
+                   "%s, %s, %s"
+                   label
+                   (Logseq_db_worker.Error.component_string cause.component)
+                   cause.message)
+              ())
+  in
+  let card (occurrence : worker_error_occurrence) =
+    let error = occurrence.error in
+    let trace = Logseq_db_worker.Error.trace error in
+    let status = if occurrence.active then "Active" else "Resolved" in
+    let metadata =
+      [ Some ("Operation", occurrence.operation)
+      ; Option.map
+          (fun phase ->
+             ( "Request phase"
+             , match phase with
+               | Logseq_db_worker.Protocol.Open -> "Open"
+               | Execute -> "Execute" ))
+          occurrence.phase
+      ; Option.map
+          (fun request_id ->
+             "Request ID", Logseq_db_types.Graph_types.Uuid.to_string request_id)
+          occurrence.request_id
+      ; Option.map (fun basis -> "Basis", Int64.to_string basis) occurrence.basis
+      ; Some ("Graph generation", string_of_int occurrence.graph_generation)
+      ; Option.map
+          (fun graph_id ->
+             "Graph ID", Logseq_db_types.Graph_types.Uuid.to_string graph_id)
+          occurrence.graph_id
+      ; Option.map (fun label -> "Observed at", label) occurrence.occurred_at_label
+      ]
+      |> List.filter_map Fun.id
+    in
+    let details =
+      Logseq_db_worker.Error.details error
+      |> List.map (fun (detail : Logseq_db_worker.Error.detail) ->
+        detail.name, worker_error_detail_value detail.value)
+    in
+    let causes =
+      List.mapi (fun index cause -> cause_row index "Context" cause) trace.contexts
+      @ [ cause_row (List.length trace.contexts) "Origin" trace.origin ]
+      @
+      if trace.truncated
+      then [ labeled_row "Causal trace" "Earlier outer contexts were truncated." ]
+      else []
+    in
+    Ui.Widget.Flex.column
+      ([ Ui.Widget.Flex.fixed
+           (styled_text
+              ~token:typography.dialog_title
+              (Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code error)))
+       ; Ui.Widget.Flex.fixed
+           (styled_text ~token:typography.entry (Logseq_db_worker.Error.message error))
+       ; Ui.Widget.Flex.fixed
+           (labeled_row ("Occurrence " ^ Int64.to_string occurrence.sequence) status)
+       ]
+       @ List.map
+           (fun row -> Ui.Widget.Flex.fixed (labeled_row (fst row) (snd row)))
+           metadata
+       @ List.map
+           (fun row -> Ui.Widget.Flex.fixed (labeled_row (fst row) (snd row)))
+           details
+       @ List.map Ui.Widget.Flex.fixed causes)
+    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 12.)
+    |> Ui.Material.card ~elevation:1.
+    |> Ui.Widget.padding
+         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:16. ~vertical:8. ())
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string
+            ("journal-worker-error-" ^ Int64.to_string occurrence.sequence))
+  in
+  let rows =
+    match occurrences with
+    | [] -> [ styled_text ~token:typography.supporting "No worker errors observed." ]
+    | occurrences -> List.map card occurrences
+  in
+  let scroll =
+    Ui.Widget.Scroll_view.vertical
+      ~key:(Ui.Key.string "journal-error-info-scroll")
+      ~on_scroll:(Ui.Event.Handler.create ~name:"journal-error-info-scroll" (fun _ -> ()))
+      [ Ui.Widget.Sliver.list rows ]
+      ()
+    |> Ui.Widget.Viewport.Vertical.with_test_id
+         (Ui.Test_id.string "journal-error-info-scroll")
+  in
+  let body =
+    Ui.Widget.Body.Vertical.create
+      [ Ui.Widget.Body.Vertical.fixed header; Ui.Widget.Body.Vertical.fill scroll ]
+    |> Ui.Widget.Body.safe_area
+  in
+  Ui.Material.scaffold ~body ()
+  |> Ui.Widget.page
+       ~key:(Ui.Key.string "journal-error-info")
+       ~page_key:(ID.Navigation.Page_key.of_string "journal-error-info")
+       ~presentation:(Ui.Navigation.Standard Ui.Navigation.Fade)
+       ~can_pop:true
+  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-error-info-page")
 ;;
 
 let diagnostics_page
@@ -1758,24 +2161,35 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
            in
            let action =
              match recovery with
-             | Some Journal_startup.Refresh_catalog -> Some "refresh-catalog"
-             | Some Begin_online_recovery | Some Retry_graph_open ->
-               Some "begin-online-recovery"
+             | Some Journal_startup.Refresh_catalog ->
+               Some ("refresh-catalog", "Retry", "Retry startup")
+             | Some Begin_online_recovery ->
+               Some
+                 ( "begin-online-recovery"
+                 , "Continue online"
+                 , "Continue startup with online recovery" )
+             | Some Retry_graph_open ->
+               Some ("begin-online-recovery", "Retry", "Retry startup")
              | Some Submit_e2ee_password | Some Sign_in | None -> None
+           in
+           let action_name, action_label, action_hint =
+             match action with
+             | Some (name, label, hint) -> Some name, label, hint
+             | None -> None, "Retry", "Retry startup"
            in
            ( message
            , [ Ui.Widget.Flex.fixed
                  (action_target
                     ~role:Filled_tonal
                     ~test_id:"graph-picker-retry"
-                    ~label:"Retry"
-                    ~hint:"Retry startup"
-                    ~enabled:(Option.is_some action)
+                    ~label:action_label
+                    ~hint:action_hint
+                    ~enabled:(Option.is_some action_name)
                     ~on_press:
                       (bind_action
                          dispatch
-                         (Option.value action ~default:"retry-disabled"))
-                    (styled_text "Retry"))
+                         (Option.value action_name ~default:"retry-disabled"))
+                    (styled_text action_label))
              ] ))
     in
     Ui.Widget.Flex.column
@@ -1839,10 +2253,10 @@ let component client handlers graph =
   in
   let submit request = Journal_graph_runtime.submit graph_runtime request in
   let pending_delete_ref : pending_delete option ref = ref None in
-  let clear_delete_command response =
+  let clear_mutation_commands response =
     match (response : Journal_graph_runtime.response).payload with
-    | Subtree_deleted _ | Delete_conflict _ | Open_failed _ | Rejected _ ->
-      pending_delete_ref := None
+    | Subtree_deleted _ | Delete_conflict _ -> pending_delete_ref := None
+    | Open_failed _ | Rejected _ -> pending_delete_ref := None
     | Graph_ready _
     | Feed_loaded _
     | Day_blocks_loaded _
@@ -1856,7 +2270,7 @@ let component client handlers graph =
   in
   let fail_graph_transport state message =
     pending_delete_ref := None;
-    terminal_graph_state state message
+    terminal_graph_state state (Transport_graph_error message)
   in
   let deliver_output output =
     Journal_graph_transport.deliver
@@ -1885,7 +2299,7 @@ let component client handlers graph =
     Bonsai.Effect.bind
       (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
       ~f:(fun delivery ->
-        List.iter clear_delete_command delivery.responses;
+        List.iter clear_mutation_commands delivery.responses;
         match !set_state_ref with
         | None -> Bonsai.Effect.Ignore
         | Some set_state ->
@@ -1894,12 +2308,41 @@ let component client handlers graph =
   let observe_graph_state set_state (graph_state : Logseq_db_worker.graph_state) =
     let update =
       set_state (fun state ->
+        let state =
+          match graph_state.phase, graph_state.error with
+          | Graph_failed, Some error
+            when state.graph_state.phase <> Graph_failed
+                 || state.graph_state.generation <> graph_state.generation ->
+            if graph_lifecycle_owns_publication error
+            then record_worker_error state ~operation:"graphLifecycle" error
+            else state
+          | Graph_failed, Some _
+          | Graph_failed, None
+          | Graph_closed, _
+          | Graph_opening, _
+          | Graph_open, _
+          | Graph_closing, _ -> state
+        in
+        let graph_error =
+          match graph_state.phase, graph_state.error with
+          | Graph_failed, Some error ->
+            List.find_opt
+              (fun occurrence -> occurrence.error == error)
+              state.worker_errors
+            |> Option.map (fun occurrence -> Worker_graph_error occurrence)
+          | Graph_failed, None
+          | Graph_closed, _
+          | Graph_opening, _
+          | Graph_open, _
+          | Graph_closing, _ -> None
+        in
         { state with
           graph_state
+        ; write_enabled =
+            (if graph_state.phase = Graph_open then state.write_enabled else false)
         ; graph_ready =
             (if graph_state.phase = Graph_open then state.graph_ready else false)
-        ; graph_error =
-            (if graph_state.phase = Graph_failed then graph_state.error else None)
+        ; graph_error
         })
     in
     let start_graph =
@@ -2049,9 +2492,10 @@ let component client handlers graph =
                 when Result.is_ok (Journal_platform.decode_sign_out_response payload) ->
                 state
               | Error _ | Ok _ ->
-                { state with
-                  sync_error = Some "Unable to sign out of the authenticated session"
-                })))
+                show_sync_error
+                  state
+                  (Non_worker_sync_failure
+                     "Unable to sign out of the authenticated session"))))
       else Bonsai.Effect.Ignore
     in
     let termination_ready =
@@ -2142,7 +2586,7 @@ let component client handlers graph =
                   Bonsai.Effect.bind
                     (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
                     ~f:(fun delivery ->
-                      List.iter clear_delete_command delivery.responses;
+                      List.iter clear_mutation_commands delivery.responses;
                       set_state (fun state ->
                         let state =
                           List.fold_left apply_worker_response state delivery.responses
@@ -2156,7 +2600,7 @@ let component client handlers graph =
             Bonsai.Effect.bind
               (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
               ~f:(fun delivery ->
-                List.iter clear_delete_command delivery.responses;
+                List.iter clear_mutation_commands delivery.responses;
                 let update =
                   set_state (fun state ->
                     let state =
@@ -2169,8 +2613,8 @@ let component client handlers graph =
                     | Some message -> fail_graph_transport state message)
                 in
                 update)
-          | Worker.Response { outcome = Completed (Client_state manager_state); _ } ->
-            apply_manager_transition set_state manager_state
+          | Worker.Response { outcome = Completed Client_command_completed; _ } ->
+            Bonsai.Effect.Ignore
           | Worker.Response { outcome = Completed (Graph_state graph_state); _ }
           | Worker.Push { payload = Graph_state_changed graph_state; _ } ->
             observe_graph_state set_state graph_state
@@ -2203,20 +2647,37 @@ let component client handlers graph =
           | Worker.Response { outcome = Failed error; _ } ->
             pending_delete_ref := None;
             set_state (fun state ->
+              let worker_error = service_error ~operation:"handleRequest" error in
+              let state =
+                record_worker_error state ~operation:"handleRequest" worker_error
+              in
               match state.feed_refresh with
-              | Some _ -> { state with feed_refresh = None; sync_error = Some error }
-              | None -> fail_active_mutation state error)
+              | Some _ ->
+                show_sync_error
+                  { state with feed_refresh = None }
+                  (Worker_sync_failure (latest_worker_error state))
+              | None ->
+                fail_active_mutation
+                  state
+                  (Worker_capture_failure (latest_worker_error state)))
           | Worker.Response { outcome = Cancelled | Shutdown; _ } ->
             pending_delete_ref := None;
             set_state (fun state ->
               match state.feed_refresh with
               | Some _ ->
-                { state with feed_refresh = None; sync_error = Some "Worker unavailable" }
-              | None -> fail_active_mutation state "Worker unavailable")
+                show_sync_error
+                  { state with feed_refresh = None }
+                  (Non_worker_sync_failure "Worker unavailable")
+              | None ->
+                fail_active_mutation state (Local_capture_failure "Worker unavailable"))
           | Worker.Terminal { error; _ } ->
             pending_delete_ref := None;
-            set_state (fun state -> terminal_graph_state state error)));
-      ())
+            set_state (fun state ->
+              let worker_error = service_error ~operation:"terminal" error in
+              record_worker_error state ~operation:"terminal" worker_error
+              |> fun state ->
+              terminal_graph_state state (Worker_graph_error (latest_worker_error state))));
+        ()))
   in
   let platform_registered = ref false in
   let platform_subscription =
@@ -2423,7 +2884,7 @@ let component client handlers graph =
           Bonsai.Effect.bind
             (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
             ~f:(fun delivery ->
-              List.iter clear_delete_command delivery.responses;
+              List.iter clear_mutation_commands delivery.responses;
               set_state (fun state ->
                 let state =
                   List.fold_left apply_worker_response state delivery.responses
@@ -2487,7 +2948,7 @@ let component client handlers graph =
         Bonsai.Effect.bind
           (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
           ~f:(fun delivery ->
-            List.iter clear_delete_command delivery.responses;
+            List.iter clear_mutation_commands delivery.responses;
             set_state (fun state ->
               let state = apply_delivery_responses state delivery in
               match
@@ -2576,6 +3037,38 @@ let component client handlers graph =
     Driver.Handler.environment handlers |> Bonsai_flutter.Environment.value
   in
   let current_time = Bonsai.Cont.Clock.get_current_time graph in
+  let sync_error_timer_key =
+    Bonsai.Cont.map state ~f:(fun state ->
+      Option.map (fun notice -> notice.sequence) state.sync_error)
+  in
+  let sync_error_timer_callback =
+    let until = Bonsai.Cont.Clock.until graph in
+    Bonsai.Cont.map3
+      set_state
+      current_time
+      until
+      ~f:(fun set_state current_time until -> function
+      | None -> Bonsai.Effect.Ignore
+      | Some scheduled_sequence ->
+        let hide =
+          Bonsai.Effect.bind current_time ~f:(fun now ->
+            Bonsai.Effect.bind
+              (until (Core.Time_ns.add now sync_error_card_lifetime))
+              ~f:(fun () ->
+                set_state (fun state ->
+                  match state.sync_error with
+                  | Some { sequence = current_sequence; _ }
+                    when Int64.equal current_sequence scheduled_sequence ->
+                    { state with sync_error = None }
+                  | None | Some _ -> state)))
+        in
+        Bonsai.Effect.of_thunk (fun () -> Bonsai.Effect.Expert.handle hide))
+  in
+  Bonsai.Cont.Edge.on_change
+    ~equal:(Option.equal Int64.equal)
+    sync_error_timer_key
+    ~callback:sync_error_timer_callback
+    graph;
   let dependencies =
     Bonsai.Cont.map4
       state
@@ -2610,54 +3103,59 @@ let component client handlers graph =
           match
             ( snapshot.write_enabled
             , snapshot.pending_delete
-            , snapshot.direct_capture
+            , snapshot.pending_status
             , snapshot.calendar )
           with
-          | false, _, _, _ | true, Some _, _, _ | true, None, _, None ->
-            Bonsai.Effect.Ignore
-          | true, None, Some capture, Some _
-            when Journal_capture.phase capture = Journal_capture.Saving ->
-            Bonsai.Effect.Ignore
-          | true, None, Some capture, Some _
-            when match Journal_capture.phase capture with
-                 | Journal_capture.Failed _ ->
-                   String.equal (Journal_capture.source capture) source
-                 | Editing | Saving -> false ->
-            let capture, request = Journal_capture.retry capture in
-            (match request with
-             | None -> Bonsai.Effect.Ignore
-             | Some request ->
-               with_direct_request
-                 { snapshot with direct_capture = Some capture; capture_error = None }
-                 request)
-          | true, None, None, Some calendar | true, None, Some _, Some calendar ->
-            if String.equal (String.trim source) ""
-            then Bonsai.Effect.Ignore
-            else (
-              match creation_time calendar with
-              | Error _ -> Bonsai.Effect.Ignore
-              | Ok creation_time ->
-                let number = snapshot.next_local_sequence in
-                let capture = Journal_capture.create ~session_number:number ~source in
-                let capture, request =
-                  Journal_capture.admit_save
-                    capture
-                    ~mutation_id:(fresh_identity ())
-                    ~block_id:(fresh_identity ())
-                    ~sibling_order:(sibling_order number)
-                    ~calendar_generation:calendar.generation
-                    ~creation_time
-                in
-                (match request with
-                 | None -> Bonsai.Effect.Ignore
-                 | Some request ->
-                   with_direct_request
-                     { snapshot with
-                       direct_capture = Some capture
-                     ; capture_error = None
-                     ; next_local_sequence = Int64.succ number
-                     }
-                     request))
+          | false, _, _, _
+          | true, Some _, _, _
+          | true, None, Some _, _
+          | true, None, None, None -> Bonsai.Effect.Ignore
+          | true, None, None, Some calendar ->
+            let capture =
+              match snapshot.direct_capture with
+              | None ->
+                Journal_capture.create
+                  ~session_number:snapshot.next_local_sequence
+                  ~source
+              | Some capture -> Journal_capture.update_source capture ~source
+            in
+            (match Journal_capture.phase capture with
+             | Saving -> Bonsai.Effect.Ignore
+             | Failed _ ->
+               let capture, request = Journal_capture.retry capture in
+               (match request with
+                | None -> Bonsai.Effect.Ignore
+                | Some request ->
+                  with_direct_request
+                    { snapshot with direct_capture = Some capture; capture_error = None }
+                    request)
+             | Editing ->
+               if String.equal (String.trim source) ""
+               then Bonsai.Effect.Ignore
+               else (
+                 match creation_time calendar with
+                 | Error _ -> Bonsai.Effect.Ignore
+                 | Ok creation_time ->
+                   let number = snapshot.next_local_sequence in
+                   let capture, request =
+                     Journal_capture.admit_save
+                       capture
+                       ~mutation_id:(fresh_identity ())
+                       ~block_id:(fresh_identity ())
+                       ~sibling_order:(sibling_order number)
+                       ~calendar_generation:calendar.generation
+                       ~creation_time
+                   in
+                   (match request with
+                    | None -> Bonsai.Effect.Ignore
+                    | Some request ->
+                      with_direct_request
+                        { snapshot with
+                          direct_capture = Some capture
+                        ; capture_error = None
+                        ; next_local_sequence = Int64.succ number
+                        }
+                        request)))
         in
         match payload with
         | Ui.Event.Payload.Text_edit edit ->
@@ -2720,17 +3218,42 @@ let component client handlers graph =
            | Some (Text_changed text) ->
              update (fun state ->
                match state.direct_capture with
-               | Some capture
-                 when match Journal_capture.phase capture with
-                      | Journal_capture.Failed _ ->
-                        not (String.equal (Journal_capture.source capture) text)
-                      | Editing | Saving -> false ->
-                 { state with direct_capture = None; capture_error = None }
-               | None | Some _ -> state)
+               | None -> state
+               | Some capture ->
+                 let changed = not (String.equal (Journal_capture.source capture) text) in
+                 { state with
+                   direct_capture =
+                     Some (Journal_capture.update_source capture ~source:text)
+                 ; capture_error = (if changed then None else state.capture_error)
+                 })
            | Some (Button_pressed { button_id = 1; text }) -> admit_direct_capture text
+           | Some (Button_pressed { button_id = 2; text }) ->
+             (match
+                snapshot.write_enabled, snapshot.pending_delete, snapshot.pending_status
+              with
+              | true, None, None ->
+                update (fun state ->
+                  let capture =
+                    match state.direct_capture with
+                    | None ->
+                      Journal_capture.create
+                        ~session_number:state.next_local_sequence
+                        ~source:text
+                    | Some capture -> Journal_capture.update_source capture ~source:text
+                  in
+                  { state with
+                    direct_capture = Some (Journal_capture.toggle_task_intent capture)
+                  ; capture_error = None
+                  })
+              | false, _, _ | true, Some _, _ | true, None, Some _ -> Bonsai.Effect.Ignore)
            | Some (Button_pressed _) -> Bonsai.Effect.Ignore
            | None -> Bonsai.Effect.Ignore)
-        | Ui.Event.Payload.Route_pop _ -> update back_state
+        | Ui.Event.Payload.Route_pop _ ->
+          update (fun state ->
+            match state.modal with
+            | Error_info -> { state with modal = No_modal }
+            | No_modal | Account | Settings | Diagnostics | Cache_reset_confirmation _ ->
+              back_state state)
         | Ui.Event.Payload.Text action ->
           if String.length action > 13 && String.sub action 0 13 = "select-graph:"
           then (
@@ -2753,6 +3276,14 @@ let component client handlers graph =
           else if String.equal action "open-diagnostics"
           then update (fun state -> { state with modal = Diagnostics })
           else if String.equal action "close-diagnostics"
+          then update (fun state -> { state with modal = No_modal })
+          else if String.equal action "open-error-info"
+          then
+            update (fun state ->
+              if state.worker_errors = []
+              then state
+              else { state with modal = Error_info })
+          else if String.equal action "close-error-info"
           then update (fun state -> { state with modal = No_modal })
           else if
             String.length action > 18 && String.sub action 0 18 = "select-typography:"
@@ -2826,7 +3357,8 @@ let component client handlers graph =
           else if String.equal action "confirm-local-cache-reset"
           then (
             match snapshot.modal with
-            | No_modal | Account | Settings | Diagnostics -> Bonsai.Effect.Ignore
+            | No_modal | Account | Settings | Diagnostics | Error_info ->
+              Bonsai.Effect.Ignore
             | Cache_reset_confirmation graph_id ->
               Bonsai.Effect.Many
                 [ send_manager (Graph_service.Delete_local_cache graph_id)
@@ -2948,15 +3480,70 @@ let component client handlers graph =
                       }
                       request))
             | None, _ | _, None -> Bonsai.Effect.Ignore)
+          else if String.length action > 16 && String.sub action 0 16 = "timeline-status:"
+          then (
+            let value = String.sub action 16 (String.length action - 16) in
+            match String.rindex_opt value ':' with
+            | None -> Bonsai.Effect.Ignore
+            | Some separator ->
+              let block_id = String.sub value 0 separator in
+              let tag =
+                String.sub value (separator + 1) (String.length value - separator - 1)
+              in
+              let task_state =
+                match tag with
+                | "no-status" -> Some Journal_model.No_status
+                | "todo" -> Some Todo
+                | "doing" -> Some Doing
+                | "done" -> Some Done
+                | _ -> None
+              in
+              (match
+                 ( snapshot.write_enabled
+                 , snapshot.pending_delete
+                 , snapshot.pending_status
+                 , task_state
+                 , block_in_timeline snapshot.timeline block_id )
+               with
+               | true, None, None, Some task_state, Some block
+                 when Journal_model.task_state block <> task_state ->
+                 let pending_status =
+                   { mutation_id = fresh_identity ()
+                   ; block_id
+                   ; expected_revision = Journal_model.revision block
+                   ; task_state
+                   }
+                 in
+                 let request =
+                   Journal_graph_request.Set_task_state
+                     { mutation_id = pending_status.mutation_id
+                     ; block_id
+                     ; expected_revision = pending_status.expected_revision
+                     ; task_state
+                     }
+                 in
+                 with_request
+                   { snapshot with
+                     pending_status = Some pending_status
+                   ; timeline_notice = None
+                   }
+                   request
+               | false, _, _, _, _
+               | true, Some _, _, _, _
+               | true, None, Some _, _, _
+               | true, None, None, None, _
+               | true, None, None, Some _, None
+               | true, None, None, Some _, Some _ -> Bonsai.Effect.Ignore))
           else if String.length action > 16 && String.sub action 0 16 = "timeline-delete:"
           then (
             let block_id = String.sub action 16 (String.length action - 16) in
             match
               ( snapshot.write_enabled
               , snapshot.pending_delete
+              , snapshot.pending_status
               , block_in_timeline snapshot.timeline block_id )
             with
-            | true, None, Some block ->
+            | true, None, None, Some block ->
               (match Journal_timeline_state.stage_delete snapshot.timeline ~block_id with
                | None -> Bonsai.Effect.Ignore
                | Some (timeline, staged) ->
@@ -2980,7 +3567,10 @@ let component client handlers graph =
                      ; next_request_generation =
                          Int64.succ snapshot.next_request_generation
                      })))
-            | false, _, _ | true, Some _, _ | true, None, None -> Bonsai.Effect.Ignore)
+            | false, _, _, _
+            | true, Some _, _, _
+            | true, None, Some _, _
+            | true, None, None, None -> Bonsai.Effect.Ignore)
           else if
             String.length action > 25
             && String.sub action 0 25 = "timeline-toggle-children:"
@@ -3005,7 +3595,9 @@ let component client handlers graph =
         | Unit
         | Bool _
         | Int64 _
+        | Int64_bool _
         | Int64_list _
+        | Int64_pair _
         | Float _
         | Float_range _
         | Tap _
@@ -3038,12 +3630,14 @@ let component client handlers graph =
           snack_bar_cancellation := Some cancellation;
           let message, action_label, duration_ms =
             match capture_error, notice with
-            | Some message, _ -> message, None, 4_000
+            | Some failure, _ -> capture_failure_message failure, None, 4_000
             | None, Some Delete_undo ->
               ( "Block and descendants removed"
               , Some "Undo"
               , if accessible_navigation then 10_000 else 5_000 )
             | None, Some Delete_failed -> "Delete failed. Block restored.", None, 4_000
+            | None, Some (Status_failed message) ->
+              "Unable to change status: " ^ message, None, 4_000
             | None, None -> assert false
           in
           Bonsai.Effect.bind
@@ -3096,6 +3690,19 @@ let component client handlers graph =
       | Some capture -> Journal_capture.phase capture = Journal_capture.Saving
       | None -> false
     in
+    let capture_task_selected =
+      match state.direct_capture with
+      | Some capture -> Journal_capture.task_state capture = Journal_model.Todo
+      | None -> false
+    in
+    let row_actions_enabled =
+      state.write_enabled
+      && Option.is_none state.pending_delete
+      && Option.is_none state.pending_status
+    in
+    let sync_error =
+      Option.map (fun notice -> sync_failure_message notice.failure) state.sync_error
+    in
     let root =
       match state.graph_ready, state.manager with
       | false, Some _ -> manager_page ~typography state dispatch
@@ -3116,12 +3723,8 @@ let component client handlers graph =
           ~device_pixel_ratio:environment.device_pixel_ratio
           ~timeline_state:state.timeline
           ~loading:(not state.feed_loaded)
-          ~graph_error:state.graph_error
-          ~sync_error:state.sync_error
-          ~cache_reset_available:
-            (match state.manager with
-             | Some { selected_graph = Some _; _ } -> true
-             | None | Some _ -> false)
+          ~graph_error:(Option.map graph_error_message state.graph_error)
+          ~sync_error
           ~today_subtitle:(today_label state)
           ~day_label:(label_for_day state)
           ~reduced_motion
@@ -3130,12 +3733,15 @@ let component client handlers graph =
           ~capture_enabled:
             (state.write_enabled
              && Option.is_none state.pending_delete
+             && Option.is_none state.pending_status
              && not capture_saving)
           ~capture_save_enabled:
             (state.write_enabled
              && Option.is_none state.pending_delete
+             && Option.is_none state.pending_status
              && not capture_saving)
           ~capture_saving
+          ~capture_task_selected
           ~capture_affordance_key:state.capture_affordance_key
           ~capture_fab_presentation:
             (Journal_timeline_state.capture_fab_presentation state.capture_fab_scroll)
@@ -3143,9 +3749,12 @@ let component client handlers graph =
           ~on_scroll:dispatch
           ~on_visible_range:dispatch
           ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
-          ~delete_enabled:(state.write_enabled && Option.is_none state.pending_delete)
+          ~delete_enabled:state.write_enabled
+          ~actions_enabled:row_actions_enabled
+          ~on_status:(prefix_action dispatch "timeline-status:")
           ~on_delete:(prefix_action dispatch "timeline-delete:")
-          ~on_cache_reset_requested:(bind_action dispatch "request-local-cache-reset")
+          ~error_info_available:(state.worker_errors <> [])
+          ~on_error_info:(bind_action dispatch "open-error-info")
           ~account_menu_available:true
           ~on_account_menu:(bind_action dispatch "open-account-menu")
     in
@@ -3212,6 +3821,9 @@ let component client handlers graph =
               state.diagnostics
               dispatch
           ]
+      | Error_info ->
+        pages
+        @ [ error_info_page ~typography (newest_first_worker_errors state) dispatch ]
       | No_modal -> pages
     in
     let body =

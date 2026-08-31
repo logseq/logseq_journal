@@ -69,16 +69,32 @@ let for_block handler block_id =
 
 let delete_action_id = 1
 
-let for_slidable handler block_id =
-  Ui.Event.Handler.create ~name:("journal-delete:" ^ block_id) (fun payload ->
+let quick_status_actions =
+  [ 2, Journal_model.No_status, "no-status", Material_icon_catalog.Circle_outlined
+  ; 3, Todo, "todo", Check_box_outline_blank
+  ; 4, Doing, "doing", Pending
+  ; 5, Done, "done", Check_circle
+  ]
+;;
+
+let for_slidable ~on_status ~on_delete block_id =
+  Ui.Event.Handler.create ~name:("journal-row-action:" ^ block_id) (fun payload ->
     match Ui.Native_widget.Slidable.event_of_payload payload with
     | Some (Ui.Native_widget.Slidable.Action_pressed action_id)
       when action_id = delete_action_id ->
-      Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text block_id)
-    | Some
-        ( Ui.Native_widget.Slidable.Action_pressed _
-        | Ui.Native_widget.Slidable.Dismissed _ )
-    | None -> ())
+      Ui.Event.Handler.Private.invoke on_delete (Ui.Event.Payload.Text block_id)
+    | Some (Ui.Native_widget.Slidable.Action_pressed action_id) ->
+      (match
+         List.find_opt
+           (fun (candidate, _, _, _) -> candidate = action_id)
+           quick_status_actions
+       with
+       | Some (_, _, tag, _) ->
+         Ui.Event.Handler.Private.invoke
+           on_status
+           (Ui.Event.Payload.Text (block_id ^ ":" ^ tag))
+       | None -> ())
+    | Some (Ui.Native_widget.Slidable.Dismissed _) | None -> ())
 ;;
 
 let delete_feedback ~foreground block =
@@ -96,7 +112,7 @@ let delete_action_divider ~device_pixel_ratio ~edge block =
   |> Ui.Widget.sized_box ~height:thickness
 ;;
 
-let delete_action ~tokens ~typography ~device_pixel_ratio block =
+let delete_action ~tokens ~typography ~device_pixel_ratio ~enabled block =
   let colors = Tokens.destructive_swipe_action tokens in
   let label =
     Ui.Widget.text
@@ -130,10 +146,13 @@ let delete_action ~tokens ~typography ~device_pixel_ratio block =
            (Ui.Semantics.create
               ~label:"Delete block and all descendants"
               ~role:Ui.Semantics.Role.Button
+              ~enabled
+              ~focusable:enabled
               ())
   in
   Ui.Native_widget.Slidable.action
     ~id:delete_action_id
+    ~enabled
     ~foreground:colors.foreground
     ~background:colors.background
     ~border_radius:0.
@@ -141,14 +160,97 @@ let delete_action ~tokens ~typography ~device_pixel_ratio block =
     ()
 ;;
 
-let delete_action_pane ~tokens ~typography ~device_pixel_ratio block =
+let delete_action_pane ~tokens ~typography ~device_pixel_ratio ~enabled block =
   Ui.Native_widget.Slidable.action_pane
     ~extent_ratio:0.25
     ~motion:Ui.Native_widget.Slidable.Behind
     ~drag_dismissible:false
     ~open_threshold:0.125
     ~close_threshold:0.125
-    ~actions:[ delete_action ~tokens ~typography ~device_pixel_ratio block ]
+    ~actions:[ delete_action ~tokens ~typography ~device_pixel_ratio ~enabled block ]
+    ()
+;;
+
+let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _, icon) =
+  let current = Journal_model.task_state block = task_state in
+  let enabled = actions_enabled && not current in
+  let status_name = Journal_model.status_name task_state in
+  let semantic_label =
+    if current then "Current status " ^ status_name else "Set status to " ^ status_name
+  in
+  let label =
+    let supporting = typography.Tokens.supporting in
+    Ui.Widget.text
+      ~style:
+        (Ui.Style.Text_style.create
+           ~font_size:(Float.min 11. supporting.font_size)
+           ~font_weight:supporting.weight
+           ~line_height:1.
+           ())
+      ~max_lines:1
+      ~overflow:Ui.Style.Text_overflow.Ellipsis
+      ~text_align:Ui.Style.Text_align.Center
+      status_name
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string
+            ("journal-row-status-action-label:"
+             ^ Journal_model.id block
+             ^ ":"
+             ^ string_of_int id))
+  in
+  let icon =
+    Material_icon_catalog.create ~size:18. icon
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string
+            ("journal-row-status-action-icon:"
+             ^ Journal_model.id block
+             ^ ":"
+             ^ string_of_int id))
+  in
+  let child =
+    Ui.Widget.Flex.row [ Ui.Widget.Flex.fixed icon; Ui.Widget.Flex.expanded label ]
+    |> Ui.Widget.center
+    |> Ui.Widget.constrained_box
+         ~constraints:(Ui.Layout.Box_constraints.create ~min_width:44. ~min_height:44. ())
+    |> Ui.Material.card ~elevation:(if current then 2. else 0.)
+    |> Ui.Widget.semantics
+         ~properties:
+           (Ui.Semantics.create
+              ~label:semantic_label
+              ~role:Ui.Semantics.Role.Button
+              ~enabled
+              ~selected:current
+              ~focusable:enabled
+              ())
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string
+            ("journal-row-status-action:"
+             ^ Journal_model.id block
+             ^ ":"
+             ^ string_of_int id))
+  in
+  Ui.Native_widget.Slidable.action
+    ~id
+    ~enabled
+    ~background:(Tokens.transparent_swipe_action_background tokens)
+    ~auto_close:true
+    ~border_radius:0.
+    ~padding:(Ui.Layout.Edge_insets.all 2.)
+    ~child
+    ()
+;;
+
+let status_action_pane ~tokens ~typography ~actions_enabled block =
+  Ui.Native_widget.Slidable.action_pane
+    ~extent_ratio:0.8
+    ~motion:Ui.Native_widget.Slidable.Behind
+    ~drag_dismissible:false
+    ~open_threshold:0.125
+    ~close_threshold:0.125
+    ~actions:
+      (List.map
+         (status_action ~tokens ~typography ~actions_enabled block)
+         quick_status_actions)
     ()
 ;;
 
@@ -186,16 +288,15 @@ let child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key =
   let connector_leading = geometry.connector_leading -. leading_delta in
   let bullet_leading = geometry.bullet_center_leading -. leading_delta in
   let text_leading = geometry.text_leading -. leading_delta in
-  let lines =
-    let rec take remaining reversed = function
-      | _ when remaining <= 0 -> List.rev reversed
-      | [] -> List.rev reversed
-      | line :: rest -> take (remaining - 1) (line :: reversed) rest
-    in
-    Journal_model.source block |> String.split_on_char '\n' |> take 4 []
+  let block_source = Journal_model.source block in
+  let measurement =
+    Tokens.measure_text
+      ~profile
+      ~font_size:profile.Tokens.supporting_font_size
+      ~max_lines:3
+      block_source
   in
-  let visible_lines = Int.max 1 (List.length lines) in
-  let extent = Tokens.block_extent ~profile ~visible_lines in
+  let extent = Tokens.block_extent ~profile ~visible_lines:measurement.visible_lines in
   let connector =
     Ui.Material.divider ~thickness:1. ()
     |> Ui.Widget.sized_box ~width:extent ~height:1.
@@ -217,23 +318,17 @@ let child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key =
          (Ui.Test_id.string ("journal-child-bullet:" ^ Journal_model.id block))
   in
   let source =
-    List.mapi
-      (fun index line ->
-         Ui.Widget.text
-           ~style:(text_style typography.Tokens.supporting)
-           ~max_lines:1
-           ~overflow:Ui.Style.Text_overflow.Ellipsis
-           ~text_align:Ui.Style.Text_align.Start
-           line
-         |> Ui.Widget.with_test_id
-              (Ui.Test_id.string
-                 (Printf.sprintf
-                    "journal-child-source:%s:%d"
-                    (Journal_model.id block)
-                    index))
-         |> Ui.Widget.Flex.fixed)
-      lines
-    |> Ui.Widget.Flex.column
+    Journal_row.preview_text
+      ~token:typography.Tokens.supporting
+      ~profile
+      ~id:("journal-child-source:" ^ Journal_model.id block)
+      ~fade_id:("journal-child-source-tail-fade:" ^ Journal_model.id block)
+      ~max_lines:3
+      ~did_overflow:measurement.did_overflow
+      block_source
+    |> Ui.Widget.opacity 0.65
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string ("journal-child-source-opacity:" ^ Journal_model.id block))
     |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
     |> Ui.Widget.padding
          ~insets:
@@ -288,7 +383,8 @@ let child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key =
             (Ui.Test_id.string ("journal-child-status-rail:" ^ Journal_model.id block))
        |> Ui.Widget.sized_box
             ~width:Tokens.row_geometry.status_rail_width
-            ~height:(float_of_int visible_lines *. profile.Tokens.block_line_height)
+            ~height:
+              (float_of_int measurement.visible_lines *. profile.Tokens.block_line_height)
      in
      children
      := (if rtl
@@ -328,6 +424,8 @@ let render_slot
       ~reduced_motion
       ~on_toggle_children
       ~delete_enabled
+      ~actions_enabled
+      ~on_status
       ~on_delete
       ~sort_base
   = function
@@ -373,22 +471,28 @@ let render_slot
         in
         Ui.Native_widget.Slidable.create_with_handler
           ~key:(Ui.Key.string ("journal-row-slidable:" ^ id))
+          ~enabled:actions_enabled
           ~group_tag:"journal-timeline"
+          ~start_action_pane:
+            (status_action_pane ~tokens ~typography ~actions_enabled block)
           ~end_action_pane:
-            (delete_action_pane ~tokens ~typography ~device_pixel_ratio block)
+            (delete_action_pane
+               ~tokens
+               ~typography
+               ~device_pixel_ratio
+               ~enabled:actions_enabled
+               block)
           ~content:surface
-          ~on_event:(for_slidable on_delete id)
+          ~on_event:(for_slidable ~on_status ~on_delete id)
           ()
         |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-row-slidable:" ^ id)))
       else row
     in
     let extent =
-      Tokens.block_extent
+      Journal_row.Item.visible_extent
+        (Journal_row.Item.of_timeline_entry entry)
         ~profile
-        ~visible_lines:
-          (Journal_row.Item.visible_line_count
-             (Journal_row.Item.of_timeline_entry entry)
-             ~expanded)
+        ~expanded
     in
     Ui.Widget.sized_box ~height:extent row
     |> Ui.Widget.focus_scope
@@ -461,6 +565,8 @@ let view
       ~on_visible_range
       ~on_toggle_children
       ~delete_enabled
+      ~actions_enabled
+      ~on_status
       ~on_delete
   =
   let window = Timeline.current_window state in
@@ -495,6 +601,8 @@ let view
               ~reduced_motion
               ~on_toggle_children
               ~delete_enabled
+              ~actions_enabled
+              ~on_status
               ~on_delete
               ~sort_base
               slot

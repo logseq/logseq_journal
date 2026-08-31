@@ -133,6 +133,59 @@ let require_text root relative needles =
       needles)
 ;;
 
+let text_between text ~start_marker ~end_marker =
+  let marker_offset marker from =
+    let marker_length = String.length marker in
+    let rec find offset =
+      if offset + marker_length > String.length text
+      then None
+      else if String.sub text offset marker_length = marker
+      then Some offset
+      else find (offset + 1)
+    in
+    find from
+  in
+  match marker_offset start_marker 0 with
+  | None -> None
+  | Some start_offset ->
+    let content_start = start_offset + String.length start_marker in
+    Option.map
+      (fun end_offset -> String.sub text content_start (end_offset - content_start))
+      (marker_offset end_marker content_start)
+;;
+
+let test_sync_error_card_is_temporary_and_error_only root =
+  let application = read_file (path root "app/application.ml") in
+  match
+    text_between
+      application
+      ~start_marker:"  let overlays =\n    match sync_error with"
+      ~end_marker:"  in\n  let body ="
+  with
+  | None -> fail "unable to locate the Timeline sync-error overlay"
+  | Some overlay ->
+    List.iter
+      (fun obsolete ->
+         if contains overlay obsolete
+         then fail "sync-error card retains obsolete action text %S" obsolete)
+      [ "Reset local copy"
+      ; "Reset local graph copy"
+      ; "request-local-cache-reset"
+      ; "cache_reset_available"
+      ; "on_cache_reset_requested"
+      ];
+    List.iter
+      (fun required ->
+         if not (contains application required)
+         then fail "sync-error timeout behavior is missing %S" required)
+      [ "let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5."
+      ; "let sync_error_timer_key ="
+      ; "let sync_error_timer_callback ="
+      ; "Core.Time_ns.add now sync_error_card_lifetime"
+      ; "Int64.equal current_sequence scheduled_sequence"
+      ]
+;;
+
 let contains_dune_internal_module_path contents =
   let is_identifier_character = function
     | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true
@@ -610,14 +663,15 @@ let test_worker_owned_managed_sync_orchestration root =
     [ "type event ="
     ; "type runner_completion"
     ; "type worker_effect ="
-    ; "| Commit_local_batch of local_batch_commit_request"
+    ; "| Complete_local_batch of local_batch_completion_request"
     ; "| Apply_authoritative_batch of authoritative_commit_request"
     ; "| Commit_outbox_transition of outbox_transition"
     ];
   forbid_text
     root
     "logseq_sync/spec/pure_reducer/core.mli"
-    [ "graph_backend"
+    [ "| Commit_local_batch of local_batch_commit_request"
+    ; "graph_backend"
     ; "open_graph:"
     ; "close_graph:"
     ; "authoritative_database:"
@@ -658,14 +712,16 @@ let test_worker_owned_managed_sync_orchestration root =
     "logseq_db_worker/lib/engine.mli"
     [ "type prepared_managed_mutation"
     ; "val commit_managed_mutation"
-    ; "val restore_managed_outbox"
+    ; "val authoritative_precondition"
+    ; "val replan_managed_mutation"
     ; "val apply_authoritative"
     ; "val commit_outbox_transition"
     ];
   forbid_text
     root
     "logseq_db_worker/lib/engine.mli"
-    [ "val reprepare_managed_mutation"
+    [ "val restore_managed_outbox"
+    ; "val reprepare_managed_mutation"
     ; "val project_encoded"
     ; "val reset_projection"
     ; "val persist_checkpoint"
@@ -973,6 +1029,7 @@ let () =
   test_startup_phase_ownership root;
   test_repository_local_runtime_tests root;
   test_sync_transport_is_websocket_only root;
+  test_sync_error_card_is_temporary_and_error_only root;
   require_exact_dependency
     root
     "logseq_journal.opam.locked"
@@ -1022,7 +1079,7 @@ let () =
        require_occurrences root relative current_datascript_revision 2;
        forbid_text root relative [ "b1029d6a7210baae15f56d7c5df383c150ca07cef90" ])
     dependency_manifests;
-  let current_melange_transit_revision = "a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93" in
+  let current_melange_transit_revision = "35f8afe7d6506863c7253e67a20befb3dde5c18f" in
   List.iter
     (fun (relative, occurrences) ->
        require_occurrences root relative current_melange_transit_revision occurrences;
@@ -1030,8 +1087,11 @@ let () =
          root
          relative
          [ "b298260eb67d96710cb26eaad96a40c81b1af21b"
+         ; "a64270a1ed5c8ad3ff7e05dbb60e83ad0465ae93"
          ; "melange-transit-native.0.1.0"
          ; "melange-transit-core.0.1.0"
+         ; "melange-transit-native.0.1.1"
+         ; "melange-transit-core.0.1.1"
          ])
     [ "logseq_db_storage.opam", 1
     ; "logseq_sync.opam", 1
@@ -1042,15 +1102,15 @@ let () =
     ; "logseq_journal.opam.locked", 2
     ; "logseq_db_worker.opam.locked", 2
     ];
-  require_occurrences root "dune-project" "(melange-transit-native (= 0.1.1))" 4;
-  require_occurrences root "dune-project" "(melange-transit-core (= 0.1.1))" 1;
+  require_occurrences root "dune-project" "(melange-transit-native (= 0.1.2))" 4;
+  require_occurrences root "dune-project" "(melange-transit-core (= 0.1.2))" 1;
   List.iter
     (fun relative ->
        require_exact_dependency
          root
          relative
          ~package:"melange-transit-native"
-         ~version:"0.1.1")
+         ~version:"0.1.2")
     dependency_manifests;
   List.iter
     (fun relative ->
@@ -1058,7 +1118,7 @@ let () =
          root
          relative
          ~package:"melange-transit-core"
-         ~version:"0.1.1")
+         ~version:"0.1.2")
     [ "logseq_journal.opam"
     ; "logseq_sync.opam.locked"
     ; "logseq_journal.opam.locked"
@@ -1316,11 +1376,16 @@ let () =
   require_allowed_dart_files
     root
     "flutter/lib"
-    [ "flutter/lib/application_host_adapter.dart"; "flutter/lib/main.dart" ];
+    [ "flutter/lib/application_host_adapter.dart"
+    ; "flutter/lib/journal_tail_fade.dart"
+    ; "flutter/lib/journal_widget_registry.dart"
+    ; "flutter/lib/main.dart"
+    ];
   require_allowed_dart_files
     root
     "flutter/test"
     [ "flutter/test/application_host_adapter_test.dart"
+    ; "flutter/test/journal_tail_fade_test.dart"
     ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
     ; "flutter/test/journal_runtime_golden_test.dart"
     ; "flutter/test/widget_test.dart"
@@ -1344,7 +1409,7 @@ let () =
     [ "logseq_db_worker_runtime_flow_test.dart" ];
   require_occurrences root "app/application.ml" "Ui.Style.Color.rgb" 1;
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
-  require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.argb" 0;
+  require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.argb" 1;
   forbid_text root "app/application.ml" [ "let color"; "(color " ];
   List.iter
     (fun relative ->
@@ -1629,7 +1694,7 @@ let () =
     ; "download a fresh snapshot"
     ; "App.View.create"
     ; "Ui.Theme.application"
-    ; "Ui.Material.alert_dialog"
+    ; "Ui.Material.Dialog.alert"
     ; "Ui.Navigation.Modal_dialog"
     ; "Bonsai_flutter.Host_effect.show_snack_bar"
     ; "Ui.Material.filled_button"
@@ -1744,7 +1809,8 @@ let () =
     ; "validate_storage_header connection"
     ; "let structurally_valid schema db"
     ];
-  require_occurrences root "logseq_db_worker/lib/engine.ml" "tree_structurally_valid" 2;
+  require_occurrences root "logseq_db_worker/lib/engine.ml" "tree_structural_violations" 3;
+  require_occurrences root "logseq_db_worker/lib/engine.ml" "validate_tree_for_mutation" 4;
   forbid_text
     root
     "logseq_db_storage/lib/storage_session.ml"
@@ -1781,7 +1847,7 @@ let () =
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.mli"
-    [ "Client_state of Logseq_sync_pure_reducer.Core.state"
+    [ "Client_command_completed"
     ; "Client_state_changed of Logseq_sync_pure_reducer.Core.state"
     ];
   forbid_text
@@ -1809,6 +1875,43 @@ let () =
     ; "journal-startup-diagnostics"
     ; "journal-diagnostics-dialog-page"
     ; "Recent sync transitions"
+    ];
+  require_text
+    root
+    "logseq_db_worker/lib/error.mli"
+    [ "type cause"
+    ; "type causal_trace"
+    ; "val trace"
+    ; "val wrap"
+    ; "val create_with_origin"
+    ];
+  require_text
+    root
+    "app/application.ml"
+    [ "type worker_error_occurrence"
+    ; "worker_errors : worker_error_occurrence list"
+    ; "journal-error-info-page"
+    ; "newest_first_worker_errors"
+    ];
+  require_text
+    root
+    "app/journal_header.ml"
+    [ "journal-error-info-button"; "Review Logseq DB worker errors" ];
+  forbid_text
+    root
+    "app/journal_graph_runtime.mli"
+    [ "Feed_failed of\n      { request_generation : int64\n      ; message : string"
+    ; "Open_failed of Logseq_db_worker.Error.t"
+    ; "Rejected of string"
+    ];
+  forbid_text
+    root
+    "app/application.ml"
+    [ "| Open_failed error -> terminal_graph_state state (Logseq_db_worker.Error.message \
+       error)"
+    ; "graph_error : string option"
+    ; "capture_error : string option"
+    ; "sync_error : string option"
     ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"

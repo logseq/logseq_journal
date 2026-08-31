@@ -251,15 +251,20 @@ let create ~sw dependencies ~post =
     }
 ;;
 
-let cache_path local_store user_id =
-  let name = Digest.string user_id |> Digest.to_hex in
+let catalog_root local_store =
   Filename.concat
     local_store.application_support_directory
-    ("sync-catalog-" ^ name ^ ".json")
+    "logseq-db-worker/sync-catalogs"
+;;
+
+let cache_path local_store (account : Core.account_scope) =
+  let identity = account.user_id ^ "\000" ^ Uri.to_string account.managed_sync_origin in
+  let name = Digestif.SHA256.digest_string identity |> Digestif.SHA256.to_hex in
+  Filename.concat (catalog_root local_store) (name ^ ".json")
 ;;
 
 let load_catalog local_store account =
-  let path = cache_path local_store account.Core.user_id in
+  let path = cache_path local_store account in
   if not (Sys.file_exists path)
   then Ok None
   else (
@@ -277,16 +282,43 @@ let load_catalog local_store account =
     | Sys_error message -> Error (Core.Effect_failed message))
 ;;
 
-let save_catalog local_store cache =
-  let path = cache_path local_store (Core.catalog_cache_user_id cache) in
+let ensure_directory path =
   try
-    let channel = open_out_bin path in
-    Fun.protect
-      ~finally:(fun () -> close_out_noerr channel)
-      (fun () -> output_string channel (Core.encode_catalog_cache cache));
-    Ok ()
+    if Sys.file_exists path
+    then
+      if Sys.is_directory path
+      then Ok ()
+      else Error (Core.Effect_failed (path ^ " is not a directory"))
+    else (
+      Unix.mkdir path 0o700;
+      Ok ())
   with
-  | Sys_error message -> Error (Core.Effect_failed message)
+  | Unix.Unix_error (error, operation, target) ->
+    Error
+      (Core.Effect_failed
+         (Printf.sprintf "%s(%s): %s" operation target (Unix.error_message error)))
+;;
+
+let save_catalog local_store account cache =
+  if not (String.equal account.Core.user_id (Core.catalog_cache_user_id cache))
+  then Error (Core.Effect_failed "catalog cache owner does not match its account scope")
+  else (
+    let worker_root =
+      Filename.concat local_store.application_support_directory "logseq-db-worker"
+    in
+    Result.bind (ensure_directory worker_root) (fun () ->
+      Result.bind
+        (ensure_directory (catalog_root local_store))
+        (fun () ->
+           let path = cache_path local_store account in
+           try
+             let channel = open_out_bin path in
+             Fun.protect
+               ~finally:(fun () -> close_out_noerr channel)
+               (fun () -> output_string channel (Core.encode_catalog_cache cache));
+             Ok ()
+           with
+           | Sys_error message -> Error (Core.Effect_failed message))))
 ;;
 
 let effect_error message = Error (Core.Effect_failed message)
@@ -320,7 +352,7 @@ let key t handle =
 
 let decrypt_protected_value t handle source =
   match key t handle with
-  | Error (Core.Effect_failed message) -> Error message
+  | Error (Core.Effect_failed message | Crypto_failed (_, message)) -> Error message
   | Ok graph_key ->
     let crypto : E2ee.crypto =
       { decrypt_aes_gcm = t.dependencies.crypto.decrypt_aes_gcm }
@@ -328,6 +360,20 @@ let decrypt_protected_value t handle source =
     Result.bind (E2ee.decrypt_value ~crypto ~graph_key source) (function
       | Transit_core.Json.String plaintext -> Ok plaintext
       | _ -> Error "decrypted protected value must be a string")
+;;
+
+let encrypt_protected_values t handle plaintexts =
+  match key t handle with
+  | Error (Core.Effect_failed message | Crypto_failed (_, message)) -> Error message
+  | Ok graph_key ->
+    let rec encrypt encrypted = function
+      | [] -> Ok (List.rev encrypted)
+      | plaintext :: rest ->
+        (match t.dependencies.crypto.encrypt_aes_gcm ~key:graph_key ~plaintext with
+         | Ok value -> encrypt (value :: encrypted) rest
+         | Error message -> Error message)
+    in
+    encrypt [] plaintexts
 ;;
 
 let store_key t ticket scope plaintext =
@@ -345,7 +391,8 @@ let execute_request
   fun t ticket request ->
   match request with
   | Core.Load_catalog account -> load_catalog t.dependencies.local_store account
-  | Save_catalog cache -> save_catalog t.dependencies.local_store cache
+  | Save_catalog { account; cache } ->
+    save_catalog t.dependencies.local_store account cache
   | Fetch_catalog authenticated ->
     let request =
       Http.catalog
@@ -490,25 +537,39 @@ let execute_request
       ~private_key_package:request.private_key_package
     |> map_error
   | Encrypt_protected_values request ->
-    Result.bind (key t request.key) (fun key ->
-      let rec encrypt acc = function
-        | [] -> Ok (List.rev acc)
-        | plaintext :: rest ->
-          (match t.dependencies.crypto.encrypt_aes_gcm ~key ~plaintext with
-           | Ok encrypted -> encrypt (encrypted :: acc) rest
-           | Error message -> effect_error message)
-      in
-      encrypt [] request.plaintexts)
+    Result.bind
+      (Result.map_error
+         (function
+           | Core.Effect_failed message | Crypto_failed (_, message) ->
+             Core.Crypto_failed (Invalid_key_material, message))
+         (key t request.key))
+      (fun key ->
+         let rec encrypt acc = function
+           | [] -> Ok (List.rev acc)
+           | plaintext :: rest ->
+             (match t.dependencies.crypto.encrypt_aes_gcm ~key ~plaintext with
+              | Ok encrypted -> encrypt (encrypted :: acc) rest
+              | Error message ->
+                Error (Core.Crypto_failed (Crypto_provider_unavailable, message)))
+         in
+         encrypt [] request.plaintexts)
   | Decrypt_protected_values request ->
-    Result.bind (key t request.key) (fun key ->
-      let rec decrypt acc = function
-        | [] -> Ok (List.rev acc)
-        | (iv, ciphertext) :: rest ->
-          (match t.dependencies.crypto.decrypt_aes_gcm ~key ~iv ~ciphertext with
-           | Ok plaintext -> decrypt (plaintext :: acc) rest
-           | Error message -> effect_error message)
-      in
-      decrypt [] request.protected_values)
+    Result.bind
+      (Result.map_error
+         (function
+           | Core.Effect_failed message | Crypto_failed (_, message) ->
+             Core.Crypto_failed (Invalid_key_material, message))
+         (key t request.key))
+      (fun key ->
+         let rec decrypt acc = function
+           | [] -> Ok (List.rev acc)
+           | (iv, ciphertext) :: rest ->
+             (match t.dependencies.crypto.decrypt_aes_gcm ~key ~iv ~ciphertext with
+              | Ok plaintext -> decrypt (plaintext :: acc) rest
+              | Error message ->
+                Error (Core.Crypto_failed (Crypto_provider_unavailable, message)))
+         in
+         decrypt [] request.protected_values)
 ;;
 
 let field_matches expected actual =
@@ -617,30 +678,56 @@ let submit t instruction =
         then t.post (Core.Timer_elapsed request.id))
     | Start_websocket request ->
       let key = Core.runner_effect_diagnostic instruction in
+      let cancelled, resolve_cancelled = Eio.Promise.create () in
+      let operation =
+        { scope = Core.runner_effect_scope instruction
+        ; cancelled = false
+        ; cancel =
+            (fun () -> ignore (Eio.Promise.try_resolve resolve_cancelled () : bool))
+        }
+      in
+      Hashtbl.replace t.operations key operation;
       t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        match
-          t.dependencies.transport.connect_websocket
-            ~sw:t.sw
-            ~uri:request.uri
-            ~token:request.token
-            ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
-            ~on_message:(fun payload ->
-              if not t.closed
-              then (
-                match Sync_protocol.decode_server_message payload with
-                | Ok message -> t.post (Core.Websocket_message (request.scope, message))
-                | Error error ->
-                  t.post (Core.Websocket_protocol_error (request.scope, error))))
-            ~on_close:(fun message ->
-              Hashtbl.remove t.websockets key;
-              if not t.closed then t.post (Core.Websocket_closed (request.scope, message)))
-        with
-        | Error message ->
-          if not t.closed
+        let result =
+          try
+            Some
+              (Eio.Fiber.first
+                 (fun () ->
+                    t.dependencies.transport.connect_websocket
+                      ~sw:t.sw
+                      ~uri:request.uri
+                      ~token:request.token
+                      ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
+                      ~on_message:(fun payload ->
+                        if (not t.closed) && not operation.cancelled
+                        then (
+                          match Sync_protocol.decode_server_message payload with
+                          | Ok message ->
+                            t.post (Core.Websocket_message (request.scope, message))
+                          | Error error ->
+                            t.post (Core.Websocket_protocol_error (request.scope, error))))
+                      ~on_close:(fun message ->
+                        Hashtbl.remove t.websockets key;
+                        if (not t.closed) && not operation.cancelled
+                        then t.post (Core.Websocket_closed (request.scope, message))))
+                 (fun () ->
+                    Eio.Promise.await cancelled;
+                    raise Runner_cancelled))
+          with
+          | Runner_cancelled -> None
+        in
+        Hashtbl.remove t.operations key;
+        match result with
+        | None -> ()
+        | Some (Error message) ->
+          if (not t.closed) && not operation.cancelled
           then t.post (Core.Websocket_closed (request.scope, Some message))
-        | Ok websocket ->
-          Hashtbl.replace t.websockets key (request.scope, websocket);
-          if not t.closed then t.post (Core.Websocket_opened request.scope))
+        | Some (Ok websocket) ->
+          if t.closed || operation.cancelled
+          then t.dependencies.transport.close_websocket websocket
+          else (
+            Hashtbl.replace t.websockets key (request.scope, websocket);
+            t.post (Core.Websocket_opened request.scope)))
     | Send_websocket request ->
       (match Sync_protocol.encode_client_message request.message with
        | Error error -> t.post (Core.Websocket_protocol_error (request.scope, error))

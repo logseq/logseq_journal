@@ -1,3 +1,4 @@
+import Cocoa
 import Darwin
 import Foundation
 import Security
@@ -6,6 +7,14 @@ import XCTest
 @testable import bonsai_flutter_logseq_journal_host
 
 class RunnerTests: XCTestCase {
+  func testApplicationLaunchCallbackCompletesOnCurrentFlutterHost() {
+    let delegate = AppDelegate()
+
+    delegate.applicationDidFinishLaunching(
+      Notification(name: NSApplication.didFinishLaunchingNotification)
+    )
+  }
+
   func testStartupActivatesApplicationAndMakesMainWindowKey() {
     let target = ApplicationActivationTargetSpy()
 

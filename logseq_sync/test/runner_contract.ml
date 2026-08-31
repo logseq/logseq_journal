@@ -121,6 +121,58 @@ let encrypted_graph () : Core.graph =
   }
 ;;
 
+let test_catalog_load_uses_account_and_origin_scoped_path () =
+  with_support (fun support ->
+    let worker_root = Filename.concat support "logseq-db-worker" in
+    let catalog_root = Filename.concat worker_root "sync-catalogs" in
+    Unix.mkdir worker_root 0o700;
+    Unix.mkdir catalog_root 0o700;
+    let cache =
+      Core.catalog_cache
+        ~user_id:"user-1"
+        ~graphs:[ encrypted_graph () ]
+        ~selected_graph:None
+    in
+    let path =
+      Filename.concat
+        catalog_root
+        "748ac0b0c274b30bc6fc1da756958deab4ebdef06a2d6373a377e2b4d8cec6df.json"
+    in
+    let channel = open_out_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr channel)
+      (fun () -> output_string channel (Core.encode_catalog_cache cache));
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let tasks = ref [] in
+        let posted = ref [] in
+        let dependencies =
+          dependencies
+            ~environment
+            ~support
+            ~fork:(fun ~sw:_ task -> tasks := task :: !tasks)
+            ()
+        in
+        let runner =
+          Runner.create ~sw dependencies ~post:(fun event -> posted := event :: !posted)
+          |> Result.get_ok
+        in
+        let restoring =
+          Core.step (core ()) (Restore_local_account { user_id = "user-1" })
+        in
+        Runner.submit runner (load_catalog_effect ());
+        List.iter (fun task -> task ()) (List.rev !tasks);
+        let restored =
+          match !posted with
+          | [ event ] -> Core.step restoring.next event
+          | _ -> fail "catalog load did not post exactly one completion"
+        in
+        Alcotest.(check int)
+          "scoped catalog is restored"
+          1
+          (List.length (Core.state restored.next).snapshot.catalog))))
+;;
+
 let token_request effects =
   List.find_map
     (function
@@ -413,9 +465,22 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
         in
         Alcotest.check
           Alcotest.bool
-          "unlock failure requests E2EE recovery"
+          "unlock failure waits for explicit E2EE recovery"
           true
-          (Core.token_request_purpose (token_request failed.effects)
+          ((Core.state failed.next).snapshot.startup.failure
+           = Some Core.During_local_restore
+           && not
+                (List.exists
+                   (function
+                     | Core.Publish (Core.Token_requested _) -> true
+                     | Run _ | Delegate _ | Publish _ -> false)
+                   failed.effects));
+        let recovery = Core.step failed.next Core.Online_recovery_requested in
+        Alcotest.check
+          Alcotest.bool
+          "explicit recovery requests E2EE authorization"
+          true
+          (Core.token_request_purpose (token_request recovery.effects)
            = Core.E2ee_key_access);
         Alcotest.(check (result string string))
           "failed cached key is not stored as a usable handle"
@@ -428,6 +493,10 @@ let scenarios =
       "dependency constructors validate resources"
       `Quick
       test_dependency_constructors_validate_owned_resources
+  ; Alcotest.test_case
+      "catalog load uses account and origin scoped path"
+      `Quick
+      test_catalog_load_uses_account_and_origin_scoped_path
   ; Alcotest.test_case
       "submit posts asynchronously"
       `Quick

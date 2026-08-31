@@ -22,7 +22,7 @@ type request =
   | Get_graph_state
 
 type response =
-  | Client_state of Logseq_sync_pure_reducer.Core.state
+  | Client_command_completed
   | Graph_response of Logseq_db_worker.Protocol.response
   | Graph_state of Logseq_db_worker.graph_state
 

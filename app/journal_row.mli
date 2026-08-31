@@ -6,8 +6,23 @@ module Item : sig
   val corrupt : id:string -> source:string option -> t
   val source_for_detail : t -> string option
   val semantic_label : t -> string
-  val visible_line_count : t -> expanded:bool -> int
+
+  val visible_extent
+    :  t
+    -> profile:Journal_visual_tokens.row_profile
+    -> expanded:bool
+    -> float
 end
+
+val preview_text
+  :  token:Journal_visual_tokens.text_token
+  -> profile:Journal_visual_tokens.row_profile
+  -> id:string
+  -> fade_id:string
+  -> max_lines:int
+  -> did_overflow:bool
+  -> string
+  -> Bonsai_flutter_ui.Widget.t
 
 val view
   :  tokens:Journal_visual_tokens.t

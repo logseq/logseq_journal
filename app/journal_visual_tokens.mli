@@ -90,6 +90,10 @@ type row_profile =
   ; day_header_extent : float
   ; content_leading : float
   ; time_slot_width : float
+  ; source_text_width : float
+  ; text_scale : float
+  ; entry_font_size : float
+  ; supporting_font_size : float
   }
 
 type fixed_extent_role =
@@ -98,6 +102,11 @@ type fixed_extent_role =
   | Day_heading
   | Day_continuation
   | Feed_continuation
+
+type text_measurement =
+  { visible_lines : int
+  ; did_overflow : bool
+  }
 
 type t
 
@@ -110,6 +119,7 @@ val hit_regions : hit_regions
 val header_geometry : header_geometry
 val composer_geometry : composer_geometry
 val row_geometry : row_geometry
+val supporting_preview_gap : float
 val preview_geometry : preview_geometry
 val motion : reduced_motion:bool -> motion
 val physical_divider_thickness : device_pixel_ratio:float -> float
@@ -122,6 +132,15 @@ val select_row_profile
   -> row_profile
 
 val block_extent : profile:row_profile -> visible_lines:int -> float
+
+val measure_text
+  :  profile:row_profile
+  -> font_size:float
+  -> max_lines:int
+  -> string
+  -> text_measurement
+
 val fixed_extent : profile:row_profile -> fixed_extent_role -> float
 val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option
 val destructive_swipe_action : t -> destructive_swipe_action
+val transparent_swipe_action_background : t -> Ui.Style.Color.t

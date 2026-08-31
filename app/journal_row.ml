@@ -1,5 +1,6 @@
 module Tokens = Journal_visual_tokens
 module Ui = Bonsai_flutter_ui
+module ID = Bonsai_flutter_spec.Id
 
 module Item = struct
   type t =
@@ -50,35 +51,79 @@ module Item = struct
   let source_for_detail t = t.source
   let id t = t.id
   let display_source t = Option.value t.source ~default:"Unavailable journal entry"
-  let logical_lines source = String.split_on_char '\n' source
+  let accessible_text value = String.split_on_char '\n' value |> String.concat ", "
 
-  let take count values =
-    let rec loop remaining reversed = function
-      | _ when remaining <= 0 -> List.rev reversed
-      | [] -> List.rev reversed
-      | value :: rest -> loop (remaining - 1) (value :: reversed) rest
+  type preview_text =
+    { text : string
+    ; max_lines : int
+    ; did_overflow : bool
+    }
+
+  type preview =
+    { source : preview_text
+    ; supporting : preview_text list
+    }
+
+  let supporting_preview (t : t) ~profile =
+    let rec allocate remaining = function
+      | _ when remaining <= 0 -> []
+      | [] -> []
+      | text :: rest ->
+        let measurement =
+          Tokens.measure_text
+            ~profile
+            ~font_size:profile.Tokens.supporting_font_size
+            ~max_lines:remaining
+            text
+        in
+        let remaining = remaining - measurement.visible_lines in
+        let tail = allocate remaining rest in
+        let did_overflow = measurement.did_overflow || (remaining = 0 && rest <> []) in
+        { text; max_lines = measurement.visible_lines; did_overflow } :: tail
     in
-    loop count [] values
+    allocate 2 t.supporting
   ;;
 
-  let preview t ~expanded =
-    let source = take 4 (logical_lines (display_source t)) in
-    if expanded || List.length source = 4
-    then source, []
-    else (
-      let remaining = 4 - List.length source in
-      let supporting = t.supporting |> List.concat_map logical_lines |> take remaining in
-      source, supporting)
+  let preview (t : t) ~profile ~expanded =
+    let source = display_source t in
+    let source_measurement =
+      Tokens.measure_text
+        ~profile
+        ~font_size:profile.Tokens.entry_font_size
+        ~max_lines:3
+        source
+    in
+    { source =
+        { text = source
+        ; max_lines = source_measurement.visible_lines
+        ; did_overflow = source_measurement.did_overflow
+        }
+    ; supporting = (if expanded then [] else supporting_preview t ~profile)
+    }
   ;;
 
-  let visible_line_count t ~expanded =
-    let source, supporting = preview t ~expanded in
-    Int.max 1 (List.length source + List.length supporting)
+  let preview_line_count preview =
+    List.fold_left
+      (fun count supporting -> count + supporting.max_lines)
+      preview.source.max_lines
+      preview.supporting
   ;;
 
-  let semantic_label_for_state t ~expanded =
-    let source, supporting = preview t ~expanded in
-    let text = String.concat ", " (source @ supporting) in
+  let preview_extent ~profile preview =
+    Tokens.block_extent ~profile ~visible_lines:(preview_line_count preview)
+    +. if preview.supporting = [] then 0. else Tokens.supporting_preview_gap
+  ;;
+
+  let visible_extent (t : t) ~profile ~expanded =
+    preview t ~profile ~expanded |> preview_extent ~profile
+  ;;
+
+  let semantic_label_for_state (t : t) ~preview =
+    let text =
+      accessible_text preview.source.text
+      :: List.map (fun supporting -> accessible_text supporting.text) preview.supporting
+      |> String.concat ", "
+    in
     let status =
       match t.task_state with
       | Journal_model.No_status -> ""
@@ -89,10 +134,52 @@ module Item = struct
     | None -> text ^ status
   ;;
 
-  let semantic_label t = semantic_label_for_state t ~expanded:true
+  let semantic_label (t : t) =
+    let status =
+      match t.task_state with
+      | Journal_model.No_status -> ""
+      | status -> ", status " ^ Journal_model.status_name status
+    in
+    match t.time with
+    | Some time -> accessible_text (display_source t) ^ status ^ ", created at " ^ time
+    | None -> accessible_text (display_source t) ^ status
+  ;;
 end
 
 let test_id value widget = Ui.Widget.with_test_id (Ui.Test_id.string value) widget
+
+module Tail_fade = struct
+  type props =
+    { line_height : float
+    ; fade_width : float
+    }
+
+  let encode_props props =
+    let payload = Bytes.make 16 '\000' in
+    Bytes.set_int64_le payload 0 (Int64.bits_of_float props.line_height);
+    Bytes.set_int64_le payload 8 (Int64.bits_of_float props.fade_width);
+    payload
+  ;;
+
+  let extension =
+    Ui.Native_widget.Extension.create
+      ~kind_id:(ID.Native_widget.Kind_id.of_int 1001)
+      ~version:1
+      ~capabilities:[]
+      ~encode_props
+      ~decode_event:(fun ~event_id:_ _ -> Error "Tail fade emits no events")
+      ()
+  ;;
+
+  let wrap ~line_height ~fade_width child =
+    Ui.Native_widget.widget
+      extension
+      ~props:{ line_height; fade_width }
+      ~on_event:(fun _ -> ())
+      ~children:[ child ]
+      ()
+  ;;
+end
 
 let text_style (token : Tokens.text_token) =
   Ui.Style.Text_style.create
@@ -149,19 +236,24 @@ let disclosure_indicator ~rtl ~expanded item =
     |> Option.some
 ;;
 
-let text_line ~typography ~item ~kind ~index source =
-  let token, prefix =
-    match kind with
-    | `Source -> typography.Tokens.entry, "source"
-    | `Supporting -> typography.supporting, "supporting"
+let preview_text ~token ~profile ~id ~fade_id ~max_lines ~did_overflow source =
+  let text =
+    Ui.Widget.text
+      ~style:(text_style token)
+      ~max_lines
+      ~overflow:Ui.Style.Text_overflow.Clip
+      ~text_align:Ui.Style.Text_align.Start
+      source
+    |> test_id id
   in
-  Ui.Widget.text
-    ~style:(text_style token)
-    ~max_lines:1
-    ~overflow:Ui.Style.Text_overflow.Ellipsis
-    ~text_align:Ui.Style.Text_align.Start
-    source
-  |> test_id (Printf.sprintf "journal-row-%s:%s:%d" prefix (Item.id item) index)
+  if not did_overflow
+  then text
+  else
+    text
+    |> Tail_fade.wrap
+         ~line_height:(token.Tokens.line_height *. profile.Tokens.text_scale)
+         ~fade_width:(token.font_size *. profile.text_scale *. 1.5)
+    |> test_id fade_id
 ;;
 
 let time_slot typography profile item ~show_timestamp =
@@ -218,21 +310,58 @@ let view
       ~reduced_motion
       ~on_toggle_children
   =
-  let source_lines, supporting_lines = Item.preview item ~expanded in
-  let visible_lines = Item.visible_line_count item ~expanded in
-  let row_extent = Tokens.block_extent ~profile ~visible_lines in
+  let preview = Item.preview item ~profile ~expanded in
+  let visible_lines = Item.preview_line_count preview in
+  let row_extent = Item.preview_extent ~profile preview in
   let source =
-    let source_widgets =
-      List.mapi
-        (fun index line -> text_line ~typography ~item ~kind:`Source ~index line)
-        source_lines
+    let source_widget =
+      preview_text
+        ~token:typography.Tokens.entry
+        ~profile
+        ~id:("journal-row-source:" ^ Item.id item)
+        ~fade_id:("journal-row-source-tail-fade:" ^ Item.id item)
+        ~max_lines:3
+        ~did_overflow:preview.source.did_overflow
+        preview.source.text
     in
     let supporting_widgets =
       List.mapi
-        (fun index line -> text_line ~typography ~item ~kind:`Supporting ~index line)
-        supporting_lines
+        (fun index (supporting : Item.preview_text) ->
+           let id = Printf.sprintf "journal-row-supporting:%s:%d" (Item.id item) index in
+           preview_text
+             ~token:typography.supporting
+             ~profile
+             ~id
+             ~fade_id:
+               (Printf.sprintf
+                  "journal-row-supporting-tail-fade:%s:%d"
+                  (Item.id item)
+                  index)
+             ~max_lines:supporting.max_lines
+             ~did_overflow:supporting.did_overflow
+             supporting.text
+           |> Ui.Widget.opacity 0.65
+           |> test_id
+                (Printf.sprintf
+                   "journal-row-supporting-opacity:%s:%d"
+                   (Item.id item)
+                   index)
+           |> Ui.Widget.Flex.flexible ~flex:supporting.max_lines)
+        preview.supporting
     in
-    List.map Ui.Widget.Flex.flexible (source_widgets @ supporting_widgets)
+    let gap =
+      if supporting_widgets = []
+      then []
+      else
+        [ Ui.Widget.empty ()
+          |> Ui.Widget.sized_box ~height:Tokens.supporting_preview_gap
+          |> test_id ("journal-row-supporting-gap:" ^ Item.id item)
+          |> Ui.Widget.Flex.fixed
+        ]
+    in
+    [ Ui.Widget.Flex.flexible ~flex:preview.source.max_lines source_widget ]
+    @ gap
+    @ supporting_widgets
     |> Ui.Widget.Flex.column
     |> test_id ("journal-row-text-stack:" ^ Item.id item)
     |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Top_start
@@ -247,18 +376,37 @@ let view
   in
   let disclosure = disclosure_indicator ~rtl ~expanded item in
   let time = time_slot typography profile item ~show_timestamp in
-  let fixed_options widgets = List.filter_map (Option.map Ui.Widget.Flex.fixed) widgets in
   let inline =
     Ui.Widget.Flex.row
       ~key:(Ui.Key.string ("journal-row-inline-layout:" ^ Item.id item))
       [ Ui.Widget.Flex.flexible source ]
     |> test_id ("journal-row-inline:" ^ Item.id item)
   in
+  let metadata_alignment =
+    if rtl then Ui.Layout.Alignment.Top_start else Ui.Layout.Alignment.Top_end
+  in
+  let metadata_line_extent =
+    Float.max profile.Tokens.block_line_height Tokens.row_geometry.disclosure_visual
+  in
+  let metadata_slot child =
+    child
+    |> Ui.Widget.align ~alignment:metadata_alignment
+    |> Ui.Widget.sized_box ~height:metadata_line_extent
+    |> Ui.Widget.Flex.fixed
+  in
+  let metadata =
+    Ui.Widget.Flex.row
+      (metadata_slot time :: List.filter_map (Option.map metadata_slot) [ disclosure ])
+    |> test_id ("journal-row-metadata:" ^ Item.id item)
+    |> Ui.Widget.align ~alignment:metadata_alignment
+    |> test_id ("journal-row-metadata-align:" ^ Item.id item)
+    |> Ui.Widget.sized_box
+         ~height:(row_extent -. (2. *. Tokens.row_geometry.entry_vertical_padding))
+  in
   let layout =
     Ui.Widget.Flex.row
       ~key:(Ui.Key.string ("journal-row-layout:" ^ Item.id item))
-      ([ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed time ]
-       @ fixed_options [ disclosure ])
+      [ Ui.Widget.Flex.expanded inline; Ui.Widget.Flex.fixed metadata ]
     |> test_id
          ((match profile.Tokens.kind with
            | Tokens.Compact -> "journal-row-compact:"
@@ -300,7 +448,7 @@ let view
       |> pressable
            ~reduced_motion
            ~control_id:("journal-row-toggle-children:" ^ Item.id item)
-           ~label:(Item.semantic_label_for_state item ~expanded)
+           ~label:(Item.semantic_label_for_state item ~preview)
            ~hint:
              (if expanded then "Hide direct child blocks" else "Show direct child blocks")
            ~value:(if expanded then "Expanded" else "Collapsed")
@@ -317,7 +465,7 @@ let view
       |> Ui.Widget.semantics
            ~properties:
              (Ui.Semantics.create
-                ~label:(Item.semantic_label_for_state item ~expanded)
+                ~label:(Item.semantic_label_for_state item ~preview)
                 ~role:Ui.Semantics.Role.Generic
                 ~sort_key:(sort_base +. 2.)
                 ())

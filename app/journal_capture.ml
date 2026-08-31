@@ -16,6 +16,7 @@ type editor =
 
 type t =
   { editor : editor
+  ; task_state : Journal_model.task_state
   ; phase : phase
   ; pending : Journal_graph_request.t option
   }
@@ -38,7 +39,11 @@ let create_editor ~session_number ~source =
 ;;
 
 let create ~session_number ~source =
-  { editor = create_editor ~session_number ~source; phase = Editing; pending = None }
+  { editor = create_editor ~session_number ~source
+  ; task_state = Journal_model.No_status
+  ; phase = Editing
+  ; pending = None
+  }
 ;;
 
 let session_id t = t.editor.session_id
@@ -47,10 +52,45 @@ let accepted_local_revision t = t.editor.accepted_local_revision
 let update_mode t = t.editor.update_mode
 let value t = t.editor.value
 let source t = Ui.Text_editing.Value.text t.editor.value
-let task_state _ = Journal_model.No_status
+let task_state t = t.task_state
 let phase t = t.phase
 let source_is_blank source = String.equal (String.trim source) ""
 let can_save t = t.phase = Editing && not (source_is_blank (source t))
+
+let replace_attempt t =
+  match t.phase with
+  | Failed _ -> { t with phase = Editing; pending = None }
+  | Editing | Saving -> t
+;;
+
+let update_source t ~source:new_source =
+  if t.phase = Saving || String.equal (source t) new_source
+  then t
+  else (
+    let t = replace_attempt t in
+    { t with
+      editor =
+        { t.editor with
+          update_mode = Ui.Text_editing.Force_replace
+        ; value = value_for_source new_source
+        }
+    })
+;;
+
+let toggle_task_intent t =
+  match t.phase with
+  | Saving -> t
+  | Editing | Failed _ ->
+    let t = replace_attempt t in
+    let task_state =
+      match t.task_state with
+      | Journal_model.No_status -> Journal_model.Todo
+      | Todo -> No_status
+      | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
+        invalid_arg "Capture task intent must be No_status or Todo"
+    in
+    { t with task_state }
+;;
 
 let value_of_edit (edit : Ui.Event.Payload.text_edit) =
   let selection =
@@ -95,7 +135,9 @@ let apply_editor_text_edit editor (edit : Ui.Event.Payload.text_edit) =
 
 let apply_text_edit t edit =
   match apply_editor_text_edit t.editor edit with
-  | Some editor -> { editor; phase = Editing; pending = None }
+  | Some editor when t.phase <> Saving ->
+    { t with editor; phase = Editing; pending = None }
+  | Some _ -> t
   | None -> t
 ;;
 
@@ -109,7 +151,7 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
       ; block_id
       ; sibling_order
       ; source = source t
-      ; task_state = Journal_model.No_status
+      ; task_state = t.task_state
       ; creation_time
       ; children = []
       }

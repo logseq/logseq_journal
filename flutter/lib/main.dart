@@ -5,6 +5,7 @@ import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:flutter/material.dart';
 
 import 'application_host_adapter.dart';
+import 'journal_widget_registry.dart';
 
 Future<void> main() async {
   JournalStartupTimeline.mark(JournalStartupMilestone.dartEntrypointStarted);
@@ -107,6 +108,7 @@ final class _PreparedRuntime {
 
 final class _JournalApplicationHostState extends State<JournalApplicationHost> {
   late final Future<_PreparedRuntime> _preparedRuntime = _prepareRuntime();
+  late final WidgetRegistry _widgetRegistry = createJournalWidgetRegistry();
 
   Future<_PreparedRuntime> _prepareRuntime() async {
     final applicationPayload = await widget.adapter.createApplicationPayload();
@@ -141,6 +143,7 @@ final class _JournalApplicationHostState extends State<JournalApplicationHost> {
           config: prepared.runtimeConfig,
           runtimeStarter: widget.runtimeOwner.start,
           applicationPlatform: prepared.applicationPlatform,
+          registry: _widgetRegistry,
         );
       }
       return widget.adapter.buildHost(context: context, child: home);

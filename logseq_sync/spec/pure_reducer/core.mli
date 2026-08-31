@@ -135,7 +135,15 @@ type effect_scope =
   }
 
 type effect_id
-type effect_error = Effect_failed of string
+
+type crypto_failure_kind =
+  | Invalid_key_material
+  | Crypto_provider_unavailable
+
+type effect_error =
+  | Effect_failed of string
+  | Crypto_failed of crypto_failure_kind * string
+
 type graph_key_handle
 type staged_artifact
 type catalog_cache
@@ -153,6 +161,7 @@ val staged_artifact
 
 val staged_artifact_path : staged_artifact -> string
 val staged_artifact_expected_rows : staged_artifact -> int
+val effect_scope_of_account : account_scope -> effect_scope
 val effect_scope_of_graph : graph_scope -> effect_scope
 
 val catalog_cache
@@ -182,6 +191,13 @@ type decryption_batch =
   }
 
 type decrypted_values = string list
+
+type outbox_state =
+  | Queued
+  | Submitted
+  | Accepted of int
+  | Blocked of string
+
 type outbox_record
 type local_batch_input
 type local_batch_plan
@@ -190,12 +206,19 @@ val decode_outbox_records : string list -> (outbox_record list, string) result
 val encode_outbox_records : outbox_record list -> (string list, string) result
 val outbox_record_mutation_id : outbox_record -> graph_id
 val outbox_record_fingerprint : outbox_record -> string
+val outbox_record_mutation_payload : outbox_record -> string
+val outbox_record_outliner_op : outbox_record -> string
+val outbox_record_state : outbox_record -> outbox_state
+val outbox_record_with_state : outbox_record -> outbox_state -> outbox_record
+val clear_outbox_transport : outbox_record -> outbox_state -> outbox_record
+val block_outbox_record : outbox_record -> string -> outbox_record
 
 (** Recompute the canonical entity checksum for a graph database. *)
 val recompute_checksum : Datascript.db -> string
 
 val local_batch_input
   :  scope:graph_scope
+  -> admission_id:string
   -> key:graph_key_handle option
   -> outbox_records:string list
   -> mutation_id:graph_id
@@ -240,7 +263,11 @@ type private_key_unlock =
 
 type _ runner_request =
   | Load_catalog : account_scope -> catalog_cache option runner_request
-  | Save_catalog : catalog_cache -> unit runner_request
+  | Save_catalog :
+      { account : account_scope
+      ; cache : catalog_cache
+      }
+      -> unit runner_request
   | Fetch_catalog : authenticated_account_scope -> graph list runner_request
   | Fetch_snapshot_baseline : authorized_graph_scope -> snapshot_baseline runner_request
   | Fetch_snapshot_metadata : authorized_graph_scope -> snapshot_metadata runner_request
@@ -322,10 +349,26 @@ type mirror_inspection =
   | Mirror_available of graph_open_request
   | Mirror_absent of graph_scope
 
-type local_batch_commit_request =
+type local_batch_failure_kind =
+  | Planning_failed
+  | Encryption_failed
+  | Encoding_failed
+  | Scope_closed
+  | Engine_unavailable
+  | Persistence_failed
+
+type local_batch_action =
+  | Commit of { outbox_records : string list }
+  | Reject of
+      { kind : local_batch_failure_kind
+      ; message : string
+      }
+
+type local_batch_completion_request =
   { operation_id : graph_id
-  ; outbox_records : string list
+  ; admission_id : string
   ; scope : graph_scope
+  ; action : local_batch_action
   }
 
 type authoritative_batch =
@@ -337,6 +380,7 @@ type authoritative_batch =
 
 type authoritative_context =
   { batch : authoritative_batch
+  ; precondition : string
   ; checkpoint : Logseq_db_types.Sync_checkpoint.t
   ; database : Datascript.db
   ; outbox_records : string list
@@ -345,13 +389,17 @@ type authoritative_context =
 type authoritative_plan
 
 val begin_authoritative_batch
-  :  authoritative_context
+  :  ?acknowledged_mutation_ids:graph_id list
+  -> authoritative_context
   -> (authoritative_plan, string) result
 
 val authoritative_crypto_request : authoritative_plan -> decryption_batch option
 
 type authoritative_commit_request =
-  { scope : graph_scope
+  { batch : authoritative_batch
+  ; precondition : string
+  ; scope : graph_scope
+  ; key : graph_key_handle option
   ; transactions : Datascript.tx_op list list
   ; projection_transactions : Datascript.tx_op list list
   ; checkpoint : Logseq_db_types.Sync_checkpoint.t
@@ -378,8 +426,9 @@ type worker_effect =
   | Activate_snapshot of snapshot_activation_request
   | Delete_mirror of mirror_deletion
   | Attach_graph of graph_open_request
-  | Detach_graph of { graph_generation : graph_generation }
-  | Commit_local_batch of local_batch_commit_request
+  | Detach_graph of graph_scope
+  | Reset_managed_account of account_scope
+  | Complete_local_batch of local_batch_completion_request
   | Inspect_authoritative_batch of authoritative_batch
   | Apply_authoritative_batch of authoritative_commit_request
   | Commit_outbox_transition of outbox_transition
@@ -460,6 +509,7 @@ type event =
   | Local_batch_committed of local_batch_commit
   | Authoritative_batch_inspected of authoritative_context
   | Authoritative_batch_applied of authoritative_commit_result
+  | Authoritative_batch_conflicted of authoritative_batch
   | Authoritative_batch_failed of scoped_error
   | Outbox_transition_committed of outbox_transition_commit
   | Outbox_transition_rejected of outbox_transition_rejection
@@ -479,6 +529,7 @@ type create_error = Invalid_create of string
 
 val initial : config -> (t, create_error) result
 val state : t -> state
+val admitted_graph_scope : t -> graph_scope option
 
 type transition =
   { next : t

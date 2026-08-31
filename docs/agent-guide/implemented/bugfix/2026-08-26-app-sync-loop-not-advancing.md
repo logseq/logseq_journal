@@ -172,6 +172,13 @@ contract existed. The complete hosted RunnerTests suite passes through the
 `bonsai-flutter` macOS execution context, and the unlocked-desktop visual check
 confirms the window activates and renders the current journal.
 
+A later run against the current Flutter macOS host exposed that
+`FlutterAppDelegate` no longer implements the Objective-C
+`applicationDidFinishLaunching:` selector. Calling that method through `super`
+therefore crashed with an unrecognized selector before activation completed. The
+override now performs only the application-owned activation, and a hosted
+RunnerTests regression invokes the real callback to prove it returns normally.
+
 ## Alternatives considered
 
 ### Release the WebSocket before authoritative catalog reconciliation

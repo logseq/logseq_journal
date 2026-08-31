@@ -15,5 +15,6 @@ val sliver
   -> top_inset:float
   -> device_pixel_ratio:float
   -> context:Context.t
+  -> on_error_info:Bonsai_flutter_ui.Event.Handler.t option
   -> on_account_menu:Bonsai_flutter_ui.Event.Handler.t option
   -> Bonsai_flutter_ui.Widget.Sliver.t

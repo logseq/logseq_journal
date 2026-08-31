@@ -29,6 +29,10 @@ module Color_exceptions = struct
 
   let destructive_swipe = { background = rgb 186 26 26; foreground = rgb 255 255 255 }
 
+  let transparent_swipe_action_background =
+    Ui.Style.Color.argb ~alpha:0 ~red:0 ~green:0 ~blue:0
+  ;;
+
   let status_rail_color ~presentation:_ = function
     | Journal_model.No_status -> None
     | status ->
@@ -128,6 +132,10 @@ type row_profile =
   ; day_header_extent : float
   ; content_leading : float
   ; time_slot_width : float
+  ; source_text_width : float
+  ; text_scale : float
+  ; entry_font_size : float
+  ; supporting_font_size : float
   }
 
 type fixed_extent_role =
@@ -136,6 +144,11 @@ type fixed_extent_role =
   | Day_heading
   | Day_continuation
   | Feed_continuation
+
+type text_measurement =
+  { visible_lines : int
+  ; did_overflow : bool
+  }
 
 type t = Color_exceptions.presentation
 
@@ -149,7 +162,7 @@ let typography = function
   | Dense ->
     { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
-    ; day_heading = text_token 13. 18. Ui.Style.Font_weight.Semi_bold
+    ; day_heading = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
     ; entry = text_token 15. 20. Ui.Style.Font_weight.Normal
     ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
@@ -161,7 +174,7 @@ let typography = function
   | Balanced ->
     { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
-    ; day_heading = text_token 13. 18. Ui.Style.Font_weight.Semi_bold
+    ; day_heading = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
     ; entry = text_token 16. 22. Ui.Style.Font_weight.Normal
     ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
@@ -173,7 +186,7 @@ let typography = function
   | Comfortable ->
     { header_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 16. 22. Ui.Style.Font_weight.Medium
-    ; day_heading = text_token 14. 20. Ui.Style.Font_weight.Semi_bold
+    ; day_heading = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     ; entry = text_token 17. 24. Ui.Style.Font_weight.Normal
     ; supporting = text_token 15. 22. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 14. 20. Ui.Style.Font_weight.Normal
@@ -218,6 +231,8 @@ let row_geometry =
   }
 ;;
 
+let supporting_preview_gap = spacing.x1
+
 let preview_geometry =
   { connector_leading = 32.
   ; bullet_center_leading = 50.
@@ -250,6 +265,21 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
        +. day_heading_line_height
        +. row_geometry.day_heading_after)
   in
+  let time_slot_width =
+    if (not narrow) && Float.compare scale 1.3 <= 0
+    then row_geometry.time_slot_base
+    else Float.ceil (row_geometry.time_slot_base *. scale)
+  in
+  let source_text_width =
+    Float.max
+      1.
+      (Float.min timeline_max_width viewport_width
+       -. content_leading
+       -. row_geometry.trailing_inset
+       -. time_slot_width
+       -. spacing.x2
+       -. row_geometry.disclosure_visual)
+  in
   if (not narrow) && Float.compare scale 1.3 <= 0
   then
     { kind = Compact
@@ -257,7 +287,11 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
     ; continuation_extent = Float.ceil (28. +. supporting_line_height)
     ; day_header_extent
     ; content_leading
-    ; time_slot_width = row_geometry.time_slot_base
+    ; time_slot_width
+    ; source_text_width
+    ; text_scale = scale
+    ; entry_font_size = typography.entry.font_size
+    ; supporting_font_size = typography.supporting.font_size
     }
   else
     { kind = Adaptive
@@ -265,17 +299,82 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
     ; continuation_extent = Float.ceil (28. +. supporting_line_height)
     ; day_header_extent
     ; content_leading
-    ; time_slot_width = Float.ceil (row_geometry.time_slot_base *. scale)
+    ; time_slot_width
+    ; source_text_width
+    ; text_scale = scale
+    ; entry_font_size = typography.entry.font_size
+    ; supporting_font_size = typography.supporting.font_size
     }
 ;;
 
 let block_extent ~profile ~visible_lines =
-  let visible_lines = Int.max 1 (Int.min 4 visible_lines) in
+  let visible_lines = Int.max 1 (Int.min 5 visible_lines) in
   Float.ceil
     (Float.max
        hit_regions.minimum_target
        ((2. *. row_geometry.entry_vertical_padding)
         +. (float_of_int visible_lines *. profile.block_line_height)))
+;;
+
+let scalar_em_width scalar =
+  if scalar = 0x0a || scalar = 0x0d
+  then 0.
+  else if scalar = 0x09 || scalar = 0x20
+  then 0.33
+  else if
+    (scalar >= 0x0300 && scalar <= 0x036f)
+    || (scalar >= 0x1ab0 && scalar <= 0x1aff)
+    || (scalar >= 0x1dc0 && scalar <= 0x1dff)
+    || (scalar >= 0x20d0 && scalar <= 0x20ff)
+    || (scalar >= 0xfe00 && scalar <= 0xfe0f)
+  then 0.
+  else if
+    (scalar >= 0x2e80 && scalar <= 0x9fff)
+    || (scalar >= 0xac00 && scalar <= 0xd7af)
+    || (scalar >= 0xf900 && scalar <= 0xfaff)
+    || (scalar >= 0x1f000 && scalar <= 0x1faff)
+  then 1.
+  else if scalar >= Char.code 'A' && scalar <= Char.code 'Z'
+  then 0.68
+  else if
+    (scalar >= Char.code 'a' && scalar <= Char.code 'z')
+    || (scalar >= Char.code '0' && scalar <= Char.code '9')
+  then 0.55
+  else if scalar < 0x80
+  then 0.4
+  else 0.65
+;;
+
+let measure_text ~profile ~font_size ~max_lines value =
+  let max_lines = Int.max 1 max_lines in
+  let available_em =
+    profile.source_text_width /. (Float.max 1. font_size *. profile.text_scale)
+    |> Float.max 0.5
+  in
+  let length = String.length value in
+  let rec loop offset lines occupied_em =
+    if lines > max_lines
+    then { visible_lines = max_lines; did_overflow = true }
+    else if offset >= length
+    then { visible_lines = lines; did_overflow = false }
+    else (
+      let decoded = String.get_utf_8_uchar value offset in
+      let valid = Uchar.utf_decode_is_valid decoded in
+      let scalar =
+        if valid then Uchar.to_int (Uchar.utf_decode_uchar decoded) else Char.code '?'
+      in
+      let next_offset = offset + if valid then Uchar.utf_decode_length decoded else 1 in
+      if scalar = 0x0a
+      then loop next_offset (lines + 1) 0.
+      else (
+        let width = scalar_em_width scalar in
+        if
+          Float.compare occupied_em 0. > 0
+          && Float.compare (occupied_em +. width) available_em > 0
+        then loop next_offset (lines + 1) width
+        else loop next_offset lines (occupied_em +. width)))
+  in
+  loop 0 1 0.
 ;;
 
 let fixed_extent ~profile = function
@@ -286,3 +385,7 @@ let fixed_extent ~profile = function
 
 let status_rail_color t status = Color_exceptions.status_rail_color ~presentation:t status
 let destructive_swipe_action t = Color_exceptions.destructive_swipe_action ~presentation:t
+
+let transparent_swipe_action_background _ =
+  Color_exceptions.transparent_swipe_action_background
+;;

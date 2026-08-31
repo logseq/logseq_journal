@@ -34,7 +34,6 @@ class AppDelegate: FlutterAppDelegate {
   private var terminationPending = false
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
-    super.applicationDidFinishLaunching(notification)
     JournalApplicationStartup.activate(
       JournalCocoaApplicationActivationTarget(application: NSApplication.shared)
     )

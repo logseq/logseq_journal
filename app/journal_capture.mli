@@ -18,6 +18,8 @@ val source : t -> string
 val task_state : t -> Journal_model.task_state
 val phase : t -> phase
 val can_save : t -> bool
+val update_source : t -> source:string -> t
+val toggle_task_intent : t -> t
 val apply_text_edit : t -> Ui.Event.Payload.text_edit -> t
 
 val admit_save

@@ -164,6 +164,14 @@ let graph_state ?(generation = 7) ?(phase = Logseq_db_worker.Graph_open) ?error 
   Logseq_db_worker.{ generation; graph_id = Some graph_id; phase; error }
 ;;
 
+let worker_error message =
+  Logseq_db_worker.Error.create
+    ~code:Logseq_db_worker.Error.Closed_session
+    ~message
+    ~details:[]
+  |> Result.get_ok
+;;
+
 let require_startup_phase expected snapshot graph message =
   let actual = Journal_startup.derive ~snapshot ~graph in
   require (actual.Journal_startup.phase = expected) "%s" message;
@@ -245,7 +253,7 @@ let test_stale_graph_generation_and_structured_failures () =
     require_startup_phase
       Journal_startup.Failed
       (startup_snapshot ())
-      (graph_state ~phase:Graph_failed ~error:"engine unavailable" ())
+      (graph_state ~phase:Graph_failed ~error:(worker_error "engine unavailable") ())
       "graph failure did not fail startup"
   in
   match state.error with

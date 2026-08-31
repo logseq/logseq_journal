@@ -1075,6 +1075,7 @@ let test_child_projection_retains_page_for_later_mutation () =
 
 let test_status_mutation_serializes_the_exact_projected_value () =
   let runtime = Journal_graph_runtime.create () in
+  set_utc_calendar runtime;
   let list_request =
     Journal_graph_runtime.submit
       runtime
@@ -1137,17 +1138,60 @@ let test_status_mutation_serializes_the_exact_projected_value () =
          ; task_state = Journal_model.task_state projected
          })
   in
-  match output.requests with
-  | [ { Protocol.command =
-          Mutate (Property (Set_property { value = Graph.Default_value exact_status; _ }))
-      ; _
-      }
-    ] ->
+  (match output.requests with
+   | [ { Protocol.command =
+           Mutate
+             (Property (Set_property { value = Graph.Default_value exact_status; _ }))
+       ; _
+       }
+     ] ->
+     require
+       (String.equal exact_status "In Review")
+       "exact In review status serialized as %S"
+       exact_status
+   | _ -> fail "exact status mutation did not emit Set_property");
+  let conflict_request =
+    Journal_graph_runtime.submit
+      runtime
+      (Journal_graph_request.Set_task_state
+         { mutation_id = "93000000-0000-4000-9000-000000000012"
+         ; block_id = Graph.Uuid.to_string root.uuid
+         ; expected_revision = 5
+         ; task_state = Journal_model.Done
+         })
+    |> fun output -> only output.requests
+  in
+  (match conflict_request.command with
+   | Read (Get_page_tree _) -> ()
+   | _ -> fail "stale status revision did not request authoritative reconciliation");
+  let latest =
+    { root with properties = [ status_property "logseq.property/status.doing" ] }
+  in
+  let conflict =
+    Journal_graph_runtime.receive
+      runtime
+      (succeeded
+         conflict_request
+         ~basis:7L
+         (Page_tree_result
+            { items = [ { Graph.block = latest; depth = 0 } ]; continuation = None }))
+  in
+  match conflict.responses with
+  | [ { Journal_graph_runtime.payload = Update_conflict latest; _ } ] ->
     require
-      (String.equal exact_status "In Review")
-      "exact In review status serialized as %S"
-      exact_status
-  | _ -> fail "exact status mutation did not emit Set_property"
+      (Journal_model.task_state latest = Journal_model.Doing
+       && Journal_model.revision latest = 7)
+      "status conflict did not return the latest authoritative block"
+  | [ { payload = Rejected (Projection_failure message); _ } ] ->
+    fail "status conflict projection failed: %s" message
+  | [ { payload = Rejected (Worker_failure failure); _ } ] ->
+    fail
+      "status conflict Worker request failed: %s"
+      (Logseq_db_worker.Error.message failure.failure.error)
+  | responses ->
+    fail
+      "status conflict produced %d responses instead of Update_conflict"
+      (List.length responses)
 ;;
 
 let test_stale_worker_response_cannot_update_runtime () =

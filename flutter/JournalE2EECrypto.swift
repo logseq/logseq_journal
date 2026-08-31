@@ -71,8 +71,10 @@ enum JournalE2EECrypto {
 
   private enum SecretStorage {
     case keychain
-#if DEBUG
+#if DEBUG && os(macOS)
     case testFileKeychain(SecKeychain)
+#endif
+#if DEBUG
     case testMemory
 #endif
   }
@@ -81,6 +83,8 @@ enum JournalE2EECrypto {
   private static let testMemorySecretsLock = NSLock()
   private static var testMemoryPrivateKeys: [String: Data] = [:]
   private static var testMemoryWrappedGraphKeys: [String: Data] = [:]
+#endif
+#if DEBUG && os(macOS)
   private static let testFileKeychainsLock = NSLock()
   private static var testFileKeychains: [String: SecKeychain] = [:]
 #endif
@@ -385,7 +389,7 @@ enum JournalE2EECrypto {
     guard configured == nil || testFileKeychainPath == nil else {
       throw JournalE2EECryptoError.invalidRequest
     }
-#if DEBUG
+#if DEBUG && os(macOS)
     if let path = testFileKeychainPath {
       return .testFileKeychain(try testFileKeychain(path: path))
     }
@@ -408,7 +412,7 @@ enum JournalE2EECrypto {
 #endif
   }
 
-#if DEBUG
+#if DEBUG && os(macOS)
   private static func testFileKeychain(path: String) throws -> SecKeychain {
     guard
       path.hasPrefix("/"),
@@ -449,10 +453,12 @@ enum JournalE2EECrypto {
     switch storage {
     case .keychain:
       break
-#if DEBUG
+#if DEBUG && os(macOS)
     case .testFileKeychain(let keychain):
       query.removeValue(forKey: kSecUseDataProtectionKeychain)
       query[kSecMatchSearchList] = [keychain]
+#endif
+#if DEBUG
     case .testMemory:
       throw JournalE2EECryptoError.invalidRequest
 #endif
@@ -466,10 +472,12 @@ enum JournalE2EECrypto {
     switch storage {
     case .keychain:
       break
-#if DEBUG
+#if DEBUG && os(macOS)
     case .testFileKeychain(let keychain):
       query.removeValue(forKey: kSecUseDataProtectionKeychain)
       query[kSecUseKeychain] = keychain
+#endif
+#if DEBUG
     case .testMemory:
       throw JournalE2EECryptoError.invalidRequest
 #endif
@@ -497,6 +505,8 @@ enum JournalE2EECrypto {
       defer { testMemorySecretsLock.unlock() }
       testMemoryPrivateKeys[identity.accountDigestHex] = key
       return
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       break
 #endif
@@ -538,6 +548,8 @@ enum JournalE2EECrypto {
       testMemorySecretsLock.lock()
       defer { testMemorySecretsLock.unlock() }
       return testMemoryPrivateKeys[identity.accountDigestHex]
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       break
 #endif
@@ -577,6 +589,8 @@ enum JournalE2EECrypto {
       defer { testMemorySecretsLock.unlock() }
       testMemoryWrappedGraphKeys[identity.graphDigestHex] = encoded
       return
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       break
 #endif
@@ -623,6 +637,8 @@ enum JournalE2EECrypto {
       defer { testMemorySecretsLock.unlock() }
       testMemoryWrappedGraphKeys.removeValue(forKey: identity.graphDigestHex)
       return
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       break
 #endif
@@ -677,6 +693,8 @@ enum JournalE2EECrypto {
       testMemorySecretsLock.lock()
       encoded = testMemoryWrappedGraphKeys[identity.graphDigestHex]
       testMemorySecretsLock.unlock()
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       encoded = try loadFromKeychain()
 #endif
@@ -724,6 +742,8 @@ enum JournalE2EECrypto {
         return decoded.identity.accountDigest != identity.accountDigest
       }
       testMemorySecretsLock.unlock()
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       try deleteWrappedFromKeychain(wrappedStorage)
 #endif
@@ -748,6 +768,8 @@ enum JournalE2EECrypto {
       testMemorySecretsLock.lock()
       testMemoryPrivateKeys.removeValue(forKey: identity.accountDigestHex)
       testMemorySecretsLock.unlock()
+#endif
+#if DEBUG && os(macOS)
     case .testFileKeychain:
       try deletePrivateFromKeychain(privateStorage)
 #endif
