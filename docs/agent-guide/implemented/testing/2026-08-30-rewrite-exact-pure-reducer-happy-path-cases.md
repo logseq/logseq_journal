@@ -163,6 +163,18 @@ Later work may add separate, reviewable traces for:
 Those traces must not be added to the first rewrite merely to increase constructor
 or matrix coverage.
 
+## Decision
+
+Replace `test_exact_pure_reducer_transition_cases` with the single sequential
+`test_pure_reducer_canonical_happy_path` trace defined above. The trace contains
+exactly `HP01` through `HP20`, derives asynchronous completions only from already
+checked instructions in the same trace, and uses static public-state and ordered-
+effect expectations with adjacent semantic rationales.
+
+Remove the obsolete checkpoint/event Cartesian product, its matrix-only fixtures,
+its scenario name, and its compatibility surface. Keep the existing focused pure-
+reducer tests for behavior outside this deliberately narrow happy path.
+
 ## Alternatives considered
 
 ### Retain the 1,020-row matrix and correct suspicious cells
@@ -240,6 +252,19 @@ checked steps preserves causality while retaining precise diagnostics.
 - Deferring stale and failure cases means the first rewrite is a canonical happy-path
   contract, not an exhaustive reducer specification; its name and documentation must
   not claim exhaustiveness.
+
+## Consequences
+
+- The suite now provides a reviewable causal contract for cold authentication,
+  existing-mirror attachment, opening pull, plaintext mutation submission,
+  acknowledgement, and authoritative confirmation.
+- Durable outbox reservation, acknowledgement ownership, and confirmation release
+  are checked in protocol order rather than inferred from unrelated fixtures.
+- Broad constructor-pair coverage is intentionally reduced; stale, failure,
+  lifecycle, restore, bootstrap, E2EE, and replacement behavior remains owned by
+  focused tests and may gain separate causal traces later.
+- The canonical trace fails at the first named `HPxx` state field or effect index and
+  checks immutable-origin replay at every step.
 
 ## Questions
 
