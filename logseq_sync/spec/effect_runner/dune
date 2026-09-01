@@ -4,8 +4,4 @@
  (modules effect_runner)
  (virtual_modules effect_runner)
  (default_implementation logseq_sync_effect_runner_impl)
- (libraries
-  eio
-  logseq_sync.pure_reducer
-  uri
-  x509))
+ (libraries eio logseq_sync.pure_reducer uri x509))

@@ -20,7 +20,7 @@ type managed_generated =
   ; expected_timeline_text : string
   }
 
-module Snapshot = Logseq_db_worker__Snapshot
+module Snapshot = Logseq_db_worker_engine.Snapshot
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 
 let uuid value =

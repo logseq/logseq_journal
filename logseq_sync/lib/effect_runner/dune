@@ -13,6 +13,7 @@
   http
   http_eio
   platform_crypto
+  tls_client_eio
   websocket_eio)
  (private_modules
   artifact_decoder
@@ -22,6 +23,7 @@
   http
   http_eio
   platform_crypto
+  tls_client_eio
   websocket_eio)
  (libraries
   bigstringaf

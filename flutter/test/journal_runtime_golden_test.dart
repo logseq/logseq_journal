@@ -21,6 +21,30 @@ const _parentSource = '混合脚本 Journal 2026 条目';
 const _firstChild = 'Increase block row height';
 const _secondChild = 'Show parent and child preview';
 const _thirdChild = 'Keep bounded virtualization';
+const _lightStatusActionBackgrounds = <Color>[
+  Color(0xff4b5e63),
+  Color(0xff585c7e),
+  Color(0xff00677c),
+  Color(0xff006b57),
+];
+const _lightStatusActionForegrounds = <Color>[
+  Colors.white,
+  Colors.white,
+  Colors.white,
+  Colors.white,
+];
+const _darkStatusActionBackgrounds = <Color>[
+  Color(0xffa7b8bc),
+  Color(0xffc0c4eb),
+  Color(0xff86d1e9),
+  Color(0xff83d6bd),
+];
+const _darkStatusActionForegrounds = <Color>[
+  Color(0xff1b3035),
+  Color(0xff2a2e50),
+  Color(0xff003642),
+  Color(0xff00382b),
+];
 
 final _runtimeBrightness =
     Platform.environment['JOURNAL_GOLDEN_BRIGHTNESS'] == 'dark'
@@ -875,6 +899,11 @@ void main() {
       await tester.drag(find.text(_parentSource), const Offset(390, 0));
       await _pumpSlidableMotion(tester);
       expect(parentController.ratio, closeTo(0.8, 0.01));
+      _expectQuickStatusActionColors(
+        tester,
+        parentSlidable,
+        brightness: _runtimeBrightness,
+      );
       for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
         expect(
           find.descendant(of: parentSlidable, matching: find.text(label)),
@@ -1228,6 +1257,81 @@ void main() {
     skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
     timeout: const Timeout(Duration(seconds: 60)),
   );
+
+  testWidgets(
+    'real runtime uses centered full-bleed swipe actions with status rail colors',
+    (tester) async {
+      final harness = await _RuntimeHarness.start(
+        tester,
+        brightness: _runtimeBrightness,
+        highContrast: _runtimeHighContrast,
+      );
+      final row = find.text(_parentSource);
+      final slidable = find.ancestor(
+        of: row,
+        matching: find.byType(fs.Slidable),
+      );
+      final controller = fs.Slidable.of(tester.element(row))!;
+
+      await tester.drag(row, const Offset(390, 0));
+      await _pumpSlidableMotion(tester);
+      expect(controller.ratio, closeTo(0.8, 0.01));
+      final statusActions = tester
+          .widgetList<fs.CustomSlidableAction>(
+            find.descendant(
+              of: slidable,
+              matching: find.byType(fs.CustomSlidableAction),
+            ),
+          )
+          .toList();
+      expect(statusActions, hasLength(4));
+      _expectQuickStatusActionColors(
+        tester,
+        slidable,
+        brightness: _runtimeBrightness,
+      );
+      for (final action in statusActions) {
+        expect(action.borderRadius, BorderRadius.zero);
+        expect(action.padding, isNull);
+        expect(action.alignment, isNull);
+      }
+      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
+        _expectActionContentCentered(tester, slidable, label);
+      }
+
+      await tester.tap(
+        find.descendant(of: slidable, matching: find.text('Doing')),
+      );
+      await harness.pumpUntil(
+        () => find
+            .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
+            .evaluate()
+            .isNotEmpty,
+        reason: 'Doing did not reconcile before Delete presentation coverage',
+      );
+      await _pumpSlidableMotion(tester);
+      expect(controller.ratio, closeTo(0, 0.01));
+
+      final deleteGesture = await tester.startGesture(tester.getCenter(row));
+      await deleteGesture.moveBy(
+        const Offset(-80, 0),
+        timeStamp: const Duration(milliseconds: 500),
+      );
+      await tester.pump();
+      _expectActionContentCentered(tester, slidable, 'Delete');
+      if (_writesReferenceGoldens) {
+        await expectLater(
+          find.byType(Scaffold).first,
+          matchesGoldenFile('goldens/journal-slidable-open.png'),
+        );
+      }
+      await deleteGesture.up(timeStamp: const Duration(milliseconds: 600));
+      await _pumpSlidableMotion(tester);
+      await harness.dispose();
+    },
+    skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
+    timeout: const Timeout(Duration(seconds: 60)),
+  );
 }
 
 Future<void> _dispatchScrollUpdate(
@@ -1551,6 +1655,50 @@ Rect _ancestorRectWithHeight(WidgetTester tester, Finder child, double height) {
   throw TestFailure('no $height-point row ancestor was found');
 }
 
+void _expectActionContentCentered(
+  WidgetTester tester,
+  Finder slidable,
+  String label,
+) {
+  final actionLabel = find.descendant(of: slidable, matching: find.text(label));
+  final action = find.ancestor(
+    of: actionLabel,
+    matching: find.byType(fs.CustomSlidableAction),
+  );
+  final content = find.descendant(of: action, matching: find.byType(Text));
+  expect(
+    content,
+    findsNWidgets(2),
+    reason: '$label action does not contain exactly one icon and one label',
+  );
+  final actionCenter = tester.getCenter(action);
+  final contentRect = _combinedRect(tester, content);
+  final contentCenter = contentRect.center;
+  expect(
+    contentCenter.dx,
+    closeTo(actionCenter.dx, 0.1),
+    reason: '$label content is not horizontally centered',
+  );
+  expect(
+    contentCenter.dy,
+    closeTo(actionCenter.dy, 0.1),
+    reason:
+        '$label content $contentRect is not vertically centered in the action at $actionCenter',
+  );
+}
+
+Rect _combinedRect(WidgetTester tester, Finder finder) {
+  final elements = finder.evaluate().toList();
+  if (elements.isEmpty) throw TestFailure('cannot combine an empty finder');
+  return elements
+      .map(
+        (element) => tester.getRect(
+          find.byElementPredicate((candidate) => identical(candidate, element)),
+        ),
+      )
+      .reduce((combined, rect) => combined.expandToInclude(rect));
+}
+
 List<Rect> _timelineDividers(
   WidgetTester tester, {
   required double devicePixelRatio,
@@ -1597,6 +1745,19 @@ void _expectSeedOwnedSemanticColors(
   final railColors = _statusRailColors(tester);
   expect(railColors, hasLength(4));
   expect(railColors.toSet(), hasLength(4));
+  final expectedBackgrounds = brightness == Brightness.light
+      ? _lightStatusActionBackgrounds
+      : _darkStatusActionBackgrounds;
+  expect(
+    railColors.toSet(),
+    <Color>{
+      expectedBackgrounds[1],
+      expectedBackgrounds[2],
+      expectedBackgrounds[3],
+      const Color(0xff7c3aed),
+    },
+    reason: 'status rails do not use the brightness-specific semantic colors',
+  );
   for (final color in railColors) {
     expect(_contrastRatio(color, scheme.surface), greaterThanOrEqualTo(3));
   }
@@ -1610,6 +1771,38 @@ void _expectSeedOwnedSemanticColors(
     expect(
       _contrastRatio(action.foregroundColor!, action.backgroundColor),
       greaterThanOrEqualTo(4.5),
+    );
+  }
+}
+
+void _expectQuickStatusActionColors(
+  WidgetTester tester,
+  Finder slidable, {
+  required Brightness brightness,
+}) {
+  final expectedBackgrounds = brightness == Brightness.light
+      ? _lightStatusActionBackgrounds
+      : _darkStatusActionBackgrounds;
+  final expectedForegrounds = brightness == Brightness.light
+      ? _lightStatusActionForegrounds
+      : _darkStatusActionForegrounds;
+  for (var index = 0; index < 4; index++) {
+    final label = const ['No status', 'Todo', 'Doing', 'Done'][index];
+    final action = tester.widget<fs.CustomSlidableAction>(
+      find.ancestor(
+        of: find.descendant(of: slidable, matching: find.text(label)),
+        matching: find.byType(fs.CustomSlidableAction),
+      ),
+    );
+    expect(
+      action.backgroundColor,
+      expectedBackgrounds[index],
+      reason: '$label background does not match $brightness',
+    );
+    expect(
+      action.foregroundColor,
+      expectedForegrounds[index],
+      reason: '$label foreground does not match $brightness',
     );
   }
 }

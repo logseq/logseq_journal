@@ -70,10 +70,10 @@ let for_block handler block_id =
 let delete_action_id = 1
 
 let quick_status_actions =
-  [ 2, Journal_model.No_status, "no-status", Material_icon_catalog.Circle_outlined
-  ; 3, Todo, "todo", Check_box_outline_blank
-  ; 4, Doing, "doing", Pending
-  ; 5, Done, "done", Check_circle
+  [ 2, Journal_model.No_status, "no-status", Material_icon_catalog.Remove_circle_outline
+  ; 3, Todo, "todo", Radio_button_unchecked
+  ; 4, Doing, "doing", Timelapse
+  ; 5, Done, "done", Check_circle_outline
   ]
 ;;
 
@@ -112,6 +112,15 @@ let delete_action_divider ~device_pixel_ratio ~edge block =
   |> Ui.Widget.sized_box ~height:thickness
 ;;
 
+let centered_action_feedback icon label =
+  Ui.Widget.Flex.column
+    [ Ui.Widget.empty () |> Ui.Widget.Flex.expanded
+    ; Ui.Widget.Flex.fixed icon
+    ; Ui.Widget.Flex.fixed label
+    ; Ui.Widget.empty () |> Ui.Widget.Flex.expanded
+    ]
+;;
+
 let delete_action ~tokens ~typography ~device_pixel_ratio ~enabled block =
   let colors = Tokens.destructive_swipe_action tokens in
   let label =
@@ -124,12 +133,11 @@ let delete_action ~tokens ~typography ~device_pixel_ratio ~enabled block =
          (Ui.Test_id.string ("journal-row-delete-label:" ^ Journal_model.id block))
   in
   let feedback =
-    Ui.Widget.column [ delete_feedback ~foreground:colors.foreground block; label ]
-    |> Ui.Widget.center
+    centered_action_feedback (delete_feedback ~foreground:colors.foreground block) label
   in
   let child =
     Ui.Widget.Stack.create
-      [ Ui.Widget.Stack.child feedback
+      [ Ui.Widget.Stack.positioned ~left:0. ~top:0. ~right:0. ~bottom:0. feedback
       ; Ui.Widget.Stack.positioned
           ~left:0.
           ~top:0.
@@ -172,6 +180,7 @@ let delete_action_pane ~tokens ~typography ~device_pixel_ratio ~enabled block =
 ;;
 
 let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _, icon) =
+  let colors = Tokens.status_swipe_action tokens task_state in
   let current = Journal_model.task_state block = task_state in
   let enabled = actions_enabled && not current in
   let status_name = Journal_model.status_name task_state in
@@ -199,7 +208,7 @@ let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _,
              ^ string_of_int id))
   in
   let icon =
-    Material_icon_catalog.create ~size:18. icon
+    Material_icon_catalog.create ~size:18. ~color:colors.foreground icon
     |> Ui.Widget.with_test_id
          (Ui.Test_id.string
             ("journal-row-status-action-icon:"
@@ -208,11 +217,7 @@ let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _,
              ^ string_of_int id))
   in
   let child =
-    Ui.Widget.Flex.row [ Ui.Widget.Flex.fixed icon; Ui.Widget.Flex.expanded label ]
-    |> Ui.Widget.center
-    |> Ui.Widget.constrained_box
-         ~constraints:(Ui.Layout.Box_constraints.create ~min_width:44. ~min_height:44. ())
-    |> Ui.Material.card ~elevation:(if current then 2. else 0.)
+    centered_action_feedback icon label
     |> Ui.Widget.semantics
          ~properties:
            (Ui.Semantics.create
@@ -232,10 +237,10 @@ let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _,
   Ui.Native_widget.Slidable.action
     ~id
     ~enabled
-    ~background:(Tokens.transparent_swipe_action_background tokens)
+    ~foreground:colors.foreground
+    ~background:colors.background
     ~auto_close:true
     ~border_radius:0.
-    ~padding:(Ui.Layout.Edge_insets.all 2.)
     ~child
     ()
 ;;

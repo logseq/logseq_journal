@@ -1,50 +1,73 @@
 module Ui = Bonsai_flutter_ui
 
-type destructive_swipe_action =
+type swipe_action_colors =
   { background : Ui.Style.Color.t
   ; foreground : Ui.Style.Color.t
   }
 
 module Color_exceptions = struct
   type presentation =
-    | Normal
-    | High_contrast
+    | Light
+    | Dark
 
-  type status_rails =
-    { todo : Ui.Style.Color.t
-    ; doing : Ui.Style.Color.t
-    ; done_ : Ui.Style.Color.t
-    ; later : Ui.Style.Color.t
+  type quick_status_palette =
+    { no_status : swipe_action_colors
+    ; todo : swipe_action_colors
+    ; doing : swipe_action_colors
+    ; done_ : swipe_action_colors
     }
 
   let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue
 
-  let status_rails =
-    { todo = rgb 100 116 139
-    ; doing = rgb 37 99 235
-    ; done_ = rgb 5 142 70
-    ; later = rgb 124 58 237
+  let light_quick_status =
+    { no_status = { background = rgb 75 94 99; foreground = rgb 255 255 255 }
+    ; todo = { background = rgb 88 92 126; foreground = rgb 255 255 255 }
+    ; doing = { background = rgb 0 103 124; foreground = rgb 255 255 255 }
+    ; done_ = { background = rgb 0 107 87; foreground = rgb 255 255 255 }
     }
   ;;
 
-  let destructive_swipe = { background = rgb 186 26 26; foreground = rgb 255 255 255 }
-
-  let transparent_swipe_action_background =
-    Ui.Style.Color.argb ~alpha:0 ~red:0 ~green:0 ~blue:0
+  let dark_quick_status =
+    { no_status = { background = rgb 167 184 188; foreground = rgb 27 48 53 }
+    ; todo = { background = rgb 192 196 235; foreground = rgb 42 46 80 }
+    ; doing = { background = rgb 134 209 233; foreground = rgb 0 54 66 }
+    ; done_ = { background = rgb 131 214 189; foreground = rgb 0 56 43 }
+    }
   ;;
 
-  let status_rail_color ~presentation:_ = function
+  let later_rail = rgb 124 58 237
+  let destructive_swipe = { background = rgb 186 26 26; foreground = rgb 255 255 255 }
+
+  let quick_status_palette = function
+    | Light -> light_quick_status
+    | Dark -> dark_quick_status
+  ;;
+
+  let status_rail_color ~presentation status =
+    let quick_status = quick_status_palette presentation in
+    match status with
     | Journal_model.No_status -> None
     | status ->
       (match Journal_model.status_category status with
        | None -> None
-       | Some Todo_category -> Some status_rails.todo
-       | Some Doing_category -> Some status_rails.doing
-       | Some Done_category -> Some status_rails.done_
-       | Some Later_category -> Some status_rails.later)
+       | Some Todo_category -> Some quick_status.todo.background
+       | Some Doing_category -> Some quick_status.doing.background
+       | Some Done_category -> Some quick_status.done_.background
+       | Some Later_category -> Some later_rail)
   ;;
 
   let destructive_swipe_action ~presentation:_ = destructive_swipe
+
+  let status_swipe_action ~presentation =
+    let palette = quick_status_palette presentation in
+    function
+    | Journal_model.No_status -> palette.no_status
+    | Todo -> palette.todo
+    | Doing -> palette.doing
+    | Done -> palette.done_
+    | In_review | Now | Canceled | Backlog | Waiting | Later ->
+      invalid_arg "status_swipe_action only accepts quick task statuses"
+  ;;
 end
 
 type text_token =
@@ -152,8 +175,10 @@ type text_measurement =
 
 type t = Color_exceptions.presentation
 
-let resolve ~high_contrast =
-  if high_contrast then Color_exceptions.High_contrast else Color_exceptions.Normal
+let resolve ~brightness ~high_contrast:_ =
+  match brightness with
+  | Bonsai_flutter.Environment.Light -> Color_exceptions.Light
+  | Bonsai_flutter.Environment.Dark -> Color_exceptions.Dark
 ;;
 
 let text_token font_size line_height weight = { font_size; line_height; weight }
@@ -386,6 +411,6 @@ let fixed_extent ~profile = function
 let status_rail_color t status = Color_exceptions.status_rail_color ~presentation:t status
 let destructive_swipe_action t = Color_exceptions.destructive_swipe_action ~presentation:t
 
-let transparent_swipe_action_background _ =
-  Color_exceptions.transparent_swipe_action_background
+let status_swipe_action t status =
+  Color_exceptions.status_swipe_action ~presentation:t status
 ;;

@@ -1,6 +1,8 @@
 module Ui = Bonsai_flutter_ui
 module Tokens = Journal_visual_tokens
 
+let sync_progress_height = 2.
+
 module Context = struct
   type t =
     { title : string
@@ -55,12 +57,24 @@ let extents ~typography ~text_scale ~divider_height =
   toolbar_height, collapsed_height, expanded_height, subtitle_height
 ;;
 
+let sync_progress_visible = function
+  | Some Logseq_sync_pure_reducer.Core.Connecting -> true
+  | None
+  | Some Offline
+  | Some Pulling
+  | Some Submitting
+  | Some Current
+  | Some Paused
+  | Some Failed -> false
+;;
+
 let sliver
       ~typography
       ~text_scale
       ~top_inset
       ~device_pixel_ratio
       ~context
+      ~sync_phase
       ~on_error_info
       ~on_account_menu
   =
@@ -92,21 +106,34 @@ let sliver
     |> Ui.Widget.center
     |> Ui.Widget.sized_box ~height:subtitle_height
   in
+  let sync_progress =
+    if sync_progress_visible sync_phase
+    then
+      [ Ui.Material.linear_progress_indicator ()
+        |> test_id "journal-header-sync-progress"
+        |> Ui.Widget.sized_box ~height:sync_progress_height
+        |> test_id "journal-header-sync-progress-extent"
+        |> Ui.Widget.Stack.positioned ~left:0. ~right:0. ~bottom:thickness
+      ]
+    else []
+  in
   let flexible_space =
     Ui.Widget.Stack.create
-      [ Ui.Widget.Stack.positioned
-          ~left:0.
-          ~top:(top_inset +. toolbar_height)
-          ~right:0.
-          subtitle
-      ; Ui.Widget.Stack.positioned
-          ~left:0.
-          ~right:0.
-          ~bottom:0.
-          (Ui.Material.divider ~thickness ()
-           |> test_id "journal-header-divider"
-           |> Ui.Widget.sized_box ~height:thickness)
-      ]
+      ([ Ui.Widget.Stack.positioned
+           ~left:0.
+           ~top:(top_inset +. toolbar_height)
+           ~right:0.
+           subtitle
+       ]
+       @ sync_progress
+       @ [ Ui.Widget.Stack.positioned
+             ~left:0.
+             ~right:0.
+             ~bottom:0.
+             (Ui.Material.divider ~thickness ()
+              |> test_id "journal-header-divider"
+              |> Ui.Widget.sized_box ~height:thickness)
+         ])
     |> test_id "journal-header-flexible-space"
   in
   let account =

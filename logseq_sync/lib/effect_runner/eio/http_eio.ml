@@ -4,56 +4,26 @@ type response =
   ; body : string
   }
 
-let rng_initialized = Atomic.make false
-
-let initialize_rng () =
-  if Atomic.compare_and_set rng_initialized false true
-  then Mirage_crypto_rng_unix.use_default ()
-;;
-
 let bind result f =
   match result with
   | Ok value -> f value
   | Error _ as error -> error
 ;;
 
-let host_name host =
-  bind (Domain_name.of_string host) (fun domain ->
-    match Domain_name.host domain with
-    | Ok host -> Ok host
-    | Error _ -> Error (`Msg "HTTPS host is not a valid DNS name"))
-;;
-
-let tls_config authenticator host =
-  bind (host_name host) (fun peer_name ->
-    Tls.Config.client ~authenticator ~peer_name ~alpn_protocols:[ "http/1.1" ] ())
-;;
-
-let first_address ~network ~host ~port =
-  match Eio.Net.getaddrinfo_stream ~service:(string_of_int port) network host with
-  | address :: _ -> Ok address
-  | [] -> Error "sync host has no network address"
-;;
-
 let port uri = Option.value (Uri.port uri) ~default:443
+
+let connection_error = function
+  | Tls_client_eio.Invalid_dns_host -> "HTTPS host is not a valid DNS name"
+  | No_network_address -> "sync host has no network address"
+  | Setup_failed message -> message
+;;
 
 let open_flow ~sw ~authenticator ~network uri =
   match Uri.host uri with
   | None -> Error "HTTPS request host is missing"
   | Some host ->
-    (match tls_config authenticator host with
-     | Error (`Msg message) -> Error message
-     | Ok config ->
-       bind
-         (first_address ~network ~host ~port:(port uri))
-         (fun address ->
-            try
-              let socket = Eio.Net.connect ~sw network address in
-              let peer_name = host_name host |> Result.get_ok in
-              Ok (Tls_eio.client_of_flow config ~host:peer_name socket)
-            with
-            | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-            | exception_ -> Error (Printexc.to_string exception_)))
+    Tls_client_eio.connect ~sw ~authenticator ~network ~host ~port:(port uri)
+    |> Result.map_error connection_error
 ;;
 
 let request_headers uri headers =
@@ -266,7 +236,7 @@ let location headers =
 ;;
 
 let perform ~sw ~authenticator ~network ~clock request =
-  initialize_rng ();
+  Tls_client_eio.initialize_rng ();
   let rec follow remaining request =
     match request_once ~sw ~authenticator ~network request with
     | Error _ as error -> error
@@ -305,7 +275,7 @@ let download
       ~maximum_bytes
       ~on_progress
   =
-  initialize_rng ();
+  Tls_client_eio.initialize_rng ();
   if maximum_bytes <= 0
   then Error "snapshot artifact bound must be positive"
   else (

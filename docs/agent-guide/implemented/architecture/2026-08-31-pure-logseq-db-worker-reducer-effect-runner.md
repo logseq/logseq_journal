@@ -465,6 +465,23 @@ cutover must replace the old coordinator atomically:
 Do not ship a runtime flag, fallback coordinator, mirrored state, compatibility
 module, or migration layer.
 
+## Decision
+
+Adopt `Logseq_db_worker_pure_reducer.Core` as the single immutable worker policy
+boundary and `Logseq_db_worker_effect_runner.Effect_runner` as the Eio runtime
+interpreter. The reducer owns graph lifecycle, request admission, scoped ticket
+consumption, managed-sync composition, terminal replies, invalidations, and
+shutdown for every worker target. The runner owns Engine and mirror resources,
+prepared managed mutations, sync-runner delegation, host waiters, asynchronous
+execution, and completion posting.
+
+Install `logseq_db_worker.contract`, `logseq_db_worker.engine`,
+`logseq_db_worker.pure_reducer`, and `logseq_db_worker.effect_runner` as a
+one-way physical dependency graph. Keep `Logseq_db_worker` as the thin mailbox
+driver and canonical facade. Keep the Bonsai service as a host adapter only.
+Remove the mutable `Graph_lifecycle`, `Managed_coordinator`, and `Graph_bound`
+implementations without a compatibility path or runtime fallback.
+
 ## Alternatives considered
 
 ### Extract `Managed_coordinator` into another effectful module

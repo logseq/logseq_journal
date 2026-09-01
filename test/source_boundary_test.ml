@@ -407,7 +407,7 @@ let test_logseq_sync_package_boundary root =
     ];
   forbid_text
     root
-    "logseq_db_worker/lib/protocol.mli"
+    "logseq_db_worker/contract/protocol.mli"
     [ "and mutation ="
     ; "and structural_mutation ="
     ; "and page_mutation ="
@@ -528,11 +528,12 @@ let test_injected_logseq_sync_api_boundary root =
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "module Core = Logseq_sync_pure_reducer.Core"
-    ; "module Effect_runner = Logseq_sync_effect_runner.Effect_runner"
-    ; "let transition = Core.step t.core event"
-    ; "Effect_runner.submit t.runner instruction"
-    ; "~post:(Eio.Stream.add events)"
+    [ "module Pure = Logseq_db_worker_pure_reducer.Core"
+    ; "module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner"
+    ; "module Sync_runner = Logseq_sync_effect_runner.Effect_runner"
+    ; "Db.create"
+    ; "Db.post"
+    ; "Db.request"
     ];
   forbid_text
     root
@@ -696,12 +697,9 @@ let test_worker_owned_managed_sync_orchestration root =
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "module Managed_coordinator"
-    ; "Managed_coordinator.handle"
-    ; "Core.step"
-    ; "Effect_runner.submit"
-    ; "Engine.open_"
-    ; "Engine.close"
+    [ "Logseq_db_worker_pure_reducer.Core"
+    ; "Logseq_db_worker_effect_runner.Effect_runner"
+    ; "Sync_runner.create"
     ];
   forbid_text
     root
@@ -728,10 +726,10 @@ let test_worker_owned_managed_sync_orchestration root =
     ];
   require_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lib/effect_runner/effect_runner.ml"
     [ "Mutation.identify mutation"
     ; "Mutation.identity_fingerprint identity"
-    ; "Engine.prepare_managed_mutation engine ~identity mutation"
+    ; "Engine.prepare_managed_mutation"
     ];
   forbid_text
     root
@@ -747,8 +745,8 @@ let test_worker_owned_managed_sync_orchestration root =
     ];
   require_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "graph_generation"; "lifecycle_generation" ]
+    "logseq_db_worker/lib/pure_reducer/core.ml"
+    [ "generation : int"; "lifecycle_generation" ]
 ;;
 
 let test_logseq_sync_install_manifest filename =
@@ -894,7 +892,6 @@ let test_startup_phase_ownership root =
     ; "| Graph_closing"
     ; "| Graph_failed"
     ; "type graph_state ="
-    ; "module Graph_lifecycle"
     ];
   require_text
     root
@@ -1409,7 +1406,6 @@ let () =
     [ "logseq_db_worker_runtime_flow_test.dart" ];
   require_occurrences root "app/application.ml" "Ui.Style.Color.rgb" 1;
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
-  require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.argb" 1;
   forbid_text root "app/application.ml" [ "let color"; "(color " ];
   List.iter
     (fun relative ->
@@ -1777,9 +1773,63 @@ let () =
     "logseq_sync/lib/effect_runner/eio/http_eio.ml"
     [ "let start_connection"; "HTTP parser did not consume network input" ];
   require_text root "logseq_sync/lib/effect_runner/dune" [ "httpun-eio" ];
+  List.iter
+    (require_file root)
+    [ "logseq_sync/lib/effect_runner/eio/tls_client_eio.ml"
+    ; "logseq_sync/lib/effect_runner/eio/tls_client_eio.mli"
+    ];
+  require_occurrences root "logseq_sync/lib/effect_runner/dune" "tls_client_eio" 2;
   require_text
     root
-    "logseq_db_worker/lib/error.ml"
+    "logseq_sync/lib/effect_runner/eio/tls_client_eio.ml"
+    [ "Mirage_crypto_rng_unix.use_default"
+    ; "Domain_name.of_string"
+    ; "Domain_name.host"
+    ; "Tls.Config.client"
+    ; "~alpn_protocols:[ \"http/1.1\" ]"
+    ; "Eio.Net.getaddrinfo_stream"
+    ; "Eio.Net.connect"
+    ; "Tls_eio.client_of_flow"
+    ; "Eio.Cancel.Cancelled"
+    ];
+  List.iter
+    (fun relative ->
+       require_text
+         root
+         relative
+         [ "Tls_client_eio.initialize_rng ()"; "Tls_client_eio.connect" ];
+       forbid_text
+         root
+         relative
+         [ "Mirage_crypto_rng_unix.use_default"
+         ; "Atomic.make"
+         ; "Domain_name.of_string"
+         ; "Domain_name.host"
+         ; "Tls.Config.client"
+         ; "Eio.Net.getaddrinfo_stream"
+         ; "Eio.Net.connect"
+         ; "Tls_eio.client_of_flow"
+         ])
+    [ "logseq_sync/lib/effect_runner/eio/http_eio.ml"
+    ; "logseq_sync/lib/effect_runner/eio/websocket_eio.ml"
+    ];
+  require_text
+    root
+    "logseq_sync/lib/effect_runner/eio/http_eio.ml"
+    [ "HTTPS request host is missing"
+    ; "HTTPS host is not a valid DNS name"
+    ; "sync host has no network address"
+    ];
+  require_text
+    root
+    "logseq_sync/lib/effect_runner/eio/websocket_eio.ml"
+    [ "WebSocket URL must be WSS without credentials or fragments"
+    ; "WSS host is not a valid DNS name"
+    ; "WSS host has no network address"
+    ];
+  require_text
+    root
+    "logseq_db_worker/contract/error.ml"
     [ "Ownership_recovery"; "ownershipRecovery" ];
   require_text
     root
@@ -1866,6 +1916,56 @@ let () =
     ; "journal-diagnostics-export"
     ];
   forbid_text root "app/application.mli" [ "sync_diagnostic"; "Sync_diagnostic" ];
+  List.iter
+    (require_file root)
+    [ "logseq_db_worker/spec/pure_reducer/core.mli"
+    ; "logseq_db_worker/spec/pure_reducer/dune"
+    ; "logseq_db_worker/spec/effect_runner/effect_runner.mli"
+    ; "logseq_db_worker/spec/effect_runner/dune"
+    ; "logseq_db_worker/lib/pure_reducer/core.ml"
+    ; "logseq_db_worker/lib/pure_reducer/dune"
+    ; "logseq_db_worker/lib/effect_runner/effect_runner.ml"
+    ; "logseq_db_worker/lib/effect_runner/dune"
+    ];
+  List.iter
+    (forbid_path root)
+    [ "logseq_db_worker/spec/pure_reducer/core.ml"
+    ; "logseq_db_worker/spec/effect_runner/effect_runner.ml"
+    ];
+  require_text
+    root
+    "logseq_db_worker/spec/pure_reducer/dune"
+    [ "(public_name logseq_db_worker.pure_reducer)"
+    ; "(virtual_modules core)"
+    ; "(default_implementation logseq_db_worker_pure_reducer_impl)"
+    ];
+  require_text
+    root
+    "logseq_db_worker/spec/effect_runner/dune"
+    [ "(public_name logseq_db_worker.effect_runner)"
+    ; "(virtual_modules effect_runner)"
+    ; "(default_implementation logseq_db_worker_effect_runner_impl)"
+    ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/pure_reducer/core.ml"
+    [ "Eio."; "Unix."; "Sqlite3."; "Engine."; "Hashtbl"; "mutable"; "Effect.perform" ];
+  forbid_text
+    root
+    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "module Managed_coordinator"
+    ; "Graph_bound"
+    ; "Engine.open_"
+    ; "Engine.execute"
+    ; "Engine.close"
+    ; "Core.step"
+    ; "pending_mutations"
+    ; "Graph_lifecycle"
+    ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/logseq_db_worker.ml"
+    [ "Engine."; "Synced_mirror."; "Worker.Session_context"; "Logseq_sync_effect_runner" ];
   require_text
     root
     "app/application.ml"
@@ -1878,7 +1978,7 @@ let () =
     ];
   require_text
     root
-    "logseq_db_worker/lib/error.mli"
+    "logseq_db_worker/contract/error.mli"
     [ "type cause"
     ; "type causal_trace"
     ; "val trace"

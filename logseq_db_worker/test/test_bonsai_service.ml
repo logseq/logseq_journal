@@ -130,44 +130,6 @@ let open_failure_stays_in_protocol () =
       | _ -> T.fail "Expected graph-open error was not Protocol.Failed Open"))
 ;;
 
-let graph_lifecycle_is_generation_fenced () =
-  let module Lifecycle = Logseq_db_worker.Graph_lifecycle in
-  let graph_id =
-    Logseq_db_types.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000000001"
-    |> Result.get_ok
-  in
-  let lifecycle = Lifecycle.create () in
-  let error message =
-    Logseq_db_worker.Error.create
-      ~code:Logseq_db_worker.Error.Closed_session
-      ~message
-      ~details:[]
-    |> Result.get_ok
-  in
-  let require_phase expected message =
-    T.require ((Lifecycle.state lifecycle).phase = expected) "%s" message
-  in
-  require_phase Logseq_db_worker.Graph_closed "graph did not start closed";
-  Lifecycle.begin_open lifecycle ~generation:1 ~graph_id:(Some graph_id);
-  require_phase Graph_opening "graph did not enter opening";
-  Lifecycle.opened lifecycle ~generation:1;
-  require_phase Graph_open "graph did not enter open";
-  Lifecycle.failed lifecycle ~generation:0 ~error:(error "stale failure");
-  require_phase Graph_open "stale generation changed graph state";
-  Lifecycle.begin_close lifecycle ~generation:1;
-  require_phase Graph_closing "graph did not enter closing";
-  Lifecycle.closed lifecycle ~generation:1;
-  require_phase Graph_closed "graph did not close";
-  Lifecycle.begin_open lifecycle ~generation:2 ~graph_id:(Some graph_id);
-  require_phase Graph_opening "graph switch did not reopen";
-  Lifecycle.failed lifecycle ~generation:2 ~error:(error "open failed");
-  let failed = Lifecycle.state lifecycle in
-  require_phase Graph_failed "graph failure was not published";
-  T.require
-    (Option.map Logseq_db_worker.Error.message failed.error = Some "open failed")
-    "graph failure detail was discarded"
-;;
-
 let await_graph_state client =
   let request_id = Worker.send client Service.Get_graph_state |> accepted in
   let rec loop () =
@@ -263,17 +225,21 @@ let sole_public_sync_composition () =
   T.require
     (contains "Logseq_sync_effect_runner.Effect_runner")
     "Service does not use the public effect runner";
-  T.require (contains "Core.initial") "Service does not create the pure sync core";
-  T.require (contains "module Managed_coordinator") "Service has no managed coordinator";
   T.require
-    (contains "Managed_coordinator.handle")
-    "Managed events bypass the coordinator";
-  T.require (contains "Core.step") "Worker does not drive the sync reducer";
+    (contains "Logseq_db_worker_pure_reducer.Core")
+    "Service does not use the worker pure reducer contract";
   T.require
-    (contains "Effect_runner.submit")
-    "Worker does not submit runner-owned effects";
-  T.require (not (contains "Core.graph_backend")) "Sync still receives an Engine backend";
-  T.require (not (contains "Core.mutate")) "Sync still owns the managed mutation path"
+    (contains "Logseq_db_worker_effect_runner.Effect_runner")
+    "Service does not use the worker effect runner contract";
+  T.require (contains "Db.create") "Service does not create the thin worker driver";
+  T.require (contains "Db.post") "Service does not post commands to the worker mailbox";
+  T.require (contains "Db.request") "Graph requests bypass the thin worker driver";
+  T.require
+    (not (contains "module Managed_coordinator"))
+    "Service retains the old coordinator";
+  T.require (not (contains "Core.step")) "Service drives a reducer directly";
+  T.require (not (contains "Engine.open_")) "Service opens Engine resources directly";
+  T.require (not (contains "Engine.execute")) "Service executes Engine requests directly"
 ;;
 
 let () =
@@ -283,7 +249,6 @@ let () =
         "Control-plane lane preserves Graph execution"
         control_plane_lane_preserves_graph_execution
     ; T.case "Open failure remains protocol state" open_failure_stays_in_protocol
-    ; T.case "Graph lifecycle is generation fenced" graph_lifecycle_is_generation_fenced
     ; T.case "Service publishes initial graph state" service_publishes_initial_graph_state
     ; T.case
         "Client commands do not return state snapshots"

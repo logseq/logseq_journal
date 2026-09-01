@@ -941,6 +941,7 @@ let timeline_page
       ~loading
       ~graph_error
       ~sync_error
+      ~sync_phase
       ~today_subtitle
       ~day_label
       ~reduced_motion
@@ -972,6 +973,7 @@ let timeline_page
       ~top_inset
       ~device_pixel_ratio
       ~context:(Journal_header.Context.today ~subtitle:today_subtitle)
+      ~sync_phase
       ~on_error_info:(if error_info_available then Some on_error_info else None)
       ~on_account_menu:(if account_menu_available then Some on_account_menu else None)
   in
@@ -1027,9 +1029,7 @@ let timeline_page
             ~visibility:Always
             ~style:(if capture_task_selected then Filled else Plain)
             ~enabled:capture_enabled
-            (if capture_task_selected
-             then Material_icon_catalog.Task_alt
-             else Check_box_outline_blank)
+            Material_icon_catalog.Timelapse
         ; capture_button
             ~id:1
             ~test_id:"journal-capture-composer-submit"
@@ -3678,7 +3678,11 @@ let component client handlers graph =
       Option.value state.typography_preset ~default:Journal_visual_tokens.Balanced
     in
     let typography = Journal_visual_tokens.typography preset in
-    let tokens = Journal_visual_tokens.resolve ~high_contrast:environment.high_contrast in
+    let tokens =
+      Journal_visual_tokens.resolve
+        ~brightness:environment.brightness
+        ~high_contrast:environment.high_contrast
+    in
     let profile =
       Journal_visual_tokens.select_row_profile
         ~preset
@@ -3725,6 +3729,11 @@ let component client handlers graph =
           ~loading:(not state.feed_loaded)
           ~graph_error:(Option.map graph_error_message state.graph_error)
           ~sync_error
+          ~sync_phase:
+            (Option.map
+               (fun (manager : Logseq_sync_pure_reducer.Core.snapshot) ->
+                  manager.sync_phase)
+               state.manager)
           ~today_subtitle:(today_label state)
           ~day_label:(label_for_day state)
           ~reduced_motion

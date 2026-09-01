@@ -1,0 +1,10 @@
+(library
+ (name logseq_db_worker_pure_reducer)
+ (public_name logseq_db_worker.pure_reducer)
+ (modules core)
+ (virtual_modules core)
+ (default_implementation logseq_db_worker_pure_reducer_impl)
+ (libraries
+  logseq_db_worker.contract
+  logseq_db_types
+  logseq_sync.pure_reducer))

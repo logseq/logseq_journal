@@ -142,7 +142,9 @@ let create_handle
       ?(high_contrast = false)
       item
   =
-  let tokens = Tokens.resolve ~high_contrast in
+  let tokens =
+    Tokens.resolve ~brightness:Bonsai_flutter.Environment.Light ~high_contrast
+  in
   let profile =
     Tokens.select_row_profile
       ~preset:Tokens.Balanced
@@ -663,17 +665,17 @@ let _test_conditional_task_leading_slot_and_todo_icon () =
 
 let test_four_status_rails_replace_timeline_task_controls () =
   let cases =
-    [ "logseq.property/status.todo", "Todo"
-    ; "logseq.property/status.doing", "Doing"
-    ; "logseq.property/status.done", "Done"
-    ; "logseq.property/status.backlog", "Backlog"
+    [ "logseq.property/status.todo", "Todo", 0xff585c7el
+    ; "logseq.property/status.doing", "Doing", 0xff00677cl
+    ; "logseq.property/status.done", "Done", 0xff006b57l
+    ; "logseq.property/status.backlog", "Backlog", 0xff7c3aedl
     ]
   in
   List.iter
     (fun high_contrast ->
        let colors = ref [] in
        List.iter
-         (fun (ident, status_name) ->
+         (fun (ident, status_name, expected_background) ->
             let block = projected_block ~status_ident:ident () in
             let item = Journal_row.Item.of_block block in
             let handle, _profile = create_handle ~high_contrast item in
@@ -691,6 +693,13 @@ let test_four_status_rails_replace_timeline_task_controls () =
                   in
                   match view.node with
                   | Ui.Widget.Private.Decorated_box { background = Some color; _ } ->
+                    let actual = color in
+                    require
+                      (Int32.equal actual expected_background)
+                      "%s rail background is %lx, expected %lx"
+                      status_name
+                      actual
+                      expected_background;
                     colors := color :: !colors
                   | _ -> assert false);
                  require_sized_width
@@ -884,7 +893,7 @@ let test_line_count_drives_exact_scaled_row_extent () =
   check ~scale:3.2 [ 153.; 224.; 224.; 224. ]
 ;;
 
-let header_component handlers _graph =
+let header_component sync_phase handlers _graph =
   let on_account_menu =
     Bonsai_flutter.Driver.Handler.create
       handlers
@@ -902,6 +911,7 @@ let header_component handlers _graph =
           ~top_inset:0.
           ~device_pixel_ratio:3.
           ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9")
+          ~sync_phase
           ~on_error_info:None
           ~on_account_menu:(Some on_account_menu)
       ]
@@ -915,7 +925,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
     Test.Handle.create
       ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_002L)
       ~time_source
-      header_component
+      (header_component None)
   in
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
@@ -964,6 +974,93 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
          require (props.focusable <> Some true) "view-only date is keyboard focusable";
          require (props.actions = []) "view-only date exposes an activation action";
          require (props.sort_key = Some 2.) "date semantic order changed"))
+;;
+
+let test_header_sync_progress_tracks_every_sync_phase () =
+  let render sync_phase =
+    let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
+    let handle =
+      Test.Handle.create
+        ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_003L)
+        ~time_source
+        (header_component sync_phase)
+    in
+    Test.Handle.present handle;
+    handle
+  in
+  let progress_id = "journal-header-sync-progress" in
+  let progress_extent_id = "journal-header-sync-progress-extent" in
+  List.iter
+    (fun phase ->
+       let handle = render (Some phase) in
+       Fun.protect
+         ~finally:(fun () -> Test.Handle.shutdown handle)
+         (fun () ->
+            let progress = node handle progress_id in
+            let (Av progress_view) = Ui.Widget.Private.view progress.widget in
+            (match progress_view.node with
+             | Ui.Widget.Private.Material_linear_progress_indicator { value = None } -> ()
+             | Material_linear_progress_indicator { value = Some value } ->
+               fail "sync progress is determinate at %.3f" value
+             | _ -> fail "sync progress is not a Material linear progress indicator");
+            let progress_extent =
+              match Test.Handle.find handle (Test.Query.test_id progress_extent_id) with
+              | Some extent -> extent
+              | None -> fail "sync progress does not expose its exact visual thickness"
+            in
+            let (Av extent_view) = Ui.Widget.Private.view progress_extent.widget in
+            (match extent_view.node with
+             | Ui.Widget.Private.Sized_box { height = Some height; _ } ->
+               require
+                 (Float.equal height 2.)
+                 "sync progress thickness is %.1f instead of 2.0"
+                 height
+             | _ -> fail "sync progress thickness is not constrained by a SizedBox");
+            let flexible_space = node handle "journal-header-flexible-space" in
+            let (Av flexible_view) = Ui.Widget.Private.view flexible_space.widget in
+            let progress_child =
+              Array.find_opt
+                (fun (child : Ui.Widget.Private.child) ->
+                   Ui.Widget.For_testing.test_id child.widget
+                   = Some (Ui.Test_id.string progress_extent_id))
+                flexible_view.children
+            in
+            match progress_child with
+            | Some
+                { parent_data =
+                    Ui.Widget.Private.Stack_position
+                      { left = Some left
+                      ; top = None
+                      ; right = Some right
+                      ; bottom = Some bottom
+                      }
+                ; _
+                } ->
+              require
+                (Float.equal left 0.
+                 && Float.equal right 0.
+                 && Float.equal bottom (1. /. 3.))
+                "sync progress is not pinned across the header above its divider"
+            | None | Some _ ->
+              fail "sync progress does not occupy the expected header stack position"))
+    [ Logseq_sync_pure_reducer.Core.Connecting ];
+  List.iter
+    (fun sync_phase ->
+       let handle = render sync_phase in
+       Fun.protect
+         ~finally:(fun () -> Test.Handle.shutdown handle)
+         (fun () ->
+            require
+              (Option.is_none (Test.Handle.find handle (Test.Query.test_id progress_id)))
+              "inactive sync phase displayed the header progress indicator"))
+    [ None
+    ; Some Logseq_sync_pure_reducer.Core.Offline
+    ; Some Pulling
+    ; Some Submitting
+    ; Some Current
+    ; Some Paused
+    ; Some Failed
+    ]
 ;;
 
 let require_row_shape width scale expected_kind expected_extent expected_time_width =
@@ -1141,7 +1238,10 @@ let delete_timeline_component ~delete_enabled handlers _graph =
     Ui.Widget.Scroll_view.vertical
       ~on_scroll:ignored
       [ Journal_timeline.view
-          ~tokens:(Tokens.resolve ~high_contrast:false)
+          ~tokens:
+            (Tokens.resolve
+               ~brightness:Bonsai_flutter.Environment.Light
+               ~high_contrast:false)
           ~typography:(Tokens.typography Tokens.Balanced)
           ~profile:
             (Tokens.select_row_profile
@@ -1181,6 +1281,26 @@ let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
          (Option.is_none
             (Test.Handle.find handle (Test.Query.test_id "journal-bottom-clearance")))
          "timeline retained obsolete composer bottom clearance";
+       List.iter
+         (fun (action_id, expected_code_point) ->
+            let test_id =
+              "journal-row-status-action-icon:" ^ block_id ^ ":" ^ string_of_int action_id
+            in
+            let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
+            match view.node with
+            | Ui.Widget.Private.Icon { code_point; font_family = Some font_family; _ } ->
+              require
+                (code_point = expected_code_point)
+                "%s rendered U+%04X instead of U+%04X"
+                test_id
+                code_point
+                expected_code_point;
+              require
+                (String.equal font_family "MaterialIcons")
+                "%s does not use MaterialIcons"
+                test_id
+            | _ -> fail "%s is not a Material icon" test_id)
+         [ 2, 0xe518; 3, 0xe504; 4, 0xe660; 5, 0xe15a ];
        let slidable = node handle ("journal-row-slidable:" ^ block_id) in
        (let (Av view) = Ui.Widget.Private.view slidable.widget in
         match view.node with
@@ -1217,8 +1337,37 @@ let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
                   require
                     (Bool.equal action.enabled (action.id <> 5))
                     "current Done status action state changed";
-                  require action.auto_close "status action does not auto-close")
-               pane.actions);
+                  require action.auto_close "status action does not auto-close";
+                  require
+                    (Float.equal action.border_radius 0.)
+                    "status action retained rounded corners";
+                  require
+                    (Option.is_none action.padding)
+                    "status action retained inset card spacing")
+               pane.actions;
+             let argb = Ui.Style.Color.Private.to_argb32 in
+             List.iter2
+               (fun (action : Ui.Native_widget.Slidable.For_testing.action_props)
+                 (expected_background, expected_foreground) ->
+                  require
+                    (Option.equal
+                       Int32.equal
+                       (Option.map argb action.foreground)
+                       (Some expected_foreground))
+                    "status action %d foreground differs"
+                    action.id;
+                  require
+                    (Int32.equal (argb action.background) expected_background)
+                    "status action %d background is %lx, expected %lx"
+                    action.id
+                    (argb action.background)
+                    expected_background)
+               pane.actions
+               [ 0xff4b5e63l, 0xffffffffl
+               ; 0xff585c7el, 0xffffffffl
+               ; 0xff00677cl, 0xffffffffl
+               ; 0xff006b57l, 0xffffffffl
+               ]);
           (match props.end_action_pane with
            | None -> fail "delete Slidable omitted its logical-end pane"
            | Some pane ->
@@ -1235,7 +1384,10 @@ let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
              (match pane.actions with
               | [ action ] ->
                 let colors =
-                  Tokens.destructive_swipe_action (Tokens.resolve ~high_contrast:false)
+                  Tokens.destructive_swipe_action
+                    (Tokens.resolve
+                       ~brightness:Bonsai_flutter.Environment.Light
+                       ~high_contrast:false)
                 in
                 let argb = Ui.Style.Color.Private.to_argb32 in
                 require (action.id = 1) "delete action ID changed";
@@ -1334,6 +1486,7 @@ let () =
   test_wrapping_estimate_bounds_latin_cjk_emoji_and_explicit_lines ();
   test_line_count_drives_exact_scaled_row_extent ();
   test_header_account_action_and_view_only_date_have_truthful_semantics ();
+  test_header_sync_progress_tracks_every_sync_phase ();
   test_compact_and_adaptive_shapes_at_required_extremes ();
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();

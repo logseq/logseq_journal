@@ -1,6 +1,6 @@
 module Ui = Bonsai_flutter_ui
 
-type destructive_swipe_action =
+type swipe_action_colors =
   { background : Ui.Style.Color.t
   ; foreground : Ui.Style.Color.t
   }
@@ -110,7 +110,7 @@ type text_measurement =
 
 type t
 
-val resolve : high_contrast:bool -> t
+val resolve : brightness:Bonsai_flutter.Environment.brightness -> high_contrast:bool -> t
 val typography : typography_preset -> typography
 val typography_preset_of_stored_value : string option -> typography_preset
 val stored_value_of_typography_preset : typography_preset -> string
@@ -142,5 +142,5 @@ val measure_text
 
 val fixed_extent : profile:row_profile -> fixed_extent_role -> float
 val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option
-val destructive_swipe_action : t -> destructive_swipe_action
-val transparent_swipe_action_background : t -> Ui.Style.Color.t
+val destructive_swipe_action : t -> swipe_action_colors
+val status_swipe_action : t -> Journal_model.task_state -> swipe_action_colors

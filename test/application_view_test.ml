@@ -1546,7 +1546,7 @@ let test_capture_fab_directly_saves_one_plain_top_level_block () =
          require_test_id handle "journal-capture-composer-submit";
          require_material_icon handle "journal-capture-composer-submit" 0xe0a0;
          require_test_id handle "journal-capture-composer-task";
-         require_material_icon handle "journal-capture-composer-task" 0xe158;
+         require_material_icon handle "journal-capture-composer-task" 0xe660;
          require_no_test_id handle "journal-capture-target";
          require_no_test_id handle "journal-capture-feedback";
          send_capture_affordance_button handle ~button_id:1 ~text:"   \n";
@@ -1612,7 +1612,7 @@ let test_capture_task_icon_preserves_intent_and_persists_todo () =
               "checked Capture task action did not announce its state";
             require (save.id = 1) "Capture Save ID changed after task selection"
           | _ -> fail "Capture task selection changed the composer action set");
-         require_material_icon handle "journal-capture-composer-task" 0xe646;
+         require_material_icon handle "journal-capture-composer-task" 0xe660;
          require
            (ID.Ui.Node_id.equal
               composer.node_id
@@ -3167,6 +3167,74 @@ let require_quick_status_pane
   | None | Some _ -> fail "row lost its single logical-end Delete action"
 ;;
 
+let require_quick_status_color_pairs handle block_id expected =
+  let argb = Ui.Style.Color.Private.to_argb32 in
+  let actions =
+    match (slidable_props handle block_id).start_action_pane with
+    | Some pane -> pane.actions
+    | None -> fail "row %s has no quick status pane" block_id
+  in
+  require
+    (List.length actions = List.length expected)
+    "row %s has %d quick status colors, expected %d"
+    block_id
+    (List.length actions)
+    (List.length expected);
+  List.iter2
+    (fun (action : Ui.Native_widget.Slidable.For_testing.action_props)
+      (expected_background, expected_foreground) ->
+       require
+         (Int32.equal (argb action.background) expected_background)
+         "quick status action %d background is %lx, expected %lx"
+         action.id
+         (argb action.background)
+         expected_background;
+       require
+         (Option.equal
+            Int32.equal
+            (Option.map argb action.foreground)
+            (Some expected_foreground))
+         "quick status action %d foreground differs"
+         action.id)
+    actions
+    expected
+;;
+
+let test_quick_status_colors_follow_brightness_and_reuse_normal_high_contrast_pairs () =
+  let light =
+    [ 0xff4b5e63l, 0xffffffffl
+    ; 0xff585c7el, 0xffffffffl
+    ; 0xff00677cl, 0xffffffffl
+    ; 0xff006b57l, 0xffffffffl
+    ]
+  in
+  let dark =
+    [ 0xffa7b8bcl, 0xff1b3035l
+    ; 0xffc0c4ebl, 0xff2a2e50l
+    ; 0xff86d1e9l, 0xff003642l
+    ; 0xff83d6bdl, 0xff00382bl
+    ]
+  in
+  with_startup (fun startup ->
+    let entry = capture ~task_state:Journal_model.Todo 89 "Brightness status colors" in
+    seed startup [ entry ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle entry.source;
+         List.iter
+           (fun (brightness, high_contrast, expected) ->
+              set_environment handle (environment ~brightness ~high_contrast ());
+              pump_worker handle;
+              require_quick_status_color_pairs handle entry.block_id expected)
+           [ Environment.Light, false, light
+           ; Environment.Light, true, light
+           ; Environment.Dark, false, dark
+           ; Environment.Dark, true, dark
+           ]))
+;;
+
 let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
   with_startup (fun startup ->
     let parent = capture ~task_state:Journal_model.Todo 90 "Parent task source" in
@@ -3726,6 +3794,7 @@ let () =
   test_capture_allocates_fresh_block_identity_after_restart ();
   test_localized_day_request_updates_only_matching_generation ();
   test_locale_event_invalidates_labels_and_rejects_in_flight_response ();
+  test_quick_status_colors_follow_brightness_and_reuse_normal_high_contrast_pairs ();
   test_same_context_resume_keeps_the_populated_timeline ();
   test_locale_only_change_reformats_without_reloading ();
   test_day_rollover_refreshes_without_blanking_content ();

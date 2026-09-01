@@ -73,6 +73,32 @@
   logseq_db_worker_test_support
   logseq_sync.effect_runner))
 
+(test
+ (name test_pure_reducer)
+ (modules test_pure_reducer)
+ (libraries
+  alcotest
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker.pure_reducer
+  logseq_sync.pure_reducer
+  uri))
+
+(test
+ (name test_effect_runner)
+ (modules test_effect_runner)
+ (libraries
+  alcotest
+  eio_main
+  eio.unix
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker.effect_runner
+  logseq_db_worker.pure_reducer
+  logseq_db_worker_test_support
+  logseq_sync.pure_reducer
+  uri))
+
 (library
  (name managed_sync_e2e_support)
  (wrapped false)

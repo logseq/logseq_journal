@@ -1,8 +1,8 @@
 module Protocol = Logseq_db_worker.Protocol
 module Config = Logseq_db_worker.Config
 module Engine = Logseq_db_worker.Engine
-module Snapshot = Logseq_db_worker__Snapshot
-module Graph_locator = Logseq_db_worker__Graph_locator
+module Snapshot = Logseq_db_worker_engine.Snapshot
+module Graph_locator = Logseq_db_worker_engine.Graph_locator
 
 type session_error =
   | Local_decode_error of string

@@ -10,42 +10,22 @@ let bind result f =
   | Error _ as error -> error
 ;;
 
-let initialize_rng =
-  let initialized = Atomic.make false in
-  fun () ->
-    if Atomic.compare_and_set initialized false true
-    then Mirage_crypto_rng_unix.use_default ()
-;;
-
-let host_name host =
-  bind (Domain_name.of_string host) (fun domain ->
-    match Domain_name.host domain with
-    | Ok host -> Ok host
-    | Error _ -> Error (`Msg "WSS host is not a valid DNS name"))
-;;
-
-let tls_config authenticator host =
-  bind (host_name host) (fun peer_name ->
-    Tls.Config.client ~authenticator ~peer_name ~alpn_protocols:[ "http/1.1" ] ())
+let connection_error = function
+  | Tls_client_eio.Invalid_dns_host -> "WSS host is not a valid DNS name"
+  | No_network_address -> "WSS host has no network address"
+  | Setup_failed message -> message
 ;;
 
 let open_flow ~sw ~authenticator ~network uri =
   match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
   | Some "wss", Some host, None, None ->
-    (match tls_config authenticator host with
-     | Error (`Msg message) -> Error message
-     | Ok config ->
-       let port = Option.value (Uri.port uri) ~default:443 in
-       (match Eio.Net.getaddrinfo_stream ~service:(string_of_int port) network host with
-        | [] -> Error "WSS host has no network address"
-        | address :: _ ->
-          (try
-             let socket = Eio.Net.connect ~sw network address in
-             let peer_name = host_name host |> Result.get_ok in
-             Ok (Tls_eio.client_of_flow config ~host:peer_name socket)
-           with
-           | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-           | exception_ -> Error (Printexc.to_string exception_))))
+    Tls_client_eio.connect
+      ~sw
+      ~authenticator
+      ~network
+      ~host
+      ~port:(Option.value (Uri.port uri) ~default:443)
+    |> Result.map_error connection_error
   | Some _, Some _, _, _ | Some _, None, _, _ | None, _, _, _ ->
     Error "WebSocket URL must be WSS without credentials or fragments"
 ;;
@@ -152,7 +132,7 @@ let connect
       ~on_message
       ~on_close
   =
-  initialize_rng ();
+  Tls_client_eio.initialize_rng ();
   if maximum_frame_bytes <= 0
   then Error "WebSocket frame bound must be positive"
   else

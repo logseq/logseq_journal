@@ -4,7 +4,4 @@
  (modules core sync_protocol)
  (virtual_modules core sync_protocol)
  (default_implementation logseq_sync_pure_reducer_impl)
- (libraries
-  datascript_ocaml
-  logseq_db_types
-  uri))
+ (libraries datascript_ocaml logseq_db_types uri))

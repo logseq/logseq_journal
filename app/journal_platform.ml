@@ -400,8 +400,11 @@ let purpose = function
 let id_token_request (challenge : Logseq_sync_pure_reducer.Core.token_request) =
   Yojson.Safe.to_string
     (`Assoc
-        [ "challengeId", `String (Logseq_sync_pure_reducer.Core.token_request_id challenge)
-        ; "purpose", `String (purpose (Logseq_sync_pure_reducer.Core.token_request_purpose challenge))
+        [ ( "challengeId"
+          , `String (Logseq_sync_pure_reducer.Core.token_request_id challenge) )
+        ; ( "purpose"
+          , `String
+              (purpose (Logseq_sync_pure_reducer.Core.token_request_purpose challenge)) )
         ])
   |> Bytes.of_string
   |> encode_envelope 8

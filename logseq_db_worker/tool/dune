@@ -7,6 +7,7 @@
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
+  logseq_db_worker.engine
   logseq_db_worker_test_support
   sqlite3
   unix
@@ -29,6 +30,7 @@
   core_unix
   digestif
   logseq_db_worker
+  logseq_db_worker.engine
   logseq_db_worker_test_support
   mtime.clock.os
   sqlite3

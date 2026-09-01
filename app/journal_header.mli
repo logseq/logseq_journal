@@ -15,6 +15,7 @@ val sliver
   -> top_inset:float
   -> device_pixel_ratio:float
   -> context:Context.t
+  -> sync_phase:Logseq_sync_pure_reducer.Core.sync_phase option
   -> on_error_info:Bonsai_flutter_ui.Event.Handler.t option
   -> on_account_menu:Bonsai_flutter_ui.Event.Handler.t option
   -> Bonsai_flutter_ui.Widget.Sliver.t
