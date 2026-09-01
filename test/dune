@@ -62,6 +62,7 @@
   core
   logseq_db_types
   logseq_db_worker
+  managed_application_test_support
   logseq_db_worker_test_support
   logseq_sync.pure_reducer
   unix))
@@ -93,12 +94,8 @@
  (name journal_runtime_golden_fixture)
  (modules journal_runtime_golden_fixture)
  (libraries
-  app
-  logseq_db_types
-  logseq_db_worker
-  logseq_db_worker_cli
+  logseq_db_worker_fixture_generator
   logseq_db_worker_test_support
-  logseq_sync.pure_reducer
   unix))
 
 (test
@@ -130,9 +127,22 @@
   core
   logseq_db_types
   logseq_db_worker
+  managed_application_test_support
   logseq_db_worker_test_support
   logseq_sync.pure_reducer
   unix))
+
+(library
+ (name managed_application_test_support)
+ (wrapped false)
+ (modules managed_application_fixture)
+ (libraries
+  app
+  logseq_db_worker
+  logseq_db_worker.bonsai
+  logseq_db_worker_test_support
+  logseq_sync.effect_runner
+  melange-transit-native))
 
 (rule
  (alias runtest)

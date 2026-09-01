@@ -18,7 +18,7 @@ module Graph_protocol = Logseq_db_worker.Protocol
 module Mutation = Logseq_db_types.Mutation
 
 let with_startup test =
-  Adapter_fixture.with_snapshot (fun fixture -> test fixture.Adapter_fixture.config)
+  Adapter_fixture.with_managed (fun fixture -> test fixture.Adapter_fixture.config)
 ;;
 
 let encode_startup startup =
@@ -79,37 +79,38 @@ let preference_response_packet stored_value =
 ;;
 
 let startup_request_ids handle =
-  let rec wait_for_requests remaining calendar preference =
+  let rec wait_for_requests remaining calendar preference binding =
     if remaining = 0
     then fail "timed out waiting for the initial calendar and typography requests"
     else (
       Test.Handle.present handle;
-      let calendar, preference =
+      let calendar, preference, binding =
         match Test.Handle.last_frame handle with
-        | None -> calendar, preference
+        | None -> calendar, preference, binding
         | Some frame ->
           (match Protocol.Binary_codec.decode frame.bytes with
            | Error error -> fail "application frame did not decode: %s" error.message
            | Ok wire ->
              List.fold_left
-               (fun (calendar, preference) -> function
+               (fun (calendar, preference, binding) -> function
                   | Protocol.Wire_frame.Application_request { request_id; payload }
                     when Bytes.length payload >= 8 ->
                     (match Bytes.get_uint16_le payload 6 with
-                     | 1 -> Some request_id, preference
-                     | 16 -> calendar, Some request_id
-                     | _ -> calendar, preference)
-                  | _ -> calendar, preference)
-               (calendar, preference)
+                     | 1 -> Some request_id, preference, binding
+                     | 16 -> calendar, Some request_id, binding
+                     | 20 -> calendar, preference, Some request_id
+                     | _ -> calendar, preference, binding)
+                  | _ -> calendar, preference, binding)
+               (calendar, preference, binding)
                wire.operations)
       in
-      match calendar, preference with
-      | Some calendar, Some preference -> calendar, preference
+      match calendar, preference, binding with
+      | Some calendar, Some preference, Some binding -> calendar, preference, binding
       | _ ->
         Test.Handle.pump_next handle ();
-        wait_for_requests (remaining - 1) calendar preference)
+        wait_for_requests (remaining - 1) calendar preference binding)
   in
-  wait_for_requests 500 None None
+  wait_for_requests 500 None None None
 ;;
 
 let respond_to_application_request handle ~sequence ~request_id payload =
@@ -139,7 +140,9 @@ let initialize_test_platform
   (match Journal_platform.decode_calendar packet with
    | Ok _ -> ()
    | Error message -> fail "initial calendar fixture is invalid: %s" message);
-  let calendar_request, preference_request = startup_request_ids handle in
+  let calendar_request, preference_request, binding_request =
+    startup_request_ids handle
+  in
   respond_to_application_request handle ~sequence:1L ~request_id:calendar_request packet;
   Test.Handle.present handle;
   respond_to_application_request
@@ -148,10 +151,40 @@ let initialize_test_platform
     ~request_id:preference_request
     (preference_response_packet stored_preset);
   Test.Handle.present handle;
+  respond_to_application_request
+    handle
+    ~sequence:3L
+    ~request_id:binding_request
+    (platform_envelope
+       21
+       (Bytes.of_string
+          (Printf.sprintf
+             {|{"userId":%S,"managedSyncOrigin":%S}|}
+             Adapter_fixture.managed_user_id
+             Adapter_fixture.managed_base_url)));
+  Test.Handle.present handle;
+  Test.Handle.resize handle ~width:390. ~height:844.;
+  Test.Handle.present handle;
   Test.Handle.resize handle ~width:390. ~height:844.;
   Test.Handle.present handle;
   Test.Handle.resize handle ~width:390. ~height:844.;
   Test.Handle.present handle
+;;
+
+let await_managed_graph handle =
+  let rec loop attempts =
+    Test.Handle.present handle;
+    if Option.is_some (Test.Handle.find handle (Test.Query.test_id "journal-scroll"))
+    then ()
+    else if attempts = 0
+    then
+      fail "timed out waiting for managed graph attachment\n%s" (Test.Handle.show handle)
+    else (
+      Unix.sleepf 0.001;
+      Test.Handle.pump_next handle ();
+      loop (attempts - 1))
+  in
+  loop 500
 ;;
 
 let create_raw_handle startup =
@@ -159,19 +192,21 @@ let create_raw_handle startup =
   Test.Handle.create_app
     ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
     ~time_source
-    Application.app
+    Managed_application_fixture.app
     ~application_payload:(encode_startup startup)
 ;;
 
 let create_handle startup =
   let handle = create_raw_handle startup in
   initialize_test_platform handle;
+  await_managed_graph handle;
   handle
 ;;
 
 let create_handle_with_preference startup stored_preset =
   let handle = create_raw_handle startup in
   initialize_test_platform ~stored_preset handle;
+  await_managed_graph handle;
   handle
 ;;
 
@@ -181,10 +216,11 @@ let create_handle_with_calendar startup packet =
     Test.Handle.create_app
       ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
       ~time_source
-      Application.app
+      Managed_application_fixture.app
       ~application_payload:(encode_startup startup)
   in
   initialize_test_platform ~packet handle;
+  await_managed_graph handle;
   handle
 ;;
 
@@ -194,10 +230,11 @@ let create_timed_handle startup =
     Test.Handle.create_app
       ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
       ~time_source
-      Application.app
+      Managed_application_fixture.app
       ~application_payload:(encode_startup startup)
   in
   initialize_test_platform handle;
+  await_managed_graph handle;
   handle, ref 0L
 ;;
 
@@ -258,10 +295,17 @@ let graph_request command =
 ;;
 
 let execute engine command =
-  match Logseq_db_worker.Engine.execute engine (graph_request command) with
-  | Graph_protocol.Succeeded { success; _ } -> success
-  | Failed failure ->
-    fail "graph fixture request failed: %s" (Logseq_db_worker.Error.message failure.error)
+  match command with
+  | Graph_protocol.Read _ ->
+    (match Logseq_db_worker.Engine.execute engine (graph_request command) with
+     | Graph_protocol.Succeeded { success; _ } -> success
+     | Failed failure ->
+       fail
+         "graph fixture request failed: %s"
+         (Logseq_db_worker.Error.message failure.error))
+  | Mutate mutation ->
+    Graph_protocol.Mutation_result
+      (Adapter_fixture.apply_managed_mutation engine mutation)
 ;;
 
 let context engine mutation_id =
@@ -350,7 +394,7 @@ let seed startup captures =
          }
        in
        let engine =
-         Logseq_db_worker.Engine.open_ ~dependencies startup |> Result.get_ok
+         Adapter_fixture.open_configured_engine ~dependencies startup |> Result.get_ok
        in
        Fun.protect
          ~finally:(fun () ->
@@ -396,7 +440,9 @@ let seed_child_by_parent_id
       source
   =
   let engine =
-    Logseq_db_worker.Engine.open_ ~dependencies:Adapter_fixture.dependencies startup
+    Adapter_fixture.open_configured_engine
+      ~dependencies:Adapter_fixture.dependencies
+      startup
     |> Result.get_ok
   in
   Fun.protect
@@ -524,6 +570,20 @@ let click_test_id handle test_id =
   Test.Handle.present handle;
   Test.Handle.click handle (Test.Query.test_id test_id);
   Test.Handle.present handle
+;;
+
+let click_until_test_id handle ~source ~target =
+  let rec loop attempts =
+    if Option.is_some (Test.Handle.find handle (Test.Query.test_id target))
+    then ()
+    else if attempts = 0
+    then fail "timed out opening %s from %s" target source
+    else (
+      click_test_id handle source;
+      Unix.sleepf 0.001;
+      loop (attempts - 1))
+  in
+  loop 50
 ;;
 
 let choice_event_sequence = ref 8_000L
@@ -1418,31 +1478,7 @@ let require_journal_scroll handle ~expanded_height ~collapsed_height =
   require_sized_size handle "journal-account-menu-target" ~width:44. ~height:44.
 ;;
 
-let test_graph_open_error_retains_the_journal_scroll_contract () =
-  Adapter_fixture.with_snapshot (fun fixture ->
-    let token =
-      Graph.Uuid.of_string "ffffffff-ffff-4fff-8fff-ffffffffffff" |> Result.get_ok
-    in
-    let startup =
-      { fixture.Adapter_fixture.config with
-        target = Logseq_db_worker.Config.Snapshot { token }
-      }
-    in
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         set_environment handle (environment ());
-         pump_until handle "graph-open error" (fun () ->
-           Option.is_some
-             (Test.Handle.find handle (Test.Query.test_id "logseq-graph-open-failed")));
-         require_journal_scroll
-           handle
-           ~expanded_height:(96. +. (1. /. 3.))
-           ~collapsed_height:(56. +. (1. /. 3.))))
-;;
-
-let test_error_info_action_and_page_follow_worker_error_ledger () =
+let test_healthy_worker_hides_error_info () =
   with_startup (fun startup ->
     let handle = create_handle startup in
     Fun.protect
@@ -1450,35 +1486,7 @@ let test_error_info_action_and_page_follow_worker_error_ledger () =
       (fun () ->
          pump_until_text handle "No journal entries yet";
          require_no_test_id handle "journal-error-info-button";
-         require_no_semantics handle "Error info"));
-  Adapter_fixture.with_snapshot (fun fixture ->
-    let token =
-      Graph.Uuid.of_string "ffffffff-ffff-4fff-8fff-ffffffffffff" |> Result.get_ok
-    in
-    let startup =
-      { fixture.Adapter_fixture.config with
-        target = Logseq_db_worker.Config.Snapshot { token }
-      }
-    in
-    let handle = create_handle startup in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         pump_until handle "Error info action" (fun () ->
-           Option.is_some
-             (Test.Handle.find handle (Test.Query.test_id "journal-error-info-button")));
-         require_semantics handle "Error info";
-         click_test_id handle "journal-error-info-button";
-         require_test_id handle "journal-error-info-page";
-         require_visible_text handle "Error info";
-         require_visible_text handle "graphNotFound";
-         require_visible_text handle "The graph target does not exist.";
-         require_visible_text handle "Active";
-         require_visible_text handle "Occurrence 1";
-         require_semantics handle "Back from Error info";
-         click_test_id handle "journal-error-info-back";
-         require_no_test_id handle "journal-error-info-page";
-         require_test_id handle "logseq-graph-open-failed"))
+         require_no_semantics handle "Error info"))
 ;;
 
 let require_content_width_padding handle ~horizontal =
@@ -1688,7 +1696,8 @@ let test_capture_task_icon_preserves_intent_and_persists_todo () =
       (fun () ->
          pump_until_text handle "No journal entries yet";
          let composer = node_by_test_id handle "journal-capture-expandable" in
-         send_capture_affordance_button handle ~button_id:2 ~text:"";
+         let source = "  Todo Capture 中文 👩🏽‍💻 literal  " in
+         send_capture_affordance_button handle ~button_id:2 ~text:source;
          let selected = capture_affordance_props handle in
          (match selected.buttons with
           | [ task; save ] ->
@@ -1710,7 +1719,6 @@ let test_capture_task_icon_preserves_intent_and_persists_todo () =
               composer.node_id
               (node_by_test_id handle "journal-capture-expandable").node_id)
            "task selection replaced the mounted composer";
-         let source = "  Todo Capture 中文 👩🏽‍💻 literal  " in
          send_capture_affordance_button handle ~button_id:1 ~text:source;
          let saving = capture_affordance_props handle in
          (match saving.buttons with
@@ -1826,9 +1834,20 @@ let test_capture_fab_honors_reduced_motion_without_changing_its_slot () =
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         set_environment handle (environment ~reduced_motion:true ());
          pump_until_text handle "No journal entries yet";
-         let props = capture_affordance_props handle in
+         let rec reduced_motion_props attempts =
+           set_environment handle (environment ~reduced_motion:true ());
+           let props = capture_affordance_props handle in
+           if props.animation_duration_ms = 0
+           then props
+           else if attempts = 0
+           then props
+           else (
+             Unix.sleepf 0.001;
+             pump_worker handle;
+             reduced_motion_props (attempts - 1))
+         in
+         let props = reduced_motion_props 50 in
          require
            (props.animation_duration_ms = 0)
            "reduced motion kept a nonzero Capture expansion duration";
@@ -1986,7 +2005,9 @@ let test_typography_waits_for_the_persisted_preset_without_flashing_balanced () 
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         let calendar_request, preference_request = startup_request_ids handle in
+         let calendar_request, preference_request, binding_request =
+           startup_request_ids handle
+         in
          require_no_visible_text handle "Today";
          require_no_visible_text handle entry.source;
          respond_to_application_request
@@ -2005,6 +2026,18 @@ let test_typography_waits_for_the_persisted_preset_without_flashing_balanced () 
            ~sequence:21L
            ~request_id:preference_request
            (preference_response_packet (Some "comfortable"));
+         Test.Handle.present handle;
+         respond_to_application_request
+           handle
+           ~sequence:22L
+           ~request_id:binding_request
+           (platform_envelope
+              21
+              (Bytes.of_string
+                 (Printf.sprintf
+                    {|{"userId":%S,"managedSyncOrigin":%S}|}
+                    Adapter_fixture.managed_user_id
+                    Adapter_fixture.managed_base_url)));
          Test.Handle.present handle;
          Test.Handle.resize handle ~width:390. ~height:844.;
          pump_until_text handle entry.source;
@@ -2062,11 +2095,17 @@ let test_settings_choice_group_applies_and_persists_one_atomic_preset () =
              (Test.Handle.find handle (Test.Query.test_id "journal-account-menu-button")));
          pump_until_text handle entry.source;
          let capture_before = node_by_test_id handle "journal-capture-expandable" in
-         click_test_id handle "journal-account-menu-button";
+         click_until_test_id
+           handle
+           ~source:"journal-account-menu-button"
+           ~target:"journal-account-dialog-page";
          require_test_id handle "journal-account-dialog-page";
          require_no_test_id handle "journal-settings-dialog-page";
          require_test_id handle "journal-account-settings";
-         click_test_id handle "journal-account-settings";
+         click_until_test_id
+           handle
+           ~source:"journal-account-settings"
+           ~target:"journal-settings-dialog-page";
          require_no_test_id handle "journal-account-dialog-page";
          require_test_id handle "journal-settings-dialog-page";
          require_visible_text handle "Typography";
@@ -2448,9 +2487,15 @@ let test_diagnostics_is_scrollable_read_only_and_display_safe () =
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
          pump_until_text handle entry.source;
-         click_test_id handle "journal-account-menu-button";
+         click_until_test_id
+           handle
+           ~source:"journal-account-menu-button"
+           ~target:"journal-account-dialog-page";
          require_test_id handle "journal-account-diagnostics";
-         click_test_id handle "journal-account-diagnostics";
+         click_until_test_id
+           handle
+           ~source:"journal-account-diagnostics"
+           ~target:"journal-diagnostics-dialog-page";
          require_no_test_id handle "journal-account-dialog-page";
          require_test_id handle "journal-diagnostics-dialog-page";
          require_test_id handle "journal-diagnostics-scroll";
@@ -2461,10 +2506,10 @@ let test_diagnostics_is_scrollable_read_only_and_display_safe () =
          require_visible_text handle "Startup phase";
          require_visible_text handle "Graph phase";
          require_visible_text handle "Open";
-         require_visible_text handle "Manager";
-         require_visible_text handle "Transport";
+         require_visible_text handle "Connecting";
+         require_visible_text handle "Signed out";
          require_visible_text handle "Recent sync transitions";
-         require_visible_text handle "Not available";
+         require_visible_text handle "No transitions";
          require_no_visible_text handle "Startup presentation";
          require_no_test_id handle "journal-diagnostics-copy";
          require_no_test_id handle "journal-diagnostics-export";
@@ -2813,8 +2858,18 @@ let test_capture_allocates_fresh_block_identity_after_restart () =
     in
     seed startup [ persisted ];
     let save_capture handle source =
-      send_capture_affordance_button handle ~button_id:1 ~text:source;
-      pump_until_text handle source
+      let rec loop attempts =
+        if Option.is_some (Test.Handle.find handle (Test.Query.visible_text source))
+        then ()
+        else if attempts = 0
+        then fail "timed out saving %S after managed restart" source
+        else (
+          send_capture_affordance_button handle ~button_id:1 ~text:source;
+          Unix.sleepf 0.001;
+          pump_worker handle;
+          loop (attempts - 1))
+      in
+      loop 50
     in
     let first_source = "Captured after first restart" in
     let first_handle = create_handle startup in
@@ -2835,6 +2890,16 @@ let test_capture_allocates_fresh_block_identity_after_restart () =
               (Test.Handle.find_all first_handle (Test.Query.visible_text first_source))
             = 1)
            "first restart did not render exactly one fresh row");
+    let durable_outbox_count =
+      let engine = Adapter_fixture.open_configured_engine startup |> Result.get_ok in
+      Fun.protect
+        ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
+        (fun () ->
+           Logseq_db_worker.Engine.managed_outbox_records engine
+           |> Result.get_ok
+           |> List.length)
+    in
+    require (durable_outbox_count > 0) "managed Capture did not persist its outbox record";
     let second_source = "Captured after second restart" in
     let second_handle = create_handle startup in
     Fun.protect
@@ -2863,7 +2928,10 @@ let latest_application_request handle =
      | Ok wire ->
        List.find_map
          (function
-           | Application_request { request_id; payload } -> Some (request_id, payload)
+           | Application_request { request_id; payload }
+             when Bytes.length payload >= 8 && Bytes.get_uint16_le payload 6 = 4 ->
+             Some (request_id, payload)
+           | Application_request _ -> None
            | _ -> None)
          wire.operations)
 ;;
@@ -2908,7 +2976,7 @@ let respond_to_application_request ?(sequence = 3L) handle request_id payload =
   Test.Handle.present handle;
   let event =
     Protocol.Inbound_event.
-      { sequence = ID.Runtime.Event_sequence.of_int64 sequence
+      { sequence = ID.Runtime.Event_sequence.of_int64 (Int64.succ sequence)
       ; displayed_revision = Test.Handle.revision handle
       ; node_id = ID.Ui.Node_id.zero
       ; handler_id = ID.Ui.Handler_id.zero
@@ -2971,7 +3039,7 @@ let send_application_event handle ~sequence payload =
   Test.Handle.present handle;
   let event =
     Protocol.Inbound_event.
-      { sequence = ID.Runtime.Event_sequence.of_int64 sequence
+      { sequence = ID.Runtime.Event_sequence.of_int64 (Int64.succ sequence)
       ; displayed_revision = Test.Handle.revision handle
       ; node_id = ID.Ui.Node_id.zero
       ; handler_id = ID.Ui.Handler_id.zero
@@ -3977,7 +4045,9 @@ let test_delete_action_stages_undoes_and_commits_only_after_deadline () =
       "timeout close reason retained or replayed Undo";
     Test.Handle.shutdown handle;
     let engine =
-      Logseq_db_worker.Engine.open_ ~dependencies:Adapter_fixture.dependencies startup
+      Adapter_fixture.open_configured_engine
+        ~dependencies:Adapter_fixture.dependencies
+        startup
       |> Result.get_ok
     in
     Fun.protect
@@ -4072,8 +4142,7 @@ let test_delete_action_accessibility_duration_and_single_mutation_gate () =
 let () =
   test_application_owns_one_system_material_theme ();
   test_initial_feed_has_a_truthful_loading_state ();
-  test_graph_open_error_retains_the_journal_scroll_contract ();
-  test_error_info_action_and_page_follow_worker_error_ledger ();
+  test_healthy_worker_hides_error_info ();
   test_timeline_content_is_capped_and_centered ();
   test_root_is_owned_by_the_ocaml_timeline ();
   test_capture_fab_directly_saves_one_plain_top_level_block ();

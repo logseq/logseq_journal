@@ -511,7 +511,7 @@ type durable_facts =
 let durable_facts support graph_id =
   let resolved =
     match
-      Logseq_db_worker.Synced_mirror.resolve
+      Logseq_db_worker_engine.Synced_mirror.resolve
         ~application_support_directory:support
         ~graph_id
     with

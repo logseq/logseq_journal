@@ -2296,7 +2296,8 @@ let challenge_websocket_if_ready core =
     , core.current_graph_scope
     , core.public_state.snapshot.applied_server_t )
   with
-  | None, false, Some _, Some _ -> challenge_graph_token core Websocket_connect
+  | None, false, Some _, Some _ when core.public_state.snapshot.startup.authenticated ->
+    challenge_graph_token core Websocket_connect
   | _ -> unchanged core
 ;;
 

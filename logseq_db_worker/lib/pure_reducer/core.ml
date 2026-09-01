@@ -1,10 +1,3 @@
-type target_kind =
-  | Managed
-  | Snapshot
-  | Import_snapshot
-  | Synced_mirror
-  | Native_local
-
 type graph_phase =
   | Graph_closed
   | Graph_opening
@@ -70,7 +63,6 @@ type sync_worker_result =
   }
 
 type _ runner_request =
-  | Open_engine : Logseq_db_worker_contract.Config.t -> engine_opened runner_request
   | Execute_request :
       { engine : engine_handle
       ; request : Logseq_db_worker_contract.Protocol.request
@@ -92,7 +84,6 @@ type runner_effect = Request : ticket * 'a runner_request -> runner_effect
 type effect_error = Logseq_db_worker_contract.Error.t
 
 type runner_completion =
-  | Open_engine_completed of ticket * (engine_opened, effect_error) result
   | Execute_request_completed of
       ticket * (Logseq_db_worker_contract.Protocol.response, effect_error) result
   | Close_engine_completed of ticket * (unit, effect_error) result
@@ -137,7 +128,6 @@ let sync_effect_name runner_effect =
 ;;
 
 let instruction_diagnostic = function
-  | Run_worker (Request (_, Open_engine _)) -> "run-worker:Open_engine"
   | Run_worker (Request (_, Execute_request _)) -> "run-worker:Execute_request"
   | Run_worker (Request (_, Close_engine _)) -> "run-worker:Close_engine"
   | Run_worker (Request (_, Prepare_managed_mutation _)) ->
@@ -168,32 +158,19 @@ let equal_instructions left right =
   List.length left = List.length right && List.for_all2 equal_instruction left right
 ;;
 
-type config =
-  { worker : Logseq_db_worker_contract.Config.t
-  ; sync : Logseq_sync_pure_reducer.Core.config option
-  }
+type config = Logseq_sync_pure_reducer.Core.config
 
-type config_error = Invalid_config of string
-
-let config ~worker ~sync =
-  match worker.Logseq_db_worker_contract.Config.target, sync with
-  | Managed_sync _, None -> Error (Invalid_config "managed target requires sync config")
-  | (Snapshot _ | Import_snapshot _ | Synced_mirror _ | Native_local_graph _), Some _ ->
-    Error (Invalid_config "local target cannot contain sync config")
-  | _ -> Ok { worker; sync }
-;;
+let config ~worker:_ ~sync = sync
 
 type view =
-  { target : target_kind
-  ; graph : graph_state
-  ; sync : Logseq_sync_pure_reducer.Core.state option
+  { graph : graph_state
+  ; sync : Logseq_sync_pure_reducer.Core.state
   ; pending_requests : int
   ; pending_effects : int
   ; shutdown : bool
   }
 
 type pending =
-  | Pending_open of ticket
   | Pending_execute of request_id * Logseq_db_worker_contract.Protocol.request * ticket
   | Pending_prepare of request_id * Logseq_db_worker_contract.Protocol.request * ticket
   | Pending_sync_worker of ticket * Logseq_sync_pure_reducer.Core.worker_effect
@@ -205,10 +182,8 @@ type managed_request =
   }
 
 type state =
-  { config : config
-  ; target : target_kind
-  ; graph : graph_state
-  ; sync_core : Logseq_sync_pure_reducer.Core.t option
+  { graph : graph_state
+  ; sync_core : Logseq_sync_pure_reducer.Core.t
   ; engine : engine_handle option
   ; pending : pending list
   ; managed_requests : managed_request list
@@ -220,30 +195,15 @@ type state =
 
 type create_error = Invalid_create of string
 
-let target_kind = function
-  | Logseq_db_worker_contract.Config.Managed_sync _ -> Managed
-  | Snapshot _ -> Snapshot
-  | Import_snapshot _ -> Import_snapshot
-  | Synced_mirror _ -> Synced_mirror
-  | Native_local_graph _ -> Native_local
-;;
-
 let initial (config : config) =
   let sync_core =
-    match config.sync with
-    | None -> Ok None
-    | Some config ->
-      Result.map_error
-        (fun (Logseq_sync_pure_reducer.Core.Invalid_create message) ->
-           Invalid_create message)
-        (Logseq_sync_pure_reducer.Core.initial config)
-      |> Result.map Option.some
+    Logseq_sync_pure_reducer.Core.initial config
+    |> Result.map_error (fun (Logseq_sync_pure_reducer.Core.Invalid_create message) ->
+      Invalid_create message)
   in
   Result.map
     (fun sync_core ->
-       { config
-       ; target = target_kind config.worker.target
-       ; graph = { generation = 0; graph_id = None; phase = Graph_closed; error = None }
+       { graph = { generation = 0; graph_id = None; phase = Graph_closed; error = None }
        ; sync_core
        ; engine = None
        ; pending = []
@@ -257,14 +217,13 @@ let initial (config : config) =
 ;;
 
 let view state =
-  { target = state.target
-  ; graph = state.graph
-  ; sync = Option.map Logseq_sync_pure_reducer.Core.state state.sync_core
+  { graph = state.graph
+  ; sync = Logseq_sync_pure_reducer.Core.state state.sync_core
   ; pending_requests =
       List.fold_left
         (fun count -> function
            | Pending_execute _ | Pending_prepare _ -> count + 1
-           | Pending_open _ | Pending_sync_worker _ -> count)
+           | Pending_sync_worker _ -> count)
         0
         state.pending
   ; pending_effects = List.length state.pending
@@ -300,7 +259,6 @@ let fresh_ticket state =
 let remove_pending id pending =
   List.filter
     (function
-      | Pending_open ticket -> not (Int64.equal id ticket.id)
       | Pending_execute (_, _, ticket) -> not (Int64.equal id ticket.id)
       | Pending_prepare (_, _, ticket) -> not (Int64.equal id ticket.id)
       | Pending_sync_worker (ticket, _) -> not (Int64.equal id ticket.id))
@@ -310,7 +268,6 @@ let remove_pending id pending =
 let has_pending id pending =
   List.exists
     (function
-      | Pending_open ticket -> Int64.equal id ticket.id
       | Pending_execute (_, _, ticket) -> Int64.equal id ticket.id
       | Pending_prepare (_, _, ticket) -> Int64.equal id ticket.id
       | Pending_sync_worker (ticket, _) -> Int64.equal id ticket.id)
@@ -388,7 +345,7 @@ let retire_graph_requests state message =
       (function
         | Pending_execute (id, request, _) | Pending_prepare (id, request, _) ->
           Some (Publish (Reply (id, unavailable_response request Execute message)))
-        | Pending_open _ | Pending_sync_worker _ -> None)
+        | Pending_sync_worker _ -> None)
       state.pending
   in
   let managed_replies =
@@ -430,9 +387,7 @@ let apply_lifecycle state = function
 ;;
 
 let translate_sync transition state =
-  let state =
-    { state with sync_core = Some transition.Logseq_sync_pure_reducer.Core.next }
-  in
+  let state = { state with sync_core = transition.Logseq_sync_pure_reducer.Core.next } in
   let rec loop state reversed = function
     | [] -> { next = state; effects = List.rev reversed }
     | Logseq_sync_pure_reducer.Core.Run runner_effect :: rest ->
@@ -459,21 +414,7 @@ let step state event =
   then no_effects state
   else (
     match event with
-    | Start when state.target = Managed -> no_effects state
-    | Start ->
-      let ticket, state = fresh_ticket state in
-      let next =
-        { state with
-          graph = { state.graph with phase = Graph_opening; error = None }
-        ; pending = Pending_open ticket :: state.pending
-        }
-      in
-      { next
-      ; effects =
-          [ Run_worker (Request (ticket, Open_engine state.config.worker))
-          ; Publish (Graph_state_changed next.graph)
-          ]
-      }
+    | Start -> no_effects state
     | Graph_request { id; request } when state.graph.phase <> Graph_open ->
       let response =
         unavailable_response
@@ -493,13 +434,9 @@ let step state event =
          in
          { next = state; effects = [ Publish (Reply (id, response)) ] }
        | Some engine ->
-         (match state.target, request.Logseq_db_worker_contract.Protocol.command with
-          | Managed, Mutate _ ->
-            (match
-               Option.bind
-                 state.sync_core
-                 Logseq_sync_pure_reducer.Core.admitted_graph_scope
-             with
+         (match request.Logseq_db_worker_contract.Protocol.command with
+          | Mutate _ ->
+            (match Logseq_sync_pure_reducer.Core.admitted_graph_scope state.sync_core with
              | None ->
                let response =
                  unavailable_response request Execute "No managed graph is admitted."
@@ -525,8 +462,7 @@ let step state event =
                               { engine; scope; admission_id; request } ))
                    ]
                })
-          | Managed, Read _
-          | (Snapshot | Import_snapshot | Synced_mirror | Native_local), _ ->
+          | Read _ ->
             let ticket, state = fresh_ticket state in
             { next =
                 { state with
@@ -536,44 +472,15 @@ let step state event =
                 [ Run_worker (Request (ticket, Execute_request { engine; request })) ]
             }))
     | Sync_event event ->
-      (match state.sync_core with
-       | None -> no_effects state
-       | Some core -> translate_sync (Logseq_sync_pure_reducer.Core.step core event) state)
+      translate_sync (Logseq_sync_pure_reducer.Core.step state.sync_core event) state
     | Set_foreground foreground ->
       let lifecycle_generation = Int64.succ state.lifecycle_generation in
       let state = { state with lifecycle_generation } in
-      (match state.sync_core with
-       | None -> no_effects state
-       | Some core ->
-         translate_sync
-           (Logseq_sync_pure_reducer.Core.step
-              core
-              (Foreground_changed { foreground; lifecycle_generation }))
-           state)
-    | Runner_completed (Open_engine_completed (ticket, result)) ->
-      if
-        ticket.generation <> state.graph.generation
-        || not (has_pending ticket.id state.pending)
-      then no_effects state
-      else (
-        let state = { state with pending = remove_pending ticket.id state.pending } in
-        match result with
-        | Ok opened ->
-          let graph =
-            { state.graph with
-              graph_id = opened.graph_id
-            ; phase = Graph_open
-            ; error = None
-            }
-          in
-          { next = { state with graph; engine = Some opened.engine }
-          ; effects = [ Publish (Graph_state_changed graph) ]
-          }
-        | Error error ->
-          let graph = { state.graph with phase = Graph_failed; error = Some error } in
-          { next = { state with graph }
-          ; effects = [ Publish (Graph_state_changed graph) ]
-          })
+      translate_sync
+        (Logseq_sync_pure_reducer.Core.step
+           state.sync_core
+           (Foreground_changed { foreground; lifecycle_generation }))
+        state
     | Runner_completed (Execute_request_completed (ticket, result)) ->
       if
         ticket.generation <> state.graph.generation
@@ -585,10 +492,7 @@ let step state event =
             (function
               | Pending_execute (request_id, request, candidate)
                 when Int64.equal candidate.id ticket.id -> Some (request_id, request)
-              | Pending_open _
-              | Pending_prepare _
-              | Pending_sync_worker _
-              | Pending_execute _ -> None)
+              | Pending_prepare _ | Pending_sync_worker _ | Pending_execute _ -> None)
             state.pending
           |> Option.get
         in
@@ -620,10 +524,7 @@ let step state event =
             (function
               | Pending_prepare (request_id, request, candidate)
                 when Int64.equal candidate.id ticket.id -> Some (request_id, request)
-              | Pending_open _
-              | Pending_execute _
-              | Pending_prepare _
-              | Pending_sync_worker _ -> None)
+              | Pending_execute _ | Pending_prepare _ | Pending_sync_worker _ -> None)
             state.pending
           |> Option.get
         in
@@ -647,24 +548,11 @@ let step state event =
           let state =
             { state with managed_requests = managed_request :: state.managed_requests }
           in
-          (match state.sync_core with
-           | None ->
-             { next = state
-             ; effects =
-                 [ Publish
-                     (Reply
-                        ( request_id
-                        , managed_failure
-                            request
-                            "Managed synchronization is unavailable." ))
-                 ]
-             }
-           | Some core ->
-             translate_sync
-               (Logseq_sync_pure_reducer.Core.step
-                  core
-                  (Local_batch_prepared prepared.input))
-               state))
+          translate_sync
+            (Logseq_sync_pure_reducer.Core.step
+               state.sync_core
+               (Local_batch_prepared prepared.input))
+            state)
     | Runner_completed (Close_engine_completed _) -> no_effects state
     | Runner_completed (Sync_worker_effect_completed (ticket, result)) ->
       if
@@ -677,10 +565,7 @@ let step state event =
             (function
               | Pending_sync_worker (candidate, runner_effect)
                 when Int64.equal candidate.id ticket.id -> Some runner_effect
-              | Pending_open _
-              | Pending_execute _
-              | Pending_prepare _
-              | Pending_sync_worker _ -> None)
+              | Pending_execute _ | Pending_prepare _ | Pending_sync_worker _ -> None)
             state.pending
           |> Option.get
         in
@@ -689,10 +574,12 @@ let step state event =
         | Ok result ->
           let state, lifecycle_effects = apply_lifecycle state result.lifecycle in
           let transitioned =
-            match state.sync_core, result.event with
-            | Some core, Some event ->
-              translate_sync (Logseq_sync_pure_reducer.Core.step core event) state
-            | (None | Some _), None | None, Some _ -> no_effects state
+            match result.event with
+            | Some event ->
+              translate_sync
+                (Logseq_sync_pure_reducer.Core.step state.sync_core event)
+                state
+            | None -> no_effects state
           in
           let state = transitioned.next in
           let terminal_effects, state =
@@ -810,21 +697,10 @@ let step state event =
       })
 ;;
 
-let complete_open runner_effect result =
-  match runner_effect with
-  | Request (ticket, Open_engine _) ->
-    Some (Runner_completed (Open_engine_completed (ticket, result)))
-  | Request (_, Execute_request _)
-  | Request (_, Close_engine _)
-  | Request (_, Prepare_managed_mutation _)
-  | Request (_, Handle_sync_worker_effect _) -> None
-;;
-
 let complete_execute runner_effect result =
   match runner_effect with
   | Request (ticket, Execute_request _) ->
     Some (Runner_completed (Execute_request_completed (ticket, result)))
-  | Request (_, Open_engine _)
   | Request (_, Close_engine _)
   | Request (_, Prepare_managed_mutation _)
   | Request (_, Handle_sync_worker_effect _) -> None

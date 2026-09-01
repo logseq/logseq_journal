@@ -99,7 +99,6 @@
   (bonsai (= v0.17.0))
   (bonsai_flutter (= 0.1.0~dev))
   (bonsai_flutter_test (= 0.1.0~dev))
-  (cmdliner (= 2.1.1))
   (core (= v0.17.2))
   (datascript_ocaml (= dev))
   (datascript-ocaml-native (= dev))

@@ -151,10 +151,8 @@ let benchmark_sample engine sample =
 let () =
   Printf.printf
     "sample,payload_bytes,operation,iterations,ns_per_operation,allocated_bytes_per_operation,fingerprint_bytes\n";
-  F.with_synced_mirror (fun fixture ->
-    let engine =
-      Engine.open_ ~dependencies:F.dependencies fixture.config |> Result.get_ok
-    in
+  F.with_managed (fun fixture ->
+    let engine = F.open_engine fixture |> Result.get_ok in
     Fun.protect
       ~finally:(fun () -> Engine.close engine |> Result.get_ok)
       (fun () ->

@@ -6,7 +6,6 @@
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
-  logseq_db_worker_cli
   sqlite3
   unix
   yojson))
@@ -17,8 +16,7 @@
   test_codec
   test_storage_atomicity
   test_admission
-  test_engine
-  test_engine_open
+  test_engine_managed
   test_performance
   test_fixture_generator
   test_synced_config_admission)
@@ -27,8 +25,7 @@
   test_codec
   test_storage_atomicity
   test_admission
-  test_engine
-  test_engine_open
+  test_engine_managed
   test_performance
   test_fixture_generator
   test_synced_config_admission)
@@ -39,27 +36,12 @@
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
-  logseq_db_worker_cli
   logseq_db_worker_fixture_generator
   logseq_db_worker_test_support
   logseq_sync.pure_reducer
   sqlite3
   unix
   uri
-  yojson))
-
-(test
- (name test_cli)
- (modules test_cli)
- (libraries
-  bonsai_flutter.driver
-  logseq_db_worker
-  logseq_db_worker.bonsai
-  logseq_db_worker_cli
-  logseq_db_worker_test_support
-  logseq_sync.effect_runner
-  sqlite3
-  unix
   yojson))
 
 (test
@@ -70,6 +52,7 @@
   bonsai_flutter_test
   logseq_db_worker
   logseq_db_worker.bonsai
+  logseq_db_worker.engine
   logseq_db_worker_test_support
   logseq_sync.effect_runner))
 
@@ -122,6 +105,7 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.bonsai
+  logseq_db_worker.engine
   logseq_db_worker_test_support
   logseq_sync.pure_reducer
   managed_sync_e2e_support
@@ -133,15 +117,6 @@
  (deps test_managed_sync_e2e.exe ../tool/cognito_e2e_login.sh)
  (action
   (run ./test_managed_sync_e2e.exe)))
-
-(rule
- (alias runtest)
- (deps test_ios_device_harness.sh ../tool/test_ios_device.sh)
- (action
-  (run
-   sh
-   %{dep:test_ios_device_harness.sh}
-   %{dep:../tool/test_ios_device.sh})))
 
 (rule
  (alias runtest)

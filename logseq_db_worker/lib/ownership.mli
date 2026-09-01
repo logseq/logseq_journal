@@ -1,8 +1,3 @@
-type target =
-  | Snapshot_target
-  | Native_target
-  | Synced_target
-
 type t
 
 type error =
@@ -12,7 +7,7 @@ type error =
   | Not_owner
   | Invalid_sentinel
 
-val acquire : target:target -> graph_dir:string -> (t, error) result
+val acquire : graph_dir:string -> (t, error) result
 val revalidate : t -> (unit, error) result
 val release : t -> (unit, error) result
 val generation : t -> string

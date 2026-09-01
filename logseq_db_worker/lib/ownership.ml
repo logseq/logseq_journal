@@ -1,8 +1,3 @@
-type target =
-  | Snapshot_target
-  | Native_target
-  | Synced_target
-
 type lock =
   { repo : string
   ; pid : int
@@ -151,7 +146,7 @@ let acquire_owner_db graph_dir =
   | Sqlite3.SqliteError _ -> Error Identity_changed
 ;;
 
-let acquire ~target ~graph_dir =
+let acquire ~graph_dir =
   try
     let graph_dir = Unix.realpath graph_dir in
     let graph_stat = Unix.stat graph_dir in
@@ -176,7 +171,6 @@ let acquire ~target ~graph_dir =
             | Some lock when not (String.equal lock.repo graph_name) ->
               Error Invalid_sentinel
             | Some lock when pid_is_alive lock.pid -> Error Already_owned
-            | Some _ when target = Snapshot_target -> Error Ambiguous_stale_lock
             | Some _ ->
               (try
                  let current = Unix.stat graph_dir in

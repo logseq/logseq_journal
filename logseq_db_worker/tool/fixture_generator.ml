@@ -7,12 +7,6 @@ type mode =
 
 type generated =
   { support_root : string
-  ; snapshot_token : Logseq_db_types.Graph_types.Uuid.t
-  ; graph_dir : string
-  }
-
-type managed_generated =
-  { support_root : string
   ; graph_id : Logseq_db_types.Graph_types.Uuid.t
   ; graph_dir : string
   ; user_id : string
@@ -20,50 +14,98 @@ type managed_generated =
   ; expected_timeline_text : string
   }
 
-module Snapshot = Logseq_db_worker_engine.Snapshot
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
 
-let uuid value =
-  match Logseq_db_types.Graph_types.Uuid.of_string value with
-  | Ok uuid -> uuid
-  | Error message -> failwith message
+let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok
+
+let rec ensure_directory_tree path =
+  if Sys.file_exists path
+  then ()
+  else (
+    ensure_directory_tree (Filename.dirname path);
+    Unix.mkdir path 0o700)
 ;;
 
-let seed_pagination_graph ~support_root ~graph_dir =
-  let open Logseq_db_worker in
-  let open Protocol in
-  let config =
-    Config.create
-      ~application_support_directory:support_root
-      ~target:(Native_local_graph { graph_name = Filename.basename graph_dir; graph_dir })
-      ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Protocol.maximum_response_bytes
-      ~default_page_size:Protocol.default_page_size
+let install_catalog_fixture ~support_root ~user_id ~base_url ~graph_id ~encrypted =
+  let root = Filename.concat support_root "logseq-db-worker/sync-catalogs" in
+  ensure_directory_tree root;
+  let digest =
+    Digestif.SHA256.digest_string (user_id ^ "\000" ^ base_url) |> Digestif.SHA256.to_hex
+  in
+  let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
+  let rec instantiate = function
+    | `String "__BASE_URL__" -> `String base_url
+    | `String "__GRAPH_ID__" -> `String graph_id
+    | `String "__USER_ID__" -> `String user_id
+    | `Assoc fields ->
+      `Assoc
+        (List.map
+           (fun (name, value) ->
+              ( name
+              , if String.equal name "encrypted"
+                then `Bool encrypted
+                else instantiate value ))
+           fields)
+    | `List values -> `List (List.map instantiate values)
+    | (`Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _) as value -> value
+  in
+  let json =
+    Logseq_db_worker_test_support.Test_support.fixture
+      "sync/encrypted-catalog-template.json"
+    |> Yojson.Safe.from_file
+    |> instantiate
+  in
+  Yojson.Safe.to_file (Filename.concat root (digest ^ ".json")) json
+;;
+
+let attachment graph_id graph_dir checkpoint =
+  Logseq_db_worker.Engine.
+    { graph_id
+    ; graph_name = "runtime-flow-source"
+    ; graph_dir
+    ; database_path = Filename.concat graph_dir "db.sqlite"
+    ; checkpoint
+    }
+;;
+
+let apply_mutation engine checkpoint mutation =
+  let identity = Logseq_db_types.Mutation.identify mutation in
+  let prepared =
+    Logseq_db_worker.Engine.prepare_managed_mutation engine ~identity mutation
     |> Result.get_ok
   in
+  let precondition =
+    Logseq_db_worker.Engine.authoritative_precondition engine |> Result.get_ok
+  in
+  match
+    Logseq_db_worker.Engine.apply_authoritative
+      engine
+      ~expected_precondition:precondition
+      [ Logseq_db_worker.Engine.prepared_mutation_operations prepared ]
+      ~projection_transactions:[]
+      ~checkpoint
+      ~outbox_records:[]
+  with
+  | Ok _ -> ()
+  | Error Authoritative_conflict -> failwith "fixture authoritative commit conflicted"
+  | Error (Authoritative_apply_failed message) -> failwith message
+;;
+
+let seed_pagination_graph ~support_root ~graph_id ~graph_dir ~checkpoint =
+  let config = Adapter_fixture.config support_root graph_id in
   let engine =
-    Engine.open_ ~dependencies:Adapter_fixture.dependencies config |> Result.get_ok
+    Logseq_db_worker.Engine.open_
+      ~dependencies:Adapter_fixture.dependencies
+      ~response_budget_bytes:config.response_budget_bytes
+      (attachment graph_id graph_dir checkpoint)
+    |> Result.get_ok
   in
   let sequence = ref 1 in
-  let execute mutation =
-    let number = !sequence in
-    incr sequence;
-    let request_id = uuid (Printf.sprintf "92000000-0000-4000-8000-%012x" number) in
-    let response =
-      Engine.execute engine { api_version; request_id; command = Mutate mutation }
-    in
-    match response with
-    | Succeeded { success = Mutation_result { status = Applied; _ }; _ } -> ()
-    | Succeeded
-        { success = Mutation_result { status = No_change | Already_applied; _ }; _ }
-    | Succeeded _ -> failwith "pagination fixture mutation was not applied"
-    | Failed failure -> failwith (Error.message failure.error)
-  in
   let context () =
     let number = !sequence in
-    let expected_basis = Option.get (Engine.basis engine) in
+    incr sequence;
     { mutation_id = uuid (Printf.sprintf "93000000-0000-4000-8000-%012x" number)
-    ; expected_basis
+    ; expected_basis = Option.get (Logseq_db_worker.Engine.basis engine)
     }
   in
   let seed_day index day title row_count row_prefix =
@@ -74,7 +116,9 @@ let seed_pagination_graph ~support_root ~graph_dir =
            (day / 10_000)
            (day mod 10_000))
     in
-    execute
+    apply_mutation
+      engine
+      checkpoint
       (Page
          (Create_page
             { title
@@ -89,28 +133,16 @@ let seed_pagination_graph ~support_root ~graph_dir =
         ; title = Printf.sprintf "%s row %02d" row_prefix row
         ; children = []
         })
-      @
-      if index = 1
-      then
-        [ { uuid = uuid "95000000-0000-4000-8000-000000000001"
-          ; title = "Pagination expandable parent"
-          ; children =
-              [ { uuid = uuid "95000000-0000-4000-8000-000000000002"
-                ; title = "Pagination persisted child"
-                ; children = []
-                }
-              ]
-          }
-        ]
-      else []
     in
-    execute
+    apply_mutation
+      engine
+      checkpoint
       (Structural
          (Insert_blocks
             { roots; position = Relative (Last_child page); context = context () }))
   in
   Fun.protect
-    ~finally:(fun () -> ignore (Engine.close engine))
+    ~finally:(fun () -> ignore (Logseq_db_worker.Engine.close engine))
     (fun () ->
        seed_day 1 20260807 "Aug 7th, 2026" 1 "Pagination today";
        seed_day 2 20260806 "Aug 6th, 2026" 1 "Pagination day six";
@@ -118,7 +150,7 @@ let seed_pagination_graph ~support_root ~graph_dir =
        seed_day 4 20260804 "Aug 4th, 2026" 70 "Pagination day four")
 ;;
 
-let create ~support_root ~mode =
+let create_with_catalog_encryption ~support_root ~mode ~encrypted =
   try
     if Filename.is_relative support_root
     then Error "support root must be absolute"
@@ -126,166 +158,27 @@ let create ~support_root ~mode =
     then Error "support root must be an existing directory"
     else (
       let support_root = Unix.realpath support_root in
-      let sources = Filename.concat support_root "sources" in
-      let source_graph_dir = Filename.concat sources "runtime-flow-source" in
-      if Sys.file_exists source_graph_dir
-      then Error "runtime flow source already exists"
-      else (
-        if Sys.file_exists sources
-        then (
-          if not (Sys.is_directory sources)
-          then failwith "fixture sources path is not a directory")
-        else Unix.mkdir sources 0o700;
-        let source_graph_dir =
-          Adapter_fixture.create_oracle_graph sources "runtime-flow-source"
-        in
-        (match mode with
-         | Runtime_flow -> ()
-         | Runtime_flow_with_pagination ->
-           seed_pagination_graph ~support_root ~graph_dir:source_graph_dir
-         | Runtime_flow_with_persistence_failure ->
-           Adapter_fixture.install_mutation_write_failure source_graph_dir);
-        let catalog =
-          match Snapshot.create_catalog ~application_support_directory:support_root with
-          | Ok catalog -> catalog
-          | Error _ -> failwith "unable to create snapshot catalog"
-        in
-        let snapshot_token =
-          match Snapshot.create catalog ~source_graph_dir with
-          | Ok token -> token
-          | Error _ -> failwith "unable to publish runtime fixture snapshot"
-        in
-        let graph_dir =
-          match Snapshot.resolve catalog snapshot_token with
-          | Ok resolved -> resolved.graph_dir
-          | Error _ -> failwith "unable to resolve published runtime fixture"
-        in
-        Ok { support_root; snapshot_token; graph_dir }))
-  with
-  | Unix.Unix_error (error, operation, path) ->
-    Error
-      (Printf.sprintf
-         "fixture filesystem operation failed: %s(%s): %s"
-         operation
-         path
-         (Unix.error_message error))
-  | Failure message -> Error message
-;;
-
-let rec ensure_directory_tree path =
-  if Sys.file_exists path
-  then ()
-  else (
-    ensure_directory_tree (Filename.dirname path);
-    Unix.mkdir path 0o700)
-;;
-
-let add_remote_identity graph_dir graph_id_text =
-  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
-  let module Session = Logseq_db_storage.Storage_session in
-  let connection =
-    Storage.open_database (Filename.concat graph_dir "db.sqlite") |> Result.get_ok
-  in
-  let storage = Storage.datascript_storage connection in
-  let db = Storage.restore_database connection |> Result.get_ok in
-  let session =
-    Session.create
-      ~db
-      ~tail:(Datascript.Storage.restore_tail_groups storage)
-      ~callbacks:(Storage.connection_callbacks connection)
-  in
-  let entity id ident value =
-    Datascript.Entity
-      { db_id = Some (Temp_id id)
-      ; attrs = [ "db/ident", One_value (Keyword ident); "kv/value", One_value value ]
-      }
-  in
-  let staged =
-    Session.stage_transact
-      session
-      [ entity "remote-flag" "logseq.kv/graph-remote?" (Bool true)
-      ; entity "remote-uuid" "logseq.kv/graph-uuid" (Uuid graph_id_text)
-      ]
-    |> Result.get_ok
-  in
-  Session.commit_staged session staged |> Result.get_ok;
-  Session.close session |> Result.get_ok
-;;
-
-let install_catalog_fixture ~support_root ~user_id ~base_url ~graph_id =
-  let root = Filename.concat support_root "logseq-db-worker/sync-catalogs" in
-  ensure_directory_tree root;
-  let digest =
-    Digestif.SHA256.digest_string (user_id ^ "\000" ^ base_url) |> Digestif.SHA256.to_hex
-  in
-  let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
-  let rec instantiate = function
-    | `String "__BASE_URL__" -> `String base_url
-    | `String "__GRAPH_ID__" -> `String graph_id
-    | `String "__USER_ID__" -> `String user_id
-    | `Assoc fields ->
-      `Assoc (List.map (fun (name, value) -> name, instantiate value) fields)
-    | `List values -> `List (List.map instantiate values)
-    | (`Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _) as value -> value
-  in
-  let json =
-    Logseq_db_worker_test_support.Test_support.fixture
-      "sync/encrypted-catalog-template.json"
-    |> Yojson.Safe.from_file
-    |> instantiate
-  in
-  Yojson.Safe.to_file (Filename.concat root (digest ^ ".json")) json
-;;
-
-let create_encrypted_warm_start ~support_root =
-  try
-    if Filename.is_relative support_root
-    then Error "support root must be absolute"
-    else if not (Sys.file_exists support_root && Sys.is_directory support_root)
-    then Error "support root must be an existing directory"
-    else (
-      let support_root = Unix.realpath support_root in
-      let graph_id_text = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" in
-      let graph_id = uuid graph_id_text in
-      let graph_dir =
-        Filename.concat
-          support_root
-          (Filename.concat "logseq-db-worker/synced-graphs" graph_id_text)
-      in
+      let graph_id = uuid "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" in
+      let graph_id_text = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
+      let root = Filename.concat support_root "logseq-db-worker/synced-graphs" in
+      let graph_dir = Filename.concat root graph_id_text in
       if Sys.file_exists graph_dir
-      then Error "encrypted warm-start mirror already exists"
+      then Error "managed warm-start mirror already exists"
       else (
-        let root = Filename.dirname graph_dir in
         ensure_directory_tree root;
         let created = Adapter_fixture.create_oracle_graph root graph_id_text in
         if not (String.equal created graph_dir)
-        then failwith "encrypted warm-start mirror path changed";
-        seed_pagination_graph ~support_root ~graph_dir;
-        add_remote_identity graph_dir graph_id_text;
-        let database_path = Filename.concat graph_dir "db.sqlite" in
-        let metadata =
-          match
-            Logseq_db_types.Sync_checkpoint.create
-              ~graph_id
-              ~schema:Logseq_db_types.Graph_types.{ major = 65; minor = 33 }
-              ~applied_server_t:40
-              ~checksum:"0000000000000000"
-          with
-          | Ok value -> value
-          | Error message -> failwith message
-        in
-        let sqlite = Sqlite3.db_open database_path in
-        (match
-           Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite metadata
-         with
-         | Ok () -> ()
-         | Error message ->
-           failwith ("unable to initialize encrypted warm-start fixture: " ^ message));
-        if not (Sqlite3.db_close sqlite)
-        then failwith "unable to close encrypted warm-start metadata";
+        then failwith "managed mirror path changed";
+        let checkpoint = Adapter_fixture.prepare_mirror graph_dir graph_id in
+        (match mode with
+         | Runtime_flow -> ()
+         | Runtime_flow_with_pagination ->
+           seed_pagination_graph ~support_root ~graph_id ~graph_dir ~checkpoint
+         | Runtime_flow_with_persistence_failure ->
+           Adapter_fixture.install_mutation_write_failure graph_dir);
         let base_url = "https://api.logseq.io" in
-        let user_id = "macos-integration-" ^ Digest.to_hex (Digest.string support_root) in
-        install_catalog_fixture ~support_root ~user_id ~base_url ~graph_id;
+        let user_id = "fixture-" ^ Digest.to_hex (Digest.string support_root) in
+        install_catalog_fixture ~support_root ~user_id ~base_url ~graph_id ~encrypted;
         Ok
           { support_root
           ; graph_id
@@ -305,17 +198,19 @@ let create_encrypted_warm_start ~support_root =
   | Failure message -> Error message
 ;;
 
-let to_yojson (generated : generated) =
-  `Assoc
-    [ "formatVersion", `Int 1
-    ; "supportRoot", `String generated.support_root
-    ; ( "snapshotToken"
-      , `String (Logseq_db_types.Graph_types.Uuid.to_string generated.snapshot_token) )
-    ; "graphDir", `String generated.graph_dir
-    ]
+let create ~support_root ~mode =
+  create_with_catalog_encryption ~support_root ~mode ~encrypted:true
 ;;
 
-let managed_to_yojson (generated : managed_generated) =
+let create_unencrypted_warm_start ~support_root =
+  create_with_catalog_encryption ~support_root ~mode:Runtime_flow ~encrypted:false
+;;
+
+let create_encrypted_warm_start ~support_root =
+  create ~support_root ~mode:Runtime_flow_with_pagination
+;;
+
+let to_yojson generated =
   `Assoc
     [ "formatVersion", `Int 1
     ; "supportRoot", `String generated.support_root
@@ -326,3 +221,5 @@ let managed_to_yojson (generated : managed_generated) =
     ; "expectedTimelineText", `String generated.expected_timeline_text
     ]
 ;;
+
+let managed_to_yojson = to_yojson

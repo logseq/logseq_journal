@@ -1,21 +1,7 @@
 (** Accepts Logseq graph schemas at version 65.33 or newer. *)
 type compatibility_profile = Logseq_65_33_or_newer
 
-type target =
-  | Managed_sync of { base_url : string }
-  | Snapshot of { token : Graph_types.Uuid.t }
-  | Import_snapshot of { inbox_entry : string }
-  | Synced_mirror of
-      { graph_id : Graph_types.Uuid.t
-      ; graph_name : string
-      ; graph_dir : string
-      ; database_path : string
-      ; checkpoint : Sync_checkpoint.t
-      }
-  | Native_local_graph of
-      { graph_name : string
-      ; graph_dir : string
-      }
+type target = Managed_sync of { base_url : string }
 
 type t =
   { application_support_directory : string

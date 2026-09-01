@@ -382,23 +382,15 @@ let () =
     ; T.case "schema profile accepts 65.33 or newer" (fun () ->
         match Logseq_db_worker.Config.Logseq_65_33_or_newer with
         | Logseq_db_worker.Config.Logseq_65_33_or_newer -> ())
-    ; T.case "all targets are exclusive read-write" (fun () ->
+    ; T.case "managed sync is the only startup target" (fun () ->
         let directory = Filename.temp_file "logseq-db-worker-config-" "" in
         Sys.remove directory;
         Unix.mkdir directory 0o700;
-        let token =
-          match
-            Logseq_db_types.Graph_types.Uuid.of_string
-              "40000000-0000-4000-8000-000000000001"
-          with
-          | Ok token -> token
-          | Error message -> T.fail "%s" message
-        in
         let config =
           match
             Logseq_db_worker.Config.create
               ~application_support_directory:directory
-              ~target:(Snapshot { token })
+              ~target:(Managed_sync { base_url = "https://api.logseq.io" })
               ~compatibility_profile:Logseq_65_33_or_newer
               ~response_budget_bytes:P.maximum_response_bytes
               ~default_page_size:P.default_page_size
@@ -427,8 +419,8 @@ let () =
             [ "applicationSupportDirectory", `String missing
             ; ( "target"
               , `Assoc
-                  [ "kind", `String "snapshot"
-                  ; "token", `String "40000000-0000-4000-8000-000000000001"
+                  [ "kind", `String "managedSync"
+                  ; "baseUrl", `String "https://api.logseq.io"
                   ] )
             ; "compatibilityProfile", `String "logseq-65.33-or-newer"
             ; "responseBudgetBytes", `Int P.maximum_response_bytes
@@ -442,5 +434,44 @@ let () =
             "bounded decode changed the startup capability"
         | Error message ->
           T.fail "bounded config decode touched the filesystem: %s" message)
+    ; T.case "reject retired startup target wire values" (fun () ->
+        let envelope target =
+          `Assoc
+            [ "applicationSupportDirectory", `String "/tmp/logseq-journal-support"
+            ; "target", target
+            ; "compatibilityProfile", `String "logseq-65.33-or-newer"
+            ; "responseBudgetBytes", `Int P.maximum_response_bytes
+            ; "defaultPageSize", `Int P.default_page_size
+            ]
+        in
+        let reject kind fields =
+          let target = `Assoc (("kind", `String kind) :: fields) in
+          match Logseq_db_worker.Config.of_yojson (envelope target) with
+          | Error _ -> ()
+          | Ok _ -> T.fail "retired %s target was accepted" kind
+        in
+        reject
+          ("snap" ^ "shot")
+          [ "token", `String "40000000-0000-4000-8000-000000000001" ];
+        reject ("import" ^ "Snapshot") [ "inbox" ^ "Entry", `String "incoming" ];
+        reject
+          ("nativeLocal" ^ "Graph")
+          [ "graphName", `String "Journal"; "graphDir", `String "/tmp/Journal" ];
+        reject
+          ("synced" ^ "Mirror")
+          [ "graphId", `String "40000000-0000-4000-8000-000000000001"
+          ; "graphName", `String "Journal"
+          ; "graphDir", `String "/tmp/Journal"
+          ; "databasePath", `String "/tmp/Journal/db.sqlite"
+          ; ( "checkpoint"
+            , `Assoc
+                [ "appliedServerT", `Int 0
+                ; "checksum", `String "0000000000000000"
+                ; "schemaMajor", `Int 65
+                ; "schemaMinor", `Int 33
+                ; "status", `String "active"
+                ; "lastError", `Null
+                ] )
+          ])
     ]
 ;;

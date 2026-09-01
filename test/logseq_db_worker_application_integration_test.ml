@@ -84,75 +84,10 @@ let string_contains text fragment =
   loop 0
 ;;
 
-let seed_fatal_test_block (fixture : Adapter_fixture.t) =
-  let engine =
-    Logseq_db_worker.Engine.open_
-      ~dependencies:Adapter_fixture.dependencies
-      fixture.config
-    |> Result.get_ok
-  in
-  let page_uuid = uuid "00000001-2026-0809-0000-000000000000" in
-  let block_uuid = uuid "95000000-0000-4000-a000-000000000001" in
-  let execute mutation_id mutation =
-    let request =
-      Protocol.{ api_version; request_id = uuid mutation_id; command = Mutate mutation }
-    in
-    match Logseq_db_worker.Engine.execute engine request with
-    | Succeeded _ -> ()
-    | Failed failure ->
-      fail "fatal test seed failed: %s" (Logseq_db_worker.Error.message failure.error)
-  in
-  let context mutation_id =
-    Logseq_db_types.Mutation.
-      { mutation_id = uuid mutation_id
-      ; expected_basis = Option.value (Logseq_db_worker.Engine.basis engine) ~default:0L
-      }
-  in
-  execute
-    "95000000-0000-4000-9000-000000000001"
-    (Page
-       (Create_page
-          { title = "2026-08-09"
-          ; kind =
-              Create_journal_page
-                { journal_day = 20260809; supplied_uuid = Some page_uuid }
-          ; context = context "95000000-0000-4000-9000-000000000002"
-          }));
-  execute
-    "95000000-0000-4000-9000-000000000003"
-    (Structural
-       (Insert_blocks
-          { roots =
-              [ { Logseq_db_types.Mutation.uuid = block_uuid
-                ; title = "Fatal mutation row"
-                ; children = []
-                }
-              ]
-          ; position = Relative (Last_child page_uuid)
-          ; context = context "95000000-0000-4000-9000-000000000004"
-          }));
-  (match Logseq_db_worker.Engine.close engine with
-   | Ok () -> ()
-   | Error message -> fail "fatal test seed close failed: %s" message);
-  Graph.Uuid.to_string block_uuid
-;;
-
 let seed_startup_feed_days (fixture : Adapter_fixture.t) count =
-  let engine =
-    Logseq_db_worker.Engine.open_
-      ~dependencies:Adapter_fixture.dependencies
-      fixture.config
-    |> Result.get_ok
-  in
-  let execute serial mutation =
-    let request_id =
-      uuid (Printf.sprintf "97000000-0000-4000-9000-%012d" (serial + 1_000))
-    in
-    let request = Protocol.{ api_version; request_id; command = Mutate mutation } in
-    match Logseq_db_worker.Engine.execute engine request with
-    | Succeeded _ -> ()
-    | Failed failure ->
-      fail "startup feed seed failed: %s" (Logseq_db_worker.Error.message failure.error)
+  let engine = Adapter_fixture.open_engine fixture |> Result.get_ok in
+  let execute _serial mutation =
+    ignore (Adapter_fixture.apply_managed_mutation engine mutation)
   in
   let context serial =
     Logseq_db_types.Mutation.
@@ -253,37 +188,40 @@ let initial_calendar_packet =
 ;;
 
 let initialize_test_platform handle =
-  let rec wait_for_requests remaining calendar preference =
+  let rec wait_for_requests remaining calendar preference binding =
     if remaining = 0
     then fail "timed out waiting for the initial calendar request"
     else (
       Test.Handle.present handle;
-      let calendar, preference =
+      let calendar, preference, binding =
         match Test.Handle.last_frame handle with
-        | None -> calendar, preference
+        | None -> calendar, preference, binding
         | Some frame ->
           (match Host_protocol.Binary_codec.decode frame.bytes with
            | Error error -> fail "application frame did not decode: %s" error.message
            | Ok wire ->
              List.fold_left
-               (fun (calendar, preference) -> function
+               (fun (calendar, preference, binding) -> function
                   | Host_protocol.Wire_frame.Application_request { request_id; payload }
                     when Bytes.length payload >= 8 ->
                     (match Bytes.get_uint16_le payload 6 with
-                     | 1 -> Some request_id, preference
-                     | 16 -> calendar, Some request_id
-                     | _ -> calendar, preference)
-                  | _ -> calendar, preference)
-               (calendar, preference)
+                     | 1 -> Some request_id, preference, binding
+                     | 16 -> calendar, Some request_id, binding
+                     | 20 -> calendar, preference, Some request_id
+                     | _ -> calendar, preference, binding)
+                  | _ -> calendar, preference, binding)
+               (calendar, preference, binding)
                wire.operations)
       in
-      match calendar, preference with
-      | Some calendar, Some preference -> calendar, preference
-      | None, None | Some _, None | None, Some _ ->
+      match calendar, preference, binding with
+      | Some calendar, Some preference, Some binding -> calendar, preference, binding
+      | _ ->
         Test.Handle.pump_next handle ();
-        wait_for_requests (remaining - 1) calendar preference)
+        wait_for_requests (remaining - 1) calendar preference binding)
   in
-  let calendar_request, preference_request = wait_for_requests 500 None None in
+  let calendar_request, preference_request, binding_request =
+    wait_for_requests 500 None None None
+  in
   let event =
     Host_protocol.Inbound_event.
       { sequence = ID.Runtime.Event_sequence.of_int64 1L
@@ -328,6 +266,34 @@ let initialize_test_platform handle =
         }
     ();
   Test.Handle.present handle;
+  let binding_payload =
+    Printf.sprintf
+      {|{"userId":%S,"managedSyncOrigin":%S}|}
+      Adapter_fixture.managed_user_id
+      Adapter_fixture.managed_base_url
+    |> Bytes.of_string
+    |> platform_envelope 21
+  in
+  let binding_event =
+    Host_protocol.Inbound_event.
+      { sequence = ID.Runtime.Event_sequence.of_int64 3L
+      ; displayed_revision = Test.Handle.revision handle
+      ; node_id = ID.Ui.Node_id.zero
+      ; handler_id = ID.Ui.Handler_id.zero
+      ; event_tag = Host_protocol.Generated_protocol.Event_tag.application_response
+      ; payload =
+          Application_response { request_id = binding_request; payload = binding_payload }
+      }
+  in
+  Test.Handle.pump_next
+    handle
+    ~events:
+      Host_protocol.Inbound_event.
+        { runtime_epoch = ID.Runtime.Epoch.of_int64 9_001L; events = [ binding_event ] }
+    ();
+  Test.Handle.present handle;
+  Test.Handle.resize handle ~width:390. ~height:844.;
+  Test.Handle.present handle;
   Test.Handle.resize handle ~width:390. ~height:844.;
   Test.Handle.present handle;
   Test.Handle.resize handle ~width:390. ~height:844.;
@@ -339,7 +305,7 @@ let create_handle config =
     Test.Handle.create_app
       ~runtime_epoch:(ID.Runtime.Epoch.of_int64 9_001L)
       ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
-      Application.app
+      Managed_application_fixture.app
       ~application_payload:(encode_startup config)
   in
   initialize_test_platform handle;
@@ -384,37 +350,6 @@ let capture_affordance_enabled handle =
          .enabled
      | _ -> fail "Capture affordance is not an Expandable_message_composer")
   | None -> fail "Capture affordance is not mounted"
-;;
-
-let press_delete_action handle block_id =
-  Test.Handle.present handle;
-  let query = Test.Query.test_id ("journal-row-slidable:" ^ block_id) in
-  let node =
-    match Test.Handle.find handle query with
-    | Some node -> node
-    | None ->
-      fail "missing Slidable wrapper for %s\n%s" block_id (Test.Handle.show handle)
-  in
-  let kind_id =
-    let (Av view) = Ui.Widget.Private.view node.widget in
-    match view.node with
-    | Ui.Widget.Private.Native_widget { kind_id; _ } -> kind_id
-    | _ -> fail "delete Slidable is not a native widget"
-  in
-  Test.Handle.native_event
-    handle
-    query
-    ~kind_id
-    ~version:3
-    ~event_id:Ui.Native_widget.Slidable.action_pressed_event_id
-    ~payload:(Ui.Native_widget.Slidable.For_testing.encode_action_pressed 1)
-;;
-
-let advance_clock handle seconds =
-  let now = Int64.of_float (seconds *. 1_000_000_000.) in
-  Test.Handle.present handle;
-  ignore (Test.Handle.pump handle ~monotonic_now_ns:now ());
-  Test.Handle.presentation_succeeded handle ~monotonic_now_ns:now
 ;;
 
 let read_file path =
@@ -465,19 +400,20 @@ let test_application_owns_exactly_one_graph_worker () =
 ;;
 
 let test_startup_selects_typed_target_before_worker_startup () =
-  Adapter_fixture.with_snapshot (fun fixture ->
+  Adapter_fixture.with_managed (fun fixture ->
     let payload = encode_startup fixture.config in
     require (Bytes.sub_string payload 0 4 = "LDB1") "startup magic is not LDB1";
     match Journal_startup.decode payload with
     | Error error ->
       fail "typed startup did not decode: %s" (Journal_startup.Error.to_string error)
-    | Ok { Logseq_db_worker.Config.target = Snapshot { token }; _ } ->
-      require (Graph.Uuid.equal token fixture.token) "startup changed the snapshot token"
-    | Ok _ -> fail "startup changed the typed graph target")
+    | Ok { Logseq_db_worker.Config.target = Managed_sync { base_url }; _ } ->
+      require
+        (String.equal base_url Adapter_fixture.managed_base_url)
+        "startup changed the managed origin")
 ;;
 
 let test_initial_graph_info_drives_headless_application () =
-  Adapter_fixture.with_snapshot (fun fixture ->
+  Adapter_fixture.with_managed (fun fixture ->
     let handle = create_handle fixture.config in
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
@@ -488,7 +424,7 @@ let test_initial_graph_info_drives_headless_application () =
 ;;
 
 let test_initial_feed_loads_at_most_seven_days () =
-  Adapter_fixture.with_snapshot (fun fixture ->
+  Adapter_fixture.with_managed (fun fixture ->
     seed_startup_feed_days fixture 8;
     let handle = create_handle fixture.config in
     Fun.protect
@@ -507,37 +443,17 @@ let test_initial_feed_loads_at_most_seven_days () =
            "startup feed loaded more than seven days"))
 ;;
 
-let test_open_failed_renders_without_crashing_worker_runtime () =
-  Adapter_fixture.with_snapshot (fun fixture ->
-    let config = Adapter_fixture.missing_config fixture.support in
-    let handle = create_handle config in
-    Fun.protect
-      ~finally:(fun () -> Test.Handle.shutdown handle)
-      (fun () ->
-         wait_for handle "typed graph open failure" (fun () ->
-           has_test_id handle "logseq-graph-open-failed");
-         require
-           (not (capture_affordance_enabled handle))
-           "Open_failed left graph interaction enabled"))
-;;
-
-let test_fatal_storage_error_terminalizes_application () =
-  Adapter_fixture.with_snapshot (fun fixture ->
-    let block_id = seed_fatal_test_block fixture in
-    let fixture = Adapter_fixture.clone_with_mutation_write_failure fixture in
+let test_missing_managed_mirror_returns_to_safe_startup () =
+  Adapter_fixture.with_missing_managed (fun fixture ->
     let handle = create_handle fixture.config in
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         wait_for handle "seeded graph row" (fun () ->
-           has_text handle "Fatal mutation row");
-         press_delete_action handle block_id;
-         advance_clock handle 5.;
-         wait_for handle "terminal fatal graph state" (fun () ->
-           has_test_id handle "logseq-graph-open-failed");
+         wait_for handle "missing managed mirror fallback" (fun () ->
+           has_text handle "Sign in to open a graph");
          require
-           (not (capture_affordance_enabled handle))
-           "fatal storage state allowed another graph mutation"))
+           (not (has_test_id handle "journal-capture-expandable"))
+           "missing managed mirror left graph interaction enabled"))
 ;;
 
 let test_projection_uses_stable_uuid_and_is_bounded () =
@@ -1206,7 +1122,6 @@ let test_stale_worker_response_cannot_update_runtime () =
     ; graph_dir = "/tmp/stale"
     ; schema = { major = 65; minor = 33 }
     ; basis = 1L
-    ; mode = Snapshot
     ; admission_facts = []
     }
   in
@@ -1326,7 +1241,6 @@ let graph_info ~basis : Graph.graph_info =
   ; graph_dir = "/tmp/reconciliation"
   ; schema = { major = 65; minor = 33 }
   ; basis
-  ; mode = Snapshot
   ; admission_facts = []
   }
 ;;
@@ -1529,8 +1443,7 @@ let () =
   run "typed target startup" test_startup_selects_typed_target_before_worker_startup;
   run "initial Graph_info" test_initial_graph_info_drives_headless_application;
   run "seven-day initial feed" test_initial_feed_loads_at_most_seven_days;
-  run "Open_failed UI" test_open_failed_renders_without_crashing_worker_runtime;
-  run "fatal storage UI" test_fatal_storage_error_terminalizes_application;
+  run "missing managed mirror UI" test_missing_managed_mirror_returns_to_safe_startup;
   run "bounded stable projection" test_projection_uses_stable_uuid_and_is_bounded;
   run
     "exact status projection"

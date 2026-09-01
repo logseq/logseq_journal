@@ -5,11 +5,14 @@ type resolved = { graph_dir : string }
 
 type t =
   { support : string
-  ; source_graph_dir : string
-  ; token : Logseq_db_types.Graph_types.Uuid.t
+  ; graph_id : Logseq_db_types.Graph_types.Uuid.t
   ; config : Logseq_db_worker.Config.t
+  ; attachment : Logseq_db_worker.Engine.attachment
   ; resolved : resolved
   }
+
+let managed_user_id = "managed-fixture-user"
+let managed_base_url = "https://api.logseq.io"
 
 let rec remove_tree path =
   match Unix.lstat path with
@@ -25,6 +28,14 @@ let with_temp_directory prefix f =
   Sys.remove path;
   Unix.mkdir path 0o700;
   Fun.protect ~finally:(fun () -> remove_tree path) (fun () -> f path)
+;;
+
+let rec ensure_directory path =
+  if Sys.file_exists path
+  then ()
+  else (
+    ensure_directory (Filename.dirname path);
+    Unix.mkdir path 0o700)
 ;;
 
 let create_oracle_graph root graph_name =
@@ -71,179 +82,140 @@ let install_mutation_write_failure graph_dir =
   T.require (Sqlite3.db_close db) "unable to install mutation write failure"
 ;;
 
-let config support token =
-  match
-    Logseq_db_worker.Config.create
-      ~application_support_directory:support
-      ~target:(Snapshot { token })
-      ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
-  with
-  | Ok config -> config
-  | Error message -> T.fail "invalid adapter fixture config: %s" message
+let uuid value =
+  Logseq_db_types.Graph_types.Uuid.of_string value
+  |> Result.fold ~ok:Fun.id ~error:(fun message -> T.fail "%s" message)
 ;;
 
-let resolved_snapshot support token =
-  { graph_dir =
-      Filename.concat
-        (Filename.concat support "logseq-db-worker/snapshots")
-        (Logseq_db_types.Graph_types.Uuid.to_string token)
-  }
+let config support _graph_id =
+  Logseq_db_worker.Config.create
+    ~application_support_directory:support
+    ~target:(Managed_sync { base_url = managed_base_url })
+    ~compatibility_profile:Logseq_65_33_or_newer
+    ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+    ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+  |> Result.fold ~ok:Fun.id ~error:(fun message ->
+    T.fail "invalid managed fixture config: %s" message)
 ;;
 
-let with_snapshot ?(fail_mutation_writes = false) f =
+let install_catalog support graph_id =
+  let root = Filename.concat support "logseq-db-worker/sync-catalogs" in
+  ensure_directory root;
+  let digest =
+    Digestif.SHA256.digest_string (managed_user_id ^ "\000" ^ managed_base_url)
+    |> Digestif.SHA256.to_hex
+  in
+  let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
+  Yojson.Safe.to_file
+    (Filename.concat root (digest ^ ".json"))
+    (`Assoc
+        [ "userId", `String managed_user_id
+        ; "baseUrl", `String managed_base_url
+        ; ( "graphs"
+          , `List
+              [ `Assoc
+                  [ "graphId", `String graph_id
+                  ; "name", `String "oracle-graph"
+                  ; ( "schema"
+                    , `Assoc [ "major", `Int 65; "minor", `Int 33; "exact", `Bool true ] )
+                  ; "encrypted", `Bool true
+                  ]
+              ] )
+        ; "selectedGraph", `String graph_id
+        ])
+;;
+
+let add_remote_identity graph_dir graph_id =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let connection =
+    Storage.open_database (Filename.concat graph_dir "db.sqlite") |> Result.get_ok
+  in
+  let storage = Storage.datascript_storage connection in
+  let database = Storage.restore_database connection |> Result.get_ok in
+  let session =
+    Session.create
+      ~db:database
+      ~tail:(Datascript.Storage.restore_tail_groups storage)
+      ~callbacks:(Storage.connection_callbacks connection)
+  in
+  let entity id ident value =
+    Datascript.Entity
+      { db_id = Some (Temp_id id)
+      ; attrs = [ "db/ident", One_value (Keyword ident); "kv/value", One_value value ]
+      }
+  in
+  let staged =
+    Session.stage_transact
+      session
+      [ entity "remote-flag" "logseq.kv/graph-remote?" (Bool true)
+      ; entity
+          "remote-uuid"
+          "logseq.kv/graph-uuid"
+          (Uuid (Logseq_db_types.Graph_types.Uuid.to_string graph_id))
+      ]
+    |> Result.get_ok
+  in
+  Session.commit_staged session staged |> Result.get_ok;
+  Session.close session |> Result.get_ok
+;;
+
+let prepare_mirror graph_dir graph_id =
+  add_remote_identity graph_dir graph_id;
+  let checkpoint =
+    Logseq_db_types.Sync_checkpoint.create
+      ~graph_id
+      ~schema:Logseq_db_types.Graph_types.{ major = 65; minor = 33 }
+      ~applied_server_t:0
+      ~checksum:"0000000000000000"
+    |> Result.get_ok
+  in
+  let sqlite = Sqlite3.db_open (Filename.concat graph_dir "db.sqlite") in
+  (match
+     Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint
+   with
+   | Ok () -> ()
+   | Error message -> T.fail "unable to initialize managed checkpoint: %s" message);
+  (match Logseq_db_storage.Sync_outbox_store.initialize_database sqlite with
+   | Ok () -> ()
+   | Error message -> T.fail "unable to initialize managed outbox: %s" message);
+  T.require (Sqlite3.db_close sqlite) "managed fixture SQLite close failed";
+  checkpoint
+;;
+
+let with_managed ?(fail_mutation_writes = false) f =
   with_temp_directory "logseq-db-worker-adapter-" (fun support ->
-    let sources = Filename.concat support "sources" in
-    Unix.mkdir sources 0o700;
-    let source_graph_dir = create_oracle_graph sources "oracle-graph" in
-    if fail_mutation_writes then install_mutation_write_failure source_graph_dir;
-    let token =
-      match
-        Cli_command.create_snapshot
-          ~application_support_directory:support
-          ~source_graph_dir
-      with
-      | Ok token -> token
-      | Error message -> T.fail "unable to create adapter snapshot: %s" message
-    in
-    let resolved = resolved_snapshot support token in
-    f { support; source_graph_dir; token; config = config support token; resolved })
-;;
-
-let with_synced_mirror f =
-  with_snapshot (fun fixture ->
-    let snapshot_engine =
-      let dependencies =
-        Logseq_db_worker.Engine.
-          { clocks =
-              { epoch_ms = (fun () -> 1_704_067_200_000L)
-              ; monotonic_ns = (fun () -> 1_000_000L)
-              }
-          ; cursor_authentication_key = Bytes.make 32 'a'
-          }
-      in
-      match Logseq_db_worker.Engine.open_ ~dependencies fixture.config with
-      | Ok engine -> engine
-      | Error error ->
-        T.fail
-          "unable to inspect synced mirror fixture: %s"
-          (Logseq_db_worker.Error.message error)
-    in
-    let graph_info =
-      let request =
-        Logseq_db_worker.Protocol.
-          { api_version
-          ; request_id =
-              Logseq_db_types.Graph_types.Uuid.of_string
-                "10000000-0000-4000-8000-000000000001"
-              |> Result.get_ok
-          ; command = Read Graph_info
-          }
-      in
-      match Logseq_db_worker.Engine.execute snapshot_engine request with
-      | Logseq_db_worker.Protocol.Succeeded { success = Graph_info_result graph_info; _ }
-        -> graph_info
-      | _ -> T.fail "unable to read synced mirror fixture graph info"
-    in
-    ignore (Logseq_db_worker.Engine.close snapshot_engine);
-    let remote_graph_id =
-      Logseq_db_types.Graph_types.Uuid.of_string "60000000-0000-4000-8000-000000000001"
-      |> Result.get_ok
-    in
-    let database_path = Filename.concat fixture.resolved.graph_dir "db.sqlite" in
-    let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
-    let module Session = Logseq_db_storage.Storage_session in
-    let connection = Storage.open_database database_path |> Result.get_ok in
-    let storage = Storage.datascript_storage connection in
-    let database = Storage.restore_database connection |> Result.get_ok in
-    let session =
-      Session.create
-        ~db:database
-        ~tail:(Datascript.Storage.restore_tail_groups storage)
-        ~callbacks:(Storage.connection_callbacks connection)
-    in
-    let entity id ident value =
-      Datascript.Entity
-        { db_id = Some (Temp_id id)
-        ; attrs = [ "db/ident", One_value (Keyword ident); "kv/value", One_value value ]
+    let graph_id = uuid "60000000-0000-4000-8000-000000000001" in
+    let graph_id_text = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
+    let root = Filename.concat support "logseq-db-worker/synced-graphs" in
+    ensure_directory root;
+    let graph_dir = create_oracle_graph root graph_id_text in
+    let checkpoint = prepare_mirror graph_dir graph_id in
+    install_catalog support graph_id;
+    if fail_mutation_writes then install_mutation_write_failure graph_dir;
+    let attachment =
+      Logseq_db_worker.Engine.
+        { graph_id
+        ; graph_name = "oracle-graph"
+        ; graph_dir
+        ; database_path = Filename.concat graph_dir "db.sqlite"
+        ; checkpoint
         }
     in
-    let staged =
-      Session.stage_transact
-        session
-        [ entity "remote-flag" "logseq.kv/graph-remote?" (Bool true)
-        ; entity
-            "remote-uuid"
-            "logseq.kv/graph-uuid"
-            (Uuid (Logseq_db_types.Graph_types.Uuid.to_string remote_graph_id))
-        ]
-      |> Result.get_ok
-    in
-    Session.commit_staged session staged |> Result.get_ok;
-    Session.close session |> Result.get_ok;
-    let checkpoint =
-      Logseq_db_types.Sync_checkpoint.create
-        ~graph_id:remote_graph_id
-        ~schema:graph_info.schema
-        ~applied_server_t:0
-        ~checksum:"0000000000000000"
-      |> Result.get_ok
-    in
-    let sqlite = Sqlite3.db_open database_path in
-    Fun.protect
-      ~finally:(fun () ->
-        T.require (Sqlite3.db_close sqlite) "fixture SQLite close failed")
-      (fun () ->
-         (match
-            Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint
-          with
-          | Ok () -> ()
-          | Error message -> T.fail "unable to initialize sync checkpoint: %s" message);
-         match Logseq_db_storage.Sync_outbox_store.initialize_database sqlite with
-         | Ok () -> ()
-         | Error message -> T.fail "unable to initialize sync outbox: %s" message);
-    let config =
-      Logseq_db_worker.Config.create
-        ~application_support_directory:fixture.support
-        ~target:
-          (Synced_mirror
-             { graph_id = remote_graph_id
-             ; graph_name = graph_info.graph_name
-             ; graph_dir = fixture.resolved.graph_dir
-             ; database_path
-             ; checkpoint
-             })
-        ~compatibility_profile:Logseq_65_33_or_newer
-        ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-        ~default_page_size:Logseq_db_worker.Protocol.default_page_size
-      |> Result.get_ok
-    in
-    f { fixture with config })
+    f
+      { support
+      ; graph_id
+      ; config = config support graph_id
+      ; attachment
+      ; resolved = { graph_dir }
+      })
 ;;
 
-let clone_with_mutation_write_failure fixture =
-  install_mutation_write_failure fixture.resolved.graph_dir;
-  let token =
-    match
-      Cli_command.create_snapshot
-        ~application_support_directory:fixture.support
-        ~source_graph_dir:fixture.resolved.graph_dir
-    with
-    | Ok token -> token
-    | Error message -> T.fail "unable to clone mutation-failure snapshot: %s" message
-  in
-  let resolved = resolved_snapshot fixture.support token in
-  { fixture with token; config = config fixture.support token; resolved }
+let with_missing_managed f =
+  with_managed (fun fixture ->
+    remove_tree fixture.resolved.graph_dir;
+    f fixture)
 ;;
-
-let uuid value =
-  match Logseq_db_types.Graph_types.Uuid.of_string value with
-  | Ok uuid -> uuid
-  | Error message -> T.fail "%s" message
-;;
-
-let missing_config support = config support (uuid "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
 
 let dependencies =
   Logseq_db_worker.Engine.
@@ -253,6 +225,79 @@ let dependencies =
         }
     ; cursor_authentication_key = Bytes.make 32 'a'
     }
+;;
+
+let open_engine ?(dependencies = dependencies) fixture =
+  Logseq_db_worker.Engine.open_
+    ~dependencies
+    ~response_budget_bytes:fixture.config.response_budget_bytes
+    fixture.attachment
+  |> Result.map (fun engine ->
+    Logseq_db_worker.Engine.restore_managed_projection engine |> Result.get_ok;
+    engine)
+;;
+
+let attachment_for_config config =
+  let root =
+    Filename.concat
+      config.Logseq_db_worker.Config.application_support_directory
+      "logseq-db-worker/synced-graphs"
+  in
+  match Sys.readdir root |> Array.to_list with
+  | [ graph_id_text ] ->
+    let graph_id = uuid graph_id_text in
+    let graph_dir = Filename.concat root graph_id_text in
+    let database_path = Filename.concat graph_dir "db.sqlite" in
+    let checkpoint =
+      Logseq_db_storage.Sync_checkpoint_store.read_path database_path |> Result.get_ok
+    in
+    Logseq_db_worker.Engine.
+      { graph_id; graph_name = "oracle-graph"; graph_dir; database_path; checkpoint }
+  | entries -> T.fail "expected one managed fixture mirror, got %d" (List.length entries)
+;;
+
+let open_configured_engine ?(dependencies = dependencies) config =
+  Logseq_db_worker.Engine.open_
+    ~dependencies
+    ~response_budget_bytes:config.Logseq_db_worker.Config.response_budget_bytes
+    (attachment_for_config config)
+  |> Result.map (fun engine ->
+    Logseq_db_worker.Engine.restore_managed_projection engine |> Result.get_ok;
+    engine)
+;;
+
+let apply_managed_mutation engine mutation =
+  let prepared =
+    Logseq_db_worker.Engine.prepare_managed_mutation
+      engine
+      ~identity:(Logseq_db_types.Mutation.identify mutation)
+      mutation
+    |> Result.get_ok
+  in
+  let expected_precondition =
+    Logseq_db_worker.Engine.authoritative_precondition engine |> Result.get_ok
+  in
+  let checkpoint = Logseq_db_worker.Engine.sync_checkpoint engine |> Result.get_ok in
+  match
+    Logseq_db_worker.Engine.apply_authoritative
+      engine
+      ~expected_precondition
+      [ Logseq_db_worker.Engine.prepared_mutation_operations prepared ]
+      ~projection_transactions:[]
+      ~checkpoint
+      ~outbox_records:[]
+  with
+  | Ok (basis_before, basis_after, changed_uuids, _) ->
+    Logseq_db_types.Mutation.
+      { status = Applied
+      ; basis_before
+      ; basis_after
+      ; changed_uuids
+      ; changed_uuids_truncated = false
+      }
+  | Error Authoritative_conflict -> T.fail "managed fixture mutation conflicted"
+  | Error (Authoritative_apply_failed message) ->
+    T.fail "managed fixture mutation failed: %s" message
 ;;
 
 let graph_info_request ?(request_id = "10000000-0000-4000-8000-000000000001") () =

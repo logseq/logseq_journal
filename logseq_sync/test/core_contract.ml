@@ -950,6 +950,31 @@ let test_warm_graph_attachment_defers_websocket_until_timeline () =
     (Core.token_request_purpose (token_request presented.effects) = Core.Catalog_discovery)
 ;;
 
+let test_unauthenticated_warm_graph_does_not_challenge_websocket () =
+  let graph = graph () in
+  let selected, _ = select_catalog_graph graph in
+  let cache = save_catalog_cache selected.effects in
+  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
+  let restored =
+    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
+  in
+  let mirror = inspect_mirror_request restored.effects in
+  let request = open_request graph mirror.scope "unauthenticated-warm-graph" in
+  let inspected = Core.step restored.next (Mirror_inspected (Mirror_available request)) in
+  let attached =
+    Core.step
+      inspected.next
+      (Graph_attached
+         { scope = request.scope; checkpoint = request.checkpoint; outbox_records = [] })
+  in
+  let presented = Core.step attached.next Timeline_presented in
+  Alcotest.check
+    Alcotest.bool
+    "unauthenticated warm graph emits no WebSocket token after presentation"
+    false
+    (has_token_request presented.effects)
+;;
+
 let test_account_replacement_cancels_and_detaches_before_new_catalog_work () =
   let selected, mirror = select_catalog_graph (graph ()) in
   let replaced =
@@ -4327,6 +4352,10 @@ let scenarios =
       "warm graph attachment defers WebSocket until Timeline"
       `Quick
       test_warm_graph_attachment_defers_websocket_until_timeline
+  ; Alcotest.test_case
+      "unauthenticated warm graph does not challenge WebSocket"
+      `Quick
+      test_unauthenticated_warm_graph_does_not_challenge_websocket
   ; Alcotest.test_case
       "account replacement tears down the previous account first"
       `Quick

@@ -2,7 +2,6 @@ module Config = Logseq_db_worker_contract.Config
 module Error = Logseq_db_worker_contract.Error
 module Protocol = Logseq_db_worker_contract.Protocol
 module Engine = Logseq_db_worker_engine.Engine
-module Synced_mirror = Logseq_db_worker_engine.Synced_mirror
 module Pure_reducer = Logseq_db_worker_pure_reducer.Core
 module Effect_runner = Logseq_db_worker_effect_runner.Effect_runner
 

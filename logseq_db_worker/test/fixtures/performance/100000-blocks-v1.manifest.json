@@ -14,7 +14,7 @@
     "warmupSamples": 20,
     "measuredSamples": 100,
     "percentileEstimator": "nearest-rank",
-    "coldCacheProcedure": "Use a fresh measurement process and a newly published snapshot; do not claim privileged OS cache eviction.",
+    "coldCacheProcedure": "Use a fresh measurement process and a newly bootstrapped managed mirror; do not claim privileged OS cache eviction.",
     "rssSampler": "getrusage(RUSAGE_SELF).ru_maxrss",
     "varianceAllowancePercent": 0,
     "retryRule": "No automatic retry; any threshold failure fails the gate."

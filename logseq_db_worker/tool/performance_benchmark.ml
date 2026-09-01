@@ -2,7 +2,6 @@ module Worker = Logseq_db_worker
 module Protocol = Worker.Protocol
 module Engine = Worker.Engine
 module Uuid = Logseq_db_types.Graph_types.Uuid
-module Snapshot = Logseq_db_worker_engine.Snapshot
 module Storage = Logseq_db_storage.Logseq_sqlite_storage
 module Session = Logseq_db_storage.Storage_session
 module Adapter_fixture = Logseq_db_worker_test_support.Adapter_fixture
@@ -214,54 +213,43 @@ let generate support_root =
   if Filename.is_relative support_root then fail "support root must be absolute";
   ensure_directory support_root;
   let support_root = Unix.realpath support_root in
-  let sources = Filename.concat support_root "sources" in
-  ensure_directory sources;
-  let source_graph_dir = Filename.concat sources "performance-100000-v1" in
-  if Sys.file_exists source_graph_dir then fail "performance source already exists";
-  let graph_dir = Adapter_fixture.create_oracle_graph sources "performance-100000-v1" in
+  let graph_id = uuid "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" in
+  let root = Filename.concat support_root "logseq-db-worker/synced-graphs" in
+  ensure_directory root;
+  let graph_name = Uuid.to_string graph_id in
+  let graph_dir = Filename.concat root graph_name in
+  if Sys.file_exists graph_dir then fail "performance managed mirror already exists";
+  let graph_dir = Adapter_fixture.create_oracle_graph root graph_name in
   seed_performance_graph graph_dir;
   let actual_hash = fixture_sha256 () in
   if not (String.equal actual_hash expected_fixture_sha256)
   then fail "performance fixture hash mismatch: %s" actual_hash;
-  let catalog =
-    match Snapshot.create_catalog ~application_support_directory:support_root with
-    | Ok catalog -> catalog
-    | Error _ -> fail "unable to create performance snapshot catalog"
-  in
-  let token, snapshot_seconds =
-    timed (fun () ->
-      match Snapshot.create catalog ~source_graph_dir:graph_dir with
-      | Ok token -> token
-      | Error _ -> fail "unable to publish performance snapshot")
-  in
-  let resolved =
-    match Snapshot.resolve catalog token with
-    | Ok resolved -> resolved
-    | Error _ -> fail "unable to resolve performance snapshot"
-  in
-  let bytes = directory_bytes resolved.graph_dir in
+  ignore (Adapter_fixture.prepare_mirror graph_dir graph_id);
+  let bytes = directory_bytes graph_dir in
   `Assoc
     [ "formatVersion", `Int 1
     ; "supportRoot", `String support_root
-    ; "snapshotToken", `String (Uuid.to_string token)
-    ; "graphDir", `String resolved.graph_dir
+    ; "graphId", `String (Uuid.to_string graph_id)
+    ; "graphDir", `String graph_dir
     ; "fixtureContentSha256", `String actual_hash
     ; "fixtureBytes", `Intlit (Int64.to_string bytes)
-    ; "snapshotBytesPerSecond", `Float (Int64.to_float bytes /. snapshot_seconds)
     ]
 ;;
 
-let config ~support_root ~graph_dir =
-  match
-    Worker.Config.create
-      ~application_support_directory:support_root
-      ~target:(Native_local_graph { graph_name = Filename.basename graph_dir; graph_dir })
-      ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Protocol.maximum_response_bytes
-      ~default_page_size:Protocol.default_page_size
-  with
-  | Ok config -> config
-  | Error message -> fail "invalid performance config: %s" message
+let attachment ~graph_id ~graph_dir =
+  let graph_id = uuid graph_id in
+  let checkpoint =
+    Logseq_db_storage.Sync_checkpoint_store.read_path
+      (Filename.concat graph_dir "db.sqlite")
+    |> Result.get_ok
+  in
+  Engine.
+    { graph_id
+    ; graph_name = "performance-100000-v1"
+    ; graph_dir
+    ; database_path = Filename.concat graph_dir "db.sqlite"
+    ; checkpoint
+    }
 ;;
 
 let dependencies =
@@ -297,20 +285,33 @@ let save engine index title =
     | Some basis -> basis
     | None -> fail "performance engine has no basis"
   in
-  execute
-    engine
-    ~family:0x30000000
-    ~index
-    (Protocol.Mutate
-       (Structural
-          (Save_block
-             { block = uuid (block_uuid_text 0)
-             ; title
-             ; context =
-                 { mutation_id = indexed_uuid 0x40000000 index; expected_basis = basis }
-             })))
-  |> require_success "Save_block"
-  |> ignore
+  let mutation =
+    Logseq_db_types.Mutation.Structural
+      (Logseq_db_types.Mutation.Save_block
+         { block = uuid (block_uuid_text 0)
+         ; title
+         ; context =
+             { mutation_id = indexed_uuid 0x40000000 index; expected_basis = basis }
+         })
+  in
+  let identity = Logseq_db_types.Mutation.identify mutation in
+  let prepared =
+    Engine.prepare_managed_mutation engine ~identity mutation |> Result.get_ok
+  in
+  let checkpoint = Engine.sync_checkpoint engine |> Result.get_ok in
+  let expected_precondition = Engine.authoritative_precondition engine |> Result.get_ok in
+  match
+    Engine.apply_authoritative
+      engine
+      ~expected_precondition
+      [ Engine.prepared_mutation_operations prepared ]
+      ~projection_transactions:[]
+      ~checkpoint
+      ~outbox_records:[]
+  with
+  | Ok _ -> ()
+  | Error Authoritative_conflict -> fail "managed Save_block conflicted"
+  | Error (Authoritative_apply_failed message) -> fail "%s" message
 ;;
 
 let measure_samples ~warmup ~samples operation =
@@ -449,9 +450,13 @@ let boundedness engine =
     ]
 ;;
 
-let measure ~support_root ~graph_dir ~fixture_hash ~snapshot_throughput ~build_profile =
+let measure ~graph_id ~graph_dir ~fixture_hash ~build_profile =
   let engine_result, cold_open_seconds =
-    timed (fun () -> Engine.open_ ~dependencies (config ~support_root ~graph_dir))
+    timed (fun () ->
+      Engine.open_
+        ~dependencies
+        ~response_budget_bytes:Protocol.maximum_response_bytes
+        (attachment ~graph_id ~graph_dir))
   in
   let engine =
     match engine_result with
@@ -465,10 +470,7 @@ let measure ~support_root ~graph_dir ~fixture_hash ~snapshot_throughput ~build_p
       | Ok () -> ()
       | Error message -> fail "performance engine close failed: %s" message)
     (fun () ->
-       let graph_bytes = directory_bytes graph_dir in
-       let _, first_backup_seconds =
-         timed (fun () -> save engine 0 "Performance block 0 backup-established")
-       in
+       save engine 0 "Performance block 0 managed-baseline";
        let get_block_samples =
          measure_samples ~warmup:warmup_samples ~samples:measured_samples (fun index ->
            read
@@ -495,7 +497,7 @@ let measure ~support_root ~graph_dir ~fixture_hash ~snapshot_throughput ~build_p
              (index + 1)
              (Printf.sprintf "Performance block 0 mutation %d" index))
        in
-       report_latency "post-backup Save_block" mutation_samples;
+       report_latency "managed Save_block" mutation_samples;
        let boundedness = boundedness engine in
        let resource_usage = Core_unix.Resource_usage.get `Self in
        `Assoc
@@ -529,15 +531,9 @@ let measure ~support_root ~graph_dir ~fixture_hash ~snapshot_throughput ~build_p
            , `Assoc
                [ "getBlock", latency_json get_block_samples
                ; "getChildren100", latency_json get_children_samples
-               ; "postBackupSaveBlock", latency_json mutation_samples
+               ; "managedSaveBlock", latency_json mutation_samples
                ] )
          ; "boundedness", boundedness
-         ; ( "throughput"
-           , `Assoc
-               [ "snapshotBytesPerSecond", `Float snapshot_throughput
-               ; ( "firstBackupBytesPerSecond"
-                 , `Float (Int64.to_float graph_bytes /. first_backup_seconds) )
-               ] )
          ])
 ;;
 
@@ -560,9 +556,8 @@ let argument name arguments =
 ;;
 
 let usage =
-  "usage: performance_benchmark generate --support-root ROOT | measure --support-root \
-   ROOT --graph-dir DIR --fixture-hash SHA256 --snapshot-throughput BYTES_PER_SECOND \
-   --build-profile release --output FILE"
+  "usage: performance_benchmark generate --support-root ROOT | measure --graph-id UUID \
+   --graph-dir DIR --fixture-hash SHA256 --build-profile release --output FILE"
 ;;
 
 let () =
@@ -575,11 +570,9 @@ let () =
     | "measure" :: arguments ->
       let output = argument "--output" arguments in
       measure
-        ~support_root:(argument "--support-root" arguments)
+        ~graph_id:(argument "--graph-id" arguments)
         ~graph_dir:(argument "--graph-dir" arguments)
         ~fixture_hash:(argument "--fixture-hash" arguments)
-        ~snapshot_throughput:
-          (float_of_string (argument "--snapshot-throughput" arguments))
         ~build_profile:(argument "--build-profile" arguments)
       |> write_json output
     | _ -> fail "%s" usage

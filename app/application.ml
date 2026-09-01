@@ -4063,20 +4063,19 @@ let component client handlers graph =
 let decode_config payload =
   match Journal_startup.decode payload with
   | Ok startup ->
-    (match startup.Logseq_db_worker.Config.target with
-     | Managed_sync { base_url } ->
-       managed_sync_startup := true;
-       managed_sync_origin := base_url
-     | Snapshot _ | Import_snapshot _ | Synced_mirror _ | Native_local_graph _ ->
-       managed_sync_startup := false);
+    let (Managed_sync { base_url }) = startup.Logseq_db_worker.Config.target in
+    managed_sync_startup := true;
+    managed_sync_origin := base_url;
     Ok startup
   | Error error -> Error (Journal_startup.Error.to_string error)
 ;;
 
-let app =
-  App.create_with_worker
-    ~name:"Logseq Journal"
-    ~decode_config
-    ~service:Graph_service.service
-    component
+let create ~service =
+  App.create_with_worker ~name:"Logseq Journal" ~decode_config ~service component
 ;;
+
+module For_testing = struct
+  let app_with_service service = create ~service
+end
+
+let app = create ~service:Graph_service.service

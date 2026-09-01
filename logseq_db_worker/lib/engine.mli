@@ -12,7 +12,20 @@ type dependencies =
 
 exception Fatal_storage_error of Error.t
 
-val open_ : dependencies:dependencies -> Config.t -> (t, Error.t) result
+type attachment =
+  { graph_id : Graph_types.Uuid.t
+  ; graph_name : string
+  ; graph_dir : string
+  ; database_path : string
+  ; checkpoint : Sync_checkpoint.t
+  }
+
+val open_
+  :  dependencies:dependencies
+  -> response_budget_bytes:int
+  -> attachment
+  -> (t, Error.t) result
+
 val execute : t -> Protocol.request -> Protocol.response
 val sync_checkpoint : t -> (Sync_checkpoint.t, string) result
 val authoritative_database : t -> (Datascript.db, string) result
@@ -49,6 +62,8 @@ val replan_managed_mutation
   -> database:Datascript.db
   -> Logseq_db_types.Mutation.t
   -> (managed_replan, string) result
+
+val restore_managed_projection : t -> (unit, string) result
 
 val commit_managed_mutation
   :  t

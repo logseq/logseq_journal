@@ -232,39 +232,33 @@ let create ~(dependencies : dependencies) =
     ~init:(fun context config ->
       let sw = Worker.Session_context.switch context in
       let event_sink = ref (fun (_ : Pure.event) -> ()) in
+      let (Managed_sync { base_url }) = config.Db.Config.target in
       let selected =
-        match config.Db.Config.target with
-        | Managed_sync { base_url } ->
-          (match sync_limits config with
+        match sync_limits config with
+        | Error error -> Error (error_message error)
+        | Ok limits ->
+          (match Sync.config ~managed_sync_origin:(Uri.of_string base_url) ~limits with
            | Error error -> Error (error_message error)
-           | Ok limits ->
-             (match Sync.config ~managed_sync_origin:(Uri.of_string base_url) ~limits with
-              | Error error -> Error (error_message error)
-              | Ok sync_config ->
-                (match sync_dependencies dependencies context config with
-                 | Error error -> Error (sync_dependency_error_message error)
-                 | Ok runner_dependencies ->
-                   (match
-                      Sync_runner.create ~sw runner_dependencies ~post:(fun event ->
-                        !event_sink (Pure.Sync_event event))
-                    with
-                    | Error error -> Error (sync_create_error_message error)
-                    | Ok runner ->
-                      Ok
-                        ( Some sync_config
-                        , Worker_runner.sync_runner
-                            ~submit:(Sync_runner.submit runner)
-                            ~shutdown:(fun () -> Sync_runner.shutdown runner)
-                            ~decrypt_protected_value:
-                              (Sync_runner.decrypt_protected_value runner)
-                            ~encrypt_protected_values:
-                              (Sync_runner.encrypt_protected_values runner)
-                            () )))))
-        | Snapshot _ | Import_snapshot _ | Synced_mirror _ | Native_local_graph _ ->
-          Ok
-            ( None
-            , Worker_runner.sync_runner ~submit:(fun _ -> ()) ~shutdown:(fun () -> ()) ()
-            )
+           | Ok sync_config ->
+             (match sync_dependencies dependencies context config with
+              | Error error -> Error (sync_dependency_error_message error)
+              | Ok runner_dependencies ->
+                (match
+                   Sync_runner.create ~sw runner_dependencies ~post:(fun event ->
+                     !event_sink (Pure.Sync_event event))
+                 with
+                 | Error error -> Error (sync_create_error_message error)
+                 | Ok runner ->
+                   Ok
+                     ( sync_config
+                     , Worker_runner.sync_runner
+                         ~submit:(Sync_runner.submit runner)
+                         ~shutdown:(fun () -> Sync_runner.shutdown runner)
+                         ~decrypt_protected_value:
+                           (Sync_runner.decrypt_protected_value runner)
+                         ~encrypt_protected_values:
+                           (Sync_runner.encrypt_protected_values runner)
+                         () ))))
       in
       match selected with
       | Error message -> Error message
@@ -272,33 +266,28 @@ let create ~(dependencies : dependencies) =
         (match Worker_runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task) with
          | Error error -> Error (worker_dependency_error_message error)
          | Ok runtime ->
-           (match Pure.config ~worker:config ~sync:sync_config with
-            | Error (Pure.Invalid_config message) -> Error message
-            | Ok pure_config ->
-              (match
-                 Worker_runner.dependencies
-                   ~runtime
-                   ~config
-                   ~engine:dependencies.engine
-                   ~sync_runner:selected_sync_runner
-                   ~publish:(publish context)
-               with
-               | Error error -> Error (worker_dependency_error_message error)
-               | Ok runner_dependencies ->
-                 (match Db.create ~sw ~config:pure_config ~runner_dependencies with
-                  | Error (Db.Invalid_create message) -> Error message
-                  | Ok worker ->
-                    event_sink := Db.post worker;
-                    Ok worker)))))
+           let pure_config = Pure.config ~worker:config ~sync:sync_config in
+           (match
+              Worker_runner.dependencies
+                ~runtime
+                ~config
+                ~engine:dependencies.engine
+                ~sync_runner:selected_sync_runner
+                ~publish:(publish context)
+            with
+            | Error error -> Error (worker_dependency_error_message error)
+            | Ok runner_dependencies ->
+              (match Db.create ~sw ~config:pure_config ~runner_dependencies with
+               | Error (Db.Invalid_create message) -> Error message
+               | Ok worker ->
+                 event_sink := Db.post worker;
+                 Ok worker))))
     ~handle:(fun _context worker request ->
       match request with
       | Get_graph_state -> Ok (Graph_state (Db.graph_state worker))
       | Client_command command ->
-        if (Db.view worker).target = Pure.Managed
-        then (
-          Db.post worker (client_event command);
-          Ok Client_command_completed)
-        else Error "sync client is unavailable for this local graph target"
+        Db.post worker (client_event command);
+        Ok Client_command_completed
       | Graph_request request -> Ok (Graph_response (Db.request worker request)))
     ~shutdown:Db.shutdown
     ()

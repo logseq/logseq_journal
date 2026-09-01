@@ -1874,7 +1874,7 @@ let () =
     ; "let structurally_valid schema db"
     ];
   require_occurrences root "logseq_db_worker/lib/engine.ml" "tree_structural_violations" 3;
-  require_occurrences root "logseq_db_worker/lib/engine.ml" "validate_tree_for_mutation" 4;
+  require_occurrences root "logseq_db_worker/lib/engine.ml" "validate_tree_for_mutation" 3;
   forbid_text
     root
     "logseq_db_storage/lib/storage_session.ml"
@@ -1979,7 +1979,43 @@ let () =
   forbid_text
     root
     "logseq_db_worker/lib/logseq_db_worker.ml"
-    [ "Engine."; "Synced_mirror."; "Worker.Session_context"; "Logseq_sync_effect_runner" ];
+    [ "Engine."
+    ; "Synced_mirror."
+    ; "module Synced_mirror"
+    ; "Worker.Session_context"
+    ; "Logseq_sync_effect_runner"
+    ];
+  List.iter
+    (forbid_path root)
+    [ "logseq_db_worker/lib/snapshot.ml"
+    ; "logseq_db_worker/lib/snapshot.mli"
+    ; "logseq_db_worker/lib/backup.ml"
+    ; "logseq_db_worker/lib/backup.mli"
+    ; "logseq_db_worker/lib/graph_locator.ml"
+    ; "logseq_db_worker/lib/graph_locator.mli"
+    ; "logseq_db_worker/lib/derived_sidecars.ml"
+    ; "logseq_db_worker/lib/derived_sidecars.mli"
+    ; "logseq_db_worker/cli"
+    ; "logseq_db_worker/test/test_cli.ml"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "Snapshot" ^ " of"
+         ; "Import_" ^ "snapshot"
+         ; "Synced_mirror" ^ " of"
+         ; "Native_local_" ^ "graph"
+         ; "import" ^ "Snapshot"
+         ; "nativeLocal" ^ "Graph"
+         ; "synced" ^ "Mirror"
+         ])
+    [ "logseq_db_worker/contract/config.mli"
+    ; "logseq_db_worker/contract/config.ml"
+    ; "logseq_db_worker/spec/pure_reducer/core.mli"
+    ; "logseq_db_worker/lib/pure_reducer/core.ml"
+    ];
   require_text
     root
     "app/application.ml"

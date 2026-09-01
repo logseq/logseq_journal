@@ -3,24 +3,11 @@ type lifecycle =
   | Fatal of Error.t
   | Closed
 
-type write_target =
-  | Snapshot_write_target of { token : Graph_types.Uuid.t }
-  | Native_write_target of { sidecars : Derived_sidecars.t }
-  | Synced_local_first_target
-
-type active_write_session =
-  | Snapshot_write_session of Snapshot.write_session
-  | Native_write_session
-
 type t =
   { session : Storage_session.t
   ; owner : Ownership.t
-  ; catalog : Snapshot.catalog
-  ; write_target : write_target
-  ; backup : Backup.t option
-  ; mutable write_session : active_write_session option
   ; mutable graph_info : Graph_types.graph_info
-  ; mutable sync_metadata : Sync_checkpoint.t option
+  ; mutable sync_metadata : Sync_checkpoint.t
   ; mutable sync_outbox : string list
   ; mutable projected_db : Datascript.db
   ; mutable mutation_cache :
@@ -53,12 +40,6 @@ let error code message =
   | Error validation -> invalid_arg validation
 ;;
 
-let error_with_details code message details =
-  match Error.create ~code ~message ~details with
-  | Ok error -> error
-  | Error validation -> invalid_arg validation
-;;
-
 let lower_cause ~component ~operation ~code message =
   Error.create_cause_or_fallback
     ~component
@@ -80,64 +61,6 @@ let corrupt_storage () =
 ;;
 
 let unsupported_semantics message = error Error.Unsupported_semantics message
-
-let snapshot_error error =
-  let worker_code, message, origin_code, origin_message =
-    match error with
-    | Snapshot.Token_unknown ->
-      ( Error.Graph_not_found
-      , "The graph target does not exist."
-      , "tokenUnknown"
-      , "The snapshot token is unknown." )
-    | Source_missing ->
-      ( Error.Graph_not_found
-      , "The graph target does not exist."
-      , "sourceMissing"
-      , "The snapshot source is missing." )
-    | Invalid_catalog_root ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "invalidCatalogRoot"
-      , "The snapshot catalog root is invalid." )
-    | Invalid_inbox_entry ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "invalidInboxEntry"
-      , "The snapshot inbox entry is invalid." )
-    | Path_escape ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "pathEscape"
-      , "The snapshot path escapes its catalog." )
-    | Symlink_rejected ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "symlinkRejected"
-      , "The snapshot path contains a symbolic link." )
-    | Hard_link_rejected ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "hardLinkRejected"
-      , "The snapshot database contains a hard link." )
-    | Manifest_mismatch ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "manifestMismatch"
-      , "The snapshot manifest does not match its database." )
-    | Publish_failed lower ->
-      ( Error.Corrupt_storage
-      , "The graph storage is corrupt or incomplete."
-      , "publishFailed"
-      , lower )
-  in
-  error_with_origin
-    worker_code
-    message
-    ~component:Error.Snapshot
-    ~operation:"snapshotOperation"
-    ~origin_code
-    ~origin_message
-;;
 
 let ownership_error ownership =
   let worker_code, message =
@@ -326,37 +249,6 @@ let remove_obsolete_pending_intents graph_dir =
   | Unix.Unix_error _ -> Error (corrupt_storage ())
 ;;
 
-type resolved_target =
-  { graph_name : string
-  ; graph_dir : string
-  ; database_path : string
-  ; catalog : Snapshot.catalog
-  ; kind : [ `Snapshot of Graph_types.Uuid.t | `Native | `Synced of Sync_checkpoint.t ]
-  }
-
-let graph_locator_error locator =
-  let origin_code, origin_message =
-    match locator with
-    | Graph_locator.Invalid_graph_name _ ->
-      "invalidGraphName", "The graph name is invalid."
-    | Invalid_utf8 -> "invalidUtf8", "The graph name is not valid UTF-8."
-    | Path_escape -> "pathEscape", "The graph path escapes the platform graph root."
-    | Symlink_escape -> "symlinkEscape", "The graph path escapes through a symbolic link."
-    | Basename_mismatch ->
-      "basenameMismatch", "The graph directory basename does not match the graph name."
-    | Graph_directory_missing ->
-      "graphDirectoryMissing", "The graph directory is missing."
-    | Database_missing -> "databaseMissing", "The graph database is missing."
-  in
-  error_with_origin
-    Error.Graph_not_found
-    "The graph target does not exist."
-    ~component:Error.Graph_locator
-    ~operation:"validateNativeGraph"
-    ~origin_code
-    ~origin_message
-;;
-
 let sqlite_error ~operation ~worker_code ~public_message storage_error =
   let origin_code, origin_message =
     match storage_error with
@@ -387,177 +279,31 @@ let storage_string_error ~operation ~origin_code ~worker_code ~public_message me
     ~origin_message:message
 ;;
 
-let resolve_target config =
-  match
-    Snapshot.create_catalog
-      ~application_support_directory:config.Config.application_support_directory
-  with
-  | Error error -> Error (snapshot_error error)
-  | Ok catalog ->
-    (match config.target with
-     | Config.Managed_sync _ ->
-       Error
-         (error
-            Error.Invalid_request
-            "Managed sync startup must be opened by the managed sync service.")
-     | Config.Snapshot { token } ->
-       (match Snapshot.resolve catalog token with
-        | Ok resolved ->
-          Ok
-            { graph_name = resolved.Snapshot.graph_name
-            ; graph_dir = resolved.graph_dir
-            ; database_path = Filename.concat resolved.graph_dir "db.sqlite"
-            ; catalog
-            ; kind = `Snapshot token
-            }
-        | Error error -> Error (snapshot_error error))
-     | Config.Import_snapshot { inbox_entry } ->
-       (match Snapshot.import catalog ~inbox_entry with
-        | Error error -> Error (snapshot_error error)
-        | Ok token ->
-          (match Snapshot.resolve catalog token with
-           | Ok resolved ->
-             Ok
-               { graph_name = resolved.Snapshot.graph_name
-               ; graph_dir = resolved.graph_dir
-               ; database_path = Filename.concat resolved.graph_dir "db.sqlite"
-               ; catalog
-               ; kind = `Snapshot token
-               }
-           | Error error -> Error (snapshot_error error)))
-     | Config.Synced_mirror { graph_name; graph_dir; database_path; checkpoint; _ } ->
-       Ok { graph_name; graph_dir; database_path; catalog; kind = `Synced checkpoint }
-     | Config.Native_local_graph { graph_name; graph_dir } ->
-       (match Graph_locator.validate_native ~graph_name ~graph_dir with
-        | Error locator -> Error (graph_locator_error locator)
-        | Ok resolved ->
-          Ok
-            { graph_name = resolved.Graph_locator.graph_name
-            ; graph_dir = resolved.graph_dir
-            ; database_path = resolved.database_path
-            ; catalog
-            ; kind = `Native
-            }))
+type attachment =
+  { graph_id : Graph_types.Uuid.t
+  ; graph_name : string
+  ; graph_dir : string
+  ; database_path : string
+  ; checkpoint : Sync_checkpoint.t
+  }
+
+let validate_attachment target =
+  if not (Graph_types.Uuid.equal target.graph_id target.checkpoint.graph_id)
+  then
+    Error
+      (error Error.Invalid_request "The graph identity does not match its checkpoint.")
+  else if target.checkpoint.format_version <> Sync_checkpoint.format_version
+  then Error (error Error.Invalid_request "The checkpoint format is unsupported.")
+  else if
+    String.length target.graph_name = 0
+    || Filename.is_relative target.graph_dir
+    || Filename.is_relative target.database_path
+    || not (String.equal (Filename.dirname target.database_path) target.graph_dir)
+  then Error (error Error.Invalid_request "The synced mirror attachment is invalid.")
+  else Ok target
 ;;
 
-let client_history_error () =
-  unsupported_semantics "Native graph client-operation history is not supported."
-;;
-
-let sqlite_scalar_int db sql =
-  let statement = Sqlite3.prepare db sql in
-  Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-    (fun () ->
-       match Sqlite3.step statement with
-       | Sqlite3.Rc.ROW -> Ok (Sqlite3.column_int statement 0)
-       | _ -> Error ())
-;;
-
-let client_history_table_nonempty db table =
-  let table_exists =
-    sqlite_scalar_int
-      db
-      (Printf.sprintf
-         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '%s')"
-         table)
-  in
-  match table_exists with
-  | Error () -> Error ()
-  | Ok 0 -> Ok false
-  | Ok _ ->
-    (match
-       sqlite_scalar_int
-         db
-         (Printf.sprintf "SELECT EXISTS(SELECT 1 FROM %s LIMIT 1)" table)
-     with
-     | Ok value -> Ok (value <> 0)
-     | Error () -> Error ())
-;;
-
-type native_client_history =
-  | Empty_client_history
-  | Client_rtc_identity
-  | Unsupported_client_history
-
-type inspected_path =
-  | Missing_path
-  | Existing_path of Unix.file_kind
-  | Unreadable_path
-
-let inspect_path path =
-  try Existing_path (Unix.lstat path).Unix.st_kind with
-  | Unix.Unix_error (Unix.ENOENT, _, _) -> Missing_path
-  | Unix.Unix_error _ -> Unreadable_path
-;;
-
-let client_history_has_rtc_identity db =
-  match
-    sqlite_scalar_int
-      db
-      "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
-       'sync_meta')"
-  with
-  | Error () -> Error ()
-  | Ok 0 -> Ok false
-  | Ok _ ->
-    (match
-       sqlite_scalar_int
-         db
-         "SELECT EXISTS(SELECT 1 FROM sync_meta WHERE key = 'graph-uuid' AND value IS \
-          NOT NULL LIMIT 1)"
-     with
-     | Ok value -> Ok (value <> 0)
-     | Error () -> Error ())
-;;
-
-let sqlite_file_uri path =
-  let buffer = Buffer.create (String.length path + 24) in
-  String.iter
-    (fun character ->
-       match character with
-       | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '-' | '.' | '_' | '~' | '/' ->
-         Buffer.add_char buffer character
-       | _ -> Buffer.add_string buffer (Printf.sprintf "%%%02X" (Char.code character)))
-    path;
-  "file:" ^ Buffer.contents buffer ^ "?immutable=1"
-;;
-
-let classify_native_client_history graph_dir =
-  let directory = Filename.concat graph_dir "client-ops-" in
-  let path = Filename.concat directory "db.sqlite" in
-  match inspect_path directory with
-  | Missing_path -> Empty_client_history
-  | Unreadable_path | Existing_path (S_LNK | S_REG | S_CHR | S_BLK | S_FIFO | S_SOCK) ->
-    Unsupported_client_history
-  | Existing_path S_DIR ->
-    (match inspect_path path with
-     | Missing_path -> Empty_client_history
-     | Unreadable_path | Existing_path (S_LNK | S_DIR | S_CHR | S_BLK | S_FIFO | S_SOCK)
-       -> Unsupported_client_history
-     | Existing_path S_REG ->
-       (try
-          let db = Sqlite3.db_open ~mode:`READONLY ~uri:true (sqlite_file_uri path) in
-          Fun.protect
-            ~finally:(fun () -> ignore (Sqlite3.db_close db))
-            (fun () ->
-               match client_history_has_rtc_identity db with
-               | Ok true -> Client_rtc_identity
-               | Error () -> Unsupported_client_history
-               | Ok false ->
-                 let rec inspect = function
-                   | [] -> Empty_client_history
-                   | table :: rest ->
-                     (match client_history_table_nonempty db table with
-                      | Ok false -> inspect rest
-                      | Ok true | Error () -> Unsupported_client_history)
-                 in
-                 inspect [ "client_ops"; "sync_conflicts"; "sync_meta" ])
-        with
-        | Sqlite3.SqliteError _ -> Unsupported_client_history))
-;;
-
-let build_engine dependencies config target owner connection db storage =
+let build_engine dependencies ~response_budget_bytes target owner connection db storage =
   let fail error =
     close_partial owner connection;
     Error error
@@ -571,36 +317,23 @@ let build_engine dependencies config target owner connection db storage =
          ~public_message:"The graph storage is corrupt or incomplete."
          storage_error)
   | Ok startup_metadata ->
-    let sync_metadata_matches =
-      match target.kind with
-      | `Snapshot _ | `Native -> true
-      | `Synced expected ->
-        (match Logseq_sqlite_storage.sync_metadata connection with
-         | Ok actual -> actual = expected
-         | Error _ -> false)
+    let metadata_matches =
+      match Logseq_sqlite_storage.sync_metadata connection with
+      | Ok actual -> actual = target.checkpoint
+      | Error _ -> false
     in
-    if not sync_metadata_matches
+    if not metadata_matches
     then fail (corrupt_storage ())
     else (
-      let admission_target =
-        match target.kind with
-        | `Snapshot _ | `Native -> Admission.Local_target
-        | `Synced metadata -> Synced_target metadata.graph_id
-      in
       match
         Admission.inspect
-          ~target:admission_target
+          ~target:(Admission.Synced_target target.graph_id)
           ~db
           ~storage_schema:startup_metadata.schema
       with
       | Error admission -> fail (admission_error admission)
       | Ok admitted ->
-        let metadata_matches =
-          match target.kind with
-          | `Snapshot _ | `Native -> true
-          | `Synced metadata -> metadata.schema = admitted.schema
-        in
-        if not metadata_matches
+        if target.checkpoint.schema <> admitted.schema
         then fail (corrupt_storage ())
         else (
           let session =
@@ -609,76 +342,40 @@ let build_engine dependencies config target owner connection db storage =
               ~tail:(Datascript.Storage.restore_tail_groups storage)
               ~callbacks:(Logseq_sqlite_storage.connection_callbacks connection)
           in
-          let target_resources =
-            match target.kind with
-            | `Snapshot token ->
-              Ok
-                ( Snapshot_write_target { token }
-                , Some (Backup.create ~catalog:target.catalog ~source_token:token)
-                , Graph_types.Snapshot )
-            | `Native ->
-              (match Derived_sidecars.create ~graph_dir:target.graph_dir ~owner with
-               | Error _ -> Error (corrupt_storage ())
-               | Ok sidecars ->
-                 Ok
-                   ( Native_write_target { sidecars }
-                   , Some
-                       (Backup.create_native
-                          ~catalog:target.catalog
-                          ~source_graph_dir:target.graph_dir
-                          ~owner)
-                   , Graph_types.Native_read_write ))
-            | `Synced _ ->
-              Ok (Synced_local_first_target, None, Graph_types.Synced_local_first)
+          let sync_outbox =
+            Storage_session.load_sync_outbox session
+            |> Result.map_error (fun _ -> corrupt_storage ())
           in
-          match target_resources with
+          match sync_outbox with
           | Error error -> fail error
-          | Ok (write_target, backup, mode) ->
-            let sync_outbox =
-              match target.kind with
-              | `Synced _ ->
-                Storage_session.load_sync_outbox session
-                |> Result.map_error (fun _ -> corrupt_storage ())
-              | `Snapshot _ | `Native -> Ok []
-            in
-            (match sync_outbox with
-             | Error error -> fail error
-             | Ok sync_outbox ->
-               Ok
-                 { session
-                 ; owner
-                 ; catalog = target.catalog
-                 ; write_target
-                 ; backup
-                 ; write_session = None
-                 ; mutation_cache = []
-                 ; graph_info =
-                     { local_graph_uuid = admitted.local_graph_uuid
-                     ; graph_name = target.graph_name
-                     ; graph_dir = target.graph_dir
-                     ; schema = admitted.schema
-                     ; basis = db_basis db
-                     ; mode
-                     ; admission_facts =
-                         admitted.admission_facts @ [ Graph_types.Ownership_verified ]
-                     }
-                 ; sync_metadata =
-                     (match target.kind with
-                      | `Synced metadata -> Some metadata
-                      | `Snapshot _ | `Native -> None)
-                 ; sync_outbox
-                 ; projected_db = db
-                 ; epoch_ms = dependencies.clocks.epoch_ms
-                 ; cursor_authentication_key =
-                     Bytes.copy dependencies.cursor_authentication_key
-                 ; response_budget_bytes = config.Config.response_budget_bytes
-                 ; lifecycle = Ready
-                 ; engine_instance = Atomic.fetch_and_add next_engine_instance 1
-                 ; sync_revision = 0L
-                 })))
+          | Ok sync_outbox ->
+            Ok
+              { session
+              ; owner
+              ; mutation_cache = []
+              ; graph_info =
+                  { local_graph_uuid = admitted.local_graph_uuid
+                  ; graph_name = target.graph_name
+                  ; graph_dir = target.graph_dir
+                  ; schema = admitted.schema
+                  ; basis = db_basis db
+                  ; admission_facts =
+                      admitted.admission_facts @ [ Graph_types.Ownership_verified ]
+                  }
+              ; sync_metadata = target.checkpoint
+              ; sync_outbox
+              ; projected_db = db
+              ; epoch_ms = dependencies.clocks.epoch_ms
+              ; cursor_authentication_key =
+                  Bytes.copy dependencies.cursor_authentication_key
+              ; response_budget_bytes
+              ; lifecycle = Ready
+              ; engine_instance = Atomic.fetch_and_add next_engine_instance 1
+              ; sync_revision = 0L
+              }))
 ;;
 
-let open_owned dependencies config target owner =
+let open_owned dependencies ~response_budget_bytes target owner =
   let fail_before_open error =
     ignore (Ownership.release owner);
     Error error
@@ -686,12 +383,7 @@ let open_owned dependencies config target owner =
   match Ownership.revalidate owner with
   | Error ownership -> fail_before_open (ownership_error ownership)
   | Ok () ->
-    let cleanup =
-      match target.kind with
-      | `Synced _ -> remove_obsolete_pending_intents target.graph_dir
-      | `Snapshot _ | `Native -> Ok ()
-    in
-    (match cleanup with
+    (match remove_obsolete_pending_intents target.graph_dir with
      | Error error -> fail_before_open error
      | Ok () ->
        let database_path = target.database_path in
@@ -733,12 +425,7 @@ let open_owned dependencies config target owner =
                match Ownership.revalidate owner with
                | Error ownership -> fail (ownership_error ownership)
                | Ok () ->
-                 let outbox_initialized =
-                   match target.kind with
-                   | `Synced _ -> Logseq_sqlite_storage.initialize_sync_outbox connection
-                   | `Snapshot _ | `Native -> Ok ()
-                 in
-                 (match outbox_initialized with
+                 (match Logseq_sqlite_storage.initialize_sync_outbox connection with
                   | Error message ->
                     fail
                       (storage_string_error
@@ -758,93 +445,30 @@ let open_owned dependencies config target owner =
                             ~public_message:"The graph storage is corrupt or incomplete."
                             storage_error)
                      | Ok db ->
-                       build_engine dependencies config target owner connection db storage))))))
+                       build_engine
+                         dependencies
+                         ~response_budget_bytes
+                         target
+                         owner
+                         connection
+                         db
+                         storage))))))
 ;;
 
-let open_once ~dependencies config =
+let open_ ~dependencies ~response_budget_bytes target =
   if Bytes.length dependencies.cursor_authentication_key < 32
   then Error (error Error.Invalid_request "The cursor authentication key is too short.")
+  else if
+    response_budget_bytes <= 0 || response_budget_bytes > Protocol.maximum_response_bytes
+  then
+    Error (error Error.Invalid_request "The response budget is outside protocol bounds.")
   else (
-    match resolve_target config with
-    | Error _ as error -> error
+    match validate_attachment target with
+    | Error _ as invalid -> invalid
     | Ok target ->
-      let ownership_target =
-        match target.kind with
-        | `Snapshot _ -> Ownership.Snapshot_target
-        | `Native -> Ownership.Native_target
-        | `Synced _ -> Ownership.Synced_target
-      in
-      (match Ownership.acquire ~target:ownership_target ~graph_dir:target.graph_dir with
+      (match Ownership.acquire ~graph_dir:target.graph_dir with
        | Error ownership -> Error (ownership_error ownership)
-       | Ok owner ->
-         (match target.kind with
-          | `Native ->
-            (match classify_native_client_history target.graph_dir with
-             | Empty_client_history -> open_owned dependencies config target owner
-             | Client_rtc_identity ->
-               ignore (Ownership.release owner);
-               Error (admission_error Admission.Ambiguous_sync_state)
-             | Unsupported_client_history ->
-               ignore (Ownership.release owner);
-               Error (client_history_error ()))
-          | `Snapshot _ | `Synced _ -> open_owned dependencies config target owner)))
-;;
-
-let ios_native_fallback config =
-  match config.Config.target with
-  | Native_local_graph { graph_name; graph_dir } ->
-    let expected =
-      Filename.concat
-        (Filename.concat config.application_support_directory "graphs")
-        graph_name
-    in
-    if String.equal graph_dir expected then Some (graph_name, graph_dir) else None
-  | Managed_sync _ | Snapshot _ | Import_snapshot _ | Synced_mirror _ -> None
-;;
-
-let eligible_native_fallback_error error =
-  match Error.code error with
-  | Graph_not_found | Corrupt_storage -> true
-  | Invalid_request
-  | Unsupported_api_version
-  | Graph_locked
-  | Ownership_recovery
-  | Unsupported_schema
-  | Remote_graph
-  | Ambiguous_sync_state
-  | Unsupported_value
-  | Unsupported_semantics
-  | Not_found
-  | Ambiguous_selector
-  | Duplicate_selector
-  | Built_in_protected
-  | Invalid_tree
-  | Invalid_order
-  | Invalid_position
-  | Conflict
-  | Response_too_large
-  | Storage_busy
-  | Closed_session -> false
-;;
-
-let open_ ~dependencies config =
-  match open_once ~dependencies config with
-  | Ok _ as opened -> opened
-  | Error original_error ->
-    (match ios_native_fallback config with
-     | None -> Error original_error
-     | Some _ when not (eligible_native_fallback_error original_error) ->
-       Error original_error
-     | Some (inbox_entry, destination_graph_dir) ->
-       (match
-          Snapshot.create_catalog
-            ~application_support_directory:config.application_support_directory
-        with
-        | Error _ -> Error original_error
-        | Ok catalog ->
-          (match Snapshot.import_native catalog ~inbox_entry ~destination_graph_dir with
-           | Error _ -> Error original_error
-           | Ok () -> open_once ~dependencies config)))
+       | Ok owner -> open_owned dependencies ~response_budget_bytes target owner))
 ;;
 
 let session_error_message = function
@@ -853,14 +477,6 @@ let session_error_message = function
   | Storage_session.Stage_failed message
   | Storage_session.Persistence_failed message -> message
   | Storage_session.Already_consumed -> "staged transaction was already consumed"
-;;
-
-let rec find_cached_mutation mutation_id = function
-  | [] -> None
-  | (cached_id, fingerprint, result) :: rest ->
-    if Graph_types.Uuid.equal mutation_id cached_id
-    then Some (fingerprint, result)
-    else find_cached_mutation mutation_id rest
 ;;
 
 let take limit values =
@@ -932,71 +548,6 @@ let require_ownership t message =
   | Error _ -> terminalize t message
 ;;
 
-let ensure_write_session t mutation_id =
-  match t.write_session with
-  | Some _ -> Ok ()
-  | None ->
-    require_ownership t "graph ownership changed before mutation preparation";
-    (match t.backup with
-     | None ->
-       Error (unsupported_semantics "Synced graphs do not commit direct mutations.")
-     | Some backup ->
-       (match Backup.ensure_verified backup with
-        | Error (Backup.Snapshot_error error) -> Error (snapshot_error error)
-        | Error (Backup.Ownership_error _) ->
-          terminalize t "graph ownership changed while creating the recovery backup"
-        | Ok recovery_token ->
-          require_ownership t "graph ownership changed after creating the recovery backup";
-          (match t.write_target with
-           | Snapshot_write_target { token } ->
-             (match
-                Snapshot.begin_write_session t.catalog token ~recovery_token ~mutation_id
-              with
-              | Error error -> Error (snapshot_error error)
-              | Ok write_session ->
-                t.write_session <- Some (Snapshot_write_session write_session);
-                Ok ())
-           | Native_write_target { sidecars } ->
-             (match Derived_sidecars.invalidate sidecars with
-              | Ok _ ->
-                require_ownership t "graph ownership changed after sidecar invalidation";
-                t.write_session <- Some Native_write_session;
-                Ok ()
-              | Error (Derived_sidecars.Ownership_error _) ->
-                terminalize t "graph ownership changed during sidecar invalidation"
-              | Error (Invalid_marker | Io_error) -> Error (corrupt_storage ()))
-           | Synced_local_first_target ->
-             Error (unsupported_semantics "Synced graphs do not commit direct mutations."))))
-;;
-
-let collect_garbage_if_needed t =
-  match Storage_session.garbage_collection_needed t.session with
-  | Error error -> terminalize t (session_error_message error)
-  | Ok false -> Ok ()
-  | Ok true ->
-    (match t.backup with
-     | None -> Error (unsupported_semantics "Synced graphs do not run local write GC.")
-     | Some backup ->
-       (match Backup.ensure_verified backup with
-        | Error (Backup.Snapshot_error error) -> Error (snapshot_error error)
-        | Error (Backup.Ownership_error _) ->
-          terminalize t "graph ownership changed while verifying the GC recovery backup"
-        | Ok _recovery_token ->
-          require_ownership t "graph ownership changed before reachability GC";
-          (match Storage_session.collect_garbage t.session with
-           | Ok () -> Ok ()
-           | Error error -> terminalize t (session_error_message error))))
-;;
-
-let add_backup_fact graph_info =
-  if List.mem Graph_types.Backup_verified graph_info.Graph_types.admission_facts
-  then graph_info
-  else
-    { graph_info with
-      admission_facts = graph_info.admission_facts @ [ Graph_types.Backup_verified ]
-    }
-;;
-
 let mutation_requires_full_structure_validation = function
   | Logseq_db_types.Mutation.Structural (Save_block _) -> false
   | Structural
@@ -1019,158 +570,6 @@ let validate_tree_for_mutation mutation ~before ~after =
       Structural_violation_set.mem violation existing))
 ;;
 
-let execute_local_mutation t request_id mutation =
-  let basis_before = t.graph_info.basis in
-  let context = Mutation.context mutation in
-  let identity = Mutation.identify mutation in
-  let fingerprint = Mutation.identity_fingerprint identity in
-  let succeeded result =
-    Protocol.Succeeded
-      { request_id
-      ; basis = t.graph_info.basis
-      ; success = Protocol.Mutation_result result
-      }
-  in
-  match find_cached_mutation context.mutation_id t.mutation_cache with
-  | Some (cached_fingerprint, result) ->
-    if String.equal fingerprint cached_fingerprint
-    then succeeded result
-    else
-      Protocol.failed
-        ~request_id
-        ~phase:Execute
-        ~basis:(Some basis_before)
-        (error Error.Conflict "The mutation ID was already used for a different command.")
-  | None ->
-    if context.expected_basis <> basis_before
-    then
-      Protocol.failed
-        ~request_id
-        ~phase:Execute
-        ~basis:(Some basis_before)
-        (error_with_details
-           Error.Conflict
-           "The graph basis changed."
-           [ { name = "expectedBasis"; value = Detail_int context.expected_basis }
-           ; { name = "actualBasis"; value = Detail_int basis_before }
-           ])
-    else (
-      let database = Storage_session.current_db t.session in
-      match Mutation_plan.plan ~now_ms:(t.epoch_ms ()) database mutation with
-      | Error planner ->
-        Protocol.failed
-          ~request_id
-          ~phase:Execute
-          ~basis:(Some basis_before)
-          (planner_error planner)
-      | Ok plan when plan.tx_ops = [] ->
-        let result =
-          Mutation.
-            { status = plan.status
-            ; basis_before
-            ; basis_after = basis_before
-            ; changed_uuids = []
-            ; changed_uuids_truncated = false
-            }
-        in
-        remember_mutation t context.mutation_id fingerprint result;
-        succeeded result
-      | Ok plan ->
-        (match
-           Storage_session.stage_transact ~tx_meta:plan.tx_meta t.session plan.tx_ops
-         with
-         | Error (Storage_session.Fatal message | Persistence_failed message) ->
-           terminalize t message
-         | Error stage_error ->
-           Protocol.failed
-             ~request_id
-             ~phase:Execute
-             ~basis:(Some basis_before)
-             (unsupported_semantics (session_error_message stage_error))
-         | Ok staged ->
-           if
-             not
-               (validate_tree_for_mutation
-                  mutation
-                  ~before:database
-                  ~after:(Storage_session.staged_db_after staged))
-           then
-             Protocol.failed
-               ~request_id
-               ~phase:Execute
-               ~basis:(Some basis_before)
-               (error Error.Invalid_tree "The mutation would violate graph structure.")
-           else (
-             match ensure_write_session t context.mutation_id with
-             | Error backup_error ->
-               Protocol.failed
-                 ~request_id
-                 ~phase:Execute
-                 ~basis:(Some basis_before)
-                 backup_error
-             | Ok () ->
-               (match collect_garbage_if_needed t with
-                | Error backup_error ->
-                  Protocol.failed
-                    ~request_id
-                    ~phase:Execute
-                    ~basis:(Some basis_before)
-                    backup_error
-                | Ok () ->
-                  (match Ownership.revalidate t.owner with
-                   | Error _ ->
-                     terminalize t "graph ownership changed before mutation commit"
-                   | Ok () ->
-                     (match Storage_session.commit_staged t.session staged with
-                      | Error persistence ->
-                        terminalize t (session_error_message persistence)
-                      | Ok () ->
-                        (match t.write_session with
-                         | None -> terminalize t "write session disappeared after commit"
-                         | Some Native_write_session ->
-                           (match Ownership.revalidate t.owner with
-                            | Error _ ->
-                              terminalize
-                                t
-                                "graph ownership changed after mutation commit"
-                            | Ok () -> ())
-                         | Some (Snapshot_write_session write_session) ->
-                           (match Ownership.revalidate t.owner with
-                            | Error _ ->
-                              terminalize
-                                t
-                                "graph ownership changed after mutation commit"
-                            | Ok () ->
-                              (match
-                                 Snapshot.record_committed_write t.catalog write_session
-                               with
-                               | Ok () -> ()
-                               | Error _ ->
-                                 terminalize
-                                   t
-                                   "unable to authenticate committed snapshot write")));
-                        let basis_after = Int64.succ basis_before in
-                        let changed_uuids =
-                          take Protocol.maximum_changed_uuids plan.changed_uuids
-                        in
-                        let result =
-                          Mutation.
-                            { status = Applied
-                            ; basis_before
-                            ; basis_after
-                            ; changed_uuids
-                            ; changed_uuids_truncated =
-                                List.length plan.changed_uuids
-                                > Protocol.maximum_changed_uuids
-                            }
-                        in
-                        t.projected_db <- Storage_session.current_db t.session;
-                        t.graph_info
-                        <- add_backup_fact { t.graph_info with basis = basis_after };
-                        remember_mutation t context.mutation_id fingerprint result;
-                        succeeded result))))))
-;;
-
 let managed_outliner_op = function
   | Logseq_db_types.Mutation.Structural (Save_block _) -> Some "save-block"
   | Structural (Insert_blocks _) -> Some "insert-blocks"
@@ -1190,25 +589,16 @@ let managed_outliner_op = function
   | Property _ -> None
 ;;
 
-let execute_mutation t request_id mutation =
-  match t.write_target with
-  | Synced_local_first_target ->
-    Protocol.failed
-      ~request_id
-      ~phase:Execute
-      ~basis:(Some t.graph_info.basis)
-      (unsupported_semantics
-         "Managed graph mutations must enter through Logseq_sync_pure_reducer.Core.")
-  | Snapshot_write_target _ | Native_write_target _ ->
-    execute_local_mutation t request_id mutation
+let execute_mutation t request_id _mutation =
+  Protocol.failed
+    ~request_id
+    ~phase:Execute
+    ~basis:(Some t.graph_info.basis)
+    (unsupported_semantics
+       "Managed graph mutations must enter through Logseq_sync_pure_reducer.Core.")
 ;;
 
-let ensure_managed_target t =
-  match t.write_target, t.sync_metadata with
-  | Synced_local_first_target, Some checkpoint -> Ok checkpoint
-  | Snapshot_write_target _, _ | Native_write_target _, _ | _, None ->
-    Error "The active graph is not a managed sync mirror."
-;;
+let ensure_managed_target t = Ok t.sync_metadata
 
 let authoritative_precondition_value t =
   Printf.sprintf "%d:%Ld" t.engine_instance t.sync_revision
@@ -1291,6 +681,51 @@ let replan_managed_mutation t ~database mutation =
               }
         with
         | _ -> Error "The replanned mutation cannot be projected."))
+;;
+
+let decode_outbox_mutation record =
+  let module Sync = Logseq_sync_pure_reducer.Core in
+  let payload = Sync.outbox_record_mutation_payload record in
+  let mutation =
+    try Logseq_db_types.Mutation.of_yojson (Yojson.Safe.from_string payload) with
+    | Yojson.Json_error _ -> Error "The durable mutation payload is corrupt."
+  in
+  Result.bind mutation (fun mutation ->
+    let identity = Logseq_db_types.Mutation.identify mutation in
+    let context = Logseq_db_types.Mutation.context mutation in
+    if
+      not
+        (Graph_types.Uuid.equal
+           context.mutation_id
+           (Sync.outbox_record_mutation_id record))
+    then Error "The durable mutation ID does not match its semantic payload."
+    else if
+      not (String.equal (Logseq_db_types.Mutation.identity_payload identity) payload)
+    then Error "The durable mutation payload is not canonical."
+    else if
+      not
+        (String.equal
+           (Logseq_db_types.Mutation.identity_fingerprint identity)
+           (Sync.outbox_record_fingerprint record))
+    then Error "The durable mutation fingerprint does not match its payload."
+    else Ok mutation)
+;;
+
+let restore_managed_projection t =
+  let module Sync = Logseq_sync_pure_reducer.Core in
+  Result.bind (ensure_managed_target t) (fun _ ->
+    Result.bind (Sync.decode_outbox_records t.sync_outbox) (fun records ->
+      let rec replay database = function
+        | [] ->
+          t.projected_db <- database;
+          t.graph_info <- { t.graph_info with basis = db_basis database };
+          Ok ()
+        | record :: rest ->
+          Result.bind (decode_outbox_mutation record) (fun mutation ->
+            Result.bind (replan_managed_mutation t ~database mutation) (fun replan ->
+              replay replan.projected_database rest))
+      in
+      replay (Storage_session.current_db t.session) records))
 ;;
 
 let prepare_managed_mutation t ~identity mutation =
@@ -1490,7 +925,7 @@ let apply_authoritative
               | Error commit_error ->
                 Error (Authoritative_apply_failed (session_error_message commit_error))
               | Ok () ->
-                t.sync_metadata <- Some checkpoint;
+                t.sync_metadata <- checkpoint;
                 t.sync_outbox <- outbox_records;
                 t.projected_db <- projected;
                 t.graph_info <- { t.graph_info with basis = basis_after };
@@ -1570,33 +1005,14 @@ let close (t : t) =
           t.lifecycle <- Fatal (fatal_error message);
           Error message
         | Ok () ->
-          let finalize =
-            match t.write_session with
-            | None -> Ok ()
-            | Some Native_write_session ->
-              t.write_session <- None;
-              Ok ()
-            | Some (Snapshot_write_session write_session) ->
-              (match Snapshot.finish_write_session t.catalog write_session with
-               | Ok () ->
-                 t.write_session <- None;
-                 Ok ()
-               | Error _ -> Error "snapshot write-session finalization failed")
-          in
-          (match finalize with
-           | Error message ->
-             ignore (Ownership.release t.owner);
+          (match Ownership.release t.owner with
+           | Error _ ->
+             let message = "graph ownership release failed" in
              t.lifecycle <- Fatal (fatal_error message);
              Error message
            | Ok () ->
-             (match Ownership.release t.owner with
-              | Error _ ->
-                let message = "graph ownership release failed" in
-                t.lifecycle <- Fatal (fatal_error message);
-                Error message
-              | Ok () ->
-                t.lifecycle <- Closed;
-                Ok ()))))
+             t.lifecycle <- Closed;
+             Ok ())))
 ;;
 
 let basis t =

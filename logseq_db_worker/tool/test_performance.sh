@@ -18,11 +18,11 @@ opam exec -- dune build --profile release \
   logseq_db_worker/test/test_performance.exe
 
 generated=$($benchmark generate --support-root "$work_root/support")
-support_root=$(ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("supportRoot")' <<EOF
+graph_dir=$(ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("graphDir")' <<EOF
 $generated
 EOF
 )
-graph_dir=$(ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("graphDir")' <<EOF
+graph_id=$(ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("graphId")' <<EOF
 $generated
 EOF
 )
@@ -30,16 +30,11 @@ fixture_hash=$(ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("fixtureContent
 $generated
 EOF
 )
-snapshot_throughput=$(ruby -rjson -e 'puts JSON.parse(STDIN.read).fetch("snapshotBytesPerSecond")' <<EOF
-$generated
-EOF
-)
 
 $benchmark measure \
-  --support-root "$support_root" \
+  --graph-id "$graph_id" \
   --graph-dir "$graph_dir" \
   --fixture-hash "$fixture_hash" \
-  --snapshot-throughput "$snapshot_throughput" \
   --build-profile release \
   --output "$result"
 

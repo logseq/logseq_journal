@@ -1,12 +1,5 @@
 (** Pure Logseq DB worker orchestration policy. *)
 
-type target_kind =
-  | Managed
-  | Snapshot
-  | Import_snapshot
-  | Synced_mirror
-  | Native_local
-
 type graph_phase =
   | Graph_closed
   | Graph_opening
@@ -68,7 +61,6 @@ type sync_worker_result =
   }
 
 type _ runner_request =
-  | Open_engine : Logseq_db_worker_contract.Config.t -> engine_opened runner_request
   | Execute_request :
       { engine : engine_handle
       ; request : Logseq_db_worker_contract.Protocol.request
@@ -90,7 +82,6 @@ type runner_effect = Request : ticket * 'a runner_request -> runner_effect
 type effect_error = Logseq_db_worker_contract.Error.t
 
 type runner_completion =
-  | Open_engine_completed of ticket * (engine_opened, effect_error) result
   | Execute_request_completed of
       ticket * (Logseq_db_worker_contract.Protocol.response, effect_error) result
   | Close_engine_completed of ticket * (unit, effect_error) result
@@ -115,17 +106,15 @@ val equal_instruction : instruction -> instruction -> bool
 val equal_instructions : instruction list -> instruction list -> bool
 
 type config
-type config_error = Invalid_config of string
 
 val config
   :  worker:Logseq_db_worker_contract.Config.t
-  -> sync:Logseq_sync_pure_reducer.Core.config option
-  -> (config, config_error) result
+  -> sync:Logseq_sync_pure_reducer.Core.config
+  -> config
 
 type view =
-  { target : target_kind
-  ; graph : graph_state
-  ; sync : Logseq_sync_pure_reducer.Core.state option
+  { graph : graph_state
+  ; sync : Logseq_sync_pure_reducer.Core.state
   ; pending_requests : int
   ; pending_effects : int
   ; shutdown : bool
@@ -149,8 +138,6 @@ type event =
   | Set_foreground of bool
   | Runner_completed of runner_completion
   | Shutdown
-
-val complete_open : runner_effect -> (engine_opened, effect_error) result -> event option
 
 val complete_execute
   :  runner_effect

@@ -14,15 +14,10 @@ let envelope tag payload =
   bytes
 ;;
 
-let token =
-  Logseq_db_types.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000000001"
-  |> Result.get_ok
-;;
-
 let sample : Journal_startup.t =
   Logseq_db_worker.Config.create
     ~application_support_directory:"/tmp/support"
-    ~target:(Snapshot { token })
+    ~target:(Managed_sync { base_url = "https://api.logseq.io" })
     ~compatibility_profile:Logseq_65_33_or_newer
     ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
     ~default_page_size:Logseq_db_worker.Protocol.default_page_size
@@ -64,12 +59,8 @@ let test_exact_codec_and_round_trip () =
        sample.application_support_directory)
     "application-support directory changed";
   match decoded.target with
-  | Snapshot { token = decoded } ->
-    require
-      (Logseq_db_types.Graph_types.Uuid.equal token decoded)
-      "snapshot token changed"
-  | Managed_sync _ | Import_snapshot _ | Native_local_graph _ | Synced_mirror _ ->
-    fail "snapshot target changed"
+  | Managed_sync { base_url } ->
+    require (String.equal base_url "https://api.logseq.io") "managed sync origin changed"
 ;;
 
 let test_bounded_rejection () =

@@ -52,11 +52,6 @@ type schema_version =
   ; minor : int
   }
 
-type graph_mode =
-  | Snapshot
-  | Native_read_write
-  | Synced_local_first
-
 type admission_fact =
   | Compatible_schema of
       { minimum : schema_version
@@ -70,8 +65,6 @@ type admission_fact =
   | Synced_graph_identity of Uuid.t
   | Lossless_codec
   | Ownership_verified
-  | Backup_verified
-  | Sidecars_invalidated
 
 type graph_info =
   { local_graph_uuid : Uuid.t
@@ -79,7 +72,6 @@ type graph_info =
   ; graph_dir : string
   ; schema : schema_version
   ; basis : int64
-  ; mode : graph_mode
   ; admission_facts : admission_fact list
   }
 

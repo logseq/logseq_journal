@@ -137,25 +137,6 @@ let close_attached t =
     close_engine_by_id t engine_id
 ;;
 
-let config_for_graph
-      (config : Logseq_db_worker_contract.Config.t)
-      (request : Logseq_sync_pure_reducer.Core.graph_open_request)
-  =
-  Logseq_db_worker_contract.Config.create
-    ~application_support_directory:config.application_support_directory
-    ~target:
-      (Synced_mirror
-         { graph_id = request.graph.graph_id
-         ; graph_name = request.graph.name
-         ; graph_dir = request.graph_directory
-         ; database_path = request.database_path
-         ; checkpoint = request.checkpoint
-         })
-    ~compatibility_profile:config.compatibility_profile
-    ~response_budget_bytes:config.response_budget_bytes
-    ~default_page_size:config.default_page_size
-;;
-
 let managed_response (request : Logseq_db_worker_contract.Protocol.request) success =
   Logseq_db_worker_contract.Protocol.Succeeded
     { request_id = request.Logseq_db_worker_contract.Protocol.request_id
@@ -534,9 +515,23 @@ let handle_sync_worker_effect t runner_effect =
     Ok (sync_result ~lifecycle ())
   | Attach_graph request ->
     ignore (close_attached t);
-    (match config_for_graph t.dependencies.config request with
-     | Error message ->
-       let error = effect_error message in
+    let attachment =
+      Logseq_db_worker_engine.Engine.
+        { graph_id = request.graph.graph_id
+        ; graph_name = request.graph.name
+        ; graph_dir = request.graph_directory
+        ; database_path = request.database_path
+        ; checkpoint = request.checkpoint
+        }
+    in
+    (match
+       Logseq_db_worker_engine.Engine.open_
+         ~dependencies:t.dependencies.engine
+         ~response_budget_bytes:t.dependencies.config.response_budget_bytes
+         attachment
+     with
+     | Error error ->
+       let message = Logseq_db_worker_contract.Error.message error in
        Ok
          (sync_result
             ~event:
@@ -544,12 +539,25 @@ let handle_sync_worker_effect t runner_effect =
                  { scope = Sync.effect_scope_of_graph request.scope; message })
             ~lifecycle:(Core.Lifecycle_failed (request.scope.graph_generation, error))
             ())
-     | Ok config ->
+     | Ok engine ->
+       let engine_id = "managed-" ^ Int64.to_string t.next_engine_id in
+       t.next_engine_id <- Int64.succ t.next_engine_id;
+       Hashtbl.replace t.engines engine_id engine;
+       t.attached <- Some (engine_id, request.scope);
        (match
-          Logseq_db_worker_engine.Engine.open_ ~dependencies:t.dependencies.engine config
+          Result.bind
+            (Logseq_db_worker_engine.Engine.restore_managed_projection engine)
+            (fun () ->
+               Result.bind
+                 (Logseq_db_worker_engine.Engine.sync_checkpoint engine)
+                 (fun checkpoint ->
+                    Result.map
+                      (fun outbox_records -> checkpoint, outbox_records)
+                      (Logseq_db_worker_engine.Engine.managed_outbox_records engine)))
         with
-        | Error error ->
-          let message = Logseq_db_worker_contract.Error.message error in
+        | Error message ->
+          ignore (close_attached t);
+          let error = effect_error message in
           Ok
             (sync_result
                ~event:
@@ -557,45 +565,20 @@ let handle_sync_worker_effect t runner_effect =
                     { scope = Sync.effect_scope_of_graph request.scope; message })
                ~lifecycle:(Core.Lifecycle_failed (request.scope.graph_generation, error))
                ())
-        | Ok engine ->
-          let engine_id = "managed-" ^ Int64.to_string t.next_engine_id in
-          t.next_engine_id <- Int64.succ t.next_engine_id;
-          Hashtbl.replace t.engines engine_id engine;
-          t.attached <- Some (engine_id, request.scope);
-          (match
-             Result.bind
-               (Logseq_db_worker_engine.Engine.sync_checkpoint engine)
-               (fun checkpoint ->
-                  Result.map
-                    (fun outbox_records -> checkpoint, outbox_records)
-                    (Logseq_db_worker_engine.Engine.managed_outbox_records engine))
-           with
-           | Error message ->
-             ignore (close_attached t);
-             let error = effect_error message in
-             Ok
-               (sync_result
-                  ~event:
-                    (Sync.Graph_attachment_failed
-                       { scope = Sync.effect_scope_of_graph request.scope; message })
-                  ~lifecycle:
-                    (Core.Lifecycle_failed (request.scope.graph_generation, error))
-                  ())
-           | Ok (checkpoint, outbox_records) ->
-             let opened =
-               Core.engine_opened
-                 ~engine_id
-                 ~graph_id:(Some request.scope.graph_id)
-                 ~basis:(Logseq_db_worker_engine.Engine.basis engine)
-             in
-             Ok
-               (sync_result
-                  ~event:
-                    (Sync.Graph_attached
-                       { scope = request.scope; checkpoint; outbox_records })
-                  ~lifecycle:
-                    (Core.Lifecycle_opened (opened, request.scope.graph_generation))
-                  ()))))
+        | Ok (checkpoint, outbox_records) ->
+          let opened =
+            Core.engine_opened
+              ~engine_id
+              ~graph_id:(Some request.scope.graph_id)
+              ~basis:(Logseq_db_worker_engine.Engine.basis engine)
+          in
+          Ok
+            (sync_result
+               ~event:
+                 (Sync.Graph_attached
+                    { scope = request.scope; checkpoint; outbox_records })
+               ~lifecycle:(Core.Lifecycle_opened (opened, request.scope.graph_generation))
+               ())))
   | Detach_graph scope ->
     (match t.attached with
      | Some (_, attached) when attached = scope -> ignore (close_attached t)
@@ -776,34 +759,9 @@ let handle_sync_worker_effect t runner_effect =
      | Some _ | None -> Error (effect_error "The outbox graph scope is stale."))
 ;;
 
-let graph_id_of_target = function
-  | Logseq_db_worker_contract.Config.Snapshot { token } -> Some token
-  | Synced_mirror { graph_id; _ } -> Some graph_id
-  | Managed_sync _ | Import_snapshot _ | Native_local_graph _ -> None
-;;
-
 let run_request : type a. t -> Core.ticket -> a Core.runner_request -> unit =
   fun t ticket request ->
   match request with
-  | Core.Open_engine config ->
-    (match
-       Logseq_db_worker_engine.Engine.open_ ~dependencies:t.dependencies.engine config
-     with
-     | Error error ->
-       t.post (Core.Runner_completed (Core.Open_engine_completed (ticket, Error error)))
-     | Ok engine ->
-       let engine_id = Int64.to_string t.next_engine_id in
-       t.next_engine_id <- Int64.succ t.next_engine_id;
-       Hashtbl.replace t.engines engine_id engine;
-       t.post
-         (Core.Runner_completed
-            (Core.Open_engine_completed
-               ( ticket
-               , Ok
-                   (Core.engine_opened
-                      ~engine_id
-                      ~graph_id:(graph_id_of_target config.target)
-                      ~basis:(Logseq_db_worker_engine.Engine.basis engine)) ))))
   | Core.Execute_request { engine; request } ->
     (match Hashtbl.find_opt t.engines (Core.engine_handle_id engine) with
      | None ->

@@ -37,11 +37,7 @@ type detail =
 
 type component =
   | Logseq_db_worker
-  | Snapshot
-  | Graph_locator
   | Ownership
-  | Backup
-  | Synced_mirror
   | Sqlite
   | Storage
   | Storage_session

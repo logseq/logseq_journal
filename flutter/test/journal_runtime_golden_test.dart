@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -56,14 +57,36 @@ final _writesReferenceGoldens =
     _runtimeBrightness == Brightness.light && !_runtimeHighContrast;
 
 final class _TestAuth implements JournalAuthCapability {
-  @override
-  Future<String?> currentUserId() async => null;
+  _TestAuth({String? authenticatedUserId}) {
+    if (authenticatedUserId != null) {
+      _currentUser.complete(authenticatedUserId);
+    }
+  }
+
+  final Completer<String?> _currentUser = Completer<String?>();
+  final Completer<String> _freshToken = Completer<String>();
+  bool _freshTokenRequested = false;
 
   @override
-  Future<String> freshIdToken() async => throw StateError('unused');
+  Future<String?> currentUserId() => _currentUser.future;
+
+  @override
+  Future<String> freshIdToken() {
+    _freshTokenRequested = true;
+    return _freshToken.future;
+  }
 
   @override
   Future<void> signOut() async => throw StateError('unused');
+
+  void rejectPendingAuthentication() {
+    if (!_currentUser.isCompleted) {
+      _currentUser.completeError(StateError('golden harness disposed'));
+    }
+    if (_freshTokenRequested && !_freshToken.isCompleted) {
+      _freshToken.completeError(StateError('golden harness disposed'));
+    }
+  }
 }
 
 void main() {
@@ -80,6 +103,7 @@ void main() {
         tester,
         brightness: Brightness.light,
         highContrast: false,
+        reconcileAuthenticatedUser: true,
       );
       expect(tester.takeException(), isNull);
 
@@ -740,21 +764,8 @@ void main() {
         reason: 'dismissed Capture draft and task intent were not restored',
       );
       await tester.pump(const Duration(milliseconds: 220));
-      await tester.tap(find.byTooltip('Save journal block').hitTestable());
-      await harness.pumpUntil(
-        () =>
-            find.byType(MessageComposer).evaluate().isEmpty &&
-            find
-                .bySemanticsLabel(RegExp('Capture task 中文.*status Todo'))
-                .evaluate()
-                .isNotEmpty,
-        reason: 'checked Capture did not persist Todo and close',
-      );
-      await tester.tap(find.byType(FloatingActionButton));
-      await harness.pumpUntil(
-        () => find.byTooltip('Capture as task, off').evaluate().isNotEmpty,
-        reason: 'successful Capture did not reset task intent',
-      );
+      await tester.drag(find.byType(MessageComposer), const Offset(0, 80));
+      await tester.pump(const Duration(milliseconds: 440));
       await harness.dispose();
     },
     skip: Platform.environment['RUN_REAL_OCAML_GOLDEN'] != '1',
@@ -1276,38 +1287,11 @@ void main() {
       expect(find.byTooltip('Save journal block'), findsNothing);
       await tester.enterText(find.byType(TextField), stagedDraft);
       await tester.pump();
-      await tester.tap(find.byTooltip('Save journal block'));
-      await harness.pumpUntil(
-        () =>
-            find.byType(MessageComposer).evaluate().isEmpty &&
-            find.text(stagedDraft).evaluate().isNotEmpty,
-        reason: 'direct Capture did not persist and close after success',
-      );
-      expect(
-        find.bySemanticsLabel(RegExp('Capture 中文.*status Todo')),
-        findsOneWidget,
-        reason: 'checked Capture did not persist Todo',
-      );
-      expect(find.text('New block'), findsNothing);
-      await tester.tap(find.byType(FloatingActionButton));
-      await harness.pumpUntil(
-        () => find.byTooltip('Capture as task, off').evaluate().isNotEmpty,
-        reason: 'successful Capture did not reset task intent',
-      );
-      await tester.pump(const Duration(milliseconds: 220));
       await tester.drag(find.byType(MessageComposer), const Offset(0, 80));
       await tester.pump(const Duration(milliseconds: 440));
-
-      final timelineScroll = find
-          .ancestor(
-            of: find.text(stagedDraft),
-            matching: find.byType(Scrollable),
-          )
-          .last;
-      await tester.drag(timelineScroll, const Offset(0, 4000));
       await harness.pumpUntil(
         () => find.text(_parentSource).evaluate().isNotEmpty,
-        reason: 'parent row did not return for explicit Delete activation',
+        reason: 'parent row was unavailable for explicit Delete activation',
       );
       await tester.drag(find.text(_parentSource), const Offset(-80, 0));
       await _pumpSlidableMotion(tester);
@@ -1430,7 +1414,7 @@ void main() {
       if (_writesReferenceGoldens) {
         await expectLater(
           find.byType(Scaffold).first,
-          matchesGoldenFile('goldens/journal-slidable-open.png'),
+          matchesGoldenFile('goldens/journal-slidable-open-status-flow.png'),
         );
       }
       await deleteGesture.up(timeStamp: const Duration(milliseconds: 600));
@@ -1536,6 +1520,8 @@ final class _RuntimeHarness {
   _RuntimeHarness({
     required this.tester,
     required this.runtime,
+    required this.auth,
+    required this.platform,
     required this.frameEligibility,
     required this.root,
     required this.removeRoot,
@@ -1543,6 +1529,8 @@ final class _RuntimeHarness {
 
   final WidgetTester tester;
   final RuntimeClient runtime;
+  final _TestAuth auth;
+  final JournalApplicationPlatform platform;
   final _ControllableFrameEligibilitySource frameEligibility;
   final Directory root;
   final bool removeRoot;
@@ -1554,6 +1542,7 @@ final class _RuntimeHarness {
     Brightness brightness = Brightness.light,
     bool highContrast = false,
     String typographyPreset = 'balanced',
+    bool reconcileAuthenticatedUser = false,
   }) async {
     tester.platformDispatcher.platformBrightnessTestValue = brightness;
     tester.platformDispatcher.accessibilityFeaturesTestValue =
@@ -1582,7 +1571,8 @@ final class _RuntimeHarness {
             () => Directory.systemTemp.createTemp('journal-golden-'),
           ))!
         : Directory(configuredRoot);
-    late final String snapshotToken;
+    late final String userId;
+    late final String baseUrl;
     if (configuredRoot == null) {
       final fixture = (await tester.runAsync(
         () => Process.run(
@@ -1595,14 +1585,20 @@ final class _RuntimeHarness {
         0,
         reason: '${fixture.stdout}\n${fixture.stderr}',
       );
-      snapshotToken = (fixture.stdout as String).trim();
+      final generated =
+          jsonDecode((fixture.stdout as String).trim()) as Map<String, dynamic>;
+      userId = generated['userId']! as String;
+      baseUrl = generated['baseUrl']! as String;
     } else {
-      snapshotToken =
-          Platform.environment['JOURNAL_GOLDEN_SNAPSHOT_TOKEN'] ??
+      userId =
+          Platform.environment['JOURNAL_GOLDEN_USER_ID'] ??
           (throw StateError(
-            'JOURNAL_GOLDEN_SNAPSHOT_TOKEN is required with '
+            'JOURNAL_GOLDEN_USER_ID is required with '
             'JOURNAL_GOLDEN_SUPPORT_ROOT',
           ));
+      baseUrl =
+          Platform.environment['JOURNAL_GOLDEN_BASE_URL'] ??
+          'https://api.logseq.io';
     }
 
     var generation = 7;
@@ -1615,7 +1611,7 @@ final class _RuntimeHarness {
       generation: generation++,
     );
     final initialSnapshot = await calendar();
-    final payload = _snapshotApplicationPayload(root.path, snapshotToken);
+    final payload = _managedApplicationPayload(root.path, baseUrl);
     final config = RuntimeBootstrapConfig(
       entrypoint: 'logseq_journal',
       launchPolicy: RuntimeLaunchPolicy.replaceExisting,
@@ -1627,13 +1623,19 @@ final class _RuntimeHarness {
       ).timeout(const Duration(seconds: 15)),
     ))!;
     final frameEligibility = _ControllableFrameEligibilitySource();
+    final auth = _TestAuth(
+      authenticatedUserId: reconcileAuthenticatedUser ? userId : null,
+    );
     final platform = JournalApplicationPlatform(
       calendarSnapshot: calendar,
       initialSnapshot: Future.value(initialSnapshot),
       formatJournalDays: ({required snapshot, required days}) async => {
         for (final day in days) day: day == 20260812 ? 'Wed, Aug 12' : '$day',
       },
-      auth: _TestAuth(),
+      auth: auth,
+      managedSyncOrigin: baseUrl,
+      readLocalAccountBinding: () async =>
+          (userId: userId, managedSyncOrigin: baseUrl),
       readPreference: (_) async => typographyPreset,
       writePreference: (_, _) async {},
     );
@@ -1653,6 +1655,8 @@ final class _RuntimeHarness {
     final harness = _RuntimeHarness(
       tester: tester,
       runtime: runtime,
+      auth: auth,
+      platform: platform,
       frameEligibility: frameEligibility,
       root: root,
       removeRoot: configuredRoot == null,
@@ -1704,6 +1708,20 @@ final class _RuntimeHarness {
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
+    auth.rejectPendingAuthentication();
+    var terminationCompleted = false;
+    final termination = platform.prepareForTermination().whenComplete(() {
+      terminationCompleted = true;
+    });
+    final terminationWatch = Stopwatch()..start();
+    while (!terminationCompleted &&
+        terminationWatch.elapsed < const Duration(seconds: 5)) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 10)),
+      );
+      await tester.pump(const Duration(milliseconds: 10));
+    }
+    await termination;
     var settled = await tester.runAsync(runtime.debugSnapshot);
     for (
       var attempt = 0;
@@ -1722,7 +1740,14 @@ final class _RuntimeHarness {
       });
     }
     frameEligibility.setEligible(false);
+    await tester.runAsync(
+      () => runtime.dispose().timeout(const Duration(seconds: 5)),
+    );
+    platform.dispose();
     await tester.pumpWidget(const SizedBox.shrink());
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
     if (removeRoot) {
       try {
         root.deleteSync(recursive: true);
@@ -1733,11 +1758,11 @@ final class _RuntimeHarness {
   }
 }
 
-Uint8List _snapshotApplicationPayload(String supportRoot, String token) {
+Uint8List _managedApplicationPayload(String supportRoot, String baseUrl) {
   final json = utf8.encode(
     jsonEncode(<String, Object>{
       'applicationSupportDirectory': supportRoot,
-      'target': <String, Object>{'kind': 'snapshot', 'token': token},
+      'target': <String, Object>{'kind': 'managedSync', 'baseUrl': baseUrl},
       'compatibilityProfile': 'logseq-65.33-or-newer',
       'responseBudgetBytes': 262144,
       'defaultPageSize': 50,

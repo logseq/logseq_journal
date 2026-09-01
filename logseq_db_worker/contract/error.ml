@@ -37,11 +37,7 @@ type detail =
 
 type component =
   | Logseq_db_worker
-  | Snapshot
-  | Graph_locator
   | Ownership
-  | Backup
-  | Synced_mirror
   | Sqlite
   | Storage
   | Storage_session
@@ -136,11 +132,7 @@ let code_of_string = function
 
 let component_string = function
   | Logseq_db_worker -> "logseqDbWorker"
-  | Snapshot -> "snapshot"
-  | Graph_locator -> "graphLocator"
   | Ownership -> "ownership"
-  | Backup -> "backup"
-  | Synced_mirror -> "syncedMirror"
   | Sqlite -> "sqlite"
   | Storage -> "storage"
   | Storage_session -> "storageSession"
@@ -158,11 +150,7 @@ let component_string = function
 
 let component_of_string = function
   | "logseqDbWorker" -> Some Logseq_db_worker
-  | "snapshot" -> Some Snapshot
-  | "graphLocator" -> Some Graph_locator
   | "ownership" -> Some Ownership
-  | "backup" -> Some Backup
-  | "syncedMirror" -> Some Synced_mirror
   | "sqlite" -> Some Sqlite
   | "storage" -> Some Storage
   | "storageSession" -> Some Storage_session

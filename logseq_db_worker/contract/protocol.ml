@@ -630,8 +630,6 @@ let admission_fact_to_json = function
       ]
   | Lossless_codec -> `Assoc [ "type", `String "losslessCodec" ]
   | Ownership_verified -> `Assoc [ "type", `String "ownershipVerified" ]
-  | Backup_verified -> `Assoc [ "type", `String "backupVerified" ]
-  | Sidecars_invalidated -> `Assoc [ "type", `String "sidecarsInvalidated" ]
 ;;
 
 let graph_info_to_json (info : graph_info) =
@@ -641,12 +639,6 @@ let graph_info_to_json (info : graph_info) =
     ; "graphDir", `String info.graph_dir
     ; "schema", `String (Printf.sprintf "%d.%d" info.schema.major info.schema.minor)
     ; "basis", int64_json info.basis
-    ; ( "mode"
-      , `String
-          (match info.mode with
-           | Snapshot -> "snapshot"
-           | Native_read_write -> "nativeReadWrite"
-           | Synced_local_first -> "syncedLocalFirst") )
     ; "admissionFacts", `List (List.map admission_fact_to_json info.admission_facts)
     ]
 ;;

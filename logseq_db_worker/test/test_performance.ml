@@ -96,11 +96,11 @@ let cases =
       T.require
         (p95_ms "getChildren100" < 100.)
         "Get_children(100) p95 reached or exceeded 100 ms")
-  ; T.case "post-backup structural mutation p95 is below 750 ms" (fun () ->
+  ; T.case "managed structural mutation p95 is below 750 ms" (fun () ->
       require_fixture_identity ();
       T.require
-        (p95_ms "postBackupSaveBlock" < 750.)
-        "post-backup Save_block p95 reached or exceeded 750 ms")
+        (p95_ms "managedSaveBlock" < 750.)
+        "managed Save_block p95 reached or exceeded 750 ms")
   ; T.case "at least 100 latency samples use frozen estimator" (fun () ->
       require_fixture_identity ();
       let policy = manifest () |> field "benchmarkPolicy" in
@@ -112,7 +112,7 @@ let cases =
       List.iter
         (fun metric ->
            T.require (samples metric >= 100) "%s has fewer than 100 samples" metric)
-        [ "getBlock"; "getChildren100"; "postBackupSaveBlock" ])
+        [ "getBlock"; "getChildren100"; "managedSaveBlock" ])
   ; T.case "deep tree at depth 64 remains bounded" (fun () ->
       require_fixture_identity ();
       let boundedness = result () |> field "boundedness" in
@@ -135,12 +135,6 @@ let cases =
         (int "highReferencesResponseBytes" boundedness
          <= Logseq_db_worker.Protocol.maximum_response_bytes)
         "high-reference response exceeded the protocol ceiling")
-  ; T.case "snapshot and first backup throughput are reported" (fun () ->
-      require_fixture_identity ();
-      let throughput = result () |> field "throughput" in
-      List.iter
-        (fun name -> T.require (float name throughput > 0.) "%s was not reported" name)
-        [ "snapshotBytesPerSecond"; "firstBackupBytesPerSecond" ])
   ]
 ;;
 

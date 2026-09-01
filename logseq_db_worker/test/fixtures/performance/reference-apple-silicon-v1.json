@@ -25,7 +25,7 @@
       "samples": 100,
       "p95Milliseconds": 16.440040999999184
     },
-    "postBackupSaveBlock": {
+    "managedSaveBlock": {
       "samples": 100,
       "p95Milliseconds": 484.2070840000048
     }
@@ -36,9 +36,5 @@
     "largeSiblingPaginationDeterministic": true,
     "highReferencesWithinResponseBudget": true,
     "highReferencesResponseBytes": 23135
-  },
-  "throughput": {
-    "snapshotBytesPerSecond": 290228263.2245169,
-    "firstBackupBytesPerSecond": 168999157.58450198
   }
 }
