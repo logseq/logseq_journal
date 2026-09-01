@@ -1202,7 +1202,12 @@ let test_child_count_widths_and_long_parent_source_remain_bounded () =
     [ 1; 12; 123 ]
 ;;
 
-let delete_timeline_component ~delete_enabled handlers _graph =
+let delete_timeline_component
+      ?(task_state = Journal_model.Done)
+      ~delete_enabled
+      handlers
+      _graph
+  =
   let ignored =
     Bonsai_flutter.Driver.Handler.create
       handlers
@@ -1212,7 +1217,7 @@ let delete_timeline_component ~delete_enabled handlers _graph =
       ~f:(fun () _ -> Bonsai.Effect.Ignore)
   in
   Bonsai.Cont.map ignored ~f:(fun ignored ->
-    let block = block () in
+    let block = block ~task_state () in
     let state = Journal_timeline_state.empty ~today:20260809 in
     let state =
       Journal_timeline_state.begin_request
@@ -1265,7 +1270,67 @@ let delete_timeline_component ~delete_enabled handlers _graph =
     |> Ui.Widget.Viewport.Vertical.with_height ~height:600.)
 ;;
 
-let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
+let test_non_picker_exact_statuses_remain_readable_on_the_status_button () =
+  List.iter
+    (fun (task_state, expected_background, expected_icon) ->
+       let handle =
+         Test.Handle.create
+           ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_002L)
+           ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+           (delete_timeline_component ~task_state ~delete_enabled:true)
+       in
+       Fun.protect
+         ~finally:(fun () -> Test.Handle.shutdown handle)
+         (fun () ->
+            Test.Handle.present handle;
+            require_semantics
+              handle
+              ("Change status, current status " ^ Journal_model.status_name task_state)
+              (fun props ->
+                 require (props.role = Ui.Semantics.Role.Button) "status role changed";
+                 require (props.enabled = Some true) "status button is disabled");
+            require_text
+              handle
+              ("journal-row-status-action-label:" ^ block_id)
+              (Journal_model.status_name task_state);
+            let (Av icon) =
+              Ui.Widget.Private.view
+                (node handle ("journal-row-status-action-icon:" ^ block_id)).widget
+            in
+            (match icon.node with
+             | Ui.Widget.Private.Icon { code_point; _ } ->
+               require
+                 (code_point = expected_icon)
+                 "%s status icon changed"
+                 (Journal_model.status_name task_state)
+             | _ ->
+               fail "%s status action has no icon" (Journal_model.status_name task_state));
+            let (Av slidable) =
+              Ui.Widget.Private.view
+                (node handle ("journal-row-slidable:" ^ block_id)).widget
+            in
+            match slidable.node with
+            | Ui.Widget.Private.Native_widget { payload; _ } ->
+              let props =
+                Ui.Native_widget.Slidable.For_testing.decode_props_exn payload
+              in
+              (match props.start_action_pane with
+               | Some { actions = [ action ]; _ } ->
+                 require
+                   (Int32.equal
+                      (Ui.Style.Color.Private.to_argb32 action.background)
+                      expected_background)
+                   "%s status category color changed"
+                   (Journal_model.status_name task_state)
+               | None | Some _ -> fail "status pane does not contain exactly one action")
+            | _ -> fail "status row is not a Slidable"))
+    [ Journal_model.Now, 0xff00677cl, 0xe660
+    ; Waiting, 0xff7c3aedl, 0xe660
+    ; Later, 0xff7c3aedl, 0xe504
+    ]
+;;
+
+let test_slidable_has_one_exact_status_button_and_non_dismissible_delete_action () =
   let time_source = Bonsai.Time_source.create ~start:Core.Time_ns.epoch in
   let handle =
     Test.Handle.create
@@ -1281,26 +1346,24 @@ let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
          (Option.is_none
             (Test.Handle.find handle (Test.Query.test_id "journal-bottom-clearance")))
          "timeline retained obsolete composer bottom clearance";
-       List.iter
-         (fun (action_id, expected_code_point) ->
-            let test_id =
-              "journal-row-status-action-icon:" ^ block_id ^ ":" ^ string_of_int action_id
-            in
-            let (Av view) = Ui.Widget.Private.view (node handle test_id).widget in
-            match view.node with
-            | Ui.Widget.Private.Icon { code_point; font_family = Some font_family; _ } ->
-              require
-                (code_point = expected_code_point)
-                "%s rendered U+%04X instead of U+%04X"
-                test_id
-                code_point
-                expected_code_point;
-              require
-                (String.equal font_family "MaterialIcons")
-                "%s does not use MaterialIcons"
-                test_id
-            | _ -> fail "%s is not a Material icon" test_id)
-         [ 2, 0xe518; 3, 0xe504; 4, 0xe660; 5, 0xe15a ];
+       let icon_test_id = "journal-row-status-action-icon:" ^ block_id in
+       let (Av icon_view) = Ui.Widget.Private.view (node handle icon_test_id).widget in
+       (match icon_view.node with
+        | Ui.Widget.Private.Icon { code_point; font_family = Some font_family; _ } ->
+          require
+            (code_point = 0xe15a)
+            "%s rendered U+%04X instead of Done U+E15A"
+            icon_test_id
+            code_point;
+          require
+            (String.equal font_family "MaterialIcons")
+            "%s does not use MaterialIcons"
+            icon_test_id
+        | _ -> fail "%s is not a Material icon" icon_test_id);
+       require_semantics handle "Change status, current status Done" (fun props ->
+         require (props.role = Ui.Semantics.Role.Button) "status action role changed";
+         require (props.enabled = Some true) "status action is not enabled";
+         require (props.focusable = Some true) "status action is not focusable");
        let slidable = node handle ("journal-row-slidable:" ^ block_id) in
        (let (Av view) = Ui.Widget.Private.view slidable.widget in
         match view.node with
@@ -1319,55 +1382,35 @@ let test_slidable_has_quick_status_and_non_dismissible_delete_actions () =
           (match props.start_action_pane with
            | None -> fail "status Slidable omitted its logical-start pane"
            | Some pane ->
-             require (Float.equal pane.extent_ratio 0.8) "status pane extent changed";
+             require (Float.equal pane.extent_ratio 0.25) "status pane extent changed";
              require (pane.motion = Ui.Native_widget.Slidable.Behind) "status pane moved";
              require (Option.is_none pane.dismissible) "status swipe can dismiss the row";
              require
                (not pane.drag_dismissible)
                "full-width status drag can dismiss the row";
-             require
-               (List.map
-                  (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) ->
-                     action.id)
-                  pane.actions
-                = [ 2; 3; 4; 5 ])
-               "status action IDs or order changed";
-             List.iter
-               (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) ->
-                  require
-                    (Bool.equal action.enabled (action.id <> 5))
-                    "current Done status action state changed";
-                  require action.auto_close "status action does not auto-close";
-                  require
-                    (Float.equal action.border_radius 0.)
-                    "status action retained rounded corners";
-                  require
-                    (Option.is_none action.padding)
-                    "status action retained inset card spacing")
-               pane.actions;
-             let argb = Ui.Style.Color.Private.to_argb32 in
-             List.iter2
-               (fun (action : Ui.Native_widget.Slidable.For_testing.action_props)
-                 (expected_background, expected_foreground) ->
-                  require
-                    (Option.equal
-                       Int32.equal
-                       (Option.map argb action.foreground)
-                       (Some expected_foreground))
-                    "status action %d foreground differs"
-                    action.id;
-                  require
-                    (Int32.equal (argb action.background) expected_background)
-                    "status action %d background is %lx, expected %lx"
-                    action.id
-                    (argb action.background)
-                    expected_background)
-               pane.actions
-               [ 0xff4b5e63l, 0xffffffffl
-               ; 0xff585c7el, 0xffffffffl
-               ; 0xff00677cl, 0xffffffffl
-               ; 0xff006b57l, 0xffffffffl
-               ]);
+             (match pane.actions with
+              | [ action ] ->
+                let argb = Ui.Style.Color.Private.to_argb32 in
+                require (action.id = 6) "status button retained an obsolete action ID";
+                require action.enabled "status button is disabled for the current state";
+                require action.auto_close "status button does not auto-close";
+                require
+                  (Float.equal action.border_radius 0.)
+                  "status button retained rounded corners";
+                require
+                  (Option.is_none action.padding)
+                  "status button retained inset card spacing";
+                require
+                  (Option.equal
+                     Int32.equal
+                     (Option.map argb action.foreground)
+                     (Some 0xffffffffl))
+                  "Done status button foreground differs";
+                require
+                  (Int32.equal (argb action.background) 0xff006b57l)
+                  "Done status button background differs"
+              | actions ->
+                fail "status pane has %d actions instead of one" (List.length actions)));
           (match props.end_action_pane with
            | None -> fail "delete Slidable omitted its logical-end pane"
            | Some pane ->
@@ -1490,5 +1533,6 @@ let () =
   test_compact_and_adaptive_shapes_at_required_extremes ();
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();
-  test_slidable_has_quick_status_and_non_dismissible_delete_actions ()
+  test_non_picker_exact_statuses_remain_readable_on_the_status_button ();
+  test_slidable_has_one_exact_status_button_and_non_dismissible_delete_action ()
 ;;

@@ -21,29 +21,29 @@ const _parentSource = '混合脚本 Journal 2026 条目';
 const _firstChild = 'Increase block row height';
 const _secondChild = 'Show parent and child preview';
 const _thirdChild = 'Keep bounded virtualization';
-const _lightStatusActionBackgrounds = <Color>[
-  Color(0xff4b5e63),
+const _lightStatusCategoryBackgrounds = <Color>[
   Color(0xff585c7e),
   Color(0xff00677c),
   Color(0xff006b57),
+  Color(0xff7c3aed),
 ];
-const _lightStatusActionForegrounds = <Color>[
+const _lightStatusCategoryForegrounds = <Color>[
   Colors.white,
   Colors.white,
   Colors.white,
   Colors.white,
 ];
-const _darkStatusActionBackgrounds = <Color>[
-  Color(0xffa7b8bc),
+const _darkStatusCategoryBackgrounds = <Color>[
   Color(0xffc0c4eb),
   Color(0xff86d1e9),
   Color(0xff83d6bd),
+  Color(0xff7c3aed),
 ];
-const _darkStatusActionForegrounds = <Color>[
-  Color(0xff1b3035),
+const _darkStatusCategoryForegrounds = <Color>[
   Color(0xff2a2e50),
   Color(0xff003642),
   Color(0xff00382b),
+  Colors.white,
 ];
 
 final _runtimeBrightness =
@@ -282,28 +282,26 @@ void main() {
       await tester.drag(rtlStatusRow, const Offset(-390, 0));
       await _pumpSlidableMotion(tester);
       expect(tester.takeException(), isNull);
-      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
-        final actionLabel = find.descendant(
-          of: rtlSlidable,
-          matching: find.text(label),
-        );
-        expect(actionLabel, findsOneWidget);
-        expect(
-          tester
-              .getRect(
-                find.ancestor(
-                  of: actionLabel,
-                  matching: find.byType(fs.CustomSlidableAction),
-                ),
-              )
-              .width,
-          greaterThanOrEqualTo(44),
-        );
-      }
+      final actionLabel = find.descendant(
+        of: rtlSlidable,
+        matching: find.text('No status'),
+      );
+      expect(actionLabel, findsOneWidget);
+      expect(
+        tester
+            .getRect(
+              find.ancestor(
+                of: actionLabel,
+                matching: find.byType(fs.CustomSlidableAction),
+              ),
+            )
+            .width,
+        greaterThanOrEqualTo(44),
+      );
       expect(
         fs.Slidable.of(tester.element(rtlStatusRow))!.ratio,
-        closeTo(-0.8, 0.01),
-        reason: 'RTL did not mirror logical-start status actions',
+        closeTo(-0.25, 0.01),
+        reason: 'RTL did not mirror the logical-start status button',
       );
       final rtlClose = fs.Slidable.of(tester.element(rtlStatusRow))!.close();
       await _pumpSlidableMotion(tester);
@@ -561,7 +559,7 @@ void main() {
   );
 
   testWidgets(
-    'real runtime preserves Capture task intent and applies explicit row status actions',
+    'real runtime preserves Capture task intent and applies the single status sheet',
     (tester) async {
       final harness = await _RuntimeHarness.start(
         tester,
@@ -578,63 +576,123 @@ void main() {
       final parentController = fs.Slidable.of(tester.element(parentRow))!;
       await tester.drag(parentRow, const Offset(390, 0));
       await _pumpSlidableMotion(tester);
-      expect(parentController.ratio, closeTo(0.8, 0.01));
-      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
-        final actionLabel = find.descendant(
-          of: parentSlidable,
-          matching: find.text(label),
-        );
-        expect(actionLabel, findsOneWidget);
-        expect(
-          tester
-              .getRect(
-                find.ancestor(
-                  of: actionLabel,
-                  matching: find.byType(fs.CustomSlidableAction),
-                ),
-              )
-              .width,
-          greaterThanOrEqualTo(44),
-        );
-      }
+      expect(parentController.ratio, closeTo(0.25, 0.01));
+      final actionLabel = find.descendant(
+        of: parentSlidable,
+        matching: find.text('No status'),
+      );
+      expect(actionLabel, findsOneWidget);
       final currentNoStatus = tester.widget<fs.CustomSlidableAction>(
         find.ancestor(
-          of: find.descendant(
-            of: parentSlidable,
-            matching: find.text('No status'),
-          ),
+          of: actionLabel,
           matching: find.byType(fs.CustomSlidableAction),
         ),
       );
-      expect(currentNoStatus.onPressed, isNull);
-      expect(
-        tester
-            .getSemantics(find.bySemanticsLabel('Current status No status'))
-            .getSemanticsData()
-            .flagsCollection
-            .isSelected,
-        Tristate.isTrue,
-      );
+      expect(currentNoStatus.onPressed, isNotNull);
       final parentClose = parentController.close();
       await _pumpSlidableMotion(tester);
       await parentClose;
       await tester.drag(parentRow, const Offset(390, 0));
       await _pumpSlidableMotion(tester);
-      expect(parentController.ratio, closeTo(0.8, 0.01));
+      expect(parentController.ratio, closeTo(0.25, 0.01));
       expect(
         find.bySemanticsLabel(RegExp('$_parentSource.*status ')),
         findsNothing,
         reason: 'a full-width drag changed status without an explicit tap',
       );
-      await tester.tap(
-        find.descendant(of: parentSlidable, matching: find.text('Doing')),
+      await tester.tap(actionLabel);
+      await harness.pumpUntil(
+        () => find.text('Set status').evaluate().isNotEmpty,
+        reason: 'the status button did not open the modal bottom sheet',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      expect(find.byType(BottomSheet), findsWidgets);
+      expect(find.byType(DraggableScrollableSheet), findsOneWidget);
+      final sheetRect = tester.getRect(find.byType(DraggableScrollableSheet));
+      final screenHeight = tester.getSize(find.byType(MaterialApp)).height;
+      expect(
+        sheetRect.height,
+        closeTo(screenHeight * 0.5, 1),
+        reason: 'the status sheet did not open at the Medium detent',
+      );
+      expect(
+        find.bySemanticsLabel('Status picker size'),
+        findsOneWidget,
+        reason: 'the Medium detent has no accessible drag handle',
+      );
+      for (final label in const [
+        'Backlog',
+        'Todo',
+        'Doing',
+        'In review',
+        'Done',
+        'Canceled',
+        'Clear',
+      ]) {
+        final option = find.text(label, skipOffstage: false);
+        expect(option, findsOneWidget);
+        expect(
+          sheetRect.contains(tester.getCenter(option)),
+          isTrue,
+          reason: '$label is not visible inside the Medium detent',
+        );
+        if (label != 'Clear') {
+          expect(
+            option.hitTestable(),
+            findsOneWidget,
+            reason: '$label is inside the Medium detent but cannot be tapped',
+          );
+        }
+      }
+      expect(find.text('Now'), findsNothing);
+      expect(find.text('Waiting'), findsNothing);
+      expect(find.text('Later'), findsNothing);
+      expect(find.text('Clear'), findsOneWidget);
+      expect(
+        tester
+            .getSemantics(find.bySemanticsLabel('Clear'))
+            .getSemanticsData()
+            .flagsCollection
+            .isSelected,
+        Tristate.isTrue,
+      );
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/journal-status-sheet-medium.png'),
+      );
+      await tester.drag(
+        find.bySemanticsLabel('Status picker size'),
+        const Offset(0, 420),
       );
       await harness.pumpUntil(
-        () => find
-            .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
-            .evaluate()
-            .isNotEmpty,
-        reason: 'the Doing action did not reconcile through the Worker',
+        () => find.text('Set status').evaluate().isEmpty,
+        reason: 'dragging the Medium status sheet down did not dismiss it',
+      );
+      expect(
+        find.bySemanticsLabel(RegExp('$_parentSource.*status ')),
+        findsNothing,
+        reason: 'drag dismissal changed status',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await _pumpSlidableMotion(tester);
+      final reopenStatus = parentController.openStartActionPane();
+      await _pumpSlidableMotion(tester);
+      await reopenStatus;
+      await tester.tap(actionLabel);
+      await harness.pumpUntil(
+        () => find.text('Set status').evaluate().isNotEmpty,
+        reason: 'the status sheet did not reopen after drag dismissal',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.tap(find.text('Doing'));
+      await harness.pumpUntil(
+        () =>
+            find.text('Set status').evaluate().isEmpty &&
+            find
+                .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
+                .evaluate()
+                .isNotEmpty,
+        reason: 'the Doing sheet option did not reconcile through the Worker',
       );
       await _pumpSlidableMotion(tester);
       expect(parentController.ratio, closeTo(0, 0.01));
@@ -650,7 +708,7 @@ void main() {
       await tester.pump();
       _expectMaterialGlyph(
         find.byTooltip('Capture as task, off'),
-        Icons.check_box_outline_blank,
+        Icons.timelapse,
         role: 'unchecked Capture task action',
       );
       await tester.tap(find.byTooltip('Capture as task, off').hitTestable());
@@ -660,7 +718,7 @@ void main() {
       );
       _expectMaterialGlyph(
         find.byTooltip('Capture as task, on'),
-        Icons.task_alt,
+        Icons.timelapse,
         role: 'checked Capture task action',
       );
       expect(
@@ -809,7 +867,7 @@ void main() {
       final rowRect = _ancestorRectWithHeight(
         tester,
         find.text(_parentSource),
-        100,
+        82,
       );
       expect(rowRect.width, closeTo(390, 0.5));
       expect(
@@ -855,7 +913,7 @@ void main() {
       final secondChildTop = tester
           .getTopLeft(_directChildText(_secondChild))
           .dy;
-      expect(firstChildTop - parentTop, closeTo(38, 0.1));
+      expect(firstChildTop - parentTop, closeTo(50, 0.1));
       expect(secondChildTop - firstChildTop, closeTo(44, 0.1));
       expect(
         tester.getTopLeft(find.text(_parentSource)).dy,
@@ -896,61 +954,84 @@ void main() {
       final parentController = fs.Slidable.of(
         tester.element(find.text(_parentSource)),
       )!;
-      await tester.drag(find.text(_parentSource), const Offset(390, 0));
+      await tester.dragFrom(
+        tester.getCenter(parentSlidable),
+        const Offset(390, 0),
+      );
       await _pumpSlidableMotion(tester);
-      expect(parentController.ratio, closeTo(0.8, 0.01));
-      _expectQuickStatusActionColors(
+      expect(parentController.ratio, closeTo(0.25, 0.01));
+      _expectStatusButtonColors(
         tester,
         parentSlidable,
         brightness: _runtimeBrightness,
+        currentStatus: 'No status',
       );
-      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
-        expect(
-          find.descendant(of: parentSlidable, matching: find.text(label)),
-          findsOneWidget,
-        );
-      }
+      final noStatusButton = find.descendant(
+        of: parentSlidable,
+        matching: find.text('No status'),
+      );
+      expect(noStatusButton, findsOneWidget);
       final currentNoStatus = tester.widget<fs.CustomSlidableAction>(
         find.ancestor(
-          of: find.descendant(
-            of: parentSlidable,
-            matching: find.text('No status'),
-          ),
+          of: noStatusButton,
           matching: find.byType(fs.CustomSlidableAction),
         ),
       );
-      expect(currentNoStatus.onPressed, isNull);
-      expect(
-        tester
-            .getSemantics(find.bySemanticsLabel('Current status No status'))
-            .getSemanticsData()
-            .flagsCollection
-            .isSelected,
-        Tristate.isTrue,
+      expect(currentNoStatus.onPressed, isNotNull);
+      await tester.dragFrom(
+        tester.getCenter(parentSlidable),
+        const Offset(390, 0),
       );
-      await tester.drag(find.text(_parentSource), const Offset(390, 0));
       await _pumpSlidableMotion(tester);
-      expect(parentController.ratio, closeTo(0.8, 0.01));
+      expect(parentController.ratio, closeTo(0.25, 0.01));
       expect(
         find.bySemanticsLabel(RegExp('$_parentSource.*status ')),
         findsNothing,
         reason: 'a full-width status drag mutated the block',
       );
-      await tester.tap(
-        find.descendant(of: parentSlidable, matching: find.text('Doing')),
-      );
+      await tester.tap(noStatusButton);
       await harness.pumpUntil(
-        () => find
-            .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
-            .evaluate()
-            .isNotEmpty,
-        reason: 'explicit Doing action did not reconcile through the runtime',
+        () => find.text('Set status').evaluate().isNotEmpty,
+        reason: 'status sheet did not open',
       );
+      await tester.tapAt(const Offset(8, 8));
+      await harness.pumpUntil(
+        () => find.text('Set status').evaluate().isEmpty,
+        reason: 'status sheet barrier did not dismiss the route',
+      );
+      expect(
+        find.bySemanticsLabel(RegExp('$_parentSource.*status ')),
+        findsNothing,
+        reason: 'barrier dismissal changed status',
+      );
+      await _pumpSlidableMotion(tester);
+      expect(parentController.ratio, closeTo(0, 0.01));
+      final statusReopen = parentController.openStartActionPane();
+      await _pumpSlidableMotion(tester);
+      await statusReopen;
+      expect(parentController.ratio, closeTo(0.25, 0.01));
+      await tester.tap(noStatusButton);
+      await harness.pumpUntil(
+        () => find.text('Set status').evaluate().isNotEmpty,
+        reason: 'status sheet did not reopen after dismissal',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
+      await tester.tap(find.text('Doing'));
+      await harness.pumpUntil(
+        () =>
+            find.text('Set status').evaluate().isEmpty &&
+            find
+                .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
+                .evaluate()
+                .isNotEmpty,
+        reason: 'explicit Doing option did not reconcile through the runtime',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
       await _pumpSlidableMotion(tester);
       expect(parentController.ratio, closeTo(0, 0.01));
 
       final swipeGesture = await tester.startGesture(
-        tester.getCenter(find.text(_parentSource)),
+        tester.getCenter(parentSlidable),
       );
       await swipeGesture.moveBy(
         const Offset(-80, 0),
@@ -1141,7 +1222,7 @@ void main() {
       await tester.pump();
       _expectMaterialGlyph(
         find.byTooltip('Capture as task, off'),
-        Icons.check_box_outline_blank,
+        Icons.timelapse,
         role: 'unchecked Capture task action',
       );
       await tester.tap(find.byTooltip('Capture as task, off'));
@@ -1151,7 +1232,7 @@ void main() {
       );
       _expectMaterialGlyph(
         find.byTooltip('Capture as task, on'),
-        Icons.task_alt,
+        Icons.timelapse,
         role: 'checked Capture task action',
       );
       expect(
@@ -1213,6 +1294,7 @@ void main() {
         () => find.byTooltip('Capture as task, off').evaluate().isNotEmpty,
         reason: 'successful Capture did not reset task intent',
       );
+      await tester.pump(const Duration(milliseconds: 220));
       await tester.drag(find.byType(MessageComposer), const Offset(0, 80));
       await tester.pump(const Duration(milliseconds: 440));
 
@@ -1259,7 +1341,7 @@ void main() {
   );
 
   testWidgets(
-    'real runtime uses centered full-bleed swipe actions with status rail colors',
+    'real runtime uses one centered status button with exact category colors',
     (tester) async {
       final harness = await _RuntimeHarness.start(
         tester,
@@ -1275,7 +1357,7 @@ void main() {
 
       await tester.drag(row, const Offset(390, 0));
       await _pumpSlidableMotion(tester);
-      expect(controller.ratio, closeTo(0.8, 0.01));
+      expect(controller.ratio, closeTo(0.25, 0.01));
       final statusActions = tester
           .widgetList<fs.CustomSlidableAction>(
             find.descendant(
@@ -1284,33 +1366,59 @@ void main() {
             ),
           )
           .toList();
-      expect(statusActions, hasLength(4));
-      _expectQuickStatusActionColors(
+      expect(statusActions, hasLength(1));
+      _expectStatusButtonColors(
         tester,
         slidable,
         brightness: _runtimeBrightness,
+        currentStatus: 'No status',
       );
       for (final action in statusActions) {
         expect(action.borderRadius, BorderRadius.zero);
         expect(action.padding, isNull);
         expect(action.alignment, isNull);
       }
-      for (final label in const ['No status', 'Todo', 'Doing', 'Done']) {
-        _expectActionContentCentered(tester, slidable, label);
-      }
+      _expectActionContentCentered(tester, slidable, 'No status');
+      _expectStatusActionVerticallyStackedAndComplete(
+        tester,
+        slidable,
+        'No status',
+      );
 
       await tester.tap(
-        find.descendant(of: slidable, matching: find.text('Doing')),
+        find.descendant(of: slidable, matching: find.text('No status')),
       );
       await harness.pumpUntil(
-        () => find
-            .bySemanticsLabel(RegExp('$_parentSource.*status Doing'))
-            .evaluate()
-            .isNotEmpty,
-        reason: 'Doing did not reconcile before Delete presentation coverage',
+        () => find.text('Set status').evaluate().isNotEmpty,
+        reason: 'status sheet did not open before category color coverage',
       );
+      await tester.pump(const Duration(milliseconds: 220));
+      _expectStatusSheetIconOnlyColors(tester, brightness: _runtimeBrightness);
+      await tester.tap(find.text('In review'));
+      await harness.pumpUntil(
+        () =>
+            find.text('Set status').evaluate().isEmpty &&
+            find
+                .bySemanticsLabel(RegExp('$_parentSource.*status In review'))
+                .evaluate()
+                .isNotEmpty,
+        reason:
+            'In review did not reconcile before Delete presentation coverage',
+      );
+      await tester.pump(const Duration(milliseconds: 220));
       await _pumpSlidableMotion(tester);
       expect(controller.ratio, closeTo(0, 0.01));
+      final reopenStatus = controller.openStartActionPane();
+      await _pumpSlidableMotion(tester);
+      await reopenStatus;
+      _expectStatusActionVerticallyStackedAndComplete(
+        tester,
+        slidable,
+        'In review',
+      );
+      final closeStatus = controller.close();
+      await _pumpSlidableMotion(tester);
+      await closeStatus;
 
       final deleteGesture = await tester.startGesture(tester.getCenter(row));
       await deleteGesture.moveBy(
@@ -1647,12 +1755,16 @@ Rect _ancestorRectWithHeight(WidgetTester tester, Finder child, double height) {
     of: child,
     matching: find.byWidgetPredicate((widget) => widget is SizedBox),
   );
+  final candidateRects = <Rect>[];
   for (final element in candidates.evaluate()) {
     final finder = find.byElementPredicate((candidate) => candidate == element);
     final rect = tester.getRect(finder);
+    candidateRects.add(rect);
     if ((rect.height - height).abs() < 0.1 && rect.width > 300) return rect;
   }
-  throw TestFailure('no $height-point row ancestor was found');
+  throw TestFailure(
+    'no $height-point row ancestor was found; candidates: $candidateRects',
+  );
 }
 
 void _expectActionContentCentered(
@@ -1685,6 +1797,125 @@ void _expectActionContentCentered(
     reason:
         '$label content $contentRect is not vertically centered in the action at $actionCenter',
   );
+}
+
+void _expectStatusActionVerticallyStackedAndComplete(
+  WidgetTester tester,
+  Finder slidable,
+  String label,
+) {
+  final actionLabel = find.descendant(of: slidable, matching: find.text(label));
+  final action = find.ancestor(
+    of: actionLabel,
+    matching: find.byType(fs.CustomSlidableAction),
+  );
+  final textElements = find
+      .descendant(of: action, matching: find.byType(Text))
+      .evaluate()
+      .toList();
+  expect(textElements, hasLength(2));
+  final labelElement = actionLabel.evaluate().single;
+  final iconElement = textElements.singleWhere(
+    (element) => !identical(element, labelElement),
+  );
+  final icon = find.byElementPredicate(
+    (element) => identical(element, iconElement),
+  );
+  final iconRect = tester.getRect(icon);
+  final labelRect = tester.getRect(actionLabel);
+  final actionRect = tester.getRect(action);
+  expect(
+    iconRect.bottom,
+    lessThanOrEqualTo(labelRect.top),
+    reason: '$label icon is not above its label',
+  );
+  expect(iconRect.center.dx, closeTo(actionRect.center.dx, 0.1));
+  expect(labelRect.center.dx, closeTo(actionRect.center.dx, 0.1));
+  final labelWidget = tester.widget<Text>(actionLabel);
+  expect(
+    labelWidget.overflow,
+    isNot(TextOverflow.ellipsis),
+    reason: '$label still permits ellipsis',
+  );
+  final paragraph = tester.renderObject<RenderParagraph>(
+    find.descendant(of: actionLabel, matching: find.byType(RichText)),
+  );
+  expect(
+    paragraph.didExceedMaxLines,
+    isFalse,
+    reason: '$label does not fit completely in the status action',
+  );
+}
+
+void _expectStatusSheetIconOnlyColors(
+  WidgetTester tester, {
+  required Brightness brightness,
+}) {
+  final iconColors = brightness == Brightness.light
+      ? _lightStatusCategoryBackgrounds
+      : _darkStatusCategoryBackgrounds;
+  final noStatusForeground = brightness == Brightness.light
+      ? const Color(0xff00262f)
+      : const Color(0xffa7b8bc);
+  final rows = <(String, Color)>[
+    ('Backlog', iconColors[3]),
+    ('Todo', iconColors[0]),
+    ('Doing', iconColors[1]),
+    ('In review', iconColors[1]),
+    ('Done', iconColors[2]),
+    ('Canceled', iconColors[2]),
+    ('Clear', noStatusForeground),
+  ];
+  for (final (label, expectedIconColor) in rows) {
+    final labelFinder = find.text(label);
+    final coloredRows = find
+        .ancestor(
+          of: labelFinder,
+          matching: find.byWidgetPredicate(
+            (widget) =>
+                widget is DecoratedBox && widget.decoration is BoxDecoration,
+          ),
+        )
+        .evaluate()
+        .where((element) {
+          final rect = tester.getRect(
+            find.byElementPredicate(
+              (candidate) => identical(candidate, element),
+            ),
+          );
+          return rect.width > 300 && rect.height >= 44 && rect.height < 80;
+        })
+        .toList();
+    expect(
+      coloredRows,
+      isEmpty,
+      reason: '$label still has a full-width status background',
+    );
+    final rowCandidates = find
+        .ancestor(of: labelFinder, matching: find.byType(Row))
+        .evaluate()
+        .where((element) {
+          final rect = tester.getRect(
+            find.byElementPredicate(
+              (candidate) => identical(candidate, element),
+            ),
+          );
+          return rect.width > 300 && rect.height >= 44 && rect.height < 80;
+        })
+        .toList();
+    expect(rowCandidates, hasLength(1));
+    final row = find.byElementPredicate(
+      (element) => identical(element, rowCandidates.single),
+    );
+    final texts = tester
+        .widgetList<Text>(find.descendant(of: row, matching: find.byType(Text)))
+        .toList();
+    expect(texts, hasLength(2));
+    final labelText = texts.singleWhere((text) => text.data == label);
+    final iconText = texts.singleWhere((text) => text.data != label);
+    expect(labelText.style?.color, isNull);
+    expect(iconText.style?.color, expectedIconColor);
+  }
 }
 
 Rect _combinedRect(WidgetTester tester, Finder finder) {
@@ -1746,16 +1977,11 @@ void _expectSeedOwnedSemanticColors(
   expect(railColors, hasLength(4));
   expect(railColors.toSet(), hasLength(4));
   final expectedBackgrounds = brightness == Brightness.light
-      ? _lightStatusActionBackgrounds
-      : _darkStatusActionBackgrounds;
+      ? _lightStatusCategoryBackgrounds
+      : _darkStatusCategoryBackgrounds;
   expect(
     railColors.toSet(),
-    <Color>{
-      expectedBackgrounds[1],
-      expectedBackgrounds[2],
-      expectedBackgrounds[3],
-      const Color(0xff7c3aed),
-    },
+    expectedBackgrounds.toSet(),
     reason: 'status rails do not use the brightness-specific semantic colors',
   );
   for (final color in railColors) {
@@ -1763,6 +1989,14 @@ void _expectSeedOwnedSemanticColors(
   }
   for (final element in find.byType(fs.CustomSlidableAction).evaluate()) {
     final action = element.widget as fs.CustomSlidableAction;
+    if (action.backgroundColor.a == 0) {
+      expect(action.foregroundColor, isNotNull);
+      expect(
+        _contrastRatio(action.foregroundColor!, scheme.surface),
+        greaterThanOrEqualTo(4.5),
+      );
+      continue;
+    }
     expect(
       _contrastRatio(action.backgroundColor, scheme.surface),
       greaterThanOrEqualTo(3),
@@ -1775,36 +2009,48 @@ void _expectSeedOwnedSemanticColors(
   }
 }
 
-void _expectQuickStatusActionColors(
+void _expectStatusButtonColors(
   WidgetTester tester,
   Finder slidable, {
   required Brightness brightness,
+  required String currentStatus,
 }) {
   final expectedBackgrounds = brightness == Brightness.light
-      ? _lightStatusActionBackgrounds
-      : _darkStatusActionBackgrounds;
+      ? _lightStatusCategoryBackgrounds
+      : _darkStatusCategoryBackgrounds;
   final expectedForegrounds = brightness == Brightness.light
-      ? _lightStatusActionForegrounds
-      : _darkStatusActionForegrounds;
-  for (var index = 0; index < 4; index++) {
-    final label = const ['No status', 'Todo', 'Doing', 'Done'][index];
-    final action = tester.widget<fs.CustomSlidableAction>(
-      find.ancestor(
-        of: find.descendant(of: slidable, matching: find.text(label)),
-        matching: find.byType(fs.CustomSlidableAction),
-      ),
-    );
-    expect(
-      action.backgroundColor,
-      expectedBackgrounds[index],
-      reason: '$label background does not match $brightness',
-    );
-    expect(
-      action.foregroundColor,
-      expectedForegrounds[index],
-      reason: '$label foreground does not match $brightness',
-    );
-  }
+      ? _lightStatusCategoryForegrounds
+      : _darkStatusCategoryForegrounds;
+  final categoryIndex = switch (currentStatus) {
+    'Todo' => 0,
+    'Doing' || 'In review' || 'Now' => 1,
+    'Done' || 'Canceled' => 2,
+    'Backlog' || 'Waiting' || 'Later' => 3,
+    'No status' => null,
+    _ => throw TestFailure('unknown exact status $currentStatus'),
+  };
+  final action = tester.widget<fs.CustomSlidableAction>(
+    find.ancestor(
+      of: find.descendant(of: slidable, matching: find.text(currentStatus)),
+      matching: find.byType(fs.CustomSlidableAction),
+    ),
+  );
+  expect(
+    action.backgroundColor,
+    categoryIndex == null
+        ? Colors.transparent
+        : expectedBackgrounds[categoryIndex],
+    reason: '$currentStatus background does not match $brightness',
+  );
+  expect(
+    action.foregroundColor,
+    categoryIndex == null
+        ? brightness == Brightness.light
+              ? const Color(0xff00262f)
+              : const Color(0xffa7b8bc)
+        : expectedForegrounds[categoryIndex],
+    reason: '$currentStatus foreground does not match $brightness',
+  );
 }
 
 List<Color> _statusRailColors(WidgetTester tester) => find

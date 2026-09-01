@@ -53,6 +53,7 @@ type formatting_context =
 
 type modal =
   | No_modal
+  | Status_sheet of string
   | Account
   | Settings
   | Diagnostics
@@ -223,9 +224,11 @@ let apply_manager_state state (manager_state : Logseq_sync_pure_reducer.Core.sta
   in
   let modal =
     match state.modal, snapshot.selected_graph with
+    | Status_sheet _, _ when graph_context_changed -> No_modal
     | Cache_reset_confirmation confirmation, Some selected
       when Logseq_db_types.Graph_types.Uuid.equal confirmation selected -> state.modal
-    | (No_modal | Account | Settings | Diagnostics | Error_info), _ -> state.modal
+    | (No_modal | Status_sheet _ | Account | Settings | Diagnostics | Error_info), _ ->
+      state.modal
     | Cache_reset_confirmation _, (None | Some _) -> No_modal
   in
   let state =
@@ -914,6 +917,178 @@ let action_target
 let bind_action handler action =
   Ui.Event.Handler.create ~name:("journal-action:" ^ action) (fun _payload ->
     Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text action))
+;;
+
+let status_sheet_options =
+  [ "backlog", Journal_model.Backlog
+  ; "todo", Todo
+  ; "doing", Doing
+  ; "in-review", In_review
+  ; "done", Done
+  ; "canceled", Canceled
+  ; "clear", No_status
+  ]
+;;
+
+let status_sheet_sizing =
+  let semantics =
+    Ui.Navigation.Modal_bottom_sheet.Handle_semantics.create
+      ~label:"Status picker size"
+      ~medium_value:"Medium"
+      ~large_value:"Large"
+  in
+  Ui.Navigation.Modal_bottom_sheet.Detents.create
+    ~initial:Ui.Navigation.Modal_bottom_sheet.Detent.Medium
+    ~dismiss_on_drag:true
+    ~semantics
+    [ Ui.Navigation.Modal_bottom_sheet.Detent.Medium ]
+  |> fun detents -> Ui.Navigation.Modal_bottom_sheet.Sizing.Detented detents
+;;
+
+let status_sheet_page
+      ~tokens
+      ~typography
+      ~text_scale
+      ~viewport_height
+      ~bottom_inset
+      ~reduced_motion
+      ~block
+      dispatch
+  =
+  let block_id = Journal_model.id block in
+  let current = Journal_model.task_state block in
+  let minimum_target = Journal_visual_tokens.hit_regions.minimum_target in
+  let row_extent = Float.max minimum_target (minimum_target *. text_scale) in
+  let heading =
+    styled_text ~token:typography.Journal_visual_tokens.dialog_title "Set status"
+    |> Ui.Widget.padding
+         ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ~top:2. ~bottom:2. ())
+    |> Ui.Widget.semantics
+         ~properties:
+           (Ui.Semantics.create ~label:"Set status" ~role:Ui.Semantics.Role.Header ())
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-status-sheet-heading")
+  in
+  let rows =
+    List.map
+      (fun (tag, task_state) ->
+         let selected = current = task_state in
+         let enabled = not selected in
+         let status_palette =
+           Journal_visual_tokens.status_swipe_action tokens task_state
+         in
+         let icon_tint =
+           match task_state with
+           | Journal_model.No_status -> status_palette.foreground
+           | _ -> status_palette.background
+         in
+         let label =
+           match task_state with
+           | Journal_model.No_status -> "Clear"
+           | _ -> Journal_model.status_name task_state
+         in
+         let on_press = bind_action dispatch ("status-sheet-select:" ^ tag) in
+         let icon =
+           Material_icon_catalog.create
+             ~size:22.
+             ~color:icon_tint
+             (Material_icon_catalog.for_task_state task_state)
+           |> Ui.Widget.with_test_id
+                (Ui.Test_id.string ("journal-status-sheet-option-icon:" ^ tag))
+         in
+         let label_widget =
+           styled_text ~token:typography.entry label
+           |> Ui.Widget.with_test_id
+                (Ui.Test_id.string ("journal-status-sheet-option-label:" ^ tag))
+           |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
+           |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:16. ())
+         in
+         let tile =
+           Ui.Widget.Flex.row
+             [ Ui.Widget.Flex.fixed icon; Ui.Widget.Flex.expanded label_widget ]
+           |> Ui.Widget.padding
+                ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ())
+           |> Ui.Widget.constrained_box
+                ~constraints:
+                  (Ui.Layout.Box_constraints.create
+                     ~min_height:Journal_visual_tokens.hit_regions.minimum_target
+                     ())
+         in
+         let tile =
+           if enabled
+           then Ui.Widget.pressable ~on_press ~child:tile ()
+           else Ui.Widget.button ~enabled:false ~on_press ~child:tile ()
+         in
+         let tile =
+           tile
+           |> Ui.Widget.with_test_id
+                (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
+         in
+         let properties =
+           Ui.Semantics.create
+             ~label
+             ~role:Ui.Semantics.Role.Button
+             ~enabled
+             ~selected
+             ~focusable:enabled
+             ~actions:(if enabled then [ Ui.Semantics.Action.Tap ] else [])
+             ()
+         in
+         (if enabled
+          then Ui.Widget.semantics ~on_action:on_press ~properties tile
+          else Ui.Widget.semantics ~properties tile)
+         |> Ui.Widget.sized_box ~height:row_extent)
+      status_sheet_options
+  in
+  let heading_extent =
+    (typography.Journal_visual_tokens.dialog_title.line_height *. text_scale) +. 4.
+  in
+  let detent_handle_extent = 48. in
+  let available =
+    Float.max row_extent ((viewport_height *. 0.5) -. detent_handle_extent -. bottom_inset)
+  in
+  let scroll_height =
+    Float.min (float_of_int (List.length rows) *. row_extent) (available -. heading_extent)
+    |> Float.max row_extent
+  in
+  let scroll =
+    Ui.Widget.Scroll_view.vertical
+      ~key:(Ui.Key.string "journal-status-sheet-scroll")
+      ~primary:true
+      ~on_scroll:
+        (Ui.Event.Handler.create ~name:"journal-status-sheet-scroll" (fun _ -> ()))
+      [ Ui.Widget.Sliver.list rows ]
+      ()
+    |> Ui.Widget.Viewport.Vertical.with_test_id
+         (Ui.Test_id.string "journal-status-sheet-scroll")
+    |> Ui.Widget.Viewport.Vertical.with_height ~height:scroll_height
+  in
+  let content =
+    Ui.Widget.Flex.column [ Ui.Widget.Flex.fixed heading; Ui.Widget.Flex.fixed scroll ]
+    |> Ui.Widget.safe_area ~left:false ~top:false ~right:false ~bottom:true
+    |> Ui.Widget.with_test_id
+         (Ui.Test_id.string ("journal-status-sheet-safe-area:" ^ block_id))
+  in
+  let duration = (Journal_visual_tokens.motion ~reduced_motion).route_transition_ms in
+  let presentation =
+    Ui.Navigation.Modal_bottom_sheet.create
+      ~barrier_dismissible:true
+      ~barrier_label:"Dismiss status picker"
+      ~sizing:status_sheet_sizing
+      ~use_safe_area:false
+      ~request_focus:true
+      ~transition_duration_ms:duration
+      ~reverse_transition_duration_ms:duration
+      ()
+  in
+  let route_id = "journal-status-sheet:" ^ block_id in
+  content
+  |> Ui.Widget.page
+       ~key:(Ui.Key.string route_id)
+       ~page_key:(ID.Navigation.Page_key.of_string route_id)
+       ~presentation:(Ui.Navigation.Modal_bottom_sheet presentation)
+       ~can_pop:true
+       ~restoration_id:(ID.Navigation.Restoration_id.of_string route_id)
+  |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-status-sheet-page:" ^ block_id))
 ;;
 
 let live_region_text value =
@@ -3248,9 +3423,16 @@ let component client handlers graph =
               | false, _, _ | true, Some _, _ | true, None, Some _ -> Bonsai.Effect.Ignore)
            | Some (Button_pressed _) -> Bonsai.Effect.Ignore
            | None -> Bonsai.Effect.Ignore)
-        | Ui.Event.Payload.Route_pop _ ->
+        | Ui.Event.Payload.Route_pop { page_key; _ } ->
           update (fun state ->
             match state.modal with
+            | Status_sheet block_id ->
+              let expected =
+                ID.Navigation.Page_key.of_string ("journal-status-sheet:" ^ block_id)
+              in
+              if ID.Navigation.Page_key.equal page_key expected
+              then { state with modal = No_modal }
+              else state
             | Error_info -> { state with modal = No_modal }
             | No_modal | Account | Settings | Diagnostics | Cache_reset_confirmation _ ->
               back_state state)
@@ -3357,7 +3539,7 @@ let component client handlers graph =
           else if String.equal action "confirm-local-cache-reset"
           then (
             match snapshot.modal with
-            | No_modal | Account | Settings | Diagnostics | Error_info ->
+            | No_modal | Status_sheet _ | Account | Settings | Diagnostics | Error_info ->
               Bonsai.Effect.Ignore
             | Cache_reset_confirmation graph_id ->
               Bonsai.Effect.Many
@@ -3482,31 +3664,37 @@ let component client handlers graph =
             | None, _ | _, None -> Bonsai.Effect.Ignore)
           else if String.length action > 16 && String.sub action 0 16 = "timeline-status:"
           then (
-            let value = String.sub action 16 (String.length action - 16) in
-            match String.rindex_opt value ':' with
-            | None -> Bonsai.Effect.Ignore
-            | Some separator ->
-              let block_id = String.sub value 0 separator in
-              let tag =
-                String.sub value (separator + 1) (String.length value - separator - 1)
-              in
-              let task_state =
-                match tag with
-                | "no-status" -> Some Journal_model.No_status
-                | "todo" -> Some Todo
-                | "doing" -> Some Doing
-                | "done" -> Some Done
-                | _ -> None
-              in
-              (match
-                 ( snapshot.write_enabled
-                 , snapshot.pending_delete
-                 , snapshot.pending_status
-                 , task_state
-                 , block_in_timeline snapshot.timeline block_id )
-               with
-               | true, None, None, Some task_state, Some block
-                 when Journal_model.task_state block <> task_state ->
+            let block_id = String.sub action 16 (String.length action - 16) in
+            match
+              ( snapshot.write_enabled
+              , snapshot.pending_delete
+              , snapshot.pending_status
+              , block_in_timeline snapshot.timeline block_id )
+            with
+            | true, None, None, Some _ ->
+              update (fun state -> { state with modal = Status_sheet block_id })
+            | false, _, _, _
+            | true, Some _, _, _
+            | true, None, Some _, _
+            | true, None, None, None -> Bonsai.Effect.Ignore)
+          else if
+            String.length action > 20 && String.sub action 0 20 = "status-sheet-select:"
+          then (
+            let tag = String.sub action 20 (String.length action - 20) in
+            let task_state = List.assoc_opt tag status_sheet_options in
+            match
+              ( snapshot.modal
+              , snapshot.write_enabled
+              , snapshot.pending_delete
+              , snapshot.pending_status
+              , task_state )
+            with
+            | Status_sheet block_id, true, None, None, Some task_state ->
+              (match block_in_timeline snapshot.timeline block_id with
+               | None -> update (fun state -> { state with modal = No_modal })
+               | Some block when Journal_model.task_state block = task_state ->
+                 Bonsai.Effect.Ignore
+               | Some block ->
                  let pending_status =
                    { mutation_id = fresh_identity ()
                    ; block_id
@@ -3524,16 +3712,21 @@ let component client handlers graph =
                  in
                  with_request
                    { snapshot with
-                     pending_status = Some pending_status
+                     modal = No_modal
+                   ; pending_status = Some pending_status
                    ; timeline_notice = None
                    }
-                   request
-               | false, _, _, _, _
-               | true, Some _, _, _, _
-               | true, None, Some _, _, _
-               | true, None, None, None, _
-               | true, None, None, Some _, None
-               | true, None, None, Some _, Some _ -> Bonsai.Effect.Ignore))
+                   request)
+            | No_modal, _, _, _, _
+            | Account, _, _, _, _
+            | Settings, _, _, _, _
+            | Diagnostics, _, _, _, _
+            | Error_info, _, _, _, _
+            | Cache_reset_confirmation _, _, _, _, _
+            | Status_sheet _, false, _, _, _
+            | Status_sheet _, true, Some _, _, _
+            | Status_sheet _, true, None, Some _, _
+            | Status_sheet _, true, None, None, None -> Bonsai.Effect.Ignore)
           else if String.length action > 16 && String.sub action 0 16 = "timeline-delete:"
           then (
             let block_id = String.sub action 16 (String.length action - 16) in
@@ -3799,6 +3992,21 @@ let component client handlers graph =
     in
     let pages =
       match state.modal with
+      | Status_sheet block_id ->
+        (match block_in_timeline state.timeline block_id with
+         | None -> pages
+         | Some block ->
+           pages
+           @ [ status_sheet_page
+                 ~tokens
+                 ~typography
+                 ~text_scale:environment.text_scale
+                 ~viewport_height:environment.viewport_height
+                 ~bottom_inset:environment.safe_area.bottom
+                 ~reduced_motion
+                 ~block
+                 dispatch
+             ])
       | Cache_reset_confirmation _ ->
         pages
         @ [ local_cache_reset_dialog_page ~tokens ~typography ~reduced_motion dispatch ]

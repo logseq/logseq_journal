@@ -41,12 +41,13 @@ action. In LTR a rightward swipe reveals it; RTL mirrors the physical direction
 while keeping status at logical start. The logical-end Delete action remains
 unchanged.
 
-The action shows both the current exact status icon and a short visible status
-label, rather than advertising a target transition or using an icon-only
-control. For a block without a status, the action label is `No status`; `Clear`
-is reserved for the command in the sheet. Its accessibility label follows the
-form `Change status, current status <name>` so that color is never the only
-status cue.
+The action shows the current exact status icon centered above its complete
+visible status label, rather than advertising a target transition or using an
+icon-only control. The label uses the full action width and must not ellipsize
+at the standard portrait viewport and `1.0` text scale. For a block without a
+status, the action label is `No status`; `Clear` is reserved for the command in
+the sheet. Its accessibility label follows the form `Change status, current
+status <name>` so that color is never the only status cue.
 
 The button uses four status colors. Among the seven selectable values,
 `Backlog` owns the fourth color by itself:
@@ -79,10 +80,12 @@ row mutation gate.
 ### Status bottom sheet
 
 Present a declarative Material modal bottom-sheet route using the pinned
-`Ui.Navigation.Modal_bottom_sheet` API. Use content-bounded sizing, a drag
-handle, bottom safe-area accommodation, route focus, a dismissible barrier,
-and the application's reduced-motion transition duration. Barrier tap, system
-Back, or downward dismissal closes the sheet without changing status.
+`Ui.Navigation.Modal_bottom_sheet` API. Use detented sizing with `Medium` as
+the only detent and the initial detent, enable drag dismissal, and provide the
+required accessible drag-handle semantics. Also use bottom safe-area
+accommodation, route focus, a dismissible barrier, and the application's
+reduced-motion transition duration. Barrier tap, system Back, or downward
+dismissal closes the sheet without changing status.
 
 The sheet has a concise `Set status` heading and exactly seven selectable rows
 in this order; `Now`, `Waiting`, and `Later` are not picker options:
@@ -96,11 +99,19 @@ in this order; `Now`, `Waiting`, and `Later` are not picker options:
 7. `Clear`
 
 Each row has a status icon, visible label, full-width minimum-size tap target,
-and button semantics. Color may supplement the row but must not be its sole
-cue. The option matching the current exact status is selected and cannot emit
-a no-op request. `Clear` is selected only when the exact status is
-`No_status`. If the current exact state is `Now`, `Waiting`, or `Later`, no
-sheet option is selected.
+and button semantics. Rows retain the sheet's neutral background and labels
+retain the default text color. Only the icon uses the matching shared status
+category color; `Clear` uses the neutral `No status` icon color. Color
+supplements the literal label, icon, selected state, and semantics rather than
+becoming the sole cue.
+The option matching the current exact status is selected and cannot emit a
+no-op request. `Clear` is selected only when the exact status is `No_status`.
+If the current exact state is `Now`, `Waiting`, or `Later`, no sheet option is
+selected. At the standard portrait viewport and `1.0` text scale, the `Medium`
+detent shows the heading and all seven options at once. When viewport height or
+text scaling makes that physically impossible, one primary vertical scroll
+area keeps every option reachable without clipping or reducing the minimum
+tap-target size.
 
 Selecting an enabled option closes the sheet immediately and emits exactly one
 existing `Journal_graph_request.Set_task_state` request. `Clear` maps directly
@@ -128,6 +139,24 @@ dividers. No compatibility layer or fallback four-action pane is retained.
 Implementation must not modify any OCaml file under `spec/`, any Dune file, or
 any OCaml file in the `bonsai_flutter` repository unless separately and
 explicitly authorized.
+
+## Decision
+
+Replace the four quick-status actions with one exact-current-status action and
+open a declarative Material status picker from that action. Use a single
+`Medium` detent as both the only and initial detent, with drag dismissal and an
+accessible handle. Keep all seven picker options simultaneously visible at the
+standard portrait viewport and `1.0` text scale, and use one primary vertical
+scroll area when viewport or text-scale constraints require it.
+
+Center the status icon above the complete action label. Apply the shared status
+category colors only to picker icons. Keep every picker row background neutral,
+use the default label color, and retain non-color cues for every option.
+
+Use the existing authoritative `Set_task_state` mutation path without an
+optimistic row update. Preserve exact current states outside the picker's seven
+targets until the user explicitly selects a replacement. The user confirmed
+the `Medium` detent on 2026-09-01 after reviewing the status-sheet UI.
 
 ## Alternatives considered
 
@@ -181,13 +210,24 @@ and accessibility responsibilities.
 - The status button contains both an icon and visible status text. Its label,
   icon, semantics, and category presentation reflect the block's exact current
   status, including `No status`, `In review`, `Now`, `Canceled`, `Backlog`,
-  `Waiting`, and `Later`; `No status` has no status-colored fill.
+  `Waiting`, and `Later`; the icon is above the complete standard-scale label,
+  and `No status` has no status-colored fill.
 - The selectable statuses use exactly four colors: Todo, Doing/In review,
   Done/Canceled, and a distinct Backlog color. `No status` is unfilled.
 - Swiping only reveals the button. Pressing the button opens one Material modal
   bottom sheet and does not itself emit `Set_task_state`.
+- The sheet uses a single `Medium` detent as both its only and initial detent,
+  exposes an accessible drag handle, and enables downward drag dismissal.
 - The sheet presents exactly `Backlog`, `Todo`, `Doing`, `In review`, `Done`,
   `Canceled`, and `Clear`, in that order, with accessible full-width targets.
+- Every sheet row retains the neutral sheet background and default label color.
+  Only its icon uses the matching shared status category color; `Clear` uses
+  the neutral `No status` icon color. Every row retains literal label,
+  selection, and semantic cues.
+- At the standard portrait viewport and `1.0` text scale, the heading and all
+  seven status options are simultaneously visible inside the `Medium` detent.
+  Constrained viewports and larger text keep all options reachable through the
+  sheet's single primary vertical scroll area without clipping targets.
 - The current option is selected and disabled. `Clear` is selected for
   `No_status`; none is selected for `Now`, `Waiting`, or `Later`.
 - Choosing an enabled option dismisses the sheet immediately and emits exactly
@@ -221,9 +261,33 @@ and accessibility responsibilities.
 - A modal route outlives the transient slidable pane, so block removal,
   authoritative refresh, navigation changes, and restoration must not leave a
   stale picker capable of mutating a recycled row.
-- Seven rows may exceed content-bounded height at large text scale or on a
-  small landscape viewport; the sheet content must become scrollable without
-  clipping targets or adding excess dividers.
+- A `Medium` detent provides less vertical space than content-bounded or large
+  presentation on some devices. The compact standard layout must still show
+  all seven options at once, while large text scale and small landscape
+  viewports must scroll without clipping targets or adding excess dividers.
+
+## Consequences
+
+- A logical-start swipe reveals one quarter-width status action instead of four
+  actions occupying most of the row.
+- The action always communicates the exact current status through icon, text,
+  semantics, and a category color. Its icon is centered above the complete
+  label, and `No status` remains unfilled.
+- Changing status now requires opening the `Medium` sheet and choosing one of
+  seven explicit targets. Existing `Now`, `Waiting`, and `Later` values remain
+  representable but cannot be created by this picker.
+- The selected option is disabled, and every dismissal path leaves status
+  unchanged. An enabled selection closes the sheet and sends one authoritative
+  mutation request.
+- Standard portrait presentation shows the heading and all seven options at
+  once. Constrained presentations scroll within the sheet while preserving the
+  minimum target size and bottom safe area.
+- Picker rows remain visually neutral. Only their icons reuse the exact
+  swipe-action category colors, while `Clear` uses the neutral `No status`
+  icon color.
+- Real-runtime coverage protects drag dismissal, barrier dismissal, route
+  restoration, authoritative reconciliation, exact colors, RTL, large text,
+  reduced motion, and Light, Dark, and High Contrast appearances.
 
 ## Questions
 

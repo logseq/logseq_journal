@@ -16,6 +16,14 @@ type t =
   | Remove_circle_outline
   | Timelapse
 
+let for_task_state = function
+  | Journal_model.No_status -> Remove_circle_outline
+  | Todo | Backlog | Later -> Radio_button_unchecked
+  | Doing | In_review | Now | Waiting -> Timelapse
+  | Done -> Check_circle_outline
+  | Canceled -> Remove_circle_outline
+;;
+
 let code_point = function
   | Account_circle -> 0xe043
   | Add -> 0xe047

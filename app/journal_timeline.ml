@@ -68,14 +68,7 @@ let for_block handler block_id =
 ;;
 
 let delete_action_id = 1
-
-let quick_status_actions =
-  [ 2, Journal_model.No_status, "no-status", Material_icon_catalog.Remove_circle_outline
-  ; 3, Todo, "todo", Radio_button_unchecked
-  ; 4, Doing, "doing", Timelapse
-  ; 5, Done, "done", Check_circle_outline
-  ]
-;;
+let status_action_id = 6
 
 let for_slidable ~on_status ~on_delete block_id =
   Ui.Event.Handler.create ~name:("journal-row-action:" ^ block_id) (fun payload ->
@@ -83,17 +76,10 @@ let for_slidable ~on_status ~on_delete block_id =
     | Some (Ui.Native_widget.Slidable.Action_pressed action_id)
       when action_id = delete_action_id ->
       Ui.Event.Handler.Private.invoke on_delete (Ui.Event.Payload.Text block_id)
-    | Some (Ui.Native_widget.Slidable.Action_pressed action_id) ->
-      (match
-         List.find_opt
-           (fun (candidate, _, _, _) -> candidate = action_id)
-           quick_status_actions
-       with
-       | Some (_, _, tag, _) ->
-         Ui.Event.Handler.Private.invoke
-           on_status
-           (Ui.Event.Payload.Text (block_id ^ ":" ^ tag))
-       | None -> ())
+    | Some (Ui.Native_widget.Slidable.Action_pressed action_id)
+      when action_id = status_action_id ->
+      Ui.Event.Handler.Private.invoke on_status (Ui.Event.Payload.Text block_id)
+    | Some (Ui.Native_widget.Slidable.Action_pressed _) -> ()
     | Some (Ui.Native_widget.Slidable.Dismissed _) | None -> ())
 ;;
 
@@ -118,6 +104,15 @@ let centered_action_feedback icon label =
     ; Ui.Widget.Flex.fixed icon
     ; Ui.Widget.Flex.fixed label
     ; Ui.Widget.empty () |> Ui.Widget.Flex.expanded
+    ]
+;;
+
+let centered_status_feedback icon label =
+  Ui.Widget.Flex.column
+    [ Ui.Widget.empty () |> Ui.Widget.Flex.expanded ~flex:5
+    ; icon |> Ui.Widget.center |> Ui.Widget.Flex.expanded ~flex:90
+    ; label |> Ui.Widget.center |> Ui.Widget.Flex.expanded ~flex:55
+    ; Ui.Widget.empty () |> Ui.Widget.Flex.expanded ~flex:8
     ]
 ;;
 
@@ -179,14 +174,11 @@ let delete_action_pane ~tokens ~typography ~device_pixel_ratio ~enabled block =
     ()
 ;;
 
-let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _, icon) =
+let status_action ~tokens ~typography ~actions_enabled block =
+  let task_state = Journal_model.task_state block in
   let colors = Tokens.status_swipe_action tokens task_state in
-  let current = Journal_model.task_state block = task_state in
-  let enabled = actions_enabled && not current in
   let status_name = Journal_model.status_name task_state in
-  let semantic_label =
-    if current then "Current status " ^ status_name else "Set status to " ^ status_name
-  in
+  let semantic_label = "Change status, current status " ^ status_name in
   let label =
     let supporting = typography.Tokens.supporting in
     Ui.Widget.text
@@ -197,46 +189,36 @@ let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _,
            ~line_height:1.
            ())
       ~max_lines:1
-      ~overflow:Ui.Style.Text_overflow.Ellipsis
+      ~overflow:Ui.Style.Text_overflow.Clip
       ~text_align:Ui.Style.Text_align.Center
       status_name
     |> Ui.Widget.with_test_id
-         (Ui.Test_id.string
-            ("journal-row-status-action-label:"
-             ^ Journal_model.id block
-             ^ ":"
-             ^ string_of_int id))
+         (Ui.Test_id.string ("journal-row-status-action-label:" ^ Journal_model.id block))
   in
   let icon =
-    Material_icon_catalog.create ~size:18. ~color:colors.foreground icon
+    Material_icon_catalog.create
+      ~size:18.
+      ~color:colors.foreground
+      (Material_icon_catalog.for_task_state task_state)
     |> Ui.Widget.with_test_id
-         (Ui.Test_id.string
-            ("journal-row-status-action-icon:"
-             ^ Journal_model.id block
-             ^ ":"
-             ^ string_of_int id))
+         (Ui.Test_id.string ("journal-row-status-action-icon:" ^ Journal_model.id block))
   in
   let child =
-    centered_action_feedback icon label
+    centered_status_feedback icon label
     |> Ui.Widget.semantics
          ~properties:
            (Ui.Semantics.create
               ~label:semantic_label
               ~role:Ui.Semantics.Role.Button
-              ~enabled
-              ~selected:current
-              ~focusable:enabled
+              ~enabled:actions_enabled
+              ~focusable:actions_enabled
               ())
     |> Ui.Widget.with_test_id
-         (Ui.Test_id.string
-            ("journal-row-status-action:"
-             ^ Journal_model.id block
-             ^ ":"
-             ^ string_of_int id))
+         (Ui.Test_id.string ("journal-row-status-action:" ^ Journal_model.id block))
   in
   Ui.Native_widget.Slidable.action
-    ~id
-    ~enabled
+    ~id:status_action_id
+    ~enabled:actions_enabled
     ~foreground:colors.foreground
     ~background:colors.background
     ~auto_close:true
@@ -247,15 +229,12 @@ let status_action ~tokens ~typography ~actions_enabled block (id, task_state, _,
 
 let status_action_pane ~tokens ~typography ~actions_enabled block =
   Ui.Native_widget.Slidable.action_pane
-    ~extent_ratio:0.8
+    ~extent_ratio:0.25
     ~motion:Ui.Native_widget.Slidable.Behind
     ~drag_dismissible:false
     ~open_threshold:0.125
     ~close_threshold:0.125
-    ~actions:
-      (List.map
-         (status_action ~tokens ~typography ~actions_enabled block)
-         quick_status_actions)
+    ~actions:[ status_action ~tokens ~typography ~actions_enabled block ]
     ()
 ;;
 

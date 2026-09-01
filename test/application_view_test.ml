@@ -319,7 +319,9 @@ let set_task engine block task_state =
   match task_state with
   | Journal_model.No_status -> ()
   | Todo | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
-    let value = Graph.Default_value (Journal_model.status_name task_state) in
+    let value =
+      Graph.Default_value (Option.get (Journal_model.status_default_value task_state))
+    in
     ignore
       (execute
          engine
@@ -636,23 +638,86 @@ let slidable_props handle block_id =
   | _ -> fail "row %s is not a Slidable native widget" block_id
 ;;
 
-let status_action_id = function
-  | Journal_model.No_status -> 2
-  | Todo -> 3
-  | Doing -> 4
-  | Done -> 5
-  | In_review | Now | Canceled | Backlog | Waiting | Later ->
-    invalid_arg "status_action_id only accepts quick-action states"
-;;
-
-let press_status_action handle block_id task_state =
+let press_status_button handle block_id =
   send_slidable_event
     handle
     block_id
     ~event_id:Ui.Native_widget.Slidable.action_pressed_event_id
-    ~payload:
-      (Ui.Native_widget.Slidable.For_testing.encode_action_pressed
-         (status_action_id task_state))
+    ~payload:(Ui.Native_widget.Slidable.For_testing.encode_action_pressed 6)
+;;
+
+let status_sheet_page_key block_id =
+  ID.Navigation.Page_key.of_string ("journal-status-sheet:" ^ block_id)
+;;
+
+let dismiss_status_sheet handle block_id =
+  Test.Handle.route_pop
+    handle
+    (Test.Query.test_id "journal-navigator")
+    ~page_key:(status_sheet_page_key block_id)
+    ()
+;;
+
+let dismiss_status_sheet_with_page_key handle page_key =
+  Test.Handle.route_pop handle (Test.Query.test_id "journal-navigator") ~page_key ()
+;;
+
+let choose_status_sheet_option handle tag =
+  click_test_id handle ("journal-status-sheet-option:" ^ tag)
+;;
+
+let status_sheet_option_semantics handle tag =
+  let label =
+    match tag with
+    | "backlog" -> "Backlog"
+    | "todo" -> "Todo"
+    | "doing" -> "Doing"
+    | "in-review" -> "In review"
+    | "done" -> "Done"
+    | "canceled" -> "Canceled"
+    | "clear" -> "Clear"
+    | _ -> fail "unknown status sheet option %s" tag
+  in
+  let node =
+    match Test.Handle.find handle (Test.Query.semantics_label label) with
+    | Some node -> node
+    | None -> fail "missing status sheet option %s\n%s" tag (Test.Handle.show handle)
+  in
+  let (Av view) = Ui.Widget.Private.view node.widget in
+  match view.node with
+  | Ui.Widget.Private.Semantics props ->
+    props.selected, props.enabled, props.role, props.focusable
+  | _ -> fail "status sheet option %s has no explicit semantics" tag
+;;
+
+let status_sheet_presentation handle block_id =
+  let test_id = "journal-status-sheet-page:" ^ block_id in
+  let node =
+    match Test.Handle.find handle (Test.Query.test_id test_id) with
+    | Some node -> node
+    | None ->
+      fail "missing status sheet page for %s\n%s" block_id (Test.Handle.show handle)
+  in
+  let (Av view) = Ui.Widget.Private.view node.widget in
+  match view.node with
+  | Ui.Widget.Private.Page { page_key; presentation; can_pop; restoration_id } ->
+    page_key, presentation, can_pop, restoration_id
+  | _ -> fail "status sheet page for %s is not a declarative page" block_id
+;;
+
+let require_primary_status_sheet_scroll handle =
+  let node =
+    match Test.Handle.find handle (Test.Query.test_id "journal-status-sheet-scroll") with
+    | Some node -> node
+    | None -> fail "missing status sheet scroll\n%s" (Test.Handle.show handle)
+  in
+  let (Av view) = Ui.Widget.Private.view node.widget in
+  match view.node with
+  | Ui.Widget.Private.Scroll_view { axis = Ui.Layout.Axis.Vertical; primary = true; _ } ->
+    ()
+  | Ui.Widget.Private.Scroll_view _ ->
+    fail "status sheet scroll is not the primary vertical scrollable"
+  | _ -> fail "status sheet scroll test ID is not attached to a Scroll_view"
 ;;
 
 let press_delete_action handle block_id =
@@ -783,6 +848,33 @@ let node_by_test_id handle test_id =
   match Test.Handle.find handle (Test.Query.test_id test_id) with
   | Some node -> node
   | None -> fail "expected test ID %S\n%s" test_id (Test.Handle.show handle)
+;;
+
+let require_status_sheet_option_icon_only_color handle tag expected_icon =
+  let (Av icon_view) =
+    Ui.Widget.Private.view
+      (node_by_test_id handle ("journal-status-sheet-option-icon:" ^ tag)).widget
+  in
+  (match icon_view.node with
+   | Ui.Widget.Private.Icon { color = Some actual; _ } ->
+     require
+       (Int32.equal actual expected_icon)
+       "%s icon color is %lx, expected %lx"
+       tag
+       actual
+       expected_icon
+   | _ -> fail "%s icon has no explicit status color" tag);
+  let (Av label_view) =
+    Ui.Widget.Private.view
+      (node_by_test_id handle ("journal-status-sheet-option-label:" ^ tag)).widget
+  in
+  (match label_view.node with
+   | Ui.Widget.Private.Text { style = None; _ }
+   | Ui.Widget.Private.Text { style = Some { color = None; _ }; _ } -> ()
+   | Ui.Widget.Private.Text { style = Some { color = Some actual; _ }; _ } ->
+     fail "%s label unexpectedly has explicit color %lx" tag actual
+   | _ -> fail "%s label is not text" tag);
+  require_no_test_id handle ("journal-status-sheet-option-color:" ^ tag)
 ;;
 
 let require_material_icon handle test_id expected_code_point =
@@ -1630,7 +1722,7 @@ let test_capture_task_icon_preserves_intent_and_persists_todo () =
           | _ -> fail "Todo Saving changed the composer action set");
          send_capture_affordance_button handle ~button_id:2 ~text:source;
          pump_until_text handle source;
-         require_semantics handle "Current status Todo";
+         require_semantics handle "Change status, current status Todo";
          let reset = capture_affordance_props handle in
          match reset.buttons with
          | [ task; _ ] ->
@@ -3119,10 +3211,7 @@ let test_locale_event_invalidates_labels_and_rejects_in_flight_response () =
          pump_until_text handle "周六，8月8日"))
 ;;
 
-let require_quick_status_pane
-      (props : Ui.Native_widget.Slidable.For_testing.props)
-      ~current
-  =
+let require_single_status_pane (props : Ui.Native_widget.Slidable.For_testing.props) =
   require props.enabled "row Slidable is disabled without a pending mutation";
   require props.close_on_scroll "row Slidable no longer closes on scroll";
   require
@@ -3140,102 +3229,135 @@ let require_quick_status_pane
         && not pane.drag_dismissible)
        "status pane changed its stationary non-dismissible policy";
      require
-       (Float.compare pane.extent_ratio 0.6 >= 0
-        && Float.compare pane.extent_ratio 1. <= 0)
-       "status pane extent %.3f is not bounded for four targets"
+       (Float.equal pane.extent_ratio 0.25)
+       "single status pane extent %.3f changed"
        pane.extent_ratio;
-     require
-       (List.map
-          (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) -> action.id)
-          pane.actions
-        = [ 2; 3; 4; 5 ])
-       "status action IDs or order changed";
-     List.iter2
-       (fun (action : Ui.Native_widget.Slidable.For_testing.action_props) task_state ->
-          require
-            (Bool.equal action.enabled (task_state <> current))
-            "quick status action %d enabled=%b for current state %s"
-            action.id
-            action.enabled
-            (Journal_model.status_name current);
-          require action.auto_close "quick status action %d does not auto-close" action.id)
-       pane.actions
-       [ Journal_model.No_status; Todo; Doing; Done ]);
+     (match pane.actions with
+      | [ action ] ->
+        require (action.id = 6) "single status button retained an obsolete action ID";
+        require action.enabled "single status button is disabled";
+        require action.auto_close "single status button does not close the pane"
+      | actions -> fail "status pane has %d actions instead of one" (List.length actions)));
   match props.end_action_pane with
   | Some { actions = [ delete ]; _ } ->
     require (delete.id = 1) "Delete action ID changed or collided with status IDs"
   | None | Some _ -> fail "row lost its single logical-end Delete action"
 ;;
 
-let require_quick_status_color_pairs handle block_id expected =
+let require_status_button_color_pair
+      handle
+      block_id
+      expected_background
+      expected_foreground
+  =
   let argb = Ui.Style.Color.Private.to_argb32 in
-  let actions =
+  let action =
     match (slidable_props handle block_id).start_action_pane with
-    | Some pane -> pane.actions
-    | None -> fail "row %s has no quick status pane" block_id
+    | Some { actions = [ action ]; _ } -> action
+    | Some pane -> fail "row %s has %d status actions" block_id (List.length pane.actions)
+    | None -> fail "row %s has no status pane" block_id
   in
   require
-    (List.length actions = List.length expected)
-    "row %s has %d quick status colors, expected %d"
-    block_id
-    (List.length actions)
-    (List.length expected);
-  List.iter2
-    (fun (action : Ui.Native_widget.Slidable.For_testing.action_props)
-      (expected_background, expected_foreground) ->
-       require
-         (Int32.equal (argb action.background) expected_background)
-         "quick status action %d background is %lx, expected %lx"
-         action.id
-         (argb action.background)
-         expected_background;
-       require
-         (Option.equal
-            Int32.equal
-            (Option.map argb action.foreground)
-            (Some expected_foreground))
-         "quick status action %d foreground differs"
-         action.id)
-    actions
-    expected
+    (Int32.equal (argb action.background) expected_background)
+    "status button background is %lx, expected %lx"
+    (argb action.background)
+    expected_background;
+  require
+    (Option.equal
+       Int32.equal
+       (Option.map argb action.foreground)
+       (Some expected_foreground))
+    "status button foreground differs"
 ;;
 
-let test_quick_status_colors_follow_brightness_and_reuse_normal_high_contrast_pairs () =
-  let light =
-    [ 0xff4b5e63l, 0xffffffffl
-    ; 0xff585c7el, 0xffffffffl
-    ; 0xff00677cl, 0xffffffffl
-    ; 0xff006b57l, 0xffffffffl
-    ]
-  in
-  let dark =
-    [ 0xffa7b8bcl, 0xff1b3035l
-    ; 0xffc0c4ebl, 0xff2a2e50l
-    ; 0xff86d1e9l, 0xff003642l
-    ; 0xff83d6bdl, 0xff00382bl
-    ]
-  in
+let test_exact_status_buttons_follow_the_four_color_policy () =
   with_startup (fun startup ->
-    let entry = capture ~task_state:Journal_model.Todo 89 "Brightness status colors" in
-    seed startup [ entry ];
+    let states =
+      [ Journal_model.No_status; Todo; Doing; In_review; Done; Canceled; Backlog ]
+    in
+    let entries =
+      List.mapi
+        (fun index task_state ->
+           capture
+             ~task_state
+             (80 + index)
+             ("Exact status " ^ Journal_model.status_name task_state))
+        states
+    in
+    seed startup entries;
     let handle = create_handle startup in
     Fun.protect
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
-         pump_until_text handle entry.source;
+         pump_until_text handle "Exact status No status";
+         List.iter2
+           (fun (entry : Journal_graph_projection.capture) task_state ->
+              require_single_status_pane (slidable_props handle entry.block_id);
+              require_semantics
+                handle
+                ("Change status, current status " ^ Journal_model.status_name task_state);
+              require_test_id handle ("journal-row-status-action-label:" ^ entry.block_id);
+              require_test_id handle ("journal-row-status-action-icon:" ^ entry.block_id))
+           entries
+           states;
          List.iter
            (fun (brightness, high_contrast, expected) ->
               set_environment handle (environment ~brightness ~high_contrast ());
               pump_worker handle;
-              require_quick_status_color_pairs handle entry.block_id expected)
-           [ Environment.Light, false, light
-           ; Environment.Light, true, light
-           ; Environment.Dark, false, dark
-           ; Environment.Dark, true, dark
+              List.iter2
+                (fun (entry : Journal_graph_projection.capture)
+                  (background, foreground) ->
+                   require_status_button_color_pair
+                     handle
+                     entry.block_id
+                     background
+                     foreground)
+                entries
+                expected)
+           [ ( Environment.Light
+             , false
+             , [ 0x00000000l, 0xff00262fl
+               ; 0xff585c7el, 0xffffffffl
+               ; 0xff00677cl, 0xffffffffl
+               ; 0xff00677cl, 0xffffffffl
+               ; 0xff006b57l, 0xffffffffl
+               ; 0xff006b57l, 0xffffffffl
+               ; 0xff7c3aedl, 0xffffffffl
+               ] )
+           ; ( Environment.Light
+             , true
+             , [ 0x00000000l, 0xff00262fl
+               ; 0xff585c7el, 0xffffffffl
+               ; 0xff00677cl, 0xffffffffl
+               ; 0xff00677cl, 0xffffffffl
+               ; 0xff006b57l, 0xffffffffl
+               ; 0xff006b57l, 0xffffffffl
+               ; 0xff7c3aedl, 0xffffffffl
+               ] )
+           ; ( Environment.Dark
+             , false
+             , [ 0x00000000l, 0xffa7b8bcl
+               ; 0xffc0c4ebl, 0xff2a2e50l
+               ; 0xff86d1e9l, 0xff003642l
+               ; 0xff86d1e9l, 0xff003642l
+               ; 0xff83d6bdl, 0xff00382bl
+               ; 0xff83d6bdl, 0xff00382bl
+               ; 0xff7c3aedl, 0xffffffffl
+               ] )
+           ; ( Environment.Dark
+             , true
+             , [ 0x00000000l, 0xffa7b8bcl
+               ; 0xffc0c4ebl, 0xff2a2e50l
+               ; 0xff86d1e9l, 0xff003642l
+               ; 0xff86d1e9l, 0xff003642l
+               ; 0xff83d6bdl, 0xff00382bl
+               ; 0xff83d6bdl, 0xff00382bl
+               ; 0xff7c3aedl, 0xffffffffl
+               ] )
            ]))
 ;;
 
-let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
+let test_status_sheet_routes_exact_actions_and_gates_mutations () =
   with_startup (fun startup ->
     let parent = capture ~task_state:Journal_model.Todo 90 "Parent task source" in
     let other = capture ~task_state:Journal_model.Backlog 92 "Backlog task source" in
@@ -3246,30 +3368,107 @@ let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
       ~finally:(fun () -> Test.Handle.shutdown handle)
       (fun () ->
          pump_until_text handle parent.source;
-         require_quick_status_pane
-           (slidable_props handle parent.block_id)
-           ~current:Journal_model.Todo;
-         require_quick_status_pane
-           (slidable_props handle other.block_id)
-           ~current:Journal_model.Backlog;
-         List.iter
-           (fun label -> require_visible_text handle label)
-           [ "No status"; "Todo"; "Doing"; "Done" ];
-         require_semantics handle "Set status to No status";
-         require_semantics handle "Current status Todo";
-         require_semantics handle "Set status to Doing";
-         require_semantics handle "Set status to Done";
+         require_single_status_pane (slidable_props handle parent.block_id);
+         require_single_status_pane (slidable_props handle other.block_id);
          require_test_id handle ("journal-row-status-rail:" ^ parent.block_id);
-         press_status_action handle parent.block_id Journal_model.Todo;
+         press_status_button handle parent.block_id;
          Test.Handle.present handle;
+         require_visible_text handle "Set status";
          require
            (slidable_props handle parent.block_id).enabled
-           "current-status no-op entered the mutation gate";
-         press_status_action handle parent.block_id Journal_model.Doing;
-         Test.Handle.present handle;
+           "opening the sheet entered the mutation gate";
+         let page_key, presentation, can_pop, restoration_id =
+           status_sheet_presentation handle parent.block_id
+         in
+         require
+           (ID.Navigation.Page_key.equal page_key (status_sheet_page_key parent.block_id))
+           "status sheet page key changed";
+         require can_pop "status sheet cannot be dismissed";
+         require
+           (Option.equal
+              ID.Navigation.Restoration_id.equal
+              restoration_id
+              (Some
+                 (ID.Navigation.Restoration_id.of_string
+                    ("journal-status-sheet:" ^ parent.block_id))))
+           "status sheet restoration identity changed";
+         (match presentation with
+          | Ui.Navigation.Modal_bottom_sheet sheet ->
+            let sheet = Ui.Navigation.Modal_bottom_sheet.Private.view sheet in
+            require sheet.barrier_dismissible "status sheet barrier is not dismissible";
+            (match sheet.sizing with
+             | Ui.Navigation.Modal_bottom_sheet.Sizing.Detented detents ->
+               let detents =
+                 Ui.Navigation.Modal_bottom_sheet.Detents.Private.view detents
+               in
+               require
+                 (detents.detents = [ Ui.Navigation.Modal_bottom_sheet.Detent.Medium ])
+                 "status sheet exposes a detent other than Medium";
+               require
+                 (detents.initial = Ui.Navigation.Modal_bottom_sheet.Detent.Medium)
+                 "status sheet does not start at Medium";
+               require
+                 detents.dismiss_on_drag
+                 "status sheet cannot be dismissed by dragging";
+               let semantics =
+                 Ui.Navigation.Modal_bottom_sheet.Handle_semantics.Private.view
+                   detents.semantics
+               in
+               require
+                 (String.equal semantics.label "Status picker size")
+                 "status sheet handle label changed";
+               require
+                 (String.equal semantics.medium_value "Medium")
+                 "status sheet handle does not announce Medium";
+               require
+                 (String.equal semantics.large_value "Large")
+                 "status sheet handle does not provide its required Large value"
+             | Content_bounded | Scroll_controlled ->
+               fail "status sheet does not use a Medium detent");
+            require sheet.request_focus "status sheet does not request route focus";
+            require
+              (sheet.transition_duration_ms = 180
+               && sheet.reverse_transition_duration_ms = 180)
+              "status sheet transition does not use application motion tokens"
+          | Ui.Navigation.Standard _ | Modal_dialog _ ->
+            fail "status sheet does not use Material modal bottom-sheet presentation");
+         require_primary_status_sheet_scroll handle;
+         let options =
+           [ "backlog", "Backlog"
+           ; "todo", "Todo"
+           ; "doing", "Doing"
+           ; "in-review", "In review"
+           ; "done", "Done"
+           ; "canceled", "Canceled"
+           ; "clear", "Clear"
+           ]
+         in
+         List.iter
+           (fun (tag, label) ->
+              require_test_id handle ("journal-status-sheet-option:" ^ tag);
+              require_visible_text handle label;
+              let _selected, enabled, role, focusable =
+                status_sheet_option_semantics handle tag
+              in
+              require
+                (role = Ui.Semantics.Role.Button)
+                "status option %s is not exposed as a button"
+                label;
+              require
+                (focusable = enabled)
+                "status option %s focusability does not match its enabled state"
+                label)
+           options;
+         let todo_selected, todo_enabled, _, _ =
+           status_sheet_option_semantics handle "todo"
+         in
+         require (todo_selected = Some true) "authoritative Todo option is not selected";
+         require (todo_enabled = Some false) "authoritative Todo option admits a no-op";
+         choose_status_sheet_option handle "doing";
+         require_no_test_id handle ("journal-status-sheet-page:" ^ parent.block_id);
          let pending = slidable_props handle parent.block_id in
          require (not pending.enabled) "pending status mutation left Slidable enabled";
-         press_status_action handle parent.block_id Journal_model.Done;
+         press_status_button handle parent.block_id;
          press_delete_action handle parent.block_id;
          pump_until handle "authoritative Doing status" (fun () ->
            Option.is_some
@@ -3283,13 +3482,12 @@ let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
          then (
            let request = snack_bar_request_from_last_frame handle in
            fail "status mutation failed: %s" request.message);
-         require_no_semantics handle "Current status Todo";
-         require_semantics handle "Current status Doing";
+         require_no_semantics handle "Change status, current status Todo";
+         require_semantics handle "Change status, current status Doing";
          require_visible_text handle parent.source;
-         require_quick_status_pane
-           (slidable_props handle parent.block_id)
-           ~current:Journal_model.Doing;
-         press_status_action handle other.block_id Journal_model.No_status;
+         require_single_status_pane (slidable_props handle parent.block_id);
+         press_status_button handle other.block_id;
+         choose_status_sheet_option handle "clear";
          pump_until handle "status conflict snackbar" (fun () ->
            Test.Handle.pending_host_effect_count handle = 1);
          let conflict = snack_bar_request_from_last_frame handle in
@@ -3299,17 +3497,26 @@ let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
               "Unable to change status: Status changed elsewhere. Try again.")
            "status conflict snackbar changed: %S"
            conflict.message;
-         require_quick_status_pane
-           (slidable_props handle other.block_id)
-           ~current:Journal_model.Backlog;
+         require_single_status_pane (slidable_props handle other.block_id);
          respond_to_snack_bar handle conflict 0;
-         press_status_action handle other.block_id Journal_model.No_status;
+         press_status_button handle other.block_id;
+         choose_status_sheet_option handle "clear";
          pump_until handle "authoritative No status replacement" (fun () ->
            Option.is_some
              (Test.Handle.find
                 handle
-                (Test.Query.semantics_label "Current status No status")));
+                (Test.Query.semantics_label "Change status, current status No status")));
          require_no_test_id handle ("journal-row-status-rail:" ^ other.block_id);
+         press_status_button handle other.block_id;
+         Test.Handle.present handle;
+         let clear_selected, clear_enabled, _, _ =
+           status_sheet_option_semantics handle "clear"
+         in
+         require
+           (clear_selected = Some true && clear_enabled = Some false)
+           "Clear does not represent the authoritative No status state";
+         dismiss_status_sheet handle other.block_id;
+         Test.Handle.present handle;
          click_test_id handle ("journal-row-toggle-children:" ^ parent.block_id);
          pump_until handle "direct child preview" (fun () ->
            Option.is_some
@@ -3325,6 +3532,107 @@ let test_timeline_status_pane_routes_exact_actions_and_gates_mutations () =
              (Test.Handle.find
                 handle
                 (Test.Query.test_id ("journal-child-preview:" ^ child.block_id))))))
+;;
+
+let test_status_sheet_rows_color_only_the_status_icons () =
+  with_startup (fun startup ->
+    let entry = capture 89 "Status sheet color source" in
+    seed startup [ entry ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle entry.source;
+         let tags =
+           [ "backlog"; "todo"; "doing"; "in-review"; "done"; "canceled"; "clear" ]
+         in
+         List.iter
+           (fun (brightness, high_contrast, expected) ->
+              set_environment handle (environment ~brightness ~high_contrast ());
+              pump_worker handle;
+              press_status_button handle entry.block_id;
+              Test.Handle.present handle;
+              List.iter2
+                (fun tag icon_color ->
+                   require_status_sheet_option_icon_only_color handle tag icon_color)
+                tags
+                expected;
+              dismiss_status_sheet handle entry.block_id;
+              Test.Handle.present handle)
+           [ ( Environment.Light
+             , false
+             , [ 0xff7c3aedl
+               ; 0xff585c7el
+               ; 0xff00677cl
+               ; 0xff00677cl
+               ; 0xff006b57l
+               ; 0xff006b57l
+               ; 0xff00262fl
+               ] )
+           ; ( Environment.Light
+             , true
+             , [ 0xff7c3aedl
+               ; 0xff585c7el
+               ; 0xff00677cl
+               ; 0xff00677cl
+               ; 0xff006b57l
+               ; 0xff006b57l
+               ; 0xff00262fl
+               ] )
+           ; ( Environment.Dark
+             , false
+             , [ 0xff7c3aedl
+               ; 0xffc0c4ebl
+               ; 0xff86d1e9l
+               ; 0xff86d1e9l
+               ; 0xff83d6bdl
+               ; 0xff83d6bdl
+               ; 0xffa7b8bcl
+               ] )
+           ; ( Environment.Dark
+             , true
+             , [ 0xff7c3aedl
+               ; 0xffc0c4ebl
+               ; 0xff86d1e9l
+               ; 0xff86d1e9l
+               ; 0xff83d6bdl
+               ; 0xff83d6bdl
+               ; 0xffa7b8bcl
+               ] )
+           ]))
+;;
+
+let test_status_sheet_dismissal_emits_no_mutation () =
+  with_startup (fun startup ->
+    let entry = capture ~task_state:Journal_model.Backlog 93 "Dismissed status sheet" in
+    seed startup [ entry ];
+    let handle = create_handle startup in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         pump_until_text handle entry.source;
+         press_status_button handle entry.block_id;
+         Test.Handle.present handle;
+         dismiss_status_sheet_with_page_key
+           handle
+           (ID.Navigation.Page_key.of_string "journal-status-sheet:stale-block");
+         Test.Handle.present handle;
+         require_test_id handle ("journal-status-sheet-page:" ^ entry.block_id);
+         dismiss_status_sheet handle entry.block_id;
+         Test.Handle.present handle;
+         require_no_test_id handle ("journal-status-sheet-page:" ^ entry.block_id);
+         require
+           (slidable_props handle entry.block_id).enabled
+           "dismissal entered the mutation gate";
+         press_status_button handle entry.block_id;
+         Test.Handle.present handle;
+         choose_status_sheet_option handle "canceled";
+         pump_until handle "authoritative Canceled status" (fun () ->
+           Option.is_some
+             (Test.Handle.find
+                handle
+                (Test.Query.semantics_label "Change status, current status Canceled")));
+         require_no_test_id handle ("journal-status-sheet-page:" ^ entry.block_id)))
 ;;
 
 let test_pending_day_response_drains_expanded_parent_without_renderer_input () =
@@ -3794,12 +4102,14 @@ let () =
   test_capture_allocates_fresh_block_identity_after_restart ();
   test_localized_day_request_updates_only_matching_generation ();
   test_locale_event_invalidates_labels_and_rejects_in_flight_response ();
-  test_quick_status_colors_follow_brightness_and_reuse_normal_high_contrast_pairs ();
+  test_exact_status_buttons_follow_the_four_color_policy ();
   test_same_context_resume_keeps_the_populated_timeline ();
   test_locale_only_change_reformats_without_reloading ();
   test_day_rollover_refreshes_without_blanking_content ();
   test_time_zone_refresh_reprojects_without_blanking_content ();
-  test_timeline_status_pane_routes_exact_actions_and_gates_mutations ();
+  test_status_sheet_routes_exact_actions_and_gates_mutations ();
+  test_status_sheet_rows_color_only_the_status_icons ();
+  test_status_sheet_dismissal_emits_no_mutation ();
   test_loaded_children_survive_a_stale_ios_visible_range_event ();
   test_collapsed_parent_receives_truthful_child_summaries_in_initial_feed ();
   test_collapsed_rows_keep_three_title_lines_plus_two_tail_faded_child_lines ();

@@ -1336,7 +1336,11 @@ let () =
   forbid_text
     root
     "app/journal_timeline.ml"
-    [ "Ui.Native_widget.Swipe_action"; "Ui.Native_widget.Slidable.dismissible" ];
+    [ "Ui.Native_widget.Swipe_action"
+    ; "Ui.Native_widget.Slidable.dismissible"
+    ; "quick_status_actions"
+    ; "extent_ratio:0.8"
+    ];
   List.iter
     (forbid_path root)
     [ "flutter/lib/app"
@@ -1645,12 +1649,22 @@ let () =
     root
     "app/journal_routes.ml"
     [ "Capture_view"; "open_capture"; "update_capture" ];
+  require_text
+    root
+    "app/application.ml"
+    [ "Ui.Navigation.Modal_bottom_sheet.create"
+    ; "Ui.Navigation.Modal_bottom_sheet.Handle_semantics.create"
+    ; "Ui.Navigation.Modal_bottom_sheet.Detents.create"
+    ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Detented"
+    ; "journal-status-sheet-page:"
+    ; "journal-status-sheet-option:"
+    ; "Set status"
+    ];
   forbid_text
     root
     "app/application.ml"
-    [ "Ui.Navigation.Modal_bottom_sheet.Handle_semantics"
-    ; "Ui.Navigation.Modal_bottom_sheet.Detents"
-    ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Detented"
+    [ "Ui.Navigation.Modal_bottom_sheet.Sizing.Content_bounded"
+    ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Scroll_controlled"
     ; "~keyboard_inset_bottom:environment.keyboard_insets.bottom"
     ; "~border_radius:geometry.top_corner_radius"
     ];

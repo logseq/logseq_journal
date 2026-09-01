@@ -10,63 +10,65 @@ module Color_exceptions = struct
     | Light
     | Dark
 
-  type quick_status_palette =
+  type status_palette =
     { no_status : swipe_action_colors
     ; todo : swipe_action_colors
     ; doing : swipe_action_colors
     ; done_ : swipe_action_colors
+    ; backlog : swipe_action_colors
     }
 
   let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue
+  let transparent = Ui.Style.Color.argb ~alpha:0 ~red:0 ~green:0 ~blue:0
 
-  let light_quick_status =
-    { no_status = { background = rgb 75 94 99; foreground = rgb 255 255 255 }
+  let light_status =
+    { no_status = { background = transparent; foreground = rgb 0 38 47 }
     ; todo = { background = rgb 88 92 126; foreground = rgb 255 255 255 }
     ; doing = { background = rgb 0 103 124; foreground = rgb 255 255 255 }
     ; done_ = { background = rgb 0 107 87; foreground = rgb 255 255 255 }
+    ; backlog = { background = rgb 124 58 237; foreground = rgb 255 255 255 }
     }
   ;;
 
-  let dark_quick_status =
-    { no_status = { background = rgb 167 184 188; foreground = rgb 27 48 53 }
+  let dark_status =
+    { no_status = { background = transparent; foreground = rgb 167 184 188 }
     ; todo = { background = rgb 192 196 235; foreground = rgb 42 46 80 }
     ; doing = { background = rgb 134 209 233; foreground = rgb 0 54 66 }
     ; done_ = { background = rgb 131 214 189; foreground = rgb 0 56 43 }
+    ; backlog = { background = rgb 124 58 237; foreground = rgb 255 255 255 }
     }
   ;;
 
-  let later_rail = rgb 124 58 237
   let destructive_swipe = { background = rgb 186 26 26; foreground = rgb 255 255 255 }
 
-  let quick_status_palette = function
-    | Light -> light_quick_status
-    | Dark -> dark_quick_status
+  let status_palette = function
+    | Light -> light_status
+    | Dark -> dark_status
   ;;
 
   let status_rail_color ~presentation status =
-    let quick_status = quick_status_palette presentation in
+    let palette = status_palette presentation in
     match status with
     | Journal_model.No_status -> None
     | status ->
       (match Journal_model.status_category status with
        | None -> None
-       | Some Todo_category -> Some quick_status.todo.background
-       | Some Doing_category -> Some quick_status.doing.background
-       | Some Done_category -> Some quick_status.done_.background
-       | Some Later_category -> Some later_rail)
+       | Some Todo_category -> Some palette.todo.background
+       | Some Doing_category -> Some palette.doing.background
+       | Some Done_category -> Some palette.done_.background
+       | Some Later_category -> Some palette.backlog.background)
   ;;
 
   let destructive_swipe_action ~presentation:_ = destructive_swipe
 
   let status_swipe_action ~presentation =
-    let palette = quick_status_palette presentation in
+    let palette = status_palette presentation in
     function
     | Journal_model.No_status -> palette.no_status
     | Todo -> palette.todo
-    | Doing -> palette.doing
-    | Done -> palette.done_
-    | In_review | Now | Canceled | Backlog | Waiting | Later ->
-      invalid_arg "status_swipe_action only accepts quick task statuses"
+    | Doing | In_review | Now -> palette.doing
+    | Done | Canceled -> palette.done_
+    | Backlog | Waiting | Later -> palette.backlog
   ;;
 end
 

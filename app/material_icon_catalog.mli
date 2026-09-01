@@ -14,6 +14,8 @@ type t =
   | Remove_circle_outline
   | Timelapse
 
+val for_task_state : Journal_model.task_state -> t
+
 val create
   :  ?key:Bonsai_flutter_ui.Key.t
   -> ?size:float
