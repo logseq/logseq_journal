@@ -4,7 +4,153 @@ module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner
 module Sync = Logseq_sync_pure_reducer.Core
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 module Protocol = Db.Protocol
+module Overlay = Logseq_overlay_db.Database
 module ID = Bonsai_flutter_spec.Id
+
+type graph_id = Logseq_db_types.Graph_types.Uuid.t
+type graph = Logseq_db_types.Managed_graph.t
+
+type sync_phase =
+  | Offline
+  | Connecting
+  | Pulling
+  | Submitting
+  | Current
+  | Paused
+  | Failed
+
+type startup_failure_stage =
+  | During_authentication
+  | During_catalog
+  | During_local_restore
+  | During_bootstrap
+  | During_e2ee
+
+type startup_facts =
+  { authenticated : bool
+  ; catalog_loading : bool
+  ; awaiting_selection : bool
+  ; restoring_local : bool
+  ; bootstrapping : bool
+  ; awaiting_e2ee_password : bool
+  ; failure : startup_failure_stage option
+  ; account_generation : int
+  ; graph_generation : int
+  ; presentation_generation : int
+  }
+
+type snapshot =
+  { sync_phase : sync_phase
+  ; catalog : graph list
+  ; selected_graph : graph_id option
+  ; applied_server_t : int option
+  ; timeline_presentation_pending : bool
+  ; startup : startup_facts
+  ; last_error : string option
+  }
+
+type diagnostic_group =
+  { title : string
+  ; entries : (string * string) list
+  }
+
+type diagnostics =
+  { groups : diagnostic_group list
+  ; history : string list
+  }
+
+type state =
+  { snapshot : snapshot
+  ; diagnostics : diagnostics
+  }
+
+type token_purpose =
+  | Catalog_discovery
+  | Snapshot_bootstrap
+  | E2ee_key_access
+  | Websocket_connect
+
+type token_request = Sync.token_request
+
+let token_request_id = Sync.token_request_id
+
+let token_request_purpose request =
+  match Sync.token_request_purpose request with
+  | Sync.Catalog_discovery -> Catalog_discovery
+  | Snapshot_bootstrap -> Snapshot_bootstrap
+  | E2ee_key_access -> E2ee_key_access
+  | Websocket_connect -> Websocket_connect
+;;
+
+type bootstrap_progress =
+  { graph_id : graph_id
+  ; received_bytes : int64
+  ; total_bytes : int64 option
+  }
+
+let sync_phase = function
+  | Sync.Offline -> Offline
+  | Connecting -> Connecting
+  | Pulling -> Pulling
+  | Submitting -> Submitting
+  | Current -> Current
+  | Paused -> Paused
+  | Failed -> Failed
+;;
+
+let failure_stage = function
+  | Sync.During_authentication -> During_authentication
+  | During_catalog -> During_catalog
+  | During_local_restore -> During_local_restore
+  | During_bootstrap -> During_bootstrap
+  | During_e2ee -> During_e2ee
+;;
+
+let startup_facts (facts : Sync.startup_facts) =
+  { authenticated = facts.authenticated
+  ; catalog_loading = facts.catalog_loading
+  ; awaiting_selection = facts.awaiting_selection
+  ; restoring_local = facts.restoring_local
+  ; bootstrapping = facts.bootstrapping
+  ; awaiting_e2ee_password = facts.awaiting_e2ee_password
+  ; failure = Option.map failure_stage facts.failure
+  ; account_generation = facts.account_generation
+  ; graph_generation = facts.graph_generation
+  ; presentation_generation = facts.presentation_generation
+  }
+;;
+
+let snapshot (value : Sync.snapshot) =
+  { sync_phase = sync_phase value.sync_phase
+  ; catalog = value.catalog
+  ; selected_graph = value.selected_graph
+  ; applied_server_t = value.applied_server_t
+  ; timeline_presentation_pending = value.timeline_presentation_pending
+  ; startup = startup_facts value.startup
+  ; last_error = value.last_error
+  }
+;;
+
+let diagnostics (value : Sync.diagnostics) =
+  { groups =
+      List.map
+        (fun (group : Sync.diagnostic_group) ->
+           { title = group.title; entries = group.entries })
+        value.groups
+  ; history = value.history
+  }
+;;
+
+let client_state (value : Sync.state) =
+  { snapshot = snapshot value.snapshot; diagnostics = diagnostics value.diagnostics }
+;;
+
+let bootstrap_progress (value : Sync.bootstrap_progress) =
+  { graph_id = value.graph_id
+  ; received_bytes = value.received_bytes
+  ; total_bytes = value.total_bytes
+  }
+;;
 
 type client_command =
   | Restore_local_account of { user_id : string }
@@ -36,9 +182,9 @@ type response =
 
 type push =
   | Graph_push of Protocol.push
-  | Client_state_changed of Sync.state
-  | Need_id_token of Sync.token_request
-  | Bootstrap_progress of Sync.bootstrap_progress
+  | Client_state_changed of state
+  | Need_id_token of token_request
+  | Bootstrap_progress of bootstrap_progress
   | Graph_state_changed of Db.graph_state
 
 let invalidation_topic = ID.Worker.Push_topic.of_int 0
@@ -47,95 +193,60 @@ let auth_topic = ID.Worker.Push_topic.of_int 2
 let bootstrap_topic = ID.Worker.Push_topic.of_int 3
 let graph_state_topic = ID.Worker.Push_topic.of_int 4
 
-let random_key () =
-  let channel = open_in_bin "/dev/urandom" in
-  Fun.protect
-    ~finally:(fun () -> close_in_noerr channel)
-    (fun () -> really_input_string channel 32 |> Bytes.of_string)
-;;
-
 type dependencies =
-  { engine : Db.Engine.dependencies
+  { overlay : Overlay.dependencies
   ; tls_authenticator : Sync_runner.tls_authenticator
   ; secrets : Sync_runner.secrets
   ; crypto : Sync_runner.crypto
   }
 
-let dependencies ~engine ~tls_authenticator ~secrets ~crypto =
-  { engine; tls_authenticator; secrets; crypto }
+let dependencies ~overlay ~tls_authenticator ~secrets ~crypto =
+  { overlay; tls_authenticator; secrets; crypto }
 ;;
 
 let production_dependencies () =
-  let engine =
-    Db.Engine.
-      { clocks =
-          { epoch_ms = (fun () -> Unix.gettimeofday () *. 1_000. |> Int64.of_float)
-          ; monotonic_ns = Mtime_clock.elapsed_ns
-          }
-      ; cursor_authentication_key = random_key ()
+  let limits =
+    Logseq_overlay_db.Types.
+      { response_budget_bytes = Protocol.maximum_response_bytes
+      ; outbox_max_records = 4_096
+      ; outbox_max_bytes = 8 * 1024 * 1024
+      ; change_max_items = Protocol.maximum_changed_uuids
+      ; change_max_bytes = Protocol.maximum_push_bytes
+      ; dispatcher_capacity = 256
+      ; wire_batch_max_bytes = Protocol.maximum_response_bytes
       }
+  in
+  let overlay =
+    Overlay.dependencies
+      ~epoch_ms:(fun () -> Unix.gettimeofday () *. 1_000. |> Int64.of_float)
+      ~monotonic_ns:Mtime_clock.elapsed_ns
+      ~limits
+    |> Result.get_ok
   in
   let secrets = Sync_runner.apple_secrets () |> Result.get_ok in
   let crypto = Sync_runner.apple_crypto () |> Result.get_ok in
   let tls_authenticator = Sync_runner.system_tls_authenticator () |> Result.get_ok in
-  { engine; tls_authenticator; secrets; crypto }
-;;
-
-let take count values =
-  let rec loop remaining reversed = function
-    | _ when remaining = 0 -> List.rev reversed
-    | [] -> List.rev reversed
-    | value :: rest -> loop (remaining - 1) (value :: reversed) rest
-  in
-  loop count [] values
-;;
-
-let protocol_invalidation (invalidation : Sync.invalidation) =
-  let rec fit limit =
-    let changed_uuids = take limit invalidation.changed_uuids in
-    let push =
-      Protocol.Graph_invalidated
-        { basis = invalidation.basis
-        ; changed_uuids
-        ; changed_uuids_truncated =
-            invalidation.changed_uuids_truncated
-            || List.length changed_uuids < List.length invalidation.changed_uuids
-        ; invalidate_graph_info = true
-        ; invalidate_pages = true
-        ; invalidate_tags = true
-        ; invalidate_properties = true
-        ; invalidate_tasks = true
-        ; invalidate_references = true
-        }
-    in
-    let bytes = Protocol.push_to_yojson push |> Yojson.Safe.to_string |> String.length in
-    if bytes <= Protocol.maximum_push_bytes
-    then push
-    else if limit = 0
-    then failwith "sync invalidation metadata exceeds its protocol budget"
-    else fit (limit / 2)
-  in
-  fit (List.length invalidation.changed_uuids)
+  { overlay; tls_authenticator; secrets; crypto }
 ;;
 
 let publish context = function
   | Pure.Reply _ -> ()
   | Graph_push push ->
     Worker.Session_context.emit context ~topic:invalidation_topic (Graph_push push)
-  | Sync_output (State_changed state) ->
-    Worker.Session_context.emit context ~topic:manager_topic (Client_state_changed state)
-  | Sync_output (Token_requested request) ->
-    Worker.Session_context.emit context ~topic:auth_topic (Need_id_token request)
-  | Sync_output (Bootstrap_progressed progress) ->
-    Worker.Session_context.emit
-      context
-      ~topic:bootstrap_topic
-      (Bootstrap_progress progress)
-  | Sync_output (Graph_invalidated invalidation) ->
-    Worker.Session_context.emit
-      context
-      ~topic:invalidation_topic
-      (Graph_push (protocol_invalidation invalidation))
+  | Sync_output output ->
+    (match output with
+     | State_changed state ->
+       Worker.Session_context.emit
+         context
+         ~topic:manager_topic
+         (Client_state_changed (client_state state))
+     | Token_requested request ->
+       Worker.Session_context.emit context ~topic:auth_topic (Need_id_token request)
+     | Bootstrap_progressed progress ->
+       Worker.Session_context.emit
+         context
+         ~topic:bootstrap_topic
+         (Bootstrap_progress (bootstrap_progress progress)))
   | Graph_state_changed state ->
     Worker.Session_context.emit
       context
@@ -157,8 +268,7 @@ let sync_dependencies dependencies context config =
   Result.bind
     (Sync_runner.runtime
        ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
-       ~sleep:(Eio.Time.sleep clock)
-       ~monotonic_ns:Mtime_clock.elapsed_ns)
+       ~sleep:(Eio.Time.sleep clock))
     (fun runtime ->
        Result.bind
          (Sync_runner.transport
@@ -271,7 +381,7 @@ let create ~(dependencies : dependencies) =
               Worker_runner.dependencies
                 ~runtime
                 ~config
-                ~engine:dependencies.engine
+                ~overlay:dependencies.overlay
                 ~sync_runner:selected_sync_runner
                 ~publish:(publish context)
             with

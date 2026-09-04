@@ -1,0 +1,48 @@
+{
+  "format_version": 1,
+  "fixture": {
+    "name": "100000-blocks-v1",
+    "block_count": 100000,
+    "checksum": "sha256:d6f0ab746f1ca9da2d66842e9dcd834b13b757822c2fecff8a65040bbfb7e8f3",
+    "seed": "logseq-overlay-db-performance-v1:100000"
+  },
+  "environment": {
+    "compiler": "ocaml-5.1.1",
+    "profile": "release",
+    "machine_class": "repository-reference-apple-silicon",
+    "command": "./logseq_overlay_db/tool/test_performance.sh"
+  },
+  "active_outbox_records": [0, 1, 32, 128, 1024, 4096],
+  "admission": {
+    "maximum_records": 4096,
+    "maximum_bytes": 8388608
+  },
+  "p95_milliseconds": {
+    "get_blocks_64": 20,
+    "get_structure_200": 20,
+    "get_journals_200": 25,
+    "single_block_change_classification": 10,
+    "replan_and_diff_128": 100,
+    "reopen_1024": 100,
+    "maximum_get_blocks_64": 80,
+    "maximum_get_structure_200": 80,
+    "maximum_get_journals_200": 100,
+    "maximum_rebase_and_diff_4096": 3200,
+    "maximum_delete_conflict": 3200,
+    "maximum_reopen_4096": 500
+  },
+  "memory": {
+    "maximum_point_auxiliary_bytes": 33554432,
+    "retained_rss_outbox_multiplier": 12,
+    "retained_rss_fixed_bytes": 33554432
+  },
+  "instrumentation": {
+    "forbid_authoritative_full_scan": true,
+    "forbid_outbox_full_scan_for_point_reads": true,
+    "require_single_authoritative_root": true,
+    "require_bounded_compaction_path_access": true,
+    "require_wall_time_samples": true,
+    "require_allocation_samples": true,
+    "require_rss_samples": true
+  }
+}

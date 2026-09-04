@@ -1,0 +1,247 @@
+{
+  "apiVersion": 2,
+  "responses": [
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000001",
+      "outcome": {
+        "type": "graphInfo",
+        "graphUuid": "40000000-0000-4000-8000-000000000001",
+        "graphName": "Journal",
+        "schema": {"major": 65, "minor": 33},
+        "admissionFacts": [
+          {
+            "type": "compatibleSchema",
+            "minimum": {"major": 65, "minor": 33},
+            "actual": {"major": 65, "minor": 33}
+          },
+          {
+            "type": "syncedGraphIdentity",
+            "graphUuid": "40000000-0000-4000-8000-000000000001"
+          },
+          {"type": "losslessCodec"},
+          {"type": "ownershipVerified"}
+        ],
+        "limits": {
+          "responseBudgetBytes": 262144,
+          "outboxMaxRecords": 4096,
+          "outboxMaxBytes": 8388608,
+          "changeMaxItems": 4096,
+          "changeMaxBytes": 65536,
+          "dispatcherCapacity": 256,
+          "wireBatchMaxBytes": 1048576
+        },
+        "generation": "generation:v1:1",
+        "projectionRevision": "projection-revision:v1:3"
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000002",
+      "outcome": {
+        "type": "journals",
+        "revisionScope": {"type": "journalIndex"},
+        "scopeRevision": "scope-revision:v1:journal-index",
+        "items": [
+          {
+            "page": {
+              "uuid": "20000000-0000-4000-8000-000000000001",
+              "name": "2026-09-02",
+              "title": "Sep 2nd, 2026",
+              "kind": {"type": "journal", "journalDay": 20260902},
+              "createdAtMs": "1788278400000",
+              "updatedAtMs": "1788278400000",
+              "tags": [],
+              "properties": [],
+              "recycled": false
+            },
+            "journalDay": 20260902,
+            "revision": "page-revision:v1:1"
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000003",
+      "outcome": {
+        "type": "page",
+        "lookup": {
+          "type": "present",
+          "revision": "page-revision:v1:1",
+          "page": {
+            "uuid": "20000000-0000-4000-8000-000000000001",
+            "name": "2026-09-02",
+            "title": "Sep 2nd, 2026",
+            "kind": {"type": "journal", "journalDay": 20260902},
+            "createdAtMs": "1788278400000",
+            "updatedAtMs": "1788278400000",
+            "tags": [],
+            "properties": [],
+            "recycled": false
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000004",
+      "outcome": {
+        "type": "page",
+        "lookup": {
+          "type": "missing",
+          "uuid": "20000000-0000-4000-8000-000000000099",
+          "revision": "page-revision:v1:missing"
+        }
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000005",
+      "outcome": {
+        "type": "block",
+        "lookup": {
+          "type": "present",
+          "revision": "block-revision:v1:1",
+          "taskStatus": "todo",
+          "renderedPageTitle": "Sep 2nd, 2026",
+          "block": {
+            "uuid": "10000000-0000-4000-8000-000000000001",
+            "title": "Write the cutover",
+            "parent": "20000000-0000-4000-8000-000000000001",
+            "page": "20000000-0000-4000-8000-000000000001",
+            "order": "a0",
+            "createdAtMs": "1788278400000",
+            "updatedAtMs": "1788278400000",
+            "refs": [],
+            "tags": [],
+            "properties": []
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000006",
+      "outcome": {
+        "type": "block",
+        "lookup": {
+          "type": "missing",
+          "uuid": "10000000-0000-4000-8000-000000000099",
+          "revision": "block-revision:v1:missing"
+        }
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000007",
+      "outcome": {
+        "type": "children",
+        "parent": "20000000-0000-4000-8000-000000000001",
+        "revisionScope": {
+          "type": "children",
+          "parent": "20000000-0000-4000-8000-000000000001"
+        },
+        "scopeRevision": "scope-revision:v1:children",
+        "items": [],
+        "nextCursor": null
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000008",
+      "outcome": {
+        "type": "pageTree",
+        "page": "20000000-0000-4000-8000-000000000001",
+        "maximumDepth": 8,
+        "revisionScope": {
+          "type": "pageTree",
+          "page": "20000000-0000-4000-8000-000000000001",
+          "maximumDepth": 8
+        },
+        "scopeRevision": "scope-revision:v1:page-tree",
+        "items": [],
+        "nextCursor": null
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000009",
+      "outcome": {
+        "type": "mutationCommitted",
+        "mutationId": "30000000-0000-4000-8000-000000000001",
+        "status": "applied",
+        "generation": "generation:v1:1",
+        "beforeProjectionRevision": "projection-revision:v1:2",
+        "afterProjectionRevision": "projection-revision:v1:3"
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000010",
+      "outcome": {
+        "type": "changes",
+        "generation": "generation:v1:1",
+        "fromExclusive": null,
+        "through": "change-window:v1:2",
+        "windows": [
+          {
+            "id": "change-window:v1:1",
+            "predecessor": "projection-revision:v1:1",
+            "successor": "projection-revision:v1:2",
+            "blockUuids": ["10000000-0000-4000-8000-000000000001"],
+            "pageUuids": [],
+            "structureInterests": []
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000011",
+      "outcome": {
+        "type": "changesAcknowledged",
+        "generation": "generation:v1:1",
+        "through": "change-window:v1:2"
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000012",
+      "outcome": {
+        "type": "failed",
+        "code": "revisionConflict",
+        "message": "The target changed."
+      }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000013",
+      "outcome": {
+        "type": "resyncRequired",
+        "generation": "generation:v1:2",
+        "reason": "generationChanged"
+      }
+    }
+  ],
+  "pushes": [
+    {
+      "apiVersion": 2,
+      "push": {
+        "type": "changesAvailable",
+        "generation": "generation:v1:1",
+        "through": "change-window:v1:2"
+      }
+    },
+    {
+      "apiVersion": 2,
+      "push": {
+        "type": "resyncRequired",
+        "generation": "generation:v1:2",
+        "reason": "retentionOverflow"
+      }
+    }
+  ]
+}

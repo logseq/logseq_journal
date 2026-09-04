@@ -191,55 +191,6 @@ type decryption_batch =
   }
 
 type decrypted_values = string list
-
-type outbox_state =
-  | Queued
-  | Submitted
-  | Accepted of int
-  | Blocked of string
-
-type outbox_record
-type local_batch_input
-type local_batch_plan
-
-val decode_outbox_records : string list -> (outbox_record list, string) result
-val encode_outbox_records : outbox_record list -> (string list, string) result
-val outbox_record_mutation_id : outbox_record -> graph_id
-val outbox_record_fingerprint : outbox_record -> string
-val outbox_record_mutation_payload : outbox_record -> string
-val outbox_record_outliner_op : outbox_record -> string
-val outbox_record_state : outbox_record -> outbox_state
-val outbox_record_with_state : outbox_record -> outbox_state -> outbox_record
-val clear_outbox_transport : outbox_record -> outbox_state -> outbox_record
-val block_outbox_record : outbox_record -> string -> outbox_record
-
-(** Recompute the canonical entity checksum for a graph database. *)
-val recompute_checksum : Datascript.db -> string
-
-val local_batch_input
-  :  scope:graph_scope
-  -> admission_id:string
-  -> key:graph_key_handle option
-  -> outbox_records:string list
-  -> mutation_id:graph_id
-  -> mutation_payload:string
-  -> mutation_fingerprint:string
-  -> outliner_op:string
-  -> database:Datascript.db
-  -> operations:Datascript.tx_op list
-  -> (local_batch_input, string) result
-
-val begin_local_batch : local_batch_input -> (local_batch_plan, string) result
-val local_batch_crypto_request : local_batch_plan -> encryption_batch option
-val local_batch_input_scope : local_batch_input -> graph_scope
-val local_batch_input_mutation_id : local_batch_input -> graph_id
-val local_batch_input_fingerprint : local_batch_input -> string
-
-val finish_local_batch
-  :  local_batch_plan
-  -> encrypted_values option
-  -> (outbox_record, string) result
-
 type snapshot_baseline = string
 type snapshot_metadata = string
 
@@ -277,6 +228,12 @@ type _ runner_request =
   | Load_and_unlock_graph_key : graph_scope -> graph_key_handle runner_request
   | Fetch_and_unlock_graph_key : graph_key_request -> graph_key_handle runner_request
   | Unlock_private_key : private_key_unlock -> unit runner_request
+  | Delete_wrapped_graph_key :
+      { account : account_scope
+      ; graph_id : graph_id
+      }
+      -> unit runner_request
+  | Delete_account_secrets : account_scope -> unit runner_request
   | Encrypt_protected_values : encryption_batch -> encrypted_values runner_request
   | Decrypt_protected_values : decryption_batch -> decrypted_values runner_request
 
@@ -337,107 +294,40 @@ type mirror_deletion =
   ; scope : effect_scope
   }
 
-type graph_open_request =
-  { graph : graph
-  ; graph_directory : string
-  ; database_path : string
-  ; checkpoint : Logseq_db_types.Sync_checkpoint.t
-  ; scope : graph_scope
-  }
-
 type mirror_inspection =
-  | Mirror_available of graph_open_request
+  | Mirror_available of mirror_request
   | Mirror_absent of graph_scope
 
-type local_batch_failure_kind =
-  | Planning_failed
-  | Encryption_failed
-  | Encoding_failed
-  | Scope_closed
-  | Engine_unavailable
-  | Persistence_failed
-
-type local_batch_action =
-  | Commit of { outbox_records : string list }
-  | Reject of
-      { kind : local_batch_failure_kind
-      ; message : string
-      }
-
-type local_batch_completion_request =
-  { operation_id : graph_id
-  ; admission_id : string
+type outbox_transition_request =
+  { expected : Logseq_overlay_db.Types.sync_token
+  ; key : graph_key_handle option
   ; scope : graph_scope
-  ; action : local_batch_action
+  ; transition : Logseq_overlay_db.Types.outbox_transition
   }
 
 type authoritative_batch =
-  { message : Sync_protocol.Server.message
+  { input : Logseq_overlay_db.Types.authoritative_batch
+  ; key : graph_key_handle option
   ; scope : connection_scope
   ; presentation_generation : presentation_generation
   ; lifecycle_generation : lifecycle_generation
-  }
-
-type authoritative_context =
-  { batch : authoritative_batch
-  ; precondition : string
-  ; checkpoint : Logseq_db_types.Sync_checkpoint.t
-  ; database : Datascript.db
-  ; outbox_records : string list
-  }
-
-type authoritative_plan
-
-val begin_authoritative_batch
-  :  ?acknowledged_mutation_ids:graph_id list
-  -> authoritative_context
-  -> (authoritative_plan, string) result
-
-val authoritative_crypto_request : authoritative_plan -> decryption_batch option
-
-type authoritative_commit_request =
-  { batch : authoritative_batch
-  ; precondition : string
-  ; scope : graph_scope
-  ; key : graph_key_handle option
-  ; transactions : Datascript.tx_op list list
-  ; projection_transactions : Datascript.tx_op list list
-  ; checkpoint : Logseq_db_types.Sync_checkpoint.t
-  ; outbox_records : string list
-  ; activity : Logseq_db_types.Sync_status.activity
-  }
-
-val finish_authoritative_batch
-  :  authoritative_plan
-  -> decrypted_values option
-  -> (authoritative_commit_request, string) result
-
-type outbox_transition =
-  { scope : graph_scope
-  ; presentation_generation : presentation_generation
-  ; lifecycle_generation : lifecycle_generation
-  ; expected_outbox_records : string list
-  ; outbox_records : string list
-  ; pending_message : Sync_protocol.Client.message option
   }
 
 type worker_effect =
   | Inspect_mirror of mirror_request
   | Activate_snapshot of snapshot_activation_request
   | Delete_mirror of mirror_deletion
-  | Attach_graph of graph_open_request
+  | Attach_graph of mirror_request
   | Detach_graph of graph_scope
   | Reset_managed_account of account_scope
-  | Complete_local_batch of local_batch_completion_request
-  | Inspect_authoritative_batch of authoritative_batch
-  | Apply_authoritative_batch of authoritative_commit_request
-  | Commit_outbox_transition of outbox_transition
+  | Inspect_sync of graph_scope
+  | Apply_outbox_transition of outbox_transition_request
+  | Apply_authoritative_batch of authoritative_batch
 
 type output =
   | State_changed of state
   | Token_requested of token_request
   | Bootstrap_progressed of bootstrap_progress
-  | Graph_invalidated of invalidation
 
 type instruction =
   | Run of runner_effect
@@ -454,33 +344,29 @@ type scoped_error =
 
 type graph_attachment =
   { scope : graph_scope
-  ; checkpoint : Logseq_db_types.Sync_checkpoint.t
-  ; outbox_records : string list
+  ; sync : Logseq_overlay_db.Types.sync_view
   }
 
-type local_batch_commit =
+type sync_inspection =
   { scope : graph_scope
-  ; outbox_records : string list
+  ; sync : Logseq_overlay_db.Types.sync_view
   }
 
 type authoritative_commit_result =
   { scope : graph_scope
-  ; checkpoint : Logseq_db_types.Sync_checkpoint.t
-  ; outbox_records : string list
-  ; activity : Logseq_db_types.Sync_status.activity
-  ; invalidation : invalidation option
+  ; commit : Logseq_overlay_db.Types.authoritative_commit
+  ; sync : Logseq_overlay_db.Types.sync_view
   }
 
-type outbox_transition_commit =
+type authoritative_deferred_result =
   { scope : graph_scope
-  ; outbox_records : string list
-  ; pending_message : Sync_protocol.Client.message option
+  ; defer : Logseq_overlay_db.Types.authoritative_defer
   }
 
-type outbox_transition_rejection =
+type outbox_transition_result =
   { scope : graph_scope
-  ; outbox_records : string list
-  ; message : string
+  ; commit : Logseq_overlay_db.Types.outbox_commit
+  ; sync : Logseq_overlay_db.Types.sync_view
   }
 
 type snapshot_activation = { scope : graph_scope }
@@ -489,6 +375,7 @@ type event =
   | Restore_local_account of { user_id : string }
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
+  | Local_outbox_changed
   | Timeline_presented
   | Token_provided of token_request * string
   | Token_rejected of token_request
@@ -505,14 +392,11 @@ type event =
   | Mirror_inspected of mirror_inspection
   | Graph_attached of graph_attachment
   | Graph_attachment_failed of scoped_error
-  | Local_batch_prepared of local_batch_input
-  | Local_batch_committed of local_batch_commit
-  | Authoritative_batch_inspected of authoritative_context
+  | Sync_inspected of sync_inspection
+  | Outbox_transition_applied of outbox_transition_result
   | Authoritative_batch_applied of authoritative_commit_result
-  | Authoritative_batch_conflicted of authoritative_batch
+  | Authoritative_batch_deferred of authoritative_deferred_result
   | Authoritative_batch_failed of scoped_error
-  | Outbox_transition_committed of outbox_transition_commit
-  | Outbox_transition_rejected of outbox_transition_rejection
   | Snapshot_activated of snapshot_activation
   | Snapshot_activation_failed of scoped_error
   | Runner_completed of runner_completion

@@ -1,10 +1,10 @@
 module Core = Logseq_db_worker_pure_reducer.Core
 module Runner = Logseq_db_worker_effect_runner.Effect_runner
 module Sync = Logseq_sync_pure_reducer.Core
-module F = Logseq_db_worker_test_support.Adapter_fixture
+module T = Logseq_db_worker_test_support.Test_support
 
 let test_sync_and_publish_instructions_are_not_reduced_recursively () =
-  F.with_managed (fun fixture ->
+  T.with_managed (fun fixture ->
     Eio_main.run (fun _environment ->
       Eio.Switch.run (fun sw ->
         let submitted = ref [] in
@@ -20,7 +20,7 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
           Runner.dependencies
             ~runtime
             ~config:fixture.config
-            ~engine:F.dependencies
+            ~overlay:fixture.overlay
             ~sync_runner
             ~publish:(fun output -> published := output :: !published)
           |> Result.get_ok

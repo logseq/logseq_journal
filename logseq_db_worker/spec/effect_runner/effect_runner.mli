@@ -1,4 +1,4 @@
-(** Eio interpreter for ordered worker instructions. *)
+(** Eio interpreter for Worker requests and typed overlay transitions. *)
 
 type t
 type runtime
@@ -28,7 +28,7 @@ val sync_runner
 val dependencies
   :  runtime:runtime
   -> config:Logseq_db_worker_contract.Config.t
-  -> engine:Logseq_db_worker_engine.Engine.dependencies
+  -> overlay:Logseq_overlay_db.Database.dependencies
   -> sync_runner:sync_runner
   -> publish:(Logseq_db_worker_pure_reducer.Core.output -> unit)
   -> (dependencies, dependency_error) result

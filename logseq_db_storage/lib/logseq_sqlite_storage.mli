@@ -8,6 +8,8 @@ type batch =
   { writes : write list
   ; sync_metadata : Sync_checkpoint.t option
   ; sync_outbox : string list option
+  ; mutation_receipts : (string * string) list option
+  ; terminal_batch_receipts : (string * string) list option
   }
 
 type garbage_stats =
@@ -43,6 +45,8 @@ type callbacks =
   ; upsert_sync_metadata : Sync_checkpoint.t -> (unit, string) result
   ; load_sync_outbox : unit -> (string list, string) result
   ; replace_sync_outbox : string list -> (unit, string) result
+  ; upsert_mutation_receipts : (string * string) list -> (unit, string) result
+  ; upsert_terminal_batch_receipts : (string * string) list -> (unit, string) result
   ; commit : unit -> (unit, string) result
   ; rollback : unit -> unit
   ; unreachable_address_count : unit -> int

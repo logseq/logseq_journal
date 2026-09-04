@@ -1,3 +1,4 @@
+module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 module Ui = Bonsai_flutter_ui
 module Tokens = Journal_visual_tokens
 
@@ -15,18 +16,11 @@ module Context = struct
   let is_today t = t.is_today
   let title t = t.title
   let subtitle t = t.subtitle
+  let display_title t = t.title ^ " · " ^ t.subtitle
   let semantics_label t = t.title ^ ", " ^ t.subtitle
 end
 
 let test_id value widget = Ui.Widget.with_test_id (Ui.Test_id.string value) widget
-
-let text_style (token : Tokens.text_token) =
-  Ui.Style.Text_style.create
-    ~font_size:token.font_size
-    ~font_weight:token.weight
-    ~line_height:(token.line_height /. token.font_size)
-    ()
-;;
 
 let glyph ~id icon =
   Material_icon_catalog.create ~size:18. icon
@@ -46,19 +40,8 @@ let shell ~id child =
   |> test_id id
 ;;
 
-let extents ~typography ~text_scale ~divider_height =
-  let scale = Float.max 1. text_scale in
-  let title_height = typography.Tokens.header_title.line_height *. scale in
-  let subtitle_height = typography.header_subtitle.line_height *. scale in
-  let toolbar_height = Float.max 56. (title_height +. 16.) in
-  let expanded_content_height = Float.max 96. (title_height +. subtitle_height +. 24.) in
-  let expanded_height = expanded_content_height +. divider_height in
-  let collapsed_height = toolbar_height +. divider_height in
-  toolbar_height, collapsed_height, expanded_height, subtitle_height
-;;
-
 let sync_progress_visible = function
-  | Some Logseq_sync_pure_reducer.Core.Connecting -> true
+  | Some Graph_service.Connecting -> true
   | None
   | Some Offline
   | Some Pulling
@@ -69,72 +52,38 @@ let sync_progress_visible = function
 ;;
 
 let sliver
-      ~typography
-      ~text_scale
-      ~top_inset
-      ~device_pixel_ratio
+      ~typography:_
+      ~text_scale:_
+      ~top_inset:_
+      ~device_pixel_ratio:_
       ~context
       ~sync_phase
       ~on_error_info
       ~on_account_menu
   =
-  let thickness = Tokens.physical_divider_thickness ~device_pixel_ratio in
-  let toolbar_height, collapsed_height, expanded_height, subtitle_height =
-    extents ~typography ~text_scale ~divider_height:thickness
-  in
   let leading = Ui.Widget.empty () |> shell ~id:"journal-header-leading-placeholder" in
-  let title =
+  let date_context =
     Ui.Widget.text
-      ~style:(text_style typography.header_title)
       ~max_lines:1
       ~overflow:Ui.Style.Text_overflow.Clip
-      (Context.title context)
+      (Context.display_title context)
     |> test_id "journal-header-title"
     |> Ui.Widget.semantics
          ~properties:
            (Ui.Semantics.create ~label:(Context.semantics_label context) ~sort_key:2. ())
     |> test_id "journal-date-context"
   in
-  let subtitle =
-    Ui.Widget.text
-      ~style:(text_style typography.header_subtitle)
-      ~max_lines:1
-      ~text_align:Ui.Style.Text_align.Center
-      ~overflow:Ui.Style.Text_overflow.Clip
-      (Context.subtitle context)
-    |> test_id "journal-header-subtitle"
-    |> Ui.Widget.center
-    |> Ui.Widget.sized_box ~height:subtitle_height
-  in
-  let sync_progress =
+  let title =
     if sync_progress_visible sync_phase
     then
-      [ Ui.Material.linear_progress_indicator ()
-        |> test_id "journal-header-sync-progress"
-        |> Ui.Widget.sized_box ~height:sync_progress_height
-        |> test_id "journal-header-sync-progress-extent"
-        |> Ui.Widget.Stack.positioned ~left:0. ~right:0. ~bottom:thickness
-      ]
-    else []
-  in
-  let flexible_space =
-    Ui.Widget.Stack.create
-      ([ Ui.Widget.Stack.positioned
-           ~left:0.
-           ~top:(top_inset +. toolbar_height)
-           ~right:0.
-           subtitle
-       ]
-       @ sync_progress
-       @ [ Ui.Widget.Stack.positioned
-             ~left:0.
-             ~right:0.
-             ~bottom:0.
-             (Ui.Material.divider ~thickness ()
-              |> test_id "journal-header-divider"
-              |> Ui.Widget.sized_box ~height:thickness)
-         ])
-    |> test_id "journal-header-flexible-space"
+      Ui.Widget.column
+        [ date_context
+        ; Ui.Material.linear_progress_indicator ~kind:Ui.Material.Flat ()
+          |> test_id "journal-header-sync-progress"
+          |> Ui.Widget.sized_box ~height:sync_progress_height
+          |> test_id "journal-header-sync-progress-extent"
+        ]
+    else date_context
   in
   let account =
     match on_account_menu with
@@ -155,6 +104,7 @@ let sliver
                 ~actions:[ Ui.Semantics.Action.Tap ]
                 ~sort_key:4.
                 ())
+      |> Ui.Material.Tooltip.plain ~message:"Account menu"
       |> shell ~id:"journal-account-menu-target"
   in
   let error_info =
@@ -179,23 +129,19 @@ let sliver
                    ~actions:[ Ui.Semantics.Action.Tap ]
                    ~sort_key:3.
                    ())
+         |> Ui.Material.Tooltip.plain ~message:"Error info"
          |> shell ~id:"journal-error-info-target")
   in
-  Ui.Widget.Sliver.app_bar
+  Ui.Material.App_bar.sliver
     ~key:(Ui.Key.string "journal-header-app-bar")
     ~pinned:true
-    ~expanded_height
-    ~collapsed_height
     ~floating:false
     ~snap:false
-    ~stretch:false
-    ~toolbar_height
-    ~force_elevated:false
-    ~automatically_imply_leading:false
     ~center_title:true
-    ~elevation:0.
+    ~variant:Ui.Material.App_bar.Small
+    ~shape:Ui.Material.App_bar.Square
+    ~density:Ui.Material.App_bar.Compact
     ~leading
-    ~flexible_space
     ~actions:(Option.to_list error_info @ [ account ])
     ~title
     ()

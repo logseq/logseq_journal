@@ -1,3 +1,0 @@
-(test
- (name test_mutation_identity)
- (libraries logseq_db_types))

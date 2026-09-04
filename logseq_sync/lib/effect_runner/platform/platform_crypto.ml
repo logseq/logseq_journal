@@ -68,15 +68,6 @@ let graph_identity_fields ~managed_sync_origin ~user_id ~graph_id =
   @ [ "graphId", `String (Graph_types.Uuid.to_string graph_id) ]
 ;;
 
-let has_private_key ~managed_sync_origin ~user_id =
-  match invoke "hasPrivateKey" (identity_fields ~managed_sync_origin ~user_id) with
-  | Ok fields ->
-    (match List.assoc_opt "value" fields with
-     | Some (`Bool value) -> value
-     | _ -> false)
-  | Error _ -> false
-;;
-
 let unlock_private_key ~managed_sync_origin ~user_id ~password ~private_key_package =
   bind (E2ee.private_key_package private_key_package) (fun package ->
     bind
@@ -93,27 +84,13 @@ let unlock_private_key ~managed_sync_origin ~user_id ~password ~private_key_pack
 ;;
 
 type crypto =
-  { decrypt_private_key :
-      password:string
-      -> iterations:int
-      -> salt:string
-      -> iv:string
-      -> ciphertext:string
-      -> (string, string) result
-  ; decrypt_graph_key : private_key:string -> ciphertext:string -> (string, string) result
-  ; encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
+  { encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
   ; decrypt_aes_gcm :
       key:string -> iv:string -> ciphertext:string -> (string, string) result
   }
 
 let crypto =
-  { decrypt_private_key =
-      (fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
-        Error "password unlock is owned by the platform account shell")
-  ; decrypt_graph_key =
-      (fun ~private_key:_ ~ciphertext:_ ->
-        Error "private keys never cross the platform crypto boundary")
-  ; encrypt_aes_gcm =
+  { encrypt_aes_gcm =
       (fun ~key ~plaintext ->
         bind
           (invoke

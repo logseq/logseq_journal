@@ -24,7 +24,6 @@ let with_support f =
 
 let secrets () =
   Runner.secrets
-    ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> false)
     ~unlock_private_key:
       (fun
         ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
@@ -44,10 +43,6 @@ let secrets () =
 
 let crypto () =
   Runner.crypto
-    ~decrypt_private_key:(fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
-      Error "private key decryption unavailable")
-    ~decrypt_graph_key:(fun ~private_key:_ ~ciphertext:_ ->
-      Error "graph key decryption unavailable")
     ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "encryption unavailable")
     ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "decryption unavailable")
   |> Result.get_ok
@@ -80,10 +75,7 @@ let load_catalog_effect () =
 ;;
 
 let dependencies ?secrets_dependency ?crypto_dependency ~environment ~support ~fork () =
-  let runtime =
-    Runner.runtime ~fork ~sleep:(fun _ -> ()) ~monotonic_ns:(fun () -> 0L)
-    |> Result.get_ok
-  in
+  let runtime = Runner.runtime ~fork ~sleep:(fun _ -> ()) |> Result.get_ok in
   let transport =
     Runner.transport
       ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
@@ -311,7 +303,6 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption () =
         let posted = ref [] in
         let secrets_dependency =
           Runner.secrets
-            ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> true)
             ~unlock_private_key:
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
@@ -337,12 +328,6 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption () =
         in
         let crypto_dependency =
           Runner.crypto
-            ~decrypt_private_key:
-              (fun
-                ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
-              Error "private key decryption was not expected")
-            ~decrypt_graph_key:(fun ~private_key:_ ~ciphertext:_ ->
-              Error "graph key decryption was not expected")
             ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ ->
               Error "encryption was not expected")
             ~decrypt_aes_gcm:(fun ~key ~iv:_ ~ciphertext:_ ->
@@ -409,7 +394,6 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
         let posted = ref [] in
         let secrets_dependency =
           Runner.secrets
-            ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> true)
             ~unlock_private_key:
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
@@ -488,6 +472,346 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
           (Runner.decrypt_protected_value runner handle "plaintext"))))
 ;;
 
+let account_deletion_effect () =
+  let authenticated =
+    Core.step (core ()) (Account_authenticated { user_id = Some "account-user" })
+  in
+  let signed_out =
+    Core.step authenticated.next (Account_authenticated { user_id = None })
+  in
+  List.find_map
+    (function
+      | Core.Run (Core.Request (ticket, Core.Delete_account_secrets account)) ->
+        Some (Core.Request (ticket, Core.Delete_account_secrets account))
+      | Run _ | Delegate _ | Publish _ -> None)
+    signed_out.effects
+  |> Option.get
+;;
+
+let graph_deletion_effect () =
+  let authenticated =
+    Core.step (core ()) (Account_authenticated { user_id = Some "graph-user" })
+  in
+  let deleted_graph = graph_id () in
+  Core.step authenticated.next (Local_cache_deletion_requested deleted_graph)
+  |> fun transition ->
+  List.find_map
+    (function
+      | Core.Run (Core.Request (ticket, Core.Delete_wrapped_graph_key request)) ->
+        Some (Core.Request (ticket, Core.Delete_wrapped_graph_key request))
+      | Run _ | Delegate _ | Publish _ -> None)
+    transition.effects
+  |> Option.get
+;;
+
+let test_deletion_callbacks_receive_exact_identity_once () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let tasks = ref [] in
+        let posted = ref [] in
+        let accounts = ref [] in
+        let graphs = ref [] in
+        let secrets_dependency =
+          Runner.secrets
+            ~unlock_private_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
+              Error "unexpected private-key unlock")
+            ~unlock_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+              Error "unexpected graph-key unlock")
+            ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+              Error (Runner.Wrapped_graph_key_unavailable "unexpected wrapped-key load"))
+            ~verify_and_save_wrapped_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+              Error "unexpected wrapped-key save")
+            ~delete_wrapped_graph_key:(fun ~managed_sync_origin ~user_id ~graph_id ->
+              graphs := (Uri.to_string managed_sync_origin, user_id, graph_id) :: !graphs;
+              Ok ())
+            ~delete_account_secrets:(fun ~managed_sync_origin ~user_id ->
+              accounts := (Uri.to_string managed_sync_origin, user_id) :: !accounts;
+              Ok ())
+          |> Result.get_ok
+        in
+        let dependencies =
+          dependencies
+            ~secrets_dependency
+            ~environment
+            ~support
+            ~fork:(fun ~sw:_ task -> tasks := task :: !tasks)
+            ()
+        in
+        let runner =
+          Runner.create ~sw dependencies ~post:(fun event -> posted := event :: !posted)
+          |> Result.get_ok
+        in
+        Runner.submit runner (account_deletion_effect ());
+        Runner.submit runner (graph_deletion_effect ());
+        List.iter (fun task -> task ()) (List.rev !tasks);
+        Alcotest.(check (list (pair string string)))
+          "account callback receives the captured identity once"
+          [ "https://api.logseq.io", "account-user" ]
+          (List.rev !accounts);
+        (match List.rev !graphs with
+         | [ (origin, user_id, deleted_graph) ] ->
+           Alcotest.(check string) "graph callback origin" "https://api.logseq.io" origin;
+           Alcotest.(check string) "graph callback user" "graph-user" user_id;
+           Alcotest.(check bool) "graph callback ID" true (deleted_graph = graph_id ())
+         | _ -> Alcotest.fail "graph deletion callback was not invoked exactly once");
+        Alcotest.(check int) "both deletion requests complete" 2 (List.length !posted))))
+;;
+
+let test_deletion_callback_failures_are_typed () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let tasks = ref [] in
+        let posted = ref [] in
+        let secrets_dependency =
+          Runner.secrets
+            ~unlock_private_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
+              Error "unexpected private-key unlock")
+            ~unlock_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+              Error "unexpected graph-key unlock")
+            ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+              Error (Runner.Wrapped_graph_key_unavailable "unexpected wrapped-key load"))
+            ~verify_and_save_wrapped_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+              Error "unexpected wrapped-key save")
+            ~delete_wrapped_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Error "graph-delete")
+            ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ ->
+              Error "account-delete")
+          |> Result.get_ok
+        in
+        let dependencies =
+          dependencies
+            ~secrets_dependency
+            ~environment
+            ~support
+            ~fork:(fun ~sw:_ task -> tasks := task :: !tasks)
+            ()
+        in
+        let runner =
+          Runner.create ~sw dependencies ~post:(fun event -> posted := event :: !posted)
+          |> Result.get_ok
+        in
+        Runner.submit runner (account_deletion_effect ());
+        Runner.submit runner (graph_deletion_effect ());
+        List.iter (fun task -> task ()) (List.rev !tasks);
+        let failures =
+          List.rev !posted
+          |> List.map (function
+            | Core.Runner_completed
+                (Core.Completion (_, Error (Core.Effect_failed message))) -> message
+            | _ -> fail "deletion callback did not map its error to Effect_failed")
+        in
+        Alcotest.(check (list string))
+          "callback errors remain typed"
+          [ "account-delete"; "graph-delete" ]
+          failures)))
+;;
+
+let private_key_unlock_and_sign_out () =
+  let authenticated =
+    Core.step (core ()) (Account_authenticated { user_id = Some "serialized-user" })
+  in
+  let catalog_token = token_request authenticated.effects in
+  let authorized =
+    Core.step authenticated.next (Token_provided (catalog_token, "catalog-token"))
+  in
+  let catalog =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+          Some
+            (Core.step
+               authorized.next
+               (Runner_completed (Completion (ticket, Ok [ encrypted_graph () ]))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      authorized.effects
+    |> Option.get
+  in
+  let selected = Core.step catalog.next (Graph_selected (graph_id ())) in
+  let scope = Core.admitted_graph_scope selected.next |> Option.get in
+  let missing = Core.step selected.next (Mirror_inspected (Mirror_absent scope)) in
+  let failed =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+          Some
+            (Core.step
+               missing.next
+               (Runner_completed
+                  (Completion (ticket, Error (Core.Effect_failed "missing key")))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      missing.effects
+    |> Option.get
+  in
+  let recovery = Core.step failed.next Online_recovery_requested in
+  let recovery_token = token_request recovery.effects in
+  let graph_key_fetch =
+    Core.step recovery.next (Token_provided (recovery_token, "e2ee-token"))
+  in
+  let user_key_fetch =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+          Some
+            (Core.step
+               graph_key_fetch.next
+               (Runner_completed (Completion (ticket, Ok "encrypted-graph-key"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      graph_key_fetch.effects
+    |> Option.get
+  in
+  let password_prompt =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+          Some
+            (Core.step
+               user_key_fetch.next
+               (Runner_completed (Completion (ticket, Ok "private-key-package"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      user_key_fetch.effects
+    |> Option.get
+  in
+  let unlocking = Core.step password_prompt.next (E2ee_password_submitted "password") in
+  let unlock =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Unlock_private_key request)) ->
+          Some (Core.Request (ticket, Core.Unlock_private_key request))
+        | Run _ | Delegate _ | Publish _ -> None)
+      unlocking.effects
+    |> Option.get
+  in
+  let signed_out = Core.step unlocking.next (Account_authenticated { user_id = None }) in
+  unlock, signed_out.effects
+;;
+
+let test_secret_cleanup_is_serialized_after_an_older_write () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let write_started, resolve_write_started = Eio.Promise.create () in
+        let release_write, resolve_release_write = Eio.Promise.create () in
+        let deletion_finished, resolve_deletion_finished = Eio.Promise.create () in
+        let order = ref [] in
+        let secrets_dependency =
+          Runner.secrets
+            ~unlock_private_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
+              Eio.Cancel.protect (fun () ->
+                order := "write-started" :: !order;
+                Eio.Promise.resolve resolve_write_started ();
+                Eio.Promise.await release_write;
+                order := "write-finished" :: !order;
+                Ok ()))
+            ~unlock_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+              Error "unexpected graph-key unlock")
+            ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+              Error (Runner.Wrapped_graph_key_unavailable "unexpected wrapped-key load"))
+            ~verify_and_save_wrapped_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+              Error "unexpected wrapped-key save")
+            ~delete_wrapped_graph_key:
+              (fun
+                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+              Error "unexpected graph deletion")
+            ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ ->
+              order := "delete-account" :: !order;
+              Eio.Promise.resolve resolve_deletion_finished ();
+              Ok ())
+          |> Result.get_ok
+        in
+        let dependencies =
+          dependencies
+            ~secrets_dependency
+            ~environment
+            ~support
+            ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
+            ()
+        in
+        let runner =
+          Runner.create ~sw dependencies ~post:(fun _ -> ()) |> Result.get_ok
+        in
+        let unlock, sign_out_effects = private_key_unlock_and_sign_out () in
+        Runner.submit runner unlock;
+        Eio.Promise.await write_started;
+        List.iter
+          (function
+            | Core.Run runner_effect -> Runner.submit runner runner_effect
+            | Delegate _ | Publish _ -> ())
+          sign_out_effects;
+        Eio.Fiber.yield ();
+        Alcotest.(check bool)
+          "delete waits while the older write is open"
+          false
+          (List.mem "delete-account" !order);
+        Eio.Promise.resolve resolve_release_write ();
+        Eio.Promise.await deletion_finished;
+        Alcotest.(check (list string))
+          "older write finishes before deletion"
+          [ "write-started"; "write-finished"; "delete-account" ]
+          (List.rev !order))))
+;;
+
+let source_contents relative alternatives =
+  let candidates = relative :: alternatives in
+  match List.find_opt Sys.file_exists candidates with
+  | None -> fail "unable to locate source file %s" relative
+  | Some filename ->
+    let channel = open_in_bin filename in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr channel)
+      (fun () -> really_input_string channel (in_channel_length channel))
+;;
+
+let contains text needle =
+  let rec loop offset =
+    if offset + String.length needle > String.length text
+    then false
+    else if String.sub text offset (String.length needle) = needle
+    then true
+    else loop (offset + 1)
+  in
+  String.length needle = 0 || loop 0
+;;
+
+let test_runner_source_has_no_placeholder_capabilities () =
+  let source =
+    source_contents
+      "logseq_sync/lib/effect_runner/effect_runner.ml"
+      [ "../lib/effect_runner/effect_runner.ml" ]
+  in
+  List.iter
+    (fun forbidden ->
+       if contains source forbidden
+       then fail "runner retains placeholder capability %s" forbidden)
+    [ "monotonic_ns"
+    ; "has_private_key"
+    ; "decrypt_private_key"
+    ; "decrypt_graph_key"
+    ; "ignore secrets.delete_wrapped_graph_key"
+    ; "ignore secrets.delete_account_secrets"
+    ]
+;;
+
 let scenarios =
   [ Alcotest.test_case
       "dependency constructors validate resources"
@@ -513,5 +837,21 @@ let scenarios =
       "cached wrapped key unlock failure is fail-closed"
       `Quick
       test_cached_wrapped_key_unlock_failure_is_fail_closed
+  ; Alcotest.test_case
+      "deletion callbacks receive exact identity once"
+      `Quick
+      test_deletion_callbacks_receive_exact_identity_once
+  ; Alcotest.test_case
+      "deletion callback failures are typed"
+      `Quick
+      test_deletion_callback_failures_are_typed
+  ; Alcotest.test_case
+      "secret cleanup is serialized after older writes"
+      `Quick
+      test_secret_cleanup_is_serialized_after_an_older_write
+  ; Alcotest.test_case
+      "runner source has no placeholder capabilities"
+      `Quick
+      test_runner_source_has_no_placeholder_capabilities
   ]
 ;;

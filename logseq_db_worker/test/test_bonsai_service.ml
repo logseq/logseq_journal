@@ -1,5 +1,4 @@
 module T = Logseq_db_worker_test_support.Test_support
-module F = Logseq_db_worker_test_support.Adapter_fixture
 module P = Logseq_db_worker.Protocol
 module ID = Bonsai_flutter_spec.Id
 module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
@@ -7,9 +6,6 @@ module Runner = Logseq_sync_effect_runner.Effect_runner
 
 let crypto =
   Runner.crypto
-    ~decrypt_private_key:(fun ~password:_ ~iterations:_ ~salt:_ ~iv:_ ~ciphertext:_ ->
-      Error "unavailable")
-    ~decrypt_graph_key:(fun ~private_key:_ ~ciphertext:_ -> Error "unavailable")
     ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "unavailable")
     ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "unavailable")
   |> Result.get_ok
@@ -17,7 +13,6 @@ let crypto =
 
 let secrets =
   Runner.secrets
-    ~has_private_key:(fun ~managed_sync_origin:_ ~user_id:_ -> false)
     ~unlock_private_key:
       (fun
         ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
@@ -37,7 +32,7 @@ let secrets =
 
 let dependencies =
   Service.dependencies
-    ~engine:F.dependencies
+    ~overlay:(T.overlay_dependencies ())
     ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
     ~secrets
     ~crypto
@@ -74,18 +69,44 @@ let with_client config run =
   Fun.protect ~finally:(fun () -> Worker_runtime.stop client) (fun () -> run client)
 ;;
 
-let test_managed_worker_starts_closed_and_replies_in_protocol () =
-  F.with_managed (fun fixture ->
+let v2_graph_info_request () =
+  let json =
+    `Assoc
+      [ "apiVersion", `Int 2
+      ; "requestId", `String "00000000-0000-4000-8000-000000000001"
+      ; "command", `Assoc [ "type", `String "graphInfo" ]
+      ]
+  in
+  match P.request_of_yojson json with
+  | Ok request -> request
+  | Error error ->
+    T.fail
+      "unable to build v2 graph-info request: %s"
+      (Logseq_db_worker.Error.message error)
+;;
+
+let test_managed_worker_starts_closed_and_replies_with_v2_envelope () =
+  T.with_managed (fun fixture ->
     with_client fixture.config (fun client ->
-      let request = F.graph_info_request () in
+      let request = v2_graph_info_request () in
       let id = Worker.send client (Service.Graph_request request) |> accepted in
       match await_response client id with
-      | Service.Graph_response (P.Failed { phase = Open; _ }) -> ()
-      | _ -> T.fail "managed worker did not reject a pre-selection graph request"))
+      | Service.Graph_response response ->
+        (match P.response_to_yojson response with
+         | `Assoc
+             [ ("apiVersion", `Int 2)
+             ; ("requestId", `String "00000000-0000-4000-8000-000000000001")
+             ; ("outcome", `Assoc (("type", `String "failed") :: _))
+             ] -> ()
+         | json ->
+           T.fail
+             "pre-selection v2 request did not return a v2 failure envelope: %s"
+             (Yojson.Safe.to_string json))
+      | _ -> T.fail "managed worker returned the wrong response kind"))
 ;;
 
 let test_managed_client_command_is_accepted () =
-  F.with_managed (fun fixture ->
+  T.with_managed (fun fixture ->
     with_client fixture.config (fun client ->
       let id =
         Worker.send
@@ -102,8 +123,8 @@ let () =
   T.run
     "bonsai worker service"
     [ T.case
-        "managed worker starts closed"
-        test_managed_worker_starts_closed_and_replies_in_protocol
+        "managed worker starts closed with a v2 envelope"
+        test_managed_worker_starts_closed_and_replies_with_v2_envelope
     ; T.case "managed client command is accepted" test_managed_client_command_is_accepted
     ]
 ;;

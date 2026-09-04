@@ -12,23 +12,23 @@ val garbage_collection_unreachable_address_threshold : int
 val garbage_collection_file_growth_threshold_bytes : int64
 
 val create
-  :  db:Datascript.db
-  -> tail:Datascript.datom list list
+  :  tail:Datascript.datom list list
   -> callbacks:Logseq_sqlite_storage.callbacks
   -> t
 
-val current_db : t -> Datascript.db
 val current_tail : t -> Datascript.datom list list
 
 val stage_transact
   :  ?tx_meta:Datascript.tx_meta
   -> t
+  -> authoritative_before:Datascript.db
   -> Datascript.tx_op list
   -> (staged, error) result
 
 val stage_transact_batch
   :  ?tx_meta:Datascript.tx_meta
   -> t
+  -> authoritative_before:Datascript.db
   -> Datascript.tx_op list list
   -> (staged, error) result
 
@@ -51,6 +51,15 @@ val commit_staged_with_sync_metadata_and_outbox
   -> staged
   -> Sync_checkpoint.t
   -> string list
+  -> (unit, error) result
+
+val commit_staged_with_sync_metadata_outbox_and_receipts
+  :  t
+  -> staged
+  -> Sync_checkpoint.t
+  -> string list
+  -> (string * string) list
+  -> (string * string) list
   -> (unit, error) result
 
 val garbage_collection_needed : t -> (bool, error) result

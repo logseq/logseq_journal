@@ -251,14 +251,6 @@ class RunnerTests: XCTestCase {
       "userId": userID,
       "graphId": graphID,
     ])
-    XCTAssertEqual(
-      try JournalE2EECrypto.handle([
-        "operation": "hasPrivateKey",
-        "origin": origin,
-        "userId": userID,
-      ])["value"] as? Bool,
-      true
-    )
     XCTAssertThrowsError(
       try JournalE2EECrypto.handle([
         "operation": "loadAndVerifyWrappedGraphKey",

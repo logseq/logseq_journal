@@ -1,0 +1,21 @@
+{
+  "apiVersion": 2,
+  "reads": {
+    "graphInfo": {"interest":"graphInfo","revision":"generation"},
+    "listJournals": {"interest":"journalIndex","revision":"journalIndexRevision"},
+    "getPage": {"interest":"pageUuid","revision":"pageRevision"},
+    "getBlock": {"interest":"blockUuid","revision":"blockRevision"},
+    "getChildren": {"interest":"childrenScope","revision":"structureRevision"},
+    "getPageTree": {"interest":"pageTreeDepth","revision":"structureRevision"}
+  },
+  "mutations": {
+    "saveBlock": {"target":"blockUuid","requiredPreconditions":["block"]},
+    "insertBlocks": {"target":"appendToParent","requiredPreconditions":["childrenScope"]},
+    "deleteBlocks": {"target":"singleRoot","requiredPreconditions":["block","pageTreeScope"]},
+    "createJournalPage": {"target":"journalDayAndPageUuid","requiredPreconditions":["journalIndex"]},
+    "setTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]},
+    "clearTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]}
+  },
+  "identity": {"fields":["mutationId","canonicalIntent"],"forbiddenFields":["expectedBasis"]},
+  "delivery": {"mode":"cumulativeUnacknowledgedWindows","ack":"explicit","overflow":"resync","generationChange":"mandatoryResync"}
+}

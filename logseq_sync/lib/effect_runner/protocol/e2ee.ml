@@ -27,6 +27,52 @@ let protect operation f =
   | error -> Error (operation ^ ": " ^ Printexc.to_string error)
 ;;
 
+let bounded_string field = function
+  | `String value
+    when String.length value > 0
+         && String.length value <= 65_536
+         && String.is_valid_utf_8 value
+         && not (String.contains value '\000') -> Ok value
+  | `String _
+  | `Assoc _
+  | `List _
+  | `Tuple _
+  | `Variant _
+  | `Null
+  | `Bool _
+  | `Int _
+  | `Intlit _
+  | `Float _ -> Error ("E2EE response " ^ field ^ " must be a bounded non-empty string")
+;;
+
+let graph_key_response source =
+  try
+    match Yojson.Safe.from_string source with
+    | `Assoc [ ("encrypted-aes-key", value) ] -> bounded_string "encrypted-aes-key" value
+    | `Assoc _ | `List _ | `Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _ ->
+      Error "E2EE graph-key response must contain exactly one encrypted-aes-key string"
+  with
+  | Yojson.Json_error _ -> Error "E2EE response must be valid JSON"
+;;
+
+let user_keys_response source =
+  try
+    match Yojson.Safe.from_string source with
+    | `Assoc
+        [ ("public-key", public_key); ("encrypted-private-key", encrypted_private_key) ]
+    | `Assoc
+        [ ("encrypted-private-key", encrypted_private_key); ("public-key", public_key) ]
+      ->
+      bind (bounded_string "public-key" public_key) (fun _ ->
+        bounded_string "encrypted-private-key" encrypted_private_key)
+    | `Assoc _ | `List _ | `Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _ ->
+      Error
+        "E2EE user-key response must contain exactly public-key and \
+         encrypted-private-key strings"
+  with
+  | Yojson.Json_error _ -> Error "E2EE response must be valid JSON"
+;;
+
 let private_key_package source =
   bind
     (protect "decode encrypted private key" (fun () -> Codec.of_string source))

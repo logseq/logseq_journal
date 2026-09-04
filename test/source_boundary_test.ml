@@ -295,8 +295,6 @@ let test_logseq_sync_package_boundary root =
     ; "logseq_db_types/lib/dune"
     ; "logseq_db_types/lib/graph_types.ml"
     ; "logseq_db_types/lib/graph_types.mli"
-    ; "logseq_db_types/lib/mutation.ml"
-    ; "logseq_db_types/lib/mutation.mli"
     ; "logseq_db_types/lib/sync_checkpoint.ml"
     ; "logseq_db_types/lib/sync_checkpoint.mli"
     ; "logseq_db_storage/lib/dune"
@@ -361,6 +359,7 @@ let test_logseq_sync_package_boundary root =
     ; "(package\n (name logseq_sync)"
     ; "(package\n (name logseq_db_worker)"
     ];
+  require_occurrences root "dune-project" "(logseq_overlay_db (= 0.1.0))" 2;
   require_text
     root
     "logseq_sync/spec/pure_reducer/dune"
@@ -372,24 +371,29 @@ let test_logseq_sync_package_boundary root =
     ; "(public_name logseq_sync.effect_runner)"
     ; "logseq_sync.pure_reducer"
     ];
-  require_text root "logseq_sync/lib/pure_reducer/dune" [ "(private_modules" ];
   require_text root "logseq_sync/lib/effect_runner/dune" [ "(private_modules" ];
   require_text
     root
     "logseq_db_worker/lib/dune"
-    [ "logseq_db_types"; "logseq_db_storage"; "logseq_sync.pure_reducer" ];
+    [ "logseq_overlay_db"; "logseq_sync.pure_reducer" ];
+  forbid_text root "logseq_db_worker/lib/dune" [ "logseq_db_storage"; "datascript" ];
   require_text root "logseq_db_storage.opam" [ "\"logseq_db_types\" {= \"0.1.0\"}" ];
-  require_text
-    root
-    "logseq_sync.opam"
-    [ "\"logseq_db_types\" {= \"0.1.0\"}"; "\"logseq_db_storage\" {= \"0.1.0\"}" ];
+  require_text root "logseq_sync.opam" [ "\"logseq_overlay_db\" {= \"0.1.0\"}" ];
+  require_text root "logseq_sync.opam.locked" [ "\"logseq_overlay_db\" {= \"0.1.0\"}" ];
+  forbid_text root "logseq_sync.opam" [ "\"logseq_db_storage\""; "\"datascript_ocaml\"" ];
   require_text
     root
     "logseq_db_worker.opam"
-    [ "\"logseq_db_types\" {= \"0.1.0\"}"
-    ; "\"logseq_db_storage\" {= \"0.1.0\"}"
-    ; "\"logseq_sync\" {= \"0.1.0\"}"
-    ];
+    [ "\"logseq_overlay_db\" {= \"0.1.0\"}"; "\"logseq_sync\" {= \"0.1.0\"}" ];
+  require_text
+    root
+    "logseq_db_worker.opam.locked"
+    [ "\"logseq_overlay_db\" {= \"0.1.0\"}"; "\"logseq_sync\" {= \"0.1.0\"}" ];
+  require_text root "logseq_journal.opam.locked" [ "\"logseq_overlay_db\" {= \"0.1.0\"}" ];
+  forbid_text
+    root
+    "logseq_db_worker.opam"
+    [ "\"logseq_db_storage\""; "\"datascript_ocaml\"" ];
   forbid_text
     root
     "logseq_db_worker.opam"
@@ -408,7 +412,14 @@ let test_logseq_sync_package_boundary root =
   forbid_text
     root
     "logseq_db_worker/contract/protocol.mli"
-    [ "and mutation ="
+    [ "| Read of"
+    ; "| Mutate of"
+    ; "| V2 of"
+    ; "Graph_invalidated"
+    ; "type invalidation ="
+    ; "and read_command ="
+    ; "Logseq_db_types.Mutation"
+    ; "and mutation ="
     ; "and structural_mutation ="
     ; "and page_mutation ="
     ; "and property_mutation ="
@@ -576,7 +587,13 @@ let test_standalone_sync_protocol_boundary root =
     [ "(name logseq_sync_pure_reducer_impl)"
     ; "(public_name logseq_sync.pure_reducer.impl)"
     ; "(implements logseq_sync_pure_reducer)"
-    ; "(modules checksum core pure_tx sync_protocol)"
+    ; "(modules core sync_protocol)"
+    ];
+  List.iter
+    (forbid_path root)
+    [ "logseq_sync/lib/pure_reducer/checksum.ml"
+    ; "logseq_sync/lib/pure_reducer/checksum.mli"
+    ; "logseq_sync/lib/pure_reducer/pure_tx.ml"
     ];
   require_text
     root
@@ -657,35 +674,22 @@ let test_bonsai_flutter_dune_closure_names root =
     ]
 ;;
 
-let test_worker_owned_managed_sync_orchestration root =
-  require_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "type event ="
-    ; "type runner_completion"
-    ; "type worker_effect ="
-    ; "| Complete_local_batch of local_batch_completion_request"
-    ; "| Apply_authoritative_batch of authoritative_commit_request"
-    ; "| Commit_outbox_transition of outbox_transition"
-    ];
-  forbid_text
-    root
-    "logseq_sync/spec/pure_reducer/core.mli"
-    [ "| Commit_local_batch of local_batch_commit_request"
-    ; "graph_backend"
-    ; "open_graph:"
-    ; "close_graph:"
-    ; "authoritative_database:"
-    ; "projected_database:"
-    ; "prepare_local_change:"
-    ; "reprepare_local_change:"
-    ; "project_encoded:"
-    ; "reset_projection:"
-    ; "stage_authoritative:"
-    ; "persist_checkpoint:"
-    ; "type ('graph, 'mutation, 'mutation_result) t"
-    ; "val mutate"
-    ];
+let test_worker_owned_overlay_orchestration root =
+  let forbidden_raw_data_plane =
+    [ "Datascript.db"
+    ; "Datascript.tx_op"
+    ; "Logseq_db_storage"
+    ; "Sync_checkpoint.t"
+    ; "outbox_records : string list"
+    ; "projection_transactions"
+    ; "authoritative_database"
+    ; "projected_database"
+    ]
+  in
+  List.iter
+    (fun relative -> forbid_text root relative forbidden_raw_data_plane)
+    (files_with_suffixes root "logseq_sync/spec" [ ".mli" ]
+     @ files_with_suffixes root "logseq_sync/lib" [ ".ml"; ".mli" ]);
   let sync_files = files_with_suffixes root "logseq_sync" [ ".ml"; ".mli" ] in
   List.iter
     (fun relative ->
@@ -696,6 +700,23 @@ let test_worker_owned_managed_sync_orchestration root =
     sync_files;
   require_text
     root
+    "logseq_sync/spec/pure_reducer/core.mli"
+    [ "Logseq_overlay_db.Types"; "type worker_effect =" ];
+  require_text
+    root
+    "logseq_db_worker/lib/effect_runner/effect_runner.ml"
+    [ "Logseq_overlay_db.Database"; "Logseq_overlay_db.Types" ];
+  forbid_text
+    root
+    "logseq_db_worker/lib/effect_runner/effect_runner.ml"
+    [ "Logseq_db_worker_engine"
+    ; "Engine."
+    ; "Mutation."
+    ; "Datascript."
+    ; "Logseq_db_storage"
+    ];
+  require_text
+    root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
     [ "Logseq_db_worker_pure_reducer.Core"
     ; "Logseq_db_worker_effect_runner.Effect_runner"
@@ -704,49 +725,12 @@ let test_worker_owned_managed_sync_orchestration root =
   forbid_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "Core.graph_backend"; "Core.mutate"; "Core.Engine" ];
-  require_text
-    root
-    "logseq_db_worker/lib/engine.mli"
-    [ "type prepared_managed_mutation"
-    ; "val commit_managed_mutation"
-    ; "val authoritative_precondition"
-    ; "val replan_managed_mutation"
-    ; "val apply_authoritative"
-    ; "val commit_outbox_transition"
-    ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/engine.mli"
-    [ "val restore_managed_outbox"
-    ; "val reprepare_managed_mutation"
-    ; "val project_encoded"
-    ; "val reset_projection"
-    ; "val persist_checkpoint"
-    ];
-  require_text
-    root
-    "logseq_db_worker/lib/effect_runner/effect_runner.ml"
-    [ "Mutation.identify mutation"
-    ; "Mutation.identity_fingerprint identity"
-    ; "Engine.prepare_managed_mutation"
-    ];
-  forbid_text
-    root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
-    [ "Mutation.to_yojson mutation" ];
-  forbid_text root "logseq_db_worker/lib/engine.ml" [ "Marshal.to_string" ];
-  require_text
-    root
-    "logseq_db_storage/lib/storage_session.mli"
-    [ "val load_sync_outbox"
-    ; "val commit_sync_outbox_insert"
-    ; "val commit_staged_with_sync_metadata_and_outbox"
-    ];
-  require_text
-    root
-    "logseq_db_worker/lib/pure_reducer/core.ml"
-    [ "generation : int"; "lifecycle_generation" ]
+    [ "Core.graph_backend"
+    ; "Core.mutate"
+    ; "Core.Engine"
+    ; "Mutation.to_yojson mutation"
+    ; "Db.Engine"
+    ]
 ;;
 
 let test_logseq_sync_install_manifest filename =
@@ -789,6 +773,141 @@ let test_logseq_sync_install_manifest filename =
     ; "/logseq_sync__Effect_runner.cmi"
     ; "/logseq_sync__Sync_protocol.cmi"
     ]
+;;
+
+let test_logseq_overlay_db_install_manifest filename =
+  let contents = read_file filename in
+  List.iter
+    (fun installed_interface ->
+       if not (contains contents installed_interface)
+       then fail "installed logseq_overlay_db package is missing %s" installed_interface)
+    [ "/logseq_overlay_db/types.mli"; "/logseq_overlay_db/database.mli" ];
+  List.iter
+    (fun (source, compiled) ->
+       if not (contains contents ("/impl/" ^ source ^ ".mli"))
+       then fail "installed overlay implementation is missing private module %s" source;
+       if not (contains contents ("/impl/.private/" ^ compiled ^ ".cmi"))
+       then fail "installed overlay module is not compiled into .private: %s" source;
+       if contains contents ("/logseq_overlay_db/" ^ source ^ ".mli")
+       then fail "installed overlay virtual library exposes private module %s" source)
+    [ "queryable_outbox", "logseq_overlay_db__logseq_overlay_db_impl__Queryable_outbox"
+    ; "overlay_read", "logseq_overlay_db__logseq_overlay_db_impl__Overlay_read"
+    ; "overlay_planner", "logseq_overlay_db__logseq_overlay_db_impl__Overlay_planner"
+    ; "transition", "logseq_overlay_db__logseq_overlay_db_impl__Transition"
+    ; ( "authoritative_store"
+      , "logseq_overlay_db__logseq_overlay_db_impl__Authoritative_store" )
+    ]
+;;
+
+let test_final_overlay_data_plane_boundary root =
+  List.iter
+    (require_file root)
+    [ "logseq_overlay_db/spec/types.mli"
+    ; "logseq_overlay_db/spec/database.mli"
+    ; "logseq_overlay_db/lib/database.ml"
+    ];
+  List.iter
+    (forbid_path root)
+    [ "logseq_db_types/lib/mutation.ml"
+    ; "logseq_db_types/lib/mutation.mli"
+    ; "logseq_db_worker/lib/engine.ml"
+    ; "logseq_db_worker/lib/engine.mli"
+    ; "logseq_db_worker/lib/read_model.ml"
+    ; "logseq_db_worker/lib/read_model.mli"
+    ; "logseq_db_worker/lib/query.ml"
+    ; "logseq_db_worker/lib/query.mli"
+    ; "logseq_db_worker/lib/mutation_plan.ml"
+    ; "logseq_db_worker/lib/mutation_plan.mli"
+    ; "logseq_db_worker/lib/outliner_order.ml"
+    ; "logseq_db_worker/lib/outliner_order.mli"
+    ; "logseq_db_worker/lib/ownership.ml"
+    ; "logseq_db_worker/lib/ownership.mli"
+    ; "logseq_db_worker/lib/synced_mirror.ml"
+    ; "logseq_db_worker/lib/synced_mirror.mli"
+    ; "logseq_db_worker/lib/synced_snapshot_parser.ml"
+    ; "logseq_db_worker/lib/synced_snapshot_parser.mli"
+    ; "logseq_db_worker/lib/outliner"
+    ; "logseq_db_worker/test/test_engine_managed.ml"
+    ; "logseq_db_worker/test/test_storage_atomicity.ml"
+    ; "logseq_db_worker/test/test_performance.ml"
+    ; "logseq_db_worker/test/fixtures/protocol/v1-command-catalog.json"
+    ; "logseq_db_worker/test/fixtures/protocol/v1-operation-contracts.json"
+    ; "logseq_db_worker/test/fixtures/protocol/v1-outcome-catalog.json"
+    ; "logseq_db_worker/test/fixtures/performance/100000-blocks-v1.manifest.json"
+    ; "logseq_db_worker/test/fixtures/performance/reference-apple-silicon-v1.json"
+    ; "logseq_db_worker/tool/performance_benchmark.ml"
+    ; "logseq_db_worker/tool/test_performance.sh"
+    ; "logseq_sync/lib/pure_reducer/pure_tx.ml"
+    ; "logseq_sync/lib/pure_reducer/checksum.ml"
+    ; "logseq_sync/lib/pure_reducer/checksum.mli"
+    ; "logseq_db_types/test/test_mutation_identity.ml"
+    ; "logseq_db_types/test/dune"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "Datascript.db"
+         ; "Datascript.conn"
+         ; "Datascript.entity_id"
+         ; "Datascript.tx_op"
+         ; "Logseq_db_types.Mutation"
+         ; "projected_db"
+         ; "projected_conn"
+         ; "Projected_connection"
+         ])
+    (files_with_suffixes root "logseq_overlay_db/spec" [ ".mli" ]);
+  forbid_text
+    root
+    "logseq_db_storage/lib/storage_session.mli"
+    [ "val current_db"; "db:Datascript.db"; "Persistent_sorted_set.t" ];
+  forbid_text
+    root
+    "logseq_overlay_db/lib/database.ml"
+    [ "mutable authoritative_blocks"
+    ; "mutable authoritative_pages"
+    ; "mutable blocks : (Graph.block_uuid * Types.block_record) list"
+    ; "mutable pages : (Graph.page_uuid * Types.page_record) list"
+    ; "blocks : (Graph.block_uuid * Types.block_record) list"
+    ; "pages : (Graph.page_uuid * Types.page_record) list"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "Logseq_db_types.Mutation"
+         ; "Logseq_db_worker_engine"
+         ; "Engine."
+         ; "Datascript."
+         ; "Logseq_db_storage"
+         ; "Storage_session"
+         ; "projected_db"
+         ; "projected_conn"
+         ])
+    (files_with_suffixes root "logseq_db_worker/contract" [ ".ml"; ".mli"; "dune" ]
+     @ files_with_suffixes root "logseq_db_worker/spec" [ ".ml"; ".mli"; "dune" ]
+     @ files_with_suffixes root "logseq_db_worker/lib" [ ".ml"; ".mli"; "dune" ]
+     @ files_with_suffixes root "logseq_db_worker/bonsai" [ ".ml"; ".mli"; "dune" ]);
+  List.iter
+    (fun relative -> forbid_text root relative [ "Logseq_overlay_db"; "Logseq_sync" ])
+    (ocaml_product_files root);
+  forbid_text root "app/dune" [ "logseq_sync"; "logseq_overlay_db" ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "type graph_info ="; "basis : int64"; "expected_basis" ])
+    [ "logseq_db_types/lib/graph_types.ml"; "logseq_db_types/lib/graph_types.mli" ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "type state ="; "type t ="; "type pending ="; "type success =" ])
+    [ "logseq_db_types/lib/sync_status.ml"; "logseq_db_types/lib/sync_status.mli" ]
 ;;
 
 let test_repository_local_runtime_tests root =
@@ -949,10 +1068,10 @@ let test_deployed_managed_sync_e2e_boundary root =
     ; "Service.service"
     ; "Worker_runtime.start"
     ; "Service.Graph_request"
-    ; "List_pages"
-    ; "Insert_blocks"
-    ; "Get_block"
-    ; "Delete_blocks"
+    ; "V2_list_journals"
+    ; "V2_insert_blocks"
+    ; "V2_get_block"
+    ; "V2_delete_blocks"
     ; "flutter/JournalE2EECrypto.swift"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_FILE_KEYCHAIN"
     ; "DYLD_INSERT_LIBRARIES"
@@ -990,6 +1109,9 @@ let test_deployed_managed_sync_e2e_boundary root =
     ; "Create_ordinary_page"
     ; "Delete_page"
     ; "Permanently_delete_recycled_page"
+    ; "List_pages"
+    ; "expected_basis"
+    ; "Logseq_db_types.Mutation"
     ];
   List.iter
     (forbid_path root)
@@ -1008,12 +1130,16 @@ let test_deployed_managed_sync_e2e_boundary root =
 ;;
 
 let () =
-  if Array.length Sys.argv > 3
-  then failwith "usage: source_boundary_test [REPOSITORY_ROOT [INSTALL_MANIFEST]]";
+  if Array.length Sys.argv > 4
+  then
+    failwith
+      "usage: source_boundary_test [REPOSITORY_ROOT [SYNC_INSTALL_MANIFEST \
+       [OVERLAY_INSTALL_MANIFEST]]]";
   let root =
     if Array.length Sys.argv >= 2 then Sys.argv.(1) else repository_root (Sys.getcwd ())
   in
-  if Array.length Sys.argv = 3 then test_logseq_sync_install_manifest Sys.argv.(2);
+  if Array.length Sys.argv >= 3 then test_logseq_sync_install_manifest Sys.argv.(2);
+  if Array.length Sys.argv = 4 then test_logseq_overlay_db_install_manifest Sys.argv.(3);
   test_exact_dependency_matching ();
   test_deployed_managed_sync_e2e_boundary root;
   test_public_api_only_test_boundaries root;
@@ -1022,7 +1148,8 @@ let () =
   test_injected_logseq_sync_api_boundary root;
   test_standalone_sync_protocol_boundary root;
   test_bonsai_flutter_dune_closure_names root;
-  test_worker_owned_managed_sync_orchestration root;
+  test_worker_owned_overlay_orchestration root;
+  test_final_overlay_data_plane_boundary root;
   test_startup_phase_ownership root;
   test_repository_local_runtime_tests root;
   test_sync_transport_is_websocket_only root;
@@ -1032,7 +1159,7 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "de1196c2663b43388ebf04bd0612c5050edef753" in
+  let current_bonsai_flutter_revision = "3d2a540d886839fb243ce78f4bcc38da13c600a9" in
   let obsolete_bonsai_flutter_revisions =
     [ "f4377637a33cdc450204734d033bbcbb861e06bb"
     ; "1755441c24d718206a3d61af0882c0727f810d46"
@@ -1048,6 +1175,7 @@ let () =
     ; "d182690aeaa82ad0a972756205c62e3b598e3c24"
     ; "5f8f540e4ccfd1e1807294aec8ac5f229161e2da"
     ; "fcde784654ee5b8557afc3c966d840f2b1331912"
+    ; "de1196c2663b43388ebf04bd0612c5050edef753"
     ]
   in
   List.iter
@@ -1061,20 +1189,27 @@ let () =
     ];
   let dependency_manifests =
     [ "logseq_db_storage.opam"
+    ; "logseq_overlay_db.opam"
     ; "logseq_sync.opam"
     ; "logseq_journal.opam"
     ; "logseq_db_worker.opam"
     ; "logseq_db_storage.opam.locked"
+    ; "logseq_overlay_db.opam.locked"
     ; "logseq_sync.opam.locked"
     ; "logseq_journal.opam.locked"
     ; "logseq_db_worker.opam.locked"
     ]
   in
-  let current_datascript_revision = "5895af25101de15f56d7c5df383c150ca07cef90" in
+  let current_datascript_revision = "40345cc2f59214daa88b33b8aec711337d20afa7" in
   List.iter
     (fun relative ->
        require_occurrences root relative current_datascript_revision 2;
-       forbid_text root relative [ "b1029d6a7210baae15f56d7c5df383c150ca07cef90" ])
+       forbid_text
+         root
+         relative
+         [ "b1029d6a7210baae15f56d7c5df383c150ca07cef90"
+         ; "5895af25101de15f56d7c5df383c150ca07cef90"
+         ])
     dependency_manifests;
   let current_melange_transit_revision = "35f8afe7d6506863c7253e67a20befb3dde5c18f" in
   List.iter
@@ -1090,16 +1225,18 @@ let () =
          ; "melange-transit-native.0.1.1"
          ; "melange-transit-core.0.1.1"
          ])
-    [ "logseq_db_storage.opam", 1
-    ; "logseq_sync.opam", 1
+    [ "logseq_db_storage.opam", 2
+    ; "logseq_overlay_db.opam", 2
+    ; "logseq_sync.opam", 2
     ; "logseq_journal.opam", 2
-    ; "logseq_db_worker.opam", 1
+    ; "logseq_db_worker.opam", 2
     ; "logseq_db_storage.opam.locked", 2
+    ; "logseq_overlay_db.opam.locked", 2
     ; "logseq_sync.opam.locked", 2
     ; "logseq_journal.opam.locked", 2
     ; "logseq_db_worker.opam.locked", 2
     ];
-  require_occurrences root "dune-project" "(melange-transit-native (= 0.1.2))" 4;
+  require_occurrences root "dune-project" "(melange-transit-native (= 0.1.2))" 5;
   require_occurrences root "dune-project" "(melange-transit-core (= 0.1.2))" 1;
   List.iter
     (fun relative ->
@@ -1145,10 +1282,6 @@ let () =
     ; "logseq_sync/lib/effect_runner/protocol/catalog.mli"
     ; "logseq_sync/lib/effect_runner/eio/http.ml"
     ; "logseq_sync/lib/effect_runner/eio/http.mli"
-    ; "logseq_db_worker/lib/outliner/graph_read.ml"
-    ; "logseq_db_worker/lib/outliner/graph_read.mli"
-    ; "logseq_db_worker/lib/outliner/planner_contract.ml"
-    ; "logseq_db_worker/lib/outliner/planner_contract.mli"
     ; "flutter/lib/application_host_adapter.dart"
     ; "flutter/lib/main.dart"
     ; "flutter/test/application_host_adapter_test.dart"
@@ -1156,98 +1289,6 @@ let () =
     ; "test/test_material_icons_artifact.sh"
     ; "tool/verify_material_icons_font.sh"
     ];
-  require_text
-    root
-    "logseq_db_worker/lib/outliner/graph_read.mli"
-    [ "val values"
-    ; "val one"
-    ; "val string_value"
-    ; "val reference_value"
-    ; "val has_true"
-    ; "val entities_by_uuid"
-    ; "val uuid_of_entity"
-    ; "val is_page"
-    ; "val children"
-    ];
-  require_text
-    root
-    "logseq_db_worker/lib/outliner/planner_contract.mli"
-    [ "type t ="
-    ; "tx_ops : Datascript.tx_op list"
-    ; "status : Logseq_db_types.Mutation.status"
-    ; "type error ="
-    ; "Unsupported_semantics of string"
-    ; "Built_in_protected"
-    ];
-  let outliner_planners =
-    [ "save_block"
-    ; "insert_blocks"
-    ; "move_blocks"
-    ; "indent_outdent"
-    ; "delete_blocks"
-    ; "pages"
-    ; "properties"
-    ]
-  in
-  List.iter
-    (fun planner ->
-       List.iter
-         (fun suffix ->
-            forbid_text
-              root
-              ("logseq_db_worker/lib/outliner/" ^ planner ^ suffix)
-              [ "type t =\n  { tx_ops"; "type error =" ])
-         [ ".ml"; ".mli" ])
-    outliner_planners;
-  List.iter
-    (fun relative ->
-       forbid_text
-         root
-         relative
-         [ "let values db entity attr ="
-         ; "let string_value db entity attr ="
-         ; "let reference_value db entity attr ="
-         ; "let has_true db entity attr ="
-         ; "let entities_by_uuid db uuid ="
-         ; "let uuid_of_entity db entity ="
-         ; "let is_page db entity ="
-         ; "let children db parent ="
-         ])
-    [ "logseq_db_worker/lib/outliner/delete_blocks.ml"
-    ; "logseq_db_worker/lib/outliner/indent_outdent.ml"
-    ; "logseq_db_worker/lib/outliner/insert_blocks.ml"
-    ; "logseq_db_worker/lib/outliner/move_blocks.ml"
-    ; "logseq_db_worker/lib/outliner/pages.ml"
-    ; "logseq_db_worker/lib/outliner/properties.ml"
-    ; "logseq_db_worker/lib/outliner/references.ml"
-    ; "logseq_db_worker/lib/outliner/save_block.ml"
-    ];
-  List.iter
-    (fun relative -> forbid_text root relative [ "let one db entity attr =" ])
-    [ "logseq_db_worker/lib/outliner/delete_blocks.ml"
-    ; "logseq_db_worker/lib/outliner/indent_outdent.ml"
-    ; "logseq_db_worker/lib/outliner/insert_blocks.ml"
-    ; "logseq_db_worker/lib/outliner/move_blocks.ml"
-    ; "logseq_db_worker/lib/outliner/pages.ml"
-    ; "logseq_db_worker/lib/outliner/save_block.ml"
-    ];
-  require_text
-    root
-    "logseq_db_worker/lib/mutation_plan.ml"
-    [ "include Outliner.Planner_contract" ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/mutation_plan.ml"
-    [ "type t ="; "type error ="; "| Ok plan ->" ];
-  forbid_text root "logseq_db_worker/lib/mutation_plan.mli" [ "type t ="; "type error =" ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/outliner/pages.ml"
-    [ "Save_block.Built_in_protected" ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/outliner/indent_outdent.ml"
-    [ "Move_blocks.Unsupported_semantics" ];
   require_text
     root
     "app/material_icon_catalog.mli"
@@ -1284,31 +1325,45 @@ let () =
   require_text
     root
     "app/journal_header.ml"
-    [ "Ui.Widget.Sliver.app_bar"
+    [ "Ui.Material.App_bar.sliver"
+    ; "Ui.Material.Tooltip.plain"
     ; "~pinned:true"
     ; "~floating:false"
     ; "~snap:false"
-    ; "~stretch:false"
-    ; "~automatically_imply_leading:false"
     ; "~center_title:true"
+    ; "~variant:Ui.Material.App_bar.Small"
+    ; "~shape:Ui.Material.App_bar.Square"
+    ; "~density:Ui.Material.App_bar.Compact"
     ];
   forbid_text
     root
     "app/journal_header.ml"
     [ "Ui.Widget.safe_area"
+    ; "Ui.Widget.Sliver.app_bar"
+    ; "journal-header-flexible-space"
+    ; "journal-header-divider"
     ; "journal-header-stack"
     ; "journal-header-surface"
     ; "journal-header-content-height"
     ];
+  forbid_text
+    root
+    "app/application.ml"
+    [ "Ui.Widget.button"; "Ui.Material.choice_chip"; "Ui.Material.list_tile" ];
   require_text
     root
     "app/application.ml"
     [ "Journal_header.sliver"
+    ; "Ui.Material.Chip.filter"
+    ; "Ui.Material.Dialog.alert"
+    ; "Ui.Material.text_button"
+    ; "Ui.Material.Tooltip.plain"
     ; "Ui.Widget.Scroll_view.vertical"
     ; "journal-scroll"
     ; "~floating_action_button:capture"
     ; "~floating_action_button_location:Ui.Material.End_float"
     ];
+  forbid_text root "app/journal_header.ml" [ "~variant:Ui.Material.App_bar.Medium" ];
   forbid_text
     root
     "app/application.ml"
@@ -1452,13 +1507,12 @@ let () =
     "app/application.ml"
     [ "Ui.Theme.System"
     ; "~high_contrast_dark"
-    ; "Ui.Material.list_tile"
+    ; "Ui.Material.text_button"
     ; "Ui.Native_widget.Expandable_message_composer"
     ; "~floating_action_button:capture"
     ];
-  List.iter
-    (fun relative -> require_text root relative [ "Ui.Material.divider" ])
-    [ "app/journal_header.ml"; "app/journal_timeline.ml" ];
+  require_text root "app/journal_timeline.ml" [ "Ui.Material.divider" ];
+  forbid_text root "app/journal_header.ml" [ "Ui.Material.divider" ];
   forbid_text
     root
     "app/journal_timeline.ml"
@@ -1845,10 +1899,6 @@ let () =
     root
     "logseq_db_worker/contract/error.ml"
     [ "Ownership_recovery"; "ownershipRecovery" ];
-  require_text
-    root
-    "logseq_db_worker/lib/engine.ml"
-    [ "Ownership recovery could not be verified" ];
   forbid_text root "app/application.ml" [ "timeline-task:" ];
   require_text
     root
@@ -1866,15 +1916,6 @@ let () =
     ; "val fixed_extent"
     ; "type preview_geometry"
     ];
-  forbid_text
-    root
-    "logseq_db_worker/lib/engine.ml"
-    [ "Datascript.serializable"
-    ; "validate_storage_header connection"
-    ; "let structurally_valid schema db"
-    ];
-  require_occurrences root "logseq_db_worker/lib/engine.ml" "tree_structural_violations" 3;
-  require_occurrences root "logseq_db_worker/lib/engine.ml" "validate_tree_for_mutation" 3;
   forbid_text
     root
     "logseq_db_storage/lib/storage_session.ml"
@@ -1911,9 +1952,7 @@ let () =
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.mli"
-    [ "Client_command_completed"
-    ; "Client_state_changed of Logseq_sync_pure_reducer.Core.state"
-    ];
+    [ "Client_command_completed"; "Client_state_changed of state" ];
   forbid_text
     root
     "logseq_sync/spec/action.mli"
@@ -2062,6 +2101,32 @@ let () =
     ; "graph_error : string option"
     ; "capture_error : string option"
     ; "sync_error : string option"
+    ];
+  List.iter
+    (forbid_path root)
+    [ "logseq_db_worker/test/adapter_fixture.ml"
+    ; "logseq_db_worker/test/structural_fixture.ml"
+    ; "logseq_db_worker/test/test_fixture_generator.ml"
+    ; "logseq_db_worker/tool/fixture_generator.ml"
+    ; "logseq_db_worker/tool/generate_fixtures.ml"
+    ; "logseq_db_worker/tool/mutation_identity_benchmark.ml"
+    ; "test/journal_runtime_golden_fixture.ml"
+    ; "test/managed_application_fixture.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_01_unowned_snapshot_progress.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_02_duplicate_mirror_inspection.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_03_duplicate_graph_attachment.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_04_duplicate_websocket_open.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_05_message_after_websocket_close.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_06_unsolicited_authoritative_apply.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_07_restore_accepts_old_catalog.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_08_reused_graph_token_challenge.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_09_unsolicited_local_commit.ml"
+    ; "logseq_sync/test/test_pure_reducer_bad_case_10_mismatched_outbox_commit.ml"
+    ];
+  List.iter
+    (require_file root)
+    [ "test/application_view_test.ml"
+    ; "test/logseq_db_worker_application_integration_test.ml"
     ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"

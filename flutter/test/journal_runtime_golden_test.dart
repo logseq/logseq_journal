@@ -15,6 +15,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 // ignore: depend_on_referenced_packages
+import 'package:material_3_expressive/material_3_expressive.dart';
+// ignore: depend_on_referenced_packages
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 import 'package:flutter_test/flutter_test.dart';
 
@@ -117,7 +119,7 @@ void main() {
         await tester.pump();
         expect(
           _sliverPaintExtent(tester, find.byType(SliverAppBar)),
-          closeTo(56 + 47 + 1, 0.5),
+          closeTo(64 + 47, 0.5),
         );
         position.jumpTo(0);
         await tester.pump(const Duration(milliseconds: 220));
@@ -141,6 +143,18 @@ void main() {
           () => find.text('Settings').evaluate().isNotEmpty,
           reason: 'the Account dialog did not expose Settings',
         );
+        expect(find.byType(M3EDialog), findsOneWidget);
+        final accountDialog = tester.widget<M3EDialog>(find.byType(M3EDialog));
+        expect(accountDialog.actions, hasLength(1));
+        final accountButtons = find.descendant(
+          of: find.byType(M3EDialog),
+          matching: find.byType(M3EButton),
+        );
+        expect(accountButtons, findsNWidgets(6));
+        for (final element in accountButtons.evaluate()) {
+          expect((element.widget as M3EButton).style, M3EButtonStyle.text);
+        }
+        expect(tester.takeException(), isNull);
         await tester.tap(find.text('Settings').last);
         await harness.pumpUntil(
           () => find.text(label).evaluate().isNotEmpty,
@@ -150,14 +164,15 @@ void main() {
         await harness.pumpUntil(() {
           final chip = find.ancestor(
             of: find.text(label),
-            matching: find.byType(ChoiceChip),
+            matching: find.byType(M3EChip),
           );
           return chip.evaluate().isNotEmpty &&
-              tester.widget<ChoiceChip>(chip).selected;
+              tester.widget<M3EChip>(chip).type == M3EChipType.filter &&
+              tester.widget<M3EChip>(chip).selected;
         }, reason: 'the $storedValue preset did not become selected');
         await tester.tap(find.text('Close'));
         await harness.pumpUntil(
-          () => find.byType(ChoiceChip).evaluate().isEmpty,
+          () => find.byType(M3EChip).evaluate().isEmpty,
           reason: 'Settings did not close after selecting $storedValue',
         );
         await tester.pump(const Duration(milliseconds: 220));
@@ -632,6 +647,14 @@ void main() {
       await tester.pump(const Duration(milliseconds: 220));
       expect(find.byType(BottomSheet), findsWidgets);
       expect(find.byType(DraggableScrollableSheet), findsOneWidget);
+      final statusButtons = find.descendant(
+        of: find.byType(DraggableScrollableSheet),
+        matching: find.byType(M3EButton),
+      );
+      expect(statusButtons, findsNWidgets(7));
+      for (final element in statusButtons.evaluate()) {
+        expect((element.widget as M3EButton).style, M3EButtonStyle.text);
+      }
       final sheetRect = tester.getRect(find.byType(DraggableScrollableSheet));
       final screenHeight = tester.getSize(find.byType(MaterialApp)).height;
       expect(
@@ -808,6 +831,13 @@ void main() {
       expect(captureFabRect.width, lessThan(scaffoldRect.width));
       expect(find.byType(CustomScrollView), findsOneWidget);
       expect(find.byType(SliverAppBar), findsOneWidget);
+      expect(
+        find.ancestor(
+          of: find.bySemanticsLabel('Account menu'),
+          matching: find.byType(M3ETooltip),
+        ),
+        findsOneWidget,
+      );
       var journalAppBar = tester.widget<SliverAppBar>(
         find.byType(SliverAppBar),
       );
@@ -815,20 +845,19 @@ void main() {
       expect(journalAppBar.floating, isFalse);
       expect(journalAppBar.snap, isFalse);
       expect(journalAppBar.stretch, isFalse);
-      expect(journalAppBar.automaticallyImplyLeading, isFalse);
+      expect(journalAppBar.automaticallyImplyLeading, isTrue);
       expect(journalAppBar.centerTitle, isTrue);
-      expect(journalAppBar.expandedHeight, 97);
-      expect(journalAppBar.collapsedHeight, 57);
+      expect(journalAppBar.expandedHeight, 64);
+      expect(journalAppBar.collapsedHeight, 64);
       expect(journalAppBar.toolbarHeight, 56);
-      expect(journalAppBar.elevation, 0);
-      expect(journalAppBar.backgroundColor, isNull);
-      expect(journalAppBar.foregroundColor, isNull);
+      expect(journalAppBar.elevation, isNull);
+      expect(journalAppBar.backgroundColor, isNotNull);
+      expect(journalAppBar.foregroundColor, isNotNull);
       expect(journalAppBar.leading, isNotNull);
-      expect(journalAppBar.flexibleSpace, isNotNull);
+      expect(journalAppBar.flexibleSpace, isNull);
       expect(journalAppBar.bottom, isNull);
       expect(journalAppBar.actions, isNotEmpty);
-      expect(find.text('Today'), findsOneWidget);
-      expect(find.text('Wed, Aug 12'), findsOneWidget);
+      expect(find.text('Today · Wed, Aug 12'), findsOneWidget);
       expect(
         find.byWidgetPredicate(
           (widget) =>
@@ -839,7 +868,7 @@ void main() {
       );
       expect(
         _sliverPaintExtent(tester, find.byType(SliverAppBar)),
-        closeTo(96 + 47 + 1, 0.5),
+        closeTo(64 + 47, 0.5),
       );
       final journalScroll = tester.state<ScrollableState>(
         find.descendant(
@@ -849,15 +878,14 @@ void main() {
       );
       journalScroll.position.jumpTo(80);
       await tester.pump();
-      expect(find.text('Today'), findsOneWidget);
-      expect(find.text('Wed, Aug 12').hitTestable(), findsNothing);
+      expect(find.text('Today · Wed, Aug 12').hitTestable(), findsOneWidget);
       expect(
         _sliverPaintExtent(tester, find.byType(SliverAppBar)),
-        closeTo(56 + 47 + 1, 0.5),
+        closeTo(64 + 47, 0.5),
       );
       journalScroll.position.jumpTo(0);
       await tester.pump();
-      expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
+      expect(find.text('Today · Wed, Aug 12').hitTestable(), findsOneWidget);
       expect(find.text(_parentSource), findsOneWidget);
       expect(find.text(_firstChild), findsOneWidget);
       expect(find.text('21:37'), findsOneWidget);
@@ -1203,19 +1231,15 @@ void main() {
       await harness.pumpUntil(
         () =>
             MediaQuery.textScalerOf(
-                  tester.element(find.byType(MessageComposer)),
-                ).scale(1) >
-                3 &&
-            tester
-                    .widget<SliverAppBar>(find.byType(SliverAppBar))
-                    .toolbarHeight >
-                100,
+              tester.element(find.byType(MessageComposer)),
+            ).scale(1) >
+            3,
         reason: 'large text scale did not reach the composer',
       );
       journalAppBar = tester.widget<SliverAppBar>(find.byType(SliverAppBar));
-      expect(journalAppBar.collapsedHeight, closeTo(106.6, 0.1));
-      expect(journalAppBar.toolbarHeight, closeTo(105.6, 0.1));
-      expect(journalAppBar.expandedHeight, closeTo(178.6, 0.1));
+      expect(journalAppBar.collapsedHeight, 64);
+      expect(journalAppBar.toolbarHeight, 56);
+      expect(journalAppBar.expandedHeight, 64);
       tester.view.viewInsets = const FakeViewPadding(bottom: 320);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 220));
@@ -1453,14 +1477,14 @@ void _expectTimelineStartsBelowHeader(WidgetTester tester) {
       tester.getRect(find.byType(CustomScrollView)).top +
       _sliverPaintExtent(tester, appBar);
   expect(
-    tester.getRect(find.text('Today')).top,
+    tester.getRect(find.text('Today · Wed, Aug 12').first).top,
     greaterThanOrEqualTo(topInset),
   );
   expect(
     tester.getRect(find.bySemanticsLabel('Account menu')).top,
     greaterThanOrEqualTo(topInset),
   );
-  expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
+  expect(find.text('Today · Wed, Aug 12').hitTestable(), findsOneWidget);
   expect(
     tester.getRect(find.text(_parentSource)).top,
     greaterThanOrEqualTo(paintBoundary - 0.5),

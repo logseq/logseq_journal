@@ -42,7 +42,7 @@ type feed_refresh =
   { generation : int64
   ; context : feed_projection_context
   ; cause : feed_refresh_cause
-  ; graph_generation : Logseq_sync_pure_reducer.Core.graph_id option
+  ; graph_generation : Graph_service.graph_id option
   ; minimum_basis : int64 option
   }
 
@@ -64,7 +64,7 @@ type worker_error_occurrence =
   { sequence : int64
   ; error : Logseq_db_worker.Error.t
   ; request_id : Logseq_db_types.Graph_types.Uuid.t option
-  ; phase : Logseq_db_worker.Protocol.failure_phase option
+  ; phase : string option
   ; basis : int64 option
   ; graph_generation : int
   ; graph_id : Logseq_db_types.Graph_types.Uuid.t option
@@ -112,10 +112,10 @@ type state =
   ; feed_refresh : feed_refresh option
   ; graph_error : graph_error option
   ; sync_error : sync_error_notice option
-  ; manager : Logseq_sync_pure_reducer.Core.snapshot option
+  ; manager : Graph_service.snapshot option
   ; graph_state : Logseq_db_worker.graph_state
-  ; diagnostics : Logseq_sync_pure_reducer.Core.diagnostics option
-  ; bootstrap_progress : Logseq_sync_pure_reducer.Core.bootstrap_progress option
+  ; diagnostics : Graph_service.diagnostics option
+  ; bootstrap_progress : Graph_service.bootstrap_progress option
   ; next_worker_error_sequence : int64
   ; worker_errors : worker_error_occurrence list
   ; next_sync_error_sequence : int64
@@ -189,12 +189,12 @@ let show_sync_error state failure =
 
 let current_graph_generation state =
   Option.map
-    (fun (manager : Logseq_sync_pure_reducer.Core.snapshot) -> manager.selected_graph)
+    (fun (manager : Graph_service.snapshot) -> manager.selected_graph)
     state.manager
   |> Option.join
 ;;
 
-let apply_manager_state state (manager_state : Logseq_sync_pure_reducer.Core.state) =
+let apply_manager_state state (manager_state : Graph_service.state) =
   let snapshot = manager_state.snapshot in
   let previous_sync_error =
     Option.bind state.manager (fun manager -> manager.last_error)
@@ -403,19 +403,16 @@ let record_runtime_worker_failure
       state
       (worker_failure : Journal_graph_runtime.worker_failure)
   =
-  let failure = worker_failure.failure in
   record_worker_error
     state
     ~operation:worker_failure.operation
-    ~request_id:failure.request_id
-    ~phase:failure.phase
-    ?basis:failure.basis
-    failure.error
+    ~request_id:worker_failure.request_id
+    worker_failure.error
 ;;
 
 let failure_source_message = function
   | Journal_graph_runtime.Worker_failure worker_failure ->
-    Logseq_db_worker.Error.message worker_failure.failure.error
+    Logseq_db_worker.Error.message worker_failure.error
   | Projection_failure message -> message
 ;;
 
@@ -724,6 +721,26 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
           timeline_entry_update
     }
+  | Block_removed { block_id } ->
+    { state with timeline = Journal_timeline_state.remove_block state.timeline ~block_id }
+  | Page_tree_reconciled { page; value } ->
+    { state with
+      timeline =
+        Journal_timeline_state.replace_timeline_entry_page state.timeline ~page value
+    }
+  | Children_reconciled detail ->
+    let routes =
+      match Journal_routes.detail state.routes with
+      | None -> state.routes
+      | Some current ->
+        Journal_routes.update_detail
+          state.routes
+          (Journal_detail.reconcile_children current detail)
+    in
+    { state with
+      routes
+    ; timeline = Journal_timeline_state.reconcile_detail state.timeline detail
+    }
   | Update_conflict latest ->
     (match state.pending_status with
      | Some pending when String.equal pending.block_id (Journal_model.id latest) ->
@@ -868,6 +885,33 @@ let styled_text ?token value =
   | Some token -> Ui.Widget.text ~style:(text_style token) value
 ;;
 
+let transparent_row_button_content
+      ~(typography : Journal_visual_tokens.typography)
+      ?leading
+      label
+  =
+  let label =
+    styled_text ~token:typography.entry label
+    |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
+  in
+  let children =
+    match leading with
+    | None -> [ Ui.Widget.Flex.expanded label ]
+    | Some leading ->
+      [ Ui.Widget.Flex.fixed leading
+      ; Ui.Widget.Flex.expanded
+          (label |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:16. ()))
+      ]
+  in
+  Ui.Widget.Flex.row children
+  |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ())
+  |> Ui.Widget.constrained_box
+       ~constraints:
+         (Ui.Layout.Box_constraints.create
+            ~min_height:Journal_visual_tokens.hit_regions.minimum_target
+            ())
+;;
+
 type action_role =
   | Filled
   | Filled_tonal
@@ -995,31 +1039,18 @@ let status_sheet_page
            |> Ui.Widget.with_test_id
                 (Ui.Test_id.string ("journal-status-sheet-option-icon:" ^ tag))
          in
-         let label_widget =
-           styled_text ~token:typography.entry label
+         let content =
+           transparent_row_button_content ~typography ~leading:icon label
            |> Ui.Widget.with_test_id
                 (Ui.Test_id.string ("journal-status-sheet-option-label:" ^ tag))
-           |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
-           |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:16. ())
          in
          let tile =
-           Ui.Widget.Flex.row
-             [ Ui.Widget.Flex.fixed icon; Ui.Widget.Flex.expanded label_widget ]
-           |> Ui.Widget.padding
-                ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ())
-           |> Ui.Widget.constrained_box
-                ~constraints:
-                  (Ui.Layout.Box_constraints.create
-                     ~min_height:Journal_visual_tokens.hit_regions.minimum_target
-                     ())
-         in
-         let tile =
-           if enabled
-           then Ui.Widget.pressable ~on_press ~child:tile ()
-           else Ui.Widget.button ~enabled:false ~on_press ~child:tile ()
-         in
-         let tile =
-           tile
+           Ui.Material.text_button
+             ~key:(Ui.Key.string ("journal-status-sheet-option:" ^ tag))
+             ~enabled
+             ~on_press
+             ~child:content
+             ()
            |> Ui.Widget.with_test_id
                 (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
          in
@@ -1293,9 +1324,16 @@ let timeline_page
   |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-timeline-page")
 ;;
 
-let dialog_body ~typography ~test_id ~title ~message ~primary ~secondary =
+let dialog_body
+      ~(typography : Journal_visual_tokens.typography)
+      ~test_id
+      ~title
+      ~message
+      ~primary
+      ~secondary
+  =
   Ui.Material.Dialog.alert
-    ~title:(styled_text ~token:typography.Journal_visual_tokens.dialog_title title)
+    ~title
     ~content:(styled_text ~token:typography.supporting message)
     ~actions:[ primary; secondary ]
     ()
@@ -1342,23 +1380,23 @@ let account_dialog_page
       ~on_press:(bind_action dispatch command)
       (styled_text text)
   in
-  let actions =
+  let controls =
     [ action
-        ~role:Outlined
+        ~role:Text
         ~test_id:"journal-account-settings"
         ~label:"Settings"
         ~hint:"Open application presentation settings"
         ~command:"open-settings"
         "Settings"
     ; action
-        ~role:Outlined
+        ~role:Text
         ~test_id:"journal-account-diagnostics"
         ~label:"Diagnostics"
         ~hint:"Open read-only application diagnostics"
         ~command:"open-diagnostics"
         "Diagnostics"
     ; action
-        ~role:Outlined
+        ~role:Text
         ~test_id:"journal-account-switch-graph"
         ~label:"Switch graph"
         ~hint:"Close the current graph and choose another authorized graph"
@@ -1368,7 +1406,7 @@ let account_dialog_page
     @ (if cache_reset_available
        then
          [ action
-             ~role:Filled_tonal
+             ~role:Text
              ~test_id:"journal-account-reset-local-copy"
              ~label:"Reset local graph copy"
              ~hint:"Delete this local mirror and download a fresh snapshot"
@@ -1377,29 +1415,32 @@ let account_dialog_page
          ]
        else [])
     @ [ action
-          ~role:Filled
+          ~role:Text
           ~test_id:"journal-account-sign-out"
           ~label:"Sign out"
           ~hint:"Close the current graph and return to sign in"
           ~command:"sign-out"
           "Sign out"
-      ; action
-          ~role:Text
-          ~test_id:"journal-account-menu-dismiss"
-          ~label:"Close account menu"
-          ~hint:"Return to the journal"
-          ~command:"close-account-menu"
-          "Cancel"
       ]
   in
-  Ui.Material.Dialog.alert
-    ~title:(styled_text ~token:typography.dialog_title "Account")
-    ~content:
+  let cancel =
+    action
+      ~role:Text
+      ~test_id:"journal-account-menu-dismiss"
+      ~label:"Close account menu"
+      ~hint:"Return to the journal"
+      ~command:"close-account-menu"
+      "Cancel"
+  in
+  let content =
+    Ui.Widget.column
       (styled_text
          ~token:typography.supporting
-         "Manage the current Logseq graph and authenticated session.")
-    ~actions
-    ()
+         "Manage the current Logseq graph and authenticated session."
+       :: controls)
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-actions")
+  in
+  Ui.Material.Dialog.alert ~title:"Account" ~content ~actions:[ cancel ] ()
   |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu")
   |> modal_dialog_page
        ~tokens
@@ -1434,19 +1475,20 @@ let typography_metrics preset =
     ]
 ;;
 
-let settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch =
+let settings_dialog_page
+      ~tokens
+      ~(typography : Journal_visual_tokens.typography)
+      ~preset
+      ~reduced_motion
+      dispatch
+  =
   let chip option label command test_id =
     let selected = preset = option in
-    let on_selected = bind_action dispatch command in
-    Ui.Material.choice_chip
-      ~key:(Ui.Key.string test_id)
-      ~selected
-      ~on_selected
-      ~label:(styled_text ~token:typography.Journal_visual_tokens.button_label label)
-      ()
+    let on_press = bind_action dispatch command in
+    Ui.Material.Chip.filter ~key:(Ui.Key.string test_id) ~selected ~on_press ~label ()
     |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
     |> Ui.Widget.semantics
-         ~on_action:on_selected
+         ~on_action:on_press
          ~properties:
            (Ui.Semantics.create
               ~label
@@ -1513,19 +1555,7 @@ let settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch =
       ~on_press:(bind_action dispatch "close-settings")
       (styled_text "Close")
   in
-  Ui.Material.Dialog.alert
-    ~title:
-      (styled_text ~token:typography.dialog_title "Settings"
-       |> Ui.Widget.semantics
-            ~properties:
-              (Ui.Semantics.create
-                 ~label:"Settings"
-                 ~role:Ui.Semantics.Role.Header
-                 ~heading_level:1
-                 ()))
-    ~content
-    ~actions:[ close ]
-    ()
+  Ui.Material.Dialog.alert ~title:"Settings" ~content ~actions:[ close ] ()
   |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-settings")
   |> modal_dialog_page
        ~tokens
@@ -1544,14 +1574,14 @@ let current_diagnostic_rows rows =
   List.filter (fun (label, _) -> not (obsolete_diagnostic_row label)) rows
 ;;
 
-let diagnostic_rows (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) =
+let diagnostic_rows (diagnostics : Graph_service.diagnostics) =
   List.concat_map
-    (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) ->
+    (fun (group : Graph_service.diagnostic_group) ->
        current_diagnostic_rows group.entries)
     diagnostics.groups
 ;;
 
-let sync_phase_name : Logseq_sync_pure_reducer.Core.sync_phase -> string = function
+let sync_phase_name : Graph_service.sync_phase -> string = function
   | Offline -> "Offline"
   | Connecting -> "Connecting"
   | Pulling -> "Pulling"
@@ -1616,18 +1646,17 @@ let diagnostic_groups diagnostics =
     ; "Serialization", unavailable [ "Serialization" ]
     ; "Authorization", unavailable [ "Pending token challenges" ]
     ]
-  | Some (diagnostics : Logseq_sync_pure_reducer.Core.diagnostics) ->
+  | Some (diagnostics : Graph_service.diagnostics) ->
     diagnostics.groups
-    |> List.filter_map (fun (group : Logseq_sync_pure_reducer.Core.diagnostic_group) ->
+    |> List.filter_map (fun (group : Graph_service.diagnostic_group) ->
       let entries = current_diagnostic_rows group.entries in
       if entries = [] then None else Some (group.title, entries))
 ;;
 
 let diagnostic_history_lines = function
   | None -> [ "No transitions" ]
-  | Some ({ history = []; _ } : Logseq_sync_pure_reducer.Core.diagnostics) ->
-    [ "No transitions" ]
-  | Some ({ history; _ } : Logseq_sync_pure_reducer.Core.diagnostics) -> history
+  | Some ({ history = []; _ } : Graph_service.diagnostics) -> [ "No transitions" ]
+  | Some ({ history; _ } : Graph_service.diagnostics) -> history
 ;;
 
 let worker_error_detail_value = function
@@ -1711,13 +1740,7 @@ let error_info_page ~(typography : Journal_visual_tokens.typography) occurrences
     let status = if occurrence.active then "Active" else "Resolved" in
     let metadata =
       [ Some ("Operation", occurrence.operation)
-      ; Option.map
-          (fun phase ->
-             ( "Request phase"
-             , match phase with
-               | Logseq_db_worker.Protocol.Open -> "Open"
-               | Execute -> "Execute" ))
-          occurrence.phase
+      ; Option.map (fun phase -> "Request phase", phase) occurrence.phase
       ; Option.map
           (fun request_id ->
              "Request ID", Logseq_db_types.Graph_types.Uuid.to_string request_id)
@@ -2210,6 +2233,7 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
                 ~focusable:true
                 ~actions:[ Ui.Semantics.Action.Tap ]
                 ())
+      |> Ui.Material.Tooltip.plain ~message:"Refresh graphs"
       |> Ui.Widget.sized_box ~width:48. ~height:48.
     in
     let toolbar =
@@ -2221,13 +2245,13 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
     in
     let rows =
       List.map
-        (fun (graph : Logseq_sync_pure_reducer.Core.graph) ->
+        (fun (graph : Graph_service.graph) ->
            let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
            let on_press = bind_action dispatch ("select-graph:" ^ graph_id) in
-           Ui.Material.list_tile
+           Ui.Material.text_button
              ~key:(Ui.Key.string ("graph-picker:" ^ graph_id))
              ~on_press
-             ~title:(styled_text ~token:typography.entry graph.name)
+             ~child:(transparent_row_button_content ~typography graph.name)
              ()
            |> Ui.Widget.with_test_id (Ui.Test_id.string ("graph-picker:" ^ graph_id))
            |> Ui.Widget.semantics
@@ -2241,7 +2265,7 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
                      ~focusable:true
                      ~actions:[ Ui.Semantics.Action.Tap ]
                      ()))
-        snapshot.Logseq_sync_pure_reducer.Core.catalog
+        snapshot.Graph_service.catalog
     in
     let scroll =
       Ui.Widget.Scroll_view.vertical
@@ -2278,9 +2302,7 @@ let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch
              match state.bootstrap_progress with
              | None -> "Preparing the local mirror"
              | Some progress ->
-               Printf.sprintf
-                 "Downloaded %Ld bytes"
-                 progress.Logseq_sync_pure_reducer.Core.received_bytes
+               Printf.sprintf "Downloaded %Ld bytes" progress.Graph_service.received_bytes
            in
            ( "Downloading graph"
            , [ Ui.Widget.Flex.fixed
@@ -2439,6 +2461,9 @@ let component client handlers graph =
     | Feed_failed _
     | Block_captured _
     | Block_updated _
+    | Block_removed _
+    | Page_tree_reconciled _
+    | Children_reconciled _
     | Update_conflict _
     | Child_created _
     | Block_found _ -> ()
@@ -2650,12 +2675,10 @@ let component client handlers graph =
   let sign_out_in_flight = ref false in
   let termination_in_flight = ref false in
   let apply_manager_transition set_state manager_state =
-    let manager = manager_state.Logseq_sync_pure_reducer.Core.snapshot in
+    let manager = manager_state.Graph_service.snapshot in
     let update = set_state (fun state -> apply_manager_state state manager_state) in
     let sign_out =
-      if
-        (not manager.Logseq_sync_pure_reducer.Core.startup.authenticated)
-        && !sign_out_in_flight
+      if (not manager.Graph_service.startup.authenticated) && !sign_out_in_flight
       then (
         sign_out_in_flight := false;
         Bonsai.Effect.bind
@@ -2676,7 +2699,7 @@ let component client handlers graph =
     let termination_ready =
       if
         !termination_in_flight
-        && (manager.Logseq_sync_pure_reducer.Core.startup.awaiting_selection
+        && (manager.Graph_service.startup.awaiting_selection
             || not manager.startup.authenticated)
       then (
         termination_in_flight := false;
@@ -2701,22 +2724,17 @@ let component client handlers graph =
         ignore (Worker.send client Graph_service.Get_graph_state : Worker.send_result);
         Worker.on_event client (fun event ->
           match event with
-          | Worker.Push
-              { payload =
-                  Graph_service.Graph_push
-                    (Logseq_db_worker.Protocol.Graph_invalidated invalidation)
-              ; _
-              } ->
+          | Worker.Push { payload = Graph_service.Graph_push push; _ } ->
             let snapshot = !state_ref in
             if not snapshot.graph_ready
             then Bonsai.Effect.Ignore
             else (
               let generation = snapshot.next_request_generation in
               let output =
-                Journal_graph_runtime.reconcile_invalidation
+                Journal_graph_runtime.reconcile_push
                   graph_runtime
                   ~request_generation:generation
-                  invalidation
+                  push
               in
               if output.requests = [] && output.responses = []
               then Bonsai.Effect.Ignore
@@ -2725,7 +2743,7 @@ let component client handlers graph =
                   List.exists
                     (fun (request : Logseq_db_worker.Protocol.request) ->
                        match request.command with
-                       | Read (List_pages _) -> true
+                       | V2_list_journals _ -> true
                        | _ -> false)
                     output.requests
                 in
@@ -2737,12 +2755,6 @@ let component client handlers graph =
                       match state.calendar with
                       | Some calendar when state.graph_ready ->
                         let context = feed_projection_context calendar in
-                        let minimum_basis =
-                          match state.feed_refresh with
-                          | Some { minimum_basis = Some basis; _ } ->
-                            Some (Int64.max basis invalidation.basis)
-                          | None | Some _ -> Some invalidation.basis
-                        in
                         { state with
                           feed_refresh =
                             Some
@@ -2750,7 +2762,7 @@ let component client handlers graph =
                               ; context
                               ; cause = Sync_refresh
                               ; graph_generation = current_graph_generation state
-                              ; minimum_basis
+                              ; minimum_basis = None
                               }
                         ; next_request_generation = Int64.succ generation
                         }
@@ -2803,9 +2815,7 @@ let component client handlers graph =
               ~f:(function
                 | Error _ -> send_manager (Graph_service.Reject_token challenge)
                 | Ok payload ->
-                  let challenge_id =
-                    Logseq_sync_pure_reducer.Core.token_request_id challenge
-                  in
+                  let challenge_id = Graph_service.token_request_id challenge in
                   (match
                      Journal_platform.decode_id_token_response ~challenge_id payload
                    with
@@ -3793,6 +3803,8 @@ let component client handlers graph =
         | Int64_pair _
         | Float _
         | Float_range _
+        | Civil_date _
+        | Civil_time _
         | Tap _
         | Pointer _
         | Key _ -> Bonsai.Effect.Ignore)
@@ -3924,8 +3936,7 @@ let component client handlers graph =
           ~sync_error
           ~sync_phase:
             (Option.map
-               (fun (manager : Logseq_sync_pure_reducer.Core.snapshot) ->
-                  manager.sync_phase)
+               (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
                state.manager)
           ~today_subtitle:(today_label state)
           ~day_label:(label_for_day state)

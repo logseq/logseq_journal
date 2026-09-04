@@ -322,6 +322,12 @@ let apply_block t block =
   { t with root = block; editor; mode; pending = None; conflict_revision = None }
 ;;
 
+let reconcile_children t (detail : Journal_graph_projection.detail) =
+  if String.equal (Journal_model.id t.root) (Journal_model.id detail.root)
+  then { t with children = detail.children.blocks }
+  else t
+;;
+
 let root_with_child t ~parent_revision =
   Journal_model.create
     ~id:(Journal_model.id t.root)

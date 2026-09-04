@@ -40,7 +40,6 @@ type component =
   | Ownership
   | Sqlite
   | Storage
-  | Storage_session
   | Query
   | Read_model
   | Outliner

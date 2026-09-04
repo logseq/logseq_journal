@@ -48,4 +48,5 @@ val admit_child
   -> t * Journal_graph_request.t option
 
 val apply_block : t -> Journal_model.t -> t
+val reconcile_children : t -> Journal_graph_projection.detail -> t
 val apply_child_created : t -> child:Journal_model.t -> parent_revision:int -> t

@@ -1,0 +1,3 @@
+- number of dividers must <= 3
+- On launch, the app must immediately open the most recently opened graph instead of showing the graph selection UI.
+- When modifying the UI, prefer the most appropriate built-in Flutter component instead of building a custom one.

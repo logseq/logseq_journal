@@ -1,0 +1,47 @@
+(library
+ (name logseq_overlay_db_test_support)
+ (wrapped false)
+ (modules test_support naive_projection_oracle)
+ (libraries
+  alcotest
+  datascript-ocaml-native
+  eio_main
+  logseq_db_storage
+  logseq_db_types
+  logseq_overlay_db
+  melange-transit-native
+  sqlite3
+  unix
+  yojson))
+
+(tests
+ (names
+  test_overlay_reads
+  test_overlay_mutations
+  test_overlay_changes
+  test_overlay_sync
+  test_overlay_storage
+  test_overlay_concurrency
+  test_performance)
+ (modules
+  test_overlay_reads
+  test_overlay_mutations
+  test_overlay_changes
+  test_overlay_sync
+  test_overlay_storage
+  test_overlay_concurrency
+  test_performance)
+ (libraries
+  alcotest
+  eio_main
+  logseq_db_storage
+  logseq_db_types
+  logseq_overlay_db
+  logseq_overlay_db_test_support
+  melange-transit-native
+  sqlite3
+  unix
+  yojson)
+ (deps
+  (source_tree fixtures)
+  (source_tree ../../logseq_db_worker/test/fixtures/storage)))

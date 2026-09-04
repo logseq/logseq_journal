@@ -5,8 +5,8 @@
   bonsai_flutter.driver
   eio
   logseq_db_worker
-  logseq_db_storage
   logseq_db_types
+  logseq_overlay_db
   logseq_sync.effect_runner
   logseq_sync.pure_reducer
   melange-transit-native

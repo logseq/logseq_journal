@@ -30,11 +30,11 @@
   bonsai_flutter.ui
   bonsai_flutter.driver
   core
+  datascript-ocaml-native
   incr_dom.ui_incr
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.bonsai
-  logseq_sync.pure_reducer
   threads
   unix
   virtual_dom.ui_effect))

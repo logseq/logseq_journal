@@ -1,0 +1,53 @@
+(include_subdirs unqualified)
+
+(library
+ (name logseq_overlay_db_impl)
+ (public_name logseq_overlay_db.impl)
+ (implements logseq_overlay_db)
+ (modules :standard)
+ (private_modules
+  authoritative_checksum
+  authoritative_store
+  change_dispatcher
+  crypto_bridge
+  delete_conflict
+  logical_change
+  logical_snapshot
+  mirror
+  mutation_receipt
+  create_journal_page
+  delete_blocks
+  graph_read
+  insert_blocks
+  outliner
+  outliner_order
+  planner_contract
+  references
+  save_block
+  task_status
+  tree
+  validation
+  overlay_effect
+  overlay_planner
+  overlay_read
+  ownership
+  persistence_json
+  persistence_outbox_v14
+  persistence_receipt_v1
+  query_cursor
+  queryable_outbox
+  snapshot_parser
+  sync_tx_codec
+  transition)
+ (libraries
+  datascript-ocaml-native
+  digestif
+  eio
+  logseq_db_storage
+  logseq_db_types
+  melange-transit-native
+  ppx_deriving_yojson.runtime
+  sqlite3
+  uutf)
+ (preprocess
+  (pps ppx_deriving_yojson)))

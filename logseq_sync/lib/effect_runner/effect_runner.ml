@@ -7,10 +7,9 @@ type create_error = Invalid_create of string
 type runtime =
   { fork : sw:Eio.Switch.t -> (unit -> unit) -> unit
   ; sleep : float -> unit
-  ; monotonic_ns : unit -> int64
   }
 
-let runtime ~fork ~sleep ~monotonic_ns = Ok { fork; sleep; monotonic_ns }
+let runtime ~fork ~sleep = Ok { fork; sleep }
 
 type transport =
   { perform_http : sw:Eio.Switch.t -> Http.request -> (Http_eio.response, string) result
@@ -100,8 +99,7 @@ type wrapped_key_load_error =
   | Local_private_key_unavailable of string
 
 type secrets =
-  { has_private_key : managed_sync_origin:Uri.t -> user_id:string -> bool
-  ; unlock_private_key :
+  { unlock_private_key :
       managed_sync_origin:Uri.t
       -> user_id:string
       -> password:string
@@ -133,7 +131,6 @@ type secrets =
   }
 
 let secrets
-      ~has_private_key
       ~unlock_private_key
       ~unlock_graph_key
       ~load_wrapped_graph_key
@@ -142,8 +139,7 @@ let secrets
       ~delete_account_secrets
   =
   Ok
-    { has_private_key
-    ; unlock_private_key
+    { unlock_private_key
     ; unlock_graph_key
     ; load_wrapped_graph_key
     ; verify_and_save_wrapped_graph_key
@@ -153,26 +149,15 @@ let secrets
 ;;
 
 type crypto =
-  { decrypt_private_key :
-      password:string
-      -> iterations:int
-      -> salt:string
-      -> iv:string
-      -> ciphertext:string
-      -> (string, string) result
-  ; decrypt_graph_key : private_key:string -> ciphertext:string -> (string, string) result
-  ; encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
+  { encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
   ; decrypt_aes_gcm :
       key:string -> iv:string -> ciphertext:string -> (string, string) result
   }
 
-let crypto ~decrypt_private_key ~decrypt_graph_key ~encrypt_aes_gcm ~decrypt_aes_gcm =
-  Ok { decrypt_private_key; decrypt_graph_key; encrypt_aes_gcm; decrypt_aes_gcm }
-;;
+let crypto ~encrypt_aes_gcm ~decrypt_aes_gcm = Ok { encrypt_aes_gcm; decrypt_aes_gcm }
 
 let apple_secrets () =
   secrets
-    ~has_private_key:Platform_crypto.has_private_key
     ~unlock_private_key:Platform_crypto.unlock_private_key
     ~unlock_graph_key:Platform_crypto.unlock_graph_key
     ~load_wrapped_graph_key:(fun ~managed_sync_origin ~user_id ~graph_id ->
@@ -191,11 +176,7 @@ let apple_secrets () =
 
 let apple_crypto () =
   let adapter = Platform_crypto.crypto in
-  crypto
-    ~decrypt_private_key:adapter.decrypt_private_key
-    ~decrypt_graph_key:adapter.decrypt_graph_key
-    ~encrypt_aes_gcm:adapter.encrypt_aes_gcm
-    ~decrypt_aes_gcm:adapter.decrypt_aes_gcm
+  crypto ~encrypt_aes_gcm:adapter.encrypt_aes_gcm ~decrypt_aes_gcm:adapter.decrypt_aes_gcm
 ;;
 
 type dependencies =
@@ -208,13 +189,6 @@ type dependencies =
   }
 
 let dependencies ~runtime ~transport ~local_store ~artifact_store ~secrets ~crypto =
-  ignore runtime.monotonic_ns;
-  ignore secrets.has_private_key;
-  ignore secrets.verify_and_save_wrapped_graph_key;
-  ignore secrets.delete_wrapped_graph_key;
-  ignore secrets.delete_account_secrets;
-  ignore crypto.decrypt_private_key;
-  ignore crypto.decrypt_graph_key;
   Ok { runtime; transport; local_store; artifact_store; secrets; crypto }
 ;;
 
@@ -236,6 +210,7 @@ type t =
   ; operations : (string, operation) Hashtbl.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (string, Core.connection_scope * Websocket_eio.t) Hashtbl.t
+  ; secret_lock : Eio.Mutex.t
   ; mutable closed : bool
   }
 
@@ -247,6 +222,7 @@ let create ~sw dependencies ~post =
     ; operations = Hashtbl.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
+    ; secret_lock = Eio.Mutex.create ()
     ; closed = false
     }
 ;;
@@ -383,6 +359,7 @@ let store_key t ticket scope plaintext =
 ;;
 
 let map_error result = Result.map_error (fun message -> Core.Effect_failed message) result
+let run_secret_action t action = Eio.Mutex.use_rw ~protect:true t.secret_lock action
 
 let execute_request
   : type a.
@@ -425,14 +402,18 @@ let execute_request
         ~graph_id:authorized.graph.graph_id
         ~token:authorized.token
     in
-    Result.map (fun response -> response.Http_eio.body) (perform_http t request)
+    Result.bind (perform_http t request) (fun response ->
+      E2ee.graph_key_response response.Http_eio.body
+      |> Result.map_error (fun message -> Core.Effect_failed message))
   | Fetch_e2ee_user_keys authenticated ->
     let request =
       Http.e2ee_user_keys
         ~base_url:authenticated.account.managed_sync_origin
         ~token:authenticated.token
     in
-    Result.map (fun response -> response.Http_eio.body) (perform_http t request)
+    Result.bind (perform_http t request) (fun response ->
+      E2ee.user_keys_response response.Http_eio.body
+      |> Result.map_error (fun message -> Core.Effect_failed message))
   | Download_snapshot download ->
     let staging = t.dependencies.artifact_store.staging_directory in
     let ensure_staging () =
@@ -495,47 +476,63 @@ let execute_request
                     ~temporary_paths))
           |> Result.map_error (fun message -> Core.Effect_failed message))))
   | Load_and_unlock_graph_key scope ->
-    let account = scope.account in
-    (match
-       t.dependencies.secrets.load_wrapped_graph_key
-         ~managed_sync_origin:account.managed_sync_origin
-         ~user_id:account.user_id
-         ~graph_id:scope.graph_id
-     with
-     | Error
-         (Wrapped_graph_key_unavailable message | Local_private_key_unavailable message)
-       -> effect_error message
-     | Ok encrypted_graph_key ->
-       t.dependencies.secrets.unlock_graph_key
-         ~managed_sync_origin:account.managed_sync_origin
-         ~user_id:account.user_id
-         ~encrypted_graph_key
-       |> Result.map (store_key t ticket scope)
-       |> map_error)
+    run_secret_action t (fun () ->
+      let account = scope.account in
+      match
+        t.dependencies.secrets.load_wrapped_graph_key
+          ~managed_sync_origin:account.managed_sync_origin
+          ~user_id:account.user_id
+          ~graph_id:scope.graph_id
+      with
+      | Error
+          (Wrapped_graph_key_unavailable message | Local_private_key_unavailable message)
+        -> effect_error message
+      | Ok encrypted_graph_key ->
+        t.dependencies.secrets.unlock_graph_key
+          ~managed_sync_origin:account.managed_sync_origin
+          ~user_id:account.user_id
+          ~encrypted_graph_key
+        |> Result.map (store_key t ticket scope)
+        |> map_error)
   | Fetch_and_unlock_graph_key request ->
-    let account = request.scope.graph.account in
-    Result.bind
-      (t.dependencies.secrets.unlock_graph_key
-         ~managed_sync_origin:account.managed_sync_origin
-         ~user_id:account.user_id
-         ~encrypted_graph_key:request.encrypted_graph_key)
-      (fun key ->
-         Result.map
-           (fun () -> store_key t ticket request.scope.graph key)
-           (t.dependencies.secrets.verify_and_save_wrapped_graph_key
-              ~managed_sync_origin:account.managed_sync_origin
-              ~user_id:account.user_id
-              ~graph_id:request.scope.graph.graph_id
-              ~encrypted_graph_key:request.encrypted_graph_key))
-    |> map_error
+    run_secret_action t (fun () ->
+      let account = request.scope.graph.account in
+      Result.bind
+        (t.dependencies.secrets.unlock_graph_key
+           ~managed_sync_origin:account.managed_sync_origin
+           ~user_id:account.user_id
+           ~encrypted_graph_key:request.encrypted_graph_key)
+        (fun key ->
+           Result.map
+             (fun () -> store_key t ticket request.scope.graph key)
+             (t.dependencies.secrets.verify_and_save_wrapped_graph_key
+                ~managed_sync_origin:account.managed_sync_origin
+                ~user_id:account.user_id
+                ~graph_id:request.scope.graph.graph_id
+                ~encrypted_graph_key:request.encrypted_graph_key))
+      |> map_error)
   | Unlock_private_key request ->
-    let account = request.scope.account in
-    t.dependencies.secrets.unlock_private_key
-      ~managed_sync_origin:account.managed_sync_origin
-      ~user_id:account.user_id
-      ~password:request.password
-      ~private_key_package:request.private_key_package
-    |> map_error
+    run_secret_action t (fun () ->
+      let account = request.scope.account in
+      t.dependencies.secrets.unlock_private_key
+        ~managed_sync_origin:account.managed_sync_origin
+        ~user_id:account.user_id
+        ~password:request.password
+        ~private_key_package:request.private_key_package
+      |> map_error)
+  | Delete_wrapped_graph_key request ->
+    run_secret_action t (fun () ->
+      t.dependencies.secrets.delete_wrapped_graph_key
+        ~managed_sync_origin:request.account.managed_sync_origin
+        ~user_id:request.account.user_id
+        ~graph_id:request.graph_id
+      |> map_error)
+  | Delete_account_secrets account ->
+    run_secret_action t (fun () ->
+      t.dependencies.secrets.delete_account_secrets
+        ~managed_sync_origin:account.managed_sync_origin
+        ~user_id:account.user_id
+      |> map_error)
   | Encrypt_protected_values request ->
     Result.bind
       (Result.map_error

@@ -2,12 +2,5 @@
  (name logseq_sync_pure_reducer_impl)
  (public_name logseq_sync.pure_reducer.impl)
  (implements logseq_sync_pure_reducer)
- (modules checksum core pure_tx sync_protocol)
- (private_modules checksum pure_tx)
- (libraries
-  datascript_ocaml
-  logseq_db_types
-  melange-transit-native
-  uri
-  uutf
-  yojson))
+ (modules core sync_protocol)
+ (libraries logseq_db_types logseq_overlay_db uri yojson))

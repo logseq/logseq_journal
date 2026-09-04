@@ -8,6 +8,8 @@ type batch =
   { writes : write list
   ; sync_metadata : Sync_checkpoint.t option
   ; sync_outbox : string list option
+  ; mutation_receipts : (string * string) list option
+  ; terminal_batch_receipts : (string * string) list option
   }
 
 type garbage_stats =
@@ -43,6 +45,8 @@ type callbacks =
   ; upsert_sync_metadata : Sync_checkpoint.t -> (unit, string) result
   ; load_sync_outbox : unit -> (string list, string) result
   ; replace_sync_outbox : string list -> (unit, string) result
+  ; upsert_mutation_receipts : (string * string) list -> (unit, string) result
+  ; upsert_terminal_batch_receipts : (string * string) list -> (unit, string) result
   ; commit : unit -> (unit, string) result
   ; rollback : unit -> unit
   ; unreachable_address_count : unit -> int
@@ -138,15 +142,36 @@ let commit_batch callbacks batch =
           (match outbox with
            | Error message -> rollback (Commit_failed message)
            | Ok () ->
-             (match callbacks.commit () with
-              | Ok () -> Ok ()
-              | Error message -> rollback (Commit_failed message)))))
+             let receipts =
+               match batch.mutation_receipts with
+               | None -> Ok ()
+               | Some rows -> callbacks.upsert_mutation_receipts rows
+             in
+             (match receipts with
+              | Error message -> rollback (Commit_failed message)
+              | Ok () ->
+                let terminal_receipts =
+                  match batch.terminal_batch_receipts with
+                  | None -> Ok ()
+                  | Some rows -> callbacks.upsert_terminal_batch_receipts rows
+                in
+                (match terminal_receipts with
+                 | Error message -> rollback (Commit_failed message)
+                 | Ok () ->
+                   (match callbacks.commit () with
+                    | Ok () -> Ok ()
+                    | Error message -> rollback (Commit_failed message)))))))
 ;;
 
 let commit_sync_metadata callbacks metadata =
   commit_batch
     callbacks
-    { writes = []; sync_metadata = Some metadata; sync_outbox = None }
+    { writes = []
+    ; sync_metadata = Some metadata
+    ; sync_outbox = None
+    ; mutation_receipts = None
+    ; terminal_batch_receipts = None
+    }
 ;;
 
 let unreachable_addresses (callbacks : callbacks) =
@@ -475,6 +500,8 @@ let open_database path =
                        encoded
                  ; sync_metadata = None
                  ; sync_outbox = None
+                 ; mutation_receipts = None
+                 ; terminal_batch_receipts = None
                  })
         in
         let initial_root_metadata =
@@ -531,6 +558,9 @@ let open_database path =
           ; upsert_sync_metadata = Sync_checkpoint_store.update_database sqlite
           ; load_sync_outbox = (fun () -> Sync_outbox_store.read_database sqlite)
           ; replace_sync_outbox = Sync_outbox_store.replace_database sqlite
+          ; upsert_mutation_receipts = Mutation_receipt_store.upsert_mutations sqlite
+          ; upsert_terminal_batch_receipts =
+              Mutation_receipt_store.upsert_terminal_batches sqlite
           ; commit = exec "COMMIT"
           ; rollback = (fun () -> ignore (Sqlite3.exec sqlite "ROLLBACK"))
           ; unreachable_address_count =

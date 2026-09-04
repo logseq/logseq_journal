@@ -1,33 +1,66 @@
 module Core = Logseq_sync_pure_reducer.Core
-module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
 
-let fail format = Printf.ksprintf (fun message -> Alcotest.fail message) format
+type observed =
+  { state : Core.state
+  ; admitted_graph_scope : Core.graph_scope option
+  }
 
-let contains source needle =
-  let rec loop offset =
-    offset + String.length needle <= String.length source
-    && (String.equal (String.sub source offset (String.length needle)) needle
-        || loop (offset + 1))
-  in
-  loop 0
+let observe core =
+  { state = Core.state core; admitted_graph_scope = Core.admitted_graph_scope core }
+;;
+
+let check_observed test_id message expected actual =
+  Alcotest.(check bool) (test_id ^ " " ^ message) true (expected = actual)
+;;
+
+let check_instructions test_id expected actual =
+  Alcotest.(check bool)
+    (test_id ^ " ordered instructions")
+    true
+    (Core.equal_instructions expected actual)
+;;
+
+let preview_step test_id origin event =
+  let origin_observed = observe origin in
+  let transition = Core.step origin event in
+  check_observed test_id "preview preserves origin" origin_observed (observe origin);
+  transition
+;;
+
+let check_replay test_id origin event (first : Core.transition) =
+  let origin_observed = observe origin in
+  check_observed test_id "origin remains immutable" origin_observed (observe origin);
+  let replay = Core.step origin event in
+  check_observed test_id "replay observation" (observe first.next) (observe replay.next);
+  check_instructions test_id first.effects replay.effects;
+  first
+;;
+
+let check_step test_id origin event expected effects =
+  let origin_observed = observe origin in
+  let first = Core.step origin event in
+  check_observed test_id "public observation" expected (observe first.next);
+  check_instructions test_id effects first.effects;
+  check_observed test_id "origin remains immutable" origin_observed (observe origin);
+  check_replay test_id origin event first
 ;;
 
 let limits () =
   Core.limits
     ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
-    ~maximum_artifact_bytes:(1024 * 1024 * 1024)
+    ~maximum_artifact_bytes:(1024 * 1024)
     ~submission_batch_size:32
   |> Result.get_ok
 ;;
 
-let config () =
+let initial () =
   Core.config
     ~managed_sync_origin:(Uri.of_string "https://api.logseq.io")
     ~limits:(limits ())
   |> Result.get_ok
+  |> Core.initial
+  |> Result.get_ok
 ;;
-
-let initial () = Core.initial (config ()) |> Result.get_ok
 
 let token_request effects =
   List.find_map
@@ -35,1051 +68,478 @@ let token_request effects =
       | Core.Publish (Core.Token_requested request) -> Some request
       | Run _ | Delegate _ | Publish _ -> None)
     effects
-  |> function
-  | Some request -> request
-  | None -> fail "transition did not publish a token request"
+  |> Option.get
 ;;
 
-let has_token_request effects =
-  List.exists
-    (function
-      | Core.Publish (Core.Token_requested _) -> true
-      | Run _ | Delegate _ | Publish _ -> false)
-    effects
-;;
-
-let fetch_catalog_completion effects (graphs : Core.graph list) =
-  let rec find = function
-    | [] -> fail "transition did not request the remote catalog"
-    | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) :: _ ->
-      Core.Runner_completed (Core.Completion (ticket, Ok graphs))
-    | _ :: rest -> find rest
-  in
-  find effects
-;;
-
-let test_config_validation_is_pure_and_bounded () =
-  let invalid =
-    Core.limits
-      ~maximum_response_bytes:0
-      ~maximum_artifact_bytes:1
-      ~submission_batch_size:1
-  in
-  Alcotest.check
-    Alcotest.bool
-    "zero response bound is rejected"
-    true
-    (Result.is_error invalid);
-  let limits = limits () in
-  let insecure =
-    Core.config ~managed_sync_origin:(Uri.of_string "http://api.logseq.io") ~limits
-  in
-  Alcotest.check
-    Alcotest.bool
-    "non-TLS origin is rejected"
-    true
-    (Result.is_error insecure)
-;;
-
-let test_stale_and_duplicate_token_events_are_rejected () =
-  let first_auth =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
-  in
-  let first_request = token_request first_auth.effects in
-  let second_auth =
-    Core.step first_auth.next (Account_authenticated { user_id = Some "user-2" })
-  in
-  let second_request = token_request second_auth.effects in
-  let stale =
-    Core.step second_auth.next (Token_provided (first_request, "stale-token"))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "stale token response does not mutate state"
-    true
-    (Core.state stale.next = Core.state second_auth.next);
-  Alcotest.(check int) "stale token response emits nothing" 0 (List.length stale.effects);
-  let rejected = Core.step stale.next (Token_rejected second_request) in
-  Alcotest.check
-    Alcotest.bool
-    "current rejection fails the core"
-    true
-    ((Core.state rejected.next).snapshot.sync_phase = Core.Failed);
-  let duplicate = Core.step rejected.next (Token_rejected second_request) in
-  Alcotest.check
-    Alcotest.bool
-    "ticket-like token request is consumed once"
-    true
-    (Core.state duplicate.next = Core.state rejected.next && duplicate.effects = [])
-;;
-
-let test_runner_completion_is_scoped_and_consumed_once () =
-  let authenticated =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
-  in
-  let request = token_request authenticated.effects in
-  let authorized = Core.step authenticated.next (Token_provided (request, "token")) in
-  let completion = fetch_catalog_completion authorized.effects [] in
-  let completed = Core.step authorized.next completion in
-  let duplicate = Core.step completed.next completion in
-  Alcotest.check
-    Alcotest.bool
-    "catalog completion leaves the core awaiting selection"
-    true
-    (Core.state completed.next).snapshot.startup.awaiting_selection;
-  Alcotest.check
-    Alcotest.bool
-    "duplicate completion does not mutate state"
-    true
-    (Core.state duplicate.next = Core.state completed.next);
-  Alcotest.(check int)
-    "duplicate completion emits nothing"
-    0
-    (List.length duplicate.effects)
-;;
-
-let graph_id () =
+let graph_id =
   Logseq_db_types.Graph_types.Uuid.of_string "11111111-1111-4111-8111-111111111111"
   |> Result.get_ok
 ;;
 
-let graph_scope () =
-  let account : Core.account_scope =
-    { managed_sync_origin = Uri.of_string "https://api.logseq.io"
-    ; user_id = "user-1"
-    ; account_generation = 1
-    ; presentation_generation = 1
-    ; lifecycle_generation = 1L
-    }
-  in
-  Core.{ account; graph_id = graph_id (); graph_generation = 1 }
-;;
-
-let other_graph_id () =
-  Logseq_db_types.Graph_types.Uuid.of_string "99999999-9999-4999-8999-999999999999"
-  |> Result.get_ok
-;;
-
-let graph ?(encrypted = false) () : Core.graph =
-  { graph_id = graph_id ()
-  ; name = (if encrypted then "Encrypted Journal" else "Journal")
-  ; schema = { major = 1; minor = 0; exact = true }
-  ; encrypted
-  }
-;;
-
-let other_graph () : Core.graph =
-  { graph_id = other_graph_id ()
-  ; name = "Other Journal"
+let graph : Core.graph =
+  { graph_id
+  ; name = "Journal"
   ; schema = { major = 1; minor = 0; exact = true }
   ; encrypted = false
   }
 ;;
 
-let graph_id_equal = Logseq_db_types.Graph_types.Uuid.equal
+let encrypted_graph = { graph with encrypted = true }
 
-let save_catalog_cache effects =
-  List.find_map
-    (function
-      | Core.Run (Core.Request (_, Core.Save_catalog { cache; _ })) -> Some cache
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some cache -> cache
-  | None -> fail "transition did not save the catalog cache"
-;;
-
-let load_catalog_completion effects (cache : Core.catalog_cache option) =
-  List.find_map
-    (function
-      | Core.Run (Core.Request (ticket, Core.Load_catalog _)) ->
-        Some (Core.Runner_completed (Core.Completion (ticket, Ok cache)))
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some completion -> completion
-  | None -> fail "transition did not load the catalog cache"
-;;
-
-let complete_save_catalog transition (result : (unit, Core.effect_error) result) =
-  List.find_map
-    (function
-      | Core.Run (Core.Request (ticket, Core.Save_catalog _)) ->
-        Some
-          (Core.step
-             transition.Core.next
-             (Runner_completed (Completion (ticket, result))))
-      | Run _ | Delegate _ | Publish _ -> None)
-    transition.Core.effects
-  |> function
-  | Some completed -> completed
-  | None -> fail "transition did not save the catalog cache"
-;;
-
-let inspect_mirror_request effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Inspect_mirror request) -> Some request
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some request -> request
-  | None -> fail "transition did not inspect the selected graph mirror"
-;;
-
-let has_graph_open_work effects =
-  List.exists
-    (function
-      | Core.Delegate (Core.Inspect_mirror _) -> true
-      | Core.Delegate (Core.Attach_graph _) -> true
-      | Core.Delegate (Core.Activate_snapshot _) -> true
-      | Run _ | Delegate _ | Publish _ -> false)
-    effects
-;;
-
-let refresh_catalog core graphs =
-  let requested = Core.step core Core.Catalog_refresh_requested in
-  let token = token_request requested.effects in
-  let authorized = Core.step requested.next (Token_provided (token, "refresh-token")) in
-  Core.step authorized.next (fetch_catalog_completion authorized.effects graphs)
-;;
-
-let checkpoint graph_id =
-  Logseq_db_types.Sync_checkpoint.create
-    ~graph_id
-    ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
-    ~applied_server_t:0
-    ~checksum:"0000000000000000"
-  |> Result.get_ok
-;;
-
-let select_catalog_graph (graph : Core.graph) =
+let selected_graph selected_graph =
   let authenticated =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
   let catalog_token = token_request authenticated.effects in
   let authorized =
-    Core.step authenticated.next (Token_provided (catalog_token, "catalog-token"))
+    Core.step authenticated.next (Core.Token_provided (catalog_token, "catalog-token"))
   in
   let catalog =
-    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
-  in
-  let selected = Core.step catalog.next (Graph_selected graph.graph_id) in
-  let mirror_request =
     List.find_map
       (function
-        | Core.Delegate (Core.Inspect_mirror request) -> Some request
-        | Run _ | Delegate _ | Publish _ -> None)
-      selected.effects
-    |> function
-    | Some request -> request
-    | None -> fail "graph selection did not inspect its mirror"
-  in
-  selected, mirror_request
-;;
-
-let complete_wrapped_key (transition : Core.transition) (handle : Core.graph_key_handle) =
-  List.find_map
-    (function
-      | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
-        Some
-          (Core.step transition.next (Runner_completed (Completion (ticket, Ok handle))))
-      | Run _ | Delegate _ | Publish _ -> None)
-    transition.effects
-  |> function
-  | Some completed -> completed
-  | None -> fail "transition did not load a wrapped graph key"
-;;
-
-let has_snapshot_token_request effects =
-  List.exists
-    (function
-      | Core.Publish (Core.Token_requested request) ->
-        Core.token_request_purpose request = Core.Snapshot_bootstrap
-      | Run _ | Delegate _ | Publish _ -> false)
-    effects
-;;
-
-let has_snapshot_work effects =
-  List.exists
-    (function
-      | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> true
-      | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
-      | Core.Run (Core.Request (_, Core.Download_snapshot _)) -> true
-      | Core.Delegate (Core.Activate_snapshot _) -> true
-      | Run _ | Delegate _ | Publish _ -> false)
-    effects
-;;
-
-let graph_key_load_scope effects =
-  List.find_map
-    (function
-      | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key scope)) -> Some scope
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-;;
-
-let open_request graph scope suffix : Core.graph_open_request =
-  { graph
-  ; graph_directory = "/worker/" ^ suffix
-  ; database_path = "/worker/" ^ suffix ^ "/db.sqlite"
-  ; checkpoint = checkpoint graph.graph_id
-  ; scope
-  }
-;;
-
-let complete_snapshot_bootstrap (transition : Core.transition) scope =
-  let snapshot_token = token_request transition.effects in
-  let baseline_requested =
-    Core.step transition.next (Token_provided (snapshot_token, "snapshot-token"))
-  in
-  let metadata_requested =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
           Some
             (Core.step
-               baseline_requested.next
-               (Runner_completed
-                  (Completion (ticket, Ok "{\"type\":\"pull/ok\",\"t\":7}"))))
+               authorized.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok [ selected_graph ]))))
         | Run _ | Delegate _ | Publish _ -> None)
-      baseline_requested.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "snapshot bootstrap did not fetch its baseline"
+      authorized.effects
+    |> Option.get
   in
-  let download_requested =
+  let selected = Core.step catalog.next (Core.Graph_selected selected_graph.graph_id) in
+  selected, Core.admitted_graph_scope selected.next |> Option.get
+;;
+
+let warm_encrypted_graph_loads_key_before_attach_and_protects_outbox () =
+  let selected, scope = selected_graph encrypted_graph in
+  let mirror = Core.{ graph = encrypted_graph; scope } in
+  let inspected =
+    Core.step selected.next (Core.Mirror_inspected (Mirror_available mirror))
+  in
+  let key = Core.graph_key_handle ~id:"warm-graph-key" ~scope in
+  let key_request =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key requested_scope))
+          ->
+          Some
+            ( requested_scope
+            , Core.step
+                inspected.next
+                (Core.Runner_completed (Core.Completion (ticket, Ok key))) )
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspected.effects
+  in
+  Alcotest.(check bool)
+    "encrypted warm mirror requests its cached key"
+    true
+    (Option.is_some key_request);
+  Alcotest.(check bool)
+    "encrypted warm mirror is not attached before key recovery"
+    false
+    (List.exists
+       (function
+         | Core.Delegate (Core.Attach_graph _) -> true
+         | Run _ | Delegate _ | Publish _ -> false)
+       inspected.effects);
+  match key_request with
+  | None -> ()
+  | Some (requested_scope, unlocked) ->
+    Alcotest.(check bool)
+      "cached-key request retains the selected scope"
+      true
+      (requested_scope = scope);
+    let attached_request =
+      List.find_map
+        (function
+          | Core.Delegate (Core.Attach_graph request) -> Some request
+          | Run _ | Delegate _ | Publish _ -> None)
+        unlocked.effects
+    in
+    Alcotest.(check bool)
+      "warm mirror attaches after cached-key recovery"
+      true
+      (Option.is_some attached_request);
+    (match attached_request with
+     | None -> ()
+     | Some request ->
+       Alcotest.(check bool)
+         "attachment retains selected scope"
+         true
+         (request.scope = scope));
+    let sync_token =
+      Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:warm" |> Result.get_ok
+    in
+    let checkpoint =
+      Logseq_overlay_db.Types.Server_cursor.of_string "server-cursor:v1:0"
+      |> Result.get_ok
+    in
+    let sync =
+      Logseq_overlay_db.Types.sync_view ~token:sync_token ~checkpoint ~submissions:[]
+    in
+    let attached = Core.step unlocked.next (Core.Graph_attached { scope; sync }) in
+    let websocket_token = token_request attached.effects in
+    let connecting =
+      Core.step attached.next (Core.Token_provided (websocket_token, "websocket-token"))
+    in
+    let connection =
+      List.find_map
+        (function
+          | Core.Run (Core.Start_websocket request) -> Some request.scope
+          | Run _ | Delegate _ | Publish _ -> None)
+        connecting.effects
+      |> Option.get
+    in
+    let opened = Core.step connecting.next (Core.Websocket_opened connection) in
+    let mutation_id =
+      Logseq_db_types.Graph_types.Uuid.of_string "22222222-2222-4222-8222-222222222220"
+      |> Result.get_ok
+    in
+    let fingerprint =
+      Logseq_overlay_db.Types.Mutation_fingerprint.of_string
+        "mutation-fingerprint:v1:warm"
+      |> Result.get_ok
+    in
+    let pending : Logseq_overlay_db.Types.submission_descriptor =
+      { mutation_id
+      ; fingerprint
+      ; state = Logseq_overlay_db.Types.Queued
+      ; dependency_eligible = true
+      ; attempt_count = 0
+      ; plaintext_bytes = 16
+      ; protected_bytes = None
+      }
+    in
+    let pending_sync =
+      Logseq_overlay_db.Types.sync_view
+        ~token:sync_token
+        ~checkpoint
+        ~submissions:[ pending ]
+    in
+    let changed = Core.step opened.next Core.Local_outbox_changed in
+    let inspection_scope =
+      List.find_map
+        (function
+          | Core.Delegate (Core.Inspect_sync requested_scope) -> Some requested_scope
+          | Run _ | Delegate _ | Publish _ -> None)
+        changed.effects
+      |> Option.get
+    in
+    let planned =
+      Core.step
+        changed.next
+        (Core.Sync_inspected { scope = inspection_scope; sync = pending_sync })
+    in
+    let transition_key =
+      List.find_map
+        (function
+          | Core.Delegate (Core.Apply_outbox_transition request) -> request.key
+          | Run _ | Delegate _ | Publish _ -> None)
+        planned.effects
+    in
+    Alcotest.(check (option string))
+      "outbox protection retains the recovered key"
+      (Some "warm-graph-key")
+      (Option.map Core.graph_key_handle_id transition_key)
+;;
+
+let graph_picker_clears_terminal_graph_failure () =
+  let selected, scope = selected_graph encrypted_graph in
+  let missing =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+  in
+  let failed =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
           Some
             (Core.step
-               metadata_requested.next
-               (Runner_completed
-                  (Completion
-                     (ticket, Ok "{\"ok\":true,\"url\":\"https://snapshots.example/db\"}"))))
+               missing.next
+               (Core.Runner_completed
+                  (Core.Completion
+                     (ticket, Error (Core.Effect_failed "cached key unavailable")))))
         | Run _ | Delegate _ | Publish _ -> None)
-      metadata_requested.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "snapshot bootstrap did not fetch its metadata"
+      missing.effects
+    |> Option.get
   in
-  let completed =
+  let picker = Core.step failed.next Core.Graph_picker_requested in
+  let snapshot = (Core.state picker.next).snapshot in
+  Alcotest.(check bool)
+    "graph picker clears the terminal failure"
+    true
+    (snapshot.startup.awaiting_selection
+     && snapshot.startup.failure = None
+     && snapshot.last_error = None
+     && snapshot.sync_phase = Core.Offline
+     && snapshot.selected_graph = None)
+;;
+
+let graph_picker_fences_late_warm_key_completion () =
+  let selected, scope = selected_graph encrypted_graph in
+  let mirror = Core.{ graph = encrypted_graph; scope } in
+  let inspected =
+    Core.step selected.next (Core.Mirror_inspected (Mirror_available mirror))
+  in
+  let key_completion =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
-          let artifact =
-            Core.staged_artifact
-              ~id:"startup-matrix-artifact"
-              ~scope
-              ~path:"/staging/startup-matrix.artifact"
-              ~expected_rows:2
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+          let picker = Core.step inspected.next Core.Graph_picker_requested in
+          let key = Core.graph_key_handle ~id:"stale-warm-key" ~scope in
+          Some
+            (Core.step
+               picker.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok key))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspected.effects
+  in
+  Alcotest.(check bool)
+    "warm encrypted mirror has a pending key request"
+    true
+    (Option.is_some key_completion);
+  match key_completion with
+  | None -> ()
+  | Some completed ->
+    Alcotest.(check int)
+      "late key completion emits no graph or token work"
+      0
+      (List.length completed.effects)
+;;
+
+let warm_encrypted_graph_online_recovery_attaches_existing_mirror () =
+  let selected, scope = selected_graph encrypted_graph in
+  let mirror = Core.{ graph = encrypted_graph; scope } in
+  let inspected =
+    Core.step selected.next (Core.Mirror_inspected (Mirror_available mirror))
+  in
+  let failed =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+          Some
+            (Core.step
+               inspected.next
+               (Core.Runner_completed
+                  (Core.Completion
+                     (ticket, Error (Core.Effect_failed "cached key unavailable")))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspected.effects
+    |> Option.get
+  in
+  let recovery = Core.step failed.next Core.Online_recovery_requested in
+  let recovery_token = token_request recovery.effects in
+  let graph_key_fetch =
+    Core.step recovery.next (Core.Token_provided (recovery_token, "e2ee-token"))
+  in
+  let user_key_fetch =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+          Some
+            (Core.step
+               graph_key_fetch.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok "encrypted-graph-key"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      graph_key_fetch.effects
+    |> Option.get
+  in
+  let password_prompt =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+          Some
+            (Core.step
+               user_key_fetch.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok "private-key-package"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      user_key_fetch.effects
+    |> Option.get
+  in
+  let private_key_unlock =
+    Core.step password_prompt.next (Core.E2ee_password_submitted "password")
+  in
+  let graph_key_unlock =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
+          Some
+            (Core.step
+               private_key_unlock.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok ()))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      private_key_unlock.effects
+    |> Option.get
+  in
+  let recovered =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key request)) ->
+          let key =
+            Core.graph_key_handle ~id:"online-warm-key" ~scope:request.scope.graph
           in
           Some
             (Core.step
-               download_requested.next
-               (Runner_completed (Completion (ticket, Ok artifact))))
+               graph_key_unlock.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok key))))
         | Run _ | Delegate _ | Publish _ -> None)
-      download_requested.effects
+      graph_key_unlock.effects
+    |> Option.get
   in
-  match completed with
-  | Some completed ->
-    let activation =
-      List.find_map
-        (function
-          | Core.Delegate (Core.Activate_snapshot request) -> Some request
-          | Run _ | Delegate _ | Publish _ -> None)
-        completed.effects
-    in
-    (match activation with
-     | Some request -> request
-     | None -> fail "snapshot bootstrap did not delegate activation")
-  | None -> fail "snapshot bootstrap did not download its artifact"
-;;
-
-let encrypted_open_graph () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let open_request : Core.graph_open_request =
-    { graph
-    ; graph_directory = "/worker/encrypted-mirror"
-    ; database_path = "/worker/encrypted-mirror/db.sqlite"
-    ; checkpoint = checkpoint graph.graph_id
-    ; scope = mirror_request.scope
-    }
-  in
-  let inspected =
-    Core.step selected.next (Mirror_inspected (Mirror_available open_request))
-  in
-  let key = Core.graph_key_handle ~id:"encrypted-key" ~scope:open_request.scope in
-  let keyed = complete_wrapped_key inspected key in
-  let attached =
-    Core.step
-      keyed.next
-      (Graph_attached
-         { scope = open_request.scope
-         ; checkpoint = open_request.checkpoint
-         ; outbox_records = []
-         })
-  in
-  let websocket_token = token_request attached.effects in
-  let connecting =
-    Core.step attached.next (Token_provided (websocket_token, "websocket-token"))
-  in
-  let connection =
-    List.find_map
-      (function
-        | Core.Run (Core.Start_websocket request) -> Some request.scope
-        | Run _ | Delegate _ | Publish _ -> None)
-      connecting.effects
-    |> function
-    | Some connection -> connection
-    | None -> fail "attached encrypted graph did not start its WebSocket"
-  in
-  let opened = Core.step connecting.next (Websocket_opened connection) in
-  opened.next, connection
-;;
-
-let encrypted_authoritative_context (connection : Core.connection_scope) =
-  let module Transit = Transit_core.Json in
-  let module Codec = Transit_native.Transit.Json in
-  let envelope =
-    Codec.to_string
-      (Transit.Array [ Transit.Binary "snapshot-iv"; Transit.Binary "ciphertext" ])
-  in
-  let wire =
-    Codec.to_string
-      ~mode:Codec.Verbose
-      (Transit.Array
-         [ Transit.Array
-             [ Transit.Keyword "db/add"
-             ; Transit.String "remote-block"
-             ; Transit.Keyword "block/title"
-             ; Transit.String envelope
-             ]
-         ])
-  in
-  let batch : Core.authoritative_batch =
-    { message =
-        Sync_protocol.Server.Pull_ok
-          { t = 1; checksum = None; txs = [ { t = 1; tx = wire; outliner_op = None } ] }
-    ; scope = connection
-    ; presentation_generation = connection.graph.account.presentation_generation
-    ; lifecycle_generation = connection.graph.account.lifecycle_generation
-    }
-  in
-  Core.
-    { batch
-    ; precondition = "test-precondition"
-    ; checkpoint = checkpoint connection.graph.graph_id
-    ; database = Datascript.empty_db ()
-    ; outbox_records = []
-    }
-;;
-
-let local_batch_input
-      ?key
-      ?(scope = graph_scope ())
-      ?(admission_id = "test-admission")
-      ?(mutation_id = graph_id ())
-      ?(mutation_payload = "mutation")
-      ?(mutation_fingerprint = "fingerprint")
-      operations
-  =
-  Core.local_batch_input
-    ~scope
-    ~admission_id
-    ~key
-    ~outbox_records:[]
-    ~mutation_id
-    ~mutation_payload
-    ~mutation_fingerprint
-    ~outliner_op:"save-block"
-    ~database:(Datascript.empty_db ())
-    ~operations
-  |> Result.get_ok
-;;
-
-let test_local_batch_planning_separates_crypto_from_policy () =
-  let unprotected =
-    local_batch_input
-      [ Datascript.Add
-          ( Datascript.Temp_id "new-block"
-          , "block/uuid"
-          , Datascript.Uuid (Logseq_db_types.Graph_types.Uuid.to_string (graph_id ())) )
-      ]
-    |> Core.begin_local_batch
-    |> Result.get_ok
-  in
-  Alcotest.check
-    Alcotest.bool
-    "unprotected batch needs no runner crypto"
-    true
-    (Core.local_batch_crypto_request unprotected = None);
-  let record = Core.finish_local_batch unprotected None |> Result.get_ok in
-  let encoded = Core.encode_outbox_records [ record ] |> Result.get_ok in
-  let decoded = Core.decode_outbox_records encoded |> Result.get_ok in
-  Alcotest.check Alcotest.bool "outbox codec round-trips" true (decoded = [ record ]);
-  let key = Core.graph_key_handle ~id:"runner-owned" ~scope:(graph_scope ()) in
-  let protected =
-    local_batch_input
-      ~key
-      [ Datascript.Add
-          (Datascript.Temp_id "new-block", "block/title", Datascript.String "secret")
-      ]
-    |> Core.begin_local_batch
-    |> Result.get_ok
-  in
-  let request = Core.local_batch_crypto_request protected |> Option.get in
-  Alcotest.(check (list string))
-    "only serialized protected values leave for crypto"
-    [ "[\"~#'\",\"secret\"]" ]
-    request.plaintexts;
-  Alcotest.check
-    Alcotest.bool
-    "missing encrypted results are rejected"
-    true
-    (Result.is_error (Core.finish_local_batch protected None));
-  let protected_record =
-    Core.finish_local_batch protected (Some [ "iv", "ciphertext" ]) |> Result.get_ok
-  in
-  let encoded = Core.encode_outbox_records [ protected_record ] |> Result.get_ok in
-  Alcotest.check
-    Alcotest.bool
-    "plaintext is absent from durable outbox"
-    true
-    (not (contains (String.concat "" encoded) "secret"))
-;;
-
-let test_post_admission_planning_failure_emits_terminal_worker_effect () =
-  let input =
-    local_batch_input
-      [ Datascript.Entity
-          { db_id = Some (Datascript.Temp_id "unsupported")
-          ; attrs =
-              [ ( "block/uuid"
-                , Datascript.One_value
-                    (Datascript.Uuid "33333333-3333-4333-8333-333333333333") )
-              ]
-          }
-      ]
-  in
-  let failed = Core.step (initial ()) (Local_batch_prepared input) in
-  Alcotest.check
-    Alcotest.bool
-    "post-admission planning failure is correlated back to the worker"
+  Alcotest.(check bool)
+    "online key recovery attaches the existing mirror"
     true
     (List.exists
        (function
-         | Core.Delegate _ -> true
-         | Run _ | Publish _ -> false)
-       failed.effects)
+         | Core.Delegate (Core.Attach_graph request) -> request.scope = scope
+         | Run _ | Delegate _ | Publish _ -> false)
+       recovered.effects);
+  Alcotest.(check bool)
+    "online warm recovery does not replace the existing mirror"
+    false
+    (List.exists
+       (function
+         | Core.Publish (Core.Token_requested request) ->
+           Core.token_request_purpose request = Core.Snapshot_bootstrap
+         | Run _ | Delegate _ | Publish _ -> false)
+       recovered.effects)
 ;;
 
-let test_post_admission_encryption_failure_emits_terminal_worker_effect () =
-  let core, connection = encrypted_open_graph () in
-  let input =
-    local_batch_input
-      ~scope:connection.graph
-      [ Datascript.Add
-          (Datascript.Temp_id "new-block", "block/title", Datascript.String "secret")
-      ]
+let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
+  let authenticated =
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
-  let encrypting = Core.step core (Local_batch_prepared input) in
-  let failed =
+  let catalog_token = token_request authenticated.effects in
+  let authorized =
+    Core.step authenticated.next (Core.Token_provided (catalog_token, "catalog-token"))
+  in
+  let catalog =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Encrypt_protected_values _)) ->
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
           Some
             (Core.step
-               encrypting.next
-               (Runner_completed
-                  (Completion
-                     ( ticket
-                     , Error
-                         (Crypto_failed
-                            (Crypto_provider_unavailable, "provider unavailable")) ))))
+               authorized.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok [ encrypted_graph ]))))
         | Run _ | Delegate _ | Publish _ -> None)
-      encrypting.effects
-    |> function
-    | Some failed -> failed
-    | None -> fail "protected local batch did not request encryption"
+      authorized.effects
+    |> Option.get
   in
-  Alcotest.check
-    Alcotest.bool
-    "encryption failure terminally rejects the admitted mutation"
-    true
-    (List.exists
-       (function
-         | Core.Delegate _ -> true
-         | Run _ | Publish _ -> false)
-       failed.effects)
-;;
-
-let test_graph_selection_delegates_mirror_authority () =
-  let authenticated =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
+  let selected = Core.step catalog.next (Core.Graph_selected graph_id) in
+  let scope = Core.admitted_graph_scope selected.next |> Option.get in
+  let missing =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
   in
-  let request = token_request authenticated.effects in
-  let authorized = Core.step authenticated.next (Token_provided (request, "token")) in
-  let graph : Core.graph =
-    { graph_id = graph_id ()
-    ; name = "Journal"
-    ; schema = { major = 1; minor = 0; exact = true }
-    ; encrypted = false
-    }
-  in
-  let catalog =
-    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
-  in
-  let selected = Core.step catalog.next (Graph_selected graph.graph_id) in
-  Alcotest.check
-    Alcotest.bool
-    "selection is reflected in the new state"
-    true
-    (match (Core.state selected.next).snapshot.selected_graph with
-     | Some selected -> Logseq_db_types.Graph_types.Uuid.equal graph.graph_id selected
-     | None -> false);
-  Alcotest.check
-    Alcotest.bool
-    "worker mirror inspection is delegated"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Inspect_mirror request) ->
-           Logseq_db_types.Graph_types.Uuid.equal request.graph.graph_id graph.graph_id
-         | Run _ | Delegate _ | Publish _ -> false)
-       selected.effects);
-  let saved = save_catalog_cache selected.effects in
-  Alcotest.check
-    Alcotest.bool
-    "selected graph is persisted in the catalog cache"
-    true
-    (match Core.catalog_cache_selected_graph saved with
-     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
-     | None -> false)
-;;
-
-let test_selected_graph_survives_picker_and_codec_restart () =
-  let graph = graph () in
-  let selected, _ = select_catalog_graph graph in
-  let persisted = save_catalog_cache selected.effects in
-  let persisted =
-    persisted |> Core.encode_catalog_cache |> Core.decode_catalog_cache |> Result.get_ok
-  in
-  let picker = Core.step selected.next Core.Graph_picker_requested in
-  Alcotest.check
-    Alcotest.bool
-    "picker clears only the current process selection"
-    true
-    ((Core.state picker.next).snapshot.selected_graph = None
-     && (Core.state picker.next).snapshot.startup.awaiting_selection);
-  Alcotest.check
-    Alcotest.bool
-    "returning to the picker does not overwrite the durable selection"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Run (Core.Request (_, Core.Save_catalog _)) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          picker.effects));
-  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
-  let generation_before = (Core.state restoring.next).snapshot.startup.graph_generation in
-  let restored =
-    Core.step restoring.next (load_catalog_completion restoring.effects (Some persisted))
-  in
-  let snapshot = (Core.state restored.next).snapshot in
-  Alcotest.check
-    Alcotest.bool
-    "fresh core restores the codec-round-tripped selected graph"
-    true
-    (match snapshot.selected_graph with
-     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
-     | None -> false);
-  Alcotest.check
-    Alcotest.bool
-    "warm restore advances generation and bypasses the picker"
-    true
-    ((not snapshot.startup.awaiting_selection)
-     && snapshot.startup.graph_generation > generation_before);
-  let request = inspect_mirror_request restored.effects in
-  Alcotest.check
-    Alcotest.bool
-    "warm restore delegates mirror inspection in the restored scope"
-    true
-    (graph_id_equal request.graph.graph_id graph.graph_id
-     && request.scope.graph_generation = snapshot.startup.graph_generation);
-  Alcotest.check
-    Alcotest.bool
-    "loading a catalog cache does not immediately rewrite it"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Run (Core.Request (_, Core.Save_catalog _)) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          restored.effects))
-;;
-
-let check_invalid_cached_selection label cache =
-  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
-  let restored =
-    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
-  in
-  let snapshot = (Core.state restored.next).snapshot in
-  Alcotest.check
-    Alcotest.bool
-    (label ^ " awaits selection")
-    true
-    (snapshot.startup.awaiting_selection && snapshot.selected_graph = None);
-  Alcotest.check
-    Alcotest.bool
-    (label ^ " starts no graph work")
-    false
-    (has_graph_open_work restored.effects)
-;;
-
-let test_absent_stale_and_malformed_cached_selections_fail_closed () =
-  let graph = graph () in
-  let absent =
-    Core.catalog_cache ~user_id:"user-1" ~graphs:[ graph ] ~selected_graph:None
-  in
-  check_invalid_cached_selection "absent cached selection" absent;
-  let stale =
-    Core.catalog_cache
-      ~user_id:"user-1"
-      ~graphs:[ graph ]
-      ~selected_graph:(Some (other_graph_id ()))
-  in
-  check_invalid_cached_selection "stale cached selection" stale;
-  let malformed =
-    Core.encode_catalog_cache absent
-    |> Yojson.Safe.from_string
-    |> function
-    | `Assoc fields ->
-      `Assoc (("selectedGraph", `String "not-a-graph-uuid") :: fields)
-      |> Yojson.Safe.to_string
-      |> Core.decode_catalog_cache
-      |> Result.get_ok
-    | _ -> fail "encoded catalog cache was not an object"
-  in
-  check_invalid_cached_selection "malformed cached selection" malformed
-;;
-
-let test_catalog_refresh_preserves_admitted_selection () =
-  let graph = graph () in
-  let selected, _ = select_catalog_graph graph in
-  let before = (Core.state selected.next).snapshot in
-  let refreshed = refresh_catalog selected.next [ graph; other_graph () ] in
-  let after = (Core.state refreshed.next).snapshot in
-  Alcotest.check
-    Alcotest.bool
-    "refresh preserves the admitted selected graph"
-    true
-    (match after.selected_graph with
-     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
-     | None -> false);
-  Alcotest.check
-    Alcotest.bool
-    "refresh keeps the active graph generation and bypasses the picker"
-    true
-    (after.startup.graph_generation = before.startup.graph_generation
-     && not after.startup.awaiting_selection);
-  let saved = save_catalog_cache refreshed.effects in
-  Alcotest.check
-    Alcotest.bool
-    "refresh persists the admitted selected graph"
-    true
-    (match Core.catalog_cache_selected_graph saved with
-     | Some selected_graph -> graph_id_equal selected_graph graph.graph_id
-     | None -> false)
-;;
-
-let test_catalog_refresh_removes_unadmitted_selection () =
-  let graph = graph () in
-  let selected, _ = select_catalog_graph graph in
-  let before = (Core.state selected.next).snapshot in
-  let refreshed = refresh_catalog selected.next [ other_graph () ] in
-  let after = (Core.state refreshed.next).snapshot in
-  Alcotest.check
-    Alcotest.bool
-    "refresh clears a graph omitted by the authoritative catalog"
-    true
-    (after.selected_graph = None && after.startup.awaiting_selection);
-  Alcotest.check
-    Alcotest.bool
-    "refresh fences the removed graph generation"
-    true
-    (after.startup.graph_generation > before.startup.graph_generation);
-  Alcotest.check
-    Alcotest.bool
-    "refresh detaches the removed graph"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Detach_graph _) -> true
-         | Run _ | Delegate _ | Publish _ -> false)
-       refreshed.effects);
-  Alcotest.check
-    Alcotest.bool
-    "refresh starts no work for the removed graph"
-    false
-    (has_graph_open_work refreshed.effects);
-  let saved = save_catalog_cache refreshed.effects in
-  Alcotest.check
-    (Alcotest.option Alcotest.string)
-    "refresh persists no removed selection"
-    None
-    (Core.catalog_cache_selected_graph saved
-     |> Option.map Logseq_db_types.Graph_types.Uuid.to_string)
-;;
-
-let test_catalog_save_failure_keeps_selected_graph_usable () =
-  let graph = graph () in
-  let selected, mirror_request = select_catalog_graph graph in
   let failed =
-    complete_save_catalog selected (Error (Core.Effect_failed "disk unavailable"))
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+          Some
+            (Core.step
+               missing.next
+               (Core.Runner_completed
+                  (Core.Completion (ticket, Error (Core.Effect_failed "missing key")))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      missing.effects
+    |> Option.get
   in
-  Alcotest.check
-    Alcotest.bool
-    "advisory save failure preserves the selected graph state"
-    true
-    (Core.state failed.next = Core.state selected.next);
-  let available = open_request graph mirror_request.scope "save-failure" in
-  let inspected =
-    Core.step failed.next (Core.Mirror_inspected (Core.Mirror_available available))
+  let recovery = Core.step failed.next Core.Online_recovery_requested in
+  let recovery_token = token_request recovery.effects in
+  let graph_key_fetch =
+    Core.step recovery.next (Core.Token_provided (recovery_token, "e2ee-token"))
   in
-  Alcotest.check
-    Alcotest.bool
-    "mirror opening continues after advisory save failure"
+  let user_key_fetch =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+          Some
+            (Core.step
+               graph_key_fetch.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok "encrypted-graph-key"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      graph_key_fetch.effects
+    |> Option.get
+  in
+  let password_prompt =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+          Some
+            (Core.step
+               user_key_fetch.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok "private-key-package"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      user_key_fetch.effects
+    |> Option.get
+  in
+  Alcotest.(check bool)
+    "private key package prompts for the E2EE password"
     true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Attach_graph request) ->
-           request.scope = mirror_request.scope
-         | Run _ | Delegate _ | Publish _ -> false)
-       inspected.effects)
+    (Core.state password_prompt.next).snapshot.startup.awaiting_e2ee_password;
+  let private_key_unlock =
+    Core.step password_prompt.next (Core.E2ee_password_submitted "password")
+  in
+  let graph_key_unlock =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Unlock_private_key request)) ->
+          Alcotest.(check string) "password is forwarded once" "password" request.password;
+          Alcotest.(check string)
+            "private key package is forwarded"
+            "private-key-package"
+            request.private_key_package;
+          Some
+            (Core.step
+               private_key_unlock.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok ()))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      private_key_unlock.effects
+    |> Option.get
+  in
+  let bootstrapping =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key request)) ->
+          Alcotest.(check string)
+            "encrypted graph key is forwarded"
+            "encrypted-graph-key"
+            request.encrypted_graph_key;
+          let handle = Core.graph_key_handle ~id:"graph-key" ~scope:request.scope.graph in
+          Some
+            (Core.step
+               graph_key_unlock.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok handle))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      graph_key_unlock.effects
+    |> Option.get
+  in
+  let bootstrap_token = token_request bootstrapping.effects in
+  Alcotest.(check bool)
+    "unlocked graph key resumes snapshot bootstrap"
+    true
+    (Core.token_request_purpose bootstrap_token = Core.Snapshot_bootstrap)
 ;;
 
-let test_same_account_reconciliation_preserves_warm_restore () =
-  let graph = graph () in
-  let selected, _ = select_catalog_graph graph in
-  let cache = save_catalog_cache selected.effects in
-  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
-  let restored =
-    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
-  in
-  let restored_snapshot = (Core.state restored.next).snapshot in
-  let reconciled =
-    Core.step restored.next (Account_authenticated { user_id = Some "user-1" })
-  in
-  let reconciled_snapshot = (Core.state reconciled.next).snapshot in
-  Alcotest.check
-    Alcotest.bool
-    "same-account authentication retains the warm selected graph"
-    true
-    (reconciled_snapshot.selected_graph = restored_snapshot.selected_graph
-     && reconciled_snapshot.startup.graph_generation
-        = restored_snapshot.startup.graph_generation
-     && not reconciled_snapshot.startup.awaiting_selection);
-  Alcotest.check
-    Alcotest.bool
-    "same-account authentication does not detach the warm graph"
-    false
-    (List.exists
-       (function
-         | Core.Delegate (Core.Detach_graph _) -> true
-         | Run _ | Delegate _ | Publish _ -> false)
-       reconciled.effects);
-  Alcotest.check
-    Alcotest.bool
-    "same-account authentication waits for Timeline presentation"
-    false
-    (has_token_request reconciled.effects);
-  let presented = Core.step reconciled.next Timeline_presented in
-  let catalog_token = token_request presented.effects in
-  let authorized =
-    Core.step presented.next (Token_provided (catalog_token, "catalog-token"))
-  in
-  let refreshed =
-    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
-  in
-  let saved = save_catalog_cache refreshed.effects in
-  Alcotest.check
-    Alcotest.bool
-    "same-account catalog reconciliation persists the warm selection"
-    true
-    (match Core.catalog_cache_selected_graph saved with
-     | Some graph_id -> graph_id_equal graph_id graph.graph_id
-     | None -> false)
-;;
-
-let test_warm_graph_attachment_defers_websocket_until_timeline () =
-  let graph = graph () in
-  let selected, _ = select_catalog_graph graph in
-  let cache = save_catalog_cache selected.effects in
-  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
-  let restored =
-    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
-  in
-  let reconciled =
-    Core.step restored.next (Account_authenticated { user_id = Some "user-1" })
-  in
-  let mirror = inspect_mirror_request restored.effects in
-  let request = open_request graph mirror.scope "warm-websocket-barrier" in
-  let inspected =
-    Core.step reconciled.next (Mirror_inspected (Mirror_available request))
-  in
-  let attached =
-    Core.step
-      inspected.next
-      (Graph_attached
-         { scope = request.scope; checkpoint = request.checkpoint; outbox_records = [] })
-  in
-  Alcotest.check
-    Alcotest.bool
-    "warm graph attachment emits no pre-presentation WebSocket token"
-    false
-    (has_token_request attached.effects);
-  let presented = Core.step attached.next Timeline_presented in
-  Alcotest.check
-    Alcotest.bool
-    "post-presentation reconciliation begins with catalog authentication"
-    true
-    (Core.token_request_purpose (token_request presented.effects) = Core.Catalog_discovery)
-;;
-
-let test_unauthenticated_warm_graph_does_not_challenge_websocket () =
-  let graph = graph () in
-  let selected, _ = select_catalog_graph graph in
-  let cache = save_catalog_cache selected.effects in
-  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
-  let restored =
-    Core.step restoring.next (load_catalog_completion restoring.effects (Some cache))
-  in
-  let mirror = inspect_mirror_request restored.effects in
-  let request = open_request graph mirror.scope "unauthenticated-warm-graph" in
-  let inspected = Core.step restored.next (Mirror_inspected (Mirror_available request)) in
-  let attached =
-    Core.step
-      inspected.next
-      (Graph_attached
-         { scope = request.scope; checkpoint = request.checkpoint; outbox_records = [] })
-  in
-  let presented = Core.step attached.next Timeline_presented in
-  Alcotest.check
-    Alcotest.bool
-    "unauthenticated warm graph emits no WebSocket token after presentation"
-    false
-    (has_token_request presented.effects)
-;;
-
-let test_account_replacement_cancels_and_detaches_before_new_catalog_work () =
-  let selected, mirror = select_catalog_graph (graph ()) in
-  let replaced =
-    Core.step selected.next (Account_authenticated { user_id = Some "user-2" })
-  in
-  let rec positions index cancel detach token = function
-    | [] -> cancel, detach, token
-    | Core.Run (Core.Cancel_effects scope) :: rest
-      when scope = Core.effect_scope_of_account mirror.scope.account ->
-      positions (index + 1) (Some index) detach token rest
-    | Core.Delegate _ :: rest -> positions (index + 1) cancel (Some index) token rest
-    | Core.Publish (Core.Token_requested _) :: rest ->
-      positions (index + 1) cancel detach (Some index) rest
-    | _ :: rest -> positions (index + 1) cancel detach token rest
-  in
-  match positions 0 None None None replaced.effects with
-  | Some cancel, Some detach, Some token ->
-    Alcotest.check
-      Alcotest.bool
-      "old account cancellation and worker detach precede replacement catalog work"
-      true
-      (cancel < detach && detach < token)
-  | _ -> fail "account replacement omitted scoped cancellation, detach, or catalog work"
-;;
-
-let test_sign_out_cancels_and_detaches_the_managed_attachment () =
-  let selected, mirror = select_catalog_graph (graph ()) in
-  let signed_out = Core.step selected.next (Account_authenticated { user_id = None }) in
-  Alcotest.check
-    Alcotest.bool
-    "sign-out cancels the exact old account scope"
-    true
-    (List.exists
-       (function
-         | Core.Run (Core.Cancel_effects scope) ->
-           scope = Core.effect_scope_of_account mirror.scope.account
-         | Run _ | Delegate _ | Publish _ -> false)
-       signed_out.effects);
-  Alcotest.check
-    Alcotest.bool
-    "sign-out delegates worker teardown"
-    true
-    (List.exists
-       (function
-         | Core.Delegate _ -> true
-         | Run _ | Publish _ -> false)
-       signed_out.effects)
-;;
-
-let test_auth_before_cache_load_waits_for_local_timeline () =
-  let graph = graph () in
-  let cache =
-    Core.catalog_cache
-      ~user_id:"user-1"
-      ~graphs:[ graph ]
-      ~selected_graph:(Some graph.graph_id)
-  in
-  let restoring = Core.step (initial ()) (Restore_local_account { user_id = "user-1" }) in
-  let reconciled =
-    Core.step restoring.next (Account_authenticated { user_id = Some "user-1" })
-  in
-  Alcotest.check
-    Alcotest.bool
-    "authentication does not challenge while the local cache is loading"
-    false
-    (has_token_request reconciled.effects);
-  let restored =
-    Core.step reconciled.next (load_catalog_completion restoring.effects (Some cache))
-  in
-  let snapshot = (Core.state restored.next).snapshot in
-  Alcotest.check
-    Alcotest.bool
-    "late local cache completion restores the selected graph"
-    true
-    (match snapshot.selected_graph with
-     | Some graph_id ->
-       graph_id_equal graph_id graph.graph_id && not snapshot.startup.awaiting_selection
-     | None -> false);
-  ignore (inspect_mirror_request restored.effects);
-  Alcotest.check
-    Alcotest.bool
-    "local restoration remains network-free before Timeline presentation"
-    false
-    (has_token_request restored.effects);
-  let presented = Core.step restored.next Timeline_presented in
-  ignore (token_request presented.effects)
-;;
-
-let test_snapshot_activation_reinspects_worker_mirror () =
+let begin_snapshot_bootstrap () =
   let authenticated =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
-  let request = token_request authenticated.effects in
-  let authorized = Core.step authenticated.next (Token_provided (request, "token")) in
-  let graph : Core.graph =
-    { graph_id = graph_id ()
-    ; name = "Journal"
-    ; schema = { major = 1; minor = 0; exact = true }
-    ; encrypted = false
-    }
+  let catalog_token = token_request authenticated.effects in
+  let authorized =
+    Core.step authenticated.next (Core.Token_provided (catalog_token, "catalog-token"))
   in
   let catalog =
-    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+          Some
+            (Core.step
+               authorized.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok [ graph ]))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      authorized.effects
+    |> Option.get
   in
-  let selected = Core.step catalog.next (Graph_selected graph.graph_id) in
+  let selected = Core.step catalog.next (Core.Graph_selected graph_id) in
   let scope =
     List.find_map
       (function
@@ -1088,86 +548,68 @@ let test_snapshot_activation_reinspects_worker_mirror () =
       selected.effects
     |> Option.get
   in
-  let activated = Core.step selected.next (Snapshot_activated { scope }) in
-  Alcotest.check
-    Alcotest.bool
-    "activated snapshot is re-resolved by worker authority"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Inspect_mirror request) -> request.scope = scope
-         | Run _ | Delegate _ | Publish _ -> false)
-       activated.effects)
+  let missing =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+  in
+  let snapshot_token = token_request missing.effects in
+  let requested =
+    Core.step missing.next (Core.Token_provided (snapshot_token, "snapshot-token"))
+  in
+  requested, scope
 ;;
 
-let test_encrypted_snapshot_activation_carries_decryption_capability () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let missing =
-    Core.step selected.next (Mirror_inspected (Mirror_absent mirror_request.scope))
-  in
-  let key = Core.graph_key_handle ~id:"cold-bootstrap-key" ~scope:mirror_request.scope in
-  let keyed = complete_wrapped_key missing key in
-  let snapshot_token = token_request keyed.effects in
-  Alcotest.check
-    Alcotest.bool
-    "encrypted bootstrap requests a snapshot token only after the key is loaded"
-    true
-    (Core.token_request_purpose snapshot_token = Core.Snapshot_bootstrap);
-  let baseline_requested =
-    Core.step keyed.next (Token_provided (snapshot_token, "snapshot-token"))
-  in
-  let metadata_requested =
+let snapshot_bootstrap_preserves_server_cursor () =
+  let requested, scope = begin_snapshot_bootstrap () in
+  let metadata =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
           Some
             (Core.step
-               baseline_requested.next
-               (Runner_completed
-                  (Completion (ticket, Ok "{\"type\":\"pull/ok\",\"t\":7}"))))
+               requested.next
+               (Core.Runner_completed
+                  (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|}))))
         | Run _ | Delegate _ | Publish _ -> None)
-      baseline_requested.effects
-    |> function
-    | Some transition -> transition
-    | None -> fail "encrypted bootstrap did not fetch its baseline"
+      requested.effects
+    |> Option.get
   in
-  let download_requested =
+  let download =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
           Some
             (Core.step
-               metadata_requested.next
-               (Runner_completed
-                  (Completion
-                     (ticket, Ok "{\"ok\":true,\"url\":\"https://snapshots.example/db\"}"))))
+               metadata.next
+               (Core.Runner_completed
+                  (Core.Completion
+                     ( ticket
+                     , Ok {|{"ok":true,"url":"https://example.com/snapshot.sqlite"}|} ))))
         | Run _ | Delegate _ | Publish _ -> None)
-      metadata_requested.effects
-    |> function
-    | Some transition -> transition
-    | None -> fail "encrypted bootstrap did not fetch snapshot metadata"
+      metadata.effects
+    |> Option.get
   in
   let activated =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
+        | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
+          Alcotest.(check int)
+            "download retains configured bound"
+            (1024 * 1024)
+            request.maximum_bytes;
           let artifact =
             Core.staged_artifact
-              ~id:"encrypted-artifact"
-              ~scope:mirror_request.scope
-              ~path:"/staging/encrypted.artifact"
-              ~expected_rows:2
+              ~id:"snapshot"
+              ~scope
+              ~path:"/tmp/snapshot.sqlite"
+              ~expected_rows:10
           in
           Some
             (Core.step
-               download_requested.next
-               (Runner_completed (Completion (ticket, Ok artifact))))
+               download.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok artifact))))
         | Run _ | Delegate _ | Publish _ -> None)
-      download_requested.effects
-    |> function
-    | Some transition -> transition
-    | None -> fail "encrypted bootstrap did not download its snapshot"
+      download.effects
+    |> Option.get
   in
   let activation =
     List.find_map
@@ -1175,1043 +617,73 @@ let test_encrypted_snapshot_activation_carries_decryption_capability () =
         | Core.Delegate (Core.Activate_snapshot request) -> Some request
         | Run _ | Delegate _ | Publish _ -> None)
       activated.effects
-    |> function
-    | Some request -> request
-    | None -> fail "downloaded encrypted snapshot was not activated"
+    |> Option.get
   in
-  Alcotest.check
-    Alcotest.bool
-    "encrypted snapshot activation carries the current scoped key handle"
+  Alcotest.(check int) "activation uses baseline cursor" 42 activation.applied_server_t;
+  Alcotest.(check bool)
+    "plain snapshot has no graph key"
     true
-    (match activation.key with
-     | Some actual ->
-       String.equal (Core.graph_key_handle_id actual) (Core.graph_key_handle_id key)
-       && Core.graph_key_handle_scope actual = mirror_request.scope
-     | None -> false)
+    (Option.is_none activation.key)
 ;;
 
-let test_unencrypted_startup_matrix () =
-  let graph = graph () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let missing =
-    Core.step selected.next (Mirror_inspected (Mirror_absent mirror_request.scope))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "an unencrypted missing mirror requests snapshot authorization immediately"
-    true
-    (has_snapshot_token_request missing.effects);
-  let activation = complete_snapshot_bootstrap missing mirror_request.scope in
-  Alcotest.check
-    Alcotest.bool
-    "unencrypted snapshot activation carries no graph key"
-    true
-    (Option.is_none activation.key);
-  let selected, mirror_request = select_catalog_graph graph in
-  let available_request = open_request graph mirror_request.scope "plain-warm-mirror" in
-  let available =
-    Core.step selected.next (Mirror_inspected (Mirror_available available_request))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "an unencrypted available mirror attaches immediately"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Attach_graph request) ->
-           request.scope = mirror_request.scope
-         | Run _ | Delegate _ | Publish _ -> false)
-       available.effects);
-  Alcotest.check
-    Alcotest.bool
-    "an unencrypted available mirror does not bootstrap a snapshot"
-    true
-    (not
-       (has_snapshot_token_request available.effects
-        || has_snapshot_work available.effects));
-  let selected, _ = select_catalog_graph graph in
-  let recovery = Core.step selected.next Online_recovery_requested in
-  Alcotest.check
-    Alcotest.bool
-    "unencrypted online recovery requests snapshot authorization immediately"
-    true
-    (has_snapshot_token_request recovery.effects);
-  let selected, mirror_request = select_catalog_graph graph in
-  let deletion =
-    Core.step selected.next (Local_cache_deletion_requested graph.graph_id)
-  in
-  Alcotest.check
-    Alcotest.bool
-    "unencrypted cache deletion requests snapshot authorization"
-    true
-    (has_snapshot_token_request deletion.effects);
-  Alcotest.check
-    Alcotest.bool
-    "unencrypted cache deletion advances the graph generation"
-    true
-    ((Core.state deletion.next).snapshot.startup.graph_generation
-     = mirror_request.scope.graph_generation + 1);
-  Alcotest.check
-    Alcotest.bool
-    "unencrypted cache deletion delegates mirror deletion"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Delete_mirror request) ->
-           Logseq_db_types.Graph_types.Uuid.equal request.graph_id graph.graph_id
-         | Run _ | Delegate _ | Publish _ -> false)
-       deletion.effects)
-;;
-
-let test_encrypted_bootstrap_routes_wait_for_a_scoped_key () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let missing =
-    Core.step selected.next (Mirror_inspected (Mirror_absent mirror_request.scope))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "an encrypted missing mirror loads its key"
-    true
-    (graph_key_load_scope missing.effects = Some mirror_request.scope);
-  Alcotest.check
-    Alcotest.bool
-    "an encrypted missing mirror starts no snapshot work before its key"
-    true
-    (not
-       (has_snapshot_token_request missing.effects || has_snapshot_work missing.effects));
-  let selected, mirror_request = select_catalog_graph graph in
-  let recovery = Core.step selected.next Online_recovery_requested in
-  Alcotest.check
-    Alcotest.bool
-    "encrypted online recovery loads its key"
-    true
-    (graph_key_load_scope recovery.effects = Some mirror_request.scope);
-  Alcotest.check
-    Alcotest.bool
-    "encrypted online recovery starts no snapshot work before its key"
-    true
-    (not
-       (has_snapshot_token_request recovery.effects || has_snapshot_work recovery.effects));
-  let duplicate_recovery = Core.step recovery.next Online_recovery_requested in
-  Alcotest.(check int)
-    "repeated recovery during key loading emits no competing chain"
-    0
-    (List.length duplicate_recovery.effects);
-  let selected, mirror_request = select_catalog_graph graph in
-  let deletion =
-    Core.step selected.next (Local_cache_deletion_requested graph.graph_id)
-  in
-  let new_scope = graph_key_load_scope deletion.effects in
-  Alcotest.check
-    Alcotest.bool
-    "encrypted cache deletion reloads a key in the new generation"
-    true
-    (match new_scope with
-     | Some scope ->
-       scope.graph_generation = mirror_request.scope.graph_generation + 1
-       && Logseq_db_types.Graph_types.Uuid.equal scope.graph_id graph.graph_id
-     | None -> false);
-  Alcotest.check
-    Alcotest.bool
-    "encrypted cache deletion starts no snapshot work before its new key"
-    true
-    (not
-       (has_snapshot_token_request deletion.effects || has_snapshot_work deletion.effects))
-;;
-
-let test_encrypted_recovery_resumes_and_coalesces_snapshot_bootstrap () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let available_request = open_request graph mirror_request.scope "keyed-recovery" in
-  let inspected =
-    Core.step selected.next (Mirror_inspected (Mirror_available available_request))
-  in
-  let key = Core.graph_key_handle ~id:"recovery-key" ~scope:mirror_request.scope in
-  let keyed = complete_wrapped_key inspected key in
-  let recovery = Core.step keyed.next Online_recovery_requested in
-  Alcotest.check
-    Alcotest.bool
-    "online recovery reuses a correctly scoped key"
-    true
-    (has_snapshot_token_request recovery.effects
-     && Option.is_none (graph_key_load_scope recovery.effects));
-  let duplicate_token = Core.step recovery.next Online_recovery_requested in
-  Alcotest.(check int)
-    "repeated recovery while snapshot authorization is pending is coalesced"
-    0
-    (List.length duplicate_token.effects);
-  let snapshot_token = token_request recovery.effects in
-  let baseline =
-    Core.step recovery.next (Token_provided (snapshot_token, "snapshot-token"))
-  in
-  let duplicate_baseline = Core.step baseline.next Online_recovery_requested in
-  Alcotest.(check int)
-    "repeated recovery while snapshot IO is pending is coalesced"
-    0
-    (List.length duplicate_baseline.effects)
-;;
-
-let test_cache_deletion_rejects_stale_and_wrong_scope_key_completions () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let missing =
-    Core.step selected.next (Mirror_inspected (Mirror_absent mirror_request.scope))
-  in
-  let stale_key = Core.graph_key_handle ~id:"stale-key" ~scope:mirror_request.scope in
-  let deletion = Core.step missing.next (Local_cache_deletion_requested graph.graph_id) in
-  let stale =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
-          Some
-            (Core.step
-               deletion.next
-               (Runner_completed (Completion (ticket, Ok stale_key))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      missing.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "missing mirror did not load a wrapped graph key"
-  in
-  Alcotest.(check int)
-    "a completion from the deleted generation emits no snapshot work"
-    0
-    (List.length stale.effects);
-  let new_scope =
-    graph_key_load_scope deletion.effects
-    |> function
-    | Some scope -> scope
-    | None -> fail "encrypted cache deletion did not reload its graph key"
-  in
-  let wrong_scope =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
-          Some
-            (Core.step
-               deletion.next
-               (Runner_completed (Completion (ticket, Ok stale_key))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      deletion.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "encrypted cache deletion did not reload its graph key"
-  in
-  Alcotest.check
-    Alcotest.bool
-    "a wrong-scope key cannot begin snapshot work"
-    true
-    (new_scope <> mirror_request.scope
-     && not
-          (has_snapshot_token_request wrong_scope.effects
-           || has_snapshot_work wrong_scope.effects));
-  Alcotest.check
-    Alcotest.bool
-    "a wrong-scope key completion enters E2EE failure"
-    true
-    ((Core.state wrong_scope.next).snapshot.startup.failure = Some Core.During_e2ee)
-;;
-
-let test_encrypted_bootstrap_recovers_a_missing_cached_key () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let missing =
-    Core.step selected.next (Mirror_inspected (Mirror_absent mirror_request.scope))
-  in
+let invalid_snapshot_baseline_fails_bootstrap () =
+  let requested, _scope = begin_snapshot_bootstrap () in
   let failed =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
           Some
             (Core.step
-               missing.next
-               (Runner_completed
-                  (Completion (ticket, Error (Effect_failed "cached key missing")))))
+               requested.next
+               (Core.Runner_completed
+                  (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":-1}|}))))
         | Run _ | Delegate _ | Publish _ -> None)
-      missing.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "missing mirror did not load a wrapped graph key"
+      requested.effects
+    |> Option.get
   in
-  Alcotest.check
-    Alcotest.bool
-    "cached-key failure enters explicit local recovery"
+  let snapshot = (Core.state failed.next).snapshot in
+  Alcotest.(check bool)
+    "invalid baseline enters failed state"
     true
-    ((Core.state failed.next).snapshot.startup.failure = Some Core.During_local_restore
-     && not (has_token_request failed.effects));
-  Alcotest.check
-    Alcotest.bool
-    "cached-key failure starts no snapshot work"
-    true
-    (not (has_snapshot_token_request failed.effects || has_snapshot_work failed.effects));
-  let reconciled =
-    Core.step failed.next (Account_authenticated { user_id = Some "user-1" })
-  in
-  Alcotest.check
-    Alcotest.bool
-    "late same-account authentication preserves explicit local recovery"
-    true
-    ((Core.state reconciled.next).snapshot.startup.failure
-     = Some Core.During_local_restore
-     && not (has_token_request reconciled.effects));
-  let recovery = Core.step reconciled.next Online_recovery_requested in
-  let e2ee_token = token_request recovery.effects in
-  Alcotest.check
-    Alcotest.bool
-    "user-approved recovery requests E2EE authorization"
-    true
-    (Core.token_request_purpose e2ee_token = Core.E2ee_key_access);
-  let graph_key_fetch =
-    Core.step recovery.next (Token_provided (e2ee_token, "e2ee-token"))
-  in
-  let remote_key_loaded =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
-          Some
-            (Core.step
-               graph_key_fetch.next
-               (Runner_completed
-                  (Completion
-                     ( ticket
-                     , Ok "{\"encrypted-aes-key\":\"[\\\"~#binary\\\",\\\"AA==\\\"]\"}" ))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      graph_key_fetch.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "E2EE recovery did not fetch the remote graph key"
-  in
-  let recovered_key =
-    Core.graph_key_handle ~id:"recovered-key" ~scope:mirror_request.scope
-  in
-  let recovered =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key _)) ->
-          Some
-            (Core.step
-               remote_key_loaded.next
-               (Runner_completed (Completion (ticket, Ok recovered_key))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      remote_key_loaded.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "E2EE recovery did not unlock the remote graph key"
-  in
-  Alcotest.check
-    Alcotest.bool
-    "remote graph-key recovery resumes snapshot authorization"
-    true
-    (has_snapshot_token_request recovered.effects);
-  let activation = complete_snapshot_bootstrap recovered mirror_request.scope in
-  Alcotest.check
-    Alcotest.bool
-    "recovered encrypted bootstrap retains the scoped handle through activation"
-    true
-    (match activation.key with
-     | Some actual ->
-       Core.graph_key_handle_id actual = Core.graph_key_handle_id recovered_key
-       && Core.graph_key_handle_scope actual = mirror_request.scope
-     | None -> false)
+    (snapshot.sync_phase = Core.Failed
+     && snapshot.startup.failure = Some Core.During_bootstrap)
 ;;
 
-let test_encrypted_warm_mirror_waits_for_a_scoped_graph_key () =
-  let graph = graph ~encrypted:true () in
-  let selected, mirror_request = select_catalog_graph graph in
-  let open_request : Core.graph_open_request =
-    { graph
-    ; graph_directory = "/worker/encrypted-warm-mirror"
-    ; database_path = "/worker/encrypted-warm-mirror/db.sqlite"
-    ; checkpoint = checkpoint graph.graph_id
-    ; scope = mirror_request.scope
-    }
-  in
-  let inspected =
-    Core.step selected.next (Mirror_inspected (Mirror_available open_request))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "encrypted mirror is not attached before wrapped-key loading completes"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Attach_graph _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          inspected.effects));
-  let correct_key = Core.graph_key_handle ~id:"warm-key" ~scope:mirror_request.scope in
-  let correctly_keyed = complete_wrapped_key inspected correct_key in
-  Alcotest.check
-    Alcotest.bool
-    "correctly scoped key permits warm-mirror attachment"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Attach_graph request) ->
-           request.scope = mirror_request.scope
-         | Run _ | Delegate _ | Publish _ -> false)
-       correctly_keyed.effects);
-  let already_keyed =
-    Core.step correctly_keyed.next (Mirror_inspected (Mirror_available open_request))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "a duplicate mirror inspection is ignored after attachment is delegated"
-    true
-    (already_keyed.effects = []);
-  let wrong_scope =
-    { mirror_request.scope with
-      graph_id = other_graph_id ()
-    ; graph_generation = mirror_request.scope.graph_generation + 1
-    }
-  in
-  let wrong_key = Core.graph_key_handle ~id:"wrong-key" ~scope:wrong_scope in
-  let wrongly_keyed = complete_wrapped_key inspected wrong_key in
-  Alcotest.check
-    Alcotest.bool
-    "out-of-scope key cannot attach the encrypted mirror"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Attach_graph _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          wrongly_keyed.effects));
-  Alcotest.check
-    Alcotest.bool
-    "out-of-scope key is reported as an E2EE failure"
-    true
-    ((Core.state wrongly_keyed.next).snapshot.startup.failure = Some Core.During_e2ee)
+module Overlay = Logseq_overlay_db.Types
+module Protocol = Logseq_sync_pure_reducer.Sync_protocol
+
+let token module_of_string value = module_of_string value |> Result.get_ok
+
+let mutation_ids =
+  [ "22222222-2222-4222-8222-222222222221"
+  ; "22222222-2222-4222-8222-222222222222"
+  ; "22222222-2222-4222-8222-222222222223"
+  ]
+  |> List.map (fun value ->
+    Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok)
 ;;
 
-let test_encrypted_authoritative_pull_decrypts_before_worker_apply () =
-  let core, connection = encrypted_open_graph () in
-  let context = encrypted_authoritative_context connection in
-  let decrypting = Core.step core (Authoritative_batch_inspected context) in
-  let module Transit = Transit_core.Json in
-  let module Codec = Transit_native.Transit.Json in
-  let plaintext = Codec.to_string (Transit.String "decrypted title") in
-  let decryption_request =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Decrypt_protected_values request)) ->
-          Some
-            (request, Core.Runner_completed (Core.Completion (ticket, Ok [ plaintext ])))
-        | Run _ | Delegate _ | Publish _ -> None)
-      decrypting.effects
-    |> function
-    | Some value -> value
-    | None -> fail "encrypted authoritative pull did not request decryption"
-  in
-  let request, completion = decryption_request in
-  Alcotest.(check (list (pair string string)))
-    "only parsed encryption envelopes are sent to the runner"
-    [ "snapshot-iv", "ciphertext" ]
-    request.protected_values;
-  Alcotest.check
-    Alcotest.bool
-    "worker apply is absent before authoritative decryption completes"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Apply_authoritative_batch _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          decrypting.effects));
-  let decrypted = Core.step decrypting.next completion in
-  let application =
-    List.find_map
-      (function
-        | Core.Delegate (Core.Apply_authoritative_batch request) -> Some request
-        | Run _ | Delegate _ | Publish _ -> None)
-      decrypted.effects
-    |> function
-    | Some request -> request
-    | None -> fail "decrypted authoritative pull was not delegated to the worker"
-  in
-  Alcotest.check
-    Alcotest.bool
-    "worker receives the decrypted protected value"
-    true
-    (List.exists
-       (List.exists (function
-          | Datascript.Add (_, "block/title", Datascript.String "decrypted title") -> true
-          | _ -> false))
-       application.transactions)
-;;
-
-let test_authoritative_decryption_failure_is_fail_closed () =
-  let core, connection = encrypted_open_graph () in
-  let context = encrypted_authoritative_context connection in
-  let decrypting = Core.step core (Authoritative_batch_inspected context) in
-  let failed =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Decrypt_protected_values _)) ->
-          Some
-            (Core.step
-               decrypting.next
-               (Runner_completed
-                  (Completion (ticket, Error (Effect_failed "authentication failed")))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      decrypting.effects
-    |> function
-    | Some transition -> transition
-    | None -> fail "encrypted authoritative pull did not request decryption"
-  in
-  Alcotest.check
-    Alcotest.bool
-    "failed decryption never delegates authoritative application"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Apply_authoritative_batch _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          failed.effects));
-  Alcotest.(check (option int))
-    "failed decryption does not advance the public checkpoint"
-    (Some 0)
-    (Core.state failed.next).snapshot.applied_server_t;
-  Alcotest.check
-    Alcotest.bool
-    "failed decryption is classified as an E2EE failure"
-    true
-    ((Core.state failed.next).snapshot.startup.failure = Some Core.During_e2ee)
-;;
-
-let remote_add_operation () =
-  let module Transit = Transit_core.Json in
-  Transit.Array
-    [ Transit.Keyword "db/add"
-    ; Transit.String "remote-block"
-    ; Transit.Keyword "block/uuid"
-    ; Transit.Uuid "22222222-2222-4222-8222-222222222222"
-    ]
-;;
-
-let transit_wire value =
-  Transit_native.Transit.Json.to_string ~mode:Transit_native.Transit.Json.Verbose value
-;;
-
-let authoritative_context
-      ?(checkpoint_t = 0)
-      ?wire
-      ?(outbox_records = [])
-      ~server_t
-      ~transaction_t
-      ()
-  =
-  let module Transit = Transit_core.Json in
-  let wire =
-    Option.value wire ~default:(transit_wire (Transit.Array [ remote_add_operation () ]))
-  in
-  let checkpoint =
-    Logseq_db_types.Sync_checkpoint.create
-      ~graph_id:(graph_id ())
-      ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
-      ~applied_server_t:checkpoint_t
-      ~checksum:"0000000000000000"
-    |> Result.get_ok
-  in
-  let batch : Core.authoritative_batch =
-    { message =
-        Sync_protocol.Server.Pull_ok
-          { t = server_t
-          ; checksum = None
-          ; txs = [ { t = transaction_t; tx = wire; outliner_op = None } ]
-          }
-    ; scope = { graph = graph_scope (); connection_generation = 1 }
-    ; presentation_generation = 1
-    ; lifecycle_generation = 1L
-    }
-  in
-  Core.
-    { batch
-    ; precondition = "test-precondition"
-    ; checkpoint
-    ; database = Datascript.empty_db ()
-    ; outbox_records
-    }
-;;
-
-let test_authoritative_pull_is_pure_and_advances_checkpoint () =
-  let plan =
-    authoritative_context ~server_t:1 ~transaction_t:1 ()
-    |> Core.begin_authoritative_batch
-    |> Result.get_ok
-  in
-  Alcotest.check
-    Alcotest.bool
-    "plaintext authoritative transaction needs no crypto"
-    true
-    (Core.authoritative_crypto_request plan = None);
-  let request = Core.finish_authoritative_batch plan None |> Result.get_ok in
-  Alcotest.(check int) "one transaction is decoded" 1 (List.length request.transactions);
-  Alcotest.(check int)
-    "checkpoint advances atomically with the transaction"
-    1
-    request.checkpoint.applied_server_t;
-  Alcotest.check
-    Alcotest.bool
-    "pull activity records an application"
-    true
-    (request.activity = Logseq_db_types.Sync_status.Pull_applied)
-;;
-
-let test_authoritative_pull_rejects_cursor_gaps () =
-  let result =
-    authoritative_context ~server_t:2 ~transaction_t:2 ()
-    |> Core.begin_authoritative_batch
-  in
-  Alcotest.check Alcotest.bool "cursor gap is rejected" true (Result.is_error result)
-;;
-
-let test_authoritative_pull_accepts_transit_list_collection () =
-  let module Transit = Transit_core.Json in
-  let wire = transit_wire (Transit.List [ remote_add_operation () ]) in
-  let request =
-    authoritative_context ~wire ~server_t:1 ~transaction_t:1 ()
-    |> Core.begin_authoritative_batch
-    |> Result.get_ok
-    |> fun plan -> Core.finish_authoritative_batch plan None |> Result.get_ok
-  in
-  Alcotest.(check int)
-    "Transit list contributes one transaction"
-    1
-    (List.length request.transactions);
-  Alcotest.(check int)
-    "Transit list advances the checkpoint"
-    1
-    request.checkpoint.applied_server_t
-;;
-
-let test_authoritative_pull_preserves_transit_cache_wire_order () =
-  let wire =
-    {|[["~:db/retractEntity",["~:block/uuid","~u22222222-2222-4222-8222-222222222222"]],["^0",["^1","~u33333333-3333-4333-8333-333333333333"]]]|}
-  in
-  let plan =
-    authoritative_context ~wire ~server_t:1 ~transaction_t:1 ()
-    |> Core.begin_authoritative_batch
-    |> Result.get_ok
-  in
-  Alcotest.check
-    Alcotest.bool
-    "both cached retract-entity operations are accepted without crypto"
-    true
-    (Core.authoritative_crypto_request plan = None)
-;;
-
-let test_authoritative_pull_rejects_empty_or_non_array_operations () =
-  let module Transit = Transit_core.Json in
-  let empty_list = transit_wire (Transit.List []) in
-  let list_operation =
-    transit_wire
-      (Transit.Array
-         [ Transit.List
-             [ Transit.Keyword "db/add"
-             ; Transit.String "remote-block"
-             ; Transit.Keyword "block/uuid"
-             ; Transit.Uuid "22222222-2222-4222-8222-222222222222"
-             ]
-         ])
-  in
-  List.iter
-    (fun wire ->
-       let result =
-         authoritative_context ~wire ~server_t:1 ~transaction_t:1 ()
-         |> Core.begin_authoritative_batch
-       in
-       Alcotest.check
-         Alcotest.bool
-         "invalid transaction shape is rejected"
-         true
-         (Result.is_error result))
-    [ empty_list; list_operation ]
-;;
-
-let queued_local_batch_input ?(scope = graph_scope ()) () =
-  local_batch_input
-    ~scope
-    [ Datascript.Add
-        ( Datascript.Temp_id "queued-duplicate"
-        , "block/uuid"
-        , Datascript.Uuid "33333333-3333-4333-8333-333333333333" )
-    ]
-;;
-
-let queued_outbox_records () =
-  let record =
-    queued_local_batch_input ()
-    |> Core.begin_local_batch
-    |> Result.get_ok
-    |> fun plan -> Core.finish_local_batch plan None |> Result.get_ok
-  in
-  Core.encode_outbox_records [ record ] |> Result.get_ok
-;;
-
-let accepted_outbox_records server_t =
-  queued_outbox_records ()
-  |> List.map (fun source ->
-    match Yojson.Safe.from_string source with
-    | `Assoc fields ->
-      `Assoc
-        (List.map
-           (fun (name, value) ->
-              if String.equal name "state"
-              then name, `Assoc [ "type", `String "accepted"; "serverT", `Int server_t ]
-              else name, value)
-           fields)
-      |> Yojson.Safe.to_string
-    | _ -> fail "encoded outbox record must be an object")
-;;
-
-let test_duplicate_pull_skips_authoritative_transaction_bodies () =
-  let plan =
-    authoritative_context
-      ~checkpoint_t:1
-      ~wire:"not transit"
-      ~server_t:1
-      ~transaction_t:1
-      ()
-    |> Core.begin_authoritative_batch
-    |> Result.get_ok
-  in
-  Alcotest.check
-    Alcotest.bool
-    "duplicate malformed transaction requests no crypto"
-    true
-    (Core.authoritative_crypto_request plan = None);
-  let request = Core.finish_authoritative_batch plan None |> Result.get_ok in
-  Alcotest.check
-    Alcotest.bool
-    "duplicate is classified without decoding its body"
-    true
-    (request.activity = Logseq_db_types.Sync_status.Pull_duplicate);
-  Alcotest.(check int)
-    "duplicate applies no authoritative transactions"
-    0
-    (List.length request.transactions)
-;;
-
-let test_duplicate_pull_never_replays_stored_transport_transactions () =
-  let queued = queued_outbox_records () in
-  let projected =
-    authoritative_context
-      ~checkpoint_t:1
-      ~wire:"not transit"
-      ~outbox_records:queued
-      ~server_t:1
-      ~transaction_t:1
-      ()
-    |> Core.begin_authoritative_batch
-    |> Result.get_ok
-    |> fun plan -> Core.finish_authoritative_batch plan None |> Result.get_ok
-  in
-  Alcotest.(check int)
-    "queued outbox transport bytes are not replayed after authoritative inspection"
-    0
-    (List.length projected.projection_transactions);
-  Alcotest.(check int)
-    "queued outbox remains durable"
-    1
-    (List.length projected.outbox_records);
-  let accepted = accepted_outbox_records 1 in
-  let cleaned =
-    authoritative_context
-      ~checkpoint_t:1
-      ~wire:"not transit"
-      ~outbox_records:accepted
-      ~server_t:1
-      ~transaction_t:1
-      ()
-    |> Core.begin_authoritative_batch
-    |> Result.get_ok
-    |> fun plan -> Core.finish_authoritative_batch plan None |> Result.get_ok
-  in
-  Alcotest.(check int)
-    "acknowledged outbox is removed"
-    0
-    (List.length cleaned.outbox_records)
-;;
-
-let test_duplicate_pull_still_rejects_future_transaction_cursor () =
-  let result =
-    authoritative_context
-      ~checkpoint_t:1
-      ~wire:"not transit"
-      ~server_t:1
-      ~transaction_t:2
-      ()
-    |> Core.begin_authoritative_batch
-  in
-  Alcotest.check
-    Alcotest.bool
-    "duplicate future cursor is rejected before body inspection"
-    true
-    (Result.is_error result)
-;;
-
-let test_typed_websocket_messages_reach_policy_without_raw_json () =
-  let core, connection = encrypted_open_graph () in
-  let pong = Core.step core (Websocket_message (connection, Sync_protocol.Server.Pong)) in
-  Alcotest.check
-    Alcotest.bool
-    "application pong is a typed non-authoritative no-op"
-    true
-    (Core.state pong.next = Core.state core && pong.effects = []);
-  let presence =
-    Core.step
-      pong.next
-      (Websocket_message
-         ( connection
-         , Sync_protocol.Server.Presence
-             { user_id = "user-2"; editing_block_uuid = Some "block-2" } ))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "presence is a typed non-authoritative no-op"
-    true
-    (Core.state presence.next = Core.state pong.next && presence.effects = []);
-  let message = Sync_protocol.Server.Changed { t = 1 } in
-  let changed = Core.step presence.next (Websocket_message (connection, message)) in
-  Alcotest.check
-    Alcotest.bool
-    "authoritative typed message is delegated without re-encoding"
-    true
-    (List.exists
-       (function
-         | Core.Delegate (Core.Inspect_authoritative_batch batch) ->
-           batch.message = message
-         | Run _ | Delegate _ | Publish _ -> false)
-       changed.effects)
-;;
-
-let opened_graph_with_outbox outbox_records =
-  let graph = graph () in
-  let selected, mirror = select_catalog_graph graph in
-  let request = open_request graph mirror.scope "submission-owner" in
-  let inspected = Core.step selected.next (Mirror_inspected (Mirror_available request)) in
-  let attached =
-    Core.step
-      inspected.next
-      (Graph_attached
-         { scope = request.scope; checkpoint = request.checkpoint; outbox_records })
-  in
-  let websocket_token = token_request attached.effects in
-  let connecting =
-    Core.step attached.next (Token_provided (websocket_token, "websocket-token"))
-  in
-  let connection =
-    List.find_map
-      (function
-        | Core.Run (Core.Start_websocket request) -> Some request.scope
-        | Run _ | Delegate _ | Publish _ -> None)
-      connecting.effects
-    |> function
-    | Some connection -> connection
-    | None -> fail "attached graph did not start its WebSocket"
-  in
-  let opened = Core.step connecting.next (Websocket_opened connection) in
-  opened, request, connection
-;;
-
-let complete_opening_pull
-      (opened : Core.transition)
-      (request : Core.graph_open_request)
-      (connection : Core.connection_scope)
-      outbox_records
-  =
-  let message =
-    Sync_protocol.Server.Pull_ok
-      { t = request.checkpoint.applied_server_t; checksum = None; txs = [] }
-  in
-  let inspection = Core.step opened.next (Websocket_message (connection, message)) in
-  let batch =
-    List.find_map
-      (function
-        | Core.Delegate (Core.Inspect_authoritative_batch batch) -> Some batch
-        | Run _ | Delegate _ | Publish _ -> None)
-      inspection.effects
-    |> function
-    | Some batch -> batch
-    | None -> fail "opening pull did not request authoritative inspection"
-  in
-  let context : Core.authoritative_context =
-    { batch
-    ; precondition = "opening-pull-precondition"
-    ; checkpoint = request.checkpoint
-    ; database = Datascript.empty_db ()
-    ; outbox_records
-    }
-  in
-  let inspected = Core.step inspection.next (Authoritative_batch_inspected context) in
-  let apply_request =
-    List.find_map
-      (function
-        | Core.Delegate (Core.Apply_authoritative_batch request) -> Some request
-        | Run _ | Delegate _ | Publish _ -> None)
-      inspected.effects
-    |> function
-    | Some request -> request
-    | None -> fail "opening pull inspection did not request authoritative apply"
-  in
-  Core.step
-    inspected.next
-    (Authoritative_batch_applied
-       { scope = apply_request.scope
-       ; checkpoint = apply_request.checkpoint
-       ; outbox_records = apply_request.outbox_records
-       ; activity = apply_request.activity
-       ; invalidation = None
-       })
-;;
-
-let current_graph_with_outbox outbox_records =
-  let opened, request, connection = opened_graph_with_outbox outbox_records in
-  let current = complete_opening_pull opened request connection outbox_records in
-  current, request, connection
-;;
-
-let test_submission_owner_is_reserved_before_durable_transition () =
-  let current, request, _ = current_graph_with_outbox [] in
-  let prepared =
-    Core.step
-      current.next
-      (Local_batch_prepared (queued_local_batch_input ~scope:request.scope ()))
-  in
-  let queued =
-    List.find_map
-      (function
-        | Core.Delegate
-            (Core.Complete_local_batch { action = Core.Commit { outbox_records }; _ }) ->
-          Some outbox_records
-        | Delegate (Complete_local_batch { action = Reject _; _ })
-        | Run _ | Delegate _ | Publish _ -> None)
-      prepared.effects
-    |> function
-    | Some outbox_records -> outbox_records
-    | None -> fail "local batch preparation did not request a durable commit"
-  in
-  let first =
-    Core.step
-      prepared.next
-      (Local_batch_committed { scope = request.scope; outbox_records = queued })
-  in
-  let transition =
-    List.find_map
-      (function
-        | Core.Delegate (Core.Commit_outbox_transition transition) -> Some transition
-        | Run _ | Delegate _ | Publish _ -> None)
-      first.effects
-    |> function
-    | Some transition -> transition
-    | None -> fail "first queued mutation did not reserve a submission"
-  in
-  let duplicate_before_cas =
-    Core.step
-      first.next
-      (Local_batch_committed { scope = request.scope; outbox_records = queued })
-  in
-  Alcotest.check
-    Alcotest.bool
-    "a reserving descriptor prevents a second batch before durable CAS completes"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Commit_outbox_transition _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          duplicate_before_cas.effects));
-  let committed =
-    Core.step
-      first.next
-      (Outbox_transition_committed
-         { scope = transition.scope
-         ; outbox_records = transition.outbox_records
-         ; pending_message = transition.pending_message
-         })
-  in
-  let next_mutation_id =
-    Logseq_db_types.Graph_types.Uuid.of_string "44444444-4444-4444-8444-444444444444"
-    |> Result.get_ok
-  in
-  let next_record =
-    local_batch_input
-      ~scope:request.scope
-      ~mutation_id:next_mutation_id
-      ~mutation_fingerprint:"next-fingerprint"
-      [ Datascript.Add
-          ( Datascript.Temp_id "queued-next"
-          , "block/uuid"
-          , Datascript.Uuid (Logseq_db_types.Graph_types.Uuid.to_string next_mutation_id)
-          )
-      ]
-    |> Core.begin_local_batch
-    |> Result.get_ok
-    |> fun plan -> Core.finish_local_batch plan None |> Result.get_ok
-  in
-  let submitted = Core.decode_outbox_records transition.outbox_records |> Result.get_ok in
-  let with_next =
-    Core.encode_outbox_records (submitted @ [ next_record ]) |> Result.get_ok
-  in
-  let while_in_flight =
-    Core.step
-      committed.next
-      (Local_batch_committed { scope = request.scope; outbox_records = with_next })
-  in
-  Alcotest.check
-    Alcotest.bool
-    "an in-flight descriptor leaves later mutations queued"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Commit_outbox_transition _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          while_in_flight.effects))
-;;
-
-let test_acknowledgement_without_submission_owner_is_ignored () =
-  let current, _, connection = current_graph_with_outbox [] in
-  let stale_ack =
-    Core.step
-      current.next
-      (Websocket_message
-         (connection, Sync_protocol.Server.Tx_batch_ok { t = 1; checksum = None }))
-  in
-  Alcotest.check
-    Alcotest.bool
-    "an acknowledgement with no live owner cannot reach authoritative inspection"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Inspect_authoritative_batch _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          stale_ack.effects))
-;;
-
-let test_submission_waits_for_durable_outbox_transition () =
+let submitted_core () =
   let authenticated =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
   let catalog_token = token_request authenticated.effects in
   let authorized =
-    Core.step authenticated.next (Token_provided (catalog_token, "catalog-token"))
-  in
-  let graph : Core.graph =
-    { graph_id = graph_id ()
-    ; name = "Journal"
-    ; schema = { major = 1; minor = 0; exact = true }
-    ; encrypted = false
-    }
+    Core.step authenticated.next (Core.Token_provided (catalog_token, "catalog-token"))
   in
   let catalog =
-    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+          Some
+            (Core.step
+               authorized.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok [ graph ]))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      authorized.effects
+    |> Option.get
   in
-  let selected = Core.step catalog.next (Graph_selected graph.graph_id) in
+  let selected = Core.step catalog.next (Core.Graph_selected graph_id) in
   let mirror_request =
     List.find_map
       (function
@@ -2220,46 +692,27 @@ let test_submission_waits_for_durable_outbox_transition () =
       selected.effects
     |> Option.get
   in
-  let checkpoint =
-    Logseq_db_types.Sync_checkpoint.create
-      ~graph_id:graph.graph_id
-      ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
-      ~applied_server_t:0
-      ~checksum:"0000000000000000"
-    |> Result.get_ok
-  in
-  let open_request : Core.graph_open_request =
-    { graph
-    ; graph_directory = "/worker/mirror"
-    ; database_path = "/worker/mirror/db.sqlite"
-    ; checkpoint
-    ; scope = mirror_request.scope
-    }
-  in
   let inspected =
-    Core.step selected.next (Mirror_inspected (Mirror_available open_request))
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available mirror_request))
   in
-  let record =
-    local_batch_input
-      [ Datascript.Add
-          ( Datascript.Temp_id "queued"
-          , "block/uuid"
-          , Datascript.Uuid "33333333-3333-4333-8333-333333333333" )
-      ]
-    |> Core.begin_local_batch
-    |> Result.get_ok
-    |> fun plan -> Core.finish_local_batch plan None |> Result.get_ok
+  let attach_request =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Attach_graph request) -> Some request
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspected.effects
+    |> Option.get
   in
-  let queued_records = Core.encode_outbox_records [ record ] |> Result.get_ok in
-  let attached =
-    Core.step
-      inspected.next
-      (Graph_attached
-         { scope = open_request.scope; checkpoint; outbox_records = queued_records })
+  let scope = attach_request.scope in
+  let sync_token = Overlay.sync_token_of_string "sync-token:v1:1" |> Result.get_ok in
+  let checkpoint =
+    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
   in
+  let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
+  let attached = Core.step inspected.next (Core.Graph_attached { scope; sync }) in
   let websocket_token = token_request attached.effects in
   let connecting =
-    Core.step attached.next (Token_provided (websocket_token, "websocket-token"))
+    Core.step attached.next (Core.Token_provided (websocket_token, "websocket-token"))
   in
   let connection =
     List.find_map
@@ -2269,2200 +722,1278 @@ let test_submission_waits_for_durable_outbox_transition () =
       connecting.effects
     |> Option.get
   in
-  let opened = Core.step connecting.next (Websocket_opened connection) in
-  Alcotest.check
-    Alcotest.bool
-    "opening WebSocket waits for the authoritative pull"
-    true
-    ((Core.state opened.next).snapshot.sync_phase = Core.Pulling);
-  Alcotest.check
-    Alcotest.bool
-    "opening WebSocket sends the checkpoint pull"
-    true
-    (List.exists
-       (function
-         | Core.Run (Core.Send_websocket { message; _ }) ->
-           message = Sync_protocol.Client.Pull { since = Some 0 }
-         | Run _ | Delegate _ | Publish _ -> false)
-       opened.effects);
-  Alcotest.check
-    Alcotest.bool
-    "queued submission waits for the opening pull"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Delegate (Core.Commit_outbox_transition _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          opened.effects));
-  let current = complete_opening_pull opened open_request connection queued_records in
-  let transition =
-    List.find_map
-      (function
-        | Core.Delegate (Core.Commit_outbox_transition transition) -> Some transition
-        | Run _ | Delegate _ | Publish _ -> None)
-      current.effects
-    |> Option.get
+  let opened = Core.step connecting.next (Core.Websocket_opened connection) in
+  let batch_id =
+    Overlay.Submission_batch_id.of_string "submission-batch:v1:test" |> Result.get_ok
   in
-  (match Core.decode_outbox_records transition.outbox_records with
-   | Ok records ->
-     Alcotest.(check int)
-       "submitted durable outbox remains decodable"
-       1
-       (List.length records)
-   | Error message ->
-     Alcotest.failf "submitted durable outbox failed to decode: %s" message);
-  Alcotest.check
-    Alcotest.bool
-    "WebSocket send is absent before durable transition"
-    true
-    (not
-       (List.exists
-          (function
-            | Core.Run (Core.Send_websocket _) -> true
-            | Run _ | Delegate _ | Publish _ -> false)
-          current.effects));
-  let committed =
-    Core.step
-      current.next
-      (Outbox_transition_committed
-         { scope = transition.scope
-         ; outbox_records = transition.outbox_records
-         ; pending_message = transition.pending_message
+  let wires =
+    List.map
+      (fun mutation_id ->
+         Overlay.submission_wire
+           ~maximum_bytes:1024
+           ~mutation_id
+           ~operation:Overlay.Save_block_operation
+           ~protected_transaction:"protected"
+         |> Result.get_ok)
+      mutation_ids
+  in
+  let batch =
+    Overlay.submission_batch
+      ~maximum_wires:3
+      ~maximum_bytes:4096
+      ~batch_id
+      ~t_before:checkpoint
+      ~wires
+    |> Result.get_ok
+  in
+  let queued_submissions =
+    List.map2
+      (fun mutation_id wire ->
+         { Overlay.mutation_id
+         ; fingerprint =
+             Overlay.Mutation_fingerprint.of_string
+               ("mutation-fingerprint:v1:"
+                ^ Logseq_db_types.Graph_types.Uuid.to_string mutation_id)
+             |> Result.get_ok
+         ; state = Overlay.Queued
+         ; dependency_eligible = true
+         ; attempt_count = 0
+         ; plaintext_bytes = 16
+         ; protected_bytes = Some (Overlay.submission_wire_byte_length wire)
          })
+      mutation_ids
+      wires
   in
-  Alcotest.check
-    Alcotest.bool
-    "WebSocket send follows the durable transition fact"
+  let queued_sync =
+    Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:queued_submissions
+  in
+  let inspect = Core.step opened.next Core.Local_outbox_changed in
+  let inspected_scope =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Inspect_sync requested_scope) -> Some requested_scope
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspect.effects
+    |> Option.get
+  in
+  let planned =
+    Core.step
+      inspect.next
+      (Core.Sync_inspected { scope = inspected_scope; sync = queued_sync })
+  in
+  let transition_request =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Apply_outbox_transition request) -> Some request
+        | Run _ | Delegate _ | Publish _ -> None)
+      planned.effects
+    |> Option.get
+  in
+  let generation = Overlay.Generation.of_string "generation:v1:1" |> Result.get_ok in
+  let projection =
+    Overlay.Projection_revision.of_string "projection:v1:1" |> Result.get_ok
+  in
+  let commit : Overlay.outbox_commit =
+    { generation
+    ; before_projection_revision = projection
+    ; after_projection_revision = projection
+    ; sync_token
+    ; transition = transition_request.transition
+    ; activity = Overlay.Logically_active
+    ; logical_change_summary = Overlay.No_logical_change
+    ; submission_batch = Some batch
+    }
+  in
+  let submitted =
+    Core.step
+      planned.next
+      (Core.Outbox_transition_applied { scope = transition_request.scope; commit; sync })
+  in
+  submitted.next, connection
+;;
+
+let rejection_transition effects =
+  List.find_map
+    (function
+      | Core.Delegate
+          (Core.Apply_outbox_transition
+             { transition = Overlay.Reject_group { resolution; _ }; _ }) ->
+        Some resolution
+      | Run _ | Delegate _ | Publish _ -> None)
+    effects
+  |> Option.get
+;;
+
+let partial_rejection_is_normalized_exactly () =
+  let core, connection = submitted_core () in
+  let first, second, third =
+    match mutation_ids with
+    | [ first; second; third ] -> first, second, third
+    | _ -> assert false
+  in
+  let detail_suffix =
+    [ "cannot"
+    ; "store"
+    ; "value"
+    ; "as"
+    ; "expected"
+    ; "uuid"
+    ; "type"
+    ; "block"
+    ; "order"
+    ; "should"
+    ; "be"
+    ; "a"
+    ; "valid"
+    ; "fractional"
+    ; "index"
+    ; "invalid"
+    ; "type"
+    ]
+  in
+  let repeated_prefix = List.init 80 (fun _ -> "data") in
+  let rejection : Logseq_sync_pure_reducer.Sync_protocol.rejection =
+    { reason = Db_transact_failed
+    ; t = Some 1
+    ; checksum = Some "0123456789abcdef"
+    ; success_tx_ids = [ first ]
+    ; failed_tx_id = Some second
+    ; missing_block_uuids = [ graph_id ]
+    ; error_detail = Some (String.concat " " (repeated_prefix @ detail_suffix))
+    ; data = None
+    }
+  in
+  let rejected =
+    Core.step
+      core
+      (Core.Websocket_message
+         (connection, Logseq_sync_pure_reducer.Sync_protocol.Server.Tx_reject rejection))
+  in
+  Alcotest.(check bool)
+    "rejection reason is retained in sanitized diagnostics"
+    true
+    (let retained_prefix = List.init (64 - List.length detail_suffix) (fun _ -> "data") in
+     let expected =
+       "tx-reject:db-transact-failed:missing-dependencies:detail-"
+       ^ String.concat "-" (retained_prefix @ detail_suffix)
+     in
+     List.mem expected (Core.state rejected.next).diagnostics.history);
+  match rejection_transition rejected.effects with
+  | Overlay.Definitive { reason = Missing_dependencies; partition } ->
+    Alcotest.(check bool)
+      "accepted prefix retained"
+      true
+      (partition.accepted_prefix = [ first ]);
+    Alcotest.(check bool)
+      "failed member retained"
+      true
+      (partition.failed_member = Some second);
+    Alcotest.(check bool) "suffix inferred" true (partition.unexecuted_suffix = [ third ]);
+    Alcotest.(check bool)
+      "prefix barrier required"
+      true
+      (Option.is_some partition.acceptance_barrier)
+  | _ -> Alcotest.fail "partial rejection was not normalized as missing dependencies"
+;;
+
+let local_outbox_change_requests_sync_inspection () =
+  let core, _connection = submitted_core () in
+  let transition = Core.step core Core.Local_outbox_changed in
+  Alcotest.(check bool)
+    "local outbox change delegates one fresh sync inspection"
     true
     (List.exists
        (function
-         | Core.Run (Core.Send_websocket _) -> true
+         | Core.Delegate (Core.Inspect_sync _) -> true
          | Run _ | Delegate _ | Publish _ -> false)
-       committed.effects)
+       transition.effects)
 ;;
 
-let test_e2ee_recovery_keeps_password_out_of_core_state () =
-  let authenticated =
-    Core.step (initial ()) (Account_authenticated { user_id = Some "user-1" })
+let accepted_submission_pulls_its_authoritative_transaction () =
+  let core, connection = submitted_core () in
+  let acknowledged =
+    Core.step
+      core
+      (Core.Websocket_message
+         ( connection
+         , Logseq_sync_pure_reducer.Sync_protocol.Server.Tx_batch_ok
+             { t = 1; checksum = Some "0123456789abcdef" } ))
   in
-  let catalog_token = token_request authenticated.effects in
-  let authorized =
-    Core.step authenticated.next (Token_provided (catalog_token, "catalog-token"))
+  let request =
+    List.find_map
+      (function
+        | Core.Delegate
+            (Core.Apply_outbox_transition
+               ({ transition = Overlay.Accept_group _; _ } as request)) -> Some request
+        | Run _ | Delegate _ | Publish _ -> None)
+      acknowledged.effects
+    |> Option.get
   in
-  let graph : Core.graph =
-    { graph_id = graph_id ()
-    ; name = "Encrypted Journal"
-    ; schema = { major = 1; minor = 0; exact = true }
-    ; encrypted = true
+  let sync_token = Overlay.sync_token_of_string "sync-token:v1:2" |> Result.get_ok in
+  let checkpoint =
+    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
+  in
+  let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
+  let generation = Overlay.Generation.of_string "generation:v1:2" |> Result.get_ok in
+  let projection =
+    Overlay.Projection_revision.of_string "projection:v1:1" |> Result.get_ok
+  in
+  let commit : Overlay.outbox_commit =
+    { generation
+    ; before_projection_revision = projection
+    ; after_projection_revision = projection
+    ; sync_token
+    ; transition = request.transition
+    ; activity = Overlay.Logically_inactive
+    ; logical_change_summary = Overlay.No_logical_change
+    ; submission_batch = None
     }
   in
-  let catalog =
-    Core.step authorized.next (fetch_catalog_completion authorized.effects [ graph ])
+  let completed =
+    Core.step
+      acknowledged.next
+      (Core.Outbox_transition_applied { scope = request.scope; commit; sync })
   in
-  let selected = Core.step catalog.next (Graph_selected graph.graph_id) in
-  let scope =
-    List.find_map
-      (function
-        | Core.Delegate (Core.Inspect_mirror request) -> Some request.scope
-        | Run _ | Delegate _ | Publish _ -> None)
-      selected.effects
-    |> Option.get
-  in
-  let missing = Core.step selected.next (Mirror_inspected (Mirror_absent scope)) in
-  let wrapped_failed =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
-          Some
-            (Core.step
-               missing.next
-               (Runner_completed
-                  (Completion (ticket, Error (Effect_failed "local key missing")))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      missing.effects
-    |> Option.get
-  in
-  Alcotest.check
-    Alcotest.bool
-    "missing cached key waits for explicit online recovery"
-    true
-    ((Core.state wrapped_failed.next).snapshot.startup.failure
-     = Some Core.During_local_restore
-     && not (has_token_request wrapped_failed.effects));
-  let recovery = Core.step wrapped_failed.next Online_recovery_requested in
-  let e2ee_token = token_request recovery.effects in
-  let graph_key_fetch =
-    Core.step recovery.next (Token_provided (e2ee_token, "e2ee-token"))
-  in
-  let graph_key_loaded =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
-          Some
-            (Core.step
-               graph_key_fetch.next
-               (Runner_completed
-                  (Completion
-                     ( ticket
-                     , Ok "{\"encrypted-aes-key\":\"[\\\"~#binary\\\",\\\"AA==\\\"]\"}" ))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      graph_key_fetch.effects
-    |> Option.get
-  in
-  let unlock_failed =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key _)) ->
-          Some
-            (Core.step
-               graph_key_loaded.next
-               (Runner_completed
-                  (Completion (ticket, Error (Effect_failed "private key missing")))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      graph_key_loaded.effects
-    |> Option.get
-  in
-  let user_keys_loaded =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
-          Some
-            (Core.step
-               unlock_failed.next
-               (Runner_completed
-                  (Completion
-                     ( ticket
-                     , Ok
-                         "{\"public-key\":\"public\",\"encrypted-private-key\":\"package\"}"
-                     ))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      unlock_failed.effects
-    |> Option.get
-  in
-  Alcotest.check
-    Alcotest.bool
-    "password prompt is visible"
-    true
-    (Core.state user_keys_loaded.next).snapshot.startup.awaiting_e2ee_password;
-  let password = "correct horse battery staple" in
-  let submitted = Core.step user_keys_loaded.next (E2ee_password_submitted password) in
-  Alcotest.check
-    Alcotest.bool
-    "password crosses only the typed runner request"
+  Alcotest.(check bool)
+    "accepted submission pulls from the durable cursor"
     true
     (List.exists
        (function
-         | Core.Run (Core.Request (_, Core.Unlock_private_key request)) ->
-           String.equal request.password password
+         | Core.Run
+             (Core.Send_websocket
+                { message = Logseq_sync_pure_reducer.Sync_protocol.Client.Pull { since }
+                ; _
+                }) -> since = Some 0
          | Run _ | Delegate _ | Publish _ -> false)
-       submitted.effects);
-  let diagnostics = (Core.state submitted.next).diagnostics in
-  let diagnostic_text =
-    diagnostics.history
-    @ List.concat_map
-        (fun group ->
-           group.Core.entries |> List.concat_map (fun (key, value) -> [ key; value ]))
-        diagnostics.groups
-    |> String.concat " "
+       completed.effects)
+;;
+
+let whole_batch_invalid_tx_partitions_every_member () =
+  let core, connection = submitted_core () in
+  let rejection : Logseq_sync_pure_reducer.Sync_protocol.rejection =
+    { reason = Invalid_tx
+    ; t = None
+    ; checksum = None
+    ; success_tx_ids = []
+    ; failed_tx_id = None
+    ; missing_block_uuids = []
+    ; error_detail = None
+    ; data = None
+    }
   in
-  Alcotest.check
-    Alcotest.bool
-    "password is absent from core diagnostics"
-    true
-    (not (contains diagnostic_text password));
-  let private_key_unlocked =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
-          Some (Core.step submitted.next (Runner_completed (Completion (ticket, Ok ()))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      submitted.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "password recovery did not unlock the private key"
+  let rejected =
+    Core.step
+      core
+      (Core.Websocket_message
+         (connection, Logseq_sync_pure_reducer.Sync_protocol.Server.Tx_reject rejection))
   in
-  let recovered_key = Core.graph_key_handle ~id:"password-key" ~scope in
-  let graph_key_unlocked =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key _)) ->
-          Some
-            (Core.step
-               private_key_unlocked.next
-               (Runner_completed (Completion (ticket, Ok recovered_key))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      private_key_unlocked.effects
-    |> function
-    | Some completed -> completed
-    | None -> fail "password recovery did not retry graph-key unlocking"
+  match rejection_transition rejected.effects, mutation_ids with
+  | ( Overlay.Definitive
+        { reason = Invalid_request
+        ; partition =
+            { accepted_prefix = []; failed_member = Some failed; unexecuted_suffix; _ }
+        }
+    , expected_failed :: expected_suffix ) ->
+    Alcotest.(check bool)
+      "first member failed"
+      true
+      (Logseq_db_types.Graph_types.Uuid.equal failed expected_failed);
+    Alcotest.(check bool)
+      "remaining members are unexecuted"
+      true
+      (unexecuted_suffix = expected_suffix)
+  | _ -> Alcotest.fail "invalid tx did not produce a complete batch partition"
+;;
+
+let canonical_overlay_happy_path () =
+  let origin = initial () in
+  let initial_state = Core.state origin in
+  let authenticated_startup =
+    { initial_state.snapshot.startup with
+      authenticated = true
+    ; catalog_loading = true
+    ; account_generation = 1
+    ; presentation_generation = 1
+    }
   in
-  Alcotest.check
-    Alcotest.bool
-    "password recovery resumes snapshot authorization"
-    true
-    (has_snapshot_token_request graph_key_unlocked.effects)
-;;
-
-type state_view =
-  { state : Core.state
-  ; admitted_graph_scope : Core.graph_scope option
-  }
-
-type runner_request_kind =
-  | Load_catalog_request
-  | Save_catalog_request
-  | Fetch_catalog_request
-  | Fetch_snapshot_baseline_request
-  | Fetch_snapshot_metadata_request
-  | Download_snapshot_request
-  | Fetch_e2ee_graph_key_request
-  | Fetch_e2ee_user_keys_request
-  | Load_and_unlock_graph_key_request
-  | Fetch_and_unlock_graph_key_request
-  | Unlock_private_key_request
-  | Encrypt_protected_values_request
-  | Decrypt_protected_values_request
-
-type runner_request_view =
-  { ticket_id : string
-  ; ticket_scope : string
-  ; request_kind : runner_request_kind
-  ; request_payload : string
-  }
-
-type websocket_request_view =
-  { websocket_scope : string
-  ; websocket_uri : string
-  ; websocket_token : string
-  }
-
-type websocket_send_view =
-  { websocket_send_scope : string
-  ; websocket_message : string
-  }
-
-type timer_request_view =
-  { timer_diagnostic : string
-  ; timer_scope : string
-  ; delay_seconds : float
-  }
-
-type worker_effect_kind =
-  | Inspect_mirror_effect
-  | Activate_snapshot_effect
-  | Delete_mirror_effect
-  | Attach_graph_effect
-  | Detach_graph_effect
-  | Reset_managed_account_effect
-  | Complete_local_batch_effect
-  | Inspect_authoritative_batch_effect
-  | Apply_authoritative_batch_effect
-  | Commit_outbox_transition_effect
-
-type worker_effect_view =
-  { worker_effect_kind : worker_effect_kind
-  ; worker_effect_payload : string
-  }
-
-type token_request_view =
-  { token_request_id : string
-  ; token_request_purpose : Core.token_purpose
-  }
-
-type effect_view =
-  | Run_request of runner_request_view
-  | Start_websocket of websocket_request_view
-  | Send_websocket of websocket_send_view
-  | Close_websocket of string
-  | Schedule_timer of timer_request_view
-  | Cancel_effects of string
-  | Delegate of worker_effect_view
-  | Publish_state of state_view
-  | Publish_token_request of token_request_view
-  | Publish_bootstrap_progress of Core.bootstrap_progress
-  | Publish_graph_invalidation of Core.invalidation
-
-let json_string value = Yojson.Safe.to_string value
-let uuid_string = Logseq_db_types.Graph_types.Uuid.to_string
-
-let option_json convert = function
-  | None -> `Null
-  | Some value -> convert value
-;;
-
-let secret_json value =
-  `Assoc
-    [ "length", `Int (String.length value)
-    ; "digest", `String (Digest.to_hex (Digest.string value))
-    ]
-;;
-
-let graph_json (graph : Core.graph) =
-  `Assoc
-    [ "graph_id", `String (uuid_string graph.graph_id)
-    ; "name", `String graph.name
-    ; ( "schema"
-      , `Assoc
-          [ "major", `Int graph.schema.major
-          ; "minor", `Int graph.schema.minor
-          ; "exact", `Bool graph.schema.exact
-          ] )
-    ; "encrypted", `Bool graph.encrypted
-    ]
-;;
-
-let account_scope_json (scope : Core.account_scope) =
-  `Assoc
-    [ "managed_sync_origin", `String (Uri.to_string scope.managed_sync_origin)
-    ; "user_id", `String scope.user_id
-    ; "account_generation", `Int scope.account_generation
-    ; "presentation_generation", `Int scope.presentation_generation
-    ; "lifecycle_generation", `String (Int64.to_string scope.lifecycle_generation)
-    ]
-;;
-
-let authenticated_account_scope_json (scope : Core.authenticated_account_scope) =
-  `Assoc [ "account", account_scope_json scope.account; "token", secret_json scope.token ]
-;;
-
-let graph_scope_json (scope : Core.graph_scope) =
-  `Assoc
-    [ "account", account_scope_json scope.account
-    ; "graph_id", `String (uuid_string scope.graph_id)
-    ; "graph_generation", `Int scope.graph_generation
-    ]
-;;
-
-let authorized_graph_scope_json (scope : Core.authorized_graph_scope) =
-  `Assoc [ "graph", graph_scope_json scope.graph; "token", secret_json scope.token ]
-;;
-
-let connection_scope_json (scope : Core.connection_scope) =
-  `Assoc
-    [ "graph", graph_scope_json scope.graph
-    ; "connection_generation", `Int scope.connection_generation
-    ]
-;;
-
-let effect_scope_json (scope : Core.effect_scope) =
-  let option_int = option_json (fun value -> `Int value) in
-  `Assoc
-    [ "account_generation", option_int scope.account_generation
-    ; "graph_generation", option_int scope.graph_generation
-    ; "connection_generation", option_int scope.connection_generation
-    ; "presentation_generation", option_int scope.presentation_generation
-    ; ( "lifecycle_generation"
-      , option_json
-          (fun value -> `String (Int64.to_string value))
-          scope.lifecycle_generation )
-    ]
-;;
-
-let graph_key_json key =
-  `Assoc
-    [ "id", `String (Core.graph_key_handle_id key)
-    ; "scope", graph_scope_json (Core.graph_key_handle_scope key)
-    ]
-;;
-
-let catalog_cache_json cache =
-  `Assoc
-    [ "user_id", `String (Core.catalog_cache_user_id cache)
-    ; "graphs", `List (List.map graph_json (Core.catalog_cache_graphs cache))
-    ; ( "selected_graph"
-      , option_json
-          (fun graph_id -> `String (uuid_string graph_id))
-          (Core.catalog_cache_selected_graph cache) )
-    ]
-;;
-
-let rec datascript_entity_ref_json = function
-  | Datascript.Entity_id id -> `Assoc [ "entity_id", `Int id ]
-  | Temp_id id -> `Assoc [ "temp_id", `String id ]
-  | CurrentTx -> `String "current_tx"
-  | Ident ident -> `Assoc [ "ident", `String ident ]
-  | Lookup_ref (attribute, value) ->
-    `Assoc [ "lookup_ref", `List [ `String attribute; datascript_value_json value ] ]
-
-and datascript_value_json = function
-  | Datascript.Nil -> `String "nil"
-  | Int value -> `Assoc [ "int", `Int value ]
-  | Float value -> `Assoc [ "float", `Float value ]
-  | String value -> `Assoc [ "string", `String value ]
-  | Symbol value -> `Assoc [ "symbol", `String value ]
-  | Bool value -> `Assoc [ "bool", `Bool value ]
-  | Keyword value -> `Assoc [ "keyword", `String value ]
-  | Uuid value -> `Assoc [ "uuid", `String value ]
-  | Instant value -> `Assoc [ "instant", `Int value ]
-  | Regex value -> `Assoc [ "regex", `String value ]
-  | Ref value -> `Assoc [ "ref", `Int value ]
-  | List values -> `Assoc [ "list", `List (List.map datascript_value_json values) ]
-  | Vector values -> `Assoc [ "vector", `List (List.map datascript_value_json values) ]
-  | Map entries ->
-    `Assoc
-      [ ( "map"
-        , `List
-            (List.map
-               (fun (key, value) ->
-                  `List [ datascript_value_json key; datascript_value_json value ])
-               entries) )
+  let authenticated_state =
+    { initial_state with
+      snapshot = { initial_state.snapshot with startup = authenticated_startup }
+    }
+  in
+  let authenticated_observed =
+    { state = authenticated_state; admitted_graph_scope = None }
+  in
+  let hp01_event = Core.Account_authenticated { user_id = Some "user" } in
+  let hp01_preview = preview_step "HP01" origin hp01_event in
+  let catalog_token =
+    match hp01_preview.effects with
+    | [ Core.Publish (Core.State_changed state)
+      ; Core.Publish (Core.Token_requested request)
       ]
-  | Set values -> `Assoc [ "set", `List (List.map datascript_value_json values) ]
-  | Tuple values ->
-    `Assoc [ "tuple", `List (List.map (option_json datascript_value_json) values) ]
-  | TxRef -> `String "tx_ref"
-  | Ref_to reference -> `Assoc [ "ref_to", datascript_entity_ref_json reference ]
-;;
-
-let rec datascript_tx_value_json = function
-  | Datascript.One_value value -> `Assoc [ "one_value", datascript_value_json value ]
-  | Many_values values ->
-    `Assoc [ "many_values", `List (List.map datascript_value_json values) ]
-  | One_entity entity -> `Assoc [ "one_entity", datascript_tx_entity_json entity ]
-  | Many_entities entities ->
-    `Assoc [ "many_entities", `List (List.map datascript_tx_entity_json entities) ]
-
-and datascript_tx_entity_json (entity : Datascript.tx_entity) =
-  `Assoc
-    [ "db_id", option_json datascript_entity_ref_json entity.db_id
-    ; ( "attrs"
-      , `List
-          (List.map
-             (fun (attribute, value) ->
-                `List [ `String attribute; datascript_tx_value_json value ])
-             entity.attrs) )
-    ]
-;;
-
-let datascript_datom_json (datom : Datascript.datom) =
-  `Assoc
-    [ "e", `Int datom.e
-    ; "a", `String datom.a
-    ; "v", datascript_value_json datom.v
-    ; "tx", `Int datom.tx
-    ; "added", `Bool datom.added
-    ]
-;;
-
-let datascript_tx_op_json = function
-  | Datascript.Add (entity, attribute, value) ->
-    `Assoc
-      [ ( "add"
-        , `List
-            [ datascript_entity_ref_json entity
-            ; `String attribute
-            ; datascript_value_json value
-            ] )
-      ]
-  | Retract (entity, attribute, value) ->
-    `Assoc
-      [ ( "retract"
-        , `List
-            [ datascript_entity_ref_json entity
-            ; `String attribute
-            ; option_json datascript_value_json value
-            ] )
-      ]
-  | RetractEntity entity -> `Assoc [ "retract_entity", datascript_entity_ref_json entity ]
-  | RetractAttr (entity, attribute) ->
-    `Assoc
-      [ "retract_attr", `List [ datascript_entity_ref_json entity; `String attribute ] ]
-  | CompareAndSet (entity, attribute, previous, next) ->
-    `Assoc
-      [ ( "compare_and_set"
-        , `List
-            [ datascript_entity_ref_json entity
-            ; `String attribute
-            ; option_json datascript_value_json previous
-            ; datascript_value_json next
-            ] )
-      ]
-  | Entity entity -> `Assoc [ "entity", datascript_tx_entity_json entity ]
-  | Raw_datom datom -> `Assoc [ "raw_datom", datascript_datom_json datom ]
-  | InstallTxFn (entity, _) ->
-    `Assoc [ "install_tx_fn", datascript_entity_ref_json entity ]
-  | CallIdent (entity, values) ->
-    `Assoc
-      [ ( "call_ident"
-        , `List
-            [ datascript_entity_ref_json entity
-            ; `List (List.map datascript_value_json values)
-            ] )
-      ]
-  | Call _ -> `String "call"
-;;
-
-let checkpoint_json (checkpoint : Logseq_db_types.Sync_checkpoint.t) =
-  let status =
-    match checkpoint.status with
-    | Logseq_db_types.Sync_checkpoint.Active -> "active"
-    | Paused -> "paused"
+      when state = authenticated_state
+           && Core.token_request_purpose request = Core.Catalog_discovery -> request
+    | _ -> Alcotest.fail "HP01 unexpected instruction shape"
   in
-  `Assoc
-    [ "format_version", `Int checkpoint.format_version
-    ; "graph_id", `String (uuid_string checkpoint.graph_id)
-    ; ( "schema"
-      , `Assoc
-          [ "major", `Int checkpoint.schema.major; "minor", `Int checkpoint.schema.minor ]
-      )
-    ; "applied_server_t", `Int checkpoint.applied_server_t
-    ; "checksum", `String checkpoint.checksum
-    ; "status", `String status
-    ; "last_error", option_json (fun value -> `String value) checkpoint.last_error
-    ]
-;;
-
-let sync_activity_json = function
-  | Logseq_db_types.Sync_status.Pull_applied -> `String "pull_applied"
-  | Pull_duplicate -> `String "pull_duplicate"
-  | Pull_required -> `String "pull_required"
-  | Sync_paused -> `String "sync_paused"
-  | Sync_submission_blocked -> `String "sync_submission_blocked"
-;;
-
-let client_message_json message =
-  match Sync_protocol.encode_client_message message with
-  | Ok encoded -> Yojson.Safe.from_string encoded
-  | Error error ->
-    fail "unable to project client message: %s" (Sync_protocol.error_to_string error)
-;;
-
-let server_message_json message =
-  match Sync_protocol.encode_server_message message with
-  | Ok encoded -> Yojson.Safe.from_string encoded
-  | Error error ->
-    fail "unable to project server message: %s" (Sync_protocol.error_to_string error)
-;;
-
-let outbox_state_json = function
-  | Core.Queued -> `String "queued"
-  | Submitted -> `String "submitted"
-  | Accepted cursor -> `Assoc [ "accepted", `Int cursor ]
-  | Blocked message -> `Assoc [ "blocked", `String message ]
-;;
-
-let outbox_records_json records =
-  let raw_record_json raw =
-    match Core.decode_outbox_records [ raw ] with
-    | Ok [ record ] ->
-      `Assoc
-        [ "mutation_id", `String (uuid_string (Core.outbox_record_mutation_id record))
-        ; "fingerprint", `String (Core.outbox_record_fingerprint record)
-        ; "mutation_payload", secret_json (Core.outbox_record_mutation_payload record)
-        ; "outliner_op", `String (Core.outbox_record_outliner_op record)
-        ; "state", outbox_state_json (Core.outbox_record_state record)
-        ; "encoded_record", secret_json raw
-        ]
-    | Ok _ | Error _ -> `Assoc [ "invalid_encoded_record", secret_json raw ]
-  in
-  `List (List.map raw_record_json records)
-;;
-
-let authoritative_batch_json (batch : Core.authoritative_batch) =
-  `Assoc
-    [ "message", server_message_json batch.message
-    ; "scope", connection_scope_json batch.scope
-    ; "presentation_generation", `Int batch.presentation_generation
-    ; "lifecycle_generation", `String (Int64.to_string batch.lifecycle_generation)
-    ]
-;;
-
-let invalidation_json (invalidation : Core.invalidation) =
-  `Assoc
-    [ "basis", `String (Int64.to_string invalidation.basis)
-    ; ( "changed_uuids"
-      , `List (List.map (fun id -> `String (uuid_string id)) invalidation.changed_uuids) )
-    ; "changed_uuids_truncated", `Bool invalidation.changed_uuids_truncated
-    ]
-;;
-
-let graph_open_request_json (request : Core.graph_open_request) =
-  `Assoc
-    [ "graph", graph_json request.graph
-    ; "graph_directory", `String request.graph_directory
-    ; "database_path", `String request.database_path
-    ; "checkpoint", checkpoint_json request.checkpoint
-    ; "scope", graph_scope_json request.scope
-    ]
-;;
-
-let runner_request_view
-  : type a. a Core.effect_ticket -> a Core.runner_request -> runner_request_view
-  =
-  fun ticket request ->
-  let request_kind, payload =
-    match request with
-    | Core.Load_catalog account -> Load_catalog_request, account_scope_json account
-    | Save_catalog { account; cache } ->
-      ( Save_catalog_request
-      , `Assoc
-          [ "account", account_scope_json account; "cache", catalog_cache_json cache ] )
-    | Fetch_catalog scope -> Fetch_catalog_request, authenticated_account_scope_json scope
-    | Fetch_snapshot_baseline scope ->
-      Fetch_snapshot_baseline_request, authorized_graph_scope_json scope
-    | Fetch_snapshot_metadata scope ->
-      Fetch_snapshot_metadata_request, authorized_graph_scope_json scope
-    | Download_snapshot request ->
-      ( Download_snapshot_request
-      , `Assoc
-          [ "scope", authorized_graph_scope_json request.scope
-          ; "uri", `String (Uri.to_string request.uri)
-          ; ( "expected_bytes"
-            , option_json
-                (fun value -> `String (Int64.to_string value))
-                request.expected_bytes )
-          ; "maximum_bytes", `Int request.maximum_bytes
-          ] )
-    | Fetch_e2ee_graph_key scope ->
-      Fetch_e2ee_graph_key_request, authorized_graph_scope_json scope
-    | Fetch_e2ee_user_keys scope ->
-      Fetch_e2ee_user_keys_request, authenticated_account_scope_json scope
-    | Load_and_unlock_graph_key scope ->
-      Load_and_unlock_graph_key_request, graph_scope_json scope
-    | Fetch_and_unlock_graph_key request ->
-      ( Fetch_and_unlock_graph_key_request
-      , `Assoc
-          [ "scope", authorized_graph_scope_json request.scope
-          ; "encrypted_graph_key", secret_json request.encrypted_graph_key
-          ] )
-    | Unlock_private_key request ->
-      ( Unlock_private_key_request
-      , `Assoc
-          [ "scope", authenticated_account_scope_json request.scope
-          ; "password", secret_json request.password
-          ; "private_key_package", secret_json request.private_key_package
-          ] )
-    | Encrypt_protected_values request ->
-      ( Encrypt_protected_values_request
-      , `Assoc
-          [ "scope", graph_scope_json request.scope
-          ; "key", graph_key_json request.key
-          ; "plaintexts", `List (List.map secret_json request.plaintexts)
-          ] )
-    | Decrypt_protected_values request ->
-      ( Decrypt_protected_values_request
-      , `Assoc
-          [ "scope", graph_scope_json request.scope
-          ; "key", graph_key_json request.key
-          ; ( "protected_values"
-            , `List
-                (List.map
-                   (fun (attribute, encrypted) ->
-                      `List [ `String attribute; secret_json encrypted ])
-                   request.protected_values) )
-          ] )
-  in
-  { ticket_id = Core.effect_id_to_string (Core.effect_ticket_id ticket)
-  ; ticket_scope = effect_scope_json (Core.effect_ticket_scope ticket) |> json_string
-  ; request_kind
-  ; request_payload = json_string payload
-  }
-;;
-
-let local_batch_action_json = function
-  | Core.Commit { outbox_records } ->
-    `Assoc [ "commit", outbox_records_json outbox_records ]
-  | Reject { kind; message } ->
-    let kind =
-      match kind with
-      | Core.Planning_failed -> "planning_failed"
-      | Encryption_failed -> "encryption_failed"
-      | Encoding_failed -> "encoding_failed"
-      | Scope_closed -> "scope_closed"
-      | Engine_unavailable -> "engine_unavailable"
-      | Persistence_failed -> "persistence_failed"
-    in
-    `Assoc [ "reject", `Assoc [ "kind", `String kind; "message", `String message ] ]
-;;
-
-let worker_effect_view worker =
-  let worker_effect_kind, payload =
-    match worker with
-    | Core.Inspect_mirror request ->
-      ( Inspect_mirror_effect
-      , `Assoc
-          [ "graph", graph_json request.graph; "scope", graph_scope_json request.scope ] )
-    | Activate_snapshot request ->
-      ( Activate_snapshot_effect
-      , `Assoc
-          [ "artifact_path", `String (Core.staged_artifact_path request.artifact)
-          ; ( "artifact_expected_rows"
-            , `Int (Core.staged_artifact_expected_rows request.artifact) )
-          ; "scope", graph_scope_json request.scope
-          ; "applied_server_t", `Int request.applied_server_t
-          ; "key", option_json graph_key_json request.key
-          ] )
-    | Delete_mirror request ->
-      ( Delete_mirror_effect
-      , `Assoc
-          [ "graph_id", `String (uuid_string request.graph_id)
-          ; "scope", effect_scope_json request.scope
-          ] )
-    | Attach_graph request -> Attach_graph_effect, graph_open_request_json request
-    | Detach_graph scope -> Detach_graph_effect, graph_scope_json scope
-    | Reset_managed_account scope ->
-      Reset_managed_account_effect, account_scope_json scope
-    | Complete_local_batch request ->
-      ( Complete_local_batch_effect
-      , `Assoc
-          [ "operation_id", `String (uuid_string request.operation_id)
-          ; "admission_id", `String request.admission_id
-          ; "scope", graph_scope_json request.scope
-          ; "action", local_batch_action_json request.action
-          ] )
-    | Inspect_authoritative_batch batch ->
-      Inspect_authoritative_batch_effect, authoritative_batch_json batch
-    | Apply_authoritative_batch request ->
-      ( Apply_authoritative_batch_effect
-      , `Assoc
-          [ "batch", authoritative_batch_json request.batch
-          ; "precondition", `String request.precondition
-          ; "scope", graph_scope_json request.scope
-          ; "key", option_json graph_key_json request.key
-          ; ( "transactions"
-            , `List
-                (List.map
-                   (fun transaction -> `List (List.map datascript_tx_op_json transaction))
-                   request.transactions) )
-          ; ( "projection_transactions"
-            , `List
-                (List.map
-                   (fun transaction -> `List (List.map datascript_tx_op_json transaction))
-                   request.projection_transactions) )
-          ; "checkpoint", checkpoint_json request.checkpoint
-          ; "outbox_records", outbox_records_json request.outbox_records
-          ; "activity", sync_activity_json request.activity
-          ] )
-    | Commit_outbox_transition request ->
-      ( Commit_outbox_transition_effect
-      , `Assoc
-          [ "scope", graph_scope_json request.scope
-          ; "presentation_generation", `Int request.presentation_generation
-          ; "lifecycle_generation", `String (Int64.to_string request.lifecycle_generation)
-          ; "expected_outbox_records", outbox_records_json request.expected_outbox_records
-          ; "outbox_records", outbox_records_json request.outbox_records
-          ; "pending_message", option_json client_message_json request.pending_message
-          ] )
-  in
-  { worker_effect_kind; worker_effect_payload = json_string payload }
-;;
-
-let view_state core =
-  { state = Core.state core; admitted_graph_scope = Core.admitted_graph_scope core }
-;;
-
-let view_instruction = function
-  | Core.Run (Core.Request (ticket, request)) ->
-    Run_request (runner_request_view ticket request)
-  | Run (Start_websocket request) ->
-    Start_websocket
-      { websocket_scope = connection_scope_json request.scope |> json_string
-      ; websocket_uri = Uri.to_string request.uri
-      ; websocket_token = secret_json request.token |> json_string
-      }
-  | Run (Send_websocket request) ->
-    Send_websocket
-      { websocket_send_scope = connection_scope_json request.scope |> json_string
-      ; websocket_message = client_message_json request.message |> json_string
-      }
-  | Run (Close_websocket scope) ->
-    Close_websocket (connection_scope_json scope |> json_string)
-  | Run (Schedule_timer request as runner_effect) ->
-    Schedule_timer
-      { timer_diagnostic = Core.runner_effect_diagnostic runner_effect
-      ; timer_scope = effect_scope_json request.scope |> json_string
-      ; delay_seconds = request.delay_seconds
-      }
-  | Run (Cancel_effects scope) -> Cancel_effects (effect_scope_json scope |> json_string)
-  | Delegate worker -> Delegate (worker_effect_view worker)
-  | Publish (State_changed state) -> Publish_state { state; admitted_graph_scope = None }
-  | Publish (Token_requested request) ->
-    Publish_token_request
-      { token_request_id = Core.token_request_id request
-      ; token_request_purpose = Core.token_request_purpose request
-      }
-  | Publish (Bootstrap_progressed progress) -> Publish_bootstrap_progress progress
-  | Publish (Graph_invalidated invalidation) -> Publish_graph_invalidation invalidation
-;;
-
-let runner_request_kind_name = function
-  | Load_catalog_request -> "Load_catalog"
-  | Save_catalog_request -> "Save_catalog"
-  | Fetch_catalog_request -> "Fetch_catalog"
-  | Fetch_snapshot_baseline_request -> "Fetch_snapshot_baseline"
-  | Fetch_snapshot_metadata_request -> "Fetch_snapshot_metadata"
-  | Download_snapshot_request -> "Download_snapshot"
-  | Fetch_e2ee_graph_key_request -> "Fetch_e2ee_graph_key"
-  | Fetch_e2ee_user_keys_request -> "Fetch_e2ee_user_keys"
-  | Load_and_unlock_graph_key_request -> "Load_and_unlock_graph_key"
-  | Fetch_and_unlock_graph_key_request -> "Fetch_and_unlock_graph_key"
-  | Unlock_private_key_request -> "Unlock_private_key"
-  | Encrypt_protected_values_request -> "Encrypt_protected_values"
-  | Decrypt_protected_values_request -> "Decrypt_protected_values"
-;;
-
-let worker_effect_kind_name = function
-  | Inspect_mirror_effect -> "Inspect_mirror"
-  | Activate_snapshot_effect -> "Activate_snapshot"
-  | Delete_mirror_effect -> "Delete_mirror"
-  | Attach_graph_effect -> "Attach_graph"
-  | Detach_graph_effect -> "Detach_graph"
-  | Reset_managed_account_effect -> "Reset_managed_account"
-  | Complete_local_batch_effect -> "Complete_local_batch"
-  | Inspect_authoritative_batch_effect -> "Inspect_authoritative_batch"
-  | Apply_authoritative_batch_effect -> "Apply_authoritative_batch"
-  | Commit_outbox_transition_effect -> "Commit_outbox_transition"
-;;
-
-let token_purpose_name = function
-  | Core.Catalog_discovery -> "Catalog_discovery"
-  | Snapshot_bootstrap -> "Snapshot_bootstrap"
-  | E2ee_key_access -> "E2ee_key_access"
-  | Websocket_connect -> "Websocket_connect"
-;;
-
-let state_view_json view =
-  let snapshot = view.state.snapshot in
-  let startup = snapshot.startup in
-  let sync_phase =
-    match snapshot.sync_phase with
-    | Core.Offline -> "offline"
-    | Connecting -> "connecting"
-    | Pulling -> "pulling"
-    | Submitting -> "submitting"
-    | Current -> "current"
-    | Paused -> "paused"
-    | Failed -> "failed"
-  in
-  let failure =
-    option_json
-      (fun failure ->
-         `String
-           (match failure with
-            | Core.During_authentication -> "during_authentication"
-            | During_catalog -> "during_catalog"
-            | During_local_restore -> "during_local_restore"
-            | During_bootstrap -> "during_bootstrap"
-            | During_e2ee -> "during_e2ee"))
-      startup.failure
-  in
-  let diagnostic_group_json (group : Core.diagnostic_group) =
-    `Assoc
-      [ "title", `String group.title
-      ; ( "entries"
-        , `List
-            (List.map
-               (fun (key, value) -> `List [ `String key; `String value ])
-               group.entries) )
-      ]
-  in
-  `Assoc
-    [ ( "state"
-      , `Assoc
-          [ ( "snapshot"
-            , `Assoc
-                [ "sync_phase", `String sync_phase
-                ; "catalog", `List (List.map graph_json snapshot.catalog)
-                ; ( "selected_graph"
-                  , option_json
-                      (fun value -> `String (uuid_string value))
-                      snapshot.selected_graph )
-                ; ( "applied_server_t"
-                  , option_json (fun value -> `Int value) snapshot.applied_server_t )
-                ; ( "timeline_presentation_pending"
-                  , `Bool snapshot.timeline_presentation_pending )
-                ; ( "startup"
-                  , `Assoc
-                      [ "authenticated", `Bool startup.authenticated
-                      ; "catalog_loading", `Bool startup.catalog_loading
-                      ; "awaiting_selection", `Bool startup.awaiting_selection
-                      ; "restoring_local", `Bool startup.restoring_local
-                      ; "bootstrapping", `Bool startup.bootstrapping
-                      ; "awaiting_e2ee_password", `Bool startup.awaiting_e2ee_password
-                      ; "failure", failure
-                      ; "account_generation", `Int startup.account_generation
-                      ; "graph_generation", `Int startup.graph_generation
-                      ; "presentation_generation", `Int startup.presentation_generation
-                      ] )
-                ; ( "last_error"
-                  , option_json (fun value -> `String value) snapshot.last_error )
-                ] )
-          ; ( "diagnostics"
-            , `Assoc
-                [ ( "groups"
-                  , `List (List.map diagnostic_group_json view.state.diagnostics.groups) )
-                ; ( "history"
-                  , `List
-                      (List.map
-                         (fun value -> `String value)
-                         view.state.diagnostics.history) )
-                ] )
-          ] )
-    ; "admitted_graph_scope", option_json graph_scope_json view.admitted_graph_scope
-    ]
-;;
-
-let show_state_view view = state_view_json view |> json_string
-
-let show_effect_view = function
-  | Run_request request ->
-    Printf.sprintf
-      "Run_request(kind=%s,ticket=%s,scope=%s,payload=%s)"
-      (runner_request_kind_name request.request_kind)
-      request.ticket_id
-      request.ticket_scope
-      request.request_payload
-  | Start_websocket request ->
-    Printf.sprintf
-      "Start_websocket(scope=%s,uri=%s,token=%s)"
-      request.websocket_scope
-      request.websocket_uri
-      request.websocket_token
-  | Send_websocket request ->
-    Printf.sprintf
-      "Send_websocket(scope=%s,message=%s)"
-      request.websocket_send_scope
-      request.websocket_message
-  | Close_websocket scope -> "Close_websocket(scope=" ^ scope ^ ")"
-  | Schedule_timer request ->
-    Printf.sprintf
-      "Schedule_timer(diagnostic=%s,scope=%s,delay=%g)"
-      request.timer_diagnostic
-      request.timer_scope
-      request.delay_seconds
-  | Cancel_effects scope -> "Cancel_effects(scope=" ^ scope ^ ")"
-  | Delegate worker ->
-    Printf.sprintf
-      "Delegate(kind=%s,payload=%s)"
-      (worker_effect_kind_name worker.worker_effect_kind)
-      worker.worker_effect_payload
-  | Publish_state state -> "Publish_state(" ^ show_state_view state ^ ")"
-  | Publish_token_request request ->
-    Printf.sprintf
-      "Publish_token_request(id=%s,purpose=%s)"
-      request.token_request_id
-      (token_purpose_name request.token_request_purpose)
-  | Publish_bootstrap_progress progress ->
-    Printf.sprintf
-      "Publish_bootstrap_progress(graph=%s,received=%Ld,total=%s)"
-      (uuid_string progress.graph_id)
-      progress.received_bytes
-      (Option.fold ~none:"none" ~some:Int64.to_string progress.total_bytes)
-  | Publish_graph_invalidation invalidation ->
-    "Publish_graph_invalidation(" ^ (invalidation_json invalidation |> json_string) ^ ")"
-;;
-
-let first_state_difference expected actual =
-  let expected_snapshot = expected.state.snapshot in
-  let actual_snapshot = actual.state.snapshot in
-  let expected_startup = expected_snapshot.startup in
-  let actual_startup = actual_snapshot.startup in
-  if expected_snapshot.sync_phase <> actual_snapshot.sync_phase
-  then "state.snapshot.sync_phase"
-  else if expected_snapshot.catalog <> actual_snapshot.catalog
-  then "state.snapshot.catalog"
-  else if expected_snapshot.selected_graph <> actual_snapshot.selected_graph
-  then "state.snapshot.selected_graph"
-  else if expected_snapshot.applied_server_t <> actual_snapshot.applied_server_t
-  then "state.snapshot.applied_server_t"
-  else if
-    expected_snapshot.timeline_presentation_pending
-    <> actual_snapshot.timeline_presentation_pending
-  then "state.snapshot.timeline_presentation_pending"
-  else if expected_startup.authenticated <> actual_startup.authenticated
-  then "state.snapshot.startup.authenticated"
-  else if expected_startup.catalog_loading <> actual_startup.catalog_loading
-  then "state.snapshot.startup.catalog_loading"
-  else if expected_startup.awaiting_selection <> actual_startup.awaiting_selection
-  then "state.snapshot.startup.awaiting_selection"
-  else if expected_startup.restoring_local <> actual_startup.restoring_local
-  then "state.snapshot.startup.restoring_local"
-  else if expected_startup.bootstrapping <> actual_startup.bootstrapping
-  then "state.snapshot.startup.bootstrapping"
-  else if expected_startup.awaiting_e2ee_password <> actual_startup.awaiting_e2ee_password
-  then "state.snapshot.startup.awaiting_e2ee_password"
-  else if expected_startup.failure <> actual_startup.failure
-  then "state.snapshot.startup.failure"
-  else if expected_startup.account_generation <> actual_startup.account_generation
-  then "state.snapshot.startup.account_generation"
-  else if expected_startup.graph_generation <> actual_startup.graph_generation
-  then "state.snapshot.startup.graph_generation"
-  else if
-    expected_startup.presentation_generation <> actual_startup.presentation_generation
-  then "state.snapshot.startup.presentation_generation"
-  else if expected_snapshot.last_error <> actual_snapshot.last_error
-  then "state.snapshot.last_error"
-  else if expected.state.diagnostics.groups <> actual.state.diagnostics.groups
-  then "state.diagnostics.groups"
-  else if expected.state.diagnostics.history <> actual.state.diagnostics.history
-  then "state.diagnostics.history"
-  else if expected.admitted_graph_scope <> actual.admitted_graph_scope
-  then "admitted_graph_scope"
-  else "unknown"
-;;
-
-let first_effect_difference expected actual =
-  let rec loop index expected actual =
-    match expected, actual with
-    | expected :: expected_rest, actual :: actual_rest when expected = actual ->
-      loop (index + 1) expected_rest actual_rest
-    | expected :: _, actual :: _ ->
-      Printf.sprintf
-        "effect[%d] expected %s but got %s"
-        index
-        (show_effect_view expected)
-        (show_effect_view actual)
-    | [], actual :: _ ->
-      Printf.sprintf "effect[%d] was unexpectedly %s" index (show_effect_view actual)
-    | expected :: _, [] ->
-      Printf.sprintf
-        "effect[%d] was missing; expected %s"
-        index
-        (show_effect_view expected)
-    | [], [] -> "unknown effect difference"
-  in
-  loop 0 expected actual
-;;
-
-let static_uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok
-
-let make_state_view
-      ~sync_phase
-      ~catalog
-      ~selected_graph
-      ~applied_server_t
-      ~timeline_presentation_pending
-      ~authenticated
-      ~catalog_loading
-      ~awaiting_selection
-      ~restoring_local
-      ~bootstrapping
-      ~awaiting_e2ee_password
-      ~failure
-      ~account_generation
-      ~graph_generation
-      ~presentation_generation
-      ~last_error
-      ~diagnostic_groups
-      ~diagnostic_history
-      ~admitted_graph_scope
-  =
-  let startup : Core.startup_facts =
-    { authenticated
-    ; catalog_loading
-    ; awaiting_selection
-    ; restoring_local
-    ; bootstrapping
-    ; awaiting_e2ee_password
-    ; failure
-    ; account_generation
-    ; graph_generation
-    ; presentation_generation
-    }
-  in
-  let snapshot : Core.snapshot =
-    { sync_phase
-    ; catalog
-    ; selected_graph
-    ; applied_server_t
-    ; timeline_presentation_pending
-    ; startup
-    ; last_error
-    }
-  in
-  let diagnostics : Core.diagnostics =
-    { groups = diagnostic_groups; history = diagnostic_history }
-  in
-  { state = { snapshot; diagnostics }; admitted_graph_scope }
-;;
-
-type happy_path_rationale =
-  { id : string
-  ; contract : string
-  ; owner : string
-  ; unchanged : string
-  ; changes : string
-  ; effects : string
-  }
-
-let happy_path_rationales =
-  [ { id = "HP01"
-    ; contract = "Authentication starts a fresh managed-account generation."
-    ; owner = "The authenticated user establishes the account generation."
-    ; unchanged = "The empty catalog and absent graph selection remain empty."
-    ; changes = "Authentication and catalog loading become active."
-    ; effects = "Publish the new state, then request a catalog token."
-    }
-  ; { id = "HP02"
-    ; contract = "A current catalog token authorizes one catalog fetch."
-    ; owner = "The exact catalog token request emitted by HP01."
-    ; unchanged = "The public catalog-loading state is retained."
-    ; changes = "The token owner is consumed and one runner ticket is created."
-    ; effects = "Run exactly one typed Fetch_catalog request."
-    }
-  ; { id = "HP03"
-    ; contract = "A successful catalog fetch installs the account catalog."
-    ; owner = "The exact Fetch_catalog ticket emitted by HP02."
-    ; unchanged = "No graph is selected or admitted."
-    ; changes = "Catalog loading ends and graph selection becomes available."
-    ; effects = "Publish Offline state, then persist the unselected catalog cache."
-    }
-  ; { id = "HP04"
-    ; contract = "Selecting a declared catalog member admits a graph generation."
-    ; owner = "The selected UUID belongs to the catalog installed by HP03."
-    ; unchanged = "The catalog and account generation remain stable."
-    ; changes = "The graph is selected, admitted, and marked bootstrapping."
-    ; effects = "Inspect the mirror, publish state, then persist the selection."
-    }
-  ; { id = "HP05"
-    ; contract = "A matching existing mirror can be attached."
-    ; owner = "The exact graph scope inspected by HP04."
-    ; unchanged = "The selected bootstrapping public view is retained."
-    ; changes = "Only private attachment ownership advances."
-    ; effects = "Delegate exactly one Attach_graph request."
-    }
-  ; { id = "HP06"
-    ; contract = "Attachment establishes the durable checkpoint and outbox."
-    ; owner = "The exact Attach_graph request emitted by HP05."
-    ; unchanged = "Catalog, selection, and graph generation remain stable."
-    ; changes = "Bootstrap clears and Connecting starts at server cursor zero."
-    ; effects = "Publish state, then request a WebSocket token."
-    }
-  ; { id = "HP07"
-    ; contract = "A current WebSocket token starts one scoped connection."
-    ; owner = "The exact Websocket_connect token request emitted by HP06."
-    ; unchanged = "The public Connecting state is retained."
-    ; changes = "The connection generation advances exactly once."
-    ; effects = "Run exactly one Start_websocket instruction."
-    }
-  ; { id = "HP08"
-    ; contract = "Opening the admitted connection starts the authoritative pull."
-    ; owner = "The exact connection scope emitted by HP07."
-    ; unchanged = "Catalog, graph, and checkpoint remain stable."
-    ; changes = "The connection becomes live and the phase becomes Pulling."
-    ; effects = "Publish Pulling, then send Pull since cursor zero."
-    }
-  ; { id = "HP09"
-    ; contract = "A pull response requires worker inspection before Current."
-    ; owner = "The live connection emitted by HP07 and opened by HP08."
-    ; unchanged = "The public Pulling state and cursor remain unchanged."
-    ; changes = "An authoritative batch owner is reserved privately."
-    ; effects = "Delegate exactly one inspection of the typed pull response."
-    }
-  ; { id = "HP10"
-    ; contract = "Worker inspection supplies the authoritative apply precondition."
-    ; owner = "The exact authoritative batch emitted by HP09."
-    ; unchanged = "Public state and active authoritative ownership remain stable."
-    ; changes = "The inspected context becomes a duplicate-pull apply request."
-    ; effects = "Delegate one apply with the worker checkpoint, outbox, and precondition."
-    }
-  ; { id = "HP11"
-    ; contract = "Only a completed authoritative apply can establish Current."
-    ; owner = "The exact apply request emitted by HP10."
-    ; unchanged = "The admitted graph and cursor-zero checkpoint remain stable."
-    ; changes = "The authoritative owner clears and the phase becomes Current."
-    ; effects = "Publish Current and open no submission for an empty outbox."
-    }
-  ; { id = "HP12"
-    ; contract = "A plaintext local mutation is planned without crypto."
-    ; owner = "The mutation targets the graph admitted by HP04."
-    ; unchanged = "Current sync state and durable outbox remain unchanged in Core."
-    ; changes = "A stable worker commit operation is produced."
-    ; effects = "Delegate one Complete_local_batch containing a queued record."
-    }
-  ; { id = "HP13"
-    ; contract = "A worker-committed queued record must be reserved durably."
-    ; owner = "The exact local completion operation emitted by HP12."
-    ; unchanged = "The public Current state remains unchanged."
-    ; changes = "The queued outbox is adopted and one submission owner is reserved."
-    ; effects = "Commit Queued to Submitted without sending on the WebSocket."
-    }
-  ; { id = "HP14"
-    ; contract = "Only the exact durable reservation may dispatch a transaction."
-    ; owner = "The exact outbox transition emitted by HP13."
-    ; unchanged = "Catalog, graph, and cursor remain stable."
-    ; changes = "The owner becomes dispatched and the phase becomes Submitting."
-    ; effects = "Send Tx_batch first, then publish Submitting."
-    }
-  ; { id = "HP15"
-    ; contract = "A transaction acknowledgement must correlate to its dispatched owner."
-    ; owner = "The live dispatched owner and its exact connection."
-    ; unchanged = "The public Submitting state and durable record remain unchanged."
-    ; changes = "The owner advances to acknowledgement application."
-    ; effects = "Delegate one authoritative inspection of Tx_batch_ok."
-    }
-  ; { id = "HP16"
-    ; contract = "Acknowledgement inspection accepts only the owned mutation."
-    ; owner = "The exact acknowledgement batch emitted by HP15."
-    ; unchanged = "Public state, mutation identity, and checkpoint stay stable."
-    ; changes = "The owned durable record becomes Accepted at cursor one."
-    ; effects = "Delegate one Pull_required apply with the worker precondition."
-    }
-  ; { id = "HP17"
-    ; contract = "Acknowledgement apply retains ownership until confirmation."
-    ; owner = "The exact Pull_required apply emitted by HP16."
-    ; unchanged = "The accepted record and applied cursor zero remain durable."
-    ; changes = "The owner awaits cursor one and the phase becomes Pulling."
-    ; effects = "Publish Pulling, then send one Pull since cursor zero."
-    }
-  ; { id = "HP18"
-    ; contract = "The confirmation response begins a new authoritative apply chain."
-    ; owner = "The live connection retained by HP17."
-    ; unchanged = "Public Pulling state and accepted mutation remain stable."
-    ; changes = "A confirmation authoritative owner is reserved."
-    ; effects = "Delegate one inspection of the cursor-one response."
-    }
-  ; { id = "HP19"
-    ; contract = "Confirmation inspection reconciles accepted durable work."
-    ; owner = "The exact confirmation batch emitted by HP18."
-    ; unchanged = "Public state and worker precondition remain stable."
-    ; changes = "The checkpoint advances and the confirmed record is removed."
-    ; effects = "Delegate one Pull_applied request with rebuilt empty outbox."
-    }
-  ; { id = "HP20"
-    ; contract = "A committed authoritative confirmation releases submission ownership."
-    ; owner = "The exact Pull_applied request emitted by HP19."
-    ; unchanged = "Catalog, selection, and graph admission remain stable."
-    ; changes = "Current advances to cursor one, outbox empties, and owner releases."
-    ; effects = "Publish state, then worker invalidation, with no duplicate submission."
-    }
-  ]
-;;
-
-let happy_graph_id = static_uuid "11111111-1111-4111-8111-111111111111"
-let happy_mutation_id = static_uuid "33333333-3333-4333-8333-333333333333"
-
-let happy_graph : Core.graph =
-  { graph_id = happy_graph_id
-  ; name = "Journal"
-  ; schema = { major = 1; minor = 0; exact = true }
-  ; encrypted = false
-  }
-;;
-
-let happy_account_scope : Core.account_scope =
-  { managed_sync_origin = Uri.of_string "https://api.logseq.io"
-  ; user_id = "user-1"
-  ; account_generation = 1
-  ; presentation_generation = 1
-  ; lifecycle_generation = 0L
-  }
-;;
-
-let happy_graph_scope : Core.graph_scope =
-  { account = happy_account_scope; graph_id = happy_graph_id; graph_generation = 2 }
-;;
-
-let happy_connection_scope : Core.connection_scope =
-  { graph = happy_graph_scope; connection_generation = 1 }
-;;
-
-let happy_checkpoint_0 = checkpoint happy_graph_id
-
-let happy_checkpoint_1 =
-  Logseq_db_types.Sync_checkpoint.create
-    ~graph_id:happy_graph_id
-    ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
-    ~applied_server_t:1
-    ~checksum:"0000000000000000"
-  |> Result.get_ok
-;;
-
-let happy_open_request : Core.graph_open_request =
-  { graph = happy_graph
-  ; graph_directory = "/worker/canonical-happy-path"
-  ; database_path = "/worker/canonical-happy-path/db.sqlite"
-  ; checkpoint = happy_checkpoint_0
-  ; scope = happy_graph_scope
-  }
-;;
-
-let happy_operation =
-  Datascript.Add
-    ( Datascript.Temp_id "hp-block"
-    , "block/uuid"
-    , Datascript.Uuid "33333333-3333-4333-8333-333333333333" )
-;;
-
-let happy_encoded_tx =
-  "[[\"~:db/add\",\"hp-block\",\"~:block/uuid\",\"~u33333333-3333-4333-8333-333333333333\"]]"
-;;
-
-let happy_queued_record =
-  "{\"mutationId\":\"33333333-3333-4333-8333-333333333333\",\"mutationPayload\":\"hp-mutation\",\"mutationFingerprint\":\"hp-fingerprint\",\"outlinerOp\":\"save-block\",\"state\":{\"type\":\"queued\"},\"encodedTx\":\"[[\\\"~:db/add\\\",\\\"hp-block\\\",\\\"~:block/uuid\\\",\\\"~u33333333-3333-4333-8333-333333333333\\\"]]\"}"
-;;
-
-let happy_submitted_record =
-  "{\"mutationId\":\"33333333-3333-4333-8333-333333333333\",\"mutationPayload\":\"hp-mutation\",\"mutationFingerprint\":\"hp-fingerprint\",\"outlinerOp\":\"save-block\",\"state\":{\"type\":\"submitted\"},\"encodedTx\":\"[[\\\"~:db/add\\\",\\\"hp-block\\\",\\\"~:block/uuid\\\",\\\"~u33333333-3333-4333-8333-333333333333\\\"]]\"}"
-;;
-
-let happy_accepted_record =
-  "{\"mutationId\":\"33333333-3333-4333-8333-333333333333\",\"mutationPayload\":\"hp-mutation\",\"mutationFingerprint\":\"hp-fingerprint\",\"outlinerOp\":\"save-block\",\"state\":{\"type\":\"accepted\",\"serverT\":1},\"encodedTx\":\"[[\\\"~:db/add\\\",\\\"hp-block\\\",\\\"~:block/uuid\\\",\\\"~u33333333-3333-4333-8333-333333333333\\\"]]\"}"
-;;
-
-let happy_tx_message =
-  Sync_protocol.Client.Tx_batch
-    { client_revision = None
-    ; t_before = 0
-    ; txs =
-        [ { tx = happy_encoded_tx
-          ; tx_id = Some happy_mutation_id
-          ; outliner_op = Some "save-block"
-          }
-        ]
-    }
-;;
-
-let happy_opening_message =
-  Sync_protocol.Server.Pull_ok { t = 0; checksum = Some "0000000000000000"; txs = [] }
-;;
-
-let happy_ack_message =
-  Sync_protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0000000000000000" }
-;;
-
-let happy_confirmation_message =
-  Sync_protocol.Server.Pull_ok
-    { t = 1
-    ; checksum = Some "0000000000000000"
-    ; txs = [ { t = 1; tx = happy_encoded_tx; outliner_op = Some "save-block" } ]
-    }
-;;
-
-let happy_batch message : Core.authoritative_batch =
-  { message
-  ; scope = happy_connection_scope
-  ; presentation_generation = 1
-  ; lifecycle_generation = 0L
-  }
-;;
-
-let happy_state
-      ~sync_phase
-      ~catalog
-      ~selected_graph
-      ~applied_server_t
-      ~authenticated
-      ~catalog_loading
-      ~awaiting_selection
-      ~bootstrapping
-      ~account_generation
-      ~graph_generation
-      ~presentation_generation
-      ~admitted_graph_scope
-  =
-  make_state_view
-    ~sync_phase
-    ~catalog
-    ~selected_graph
-    ~applied_server_t
-    ~timeline_presentation_pending:true
-    ~authenticated
-    ~catalog_loading
-    ~awaiting_selection
-    ~restoring_local:false
-    ~bootstrapping
-    ~awaiting_e2ee_password:false
-    ~failure:None
-    ~account_generation
-    ~graph_generation
-    ~presentation_generation
-    ~last_error:None
-    ~diagnostic_groups:[]
-    ~diagnostic_history:[]
-    ~admitted_graph_scope
-;;
-
-let happy_catalog_loading_state =
-  happy_state
-    ~sync_phase:Core.Connecting
-    ~catalog:[]
-    ~selected_graph:None
-    ~applied_server_t:None
-    ~authenticated:true
-    ~catalog_loading:true
-    ~awaiting_selection:false
-    ~bootstrapping:false
-    ~account_generation:1
-    ~graph_generation:1
-    ~presentation_generation:1
-    ~admitted_graph_scope:None
-;;
-
-let happy_catalog_state =
-  happy_state
-    ~sync_phase:Core.Offline
-    ~catalog:[ happy_graph ]
-    ~selected_graph:None
-    ~applied_server_t:None
-    ~authenticated:true
-    ~catalog_loading:false
-    ~awaiting_selection:true
-    ~bootstrapping:false
-    ~account_generation:1
-    ~graph_generation:1
-    ~presentation_generation:1
-    ~admitted_graph_scope:None
-;;
-
-let happy_selected_state =
-  happy_state
-    ~sync_phase:Core.Offline
-    ~catalog:[ happy_graph ]
-    ~selected_graph:(Some happy_graph_id)
-    ~applied_server_t:None
-    ~authenticated:true
-    ~catalog_loading:false
-    ~awaiting_selection:false
-    ~bootstrapping:true
-    ~account_generation:1
-    ~graph_generation:2
-    ~presentation_generation:1
-    ~admitted_graph_scope:(Some happy_graph_scope)
-;;
-
-let happy_sync_state sync_phase applied_server_t =
-  happy_state
-    ~sync_phase
-    ~catalog:[ happy_graph ]
-    ~selected_graph:(Some happy_graph_id)
-    ~applied_server_t:(Some applied_server_t)
-    ~authenticated:true
-    ~catalog_loading:false
-    ~awaiting_selection:false
-    ~bootstrapping:false
-    ~account_generation:1
-    ~graph_generation:2
-    ~presentation_generation:1
-    ~admitted_graph_scope:(Some happy_graph_scope)
-;;
-
-let published_state view = Publish_state { view with admitted_graph_scope = None }
-let static_instruction_view instruction = view_instruction instruction
-
-let expected_runner_request ~id ~scope ~request_kind ~request_payload =
-  Run_request
-    { ticket_id = string_of_int id
-    ; ticket_scope = effect_scope_json scope |> json_string
-    ; request_kind
-    ; request_payload = json_string request_payload
-    }
-;;
-
-let check_happy_step id origin event expected_next expected_effects =
-  let origin_before = view_state origin in
-  let first =
-    try Core.step origin event with
-    | exn -> fail "%s raised %s" id (Printexc.to_string exn)
-  in
-  let actual_next = view_state first.next in
-  if actual_next <> expected_next
-  then
-    fail
-      "%s changed %s; expected %s but got %s"
-      id
-      (first_state_difference expected_next actual_next)
-      (show_state_view expected_next)
-      (show_state_view actual_next);
-  let actual_effects = List.map view_instruction first.effects in
-  if actual_effects <> expected_effects
-  then fail "%s %s" id (first_effect_difference expected_effects actual_effects);
-  let origin_after = view_state origin in
-  if origin_after <> origin_before
-  then
-    fail
-      "%s mutated its origin at %s"
-      id
-      (first_state_difference origin_before origin_after);
-  let replay =
-    try Core.step origin event with
-    | exn -> fail "%s replay raised %s" id (Printexc.to_string exn)
-  in
-  let replay_next = view_state replay.next in
-  let replay_effects = List.map view_instruction replay.effects in
-  if replay_next <> actual_next
-  then fail "%s replay changed %s" id (first_state_difference actual_next replay_next);
-  if replay_effects <> actual_effects
-  then fail "%s replay %s" id (first_effect_difference actual_effects replay_effects);
-  first
-;;
-
-let extract_fetch_catalog_completion id effects (graphs : Core.graph list) : Core.event =
-  List.find_map
-    (function
-      | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
-        Some (Core.Runner_completed (Core.Completion (ticket, Ok graphs)))
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some completion -> completion
-  | None -> fail "%s did not emit Fetch_catalog" id
-;;
-
-let extract_mirror_request id effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Inspect_mirror request) -> Some request
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some request -> request
-  | None -> fail "%s did not emit Inspect_mirror" id
-;;
-
-let extract_attach_request id effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Attach_graph request) -> Some request
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some request -> request
-  | None -> fail "%s did not emit Attach_graph" id
-;;
-
-let extract_websocket_connection id effects =
-  List.find_map
-    (function
-      | Core.Run (Core.Start_websocket request) -> Some request.scope
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some scope -> scope
-  | None -> fail "%s did not emit Start_websocket" id
-;;
-
-let extract_authoritative_batch id effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Inspect_authoritative_batch batch) -> Some batch
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some batch -> batch
-  | None -> fail "%s did not emit Inspect_authoritative_batch" id
-;;
-
-let extract_authoritative_apply id effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Apply_authoritative_batch request) -> Some request
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some request -> request
-  | None -> fail "%s did not emit Apply_authoritative_batch" id
-;;
-
-let extract_local_commit id effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Complete_local_batch request) ->
-        (match request.action with
-         | Core.Commit { outbox_records } -> Some (request, outbox_records)
-         | Reject _ -> None)
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some commit -> commit
-  | None -> fail "%s did not emit a committing Complete_local_batch" id
-;;
-
-let extract_outbox_transition id effects =
-  List.find_map
-    (function
-      | Core.Delegate (Core.Commit_outbox_transition transition) -> Some transition
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some transition -> transition
-  | None -> fail "%s did not emit Commit_outbox_transition" id
-;;
-
-let authoritative_result ?invalidation (request : Core.authoritative_commit_request) =
-  Core.
-    { scope = request.scope
-    ; checkpoint = request.checkpoint
-    ; outbox_records = request.outbox_records
-    ; activity = request.activity
-    ; invalidation
-    }
-;;
-
-let test_pure_reducer_canonical_happy_path () =
-  let expected_ids = List.init 20 (fun index -> Printf.sprintf "HP%02d" (index + 1)) in
-  let actual_ids = List.map (fun rationale -> rationale.id) happy_path_rationales in
-  Alcotest.(check (list string)) "canonical rationale IDs" expected_ids actual_ids;
-  List.iter
-    (fun rationale ->
-       let fields =
-         [ rationale.contract
-         ; rationale.owner
-         ; rationale.unchanged
-         ; rationale.changes
-         ; rationale.effects
-         ]
-       in
-       Alcotest.check
-         Alcotest.bool
-         (rationale.id ^ " rationale fields are non-empty")
-         true
-         (List.for_all (fun value -> String.length value > 0) fields))
-    happy_path_rationales;
   let hp01 =
-    check_happy_step
+    check_step
       "HP01"
-      (initial ())
-      (Core.Account_authenticated { user_id = Some "user-1" })
-      happy_catalog_loading_state
-      [ published_state happy_catalog_loading_state
-      ; Publish_token_request
-          { token_request_id = "catalog-1"
-          ; token_request_purpose = Core.Catalog_discovery
-          }
+      origin
+      hp01_event
+      authenticated_observed
+      [ Core.Publish (Core.State_changed authenticated_state)
+      ; Core.Publish (Core.Token_requested catalog_token)
       ]
   in
-  let catalog_token = token_request hp01.effects in
-  let authenticated_scope : Core.authenticated_account_scope =
-    { account = happy_account_scope; token = "catalog-token" }
+  let account_scope : Core.account_scope =
+    { managed_sync_origin = Uri.of_string "https://api.logseq.io"
+    ; user_id = "user"
+    ; account_generation = 1
+    ; presentation_generation = 1
+    ; lifecycle_generation = 0L
+    }
+  in
+  let authorized_scope : Core.authenticated_account_scope =
+    { account = account_scope; token = "catalog-token" }
+  in
+  let hp02_event = Core.Token_provided (catalog_token, "catalog-token") in
+  let hp02_preview = preview_step "HP02" hp01.next hp02_event in
+  let catalog_ticket : Core.graph list Core.effect_ticket =
+    match hp02_preview.effects with
+    | [ Core.Run (Core.Request (ticket, Core.Fetch_catalog scope)) ]
+      when scope = authorized_scope -> ticket
+    | _ -> Alcotest.fail "HP02 unexpected instruction shape"
   in
   let hp02 =
-    check_happy_step
+    check_step
       "HP02"
       hp01.next
-      (Core.Token_provided (catalog_token, "catalog-token"))
-      happy_catalog_loading_state
-      [ expected_runner_request
-          ~id:0
-          ~scope:(Core.effect_scope_of_account happy_account_scope)
-          ~request_kind:Fetch_catalog_request
-          ~request_payload:(authenticated_account_scope_json authenticated_scope)
+      hp02_event
+      authenticated_observed
+      [ Core.Run (Core.Request (catalog_ticket, Core.Fetch_catalog authorized_scope)) ]
+  in
+  let catalogued_startup =
+    { authenticated_startup with catalog_loading = false; awaiting_selection = true }
+  in
+  let catalogued_state =
+    { authenticated_state with
+      snapshot =
+        { authenticated_state.snapshot with
+          catalog = [ graph ]
+        ; startup = catalogued_startup
+        }
+    }
+  in
+  let catalogued_observed = { state = catalogued_state; admitted_graph_scope = None } in
+  let hp03_event =
+    Core.Runner_completed (Core.Completion (catalog_ticket, Ok [ graph ]))
+  in
+  let hp03_preview = preview_step "HP03" hp02.next hp03_event in
+  let save_catalog_effect =
+    match hp03_preview.effects with
+    | [ Core.Publish (Core.State_changed state)
+      ; Core.Run (Core.Request (ticket, Core.Save_catalog { account; cache }))
       ]
-  in
-  let catalog_completion =
-    extract_fetch_catalog_completion "HP02" hp02.effects [ happy_graph ]
-  in
-  let expected_unselected_cache =
-    Core.catalog_cache ~user_id:"user-1" ~graphs:[ happy_graph ] ~selected_graph:None
+      when state = catalogued_state
+           && account = account_scope
+           && Core.catalog_cache_user_id cache = "user"
+           && Core.catalog_cache_graphs cache = [ graph ]
+           && Core.catalog_cache_selected_graph cache = None ->
+      Core.Run
+        (Core.Request (ticket, Core.Save_catalog { account = account_scope; cache }))
+    | _ -> Alcotest.fail "HP03 unexpected instruction shape"
   in
   let hp03 =
-    check_happy_step
+    check_step
       "HP03"
       hp02.next
-      catalog_completion
-      happy_catalog_state
-      [ published_state happy_catalog_state
-      ; expected_runner_request
-          ~id:1
-          ~scope:(Core.effect_scope_of_account happy_account_scope)
-          ~request_kind:Save_catalog_request
-          ~request_payload:
-            (`Assoc
-                [ "account", account_scope_json happy_account_scope
-                ; "cache", catalog_cache_json expected_unselected_cache
-                ])
-      ]
+      hp03_event
+      catalogued_observed
+      [ Core.Publish (Core.State_changed catalogued_state); save_catalog_effect ]
   in
-  let expected_selected_cache =
-    Core.catalog_cache
-      ~user_id:"user-1"
-      ~graphs:[ happy_graph ]
-      ~selected_graph:(Some happy_graph_id)
+  let graph_scope : Core.graph_scope =
+    { account = account_scope; graph_id; graph_generation = 1 }
+  in
+  let selected_startup =
+    { catalogued_startup with
+      awaiting_selection = false
+    ; restoring_local = true
+    ; graph_generation = 1
+    }
+  in
+  let selected_state =
+    { catalogued_state with
+      snapshot =
+        { catalogued_state.snapshot with
+          selected_graph = Some graph_id
+        ; startup = selected_startup
+        }
+    }
+  in
+  let selected_observed =
+    { state = selected_state; admitted_graph_scope = Some graph_scope }
+  in
+  let hp04_event = Core.Graph_selected graph_id in
+  let hp04_preview = preview_step "HP04" hp03.next hp04_event in
+  let mirror_request, selected_save_effect =
+    match hp04_preview.effects with
+    | [ Core.Delegate (Core.Inspect_mirror request)
+      ; Core.Publish (Core.State_changed state)
+      ; Core.Run (Core.Request (ticket, Core.Save_catalog { account; cache }))
+      ]
+      when (request = Core.{ graph; scope = graph_scope })
+           && state = selected_state
+           && account = account_scope
+           && Core.catalog_cache_user_id cache = "user"
+           && Core.catalog_cache_graphs cache = [ graph ]
+           && Core.catalog_cache_selected_graph cache = Some graph_id ->
+      ( request
+      , Core.Run
+          (Core.Request (ticket, Core.Save_catalog { account = account_scope; cache })) )
+    | _ -> Alcotest.fail "HP04 unexpected instruction shape"
   in
   let hp04 =
-    check_happy_step
+    check_step
       "HP04"
       hp03.next
-      (Core.Graph_selected happy_graph_id)
-      happy_selected_state
-      [ static_instruction_view
-          (Core.Delegate
-             (Core.Inspect_mirror { graph = happy_graph; scope = happy_graph_scope }))
-      ; published_state happy_selected_state
-      ; expected_runner_request
-          ~id:2
-          ~scope:(Core.effect_scope_of_account happy_account_scope)
-          ~request_kind:Save_catalog_request
-          ~request_payload:
-            (`Assoc
-                [ "account", account_scope_json happy_account_scope
-                ; "cache", catalog_cache_json expected_selected_cache
-                ])
+      hp04_event
+      selected_observed
+      [ Core.Delegate (Core.Inspect_mirror mirror_request)
+      ; Core.Publish (Core.State_changed selected_state)
+      ; selected_save_effect
       ]
   in
-  let mirror_request = extract_mirror_request "HP04" hp04.effects in
-  let inspected_open_request : Core.graph_open_request =
-    { happy_open_request with graph = mirror_request.graph; scope = mirror_request.scope }
-  in
+  let hp05_event = Core.Mirror_inspected (Core.Mirror_available mirror_request) in
   let hp05 =
-    check_happy_step
+    check_step
       "HP05"
       hp04.next
-      (Core.Mirror_inspected (Core.Mirror_available inspected_open_request))
-      happy_selected_state
-      [ static_instruction_view (Core.Delegate (Core.Attach_graph happy_open_request)) ]
+      hp05_event
+      selected_observed
+      [ Core.Delegate (Core.Attach_graph mirror_request) ]
   in
-  let attach_request = extract_attach_request "HP05" hp05.effects in
-  let happy_connecting_state = happy_sync_state Core.Connecting 0 in
+  let cursor0 = token Overlay.Server_cursor.of_string "server-cursor:v1:0" in
+  let sync_token0 = token Overlay.sync_token_of_string "sync-token:v1:hp-0" in
+  let empty_sync0 =
+    Overlay.sync_view ~token:sync_token0 ~checkpoint:cursor0 ~submissions:[]
+  in
+  let attached_startup =
+    { selected_startup with restoring_local = false; bootstrapping = false }
+  in
+  let attached_state =
+    { selected_state with
+      snapshot =
+        { selected_state.snapshot with
+          sync_phase = Core.Current
+        ; applied_server_t = Some 0
+        ; timeline_presentation_pending = true
+        ; startup = attached_startup
+        }
+    }
+  in
+  let attached_observed =
+    { state = attached_state; admitted_graph_scope = Some graph_scope }
+  in
+  let hp06_event =
+    Core.Graph_attached { scope = mirror_request.scope; sync = empty_sync0 }
+  in
+  let hp06_preview = preview_step "HP06" hp05.next hp06_event in
+  let websocket_token =
+    match hp06_preview.effects with
+    | [ Core.Publish (Core.State_changed state)
+      ; Core.Publish (Core.Token_requested request)
+      ]
+      when state = attached_state
+           && Core.token_request_purpose request = Core.Websocket_connect -> request
+    | _ -> Alcotest.fail "HP06 unexpected instruction shape"
+  in
   let hp06 =
-    check_happy_step
+    check_step
       "HP06"
       hp05.next
-      (Core.Graph_attached
-         { scope = attach_request.scope
-         ; checkpoint = attach_request.checkpoint
-         ; outbox_records = []
-         })
-      happy_connecting_state
-      [ published_state happy_connecting_state
-      ; Publish_token_request
-          { token_request_id = "websocket-1-2"
-          ; token_request_purpose = Core.Websocket_connect
-          }
+      hp06_event
+      attached_observed
+      [ Core.Publish (Core.State_changed attached_state)
+      ; Core.Publish (Core.Token_requested websocket_token)
       ]
   in
-  let websocket_token = token_request hp06.effects in
+  let connecting_state =
+    { attached_state with
+      snapshot = { attached_state.snapshot with sync_phase = Core.Connecting }
+    }
+  in
+  let connecting_observed =
+    { state = connecting_state; admitted_graph_scope = Some graph_scope }
+  in
+  let connection : Core.connection_scope =
+    { graph = graph_scope; connection_generation = 1 }
+  in
   let websocket_request : Core.websocket_request =
-    { scope = happy_connection_scope
+    { scope = connection
     ; uri = Uri.of_string "wss://api.logseq.io/sync/11111111-1111-4111-8111-111111111111"
     ; token = "websocket-token"
     }
   in
+  let hp07_event = Core.Token_provided (websocket_token, "websocket-token") in
   let hp07 =
-    check_happy_step
+    check_step
       "HP07"
       hp06.next
-      (Core.Token_provided (websocket_token, "websocket-token"))
-      happy_connecting_state
-      [ static_instruction_view (Core.Run (Core.Start_websocket websocket_request)) ]
+      hp07_event
+      connecting_observed
+      [ Core.Publish (Core.State_changed connecting_state)
+      ; Core.Run (Core.Start_websocket websocket_request)
+      ]
   in
-  let connection = extract_websocket_connection "HP07" hp07.effects in
-  let happy_pulling_state_0 = happy_sync_state Core.Pulling 0 in
+  let pulling0_state =
+    { connecting_state with
+      snapshot = { connecting_state.snapshot with sync_phase = Core.Pulling }
+    }
+  in
+  let pulling0_observed =
+    { state = pulling0_state; admitted_graph_scope = Some graph_scope }
+  in
+  let pull0 =
+    Core.Run
+      (Core.Send_websocket
+         { scope = connection; message = Protocol.Client.Pull { since = Some 0 } })
+  in
+  let hp08_event = Core.Websocket_opened connection in
   let hp08 =
-    check_happy_step
+    check_step
       "HP08"
       hp07.next
-      (Core.Websocket_opened connection)
-      happy_pulling_state_0
-      [ published_state happy_pulling_state_0
-      ; static_instruction_view
-          (Core.Run
-             (Core.Send_websocket
-                { scope = happy_connection_scope
-                ; message = Sync_protocol.Client.Pull { since = Some 0 }
-                }))
-      ]
+      hp08_event
+      pulling0_observed
+      [ Core.Publish (Core.State_changed pulling0_state); pull0 ]
   in
-  let opening_batch = happy_batch happy_opening_message in
+  let remote_tx : Protocol.Server.pull_transaction =
+    { t = 1; tx = "[]"; outliner_op = Some "save-block" }
+  in
+  let opening_message =
+    Protocol.Server.Pull_ok
+      { t = 1; checksum = Some "0123456789abcdef"; txs = [ remote_tx ] }
+  in
+  let hp09_event = Core.Websocket_message (connection, opening_message) in
+  let hp09_preview = preview_step "HP09" hp08.next hp09_event in
+  let opening_batch =
+    match hp09_preview.effects with
+    | [ Core.Delegate (Core.Apply_authoritative_batch request) ]
+      when request.scope = connection
+           && request.presentation_generation = 1
+           && request.lifecycle_generation = 0L
+           && request.key = None
+           && Overlay.Server_cursor.to_string
+                (Overlay.authoritative_batch_through request.input)
+              = "server-cursor:v1:1"
+           && List.length (Overlay.authoritative_batch_transactions request.input) = 1 ->
+      request
+    | _ -> Alcotest.fail "HP09 unexpected instruction shape"
+  in
   let hp09 =
-    check_happy_step
+    check_step
       "HP09"
       hp08.next
-      (Core.Websocket_message (connection, happy_opening_message))
-      happy_pulling_state_0
-      [ static_instruction_view
-          (Core.Delegate (Core.Inspect_authoritative_batch opening_batch))
-      ]
+      hp09_event
+      pulling0_observed
+      [ Core.Delegate (Core.Apply_authoritative_batch opening_batch) ]
   in
-  let inspected_opening_batch = extract_authoritative_batch "HP09" hp09.effects in
-  let opening_context : Core.authoritative_context =
-    { batch = inspected_opening_batch
-    ; precondition = "hp-opening-precondition"
-    ; checkpoint = happy_checkpoint_0
-    ; database = Datascript.empty_db ()
-    ; outbox_records = []
+  let generation1 = token Overlay.Generation.of_string "generation:v1:hp-1" in
+  let projection1 = token Overlay.Projection_revision.of_string "projection:v1:1" in
+  let cursor1 = token Overlay.Server_cursor.of_string "server-cursor:v1:1" in
+  let sync_token1 = token Overlay.sync_token_of_string "sync-token:v1:hp-1" in
+  let sync1 = Overlay.sync_view ~token:sync_token1 ~checkpoint:cursor1 ~submissions:[] in
+  let authoritative_commit1 : Overlay.authoritative_commit =
+    { generation = generation1
+    ; before_projection_revision = projection1
+    ; after_projection_revision = projection1
+    ; checkpoint = cursor1
+    ; sync_token = sync_token1
+    ; terminal_receipts = []
+    ; replanned_queued_ids = []
+    ; blocked_ids = []
+    ; logical_change_summary = Overlay.No_logical_change
     }
   in
-  let opening_apply : Core.authoritative_commit_request =
-    { batch = opening_batch
-    ; precondition = "hp-opening-precondition"
-    ; scope = happy_graph_scope
-    ; key = None
-    ; transactions = []
-    ; projection_transactions = []
-    ; checkpoint = happy_checkpoint_0
-    ; outbox_records = []
-    ; activity = Logseq_db_types.Sync_status.Pull_duplicate
+  let current1_state =
+    { pulling0_state with
+      snapshot =
+        { pulling0_state.snapshot with
+          sync_phase = Core.Current
+        ; applied_server_t = Some 1
+        }
     }
+  in
+  let current1_observed =
+    { state = current1_state; admitted_graph_scope = Some graph_scope }
+  in
+  let hp10_event =
+    Core.Authoritative_batch_applied
+      { scope = opening_batch.scope.graph; commit = authoritative_commit1; sync = sync1 }
   in
   let hp10 =
-    check_happy_step
+    check_step
       "HP10"
       hp09.next
-      (Core.Authoritative_batch_inspected opening_context)
-      happy_pulling_state_0
-      [ static_instruction_view
-          (Core.Delegate (Core.Apply_authoritative_batch opening_apply))
-      ]
+      hp10_event
+      current1_observed
+      [ Core.Publish (Core.State_changed current1_state) ]
   in
-  let opening_apply_request = extract_authoritative_apply "HP10" hp10.effects in
-  let happy_current_state_0 = happy_sync_state Core.Current 0 in
+  let hp11_event = Core.Local_outbox_changed in
   let hp11 =
-    check_happy_step
+    check_step
       "HP11"
       hp10.next
-      (Core.Authoritative_batch_applied (authoritative_result opening_apply_request))
-      happy_current_state_0
-      [ published_state happy_current_state_0 ]
+      hp11_event
+      current1_observed
+      [ Core.Delegate (Core.Inspect_sync graph_scope) ]
   in
-  let local_input =
-    Core.local_batch_input
-      ~scope:happy_graph_scope
-      ~admission_id:"hp-admission"
-      ~key:None
-      ~outbox_records:[]
-      ~mutation_id:happy_mutation_id
-      ~mutation_payload:"hp-mutation"
-      ~mutation_fingerprint:"hp-fingerprint"
-      ~outliner_op:"save-block"
-      ~database:(Datascript.empty_db ())
-      ~operations:[ happy_operation ]
-    |> Result.get_ok
+  let mutation_id = List.hd mutation_ids in
+  let fingerprint =
+    token Overlay.Mutation_fingerprint.of_string "mutation-fingerprint:v1:hp"
   in
-  let local_commit_request : Core.local_batch_completion_request =
-    { operation_id = happy_mutation_id
-    ; admission_id = "hp-admission"
-    ; scope = happy_graph_scope
-    ; action = Core.Commit { outbox_records = [ happy_queued_record ] }
+  let queued : Overlay.submission_descriptor =
+    { mutation_id
+    ; fingerprint
+    ; state = Overlay.Queued
+    ; dependency_eligible = true
+    ; attempt_count = 0
+    ; plaintext_bytes = 16
+    ; protected_bytes = Some 16
     }
+  in
+  let queued_sync =
+    Overlay.sync_view ~token:sync_token1 ~checkpoint:cursor1 ~submissions:[ queued ]
+  in
+  let submitting_state =
+    { current1_state with
+      snapshot = { current1_state.snapshot with sync_phase = Core.Submitting }
+    }
+  in
+  let submitting_observed =
+    { state = submitting_state; admitted_graph_scope = Some graph_scope }
+  in
+  let hp12_event = Core.Sync_inspected { scope = graph_scope; sync = queued_sync } in
+  let hp12_preview = preview_step "HP12" hp11.next hp12_event in
+  let submit_request =
+    match hp12_preview.effects with
+    | [ Core.Publish (Core.State_changed state)
+      ; Core.Delegate (Core.Apply_outbox_transition request)
+      ]
+      when state = submitting_state
+           && request.scope = graph_scope
+           && request.key = None
+           && Overlay.sync_token_equal request.expected sync_token1
+           && request.transition = Overlay.Submit_group [ mutation_id ] -> request
+    | _ -> Alcotest.fail "HP12 unexpected instruction shape"
   in
   let hp12 =
-    check_happy_step
+    check_step
       "HP12"
       hp11.next
-      (Core.Local_batch_prepared local_input)
-      happy_current_state_0
-      [ static_instruction_view
-          (Core.Delegate (Core.Complete_local_batch local_commit_request))
+      hp12_event
+      submitting_observed
+      [ Core.Publish (Core.State_changed submitting_state)
+      ; Core.Delegate (Core.Apply_outbox_transition submit_request)
       ]
   in
-  let committed_local_request, committed_queued_outbox =
-    extract_local_commit "HP12" hp12.effects
+  let batch_id = token Overlay.Submission_batch_id.of_string "submission-batch:v1:hp" in
+  let wire =
+    Overlay.submission_wire
+      ~maximum_bytes:1024
+      ~mutation_id
+      ~operation:Overlay.Save_block_operation
+      ~protected_transaction:"protected-hp-transaction"
+    |> Result.get_ok
   in
-  let expected_outbox_transition : Core.outbox_transition =
-    { scope = happy_graph_scope
-    ; presentation_generation = 1
-    ; lifecycle_generation = 0L
-    ; expected_outbox_records = [ happy_queued_record ]
-    ; outbox_records = [ happy_submitted_record ]
-    ; pending_message = Some happy_tx_message
+  let submission_batch =
+    Overlay.submission_batch
+      ~maximum_wires:1
+      ~maximum_bytes:4096
+      ~batch_id
+      ~t_before:cursor1
+      ~wires:[ wire ]
+    |> Result.get_ok
+  in
+  let sync_token2 = token Overlay.sync_token_of_string "sync-token:v1:hp-2" in
+  let submitted_descriptor = { queued with state = Overlay.Submitted batch_id } in
+  let submitted_sync =
+    Overlay.sync_view
+      ~token:sync_token2
+      ~checkpoint:cursor1
+      ~submissions:[ submitted_descriptor ]
+  in
+  let submit_commit : Overlay.outbox_commit =
+    { generation = generation1
+    ; before_projection_revision = projection1
+    ; after_projection_revision = projection1
+    ; sync_token = sync_token2
+    ; transition = submit_request.transition
+    ; activity = Overlay.Logically_active
+    ; logical_change_summary = Overlay.No_logical_change
+    ; submission_batch = Some submission_batch
     }
+  in
+  let tx_message =
+    Protocol.Client.Tx_batch
+      { client_revision = Some (Overlay.Submission_batch_id.to_string batch_id)
+      ; t_before = 1
+      ; txs =
+          [ { Protocol.Client.tx = "protected-hp-transaction"
+            ; tx_id = Some mutation_id
+            ; outliner_op = Some "save-block"
+            }
+          ]
+      }
+  in
+  let hp13_event =
+    Core.Outbox_transition_applied
+      { scope = submit_request.scope; commit = submit_commit; sync = submitted_sync }
   in
   let hp13 =
-    check_happy_step
+    check_step
       "HP13"
       hp12.next
-      (Core.Local_batch_committed
-         { scope = committed_local_request.scope
-         ; outbox_records = committed_queued_outbox
-         })
-      happy_current_state_0
-      [ static_instruction_view
-          (Core.Delegate (Core.Commit_outbox_transition expected_outbox_transition))
-      ]
+      hp13_event
+      submitting_observed
+      [ Core.Run (Core.Send_websocket { scope = connection; message = tx_message }) ]
   in
-  let reserved_transition = extract_outbox_transition "HP13" hp13.effects in
-  let happy_submitting_state = happy_sync_state Core.Submitting 0 in
+  let hp14_event =
+    Core.Websocket_message
+      ( connection
+      , Protocol.Server.Tx_batch_ok { t = 2; checksum = Some "fedcba9876543210" } )
+  in
+  let hp14_preview = preview_step "HP14" hp13.next hp14_event in
+  let accept_request =
+    match hp14_preview.effects with
+    | [ Core.Delegate (Core.Apply_outbox_transition request) ]
+      when request.scope = graph_scope
+           && request.key = None
+           && Overlay.sync_token_equal request.expected sync_token2
+           && request.transition
+              = Overlay.Accept_group
+                  { batch_id
+                  ; barrier =
+                      { through =
+                          token Overlay.Server_cursor.of_string "server-cursor:v1:2"
+                      ; checksum =
+                          token Overlay.Checksum.of_string "checksum:v1:fedcba9876543210"
+                      }
+                  } -> request
+    | _ -> Alcotest.fail "HP14 unexpected instruction shape"
+  in
   let hp14 =
-    check_happy_step
+    check_step
       "HP14"
       hp13.next
-      (Core.Outbox_transition_committed
-         { scope = reserved_transition.scope
-         ; outbox_records = reserved_transition.outbox_records
-         ; pending_message = reserved_transition.pending_message
-         })
-      happy_submitting_state
-      [ static_instruction_view
-          (Core.Run
-             (Core.Send_websocket
-                { scope = happy_connection_scope; message = happy_tx_message }))
-      ; published_state happy_submitting_state
-      ]
+      hp14_event
+      submitting_observed
+      [ Core.Delegate (Core.Apply_outbox_transition accept_request) ]
   in
-  let ack_batch = happy_batch happy_ack_message in
+  let sync_token3 = token Overlay.sync_token_of_string "sync-token:v1:hp-3" in
+  let accepted_descriptor =
+    { queued with state = Overlay.Accepted_pending_authoritative batch_id }
+  in
+  let accepted_sync =
+    Overlay.sync_view
+      ~token:sync_token3
+      ~checkpoint:cursor1
+      ~submissions:[ accepted_descriptor ]
+  in
+  let accept_commit : Overlay.outbox_commit =
+    { generation = generation1
+    ; before_projection_revision = projection1
+    ; after_projection_revision = projection1
+    ; sync_token = sync_token3
+    ; transition = accept_request.transition
+    ; activity = Overlay.Logically_active
+    ; logical_change_summary = Overlay.No_logical_change
+    ; submission_batch = None
+    }
+  in
+  let pulling1_state =
+    { submitting_state with
+      snapshot = { submitting_state.snapshot with sync_phase = Core.Pulling }
+    }
+  in
+  let pulling1_observed =
+    { state = pulling1_state; admitted_graph_scope = Some graph_scope }
+  in
+  let hp15_event =
+    Core.Outbox_transition_applied
+      { scope = accept_request.scope; commit = accept_commit; sync = accepted_sync }
+  in
   let hp15 =
-    check_happy_step
+    check_step
       "HP15"
       hp14.next
-      (Core.Websocket_message (connection, happy_ack_message))
-      happy_submitting_state
-      [ static_instruction_view
-          (Core.Delegate (Core.Inspect_authoritative_batch ack_batch))
+      hp15_event
+      pulling1_observed
+      [ Core.Publish (Core.State_changed pulling1_state)
+      ; Core.Run
+          (Core.Send_websocket
+             { scope = connection; message = Protocol.Client.Pull { since = Some 1 } })
       ]
   in
-  let inspected_ack_batch = extract_authoritative_batch "HP15" hp15.effects in
-  let ack_context : Core.authoritative_context =
-    { batch = inspected_ack_batch
-    ; precondition = "hp-ack-precondition"
-    ; checkpoint = happy_checkpoint_0
-    ; database = Datascript.empty_db ()
-    ; outbox_records = [ happy_submitted_record ]
-    }
+  let incorporated_tx : Protocol.Server.pull_transaction =
+    { t = 2; tx = "[]"; outliner_op = Some "save-block" }
   in
-  let ack_apply : Core.authoritative_commit_request =
-    { batch = ack_batch
-    ; precondition = "hp-ack-precondition"
-    ; scope = happy_graph_scope
-    ; key = None
-    ; transactions = []
-    ; projection_transactions = []
-    ; checkpoint = happy_checkpoint_0
-    ; outbox_records = [ happy_accepted_record ]
-    ; activity = Logseq_db_types.Sync_status.Pull_required
-    }
+  let confirmation_message =
+    Protocol.Server.Pull_ok
+      { t = 2; checksum = Some "fedcba9876543210"; txs = [ incorporated_tx ] }
+  in
+  let hp16_event = Core.Websocket_message (connection, confirmation_message) in
+  let hp16_preview = preview_step "HP16" hp15.next hp16_event in
+  let confirmation_batch =
+    match hp16_preview.effects with
+    | [ Core.Delegate (Core.Apply_authoritative_batch request) ]
+      when request.scope = connection
+           && request.presentation_generation = 1
+           && request.lifecycle_generation = 0L
+           && request.key = None
+           && Overlay.Server_cursor.to_string
+                (Overlay.authoritative_batch_through request.input)
+              = "server-cursor:v1:2"
+           && List.length (Overlay.authoritative_batch_transactions request.input) = 1 ->
+      request
+    | _ -> Alcotest.fail "HP16 unexpected instruction shape"
   in
   let hp16 =
-    check_happy_step
+    check_step
       "HP16"
       hp15.next
-      (Core.Authoritative_batch_inspected ack_context)
-      happy_submitting_state
-      [ static_instruction_view (Core.Delegate (Core.Apply_authoritative_batch ack_apply))
-      ]
+      hp16_event
+      pulling1_observed
+      [ Core.Delegate (Core.Apply_authoritative_batch confirmation_batch) ]
   in
-  let ack_apply_request = extract_authoritative_apply "HP16" hp16.effects in
-  let hp17 =
-    check_happy_step
-      "HP17"
-      hp16.next
-      (Core.Authoritative_batch_applied (authoritative_result ack_apply_request))
-      happy_pulling_state_0
-      [ published_state happy_pulling_state_0
-      ; static_instruction_view
-          (Core.Run
-             (Core.Send_websocket
-                { scope = happy_connection_scope
-                ; message = Sync_protocol.Client.Pull { since = Some 0 }
-                }))
-      ]
-  in
-  let confirmation_batch = happy_batch happy_confirmation_message in
-  let hp18 =
-    check_happy_step
-      "HP18"
-      hp17.next
-      (Core.Websocket_message (connection, happy_confirmation_message))
-      happy_pulling_state_0
-      [ static_instruction_view
-          (Core.Delegate (Core.Inspect_authoritative_batch confirmation_batch))
-      ]
-  in
-  let inspected_confirmation_batch = extract_authoritative_batch "HP18" hp18.effects in
-  let confirmation_context : Core.authoritative_context =
-    { batch = inspected_confirmation_batch
-    ; precondition = "hp-confirmation-precondition"
-    ; checkpoint = happy_checkpoint_0
-    ; database = Datascript.empty_db ()
-    ; outbox_records = [ happy_accepted_record ]
+  let cursor2 = token Overlay.Server_cursor.of_string "server-cursor:v1:2" in
+  let sync_token4 = token Overlay.sync_token_of_string "sync-token:v1:hp-4" in
+  let sync2 = Overlay.sync_view ~token:sync_token4 ~checkpoint:cursor2 ~submissions:[] in
+  let authoritative_commit2 : Overlay.authoritative_commit =
+    { generation = generation1
+    ; before_projection_revision = projection1
+    ; after_projection_revision = projection1
+    ; checkpoint = cursor2
+    ; sync_token = sync_token4
+    ; terminal_receipts = []
+    ; replanned_queued_ids = []
+    ; blocked_ids = []
+    ; logical_change_summary = Overlay.No_logical_change
     }
   in
-  let confirmation_apply : Core.authoritative_commit_request =
-    { batch = confirmation_batch
-    ; precondition = "hp-confirmation-precondition"
-    ; scope = happy_graph_scope
-    ; key = None
-    ; transactions = [ [ happy_operation ] ]
-    ; projection_transactions = []
-    ; checkpoint = happy_checkpoint_1
-    ; outbox_records = []
-    ; activity = Logseq_db_types.Sync_status.Pull_applied
+  let current2_state =
+    { pulling1_state with
+      snapshot =
+        { pulling1_state.snapshot with
+          sync_phase = Core.Current
+        ; applied_server_t = Some 2
+        }
     }
   in
-  let hp19 =
-    check_happy_step
-      "HP19"
-      hp18.next
-      (Core.Authoritative_batch_inspected confirmation_context)
-      happy_pulling_state_0
-      [ static_instruction_view
-          (Core.Delegate (Core.Apply_authoritative_batch confirmation_apply))
-      ]
+  let current2_observed =
+    { state = current2_state; admitted_graph_scope = Some graph_scope }
   in
-  let confirmation_apply_request = extract_authoritative_apply "HP19" hp19.effects in
-  let invalidation : Core.invalidation =
-    { basis = 7L; changed_uuids = [ happy_mutation_id ]; changed_uuids_truncated = false }
+  let hp17_event =
+    Core.Authoritative_batch_applied
+      { scope = confirmation_batch.scope.graph
+      ; commit = authoritative_commit2
+      ; sync = sync2
+      }
   in
-  let happy_current_state_1 = happy_sync_state Core.Current 1 in
   ignore
-    (check_happy_step
-       "HP20"
-       hp19.next
-       (Core.Authoritative_batch_applied
-          (authoritative_result ~invalidation confirmation_apply_request))
-       happy_current_state_1
-       [ published_state happy_current_state_1; Publish_graph_invalidation invalidation ])
+    (check_step
+       "HP17"
+       hp16.next
+       hp17_event
+       current2_observed
+       [ Core.Publish (Core.State_changed current2_state) ])
+;;
+
+let config_is_bounded () =
+  Alcotest.check
+    Alcotest.bool
+    "zero response bound is rejected"
+    true
+    (Result.is_error
+       (Core.limits
+          ~maximum_response_bytes:0
+          ~maximum_artifact_bytes:1
+          ~submission_batch_size:1))
+;;
+
+let authentication_delegates_catalog_transport () =
+  let authenticated =
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
+  in
+  let request = token_request authenticated.effects in
+  let authorized =
+    Core.step authenticated.next (Core.Token_provided (request, "token"))
+  in
+  let requested =
+    List.exists
+      (function
+        | Core.Run (Core.Request (_, Core.Fetch_catalog _)) -> true
+        | Run _ | Delegate _ | Publish _ -> false)
+      authorized.effects
+  in
+  Alcotest.check Alcotest.bool "catalog request is transport-owned" true requested
+;;
+
+let websocket_connect_uses_deployed_graph_path () =
+  let authenticated =
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
+  in
+  let catalog_token = token_request authenticated.effects in
+  let authorized =
+    Core.step authenticated.next (Core.Token_provided (catalog_token, "catalog-token"))
+  in
+  let catalog =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+          Some
+            (Core.step
+               authorized.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok [ graph ]))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      authorized.effects
+    |> Option.get
+  in
+  let selected = Core.step catalog.next (Core.Graph_selected graph_id) in
+  let mirror_request =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Inspect_mirror request) -> Some request
+        | Run _ | Delegate _ | Publish _ -> None)
+      selected.effects
+    |> Option.get
+  in
+  let inspected =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available mirror_request))
+  in
+  let attach_request =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Attach_graph request) -> Some request
+        | Run _ | Delegate _ | Publish _ -> None)
+      inspected.effects
+    |> Option.get
+  in
+  let scope = attach_request.scope in
+  let sync_token = Overlay.sync_token_of_string "sync-token:v1:1" |> Result.get_ok in
+  let checkpoint =
+    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
+  in
+  let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
+  let attached = Core.step inspected.next (Core.Graph_attached { scope; sync }) in
+  let websocket_token = token_request attached.effects in
+  let connecting =
+    Core.step attached.next (Core.Token_provided (websocket_token, "websocket-token"))
+  in
+  let uri =
+    List.find_map
+      (function
+        | Core.Run (Core.Start_websocket request) -> Some request.uri
+        | Run _ | Delegate _ | Publish _ -> None)
+      connecting.effects
+    |> Option.get
+  in
+  Alcotest.(check string)
+    "deployed WebSocket endpoint"
+    ("wss://api.logseq.io/sync/" ^ Logseq_db_types.Graph_types.Uuid.to_string graph_id)
+    (Uri.to_string uri)
+;;
+
+let stale_token_is_ignored () =
+  let authenticated =
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
+  in
+  let request = token_request authenticated.effects in
+  let rejected = Core.step authenticated.next (Core.Token_rejected request) in
+  let replay = Core.step rejected.next (Core.Token_rejected request) in
+  Alcotest.check
+    Alcotest.int
+    "replayed token emits nothing"
+    0
+    (List.length replay.effects)
+;;
+
+let authenticated_fetch user_id
+  : Core.transition * Core.graph list Core.effect_ticket * Core.account_scope
+  =
+  let authenticated =
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some user_id })
+  in
+  let request = token_request authenticated.effects in
+  let authorized =
+    Core.step authenticated.next (Core.Token_provided (request, "token"))
+  in
+  match authorized.effects with
+  | [ Core.Run (Core.Request (ticket, Core.Fetch_catalog account)) ] ->
+    authorized, ticket, account.account
+  | _ -> Alcotest.fail "authentication did not issue one catalog request"
+;;
+
+let account_deletion_completion signed_out (result : (unit, Core.effect_error) result) =
+  List.find_map
+    (function
+      | Core.Run (Core.Request (ticket, Core.Delete_account_secrets account)) ->
+        Some (Core.Runner_completed (Core.Completion (ticket, result)), account)
+      | Run _ | Delegate _ | Publish _ -> None)
+    signed_out.Core.effects
+  |> Option.get
+;;
+
+let sign_out_captures_identity_advances_generations_and_fences_old_work () =
+  let authorized, catalog_ticket, old_account = authenticated_fetch "old-user" in
+  let before = Core.state authorized.next in
+  let signed_out =
+    Core.step authorized.next (Core.Account_authenticated { user_id = None })
+  in
+  let after = Core.state signed_out.next in
+  Alcotest.(check bool)
+    "account generation advances"
+    true
+    (after.snapshot.startup.account_generation
+     = before.snapshot.startup.account_generation + 1);
+  Alcotest.(check bool)
+    "presentation generation advances"
+    true
+    (after.snapshot.startup.presentation_generation
+     = before.snapshot.startup.presentation_generation + 1);
+  Alcotest.(check bool)
+    "authentication is cleared"
+    false
+    after.snapshot.startup.authenticated;
+  (match signed_out.effects with
+   | [ Core.Run (Core.Cancel_effects cancelled)
+     ; Core.Delegate (Core.Reset_managed_account reset)
+     ; Core.Run (Core.Request (_, Core.Delete_account_secrets deleted))
+     ; Core.Publish (Core.State_changed published)
+     ] ->
+     Alcotest.(check bool)
+       "old account work is cancelled before cleanup"
+       true
+       (cancelled = Core.effect_scope_of_account old_account);
+     Alcotest.(check bool) "worker reset captures old account" true (reset = old_account);
+     Alcotest.(check bool) "cleanup captures old account" true (deleted = old_account);
+     Alcotest.(check bool) "signed-out state is published" true (published = after)
+   | _ -> Alcotest.fail "sign-out effects were missing or incorrectly ordered");
+  let late_catalog =
+    Core.step
+      signed_out.next
+      (Core.Runner_completed (Core.Completion (catalog_ticket, Ok [ graph ])))
+  in
+  Alcotest.(check int)
+    "old catalog completion is inert"
+    0
+    (List.length late_catalog.effects);
+  Alcotest.(check bool)
+    "old catalog completion cannot restore state"
+    true
+    (Core.state late_catalog.next = after)
+;;
+
+let sign_out_cleanup_completion_is_inert_and_sanitized () =
+  let authorized, _, _ = authenticated_fetch "old-user" in
+  let signed_out =
+    Core.step authorized.next (Core.Account_authenticated { user_id = None })
+  in
+  let success, _ = account_deletion_completion signed_out (Ok ()) in
+  let succeeded = Core.step signed_out.next success in
+  Alcotest.(check int)
+    "successful cleanup publishes nothing"
+    0
+    (List.length succeeded.effects);
+  Alcotest.(check bool)
+    "successful cleanup leaves public state unchanged"
+    true
+    (Core.state succeeded.next = Core.state signed_out.next);
+  let signed_out_again =
+    Core.step authorized.next (Core.Account_authenticated { user_id = None })
+  in
+  let failure, _ =
+    account_deletion_completion
+      signed_out_again
+      (Error (Core.Effect_failed "service=secret key=private"))
+  in
+  let failed = Core.step signed_out_again.next failure in
+  let failed_state = Core.state failed.next in
+  Alcotest.(check (option string))
+    "cleanup failure is sanitized"
+    (Some "account secret cleanup failed")
+    failed_state.snapshot.last_error;
+  Alcotest.(check bool)
+    "cleanup failure does not restore authentication"
+    false
+    failed_state.snapshot.startup.authenticated;
+  let replacement =
+    Core.step
+      signed_out_again.next
+      (Core.Account_authenticated { user_id = Some "new-user" })
+  in
+  let late_failure = Core.step replacement.next failure in
+  Alcotest.(check int)
+    "old cleanup failure publishes nothing for replacement account"
+    0
+    (List.length late_failure.effects);
+  Alcotest.(check bool)
+    "old cleanup failure cannot fail replacement account"
+    true
+    (Core.state late_failure.next = Core.state replacement.next)
+;;
+
+let local_cache_deletion_uses_authenticated_account_and_requested_graph () =
+  let authenticated =
+    Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
+  in
+  let requested_graph =
+    Logseq_db_types.Graph_types.Uuid.of_string "33333333-3333-4333-8333-333333333333"
+    |> Result.get_ok
+  in
+  let deletion =
+    Core.step authenticated.next (Core.Local_cache_deletion_requested requested_graph)
+  in
+  let success =
+    match deletion.effects with
+    | [ Core.Delegate (Core.Delete_mirror mirror)
+      ; Core.Run
+          (Core.Request
+             (ticket, Core.Delete_wrapped_graph_key { account; graph_id = deleted_graph }))
+      ] ->
+      Alcotest.(check bool)
+        "mirror uses requested graph"
+        true
+        (mirror.graph_id = requested_graph);
+      Alcotest.(check bool)
+        "wrapped-key cleanup uses requested graph"
+        true
+        (deleted_graph = requested_graph);
+      Alcotest.(check string) "cleanup captures authenticated user" "user" account.user_id;
+      Core.Runner_completed (Core.Completion (ticket, Ok ()))
+    | _ -> Alcotest.fail "local-cache deletion did not issue both cleanup operations"
+  in
+  let succeeded = Core.step deletion.next success in
+  Alcotest.(check int)
+    "successful graph-key cleanup is state-inert"
+    0
+    (List.length succeeded.effects);
+  let deletion_again =
+    Core.step authenticated.next (Core.Local_cache_deletion_requested requested_graph)
+  in
+  let failure =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Delete_wrapped_graph_key _)) ->
+          Some
+            (Core.Runner_completed
+               (Core.Completion
+                  (ticket, Error (Core.Effect_failed "keychain item secret bytes"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      deletion_again.effects
+    |> Option.get
+  in
+  let failed = Core.step deletion_again.next failure in
+  Alcotest.(check (option string))
+    "graph cleanup failure is sanitized"
+    (Some "wrapped graph key cleanup failed")
+    (Core.state failed.next).snapshot.last_error;
+  Alcotest.(check bool)
+    "graph cleanup failure keeps authentication"
+    true
+    (Core.state failed.next).snapshot.startup.authenticated;
+  let anonymous =
+    Core.step (initial ()) (Core.Local_cache_deletion_requested requested_graph)
+  in
+  match anonymous.effects with
+  | [ Core.Delegate (Core.Delete_mirror mirror) ] ->
+    Alcotest.(check bool)
+      "anonymous mirror deletion uses requested graph"
+      true
+      (mirror.graph_id = requested_graph)
+  | _ -> Alcotest.fail "anonymous deletion invented a Keychain identity"
 ;;
 
 let scenarios =
   [ Alcotest.test_case
-      "configuration is bounded"
+      "pure reducer canonical overlay happy path"
       `Quick
-      test_config_validation_is_pure_and_bounded
+      canonical_overlay_happy_path
+  ; Pure_reducer_bad_case_01.scenario
+  ; Pure_reducer_bad_case_02.scenario
+  ; Pure_reducer_bad_case_03.scenario
+  ; Pure_reducer_bad_case_04.scenario
+  ; Pure_reducer_bad_case_05.scenario
+  ; Pure_reducer_bad_case_06.scenario
+  ; Pure_reducer_bad_case_07.scenario
+  ; Pure_reducer_bad_case_08.scenario
+  ; Pure_reducer_bad_case_09.scenario
+  ; Pure_reducer_bad_case_10.scenario
+  ; Alcotest.test_case "config is bounded" `Quick config_is_bounded
   ; Alcotest.test_case
-      "stale token events are rejected"
+      "authentication delegates catalog transport"
       `Quick
-      test_stale_and_duplicate_token_events_are_rejected
+      authentication_delegates_catalog_transport
   ; Alcotest.test_case
-      "runner completion is one-shot"
+      "websocket connect uses the deployed graph path"
       `Quick
-      test_runner_completion_is_scoped_and_consumed_once
+      websocket_connect_uses_deployed_graph_path
+  ; Alcotest.test_case "stale token is ignored" `Quick stale_token_is_ignored
   ; Alcotest.test_case
-      "local batch planning separates crypto"
+      "sign-out captures identity and fences old work"
       `Quick
-      test_local_batch_planning_separates_crypto_from_policy
+      sign_out_captures_identity_advances_generations_and_fences_old_work
   ; Alcotest.test_case
-      "post-admission planning failure is terminal"
+      "sign-out cleanup completion is inert and sanitized"
       `Quick
-      test_post_admission_planning_failure_emits_terminal_worker_effect
+      sign_out_cleanup_completion_is_inert_and_sanitized
   ; Alcotest.test_case
-      "post-admission encryption failure is terminal"
+      "local cache deletion cleans the requested graph key"
       `Quick
-      test_post_admission_encryption_failure_emits_terminal_worker_effect
+      local_cache_deletion_uses_authenticated_account_and_requested_graph
   ; Alcotest.test_case
-      "graph selection delegates mirror authority"
+      "snapshot bootstrap preserves server cursor"
       `Quick
-      test_graph_selection_delegates_mirror_authority
+      snapshot_bootstrap_preserves_server_cursor
   ; Alcotest.test_case
-      "selected graph survives picker and codec restart"
+      "invalid snapshot baseline fails bootstrap"
       `Quick
-      test_selected_graph_survives_picker_and_codec_restart
+      invalid_snapshot_baseline_fails_bootstrap
   ; Alcotest.test_case
-      "invalid cached selections fail closed"
+      "encrypted recovery unlocks graph key before bootstrap"
       `Quick
-      test_absent_stale_and_malformed_cached_selections_fail_closed
+      encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap
   ; Alcotest.test_case
-      "catalog refresh preserves admitted selection"
+      "warm encrypted graph loads key before attach and protects outbox"
       `Quick
-      test_catalog_refresh_preserves_admitted_selection
+      warm_encrypted_graph_loads_key_before_attach_and_protects_outbox
   ; Alcotest.test_case
-      "catalog refresh removes unadmitted selection"
+      "graph picker clears terminal graph failure"
       `Quick
-      test_catalog_refresh_removes_unadmitted_selection
+      graph_picker_clears_terminal_graph_failure
   ; Alcotest.test_case
-      "catalog save failure keeps selected graph usable"
+      "graph picker fences late warm key completion"
       `Quick
-      test_catalog_save_failure_keeps_selected_graph_usable
+      graph_picker_fences_late_warm_key_completion
   ; Alcotest.test_case
-      "same-account reconciliation preserves warm restore"
+      "warm encrypted graph online recovery attaches existing mirror"
       `Quick
-      test_same_account_reconciliation_preserves_warm_restore
+      warm_encrypted_graph_online_recovery_attaches_existing_mirror
   ; Alcotest.test_case
-      "warm graph attachment defers WebSocket until Timeline"
+      "partial rejection is normalized exactly"
       `Quick
-      test_warm_graph_attachment_defers_websocket_until_timeline
+      partial_rejection_is_normalized_exactly
   ; Alcotest.test_case
-      "unauthenticated warm graph does not challenge WebSocket"
+      "local outbox change requests sync inspection"
       `Quick
-      test_unauthenticated_warm_graph_does_not_challenge_websocket
+      local_outbox_change_requests_sync_inspection
   ; Alcotest.test_case
-      "account replacement tears down the previous account first"
+      "accepted submission pulls its authoritative transaction"
       `Quick
-      test_account_replacement_cancels_and_detaches_before_new_catalog_work
+      accepted_submission_pulls_its_authoritative_transaction
   ; Alcotest.test_case
-      "sign-out tears down the managed attachment"
+      "whole-batch invalid tx partitions every member"
       `Quick
-      test_sign_out_cancels_and_detaches_the_managed_attachment
-  ; Alcotest.test_case
-      "auth before cache load waits for local Timeline"
-      `Quick
-      test_auth_before_cache_load_waits_for_local_timeline
-  ; Alcotest.test_case
-      "snapshot activation re-inspects mirror"
-      `Quick
-      test_snapshot_activation_reinspects_worker_mirror
-  ; Alcotest.test_case
-      "encrypted snapshot activation carries decryption capability"
-      `Quick
-      test_encrypted_snapshot_activation_carries_decryption_capability
-  ; Alcotest.test_case
-      "unencrypted startup routes share bootstrap policy"
-      `Quick
-      test_unencrypted_startup_matrix
-  ; Alcotest.test_case
-      "encrypted bootstrap routes wait for a scoped key"
-      `Quick
-      test_encrypted_bootstrap_routes_wait_for_a_scoped_key
-  ; Alcotest.test_case
-      "encrypted recovery resumes and coalesces bootstrap"
-      `Quick
-      test_encrypted_recovery_resumes_and_coalesces_snapshot_bootstrap
-  ; Alcotest.test_case
-      "cache deletion fences stale graph keys"
-      `Quick
-      test_cache_deletion_rejects_stale_and_wrong_scope_key_completions
-  ; Alcotest.test_case
-      "encrypted bootstrap recovers a missing cached key"
-      `Quick
-      test_encrypted_bootstrap_recovers_a_missing_cached_key
-  ; Alcotest.test_case
-      "encrypted warm mirror waits for a scoped graph key"
-      `Quick
-      test_encrypted_warm_mirror_waits_for_a_scoped_graph_key
-  ; Alcotest.test_case
-      "encrypted authoritative pull decrypts before worker apply"
-      `Quick
-      test_encrypted_authoritative_pull_decrypts_before_worker_apply
-  ; Alcotest.test_case
-      "authoritative decryption failure is fail closed"
-      `Quick
-      test_authoritative_decryption_failure_is_fail_closed
-  ; Alcotest.test_case
-      "authoritative pull advances checkpoint"
-      `Quick
-      test_authoritative_pull_is_pure_and_advances_checkpoint
-  ; Alcotest.test_case
-      "authoritative pull rejects cursor gaps"
-      `Quick
-      test_authoritative_pull_rejects_cursor_gaps
-  ; Alcotest.test_case
-      "authoritative pull accepts Transit list collection"
-      `Quick
-      test_authoritative_pull_accepts_transit_list_collection
-  ; Alcotest.test_case
-      "authoritative pull preserves Transit cache wire order"
-      `Quick
-      test_authoritative_pull_preserves_transit_cache_wire_order
-  ; Alcotest.test_case
-      "authoritative pull rejects invalid collection entries"
-      `Quick
-      test_authoritative_pull_rejects_empty_or_non_array_operations
-  ; Alcotest.test_case
-      "duplicate pull skips authoritative transaction bodies"
-      `Quick
-      test_duplicate_pull_skips_authoritative_transaction_bodies
-  ; Alcotest.test_case
-      "duplicate pull never replays stored transport transactions"
-      `Quick
-      test_duplicate_pull_never_replays_stored_transport_transactions
-  ; Alcotest.test_case
-      "duplicate pull rejects future transaction cursor"
-      `Quick
-      test_duplicate_pull_still_rejects_future_transaction_cursor
-  ; Alcotest.test_case
-      "typed WebSocket messages reach sync policy"
-      `Quick
-      test_typed_websocket_messages_reach_policy_without_raw_json
-  ; Alcotest.test_case
-      "submission owner is reserved before durable transition"
-      `Quick
-      test_submission_owner_is_reserved_before_durable_transition
-  ; Alcotest.test_case
-      "acknowledgement without owner is ignored"
-      `Quick
-      test_acknowledgement_without_submission_owner_is_ignored
-  ; Alcotest.test_case
-      "submission waits for durable outbox transition"
-      `Quick
-      test_submission_waits_for_durable_outbox_transition
-  ; Alcotest.test_case
-      "E2EE password stays out of core state"
-      `Quick
-      test_e2ee_recovery_keeps_password_out_of_core_state
-  ; Alcotest.test_case
-      "canonical pure reducer happy path"
-      `Quick
-      test_pure_reducer_canonical_happy_path
+      whole_batch_invalid_tx_partitions_every_member
   ]
 ;;

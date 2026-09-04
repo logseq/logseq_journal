@@ -14,10 +14,8 @@ type physical_indexes =
   }
 
 type t =
-  { mutable db : Datascript.db
-  ; callbacks : Logseq_sqlite_storage.callbacks
+  { callbacks : Logseq_sqlite_storage.callbacks
   ; mutable tail : Datascript.datom list list
-  ; mutable physical : physical_indexes
   ; mutable unreachable_address_count : int option
   ; mutable garbage_collection_size_baseline : int64
   ; mutable lifecycle : lifecycle
@@ -152,8 +150,9 @@ let physical_indexes ~attached callbacks db =
     ; metadata
     }
   | None ->
-    let snapshot = Datascript.serializable db in
-    let primary, duplicates = split_primary_and_duplicates snapshot.serializable_datoms in
+    let datoms = Datascript.datoms db Datascript.Eavt () |> List.of_seq in
+    let schema = Datascript.schema db in
+    let primary, duplicates = split_primary_and_duplicates datoms in
     let make index datoms =
       let values = Array.of_list (List.sort (compare_datom index) datoms) in
       Persistent_sorted_set.of_sorted_array_by
@@ -165,9 +164,7 @@ let physical_indexes ~attached callbacks db =
     let avet =
       List.filter
         (fun datom ->
-           Datascript.Schema.schema_attr_is_avet_accessible
-             snapshot.serializable_schema
-             datom.Datascript.a)
+           Datascript.Schema.schema_attr_is_avet_accessible schema datom.Datascript.a)
         primary
     in
     { eavt = make Datascript.Eavt primary
@@ -184,21 +181,19 @@ let physical_indexes ~attached callbacks db =
     }
 ;;
 
-let create ~db ~tail ~callbacks =
-  let attached = Option.is_some (Datascript.storage db) in
-  let physical = physical_indexes ~attached callbacks db in
+let create ~tail ~(callbacks : Logseq_sqlite_storage.callbacks) =
+  let attached =
+    Option.is_some (callbacks.storage.storage_restore Datascript.Storage.root_address)
+  in
   let unreachable_address_count = if attached then None else Some 0 in
-  { db
-  ; callbacks
+  { callbacks
   ; tail
-  ; physical
   ; unreachable_address_count
   ; garbage_collection_size_baseline = callbacks.database_size_bytes ()
   ; lifecycle = Open
   }
 ;;
 
-let current_db t = t.db
 let current_tail t = t.tail
 let staged_db_after staged = staged.db_after
 let staged_tx_data staged = staged.tx_data
@@ -272,14 +267,16 @@ let update_physical schema physical datom =
 ;;
 
 let compact_physical callbacks physical db tail =
-  let snapshot = Datascript.serializable db in
+  let schema = db.Datascript.schema in
+  let max_eid = db.Datascript.max_eid in
+  let max_tx = db.Datascript.max_tx in
   let physical =
     List.fold_left
-      (fun physical group ->
-         List.fold_left (update_physical snapshot.serializable_schema) physical group)
+      (fun physical group -> List.fold_left (update_physical schema) physical group)
       physical
       tail
   in
+  let physical = { physical with duplicates = db.duplicate_datoms } in
   let eavt_address, eavt = Persistent_sorted_set.store physical.eavt in
   let aevt_address, aevt = Persistent_sorted_set.store physical.aevt in
   let avet_address, avet = Persistent_sorted_set.store physical.avet in
@@ -304,18 +301,17 @@ let compact_physical callbacks physical db tail =
     }
   in
   let root =
-    Datascript.
-      { storage_schema = snapshot.serializable_schema
-      ; storage_max_eid = snapshot.serializable_max_eid
-      ; storage_max_tx = snapshot.serializable_max_tx
-      ; storage_eavt = eavt_address
-      ; storage_aevt = aevt_address
-      ; storage_avet = avet_address
-      ; storage_duplicate_datoms = physical.duplicates
-      ; storage_max_addr = !(physical.next_address)
-      ; storage_branching_factor = physical.settings.branching_factor
-      ; storage_ref_type = physical.settings.ref_type
-      }
+    { Datascript.storage_schema = schema
+    ; storage_max_eid = max_eid
+    ; storage_max_tx = max_tx
+    ; storage_eavt = eavt_address
+    ; storage_aevt = aevt_address
+    ; storage_avet = avet_address
+    ; storage_duplicate_datoms = physical.duplicates
+    ; storage_max_addr = !(physical.next_address)
+    ; storage_branching_factor = physical.settings.branching_factor
+    ; storage_ref_type = physical.settings.ref_type
+    }
   in
   ( { physical with eavt; aevt; avet; metadata }
   , [ Datascript.Storage.root_address, Datascript.Storage_root root
@@ -323,7 +319,7 @@ let compact_physical callbacks physical db tail =
     ] )
 ;;
 
-let stage_transact_batch ?tx_meta t transaction_batches =
+let stage_transact_batch ?tx_meta t ~authoritative_before transaction_batches =
   match t.lifecycle with
   | Closed_state -> Error Closed
   | Fatal_state message -> Error (Fatal message)
@@ -339,7 +335,7 @@ let stage_transact_batch ?tx_meta t transaction_batches =
               ( report.db_after
               , (if report.tx_data = [] then tail else tail @ [ report.tx_data ])
               , all_tx_data @ report.tx_data ))
-           (t.db, [], [])
+           (authoritative_before, [], [])
            transaction_batches
        in
        let tail_after = t.tail @ added_tail in
@@ -353,8 +349,13 @@ let stage_transact_batch ?tx_meta t transaction_batches =
          let physical_after, entries =
            if compact
            then (
+             let attached =
+               Option.is_some
+                 (t.callbacks.storage.storage_restore Datascript.Storage.root_address)
+             in
+             let physical = physical_indexes ~attached t.callbacks authoritative_before in
              let physical, entries =
-               compact_physical t.callbacks t.physical db_after tail_after
+               compact_physical t.callbacks physical db_after tail_after
              in
              Some physical, entries)
            else
@@ -380,7 +381,9 @@ let stage_transact_batch ?tx_meta t transaction_batches =
        Error (Stage_failed (Printexc.to_string exn)))
 ;;
 
-let stage_transact ?tx_meta t tx_ops = stage_transact_batch ?tx_meta t [ tx_ops ]
+let stage_transact ?tx_meta t ~authoritative_before tx_ops =
+  stage_transact_batch ?tx_meta t ~authoritative_before [ tx_ops ]
+;;
 
 let storage_error_message = function
   | Logseq_sqlite_storage.Pragma_mismatch message
@@ -397,7 +400,14 @@ let terminalize t message =
   Error (Persistence_failed message)
 ;;
 
-let commit_staged_internal t staged sync_metadata sync_outbox =
+let commit_staged_internal
+      t
+      staged
+      sync_metadata
+      sync_outbox
+      mutation_receipts
+      terminal_batch_receipts
+  =
   match t.lifecycle with
   | Closed_state -> Error Closed
   | Fatal_state message -> Error (Fatal message)
@@ -407,14 +417,17 @@ let commit_staged_internal t staged sync_metadata sync_outbox =
     else (
       staged.consumed <- true;
       let batch =
-        { staged.batch with Logseq_sqlite_storage.sync_metadata; sync_outbox }
+        { staged.batch with
+          Logseq_sqlite_storage.sync_metadata
+        ; sync_outbox
+        ; mutation_receipts
+        ; terminal_batch_receipts
+        }
       in
       match Logseq_sqlite_storage.commit_batch t.callbacks batch with
       | Error error -> terminalize t (storage_error_message error)
       | Ok () ->
-        t.db <- staged.db_after;
         t.tail <- staged.tail_after;
-        Option.iter (fun physical -> t.physical <- physical) staged.physical_after;
         (match staged.physical_after with
          | None -> Ok ()
          | Some _ ->
@@ -436,14 +449,31 @@ let commit_staged_internal t staged sync_metadata sync_outbox =
            Ok ()))
 ;;
 
-let commit_staged t staged = commit_staged_internal t staged None None
+let commit_staged t staged = commit_staged_internal t staged None None None None
 
 let commit_staged_with_sync_metadata t staged metadata =
-  commit_staged_internal t staged (Some metadata) None
+  commit_staged_internal t staged (Some metadata) None None None
 ;;
 
 let commit_staged_with_sync_metadata_and_outbox t staged metadata records =
-  commit_staged_internal t staged (Some metadata) (Some records)
+  commit_staged_internal t staged (Some metadata) (Some records) None None
+;;
+
+let commit_staged_with_sync_metadata_outbox_and_receipts
+      t
+      staged
+      metadata
+      records
+      receipts
+      terminal_batch_receipts
+  =
+  commit_staged_internal
+    t
+    staged
+    (Some metadata)
+    (Some records)
+    (Some receipts)
+    (Some terminal_batch_receipts)
 ;;
 
 let persist_sync_metadata t metadata =
@@ -472,7 +502,12 @@ let commit_sync_outbox_insert t records =
   | Open ->
     let batch =
       Logseq_sqlite_storage.
-        { writes = []; sync_metadata = None; sync_outbox = Some records }
+        { writes = []
+        ; sync_metadata = None
+        ; sync_outbox = Some records
+        ; mutation_receipts = None
+        ; terminal_batch_receipts = None
+        }
     in
     (match Logseq_sqlite_storage.commit_batch t.callbacks batch with
      | Ok () -> Ok ()

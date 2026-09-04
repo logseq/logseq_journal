@@ -41,15 +41,6 @@ type admission_fact =
   | Lossless_codec
   | Ownership_verified
 
-type graph_info =
-  { local_graph_uuid : Uuid.t
-  ; graph_name : string
-  ; graph_dir : string
-  ; schema : schema_version
-  ; basis : int64
-  ; admission_facts : admission_fact list
-  }
-
 type page_kind =
   | Ordinary_page
   | Journal_page of { journal_day : int }

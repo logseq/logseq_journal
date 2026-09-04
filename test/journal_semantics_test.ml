@@ -1,3 +1,4 @@
+module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 module ID = Bonsai_flutter_spec.Id
 module Test = Bonsai_flutter_test
 module Tokens = Journal_visual_tokens
@@ -931,6 +932,23 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
        Test.Handle.present handle;
+       (let (Av header_view) =
+          Ui.Widget.Private.view (node handle "journal-header").widget
+        in
+        match header_view.node with
+        | Ui.Widget.Private.Sliver_app_bar
+            { pinned = true
+            ; floating = false
+            ; snap = false
+            ; center_title = true
+            ; variant = 0
+            ; shape = 1
+            ; density = 1
+            ; _
+            } -> ()
+        | Sliver_app_bar _ ->
+          fail "Journal header does not use the selected Material app-bar configuration"
+        | _ -> fail "Journal header is not a Material sliver app bar");
        List.iter
          (fun test_id -> ignore (node handle test_id))
          [ "journal-header-leading-placeholder"
@@ -939,6 +957,10 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
          ; "journal-account-icon"
          ];
        require_icon handle "journal-account-icon" ~code_point:0xe043 ~color:0x00000000l;
+       require
+         (Option.is_some
+            (Test.Handle.find handle (Test.Query.visible_text "Today · Sunday, August 9")))
+         "Journal header lost its visible date context";
        List.iter
          (fun test_id ->
             require
@@ -999,8 +1021,11 @@ let test_header_sync_progress_tracks_every_sync_phase () =
             let progress = node handle progress_id in
             let (Av progress_view) = Ui.Widget.Private.view progress.widget in
             (match progress_view.node with
-             | Ui.Widget.Private.Material_linear_progress_indicator { value = None } -> ()
-             | Material_linear_progress_indicator { value = Some value } ->
+             | Ui.Widget.Private.Material_linear_progress_indicator
+                 { value = None; wavy = false } -> ()
+             | Material_linear_progress_indicator { value = None; wavy = true } ->
+               fail "sync progress unexpectedly uses the wavy variant"
+             | Material_linear_progress_indicator { value = Some value; _ } ->
                fail "sync progress is determinate at %.3f" value
              | _ -> fail "sync progress is not a Material linear progress indicator");
             let progress_extent =
@@ -1016,34 +1041,13 @@ let test_header_sync_progress_tracks_every_sync_phase () =
                  "sync progress thickness is %.1f instead of 2.0"
                  height
              | _ -> fail "sync progress thickness is not constrained by a SizedBox");
-            let flexible_space = node handle "journal-header-flexible-space" in
-            let (Av flexible_view) = Ui.Widget.Private.view flexible_space.widget in
-            let progress_child =
-              Array.find_opt
-                (fun (child : Ui.Widget.Private.child) ->
-                   Ui.Widget.For_testing.test_id child.widget
-                   = Some (Ui.Test_id.string progress_extent_id))
-                flexible_view.children
-            in
-            match progress_child with
-            | Some
-                { parent_data =
-                    Ui.Widget.Private.Stack_position
-                      { left = Some left
-                      ; top = None
-                      ; right = Some right
-                      ; bottom = Some bottom
-                      }
-                ; _
-                } ->
-              require
-                (Float.equal left 0.
-                 && Float.equal right 0.
-                 && Float.equal bottom (1. /. 3.))
-                "sync progress is not pinned across the header above its divider"
-            | None | Some _ ->
-              fail "sync progress does not occupy the expected header stack position"))
-    [ Logseq_sync_pure_reducer.Core.Connecting ];
+            require
+              (Option.is_none
+                 (Test.Handle.find
+                    handle
+                    (Test.Query.test_id "journal-header-flexible-space")))
+              "sync progress retains the obsolete flexible-space app-bar path"))
+    [ Graph_service.Connecting ];
   List.iter
     (fun sync_phase ->
        let handle = render sync_phase in
@@ -1054,7 +1058,7 @@ let test_header_sync_progress_tracks_every_sync_phase () =
               (Option.is_none (Test.Handle.find handle (Test.Query.test_id progress_id)))
               "inactive sync phase displayed the header progress indicator"))
     [ None
-    ; Some Logseq_sync_pure_reducer.Core.Offline
+    ; Some Graph_service.Offline
     ; Some Pulling
     ; Some Submitting
     ; Some Current

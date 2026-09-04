@@ -889,13 +889,6 @@ enum JournalE2EECrypto {
       throw JournalE2EECryptoError.invalidRequest
     }
     switch operation {
-    case "hasPrivateKey":
-      let identity = try self.identity(request, includeGraph: false)
-      return [
-        "ok": true,
-        "value": try loadPrivateKey(origin: identity.origin, userID: identity.userID) != nil,
-      ]
-
     case "unlockPrivateKey":
       let identity = try self.identity(request, includeGraph: false)
       guard

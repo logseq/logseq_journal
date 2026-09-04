@@ -1,19 +1,10 @@
 type crypto =
-  { decrypt_private_key :
-      password:string
-      -> iterations:int
-      -> salt:string
-      -> iv:string
-      -> ciphertext:string
-      -> (string, string) result
-  ; decrypt_graph_key : private_key:string -> ciphertext:string -> (string, string) result
-  ; encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
+  { encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
   ; decrypt_aes_gcm :
       key:string -> iv:string -> ciphertext:string -> (string, string) result
   }
 
 val crypto : crypto
-val has_private_key : managed_sync_origin:Uri.t -> user_id:string -> bool
 
 val unlock_private_key
   :  managed_sync_origin:Uri.t

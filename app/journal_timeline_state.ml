@@ -498,6 +498,49 @@ let replace_timeline_entry (state : t) replacement =
   { state with slots; anchor_decision = Preserve_visible_slot }
 ;;
 
+let replace_timeline_entry_page
+      (state : t)
+      ~(page : Journal_graph_projection.page)
+      (replacement : Journal_graph_projection.timeline_entry_page)
+  =
+  let replacement_slots =
+    List.map (fun entry -> Top_level entry) replacement.entries
+    @
+    match replacement.continuation with
+    | None -> []
+    | Some after -> [ Day_continuation { day = page.day; after = Some after } ]
+  in
+  let belongs_to_page = function
+    | Top_level entry -> String.equal (Journal_model.page_id entry.block) page.id
+    | Child_preview { block; _ } -> String.equal (Journal_model.page_id block) page.id
+    | Day_continuation continuation -> continuation.day = page.day
+    | Day_heading _ | Children_loading _ | Children_more _ | Feed_continuation _ -> false
+  in
+  let rec skip_page = function
+    | slot :: rest when belongs_to_page slot -> skip_page rest
+    | rest -> rest
+  in
+  let rec replace reversed = function
+    | (Day_heading candidate as heading) :: rest when String.equal candidate.id page.id ->
+      Some (List.rev_append reversed ((heading :: replacement_slots) @ skip_page rest))
+    | Top_level entry :: _ as rest
+      when String.equal (Journal_model.page_id entry.block) page.id ->
+      Some (List.rev_append reversed (replacement_slots @ skip_page rest))
+    | slot :: rest -> replace (slot :: reversed) rest
+    | [] -> None
+  in
+  match replace [] state.slots with
+  | None -> state
+  | Some slots ->
+    let delta = List.length slots - List.length state.slots in
+    { state with
+      slots
+    ; total_count = max 0 (state.total_count + delta)
+    ; anchor_decision = Preserve_visible_slot
+    }
+    |> cap_retained
+;;
+
 let apply_detail (state : t) ~generation (detail : Journal_graph_projection.detail) =
   match state.pending with
   | Some (expected_generation, Children { parent_id; epoch })
@@ -538,6 +581,52 @@ let apply_detail (state : t) ~generation (detail : Journal_graph_projection.deta
           | _ -> false)
         replacement)
   | Some _ | None -> state
+;;
+
+let reconcile_detail (state : t) (detail : Journal_graph_projection.detail) =
+  let parent_id = Journal_model.id detail.root in
+  let state = replace_block state detail.root in
+  if not (List.exists (String.equal parent_id) state.expanded_ids)
+  then state
+  else (
+    let all_blocks = sort_blocks detail.children.blocks in
+    let blocks = take 3 all_blocks in
+    let has_more =
+      Option.is_some detail.children.continuation || List.length all_blocks > 3
+    in
+    let replacement =
+      List.map (fun block -> Child_preview { parent_id; block }) blocks
+      @ if has_more then [ Children_more { parent_id } ] else []
+    in
+    let rec remove_owned = function
+      | Child_preview preview :: rest when String.equal preview.parent_id parent_id ->
+        remove_owned rest
+      | Children_loading loading :: rest when String.equal loading.parent_id parent_id ->
+        remove_owned rest
+      | Children_more more :: rest when String.equal more.parent_id parent_id ->
+        remove_owned rest
+      | rest -> rest
+    in
+    let rec replace reversed = function
+      | (Top_level entry as slot) :: rest
+        when String.equal (Journal_model.id entry.block) parent_id ->
+        Some (List.rev_append reversed ((slot :: replacement) @ remove_owned rest))
+      | (Child_preview preview as slot) :: rest
+        when String.equal (Journal_model.id preview.block) parent_id ->
+        Some (List.rev_append reversed ((slot :: replacement) @ remove_owned rest))
+      | slot :: rest -> replace (slot :: reversed) rest
+      | [] -> None
+    in
+    match replace [] state.slots with
+    | None -> state
+    | Some slots ->
+      let delta = List.length slots - List.length state.slots in
+      { state with
+        slots
+      ; total_count = max 0 (state.total_count + delta)
+      ; anchor_decision = Preserve_visible_slot
+      }
+      |> cap_retained)
 ;;
 
 let next_request (state : t) =
@@ -727,6 +816,33 @@ let stage_delete (state : t) ~block_id =
         ; focus_restore_block_id = None
         }
       , { block; before } )
+;;
+
+let remove_block (state : t) ~block_id =
+  match stage_delete state ~block_id with
+  | Some (state, _) -> state
+  | None ->
+    let slots =
+      List.filter
+        (function
+          | Child_preview { block; _ } ->
+            not (String.equal (Journal_model.id block) block_id)
+          | Day_heading _
+          | Top_level _
+          | Day_continuation _
+          | Children_loading _
+          | Children_more _
+          | Feed_continuation _ -> true)
+        state.slots
+    in
+    let removed = List.length state.slots - List.length slots in
+    { state with
+      slots
+    ; total_count = max 0 (state.total_count - removed)
+    ; expanded_ids =
+        List.filter (fun id -> not (String.equal id block_id)) state.expanded_ids
+    ; anchor_decision = Preserve_visible_slot
+    }
 ;;
 
 let undo_delete staged = { staged.before with pending = None }

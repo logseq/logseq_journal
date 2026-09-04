@@ -37,7 +37,7 @@ let graph_info_request () =
   Protocol.
     { api_version
     ; request_id = uuid "10000000-0000-4000-8000-000000000001"
-    ; command = Read Graph_info
+    ; command = V2_graph_info
     }
 ;;
 
@@ -72,11 +72,14 @@ let test_sync_instructions_are_translated_in_order () =
       (initial ())
       (Sync_event (Sync.Restore_local_account { user_id = "user-1" }))
   in
-  Alcotest.check
-    (Alcotest.list Alcotest.string)
-    "child order"
-    [ "publish:sync-state"; "run-sync:Load_catalog" ]
-    (List.map Core.instruction_diagnostic transition.effects)
+  match List.map Core.instruction_diagnostic transition.effects with
+  | [ "publish:sync-output"; run ] ->
+    Alcotest.check
+      Alcotest.bool
+      "load catalog follows state publication"
+      true
+      (String.starts_with ~prefix:"run-sync:request:" run)
+  | values -> Alcotest.failf "unexpected child order: %s" (String.concat ", " values)
 ;;
 
 let test_replay_is_deterministic () =

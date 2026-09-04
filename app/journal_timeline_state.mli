@@ -89,12 +89,21 @@ val apply_timeline_entry_page
   -> t
 
 val apply_detail : t -> generation:int64 -> Journal_graph_projection.detail -> t
+val reconcile_detail : t -> Journal_graph_projection.detail -> t
 val next_request : t -> request option
 val pending_request : t -> (int64 * request) option
 val expand : t -> parent_id:string -> t
 val collapse : t -> parent_id:string -> t
 val replace_block : t -> Journal_model.t -> t
+val remove_block : t -> block_id:string -> t
 val replace_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
+
+val replace_timeline_entry_page
+  :  t
+  -> page:Journal_graph_projection.page
+  -> Journal_graph_projection.timeline_entry_page
+  -> t
+
 val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
 val stage_delete : t -> block_id:string -> (t * staged_delete) option
 val undo_delete : staged_delete -> t

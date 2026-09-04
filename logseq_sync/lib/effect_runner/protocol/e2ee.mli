@@ -13,6 +13,8 @@ type private_key_package =
 
 val binary : string -> (string, string) result
 val private_key_package : string -> (private_key_package, string) result
+val graph_key_response : string -> (string, string) result
+val user_keys_response : string -> (string, string) result
 
 val decrypt_value
   :  crypto:crypto

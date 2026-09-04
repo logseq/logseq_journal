@@ -1,0 +1,33 @@
+{
+  "apiVersion": 2,
+  "bounds": {
+    "requestBytes": 1048576,
+    "responseBytes": 262144,
+    "pushBytes": 65536,
+    "defaultPageSize": 50,
+    "maximumPageSize": 200,
+    "maximumTreeNodes": 2000,
+    "maximumTreeDepth": 64,
+    "maximumChangedUuids": 1024,
+    "maximumUnacknowledgedWindows": 256
+  },
+  "requests": [
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000001","command":{"type":"graphInfo"}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000002","command":{"type":"listJournals","fromDay":20260901,"throughDay":20260930,"limit":50,"cursor":null,"revision":null}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000003","command":{"type":"getPage","page":"20000000-0000-4000-8000-000000000001","revision":null}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000004","command":{"type":"getBlock","block":"10000000-0000-4000-8000-000000000001","revision":null}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000005","command":{"type":"getChildren","parent":"20000000-0000-4000-8000-000000000001","limit":50,"cursor":null,"revision":null}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000006","command":{"type":"getPageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":8,"limit":200,"cursor":null,"revision":null}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000007","command":{"type":"saveBlock","mutationId":"30000000-0000-4000-8000-000000000001","block":"10000000-0000-4000-8000-000000000001","title":"Updated","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:1"}],"pages":[],"scopes":[]}}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000008","command":{"type":"insertBlocks","mutationId":"30000000-0000-4000-8000-000000000002","parent":"20000000-0000-4000-8000-000000000001","roots":[{"uuid":"10000000-0000-4000-8000-000000000002","title":"Parent","children":[{"uuid":"10000000-0000-4000-8000-000000000003","title":"Child","children":[]}]}],"preconditions":{"blocks":[],"pages":[],"scopes":[{"scope":{"type":"children","parent":"20000000-0000-4000-8000-000000000001"},"revision":"structure-revision:v1:1"}]}}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000009","command":{"type":"deleteBlocks","mutationId":"30000000-0000-4000-8000-000000000003","root":"10000000-0000-4000-8000-000000000002","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000002","revision":"block-revision:v1:1"}],"pages":[],"scopes":[{"scope":{"type":"pageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":8},"revision":"structure-revision:v1:1"}]}}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000010","command":{"type":"createJournalPage","mutationId":"30000000-0000-4000-8000-000000000004","page":"20000000-0000-4000-8000-000000000002","journalDay":20260902,"title":"Sep 2nd, 2026","preconditions":{"blocks":[],"pages":[],"scopes":[{"scope":{"type":"journalIndex"},"revision":"journal-index-revision:v1:1"}]}}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000011","command":{"type":"setTaskStatus","mutationId":"30000000-0000-4000-8000-000000000005","block":"10000000-0000-4000-8000-000000000001","status":"todo","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:1"}],"pages":[],"scopes":[]}}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000012","command":{"type":"clearTaskStatus","mutationId":"30000000-0000-4000-8000-000000000006","block":"10000000-0000-4000-8000-000000000001","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:2"}],"pages":[],"scopes":[]}}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000013","command":{"type":"pullChanges","generation":"generation:v1:1","after":null,"limit":50}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000014","command":{"type":"ackChanges","generation":"generation:v1:1","through":"change-window:v1:2"}}
+  ],
+  "readOperations": ["graphInfo", "listJournals", "getPage", "getBlock", "getChildren", "getPageTree"],
+  "mutationOperations": ["saveBlock", "insertBlocks", "deleteBlocks", "createJournalPage", "setTaskStatus", "clearTaskStatus"],
+  "changeOperations": ["pullChanges", "ackChanges"]
+}

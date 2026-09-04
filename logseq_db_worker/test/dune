@@ -1,60 +1,19 @@
 (library
  (name logseq_db_worker_test_support)
- (modules test_support structural_fixture adapter_fixture)
- (libraries
-  datascript_ocaml
-  logseq_db_storage
-  logseq_db_types
-  logseq_db_worker
-  sqlite3
-  unix
-  yojson))
+ (modules test_support)
+ (libraries logseq_db_types logseq_db_worker logseq_overlay_db unix yojson))
 
 (tests
- (names
-  test_protocol
-  test_codec
-  test_storage_atomicity
-  test_admission
-  test_engine_managed
-  test_performance
-  test_fixture_generator
-  test_synced_config_admission)
- (modules
-  test_protocol
-  test_codec
-  test_storage_atomicity
-  test_admission
-  test_engine_managed
-  test_performance
-  test_fixture_generator
-  test_synced_config_admission)
+ (names test_protocol test_overlay_integration)
+ (modules test_protocol test_overlay_integration)
+ (deps
+  (source_tree fixtures/protocol))
  (libraries
-  datascript_ocaml
-  eio_main
-  eio.unix
-  logseq_db_storage
-  logseq_db_types
+  datascript_ocaml.types
+  datascript-ocaml-native
   logseq_db_worker
-  logseq_db_worker_fixture_generator
   logseq_db_worker_test_support
-  logseq_sync.pure_reducer
-  sqlite3
-  unix
-  uri
   yojson))
-
-(test
- (name test_bonsai_service)
- (modules test_bonsai_service)
- (libraries
-  bonsai_flutter.driver
-  bonsai_flutter_test
-  logseq_db_worker
-  logseq_db_worker.bonsai
-  logseq_db_worker.engine
-  logseq_db_worker_test_support
-  logseq_sync.effect_runner))
 
 (test
  (name test_pure_reducer)
@@ -68,10 +27,27 @@
   uri))
 
 (test
+ (name test_bonsai_service)
+ (modules test_bonsai_service)
+ (libraries
+  bonsai_flutter.driver
+  bonsai_flutter_test
+  datascript-ocaml-native
+  datascript_ocaml
+  datascript_ocaml.types
+  logseq_db_worker
+  logseq_db_worker.bonsai
+  logseq_db_worker_test_support
+  logseq_sync.effect_runner))
+
+(test
  (name test_effect_runner)
  (modules test_effect_runner)
  (libraries
   alcotest
+  datascript-ocaml-native
+  datascript_ocaml
+  datascript_ocaml.types
   eio_main
   eio.unix
   logseq_db_types
@@ -92,24 +68,42 @@
  (name test_managed_sync_e2e_support)
  (modules test_managed_sync_e2e_support)
  (libraries
+  datascript-ocaml-native
+  datascript_ocaml.types
   logseq_db_types
   logseq_db_worker_test_support
   managed_sync_e2e_support))
 
 (executable
  (name test_managed_sync_e2e)
- (modules test_managed_sync_e2e)
+ (modules test_managed_sync_e2e managed_sync_protocol_probe)
  (libraries
+  bigstringaf
   bonsai_flutter.driver
+  ca-certs-nss
+  cstruct
+  datascript-ocaml-native
+  datascript_ocaml
+  datascript_ocaml.types
+  digestif
+  domain-name
+  eio_main
+  eio.unix
+  faraday
+  httpun
+  httpun-eio
+  httpun-ws
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.bonsai
-  logseq_db_worker.engine
-  logseq_db_worker_test_support
   logseq_sync.pure_reducer
   managed_sync_e2e_support
+  mirage-crypto-rng
+  mirage-crypto-rng.unix
   sqlite3
+  tls-eio
+  uri
   unix))
 
 (rule
@@ -117,13 +111,3 @@
  (deps test_managed_sync_e2e.exe ../tool/cognito_e2e_login.sh)
  (action
   (run ./test_managed_sync_e2e.exe)))
-
-(rule
- (alias runtest)
- (deps
-  (source_tree fixtures/expected))
- (action
-  (run
-   %{exe:../tool/compare_canonical_graphs.exe}
-   --fixtures
-   %{workspace_root}/logseq_db_worker/test/fixtures/expected)))

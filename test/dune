@@ -20,6 +20,7 @@
   (source_tree ../logseq_db_storage)
   (source_tree ../logseq_db_types)
   (source_tree ../logseq_db_worker)
+  (source_tree ../logseq_overlay_db)
   (source_tree ../logseq_sync)
   (source_tree ../tool)
   ../bonsai-flutter.sexp
@@ -42,30 +43,30 @@
   ../logseq_db_worker.opam.locked
   ../logseq_journal.opam
   ../logseq_journal.opam.locked
+  ../logseq_overlay_db.install
+  ../logseq_overlay_db.opam
+  ../logseq_overlay_db.opam.locked
   ../logseq_sync.install
   ../logseq_sync.opam
   ../logseq_sync.opam.locked)
  (action
-  (run %{test} %{workspace_root} %{dep:../logseq_sync.install})))
+  (run
+   %{test}
+   %{workspace_root}
+   %{dep:../logseq_sync.install}
+   %{dep:../logseq_overlay_db.install})))
 
 (test
- (name application_view_test)
- (modules application_view_test)
- (libraries
-  app
-  bonsai
-  bonsai_flutter
-  bonsai_flutter.driver
-  bonsai_flutter.spec
-  bonsai_flutter.ui
-  bonsai_flutter_test
-  core
-  logseq_db_types
-  logseq_db_worker
-  managed_application_test_support
-  logseq_db_worker_test_support
-  logseq_sync.pure_reducer
-  unix))
+ (name logseq_overlay_db_boundary_test)
+ (modules logseq_overlay_db_boundary_test)
+ (deps
+  (source_tree ../logseq_overlay_db)
+  ../dune-project
+  ../logseq_overlay_db.install
+  ../logseq_overlay_db.opam
+  ../logseq_overlay_db.opam.locked)
+ (action
+  (run %{test} %{workspace_root} %{dep:../logseq_overlay_db.install})))
 
 (test
  (name journal_adaptive_test)
@@ -86,17 +87,29 @@
   core))
 
 (test
+ (name journal_graph_runtime_locality_test)
+ (modules journal_graph_runtime_locality_test)
+ (libraries
+  alcotest
+  app
+  datascript-ocaml-native
+  datascript_ocaml
+  datascript_ocaml.types))
+
+(test
+ (name application_view_test)
+ (modules application_view_test)
+ (libraries alcotest app))
+
+(test
+ (name logseq_db_worker_application_integration_test)
+ (modules logseq_db_worker_application_integration_test)
+ (libraries alcotest app))
+
+(test
  (name journal_timeline_state_test)
  (modules journal_timeline_state_test)
  (libraries app bonsai_flutter.ui datascript-ocaml-native unix))
-
-(executable
- (name journal_runtime_golden_fixture)
- (modules journal_runtime_golden_fixture)
- (libraries
-  logseq_db_worker_fixture_generator
-  logseq_db_worker_test_support
-  unix))
 
 (test
  (name journal_time_test)
@@ -112,37 +125,6 @@
  (name journal_routes_test)
  (modules journal_routes_test)
  (libraries app bonsai_flutter.spec bonsai_flutter.ui))
-
-(test
- (name logseq_db_worker_application_integration_test)
- (modules logseq_db_worker_application_integration_test)
- (libraries
-  app
-  bonsai
-  bonsai_flutter
-  bonsai_flutter.driver
-  bonsai_flutter.spec
-  bonsai_flutter.ui
-  bonsai_flutter_test
-  core
-  logseq_db_types
-  logseq_db_worker
-  managed_application_test_support
-  logseq_db_worker_test_support
-  logseq_sync.pure_reducer
-  unix))
-
-(library
- (name managed_application_test_support)
- (wrapped false)
- (modules managed_application_fixture)
- (libraries
-  app
-  logseq_db_worker
-  logseq_db_worker.bonsai
-  logseq_db_worker_test_support
-  logseq_sync.effect_runner
-  melange-transit-native))
 
 (rule
  (alias runtest)

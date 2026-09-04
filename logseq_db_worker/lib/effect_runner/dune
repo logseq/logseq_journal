@@ -6,10 +6,9 @@
  (implements logseq_db_worker_effect_runner)
  (modules effect_runner)
  (libraries
-  datascript_ocaml
   eio
   logseq_db_worker.contract
-  logseq_db_worker.engine
   logseq_db_worker.pure_reducer
+  logseq_overlay_db
   logseq_sync.pure_reducer
-  yojson))
+  melange-transit-native))

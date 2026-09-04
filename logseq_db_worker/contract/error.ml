@@ -40,7 +40,6 @@ type component =
   | Ownership
   | Sqlite
   | Storage
-  | Storage_session
   | Query
   | Read_model
   | Outliner
@@ -135,7 +134,6 @@ let component_string = function
   | Ownership -> "ownership"
   | Sqlite -> "sqlite"
   | Storage -> "storage"
-  | Storage_session -> "storageSession"
   | Query -> "query"
   | Read_model -> "readModel"
   | Outliner -> "outliner"
@@ -153,7 +151,6 @@ let component_of_string = function
   | "ownership" -> Some Ownership
   | "sqlite" -> Some Sqlite
   | "storage" -> Some Storage
-  | "storageSession" -> Some Storage_session
   | "query" -> Some Query
   | "readModel" -> Some Read_model
   | "outliner" -> Some Outliner

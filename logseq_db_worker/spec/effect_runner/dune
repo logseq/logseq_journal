@@ -7,6 +7,6 @@
  (libraries
   eio
   logseq_db_worker.contract
-  logseq_db_worker.engine
   logseq_db_worker.pure_reducer
+  logseq_overlay_db
   logseq_sync.pure_reducer))

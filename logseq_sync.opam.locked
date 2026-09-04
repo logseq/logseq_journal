@@ -62,6 +62,7 @@ depends: [
   "logs" {= "0.10.0"}
   "logseq_db_storage" {= "0.1.0"}
   "logseq_db_types" {= "0.1.0"}
+  "logseq_overlay_db" {= "0.1.0"}
   "lwt-dllist" {= "1.1.0"}
   "macaddr" {= "5.6.2"}
   "melange" {= "5.1.0-51"}
@@ -121,11 +122,11 @@ depexts: "zlib"
 pin-depends: [
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"
+    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"
+    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
   ]
   [
     "melange-edn-core.0.5.0"

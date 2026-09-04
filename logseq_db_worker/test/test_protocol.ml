@@ -1,17 +1,17 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
 
-let fixture_has_version path =
+let fixture_has_version expected_version path =
   match T.read_json (T.fixture path) with
   | `Assoc fields ->
     (match List.assoc_opt "apiVersion" fields with
-     | Some (`Int 1) -> ()
-     | _ -> T.fail "%s does not declare apiVersion 1" path)
+     | Some (`Int version) when version = expected_version -> ()
+     | _ -> T.fail "%s does not declare apiVersion %d" path expected_version)
   | _ -> T.fail "%s is not a JSON object" path
 ;;
 
 let command_catalog_requests () =
-  match T.read_json (T.fixture "protocol/v1-command-catalog.json") with
+  match T.read_json (T.fixture "protocol/v2-command-catalog.json") with
   | `Assoc fields ->
     (match List.assoc_opt "requests" fields with
      | Some (`List requests) -> requests
@@ -35,7 +35,7 @@ let request_round_trip () =
 ;;
 
 let outcome_field name =
-  match T.read_json (T.fixture "protocol/v1-outcome-catalog.json") with
+  match T.read_json (T.fixture "protocol/v2-outcome-catalog.json") with
   | `Assoc fields ->
     (match List.assoc_opt name fields with
      | Some (`List values) -> values
@@ -47,7 +47,11 @@ let response_round_trip () =
   List.iter
     (fun expected ->
        match P.response_of_yojson expected with
-       | Error message -> T.fail "response decode failed: %s" message
+       | Error message ->
+         T.fail
+           "response decode failed for %s: %s"
+           (Yojson.Safe.to_string expected)
+           message
        | Ok response ->
          T.require
            (Yojson.Safe.equal
@@ -101,7 +105,7 @@ let causal_error_round_trip () =
             ~code:(Some "corruptStorage")
             ~message:"The graph storage is corrupt or incomplete."
         ; cause_json
-            ~component:"storageSession"
+            ~component:"storage"
             ~operation:"restoreDatabase"
             ~code:(Some "SQLITE_CORRUPT")
             ~message:"SQLite rejected the database image."
@@ -156,14 +160,14 @@ let cause_or_fallback_replaces_rejected_messages () =
     (fun message ->
        let cause =
          Logseq_db_worker.Error.create_cause_or_fallback
-           ~component:Logseq_db_worker.Error.Storage_session
+           ~component:Logseq_db_worker.Error.Storage
            ~operation:"openDatabase"
            ~code:(Some "SQLITE_CANTOPEN")
            ~message
            ~fallback_message
        in
        T.require
-         (cause.component = Logseq_db_worker.Error.Storage_session)
+         (cause.component = Logseq_db_worker.Error.Storage)
          "fallback cause component changed";
        T.require
          (String.equal cause.operation "openDatabase")
@@ -292,7 +296,7 @@ let () =
   T.run
     "protocol"
     [ T.case "frozen protocol budgets" (fun () ->
-        T.require (P.api_version = 1) "api version changed";
+        T.require (P.api_version = 2) "api version is not v2";
         T.require (P.maximum_request_bytes = 1_048_576) "request budget changed";
         T.require (P.maximum_response_bytes = 262_144) "response budget changed";
         T.require (P.maximum_push_bytes = 65_536) "push budget changed";
@@ -301,11 +305,11 @@ let () =
         T.require (P.maximum_tree_nodes = 2_000) "tree node budget changed";
         T.require (P.maximum_tree_depth = 64) "tree depth budget changed")
     ; T.case "versioned command fixture" (fun () ->
-        fixture_has_version "protocol/v1-command-catalog.json")
+        fixture_has_version 2 "protocol/v2-command-catalog.json")
     ; T.case "versioned outcome fixture" (fun () ->
-        fixture_has_version "protocol/v1-outcome-catalog.json")
+        fixture_has_version 2 "protocol/v2-outcome-catalog.json")
     ; T.case "versioned operation fixture" (fun () ->
-        fixture_has_version "protocol/v1-operation-contracts.json")
+        fixture_has_version 2 "protocol/v2-operation-contracts.json")
     ; T.case "request JSON round trip" request_round_trip
     ; T.case "response JSON round trip" response_round_trip
     ; T.case "push JSON round trip" push_round_trip

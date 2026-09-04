@@ -123,6 +123,7 @@ depends: [
   "legacy_diffable" {= "v0.17.0"}
   "logs" {= "0.10.0"}
   "logseq_db_types" {= "0.1.0"}
+  "logseq_overlay_db" {= "0.1.0"}
   "logseq_sync" {= "0.1.0"}
   "logseq_db_worker" {= "0.1.0"}
   "lwt-dllist" {= "1.1.0"}
@@ -258,19 +259,19 @@ build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
   [
   "bonsai_flutter.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#de1196c2663b43388ebf04bd0612c5050edef753"
+  "git+https://github.com/RCmerci/bonsai_flutter.git#3d2a540d886839fb243ce78f4bcc38da13c600a9"
 ]
   [
   "bonsai_flutter_test.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#de1196c2663b43388ebf04bd0612c5050edef753"
+  "git+https://github.com/RCmerci/bonsai_flutter.git#3d2a540d886839fb243ce78f4bcc38da13c600a9"
 ]
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"
+    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#5895af25101de15f56d7c5df383c150ca07cef90"
+    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
   ]
   [
     "melange-edn-core.0.5.0"

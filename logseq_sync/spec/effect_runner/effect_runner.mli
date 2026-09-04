@@ -8,7 +8,6 @@ type runtime
 val runtime
   :  fork:(sw:Eio.Switch.t -> (unit -> unit) -> unit)
   -> sleep:(float -> unit)
-  -> monotonic_ns:(unit -> int64)
   -> (runtime, dependency_error) result
 
 type transport
@@ -40,8 +39,7 @@ type wrapped_key_load_error =
 type secrets
 
 val secrets
-  :  has_private_key:(managed_sync_origin:Uri.t -> user_id:string -> bool)
-  -> unlock_private_key:
+  :  unlock_private_key:
        (managed_sync_origin:Uri.t
         -> user_id:string
         -> password:string
@@ -75,16 +73,7 @@ val secrets
 type crypto
 
 val crypto
-  :  decrypt_private_key:
-       (password:string
-        -> iterations:int
-        -> salt:string
-        -> iv:string
-        -> ciphertext:string
-        -> (string, string) result)
-  -> decrypt_graph_key:
-       (private_key:string -> ciphertext:string -> (string, string) result)
-  -> encrypt_aes_gcm:(key:string -> plaintext:string -> (string * string, string) result)
+  :  encrypt_aes_gcm:(key:string -> plaintext:string -> (string * string, string) result)
   -> decrypt_aes_gcm:
        (key:string -> iv:string -> ciphertext:string -> (string, string) result)
   -> (crypto, dependency_error) result

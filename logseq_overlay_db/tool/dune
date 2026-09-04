@@ -1,0 +1,23 @@
+(library
+ (name logseq_overlay_db_fixture_generator)
+ (wrapped false)
+ (modules fixture_generator)
+ (libraries
+  datascript-ocaml-native
+  digestif
+  logseq_db_storage
+  logseq_db_types
+  logseq_overlay_db
+  sqlite3
+  unix
+  yojson))
+
+(executable
+ (name performance_benchmark)
+ (modules performance_benchmark)
+ (libraries
+  datascript-ocaml-native
+  eio_main
+  logseq_overlay_db_fixture_generator
+  unix
+  yojson))
