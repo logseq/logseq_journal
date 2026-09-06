@@ -1,17 +1,16 @@
 module Context : sig
   type t
 
-  val today : subtitle:string -> t
-  val selected : title:string -> subtitle:string -> t
-  val is_today : t -> bool
-  val title : t -> string
-  val subtitle : t -> string
+  val today : date:Journal_calendar.date_presentation option -> t
+  val date : t -> Journal_calendar.date_presentation option
   val semantics_label : t -> string
 end
 
 val sliver
-  :  typography:Journal_visual_tokens.typography
+  :  tokens:Journal_visual_tokens.t
+  -> typography:Journal_visual_tokens.typography
   -> text_scale:float
+  -> viewport_width:float
   -> top_inset:float
   -> device_pixel_ratio:float
   -> context:Context.t

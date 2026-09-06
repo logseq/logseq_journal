@@ -39,6 +39,15 @@ type startup_facts =
   ; presentation_generation : int
   }
 
+type local_deletion_stage = Logseq_sync_pure_reducer.Core.local_deletion_stage =
+  | Closing_graph
+  | Deleting_mirror
+  | Clearing_selection
+
+type local_deletion = Logseq_sync_pure_reducer.Core.local_deletion =
+  | Deletion_in_progress of local_deletion_stage
+  | Deletion_failed of local_deletion_stage
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -47,6 +56,7 @@ type snapshot =
   ; timeline_presentation_pending : bool
   ; startup : startup_facts
   ; last_error : string option
+  ; local_deletion : local_deletion option
   }
 
 type diagnostic_group =
@@ -54,33 +64,16 @@ type diagnostic_group =
   ; entries : (string * string) list
   }
 
-type diagnostics =
-  { groups : diagnostic_group list
-  ; history : string list
-  }
+type diagnostics = { groups : diagnostic_group list }
 
 type state =
   { snapshot : snapshot
   ; diagnostics : diagnostics
   }
 
-type token_purpose =
-  | Catalog_discovery
-  | Snapshot_bootstrap
-  | E2ee_key_access
-  | Websocket_connect
+type token_request = Worker_runner.id_token_request
 
-type token_request = Sync.token_request
-
-let token_request_id = Sync.token_request_id
-
-let token_request_purpose request =
-  match Sync.token_request_purpose request with
-  | Sync.Catalog_discovery -> Catalog_discovery
-  | Snapshot_bootstrap -> Snapshot_bootstrap
-  | E2ee_key_access -> E2ee_key_access
-  | Websocket_connect -> Websocket_connect
-;;
+let token_request_id = Worker_runner.id_token_request_id
 
 type bootstrap_progress =
   { graph_id : graph_id
@@ -128,6 +121,7 @@ let snapshot (value : Sync.snapshot) =
   ; timeline_presentation_pending = value.timeline_presentation_pending
   ; startup = startup_facts value.startup
   ; last_error = value.last_error
+  ; local_deletion = value.local_deletion
   }
 ;;
 
@@ -137,7 +131,6 @@ let diagnostics (value : Sync.diagnostics) =
         (fun (group : Sync.diagnostic_group) ->
            { title = group.title; entries = group.entries })
         value.groups
-  ; history = value.history
   }
 ;;
 
@@ -158,10 +151,10 @@ type client_command =
   | Acknowledge_local_feed
   | Acknowledge_timeline_presented
   | Provide_token of
-      { request : Sync.token_request
+      { request : token_request
       ; token : string
       }
-  | Reject_token of Sync.token_request
+  | Reject_token of token_request
   | Select_graph of Sync.graph_id
   | Return_to_graph_picker
   | Refresh_catalog
@@ -240,8 +233,6 @@ let publish context = function
          context
          ~topic:manager_topic
          (Client_state_changed (client_state state))
-     | Token_requested request ->
-       Worker.Session_context.emit context ~topic:auth_topic (Need_id_token request)
      | Bootstrap_progressed progress ->
        Worker.Session_context.emit
          context
@@ -262,7 +253,7 @@ let sync_limits config =
     ~submission_batch_size:32
 ;;
 
-let sync_dependencies dependencies context config =
+let sync_dependencies dependencies context config id_token_provider =
   let environment = Worker.Session_context.environment context in
   let clock = Eio.Stdenv.clock environment in
   Result.bind
@@ -272,6 +263,8 @@ let sync_dependencies dependencies context config =
     (fun runtime ->
        Result.bind
          (Sync_runner.transport
+            ~websocket_liveness:
+              (Sync_runner.Ping_pong { interval_seconds = 30.; timeout_seconds = 10. })
             ~tls_authenticator:dependencies.tls_authenticator
             ~network:(Eio.Stdenv.net environment)
             ~clock)
@@ -294,7 +287,8 @@ let sync_dependencies dependencies context config =
                         ~local_store
                         ~artifact_store
                         ~secrets:dependencies.secrets
-                        ~crypto:dependencies.crypto))))
+                        ~crypto:dependencies.crypto
+                        ~id_token_provider))))
 ;;
 
 let client_event = function
@@ -304,9 +298,8 @@ let client_event = function
     Pure.Sync_event (Sync.Account_authenticated { user_id })
   | Acknowledge_local_feed -> Pure.Sync_event Sync.Local_feed_acknowledged
   | Acknowledge_timeline_presented -> Pure.Sync_event Sync.Timeline_presented
-  | Provide_token { request; token } ->
-    Pure.Sync_event (Sync.Token_provided (request, token))
-  | Reject_token request -> Pure.Sync_event (Sync.Token_rejected request)
+  | Provide_token _ | Reject_token _ ->
+    invalid_arg "token commands are handled by the service"
   | Select_graph graph_id -> Pure.Sync_event (Sync.Graph_selected graph_id)
   | Return_to_graph_picker -> Pure.Sync_event Sync.Graph_picker_requested
   | Refresh_catalog -> Pure.Sync_event Sync.Catalog_refresh_requested
@@ -335,6 +328,13 @@ let worker_dependency_error_message = function
 ;;
 
 let create ~(dependencies : dependencies) =
+  let module Session = struct
+    type t =
+      { worker : Db.t
+      ; token_cache : Worker_runner.id_token_cache
+      }
+  end
+  in
   Worker.Service.create
     ~push_topic_count:5
     ~concurrency:(Worker.Service.Concurrent { max_in_flight = 2 })
@@ -342,6 +342,19 @@ let create ~(dependencies : dependencies) =
     ~init:(fun context config ->
       let sw = Worker.Session_context.switch context in
       let event_sink = ref (fun (_ : Pure.event) -> ()) in
+      let token_cache =
+        Worker_runner.id_token_cache
+          ~wall_clock_s:Unix.gettimeofday
+          ~monotonic_ns:Mtime_clock.elapsed_ns
+          ~request:(fun request ->
+            Worker.Session_context.emit context ~topic:auth_topic (Need_id_token request))
+      in
+      let id_token_provider =
+        Sync_runner.id_token_provider
+          ~acquire:(fun account -> Worker_runner.acquire_id_token token_cache ~account)
+          ~invalidate:(fun account ~token ->
+            Worker_runner.invalidate_id_token token_cache ~account ~token)
+      in
       let (Managed_sync { base_url }) = config.Db.Config.target in
       let selected =
         match sync_limits config with
@@ -350,7 +363,7 @@ let create ~(dependencies : dependencies) =
           (match Sync.config ~managed_sync_origin:(Uri.of_string base_url) ~limits with
            | Error error -> Error (error_message error)
            | Ok sync_config ->
-             (match sync_dependencies dependencies context config with
+             (match sync_dependencies dependencies context config id_token_provider with
               | Error error -> Error (sync_dependency_error_message error)
               | Ok runner_dependencies ->
                 (match
@@ -391,15 +404,27 @@ let create ~(dependencies : dependencies) =
                | Error (Db.Invalid_create message) -> Error message
                | Ok worker ->
                  event_sink := Db.post worker;
-                 Ok worker))))
-    ~handle:(fun _context worker request ->
+                 Ok Session.{ worker; token_cache }))))
+    ~handle:(fun _context session request ->
       match request with
-      | Get_graph_state -> Ok (Graph_state (Db.graph_state worker))
-      | Client_command command ->
-        Db.post worker (client_event command);
+      | Get_graph_state -> Ok (Graph_state (Db.graph_state session.worker))
+      | Client_command (Provide_token { request; token }) ->
+        Worker_runner.provide_id_token session.token_cache request token;
         Ok Client_command_completed
-      | Graph_request request -> Ok (Graph_response (Db.request worker request)))
-    ~shutdown:Db.shutdown
+      | Client_command (Reject_token request) ->
+        Worker_runner.reject_id_token session.token_cache request "host rejected request";
+        Ok Client_command_completed
+      | Client_command (Reconcile_authenticated_user { user_id }) ->
+        Worker_runner.reconcile_authenticated_user session.token_cache ~user_id;
+        Db.post session.worker (client_event (Reconcile_authenticated_user { user_id }));
+        Ok Client_command_completed
+      | Client_command command ->
+        Db.post session.worker (client_event command);
+        Ok Client_command_completed
+      | Graph_request request -> Ok (Graph_response (Db.request session.worker request)))
+    ~shutdown:(fun session ->
+      Worker_runner.shutdown_id_token_cache session.token_cache;
+      Db.shutdown session.worker)
     ()
 ;;
 

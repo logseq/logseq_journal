@@ -15,6 +15,7 @@ type typography =
   { header_title : text_token
   ; header_subtitle : text_token
   ; day_heading : text_token
+  ; date_weekday : text_token
   ; entry : text_token
   ; supporting : text_token
   ; timestamp : text_token
@@ -92,6 +93,7 @@ type row_profile =
   ; time_slot_width : float
   ; source_text_width : float
   ; text_scale : float
+  ; date_text_scale : float
   ; entry_font_size : float
   ; supporting_font_size : float
   }
@@ -144,3 +146,4 @@ val fixed_extent : profile:row_profile -> fixed_extent_role -> float
 val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option
 val destructive_swipe_action : t -> swipe_action_colors
 val status_swipe_action : t -> Journal_model.task_state -> swipe_action_colors
+val weekday_opacity : t -> current:bool -> float

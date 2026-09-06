@@ -17,42 +17,23 @@ type pending =
   | Task of Journal_graph_request.t
   | Child of Journal_graph_request.t
 
-type editor =
-  { session_id : ID.Text_input.session_id
-  ; document_revision : ID.Text_input.document_revision
-  ; accepted_local_revision : ID.Text_input.local_revision
-  ; update_mode : Ui.Text_editing.update_mode
-  ; value : Ui.Text_editing.Value.t
-  }
-
 type t =
   { root : Journal_model.t
   ; children : Journal_model.t list
-  ; editor : editor
+  ; editor : Journal_capture.Editor.t
   ; mode : mode
   ; pending : pending option
   ; child_capture : Journal_capture.t option
-  ; conflict_revision : int option
+  ; conflict_revision : string option
   }
-
-let value_for_source source =
-  let offset = Ui.Text_editing.Utf16.length source in
-  let selection =
-    Ui.Text_editing.Range.create ~text:source ~start_utf16:offset ~end_utf16:offset
-  in
-  Ui.Text_editing.Value.create ~text:source ~selection ()
-;;
 
 let create ~session_number (detail : Journal_graph_projection.detail) =
   { root = detail.root
   ; children = detail.children.blocks
   ; editor =
-      { session_id = ID.Text_input.Session_id.of_int64 session_number
-      ; document_revision = ID.Text_input.Document_revision.zero
-      ; accepted_local_revision = ID.Text_input.Local_revision.zero
-      ; update_mode = Ui.Text_editing.Force_replace
-      ; value = value_for_source (Journal_model.source detail.root)
-      }
+      Journal_capture.Editor.create
+        ~session_number
+        ~source:(Journal_model.source detail.root)
   ; mode = Reading
   ; pending = None
   ; child_capture = None
@@ -63,10 +44,10 @@ let create ~session_number (detail : Journal_graph_projection.detail) =
 let root t = t.root
 let children t = t.children
 let mode t = t.mode
-let session_id t = t.editor.session_id
-let document_revision t = t.editor.document_revision
-let accepted_local_revision t = t.editor.accepted_local_revision
-let update_mode t = t.editor.update_mode
+let session_id t = Journal_capture.Editor.session_id t.editor
+let document_revision t = Journal_capture.Editor.document_revision t.editor
+let accepted_local_revision t = Journal_capture.Editor.accepted_local_revision t.editor
+let update_mode t = Journal_capture.Editor.update_mode t.editor
 
 let editor_value t =
   match t.mode with
@@ -78,10 +59,10 @@ let editor_value t =
   | Failed _
   | Adding_child
   | Saving_child
-  | Committed -> Some t.editor.value
+  | Committed -> Some (Journal_capture.Editor.value t.editor)
 ;;
 
-let editor_source t = Ui.Text_editing.Value.text t.editor.value
+let editor_source t = Ui.Text_editing.Value.text (Journal_capture.Editor.value t.editor)
 let dirty t = not (String.equal (editor_source t) (Journal_model.source t.root))
 
 let can_save t =
@@ -97,49 +78,13 @@ let begin_edit t =
     -> t
 ;;
 
-let value_of_edit (edit : Ui.Event.Payload.text_edit) =
-  let selection =
-    Ui.Text_editing.Range.create
-      ~text:edit.text
-      ~start_utf16:edit.selection.start_utf16
-      ~end_utf16:edit.selection.end_utf16
-  in
-  let composing =
-    Option.map
-      (fun (range : Ui.Event.Payload.text_selection) ->
-         Ui.Text_editing.Range.create
-           ~text:edit.text
-           ~start_utf16:range.start_utf16
-           ~end_utf16:range.end_utf16)
-      edit.composing
-  in
-  Ui.Text_editing.Value.create ~text:edit.text ~selection ?composing ()
-;;
-
-let apply_text_edit t (edit : Ui.Event.Payload.text_edit) =
-  if
-    t.mode <> Editing
-    || (not (ID.Text_input.Session_id.equal t.editor.session_id edit.session_id))
-    || ID.Text_input.Local_revision.compare
-         edit.local_revision
-         t.editor.accepted_local_revision
-       <= 0
-    || not
-         (ID.Text_input.Document_revision.equal
-            edit.base_document_revision
-            t.editor.document_revision)
+let apply_text_edit t edit =
+  if t.mode <> Editing
   then t
-  else
-    { t with
-      editor =
-        { t.editor with
-          document_revision =
-            ID.Text_input.Document_revision.succ t.editor.document_revision
-        ; accepted_local_revision = edit.local_revision
-        ; update_mode = Ui.Text_editing.Ack
-        ; value = value_of_edit edit
-        }
-    }
+  else (
+    match Journal_capture.Editor.apply_text_edit t.editor edit with
+    | None -> t
+    | Some editor -> { t with editor })
 ;;
 
 let request_back t =
@@ -165,13 +110,7 @@ let keep_editing t =
 
 let discard_edit t =
   { t with
-    editor =
-      { t.editor with
-        document_revision =
-          ID.Text_input.Document_revision.succ t.editor.document_revision
-      ; update_mode = Ui.Text_editing.Force_replace
-      ; value = value_for_source (Journal_model.source t.root)
-      }
+    editor = Journal_capture.Editor.replace t.editor ~source:(Journal_model.source t.root)
   ; mode = Reading
   ; pending = None
   ; conflict_revision = None
@@ -274,12 +213,20 @@ let apply_child_text_edit t edit =
     { t with child_capture = Some (Journal_capture.apply_text_edit capture edit) }
 ;;
 
-let admit_child t ~mutation_id ~block_id ~sibling_order ~creation_time =
+let admit_child
+      t
+      ~mutation_id
+      ~calendar_generation
+      ~block_id
+      ~sibling_order
+      ~creation_time
+  =
   match t.mode, t.child_capture with
   | Adding_child, Some capture when Journal_capture.can_save capture ->
     let request =
       Journal_graph_request.Create_child
         { mutation_id
+        ; calendar_generation
         ; block_id
         ; parent_block_id = Journal_model.id t.root
         ; expected_parent_revision = Journal_model.revision t.root
@@ -311,12 +258,7 @@ let apply_block t block =
   let editor =
     match t.pending with
     | Some (Source _) ->
-      { t.editor with
-        document_revision =
-          ID.Text_input.Document_revision.succ t.editor.document_revision
-      ; update_mode = Ui.Text_editing.Ack
-      ; value = value_for_source (Journal_model.source block)
-      }
+      Journal_capture.Editor.replace t.editor ~source:(Journal_model.source block)
     | Some (Task _) | Some (Child _) | None -> t.editor
   in
   { t with root = block; editor; mode; pending = None; conflict_revision = None }
@@ -328,27 +270,11 @@ let reconcile_children t (detail : Journal_graph_projection.detail) =
   else t
 ;;
 
-let root_with_child t ~parent_revision =
-  Journal_model.create
-    ~id:(Journal_model.id t.root)
-    ~page_id:(Journal_model.page_id t.root)
-    ~journal_day:(Journal_model.journal_day t.root)
-    ~parent_id:(Journal_model.parent_id t.root)
-    ~sibling_order:(Journal_model.sibling_order t.root)
-    ~source:(Journal_model.source t.root)
-    ~task_state:(Journal_model.task_state t.root)
-    ~child_count:(Journal_model.child_count t.root + 1)
-    ~creation_time:(Journal_model.creation_time t.root)
-    ~revision:parent_revision
-    ~last_mutation_id:(Journal_model.last_mutation_id t.root)
-  |> Result.value ~default:t.root
-;;
-
-let apply_child_created t ~child ~parent_revision =
+let apply_child_created t ~child ~parent =
   match t.pending with
   | Some (Child _) ->
     { t with
-      root = root_with_child t ~parent_revision
+      root = parent
     ; children = t.children @ [ child ]
     ; mode = Reading
     ; pending = None

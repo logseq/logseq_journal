@@ -73,8 +73,8 @@ let test_every_exact_status_maps_to_the_decided_rail_category () =
 let test_typography_spacing_motion_and_hit_regions () =
   let typography = Tokens.typography Tokens.Balanced in
   require
-    (typography.header_title.font_size = 22.
-     && typography.header_title.line_height = 28.
+    (typography.header_title.font_size = 24.
+     && typography.header_title.line_height = 27.6
      && typography.header_title.weight = Ui.Style.Font_weight.Semi_bold)
     "header title typography changed";
   require
@@ -91,9 +91,9 @@ let test_typography_spacing_motion_and_hit_regions () =
     (fun preset ->
        let typography = Tokens.typography preset in
        require
-         (typography.day_heading.font_size = typography.header_title.font_size
-          && typography.day_heading.line_height = typography.header_title.line_height
-          && typography.day_heading.weight = Ui.Style.Font_weight.Semi_bold)
+         (typography.day_heading.font_size < typography.header_title.font_size
+          && typography.day_heading.line_height < typography.header_title.line_height
+          && typography.day_heading.weight = Ui.Style.Font_weight.Normal)
          "day heading typography changed")
     [ Tokens.Dense; Balanced; Comfortable ];
   require
@@ -130,7 +130,7 @@ let test_typography_spacing_motion_and_hit_regions () =
   require
     (row.time_slot_base = 52.
      && row.day_heading_before = 20.
-     && row.day_heading_after = 4.
+     && row.day_heading_after = 10.
      && row.entry_vertical_padding = 6.
      && row.disclosure_visual = 14.
      && row.status_rail_width = 4.
@@ -224,7 +224,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Compact
     ~block_line_height:28.6
     ~continuation_extent:54.
-    ~day_header_extent:61.
+    ~day_header_extent:62.
     ~content_leading:32.
     ~time_slot_width:52.;
   require_profile
@@ -233,7 +233,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Adaptive
     ~block_line_height:22.
     ~continuation_extent:48.
-    ~day_header_extent:52.
+    ~day_header_extent:54.
     ~content_leading:24.
     ~time_slot_width:52.;
   require_profile
@@ -242,7 +242,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Compact
     ~block_line_height:28.6
     ~continuation_extent:54.
-    ~day_header_extent:61.
+    ~day_header_extent:62.
     ~content_leading:32.
     ~time_slot_width:52.;
   require_profile
@@ -251,7 +251,7 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Adaptive
     ~block_line_height:44.
     ~continuation_extent:68.
-    ~day_header_extent:80.
+    ~day_header_extent:78.
     ~content_leading:32.
     ~time_slot_width:104.;
   require_profile
@@ -260,29 +260,29 @@ let test_known_row_profile_selection () =
     ~kind:Tokens.Adaptive
     ~block_line_height:70.4
     ~continuation_extent:92.
-    ~day_header_extent:114.
+    ~day_header_extent:107.
     ~content_leading:32.
     ~time_slot_width:167.
 ;;
 
 let test_row_profiles_cover_required_width_and_scale_matrix () =
   let cases =
-    [ 320., 1., Tokens.Adaptive, 22., 48., 52., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 61., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 44., 68., 80., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 114., 24., 167.
-    ; 390., 1., Tokens.Compact, 22., 48., 52., 32., 52.
-    ; 390., 1.3, Tokens.Compact, 28.6, 54., 61., 32., 52.
-    ; 390., 2., Tokens.Adaptive, 44., 68., 80., 32., 104.
-    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 114., 32., 167.
-    ; 744., 1., Tokens.Compact, 22., 48., 52., 32., 52.
-    ; 744., 1.3, Tokens.Compact, 28.6, 54., 61., 32., 52.
-    ; 744., 2., Tokens.Adaptive, 44., 68., 80., 32., 104.
-    ; 744., 3.2, Tokens.Adaptive, 70.4, 92., 114., 32., 167.
-    ; 1_200., 1., Tokens.Compact, 22., 48., 52., 32., 52.
-    ; 1_200., 1.3, Tokens.Compact, 28.6, 54., 61., 32., 52.
-    ; 1_200., 2., Tokens.Adaptive, 44., 68., 80., 32., 104.
-    ; 1_200., 3.2, Tokens.Adaptive, 70.4, 92., 114., 32., 167.
+    [ 320., 1., Tokens.Adaptive, 22., 48., 54., 24., 52.
+    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 62., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 44., 68., 71., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 71., 24., 167.
+    ; 390., 1., Tokens.Compact, 22., 48., 54., 32., 52.
+    ; 390., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
+    ; 390., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
+    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 81., 32., 167.
+    ; 744., 1., Tokens.Compact, 22., 48., 54., 32., 52.
+    ; 744., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
+    ; 744., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
+    ; 744., 3.2, Tokens.Adaptive, 70.4, 92., 107., 32., 167.
+    ; 1_200., 1., Tokens.Compact, 22., 48., 54., 32., 52.
+    ; 1_200., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
+    ; 1_200., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
+    ; 1_200., 3.2, Tokens.Adaptive, 70.4, 92., 107., 32., 167.
     ]
   in
   List.iter
@@ -313,7 +313,7 @@ let test_zero_viewport_and_profile_growth_remain_known_extent () =
     ~kind:Tokens.Adaptive
     ~block_line_height:22.
     ~continuation_extent:48.
-    ~day_header_extent:52.
+    ~day_header_extent:54.
     ~content_leading:24.
     ~time_slot_width:52.;
   let scales = [ 1.; 1.3; 2.; 3.2 ] in
@@ -380,7 +380,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ~block_extents:[ 44.; 56.; 78.; 100.; 122. ]
     [ Tokens.Children_loading, 44.
     ; Tokens.Children_more, 44.
-    ; Tokens.Day_heading, 52.
+    ; Tokens.Day_heading, 54.
     ; Tokens.Day_continuation, 48.
     ; Tokens.Feed_continuation, 48.
     ];
@@ -390,33 +390,24 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ~block_extents:[ 83.; 153.; 224.; 294.; 364. ]
     [ Tokens.Children_loading, 83.
     ; Tokens.Children_more, 83.
-    ; Tokens.Day_heading, 114.
+    ; Tokens.Day_heading, 71.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
     ]
 ;;
 
 let test_header_context_copy_is_pure_product_state () =
-  let today = Journal_header.Context.today ~subtitle:"Sunday, August 9" in
-  require (Journal_header.Context.is_today today) "Today context lost its state";
+  let date = Journal_calendar.present_journal_day 20260809 |> Result.get_ok in
+  let today = Journal_header.Context.today ~date:(Some date) in
+  require (Journal_header.Context.date today = Some date) "header lost its date";
   require
-    (String.equal (Journal_header.Context.title today) "Today")
-    "Today title changed";
+    (String.equal (Journal_header.Context.semantics_label today) "2026.08.09, Sunday")
+    "header date semantics changed";
   require
     (String.equal
-       (Journal_header.Context.semantics_label today)
-       "Today, Sunday, August 9")
-    "Today semantics changed";
-  let selected =
-    Journal_header.Context.selected ~title:"August 8" ~subtitle:"Saturday, 2026"
-  in
-  require (not (Journal_header.Context.is_today selected)) "selected context became Today";
-  require
-    (String.equal (Journal_header.Context.title selected) "August 8")
-    "selected title changed";
-  require
-    (String.equal (Journal_header.Context.subtitle selected) "Saturday, 2026")
-    "selected subtitle changed"
+       (Journal_header.Context.semantics_label (Journal_header.Context.today ~date:None))
+       "Date unavailable")
+    "missing calendar fabricated a date"
 ;;
 
 let tests =

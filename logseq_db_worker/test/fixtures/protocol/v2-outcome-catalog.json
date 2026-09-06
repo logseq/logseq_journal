@@ -224,6 +224,19 @@
         "generation": "generation:v1:2",
         "reason": "generationChanged"
       }
+    },
+    {
+      "apiVersion": 2,
+      "requestId": "00000000-0000-4000-8000-000000000014",
+      "outcome": {
+        "type": "admission",
+        "activeRecords": 3,
+        "activeBytes": 1536,
+        "protectedWireBytes": 512,
+        "retainedOriginEvidenceBytes": 256,
+        "maximumRecords": 4096,
+        "maximumBytes": 8388608
+      }
     }
   ],
   "pushes": [

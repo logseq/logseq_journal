@@ -37,6 +37,15 @@ type startup_facts =
   ; presentation_generation : presentation_generation
   }
 
+type local_deletion_stage =
+  | Closing_graph
+  | Deleting_mirror
+  | Clearing_selection
+
+type local_deletion =
+  | Deletion_in_progress of local_deletion_stage
+  | Deletion_failed of local_deletion_stage
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -45,6 +54,7 @@ type snapshot =
   ; timeline_presentation_pending : bool
   ; startup : startup_facts
   ; last_error : string option
+  ; local_deletion : local_deletion option
   }
 
 type diagnostic_group =
@@ -52,10 +62,7 @@ type diagnostic_group =
   ; entries : (string * string) list
   }
 
-type diagnostics =
-  { groups : diagnostic_group list
-  ; history : string list
-  }
+type diagnostics = { groups : diagnostic_group list }
 
 type state =
   { snapshot : snapshot
@@ -95,24 +102,6 @@ let config ~managed_sync_origin ~limits =
   | _ -> Error (Invalid_config "managed sync origin must be an absolute HTTPS URI")
 ;;
 
-type token_purpose =
-  | Catalog_discovery
-  | Snapshot_bootstrap
-  | E2ee_key_access
-  | Websocket_connect
-
-type token_request =
-  { request_id : string
-  ; purpose : token_purpose
-  ; account_generation : account_generation
-  ; graph_generation : graph_generation option
-  ; connection_generation : connection_generation option
-  }
-[@@warning "-69"]
-
-let token_request_id request = request.request_id
-let token_request_purpose request = request.purpose
-
 type bootstrap_progress =
   { graph_id : graph_id
   ; received_bytes : int64
@@ -133,20 +122,10 @@ type account_scope =
   ; lifecycle_generation : lifecycle_generation
   }
 
-type authenticated_account_scope =
-  { account : account_scope
-  ; token : string
-  }
-
 type graph_scope =
   { account : account_scope
   ; graph_id : graph_id
   ; graph_generation : graph_generation
-  }
-
-type authorized_graph_scope =
-  { graph : graph_scope
-  ; token : string
   }
 
 type connection_scope =
@@ -322,19 +301,19 @@ type snapshot_baseline = string
 type snapshot_metadata = string
 
 type snapshot_download =
-  { scope : authorized_graph_scope
+  { scope : graph_scope
   ; uri : Uri.t
   ; expected_bytes : int64 option
   ; maximum_bytes : int
   }
 
 type graph_key_request =
-  { scope : authorized_graph_scope
+  { scope : graph_scope
   ; encrypted_graph_key : string
   }
 
 type private_key_unlock =
-  { scope : authenticated_account_scope
+  { scope : account_scope
   ; password : string
   ; private_key_package : string
   }
@@ -346,20 +325,15 @@ type _ runner_request =
       ; cache : catalog_cache
       }
       -> unit runner_request
-  | Fetch_catalog : authenticated_account_scope -> graph list runner_request
-  | Fetch_snapshot_baseline : authorized_graph_scope -> snapshot_baseline runner_request
-  | Fetch_snapshot_metadata : authorized_graph_scope -> snapshot_metadata runner_request
+  | Fetch_catalog : account_scope -> graph list runner_request
+  | Fetch_snapshot_baseline : graph_scope -> snapshot_baseline runner_request
+  | Fetch_snapshot_metadata : graph_scope -> snapshot_metadata runner_request
   | Download_snapshot : snapshot_download -> staged_artifact runner_request
-  | Fetch_e2ee_graph_key : authorized_graph_scope -> string runner_request
-  | Fetch_e2ee_user_keys : authenticated_account_scope -> string runner_request
+  | Fetch_e2ee_graph_key : graph_scope -> string runner_request
+  | Fetch_e2ee_user_keys : account_scope -> string runner_request
   | Load_and_unlock_graph_key : graph_scope -> graph_key_handle runner_request
   | Fetch_and_unlock_graph_key : graph_key_request -> graph_key_handle runner_request
   | Unlock_private_key : private_key_unlock -> unit runner_request
-  | Delete_wrapped_graph_key :
-      { account : account_scope
-      ; graph_id : graph_id
-      }
-      -> unit runner_request
   | Delete_account_secrets : account_scope -> unit runner_request
   | Encrypt_protected_values : encryption_batch -> encrypted_values runner_request
   | Decrypt_protected_values : decryption_batch -> decrypted_values runner_request
@@ -376,7 +350,6 @@ type _ request_kind =
   | Load_and_unlock_graph_key_kind : graph_key_handle request_kind
   | Fetch_and_unlock_graph_key_kind : graph_key_handle request_kind
   | Unlock_private_key_kind : unit request_kind
-  | Delete_wrapped_graph_key_kind : unit request_kind
   | Delete_account_secrets_kind : unit request_kind
   | Encrypt_protected_values_kind : encrypted_values request_kind
   | Decrypt_protected_values_kind : decrypted_values request_kind
@@ -394,7 +367,6 @@ let effect_id_to_string = string_of_int
 type websocket_request =
   { scope : connection_scope
   ; uri : Uri.t
-  ; token : string
   }
 
 type websocket_send =
@@ -423,16 +395,15 @@ type runner_completion =
 
 let scope_of_request : type a. a runner_request -> effect_scope = function
   | Load_catalog account | Save_catalog { account; _ } -> effect_scope_of_account account
-  | Fetch_catalog value -> effect_scope_of_account value.account
+  | Fetch_catalog value -> effect_scope_of_account value
   | Fetch_snapshot_baseline value | Fetch_snapshot_metadata value ->
-    effect_scope_of_graph value.graph
-  | Download_snapshot value -> effect_scope_of_graph value.scope.graph
-  | Fetch_e2ee_graph_key value -> effect_scope_of_graph value.graph
-  | Fetch_e2ee_user_keys value -> effect_scope_of_account value.account
+    effect_scope_of_graph value
+  | Download_snapshot value -> effect_scope_of_graph value.scope
+  | Fetch_e2ee_graph_key value -> effect_scope_of_graph value
+  | Fetch_e2ee_user_keys value -> effect_scope_of_account value
   | Load_and_unlock_graph_key value -> effect_scope_of_graph value
-  | Fetch_and_unlock_graph_key value -> effect_scope_of_graph value.scope.graph
-  | Unlock_private_key value -> effect_scope_of_account value.scope.account
-  | Delete_wrapped_graph_key value -> effect_scope_of_account value.account
+  | Fetch_and_unlock_graph_key value -> effect_scope_of_graph value.scope
+  | Unlock_private_key value -> effect_scope_of_account value.scope
   | Delete_account_secrets value -> effect_scope_of_account value
   | Encrypt_protected_values value -> effect_scope_of_graph value.scope
   | Decrypt_protected_values value -> effect_scope_of_graph value.scope
@@ -486,6 +457,11 @@ type outbox_transition_request =
   ; transition : Overlay.outbox_transition
   }
 
+type outbox_transition_failure =
+  { request : outbox_transition_request
+  ; message : string
+  }
+
 type authoritative_batch =
   { input : Overlay.authoritative_batch
   ; key : graph_key_handle option
@@ -507,7 +483,6 @@ type worker_effect =
 
 type output =
   | State_changed of state
-  | Token_requested of token_request
   | Bootstrap_progressed of bootstrap_progress
 
 type instruction =
@@ -558,8 +533,6 @@ type event =
   | Local_feed_acknowledged
   | Local_outbox_changed
   | Timeline_presented
-  | Token_provided of token_request * string
-  | Token_rejected of token_request
   | Graph_selected of graph_id
   | Graph_picker_requested
   | Catalog_refresh_requested
@@ -570,11 +543,14 @@ type event =
       { foreground : bool
       ; lifecycle_generation : lifecycle_generation
       }
+  | Graph_detached of graph_scope * (unit, string) result
+  | Mirror_deleted of mirror_deletion * (unit, string) result
   | Mirror_inspected of mirror_inspection
   | Graph_attached of graph_attachment
   | Graph_attachment_failed of scoped_error
   | Sync_inspected of sync_inspection
   | Outbox_transition_applied of outbox_transition_result
+  | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
   | Authoritative_batch_failed of scoped_error
@@ -596,6 +572,7 @@ type submission_owner =
   ; mutation_ids : graph_id list
   ; connection : connection_scope
   ; accepted_through : int option
+  ; response_timer : timer_id option
   }
 
 type t =
@@ -604,9 +581,12 @@ type t =
   ; user_id : string option
   ; lifecycle_generation : lifecycle_generation
   ; next_effect_id : int
-  ; pending_token : token_request option
   ; pending_effects : pending_effect list
+  ; catalog_cache_loading : bool
+  ; deferred_catalog_reconciliation : bool
+  ; cached_selected_graph : graph_id option
   ; selected_graph_value : graph option
+  ; deletion_scope : graph_scope option
   ; current_graph_scope : graph_scope option
   ; connection_generation : connection_generation
   ; graph_key : graph_key_handle option
@@ -615,7 +595,7 @@ type t =
   ; pending_attachment : mirror_request option
   ; pending_encrypted_graph_key : string option
   ; pending_private_key_package : string option
-  ; snapshot_authorization : authorized_graph_scope option
+  ; snapshot_scope : graph_scope option
   ; snapshot_server_t : int option
   ; active_snapshot_download : graph_scope option
   ; sync_view : Overlay.sync_view option
@@ -647,7 +627,8 @@ let initial_startup =
 
 let initial config =
   let snapshot =
-    { sync_phase = Offline
+    { local_deletion = None
+    ; sync_phase = Offline
     ; catalog = []
     ; selected_graph = None
     ; applied_server_t = None
@@ -658,13 +639,16 @@ let initial config =
   in
   Ok
     { config
-    ; public_state = { snapshot; diagnostics = { groups = []; history = [] } }
+    ; public_state = { snapshot; diagnostics = { groups = [] } }
     ; user_id = None
     ; lifecycle_generation = 0L
     ; next_effect_id = 1
-    ; pending_token = None
     ; pending_effects = []
+    ; catalog_cache_loading = false
+    ; deferred_catalog_reconciliation = false
+    ; cached_selected_graph = None
     ; selected_graph_value = None
+    ; deletion_scope = None
     ; current_graph_scope = None
     ; connection_generation = 0
     ; graph_key = None
@@ -673,7 +657,7 @@ let initial config =
     ; pending_attachment = None
     ; pending_encrypted_graph_key = None
     ; pending_private_key_package = None
-    ; snapshot_authorization = None
+    ; snapshot_scope = None
     ; snapshot_server_t = None
     ; active_snapshot_download = None
     ; sync_view = None
@@ -703,117 +687,6 @@ let set_snapshot core snapshot =
   { core with public_state = { core.public_state with snapshot } }
 ;;
 
-let rejection_reason_diagnostic = function
-  | Sync_protocol.Stale -> "stale"
-  | Db_transact_failed -> "db-transact-failed"
-  | Empty_tx_data -> "empty-tx-data"
-  | Invalid_tx -> "invalid-tx"
-  | Invalid_t_before -> "invalid-t-before"
-  | Snapshot_upload_in_progress -> "snapshot-upload-in-progress"
-;;
-
-let append_diagnostic_history core entry =
-  let rec take count reversed = function
-    | _ when count = 0 -> List.rev reversed
-    | [] -> List.rev reversed
-    | value :: rest -> take (count - 1) (value :: reversed) rest
-  in
-  let diagnostics = core.public_state.diagnostics in
-  let diagnostics =
-    { diagnostics with history = take 32 [] (entry :: diagnostics.history) }
-  in
-  { core with public_state = { core.public_state with diagnostics } }
-;;
-
-let safe_rejection_detail_keywords = function
-  | None -> []
-  | Some detail ->
-    let normalized =
-      detail
-      |> String.lowercase_ascii
-      |> String.map (function
-        | ('a' .. 'z' | '-') as character -> character
-        | _ -> ' ')
-    in
-    let allowed =
-      [ "add"
-      ; "a"
-      ; "as"
-      ; "be"
-      ; "block"
-      ; "already"
-      ; "assert"
-      ; "attribute"
-      ; "cannot"
-      ; "cardinality"
-      ; "cas"
-      ; "component"
-      ; "conflict"
-      ; "constraint"
-      ; "datom"
-      ; "data"
-      ; "decrypt"
-      ; "encrypted"
-      ; "entity"
-      ; "exists"
-      ; "expected"
-      ; "failed"
-      ; "found"
-      ; "fractional"
-      ; "got"
-      ; "instant"
-      ; "integer"
-      ; "index"
-      ; "invalid"
-      ; "is"
-      ; "key"
-      ; "keyword"
-      ; "lookup"
-      ; "map"
-      ; "missing"
-      ; "must"
-      ; "nil"
-      ; "normal-block"
-      ; "order"
-      ; "page"
-      ; "parent"
-      ; "ref"
-      ; "reference"
-      ; "required"
-      ; "retract"
-      ; "schema"
-      ; "should"
-      ; "string"
-      ; "store"
-      ; "tempid"
-      ; "transact"
-      ; "transaction"
-      ; "to"
-      ; "tx"
-      ; "type"
-      ; "unique"
-      ; "unknown"
-      ; "unsupported"
-      ; "uuid"
-      ; "value"
-      ; "valid"
-      ; "vector"
-      ; "write"
-      ]
-    in
-    let rec take count reversed = function
-      | _ when count = 0 -> List.rev reversed
-      | [] -> List.rev reversed
-      | word :: rest -> take (count - 1) (word :: reversed) rest
-    in
-    normalized
-    |> String.split_on_char ' '
-    |> List.filter (fun word -> List.mem word allowed)
-    |> List.rev
-    |> take 64 []
-    |> List.rev
-;;
-
 let fail core stage message =
   let startup = { core.public_state.snapshot.startup with failure = Some stage } in
   let snapshot =
@@ -825,13 +698,12 @@ let fail core stage message =
   in
   let core =
     { core with
-      pending_token = None
-    ; pending_effects = []
+      pending_effects = []
     ; pending_mirror_inspection = None
     ; pending_attachment = None
     ; pending_encrypted_graph_key = None
     ; pending_private_key_package = None
-    ; snapshot_authorization = None
+    ; snapshot_scope = None
     ; snapshot_server_t = None
     ; active_snapshot_download = None
     ; pending_sync_inspection = None
@@ -846,7 +718,6 @@ let fail core stage message =
 ;;
 
 let cleanup_failed core message =
-  let core = append_diagnostic_history core message in
   let next =
     set_snapshot core { core.public_state.snapshot with last_error = Some message }
   in
@@ -881,7 +752,6 @@ let request_kind : type a. a runner_request -> a request_kind = function
   | Load_and_unlock_graph_key _ -> Load_and_unlock_graph_key_kind
   | Fetch_and_unlock_graph_key _ -> Fetch_and_unlock_graph_key_kind
   | Unlock_private_key _ -> Unlock_private_key_kind
-  | Delete_wrapped_graph_key _ -> Delete_wrapped_graph_key_kind
   | Delete_account_secrets _ -> Delete_account_secrets_kind
   | Encrypt_protected_values _ -> Encrypt_protected_values_kind
   | Decrypt_protected_values _ -> Decrypt_protected_values_kind
@@ -902,38 +772,48 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
   , Request (ticket, request) )
 ;;
 
-let issue_token core purpose =
+let begin_snapshot_bootstrap core scope =
+  let core = { core with snapshot_scope = Some scope; snapshot_server_t = None } in
+  let next, request = issue_request core (Fetch_snapshot_baseline scope) in
+  { next; effects = [ Run request ] }
+;;
+
+let begin_e2ee_key_access core scope =
   let core =
-    match purpose with
-    | Websocket_connect ->
-      { core with
-        connection_generation = core.connection_generation + 1
-      ; websocket_live = false
-      ; pending_sync_inspection = None
-      ; pending_outbox_transition = None
-      ; submission_owner = None
-      ; active_authoritative_batch = None
-      ; queued_authoritative_batch = None
-      ; deferred_authoritative_owner = None
-      }
-    | Catalog_discovery | Snapshot_bootstrap | E2ee_key_access -> core
-  in
-  let request =
-    { request_id = Printf.sprintf "token-%d" core.next_effect_id
-    ; purpose
-    ; account_generation = core.public_state.snapshot.startup.account_generation
-    ; graph_generation =
-        Option.map
-          (fun (scope : graph_scope) -> scope.graph_generation)
-          core.current_graph_scope
-    ; connection_generation =
-        (match purpose with
-         | Websocket_connect -> Some core.connection_generation
-         | _ -> None)
+    { core with
+      snapshot_scope = Some scope
+    ; snapshot_server_t = None
+    ; pending_encrypted_graph_key = None
+    ; pending_private_key_package = None
     }
   in
-  ( { core with pending_token = Some request; next_effect_id = core.next_effect_id + 1 }
-  , Publish (Token_requested request) )
+  let next, request = issue_request core (Fetch_e2ee_graph_key scope) in
+  { next; effects = [ Run request ] }
+;;
+
+let start_websocket core graph =
+  let core =
+    { core with
+      connection_generation = core.connection_generation + 1
+    ; websocket_live = false
+    ; submission_owner = None
+    ; active_authoritative_batch = None
+    ; queued_authoritative_batch = None
+    ; deferred_authoritative_owner = None
+    }
+  in
+  let scope = { graph; connection_generation = core.connection_generation } in
+  let uri =
+    Uri.with_scheme core.config.managed_sync_origin (Some "wss")
+    |> fun uri ->
+    Uri.with_path
+      uri
+      ("/sync/" ^ Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
+  in
+  let next =
+    set_snapshot core { core.public_state.snapshot with sync_phase = Connecting }
+  in
+  { next; effects = [ publish next; Run (Start_websocket { scope; uri }) ] }
 ;;
 
 let server_cursor value =
@@ -986,7 +866,7 @@ let save_cache core =
       catalog_cache
         ~user_id
         ~graphs:core.public_state.snapshot.catalog
-        ~selected_graph:core.public_state.snapshot.selected_graph
+        ~selected_graph:core.cached_selected_graph
     in
     let next, request =
       issue_request core (Save_catalog { account = account_scope core user_id; cache })
@@ -994,7 +874,7 @@ let save_cache core =
     next, [ Run request ]
 ;;
 
-let authenticate core user_id =
+let authenticate_new_account core user_id =
   let startup =
     { initial_startup with
       authenticated = true
@@ -1017,8 +897,10 @@ let authenticate core user_id =
     set_snapshot
       { core with
         user_id = Some user_id
-      ; pending_token = None
       ; pending_effects = []
+      ; catalog_cache_loading = false
+      ; deferred_catalog_reconciliation = false
+      ; cached_selected_graph = None
       ; current_graph_scope = None
       ; graph_key = None
       ; pending_graph_open = None
@@ -1026,7 +908,7 @@ let authenticate core user_id =
       ; pending_attachment = None
       ; pending_encrypted_graph_key = None
       ; pending_private_key_package = None
-      ; snapshot_authorization = None
+      ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
       ; sync_view = None
@@ -1040,8 +922,47 @@ let authenticate core user_id =
       }
       snapshot
   in
-  let next, token = issue_token core Catalog_discovery in
-  { next; effects = [ publish next; token ] }
+  let next, request = issue_request core (Fetch_catalog (account_scope core user_id)) in
+  { next; effects = [ publish next; Run request ] }
+;;
+
+let clear_reconciliation_failure (snapshot : snapshot) =
+  match snapshot.startup.failure with
+  | Some During_local_restore -> snapshot
+  | None | Some _ ->
+    { snapshot with
+      startup = { snapshot.startup with failure = None }
+    ; last_error = None
+    }
+;;
+
+let request_catalog_reconciliation core =
+  let snapshot = clear_reconciliation_failure core.public_state.snapshot in
+  let startup = { snapshot.startup with authenticated = true; catalog_loading = true } in
+  let core =
+    set_snapshot
+      { core with deferred_catalog_reconciliation = false }
+      { snapshot with startup }
+  in
+  match core.user_id with
+  | None -> unchanged core
+  | Some user_id ->
+    let next, request = issue_request core (Fetch_catalog (account_scope core user_id)) in
+    { next; effects = [ publish next; Run request ] }
+;;
+
+let authenticate core user_id =
+  match core.user_id with
+  | Some current_user_id when String.equal current_user_id user_id ->
+    let snapshot = clear_reconciliation_failure core.public_state.snapshot in
+    let startup = { snapshot.startup with authenticated = true } in
+    let core = set_snapshot core { snapshot with startup } in
+    if core.catalog_cache_loading
+    then (
+      let next = { core with deferred_catalog_reconciliation = true } in
+      { next; effects = [ publish next ] })
+    else request_catalog_reconciliation core
+  | None | Some _ -> authenticate_new_account core user_id
 ;;
 
 let restore_local core user_id =
@@ -1055,8 +976,10 @@ let restore_local core user_id =
     set_snapshot
       { core with
         user_id = Some user_id
-      ; pending_token = None
       ; pending_effects = []
+      ; catalog_cache_loading = true
+      ; deferred_catalog_reconciliation = false
+      ; cached_selected_graph = None
       ; selected_graph_value = None
       ; current_graph_scope = None
       ; graph_key = None
@@ -1065,7 +988,7 @@ let restore_local core user_id =
       ; pending_attachment = None
       ; pending_encrypted_graph_key = None
       ; pending_private_key_package = None
-      ; snapshot_authorization = None
+      ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
       ; sync_view = None
@@ -1106,8 +1029,10 @@ let sign_out core =
     set_snapshot
       { core with
         user_id = None
-      ; pending_token = None
       ; pending_effects = []
+      ; catalog_cache_loading = false
+      ; deferred_catalog_reconciliation = false
+      ; cached_selected_graph = None
       ; current_graph_scope = None
       ; graph_key = None
       ; pending_graph_open = None
@@ -1115,7 +1040,7 @@ let sign_out core =
       ; pending_attachment = None
       ; pending_encrypted_graph_key = None
       ; pending_private_key_package = None
-      ; snapshot_authorization = None
+      ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
       ; sync_view = None
@@ -1143,67 +1068,15 @@ let sign_out core =
     }
 ;;
 
-let provide_token core request token =
-  if core.pending_token <> Some request || String.length token = 0
-  then unchanged core
-  else (
-    let core = { core with pending_token = None } in
-    match request.purpose, core.user_id, core.current_graph_scope with
-    | Catalog_discovery, Some user_id, _ ->
-      let next, request_effect =
-        issue_request core (Fetch_catalog { account = account_scope core user_id; token })
-      in
-      { next; effects = [ Run request_effect ] }
-    | Snapshot_bootstrap, _, Some graph ->
-      let authorization = { graph; token } in
-      let core =
-        { core with
-          snapshot_authorization = Some authorization
-        ; snapshot_server_t = None
-        }
-      in
-      let next, request_effect =
-        issue_request core (Fetch_snapshot_baseline authorization)
-      in
-      { next; effects = [ Run request_effect ] }
-    | E2ee_key_access, _, Some graph ->
-      let authorization = { graph; token } in
-      let core =
-        { core with
-          snapshot_authorization = Some authorization
-        ; snapshot_server_t = None
-        ; pending_encrypted_graph_key = None
-        ; pending_private_key_package = None
-        }
-      in
-      let next, request_effect =
-        issue_request core (Fetch_e2ee_graph_key authorization)
-      in
-      { next; effects = [ Run request_effect ] }
-    | Websocket_connect, _, Some graph ->
-      let scope = { graph; connection_generation = core.connection_generation } in
-      let uri =
-        Uri.with_scheme core.config.managed_sync_origin (Some "wss")
-        |> fun uri ->
-        Uri.with_path
-          uri
-          ("/sync/" ^ Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
-      in
-      let next =
-        set_snapshot core { core.public_state.snapshot with sync_phase = Connecting }
-      in
-      { next; effects = [ publish next; Run (Start_websocket { scope; uri; token }) ] }
-    | _, _, _ -> unchanged core)
+let graph_in_catalog graphs graph_id =
+  List.find_opt
+    (fun (graph : graph) ->
+       Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id)
+    graphs
 ;;
 
-let select_graph core graph_id =
-  match
-    ( core.user_id
-    , List.find_opt
-        (fun (graph : graph) ->
-           Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id)
-        core.public_state.snapshot.catalog )
-  with
+let select_graph_transition core ~persist graph_id =
+  match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
   | Some user_id, Some graph ->
     let graph_generation = core.public_state.snapshot.startup.graph_generation + 1 in
     let startup =
@@ -1225,7 +1098,8 @@ let select_graph core graph_id =
     let core =
       set_snapshot
         { core with
-          selected_graph_value = Some graph
+          cached_selected_graph = Some graph_id
+        ; selected_graph_value = Some graph
         ; current_graph_scope = Some scope
         ; graph_key = None
         ; pending_graph_open = None
@@ -1233,7 +1107,7 @@ let select_graph core graph_id =
         ; pending_attachment = None
         ; pending_encrypted_graph_key = None
         ; pending_private_key_package = None
-        ; snapshot_authorization = None
+        ; snapshot_scope = None
         ; snapshot_server_t = None
         ; active_snapshot_download = None
         ; sync_view = None
@@ -1246,10 +1120,12 @@ let select_graph core graph_id =
         }
         snapshot
     in
-    let next, cache = save_cache core in
+    let next, cache = if persist then save_cache core else core, [] in
     { next; effects = Delegate (Inspect_mirror mirror_request) :: publish next :: cache }
   | _ -> unchanged core
 ;;
+
+let select_graph core graph_id = select_graph_transition core ~persist:true graph_id
 
 let mirror_inspected core = function
   | Mirror_available request
@@ -1292,8 +1168,8 @@ let mirror_inspected core = function
        let next, request = issue_request core (Load_and_unlock_graph_key scope) in
        { next; effects = [ publish next; Run request ] }
      | Some _ | None ->
-       let next, token = issue_token core Snapshot_bootstrap in
-       { next; effects = [ publish next; token ] })
+       let requested = begin_snapshot_bootstrap core scope in
+       { requested with effects = publish requested.next :: requested.effects })
   | _ -> unchanged core
 ;;
 
@@ -1326,8 +1202,7 @@ let graph_attached core (attachment : graph_attachment) =
       }
     in
     let core = set_snapshot { core with sync_view = Some attachment.sync } snapshot in
-    let next, token = issue_token core Websocket_connect in
-    { next; effects = [ publish next; token ] })
+    start_websocket core attachment.scope)
 ;;
 
 let operation_name = function
@@ -1357,35 +1232,49 @@ let submission_message batch =
     }
 ;;
 
+let phase_transition core sync_phase =
+  if core.public_state.snapshot.sync_phase = sync_phase
+  then unchanged core
+  else (
+    let next = set_snapshot core { core.public_state.snapshot with sync_phase } in
+    { next; effects = [ publish next ] })
+;;
+
 let plan_submission core =
-  match
-    ( core.sync_view
-    , core.current_graph_scope
-    , core.submission_owner
-    , core.pending_outbox_transition
-    , core.websocket_live )
-  with
-  | Some sync, Some scope, None, None, true ->
-    let rec take n acc = function
-      | [] -> List.rev acc
-      | _ when n = 0 -> List.rev acc
-      | x :: xs -> take (n - 1) (x :: acc) xs
+  match core.sync_view, core.current_graph_scope, core.websocket_live with
+  | Some sync, Some scope, true ->
+    let descriptors = Overlay.sync_view_submissions sync in
+    let recovering =
+      List.find_map
+        (fun (item : Overlay.submission_descriptor) ->
+           match item.state with
+           | Overlay.Submitted batch_id
+             when Option.fold
+                    ~none:true
+                    ~some:(Overlay.Submission_batch_id.equal batch_id)
+                    core.deferred_authoritative_owner -> Some batch_id
+           | Queued
+           | Submitted _
+           | Accepted_pending_authoritative _
+           | Delete_barrier_rejected_pending_authoritative _
+           | Blocked -> None)
+        descriptors
     in
-    let ids =
-      Overlay.sync_view_submissions sync
-      |> List.filter (fun (item : Overlay.submission_descriptor) ->
-        item.state = Overlay.Queued && item.dependency_eligible)
-      |> List.map (fun (item : Overlay.submission_descriptor) -> item.mutation_id)
-      |> take core.config.limits.submission_batch_size []
+    let barrier_pending =
+      List.exists
+        (fun (item : Overlay.submission_descriptor) ->
+           match item.state with
+           | Overlay.Accepted_pending_authoritative _
+           | Delete_barrier_rejected_pending_authoritative _ -> true
+           | Queued | Submitted _ | Blocked -> false)
+        descriptors
     in
-    if ids = []
-    then unchanged core
-    else (
+    let request transition =
       let request =
         { expected = Overlay.sync_view_token sync
         ; key = core.graph_key
         ; scope
-        ; transition = Overlay.Submit_group ids
+        ; transition
         }
       in
       let next =
@@ -1393,7 +1282,40 @@ let plan_submission core =
           { core with pending_outbox_transition = Some request }
           { core.public_state.snapshot with sync_phase = Submitting }
       in
-      { next; effects = [ publish next; Delegate (Apply_outbox_transition request) ] })
+      { next; effects = [ publish next; Delegate (Apply_outbox_transition request) ] }
+    in
+    (match core.pending_outbox_transition, core.submission_owner with
+     | Some _, _ -> unchanged core
+     | None, Some owner ->
+       phase_transition
+         core
+         (if Option.is_some owner.accepted_through then Pulling else Submitting)
+     | None, None ->
+       if
+         Option.is_some core.active_authoritative_batch
+         && Option.is_none core.deferred_authoritative_owner
+       then phase_transition core Pulling
+       else (
+         match recovering with
+         | Some batch_id -> request (Overlay.Retry_group batch_id)
+         | None when barrier_pending || Option.is_some core.active_authoritative_batch ->
+           phase_transition core Pulling
+         | None ->
+           let rec take n acc = function
+             | [] -> List.rev acc
+             | _ when n = 0 -> List.rev acc
+             | x :: xs -> take (n - 1) (x :: acc) xs
+           in
+           let ids =
+             descriptors
+             |> List.filter (fun (item : Overlay.submission_descriptor) ->
+               item.state = Overlay.Queued && item.dependency_eligible)
+             |> List.map (fun (item : Overlay.submission_descriptor) -> item.mutation_id)
+             |> take core.config.limits.submission_batch_size []
+           in
+           if ids = []
+           then phase_transition core Current
+           else request (Overlay.Submit_group ids)))
   | _ -> unchanged core
 ;;
 
@@ -1411,7 +1333,7 @@ let outbox_transition_applied core (result : outbox_transition_result) =
   else (
     let transition_batch_id =
       match result.commit.transition with
-      | Overlay.Retry_group batch_id -> Some batch_id
+      | Overlay.Retry_group _ -> None
       | Accept_group { batch_id; _ } | Reject_group { batch_id; _ } -> Some batch_id
       | Submit_group _ -> None
     in
@@ -1422,7 +1344,7 @@ let outbox_transition_applied core (result : outbox_transition_result) =
     in
     let submission_owner =
       match result.commit.transition, core.submission_owner with
-      | Overlay.Reject_group { batch_id; _ }, Some owner
+      | (Overlay.Reject_group { batch_id; _ } | Accept_group { batch_id; _ }), Some owner
         when Overlay.Submission_batch_id.equal batch_id owner.batch_id -> None
       | (Submit_group _ | Retry_group _ | Accept_group _ | Reject_group _), owner -> owner
     in
@@ -1441,6 +1363,7 @@ let outbox_transition_applied core (result : outbox_transition_result) =
       | false, _ | true, None -> []
     in
     match result.commit.submission_batch, core.current_graph_scope with
+    | Some _, Some _ when not core.websocket_live -> unchanged core
     | Some batch, Some graph ->
       let connection = { graph; connection_generation = core.connection_generation } in
       let mutation_ids =
@@ -1449,12 +1372,14 @@ let outbox_transition_applied core (result : outbox_transition_result) =
       in
       let next =
         { core with
-          submission_owner =
+          next_effect_id = core.next_effect_id + 1
+        ; submission_owner =
             Some
               { batch_id = Overlay.submission_batch_id batch
               ; mutation_ids
               ; connection
               ; accepted_through = None
+              ; response_timer = Some core.next_effect_id
               }
         }
       in
@@ -1463,6 +1388,12 @@ let outbox_transition_applied core (result : outbox_transition_result) =
           resume_effects
           @ [ Run
                 (Send_websocket { scope = connection; message = submission_message batch })
+            ; Run
+                (Schedule_timer
+                   { id = core.next_effect_id
+                   ; scope = effect_scope_of_connection connection
+                   ; delay_seconds = 30.
+                   })
             ]
       }
     | _ ->
@@ -1470,10 +1401,14 @@ let outbox_transition_applied core (result : outbox_transition_result) =
         set_snapshot core { core.public_state.snapshot with sync_phase = Current }
       in
       if resume_effects <> []
-      then { next; effects = resume_effects }
+      then (
+        let next =
+          set_snapshot next { next.public_state.snapshot with sync_phase = Pulling }
+        in
+        { next; effects = resume_effects })
       else (
         match result.commit.transition with
-        | Overlay.Accept_group _ ->
+        | Overlay.Accept_group _ | Reject_group _ ->
           let next =
             set_snapshot next { next.public_state.snapshot with sync_phase = Pulling }
           in
@@ -1494,7 +1429,7 @@ let outbox_transition_applied core (result : outbox_transition_result) =
             | None, _, _ | _, None, _ | _, _, false -> []
           in
           { next; effects = publish next :: pull }
-        | Submit_group _ | Retry_group _ | Reject_group _ ->
+        | Submit_group _ | Retry_group _ ->
           let planned = plan_submission next in
           { next = planned.next; effects = publish next :: planned.effects }))
 ;;
@@ -1590,7 +1525,8 @@ let apply_accept core owner t checksum_value =
        { next =
            { core with
              pending_outbox_transition = Some request
-           ; submission_owner = Some { owner with accepted_through = Some t }
+           ; submission_owner =
+               Some { owner with accepted_through = Some t; response_timer = None }
            }
        ; effects = [ Delegate (Apply_outbox_transition request) ]
        })
@@ -1643,29 +1579,6 @@ let apply_rejection core owner rejection =
       | Db_transact_failed | Snapshot_upload_in_progress -> Overlay.Operational_failure
       | Stale -> Overlay.Operational_failure
     in
-    let disposition =
-      match rejection.Sync_protocol.reason, reason with
-      | Stale, _ -> "stale"
-      | _, Overlay.Invalid_request -> "invalid-request"
-      | _, Missing_dependencies -> "missing-dependencies"
-      | _, Operational_failure -> "operational-failure"
-      | _, Permission_denied -> "permission-denied"
-    in
-    let core =
-      let detail = safe_rejection_detail_keywords rejection.error_detail in
-      let detail =
-        match detail with
-        | [] -> ""
-        | keywords -> ":detail-" ^ String.concat "-" keywords
-      in
-      append_diagnostic_history
-        core
-        ("tx-reject:"
-         ^ rejection_reason_diagnostic rejection.Sync_protocol.reason
-         ^ ":"
-         ^ disposition
-         ^ detail)
-    in
     let resolution =
       match rejection.Sync_protocol.reason, rejection.t with
       | Sync_protocol.Stale, Some through ->
@@ -1698,7 +1611,11 @@ let apply_rejection core owner rejection =
          ; transition = Overlay.Reject_group { batch_id = owner.batch_id; resolution }
          }
        in
-       { next = { core with pending_outbox_transition = Some request }
+       { next =
+           { core with
+             pending_outbox_transition = Some request
+           ; submission_owner = Some { owner with response_timer = None }
+           }
        ; effects = [ Delegate (Apply_outbox_transition request) ]
        })
 ;;
@@ -1828,7 +1745,21 @@ let authoritative_deferred core (result : authoritative_deferred_result) =
     match core.submission_owner with
     | Some owner when Overlay.Submission_batch_id.equal owner.batch_id batch_id ->
       unchanged { core with deferred_authoritative_owner = Some batch_id }
-    | None | Some _ -> fail core During_catalog "authoritative defer owner mismatch")
+    | None ->
+      let durable =
+        Option.fold
+          ~none:false
+          ~some:(fun sync ->
+            List.exists
+              (fun (item : Overlay.submission_descriptor) ->
+                 item.state = Overlay.Submitted batch_id)
+              (Overlay.sync_view_submissions sync))
+          core.sync_view
+      in
+      if durable || Option.is_some core.pending_outbox_transition
+      then plan_submission { core with deferred_authoritative_owner = Some batch_id }
+      else fail core During_catalog "authoritative defer owner mismatch"
+    | Some _ -> fail core During_catalog "authoritative defer owner mismatch")
 ;;
 
 let consume_ticket : type a. t -> a effect_ticket -> t option =
@@ -1857,65 +1788,215 @@ let graph_key_loaded core key =
        }
      | None ->
        let core = { core with graph_key = Some key } in
-       let next, token = issue_token core Snapshot_bootstrap in
-       { next; effects = [ token ] }
+       begin_snapshot_bootstrap core scope
      | Some _ -> unchanged core)
   | None | Some _ ->
     fail core During_e2ee "graph key handle is outside the selected graph scope"
 ;;
 
-let complete_runner : type a. t -> a effect_ticket -> a -> transition =
-  fun core ticket value ->
-  match ticket.kind with
-  | Load_catalog_kind ->
-    let catalog, selected_graph =
-      match value with
-      | None -> [], None
-      | Some cache -> cache.cache_graphs, cache.cache_selected_graph
-    in
-    let startup =
-      { core.public_state.snapshot.startup with
-        restoring_local = false
-      ; awaiting_selection = true
+let clear_selected_graph_for_catalog core catalog =
+  let previous_scope = core.current_graph_scope in
+  let startup =
+    { core.public_state.snapshot.startup with
+      catalog_loading = false
+    ; awaiting_selection = true
+    ; restoring_local = false
+    ; bootstrapping = false
+    ; awaiting_e2ee_password = false
+    ; failure = None
+    ; graph_generation = core.public_state.snapshot.startup.graph_generation + 1
+    }
+  in
+  let snapshot =
+    { local_deletion = None
+    ; sync_phase = Offline
+    ; catalog
+    ; selected_graph = None
+    ; applied_server_t = None
+    ; timeline_presentation_pending = false
+    ; startup
+    ; last_error = None
+    }
+  in
+  let next =
+    set_snapshot
+      { core with
+        pending_effects = []
+      ; cached_selected_graph = None
+      ; selected_graph_value = None
+      ; current_graph_scope = None
+      ; graph_key = None
+      ; pending_graph_open = None
+      ; pending_mirror_inspection = None
+      ; pending_attachment = None
+      ; pending_encrypted_graph_key = None
+      ; pending_private_key_package = None
+      ; snapshot_scope = None
+      ; snapshot_server_t = None
+      ; active_snapshot_download = None
+      ; sync_view = None
+      ; pending_sync_inspection = None
+      ; pending_outbox_transition = None
+      ; submission_owner = None
+      ; active_authoritative_batch = None
+      ; queued_authoritative_batch = None
+      ; deferred_authoritative_owner = None
+      ; websocket_live = false
       }
+      snapshot
+  in
+  let teardown =
+    Option.fold
+      ~none:[]
+      ~some:(fun scope ->
+        [ Run (Cancel_effects (effect_scope_of_graph scope))
+        ; Delegate (Detach_graph scope)
+        ])
+      previous_scope
+  in
+  { next; effects = teardown @ [ publish next ] }
+;;
+
+let catalog_refreshed core catalog =
+  match core.public_state.snapshot.selected_graph with
+  | Some selected_graph ->
+    (match graph_in_catalog catalog selected_graph with
+     | None -> clear_selected_graph_for_catalog core catalog
+     | Some graph ->
+       let snapshot = clear_reconciliation_failure core.public_state.snapshot in
+       let startup =
+         { snapshot.startup with catalog_loading = false; awaiting_selection = false }
+       in
+       let next =
+         set_snapshot
+           { core with
+             cached_selected_graph = Some selected_graph
+           ; selected_graph_value = Some graph
+           }
+           { snapshot with catalog; startup }
+       in
+       { next; effects = [ publish next ] })
+  | None ->
+    let cached_selected_graph =
+      Option.bind core.cached_selected_graph (fun graph_id ->
+        Option.map (fun _ -> graph_id) (graph_in_catalog catalog graph_id))
     in
-    let next =
-      set_snapshot
-        core
-        { core.public_state.snapshot with catalog; selected_graph; startup }
-    in
-    { next; effects = [ publish next ] }
-  | Save_catalog_kind -> unchanged core
-  | Fetch_catalog_kind ->
     let startup =
       { core.public_state.snapshot.startup with
         catalog_loading = false
       ; awaiting_selection = true
+      ; restoring_local = false
       ; failure = None
       }
     in
-    let core =
-      set_snapshot core { core.public_state.snapshot with catalog = value; startup }
+    let next =
+      set_snapshot
+        { core with cached_selected_graph }
+        { core.public_state.snapshot with
+          catalog
+        ; selected_graph = None
+        ; startup
+        ; last_error = None
+        }
     in
-    let next, effects = save_cache core in
-    { next; effects = publish next :: effects }
+    { next; effects = [ publish next ] }
+;;
+
+let apply_fetched_catalog core catalog =
+  let refreshed = catalog_refreshed core catalog in
+  let next, save = save_cache refreshed.next in
+  { next; effects = refreshed.effects @ save }
+;;
+
+let complete_catalog_load core cache =
+  let catalog, cached_selected_graph =
+    match core.user_id, cache with
+    | Some user_id, Some cache when String.equal user_id cache.cache_user_id ->
+      let catalog = cache.cache_graphs in
+      let cached_selected_graph =
+        Option.bind cache.cache_selected_graph (fun graph_id ->
+          Option.map (fun _ -> graph_id) (graph_in_catalog catalog graph_id))
+      in
+      catalog, cached_selected_graph
+    | None, _ | Some _, None | Some _, Some _ -> [], None
+  in
+  let startup =
+    { core.public_state.snapshot.startup with
+      restoring_local = false
+    ; awaiting_selection = true
+    }
+  in
+  let loaded =
+    set_snapshot
+      { core with catalog_cache_loading = false; cached_selected_graph }
+      { core.public_state.snapshot with catalog; selected_graph = None; startup }
+  in
+  let restored =
+    match cached_selected_graph with
+    | Some graph_id -> select_graph_transition loaded ~persist:false graph_id
+    | None -> { next = loaded; effects = [ publish loaded ] }
+  in
+  if restored.next.deferred_catalog_reconciliation
+  then (
+    let requested = request_catalog_reconciliation restored.next in
+    { next = requested.next; effects = restored.effects @ requested.effects })
+  else restored
+;;
+
+let deletion_failed core stage =
+  let message =
+    match stage with
+    | Closing_graph -> "Local graph close failed."
+    | Deleting_mirror -> "Local graph deletion failed."
+    | Clearing_selection -> "Clearing the saved graph selection failed."
+  in
+  let next =
+    set_snapshot
+      { core with pending_effects = [] }
+      { core.public_state.snapshot with
+        local_deletion = Some (Deletion_failed stage)
+      ; sync_phase = Failed
+      ; last_error = Some message
+      }
+  in
+  { next; effects = [ publish next ] }
+;;
+
+let deletion_selection_saved core =
+  match core.public_state.snapshot.local_deletion with
+  | Some (Deletion_in_progress Clearing_selection) ->
+    let snapshot = core.public_state.snapshot in
+    let next =
+      set_snapshot
+        { core with deletion_scope = None }
+        { snapshot with
+          local_deletion = None
+        ; startup = { snapshot.startup with awaiting_selection = true }
+        }
+    in
+    { next; effects = [ publish next ] }
+  | None | Some _ -> unchanged core
+;;
+
+let complete_runner : type a. t -> a effect_ticket -> a -> transition =
+  fun core ticket value ->
+  match ticket.kind with
+  | Load_catalog_kind -> complete_catalog_load core value
+  | Save_catalog_kind -> deletion_selection_saved core
+  | Fetch_catalog_kind -> apply_fetched_catalog core value
   | Fetch_snapshot_baseline_kind ->
     (match
-       ( decode_snapshot_baseline value
-       , core.current_graph_scope
-       , core.snapshot_authorization )
+       decode_snapshot_baseline value, core.current_graph_scope, core.snapshot_scope
      with
-     | Ok server_t, Some graph, Some authorization when authorization.graph = graph ->
-       let next, request_effect =
-         issue_request core (Fetch_snapshot_metadata authorization)
-       in
+     | Ok server_t, Some graph, Some scope when scope = graph ->
+       let next, request_effect = issue_request core (Fetch_snapshot_metadata scope) in
        { next = { next with snapshot_server_t = Some server_t }
        ; effects = [ Run request_effect ]
        }
      | Error message, _, _ -> fail core During_bootstrap message
      | Ok _, _, _ -> unchanged core)
   | Fetch_snapshot_metadata_kind ->
-    (match decode_snapshot_uri value, core.snapshot_authorization with
+    (match decode_snapshot_uri value, core.snapshot_scope with
      | Ok uri, Some scope ->
        let request =
          { scope
@@ -1925,7 +2006,7 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
          }
        in
        let next, request_effect = issue_request core (Download_snapshot request) in
-       { next = { next with active_snapshot_download = Some scope.graph }
+       { next = { next with active_snapshot_download = Some scope }
        ; effects = [ Run request_effect ]
        }
      | Error message, _ -> fail core During_bootstrap message
@@ -1963,12 +2044,10 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
      | _ -> unchanged core)
   | Load_and_unlock_graph_key_kind -> graph_key_loaded core value
   | Fetch_e2ee_graph_key_kind ->
-    (match core.snapshot_authorization with
-     | Some authorization ->
+    (match core.snapshot_scope with
+     | Some scope ->
        let core = { core with pending_encrypted_graph_key = Some value } in
-       let account =
-         { account = authorization.graph.account; token = authorization.token }
-       in
+       let account = scope.account in
        let next, request = issue_request core (Fetch_e2ee_user_keys account) in
        { next; effects = [ Run request ] }
      | None -> unchanged core)
@@ -1986,7 +2065,7 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
     in
     { next; effects = [ publish next ] }
   | Unlock_private_key_kind ->
-    (match core.snapshot_authorization, core.pending_encrypted_graph_key with
+    (match core.snapshot_scope, core.pending_encrypted_graph_key with
      | Some scope, Some encrypted_graph_key ->
        let next, request =
          issue_request core (Fetch_and_unlock_graph_key { scope; encrypted_graph_key })
@@ -1998,7 +2077,6 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
       { core with pending_encrypted_graph_key = None; pending_private_key_package = None }
     in
     graph_key_loaded core value
-  | Delete_wrapped_graph_key_kind -> unchanged core
   | Delete_account_secrets_kind -> unchanged core
   | Encrypt_protected_values_kind -> unchanged core
   | Decrypt_protected_values_kind -> unchanged core
@@ -2017,13 +2095,24 @@ let consume_completion core (Completion (ticket, result)) =
          | _ -> core
        in
        (match ticket.kind with
+        | Save_catalog_kind ->
+          (match core.public_state.snapshot.local_deletion with
+           | Some (Deletion_in_progress Clearing_selection) ->
+             deletion_failed core Clearing_selection
+           | None | Some _ -> unchanged core)
+        | Load_catalog_kind ->
+          fail
+            { core with
+              catalog_cache_loading = false
+            ; deferred_catalog_reconciliation = false
+            }
+            During_catalog
+            message
         | Load_and_unlock_graph_key_kind -> fail core During_local_restore message
         | Fetch_e2ee_graph_key_kind
         | Fetch_e2ee_user_keys_kind
         | Fetch_and_unlock_graph_key_kind
         | Unlock_private_key_kind -> fail core During_e2ee message
-        | Delete_wrapped_graph_key_kind ->
-          cleanup_failed core "wrapped graph key cleanup failed"
         | Delete_account_secrets_kind ->
           cleanup_failed core "account secret cleanup failed"
         | Fetch_snapshot_baseline_kind
@@ -2040,8 +2129,6 @@ let websocket_closed core connection message =
       set_snapshot
         { core with
           websocket_live = false
-        ; pending_sync_inspection = None
-        ; pending_outbox_transition = None
         ; submission_owner = None
         ; active_authoritative_batch = None
         ; queued_authoritative_batch = None
@@ -2083,11 +2170,10 @@ let return_to_graph_picker core =
       ; pending_attachment = None
       ; pending_encrypted_graph_key = None
       ; pending_private_key_package = None
-      ; snapshot_authorization = None
+      ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
       ; sync_view = None
-      ; pending_token = None
       ; pending_effects = []
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
@@ -2131,8 +2217,117 @@ let inspect_sync core scope =
   | Some _ -> unchanged core
 ;;
 
+let begin_local_deletion core graph_id =
+  let snapshot = core.public_state.snapshot in
+  match core.current_graph_scope, core.sync_view with
+  | Some scope, Some _
+    when scope.graph_id = graph_id
+         && snapshot.selected_graph = Some graph_id
+         && snapshot.startup.authenticated
+         && snapshot.startup.failure = None
+         && (not snapshot.startup.restoring_local)
+         && (not snapshot.startup.bootstrapping)
+         && (not snapshot.startup.awaiting_selection)
+         && (not snapshot.startup.awaiting_e2ee_password)
+         && core.pending_attachment = None
+         && core.active_snapshot_download = None ->
+    let closing = return_to_graph_picker core in
+    let cleared = closing.next.public_state.snapshot in
+    let next =
+      set_snapshot
+        { closing.next with
+          deletion_scope = Some scope
+        ; lifecycle_generation = Int64.succ core.lifecycle_generation
+        ; connection_generation = core.connection_generation + 1
+        ; catalog_cache_loading = false
+        ; deferred_catalog_reconciliation = false
+        }
+        { cleared with
+          selected_graph = snapshot.selected_graph
+        ; local_deletion = Some (Deletion_in_progress Closing_graph)
+        ; startup = { cleared.startup with awaiting_selection = false }
+        }
+    in
+    { next
+    ; effects =
+        [ publish next
+        ; Run
+            (Close_websocket
+               { graph = scope; connection_generation = core.connection_generation })
+        ; Run
+            (Cancel_effects
+               { (effect_scope_of_account scope.account) with
+                 presentation_generation = None
+               ; lifecycle_generation = None
+               })
+        ; Delegate (Detach_graph scope)
+        ]
+    }
+  | _ -> unchanged core
+;;
+
+let graph_detached core scope result =
+  match core.deletion_scope, core.public_state.snapshot.local_deletion with
+  | Some captured, Some (Deletion_in_progress Closing_graph) when captured = scope ->
+    (match result with
+     | Error _ -> deletion_failed core Closing_graph
+     | Ok () ->
+       let next =
+         set_snapshot
+           core
+           { core.public_state.snapshot with
+             local_deletion = Some (Deletion_in_progress Deleting_mirror)
+           }
+       in
+       { next
+       ; effects =
+           [ publish next
+           ; Delegate
+               (Delete_mirror
+                  { graph_id = scope.graph_id; scope = effect_scope_of_graph scope })
+           ]
+       })
+  | _ -> unchanged core
+;;
+
+let mirror_deleted core (request : mirror_deletion) result =
+  match core.deletion_scope, core.public_state.snapshot.local_deletion with
+  | Some scope, Some (Deletion_in_progress Deleting_mirror)
+    when request.graph_id = scope.graph_id && request.scope = effect_scope_of_graph scope
+    ->
+    (match result with
+     | Error _ -> deletion_failed core Deleting_mirror
+     | Ok () ->
+       let snapshot = core.public_state.snapshot in
+       let next =
+         set_snapshot
+           { core with cached_selected_graph = None }
+           { snapshot with
+             selected_graph = None
+           ; local_deletion = Some (Deletion_in_progress Clearing_selection)
+           }
+       in
+       let account = account_scope next scope.account.user_id in
+       let cache =
+         catalog_cache
+           ~user_id:account.user_id
+           ~graphs:snapshot.catalog
+           ~selected_graph:None
+       in
+       let next, save = issue_request next (Save_catalog { account; cache }) in
+       { next; effects = [ publish next; Run save ] })
+  | _ -> unchanged core
+;;
+
+let deletion_blocks_event core event =
+  match core.public_state.snapshot.local_deletion, event with
+  | None, _ -> false
+  | Some _, (Graph_detached _ | Mirror_deleted _ | Runner_completed _ | Shutdown) -> false
+  | Some _, _ -> true
+;;
+
 let step core event =
-  if core.closed
+  if core.closed || deletion_blocks_event core event
   then unchanged core
   else (
     match event with
@@ -2143,17 +2338,10 @@ let step core event =
       (match core.current_graph_scope with
        | Some scope -> inspect_sync core scope
        | None -> unchanged core)
-    | Token_provided (request, token) -> provide_token core request token
-    | Token_rejected request ->
-      if core.pending_token = Some request
-      then
-        fail
-          { core with pending_token = None }
-          During_authentication
-          "token request rejected"
-      else unchanged core
     | Runner_completed completion -> consume_completion core completion
     | Graph_selected graph_id -> select_graph core graph_id
+    | Graph_detached (scope, result) -> graph_detached core scope result
+    | Mirror_deleted (request, result) -> mirror_deleted core request result
     | Mirror_inspected inspection -> mirror_inspected core inspection
     | Graph_attached attachment -> graph_attached core attachment
     | Sync_inspected inspection ->
@@ -2193,12 +2381,14 @@ let step core event =
     | Catalog_refresh_requested ->
       (match core.user_id with
        | None -> unchanged core
-       | Some _ ->
-         let next, token = issue_token core Catalog_discovery in
-         { next; effects = [ token ] })
+       | Some user_id ->
+         let next, request =
+           issue_request core (Fetch_catalog (account_scope core user_id))
+         in
+         { next; effects = [ Run request ] })
     | Online_recovery_requested ->
       (match core.current_graph_scope, core.public_state.snapshot.startup.failure with
-       | Some _, Some During_local_restore ->
+       | Some scope, Some During_local_restore ->
          let startup =
            { core.public_state.snapshot.startup with
              awaiting_e2ee_password = false
@@ -2214,38 +2404,16 @@ let step core event =
              ; last_error = None
              }
          in
-         let next, token = issue_token core E2ee_key_access in
-         { next; effects = [ publish next; token ] }
+         let requested = begin_e2ee_key_access core scope in
+         { requested with effects = publish requested.next :: requested.effects }
        | Some scope, _ -> inspect_sync core scope
        | None, _ -> unchanged core)
-    | Local_cache_deletion_requested graph_id ->
-      let scope =
-        match core.current_graph_scope with
-        | Some scope -> effect_scope_of_graph scope
-        | None ->
-          { account_generation = None
-          ; graph_generation = None
-          ; connection_generation = None
-          ; presentation_generation = None
-          ; lifecycle_generation = None
-          }
-      in
-      let mirror = Delegate (Delete_mirror { graph_id; scope }) in
-      (match core.user_id with
-       | None -> { next = core; effects = [ mirror ] }
-       | Some user_id ->
-         let account = account_scope core user_id in
-         let next, deletion =
-           issue_request core (Delete_wrapped_graph_key { account; graph_id })
-         in
-         { next; effects = [ mirror; Run deletion ] })
+    | Local_cache_deletion_requested graph_id -> begin_local_deletion core graph_id
     | Foreground_changed { foreground = false; lifecycle_generation } ->
       let core =
         { core with
           lifecycle_generation
         ; websocket_live = false
-        ; pending_sync_inspection = None
-        ; pending_outbox_transition = None
         ; submission_owner = None
         ; active_authoritative_batch = None
         ; queued_authoritative_batch = None
@@ -2266,9 +2434,7 @@ let step core event =
       let core = { core with lifecycle_generation } in
       (match core.current_graph_scope with
        | None -> unchanged core
-       | Some _ ->
-         let next, token = issue_token core Websocket_connect in
-         { next; effects = [ token ] })
+       | Some graph -> start_websocket core graph)
     | Timeline_presented ->
       let next =
         set_snapshot
@@ -2285,18 +2451,16 @@ let step core event =
     | Snapshot_activation_failed _ -> unchanged core
     | E2ee_password_submitted password ->
       (match
-         ( core.snapshot_authorization
+         ( core.snapshot_scope
          , core.pending_private_key_package
          , core.public_state.snapshot.startup.awaiting_e2ee_password )
        with
-       | Some authorization, Some private_key_package, true ->
+       | Some graph, Some private_key_package, true ->
          let startup =
            { core.public_state.snapshot.startup with awaiting_e2ee_password = false }
          in
          let core = set_snapshot core { core.public_state.snapshot with startup } in
-         let scope =
-           { account = authorization.graph.account; token = authorization.token }
-         in
+         let scope = graph.account in
          let next, request =
            issue_request
              core
@@ -2304,7 +2468,46 @@ let step core event =
          in
          { next; effects = [ publish next; Run request ] }
        | _ -> unchanged core)
-    | Local_feed_acknowledged | Timer_elapsed _ -> unchanged core
+    | Outbox_transition_failed { request; message } ->
+      (match core.pending_outbox_transition with
+       | Some pending
+         when graph_scope_is_current core request.scope
+              && pending.scope = request.scope
+              && pending.transition = request.transition
+              && Overlay.sync_token_equal pending.expected request.expected ->
+         let close =
+           match core.current_graph_scope with
+           | Some graph when core.websocket_live ->
+             [ Run
+                 (Close_websocket
+                    { graph; connection_generation = core.connection_generation })
+             ]
+           | Some _ | None -> []
+         in
+         let failed =
+           fail
+             { core with
+               websocket_live = false
+             ; submission_owner = None
+             ; connection_generation = core.connection_generation + 1
+             }
+             During_catalog
+             message
+         in
+         { failed with effects = close @ failed.effects }
+       | Some _ | None -> unchanged core)
+    | Timer_elapsed id ->
+      (match core.submission_owner, core.current_graph_scope with
+       | Some owner, Some graph
+         when owner.response_timer = Some id
+              && connection_is_current core owner.connection
+              && core.websocket_live ->
+         let restarted = start_websocket core graph in
+         { restarted with
+           effects = Run (Close_websocket owner.connection) :: restarted.effects
+         }
+       | _ -> unchanged core)
+    | Local_feed_acknowledged -> unchanged core
     | Shutdown ->
       let scope =
         { account_generation = None
@@ -2317,7 +2520,6 @@ let step core event =
       { next =
           { core with
             closed = true
-          ; pending_token = None
           ; pending_effects = []
           ; pending_graph_open = None
           ; pending_mirror_inspection = None

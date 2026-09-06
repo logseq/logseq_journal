@@ -7,19 +7,17 @@ let run () =
   let old_authenticated =
     Core.step (initial ()) (Core.Account_authenticated { user_id = Some "old-user" })
   in
-  let old_token = token_request old_authenticated.effects in
-  let old_authorized =
-    Core.step old_authenticated.next (Core.Token_provided (old_token, "old-token"))
-  in
   let old_completion, old_ticket =
-    match old_authorized.effects with
-    | [ Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ] ->
+    match old_authenticated.effects with
+    | [ Core.Publish (Core.State_changed _)
+      ; Core.Run (Core.Request (ticket, Core.Fetch_catalog _))
+      ] ->
       ( Core.Runner_completed (Core.Completion (ticket, Ok [ graph ]))
       , Core.effect_ticket_id ticket )
     | _ -> Alcotest.fail "BC07 old account did not request catalog"
   in
   let restoring =
-    Core.step old_authorized.next (Core.Restore_local_account { user_id = "new-user" })
+    Core.step old_authenticated.next (Core.Restore_local_account { user_id = "new-user" })
   in
   let load_completion =
     match restoring.effects with

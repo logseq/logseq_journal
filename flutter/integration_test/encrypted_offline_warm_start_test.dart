@@ -230,24 +230,9 @@ final class _RuntimeHarness {
     required _Fixture fixture,
     required JournalAuthCapability auth,
   }) async {
-    var generation = 1;
-    Future<JournalCalendarSnapshot> calendar() async => JournalCalendarSnapshot(
-      instantUnixMilliseconds: 1786055400000,
-      localDay: 20260807,
-      locale: 'en_US',
-      timeZoneId: 'Europe/Paris',
-      utcOffsetSeconds: 7200,
-      generation: generation++,
-    );
-    final initialCalendar = await calendar();
     final adapter = ApplicationHostAdapter(
       applicationSupportDirectory: () async => fixture.supportRoot,
       baseUrl: fixture.baseUrl,
-      initialCalendarSnapshot: () async => initialCalendar,
-      liveCalendarSnapshot: calendar,
-      formatJournalDays: ({required snapshot, required days}) async => {
-        for (final day in days) day: day == 20260807 ? 'Fri, Aug 7' : '$day',
-      },
       auth: auth,
       readPreference: (_) async => 'balanced',
       writePreference: (_, _) async {},

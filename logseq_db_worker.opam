@@ -31,8 +31,8 @@ pin-depends: [
   ["melange-edn-native.0.5.0" "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"]
   ["melange-transit-core.0.1.2" "git+https://github.com/RCmerci/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"]
   ["melange-transit-native.0.1.2" "git+https://github.com/RCmerci/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"]
-  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#3d2a540d886839fb243ce78f4bcc38da13c600a9"]
-  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#3d2a540d886839fb243ce78f4bcc38da13c600a9"]
+  ["bonsai_flutter.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b"]
+  ["bonsai_flutter_test.0.1.0~dev" "git+https://github.com/RCmerci/bonsai_flutter.git#84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b"]
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]

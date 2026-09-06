@@ -1,4 +1,10 @@
+type admission_request =
+  { graph_generation : int
+  ; request_generation : int64
+  }
+
 type t =
+  | Inspect_admission of admission_request
   | Capture of
       { calendar_generation : int64
       ; command : Journal_graph_projection.capture

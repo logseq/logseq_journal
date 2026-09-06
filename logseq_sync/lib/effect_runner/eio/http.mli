@@ -30,7 +30,8 @@ val e2ee_graph_key
   -> request
 
 val e2ee_user_keys : base_url:Uri.t -> token:string -> request
-val artifact : uri:Uri.t -> token:string -> request
+val same_origin : Uri.t -> Uri.t -> bool
+val artifact : base_url:Uri.t -> uri:Uri.t -> token:string option -> request
 val validate_base_url : Uri.t -> (unit, string) result
 
 val validate_response_content_type

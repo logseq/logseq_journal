@@ -6,16 +6,6 @@ let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
 ;;
 
-let envelope tag payload =
-  let bytes = Bytes.make (32 + Bytes.length payload) '\000' in
-  Bytes.blit_string "LJP2" 0 bytes 0 4;
-  Bytes.set_uint16_le bytes 4 2;
-  Bytes.set_uint16_le bytes 6 tag;
-  Bytes.set_int32_le bytes 24 (Int32.of_int (Bytes.length payload));
-  Bytes.blit payload 0 bytes 32 (Bytes.length payload);
-  bytes
-;;
-
 let sample : Journal_startup.t =
   Logseq_db_worker.Config.create
     ~application_support_directory:"/tmp/support"
@@ -79,40 +69,6 @@ let test_bounded_rejection () =
   require_decode_error bad_json
 ;;
 
-let test_application_platform_calendar_codec () =
-  require
-    (Bytes.length Journal_platform.get_calendar_request = 32
-     && Bytes.sub_string Journal_platform.get_calendar_request 0 4 = "LJP2")
-    "application calendar request envelope changed";
-  let locale = "en_US" in
-  let time_zone = "Europe/Paris" in
-  let bytes = Bytes.make (56 + String.length locale + String.length time_zone) '\000' in
-  Bytes.blit_string "LJP1" 0 bytes 0 4;
-  Bytes.set_uint16_le bytes 4 1;
-  Bytes.set_uint16_le bytes 6 3;
-  Bytes.set_uint16_le bytes 8 2;
-  Bytes.set_uint16_le bytes 10 (String.length locale);
-  Bytes.set_uint16_le bytes 12 (String.length time_zone);
-  Bytes.set_int64_le bytes 16 1_786_055_400_000L;
-  Bytes.set_int32_le bytes 24 (Int32.of_int 20260807);
-  Bytes.set_uint16_le bytes 28 30;
-  Bytes.set_int32_le bytes 32 (Int32.of_int 7200);
-  Bytes.set_int64_le bytes 40 8L;
-  Bytes.set_int64_le bytes 48 4L;
-  Bytes.blit_string locale 0 bytes 56 (String.length locale);
-  Bytes.blit_string
-    time_zone
-    0
-    bytes
-    (56 + String.length locale)
-    (String.length time_zone);
-  match Journal_platform.decode_calendar (envelope 3 bytes) with
-  | Error error -> fail "platform calendar decode failed: %s" error
-  | Ok decoded ->
-    require (decoded.snapshot.local_day = 20260807) "calendar day changed";
-    require (Int64.equal decoded.snapshot.generation 8L) "calendar generation changed"
-;;
-
 let graph_id =
   Logseq_db_types.Graph_types.Uuid.of_string "20000000-0000-4000-8000-000000000002"
   |> Result.get_ok
@@ -149,6 +105,7 @@ let startup_snapshot
         ; graph_generation
         ; presentation_generation = 5
         }
+    ; local_deletion = None
     ; last_error = Option.map (fun _ -> "startup failed") failure
     }
 ;;
@@ -254,10 +211,29 @@ let test_stale_graph_generation_and_structured_failures () =
   | None | Some _ -> fail "graph failure did not expose structured recovery"
 ;;
 
+let test_deletion_failure_has_no_recovery () =
+  let snapshot =
+    { (startup_snapshot ()) with
+      local_deletion = Some (Graph_service.Deletion_failed Closing_graph)
+    ; last_error = Some "Local graph close failed."
+    }
+  in
+  let derived = Journal_startup.derive ~snapshot ~graph:(graph_state ()) in
+  require
+    (derived.phase = Journal_startup.Failed)
+    "deletion failure returned to ready timeline";
+  require
+    (Option.fold
+       ~none:false
+       ~some:(fun error -> error.Journal_startup.recovery = None)
+       derived.error)
+    "deletion failure offered recovery"
+;;
+
 let () =
+  test_deletion_failure_has_no_recovery ();
   test_exact_codec_and_round_trip ();
   test_bounded_rejection ();
-  test_application_platform_calendar_codec ();
   test_startup_phase_is_owned_by_ui_domain ();
   test_ready_is_independent_of_sync_activity ();
   test_stale_graph_generation_and_structured_failures ()

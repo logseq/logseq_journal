@@ -31,12 +31,12 @@ let gzip_signature path =
     Fun.protect
       ~finally:(fun () -> close_in_noerr channel)
       (fun () ->
-         let first = Char.code (input_char channel) in
-         let second = Char.code (input_char channel) in
-         match first, second with
-         | 0x1f, 0x8b -> Ok true
-         | _, _ -> Ok false
-         | exception End_of_file -> Ok false)
+         try
+           let first = input_char channel in
+           let second = input_char channel in
+           Ok (first = '\x1f' && second = '\x8b')
+         with
+         | End_of_file -> Ok false)
   with
   | Sys_error message -> Error message
 ;;

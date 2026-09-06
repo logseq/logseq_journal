@@ -42,6 +42,7 @@ val apply_child_text_edit : t -> Ui.Event.Payload.text_edit -> t
 val admit_child
   :  t
   -> mutation_id:string
+  -> calendar_generation:int64
   -> block_id:string
   -> sibling_order:string
   -> creation_time:Journal_time.t
@@ -49,4 +50,4 @@ val admit_child
 
 val apply_block : t -> Journal_model.t -> t
 val reconcile_children : t -> Journal_graph_projection.detail -> t
-val apply_child_created : t -> child:Journal_model.t -> parent_revision:int -> t
+val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t

@@ -1,20 +1,3 @@
-type reason =
-  | Requested
-  | Resumed
-  | Significant_time_changed
-  | Time_zone_changed
-  | Locale_changed
-
-type calendar =
-  { snapshot : Journal_calendar.t
-  ; reason : reason
-  }
-
-type formatted_journal_days =
-  { generation : int64
-  ; headings : (int * string) list
-  }
-
 type network_lifecycle =
   | Backgrounded of { generation : int64 }
   | Foreground_resumed of { generation : int64 }
@@ -24,22 +7,8 @@ type local_account_binding =
   ; managed_sync_origin : string
   }
 
-(** Byte-exact LJP2 request for a fresh host calendar snapshot. *)
-val get_calendar_request : bytes
-
-(** Decode one bounded LJP2 calendar response or event containing an exact
-    instant, local day and minute, zone snapshot, calendar generation, and
-    lifecycle generation. *)
-val decode_calendar : bytes -> (calendar, string) result
-
 (** Decode one coalesced Apple-platform background epoch transition. *)
 val decode_network_lifecycle : bytes -> (network_lifecycle, string) result
-
-(** Encode one generation-fenced request for 1 to 64 distinct journal days. *)
-val format_journal_days_request : generation:int64 -> int list -> (bytes, string) result
-
-(** Decode a bounded host-formatted heading batch. *)
-val decode_formatted_journal_days : bytes -> (formatted_journal_days, string) result
 
 val authenticated_user_request : bytes
 val decode_authenticated_user : bytes -> (string option, string) result

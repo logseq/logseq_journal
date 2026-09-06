@@ -37,6 +37,17 @@ type startup_facts =
   ; presentation_generation : presentation_generation
   }
 
+(** Non-resumable cleanup of the normally open selected graph. Success removes
+    this status only after Save_catalog acknowledges the cleared selection. *)
+type local_deletion_stage =
+  | Closing_graph
+  | Deleting_mirror
+  | Clearing_selection
+
+type local_deletion =
+  | Deletion_in_progress of local_deletion_stage
+  | Deletion_failed of local_deletion_stage
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -45,6 +56,7 @@ type snapshot =
   ; timeline_presentation_pending : bool
   ; startup : startup_facts
   ; last_error : string option
+  ; local_deletion : local_deletion option
   }
 
 type diagnostic_group =
@@ -52,10 +64,7 @@ type diagnostic_group =
   ; entries : (string * string) list
   }
 
-type diagnostics =
-  { groups : diagnostic_group list
-  ; history : string list
-  }
+type diagnostics = { groups : diagnostic_group list }
 
 type state =
   { snapshot : snapshot
@@ -73,17 +82,6 @@ val limits
   -> (limits, config_error) result
 
 val config : managed_sync_origin:Uri.t -> limits:limits -> (config, config_error) result
-
-type token_purpose =
-  | Catalog_discovery
-  | Snapshot_bootstrap
-  | E2ee_key_access
-  | Websocket_connect
-
-type token_request
-
-val token_request_id : token_request -> string
-val token_request_purpose : token_request -> token_purpose
 
 type bootstrap_progress =
   { graph_id : graph_id
@@ -105,20 +103,10 @@ type account_scope =
   ; lifecycle_generation : lifecycle_generation
   }
 
-type authenticated_account_scope =
-  { account : account_scope
-  ; token : string
-  }
-
 type graph_scope =
   { account : account_scope
   ; graph_id : graph_id
   ; graph_generation : graph_generation
-  }
-
-type authorized_graph_scope =
-  { graph : graph_scope
-  ; token : string
   }
 
 type connection_scope =
@@ -195,19 +183,19 @@ type snapshot_baseline = string
 type snapshot_metadata = string
 
 type snapshot_download =
-  { scope : authorized_graph_scope
+  { scope : graph_scope
   ; uri : Uri.t
   ; expected_bytes : int64 option
   ; maximum_bytes : int
   }
 
 type graph_key_request =
-  { scope : authorized_graph_scope
+  { scope : graph_scope
   ; encrypted_graph_key : string
   }
 
 type private_key_unlock =
-  { scope : authenticated_account_scope
+  { scope : account_scope
   ; password : string
   ; private_key_package : string
   }
@@ -219,20 +207,15 @@ type _ runner_request =
       ; cache : catalog_cache
       }
       -> unit runner_request
-  | Fetch_catalog : authenticated_account_scope -> graph list runner_request
-  | Fetch_snapshot_baseline : authorized_graph_scope -> snapshot_baseline runner_request
-  | Fetch_snapshot_metadata : authorized_graph_scope -> snapshot_metadata runner_request
+  | Fetch_catalog : account_scope -> graph list runner_request
+  | Fetch_snapshot_baseline : graph_scope -> snapshot_baseline runner_request
+  | Fetch_snapshot_metadata : graph_scope -> snapshot_metadata runner_request
   | Download_snapshot : snapshot_download -> staged_artifact runner_request
-  | Fetch_e2ee_graph_key : authorized_graph_scope -> string runner_request
-  | Fetch_e2ee_user_keys : authenticated_account_scope -> string runner_request
+  | Fetch_e2ee_graph_key : graph_scope -> string runner_request
+  | Fetch_e2ee_user_keys : account_scope -> string runner_request
   | Load_and_unlock_graph_key : graph_scope -> graph_key_handle runner_request
   | Fetch_and_unlock_graph_key : graph_key_request -> graph_key_handle runner_request
   | Unlock_private_key : private_key_unlock -> unit runner_request
-  | Delete_wrapped_graph_key :
-      { account : account_scope
-      ; graph_id : graph_id
-      }
-      -> unit runner_request
   | Delete_account_secrets : account_scope -> unit runner_request
   | Encrypt_protected_values : encryption_batch -> encrypted_values runner_request
   | Decrypt_protected_values : decryption_batch -> decrypted_values runner_request
@@ -246,7 +229,6 @@ val effect_id_to_string : effect_id -> string
 type websocket_request =
   { scope : connection_scope
   ; uri : Uri.t
-  ; token : string
   }
 
 type websocket_send =
@@ -305,6 +287,13 @@ type outbox_transition_request =
   ; transition : Logseq_overlay_db.Types.outbox_transition
   }
 
+(** Failure of the exact delegated outbox request. The original scope, transition,
+    and expected Sync token fence failures from superseded requests. *)
+type outbox_transition_failure =
+  { request : outbox_transition_request
+  ; message : string
+  }
+
 type authoritative_batch =
   { input : Logseq_overlay_db.Types.authoritative_batch
   ; key : graph_key_handle option
@@ -326,7 +315,6 @@ type worker_effect =
 
 type output =
   | State_changed of state
-  | Token_requested of token_request
   | Bootstrap_progressed of bootstrap_progress
 
 type instruction =
@@ -377,8 +365,6 @@ type event =
   | Local_feed_acknowledged
   | Local_outbox_changed
   | Timeline_presented
-  | Token_provided of token_request * string
-  | Token_rejected of token_request
   | Graph_selected of graph_id
   | Graph_picker_requested
   | Catalog_refresh_requested
@@ -389,11 +375,17 @@ type event =
       { foreground : bool
       ; lifecycle_generation : lifecycle_generation
       }
+  (** Acknowledges the captured graph close after outstanding database operations,
+      subscriptions, storage, and ownership have been released. *)
+  | Graph_detached of graph_scope * (unit, string) result
+  (** Acknowledges the exact deletion request; stale or repeated results are inert. *)
+  | Mirror_deleted of mirror_deletion * (unit, string) result
   | Mirror_inspected of mirror_inspection
   | Graph_attached of graph_attachment
   | Graph_attachment_failed of scoped_error
   | Sync_inspected of sync_inspection
   | Outbox_transition_applied of outbox_transition_result
+  | Outbox_transition_failed of outbox_transition_failure
   | Authoritative_batch_applied of authoritative_commit_result
   | Authoritative_batch_deferred of authoritative_deferred_result
   | Authoritative_batch_failed of scoped_error

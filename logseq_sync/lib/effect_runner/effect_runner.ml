@@ -27,12 +27,49 @@ type transport =
       -> maximum_frame_bytes:int
       -> on_message:(string -> unit)
       -> on_close:(string option -> unit)
-      -> (Websocket_eio.t, string) result
+      -> (Websocket_eio.t, Websocket_eio.connect_error) result
   ; send_websocket : Websocket_eio.t -> string -> (unit, string) result
   ; close_websocket : Websocket_eio.t -> unit
+  ; abort_websocket : Websocket_eio.t -> unit
+  ; activate_websocket :
+      Websocket_eio.t
+      -> on_open:(unit -> unit)
+      -> (unit, Websocket_eio.connect_error) result
   }
 
 type tls_authenticator = X509.Authenticator.t
+
+type id_token_provider =
+  { acquire : Core.account_scope -> (string, string) result
+  ; invalidate : Core.account_scope -> token:string -> unit
+  }
+
+let id_token_provider ~acquire ~invalidate = { acquire; invalidate }
+
+type authenticated_failure =
+  | Unauthorized
+  | Forbidden
+  | Request_failed of string
+
+let authenticated_failure = function
+  | Unauthorized -> "Authentication failed."
+  | Forbidden -> "Authorization failed."
+  | Request_failed message -> message
+;;
+
+let authenticated_operation provider ~account ~perform =
+  match provider.acquire account with
+  | Error message -> Error message
+  | Ok token ->
+    (match perform token with
+     | Ok _ as result -> result
+     | Error Unauthorized ->
+       provider.invalidate account ~token;
+       (match provider.acquire account with
+        | Error message -> Error message
+        | Ok refreshed -> Result.map_error authenticated_failure (perform refreshed))
+     | Error failure -> Error (authenticated_failure failure))
+;;
 
 let tls_authenticator authenticator = authenticator
 
@@ -41,37 +78,65 @@ let system_tls_authenticator () =
   |> Result.map_error (fun (`Msg message) -> Invalid_dependency message)
 ;;
 
-let transport ~tls_authenticator ~network ~clock =
-  Ok
-    { perform_http =
-        (fun ~sw request ->
-          Http_eio.perform ~sw ~authenticator:tls_authenticator ~network ~clock request)
-    ; download =
-        (fun ~sw ~request ~destination ~maximum_bytes ~on_progress ->
-          Http_eio.download
-            ~sw
-            ~authenticator:tls_authenticator
-            ~network
-            ~clock
-            ~request
-            ~destination
-            ~maximum_bytes
-            ~on_progress)
-    ; connect_websocket =
-        (fun ~sw ~uri ~token ~maximum_frame_bytes ~on_message ~on_close ->
-          Websocket_eio.connect
-            ~sw
-            ~authenticator:tls_authenticator
-            ~network
-            ~clock
-            ~uri
-            ~token
-            ~maximum_frame_bytes
-            ~on_message
-            ~on_close)
-    ; send_websocket = Websocket_eio.send
-    ; close_websocket = Websocket_eio.close
-    }
+type websocket_liveness =
+  | Disabled
+  | Ping_pong of
+      { interval_seconds : float
+      ; timeout_seconds : float
+      }
+
+let transport ~tls_authenticator ~network ~clock ~websocket_liveness =
+  let valid = function
+    | Disabled -> true
+    | Ping_pong { interval_seconds; timeout_seconds } ->
+      Float.is_finite interval_seconds
+      && Float.is_finite timeout_seconds
+      && interval_seconds > 0.
+      && timeout_seconds > 0.
+  in
+  let liveness =
+    match websocket_liveness with
+    | Disabled -> Websocket_eio.Disabled
+    | Ping_pong { interval_seconds; timeout_seconds } ->
+      Websocket_eio.Ping_pong { interval_seconds; timeout_seconds }
+  in
+  if not (valid websocket_liveness)
+  then
+    Error (Invalid_dependency "WebSocket liveness durations must be finite and positive")
+  else
+    Ok
+      { perform_http =
+          (fun ~sw request ->
+            Http_eio.perform ~sw ~authenticator:tls_authenticator ~network ~clock request)
+      ; download =
+          (fun ~sw ~request ~destination ~maximum_bytes ~on_progress ->
+            Http_eio.download
+              ~sw
+              ~authenticator:tls_authenticator
+              ~network
+              ~clock
+              ~request
+              ~destination
+              ~maximum_bytes
+              ~on_progress)
+      ; connect_websocket =
+          (fun ~sw ~uri ~token ~maximum_frame_bytes ~on_message ~on_close ->
+            Websocket_eio.connect
+              ~liveness
+              ~sw
+              ~authenticator:tls_authenticator
+              ~network
+              ~clock
+              ~uri
+              ~token
+              ~maximum_frame_bytes
+              ~on_message
+              ~on_close)
+      ; send_websocket = Websocket_eio.send
+      ; close_websocket = Websocket_eio.close
+      ; abort_websocket = Websocket_eio.abort
+      ; activate_websocket = Websocket_eio.activate
+      }
 ;;
 
 type local_store = { application_support_directory : string }
@@ -121,11 +186,6 @@ type secrets =
       -> graph_id:Core.graph_id
       -> encrypted_graph_key:string
       -> (unit, string) result
-  ; delete_wrapped_graph_key :
-      managed_sync_origin:Uri.t
-      -> user_id:string
-      -> graph_id:Core.graph_id
-      -> (unit, string) result
   ; delete_account_secrets :
       managed_sync_origin:Uri.t -> user_id:string -> (unit, string) result
   }
@@ -135,7 +195,6 @@ let secrets
       ~unlock_graph_key
       ~load_wrapped_graph_key
       ~verify_and_save_wrapped_graph_key
-      ~delete_wrapped_graph_key
       ~delete_account_secrets
   =
   Ok
@@ -143,7 +202,6 @@ let secrets
     ; unlock_graph_key
     ; load_wrapped_graph_key
     ; verify_and_save_wrapped_graph_key
-    ; delete_wrapped_graph_key
     ; delete_account_secrets
     }
 ;;
@@ -170,7 +228,6 @@ let apple_secrets () =
       | Error (Platform_crypto.Local_private_key_unavailable message) ->
         Error (Local_private_key_unavailable message))
     ~verify_and_save_wrapped_graph_key:Platform_crypto.verify_and_save_wrapped_graph_key
-    ~delete_wrapped_graph_key:Platform_crypto.delete_wrapped_graph_key
     ~delete_account_secrets:Platform_crypto.delete_account_secrets
 ;;
 
@@ -186,10 +243,27 @@ type dependencies =
   ; artifact_store : artifact_store
   ; secrets : secrets
   ; crypto : crypto
+  ; id_token_provider : id_token_provider
   }
 
-let dependencies ~runtime ~transport ~local_store ~artifact_store ~secrets ~crypto =
-  Ok { runtime; transport; local_store; artifact_store; secrets; crypto }
+let dependencies
+      ~runtime
+      ~transport
+      ~local_store
+      ~artifact_store
+      ~secrets
+      ~crypto
+      ~id_token_provider
+  =
+  Ok
+    { runtime
+    ; transport
+    ; local_store
+    ; artifact_store
+    ; secrets
+    ; crypto
+    ; id_token_provider
+    }
 ;;
 
 type operation =
@@ -310,12 +384,19 @@ let successful_response request (response : Http_eio.response) =
     | Ok () -> Ok response)
 ;;
 
-let perform_http t request =
-  let response =
-    t.dependencies.transport.perform_http ~sw:t.sw request
-    |> Result.map_error (fun message -> Core.Effect_failed message)
-  in
-  Result.bind response (successful_response request)
+let perform_authenticated_http t account make_request =
+  authenticated_operation t.dependencies.id_token_provider ~account ~perform:(fun token ->
+    let request = make_request token in
+    match t.dependencies.transport.perform_http ~sw:t.sw request with
+    | Error message -> Error (Request_failed message)
+    | Ok response when response.Http_eio.status = 401 -> Error Unauthorized
+    | Ok response when response.Http_eio.status = 403 -> Error Forbidden
+    | Ok response ->
+      successful_response request response
+      |> Result.map_error (function
+          | Core.Effect_failed message | Crypto_failed (_, message) ->
+          Request_failed message))
+  |> Result.map_error (fun message -> Core.Effect_failed message)
 ;;
 
 let key t handle =
@@ -370,50 +451,46 @@ let execute_request
   | Core.Load_catalog account -> load_catalog t.dependencies.local_store account
   | Save_catalog { account; cache } ->
     save_catalog t.dependencies.local_store account cache
-  | Fetch_catalog authenticated ->
-    let request =
-      Http.catalog
-        ~base_url:authenticated.account.managed_sync_origin
-        ~token:authenticated.token
-    in
-    Result.bind (perform_http t request) (fun response ->
-      Catalog.decode response.body
-      |> Result.map_error (fun message -> Core.Effect_failed message))
-  | Fetch_snapshot_baseline authorized ->
-    let request =
-      Http.snapshot_baseline
-        ~base_url:authorized.graph.account.managed_sync_origin
-        ~graph_id:authorized.graph.graph_id
-        ~token:authorized.token
-    in
-    Result.map (fun response -> response.Http_eio.body) (perform_http t request)
-  | Fetch_snapshot_metadata authorized ->
-    let request =
-      Http.snapshot_metadata
-        ~base_url:authorized.graph.account.managed_sync_origin
-        ~graph_id:authorized.graph.graph_id
-        ~token:authorized.token
-    in
-    Result.map (fun response -> response.Http_eio.body) (perform_http t request)
-  | Fetch_e2ee_graph_key authorized ->
-    let request =
-      Http.e2ee_graph_key
-        ~base_url:authorized.graph.account.managed_sync_origin
-        ~graph_id:authorized.graph.graph_id
-        ~token:authorized.token
-    in
-    Result.bind (perform_http t request) (fun response ->
-      E2ee.graph_key_response response.Http_eio.body
-      |> Result.map_error (fun message -> Core.Effect_failed message))
-  | Fetch_e2ee_user_keys authenticated ->
-    let request =
-      Http.e2ee_user_keys
-        ~base_url:authenticated.account.managed_sync_origin
-        ~token:authenticated.token
-    in
-    Result.bind (perform_http t request) (fun response ->
-      E2ee.user_keys_response response.Http_eio.body
-      |> Result.map_error (fun message -> Core.Effect_failed message))
+  | Fetch_catalog account ->
+    Result.bind
+      (perform_authenticated_http t account (fun token ->
+         Http.catalog ~base_url:account.managed_sync_origin ~token))
+      (fun response ->
+         Catalog.decode response.body
+         |> Result.map_error (fun message -> Core.Effect_failed message))
+  | Fetch_snapshot_baseline graph ->
+    Result.map
+      (fun response -> response.Http_eio.body)
+      (perform_authenticated_http t graph.account (fun token ->
+         Http.snapshot_baseline
+           ~base_url:graph.account.managed_sync_origin
+           ~graph_id:graph.graph_id
+           ~token))
+  | Fetch_snapshot_metadata graph ->
+    Result.map
+      (fun response -> response.Http_eio.body)
+      (perform_authenticated_http t graph.account (fun token ->
+         Http.snapshot_metadata
+           ~base_url:graph.account.managed_sync_origin
+           ~graph_id:graph.graph_id
+           ~token))
+  | Fetch_e2ee_graph_key graph ->
+    Result.bind
+      (perform_authenticated_http t graph.account (fun token ->
+         Http.e2ee_graph_key
+           ~base_url:graph.account.managed_sync_origin
+           ~graph_id:graph.graph_id
+           ~token))
+      (fun response ->
+         E2ee.graph_key_response response.Http_eio.body
+         |> Result.map_error (fun message -> Core.Effect_failed message))
+  | Fetch_e2ee_user_keys account ->
+    Result.bind
+      (perform_authenticated_http t account (fun token ->
+         Http.e2ee_user_keys ~base_url:account.managed_sync_origin ~token))
+      (fun response ->
+         E2ee.user_keys_response response.Http_eio.body
+         |> Result.map_error (fun message -> Core.Effect_failed message))
   | Download_snapshot download ->
     let staging = t.dependencies.artifact_store.staging_directory in
     let ensure_staging () =
@@ -437,44 +514,69 @@ let execute_request
         ; Filename.concat staging ("snapshot-" ^ id ^ ".gzip-2")
         ]
       in
-      Bootstrap.cleanup (raw :: destination :: temporary_paths);
-      let request = Http.artifact ~uri:download.uri ~token:download.scope.token in
-      t.dependencies.transport.download
-        ~sw:t.sw
-        ~request
-        ~destination:raw
-        ~maximum_bytes:download.maximum_bytes
-        ~on_progress:(fun progress ->
-          if not t.closed
-          then
-            t.post
-              (Core.Snapshot_download_progress
-                 { graph_id = download.scope.graph.graph_id
-                 ; received_bytes = Int64.of_int progress.received_bytes
-                 ; total_bytes = Option.map Int64.of_int progress.total_bytes
-                 }))
-      |> Result.map_error (fun message -> Core.Effect_failed message)
-      |> fun response ->
+      let base_url = download.scope.account.managed_sync_origin in
+      let bearer_authorized = Http.same_origin base_url download.uri in
+      let download_once token =
+        let request = Http.artifact ~base_url ~uri:download.uri ~token in
+        let response =
+          t.dependencies.transport.download
+            ~sw:t.sw
+            ~request
+            ~destination:raw
+            ~maximum_bytes:download.maximum_bytes
+            ~on_progress:(fun progress ->
+              if not t.closed
+              then
+                t.post
+                  (Core.Snapshot_download_progress
+                     { graph_id = download.scope.graph_id
+                     ; received_bytes = Int64.of_int progress.received_bytes
+                     ; total_bytes = Option.map Int64.of_int progress.total_bytes
+                     }))
+          |> Result.map_error (fun message -> Core.Effect_failed message)
+        in
+        Result.map (fun response -> request, response) response
+      in
+      let response =
+        let perform token =
+          match download_once token with
+          | Error (Core.Effect_failed message | Crypto_failed (_, message)) ->
+            Error (Request_failed message)
+          | Ok (_, response) when bearer_authorized && response.Http_eio.status = 401 ->
+            Error Unauthorized
+          | Ok (_, response) when response.Http_eio.status = 403 -> Error Forbidden
+          | Ok (request, response) ->
+            successful_response request response
+            |> Result.map_error (function
+                | Core.Effect_failed message | Crypto_failed (_, message) ->
+                Request_failed message)
+        in
+        (if bearer_authorized
+         then
+           authenticated_operation
+             t.dependencies.id_token_provider
+             ~account:download.scope.account
+             ~perform:(fun token -> perform (Some token))
+         else Result.map_error authenticated_failure (perform None))
+        |> Result.map_error (fun message -> Core.Effect_failed message)
+      in
       Result.bind response (fun response ->
-        Result.bind (successful_response request response) (fun response ->
-          Result.bind
-            (Bootstrap.artifact_row_count response.headers)
-            (fun expected_rows ->
-               Result.map
-                 (fun () ->
-                    Bootstrap.cleanup (raw :: temporary_paths);
-                    Core.staged_artifact
-                      ~id
-                      ~scope:download.scope.graph
-                      ~path:destination
-                      ~expected_rows)
-                 (Bootstrap.peel_gzip_layers
-                    ~decompress_gzip:Artifact_decoder.decompress_gzip
-                    ~maximum_bytes:download.maximum_bytes
-                    ~source:raw
-                    ~destination
-                    ~temporary_paths))
-          |> Result.map_error (fun message -> Core.Effect_failed message))))
+        Result.bind (Bootstrap.artifact_row_count response.headers) (fun expected_rows ->
+          Result.map
+            (fun () ->
+               Bootstrap.cleanup (raw :: temporary_paths);
+               Core.staged_artifact
+                 ~id
+                 ~scope:download.scope
+                 ~path:destination
+                 ~expected_rows)
+            (Bootstrap.peel_gzip_layers
+               ~decompress_gzip:Artifact_decoder.decompress_gzip
+               ~maximum_bytes:download.maximum_bytes
+               ~source:raw
+               ~destination
+               ~temporary_paths))
+        |> Result.map_error (fun message -> Core.Effect_failed message)))
   | Load_and_unlock_graph_key scope ->
     run_secret_action t (fun () ->
       let account = scope.account in
@@ -496,7 +598,7 @@ let execute_request
         |> map_error)
   | Fetch_and_unlock_graph_key request ->
     run_secret_action t (fun () ->
-      let account = request.scope.graph.account in
+      let account = request.scope.account in
       Result.bind
         (t.dependencies.secrets.unlock_graph_key
            ~managed_sync_origin:account.managed_sync_origin
@@ -504,28 +606,21 @@ let execute_request
            ~encrypted_graph_key:request.encrypted_graph_key)
         (fun key ->
            Result.map
-             (fun () -> store_key t ticket request.scope.graph key)
+             (fun () -> store_key t ticket request.scope key)
              (t.dependencies.secrets.verify_and_save_wrapped_graph_key
                 ~managed_sync_origin:account.managed_sync_origin
                 ~user_id:account.user_id
-                ~graph_id:request.scope.graph.graph_id
+                ~graph_id:request.scope.graph_id
                 ~encrypted_graph_key:request.encrypted_graph_key))
       |> map_error)
   | Unlock_private_key request ->
     run_secret_action t (fun () ->
-      let account = request.scope.account in
+      let account = request.scope in
       t.dependencies.secrets.unlock_private_key
         ~managed_sync_origin:account.managed_sync_origin
         ~user_id:account.user_id
         ~password:request.password
         ~private_key_package:request.private_key_package
-      |> map_error)
-  | Delete_wrapped_graph_key request ->
-    run_secret_action t (fun () ->
-      t.dependencies.secrets.delete_wrapped_graph_key
-        ~managed_sync_origin:request.account.managed_sync_origin
-        ~user_id:request.account.user_id
-        ~graph_id:request.graph_id
       |> map_error)
   | Delete_account_secrets account ->
     run_secret_action t (fun () ->
@@ -585,6 +680,18 @@ let scope_matches expected actual =
 
 let zeroize bytes = Bytes.fill bytes 0 (Bytes.length bytes) '\000'
 
+let retire_websockets ?(remove = true) t matches retire =
+  let selected =
+    Hashtbl.fold
+      (fun key (scope, websocket) selected ->
+         if matches scope then (key, websocket) :: selected else selected)
+      t.websockets
+      []
+  in
+  if remove then List.iter (fun (key, _) -> Hashtbl.remove t.websockets key) selected;
+  List.iter (fun (_, websocket) -> retire websocket) selected
+;;
+
 let cancel_scope t scope =
   Hashtbl.iter
     (fun _ (operation : operation) ->
@@ -602,14 +709,11 @@ let cancel_scope t scope =
          None)
        else Some entry)
     t.keys;
-  Hashtbl.filter_map_inplace
-    (fun _ (connection, websocket) ->
-       if scope_matches scope (Core.runner_effect_scope (Core.Close_websocket connection))
-       then (
-         t.dependencies.transport.close_websocket websocket;
-         None)
-       else Some (connection, websocket))
-    t.websockets
+  retire_websockets
+    t
+    (fun connection ->
+       scope_matches scope (Core.runner_effect_scope (Core.Close_websocket connection)))
+    t.dependencies.transport.abort_websocket
 ;;
 
 exception Runner_cancelled
@@ -630,7 +734,9 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
       try
         Some
           (Eio.Fiber.first
-             (fun () -> execute_request t ticket request)
+             (fun () ->
+                if operation.cancelled || t.closed then raise Runner_cancelled;
+                execute_request t ticket request)
              (fun () ->
                 Eio.Promise.await cancelled;
                 raise Runner_cancelled))
@@ -685,46 +791,91 @@ let submit t instruction =
       in
       Hashtbl.replace t.operations key operation;
       t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        let result =
-          try
-            Some
-              (Eio.Fiber.first
-                 (fun () ->
-                    t.dependencies.transport.connect_websocket
-                      ~sw:t.sw
-                      ~uri:request.uri
-                      ~token:request.token
-                      ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
-                      ~on_message:(fun payload ->
-                        if (not t.closed) && not operation.cancelled
-                        then (
-                          match Sync_protocol.decode_server_message payload with
-                          | Ok message ->
-                            t.post (Core.Websocket_message (request.scope, message))
-                          | Error error ->
-                            t.post (Core.Websocket_protocol_error (request.scope, error))))
-                      ~on_close:(fun message ->
-                        Hashtbl.remove t.websockets key;
-                        if (not t.closed) && not operation.cancelled
-                        then t.post (Core.Websocket_closed (request.scope, message))))
-                 (fun () ->
-                    Eio.Promise.await cancelled;
-                    raise Runner_cancelled))
-          with
-          | Runner_cancelled -> None
-        in
-        Hashtbl.remove t.operations key;
-        match result with
-        | None -> ()
-        | Some (Error message) ->
-          if (not t.closed) && not operation.cancelled
-          then t.post (Core.Websocket_closed (request.scope, Some message))
-        | Some (Ok websocket) ->
-          if t.closed || operation.cancelled
-          then t.dependencies.transport.close_websocket websocket
-          else (
-            Hashtbl.replace t.websockets key (request.scope, websocket);
-            t.post (Core.Websocket_opened request.scope)))
+        let pending = ref None
+        and registered = ref false in
+        Fun.protect
+          ~finally:(fun () ->
+            Hashtbl.remove t.operations key;
+            if not !registered
+            then Option.iter t.dependencies.transport.abort_websocket !pending)
+          (fun () ->
+             let connect token =
+               let result =
+                 t.dependencies.transport.connect_websocket
+                   ~sw:t.sw
+                   ~uri:request.uri
+                   ~token
+                   ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
+                   ~on_message:(fun payload ->
+                     if (not t.closed) && not operation.cancelled
+                     then (
+                       match Sync_protocol.decode_server_message payload with
+                       | Ok message ->
+                         t.post (Core.Websocket_message (request.scope, message))
+                       | Error error ->
+                         t.post (Core.Websocket_protocol_error (request.scope, error))))
+                   ~on_close:(fun message ->
+                     let current =
+                       match Hashtbl.find_opt t.websockets key, !pending with
+                       | Some (_, actual), Some expected -> actual == expected
+                       | None, _ -> true
+                       | Some _, None -> false
+                     in
+                     if current
+                     then (
+                       Hashtbl.remove t.websockets key;
+                       if (not t.closed) && not operation.cancelled
+                       then t.post (Core.Websocket_closed (request.scope, message))))
+               in
+               (match result with
+                | Ok handle -> pending := Some handle
+                | Error _ -> ());
+               result
+             in
+             let connect_with_token () =
+               authenticated_operation
+                 t.dependencies.id_token_provider
+                 ~account:request.scope.graph.account
+                 ~perform:(fun token ->
+                   match connect token with
+                   | Ok websocket -> Ok websocket
+                   | Error Websocket_eio.Unauthorized -> Error Unauthorized
+                   | Error Websocket_eio.Forbidden -> Error Forbidden
+                   | Error (Websocket_eio.Connection_failed message) ->
+                     Error (Request_failed message))
+             in
+             let result =
+               try
+                 Some
+                   (Eio.Fiber.first connect_with_token (fun () ->
+                      Eio.Promise.await cancelled;
+                      raise Runner_cancelled))
+               with
+               | Runner_cancelled -> None
+             in
+             if (not t.closed) && not operation.cancelled
+             then (
+               match result with
+               | None -> ()
+               | Some (Error message) ->
+                 t.post (Core.Websocket_closed (request.scope, Some message))
+               | Some (Ok websocket) ->
+                 (match
+                    t.dependencies.transport.activate_websocket
+                      websocket
+                      ~on_open:(fun () ->
+                        Option.iter
+                          (fun (_, old) -> t.dependencies.transport.abort_websocket old)
+                          (Hashtbl.find_opt t.websockets key);
+                        Hashtbl.replace t.websockets key (request.scope, websocket);
+                        registered := true;
+                        t.post (Core.Websocket_opened request.scope))
+                  with
+                  | Ok () -> ()
+                  | Error _ ->
+                    t.post
+                      (Core.Websocket_closed
+                         (request.scope, Some "WebSocket closed before activation"))))))
     | Send_websocket request ->
       (match Sync_protocol.encode_client_message request.message with
        | Error error -> t.post (Core.Websocket_protocol_error (request.scope, error))
@@ -735,14 +886,11 @@ let submit t instruction =
               then ignore (t.dependencies.transport.send_websocket websocket payload))
            t.websockets)
     | Close_websocket scope ->
-      Hashtbl.filter_map_inplace
-        (fun _ (actual, websocket) ->
-           if actual = scope
-           then (
-             t.dependencies.transport.close_websocket websocket;
-             None)
-           else Some (actual, websocket))
-        t.websockets)
+      retire_websockets
+        ~remove:false
+        t
+        (( = ) scope)
+        t.dependencies.transport.close_websocket)
 ;;
 
 let shutdown t =
@@ -759,9 +907,5 @@ let shutdown t =
         }
     in
     cancel_scope t all;
-    Hashtbl.iter
-      (fun _ (_, websocket) -> t.dependencies.transport.close_websocket websocket)
-      t.websockets;
-    Hashtbl.clear t.websockets;
     Hashtbl.clear t.operations)
 ;;

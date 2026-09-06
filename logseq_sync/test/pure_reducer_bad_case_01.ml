@@ -16,8 +16,9 @@ let run () =
     |> check_replay "BC01 follow-up" rejected.next startup_event
   in
   match startup.effects with
-  | [ Core.Publish (Core.State_changed _); Core.Publish (Core.Token_requested request) ]
-    when Core.token_request_purpose request = Core.Catalog_discovery -> ()
+  | [ Core.Publish (Core.State_changed _)
+    ; Core.Run (Core.Request (_, Core.Fetch_catalog _))
+    ] -> ()
   | _ -> Alcotest.fail "BC01 valid startup event was not accepted"
 ;;
 

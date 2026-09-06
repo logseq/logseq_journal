@@ -825,6 +825,7 @@ type read_error =
   | Snapshot_released
   | Snapshot_generation_invalidated
   | Read_limit_exceeded
+  | Stale_read_cursor
   | Invalid_read_request of string
   | Fatal_read_state of string
 

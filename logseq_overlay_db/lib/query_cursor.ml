@@ -2,7 +2,7 @@ module Graph = Logseq_db_types.Graph_types
 
 type error =
   | Invalid
-  | Invalid_or_stale
+  | Stale
 
 let maximum_offset = 10_000
 
@@ -26,7 +26,7 @@ let offset ~projection cursor =
      | Some cursor_projection, Some cursor_offset
        when cursor_offset >= 0
             && cursor_offset <= maximum_offset
-            && cursor_projection <> projection -> Error Invalid_or_stale
+            && cursor_projection <> projection -> Error Stale
      | _ -> Error Invalid)
   | _ -> Error Invalid
 ;;

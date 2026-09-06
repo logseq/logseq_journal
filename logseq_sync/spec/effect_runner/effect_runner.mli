@@ -12,14 +12,39 @@ val runtime
 
 type transport
 type tls_authenticator
+type id_token_provider
+
+val id_token_provider
+  :  acquire:(Logseq_sync_pure_reducer.Core.account_scope -> (string, string) result)
+  -> invalidate:(Logseq_sync_pure_reducer.Core.account_scope -> token:string -> unit)
+  -> id_token_provider
+
+type authenticated_failure =
+  | Unauthorized
+  | Forbidden
+  | Request_failed of string
+
+val authenticated_operation
+  :  id_token_provider
+  -> account:Logseq_sync_pure_reducer.Core.account_scope
+  -> perform:(string -> ('a, authenticated_failure) result)
+  -> ('a, string) result
 
 val tls_authenticator : X509.Authenticator.t -> tls_authenticator
 val system_tls_authenticator : unit -> (tls_authenticator, dependency_error) result
+
+type websocket_liveness =
+  | Disabled
+  | Ping_pong of
+      { interval_seconds : float
+      ; timeout_seconds : float
+      }
 
 val transport
   :  tls_authenticator:tls_authenticator
   -> network:_ Eio.Net.t
   -> clock:_ Eio.Time.clock
+  -> websocket_liveness:websocket_liveness
   -> (transport, dependency_error) result
 
 type local_store
@@ -61,11 +86,6 @@ val secrets
         -> graph_id:Logseq_sync_pure_reducer.Core.graph_id
         -> encrypted_graph_key:string
         -> (unit, string) result)
-  -> delete_wrapped_graph_key:
-       (managed_sync_origin:Uri.t
-        -> user_id:string
-        -> graph_id:Logseq_sync_pure_reducer.Core.graph_id
-        -> (unit, string) result)
   -> delete_account_secrets:
        (managed_sync_origin:Uri.t -> user_id:string -> (unit, string) result)
   -> (secrets, dependency_error) result
@@ -90,6 +110,7 @@ val dependencies
   -> artifact_store:artifact_store
   -> secrets:secrets
   -> crypto:crypto
+  -> id_token_provider:id_token_provider
   -> (dependencies, dependency_error) result
 
 val create

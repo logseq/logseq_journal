@@ -11,36 +11,59 @@ let text_style token =
 ;;
 
 let day_heading
+      ~tokens
       ~typography
       ~profile
       ~rtl
+      ~state
       ~sort_key
-      ~label
+      ~presentation
       (page : Journal_graph_projection.page)
   =
-  Ui.Widget.text
-    ~key:(Ui.Key.string ("journal-day-heading:" ^ string_of_int page.day))
-    ~style:(text_style typography.Tokens.day_heading)
-    ~max_lines:1
-    ~overflow:Ui.Style.Text_overflow.Ellipsis
-    label
-  |> Ui.Widget.with_test_id
-       (Ui.Test_id.string ("journal-day-heading-label:" ^ string_of_int page.day))
-  |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Bottom_start
+  let date_text, weekday_text =
+    match presentation with
+    | None -> "Date unavailable", None
+    | Some (date : Journal_calendar.date_presentation) ->
+      date.date_text, Some date.weekday_text
+  in
+  let line (token : Tokens.text_token) label =
+    let ratio = profile.Tokens.date_text_scale /. profile.text_scale in
+    let token =
+      { token with
+        font_size = token.font_size *. ratio
+      ; line_height = token.line_height *. ratio
+      }
+    in
+    Ui.Widget.text ~style:(text_style token) ~max_lines:1 label
+  in
+  let before, after = Timeline.heading_spacing state ~day:page.day in
+  Ui.Widget.row
+    ((line typography.Tokens.day_heading date_text
+      |> Ui.Widget.with_test_id
+           (Ui.Test_id.string ("journal-day-heading-label:" ^ string_of_int page.day)))
+     ::
+     (match weekday_text with
+      | None -> []
+      | Some weekday ->
+        [ Ui.Widget.empty () |> Ui.Widget.sized_box ~width:14.
+        ; line typography.date_weekday weekday
+          |> Ui.Widget.opacity (Tokens.weekday_opacity tokens ~current:false)
+        ]))
+  |> Ui.Widget.sized_box ~height:(24. *. profile.Tokens.date_text_scale)
+  |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
   |> Ui.Widget.padding
        ~insets:
          (Ui.Layout.Edge_insets.only
             ~left:(if rtl then Tokens.spacing.x4 else profile.Tokens.content_leading)
             ~right:(if rtl then profile.Tokens.content_leading else Tokens.spacing.x4)
-            ~top:Tokens.row_geometry.day_heading_before
-            ~bottom:Tokens.row_geometry.day_heading_after
+            ~top:before
+            ~bottom:after
             ())
   |> Ui.Widget.with_test_id
        (Ui.Test_id.string ("journal-day-heading-padding:" ^ string_of_int page.day))
   |> Ui.Widget.semantics
        ~properties:
          (Ui.Semantics.create
-            ~label
             ~role:Ui.Semantics.Role.Header
             ~heading_level:2
             ~sort_key
@@ -356,15 +379,12 @@ let child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key =
    | None -> ()
    | Some color ->
      let rail =
-       Ui.Widget.empty ()
-       |> Ui.Widget.decorated_box
-            ~decoration:
-              (Ui.Style.Decoration.create
-                 ~background:color
-                 ~border_radius:Tokens.row_geometry.status_rail_radius
-                 ())
-       |> Ui.Widget.with_test_id
-            (Ui.Test_id.string ("journal-child-status-rail:" ^ Journal_model.id block))
+       Journal_row.rail_body
+         ~color
+         ~task_state:(Journal_model.task_state block)
+         ~height:
+           (float_of_int measurement.visible_lines *. profile.Tokens.block_line_height)
+         ~id:("journal-child-status-rail:" ^ Journal_model.id block)
        |> Ui.Widget.sized_box
             ~width:Tokens.row_geometry.status_rail_width
             ~height:
@@ -403,9 +423,10 @@ let render_slot
       ~device_pixel_ratio
       ~rtl
       ~state
-      ~day_label
+      ~day_presentation
       ~show_timestamp
       ~reduced_motion
+      ~on_retry_day
       ~on_toggle_children
       ~delete_enabled
       ~actions_enabled
@@ -415,11 +436,13 @@ let render_slot
   = function
   | Timeline.Day_heading page ->
     day_heading
+      ~tokens
+      ~state
       ~typography
       ~profile
       ~rtl
       ~sort_key:sort_base
-      ~label:(day_label page.day)
+      ~presentation:(day_presentation page.day)
       page
   | Timeline.Top_level entry ->
     let block = entry.block in
@@ -488,10 +511,27 @@ let render_slot
   | Timeline.Child_preview { block; _ } ->
     child_preview ~tokens ~typography ~profile ~rtl ~block ~sort_key:sort_base
   | Timeline.Day_continuation { day; _ } ->
-    continuation
-      ~typography
-      ~key:("journal-day-continuation:" ^ string_of_int day)
-      ~label:"Loading more journal entries"
+    (match Timeline.day_error state ~day with
+     | None ->
+       continuation
+         ~typography
+         ~key:("journal-day-continuation:" ^ string_of_int day)
+         ~label:"Loading more journal entries"
+     | Some _ ->
+       let on_press =
+         Ui.Event.Handler.create (fun _ ->
+           Ui.Event.Handler.Private.invoke
+             on_retry_day
+             (Ui.Event.Payload.Text (string_of_int day)))
+       in
+       Ui.Material.text_button
+         ~enabled:(Option.is_none (Timeline.pending_request state))
+         ~on_press
+         ~child:(Ui.Widget.text "Unable to load entries. Retry")
+         ()
+       |> Ui.Widget.center
+       |> Ui.Widget.with_test_id
+            (Ui.Test_id.string ("journal-day-retry:" ^ string_of_int day)))
     |> Ui.Widget.sized_box ~height:profile.continuation_extent
   | Timeline.Children_loading { parent_id; _ } ->
     continuation
@@ -544,9 +584,10 @@ let view
       ~end_padding
       ~rtl
       ~state
-      ~day_label
+      ~day_presentation
       ~reduced_motion
       ~on_visible_range
+      ~on_retry_day
       ~on_toggle_children
       ~delete_enabled
       ~actions_enabled
@@ -580,9 +621,10 @@ let view
               ~device_pixel_ratio
               ~rtl
               ~state
-              ~day_label
+              ~day_presentation
               ~show_timestamp:(should_show_timestamp ~today ~previous_slot slot)
               ~reduced_motion
+              ~on_retry_day
               ~on_toggle_children
               ~delete_enabled
               ~actions_enabled

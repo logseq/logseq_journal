@@ -25,8 +25,12 @@ let run () =
   in
   let accepted = Core.step rejected.next exact_event in
   match accepted.effects with
-  | [ Core.Run (Core.Send_websocket { scope; message = Protocol.Client.Tx_batch _ }) ]
-    when scope = fixture.connected.connection -> ()
+  | [ Core.Run (Core.Send_websocket { scope; message = Protocol.Client.Tx_batch _ })
+    ; Core.Run (Core.Schedule_timer timer)
+    ]
+    when scope = fixture.connected.connection
+         && timer.delay_seconds = 30.
+         && timer.scope.connection_generation = Some scope.connection_generation -> ()
   | _ -> Alcotest.fail "BC10 exact transition completion was not accepted"
 ;;
 

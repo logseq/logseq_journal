@@ -19,13 +19,17 @@ type failure_source =
 
 type payload =
   | Graph_ready of graph_info
+  | Admission_inspected of
+      { request : Journal_graph_request.admission_request
+      ; observation : Logseq_db_worker.Protocol.v2_admission_inspection
+      }
+  | Admission_unavailable of Journal_graph_request.admission_request
   | Block_captured of
       { block : Journal_graph_projection.block
       ; timeline_entry_update : Journal_graph_projection.timeline_entry option
       }
   | Child_created of
       { child : Journal_graph_projection.block
-      ; parent_revision : int
       ; timeline_entry_update : Journal_graph_projection.timeline_entry
       }
   | Block_updated of
@@ -56,6 +60,12 @@ type payload =
       { request_generation : int64
       ; page : Journal_graph_projection.timeline_entry_page
       }
+  | Day_blocks_failed of
+      { day : int
+      ; request_generation : int64
+      ; stale_cursor : bool
+      ; failure : failure_source
+      }
   | Detail_loaded of
       { request_generation : int64
       ; detail : Journal_graph_projection.detail
@@ -67,11 +77,7 @@ type payload =
   | Open_failed of worker_failure
   | Rejected of failure_source
 
-type response =
-  { basis : int64 option
-  ; payload : payload
-  }
-
+type response = { payload : payload }
 type t
 
 type output =
@@ -79,7 +85,7 @@ type output =
   ; responses : response list
   }
 
-val create : unit -> t
+val create : ?localtime:(float -> Unix.tm) -> unit -> t
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request

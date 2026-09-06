@@ -38,3 +38,10 @@ val view
   -> reduced_motion:bool
   -> on_toggle_children:Bonsai_flutter_ui.Event.Handler.t
   -> Bonsai_flutter_ui.Widget.t
+
+val rail_body
+  :  color:Bonsai_flutter_ui.Style.Color.t
+  -> task_state:Journal_model.task_state
+  -> height:float
+  -> id:string
+  -> Bonsai_flutter_ui.Widget.t

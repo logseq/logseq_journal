@@ -5,11 +5,7 @@ type page =
   }
 
 type block = Journal_model.t
-
-type time_context =
-  { time_zone_id : string
-  ; utc_offset_seconds : int
-  }
+type time_context = { localtime : float -> Unix.tm }
 
 type capture_child =
   { mutation_id : string
@@ -32,9 +28,10 @@ type capture =
 
 type create_child =
   { mutation_id : string
+  ; calendar_generation : int64
   ; block_id : string
   ; parent_block_id : string
-  ; expected_parent_revision : int
+  ; expected_parent_revision : string
   ; sibling_order : string
   ; source : string
   ; task_state : Journal_model.task_state
@@ -44,21 +41,21 @@ type create_child =
 type update_source =
   { mutation_id : string
   ; block_id : string
-  ; expected_revision : int
+  ; expected_revision : string
   ; source : string
   }
 
 type set_task_state =
   { mutation_id : string
   ; block_id : string
-  ; expected_revision : int
+  ; expected_revision : string
   ; task_state : Journal_model.task_state
   }
 
 type delete_subtree =
   { mutation_id : string
   ; block_id : string
-  ; expected_revision : int
+  ; expected_revision : string
   }
 
 type block_cursor =
@@ -105,11 +102,22 @@ type detail =
   ; children : block_page
   }
 
+type block_member =
+  { block : Logseq_db_types.Graph_types.block
+  ; revision : string
+  }
+
+type tree_member =
+  { block : Logseq_db_types.Graph_types.block
+  ; revision : string
+  ; depth : int
+  }
+
 val page_of_summary : Logseq_db_types.Graph_types.page_summary -> page option
 
 val block
   :  page:page
-  -> basis:int64
+  -> revision:string
   -> child_count:int
   -> time_context:time_context
   -> Logseq_db_types.Graph_types.block
@@ -117,15 +125,13 @@ val block
 
 val timeline_entry_page
   :  page:page
-  -> basis:int64
   -> time_context:time_context
-  -> Logseq_db_types.Graph_types.block_tree_item Logseq_db_types.Graph_types.page_result
+  -> tree_member Logseq_db_types.Graph_types.page_result
   -> (timeline_entry_page, string) result
 
 val detail
   :  page:page
-  -> basis:int64
   -> time_context:time_context
-  -> root:Logseq_db_types.Graph_types.block
-  -> Logseq_db_types.Graph_types.block Logseq_db_types.Graph_types.page_result
+  -> root:block_member
+  -> block_member Logseq_db_types.Graph_types.page_result
   -> (detail, string) result

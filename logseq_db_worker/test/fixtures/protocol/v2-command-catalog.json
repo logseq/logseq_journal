@@ -25,9 +25,10 @@
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000011","command":{"type":"setTaskStatus","mutationId":"30000000-0000-4000-8000-000000000005","block":"10000000-0000-4000-8000-000000000001","status":"todo","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:1"}],"pages":[],"scopes":[]}}},
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000012","command":{"type":"clearTaskStatus","mutationId":"30000000-0000-4000-8000-000000000006","block":"10000000-0000-4000-8000-000000000001","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:2"}],"pages":[],"scopes":[]}}},
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000013","command":{"type":"pullChanges","generation":"generation:v1:1","after":null,"limit":50}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000014","command":{"type":"ackChanges","generation":"generation:v1:1","through":"change-window:v1:2"}}
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000014","command":{"type":"ackChanges","generation":"generation:v1:1","through":"change-window:v1:2"}},
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000015","command":{"type":"inspectAdmission"}}
   ],
-  "readOperations": ["graphInfo", "listJournals", "getPage", "getBlock", "getChildren", "getPageTree"],
+  "readOperations": ["graphInfo", "inspectAdmission", "listJournals", "getPage", "getBlock", "getChildren", "getPageTree"],
   "mutationOperations": ["saveBlock", "insertBlocks", "deleteBlocks", "createJournalPage", "setTaskStatus", "clearTaskStatus"],
   "changeOperations": ["pullChanges", "ackChanges"]
 }

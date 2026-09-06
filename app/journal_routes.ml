@@ -19,7 +19,6 @@ type view =
   | Detail_view of
       { block_id : string
       ; request_generation : int64
-      ; session_number : int64
       ; detail : Journal_detail.t
       }
   | Missing_detail_view of
@@ -78,7 +77,6 @@ let apply_detail_response t ~request_generation detail =
         Detail_view
           { block_id = loading.block_id
           ; request_generation
-          ; session_number = loading.session_number
           ; detail = Journal_detail.create ~session_number:loading.session_number detail
           }
     }
@@ -146,7 +144,10 @@ let runtime_replaced t =
         Detail_loading_view
           { block_id = view.block_id
           ; request_generation = Int64.succ view.request_generation
-          ; session_number = Int64.succ view.session_number
+          ; session_number =
+              Int64.succ
+                (Bonsai_flutter_spec.Id.Text_input.Session_id.to_int64
+                   (Journal_detail.session_id view.detail))
           }
     }
   | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t

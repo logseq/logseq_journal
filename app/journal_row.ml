@@ -278,17 +278,56 @@ let time_slot typography profile item ~show_timestamp =
   |> test_id ("journal-row-time-slot:" ^ Item.id item)
 ;;
 
+let rail_body ~color ~task_state ~height ~id =
+  match task_state with
+  | Journal_model.Todo ->
+    let rec segments index remaining =
+      if Float.compare remaining 0. <= 0
+      then []
+      else (
+        let dash_height = Float.min 6. remaining in
+        let gap_height = Float.min 4. (remaining -. dash_height) in
+        let dash =
+          Ui.Widget.empty ()
+          |> Ui.Widget.decorated_box
+               ~decoration:
+                 (Ui.Style.Decoration.create
+                    ~background:color
+                    ~border_radius:Tokens.row_geometry.status_rail_radius
+                    ())
+          |> test_id (Printf.sprintf "%s:segment:%d" id index)
+          |> Ui.Widget.sized_box
+               ~width:Tokens.row_geometry.status_rail_width
+               ~height:dash_height
+        in
+        dash
+        ::
+        (if gap_height <= 0.
+         then []
+         else
+           (Ui.Widget.empty () |> Ui.Widget.sized_box ~height:gap_height)
+           :: segments (index + 1) (remaining -. dash_height -. gap_height)))
+    in
+    Ui.Widget.column (segments 0 height) |> test_id id
+  | _ ->
+    Ui.Widget.empty ()
+    |> Ui.Widget.decorated_box
+         ~decoration:
+           (Ui.Style.Decoration.create
+              ~background:color
+              ~border_radius:Tokens.row_geometry.status_rail_radius
+              ())
+    |> test_id id
+;;
+
 let status_rail ~tokens ~profile item ~visible_lines =
   Option.map
     (fun color ->
-       Ui.Widget.empty ()
-       |> Ui.Widget.decorated_box
-            ~decoration:
-              (Ui.Style.Decoration.create
-                 ~background:color
-                 ~border_radius:Tokens.row_geometry.status_rail_radius
-                 ())
-       |> test_id ("journal-row-status-rail:" ^ Item.id item)
+       rail_body
+         ~color
+         ~task_state:item.Item.task_state
+         ~height:(float_of_int visible_lines *. profile.Tokens.block_line_height)
+         ~id:("journal-row-status-rail:" ^ Item.id item)
        |> Ui.Widget.sized_box
             ~width:Tokens.row_geometry.status_rail_width
             ~height:(float_of_int visible_lines *. profile.Tokens.block_line_height)

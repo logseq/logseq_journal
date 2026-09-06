@@ -44,15 +44,27 @@ type capture_fab_scroll =
   ; accumulated_travel : float
   }
 
+type recovery =
+  { day : int
+  ; target_count : int
+  ; anchor_ids : string list
+  ; entries : Journal_graph_projection.timeline_entry list
+  ; next_cursor : Journal_graph_projection.block_cursor option
+  ; reads : int
+  }
+
 type t =
   { today : int
   ; slots : slot list
   ; first_retained_index : int
+  ; preceding_heading : bool
   ; total_count : int
   ; visible_first : int
   ; visible_last_exclusive : int
   ; visible_demand : request list option
   ; pending : (int64 * request) option
+  ; recovery : recovery option
+  ; day_failures : (int * string) list
   ; expanded_ids : string list
   ; anchor_decision : anchor_decision
   ; focus_restore_block_id : string option
@@ -116,11 +128,14 @@ let empty ~today =
   { today
   ; slots = []
   ; first_retained_index = 0
+  ; preceding_heading = false
   ; total_count = 0
   ; visible_first = 0
   ; visible_last_exclusive = 0
   ; visible_demand = None
   ; pending = None
+  ; recovery = None
+  ; day_failures = []
   ; expanded_ids = []
   ; anchor_decision = Reset_to_top
   ; focus_restore_block_id = None
@@ -174,20 +189,117 @@ let cap_retained (state : t) =
   let extra = List.length state.slots - maximum_slots in
   if extra <= 0
   then state
-  else
+  else (
+    let slots = drop extra state.slots in
     { state with
-      slots = drop extra state.slots
+      slots
+    ; day_failures =
+        List.filter
+          (fun (day, _) ->
+             List.exists
+               (function
+                 | Day_continuation item -> item.day = day
+                 | _ -> false)
+               slots)
+          state.day_failures
     ; first_retained_index = state.first_retained_index + extra
-    }
+    ; preceding_heading =
+        (match List.nth_opt state.slots (extra - 1) with
+         | Some (Day_heading _) -> true
+         | _ -> false)
+    })
 ;;
 
 let begin_request (state : t) ~generation request =
   match state.pending, request with
   | Some (pending_generation, _), Feed { before_day = None }
     when Int64.compare generation pending_generation > 0 ->
-    { state with pending = Some (generation, request) }
+    { state with
+      pending = Some (generation, request)
+    ; recovery = None
+    ; day_failures = []
+    }
   | Some _, _ -> state
+  | None, Feed { before_day = None } ->
+    { state with
+      pending = Some (generation, request)
+    ; recovery = None
+    ; day_failures = []
+    }
   | None, _ -> { state with pending = Some (generation, request) }
+;;
+
+let day_error (state : t) ~day = List.assoc_opt day state.day_failures
+
+let terminal_day_failure (state : t) ~day message =
+  { state with
+    pending = None
+  ; recovery = None
+  ; day_failures = (day, message) :: List.remove_assoc day state.day_failures
+  }
+;;
+
+let start_recovery (state : t) ~day =
+  let day_entries =
+    List.filter_map
+      (function
+        | Top_level entry when Journal_model.journal_day entry.block = day -> Some entry
+        | _ -> None)
+      state.slots
+  in
+  let anchor_ids =
+    let anchor_index = max 0 (state.visible_first - state.first_retained_index) in
+    List.mapi (fun index slot -> index, slot) state.slots
+    |> List.filter_map (fun (index, slot) ->
+      match slot with
+      | Top_level entry -> Some (index, Journal_model.id entry.block)
+      | Child_preview { block; _ } -> Some (index, Journal_model.id block)
+      | _ -> None)
+    |> List.sort (fun (left, _) (right, _) ->
+      match Int.compare (abs (left - anchor_index)) (abs (right - anchor_index)) with
+      | 0 -> Int.compare right left
+      | order -> order)
+    |> List.map snd
+  in
+  { state with
+    pending = None
+  ; day_failures = List.remove_assoc day state.day_failures
+  ; recovery =
+      Some
+        { day
+        ; target_count = List.length day_entries + 64
+        ; anchor_ids
+        ; entries = []
+        ; next_cursor = None
+        ; reads = 0
+        }
+  }
+;;
+
+let fail_day_request (state : t) ~generation ~day ~stale_cursor ~message =
+  match state.pending with
+  | Some (expected, Day request) when Int64.equal expected generation && request.day = day
+    ->
+    if stale_cursor && Option.is_none state.recovery && Option.is_some request.after
+    then start_recovery state ~day
+    else terminal_day_failure state ~day message
+  | _ -> state
+;;
+
+let retry_day (state : t) ~day =
+  if Option.is_some state.pending || Option.is_none (day_error state ~day)
+  then state
+  else start_recovery state ~day
+;;
+
+let invalidate_recovery_for_day (state : t) day =
+  match state.recovery with
+  | Some recovery when recovery.day = day ->
+    terminal_day_failure
+      state
+      ~day
+      "Journal entries changed while reloading. Retry to continue."
+  | _ -> state
 ;;
 
 let day_slots ~today (day : Journal_graph_projection.day_feed) =
@@ -255,7 +367,14 @@ let visible_requests (state : t) ~first_index ~last_exclusive =
 ;;
 
 let next_visible_request (state : t) requests =
-  List.find_opt (request_is_retained state) requests
+  List.find_opt
+    (fun request ->
+       request_is_retained state request
+       &&
+       match request with
+       | Day { day; _ } -> Option.is_none (day_error state ~day)
+       | _ -> true)
+    requests
 ;;
 
 let complete_visible_request ?successor state request =
@@ -318,6 +437,7 @@ let apply_feed (state : t) ~generation feed =
        { state with
          slots = projected
        ; first_retained_index = 0
+       ; preceding_heading = false
        ; total_count = List.length projected
        ; visible_first = 0
        ; visible_last_exclusive = min maximum_supplied_rows (List.length projected)
@@ -396,6 +516,7 @@ let apply_feed (state : t) ~generation feed =
        { state with
          slots
        ; first_retained_index = 0
+       ; preceding_heading = false
        ; total_count = List.length slots
        ; visible_first
        ; visible_last_exclusive
@@ -429,7 +550,7 @@ let apply_feed (state : t) ~generation feed =
   | Some _ | None -> state
 ;;
 
-let apply_timeline_entry_page
+let append_timeline_entry_page
       (state : t)
       ~generation
       (page : Journal_graph_projection.timeline_entry_page)
@@ -470,6 +591,7 @@ let apply_timeline_entry_page
 ;;
 
 let replace_block (state : t) replacement =
+  let state = invalidate_recovery_for_day state (Journal_model.journal_day replacement) in
   let replacement_id = Journal_model.id replacement in
   let slots =
     List.map
@@ -485,7 +607,15 @@ let replace_block (state : t) replacement =
   { state with slots; anchor_decision = Preserve_visible_slot }
 ;;
 
-let replace_timeline_entry (state : t) replacement =
+let replace_timeline_entry
+      (state : t)
+      (replacement : Journal_graph_projection.timeline_entry)
+  =
+  let state =
+    invalidate_recovery_for_day
+      state
+      (Journal_model.journal_day replacement.Journal_graph_projection.block)
+  in
   let replacement_id = Journal_model.id replacement.Journal_graph_projection.block in
   let slots =
     List.map
@@ -503,8 +633,41 @@ let replace_timeline_entry_page
       ~(page : Journal_graph_projection.page)
       (replacement : Journal_graph_projection.timeline_entry_page)
   =
+  let pending =
+    match state.pending with
+    | Some (_, Day { day; _ }) when day = page.day -> None
+    | pending -> pending
+  in
+  let state =
+    { state with
+      pending
+    ; recovery =
+        (match state.recovery with
+         | Some recovery when recovery.day = page.day -> None
+         | value -> value)
+    ; day_failures = List.remove_assoc page.day state.day_failures
+    }
+  in
+  let old_parent_ids =
+    List.filter_map
+      (function
+        | Top_level entry when Journal_model.journal_day entry.block = page.day ->
+          Some (Journal_model.id entry.block)
+        | _ -> None)
+      state.slots
+  in
   let replacement_slots =
-    List.map (fun entry -> Top_level entry) replacement.entries
+    List.concat_map
+      (fun (entry : Journal_graph_projection.timeline_entry) ->
+         let parent_id = Journal_model.id entry.block in
+         Top_level entry
+         ::
+         (if
+            List.mem parent_id state.expanded_ids
+            && Journal_model.child_count entry.block > 0
+          then [ Children_loading { parent_id; epoch = state.next_expansion_epoch } ]
+          else []))
+      replacement.entries
     @
     match replacement.continuation with
     | None -> []
@@ -514,7 +677,9 @@ let replace_timeline_entry_page
     | Top_level entry -> String.equal (Journal_model.page_id entry.block) page.id
     | Child_preview { block; _ } -> String.equal (Journal_model.page_id block) page.id
     | Day_continuation continuation -> continuation.day = page.day
-    | Day_heading _ | Children_loading _ | Children_more _ | Feed_continuation _ -> false
+    | Children_loading { parent_id; _ } | Children_more { parent_id } ->
+      List.mem parent_id old_parent_ids
+    | Day_heading _ | Feed_continuation _ -> false
   in
   let rec skip_page = function
     | slot :: rest when belongs_to_page slot -> skip_page rest
@@ -535,10 +700,144 @@ let replace_timeline_entry_page
     let delta = List.length slots - List.length state.slots in
     { state with
       slots
+    ; pending
+    ; next_expansion_epoch = Int64.succ state.next_expansion_epoch
+    ; expanded_ids =
+        List.filter
+          (fun id ->
+             (not (List.mem id old_parent_ids))
+             || List.exists
+                  (fun (entry : Journal_graph_projection.timeline_entry) ->
+                     String.equal id (Journal_model.id entry.block)
+                     && Journal_model.child_count entry.block > 0)
+                  replacement.entries)
+          state.expanded_ids
     ; total_count = max 0 (state.total_count + delta)
     ; anchor_decision = Preserve_visible_slot
     }
     |> cap_retained
+;;
+
+let apply_timeline_entry_page
+      (state : t)
+      ~generation
+      (page : Journal_graph_projection.timeline_entry_page)
+  =
+  match state.pending, state.recovery with
+  | Some (expected, Day request), Some recovery
+    when Int64.equal generation expected && request.day = recovery.day ->
+    let entries = recovery.entries @ page.entries in
+    let ids =
+      List.map
+        (fun (entry : Journal_graph_projection.timeline_entry) ->
+           Journal_model.id entry.block)
+        entries
+    in
+    let reads = recovery.reads + 1 in
+    let invalid =
+      List.length ids <> List.length (List.sort_uniq String.compare ids)
+      || (Option.is_some page.continuation
+          && (page.entries = [] || page.continuation = request.after))
+    in
+    let anchor_present =
+      match recovery.anchor_ids with
+      | [] -> true
+      | anchor :: _ ->
+        let anchor =
+          List.find_map
+            (function
+              | Child_preview { parent_id; block }
+                when String.equal (Journal_model.id block) anchor -> Some parent_id
+              | _ -> None)
+            state.slots
+          |> Option.value ~default:anchor
+        in
+        List.mem anchor ids
+        || List.exists
+             (function
+               | Top_level entry ->
+                 Journal_model.journal_day entry.block <> recovery.day
+                 && String.equal (Journal_model.id entry.block) anchor
+               | _ -> false)
+             state.slots
+    in
+    let complete =
+      Option.is_none page.continuation
+      || (List.length entries >= recovery.target_count && anchor_present)
+    in
+    if invalid || List.length entries > maximum_slots || ((not complete) && reads >= 16)
+    then
+      terminal_day_failure
+        state
+        ~day:recovery.day
+        "Unable to reload this journal within the loading limit. Retry to continue."
+    else if not complete
+    then
+      { state with
+        pending = None
+      ; recovery = Some { recovery with entries; reads; next_cursor = page.continuation }
+      }
+    else (
+      let owner_page =
+        List.find_map
+          (function
+            | Day_heading page when page.Journal_graph_projection.day = recovery.day ->
+              Some page
+            | Top_level entry when Journal_model.journal_day entry.block = recovery.day ->
+              Some
+                { Journal_graph_projection.id = Journal_model.page_id entry.block
+                ; day = recovery.day
+                ; title = ""
+                }
+            | _ -> None)
+          state.slots
+      in
+      match owner_page with
+      | None ->
+        terminal_day_failure
+          state
+          ~day:recovery.day
+          "This journal is no longer available."
+      | Some owner_page ->
+        let updated =
+          replace_timeline_entry_page
+            state
+            ~page:owner_page
+            { entries; continuation = page.continuation }
+        in
+        let anchor_id =
+          List.find_opt
+            (fun id ->
+               List.exists
+                 (function
+                   | Top_level entry -> String.equal id (Journal_model.id entry.block)
+                   | Child_preview { block; _ } ->
+                     String.equal id (Journal_model.id block)
+                   | _ -> false)
+                 updated.slots)
+            recovery.anchor_ids
+        in
+        let anchor_key =
+          match anchor_id with
+          | Some id -> "block:" ^ id
+          | None -> "day:" ^ string_of_int recovery.day
+        in
+        let rec index n = function
+          | [] -> state.visible_first
+          | slot :: _ when slot_key slot = anchor_key -> n
+          | _ :: tail -> index (n + 1) tail
+        in
+        let visible_first = index updated.first_retained_index updated.slots in
+        { updated with
+          visible_first
+        ; visible_last_exclusive =
+            min
+              updated.total_count
+              (visible_first + max 1 (state.visible_last_exclusive - state.visible_first))
+        ; visible_demand = Option.map (fun _ -> []) state.visible_demand
+        })
+  | _, Some _ -> state
+  | _, None -> append_timeline_entry_page state ~generation page
 ;;
 
 let apply_detail (state : t) ~generation (detail : Journal_graph_projection.detail) =
@@ -638,9 +937,12 @@ let next_request (state : t) =
       | Children_loading { parent_id; epoch } :: _ -> Some (Children { parent_id; epoch })
       | _ :: tail -> find_children tail
     in
-    match find_children state.slots with
-    | Some _ as request -> request
-    | None -> Option.bind state.visible_demand (next_visible_request state))
+    match state.recovery with
+    | Some recovery -> Some (Day { day = recovery.day; after = recovery.next_cursor })
+    | None ->
+      (match find_children state.slots with
+       | Some _ as request -> request
+       | None -> Option.bind state.visible_demand (next_visible_request state)))
 ;;
 
 let pending_request (state : t) = state.pending
@@ -716,8 +1018,9 @@ let collapse (state : t) ~parent_id =
       })
 ;;
 
-let prepend_timeline_entry (state : t) entry =
+let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timeline_entry) =
   let block = entry.Journal_graph_projection.block in
+  let state = invalidate_recovery_for_day state (Journal_model.journal_day block) in
   let rec insert reversed = function
     | [] -> List.rev (Top_level entry :: reversed), state.total_count
     | (Top_level candidate as slot) :: tail
@@ -774,6 +1077,7 @@ let stage_delete (state : t) ~block_id =
   match find [] state.slots with
   | None -> None
   | Some (prefix, _, block, tail) ->
+    let state = invalidate_recovery_for_day state (Journal_model.journal_day block) in
     let rec remove_owned = function
       | Child_preview preview :: rest when String.equal preview.parent_id block_id ->
         remove_owned rest
@@ -819,6 +1123,15 @@ let stage_delete (state : t) ~block_id =
 ;;
 
 let remove_block (state : t) ~block_id =
+  let state =
+    List.fold_left
+      (fun state -> function
+         | Child_preview { block; _ } when String.equal (Journal_model.id block) block_id
+           -> invalidate_recovery_for_day state (Journal_model.journal_day block)
+         | _ -> state)
+      state
+      state.slots
+  in
   match stage_delete state ~block_id with
   | Some (state, _) -> state
   | None ->
@@ -845,7 +1158,50 @@ let remove_block (state : t) ~block_id =
     }
 ;;
 
-let undo_delete staged = { staged.before with pending = None }
+let undo_delete (state : t) staged =
+  let target_key = "block:" ^ Journal_model.id staged.block in
+  if List.exists (fun slot -> String.equal (slot_key slot) target_key) state.slots
+  then state
+  else (
+    match stage_delete staged.before ~block_id:(Journal_model.id staged.block) with
+    | None -> state
+    | Some (without_target, _) ->
+      let retained_keys = List.map slot_key without_target.slots in
+      let removed slot = not (List.mem (slot_key slot) retained_keys) in
+      let rec insert_before anchor slot = function
+        | [] -> [ slot ]
+        | head :: _ as slots when Some (slot_key head) = anchor -> slot :: slots
+        | head :: tail -> head :: insert_before anchor slot tail
+      in
+      let slots, _, inserted =
+        List.fold_right
+          (fun slot (slots, anchor, inserted) ->
+             let key = slot_key slot in
+             if List.exists (fun current -> String.equal (slot_key current) key) slots
+             then slots, Some key, inserted
+             else if removed slot
+             then insert_before anchor slot slots, Some key, inserted + 1
+             else slots, anchor, inserted)
+          staged.before.slots
+          (state.slots, None, 0)
+      in
+      let id = Journal_model.id staged.block in
+      let expanded_ids =
+        if List.mem id staged.before.expanded_ids
+        then id :: state.expanded_ids
+        else state.expanded_ids
+      in
+      { state with
+        slots
+      ; total_count = state.total_count + inserted
+      ; expanded_ids
+      ; pending = None
+      ; anchor_decision = staged.before.anchor_decision
+      ; next_expansion_epoch =
+          Int64.max state.next_expansion_epoch staged.before.next_expansion_epoch
+      }
+      |> cap_retained)
+;;
 
 let return_from_detail (state : t) ~block_id =
   let exists =
@@ -918,6 +1274,27 @@ let is_expanded (state : t) ~block_id =
   List.exists (String.equal block_id) state.expanded_ids
 ;;
 
+let heading_spacing (state : t) ~day =
+  let rec find preceding = function
+    | Day_heading page :: rest when page.Journal_graph_projection.day = day ->
+      let before =
+        if preceding then 22. else Journal_visual_tokens.row_geometry.day_heading_before
+      in
+      let after =
+        match rest with
+        | Day_heading _ :: _ -> 0.
+        | _ -> Journal_visual_tokens.row_geometry.day_heading_after
+      in
+      before, after
+    | Day_heading _ :: rest -> find true rest
+    | _ :: rest -> find false rest
+    | [] ->
+      ( Journal_visual_tokens.row_geometry.day_heading_before
+      , Journal_visual_tokens.row_geometry.day_heading_after )
+  in
+  find state.preceding_heading state.slots
+;;
+
 let extent_geometry (state : t) ~profile =
   let default_extent = Journal_visual_tokens.block_extent ~profile ~visible_lines:1 in
   let extent = function
@@ -936,8 +1313,10 @@ let extent_geometry (state : t) ~profile =
       Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Children_loading
     | Children_more _ ->
       Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Children_more
-    | Day_heading _ ->
-      Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Day_heading
+    | Day_heading page ->
+      let before, after = heading_spacing state ~day:page.day in
+      Float.ceil
+        (before +. (24. *. profile.Journal_visual_tokens.date_text_scale) +. after)
     | Day_continuation _ ->
       Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Day_continuation
     | Feed_continuation _ ->

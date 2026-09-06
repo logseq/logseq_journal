@@ -36,7 +36,6 @@ let secrets () =
       (fun
         ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
       Error "wrapped graph key store unavailable")
-    ~delete_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Ok ())
     ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
   |> Result.get_ok
 ;;
@@ -78,6 +77,7 @@ let dependencies ?secrets_dependency ?crypto_dependency ~environment ~support ~f
   let runtime = Runner.runtime ~fork ~sleep:(fun _ -> ()) |> Result.get_ok in
   let transport =
     Runner.transport
+      ~websocket_liveness:Runner.Disabled
       ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
       ~network:(Eio.Stdenv.net environment)
       ~clock:(Eio.Stdenv.clock environment)
@@ -97,6 +97,10 @@ let dependencies ?secrets_dependency ?crypto_dependency ~environment ~support ~f
     ~artifact_store
     ~secrets:(Option.value secrets_dependency ~default:(secrets ()))
     ~crypto:(Option.value crypto_dependency ~default:(crypto ()))
+    ~id_token_provider:
+      (Runner.id_token_provider
+         ~acquire:(fun _ -> Ok "test-id-token")
+         ~invalidate:(fun _ ~token:_ -> ()))
   |> Result.get_ok
 ;;
 
@@ -165,24 +169,63 @@ let test_catalog_load_uses_account_and_origin_scoped_path () =
           (List.length (Core.state restored.next).snapshot.catalog))))
 ;;
 
-let token_request effects =
-  List.find_map
-    (function
-      | Core.Publish (Core.Token_requested request) -> Some request
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> function
-  | Some request -> request
-  | None -> fail "transition did not publish a token request"
+(* The runner owns whether a queued callback starts. A pure Core completion
+   cannot reproduce a cancelled callback writing to the filesystem. *)
+let test_cancelled_queued_catalog_save_does_not_write () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let tasks = ref [] in
+        let posted = ref [] in
+        let deps =
+          dependencies
+            ~environment
+            ~support
+            ~fork:(fun ~sw:_ task -> tasks := task :: !tasks)
+            ()
+        in
+        let runner =
+          Runner.create ~sw deps ~post:(fun event -> posted := event :: !posted)
+          |> Result.get_ok
+        in
+        let authenticated =
+          Core.step (core ()) (Account_authenticated { user_id = Some "user-1" })
+        in
+        let catalog =
+          List.find_map
+            (function
+              | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+                Some
+                  (Core.step
+                     authenticated.next
+                     (Runner_completed (Completion (ticket, Ok [ encrypted_graph () ]))))
+              | _ -> None)
+            authenticated.effects
+          |> Option.get
+        in
+        let selected = Core.step catalog.next (Graph_selected (graph_id ())) in
+        let save =
+          List.find_map
+            (function
+              | Core.Run (Core.Request (_, Core.Save_catalog _) as instruction) ->
+                Some instruction
+              | _ -> None)
+            selected.effects
+          |> Option.get
+        in
+        Runner.submit runner save;
+        Runner.submit runner (Core.Cancel_effects (Core.runner_effect_scope save));
+        List.iter (fun task -> task ()) (List.rev !tasks);
+        Alcotest.(check bool)
+          "cancelled save has no durable side effects"
+          false
+          (Sys.file_exists (Filename.concat support "logseq-db-worker"));
+        Alcotest.(check int) "cancelled save posts no completion" 0 (List.length !posted))))
 ;;
 
 let cached_key_effect () =
   let authenticated =
     Core.step (core ()) (Account_authenticated { user_id = Some "user-1" })
-  in
-  let catalog_token = token_request authenticated.effects in
-  let authorized =
-    Core.step authenticated.next (Token_provided (catalog_token, "catalog-token"))
   in
   let graph = encrypted_graph () in
   let catalog =
@@ -191,10 +234,10 @@ let cached_key_effect () =
         | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
           Some
             (Core.step
-               authorized.next
+               authenticated.next
                (Runner_completed (Completion (ticket, Ok [ graph ]))))
         | Run _ | Delegate _ | Publish _ -> None)
-      authorized.effects
+      authenticated.effects
     |> function
     | Some transition -> transition
     | None -> fail "transition did not fetch the graph catalog"
@@ -320,9 +363,6 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption () =
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
               Error "wrapped graph key save was not expected")
-            ~delete_wrapped_graph_key:
-              (fun
-                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Ok ())
             ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
           |> Result.get_ok
         in
@@ -408,9 +448,6 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
               Error "wrapped graph key save was not expected")
-            ~delete_wrapped_graph_key:
-              (fun
-                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Ok ())
             ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
           |> Result.get_ok
         in
@@ -453,19 +490,18 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
           true
           ((Core.state failed.next).snapshot.startup.failure
            = Some Core.During_local_restore
-           && not
-                (List.exists
-                   (function
-                     | Core.Publish (Core.Token_requested _) -> true
-                     | Run _ | Delegate _ | Publish _ -> false)
-                   failed.effects));
+           && failed.effects
+              = [ Core.Publish (Core.State_changed (Core.state failed.next)) ]);
         let recovery = Core.step failed.next Core.Online_recovery_requested in
         Alcotest.check
           Alcotest.bool
           "explicit recovery requests E2EE authorization"
           true
-          (Core.token_request_purpose (token_request recovery.effects)
-           = Core.E2ee_key_access);
+          (List.exists
+             (function
+               | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key _)) -> true
+               | Run _ | Delegate _ | Publish _ -> false)
+             recovery.effects);
         Alcotest.(check (result string string))
           "failed cached key is not stored as a usable handle"
           (Error "graph key handle is unavailable or out of scope")
@@ -488,30 +524,13 @@ let account_deletion_effect () =
   |> Option.get
 ;;
 
-let graph_deletion_effect () =
-  let authenticated =
-    Core.step (core ()) (Account_authenticated { user_id = Some "graph-user" })
-  in
-  let deleted_graph = graph_id () in
-  Core.step authenticated.next (Local_cache_deletion_requested deleted_graph)
-  |> fun transition ->
-  List.find_map
-    (function
-      | Core.Run (Core.Request (ticket, Core.Delete_wrapped_graph_key request)) ->
-        Some (Core.Request (ticket, Core.Delete_wrapped_graph_key request))
-      | Run _ | Delegate _ | Publish _ -> None)
-    transition.effects
-  |> Option.get
-;;
-
-let test_deletion_callbacks_receive_exact_identity_once () =
+let test_account_deletion_callback_receives_exact_identity_once () =
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
         let tasks = ref [] in
         let posted = ref [] in
         let accounts = ref [] in
-        let graphs = ref [] in
         let secrets_dependency =
           Runner.secrets
             ~unlock_private_key:
@@ -528,9 +547,6 @@ let test_deletion_callbacks_receive_exact_identity_once () =
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
               Error "unexpected wrapped-key save")
-            ~delete_wrapped_graph_key:(fun ~managed_sync_origin ~user_id ~graph_id ->
-              graphs := (Uri.to_string managed_sync_origin, user_id, graph_id) :: !graphs;
-              Ok ())
             ~delete_account_secrets:(fun ~managed_sync_origin ~user_id ->
               accounts := (Uri.to_string managed_sync_origin, user_id) :: !accounts;
               Ok ())
@@ -549,22 +565,15 @@ let test_deletion_callbacks_receive_exact_identity_once () =
           |> Result.get_ok
         in
         Runner.submit runner (account_deletion_effect ());
-        Runner.submit runner (graph_deletion_effect ());
         List.iter (fun task -> task ()) (List.rev !tasks);
         Alcotest.(check (list (pair string string)))
           "account callback receives the captured identity once"
           [ "https://api.logseq.io", "account-user" ]
           (List.rev !accounts);
-        (match List.rev !graphs with
-         | [ (origin, user_id, deleted_graph) ] ->
-           Alcotest.(check string) "graph callback origin" "https://api.logseq.io" origin;
-           Alcotest.(check string) "graph callback user" "graph-user" user_id;
-           Alcotest.(check bool) "graph callback ID" true (deleted_graph = graph_id ())
-         | _ -> Alcotest.fail "graph deletion callback was not invoked exactly once");
-        Alcotest.(check int) "both deletion requests complete" 2 (List.length !posted))))
+        Alcotest.(check int) "account deletion completes" 1 (List.length !posted))))
 ;;
 
-let test_deletion_callback_failures_are_typed () =
+let test_account_deletion_callback_failures_are_typed () =
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
@@ -586,9 +595,6 @@ let test_deletion_callback_failures_are_typed () =
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
               Error "unexpected wrapped-key save")
-            ~delete_wrapped_graph_key:
-              (fun
-                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Error "graph-delete")
             ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ ->
               Error "account-delete")
           |> Result.get_ok
@@ -606,7 +612,6 @@ let test_deletion_callback_failures_are_typed () =
           |> Result.get_ok
         in
         Runner.submit runner (account_deletion_effect ());
-        Runner.submit runner (graph_deletion_effect ());
         List.iter (fun task -> task ()) (List.rev !tasks);
         let failures =
           List.rev !posted
@@ -617,7 +622,7 @@ let test_deletion_callback_failures_are_typed () =
         in
         Alcotest.(check (list string))
           "callback errors remain typed"
-          [ "account-delete"; "graph-delete" ]
+          [ "account-delete" ]
           failures)))
 ;;
 
@@ -625,20 +630,16 @@ let private_key_unlock_and_sign_out () =
   let authenticated =
     Core.step (core ()) (Account_authenticated { user_id = Some "serialized-user" })
   in
-  let catalog_token = token_request authenticated.effects in
-  let authorized =
-    Core.step authenticated.next (Token_provided (catalog_token, "catalog-token"))
-  in
   let catalog =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
           Some
             (Core.step
-               authorized.next
+               authenticated.next
                (Runner_completed (Completion (ticket, Ok [ encrypted_graph () ]))))
         | Run _ | Delegate _ | Publish _ -> None)
-      authorized.effects
+      authenticated.effects
     |> Option.get
   in
   let selected = Core.step catalog.next (Graph_selected (graph_id ())) in
@@ -658,20 +659,16 @@ let private_key_unlock_and_sign_out () =
     |> Option.get
   in
   let recovery = Core.step failed.next Online_recovery_requested in
-  let recovery_token = token_request recovery.effects in
-  let graph_key_fetch =
-    Core.step recovery.next (Token_provided (recovery_token, "e2ee-token"))
-  in
   let user_key_fetch =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
           Some
             (Core.step
-               graph_key_fetch.next
+               recovery.next
                (Runner_completed (Completion (ticket, Ok "encrypted-graph-key"))))
         | Run _ | Delegate _ | Publish _ -> None)
-      graph_key_fetch.effects
+      recovery.effects
     |> Option.get
   in
   let password_prompt =
@@ -729,10 +726,6 @@ let test_secret_cleanup_is_serialized_after_an_older_write () =
               (fun
                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
               Error "unexpected wrapped-key save")
-            ~delete_wrapped_graph_key:
-              (fun
-                ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
-              Error "unexpected graph deletion")
             ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ ->
               order := "delete-account" :: !order;
               Eio.Promise.resolve resolve_deletion_finished ();
@@ -771,6 +764,89 @@ let test_secret_cleanup_is_serialized_after_an_older_write () =
           (List.rev !order))))
 ;;
 
+let authentication_policy_provider tokens invalidated =
+  Runner.id_token_provider
+    ~acquire:(fun _ ->
+      match Queue.take_opt tokens with
+      | Some token -> Ok token
+      | None -> Error "no token")
+    ~invalidate:(fun _ ~token -> invalidated := token :: !invalidated)
+;;
+
+let authentication_policy_account : Core.account_scope =
+  { managed_sync_origin = Uri.of_string "https://api.logseq.io"
+  ; user_id = "user-1"
+  ; account_generation = 1
+  ; presentation_generation = 1
+  ; lifecycle_generation = 1L
+  }
+;;
+
+let test_authenticated_operation_retries_one_unauthorized_response () =
+  let tokens = Queue.create () in
+  Queue.add "token-1" tokens;
+  Queue.add "token-2" tokens;
+  let invalidated = ref [] in
+  let attempts = ref [] in
+  let result =
+    Runner.authenticated_operation
+      (authentication_policy_provider tokens invalidated)
+      ~account:authentication_policy_account
+      ~perform:(fun token ->
+        attempts := token :: !attempts;
+        if String.equal token "token-1" then Error Runner.Unauthorized else Ok "done")
+  in
+  Alcotest.(check (result string string)) "retry succeeds" (Ok "done") result;
+  Alcotest.(check (list string))
+    "one refreshed attempt"
+    [ "token-1"; "token-2" ]
+    (List.rev !attempts);
+  Alcotest.(check (list string)) "used token invalidated" [ "token-1" ] !invalidated
+;;
+
+let test_authenticated_operation_surfaces_second_unauthorized_response () =
+  let tokens = Queue.create () in
+  Queue.add "token-1" tokens;
+  Queue.add "token-2" tokens;
+  let invalidated = ref [] in
+  let attempts = ref 0 in
+  let result =
+    Runner.authenticated_operation
+      (authentication_policy_provider tokens invalidated)
+      ~account:authentication_policy_account
+      ~perform:(fun _ ->
+        incr attempts;
+        Error Runner.Unauthorized)
+  in
+  Alcotest.(check (result string string))
+    "second unauthorized is terminal"
+    (Error "Authentication failed.")
+    result;
+  Alcotest.check Alcotest.int "at most two attempts" 2 !attempts;
+  Alcotest.(check (list string)) "only first token invalidated" [ "token-1" ] !invalidated
+;;
+
+let test_authenticated_operation_does_not_retry_forbidden_response () =
+  let tokens = Queue.create () in
+  Queue.add "token-1" tokens;
+  let invalidated = ref [] in
+  let attempts = ref 0 in
+  let result =
+    Runner.authenticated_operation
+      (authentication_policy_provider tokens invalidated)
+      ~account:authentication_policy_account
+      ~perform:(fun _ ->
+        incr attempts;
+        Error Runner.Forbidden)
+  in
+  Alcotest.(check (result string string))
+    "forbidden is terminal"
+    (Error "Authorization failed.")
+    result;
+  Alcotest.check Alcotest.int "one attempt" 1 !attempts;
+  Alcotest.(check (list string)) "token remains reusable" [] !invalidated
+;;
+
 let source_contents relative alternatives =
   let candidates = relative :: alternatives in
   match List.find_opt Sys.file_exists candidates with
@@ -807,13 +883,16 @@ let test_runner_source_has_no_placeholder_capabilities () =
     ; "has_private_key"
     ; "decrypt_private_key"
     ; "decrypt_graph_key"
-    ; "ignore secrets.delete_wrapped_graph_key"
     ; "ignore secrets.delete_account_secrets"
     ]
 ;;
 
 let scenarios =
   [ Alcotest.test_case
+      "cancelled queued catalog save never writes"
+      `Quick
+      test_cancelled_queued_catalog_save_does_not_write
+  ; Alcotest.test_case
       "dependency constructors validate resources"
       `Quick
       test_dependency_constructors_validate_owned_resources
@@ -838,17 +917,29 @@ let scenarios =
       `Quick
       test_cached_wrapped_key_unlock_failure_is_fail_closed
   ; Alcotest.test_case
-      "deletion callbacks receive exact identity once"
+      "account deletion callback receives exact identity once"
       `Quick
-      test_deletion_callbacks_receive_exact_identity_once
+      test_account_deletion_callback_receives_exact_identity_once
   ; Alcotest.test_case
-      "deletion callback failures are typed"
+      "account deletion callback failures are typed"
       `Quick
-      test_deletion_callback_failures_are_typed
+      test_account_deletion_callback_failures_are_typed
   ; Alcotest.test_case
       "secret cleanup is serialized after older writes"
       `Quick
       test_secret_cleanup_is_serialized_after_an_older_write
+  ; Alcotest.test_case
+      "authenticated operation retries one unauthorized response"
+      `Quick
+      test_authenticated_operation_retries_one_unauthorized_response
+  ; Alcotest.test_case
+      "authenticated operation surfaces a second unauthorized response"
+      `Quick
+      test_authenticated_operation_surfaces_second_unauthorized_response
+  ; Alcotest.test_case
+      "authenticated operation does not retry forbidden response"
+      `Quick
+      test_authenticated_operation_does_not_retry_forbidden_response
   ; Alcotest.test_case
       "runner source has no placeholder capabilities"
       `Quick

@@ -6,6 +6,33 @@ type sync_runner
 type dependencies
 type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
+type id_token_request
+type id_token_cache
+
+val id_token_request_id : id_token_request -> string
+
+val id_token_cache
+  :  wall_clock_s:(unit -> float)
+  -> monotonic_ns:(unit -> int64)
+  -> request:(id_token_request -> unit)
+  -> id_token_cache
+
+val acquire_id_token
+  :  id_token_cache
+  -> account:Logseq_sync_pure_reducer.Core.account_scope
+  -> (string, string) result
+
+val provide_id_token : id_token_cache -> id_token_request -> string -> unit
+val reject_id_token : id_token_cache -> id_token_request -> string -> unit
+
+val invalidate_id_token
+  :  id_token_cache
+  -> account:Logseq_sync_pure_reducer.Core.account_scope
+  -> token:string
+  -> unit
+
+val reconcile_authenticated_user : id_token_cache -> user_id:string option -> unit
+val shutdown_id_token_cache : id_token_cache -> unit
 
 val runtime
   :  fork:(sw:Eio.Switch.t -> (unit -> unit) -> unit)

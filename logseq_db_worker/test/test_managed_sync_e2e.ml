@@ -178,20 +178,19 @@ let send_command context command =
 ;;
 
 let fail_worker context phase reason =
-  let sync, cursor, startup_failure, error_kind, sync_history, error_detail =
+  let sync, cursor, startup_failure, error_kind, error_detail =
     match context.last_state with
-    | None -> "unknown", "none", "none", "none", "none", "none"
+    | None -> "unknown", "none", "none", "none", "none"
     | Some state ->
       ( sync_phase_name state.snapshot.sync_phase
       , Option.fold ~none:"none" ~some:string_of_int state.snapshot.applied_server_t
       , startup_failure_stage_name state.snapshot.startup.failure
       , sync_error_kind state.snapshot.last_error
-      , String.concat "," (List.rev state.diagnostics.history)
       , Option.fold ~none:"none" ~some:String.escaped state.snapshot.last_error )
   in
   fail
     "client=%s phase=%s reason=%s sync=%s startup-failure=%s error-kind=%s graph=%s \
-     cursor=%s outbox=unobserved last=%s history=%s sync-history=%s error=%s"
+     cursor=%s outbox=unobserved last=%s history=%s error=%s"
     context.label
     phase
     reason
@@ -202,7 +201,6 @@ let fail_worker context phase reason =
     cursor
     context.last_event
     (String.concat "," (List.rev context.state_history))
-    sync_history
     error_detail
 ;;
 
@@ -265,7 +263,7 @@ let handle_graph_state context state =
 let handle_push context = function
   | Service.Need_id_token request ->
     context.last_event <- "need-id-token";
-    let request_id = Core.token_request_id request in
+    let request_id = Service.token_request_id request in
     if Hashtbl.mem context.token_requests request_id
     then fail_worker context "authentication" "repeated-challenge";
     Hashtbl.add context.token_requests request_id ();
@@ -356,11 +354,6 @@ let await_authoritative_current context ~after_server_t phase =
     ignore (drain context : (ID.Worker.Request_id.t * Protocol.response) list);
     match context.last_state with
     | Some state ->
-      (match
-         List.find_opt (String.starts_with ~prefix:"tx-reject:") state.diagnostics.history
-       with
-       | Some reason -> fail_worker context phase reason
-       | None -> ());
       (match state.snapshot.sync_phase, state.snapshot.applied_server_t with
        | Current, Some cursor when cursor > after_server_t -> cursor
        | _ ->
@@ -1025,7 +1018,12 @@ let with_client ~label ~support ~credentials ~cognito f =
        send_command
          context
          (Reconcile_authenticated_user { user_id = Some cognito.user_id });
-       f context)
+       let result = f context in
+       let token_request_count = Hashtbl.length context.token_requests in
+       report_phase (Printf.sprintf "%s-token-request-count-%d" label token_request_count);
+       if token_request_count <> 1
+       then fail_worker context "authentication" "unexpected-token-request-count";
+       result)
 ;;
 
 type durable_facts =

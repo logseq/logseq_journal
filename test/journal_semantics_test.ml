@@ -1,5 +1,6 @@
 module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 module ID = Bonsai_flutter_spec.Id
+module Protocol = Bonsai_flutter_protocol
 module Test = Bonsai_flutter_test
 module Tokens = Journal_visual_tokens
 module Ui = Bonsai_flutter_ui
@@ -25,8 +26,6 @@ let creation_time =
     ~instant_unix_ms:1_786_237_500_000L
     ~local_day:20260809
     ~local_minute_of_day:545
-    ~time_zone_id:"Asia/Shanghai"
-    ~utc_offset_seconds:28_800
   |> require_ok
 ;;
 
@@ -46,7 +45,7 @@ let block
     ~task_state
     ~child_count
     ~creation_time
-    ~revision:4
+    ~revision:"block-4"
     ~last_mutation_id:mutation_id
   |> require_ok
 ;;
@@ -84,9 +83,9 @@ let projected_block ?status_ident ?(source = "Projected status block") () =
   in
   Journal_graph_projection.block
     ~page
-    ~basis:4L
+    ~revision:"block-4"
     ~child_count:0
-    ~time_context:{ time_zone_id = "Asia/Shanghai"; utc_offset_seconds = 28_800 }
+    ~time_context:{ localtime = (fun seconds -> Unix.gmtime (seconds +. 28_800.)) }
     graph_block
   |> require_ok
 ;;
@@ -191,7 +190,13 @@ type semantics_view =
   }
 
 let require_semantics handle label check =
-  match Test.Handle.find_all handle (Test.Query.semantics_label label) with
+  match
+    Test.Handle.find_all
+      handle
+      (if String.equal label "2026.08.09"
+       then Test.Query.test_id "journal-date-context"
+       else Test.Query.semantics_label label)
+  with
   | [ node ] ->
     let (Av view) = Ui.Widget.Private.view node.widget in
     (match view.node with
@@ -683,14 +688,21 @@ let test_four_status_rails_replace_timeline_task_controls () =
             Fun.protect
               ~finally:(fun () -> Test.Handle.shutdown handle)
               (fun () ->
-                 require_decoration
-                   handle
-                   ("journal-row-status-rail:" ^ block_id)
-                   ~background:0l
-                   ~border_radius:2.;
+                 let rail_id = "journal-row-status-rail:" ^ block_id in
+                 if String.equal status_name "Todo"
+                 then (
+                   let (Av view) = Ui.Widget.Private.view (node handle rail_id).widget in
+                   match view.node with
+                   | Ui.Widget.Private.Column -> ()
+                   | _ -> fail "TODO rail must contain bounded dash segments");
+                 let decoration_id =
+                   if String.equal status_name "Todo"
+                   then rail_id ^ ":segment:0"
+                   else rail_id
+                 in
+                 require_decoration handle decoration_id ~background:0l ~border_radius:2.;
                  (let (Av view) =
-                    Ui.Widget.Private.view
-                      (node handle ("journal-row-status-rail:" ^ block_id)).widget
+                    Ui.Widget.Private.view (node handle decoration_id).widget
                   in
                   match view.node with
                   | Ui.Widget.Private.Decorated_box { background = Some color; _ } ->
@@ -907,11 +919,18 @@ let header_component sync_phase handlers _graph =
     Ui.Widget.Scroll_view.vertical
       ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
       [ Journal_header.sliver
+          ~viewport_width:390.
+          ~tokens:
+            (Tokens.resolve
+               ~brightness:Bonsai_flutter.Environment.Light
+               ~high_contrast:false)
           ~typography:(Tokens.typography Tokens.Balanced)
           ~text_scale:1.
           ~top_inset:0.
           ~device_pixel_ratio:3.
-          ~context:(Journal_header.Context.today ~subtitle:"Sunday, August 9")
+          ~context:
+            (Journal_header.Context.today
+               ~date:(Journal_calendar.present_journal_day 20260809 |> Result.to_option))
           ~sync_phase
           ~on_error_info:None
           ~on_account_menu:(Some on_account_menu)
@@ -941,9 +960,9 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
             ; floating = false
             ; snap = false
             ; center_title = true
-            ; variant = 0
-            ; shape = 1
-            ; density = 1
+            ; expanded_height = Some 64.
+            ; collapsed_height = Some 64.
+            ; toolbar_height = 56.
             ; _
             } -> ()
         | Sliver_app_bar _ ->
@@ -958,8 +977,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
          ];
        require_icon handle "journal-account-icon" ~code_point:0xe043 ~color:0x00000000l;
        require
-         (Option.is_some
-            (Test.Handle.find handle (Test.Query.visible_text "Today · Sunday, August 9")))
+         (Option.is_some (Test.Handle.find handle (Test.Query.visible_text "2026.08.09")))
          "Journal header lost its visible date context";
        List.iter
          (fun test_id ->
@@ -978,7 +996,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
        require_semantics handle "Account menu" (fun props ->
          require (props.role = Ui.Semantics.Role.Button) "account menu is not a button";
          require
-           (props.hint = Some "Switch graphs, reset the local copy, or sign out")
+           (props.hint = Some "Switch graphs, delete the local copy, or sign out")
            "account menu hint changed";
          require (props.enabled = Some true) "account menu is disabled";
          require (props.focusable = Some true) "account menu is not focusable";
@@ -990,7 +1008,7 @@ let test_header_account_action_and_view_only_date_have_truthful_semantics () =
               props.actions)
            "account menu has no tap action";
          require (props.sort_key = Some 4.) "account menu semantic order changed");
-       require_semantics handle "Today, Sunday, August 9" (fun props ->
+       require_semantics handle "2026.08.09" (fun props ->
          require (props.role = Ui.Semantics.Role.Generic) "date context is still a button";
          require (props.enabled = None) "view-only date exposes enabled state";
          require (props.focusable <> Some true) "view-only date is keyboard focusable";
@@ -1011,60 +1029,335 @@ let test_header_sync_progress_tracks_every_sync_phase () =
     handle
   in
   let progress_id = "journal-header-sync-progress" in
-  let progress_extent_id = "journal-header-sync-progress-extent" in
-  List.iter
-    (fun phase ->
-       let handle = render (Some phase) in
-       Fun.protect
-         ~finally:(fun () -> Test.Handle.shutdown handle)
-         (fun () ->
-            let progress = node handle progress_id in
-            let (Av progress_view) = Ui.Widget.Private.view progress.widget in
-            (match progress_view.node with
-             | Ui.Widget.Private.Material_linear_progress_indicator
-                 { value = None; wavy = false } -> ()
-             | Material_linear_progress_indicator { value = None; wavy = true } ->
-               fail "sync progress unexpectedly uses the wavy variant"
-             | Material_linear_progress_indicator { value = Some value; _ } ->
-               fail "sync progress is determinate at %.3f" value
-             | _ -> fail "sync progress is not a Material linear progress indicator");
-            let progress_extent =
-              match Test.Handle.find handle (Test.Query.test_id progress_extent_id) with
-              | Some extent -> extent
-              | None -> fail "sync progress does not expose its exact visual thickness"
-            in
-            let (Av extent_view) = Ui.Widget.Private.view progress_extent.widget in
-            (match extent_view.node with
-             | Ui.Widget.Private.Sized_box { height = Some height; _ } ->
-               require
-                 (Float.equal height 2.)
-                 "sync progress thickness is %.1f instead of 2.0"
-                 height
-             | _ -> fail "sync progress thickness is not constrained by a SizedBox");
-            require
-              (Option.is_none
-                 (Test.Handle.find
-                    handle
-                    (Test.Query.test_id "journal-header-flexible-space")))
-              "sync progress retains the obsolete flexible-space app-bar path"))
-    [ Graph_service.Connecting ];
   List.iter
     (fun sync_phase ->
        let handle = render sync_phase in
        Fun.protect
          ~finally:(fun () -> Test.Handle.shutdown handle)
          (fun () ->
+            let connecting = sync_phase = Some Graph_service.Connecting in
+            let (Av header) =
+              Ui.Widget.Private.view (node handle "journal-header").widget
+            in
+            (match header.node with
+             | Ui.Widget.Private.Sliver_app_bar
+                 { has_bottom = true; bottom_height = Some 2.; _ } -> ()
+             | _ -> fail "every sync phase must reserve a two-pixel app-bar bottom");
+            let (Av bottom) =
+              Ui.Widget.Private.view
+                header.children.(Array.length header.children - 1).widget
+            in
+            (match connecting, bottom.node with
+             | true, Ui.Widget.Private.Clip _ ->
+               let (Av progress) = Ui.Widget.Private.view bottom.children.(0).widget in
+               (match progress.node with
+                | Ui.Widget.Private.Material_linear_progress_indicator
+                    { value = None; wavy = false } -> ()
+                | _ -> fail "connecting bottom must contain flat indeterminate progress")
+             | false, Ui.Widget.Private.Empty -> ()
+             | _ ->
+               fail
+                 "app-bar bottom must clip connecting progress or contain an empty widget");
             require
-              (Option.is_none (Test.Handle.find handle (Test.Query.test_id progress_id)))
-              "inactive sync phase displayed the header progress indicator"))
+              (List.length (Test.Handle.find_all handle (Test.Query.test_id progress_id))
+               = if connecting then 1 else 0)
+              "progress visibility must match exactly Connecting";
+            require
+              (Option.is_some
+                 (Test.Handle.find handle (Test.Query.visible_text "2026.08.09")))
+              "sync phase changed the date-only title"))
     [ None
-    ; Some Graph_service.Offline
+    ; Some Graph_service.Connecting
+    ; Some Offline
     ; Some Pulling
     ; Some Submitting
     ; Some Current
     ; Some Paused
     ; Some Failed
     ]
+;;
+
+let export_timeline_preview directory =
+  let render ~width ~scale ~high_contrast ~dark ~rtl ~preset =
+    let make_block ~day ~ordinal ~parent_id ~child_count ~task_state source =
+      Journal_model.create
+        ~id:(Printf.sprintf "30000000-0000-4000-a000-%012d" ordinal)
+        ~page_id:(Printf.sprintf "30000000-0000-4000-b000-%012d" day)
+        ~journal_day:day
+        ~parent_id
+        ~sibling_order:(Printf.sprintf "%012d" ordinal)
+        ~source
+        ~task_state
+        ~child_count
+        ~creation_time:
+          (Journal_time.create
+             ~instant_unix_ms:1788652800000L
+             ~local_day:day
+             ~local_minute_of_day:545
+           |> require_ok)
+        ~revision:"preview-revision"
+        ~last_mutation_id:mutation_id
+      |> require_ok
+    in
+    let root =
+      make_block
+        ~day:20260906
+        ~ordinal:1
+        ~parent_id:None
+        ~child_count:1
+        ~task_state:Journal_model.Todo
+        "Plan the week\nChoose one small next step"
+    in
+    let child =
+      make_block
+        ~day:20260906
+        ~ordinal:2
+        ~parent_id:(Some (Journal_model.id root))
+        ~child_count:0
+        ~task_state:Journal_model.Todo
+        "Review the notes"
+    in
+    let older =
+      make_block
+        ~day:20260905
+        ~ordinal:3
+        ~parent_id:None
+        ~child_count:0
+        ~task_state:Journal_model.Done
+        "A quiet afternoon walk"
+    in
+    let day day entries more : Journal_graph_projection.day_feed =
+      { page =
+          { id = Printf.sprintf "30000000-0000-4000-b000-%012d" day
+          ; day
+          ; title = "Journal"
+          }
+      ; entries =
+          List.map
+            (fun block -> { Journal_graph_projection.block; child_summaries = [] })
+            entries
+      ; has_more_entries = more
+      ; continuation = None
+      }
+    in
+    let state =
+      Journal_timeline_state.empty ~today:20260906
+      |> fun state ->
+      Journal_timeline_state.begin_request
+        state
+        ~generation:1L
+        (Feed { before_day = None })
+      |> fun state ->
+      Journal_timeline_state.apply_feed
+        state
+        ~generation:1L
+        { days =
+            [ day 20260906 [ root ] false
+            ; day 20260905 [ older ] false
+            ; day 20260904 [] false
+            ; day 20260903 [] false
+            ; day 20260902 [] true
+            ]
+        ; slot_count = 8
+        ; has_more_days = false
+        }
+      |> fun state ->
+      Journal_timeline_state.expand state ~parent_id:(Journal_model.id root)
+      |> fun state ->
+      Journal_timeline_state.reconcile_detail
+        state
+        { root; children = { blocks = [ child ]; continuation = None } }
+    in
+    let component handlers _graph =
+      let ignored =
+        Bonsai_flutter.Driver.Handler.create
+          handlers
+          ~name:"preview"
+          ~equal:(fun () () -> true)
+          (Bonsai.Cont.return ())
+          ~f:(fun () _ -> Bonsai.Effect.Ignore)
+      in
+      Bonsai.Cont.map ignored ~f:(fun ignored ->
+        let tokens =
+          Tokens.resolve
+            ~brightness:(if dark then Bonsai_flutter.Environment.Dark else Light)
+            ~high_contrast
+        in
+        let typography = Tokens.typography preset in
+        Ui.Widget.Scroll_view.vertical
+          ~on_scroll:ignored
+          [ Journal_header.sliver
+              ~tokens
+              ~typography
+              ~text_scale:scale
+              ~viewport_width:width
+              ~top_inset:0.
+              ~device_pixel_ratio:1.
+              ~context:
+                (Journal_header.Context.today
+                   ~date:
+                     (Journal_calendar.present_journal_day 20260906 |> Result.to_option))
+              ~sync_phase:None
+              ~on_error_info:None
+              ~on_account_menu:(Some ignored)
+          ; Journal_timeline.view
+              ~tokens
+              ~typography
+              ~profile:
+                (Tokens.select_row_profile
+                   ~preset
+                   ~viewport_width:width
+                   ~text_scale:scale)
+              ~device_pixel_ratio:1.
+              ~end_padding:0.
+              ~rtl
+              ~state
+              ~day_presentation:(fun day ->
+                Journal_calendar.present_journal_day day |> Result.to_option)
+              ~reduced_motion:true
+              ~on_visible_range:ignored
+              ~on_retry_day:ignored
+              ~on_toggle_children:ignored
+              ~delete_enabled:false
+              ~actions_enabled:false
+              ~on_status:ignored
+              ~on_delete:ignored
+          ]
+          ()
+        |> Ui.Widget.Viewport.Vertical.with_height ~height:844.)
+    in
+    let handle =
+      Test.Handle.create
+        ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7009L)
+        ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+        component
+    in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         Test.Handle.present handle;
+         let path =
+           Filename.concat
+             directory
+             (Printf.sprintf
+                "timeline-%g-%g-%b-%b-%b-%s.bin"
+                width
+                scale
+                high_contrast
+                dark
+                rtl
+                (Tokens.stored_value_of_typography_preset preset))
+         in
+         let channel = open_out_bin path in
+         Fun.protect
+           ~finally:(fun () -> close_out channel)
+           (fun () ->
+              output_bytes channel (Option.get (Test.Handle.last_frame handle)).bytes))
+  in
+  List.iter
+    (fun dark ->
+       List.iter
+         (fun high_contrast ->
+            List.iter
+              (fun (width, scale, rtl) ->
+                 List.iter
+                   (fun preset -> render ~width ~scale ~high_contrast ~dark ~rtl ~preset)
+                   [ Tokens.Dense; Balanced; Comfortable ])
+              [ 390., 1., false; 320., 3.2, true ])
+         [ false; true ])
+    [ false; true ]
+;;
+
+(* Export real application header frames for Flutter renderer geometry tests. *)
+let export_header_frames directory =
+  let export width scale high_contrast =
+    let phases =
+      [| None; Some Graph_service.Connecting; Some Current; Some Connecting; None |]
+    in
+    List.iter
+      (fun with_error ->
+         let component handlers graph =
+           let index, set_index = Bonsai_v017.state ~equal:Int.equal 0 graph in
+           let next =
+             Bonsai_flutter.Driver.Handler.create
+               handlers
+               ~name:"next-header-phase"
+               ~equal:( == )
+               set_index
+               ~f:(fun set_index _ -> set_index (fun index -> index + 1))
+           in
+           Bonsai.Cont.map2 index next ~f:(fun index next ->
+             Ui.Widget.Scroll_view.vertical
+               ~on_scroll:(Ui.Event.Handler.create (fun _ -> ()))
+               [ Journal_header.sliver
+                   ~viewport_width:width
+                   ~tokens:
+                     (Tokens.resolve
+                        ~brightness:Bonsai_flutter.Environment.Light
+                        ~high_contrast)
+                   ~typography:(Tokens.typography Tokens.Balanced)
+                   ~text_scale:scale
+                   ~top_inset:0.
+                   ~device_pixel_ratio:1.
+                   ~context:
+                     (Journal_header.Context.today
+                        ~date:
+                          (Journal_calendar.present_journal_day 20260809
+                           |> Result.to_option))
+                   ~sync_phase:phases.(index)
+                   ~on_error_info:(if with_error then Some next else None)
+                   ~on_account_menu:(Some next)
+               ; Ui.Widget.text "Timeline anchor" |> Ui.Widget.Sliver.box
+               ; Ui.Widget.empty ()
+                 |> Ui.Widget.sized_box ~height:2000.
+                 |> Ui.Widget.Sliver.box
+               ]
+               ()
+             |> Ui.Widget.Viewport.Vertical.with_height ~height:600.)
+         in
+         let handle =
+           Test.Handle.create
+             ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_008L)
+             ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+             component
+         in
+         Fun.protect
+           ~finally:(fun () -> Test.Handle.shutdown handle)
+           (fun () ->
+              Test.Handle.present handle;
+              Array.iteri
+                (fun index _ ->
+                   Test.Handle.present handle;
+                   if index > 0
+                   then
+                     Test.Handle.click
+                       handle
+                       (Test.Query.test_id "journal-account-menu-button");
+                   let frame = Option.get (Test.Handle.last_frame handle) in
+                   let path =
+                     Filename.concat
+                       directory
+                       (Printf.sprintf
+                          "header-%g-%g-%b-%s-%d.bin"
+                          width
+                          scale
+                          high_contrast
+                          (if with_error then "error" else "account")
+                          index)
+                   in
+                   let channel = open_out_bin path in
+                   Fun.protect
+                     ~finally:(fun () -> close_out channel)
+                     (fun () -> output_bytes channel frame.bytes))
+                phases))
+      [ false; true ]
+  in
+  List.iter
+    (fun high_contrast ->
+       List.iter
+         (fun (width, scale) -> export width scale high_contrast)
+         [ 390., 1.; 320., 1.; 320., 3.2 ])
+    [ false; true ]
 ;;
 
 let require_row_shape width scale expected_kind expected_extent expected_time_width =
@@ -1097,13 +1390,16 @@ let require_row_shape width scale expected_kind expected_extent expected_time_wi
             (node handle ("journal-row-time-slot:" ^ block_id)).widget
         in
         match view.node with
-        | Ui.Widget.Private.Constrained_box { min_width; max_width; _ } ->
+        | Ui.Widget.Private.Constrained_box { min_width; max_width = Some max_width; _ }
+          ->
           require
             (min_width = expected_time_width && max_width = expected_time_width)
             "time slot is %.1f..%.1f, expected %.1f"
             min_width
             max_width
             expected_time_width
+        | Ui.Widget.Private.Constrained_box { max_width = None; _ } ->
+          fail "time slot has no maximum width"
         | _ -> fail "time slot is not reserved");
        (let (Av view) =
           Ui.Widget.Private.view
@@ -1261,7 +1557,9 @@ let delete_timeline_component
           ~end_padding:0.
           ~rtl:false
           ~state
-          ~day_label:(fun _ -> "Today")
+          ~on_retry_day:(Ui.Event.Handler.create (fun _ -> ()))
+          ~day_presentation:(fun day ->
+            Journal_calendar.present_journal_day day |> Result.to_option)
           ~reduced_motion:false
           ~delete_enabled
           ~actions_enabled:delete_enabled
@@ -1525,7 +1823,184 @@ let test_slidable_has_one_exact_status_button_and_non_dismissible_delete_action 
          "write-disabled row retained Slidable wrapper")
 ;;
 
+let warm_start_test_service () =
+  Worker.Service.create
+    ~push_topic_count:5
+    ~concurrency:Worker.Service.Serial
+    ~init:(fun _context (_config : Journal_startup.t) -> Ok ())
+    ~handle:(fun _context () request ->
+      match (request : Graph_service.request) with
+      | Get_graph_state ->
+        Ok
+          (Graph_service.Graph_state
+             { generation = 0; graph_id = None; phase = Graph_closed; error = None })
+      | Client_command _ -> Ok Client_command_completed
+      | Graph_request request ->
+        let error =
+          Logseq_db_worker.Error.create
+            ~code:Closed_session
+            ~message:"The test graph is closed."
+            ~details:[]
+          |> Result.get_ok
+        in
+        Ok
+          (Graph_response
+             (Logseq_db_worker.Protocol.failed ~request_id:request.request_id error)))
+    ~shutdown:(fun () -> ())
+    ()
+;;
+
+let warm_start_application_payload () =
+  Logseq_db_worker.Config.create
+    ~application_support_directory:"/tmp/logseq-journal-warm-start-ordering"
+    ~target:(Managed_sync { base_url = "https://api.logseq.io" })
+    ~compatibility_profile:Logseq_65_33_or_newer
+    ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+    ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+  |> Result.get_ok
+  |> Journal_startup.encode
+  |> Result.fold ~ok:Fun.id ~error:(fun error ->
+    fail "%s" (Journal_startup.Error.to_string error))
+;;
+
+let application_requests handle =
+  match Test.Handle.last_frame handle with
+  | None -> fail "warm-start application emitted no frame"
+  | Some frame ->
+    (match Bonsai_flutter_protocol.Binary_codec.decode frame.bytes with
+     | Error error -> fail "warm-start frame did not decode: %s" error.message
+     | Ok wire ->
+       List.filter_map
+         (function
+           | Bonsai_flutter_protocol.Wire_frame.Application_request
+               { request_id; payload } -> Some (request_id, payload)
+           | _ -> None)
+         wire.operations)
+;;
+
+let request_id_for_payload requests payload =
+  List.find_map
+    (fun (request_id, request_payload) ->
+       if Bytes.equal request_payload payload then Some request_id else None)
+    requests
+;;
+
+let network_lifecycle_packet ~kind ~generation =
+  let payload = Bytes.make 16 '\000' in
+  Bytes.blit_string "LJP1" 0 payload 0 4;
+  Bytes.set_uint16_le payload 4 1;
+  Bytes.set_uint16_le payload 6 kind;
+  Bytes.set_int64_le payload 8 generation;
+  let envelope = Bytes.make 48 '\000' in
+  Bytes.blit_string "LJP2" 0 envelope 0 4;
+  Bytes.set_uint16_le envelope 4 2;
+  Bytes.set_uint16_le envelope 6 15;
+  Bytes.set_int32_le envelope 24 16l;
+  Bytes.blit payload 0 envelope 32 16;
+  envelope
+;;
+
+let application_event_batch ~runtime_epoch ~revision ~sequence payload =
+  Protocol.Inbound_event.
+    { runtime_epoch
+    ; events =
+        [ { sequence = ID.Runtime.Event_sequence.of_int64 sequence
+          ; displayed_revision = revision
+          ; node_id = ID.Ui.Node_id.zero
+          ; handler_id = ID.Ui.Handler_id.zero
+          ; event_tag = Protocol.Generated_protocol.Event_tag.application_event
+          ; payload = Application_event payload
+          }
+        ]
+    }
+;;
+
+let with_warm_start_app ?calendar_sampler runtime_epoch run =
+  let handle =
+    Test.Handle.create_app
+      ~runtime_epoch
+      ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+      (Application.For_testing.app_with_service
+         ?calendar_sampler
+         (warm_start_test_service ()))
+      ~application_payload:(warm_start_application_payload ())
+  in
+  Fun.protect ~finally:(fun () -> Test.Handle.shutdown handle) (fun () -> run handle)
+;;
+
+let test_warm_start_samples_calendar_before_requesting_local_binding () =
+  let runtime_epoch = ID.Runtime.Epoch.of_int64 7_005L in
+  let calendar_sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_508_800.)
+      ~localtime:(fun seconds -> Unix.gmtime (seconds +. 28_800.))
+      ()
+  in
+  with_warm_start_app ~calendar_sampler runtime_epoch (fun handle ->
+    let initial_requests = application_requests handle in
+    require
+      (Option.is_some
+         (request_id_for_payload
+            initial_requests
+            Journal_platform.local_account_binding_request))
+      "OCaml calendar sampling did not release managed warm startup synchronously";
+    require
+      (List.for_all
+         (fun (_, payload) -> Bytes.get_uint16_le payload 6 <> 1)
+         initial_requests)
+      "warm startup emitted the deleted calendar platform request")
+;;
+
+let test_calendar_failure_does_not_start_graph_restoration () =
+  let runtime_epoch = ID.Runtime.Epoch.of_int64 7_006L in
+  let calendar_sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> raise (Failure "calendar unavailable"))
+      ~localtime:Unix.localtime
+      ()
+  in
+  with_warm_start_app ~calendar_sampler runtime_epoch (fun handle ->
+    let initial_requests = application_requests handle in
+    require
+      (Option.is_none
+         (request_id_for_payload
+            initial_requests
+            Journal_platform.local_account_binding_request))
+      "failed calendar prerequisite still started graph restoration")
+;;
+
+let test_foreground_resume_resamples_calendar_in_ocaml () =
+  let runtime_epoch = ID.Runtime.Epoch.of_int64 7_007L in
+  let samples = ref 0 in
+  let calendar_sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () ->
+        incr samples;
+        1_788_508_800. +. (Float.of_int !samples *. 60.))
+      ~localtime:(fun seconds -> Unix.gmtime (seconds +. 28_800.))
+      ()
+  in
+  with_warm_start_app ~calendar_sampler runtime_epoch (fun handle ->
+    require (!samples = 1) "warm startup sampled the calendar more than once";
+    Test.Handle.present handle;
+    let events =
+      network_lifecycle_packet ~kind:2 ~generation:1L
+      |> application_event_batch
+           ~runtime_epoch
+           ~revision:(Test.Handle.revision handle)
+           ~sequence:1L
+    in
+    Test.Handle.pump_next handle ~events ();
+    require (!samples = 2) "foreground resume did not re-sample the OCaml calendar")
+;;
+
 let () =
+  (match Sys.getenv_opt "JOURNAL_HEADER_FRAME_DIR" with
+   | None -> ()
+   | Some directory ->
+     export_header_frames directory;
+     export_timeline_preview directory;
+     exit 0);
   test_literal_source_time_completion_and_full_access ();
   test_long_source_and_corrupt_surfaces ();
   test_four_status_rails_replace_timeline_task_controls ();
@@ -1538,5 +2013,8 @@ let () =
   test_rtl_row_geometry_uses_logical_edges ();
   test_child_count_widths_and_long_parent_source_remain_bounded ();
   test_non_picker_exact_statuses_remain_readable_on_the_status_button ();
-  test_slidable_has_one_exact_status_button_and_non_dismissible_delete_action ()
+  test_slidable_has_one_exact_status_button_and_non_dismissible_delete_action ();
+  test_warm_start_samples_calendar_before_requesting_local_binding ();
+  test_calendar_failure_does_not_start_graph_restoration ();
+  test_foreground_resume_resamples_calendar_in_ocaml ()
 ;;

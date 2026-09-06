@@ -30,6 +30,15 @@ type startup_facts =
   ; presentation_generation : int
   }
 
+type local_deletion_stage = Logseq_sync_pure_reducer.Core.local_deletion_stage =
+  | Closing_graph
+  | Deleting_mirror
+  | Clearing_selection
+
+type local_deletion = Logseq_sync_pure_reducer.Core.local_deletion =
+  | Deletion_in_progress of local_deletion_stage
+  | Deletion_failed of local_deletion_stage
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -38,6 +47,7 @@ type snapshot =
   ; timeline_presentation_pending : bool
   ; startup : startup_facts
   ; last_error : string option
+  ; local_deletion : local_deletion option
   }
 
 type diagnostic_group =
@@ -45,26 +55,16 @@ type diagnostic_group =
   ; entries : (string * string) list
   }
 
-type diagnostics =
-  { groups : diagnostic_group list
-  ; history : string list
-  }
+type diagnostics = { groups : diagnostic_group list }
 
 type state =
   { snapshot : snapshot
   ; diagnostics : diagnostics
   }
 
-type token_purpose =
-  | Catalog_discovery
-  | Snapshot_bootstrap
-  | E2ee_key_access
-  | Websocket_connect
-
 type token_request
 
 val token_request_id : token_request -> string
-val token_request_purpose : token_request -> token_purpose
 
 type bootstrap_progress =
   { graph_id : graph_id

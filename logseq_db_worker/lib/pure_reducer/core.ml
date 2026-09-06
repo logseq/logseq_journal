@@ -129,6 +129,7 @@ type state =
   { graph : graph_state
   ; sync_core : Sync.t
   ; database : database_handle option
+  ; deferred_detach : Sync.graph_scope option
   ; pending : pending list
   ; next_effect_id : int64
   ; lifecycle_generation : int64
@@ -144,6 +145,7 @@ let initial config =
     { graph = { generation = 0; graph_id = None; phase = Graph_closed; error = None }
     ; sync_core
     ; database = None
+    ; deferred_detach = None
     ; pending = []
     ; next_effect_id = 0L
     ; lifecycle_generation = 0L
@@ -221,6 +223,12 @@ let translate_sync transition state =
     | Sync.Run sync_effect :: rest -> loop state (Run_sync sync_effect :: reversed) rest
     | Sync.Publish output :: rest ->
       loop state (Publish (Sync_output output) :: reversed) rest
+    | Sync.Delegate (Sync.Detach_graph scope) :: rest ->
+      let graph = { state.graph with phase = Graph_closing } in
+      loop
+        { state with graph; deferred_detach = Some scope }
+        (Publish (Graph_state_changed graph) :: reversed)
+        rest
     | Sync.Delegate worker_effect :: rest ->
       let ticket, state = fresh_ticket state in
       let state =
@@ -292,7 +300,12 @@ let step state event =
   else (
     match event with
     | Start -> no_effects state
-    | Projection_push push -> { next = state; effects = [ Publish (Graph_push push) ] }
+    | Projection_push push ->
+      if
+        state.graph.phase = Graph_open
+        && Sync.admitted_graph_scope state.sync_core <> None
+      then { next = state; effects = [ Publish (Graph_push push) ] }
+      else no_effects state
     | Graph_request { id; request } ->
       (match state.graph.phase, state.database with
        | Graph_open, Some database ->
@@ -358,9 +371,38 @@ let step state event =
              { next = transitioned.next
              ; effects = Publish (Diagnostic message) :: transitioned.effects
              }
+           | Some (Sync.Apply_outbox_transition request) ->
+             let transitioned =
+               translate_sync
+                 (Sync.step
+                    state.sync_core
+                    (Sync.Outbox_transition_failed { request; message }))
+                 state
+             in
+             { transitioned with
+               effects = Publish (Diagnostic message) :: transitioned.effects
+             }
+           | Some (Sync.Detach_graph scope) ->
+             translate_sync
+               (Sync.step
+                  state.sync_core
+                  (Sync.Graph_detached (scope, Error "Graph close failed.")))
+               state
+           | Some (Sync.Delete_mirror request) ->
+             translate_sync
+               (Sync.step
+                  state.sync_core
+                  (Sync.Mirror_deleted (request, Error "Mirror deletion failed.")))
+               state
            | Some _ | None -> { next = state; effects = [ Publish (Diagnostic message) ] })
         | Ok result ->
-          let state, lifecycle_effects = apply_lifecycle state result.lifecycle in
+          let state, lifecycle_effects =
+            match state.graph.phase, worker_effect with
+            | Graph_closing, Some (Sync.Detach_graph _) ->
+              apply_lifecycle state result.lifecycle
+            | Graph_closing, _ -> state, []
+            | _ -> apply_lifecycle state result.lifecycle
+          in
           let transitioned =
             match result.event with
             | None -> no_effects state
@@ -384,6 +426,26 @@ let step state event =
           }
       ; effects = close_effects
       })
+;;
+
+(* Drain all already-issued database operations before executing the existing close.
+   Their replies still finish; Sync rejects their superseded graph events. *)
+let step state event =
+  let transition = step state event in
+  match transition.next.deferred_detach, transition.next.pending with
+  | Some scope, [] when not transition.next.shutdown ->
+    let ticket, next = fresh_ticket transition.next in
+    let worker_effect = Sync.Detach_graph scope in
+    { next =
+        { next with
+          deferred_detach = None
+        ; pending = [ Pending_sync_worker (ticket, worker_effect) ]
+        }
+    ; effects =
+        transition.effects
+        @ [ Run_worker (Request (ticket, Handle_sync_worker_effect worker_effect)) ]
+    }
+  | _ -> transition
 ;;
 
 let complete_execute runner_effect result =

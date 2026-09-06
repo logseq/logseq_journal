@@ -87,10 +87,24 @@ let valid_artifact uri =
   | Some _, Some _, _, _ | Some _, None, _, _ | None, _, _, _ -> false
 ;;
 
-let artifact ~uri ~token =
+let same_origin first second =
+  Uri.scheme first = Uri.scheme second
+  && Option.map String.lowercase_ascii (Uri.host first)
+     = Option.map String.lowercase_ascii (Uri.host second)
+  && Option.value (Uri.port first) ~default:443
+     = Option.value (Uri.port second) ~default:443
+;;
+
+let artifact ~base_url ~uri ~token =
+  require_base_url base_url;
   if not (valid_artifact uri) then invalid_arg "snapshot artifact URL is unsafe";
+  let headers =
+    match token with
+    | Some token when same_origin base_url uri -> authorization token
+    | Some _ | None -> [ "accept", "application/octet-stream" ]
+  in
   { uri
-  ; headers = authorization token
+  ; headers
   ; maximum_response_bytes = max_int
   ; expected_content_type = Snapshot_artifact
   }

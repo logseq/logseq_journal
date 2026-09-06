@@ -12,6 +12,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 
+import 'journal_platform_menu.dart';
+
 const _platformChannel = MethodChannel('logseq_journal/platform');
 
 enum JournalStartupMilestone {
@@ -42,85 +44,7 @@ abstract final class JournalStartupTimeline {
       Map<JournalStartupMilestone, int>.unmodifiable(_elapsedMicroseconds);
 }
 
-final class JournalCalendarSnapshot {
-  const JournalCalendarSnapshot({
-    required this.instantUnixMilliseconds,
-    required this.localDay,
-    required this.locale,
-    required this.timeZoneId,
-    required this.utcOffsetSeconds,
-    required this.generation,
-  });
-
-  final int instantUnixMilliseconds;
-  final int localDay;
-  final String locale;
-  final String timeZoneId;
-  final int utcOffsetSeconds;
-  final int generation;
-}
-
-abstract final class _CalendarFacts {
-  static const maximumSignedInt64 = 0x7fffffffffffffff;
-
-  static int localMinuteOfDay(JournalCalendarSnapshot snapshot) {
-    if (!_validLocalDay(snapshot.localDay) ||
-        snapshot.utcOffsetSeconds.abs() > 64800 ||
-        snapshot.generation < 0 ||
-        snapshot.generation > maximumSignedInt64 ||
-        snapshot.locale.isEmpty ||
-        utf8.encode(snapshot.locale).length > 128 ||
-        snapshot.timeZoneId.isEmpty ||
-        utf8.encode(snapshot.timeZoneId).length > 256) {
-      throw const FormatException('calendar facts are invalid');
-    }
-    final instantSeconds = _floorDiv(snapshot.instantUnixMilliseconds, 1000);
-    final localSeconds = instantSeconds + snapshot.utcOffsetSeconds;
-    if (_floorDiv(localSeconds, 86400) != _daysFromCivil(snapshot.localDay)) {
-      throw const FormatException('calendar local day is inconsistent');
-    }
-    return _floorDiv(localSeconds, 60) % 1440;
-  }
-
-  static int _floorDiv(int dividend, int divisor) {
-    final quotient = dividend ~/ divisor;
-    return dividend.remainder(divisor) < 0 ? quotient - 1 : quotient;
-  }
-
-  static int _daysFromCivil(int value) {
-    final year = value ~/ 10000;
-    final month = (value ~/ 100) % 100;
-    final day = value % 100;
-    final adjustedYear = month <= 2 ? year - 1 : year;
-    final era = adjustedYear ~/ 400;
-    final yearOfEra = adjustedYear - (era * 400);
-    final adjustedMonth = month + (month > 2 ? -3 : 9);
-    final dayOfYear = (((153 * adjustedMonth) + 2) ~/ 5) + day - 1;
-    final dayOfEra =
-        (yearOfEra * 365) + (yearOfEra ~/ 4) - (yearOfEra ~/ 100) + dayOfYear;
-    return (era * 146097) + dayOfEra - 719468;
-  }
-
-  static bool _validLocalDay(int value) {
-    final year = value ~/ 10000;
-    final month = (value ~/ 100) % 100;
-    final day = value % 100;
-    if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1) {
-      return false;
-    }
-    final normalized = DateTime.utc(year, month, day);
-    return normalized.year == year &&
-        normalized.month == month &&
-        normalized.day == day;
-  }
-}
-
 enum JournalPlatformTag {
-  calendarRequest(1),
-  calendarResponse(2),
-  calendarEvent(3),
-  formatDaysRequest(4),
-  formatDaysResponse(5),
   authenticatedUserRequest(6),
   authenticatedUserResponse(7),
   idTokenRequest(8),
@@ -254,17 +178,6 @@ void _validateCanonicalAbsolutePath(String value) {
   }
 }
 
-enum CalendarChangeReason {
-  requested(0),
-  resumed(1),
-  significantTimeChanged(2),
-  timeZoneChanged(3),
-  localeChanged(4);
-
-  const CalendarChangeReason(this.wireId);
-  final int wireId;
-}
-
 enum NetworkLifecycleKind {
   backgrounded(1),
   foregroundResumed(2);
@@ -273,12 +186,6 @@ enum NetworkLifecycleKind {
   final int wireId;
 }
 
-typedef CalendarSnapshotProvider = Future<JournalCalendarSnapshot> Function();
-typedef JournalDayHeadingFormatter =
-    Future<Map<int, String>> Function({
-      required JournalCalendarSnapshot snapshot,
-      required List<int> days,
-    });
 typedef JournalPreferenceReader = Future<String?> Function(String key);
 typedef JournalPreferenceWriter =
     Future<void> Function(String key, String value);
@@ -324,44 +231,6 @@ abstract final class JournalPlatformCodec {
     return value;
   }
 
-  static Uint8List encodeCalendar(
-    JournalCalendarSnapshot snapshot, {
-    required CalendarChangeReason reason,
-    required bool event,
-    required int lifecycleGeneration,
-  }) {
-    final locale = utf8.encode(snapshot.locale);
-    final timeZone = utf8.encode(snapshot.timeZoneId);
-    final payload = Uint8List(56 + locale.length + timeZone.length);
-    payload.setRange(0, 4, ascii.encode('LJP1'));
-    final data = ByteData.sublistView(payload);
-    data.setUint16(4, 1, Endian.little);
-    data.setUint16(6, event ? 3 : 2, Endian.little);
-    data.setUint16(8, reason.wireId, Endian.little);
-    data.setUint16(10, locale.length, Endian.little);
-    data.setUint16(12, timeZone.length, Endian.little);
-    data.setInt64(16, snapshot.instantUnixMilliseconds, Endian.little);
-    data.setUint32(24, snapshot.localDay, Endian.little);
-    data.setUint16(
-      28,
-      _CalendarFacts.localMinuteOfDay(snapshot),
-      Endian.little,
-    );
-    data.setInt32(32, snapshot.utcOffsetSeconds, Endian.little);
-    data.setInt64(40, snapshot.generation, Endian.little);
-    data.setInt64(48, lifecycleGeneration, Endian.little);
-    payload.setRange(56, 56 + locale.length, locale);
-    payload.setRange(56 + locale.length, payload.length, timeZone);
-    return JournalPlatformEnvelopeCodec.encode(
-      JournalPlatformEnvelope(
-        tag: event
-            ? JournalPlatformTag.calendarEvent
-            : JournalPlatformTag.calendarResponse,
-        payload: payload,
-      ),
-    );
-  }
-
   static Uint8List encodeNetworkLifecycle({
     required NetworkLifecycleKind kind,
     required int generation,
@@ -383,76 +252,7 @@ abstract final class JournalPlatformCodec {
     );
   }
 
-  static ({int generation, List<int> days}) decodeFormatRequest(
-    Uint8List request,
-  ) {
-    final envelope = JournalPlatformEnvelopeCodec.decode(request);
-    final payload = envelope.payload;
-    if (envelope.tag != JournalPlatformTag.formatDaysRequest ||
-        payload.length < 20 ||
-        ascii.decode(payload.sublist(0, 4), allowInvalid: true) != 'LJP1') {
-      throw const FormatException('invalid formatted-day request');
-    }
-    final data = ByteData.sublistView(payload);
-    final generation = data.getInt64(8, Endian.little);
-    final count = data.getUint16(16, Endian.little);
-    if (data.getUint16(4, Endian.little) != 1 ||
-        data.getUint16(6, Endian.little) != 4 ||
-        generation < 0 ||
-        count < 1 ||
-        count > 64 ||
-        data.getUint16(18, Endian.little) != 0 ||
-        payload.length != 20 + (count * 4)) {
-      throw const FormatException('invalid formatted-day request');
-    }
-    final days = List<int>.generate(
-      count,
-      (index) => data.getUint32(20 + (index * 4), Endian.little),
-      growable: false,
-    );
-    return (generation: generation, days: days);
-  }
-
-  static Uint8List encodeFormattedDays({
-    required int generation,
-    required Map<int, String> headings,
-  }) {
-    final encoded = headings.entries
-        .map((entry) => (entry.key, utf8.encode(entry.value)))
-        .toList(growable: false);
-    if (generation < 0 ||
-        encoded.isEmpty ||
-        encoded.length > 64 ||
-        encoded.any((entry) => entry.$2.isEmpty || entry.$2.length > 512)) {
-      throw const FormatException('formatted-day response is invalid');
-    }
-    final payload = Uint8List(
-      encoded.fold(20, (length, entry) => length + 8 + entry.$2.length),
-    );
-    payload.setRange(0, 4, ascii.encode('LJP1'));
-    final data = ByteData.sublistView(payload);
-    data.setUint16(4, 1, Endian.little);
-    data.setUint16(6, 5, Endian.little);
-    data.setInt64(8, generation, Endian.little);
-    data.setUint16(16, encoded.length, Endian.little);
-    var offset = 20;
-    for (final (day, heading) in encoded) {
-      data.setUint32(offset, day, Endian.little);
-      data.setUint16(offset + 4, heading.length, Endian.little);
-      payload.setRange(offset + 8, offset + 8 + heading.length, heading);
-      offset += 8 + heading.length;
-    }
-    return JournalPlatformEnvelopeCodec.encode(
-      JournalPlatformEnvelope(
-        tag: JournalPlatformTag.formatDaysResponse,
-        payload: payload,
-      ),
-    );
-  }
-
-  static ({String challengeId, String purpose}) decodeIdTokenRequest(
-    Uint8List request,
-  ) {
+  static ({String challengeId}) decodeIdTokenRequest(Uint8List request) {
     final envelope = JournalPlatformEnvelopeCodec.decode(request);
     if (envelope.tag != JournalPlatformTag.idTokenRequest) {
       throw const FormatException('invalid ID-token request');
@@ -461,25 +261,12 @@ abstract final class JournalPlatformCodec {
       utf8.decode(envelope.payload, allowMalformed: false),
     );
     if (decoded is! Map<String, dynamic> ||
-        decoded.keys.toSet().difference({
-          'challengeId',
-          'purpose',
-        }).isNotEmpty ||
-        decoded.length != 2 ||
-        decoded['challengeId'] is! String ||
-        decoded['purpose'] is! String ||
-        !(const {
-          'catalogDiscovery',
-          'snapshotBootstrap',
-          'e2eeKeyAccess',
-          'websocketConnect',
-        }).contains(decoded['purpose'])) {
+        decoded.keys.toSet().difference({'challengeId'}).isNotEmpty ||
+        decoded.length != 1 ||
+        decoded['challengeId'] is! String) {
       throw const FormatException('invalid ID-token request');
     }
-    return (
-      challengeId: decoded['challengeId']! as String,
-      purpose: decoded['purpose']! as String,
-    );
+    return (challengeId: decoded['challengeId']! as String);
   }
 
   static Uint8List encodeJson(JournalPlatformTag tag, Object value) {
@@ -581,8 +368,6 @@ final class JournalAmplifySession implements JournalAuthCapability {
 final class JournalApplicationPlatform extends WidgetsBindingObserver
     implements BonsaiFlutterApplicationPlatform {
   JournalApplicationPlatform({
-    required this.calendarSnapshot,
-    required this.formatJournalDays,
     required this.auth,
     required this.readPreference,
     required this.writePreference,
@@ -592,16 +377,9 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
     this.clearLocalAccountBinding = _ignoreLocalAccountBindingClear,
     this.waitForPresentationFrame = _waitForFlutterPresentationFrame,
     this.prepareToTerminate,
-    Future<JournalCalendarSnapshot>? initialSnapshot,
   }) {
     WidgetsBinding.instance.addObserver(this);
     _platformChannel.setMethodCallHandler(_handleNativeSignal);
-    _initialization = initialSnapshot == null
-        ? Future<JournalCalendarSnapshot?>.value()
-        : initialSnapshot.then((snapshot) {
-            _rememberSnapshot(snapshot);
-            return snapshot;
-          });
     _authEvents = Amplify.Hub.listen<AuthUser, AuthHubEvent>(HubChannel.Auth, (
       _,
     ) {
@@ -609,8 +387,6 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
     });
   }
 
-  final CalendarSnapshotProvider calendarSnapshot;
-  final JournalDayHeadingFormatter formatJournalDays;
   final JournalAuthCapability auth;
   final JournalPreferenceReader readPreference;
   final JournalPreferenceWriter writePreference;
@@ -622,41 +398,15 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
   final Future<void> Function()? prepareToTerminate;
   final StreamController<Uint8List> _events =
       StreamController<Uint8List>.broadcast(sync: true);
-  final Map<int, JournalCalendarSnapshot> _snapshots = {};
-  late final Future<JournalCalendarSnapshot?> _initialization;
   StreamSubscription<AuthHubEvent>? _authEvents;
   Completer<void>? _terminationReady;
   Future<void>? _termination;
-  int _lastGeneration = -1;
   int _lifecycleGeneration = 0;
   bool _backgrounded = false;
   bool _disposed = false;
-  bool _initialSnapshotConsumed = false;
 
   @override
   Stream<Uint8List> get events => _events.stream;
-
-  void _rememberSnapshot(JournalCalendarSnapshot snapshot) {
-    _CalendarFacts.localMinuteOfDay(snapshot);
-    _lastGeneration = snapshot.generation;
-    _snapshots[snapshot.generation] = snapshot;
-  }
-
-  Future<JournalCalendarSnapshot> _freshSnapshot() async {
-    final initial = await _initialization;
-    if (!_initialSnapshotConsumed && initial != null) {
-      _initialSnapshotConsumed = true;
-      return initial;
-    }
-    final snapshot = await calendarSnapshot();
-    _CalendarFacts.localMinuteOfDay(snapshot);
-    if (snapshot.generation <= _lastGeneration) {
-      throw StateError('calendar generation is stale');
-    }
-    _rememberSnapshot(snapshot);
-    _snapshots.removeWhere((key, _) => key < snapshot.generation - 2);
-    return snapshot;
-  }
 
   Uint8List _authenticatedUserResponse(String? userId) {
     return JournalPlatformCodec.encodeJson(
@@ -689,35 +439,6 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
   @override
   Future<Uint8List> handleRequest(Uint8List request) async {
     switch (JournalPlatformCodec.requestTag(request)) {
-      case 1:
-        JournalPlatformCodec.validateEmpty(
-          request,
-          JournalPlatformTag.calendarRequest,
-        );
-        return JournalPlatformCodec.encodeCalendar(
-          await _freshSnapshot(),
-          reason: CalendarChangeReason.requested,
-          event: false,
-          lifecycleGeneration: _lifecycleGeneration,
-        );
-      case 4:
-        final decoded = JournalPlatformCodec.decodeFormatRequest(request);
-        final snapshot = _snapshots[decoded.generation];
-        if (snapshot == null) {
-          throw StateError('calendar generation is no longer retained');
-        }
-        final headings = await formatJournalDays(
-          snapshot: snapshot,
-          days: decoded.days,
-        );
-        if (headings.keys.toSet().difference(decoded.days.toSet()).isNotEmpty ||
-            decoded.days.toSet().difference(headings.keys.toSet()).isNotEmpty) {
-          throw StateError('native day formatter returned a mismatched batch');
-        }
-        return JournalPlatformCodec.encodeFormattedDays(
-          generation: decoded.generation,
-          headings: headings,
-        );
       case 6:
         JournalPlatformCodec.validateEmpty(
           request,
@@ -837,36 +558,10 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
     }
   }
 
-  Future<void> refresh(CalendarChangeReason reason) async {
-    if (_disposed) return;
-    final snapshot = await _freshSnapshot();
-    if (_disposed) return;
-    _events.add(
-      JournalPlatformCodec.encodeCalendar(
-        snapshot,
-        reason: reason,
-        event: true,
-        lifecycleGeneration: _lifecycleGeneration,
-      ),
-    );
-  }
-
   Future<void> _handleNativeSignal(MethodCall call) async {
     if (call.method == 'prepareToTerminate') {
       await prepareForTermination();
-      return;
     }
-    if (call.method != 'calendarChanged') return;
-    final reason = call.arguments;
-    await refresh(
-      reason is int &&
-              reason >= 0 &&
-              reason < CalendarChangeReason.values.length
-          ? CalendarChangeReason.values.firstWhere(
-              (value) => value.wireId == reason,
-            )
-          : CalendarChangeReason.significantTimeChanged,
-    );
   }
 
   Future<void> prepareForTermination() =>
@@ -920,17 +615,11 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
             ),
           );
         }
-        unawaited(refresh(CalendarChangeReason.resumed));
         break;
       case AppLifecycleState.inactive:
       case AppLifecycleState.detached:
         break;
     }
-  }
-
-  @override
-  void didChangeLocales(List<Locale>? locales) {
-    unawaited(refresh(CalendarChangeReason.localeChanged));
   }
 
   void dispose() {
@@ -965,44 +654,6 @@ final class _NativeStartupEnvironment {
       throw const FormatException('native Application Support path is invalid');
     }
     return Directory(path);
-  }
-
-  Future<JournalCalendarSnapshot> initialCalendarSnapshot() async =>
-      _calendarSnapshot(await _load());
-
-  Future<JournalCalendarSnapshot> currentCalendarSnapshot() async {
-    final value = await _platformChannel.invokeMapMethod<Object?, Object?>(
-      'getStartupEnvironment',
-    );
-    if (value == null) {
-      throw const FormatException('native calendar environment is missing');
-    }
-    return _calendarSnapshot(value);
-  }
-
-  Future<Map<int, String>> formatJournalDays({
-    required JournalCalendarSnapshot snapshot,
-    required List<int> days,
-  }) async {
-    final value = await _platformChannel.invokeListMethod<Object?>(
-      'formatJournalDays',
-      <String, Object>{
-        'days': days,
-        'locale': snapshot.locale,
-        'timeZoneId': snapshot.timeZoneId,
-      },
-    );
-    if (value == null || value.length != days.length) {
-      throw const FormatException('native formatted journal days are invalid');
-    }
-    final headings = <int, String>{};
-    for (final item in value) {
-      if (item is! Map || item['day'] is! int || item['heading'] is! String) {
-        throw const FormatException('native formatted journal day is invalid');
-      }
-      headings[item['day']! as int] = item['heading']! as String;
-    }
-    return headings;
   }
 
   Future<String?> readPreference(String key) async {
@@ -1052,31 +703,6 @@ final class _NativeStartupEnvironment {
       'value': value,
     });
   }
-
-  JournalCalendarSnapshot _calendarSnapshot(Map<Object?, Object?> value) {
-    int integer(String key) {
-      final result = value[key];
-      if (result is! int) throw FormatException('native $key is invalid');
-      return result;
-    }
-
-    String string(String key) {
-      final result = value[key];
-      if (result is! String || result.isEmpty) {
-        throw FormatException('native $key is invalid');
-      }
-      return result;
-    }
-
-    return JournalCalendarSnapshot(
-      instantUnixMilliseconds: integer('instantUnixMilliseconds'),
-      localDay: integer('localDay'),
-      locale: string('locale'),
-      timeZoneId: string('timeZoneId'),
-      utcOffsetSeconds: integer('utcOffsetSeconds'),
-      generation: integer('generation'),
-    );
-  }
 }
 
 typedef ApplicationSupportDirectoryProvider = Future<Directory> Function();
@@ -1085,9 +711,6 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   ApplicationHostAdapter({
     required this.applicationSupportDirectory,
     required this.baseUrl,
-    required this.initialCalendarSnapshot,
-    required this.liveCalendarSnapshot,
-    required this.formatJournalDays,
     required this.auth,
     required this.readPreference,
     required this.writePreference,
@@ -1101,9 +724,6 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
 
   final ApplicationSupportDirectoryProvider applicationSupportDirectory;
   final Uri baseUrl;
-  final CalendarSnapshotProvider initialCalendarSnapshot;
-  final CalendarSnapshotProvider liveCalendarSnapshot;
-  final JournalDayHeadingFormatter formatJournalDays;
   final JournalAuthCapability auth;
   final JournalPreferenceReader readPreference;
   final JournalPreferenceWriter writePreference;
@@ -1113,8 +733,6 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   final Future<void>? amplifyReady;
   final Widget Function()? authenticationFailureBuilder;
   final Future<void> Function()? prepareToTerminate;
-  late final Future<JournalCalendarSnapshot> _initialSnapshot =
-      initialCalendarSnapshot();
   final ValueNotifier<bool?> _localBindingAvailable = ValueNotifier(null);
   late final Future<JournalLocalAccountBinding?> _initialLocalAccountBinding =
       readLocalAccountBinding().then(
@@ -1142,8 +760,6 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   @override
   BonsaiFlutterApplicationPlatform createApplicationPlatform() =>
       JournalApplicationPlatform(
-        calendarSnapshot: liveCalendarSnapshot,
-        formatJournalDays: formatJournalDays,
         auth: auth,
         readPreference: readPreference,
         writePreference: writePreference,
@@ -1155,7 +771,6 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
           _localBindingAvailable.value = false;
         },
         prepareToTerminate: prepareToTerminate,
-        initialSnapshot: _initialSnapshot,
       );
 
   @override
@@ -1221,7 +836,7 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
     return fs.SlidableAutoCloseBehavior(
       closeWhenOpened: true,
       closeWhenTapped: true,
-      child: host,
+      child: JournalPlatformMenu(child: host),
     );
   }
 }
@@ -1271,9 +886,6 @@ ApplicationHostAdapter createBonsaiFlutterHostAdapter({
   return ApplicationHostAdapter(
     applicationSupportDirectory: environment.applicationSupportDirectory,
     baseUrl: baseUrl ?? Uri.parse('https://api.logseq.io'),
-    initialCalendarSnapshot: environment.initialCalendarSnapshot,
-    liveCalendarSnapshot: environment.currentCalendarSnapshot,
-    formatJournalDays: environment.formatJournalDays,
     auth: JournalAmplifySession(),
     readPreference: environment.readPreference,
     writePreference: environment.writePreference,

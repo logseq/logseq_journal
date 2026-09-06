@@ -91,6 +91,7 @@ let () =
           ; "getPage"
           ; "getPageTree"
           ; "graphInfo"
+          ; "inspectAdmission"
           ; "listJournals"
           ]
           (strings "readOperations" commands);
@@ -151,10 +152,17 @@ let () =
                (List.mem expected actual)
                "v2 outcomes omit retained App read %s"
                expected)
-          [ "graphInfo"; "journals"; "page"; "block"; "children"; "pageTree" ])
+          [ "graphInfo"
+          ; "admission"
+          ; "journals"
+          ; "page"
+          ; "block"
+          ; "children"
+          ; "pageTree"
+          ])
     ; T.case "v2 command catalog is the executable protocol catalog" (fun () ->
         let expected = command_types commands in
-        T.require (List.length expected = 14) "unexpected v2 request count";
+        T.require (List.length expected = 15) "unexpected v2 request count";
         List.iter
           (fun request ->
              match Logseq_db_worker.Protocol.request_of_yojson request with

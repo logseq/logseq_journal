@@ -59,8 +59,6 @@ let capture : Journal_graph_projection.capture =
         ~instant_unix_ms:1_788_220_800_000L
         ~local_day:20260901
         ~local_minute_of_day:0
-        ~time_zone_id:"UTC"
-        ~utc_offset_seconds:0
       |> Result.get_ok
   ; children = []
   }
@@ -74,17 +72,15 @@ let capture_page_request_for runtime command =
 ;;
 
 let set_calendar runtime =
-  Runtime.set_calendar
-    runtime
-    { Journal_calendar.instant_unix_ms = 1_788_192_000_000L
-    ; local_day = 20260901
-    ; local_minute_of_day = 0
-    ; locale = "en_US"
-    ; time_zone_id = "UTC"
-    ; utc_offset_seconds = 0
-    ; generation = 1L
-    ; lifecycle_generation = 0L
-    }
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  ignore (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+  let calendar = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  Runtime.set_calendar runtime calendar
 ;;
 
 let seed_visible_block runtime =
@@ -129,6 +125,46 @@ let seed_visible_block runtime =
           }))
 ;;
 
+let observe_graph_revision runtime projection_revision =
+  let request = Runtime.start runtime in
+  Runtime.receive
+    runtime
+    (respond
+       request
+       (Protocol.V2_graph_info_outcome
+          { graph_uuid = page_uuid
+          ; graph_name = "Journal"
+          ; schema = { major = 1; minor = 0 }
+          ; admission_facts = []
+          ; limits =
+              { response_budget_bytes = 4_096
+              ; outbox_max_records = 4_096
+              ; outbox_max_bytes = 8 * 1_024 * 1_024
+              ; change_max_items = 4_096
+              ; change_max_bytes = 4 * 1_024 * 1_024
+              ; dispatcher_capacity = 32
+              ; wire_batch_max_bytes = 4 * 1_024 * 1_024
+              }
+          ; generation = "generation-1"
+          ; projection_revision
+          }))
+;;
+
+let refresh_private_block_revision runtime revision =
+  let request =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Find_block (Graph.Uuid.to_string block_uuid))
+    |> fun output -> only "point block request" output.requests
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (respond
+          request
+          (Protocol.V2_block_outcome (V2_present_block { value = record; revision }))))
+;;
+
 let test_worker_read_becomes_normalized_application_feed () =
   let runtime = Runtime.create () in
   let output = seed_visible_block runtime in
@@ -151,16 +187,55 @@ let test_worker_read_becomes_normalized_application_feed () =
     Alcotest.failf "expected one completed feed response, got %d" (List.length responses)
 ;;
 
+let test_admission_inspection_preserves_graph_generation () =
+  let runtime = Runtime.create () in
+  let request =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Inspect_admission
+         { graph_generation = 9; request_generation = 1L })
+    |> fun output -> only "admission inspection request" output.requests
+  in
+  (match request.command with
+   | V2_inspect_admission -> ()
+   | _ -> Alcotest.fail "admission inspection did not use the Worker protocol command");
+  let output =
+    Runtime.receive
+      runtime
+      (respond
+         request
+         (Protocol.V2_admission_outcome
+            { active_records = 3
+            ; active_bytes = 1536
+            ; protected_wire_bytes = 512
+            ; retained_origin_evidence_bytes = 256
+            ; maximum_records = 1000
+            ; maximum_bytes = 8 * 1024 * 1024
+            }))
+  in
+  match output.responses with
+  | [ { Runtime.payload =
+          Admission_inspected
+            { request = { graph_generation = 9; request_generation = 1L }; observation }
+      }
+    ] ->
+    Alcotest.(check int) "active records" 3 observation.active_records;
+    Alcotest.(check int) "active bytes" 1536 observation.active_bytes;
+    Alcotest.(check int) "maximum bytes" (8 * 1024 * 1024) observation.maximum_bytes
+  | _ -> Alcotest.fail "admission inspection did not retain its graph generation"
+;;
+
 let test_application_mutation_uses_target_local_revision () =
   let runtime = Runtime.create () in
   ignore (seed_visible_block runtime);
+  refresh_private_block_revision runtime "block-2";
   let output =
     Runtime.submit
       runtime
       (Journal_graph_request.Update_source
          { mutation_id = "a2000000-0000-4000-a000-000000000001"
          ; block_id = Graph.Uuid.to_string block_uuid
-         ; expected_revision = 1
+         ; expected_revision = "block-1"
          ; source = "Edited locally"
          })
   in
@@ -186,6 +261,217 @@ let test_application_mutation_uses_target_local_revision () =
       (Graph.Uuid.to_string precondition_block);
     Alcotest.(check string) "target-local revision" "block-1" revision
   | _ -> Alcotest.fail "expected one Worker v2 saveBlock request"
+;;
+
+let test_unrelated_projection_revision_does_not_reject_status_mutation () =
+  let runtime = Runtime.create () in
+  ignore (observe_graph_revision runtime "projection-1");
+  ignore (seed_visible_block runtime);
+  ignore (observe_graph_revision runtime "projection-2");
+  let output =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Set_task_state
+         { mutation_id = "a2000000-0000-4000-a000-000000000003"
+         ; block_id = Graph.Uuid.to_string block_uuid
+         ; expected_revision = "block-1"
+         ; task_state = Journal_model.Done
+         })
+  in
+  match output.requests with
+  | [ { Protocol.command =
+          V2_set_task_status
+            { block = target
+            ; status = V2_done
+            ; preconditions = { blocks = [ (precondition_block, revision) ]; _ }
+            ; _
+            }
+      ; _
+      }
+    ] ->
+    Alcotest.(check string)
+      "status target"
+      (Graph.Uuid.to_string block_uuid)
+      (Graph.Uuid.to_string target);
+    Alcotest.(check string)
+      "status precondition target"
+      (Graph.Uuid.to_string block_uuid)
+      (Graph.Uuid.to_string precondition_block);
+    Alcotest.(check string) "caller-observed status revision" "block-1" revision
+  | _ ->
+    Alcotest.fail "unrelated projection revision prevented the status Worker mutation"
+;;
+
+let test_status_conflict_refreshes_authoritative_block () =
+  let runtime = Runtime.create () in
+  ignore (seed_visible_block runtime);
+  let mutation =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Set_task_state
+         { mutation_id = "a2000000-0000-4000-a000-000000000006"
+         ; block_id = Graph.Uuid.to_string block_uuid
+         ; expected_revision = "block-1"
+         ; task_state = Journal_model.Done
+         })
+    |> fun output -> only "status mutation request" output.requests
+  in
+  let refresh =
+    Runtime.receive
+      runtime
+      (respond
+         mutation
+         (Protocol.V2_failed
+            { code = "conflict"; message = "The mutation precondition did not match." }))
+    |> fun output -> only "status conflict refresh" output.requests
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (respond
+         refresh
+         (Protocol.V2_page_tree_outcome
+            { page = page_uuid
+            ; maximum_depth = 1
+            ; revision_scope =
+                V2_page_tree_revision { page = page_uuid; maximum_depth = 1 }
+            ; scope_revision = "tree-scope-2"
+            ; items =
+                [ { value = record; revision = "block-2"; depth = 0; parent = page_uuid }
+                ]
+            ; next_cursor = None
+            }))
+  in
+  match output.responses with
+  | [ { Runtime.payload = Update_conflict latest } ] ->
+    Alcotest.(check string)
+      "authoritative conflict revision"
+      "block-2"
+      (Journal_model.revision latest);
+    Alcotest.(check bool)
+      "authoritative conflict status"
+      true
+      (Journal_model.task_state latest = Journal_model.No_status)
+  | _ -> Alcotest.fail "status conflict did not return the authoritative block"
+;;
+
+let test_delete_uses_caller_observed_block_revision () =
+  let runtime = Runtime.create () in
+  ignore (seed_visible_block runtime);
+  refresh_private_block_revision runtime "block-2";
+  let output =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Delete_subtree
+         { mutation_id = "a2000000-0000-4000-a000-000000000004"
+         ; block_id = Graph.Uuid.to_string block_uuid
+         ; expected_revision = "block-1"
+         })
+  in
+  match output.requests with
+  | [ { Protocol.command =
+          V2_delete_blocks
+            { preconditions =
+                { blocks = [ (precondition_block, block_revision) ]
+                ; scopes = [ (V2_page_tree_scope _, scope_revision) ]
+                ; _
+                }
+            ; _
+            }
+      ; _
+      }
+    ] ->
+    Alcotest.(check string)
+      "delete precondition target"
+      (Graph.Uuid.to_string block_uuid)
+      (Graph.Uuid.to_string precondition_block);
+    Alcotest.(check string) "caller-observed delete revision" "block-1" block_revision;
+    Alcotest.(check string) "retained delete scope" "tree-scope-1" scope_revision
+  | _ -> Alcotest.fail "delete did not preserve its block and structure preconditions"
+;;
+
+let seed_parent_children_interest runtime =
+  let block_request =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_detail
+         { block_id = Graph.Uuid.to_string block_uuid
+         ; after = None
+         ; limit = 4
+         ; request_generation = 8L
+         })
+    |> fun output -> only "detail block request" output.requests
+  in
+  let children_request =
+    Runtime.receive
+      runtime
+      (respond
+         block_request
+         (Protocol.V2_block_outcome
+            (V2_present_block { value = record; revision = "block-detail-1" })))
+    |> fun output -> only "detail children request" output.requests
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (respond
+          children_request
+          (Protocol.V2_children_outcome
+             { parent = block_uuid
+             ; revision_scope = V2_children_revision block_uuid
+             ; scope_revision = "children-scope-1"
+             ; items = []
+             ; next_cursor = None
+             })))
+;;
+
+let test_create_child_uses_caller_observed_parent_revision () =
+  let runtime = Runtime.create () in
+  ignore (seed_visible_block runtime);
+  seed_parent_children_interest runtime;
+  refresh_private_block_revision runtime "block-detail-2";
+  let output =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Create_child
+         { mutation_id = "a2000000-0000-4000-a000-000000000005"
+         ; calendar_generation = 1L
+         ; block_id = "a2000000-0000-4000-9000-000000000005"
+         ; parent_block_id = Graph.Uuid.to_string block_uuid
+         ; expected_parent_revision = "block-detail-1"
+         ; sibling_order = "a1"
+         ; source = "Child"
+         ; task_state = Journal_model.No_status
+         ; creation_time = capture.creation_time
+         })
+  in
+  match output.requests with
+  | [ { Protocol.command =
+          V2_insert_blocks
+            { parent
+            ; preconditions =
+                { blocks = [ (precondition_parent, parent_revision) ]
+                ; scopes = [ (V2_children_scope scope_parent, scope_revision) ]
+                ; _
+                }
+            ; _
+            }
+      ; _
+      }
+    ] ->
+    List.iter
+      (fun actual ->
+         Alcotest.(check string)
+           "child parent"
+           (Graph.Uuid.to_string block_uuid)
+           (Graph.Uuid.to_string actual))
+      [ parent; precondition_parent; scope_parent ];
+    Alcotest.(check string)
+      "caller-observed parent revision"
+      "block-detail-1"
+      parent_revision;
+    Alcotest.(check string) "retained children scope" "children-scope-1" scope_revision
+  | _ -> Alcotest.fail "child creation did not preserve parent and scope preconditions"
 ;;
 
 let capture_present_page runtime request =
@@ -387,6 +673,32 @@ let test_capture_task_fails_closed_when_inserted_block_is_missing () =
   | _ -> Alcotest.fail "missing captured block did not fail closed"
 ;;
 
+let test_stale_calendar_generation_rejects_capture_before_worker_io () =
+  let runtime = Runtime.create () in
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  ignore (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+  let current = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  Runtime.set_calendar runtime current;
+  let output =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Capture { calendar_generation = 0L; command = capture })
+  in
+  Alcotest.(check int) "no stale worker request" 0 (List.length output.requests);
+  match output.responses with
+  | [ { Runtime.payload = Rejected (Projection_failure message); _ } ] ->
+    Alcotest.(check string)
+      "stale calendar rejection"
+      "The local calendar changed before capture admission."
+      message
+  | _ -> Alcotest.fail "stale calendar generation did not reject capture"
+;;
+
 let test_uninterested_change_is_acknowledged_without_hydration () =
   let runtime = Runtime.create () in
   ignore (seed_visible_block runtime);
@@ -437,9 +749,29 @@ let () =
             `Quick
             test_worker_read_becomes_normalized_application_feed
         ; Alcotest.test_case
+            "admission inspection preserves graph generation"
+            `Quick
+            test_admission_inspection_preserves_graph_generation
+        ; Alcotest.test_case
             "mutation uses target-local revision"
             `Quick
             test_application_mutation_uses_target_local_revision
+        ; Alcotest.test_case
+            "unrelated projection does not reject status mutation"
+            `Quick
+            test_unrelated_projection_revision_does_not_reject_status_mutation
+        ; Alcotest.test_case
+            "status conflict refreshes authoritative block"
+            `Quick
+            test_status_conflict_refreshes_authoritative_block
+        ; Alcotest.test_case
+            "delete uses caller-observed block revision"
+            `Quick
+            test_delete_uses_caller_observed_block_revision
+        ; Alcotest.test_case
+            "child creation uses caller-observed parent revision"
+            `Quick
+            test_create_child_uses_caller_observed_parent_revision
         ; Alcotest.test_case
             "Capture refreshes children revision"
             `Quick
@@ -456,6 +788,10 @@ let () =
             "Capture task rejects a missing inserted block"
             `Quick
             test_capture_task_fails_closed_when_inserted_block_is_missing
+        ; Alcotest.test_case
+            "stale calendar generation rejects Capture"
+            `Quick
+            test_stale_calendar_generation_rejects_capture_before_worker_io
         ; Alcotest.test_case
             "uninterested change does not hydrate"
             `Quick

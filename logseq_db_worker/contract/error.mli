@@ -1,5 +1,6 @@
 type code =
   | Invalid_request
+  | Stale_read_cursor
   | Unsupported_api_version
   | Graph_not_found
   | Graph_locked
@@ -114,3 +115,4 @@ val code_string : code -> string
 val component_string : component -> string
 val to_yojson : t -> Yojson.Safe.t
 val of_yojson : Yojson.Safe.t -> (t, string) result
+val code_of_string : string -> code option

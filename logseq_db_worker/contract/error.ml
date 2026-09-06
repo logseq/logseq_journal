@@ -1,5 +1,6 @@
 type code =
   | Invalid_request
+  | Stale_read_cursor
   | Unsupported_api_version
   | Graph_not_found
   | Graph_locked
@@ -80,6 +81,7 @@ let maximum_name_bytes = 128
 
 let code_string = function
   | Invalid_request -> "invalidRequest"
+  | Stale_read_cursor -> "staleReadCursor"
   | Unsupported_api_version -> "unsupportedApiVersion"
   | Graph_not_found -> "graphNotFound"
   | Graph_locked -> "graphLocked"
@@ -105,6 +107,7 @@ let code_string = function
 
 let code_of_string = function
   | "invalidRequest" -> Some Invalid_request
+  | "staleReadCursor" -> Some Stale_read_cursor
   | "unsupportedApiVersion" -> Some Unsupported_api_version
   | "graphNotFound" -> Some Graph_not_found
   | "graphLocked" -> Some Graph_locked

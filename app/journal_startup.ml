@@ -12,6 +12,7 @@ type startup_phase =
   | Awaiting_selection
   | Restoring_local
   | Bootstrapping
+  | Deleting_local
   | Awaiting_e2ee_password
   | Ready
   | Failed
@@ -23,6 +24,7 @@ type startup_error_owner =
   | Bootstrap
   | E2ee
   | Graph
+  | Local_deletion
 
 type startup_recovery =
   | Sign_in
@@ -71,7 +73,23 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     && graph.phase = Logseq_db_worker.Graph_open
     && not snapshot.timeline_presentation_pending
   in
-  if ready
+  if Option.is_some snapshot.local_deletion
+  then (
+    match snapshot.local_deletion with
+    | Some (Graph_service.Deletion_in_progress _) ->
+      { phase = Deleting_local; error = None }
+    | Some (Graph_service.Deletion_failed _) ->
+      { phase = Failed
+      ; error =
+          Some
+            { owner = Local_deletion
+            ; message =
+                Option.value snapshot.last_error ~default:"Local graph deletion failed."
+            ; recovery = None
+            }
+      }
+    | None -> assert false)
+  else if ready
   then { phase = Ready; error = None }
   else if not facts.authenticated
   then { phase = Signed_out; error = None }

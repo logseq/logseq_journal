@@ -32,7 +32,7 @@ val create
   -> task_state:task_state
   -> child_count:int
   -> creation_time:Journal_time.t
-  -> revision:int
+  -> revision:string
   -> last_mutation_id:string
   -> (t, string) result
 
@@ -45,6 +45,6 @@ val task_state : t -> task_state
 val child_count : t -> int
 val creation_time : t -> Journal_time.t
 val journal_day : t -> int
-val revision : t -> int
+val revision : t -> string
 val last_mutation_id : t -> string
 val with_child_count : t -> child_count:int -> (t, string) result

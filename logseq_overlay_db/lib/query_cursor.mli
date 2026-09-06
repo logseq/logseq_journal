@@ -2,7 +2,7 @@ module Graph = Logseq_db_types.Graph_types
 
 type error =
   | Invalid
-  | Invalid_or_stale
+  | Stale
 
 val maximum_offset : int
 val create : projection:int -> offset:int -> Graph.Cursor.t

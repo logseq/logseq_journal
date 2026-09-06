@@ -22,6 +22,7 @@ type request =
 
 and command =
   | V2_graph_info
+  | V2_inspect_admission
   | V2_list_journals of
       { from_day : int
       ; through_day : int
@@ -224,6 +225,7 @@ and v2_outcome =
       ; generation : string
       ; projection_revision : string
       }
+  | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
       { revision_scope : v2_revision_scope
       ; scope_revision : string
@@ -273,6 +275,15 @@ and v2_outcome =
       { generation : string
       ; reason : string
       }
+
+and v2_admission_inspection =
+  { active_records : int
+  ; active_bytes : int
+  ; protected_wire_bytes : int
+  ; retained_origin_evidence_bytes : int
+  ; maximum_records : int
+  ; maximum_bytes : int
+  }
 
 type push =
   | V2_changes_available of
@@ -509,6 +520,7 @@ let rec v2_block_tree_of_json json =
 
 let v2_command_to_json = function
   | V2_graph_info -> `Assoc [ "type", `String "graphInfo" ]
+  | V2_inspect_admission -> `Assoc [ "type", `String "inspectAdmission" ]
   | V2_list_journals { from_day; through_day; limit; cursor; revision } ->
     `Assoc
       [ "type", `String "listJournals"
@@ -616,6 +628,9 @@ let v2_command_of_json kind json =
   | "graphInfo" ->
     ignore (fields []);
     V2_graph_info
+  | "inspectAdmission" ->
+    ignore (fields []);
+    V2_inspect_admission
   | "listJournals" ->
     let f = fields [ "fromDay"; "throughDay"; "limit"; "cursor"; "revision" ] in
     V2_list_journals
@@ -1470,6 +1485,23 @@ let v2_outcome_to_json = function
       ; "generation", `String generation
       ; "projectionRevision", `String projection_revision
       ]
+  | V2_admission_outcome
+      { active_records
+      ; active_bytes
+      ; protected_wire_bytes
+      ; retained_origin_evidence_bytes
+      ; maximum_records
+      ; maximum_bytes
+      } ->
+    `Assoc
+      [ "type", `String "admission"
+      ; "activeRecords", `Int active_records
+      ; "activeBytes", `Int active_bytes
+      ; "protectedWireBytes", `Int protected_wire_bytes
+      ; "retainedOriginEvidenceBytes", `Int retained_origin_evidence_bytes
+      ; "maximumRecords", `Int maximum_records
+      ; "maximumBytes", `Int maximum_bytes
+      ]
   | V2_journals_outcome { revision_scope; scope_revision; items; next_cursor } ->
     `Assoc
       [ "type", `String "journals"
@@ -1598,6 +1630,28 @@ let v2_outcome_of_json json =
       ; limits = v2_capability_limits_of_json (field "limits" fields)
       ; generation = string (field "generation" fields)
       ; projection_revision = string (field "projectionRevision" fields)
+      }
+  | "admission" ->
+    let fields =
+      exact_assoc
+        [ "type"
+        ; "activeRecords"
+        ; "activeBytes"
+        ; "protectedWireBytes"
+        ; "retainedOriginEvidenceBytes"
+        ; "maximumRecords"
+        ; "maximumBytes"
+        ]
+        json
+    in
+    V2_admission_outcome
+      { active_records = integer (field "activeRecords" fields)
+      ; active_bytes = integer (field "activeBytes" fields)
+      ; protected_wire_bytes = integer (field "protectedWireBytes" fields)
+      ; retained_origin_evidence_bytes =
+          integer (field "retainedOriginEvidenceBytes" fields)
+      ; maximum_records = integer (field "maximumRecords" fields)
+      ; maximum_bytes = integer (field "maximumBytes" fields)
       }
   | "journals" ->
     let fields =

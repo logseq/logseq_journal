@@ -32,3 +32,5 @@ CAMLprim value logseq_journal_crypto_call(value request) {
   free(response);
   CAMLreturn(result);
 }
+
+#include "transport_dns_stubs.h"

@@ -14,15 +14,6 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
 import 'package:flutter_test/flutter_test.dart';
 
-const sampleCalendar = JournalCalendarSnapshot(
-  instantUnixMilliseconds: 1786055400000,
-  localDay: 20260807,
-  locale: 'en_US',
-  timeZoneId: 'Europe/Paris',
-  utcOffsetSeconds: 7200,
-  generation: 7,
-);
-
 final class _Auth implements JournalAuthCapability {
   final String? userId = 'cognito-user-1';
   final String token = 'fresh-id-token';
@@ -80,9 +71,6 @@ ApplicationHostAdapter _localBindingAdapter({
 }) => ApplicationHostAdapter(
   applicationSupportDirectory: () async => Directory.systemTemp,
   baseUrl: Uri.parse('https://api.example.test'),
-  initialCalendarSnapshot: () async => sampleCalendar,
-  liveCalendarSnapshot: () async => sampleCalendar,
-  formatJournalDays: ({required snapshot, required days}) async => {},
   auth: auth,
   readPreference: _readBalancedPreference,
   writePreference: _writePreference,
@@ -167,9 +155,6 @@ void main() {
       final adapter = ApplicationHostAdapter(
         applicationSupportDirectory: () async => root,
         baseUrl: Uri.parse('https://api.example.test'),
-        initialCalendarSnapshot: () async => sampleCalendar,
-        liveCalendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -198,9 +183,6 @@ void main() {
       final adapter = ApplicationHostAdapter(
         applicationSupportDirectory: () async => Directory.systemTemp,
         baseUrl: Uri.parse('https://api.example.test'),
-        initialCalendarSnapshot: () async => sampleCalendar,
-        liveCalendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -232,9 +214,6 @@ void main() {
       final adapter = ApplicationHostAdapter(
         applicationSupportDirectory: () async => Directory.systemTemp,
         baseUrl: Uri.parse('https://api.example.test'),
-        initialCalendarSnapshot: () async => sampleCalendar,
-        liveCalendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -294,7 +273,6 @@ void main() {
         platform.handleRequest(
           request(JournalPlatformTag.idTokenRequest, {
             'challengeId': 'challenge-1',
-            'purpose': 'e2eeKeyAccess',
           }),
         ),
         throwsA(isA<SignedOutException>()),
@@ -338,7 +316,6 @@ void main() {
         platform.handleRequest(
           request(JournalPlatformTag.idTokenRequest, {
             'challengeId': 'challenge-1',
-            'purpose': 'e2eeKeyAccess',
           }),
         ),
         throwsA(isA<StateError>()),
@@ -357,8 +334,6 @@ void main() {
     () async {
       final auth = _Auth();
       final platform = JournalApplicationPlatform(
-        calendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: auth,
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -385,13 +360,6 @@ void main() {
                 case 'getStartupEnvironment':
                   return <String, Object?>{
                     'applicationSupportPath': Directory.systemTemp.path,
-                    'instantUnixMilliseconds':
-                        sampleCalendar.instantUnixMilliseconds,
-                    'localDay': sampleCalendar.localDay,
-                    'locale': sampleCalendar.locale,
-                    'timeZoneId': sampleCalendar.timeZoneId,
-                    'utcOffsetSeconds': sampleCalendar.utcOffsetSeconds,
-                    'generation': sampleCalendar.generation,
                     'typographyPreset': 'dense',
                     'localAccountBinding': null,
                   };
@@ -445,8 +413,6 @@ void main() {
     () async {
       var runtimeShutdowns = 0;
       final platform = JournalApplicationPlatform(
-        calendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: _Auth(),
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -504,58 +470,8 @@ void main() {
     expect(File('lib/application.dart').existsSync(), isFalse);
   });
 
-  test(
-    'inactive resume refreshes calendar without a network lifecycle event',
-    () async {
-      var generation = sampleCalendar.generation;
-      final platform = JournalApplicationPlatform(
-        calendarSnapshot: () async => JournalCalendarSnapshot(
-          instantUnixMilliseconds: sampleCalendar.instantUnixMilliseconds,
-          localDay: sampleCalendar.localDay,
-          locale: sampleCalendar.locale,
-          timeZoneId: sampleCalendar.timeZoneId,
-          utcOffsetSeconds: sampleCalendar.utcOffsetSeconds,
-          generation: ++generation,
-        ),
-        formatJournalDays: ({required snapshot, required days}) async => {},
-        auth: _Auth(),
-        readPreference: _readBalancedPreference,
-        writePreference: _writePreference,
-      );
-      addTearDown(platform.dispose);
-      final events = <Uint8List>[];
-      final subscription = platform.events.listen(events.add);
-      addTearDown(subscription.cancel);
-
-      platform.didChangeAppLifecycleState(AppLifecycleState.inactive);
-      platform.didChangeAppLifecycleState(AppLifecycleState.resumed);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(events, hasLength(1));
-      final envelope = JournalPlatformEnvelopeCodec.decode(events.single);
-      expect(envelope.tag, JournalPlatformTag.calendarEvent);
-      final data = ByteData.sublistView(envelope.payload);
-      expect(
-        data.getUint16(8, Endian.little),
-        CalendarChangeReason.resumed.wireId,
-      );
-      expect(data.getInt64(40, Endian.little), sampleCalendar.generation + 1);
-      expect(data.getInt64(48, Endian.little), 0);
-    },
-  );
-
   test('hidden paused resume emits one coalesced background epoch', () async {
-    var generation = sampleCalendar.generation;
     final platform = JournalApplicationPlatform(
-      calendarSnapshot: () async => JournalCalendarSnapshot(
-        instantUnixMilliseconds: sampleCalendar.instantUnixMilliseconds,
-        localDay: sampleCalendar.localDay,
-        locale: sampleCalendar.locale,
-        timeZoneId: sampleCalendar.timeZoneId,
-        utcOffsetSeconds: sampleCalendar.utcOffsetSeconds,
-        generation: ++generation,
-      ),
-      formatJournalDays: ({required snapshot, required days}) async => {},
       auth: _Auth(),
       readPreference: _readBalancedPreference,
       writePreference: _writePreference,
@@ -570,20 +486,13 @@ void main() {
     platform.didChangeAppLifecycleState(AppLifecycleState.resumed);
     await Future<void>.delayed(Duration.zero);
 
-    expect(events.map(rawEventTag), containsAllInOrder(<int>[15, 15, 3]));
+    expect(events.map(rawEventTag), containsAllInOrder(<int>[15, 15]));
     final lifecycleEvents = events
         .where((event) => rawEventTag(event) == 15)
         .toList();
     expect(lifecycleEvents, hasLength(2));
     expect(lifecycleEvents.map(rawLifecycleKind), <int>[1, 2]);
     expect(lifecycleEvents.map(rawLifecycleGeneration), <int>[1, 1]);
-    final calendar = events.singleWhere((event) => rawEventTag(event) == 3);
-    expect(
-      ByteData.sublistView(
-        JournalPlatformEnvelopeCodec.decode(calendar).payload,
-      ).getInt64(48, Endian.little),
-      1,
-    );
 
     platform.didChangeAppLifecycleState(AppLifecycleState.resumed);
     await Future<void>.delayed(Duration.zero);
@@ -615,8 +524,6 @@ void main() {
     () async {
       final auth = _Auth();
       final platform = JournalApplicationPlatform(
-        calendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: auth,
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -631,7 +538,6 @@ void main() {
       final token = await platform.handleRequest(
         request(JournalPlatformTag.idTokenRequest, {
           'challengeId': 'challenge-1',
-          'purpose': 'snapshotBootstrap',
         }),
       );
       expect(responseJson(token), {
@@ -648,8 +554,6 @@ void main() {
       final auth = _Auth();
       var frameWaits = 0;
       final platform = JournalApplicationPlatform(
-        calendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: auth,
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -685,8 +589,6 @@ void main() {
       final persisted = <JournalLocalAccountBinding>[];
       var clears = 0;
       final platform = JournalApplicationPlatform(
-        calendarSnapshot: () async => sampleCalendar,
-        formatJournalDays: ({required snapshot, required days}) async => {},
         auth: auth,
         readPreference: _readBalancedPreference,
         writePreference: _writePreference,
@@ -713,7 +615,7 @@ void main() {
   );
 
   test(
-    'production startup facts retain calendar typography and local binding in one call',
+    'production startup facts retain typography and local binding in one call',
     () async {
       final calls = <MethodCall>[];
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -724,13 +626,6 @@ void main() {
               if (call.method == 'getStartupEnvironment') {
                 return <String, Object?>{
                   'applicationSupportPath': Directory.systemTemp.path,
-                  'instantUnixMilliseconds':
-                      sampleCalendar.instantUnixMilliseconds,
-                  'localDay': sampleCalendar.localDay,
-                  'locale': sampleCalendar.locale,
-                  'timeZoneId': sampleCalendar.timeZoneId,
-                  'utcOffsetSeconds': sampleCalendar.utcOffsetSeconds,
-                  'generation': sampleCalendar.generation,
                   'typographyPreset': 'comfortable',
                   'localAccountBinding': <String, Object>{
                     'version': 1,
@@ -758,8 +653,6 @@ void main() {
           adapter.createApplicationPlatform() as JournalApplicationPlatform;
       addTearDown(platform.dispose);
 
-      final calendar = await platform.handleRequest(rawRequest(1));
-      expect(rawEventTag(calendar), 2);
       final typography = await platform.handleRequest(
         rawJsonRequest(16, {'key': 'typographyPreset'}),
       );

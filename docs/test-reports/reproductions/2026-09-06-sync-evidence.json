@@ -1,0 +1,85 @@
+{
+  "original": {
+    "checkpoint": [
+      [
+        498,
+        "c2632abe96168f7e",
+        "active",
+        null
+      ]
+    ],
+    "outbox": [
+      {
+        "position": 0,
+        "mutationType": "deleteBlocks",
+        "mutationId": "542e23eb-bbd0-495e-8364-7b7100024e8f",
+        "state": {
+          "batchId": "submission-batch:v1:2",
+          "type": "submitted"
+        },
+        "attemptCount": 1,
+        "submissionTBefore": "server-cursor:v1:498",
+        "observedOriginCursor": null
+      },
+      {
+        "position": 1,
+        "mutationType": "deleteBlocks",
+        "mutationId": "98d0f4c9-f34c-4b79-8735-87430638ab08",
+        "state": {
+          "type": "queued"
+        },
+        "attemptCount": 0,
+        "submissionTBefore": null,
+        "observedOriginCursor": null
+      },
+      {
+        "position": 2,
+        "mutationType": "insertBlocks",
+        "mutationId": "45c477b4-444e-4b26-82c6-290671bd1412",
+        "state": {
+          "type": "queued"
+        },
+        "attemptCount": 0,
+        "submissionTBefore": null,
+        "observedOriginCursor": null
+      }
+    ]
+  },
+  "isolated": {
+    "checkpoint": [
+      [
+        505,
+        "ea6e511e7f4af9fe",
+        "active",
+        null
+      ]
+    ],
+    "outbox": [
+      {
+        "position": 0,
+        "mutationType": "deleteBlocks",
+        "mutationId": "44af64cb-f7d9-42c7-8754-f0fa8136bce1",
+        "state": {
+          "batchId": "submission-batch:v1:27",
+          "type": "submitted"
+        },
+        "attemptCount": 1,
+        "submissionTBefore": "server-cursor:v1:505",
+        "observedOriginCursor": null
+      },
+      {
+        "position": 1,
+        "mutationType": "insertBlocks",
+        "mutationId": "40686e91-d14f-413b-86c3-c6565bf2def6",
+        "state": {
+          "batchId": "submission-batch:v1:29",
+          "through": "server-cursor:v1:506",
+          "type": "deleteBarrierRejectedPendingAuthoritative"
+        },
+        "attemptCount": 1,
+        "submissionTBefore": "server-cursor:v1:505",
+        "observedOriginCursor": null
+      }
+    ]
+  }
+}

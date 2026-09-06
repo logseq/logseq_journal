@@ -106,7 +106,7 @@ val replace_timeline_entry_page
 
 val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
 val stage_delete : t -> block_id:string -> (t * staged_delete) option
-val undo_delete : staged_delete -> t
+val undo_delete : t -> staged_delete -> t
 val return_from_detail : t -> block_id:string -> t
 val observe_visible_range : t -> first_index:int -> last_exclusive:int -> t
 val current_window : t -> window
@@ -127,3 +127,16 @@ val synthetic_window
   -> first_visible:int
   -> last_exclusive:int
   -> synthetic_window
+
+val heading_spacing : t -> day:int -> float * float
+val day_error : t -> day:int -> string option
+
+val fail_day_request
+  :  t
+  -> generation:int64
+  -> day:int
+  -> stale_cursor:bool
+  -> message:string
+  -> t
+
+val retry_day : t -> day:int -> t

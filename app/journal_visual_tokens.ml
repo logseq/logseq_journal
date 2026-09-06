@@ -82,6 +82,7 @@ type typography =
   { header_title : text_token
   ; header_subtitle : text_token
   ; day_heading : text_token
+  ; date_weekday : text_token
   ; entry : text_token
   ; supporting : text_token
   ; timestamp : text_token
@@ -159,6 +160,7 @@ type row_profile =
   ; time_slot_width : float
   ; source_text_width : float
   ; text_scale : float
+  ; date_text_scale : float
   ; entry_font_size : float
   ; supporting_font_size : float
   }
@@ -175,21 +177,32 @@ type text_measurement =
   ; did_overflow : bool
   }
 
-type t = Color_exceptions.presentation
+type t =
+  { presentation : Color_exceptions.presentation
+  ; high_contrast : bool
+  }
 
-let resolve ~brightness ~high_contrast:_ =
-  match brightness with
-  | Bonsai_flutter.Environment.Light -> Color_exceptions.Light
-  | Bonsai_flutter.Environment.Dark -> Color_exceptions.Dark
+let resolve ~brightness ~high_contrast =
+  let presentation =
+    match brightness with
+    | Bonsai_flutter.Environment.Light -> Color_exceptions.Light
+    | Bonsai_flutter.Environment.Dark -> Color_exceptions.Dark
+  in
+  { presentation; high_contrast }
+;;
+
+let weekday_opacity t ~current =
+  if t.high_contrast then 0.85 else if current then 0.55 else 0.50
 ;;
 
 let text_token font_size line_height weight = { font_size; line_height; weight }
 
 let typography = function
   | Dense ->
-    { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    { header_title = text_token 24. 27.6 Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
-    ; day_heading = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    ; day_heading = text_token 20. 24. Ui.Style.Font_weight.Normal
+    ; date_weekday = text_token 12. 14.4 Ui.Style.Font_weight.Medium
     ; entry = text_token 15. 20. Ui.Style.Font_weight.Normal
     ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
@@ -199,9 +212,10 @@ let typography = function
     ; manager_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     }
   | Balanced ->
-    { header_title = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    { header_title = text_token 24. 27.6 Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
-    ; day_heading = text_token 22. 28. Ui.Style.Font_weight.Semi_bold
+    ; day_heading = text_token 20. 24. Ui.Style.Font_weight.Normal
+    ; date_weekday = text_token 12. 14.4 Ui.Style.Font_weight.Medium
     ; entry = text_token 16. 22. Ui.Style.Font_weight.Normal
     ; supporting = text_token 14. 20. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 13. 18. Ui.Style.Font_weight.Normal
@@ -211,9 +225,10 @@ let typography = function
     ; manager_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     }
   | Comfortable ->
-    { header_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
+    { header_title = text_token 24. 27.6 Ui.Style.Font_weight.Semi_bold
     ; header_subtitle = text_token 16. 22. Ui.Style.Font_weight.Medium
-    ; day_heading = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
+    ; day_heading = text_token 20. 24. Ui.Style.Font_weight.Normal
+    ; date_weekday = text_token 12. 14.4 Ui.Style.Font_weight.Medium
     ; entry = text_token 17. 24. Ui.Style.Font_weight.Normal
     ; supporting = text_token 15. 22. Ui.Style.Font_weight.Normal
     ; timestamp = text_token 14. 20. Ui.Style.Font_weight.Normal
@@ -250,7 +265,7 @@ let row_geometry =
   { time_slot_base = 52.
   ; trailing_inset = 24.
   ; day_heading_before = 20.
-  ; day_heading_after = 4.
+  ; day_heading_after = 10.
   ; entry_vertical_padding = 6.
   ; disclosure_visual = 14.
   ; status_rail_width = 4.
@@ -285,7 +300,18 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
   let scale = Float.max 1. text_scale in
   let block_line_height = typography.entry.line_height *. scale in
   let supporting_line_height = typography.supporting.line_height *. scale in
-  let day_heading_line_height = typography.day_heading.line_height *. scale in
+  let date_text_scale =
+    Float.min
+      scale
+      (Float.max
+         1.
+         ((Float.min timeline_max_width viewport_width
+           -. content_leading
+           -. spacing.x4
+           -. 14.)
+          /. 156.))
+  in
+  let day_heading_line_height = typography.day_heading.line_height *. date_text_scale in
   let day_header_extent =
     Float.ceil
       (row_geometry.day_heading_before
@@ -317,6 +343,7 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
     ; time_slot_width
     ; source_text_width
     ; text_scale = scale
+    ; date_text_scale
     ; entry_font_size = typography.entry.font_size
     ; supporting_font_size = typography.supporting.font_size
     }
@@ -329,6 +356,7 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
     ; time_slot_width
     ; source_text_width
     ; text_scale = scale
+    ; date_text_scale
     ; entry_font_size = typography.entry.font_size
     ; supporting_font_size = typography.supporting.font_size
     }
@@ -410,9 +438,14 @@ let fixed_extent ~profile = function
   | Day_continuation | Feed_continuation -> profile.continuation_extent
 ;;
 
-let status_rail_color t status = Color_exceptions.status_rail_color ~presentation:t status
-let destructive_swipe_action t = Color_exceptions.destructive_swipe_action ~presentation:t
+let status_rail_color t status =
+  Color_exceptions.status_rail_color ~presentation:t.presentation status
+;;
+
+let destructive_swipe_action t =
+  Color_exceptions.destructive_swipe_action ~presentation:t.presentation
+;;
 
 let status_swipe_action t status =
-  Color_exceptions.status_swipe_action ~presentation:t status
+  Color_exceptions.status_swipe_action ~presentation:t.presentation status
 ;;

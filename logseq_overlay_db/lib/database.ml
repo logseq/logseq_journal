@@ -2562,7 +2562,7 @@ let journal_cursor_offset snapshot cursor =
     cursor
   |> Result.map_error (function
     | Query_cursor.Invalid -> Types.Invalid_read_request "invalid journal cursor"
-    | Invalid_or_stale -> Types.Invalid_read_request "invalid or stale journal cursor")
+    | Stale -> Types.Stale_read_cursor)
 ;;
 
 let get_journals snapshot ~limit ~cursor =
@@ -2682,7 +2682,7 @@ let structure_cursor_offset snapshot cursor =
     cursor
   |> Result.map_error (function
     | Query_cursor.Invalid -> Types.Invalid_read_request "invalid structure cursor"
-    | Invalid_or_stale -> Types.Invalid_read_request "invalid or stale structure cursor")
+    | Stale -> Types.Stale_read_cursor)
 ;;
 
 let paginate_structure snapshot ~limit ~offset items =
@@ -4542,10 +4542,13 @@ let crypto_item_id revision index mutation_id =
        (Graph.Uuid.to_string mutation_id))
 ;;
 
-let batch_id revision =
+let batch_id (first : outbox_record) =
   token
     Types.Submission_batch_id.of_string
-    (Printf.sprintf "submission-batch:v1:%d" revision)
+    (Printf.sprintf
+       "submission-batch:v1:%s:%d"
+       (Graph.Uuid.to_string first.mutation_id)
+       (first.attempt_count + 1))
 ;;
 
 let descriptor (record : outbox_record) =
@@ -5000,12 +5003,12 @@ let make_batch preparation encrypted =
   in
   let records, id =
     match preparation.plan with
-    | Submit_plan records -> records, batch_id (preparation.transition_revision + 1)
+    | Submit_plan records -> records, batch_id (List.hd records)
     | Retry_plan (id, records) -> records, id
     | Reject_plan (id, Definitive { partition; _ }) ->
       let records = batch_records preparation.transition_owner id in
       let _dependent, independent = rejection_suffix_records records partition in
-      independent, batch_id (preparation.transition_revision + 1)
+      independent, batch_id (List.hd independent)
     | Accept_plan _ | Reject_plan (_, Stale _) | Duplicate_plan ->
       invalid_arg "transition has no submission batch"
   in
@@ -5074,7 +5077,12 @@ let make_batch preparation encrypted =
     ~maximum_wires:preparation.transition_owner.dependencies.limits.outbox_max_records
     ~maximum_bytes:preparation.transition_owner.dependencies.limits.wire_batch_max_bytes
     ~batch_id:id
-    ~t_before:(server_cursor preparation.transition_owner.checkpoint)
+    ~t_before:
+      (match preparation.plan with
+       | Retry_plan (_, record :: _) -> Option.get record.submission_t_before
+       | Retry_plan (_, []) -> invalid_arg "retry batch is empty"
+       | Submit_plan _ | Reject_plan _ | Accept_plan _ | Duplicate_plan ->
+         server_cursor preparation.transition_owner.checkpoint)
     ~wires
   |> Result.get_ok
 ;;
@@ -5280,11 +5288,10 @@ let apply_outbox_transition database preparation ~encrypted =
                          id
                          (Types.submission_batch_id batch))
                   then invalid_arg "retry batch identity changed";
-                  update_submitted
-                    database
-                    ~capture_dependency_shadows:false
-                    records
-                    batch;
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.attempt_count <- record.attempt_count + 1)
+                    records;
                   Types.Logically_active, []
                 | Accept_plan (id, barrier)
                   when server_cursor_number barrier.through > database.checkpoint ->

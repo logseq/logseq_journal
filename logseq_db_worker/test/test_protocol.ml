@@ -61,6 +61,54 @@ let response_round_trip () =
     (outcome_field "responses")
 ;;
 
+let admission_inspection_request_round_trip () =
+  let expected =
+    `Assoc
+      [ "apiVersion", `Int 2
+      ; "requestId", `String "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+      ; "command", `Assoc [ "type", `String "inspectAdmission" ]
+      ]
+  in
+  match P.request_of_yojson expected with
+  | Error error ->
+    T.fail
+      "admission inspection request decode failed: %s"
+      (Logseq_db_worker.Error.message error)
+  | Ok request ->
+    T.require
+      (Yojson.Safe.equal
+         (Yojson.Safe.sort expected)
+         (Yojson.Safe.sort (P.request_to_yojson request)))
+      "admission inspection request changed during round trip"
+;;
+
+let admission_inspection_response_round_trip () =
+  let expected =
+    `Assoc
+      [ "apiVersion", `Int 2
+      ; "requestId", `String "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+      ; ( "outcome"
+        , `Assoc
+            [ "type", `String "admission"
+            ; "activeRecords", `Int 3
+            ; "activeBytes", `Int 1536
+            ; "protectedWireBytes", `Int 512
+            ; "retainedOriginEvidenceBytes", `Int 256
+            ; "maximumRecords", `Int 1000
+            ; "maximumBytes", `Int 8388608
+            ] )
+      ]
+  in
+  match P.response_of_yojson expected with
+  | Error error -> T.fail "admission inspection response decode failed: %s" error
+  | Ok response ->
+    T.require
+      (Yojson.Safe.equal
+         (Yojson.Safe.sort expected)
+         (Yojson.Safe.sort (P.response_to_yojson response)))
+      "admission inspection response changed during round trip"
+;;
+
 let push_round_trip () =
   List.iter
     (fun expected ->
@@ -208,6 +256,7 @@ let direct_errors_create_complete_origins () =
   let codes =
     Logseq_db_worker.Error.
       [ Invalid_request
+      ; Stale_read_cursor
       ; Unsupported_api_version
       ; Graph_not_found
       ; Graph_locked
@@ -312,6 +361,12 @@ let () =
         fixture_has_version 2 "protocol/v2-operation-contracts.json")
     ; T.case "request JSON round trip" request_round_trip
     ; T.case "response JSON round trip" response_round_trip
+    ; T.case
+        "admission inspection request JSON round trip"
+        admission_inspection_request_round_trip
+    ; T.case
+        "admission inspection response JSON round trip"
+        admission_inspection_response_round_trip
     ; T.case "push JSON round trip" push_round_trip
     ; T.case "causal error JSON round trip" causal_error_round_trip
     ; T.case

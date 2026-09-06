@@ -53,7 +53,7 @@ type t =
   ; task_state : task_state
   ; child_count : int
   ; creation_time : Journal_time.t
-  ; revision : int
+  ; revision : string
   ; last_mutation_id : string
   }
 
@@ -94,8 +94,8 @@ let create
   then Error "Journal sibling order is invalid"
   else if child_count < 0
   then Error "Journal child count must not be negative"
-  else if revision < 1
-  then Error "Journal revision must be positive"
+  else if String.equal revision ""
+  then Error "Journal revision must not be empty"
   else if not (Journal_validation.is_uuid last_mutation_id)
   then Error "Journal mutation ID must be a UUID"
   else (

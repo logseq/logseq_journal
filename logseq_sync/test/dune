@@ -3,6 +3,7 @@
  (modules
   test_sync
   core_contract
+  local_restore_failure_reconciliation
   pure_reducer_bad_case_support
   pure_reducer_bad_case_01
   pure_reducer_bad_case_02
@@ -15,6 +16,7 @@
   pure_reducer_bad_case_09
   pure_reducer_bad_case_10
   runner_contract
+  transport_contract
   sync_protocol_contract)
  (libraries
   alcotest

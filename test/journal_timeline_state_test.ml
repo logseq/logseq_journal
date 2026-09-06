@@ -41,8 +41,6 @@ let creation_time ?(day = 20260809) ?(minute = 540) () =
     ~instant_unix_ms:Int64.(add midnight (of_int (minute * 60_000)))
     ~local_day:day
     ~local_minute_of_day:minute
-    ~time_zone_id:"Asia/Shanghai"
-    ~utc_offset_seconds:28_800
   |> function
   | Ok value -> value
   | Error error -> fail "creation-time fixture failed: %s" error
@@ -55,7 +53,7 @@ let block
       ?(source = "Journal entry")
       ?(task_state = Journal_model.No_status)
       ?(child_count = 0)
-      ?(revision = 1)
+      ?(revision = "block-1")
       index
   =
   Journal_model.create
@@ -929,10 +927,10 @@ let test_exact_profile_extents_have_no_composer_clearance () =
       (List.length geometry.overrides = List.length expected_overrides)
       "timeline retained an extent override beyond the day heading"
   in
-  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:52. ~row_extent:44.;
-  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:52. ~row_extent:44.;
-  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:80. ~row_extent:100.;
-  check ~width:1_200. ~scale:3.2 ~default_extent:83. ~day_extent:114. ~row_extent:83.
+  check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:54. ~row_extent:44.;
+  check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:54. ~row_extent:44.;
+  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:78. ~row_extent:100.;
+  check ~width:1_200. ~scale:3.2 ~default_extent:83. ~day_extent:107. ~row_extent:83.
 ;;
 
 let test_block_line_counts_are_the_authoritative_sparse_extents () =
@@ -1051,7 +1049,7 @@ let test_anchor_decisions_replacements_and_route_return () =
   require
     (Timeline.anchor_decision state = Timeline.Reset_to_top)
     "initial load must explicitly reset to a safe top anchor";
-  let updated = block ~task_state:Journal_model.Done ~revision:2 40 in
+  let updated = block ~task_state:Journal_model.Done ~revision:"block-2" 40 in
   let replaced = Timeline.replace_block state updated in
   require
     (Timeline.anchor_decision replaced = Timeline.Preserve_visible_slot)
@@ -1134,7 +1132,7 @@ let test_populated_feed_refresh_preserves_position_and_expansion () =
     |> Timeline.observe_visible_range ~first_index:8 ~last_exclusive:12
   in
   let populated_window = Timeline.current_window populated in
-  let refreshed_parent = block ~child_count:1 ~order:"m" ~revision:2 42 in
+  let refreshed_parent = block ~child_count:1 ~order:"m" ~revision:"block-2" 42 in
   let refreshed =
     Timeline.begin_request populated ~generation:3L (Timeline.Feed { before_day = None })
     |> fun state ->
@@ -1239,7 +1237,7 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
     (Timeline.total_count staged_collapsed = Timeline.total_count initial - 1)
     "collapsed delete did not repair total count";
   require_equal_string_list
-    (slot_keys (Timeline.undo_delete collapsed_backup))
+    (slot_keys (Timeline.undo_delete staged_collapsed collapsed_backup))
     (slot_keys initial)
     "collapsed Undo did not restore exact slots";
   let expanded = Timeline.expand initial ~parent_id:(Journal_model.id parent) in
@@ -1280,7 +1278,7 @@ let test_stage_delete_collapsed_expanded_and_exact_undo () =
   require
     (not (Timeline.is_expanded staged ~block_id:(Journal_model.id parent)))
     "staging retained expanded identity";
-  let restored = Timeline.undo_delete backup in
+  let restored = Timeline.undo_delete staged backup in
   require_equal_string_list
     (slot_keys restored)
     (slot_keys loaded)
@@ -1481,7 +1479,310 @@ let test_capture_fab_scroll_threshold_direction_reversal_and_top_reset () =
     "large down event"
 ;;
 
+let paginating_day () =
+  let initial = block ~order:"b" 1 in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed ~more:true [ day_feed ~more:true 20260809 "Today" [ initial ] ])
+  in
+  let after = continuation_of_entries ~more:true [ entry initial ] in
+  Timeline.begin_request state ~generation:2L (Day { day = 20260809; after })
+;;
+
+let stale_day state generation =
+  Timeline.fail_day_request
+    state
+    ~generation
+    ~day:20260809
+    ~stale_cursor:true
+    ~message:"Changed"
+;;
+
+let begin_next state generation =
+  match Timeline.next_request state with
+  | None -> fail "missing next recovery request"
+  | Some request -> Timeline.begin_request state ~generation request
+;;
+
+let test_stale_day_rebuild_is_atomic_and_generation_owned () =
+  let pending = paginating_day () in
+  let ignored = stale_day pending 99L in
+  require
+    (Timeline.pending_request ignored = Timeline.pending_request pending)
+    "obsolete failure cleared a request";
+  let recovering = stale_day pending 2L in
+  require
+    (Timeline.pending_request recovering = None)
+    "stale request retained pending ownership";
+  require
+    (Timeline.next_request recovering = Some (Day { day = 20260809; after = None }))
+    "recovery reused the stale cursor";
+  let recovering = begin_next recovering 3L in
+  let continuation = continuation_of_entries ~more:true [ entry (block ~order:"a" 2) ] in
+  let staged =
+    Timeline.apply_timeline_entry_page
+      recovering
+      ~generation:3L
+      (timeline_page ~continuation [ block ~order:"a" 2 ])
+  in
+  require_equal_string_list
+    (slot_keys staged)
+    (slot_keys pending)
+    "partial recovery changed visible rows";
+  let staged = begin_next staged 4L in
+  let late =
+    Timeline.apply_timeline_entry_page staged ~generation:3L (timeline_page [ block 9 ])
+  in
+  require
+    (Timeline.pending_request late = Timeline.pending_request staged)
+    "late chunk stole recovery ownership";
+  let complete =
+    Timeline.apply_timeline_entry_page
+      late
+      ~generation:4L
+      (timeline_page [ block ~order:"c" 3 ])
+  in
+  require_equal_string_list
+    (slot_keys complete)
+    [ "block:" ^ id "block" 2; "block:" ^ id "block" 3; "feed-continuation:20260809" ]
+    "recovery did not replace deleted rows in sibling order";
+  require (Timeline.pending_request complete = None) "recovery did not complete";
+  require
+    (Timeline.day_error complete ~day:20260809 = None)
+    "successful recovery retained error"
+;;
+
+let test_repeated_staleness_stops_until_retry_and_does_not_block_feed () =
+  let state =
+    paginating_day ()
+    |> fun state -> stale_day state 2L |> fun state -> begin_next state 3L
+  in
+  let failed = stale_day state 3L in
+  require
+    (Timeline.pending_request failed = None)
+    "repeated stale result retained Loading";
+  require
+    (Option.is_some (Timeline.day_error failed ~day:20260809))
+    "repeated stale result has no retry state";
+  let failed =
+    Timeline.observe_visible_range
+      failed
+      ~first_index:0
+      ~last_exclusive:(Timeline.total_count failed)
+  in
+  require
+    (Timeline.next_request failed = Some (Feed { before_day = Some 20260809 }))
+    "failed day blocked older days or automatically retried";
+  let retried = Timeline.retry_day failed ~day:20260809 in
+  require
+    (Timeline.next_request retried = Some (Day { day = 20260809; after = None }))
+    "explicit Retry did not reset recovery";
+  let retried = begin_next retried 4L in
+  let ignored = stale_day retried 3L in
+  require
+    (Timeline.pending_request ignored = Timeline.pending_request retried)
+    "older Retry failure cleared newer request";
+  let complete =
+    Timeline.apply_timeline_entry_page ignored ~generation:4L (timeline_page [ block 4 ])
+  in
+  require (Timeline.day_error complete ~day:20260809 = None) "Retry did not recover"
+;;
+
+let test_terminal_day_failure_and_listener_supersession () =
+  let state = paginating_day () in
+  let failed =
+    Timeline.fail_day_request
+      state
+      ~generation:2L
+      ~day:20260809
+      ~stale_cursor:false
+      ~message:"Unavailable"
+  in
+  require
+    (Timeline.pending_request failed = None)
+    "ordinary read failure retained pending ownership";
+  require
+    (Timeline.next_request failed = None)
+    "ordinary failure automatically started recovery";
+  let recovering = stale_day state 2L |> fun state -> begin_next state 3L in
+  let changed = Timeline.replace_block recovering (block ~source:"Live update" 1) in
+  require
+    (Timeline.pending_request changed = None)
+    "live update did not invalidate staging";
+  let late =
+    Timeline.apply_timeline_entry_page changed ~generation:3L (timeline_page [ block 2 ])
+  in
+  require_equal_string_list
+    (slot_keys late)
+    (slot_keys changed)
+    "late recovery overwrote a listener update";
+  let fresh_graph = Timeline.empty ~today:20260809 in
+  let late_graph =
+    Timeline.apply_timeline_entry_page
+      fresh_graph
+      ~generation:3L
+      (timeline_page [ block 2 ])
+  in
+  require
+    (Timeline.retained_slot_count late_graph = 0)
+    "old graph completion populated a new graph"
+;;
+
+let test_feed_refresh_supersedes_recovery_between_chunks () =
+  let state =
+    paginating_day ()
+    |> fun state -> stale_day state 2L |> fun state -> begin_next state 3L
+  in
+  let continuation = continuation_of_entries ~more:true [ entry (block 2) ] in
+  let staged =
+    Timeline.apply_timeline_entry_page
+      state
+      ~generation:3L
+      (timeline_page ~continuation [ block 2 ])
+  in
+  let refreshed =
+    begin_and_apply_feed
+      ~generation:4L
+      ~before_day:None
+      (feed [ day_feed 20260809 "Today" [ block 5 ] ])
+      staged
+  in
+  require
+    (Timeline.next_request refreshed = None)
+    "feed refresh revived superseded staging";
+  require_equal_string_list
+    (slot_keys refreshed)
+    [ "block:" ^ id "block" 5 ]
+    "feed refresh lost its authoritative rows"
+;;
+
+let test_recovery_work_budget_and_empty_heading_context () =
+  let state = paginating_day () |> fun state -> stale_day state 2L in
+  let rec chunks generation count state =
+    if count = 16
+    then state
+    else (
+      let state = begin_next state generation in
+      let value = block ~order:(Printf.sprintf "%04d" count) (count + 10) in
+      let continuation = continuation_of_entries ~more:true [ entry value ] in
+      chunks
+        (Int64.succ generation)
+        (count + 1)
+        (Timeline.apply_timeline_entry_page
+           state
+           ~generation
+           (timeline_page ~continuation [ value ])))
+  in
+  let bounded = chunks 3L 0 state in
+  require (Timeline.pending_request bounded = None) "work limit retained Loading";
+  require
+    (Option.is_some (Timeline.day_error bounded ~day:20260809))
+    "work exhaustion claimed success";
+  require_equal_string_list
+    (slot_keys bounded)
+    (slot_keys state)
+    "work exhaustion published incomplete staging";
+  let empty_days =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260808 "Saturday" []; day_feed 20260807 "Friday" [] ])
+  in
+  require
+    (Timeline.heading_spacing empty_days ~day:20260808 = (20., 0.))
+    "empty heading retained normal trailing spacing";
+  require
+    (Timeline.heading_spacing empty_days ~day:20260807 = (22., 10.))
+    "adjacent empty headings doubled their gap"
+;;
+
+let test_empty_heading_spacing_survives_retained_window_eviction () =
+  let day_at index =
+    ((2026 - (index / 336)) * 10000)
+    + ((12 - (index mod 336 / 28)) * 100)
+    + 28
+    - (index mod 28)
+  in
+  let rec append batch before state =
+    if batch = 180
+    then state
+    else (
+      let days =
+        List.init 3 (fun offset ->
+          day_feed (day_at ((batch * 3) + offset)) "Empty journal" [])
+      in
+      let state =
+        begin_and_apply_feed
+          ~generation:(Int64.of_int (batch + 1))
+          ~before_day:before
+          (feed ~more:true days)
+          state
+      in
+      append (batch + 1) (Some (day_at ((batch * 3) + 2))) state)
+  in
+  let state = append 0 None (Timeline.empty ~today:20990101) in
+  require
+    (Timeline.first_retained_index state > 0)
+    "fixture did not cross the retention boundary";
+  match Timeline.retained_slots state with
+  | Day_heading page :: _ ->
+    require
+      (Timeline.heading_spacing state ~day:page.day = (22., 0.))
+      "retained boundary forgot its adjacent empty heading";
+    let scrolled =
+      Timeline.observe_visible_range
+        state
+        ~first_index:(Timeline.first_retained_index state + 20)
+        ~last_exclusive:(Timeline.first_retained_index state + 30)
+    in
+    require
+      (Timeline.heading_spacing scrolled ~day:page.day
+       = Timeline.heading_spacing state ~day:page.day)
+      "visible-window movement changed retained heading geometry"
+  | _ -> fail "expected an empty heading at the retained boundary"
+;;
+
+let test_page_replacement_invalidates_pending_continuation () =
+  let initial = block 1 in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed ~more:true 20260809 "Today" [ initial ] ])
+  in
+  let after = continuation_of_entries ~more:true [ entry initial ] in
+  let state =
+    Timeline.begin_request state ~generation:2L (Day { day = 20260809; after })
+  in
+  let replacement = timeline_page [ block ~source:"Authoritative replacement" 2 ] in
+  let replaced =
+    Timeline.replace_timeline_entry_page state ~page:(page 20260809 "Today") replacement
+  in
+  require
+    (Timeline.pending_request replaced = None)
+    "authoritative replacement retained the obsolete pagination request";
+  let late =
+    Timeline.apply_timeline_entry_page replaced ~generation:2L (timeline_page [ block 3 ])
+  in
+  require_equal_string_list
+    (slot_keys late)
+    (slot_keys replaced)
+    "late continuation changed the replacement"
+;;
+
 let () =
+  test_stale_day_rebuild_is_atomic_and_generation_owned ();
+  test_repeated_staleness_stops_until_retry_and_does_not_block_feed ();
+  test_terminal_day_failure_and_listener_supersession ();
+  test_feed_refresh_supersedes_recovery_between_chunks ();
+  test_recovery_work_budget_and_empty_heading_context ();
+  test_empty_heading_spacing_survives_retained_window_eviction ();
+  test_page_replacement_invalidates_pending_continuation ();
   test_projection_order_today_suppression_and_continuations ();
   test_visible_range_demand_drains_in_order_without_another_event ();
   test_visible_range_demand_stops_on_stale_or_nonadvancing_page ();

@@ -1,5 +1,6 @@
 - Use spec-dev-tool to manage agent decision documents; run `spec-dev-tool --help` and follow its AGENT WORKFLOW.
 - All changes must comply with `docs/ux-guidelines.md`.
+- Before adding a bug regression test, identify the production state owner and attempt reproduction through its public pure reducer events, completions, state, and effects. If that boundary reproduces the defect, add only pure reducer regression tests for it; do not duplicate coverage in effect-runner, persistence, transport, integration, E2E, or UI tests. If it cannot, document the missing ownership boundary and test only the narrowest layer that executes the defect. Injecting an already incorrect external result is not a pure reproduction. Use deterministic public interfaces without bypassing `.mli` files or copying implementation logic. This rule does not authorize removing existing tests or moving production ownership for test classification.
 - When asked to find simplifications, run `spec-dev-tool guide find-simplifications` from inside this Git worktree and follow the emitted workflow.
 - When asked to find test simplifications, run `spec-dev-tool guide find-test-simplifications` from inside this Git worktree and follow the emitted workflow.
 - Do not modify any ocaml files under `spec/` during development unless explicitly asked to modify the `.mli` files under `spec/`.

@@ -505,13 +505,10 @@ let fake_decrypted_plaintext ~message ciphertext =
   | _ -> Alcotest.fail "fake decrypted value was not a Transit string"
 ;;
 
-let atomic_submit_and_retry_are_byte_identical database =
+let atomic_submit_and_retry_are_byte_identical ?(advance = false) database =
   let behavior = "atomic submission and byte-identical retry" in
   let first = commit_insert database ~ordinal:220 ~uuid:T.block_uuid behavior in
   let second = commit_insert database ~ordinal:221 ~uuid:T.child_uuid behavior in
-  let before_snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  let before_version = Database.snapshot_version before_snapshot in
-  Database.release_snapshot before_snapshot;
   let prepared, request, _view =
     prepare_submit database [ first.mutation_id; second.mutation_id ] behavior
   in
@@ -527,6 +524,32 @@ let atomic_submit_and_retry_are_byte_identical database =
     "transport-only submit advanced the projection";
   let batch = Option.get committed.submission_batch in
   let original_wires = submission_batch_wires batch in
+  if advance
+  then
+    ignore
+      (commit_plain_authoritative
+         database
+         ~cursor:(server_cursor 1)
+         (let module Json = Transit_core.Json in
+          Json.Array
+            [ Json.Array
+                [ Json.Keyword "db/add"
+                ; Json.Array
+                    [ Json.Keyword "block/uuid"
+                    ; Json.Uuid
+                        (Logseq_db_types.Graph_types.Uuid.to_string
+                           T.authoritative_block_uuid)
+                    ]
+                ; Json.Keyword "block/updated-at"
+                ; Json.Int 1_704_067_200_456
+                ]
+            ]
+          |> Transit_native.Transit.Json.to_string
+               ~mode:Transit_native.Transit.Json.Verbose)
+         behavior);
+  let before_snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  let before_version = Database.snapshot_version before_snapshot in
+  Database.release_snapshot before_snapshot;
   let view = Database.inspect_sync database |> T.require_ok ~behavior in
   let retry, crypto =
     Database.begin_outbox_transition
@@ -543,6 +566,17 @@ let atomic_submit_and_retry_are_byte_identical database =
   let retried_wires =
     retry_commit.submission_batch |> Option.get |> submission_batch_wires
   in
+  let retried = Option.get retry_commit.submission_batch in
+  T.require
+    (Server_cursor.equal
+       (submission_batch_t_before batch)
+       (submission_batch_t_before retried))
+    "retry changed the frozen conditional submission baseline";
+  T.require
+    (Submission_batch_id.equal (submission_batch_id batch) (submission_batch_id retried)
+     && List.map submission_wire_mutation_id original_wires
+        = List.map submission_wire_mutation_id retried_wires)
+    "retry changed the batch identity or member order";
   T.require
     (List.map submission_wire_protected_transaction original_wires
      = List.map submission_wire_protected_transaction retried_wires)
@@ -3084,6 +3118,87 @@ let partial_rejection_blocks_suffix_dependent_on_failed_insert database =
   Database.release_snapshot snapshot
 ;;
 
+let reopened_submission_does_not_reuse_terminal_batch () =
+  let behavior = "reopened submission does not reuse a terminal batch" in
+  T.with_temp_directory "overlay-batch-reopen-" (fun support ->
+    ignore (T.seed_mirror support);
+    let dependencies = T.dependencies ~behavior in
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let open_database () =
+          let inspection =
+            Database.inspect_mirror
+              ~application_support_directory:support
+              ~graph_id:T.graph_uuid
+            |> T.require_ok ~behavior
+          in
+          Database.open_ ~sw dependencies inspection ~graph_name:"oracle-graph"
+          |> T.require_ok ~behavior
+        in
+        let first = open_database () in
+        let old_id = ref None in
+        accepted_member_terminalizes_at_its_authoritative_barrier_with
+          ~behavior
+          ~reorder_wire:(fun wire ->
+            let view = Database.inspect_sync first |> T.require_ok ~behavior in
+            (match sync_view_submissions view with
+             | [ { state = Accepted_pending_authoritative id; _ } ] -> old_id := Some id
+             | _ -> Alcotest.fail "first batch lost its acceptance owner");
+            wire)
+          first;
+        Database.close first |> T.require_ok ~behavior;
+        let second = open_database () in
+        Fun.protect
+          ~finally:(fun () -> ignore (Database.close second))
+          (fun () ->
+             let local =
+               T.commit_mutation
+                 second
+                 ~expected:
+                   (T.delete_precondition
+                      second
+                      ~block:T.authoritative_block_uuid
+                      ~behavior)
+                 (Save_block
+                    { mutation_id = T.mutation_uuid 321
+                    ; block = T.authoritative_block_uuid
+                    ; title = "After reopen"
+                    })
+                 ~behavior
+             in
+             let local =
+               match local with
+               | Local_committed commit -> commit
+               | Local_existing _ -> Alcotest.fail "new edit already existed"
+             in
+             let batch = submit_one second local behavior in
+             let old_id = Option.get !old_id in
+             T.require
+               (not (Submission_batch_id.equal old_id (submission_batch_id batch)))
+               "reopen reused a batch ID retained by a terminal receipt";
+             let view = Database.inspect_sync second |> T.require_ok ~behavior in
+             let late, _ =
+               Database.begin_outbox_transition
+                 second
+                 ~expected:(sync_view_token view)
+                 (Accept_group
+                    { batch_id = old_id
+                    ; barrier =
+                        { through = server_cursor 1
+                        ; checksum = checksum "1111111111111111"
+                        }
+                    })
+               |> T.require_ok ~behavior
+             in
+             ignore
+               (Database.apply_outbox_transition second late ~encrypted:None
+                |> T.require_ok ~behavior);
+             let after = Database.inspect_sync second |> T.require_ok ~behavior in
+             T.require
+               (sync_view_submissions view = sync_view_submissions after)
+               "old terminal acknowledgement changed the reopened submission"))))
+;;
+
 let pure_cases =
   [ Alcotest.test_case
       "revision codecs reject unknown versions"
@@ -3109,7 +3224,11 @@ let pure_cases =
 ;;
 
 let database_cases =
-  [ T.database_case
+  [ Alcotest.test_case
+      "reopen never reuses a terminal batch identity"
+      `Quick
+      reopened_submission_does_not_reuse_terminal_batch
+  ; T.database_case
       "empty sync view has checkpoint and no submissions"
       empty_sync_view_has_checkpoint_and_no_submissions
   ; T.database_case
@@ -3127,7 +3246,10 @@ let database_cases =
       local_submission_uses_server_compatible_fractional_indices
   ; T.database_case
       "submit is atomic and retry is byte-identical"
-      atomic_submit_and_retry_are_byte_identical
+      (atomic_submit_and_retry_are_byte_identical ~advance:false)
+  ; T.database_case
+      "retry preserves its frozen baseline after an authoritative change"
+      (atomic_submit_and_retry_are_byte_identical ~advance:true)
   ; T.database_case
       "submission rejects an unfrozen queued dependency"
       submission_rejects_unfrozen_queued_dependency

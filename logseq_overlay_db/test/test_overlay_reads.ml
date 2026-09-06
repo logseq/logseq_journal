@@ -312,7 +312,7 @@ let journal_cursor_is_snapshot_bound_and_paginates database =
   create 502 third_uuid 20260903;
   let newer = Database.current_snapshot database |> T.require_ok ~behavior in
   (match Database.get_journals newer ~limit:1 ~cursor:(Some cursor) with
-   | Error (Invalid_read_request _) -> ()
+   | Error Stale_read_cursor -> ()
    | Error _ -> Alcotest.fail "cross-snapshot cursor returned the wrong error"
    | Ok _ -> Alcotest.fail "cross-snapshot cursor was accepted");
   Database.release_snapshot newer
@@ -389,7 +389,7 @@ let structure_cursors_accept_request_shape_reuse_and_reject_projection database 
        newer
        (Children { parent = T.page_uuid; limit = 1; cursor = Some cursor })
    with
-   | Error (Invalid_read_request _) -> ()
+   | Error Stale_read_cursor -> ()
    | Error _ -> Alcotest.fail "cross-snapshot structure cursor returned the wrong error"
    | Ok _ -> Alcotest.fail "structure cursor was accepted for another snapshot");
   Database.release_snapshot newer

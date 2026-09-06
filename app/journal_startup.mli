@@ -10,6 +10,7 @@ type startup_phase =
   | Awaiting_selection
   | Restoring_local
   | Bootstrapping
+  | Deleting_local
   | Awaiting_e2ee_password
   | Ready
   | Failed
@@ -21,6 +22,7 @@ type startup_error_owner =
   | Bootstrap
   | E2ee
   | Graph
+  | Local_deletion
 
 type startup_recovery =
   | Sign_in

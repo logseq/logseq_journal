@@ -22,6 +22,7 @@ type request =
 
 and command =
   | V2_graph_info
+  | V2_inspect_admission
   | V2_list_journals of
       { from_day : int
       ; through_day : int
@@ -224,6 +225,7 @@ and v2_outcome =
       ; generation : string
       ; projection_revision : string
       }
+  | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
       { revision_scope : v2_revision_scope
       ; scope_revision : string
@@ -273,6 +275,15 @@ and v2_outcome =
       { generation : string
       ; reason : string
       }
+
+and v2_admission_inspection =
+  { active_records : int
+  ; active_bytes : int
+  ; protected_wire_bytes : int
+  ; retained_origin_evidence_bytes : int
+  ; maximum_records : int
+  ; maximum_bytes : int
+  }
 
 type push =
   | V2_changes_available of

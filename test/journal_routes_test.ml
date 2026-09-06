@@ -16,8 +16,6 @@ let creation_time minute =
     ~instant_unix_ms:Int64.(add 1_786_204_800_000L (of_int (minute * 60_000)))
     ~local_day:20260809
     ~local_minute_of_day:minute
-    ~time_zone_id:"Asia/Shanghai"
-    ~utc_offset_seconds:28_800
   |> function
   | Ok value -> value
   | Error error -> fail "creation time failed: %s" error
@@ -29,7 +27,7 @@ let block
       ?(source = "Original #literal @source")
       ?(task_state = Journal_model.Todo)
       ?(child_count = 1)
-      ?(revision = 1)
+      ?(revision = "block-1")
       ()
   =
   Journal_model.create
@@ -228,8 +226,8 @@ let test_detail_task_child_conflict_and_back_order () =
   (match task_request with
    | Some
        (Journal_graph_request.Set_task_state
-          { block_id; expected_revision = 1; task_state = Journal_model.Done; _ }) ->
-     require_string (Journal_model.id original) block_id "task block ID"
+          { block_id; expected_revision = "block-1"; task_state = Journal_model.Done; _ })
+     -> require_string (Journal_model.id original) block_id "task block ID"
    | _ -> fail "Detail task toggle did not admit an atomic mutation");
   let _, repeated_task =
     Journal_detail.admit_task_toggle
@@ -262,6 +260,7 @@ let test_detail_task_child_conflict_and_back_order () =
     Journal_detail.admit_child
       child_state
       ~mutation_id:"70000000-0000-4000-9000-000000000023"
+      ~calendar_generation:7L
       ~block_id:"70000000-0000-4000-a000-000000000023"
       ~sibling_order:"000000000023"
       ~creation_time:(creation_time 543)
@@ -269,7 +268,7 @@ let test_detail_task_child_conflict_and_back_order () =
   (match child_request with
    | Some
        (Journal_graph_request.Create_child
-          { parent_block_id; expected_parent_revision = 1; source; _ }) ->
+          { parent_block_id; expected_parent_revision = "block-1"; source; _ }) ->
      require_string (Journal_model.id original) parent_block_id "child parent";
      require_string "Direct child 👶" source "child source"
    | _ -> fail "Detail did not admit a direct-child mutation");
@@ -303,7 +302,7 @@ let test_detail_task_child_conflict_and_back_order () =
     Journal_detail.admit_save editing ~mutation_id:"70000000-0000-4000-9000-000000000024"
   in
   require (Option.is_some request) "Detail edit was not admitted";
-  let latest = block ~source:"Concurrent source" ~revision:2 () in
+  let latest = block ~source:"Concurrent source" ~revision:"block-2" () in
   let conflicted = Journal_detail.apply_conflict saving latest in
   require
     (Journal_detail.mode conflicted = Journal_detail.Conflict)
@@ -321,7 +320,7 @@ let test_detail_task_child_conflict_and_back_order () =
   (match retry with
    | Some
        (Journal_graph_request.Update_source
-          { expected_revision = 2; source = "我的草稿 👩🏽‍💻 e\204\129"; _ }) -> ()
+          { expected_revision = "block-2"; source = "我的草稿 👩🏽‍💻 e\204\129"; _ }) -> ()
    | _ -> fail "conflict retry did not rebase the literal draft on the latest revision");
   require
     (Journal_detail.mode retrying = Journal_detail.Saving)

@@ -57,15 +57,6 @@ let initial () =
   |> Result.get_ok
 ;;
 
-let token_request effects =
-  List.find_map
-    (function
-      | Core.Publish (Core.Token_requested request) -> Some request
-      | Run _ | Delegate _ | Publish _ -> None)
-    effects
-  |> Option.get
-;;
-
 let token module_of_string value = module_of_string value |> Result.get_ok
 
 let graph_id =
@@ -94,20 +85,16 @@ let selected_graph () =
   let authenticated =
     Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
-  let catalog_token = token_request authenticated.effects in
-  let authorized =
-    Core.step authenticated.next (Core.Token_provided (catalog_token, "catalog-token"))
-  in
   let catalog =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
           Some
             (Core.step
-               authorized.next
+               authenticated.next
                (Core.Runner_completed (Core.Completion (ticket, Ok [ graph ]))))
         | Run _ | Delegate _ | Publish _ -> None)
-      authorized.effects
+      authenticated.effects
     |> Option.get
   in
   let selected = Core.step catalog.next (Core.Graph_selected graph_id) in
@@ -118,7 +105,6 @@ type connected_fixture =
   { mirror_request : Core.mirror_request
   ; attachment : Core.graph_attachment
   ; attached : Core.transition
-  ; websocket_token : Core.token_request
   ; connection : Core.connection_scope
   ; opened : Core.transition
   }
@@ -145,22 +131,13 @@ let connected_fixture () =
   let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
   let attachment : Core.graph_attachment = { scope = attach_request.scope; sync } in
   let attached = Core.step inspected.next (Core.Graph_attached attachment) in
-  let websocket_token =
-    match attached.effects with
-    | [ Core.Publish (Core.State_changed _); Core.Publish (Core.Token_requested request) ]
-      when Core.token_request_purpose request = Core.Websocket_connect -> request
-    | _ -> Alcotest.fail "connected fixture did not request a WebSocket token"
-  in
-  let connecting =
-    Core.step attached.next (Core.Token_provided (websocket_token, "websocket-token"))
-  in
   let connection =
-    match connecting.effects with
+    match attached.effects with
     | [ Core.Publish (Core.State_changed _); Core.Run (Core.Start_websocket request) ] ->
       request.scope
     | _ -> Alcotest.fail "connected fixture did not start WebSocket"
   in
-  let opened = Core.step connecting.next (Core.Websocket_opened connection) in
+  let opened = Core.step attached.next (Core.Websocket_opened connection) in
   (match opened.effects with
    | [ Core.Publish (Core.State_changed _)
      ; Core.Run
@@ -168,7 +145,7 @@ let connected_fixture () =
      ]
      when scope = connection -> ()
    | _ -> Alcotest.fail "connected fixture did not issue opening Pull");
-  { mirror_request; attachment; attached; websocket_token; connection; opened }
+  { mirror_request; attachment; attached; connection; opened }
 ;;
 
 let current_connected_fixture () =

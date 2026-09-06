@@ -1159,9 +1159,11 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "3d2a540d886839fb243ce78f4bcc38da13c600a9" in
+  let current_bonsai_flutter_revision = "84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b" in
   let obsolete_bonsai_flutter_revisions =
-    [ "f4377637a33cdc450204734d033bbcbb861e06bb"
+    [ "5101a51d980c53bf9aab1e9420321ea8a7d58f9b"
+    ; "3d2a540d886839fb243ce78f4bcc38da13c600a9"
+    ; "f4377637a33cdc450204734d033bbcbb861e06bb"
     ; "1755441c24d718206a3d61af0882c0727f810d46"
     ; "6f2562e09d74d347a50b90541abdb4900e1e23da"
     ; "9b345b90fea476391d19092675abd665655e586a"
@@ -1331,9 +1333,8 @@ let () =
     ; "~floating:false"
     ; "~snap:false"
     ; "~center_title:true"
-    ; "~variant:Ui.Material.App_bar.Small"
-    ; "~shape:Ui.Material.App_bar.Square"
-    ; "~density:Ui.Material.App_bar.Compact"
+    ; "~expanded_height:(toolbar_height +. 8.)"
+    ; "~collapsed_height:(toolbar_height +. 8.)"
     ];
   forbid_text
     root
@@ -1433,6 +1434,7 @@ let () =
     root
     "flutter/lib"
     [ "flutter/lib/application_host_adapter.dart"
+    ; "flutter/lib/journal_platform_menu.dart"
     ; "flutter/lib/journal_tail_fade.dart"
     ; "flutter/lib/journal_widget_registry.dart"
     ; "flutter/lib/main.dart"
@@ -1441,9 +1443,11 @@ let () =
     root
     "flutter/test"
     [ "flutter/test/application_host_adapter_test.dart"
+    ; "flutter/test/macos_edit_menu_test.dart"
     ; "flutter/test/journal_tail_fade_test.dart"
     ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
     ; "flutter/test/journal_runtime_golden_test.dart"
+    ; "flutter/test/journal_header_layout_test.dart"
     ; "flutter/test/widget_test.dart"
     ];
   require_allowed_dart_files
@@ -1755,7 +1759,7 @@ let () =
     ; "graph-picker-refresh-icon"
     ; "Refresh the authorized graph catalog"
     ; "pending local changes"
-    ; "download a fresh snapshot"
+    ; "then returns to graph selection"
     ; "App.View.create"
     ; "Ui.Theme.application"
     ; "Ui.Material.Dialog.alert"
@@ -1855,7 +1859,6 @@ let () =
     ; "Domain_name.host"
     ; "Tls.Config.client"
     ; "~alpn_protocols:[ \"http/1.1\" ]"
-    ; "Eio.Net.getaddrinfo_stream"
     ; "Eio.Net.connect"
     ; "Tls_eio.client_of_flow"
     ; "Eio.Cancel.Cancelled"
@@ -1870,7 +1873,6 @@ let () =
          root
          relative
          [ "Mirage_crypto_rng_unix.use_default"
-         ; "Atomic.make"
          ; "Domain_name.of_string"
          ; "Domain_name.host"
          ; "Tls.Config.client"
@@ -1883,27 +1885,36 @@ let () =
     ];
   require_text
     root
-    "logseq_sync/lib/effect_runner/eio/http_eio.ml"
-    [ "HTTPS request host is missing"
-    ; "HTTPS host is not a valid DNS name"
-    ; "sync host has no network address"
-    ];
-  require_text
-    root
-    "logseq_sync/lib/effect_runner/eio/websocket_eio.ml"
-    [ "WebSocket URL must be WSS without credentials or fragments"
-    ; "WSS host is not a valid DNS name"
-    ; "WSS host has no network address"
-    ];
-  require_text
-    root
     "logseq_db_worker/contract/error.ml"
     [ "Ownership_recovery"; "ownershipRecovery" ];
   forbid_text root "app/application.ml" [ "timeline-task:" ];
   require_text
     root
     "app/journal_graph_projection.mli"
-    [ "type child_summary"; "type timeline_entry"; "type timeline_entry_page" ];
+    [ "type child_summary"
+    ; "type timeline_entry"
+    ; "type timeline_entry_page"
+    ; "expected_revision : string"
+    ; "expected_parent_revision : string"
+    ; "revision:string"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "expected_revision : int"
+         ; "expected_parent_revision : int"
+         ; "minimum_basis"
+         ; "mutable basis"
+         ; "basis : int64 option"
+         ])
+    [ "app/journal_graph_projection.mli"
+    ; "app/journal_graph_projection.ml"
+    ; "app/journal_graph_runtime.mli"
+    ; "app/journal_graph_runtime.ml"
+    ; "app/application.ml"
+    ];
   require_text
     root
     "app/journal_timeline_state.mli"
@@ -2063,8 +2074,25 @@ let () =
     ; "journal-account-diagnostics"
     ; "journal-startup-diagnostics"
     ; "journal-diagnostics-dialog-page"
-    ; "Recent sync transitions"
+    ; "Overlay DB"
+    ; "Outbox records"
+    ; "Protected payload"
+    ; "Origin evidence"
     ];
+  List.iter
+    (fun relative ->
+       forbid_text root relative [ "history : string list"; "append_diagnostic_history" ])
+    [ "logseq_sync/spec/pure_reducer/core.mli"
+    ; "logseq_sync/lib/pure_reducer/core.ml"
+    ; "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.mli"
+    ; "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    ];
+  forbid_text root "app/application.ml" [ "Recent sync transitions" ];
+  require_text
+    root
+    "logseq_db_worker/lib/effect_runner/effect_runner.ml"
+    [ "Database.inspect_admission"; "V2_admission_outcome" ];
+  forbid_text root "app/application.ml" [ "Database.inspect_admission" ];
   require_text
     root
     "logseq_db_worker/contract/error.mli"
@@ -2128,6 +2156,46 @@ let () =
     [ "test/application_view_test.ml"
     ; "test/logseq_db_worker_application_integration_test.ml"
     ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "get_calendar_request"
+         ; "decode_calendar"
+         ; "format_journal_days_request"
+         ; "decode_formatted_journal_days"
+         ; "time_zone_id"
+         ; "utc_offset_seconds"
+         ; "lifecycle_generation"
+         ])
+    [ "app/journal_platform.ml"
+    ; "app/journal_platform.mli"
+    ; "app/journal_calendar.ml"
+    ; "app/journal_calendar.mli"
+    ; "app/journal_time.ml"
+    ; "app/journal_time.mli"
+    ];
+  List.iter
+    (fun relative ->
+       forbid_text
+         root
+         relative
+         [ "JournalCalendarSnapshot"
+         ; "CalendarChangeReason"
+         ; "formatJournalDays"
+         ; "calendarChanged"
+         ; "timeZoneId"
+         ; "utcOffsetSeconds"
+         ])
+    [ "flutter/lib/application_host_adapter.dart"
+    ; "flutter/macos/Runner/MainFlutterWindow.swift"
+    ; "flutter/ios/Runner/AppDelegate.swift"
+    ];
+  require_text
+    root
+    "app/application.ml"
+    [ "Journal_calendar.Sampler.sample"; "Journal_calendar.present_journal_day" ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"
   | failures ->

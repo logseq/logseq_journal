@@ -24,13 +24,17 @@ type failure_source =
 
 type payload =
   | Graph_ready of graph_info
+  | Admission_inspected of
+      { request : Journal_graph_request.admission_request
+      ; observation : Protocol.v2_admission_inspection
+      }
+  | Admission_unavailable of Journal_graph_request.admission_request
   | Block_captured of
       { block : Projection.block
       ; timeline_entry_update : Projection.timeline_entry option
       }
   | Child_created of
       { child : Projection.block
-      ; parent_revision : int
       ; timeline_entry_update : Projection.timeline_entry
       }
   | Block_updated of
@@ -61,6 +65,12 @@ type payload =
       { request_generation : int64
       ; page : Projection.timeline_entry_page
       }
+  | Day_blocks_failed of
+      { day : int
+      ; request_generation : int64
+      ; stale_cursor : bool
+      ; failure : failure_source
+      }
   | Detail_loaded of
       { request_generation : int64
       ; detail : Projection.detail
@@ -72,10 +82,7 @@ type payload =
   | Open_failed of worker_failure
   | Rejected of failure_source
 
-type response =
-  { basis : int64 option
-  ; payload : payload
-  }
+type response = { payload : payload }
 
 type feed_pending =
   { generation : int64
@@ -97,6 +104,7 @@ type refresh =
   | Captured of { block_id : string }
   | Updated of { block_id : string }
   | Update_conflict_refresh of { block_id : string }
+  | Delete_conflict_refresh of { block_id : string }
   | Child_created_refresh of
       { child_id : string
       ; parent_id : string
@@ -109,12 +117,13 @@ type page_tree_interest =
 
 type children_interest =
   { page : Projection.page
-  ; root : Graph.block
+  ; root : Projection.block_member
   ; limit : int
   }
 
 type operation =
   | Graph_info
+  | Admission_info of Journal_graph_request.admission_request
   | Pull_changes of
       { request_generation : int64
       ; generation : string
@@ -150,7 +159,7 @@ type operation =
   | Detail_children of
       { generation : int64
       ; page : Projection.page
-      ; root : Graph.block
+      ; root : Projection.block_member
       }
   | Changed_children of children_interest
   | Capture_page of Projection.capture
@@ -190,14 +199,13 @@ type operation =
 type t =
   { pending : (string, operation) Hashtbl.t
   ; mutable next_request : int64
-  ; mutable basis : int64
-  ; mutable projection_revision : string option
   ; mutable change_generation : string option
   ; mutable change_cursor : string option
   ; block_revisions : (string, string) Hashtbl.t
   ; page_revisions : (string, string) Hashtbl.t
   ; scope_revisions : (string, string) Hashtbl.t
   ; mutable calendar : Journal_calendar.t option
+  ; localtime : float -> Unix.tm
   ; mutable pages : (string * Projection.page) list
   ; mutable block_pages : (string * Projection.page) list
   ; projected_blocks : (string, Projection.block) Hashtbl.t
@@ -213,7 +221,7 @@ type output =
 
 let empty = { requests = []; responses = [] }
 let requests values = { empty with requests = values }
-let response ?basis payload = { basis; payload }
+let response payload = { payload }
 let responses values = { empty with responses = values }
 
 let feed_failure request_generation message =
@@ -222,17 +230,28 @@ let feed_failure request_generation message =
     ]
 ;;
 
-let create () =
+let day_failure ~day request_generation message =
+  responses
+    [ response
+        (Day_blocks_failed
+           { day
+           ; request_generation
+           ; stale_cursor = false
+           ; failure = Projection_failure message
+           })
+    ]
+;;
+
+let create ?(localtime = Unix.localtime) () =
   { pending = Hashtbl.create 32
   ; next_request = 1L
-  ; basis = 0L
-  ; projection_revision = None
   ; change_generation = None
   ; change_cursor = None
   ; block_revisions = Hashtbl.create 64
   ; page_revisions = Hashtbl.create 32
   ; scope_revisions = Hashtbl.create 32
   ; calendar = None
+  ; localtime
   ; pages = []
   ; block_pages = []
   ; projected_blocks = Hashtbl.create 64
@@ -244,8 +263,6 @@ let create () =
 
 let reset t =
   Hashtbl.clear t.pending;
-  t.basis <- 0L;
-  t.projection_revision <- None;
   t.change_generation <- None;
   t.change_cursor <- None;
   Hashtbl.clear t.block_revisions;
@@ -261,19 +278,20 @@ let reset t =
 
 let set_calendar t (calendar : Journal_calendar.t) =
   match t.calendar with
-  | Some current when Int64.compare current.generation calendar.generation >= 0 -> ()
+  | Some current when not (Journal_calendar.is_newer ~than:current calendar) -> ()
   | None | Some _ -> t.calendar <- Some calendar
 ;;
 
 let projection_time_context t =
   match t.calendar with
   | None -> Error "The host calendar is unavailable."
-  | Some calendar ->
-    Ok
-      Projection.
-        { time_zone_id = calendar.time_zone_id
-        ; utc_offset_seconds = calendar.utc_offset_seconds
-        }
+  | Some _ -> Ok Projection.{ localtime = t.localtime }
+;;
+
+let calendar_generation_is_current t generation =
+  match t.calendar with
+  | Some calendar -> Int64.equal (Journal_calendar.generation calendar) generation
+  | None -> false
 ;;
 
 let request_uuid t =
@@ -321,15 +339,15 @@ let remember_entries t page entries =
 
 let remember_tree_items t page items =
   List.iter
-    (fun (item : Graph.block_tree_item) ->
+    (fun (item : Projection.tree_member) ->
        remember_block_page t page (Graph.Uuid.to_string item.block.uuid))
     items
 ;;
 
 let remember_blocks t page blocks =
   List.iter
-    (fun (block : Graph.block) ->
-       remember_block_page t page (Graph.Uuid.to_string block.uuid))
+    (fun (member : Projection.block_member) ->
+       remember_block_page t page (Graph.Uuid.to_string member.block.uuid))
     blocks
 ;;
 
@@ -376,15 +394,11 @@ let scope_precondition t scope =
   | Some revision -> Ok (scope, revision)
 ;;
 
-let delete_preconditions t block =
+let delete_preconditions t block block_revision =
   let block_id = Graph.Uuid.to_string block in
-  match
-    ( Hashtbl.find_opt t.block_revisions block_id
-    , Hashtbl.find_opt t.projected_blocks block_id )
-  with
-  | None, _ -> Error "The block revision is not retained."
-  | _, None -> Error "The delete target is not retained."
-  | Some block_revision, Some projected ->
+  match Hashtbl.find_opt t.projected_blocks block_id with
+  | None -> Error "The delete target is not retained."
+  | Some projected ->
     let parent_scope =
       Option.bind (Journal_model.parent_id projected) (fun parent ->
         Option.bind
@@ -509,7 +523,7 @@ let feed_can_publish pending =
       newer_pages_resolved pending.ordered_page_ids)
 ;;
 
-let feed_progress ?basis pending =
+let feed_progress pending =
   if not (feed_can_publish pending)
   then []
   else (
@@ -526,7 +540,6 @@ let feed_progress ?basis pending =
         days
     in
     [ response
-        ?basis
         (Feed_loaded
            { request_generation = pending.generation
            ; feed = { days; slot_count; has_more_days = pending.has_more_days }
@@ -537,6 +550,8 @@ let feed_progress ?basis pending =
 
 let submit t (request : Journal_graph_request.t) =
   match request with
+  | Inspect_admission request ->
+    requests [ read t (Admission_info request) Protocol.V2_inspect_admission ]
   | Load_feed { before_day; day_limit; blocks_per_day; slot_limit; request_generation } ->
     if day_limit <= 0
     then feed_failure request_generation "The feed day limit must be positive."
@@ -566,7 +581,8 @@ let submit t (request : Journal_graph_request.t) =
         ])
   | Load_day_blocks { day; after; limit; request_generation } ->
     (match page_by_day t day with
-     | None -> reject "The requested journal page is not retained."
+     | None ->
+       day_failure ~day request_generation "The requested journal page is not retained."
      | Some page ->
        let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
        (match
@@ -578,7 +594,7 @@ let submit t (request : Journal_graph_request.t) =
             limit
         with
         | Ok request -> requests [ request ]
-        | Error message -> reject message))
+        | Error message -> day_failure ~day request_generation message))
   | Load_detail { block_id; request_generation; limit; _ } ->
     (match parse_uuid "block UUID" block_id with
      | Error message -> reject message
@@ -599,10 +615,14 @@ let submit t (request : Journal_graph_request.t) =
      | Ok block ->
        requests
          [ read t Find_block_result (Protocol.V2_get_block { block; revision = None }) ])
-  | Capture { command; _ } ->
-    (match journal_uuid (Journal_time.local_day command.creation_time) with
-     | Error message -> reject message
-     | Ok page_uuid ->
+  | Capture { calendar_generation; command } ->
+    (match
+       ( calendar_generation_is_current t calendar_generation
+       , journal_uuid (Journal_time.local_day command.creation_time) )
+     with
+     | false, _ -> reject "The local calendar changed before capture admission."
+     | true, Error message -> reject message
+     | true, Ok page_uuid ->
        requests
          [ read
              t
@@ -617,17 +637,19 @@ let submit t (request : Journal_graph_request.t) =
        (match page_by_block t command.block_id with
         | None -> reject "The block page is not retained."
         | Some page ->
-          (match block_preconditions t block with
-           | Error message -> reject message
-           | Ok preconditions ->
-             requests
-               [ mutate
-                   t
-                   (Mutation_refresh
-                      { page; refresh = Updated { block_id = command.block_id } })
-                   (Protocol.V2_save_block
-                      { mutation_id; block; title = command.source; preconditions })
-               ]))
+          requests
+            [ mutate
+                t
+                (Mutation_refresh
+                   { page; refresh = Updated { block_id = command.block_id } })
+                (Protocol.V2_save_block
+                   { mutation_id
+                   ; block
+                   ; title = command.source
+                   ; preconditions =
+                       preconditions ~blocks:[ block, command.expected_revision ] ()
+                   })
+            ])
      | Error message, _ | _, Error message -> reject message)
   | Set_task_state command ->
     (match
@@ -636,119 +658,94 @@ let submit t (request : Journal_graph_request.t) =
      | Ok mutation_id, Ok block ->
        (match page_by_block t command.block_id with
         | None -> reject "The block page is not retained."
-        | Some page
-          when command.expected_revision
-               <>
-               if Int64.compare t.basis 1L < 0
-               then 1
-               else if Int64.compare t.basis (Int64.of_int max_int) > 0
-               then max_int
-               else Int64.to_int t.basis ->
-          (match
-             page_tree
-               t
-               (Refresh_page_tree
-                  { page
-                  ; refresh = Update_conflict_refresh { block_id = command.block_id }
-                  })
-               page
-               Protocol.maximum_page_size
-           with
-           | Ok request -> requests [ request ]
-           | Error message -> reject message)
         | Some page ->
-          (match block_preconditions t block with
-           | Error message -> reject message
-           | Ok preconditions ->
-             let mutation =
-               match command.task_state with
-               | Journal_model.No_status ->
-                 Protocol.V2_clear_task_status { mutation_id; block; preconditions }
-               | Todo ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_todo; preconditions }
-               | Doing ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_doing; preconditions }
-               | In_review ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_in_review; preconditions }
-               | Now ->
-                 V2_set_task_status { mutation_id; block; status = V2_now; preconditions }
-               | Done ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_done; preconditions }
-               | Canceled ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_canceled; preconditions }
-               | Backlog ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_backlog; preconditions }
-               | Waiting ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_waiting; preconditions }
-               | Later ->
-                 V2_set_task_status
-                   { mutation_id; block; status = V2_later; preconditions }
-             in
-             requests
-               [ mutate
-                   t
-                   (Mutation_refresh
-                      { page; refresh = Updated { block_id = command.block_id } })
-                   mutation
-               ]))
+          let preconditions =
+            preconditions ~blocks:[ block, command.expected_revision ] ()
+          in
+          let mutation =
+            match command.task_state with
+            | Journal_model.No_status ->
+              Protocol.V2_clear_task_status { mutation_id; block; preconditions }
+            | Todo ->
+              V2_set_task_status { mutation_id; block; status = V2_todo; preconditions }
+            | Doing ->
+              V2_set_task_status { mutation_id; block; status = V2_doing; preconditions }
+            | In_review ->
+              V2_set_task_status
+                { mutation_id; block; status = V2_in_review; preconditions }
+            | Now ->
+              V2_set_task_status { mutation_id; block; status = V2_now; preconditions }
+            | Done ->
+              V2_set_task_status { mutation_id; block; status = V2_done; preconditions }
+            | Canceled ->
+              V2_set_task_status
+                { mutation_id; block; status = V2_canceled; preconditions }
+            | Backlog ->
+              V2_set_task_status
+                { mutation_id; block; status = V2_backlog; preconditions }
+            | Waiting ->
+              V2_set_task_status
+                { mutation_id; block; status = V2_waiting; preconditions }
+            | Later ->
+              V2_set_task_status { mutation_id; block; status = V2_later; preconditions }
+          in
+          requests
+            [ mutate
+                t
+                (Mutation_refresh
+                   { page; refresh = Updated { block_id = command.block_id } })
+                mutation
+            ])
      | Error message, _ | _, Error message -> reject message)
   | Create_child command ->
-    (match
-       ( mutation_context t command.mutation_id
-       , parse_uuid "child UUID" command.block_id
-       , parse_uuid "parent UUID" command.parent_block_id )
-     with
-     | Ok mutation_id, Ok child, Ok parent ->
-       (match page_by_block t command.parent_block_id with
-        | None -> reject "The parent page is not retained."
-        | Some page ->
-          let scope = Protocol.V2_children_scope parent in
-          (match
-             ( Hashtbl.find_opt t.block_revisions (Graph.Uuid.to_string parent)
-             , scope_precondition t scope )
-           with
-           | Some revision, Ok scope_revision ->
-             let tree : Protocol.v2_block_tree =
-               { uuid = child; title = command.source; children = [] }
-             in
-             requests
-               [ mutate
-                   t
-                   (Mutation_refresh
-                      { page
-                      ; refresh =
-                          Child_created_refresh
-                            { child_id = command.block_id
-                            ; parent_id = command.parent_block_id
-                            }
-                      })
-                   (Protocol.V2_insert_blocks
-                      { mutation_id
-                      ; parent
-                      ; roots = [ tree ]
-                      ; preconditions =
-                          preconditions
-                            ~blocks:[ parent, revision ]
-                            ~scopes:[ scope_revision ]
-                            ()
-                      })
-               ]
-           | None, _ -> reject "The parent block revision is not retained."
-           | _, Error message -> reject message))
-     | Error message, _, _ | _, Error message, _ | _, _, Error message -> reject message)
+    if not (calendar_generation_is_current t command.calendar_generation)
+    then reject "The local calendar changed before child admission."
+    else (
+      match
+        ( mutation_context t command.mutation_id
+        , parse_uuid "child UUID" command.block_id
+        , parse_uuid "parent UUID" command.parent_block_id )
+      with
+      | Ok mutation_id, Ok child, Ok parent ->
+        (match page_by_block t command.parent_block_id with
+         | None -> reject "The parent page is not retained."
+         | Some page ->
+           let scope = Protocol.V2_children_scope parent in
+           (match scope_precondition t scope with
+            | Ok scope_revision ->
+              let tree : Protocol.v2_block_tree =
+                { uuid = child; title = command.source; children = [] }
+              in
+              requests
+                [ mutate
+                    t
+                    (Mutation_refresh
+                       { page
+                       ; refresh =
+                           Child_created_refresh
+                             { child_id = command.block_id
+                             ; parent_id = command.parent_block_id
+                             }
+                       })
+                    (Protocol.V2_insert_blocks
+                       { mutation_id
+                       ; parent
+                       ; roots = [ tree ]
+                       ; preconditions =
+                           preconditions
+                             ~blocks:[ parent, command.expected_parent_revision ]
+                             ~scopes:[ scope_revision ]
+                             ()
+                       })
+                ]
+            | Error message -> reject message))
+      | Error message, _, _ | _, Error message, _ | _, _, Error message -> reject message)
   | Delete_subtree command ->
     (match
        mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
      with
      | Ok mutation_id, Ok block ->
-       (match delete_preconditions t block with
+       (match delete_preconditions t block command.expected_revision with
         | Error message -> reject message
         | Ok preconditions ->
           requests
@@ -894,17 +891,18 @@ let continue_capture t (command : Projection.capture) page =
          ])
 ;;
 
-let refresh_response t page refresh basis result =
+let refresh_response t page refresh result =
   match projection_time_context t with
   | Error message -> reject message
   | Ok time_context ->
-    (match Projection.timeline_entry_page ~page ~basis ~time_context result with
+    (match Projection.timeline_entry_page ~page ~time_context result with
      | Error message -> reject message
      | Ok projected ->
        remember_entries t page projected.entries;
        let find id =
          List.find_opt
-           (fun entry -> String.equal (Journal_model.id entry.Projection.block) id)
+           (fun (entry : Projection.timeline_entry) ->
+              String.equal (Journal_model.id entry.block) id)
            projected.entries
        in
        (match refresh with
@@ -913,7 +911,6 @@ let refresh_response t page refresh basis result =
            | Some entry ->
              responses
                [ response
-                   ~basis
                    (Block_captured
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
@@ -923,14 +920,29 @@ let refresh_response t page refresh basis result =
            | Some entry ->
              responses
                [ response
-                   ~basis
                    (Block_updated
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
            | None -> reject "The updated block was not visible after commit.")
+        | Delete_conflict_refresh { block_id } ->
+          let completion =
+            match find block_id with
+            | Some entry -> Delete_conflict entry.block
+            | None ->
+              Subtree_deleted
+                { block_id
+                ; deleted_count = 0
+                ; parent = None
+                ; timeline_entry_update = None
+                }
+          in
+          responses
+            [ response completion
+            ; response (Page_tree_reconciled { page; value = projected })
+            ]
         | Update_conflict_refresh { block_id } ->
           (match find block_id with
-           | Some entry -> responses [ response ~basis (Update_conflict entry.block) ]
+           | Some entry -> responses [ response (Update_conflict entry.block) ]
            | None -> reject "The conflicted block was not visible during reconciliation.")
         | Child_created_refresh { child_id; parent_id } ->
           (match find parent_id with
@@ -938,12 +950,12 @@ let refresh_response t page refresh basis result =
            | Some parent ->
              let child =
                List.find_map
-                 (fun item ->
-                    if String.equal (Graph.Uuid.to_string item.Graph.block.uuid) child_id
+                 (fun (item : Projection.tree_member) ->
+                    if String.equal (Graph.Uuid.to_string item.block.uuid) child_id
                     then
                       Projection.block
                         ~page
-                        ~basis
+                        ~revision:item.revision
                         ~child_count:0
                         ~time_context
                         item.block
@@ -955,24 +967,7 @@ let refresh_response t page refresh basis result =
               | None -> reject "The child block was not visible after commit."
               | Some child ->
                 responses
-                  [ response
-                      ~basis
-                      (Child_created
-                         { child
-                         ; parent_revision =
-                             (if Int64.compare basis (Int64.of_int max_int) > 0
-                              then max_int
-                              else max 1 (Int64.to_int basis))
-                         ; timeline_entry_update = parent
-                         })
-                  ]))))
-;;
-
-let observe_projection_revision t revision =
-  if not (Option.equal String.equal t.projection_revision (Some revision))
-  then (
-    t.projection_revision <- Some revision;
-    t.basis <- Int64.succ t.basis)
+                  [ response (Child_created { child; timeline_entry_update = parent }) ]))))
 ;;
 
 let append_unique equal value values =
@@ -1152,6 +1147,7 @@ let remember_scope_revision t scope revision =
 
 let operation_name = function
   | Graph_info -> "graphInfo"
+  | Admission_info _ -> "inspectAdmission"
   | Pull_changes _ -> "pullChanges"
   | Acknowledge_changes -> "ackChanges"
   | List_feed_pages _ -> "listFeedPages"
@@ -1174,8 +1170,8 @@ let operation_name = function
   | Delete_mutation _ -> "deleteSubtree"
 ;;
 
-let worker_error request_id message =
-  Error.create ~code:Unsupported_semantics ~message ~details:[]
+let worker_error code request_id message =
+  Error.create ~code ~message ~details:[]
   |> Result.fold ~ok:Fun.id ~error:(fun _ ->
     Error.create
       ~code:Unsupported_semantics
@@ -1185,8 +1181,8 @@ let worker_error request_id message =
   |> fun error -> request_id, error
 ;;
 
-let failure_output t operation request_id message =
-  let request_id, error = worker_error request_id message in
+let failure_output ?(code = Error.Unsupported_semantics) t operation request_id message =
+  let request_id, error = worker_error code request_id message in
   let worker_failure = { operation = operation_name operation; request_id; error } in
   match operation with
   | List_feed_pages { request_generation; _ } ->
@@ -1210,9 +1206,19 @@ let failure_output t operation request_id message =
   | Mutation_refresh { page; refresh = Updated { block_id } } ->
     request_refresh t page (Update_conflict_refresh { block_id })
   | Graph_info -> responses [ response (Open_failed worker_failure) ]
+  | Admission_info request -> responses [ response (Admission_unavailable request) ]
   | Pull_changes _ | Acknowledge_changes ->
     responses [ response (Rejected (Worker_failure worker_failure)) ]
-  | Day_page_tree _
+  | Day_page_tree { page; generation } ->
+    responses
+      [ response
+          (Day_blocks_failed
+             { day = page.Projection.day
+             ; request_generation = generation
+             ; stale_cursor = code = Error.Stale_read_cursor
+             ; failure = Worker_failure worker_failure
+             })
+      ]
   | Detail_block _
   | Changed_block _
   | Find_block_result
@@ -1230,25 +1236,29 @@ let failure_output t operation request_id message =
   | Delete_mutation _ -> responses [ response (Rejected (Worker_failure worker_failure)) ]
 ;;
 
-let tree_result items continuation : Graph.block_tree_item Graph.page_result =
+let tree_result items continuation : Projection.tree_member Graph.page_result =
   { items =
       List.map
         (fun (item : Protocol.v2_tree_member) ->
-           Graph.{ block = item.value.block; depth = item.depth })
+           Projection.
+             { block = item.value.block; revision = item.revision; depth = item.depth })
         items
   ; continuation
   }
 ;;
 
-let children_result items continuation : Graph.block Graph.page_result =
-  { items = List.map (fun (item : Protocol.v2_child_member) -> item.value.block) items
+let children_result items continuation : Projection.block_member Graph.page_result =
+  { items =
+      List.map
+        (fun (item : Protocol.v2_child_member) ->
+           Projection.{ block = item.value.block; revision = item.revision })
+        items
   ; continuation
   }
 ;;
 
 let feed_pages_response
       t
-      ~basis
       ~before_day
       ~day_limit
       ~blocks_per_day
@@ -1301,7 +1311,6 @@ let feed_pages_response
     then
       responses
         [ response
-            ~basis
             (Feed_loaded
                { request_generation
                ; feed = { days = []; slot_count = 0; has_more_days }
@@ -1334,12 +1343,30 @@ let receive t (protocol_response : Protocol.response) =
     Hashtbl.remove t.pending key;
     (match outcome with
      | Protocol.V2_failed { code; message } ->
-       (match operation with
-        | Capture_insert { command; page; conflict_retries }
-          when String.equal code (Error.code_string Error.Conflict)
-               && conflict_retries < 2 ->
-          capture_children t command page (conflict_retries + 1)
-        | _ -> failure_output t operation request_id message)
+       (match Error.code_of_string code with
+        | None ->
+          failure_output
+            ~code:Error.Invalid_request
+            t
+            operation
+            request_id
+            "The Worker returned an unknown failure code."
+        | Some failure_code ->
+          (match operation with
+           | Capture_insert { command; page; conflict_retries }
+             when String.equal code (Error.code_string Error.Conflict)
+                  && conflict_retries < 2 ->
+             capture_children t command page (conflict_retries + 1)
+           | Delete_mutation command
+             when String.equal code (Error.code_string Error.Conflict) ->
+             (match page_by_block t command.block_id with
+              | Some page ->
+                request_refresh
+                  t
+                  page
+                  (Delete_conflict_refresh { block_id = command.block_id })
+              | None -> failure_output ~code:failure_code t operation request_id message)
+           | _ -> failure_output ~code:failure_code t operation request_id message))
      | V2_resync_required { generation; reason } ->
        (match operation with
         | Pull_changes { request_generation; _ } ->
@@ -1354,12 +1381,10 @@ let receive t (protocol_response : Protocol.response) =
          ; projection_revision
          ; _
          } ->
-       observe_projection_revision t projection_revision;
        (match operation with
         | Graph_info ->
           responses
             [ response
-                ~basis:t.basis
                 (Graph_ready
                    { graph_uuid
                    ; graph_name
@@ -1370,6 +1395,11 @@ let receive t (protocol_response : Protocol.response) =
                    })
             ]
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
+     | V2_admission_outcome observation ->
+       (match operation with
+        | Admission_info request ->
+          responses [ response (Admission_inspected { request; observation }) ]
+        | _ -> failure_output t operation request_id "Unexpected admission response.")
      | V2_journals_outcome { revision_scope; scope_revision; items; next_cursor } ->
        remember_scope_revision t revision_scope scope_revision;
        List.iter
@@ -1387,7 +1417,6 @@ let receive t (protocol_response : Protocol.response) =
             } ->
           feed_pages_response
             t
-            ~basis:t.basis
             ~before_day
             ~day_limit
             ~blocks_per_day
@@ -1429,7 +1458,8 @@ let receive t (protocol_response : Protocol.response) =
           (match page_by_uuid t value.block.page with
            | None -> reject "The block page is not retained."
            | Some page ->
-             let interest = { page; root = value.block; limit } in
+             let root = Projection.{ block = value.block; revision } in
+             let interest = { page; root; limit } in
              Hashtbl.replace
                t.children_interests
                (Graph.Uuid.to_string value.block.uuid)
@@ -1437,7 +1467,7 @@ let receive t (protocol_response : Protocol.response) =
              requests
                [ read
                    t
-                   (Detail_children { generation; page; root = value.block })
+                   (Detail_children { generation; page; root })
                    (Protocol.V2_get_children
                       { parent = value.block.uuid; limit; cursor = None; revision = None })
                ])
@@ -1446,20 +1476,14 @@ let receive t (protocol_response : Protocol.response) =
           (match page_by_uuid t value.block.page, projection_time_context t with
            | Some page, Ok time_context ->
              (match
-                Projection.block
-                  ~page
-                  ~basis:t.basis
-                  ~child_count:0
-                  ~time_context
-                  value.block
+                Projection.block ~page ~revision ~child_count:0 ~time_context value.block
               with
-              | Ok block ->
-                responses [ response ~basis:t.basis (Block_found (Some block)) ]
+              | Ok block -> responses [ response (Block_found (Some block)) ]
               | Error message -> reject message)
-           | None, _ -> responses [ response ~basis:t.basis (Block_found None) ]
+           | None, _ -> responses [ response (Block_found None) ]
            | _, Error message -> reject message)
         | V2_missing_block _, Find_block_result ->
-          responses [ response ~basis:t.basis (Block_found None) ]
+          responses [ response (Block_found None) ]
         | V2_present_block { value; revision }, Changed_block { block_id; page } ->
           remember_block_revision t value.block.uuid revision;
           let child_count =
@@ -1471,22 +1495,14 @@ let receive t (protocol_response : Protocol.response) =
            | Error message -> reject message
            | Ok time_context ->
              (match
-                Projection.block
-                  ~page
-                  ~basis:t.basis
-                  ~child_count
-                  ~time_context
-                  value.block
+                Projection.block ~page ~revision ~child_count ~time_context value.block
               with
               | Error message -> reject message
               | Ok block ->
                 remember_block_page t page block_id;
                 Hashtbl.replace t.projected_blocks block_id block;
                 responses
-                  [ response
-                      ~basis:t.basis
-                      (Block_updated { block; timeline_entry_update = None })
-                  ]))
+                  [ response (Block_updated { block; timeline_entry_update = None }) ]))
         | V2_missing_block { uuid; revision }, Changed_block { block_id; _ } ->
           remember_block_revision t uuid revision;
           t.block_pages
@@ -1494,7 +1510,7 @@ let receive t (protocol_response : Protocol.response) =
                (fun (candidate, _) -> not (String.equal candidate block_id))
                t.block_pages;
           Hashtbl.remove t.projected_blocks block_id;
-          responses [ response ~basis:t.basis (Block_removed { block_id }) ]
+          responses [ response (Block_removed { block_id }) ]
         | V2_present_block { value; revision }, Capture_block { command; page } ->
           remember_block_revision t value.block.uuid revision;
           capture_status t command page
@@ -1510,33 +1526,25 @@ let receive t (protocol_response : Protocol.response) =
        (match operation with
         | Detail_children { generation; page; root } ->
           let children = children_result items next_cursor in
-          remember_block_page t page (Graph.Uuid.to_string root.uuid);
+          remember_block_page t page (Graph.Uuid.to_string root.block.uuid);
           remember_blocks t page children.items;
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match
-                Projection.detail ~page ~basis:t.basis ~time_context ~root children
-              with
+             (match Projection.detail ~page ~time_context ~root children with
               | Ok detail ->
                 responses
-                  [ response
-                      ~basis:t.basis
-                      (Detail_loaded { request_generation = generation; detail })
-                  ]
+                  [ response (Detail_loaded { request_generation = generation; detail }) ]
               | Error message -> reject message))
         | Changed_children { page; root; _ } ->
           let children = children_result items next_cursor in
-          remember_block_page t page (Graph.Uuid.to_string root.uuid);
+          remember_block_page t page (Graph.Uuid.to_string root.block.uuid);
           remember_blocks t page children.items;
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match
-                Projection.detail ~page ~basis:t.basis ~time_context ~root children
-              with
-              | Ok detail ->
-                responses [ response ~basis:t.basis (Children_reconciled detail) ]
+             (match Projection.detail ~page ~time_context ~root children with
+              | Ok detail -> responses [ response (Children_reconciled detail) ]
               | Error message -> reject message))
         | Capture_children { command; page; conflict_retries } ->
           let children = children_result items next_cursor in
@@ -1556,7 +1564,7 @@ let receive t (protocol_response : Protocol.response) =
           pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids;
           let roots =
             List.fold_left
-              (fun count (item : Graph.block_tree_item) ->
+              (fun count (item : Projection.tree_member) ->
                  if item.depth = 0 then count + 1 else count)
               0
               result.items
@@ -1571,9 +1579,7 @@ let receive t (protocol_response : Protocol.response) =
             match projection_time_context t with
             | Error message -> feed_failure pending.generation message
             | Ok time_context ->
-              (match
-                 Projection.timeline_entry_page ~page ~basis:t.basis ~time_context result
-               with
+              (match Projection.timeline_entry_page ~page ~time_context result with
                | Error message -> feed_failure pending.generation message
                | Ok projected ->
                  remember_entries t page projected.entries;
@@ -1584,41 +1590,33 @@ let receive t (protocol_response : Protocol.response) =
                     ; continuation = projected.continuation
                     }
                     :: pending.days;
-                 { requests = []; responses = feed_progress ~basis:t.basis pending }))
+                 { requests = []; responses = feed_progress pending }))
         | Day_page_tree { page; generation } ->
           remember_tree_items t page result.items;
           (match projection_time_context t with
-           | Error message -> reject message
+           | Error message -> day_failure ~day:page.Projection.day generation message
            | Ok time_context ->
-             (match
-                Projection.timeline_entry_page ~page ~basis:t.basis ~time_context result
-              with
+             (match Projection.timeline_entry_page ~page ~time_context result with
               | Ok page ->
                 responses
-                  [ response
-                      ~basis:t.basis
-                      (Day_blocks_loaded { request_generation = generation; page })
+                  [ response (Day_blocks_loaded { request_generation = generation; page })
                   ]
-              | Error message -> reject message))
+              | Error message -> day_failure ~day:page.Projection.day generation message))
         | Refresh_page_tree { page; refresh } ->
           remember_tree_items t page result.items;
-          refresh_response t page refresh t.basis result
+          refresh_response t page refresh result
         | Changed_page_tree page ->
           remember_tree_items t page result.items;
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match
-                Projection.timeline_entry_page ~page ~basis:t.basis ~time_context result
-              with
+             (match Projection.timeline_entry_page ~page ~time_context result with
               | Error message -> reject message
               | Ok value ->
                 remember_entries t page value.entries;
-                responses
-                  [ response ~basis:t.basis (Page_tree_reconciled { page; value }) ]))
+                responses [ response (Page_tree_reconciled { page; value }) ]))
         | _ -> failure_output t operation request_id "Unexpected page-tree response.")
-     | V2_mutation_committed { after_projection_revision; _ } ->
-       observe_projection_revision t after_projection_revision;
+     | V2_mutation_committed _ ->
        (match operation with
         | Capture_create_page { command; page_uuid } ->
           requests
@@ -1634,7 +1632,6 @@ let receive t (protocol_response : Protocol.response) =
         | Delete_mutation command ->
           responses
             [ response
-                ~basis:t.basis
                 (Subtree_deleted
                    { block_id = command.block_id
                    ; deleted_count = 1

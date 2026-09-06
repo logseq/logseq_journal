@@ -221,7 +221,11 @@ val inspect_admission
   :  t
   -> (Types.admission_inspection, Types.admission_inspection_error) result
 
-(** {2 Reading one captured projection} *)
+(** {2 Reading one captured projection}
+
+    A well-formed continuation from another projection returns
+    [Types.Stale_read_cursor]. Malformed cursors or out-of-range offsets return
+    [Types.Invalid_read_request]. Neither result permits reusing the old offset. *)
 
 (** Looks up blocks by UUID in the captured projection. *)
 val get_blocks

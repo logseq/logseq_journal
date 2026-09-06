@@ -857,12 +857,12 @@ void main() {
       expect(journalAppBar.flexibleSpace, isNull);
       expect(journalAppBar.bottom, isNull);
       expect(journalAppBar.actions, isNotEmpty);
-      expect(find.text('Today · Wed, Aug 12'), findsOneWidget);
+      expect(find.text('Wed, Aug 12'), findsOneWidget);
       expect(
         find.byWidgetPredicate(
           (widget) =>
               widget is Semantics &&
-              widget.properties.label == 'Today, Wed, Aug 12',
+              widget.properties.label == 'Wed, Aug 12',
         ),
         findsOneWidget,
       );
@@ -878,14 +878,14 @@ void main() {
       );
       journalScroll.position.jumpTo(80);
       await tester.pump();
-      expect(find.text('Today · Wed, Aug 12').hitTestable(), findsOneWidget);
+      expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
       expect(
         _sliverPaintExtent(tester, find.byType(SliverAppBar)),
         closeTo(64 + 47, 0.5),
       );
       journalScroll.position.jumpTo(0);
       await tester.pump();
-      expect(find.text('Today · Wed, Aug 12').hitTestable(), findsOneWidget);
+      expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
       expect(find.text(_parentSource), findsOneWidget);
       expect(find.text(_firstChild), findsOneWidget);
       expect(find.text('21:37'), findsOneWidget);
@@ -1477,14 +1477,14 @@ void _expectTimelineStartsBelowHeader(WidgetTester tester) {
       tester.getRect(find.byType(CustomScrollView)).top +
       _sliverPaintExtent(tester, appBar);
   expect(
-    tester.getRect(find.text('Today · Wed, Aug 12').first).top,
+    tester.getRect(find.text('Wed, Aug 12').first).top,
     greaterThanOrEqualTo(topInset),
   );
   expect(
     tester.getRect(find.bySemanticsLabel('Account menu')).top,
     greaterThanOrEqualTo(topInset),
   );
-  expect(find.text('Today · Wed, Aug 12').hitTestable(), findsOneWidget);
+  expect(find.text('Wed, Aug 12').hitTestable(), findsOneWidget);
   expect(
     tester.getRect(find.text(_parentSource)).top,
     greaterThanOrEqualTo(paintBoundary - 0.5),
@@ -1625,16 +1625,6 @@ final class _RuntimeHarness {
           'https://api.logseq.io';
     }
 
-    var generation = 7;
-    Future<JournalCalendarSnapshot> calendar() async => JournalCalendarSnapshot(
-      instantUnixMilliseconds: 1786563420000,
-      localDay: 20260812,
-      locale: 'en_US',
-      timeZoneId: 'Europe/Paris',
-      utcOffsetSeconds: 7200,
-      generation: generation++,
-    );
-    final initialSnapshot = await calendar();
     final payload = _managedApplicationPayload(root.path, baseUrl);
     final config = RuntimeBootstrapConfig(
       entrypoint: 'logseq_journal',
@@ -1651,11 +1641,6 @@ final class _RuntimeHarness {
       authenticatedUserId: reconcileAuthenticatedUser ? userId : null,
     );
     final platform = JournalApplicationPlatform(
-      calendarSnapshot: calendar,
-      initialSnapshot: Future.value(initialSnapshot),
-      formatJournalDays: ({required snapshot, required days}) async => {
-        for (final day in days) day: day == 20260812 ? 'Wed, Aug 12' : '$day',
-      },
       auth: auth,
       managedSyncOrigin: baseUrl,
       readLocalAccountBinding: () async =>
@@ -1688,7 +1673,6 @@ final class _RuntimeHarness {
     addTearDown(harness.dispose);
     await harness.pumpUntil(
       () =>
-          find.text('Today').evaluate().isNotEmpty &&
           find.text('Wed, Aug 12').evaluate().isNotEmpty &&
           find.text(_parentSource).evaluate().isNotEmpty &&
           find.text('Capture interaction notes').evaluate().isNotEmpty,

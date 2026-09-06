@@ -6,6 +6,20 @@ type phase =
   | Saving
   | Failed of string
 
+module Editor : sig
+  type t
+
+  val create : session_number:int64 -> source:string -> t
+  val session_id : t -> ID.Text_input.session_id
+  val document_revision : t -> ID.Text_input.document_revision
+  val accepted_local_revision : t -> ID.Text_input.local_revision
+  val update_mode : t -> Ui.Text_editing.update_mode
+  val value : t -> Ui.Text_editing.Value.t
+  val source : t -> string
+  val replace : t -> source:string -> t
+  val apply_text_edit : t -> Ui.Event.Payload.text_edit -> t option
+end
+
 type t
 
 val create : session_number:int64 -> source:string -> t

@@ -25,7 +25,6 @@ let secrets =
       (fun
         ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
       Error "unavailable")
-    ~delete_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ -> Ok ())
     ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
   |> Result.get_ok
 ;;

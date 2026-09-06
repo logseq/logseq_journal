@@ -18,17 +18,15 @@ let response request outcome =
 ;;
 
 let set_calendar runtime =
-  Runtime.set_calendar
-    runtime
-    { Journal_calendar.instant_unix_ms = 1_788_192_000_000L
-    ; local_day = 20260901
-    ; local_minute_of_day = 0
-    ; locale = "en_US"
-    ; time_zone_id = "UTC"
-    ; utc_offset_seconds = 0
-    ; generation = 1L
-    ; lifecycle_generation = 0L
-    }
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  ignore (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+  let calendar = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  Runtime.set_calendar runtime calendar
 ;;
 
 let page_uuid = uuid "a1000000-0000-4000-8000-000000000001"
@@ -414,10 +412,66 @@ let test_resync_rehydrates_all_registered_structure_interests () =
   Alcotest.(check int) "children rehydration" 1 children
 ;;
 
+let test_read_failure_conversion_preserves_category_and_ownership () =
+  List.iter
+    (fun code ->
+       let runtime = Runtime.create () in
+       seed_feed runtime;
+       let request =
+         Runtime.submit
+           runtime
+           (Journal_graph_request.Load_day_blocks
+              { day = 20260901; after = None; limit = 64; request_generation = 23L })
+         |> fun output -> only "day read" output.requests
+       in
+       let output =
+         Runtime.receive
+           runtime
+           (response
+              request
+              (Protocol.V2_failed
+                 { code = Logseq_db_worker.Error.code_string code
+                 ; message = "Read diagnostic"
+                 }))
+       in
+       match (only "day failure" output.responses).payload with
+       | Runtime.Day_blocks_failed
+           { day; request_generation; stale_cursor; failure = Worker_failure failure } ->
+         Alcotest.(check int) "day ownership" 20260901 day;
+         Alcotest.(check int64) "request ownership" 23L request_generation;
+         Alcotest.(check bool)
+           "stale category"
+           (code = Logseq_db_worker.Error.Stale_read_cursor)
+           stale_cursor;
+         Alcotest.(check string)
+           "original code"
+           (Logseq_db_worker.Error.code_string code)
+           (Logseq_db_worker.Error.code_string
+              (Logseq_db_worker.Error.code failure.error));
+         Alcotest.(check string)
+           "original message"
+           "Read diagnostic"
+           (Logseq_db_worker.Error.message failure.error)
+       | _ -> Alcotest.fail "read failure was routed as a mutation rejection")
+    Logseq_db_worker.Error.
+      [ Stale_read_cursor
+      ; Invalid_request
+      ; Closed_session
+      ; Response_too_large
+      ; Corrupt_storage
+      ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "changes"
+    [ ( "read conversion"
+      , [ Alcotest.test_case
+            "read categories and ownership survive conversion"
+            `Quick
+            test_read_failure_conversion_preserves_category_and_ownership
+        ] )
+    ; ( "changes"
       , [ Alcotest.test_case
             "Worker generation change restarts pull without a cursor"
             `Quick

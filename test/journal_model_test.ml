@@ -24,8 +24,6 @@ let creation_time =
     ~instant_unix_ms:1_786_204_800_000L
     ~local_day:20260809
     ~local_minute_of_day:0
-    ~time_zone_id:"Asia/Shanghai"
-    ~utc_offset_seconds:28_800
   |> require_ok
 ;;
 
@@ -39,7 +37,7 @@ let create
       ?(task_state = Journal_model.Todo)
       ?(child_count = 3)
       ?(entry_creation_time = creation_time)
-      ?(revision = 7)
+      ?(revision = "block-7")
       ?(last_mutation_id = mutation_id)
       ()
   =
@@ -70,7 +68,7 @@ let test_entry_preserves_domain_behavior () =
     "literal source changed";
   require (Journal_model.task_state entry = Journal_model.Todo) "task state changed";
   require (Journal_model.child_count entry = 3) "child count changed";
-  require (Journal_model.revision entry = 7) "revision changed";
+  require (String.equal (Journal_model.revision entry) "block-7") "revision changed";
   require
     (String.equal (Journal_model.last_mutation_id entry) mutation_id)
     "mutation ID changed";
@@ -106,7 +104,7 @@ let test_invalid_identity_source_and_revision_are_rejected () =
   ; create ~source:malformed_utf8 ()
   ; create ~source:(String.make 65_537 'x') ()
   ; create ~child_count:(-1) ()
-  ; create ~revision:0 ()
+  ; create ~revision:"" ()
   ; create ~last_mutation_id:"not-a-uuid" ()
   ]
   |> List.iter require_error

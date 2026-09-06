@@ -10,9 +10,10 @@ val view
   -> end_padding:float
   -> rtl:bool
   -> state:Journal_timeline_state.t
-  -> day_label:(int -> string)
+  -> day_presentation:(int -> Journal_calendar.date_presentation option)
   -> reduced_motion:bool
   -> on_visible_range:Ui.Event.Handler.t
+  -> on_retry_day:Ui.Event.Handler.t
   -> on_toggle_children:Ui.Event.Handler.t
   -> delete_enabled:bool
   -> actions_enabled:bool
