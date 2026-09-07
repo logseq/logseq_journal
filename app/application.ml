@@ -2588,6 +2588,68 @@ let fresh_identity () =
     (String.sub entropy 20 12)
 ;;
 
+(* One serialized generator lifetime spans every component and graph switch. *)
+let block_identity_state = ref Logseq_db_types.Squuid.empty
+let block_identity_mutex = Mutex.create ()
+
+let read_block_entropy () =
+  let descriptor = Unix.openfile "/dev/urandom" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close descriptor)
+    (fun () ->
+       let bytes = Bytes.create 16 in
+       let rec read offset =
+         if offset < Bytes.length bytes
+         then (
+           match Unix.read descriptor bytes offset (Bytes.length bytes - offset) with
+           | 0 -> raise End_of_file
+           | count -> read (offset + count)
+           | exception Unix.Unix_error (Unix.EINTR, _, _) -> read offset)
+       in
+       read 0;
+       bytes)
+;;
+
+let with_block_identity ?(entropy = read_block_entropy) ~creation_time ~f () =
+  Mutex.lock block_identity_mutex;
+  let identity =
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock block_identity_mutex)
+      (fun () ->
+         let random =
+           try Ok (entropy ()) with
+           | _ ->
+             Error
+               "Unable to create a block ID because device randomness is unavailable. \
+                Your draft is kept; try saving again."
+         in
+         Result.bind random (fun random_bytes ->
+           match
+             Logseq_db_types.Squuid.next
+               !block_identity_state
+               ~timestamp_ms:(Journal_time.instant_unix_ms creation_time)
+               ~random_bytes
+           with
+           | Ok (state, identity) ->
+             block_identity_state := state;
+             Ok identity
+           | Error error ->
+             let message =
+               match error with
+               | Timestamp_out_of_range ->
+                 "The clock is outside the supported block ID range. Check your device \
+                  date and try saving again."
+               | Invalid_random_length _ ->
+                 "OS randomness returned an invalid length. Try saving again."
+               | Payload_exhausted ->
+                 "Block IDs at the current timestamp are exhausted. Wait for the clock \
+                  to advance and try saving again."
+             in
+             Error ("Unable to create a block ID. Your draft is kept. " ^ message)))
+  in
+  Result.map f identity
+;;
+
 let sibling_order value = Printf.sprintf "%012Ld" value
 
 let component ~calendar_sampler client handlers graph =
@@ -3563,18 +3625,28 @@ let component ~calendar_sampler client handlers graph =
                      Journal_time.of_calendar calendar |> Result.get_ok
                    in
                    let number = snapshot.next_local_sequence in
-                   let capture, request =
-                     Journal_capture.admit_save
-                       capture
-                       ~mutation_id:(fresh_identity ())
-                       ~block_id:(fresh_identity ())
-                       ~sibling_order:(sibling_order number)
-                       ~calendar_generation:(Journal_calendar.generation calendar)
+                   let admission =
+                     with_block_identity
                        ~creation_time
+                       ~f:(fun block_id ->
+                         Journal_capture.admit_save
+                           capture
+                           ~mutation_id:(fresh_identity ())
+                           ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
+                           ~sibling_order:(sibling_order number)
+                           ~calendar_generation:(Journal_calendar.generation calendar)
+                           ~creation_time)
+                       ()
                    in
-                   (match request with
-                    | None -> Bonsai.Effect.Ignore
-                    | Some request ->
+                   (match admission with
+                    | Error message ->
+                      update (fun state ->
+                        { state with
+                          direct_capture = Some capture
+                        ; capture_error = Some (Local_capture_failure message)
+                        })
+                    | Ok (_, None) -> Bonsai.Effect.Ignore
+                    | Ok (capture, Some request) ->
                       with_direct_request
                         { snapshot with
                           calendar = Some calendar
@@ -3936,22 +4008,30 @@ let component ~calendar_sampler client handlers graph =
                  Journal_graph_runtime.set_calendar graph_runtime calendar;
                  let creation_time = Journal_time.of_calendar calendar |> Result.get_ok in
                  let number = snapshot.next_local_sequence in
-                 let detail, request =
-                   Journal_detail.admit_child
-                     detail
-                     ~mutation_id:(fresh_identity ())
-                     ~calendar_generation:(Journal_calendar.generation calendar)
-                     ~block_id:(fresh_identity ())
-                     ~sibling_order:(sibling_order number)
+                 let admission =
+                   with_block_identity
                      ~creation_time
+                     ~f:(fun block_id ->
+                       Journal_detail.admit_child
+                         detail
+                         ~mutation_id:(fresh_identity ())
+                         ~calendar_generation:(Journal_calendar.generation calendar)
+                         ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
+                         ~sibling_order:(sibling_order number)
+                         ~creation_time)
+                     ()
                  in
-                 (match request with
-                  | None -> Bonsai.Effect.Ignore
-                  | Some request ->
+                 (match admission with
+                  | Error message ->
+                    update (fun state ->
+                      { state with capture_error = Some (Local_capture_failure message) })
+                  | Ok (_, None) -> Bonsai.Effect.Ignore
+                  | Ok (detail, Some request) ->
                     with_request
                       { snapshot with
                         calendar = Some calendar
                       ; routes = Journal_routes.update_detail snapshot.routes detail
+                      ; capture_error = None
                       ; next_local_sequence = Int64.succ number
                       }
                       request))
@@ -4373,6 +4453,9 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
 ;;
 
 module For_testing = struct
+  let read_block_entropy = read_block_entropy
+  let with_block_identity = with_block_identity
+
   let app_with_service ?calendar_sampler service =
     let calendar_sampler = Option.map (fun sampler () -> sampler) calendar_sampler in
     create ?calendar_sampler ~service ()

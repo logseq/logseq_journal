@@ -1,0 +1,2 @@
+run-worker:Execute_request
+Journal request passes unchanged into Execute_request; the reducer owns no index selection or hydration.

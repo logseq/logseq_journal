@@ -38,6 +38,7 @@ let schema =
   ; "block/order", schema_attr ~value_type:Datascript.StringType ()
   ; "block/parent", schema_attr ~indexed:true ~value_type:Datascript.RefType ()
   ; "block/page", schema_attr ~indexed:true ~value_type:Datascript.RefType ()
+  ; "block/journal-day", schema_attr ~indexed:true ~value_type:Datascript.NumberType ()
   ; "block/name", schema_attr ~value_type:Datascript.StringType ()
   ]
 ;;

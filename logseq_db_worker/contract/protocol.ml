@@ -102,7 +102,6 @@ and v2_scope =
       { page : page_uuid
       ; maximum_depth : int
       }
-  | V2_journal_index_scope
 
 and v2_task_status =
   | V2_todo
@@ -208,7 +207,6 @@ and v2_revision_scope =
       { page : page_uuid
       ; maximum_depth : int
       }
-  | V2_journal_index_revision
 
 and v2_local_status =
   | V2_applied
@@ -227,9 +225,7 @@ and v2_outcome =
       }
   | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
-      { revision_scope : v2_revision_scope
-      ; scope_revision : string
-      ; items : v2_journal_item list
+      { items : v2_journal_item list
       ; next_cursor : Cursor.t option
       }
   | V2_page_outcome of v2_page_lookup
@@ -392,7 +388,6 @@ let v2_scope_to_json = function
       ; "page", uuid_json page
       ; "maximumDepth", `Int maximum_depth
       ]
-  | V2_journal_index_scope -> `Assoc [ "type", `String "journalIndex" ]
 ;;
 
 let v2_scope_of_json json =
@@ -411,9 +406,6 @@ let v2_scope_of_json json =
       { page = uuid (field "page" fields)
       ; maximum_depth = integer (field "maximumDepth" fields)
       }
-  | "journalIndex" ->
-    ignore (exact_assoc [ "type" ] json);
-    V2_journal_index_scope
   | _ -> decode_error "invalid revision scope type"
 ;;
 
@@ -1214,7 +1206,6 @@ let v2_revision_scope_to_json = function
       ; "page", uuid_json page
       ; "maximumDepth", `Int maximum_depth
       ]
-  | V2_journal_index_revision -> `Assoc [ "type", `String "journalIndex" ]
 ;;
 
 let v2_revision_scope_of_json json =
@@ -1233,9 +1224,6 @@ let v2_revision_scope_of_json json =
       { page = uuid (field "page" fields)
       ; maximum_depth = integer (field "maximumDepth" fields)
       }
-  | "journalIndex" ->
-    ignore (exact_assoc [ "type" ] json);
-    V2_journal_index_revision
   | _ -> decode_error "invalid revision scope"
 ;;
 
@@ -1502,11 +1490,9 @@ let v2_outcome_to_json = function
       ; "maximumRecords", `Int maximum_records
       ; "maximumBytes", `Int maximum_bytes
       ]
-  | V2_journals_outcome { revision_scope; scope_revision; items; next_cursor } ->
+  | V2_journals_outcome { items; next_cursor } ->
     `Assoc
       [ "type", `String "journals"
-      ; "revisionScope", v2_revision_scope_to_json revision_scope
-      ; "scopeRevision", `String scope_revision
       ; "items", `List (List.map v2_journal_item_to_json items)
       ; "nextCursor", option_json cursor_json next_cursor
       ]
@@ -1654,13 +1640,9 @@ let v2_outcome_of_json json =
       ; maximum_bytes = integer (field "maximumBytes" fields)
       }
   | "journals" ->
-    let fields =
-      exact_assoc [ "type"; "revisionScope"; "scopeRevision"; "items"; "nextCursor" ] json
-    in
+    let fields = exact_assoc [ "type"; "items"; "nextCursor" ] json in
     V2_journals_outcome
-      { revision_scope = v2_revision_scope_of_json (field "revisionScope" fields)
-      ; scope_revision = string (field "scopeRevision" fields)
-      ; items =
+      { items =
           (match field "items" fields with
            | `List values -> List.map v2_journal_item_of_json values
            | _ -> decode_error "journal items must be a list")

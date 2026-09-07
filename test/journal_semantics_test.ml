@@ -669,6 +669,113 @@ let _test_conditional_task_leading_slot_and_todo_icon () =
        | _ -> fail "leaf body does not use a bounded center alignment")
 ;;
 
+let test_todo_rails_have_complete_equal_dashes () =
+  let color =
+    Tokens.status_rail_color
+      (Tokens.resolve ~brightness:Bonsai_flutter.Environment.Light ~high_contrast:false)
+      Journal_model.Todo
+    |> Option.get
+  in
+  let close actual expected = Float.abs (actual -. expected) < 1e-8 in
+  let check height expected =
+    let id = "todo-geometry" in
+    let handle =
+      Test.Handle.create
+        ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_010L)
+        ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+        (fun _handlers _graph ->
+           Bonsai.Cont.return
+             (Journal_row.rail_body ~color ~task_state:Journal_model.Todo ~height ~id))
+    in
+    Fun.protect
+      ~finally:(fun () -> Test.Handle.shutdown handle)
+      (fun () ->
+         Test.Handle.present handle;
+         let (Av rail) = Ui.Widget.Private.view (node handle id).widget in
+         let children = rail.children in
+         let child_count = Array.length children in
+         require
+           (child_count >= 3 && child_count mod 2 = 1)
+           "TODO height %g must have at least two dashes and no outer gap"
+           height;
+         let heights =
+           Array.mapi
+             (fun index (child : Ui.Widget.Private.child) ->
+                let (Av view) = Ui.Widget.Private.view child.widget in
+                match view.node with
+                | Ui.Widget.Private.Sized_box { width; height = Some actual } ->
+                  if index mod 2 = 0
+                  then (
+                    require (width = Some 4.) "TODO dash width changed";
+                    require
+                      (actual > 0. && actual <= 10.)
+                      "TODO height %g has invalid dash length %g"
+                      height
+                      actual;
+                    let (Av decoration) =
+                      Ui.Widget.Private.view view.children.(0).widget
+                    in
+                    match decoration.node with
+                    | Ui.Widget.Private.Decorated_box
+                        { background = Some 0xff585c7el; border_radius = 2. } -> ()
+                    | _ -> fail "TODO dash color or corner radius changed")
+                  else require (close actual 4.) "TODO internal gap is %g" actual;
+                  actual
+                | _ -> fail "TODO segment must have a bounded height")
+             children
+         in
+         Array.iteri
+           (fun index actual ->
+              if index mod 2 = 0
+              then
+                require
+                  (close actual heights.(0))
+                  "TODO height %g has unequal dashes: %g and %g"
+                  height
+                  heights.(0)
+                  actual)
+           heights;
+         require
+           (close (Array.fold_left ( +. ) 0. heights) height)
+           "TODO dashes and gaps do not fill height %g"
+           height;
+         match expected with
+         | None -> ()
+         | Some (count, length) ->
+           require
+             ((child_count + 1) / 2 = count && close heights.(0) length)
+             "TODO height %g expected %d dashes of length %g, got %d of length %g"
+             height
+             count
+             length
+             ((child_count + 1) / 2)
+             heights.(0))
+  in
+  List.iter
+    (fun (height, count, length) -> check height (Some (count, length)))
+    [ 22., 2, 9.
+    ; 4.5, 2, 0.25
+    ; 10., 2, 3.
+    ; 23.999, 2, 9.9995
+    ; 24., 2, 10.
+    ; 24.001, 3, 16.001 /. 3.
+    ; 38., 3, 10.
+    ; 38.001, 4, 6.50025
+    ];
+  List.iter
+    (fun preset ->
+       List.iter
+         (fun scale ->
+            let profile =
+              Tokens.select_row_profile ~preset ~viewport_width:320. ~text_scale:scale
+            in
+            List.iter
+              (fun lines -> check (float_of_int lines *. profile.block_line_height) None)
+              [ 1; 2; 3; 5 ])
+         [ 1.; 1.3; 2.; 3.2 ])
+    [ Tokens.Dense; Balanced; Comfortable ]
+;;
+
 let test_four_status_rails_replace_timeline_task_controls () =
   let cases =
     [ "logseq.property/status.todo", "Todo", 0xff585c7el
@@ -2003,6 +2110,7 @@ let () =
      exit 0);
   test_literal_source_time_completion_and_full_access ();
   test_long_source_and_corrupt_surfaces ();
+  test_todo_rails_have_complete_equal_dashes ();
   test_four_status_rails_replace_timeline_task_controls ();
   test_title_and_children_have_independent_bounded_tail_fade_previews ();
   test_wrapping_estimate_bounds_latin_cjk_emoji_and_explicit_lines ();

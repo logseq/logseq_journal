@@ -102,7 +102,6 @@ and v2_scope =
       { page : page_uuid
       ; maximum_depth : int
       }
-  | V2_journal_index_scope
 
 and v2_task_status =
   | V2_todo
@@ -208,7 +207,6 @@ and v2_revision_scope =
       { page : page_uuid
       ; maximum_depth : int
       }
-  | V2_journal_index_revision
 
 and v2_local_status =
   | V2_applied
@@ -227,9 +225,7 @@ and v2_outcome =
       }
   | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
-      { revision_scope : v2_revision_scope
-      ; scope_revision : string
-      ; items : v2_journal_item list
+      { items : v2_journal_item list
       ; next_cursor : Cursor.t option
       }
   | V2_page_outcome of v2_page_lookup

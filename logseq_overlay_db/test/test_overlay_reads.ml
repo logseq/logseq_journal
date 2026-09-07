@@ -155,17 +155,6 @@ let authoritative_block_is_projected_by_uuid_and_structure _database snapshot =
   | Page_tree_result _ -> Alcotest.fail "children request returned page tree"
 ;;
 
-let journal_result_has_dedicated_scope _database snapshot =
-  let result =
-    Database.get_journals snapshot ~limit:32 ~cursor:None
-    |> T.require_ok ~behavior:"journal index result"
-  in
-  match result.revision_scope with
-  | Journal_index_revision -> ()
-  | Children_revision _ | Page_tree_revision _ ->
-    Alcotest.fail "journal result reused a non-journal structure scope"
-;;
-
 let empty_children_retain_scope _database snapshot =
   match
     Database.get_structure
@@ -264,15 +253,9 @@ let journal_cursor_is_snapshot_bound_and_paginates database =
       | [ Missing_page { revision; _ } ] -> revision
       | _ -> Alcotest.fail "fresh journal UUID is already present"
     in
-    let journals =
-      Database.get_journals snapshot ~limit:1 ~cursor:None |> T.require_ok ~behavior
-    in
     Database.release_snapshot snapshot;
     let expected =
-      Database.write_precondition
-        ~blocks:[]
-        ~pages:[ uuid, revision ]
-        ~scopes:[ journals.revision_scope, journals.scope_revision ]
+      Database.write_precondition ~blocks:[] ~pages:[ uuid, revision ] ~scopes:[]
       |> T.require_ok ~behavior
     in
     let mutation =
@@ -292,7 +275,13 @@ let journal_cursor_is_snapshot_bound_and_paginates database =
   create 501 second_uuid 20260902;
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   let first =
-    Database.get_journals snapshot ~limit:1 ~cursor:None |> T.require_ok ~behavior
+    Database.get_journals
+      ~from_day:0
+      ~through_day:99_999_999
+      snapshot
+      ~limit:1
+      ~cursor:None
+    |> T.require_ok ~behavior
   in
   let cursor =
     match first.items, first.next_cursor with
@@ -302,7 +291,12 @@ let journal_cursor_is_snapshot_bound_and_paginates database =
     | _ -> Alcotest.fail "first journal page did not return one item and a cursor"
   in
   let second =
-    Database.get_journals snapshot ~limit:1 ~cursor:(Some cursor)
+    Database.get_journals
+      ~from_day:0
+      ~through_day:99_999_999
+      snapshot
+      ~limit:1
+      ~cursor:(Some cursor)
     |> T.require_ok ~behavior
   in
   (match second.items with
@@ -311,7 +305,14 @@ let journal_cursor_is_snapshot_bound_and_paginates database =
   Database.release_snapshot snapshot;
   create 502 third_uuid 20260903;
   let newer = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_journals newer ~limit:1 ~cursor:(Some cursor) with
+  (match
+     Database.get_journals
+       ~from_day:0
+       ~through_day:99_999_999
+       newer
+       ~limit:1
+       ~cursor:(Some cursor)
+   with
    | Error Stale_read_cursor -> ()
    | Error _ -> Alcotest.fail "cross-snapshot cursor returned the wrong error"
    | Ok _ -> Alcotest.fail "cross-snapshot cursor was accepted");
@@ -408,18 +409,20 @@ let malformed_and_out_of_range_cursors_are_rejected _database snapshot =
   ; Printf.sprintf "cursor:v2:%d:0:extra" projection
   ]
   |> List.iter (fun value ->
-    Database.get_journals snapshot ~limit:1 ~cursor:(Some (cursor value))
-    |> require_invalid_read ("malformed cursor " ^ value));
-  let boundary =
     Database.get_journals
+      ~from_day:0
+      ~through_day:99_999_999
       snapshot
       ~limit:1
-      ~cursor:(Some (version_two_cursor snapshot 10_000))
-    |> T.require_ok ~behavior:"10,000 cursor offset boundary"
-  in
-  T.require
-    (boundary.items = [] && Option.is_none boundary.next_cursor)
-    "the exact 10,000 cursor boundary did not behave as a valid offset"
+      ~cursor:(Some (cursor value))
+    |> require_invalid_read ("malformed cursor " ^ value));
+  Database.get_journals
+    snapshot
+    ~from_day:0
+    ~through_day:99_999_999
+    ~limit:1
+    ~cursor:(Some (version_two_cursor snapshot 10_000))
+  |> require_invalid_read "obsolete journal offset boundary"
 ;;
 
 let page_limits_are_enforced_before_pagination _database snapshot =
@@ -428,15 +431,25 @@ let page_limits_are_enforced_before_pagination _database snapshot =
       snapshot
       (Children { parent = T.page_uuid; limit; cursor = None })
   in
-  Database.get_journals snapshot ~limit:0 ~cursor:None
+  Database.get_journals ~from_day:0 ~through_day:99_999_999 snapshot ~limit:0 ~cursor:None
   |> require_invalid_read "zero journal page limit";
-  Database.get_journals snapshot ~limit:201 ~cursor:None
+  Database.get_journals
+    ~from_day:0
+    ~through_day:99_999_999
+    snapshot
+    ~limit:201
+    ~cursor:None
   |> require_invalid_read "oversized journal page limit";
   children 0 |> require_invalid_read "zero children page limit";
   children 201 |> require_invalid_read "oversized children page limit";
   children Int.max_int |> require_invalid_read "overflowing children page limit";
   ignore
-    (Database.get_journals snapshot ~limit:200 ~cursor:None
+    (Database.get_journals
+       ~from_day:0
+       ~through_day:99_999_999
+       snapshot
+       ~limit:200
+       ~cursor:None
      |> T.require_ok ~behavior:"maximum journal page limit");
   ignore (children 200 |> T.require_ok ~behavior:"maximum children page limit")
 ;;
@@ -696,8 +709,208 @@ let admission_is_not_snapshot_versioned database _snapshot =
     "admission usage exceeds its declared bound"
 ;;
 
+let journals_reject_legacy_offsets _database snapshot =
+  Database.get_journals
+    ~from_day:0
+    ~through_day:99_999_999
+    snapshot
+    ~limit:1
+    ~cursor:(Some (version_two_cursor snapshot 0))
+  |> require_invalid_read "obsolete journal offset"
+;;
+
+let indexed_journals_preserve_selection database =
+  let behavior = "indexed journal selection" in
+  let module Transit = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let journal_uuid n = T.uuid (Printf.sprintf "71000000-0000-4000-8000-%012d" n) in
+  List.iter
+    (fun n ->
+       let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+       let revision =
+         match
+           Database.get_pages snapshot [ journal_uuid n ] |> T.require_ok ~behavior
+         with
+         | [ Missing_page { revision; _ } ] -> revision
+         | _ -> Alcotest.fail "local journal already exists"
+       in
+       Database.release_snapshot snapshot;
+       let expected =
+         Database.write_precondition
+           ~blocks:[]
+           ~pages:[ journal_uuid n, revision ]
+           ~scopes:[]
+         |> T.require_ok ~behavior
+       in
+       ignore
+         (T.commit_mutation
+            database
+            ~expected
+            (Create_journal_page
+               { mutation_id = T.mutation_uuid (800 + n)
+               ; page = journal_uuid n
+               ; title = Printf.sprintf "Local journal %d" n
+               ; journal_day = 20260903
+               })
+            ~behavior))
+    [ 0; 4 ];
+  let add e a v = Transit.Array [ Keyword "db/add"; Int e; Keyword a; v ] in
+  let journal n day =
+    let e = 10000 + (n * 30) in
+    [ add e "block/uuid" (Uuid (Graph.Uuid.to_string (journal_uuid n)))
+    ; add e "block/name" (String (Printf.sprintf "indexed-%d" n))
+    ; add e "block/title" (String (Printf.sprintf "Indexed %d" n))
+    ; add e "block/journal-day" (Int day)
+    ; add e "logseq.property/public?" (Bool true)
+    ]
+  in
+  let large_tie = List.init 128 (fun n -> n + 10) in
+  let ops =
+    List.concat_map (fun n -> journal n 20260903) large_tie
+    @ journal 3 20260903
+    @ journal 2 20260903
+    @ journal 1 20260903
+    @ journal 4 20260903
+    @ journal 5 20260901
+    @ journal 6 20260904
+    @ [ add 10180 "logseq.property/built-in?" (Bool true) ]
+    @ [ add 10210 "block/journal-day" (Int 20260905)
+      ; add 10210 "block/name" (String "malformed")
+      ]
+  in
+  let wire =
+    Codec.to_string ~mode:Codec.Verbose (Transit.Array ops)
+    |> encoded_transaction_of_string ~maximum_bytes:262144
+    |> T.require_ok ~behavior
+  in
+  let cursor = Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:262144
+      ~transactions:[ authoritative_transaction ~cursor ~transaction:wire ]
+      ~through:cursor
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let preparation, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token sync) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> request, Database.unprotection_ciphertexts request) crypto
+  in
+  (match
+     Database.apply_authoritative database preparation ~decrypted
+     |> T.require_ok ~behavior
+   with
+   | Database.Authoritative_applied _ -> ()
+   | Authoritative_deferred _ -> Alcotest.fail "journal fixture deferred");
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       let rec collect cursor acc =
+         let result =
+           Database.get_journals
+             ~from_day:0
+             ~through_day:99_999_999
+             snapshot
+             ~limit:1
+             ~cursor
+           |> T.require_ok ~behavior
+         in
+         T.require (List.length result.items <= 1) "journal limit exceeded";
+         let acc = acc @ result.items in
+         match result.next_cursor with
+         | None -> acc
+         | Some cursor ->
+           T.require (List.length acc < 256) "journal cursor repeated a result";
+           collect (Some cursor) acc
+       in
+       let range ?(cursor = None) from_day through_day limit =
+         Database.get_journals snapshot ~from_day ~through_day ~limit ~cursor
+       in
+       let first = range 20260903 20260903 2 |> T.require_ok ~behavior in
+       Alcotest.(check int) "same-day range limit" 2 (List.length first.items);
+       let cursor =
+         match first.next_cursor with
+         | Some c -> c
+         | None -> Alcotest.fail "tie cursor missing"
+       in
+       range ~cursor:(Some cursor) 20260901 20260903 2
+       |> require_invalid_read "cursor cannot change query bounds";
+       let rec collect_range cursor acc =
+         let result = range ~cursor 20260903 20260903 2 |> T.require_ok ~behavior in
+         let acc = acc @ result.items in
+         match result.next_cursor with
+         | None -> acc
+         | Some c ->
+           T.require (List.length acc < 256) "range cursor repeated";
+           collect_range (Some c) acc
+       in
+       let tied = collect_range None [] in
+       Alcotest.(check (list string))
+         "same-date range includes local overlap once"
+         (List.map
+            (fun n -> Graph.Uuid.to_string (journal_uuid n))
+            ([ 0; 1; 2; 3; 4 ] @ large_tie))
+         (List.map (fun (i : journal_item) -> Graph.Uuid.to_string i.page.page.uuid) tied);
+       let older = range 20260901 20260902 1 |> T.require_ok ~behavior in
+       Alcotest.(check (list int))
+         "bounds precede limit and override moved overlap"
+         [ 20260901 ]
+         (List.map (fun (i : journal_item) -> i.journal_day) older.items);
+       T.require (Option.is_none older.next_cursor) "empty probe returned a continuation";
+       List.iter
+         (fun (lo, hi) ->
+            let empty = range lo hi 1 |> T.require_ok ~behavior in
+            T.require
+              (empty.items = [] && empty.next_cursor = None)
+              "empty range returned journals")
+         [ 20260904, 20260905; 20260905, 20260901; 0, 0 ];
+       let projection = projection_number snapshot in
+       List.iter
+         (fun source ->
+            range
+              ~cursor:(Some (Graph.Cursor.of_string source |> Result.get_ok))
+              20260903
+              20260903
+              1
+            |> require_invalid_read "malformed date cursor")
+         [ "journal:v1"
+         ; Printf.sprintf "journal:v1:%d:20260903:20260903:no-date:no-uuid" projection
+         ];
+       let items = collect None [] in
+       Alcotest.(check (list string))
+         "date descending and UUID ascending"
+         (List.map
+            (fun n -> Graph.Uuid.to_string (journal_uuid n))
+            ([ 0; 1; 2; 3; 4 ] @ large_tie @ [ 5 ]))
+         (List.map
+            (fun (i : journal_item) -> Graph.Uuid.to_string i.page.page.uuid)
+            items);
+       List.iter
+         (fun (item : journal_item) ->
+            match
+              Database.get_pages snapshot [ item.page.page.uuid ]
+              |> T.require_ok ~behavior
+            with
+            | [ Present_page { value; revision } ] ->
+              T.require
+                (value = item.page && revision = item.revision)
+                "journal hydration differs from exact page lookup"
+            | _ -> Alcotest.fail "selected journal is missing")
+         items)
+;;
+
 let cases =
-  [ T.snapshot_case
+  [ T.snapshot_case "journal offsets are obsolete" journals_reject_legacy_offsets
+  ; T.database_case
+      "indexed journals preserve selection and exact hydration"
+      indexed_journals_preserve_selection
+  ; T.snapshot_case
       "one lease pins one authoritative/outbox/version tuple"
       snapshot_is_coherent
   ; T.snapshot_case
@@ -712,9 +925,6 @@ let cases =
   ; T.database_case
       "point reads preserve property summaries"
       point_reads_preserve_property_summaries
-  ; T.snapshot_case
-      "journal listing carries Journal_index_revision"
-      journal_result_has_dedicated_scope
   ; T.snapshot_case
       "empty parent retains discoverable children scope"
       empty_children_retain_scope

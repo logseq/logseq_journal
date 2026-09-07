@@ -407,7 +407,6 @@ let precondition_scope = function
   | Protocol.V2_children_revision parent -> Protocol.V2_children_scope parent
   | V2_page_tree_revision { page; maximum_depth } ->
     V2_page_tree_scope { page; maximum_depth }
-  | V2_journal_index_revision -> V2_journal_index_scope
 ;;
 
 let require_block context ~block_uuid ~parent_uuid ~title =

@@ -281,12 +281,21 @@ let time_slot typography profile item ~show_timestamp =
 let rail_body ~color ~task_state ~height ~id =
   match task_state with
   | Journal_model.Todo ->
-    let rec segments index remaining =
-      if Float.compare remaining 0. <= 0
+    let gap_height = 4. in
+    let maximum_dash_height = 10. in
+    let dash_count =
+      max
+        2
+        (int_of_float
+           (Float.ceil ((height +. gap_height) /. (maximum_dash_height +. gap_height))))
+    in
+    let dash_height =
+      (height -. (gap_height *. float_of_int (dash_count - 1))) /. float_of_int dash_count
+    in
+    let rec segments index =
+      if index = dash_count
       then []
       else (
-        let dash_height = Float.min 6. remaining in
-        let gap_height = Float.min 4. (remaining -. dash_height) in
         let dash =
           Ui.Widget.empty ()
           |> Ui.Widget.decorated_box
@@ -302,13 +311,13 @@ let rail_body ~color ~task_state ~height ~id =
         in
         dash
         ::
-        (if gap_height <= 0.
+        (if index = dash_count - 1
          then []
          else
            (Ui.Widget.empty () |> Ui.Widget.sized_box ~height:gap_height)
-           :: segments (index + 1) (remaining -. dash_height -. gap_height)))
+           :: segments (index + 1)))
     in
-    Ui.Widget.column (segments 0 height) |> test_id id
+    Ui.Widget.column (segments 0) |> test_id id
   | _ ->
     Ui.Widget.empty ()
     |> Ui.Widget.decorated_box

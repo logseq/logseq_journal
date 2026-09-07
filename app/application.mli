@@ -48,6 +48,15 @@ val format_bytes : int -> string
 val admission_rows : Admission_refresh.observation -> (string * string) list
 
 module For_testing : sig
+  val read_block_entropy : unit -> bytes
+
+  val with_block_identity
+    :  ?entropy:(unit -> bytes)
+    -> creation_time:Journal_time.t
+    -> f:(Logseq_db_types.Graph_types.Uuid.t -> 'a)
+    -> unit
+    -> ('a, string) result
+
   val app_with_service
     :  ?calendar_sampler:Journal_calendar.Sampler.t
     -> ( Logseq_db_worker.Config.t

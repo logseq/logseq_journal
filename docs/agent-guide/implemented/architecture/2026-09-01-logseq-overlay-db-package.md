@@ -484,9 +484,9 @@ Dynamic used capacity, protected-wire bytes, and retained delete-origin-evidence
 
 They are not logical projection data, do not carry `snapshot_version`, and may change without advancing `projection_revision` or emitting a listener event.
 
-`get_journals` queries the authoritative journal index, merges journal membership effects, excludes recycled or tombstoned pages, and returns deterministic journal-day ordering with UUID tie-breaking.
+`get_journals` traverses the indexed `block/journal-day` AVET range in descending order, merges active local journal creations, resolves equal dates by ascending UUID, and hydrates only the selected window. Candidate validation preserves page classification, including built-in exclusion and existing recycled-page handling. Inclusive date bounds apply before pagination.
 
-Its typed result carries `Journal_index_revision`, the current scope revision, items, and next cursor, and Worker automatically registers `Journal_index_interest` when serving it.
+Its typed result carries items and a projection- and date-range-bound date/UUID continuation, and Worker automatically registers `Journal_index_interest` when serving it. Journal collection revisions and offset cursors are removed; creation requires the target page revision. See [Indexed Journal Pagination](../bugfix/2026-09-07-indexed-journal-pagination.md).
 
 Because journal cursors are fixed-snapshot cursors, a `Journal_index_interest` change restarts the affected list from its first window instead of appending through a stale cursor.
 
@@ -903,7 +903,7 @@ The canonical `types.mli` must define:
 - a logical `graph_info` containing graph identity, name, schema, generation-static capability and admission limits, and snapshot version, with no Datascript basis;
 - a separate administrative `admission_inspection` containing dynamic used capacity and retained origin-evidence bytes, with no logical snapshot version;
 - explicit `Present` and `Missing` block and page lookup results carrying their UUID-local state revision;
-- a typed journal-list result carrying journals, next cursor, `Journal_index_revision`, and scope revision;
+- a typed journal-list result carrying journals with page revisions and a date/UUID next cursor;
 - UUID-only structure revision scopes for exact query preconditions and broader structure interests for change delivery;
 - a closed `structure_request` ADT for immediate children and bounded-depth page trees, while the journal index uses its dedicated typed list result and explicit pages use UUID point lookup;
 - matching structure-result variants whose members cannot confuse block depth and parent data with journal page data;
@@ -978,7 +978,6 @@ type structure_revision_scope =
       { page : Graph.page_uuid
       ; maximum_depth : int
       }
-  | Journal_index_revision
 
 type structure_interest =
   | Children_interest of Graph.block_uuid
@@ -1182,6 +1181,8 @@ val get_pages
 
 val get_journals
   :  snapshot
+  -> from_day:int
+  -> through_day:int
   -> limit:int
   -> cursor:Graph.Cursor.t option
   -> (Types.journal_list_result, Types.read_error) result
@@ -2168,7 +2169,7 @@ The proposal deletes `Engine` and updates all callers in one cutover.
 - Semantic mutations contain no Datascript basis, and unrelated authoritative or transport changes do not invalidate a prepared local write whose complete logical read set is unchanged.
 - Public and durable identities use block and page UUIDs only.
 - The package supplies only the current App's public graph-information, journal listing, explicit page, explicit block, immediate-child, and bounded-page-tree reads.
-- Journal-list results expose `Journal_index_revision`, and matching `Journal_index_interest` changes discover unknown journal insertions and pagination changes without a graph-wide refresh.
+- Journal-list results retain page revisions and projection-bound date/UUID cursors; matching `Journal_index_interest` changes discover unknown journal insertions and pagination changes without a graph-wide refresh.
 - Local save, insert, delete, journal-create, and task-status effects compose correctly with authoritative data, while authoritative moves, reorders, page metadata, references, tags, properties, and task state remain correctly readable without corresponding unused public local operations.
 - Every delete freezes a bounded frontier, complete write footprint, conflict guard, and rollback window before submission, and its semantic UUID set and protected wire never dynamically include a remote descendant.
 - The deployed server atomically compare-and-appends each singleton delete only at its frozen `t_before`; an intervening transaction produces a batch-level Stale non-execution response, and implementation stops before enabling delete if that invariant or the normalized Pull plus separate-`outliner-op` contract cannot be proven online.

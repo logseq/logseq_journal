@@ -103,9 +103,7 @@ let seed_visible_block runtime =
       (respond
          journals
          (Protocol.V2_journals_outcome
-            { revision_scope = V2_journal_index_revision
-            ; scope_revision = "journal-scope-1"
-            ; items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
             ; next_cursor = None
             }))
     |> fun output -> only "page-tree request" output.requests

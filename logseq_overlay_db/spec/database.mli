@@ -225,7 +225,7 @@ val inspect_admission
 
     A well-formed continuation from another projection returns
     [Types.Stale_read_cursor]. Malformed cursors or out-of-range offsets return
-    [Types.Invalid_read_request]. Neither result permits reusing the old offset. *)
+    [Types.Invalid_read_request]. Restart the query after a stale projection. *)
 
 (** Looks up blocks by UUID in the captured projection. *)
 val get_blocks
@@ -240,10 +240,14 @@ val get_pages
   -> (Types.page_lookup list, Types.read_error) result
 
 (** Reads one bounded page of journals. A continuation cursor is an opaque,
-    projection-bound offset from zero through 10,000. [limit] must be between one
-    and 200 inclusive. *)
+    projection- and range-bound date/UUID position. Dates are inclusive bounds;
+    [from_day > through_day] is an empty range. [limit] is between one and 200.
+    An unindexed journal-day attribute returns [Types.Invalid_read_request].
+    Old journal offset cursors and changed query bounds are invalid. *)
 val get_journals
   :  snapshot
+  -> from_day:int
+  -> through_day:int
   -> limit:int
   -> cursor:Graph.Cursor.t option
   -> (Types.journal_list_result, Types.read_error) result

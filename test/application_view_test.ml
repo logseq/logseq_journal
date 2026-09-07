@@ -139,10 +139,121 @@ let test_admission_refresh_coalesces_and_fences_generations () =
   Alcotest.(check bool) "closed view unavailable" true (observation state = Unavailable)
 ;;
 
+let test_block_identity_admission_boundary () =
+  let time instant_unix_ms =
+    Journal_time.create ~instant_unix_ms ~local_day:20260907 ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  let creation_time = time 1_800_000_000_000L in
+  let entropy () = Bytes.make 16 '\000' in
+  let draft = Journal_capture.create ~session_number:99L ~source:"Keep this draft" in
+  let admit block_id =
+    Journal_capture.admit_save
+      draft
+      ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
+      ~mutation_id:"70000000-0000-4000-9000-000000000099"
+      ~calendar_generation:1L
+      ~sibling_order:"000000000099"
+      ~creation_time
+  in
+  let first =
+    Application.For_testing.with_block_identity ~entropy ~creation_time ~f:Fun.id ()
+    |> Result.get_ok
+  in
+  List.iter
+    (fun (entropy, creation_time) ->
+       let admissions = ref 0 in
+       let result =
+         Application.For_testing.with_block_identity
+           ~entropy
+           ~creation_time
+           ~f:(fun id ->
+             incr admissions;
+             admit id)
+           ()
+       in
+       Alcotest.(check int) "allocation failure publishes no admission" 0 !admissions;
+       (match result with
+        | Ok _ -> Alcotest.fail "invalid allocation succeeded"
+        | Error message ->
+          Alcotest.(check bool) "actionable save error" true (String.length message > 20));
+       Alcotest.(check string)
+         "failed allocation retains draft"
+         "Keep this draft"
+         (Journal_capture.source draft);
+       Alcotest.(check bool)
+         "failed allocation remains editable"
+         true
+         (Journal_capture.can_save draft))
+    [ ( (fun () -> raise (Unix.Unix_error (Unix.EACCES, "open", "/dev/urandom")))
+      , creation_time )
+    ; (fun () -> Bytes.empty), creation_time
+    ; entropy, time (-1L)
+    ; entropy, time 0x1000000000000L
+    ];
+  let _, request =
+    Application.For_testing.with_block_identity ~entropy ~creation_time ~f:admit ()
+    |> Result.get_ok
+  in
+  match request with
+  | Some (Journal_graph_request.Capture { command; _ }) ->
+    let text = Logseq_db_types.Graph_types.Uuid.to_string first in
+    Alcotest.(check string)
+      "failures did not advance shared generator"
+      (String.sub text 0 35 ^ "1")
+      command.block_id;
+    Alcotest.(check bool)
+      "sampled creation time retained"
+      true
+      (Journal_time.equal creation_time command.creation_time)
+  | _ -> Alcotest.fail "allocation retry did not admit a capture"
+;;
+
+let test_block_identity_serialization_and_native_entropy () =
+  let random = Application.For_testing.read_block_entropy () in
+  Alcotest.(check int) "OS entropy length" 16 (Bytes.length random);
+  let creation_time =
+    Journal_time.create
+      ~instant_unix_ms:1_800_000_000_001L
+      ~local_day:20260907
+      ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  let results = Array.make 64 None in
+  let threads =
+    Array.init 64 (fun i ->
+      Thread.create
+        (fun () ->
+           results.(i)
+           <- Some
+                (Application.For_testing.with_block_identity ~creation_time ~f:Fun.id ()))
+        ())
+  in
+  Array.iter Thread.join threads;
+  let ids =
+    Array.to_list results |> List.map (fun result -> Option.get result |> Result.get_ok)
+  in
+  let unique = List.sort_uniq Logseq_db_types.Graph_types.Uuid.compare ids in
+  Alcotest.(check int)
+    "serialized process owner allocates unique IDs"
+    64
+    (List.length unique)
+;;
+
 let () =
   Alcotest.run
     "application view"
-    [ ( "worker presentation"
+    [ ( "block identity adapter"
+      , [ Alcotest.test_case
+            "failure retains admission and state"
+            `Quick
+            test_block_identity_admission_boundary
+        ; Alcotest.test_case
+            "serialization and native entropy"
+            `Quick
+            test_block_identity_serialization_and_native_entropy
+        ] )
+    ; ( "worker presentation"
       , [ Alcotest.test_case "phase labels" `Quick test_phase_names
         ; Alcotest.test_case
             "retired diagnostics are hidden"

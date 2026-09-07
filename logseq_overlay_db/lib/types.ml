@@ -182,7 +182,6 @@ type structure_revision_scope =
       { page : Graph.page_uuid
       ; maximum_depth : int
       }
-  | Journal_index_revision
 
 type structure_interest =
   | Children_interest of Graph.block_uuid
@@ -192,8 +191,6 @@ type structure_interest =
 type journal_list_result =
   { items : journal_item list
   ; next_cursor : Graph.Cursor.t option
-  ; revision_scope : structure_revision_scope
-  ; scope_revision : scope_revision
   }
 
 type structure_request =

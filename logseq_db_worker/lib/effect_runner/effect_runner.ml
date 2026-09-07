@@ -443,7 +443,6 @@ let revision_scope_to_protocol = function
   | Overlay.Children_revision parent -> Protocol.V2_children_revision parent
   | Page_tree_revision { page; maximum_depth } ->
     V2_page_tree_revision { page; maximum_depth }
-  | Journal_index_revision -> V2_journal_index_revision
 ;;
 
 let structure_interest_to_protocol = function
@@ -532,7 +531,6 @@ let overlay_scope_of_protocol = function
   | Protocol.V2_children_scope parent -> Overlay.Children_revision parent
   | V2_page_tree_scope { page; maximum_depth } ->
     Page_tree_revision { page; maximum_depth }
-  | V2_journal_index_scope -> Journal_index_revision
 ;;
 
 let parse_preconditions (value : Protocol.v2_preconditions) =
@@ -707,13 +705,13 @@ let read_snapshot database request command =
          | V2_inspect_admission ->
            failure request Invalid_request "The command is not a snapshot read."
          | V2_list_journals { from_day; through_day; limit; cursor; _ } ->
-           (match Database.get_journals snapshot ~limit ~cursor with
+           (match
+              Database.get_journals snapshot ~from_day ~through_day ~limit ~cursor
+            with
             | Error error -> read_failure request error
             | Ok result ->
               let items =
                 result.items
-                |> List.filter (fun (item : Overlay.journal_item) ->
-                  item.Overlay.journal_day >= from_day && item.journal_day <= through_day)
                 |> List.map (fun (item : Overlay.journal_item) ->
                   Protocol.
                     { page = item.page.page
@@ -723,13 +721,7 @@ let read_snapshot database request command =
               in
               response
                 request
-                (Protocol.V2_journals_outcome
-                   { revision_scope = revision_scope_to_protocol result.revision_scope
-                   ; scope_revision =
-                       Overlay.Scope_revision.to_string result.scope_revision
-                   ; items
-                   ; next_cursor = result.next_cursor
-                   }))
+                (Protocol.V2_journals_outcome { items; next_cursor = result.next_cursor }))
          | V2_get_page { page; _ } ->
            (match Database.get_pages snapshot [ page ] with
             | Ok [ Overlay.Present_page { value; revision } ] ->

@@ -449,3 +449,23 @@ let decode ~db ~decrypted_values source =
     in
     loop [] decrypted_values operations)
 ;;
+
+let inserted_orders source =
+  bind (parse source) (fun operations ->
+    let uuids = Hashtbl.create 16 in
+    List.iter
+      (function
+        | Transit.Array [ Keyword "db/add"; entity; Keyword "block/uuid"; Uuid uuid ] ->
+          Hashtbl.replace uuids entity uuid
+        | _ -> ())
+      operations;
+    operations
+    |> List.filter_map (function
+      | Transit.Array [ Keyword "db/add"; entity; Keyword "block/order"; String order ] ->
+        Some
+          (match Hashtbl.find_opt uuids entity with
+           | Some uuid -> Ok (uuid, order)
+           | None -> Error "inserted order has no block UUID")
+      | _ -> None)
+    |> map_all Fun.id)
+;;

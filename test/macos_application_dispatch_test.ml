@@ -113,9 +113,7 @@ let service =
                  }
              | V2_list_journals _ ->
                P.V2_journals_outcome
-                 { revision_scope = V2_journal_index_revision
-                 ; scope_revision = "index-1"
-                 ; items = [ { page; journal_day = 20260831; revision = "page-1" } ]
+                 { items = [ { page; journal_day = 20260831; revision = "page-1" } ]
                  ; next_cursor = None
                  }
              | V2_get_page_tree { page; maximum_depth; _ } ->

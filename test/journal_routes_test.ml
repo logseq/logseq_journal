@@ -85,6 +85,16 @@ let require_range range ~start_utf16 ~end_utf16 label =
     end_utf16
 ;;
 
+let generated_block_id minute =
+  Logseq_db_types.Squuid.next
+    Logseq_db_types.Squuid.empty
+    ~timestamp_ms:(Journal_time.instant_unix_ms (creation_time minute))
+    ~random_bytes:(Bytes.make 16 '\000')
+  |> Result.get_ok
+  |> snd
+  |> Logseq_db_types.Graph_types.Uuid.to_string
+;;
+
 let test_direct_capture_preserves_source_and_mutation_identity () =
   let source = "  中文 👩🏽‍💻 e\204\129 #literal @mention  " in
   let capture = Journal_capture.create ~session_number:11L ~source in
@@ -93,7 +103,7 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
     Journal_capture.admit_save
       capture
       ~mutation_id:"70000000-0000-4000-9000-000000000011"
-      ~block_id:"70000000-0000-4000-a000-000000000011"
+      ~block_id:(generated_block_id 541)
       ~sibling_order:"000000000011"
       ~calendar_generation:7L
       ~creation_time:(creation_time 541)
@@ -104,14 +114,16 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
           { calendar_generation = 7L
           ; command =
               { mutation_id = "70000000-0000-4000-9000-000000000011"
-              ; block_id = "70000000-0000-4000-a000-000000000011"
+              ; block_id
               ; sibling_order = "000000000011"
               ; source = actual_source
               ; task_state = Journal_model.No_status
               ; children = []
               ; _
               }
-          }) -> require_string source actual_source "admitted direct Capture source"
+          }) ->
+     require_string (generated_block_id 541) block_id "generated direct Capture ID";
+     require_string source actual_source "admitted direct Capture source"
    | _ -> fail "direct Capture did not admit one plain top-level Worker request");
   let still_saving, repeated =
     Journal_capture.admit_save
@@ -256,12 +268,12 @@ let test_detail_task_child_conflict_and_back_order () =
          ~selection_end:15
          ())
   in
-  let _, child_request =
+  let saving_child, child_request =
     Journal_detail.admit_child
       child_state
       ~mutation_id:"70000000-0000-4000-9000-000000000023"
       ~calendar_generation:7L
-      ~block_id:"70000000-0000-4000-a000-000000000023"
+      ~block_id:(generated_block_id 543)
       ~sibling_order:"000000000023"
       ~creation_time:(creation_time 543)
   in
@@ -272,6 +284,20 @@ let test_detail_task_child_conflict_and_back_order () =
      require_string (Journal_model.id original) parent_block_id "child parent";
      require_string "Direct child 👶" source "child source"
    | _ -> fail "Detail did not admit a direct-child mutation");
+  let failed_child = Journal_detail.fail saving_child ~message:"storage unavailable" in
+  require_string
+    "Direct child 👶"
+    (Journal_capture.source (Journal_detail.child_capture failed_child |> Option.get))
+    "failed child draft";
+  let retrying_child, retry =
+    Journal_detail.retry failed_child ~mutation_id:"70000000-0000-4000-9000-000000000099"
+  in
+  require
+    (retry = child_request)
+    "child retry changed its admitted command or generated ID";
+  require
+    (Journal_detail.mode retrying_child = Journal_detail.Saving_child)
+    "child retry did not return to Saving_child";
   let detail_state =
     Journal_detail.create ~session_number:24L (detail ~root:original ())
   in

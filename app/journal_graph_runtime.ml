@@ -369,7 +369,6 @@ let scope_key = function
   | Protocol.V2_children_scope parent -> "children:" ^ Graph.Uuid.to_string parent
   | V2_page_tree_scope { page; maximum_depth } ->
     Printf.sprintf "pageTree:%s:%d" (Graph.Uuid.to_string page) maximum_depth
-  | V2_journal_index_scope -> "journalIndex"
 ;;
 
 let preconditions ?(blocks = []) ?(pages = []) ?(scopes = []) () =
@@ -453,6 +452,24 @@ let allocate_feed_page_limits ~blocks_per_day ~slot_limit pages =
   allocate (slot_limit - (2 * List.length pages)) pages
 ;;
 
+let previous_journal_day day =
+  if day <= 10101
+  then 0
+  else if day mod 100 > 1
+  then day - 1
+  else (
+    let year = day / 10000 in
+    let month = day / 100 mod 100 in
+    let year, month = if month = 1 then year - 1, 12 else year, month - 1 in
+    let last_day =
+      match month with
+      | 2 -> if year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0) then 29 else 28
+      | 4 | 6 | 9 | 11 -> 30
+      | _ -> 31
+    in
+    (year * 10000) + (month * 100) + last_day)
+;;
+
 let feed_request
       t
       ~before_day
@@ -468,8 +485,8 @@ let feed_request
     (List_feed_pages
        { before_day; day_limit; blocks_per_day; slot_limit; request_generation; pages })
     (Protocol.V2_list_journals
-       { from_day = Option.value before_day ~default:0
-       ; through_day = 99_999_999
+       { from_day = 0
+       ; through_day = Option.fold ~none:99_999_999 ~some:previous_journal_day before_day
        ; limit = Protocol.maximum_page_size
        ; cursor
        ; revision = None
@@ -1140,7 +1157,6 @@ let remember_scope_revision t scope revision =
     | Protocol.V2_children_revision parent -> Protocol.V2_children_scope parent
     | V2_page_tree_revision { page; maximum_depth } ->
       V2_page_tree_scope { page; maximum_depth }
-    | V2_journal_index_revision -> V2_journal_index_scope
   in
   Hashtbl.replace t.scope_revisions (scope_key scope) revision
 ;;
@@ -1400,8 +1416,7 @@ let receive t (protocol_response : Protocol.response) =
         | Admission_info request ->
           responses [ response (Admission_inspected { request; observation }) ]
         | _ -> failure_output t operation request_id "Unexpected admission response.")
-     | V2_journals_outcome { revision_scope; scope_revision; items; next_cursor } ->
-       remember_scope_revision t revision_scope scope_revision;
+     | V2_journals_outcome { items; next_cursor } ->
        List.iter
          (fun (item : Protocol.v2_journal_item) ->
             remember_page_revision t item.page.uuid item.revision)

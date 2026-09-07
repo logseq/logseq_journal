@@ -86,9 +86,7 @@ let seed_feed runtime =
       (response
          journals
          (Protocol.V2_journals_outcome
-            { revision_scope = V2_journal_index_revision
-            ; scope_revision = "scope-journal-1"
-            ; items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
             ; next_cursor = None
             }))
     |> fun output -> only "initial page-tree request" output.requests
@@ -462,11 +460,45 @@ let test_read_failure_conversion_preserves_category_and_ownership () =
       ]
 ;;
 
+let test_older_feed_uses_calendar_upper_bound () =
+  List.iter
+    (fun (before_day, expected) ->
+       let runtime = Runtime.create () in
+       set_calendar runtime;
+       let output =
+         Runtime.submit
+           runtime
+           (Journal_graph_request.Load_feed
+              { before_day = Some before_day
+              ; day_limit = 3
+              ; blocks_per_day = 4
+              ; slot_limit = 16
+              ; request_generation = 7L
+              })
+       in
+       let request = only "older journal request" output.requests in
+       match request.command with
+       | Protocol.V2_list_journals { from_day; through_day; _ } ->
+         Alcotest.(check int) "unbounded lower date" 0 from_day;
+         Alcotest.(check int) "exclusive calendar upper date" expected through_day
+       | _ -> Alcotest.fail "older feed did not request journals")
+    [ 20260907, 20260906
+    ; 20260301, 20260228
+    ; 20240301, 20240229
+    ; 20260101, 20251231
+    ; 10101, 0
+    ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
     [ ( "read conversion"
       , [ Alcotest.test_case
+            "older feed uses an exclusive calendar upper bound"
+            `Quick
+            test_older_feed_uses_calendar_upper_bound
+        ; Alcotest.test_case
             "read categories and ownership survive conversion"
             `Quick
             test_read_failure_conversion_preserves_category_and_ownership

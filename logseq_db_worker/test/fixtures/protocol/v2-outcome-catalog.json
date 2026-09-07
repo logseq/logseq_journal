@@ -40,8 +40,6 @@
       "requestId": "00000000-0000-4000-8000-000000000002",
       "outcome": {
         "type": "journals",
-        "revisionScope": {"type": "journalIndex"},
-        "scopeRevision": "scope-revision:v1:journal-index",
         "items": [
           {
             "page": {

@@ -125,7 +125,12 @@ let measure_journals database =
   with_snapshot database (fun snapshot ->
     measure (fun () ->
       let result =
-        Database.get_journals snapshot ~limit:200 ~cursor:None
+        Database.get_journals
+          ~from_day:0
+          ~through_day:99_999_999
+          snapshot
+          ~limit:200
+          ~cursor:None
         |> get_ok "measured get_journals"
       in
       if List.length result.items <> 200

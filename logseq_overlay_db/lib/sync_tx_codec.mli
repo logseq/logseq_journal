@@ -14,3 +14,6 @@ val decode
   -> decrypted_values:string list
   -> string
   -> (Datascript.tx_op list, string) result
+
+(** Read the already assigned UUID/order pairs from an insertion transaction. *)
+val inserted_orders : string -> ((string * string) list, string) result

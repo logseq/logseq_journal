@@ -3,7 +3,7 @@
   "reads": {
     "graphInfo": {"interest":"graphInfo","revision":"generation"},
     "inspectAdmission": {"interest":"outboxAdmission","revision":"none"},
-    "listJournals": {"interest":"journalIndex","revision":"journalIndexRevision"},
+    "listJournals": {"interest":"journalIndex","revision":"pageRevision"},
     "getPage": {"interest":"pageUuid","revision":"pageRevision"},
     "getBlock": {"interest":"blockUuid","revision":"blockRevision"},
     "getChildren": {"interest":"childrenScope","revision":"structureRevision"},
@@ -13,7 +13,7 @@
     "saveBlock": {"target":"blockUuid","requiredPreconditions":["block"]},
     "insertBlocks": {"target":"appendToParent","requiredPreconditions":["childrenScope"]},
     "deleteBlocks": {"target":"singleRoot","requiredPreconditions":["block","pageTreeScope"]},
-    "createJournalPage": {"target":"journalDayAndPageUuid","requiredPreconditions":["journalIndex"]},
+    "createJournalPage": {"target":"journalDayAndPageUuid","requiredPreconditions":["page"]},
     "setTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]},
     "clearTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]}
   },

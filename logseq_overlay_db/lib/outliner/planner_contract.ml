@@ -9,6 +9,6 @@ let contains_children_scope parent scopes =
     (fun (scope, _) ->
        match scope with
        | Types.Children_revision candidate -> Graph.Uuid.equal candidate parent
-       | Page_tree_revision _ | Journal_index_revision -> false)
+       | Page_tree_revision _ -> false)
     scopes
 ;;

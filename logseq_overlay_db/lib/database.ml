@@ -76,8 +76,6 @@ type lifecycle =
   | Active
   | Unlistened
 
-type logical_view = Logical_snapshot.t
-
 type receipt_entry = Persistence_receipt_v1.entry =
   | Commit_receipt of Types.local_commit
   | Discarded_receipt of Types.blocked_discard_commit * Types.block_reason
@@ -900,8 +898,11 @@ let ident_or_uuid database entity =
     |> Option.map Graph.Uuid.to_string
 ;;
 
-let property_value database property_type value =
-  let uuid_of_ref entity = Option.bind (one database entity "block/uuid") uuid_of_value in
+let property_value ?uuid_of_ref database property_type value =
+  let uuid_of_ref =
+    Option.value uuid_of_ref ~default:(fun entity ->
+      Option.bind (one database entity "block/uuid") uuid_of_value)
+  in
   match property_type, value with
   | Graph.Default, Datascript.String value -> Some (Graph.Default_value value)
   | Url, String value -> Some (Url_value value)
@@ -983,10 +984,16 @@ let property_definition_with_class database property_class ident =
     (property_definition_for_entity database property_class ident)
 ;;
 
-let property_summary_from_definition database (definition : Graph.property_summary) values
+let property_summary_from_definition
+      ?uuid_of_ref
+      database
+      (definition : Graph.property_summary)
+      values
   =
   let values =
-    List.filter_map (property_value database definition.Graph.schema.property_type) values
+    List.filter_map
+      (property_value ?uuid_of_ref database definition.Graph.schema.property_type)
+      values
   in
   let maximum_values = 256 in
   { definition with
@@ -1031,19 +1038,33 @@ type hydration_cache =
   ; ident_entities : (string, int) Hashtbl.t
   }
 
-let hydration_cache database =
+let hydration_cache ?(index_idents = true) database =
   let ident_entities = Hashtbl.create 64 in
-  Datascript.datoms database Datascript.Aevt ~a:"db/ident" ()
-  |> Seq.iter (fun (datom : Datascript.datom) ->
-    match ident_of_value datom.v with
-    | Some ident -> Hashtbl.replace ident_entities ident datom.e
-    | None -> ());
+  if index_idents
+  then
+    Datascript.datoms database Datascript.Aevt ~a:"db/ident" ()
+    |> Seq.iter (fun (datom : Datascript.datom) ->
+      match ident_of_value datom.v with
+      | Some ident -> Hashtbl.replace ident_entities ident datom.e
+      | None -> ());
   { uuids = Hashtbl.create 64
   ; page_titles = Hashtbl.create 8
-  ; property_class = Hashtbl.find_opt ident_entities "logseq.class/Property"
+  ; property_class =
+      (if index_idents
+       then Hashtbl.find_opt ident_entities "logseq.class/Property"
+       else entity_of_ident database "logseq.class/Property")
   ; property_definitions = Hashtbl.create 16
   ; ident_entities
   }
+;;
+
+let cached_uuid_of_entity database cache entity =
+  match Hashtbl.find_opt cache.uuids entity with
+  | Some uuid -> uuid
+  | None ->
+    let uuid = uuid_of_entity database entity in
+    Hashtbl.add cache.uuids entity uuid;
+    uuid
 ;;
 
 let property_summary_with_cache database cache ident values =
@@ -1056,14 +1077,21 @@ let property_summary_with_cache database cache ident values =
       | None ->
         let definition =
           Option.bind
-            (Hashtbl.find_opt cache.ident_entities ident)
+            (match Hashtbl.find_opt cache.ident_entities ident with
+             | Some _ as entity -> entity
+             | None -> entity_of_ident database ident)
             (property_definition_for_entity database property_class ident)
         in
         Hashtbl.add cache.property_definitions ident definition;
         definition
     in
     Option.map
-      (fun definition -> property_summary_from_definition database definition values)
+      (fun definition ->
+         property_summary_from_definition
+           ~uuid_of_ref:(cached_uuid_of_entity database cache)
+           database
+           definition
+           values)
       definition
 ;;
 
@@ -1183,8 +1211,12 @@ let set_block_field_properties
   |> set_uuid_property_values ?cache database "block/refs" refs
 ;;
 
-let page_record_of_entity_with_class database property_class entity =
-  let datoms = entity_datoms database entity in
+let page_record_of_entity_with_class ?cache database property_class entity =
+  let datoms =
+    entity_datoms database entity
+    |> List.sort_uniq (fun (left : Datascript.datom) right ->
+      compare (left.a, left.v) (right.a, right.v))
+  in
   match
     ( Option.bind (one_in_datoms datoms "block/uuid") uuid_of_value
     , Option.bind (one_in_datoms datoms "block/name") string_of_value
@@ -1211,9 +1243,22 @@ let page_record_of_entity_with_class database property_class entity =
               ; kind = page_kind_of_datoms database datoms
               ; created_at_ms
               ; updated_at_ms
-              ; tags = tagged_uuids_of_datoms database datoms
+              ; tags =
+                  (match cache with
+                   | None -> tagged_uuids_of_datoms database datoms
+                   | Some cache ->
+                     referenced_entities_in_datoms datoms "block/tags"
+                     |> List.filter_map (cached_uuid_of_entity database cache)
+                     |> List.sort_uniq Graph.Uuid.compare)
               ; properties =
-                  property_summaries_of_datoms_with_class database property_class datoms
+                  (match cache with
+                   | Some cache ->
+                     property_summaries_of_datoms_with_cache database cache datoms
+                   | None ->
+                     property_summaries_of_datoms_with_class
+                       database
+                       property_class
+                       datoms)
               ; recycled =
                   Option.is_some (one_in_datoms datoms "logseq.property/deleted-at")
               }
@@ -1221,10 +1266,13 @@ let page_record_of_entity_with_class database property_class entity =
   | _ -> None
 ;;
 
-let page_record_of_entity database entity =
+let page_record_of_entity ?cache database entity =
   page_record_of_entity_with_class
+    ?cache
     database
-    (entity_of_ident database "logseq.class/Property")
+    (match cache with
+     | Some cache -> cache.property_class
+     | None -> entity_of_ident database "logseq.class/Property")
     entity
 ;;
 
@@ -1267,57 +1315,6 @@ let entity_datoms_for_ids database entities =
   result
 ;;
 
-let pages_of_database database =
-  let cache = hydration_cache database in
-  let entities =
-    Datascript.datoms database Datascript.Aevt ~a:"block/name" ()
-    |> Seq.map (fun (datom : Datascript.datom) -> datom.e)
-    |> List.of_seq
-  in
-  let datoms_by_entity = entity_datoms_for_ids database entities in
-  entities
-  |> List.filter_map (fun entity ->
-    Option.bind (Hashtbl.find_opt datoms_by_entity entity) (fun datoms ->
-      Option.map
-        (fun (record : Types.page_record) -> record.page.uuid, record)
-        (match
-           ( Option.bind (one_in_datoms datoms "block/uuid") uuid_of_value
-           , Option.bind (one_in_datoms datoms "block/name") string_of_value
-           , Option.bind (one_in_datoms datoms "block/title") string_of_value )
-         with
-         | Some uuid, Some name, Some title ->
-           let created_at_ms =
-             Option.bind (one_in_datoms datoms "block/created-at") int_of_value
-             |> Option.value ~default:0
-             |> Int64.of_int
-           in
-           let updated_at_ms =
-             Option.bind (one_in_datoms datoms "block/updated-at") int_of_value
-             |> Option.value ~default:0
-             |> Int64.of_int
-           in
-           Some
-             Types.
-               { page =
-                   Graph.
-                     { uuid
-                     ; name
-                     ; title
-                     ; kind = page_kind_of_datoms database datoms
-                     ; created_at_ms
-                     ; updated_at_ms
-                     ; tags = tagged_uuids_of_datoms database datoms
-                     ; properties =
-                         property_summaries_of_datoms_with_cache database cache datoms
-                     ; recycled =
-                         Option.is_some
-                           (one_in_datoms datoms "logseq.property/deleted-at")
-                     }
-               }
-         | _ -> None)))
-  |> List.sort_uniq (fun (left, _) (right, _) -> Graph.Uuid.compare left right)
-;;
-
 let task_status_of_ident = function
   | "logseq.property/status.todo" -> Some Types.Todo
   | "logseq.property/status.doing" -> Some Doing
@@ -1338,15 +1335,6 @@ let task_status_of_datoms database datoms =
      | Some (Datascript.Keyword ident | String ident) -> task_status_of_ident ident
      | Some _ | None -> None)
   | Some _ | None -> None
-;;
-
-let cached_uuid_of_entity database cache entity =
-  match Hashtbl.find_opt cache.uuids entity with
-  | Some uuid -> uuid
-  | None ->
-    let uuid = uuid_of_entity database entity in
-    Hashtbl.add cache.uuids entity uuid;
-    uuid
 ;;
 
 let cached_page_title database cache entity =
@@ -1518,33 +1506,6 @@ let record_is_logically_active (record : outbox_record) =
 
 let record_has_active_dependency_shadows (record : outbox_record) =
   Queryable_outbox.has_active_dependency_shadows record.transport_state
-;;
-
-let logical_pages_of_snapshot (snapshot : snapshot) =
-  let view : logical_view =
-    { block_rows = []
-    ; page_rows = pages_of_database (Option.get snapshot.authoritative_database)
-    }
-  in
-  List.iter
-    (fun (record : outbox_record) ->
-       match record.mutation with
-       | Types.Create_journal_page _ when record_is_logically_active record ->
-         ignore
-           (Logical_snapshot.apply
-              view
-              ~ordinal:record.sequence
-              ~now:record.intent_time_ms
-              record.mutation
-            : bool)
-       | Save_block _
-       | Insert_blocks _
-       | Delete_blocks _
-       | Set_task_status _
-       | Clear_task_status _
-       | Create_journal_page _ -> ())
-    (Option.get snapshot.outbox);
-  view.page_rows
 ;;
 
 let clear_snapshot_roots (snapshot : snapshot) =
@@ -1890,17 +1851,43 @@ let logical_page_revision uuid value =
 
 let status_ident = Outliner.Task_status.ident
 
+let assigned_orders (record : outbox_record) =
+  match record.mutation with
+  | Types.Insert_blocks _ ->
+    Sync_tx_codec.inserted_orders record.normalized_transaction
+    |> Result.get_ok
+    |> List.to_seq
+    |> Uuid_map.of_seq
+  | _ -> Uuid_map.empty
+;;
+
+let assigned_order orders uuid = Uuid_map.find (Graph.Uuid.to_string uuid) orders
+
+let rec tree_children parent (tree : Types.block_tree) =
+  if Graph.Uuid.equal tree.uuid parent
+  then tree.children
+  else List.concat_map (tree_children parent) tree.children
+;;
+
+let rec tree_children_interests (tree : Types.block_tree) =
+  match tree.children with
+  | [] -> []
+  | children ->
+    Types.Children_interest tree.uuid :: List.concat_map tree_children_interests children
+;;
+
 let rec inserted_block
           database
           ~target
           ~parent
           ~page
-          ~order
+          ~orders
           ~now
           (tree : Types.block_tree)
   =
   if Graph.Uuid.equal target tree.uuid
   then (
+    let order = assigned_order orders tree.uuid in
     let properties =
       []
       |> set_property_values database "block/title" [ Datascript.String tree.title ]
@@ -1935,16 +1922,9 @@ let rec inserted_block
         ; rendered_page_title = ""
         })
   else
-    List.mapi (fun index child -> index, child) tree.children
-    |> List.find_map (fun (index, child) ->
-      inserted_block
-        database
-        ~target
-        ~parent:tree.uuid
-        ~page
-        ~order:(Outliner_order.child ~index)
-        ~now
-        child)
+    tree.children
+    |> List.find_map (fun child ->
+      inserted_block database ~target ~parent:tree.uuid ~page ~orders ~now child)
 ;;
 
 let page_record_of_shadow shadow =
@@ -1984,26 +1964,29 @@ let block_record_of_shadow shadow =
     }
 ;;
 
-let logical_page_at (snapshot : snapshot) uuid =
+let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
   let authoritative = Option.get snapshot.authoritative_database in
   let effects =
     Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.page_effects)
     |> Option.value ~default:[]
   in
   let initial =
-    match page_of_database authoritative uuid with
-    | Some _ as page -> page
+    match initial with
+    | Some initial -> initial
     | None ->
-      List.find_map
-        (fun (record : outbox_record) ->
-           if record_has_active_dependency_shadows record
-           then
-             List.find_opt
-               (fun shadow -> Graph.Uuid.equal shadow.shadow_page_uuid uuid)
-               record.dependency_shadows.shadow_pages
-             |> Option.map page_record_of_shadow
-           else None)
-        effects
+      (match page_of_database authoritative uuid with
+       | Some _ as page -> page
+       | None ->
+         List.find_map
+           (fun (record : outbox_record) ->
+              if record_has_active_dependency_shadows record
+              then
+                List.find_opt
+                  (fun shadow -> Graph.Uuid.equal shadow.shadow_page_uuid uuid)
+                  record.dependency_shadows.shadow_pages
+                |> Option.map page_record_of_shadow
+              else None)
+           effects)
   in
   List.fold_left
     (fun current (record : outbox_record) ->
@@ -2016,18 +1999,22 @@ let logical_page_at (snapshot : snapshot) uuid =
            let properties =
              []
              |> set_property_values
+                  ?cache
                   authoritative
                   "block/title"
                   [ Datascript.String title ]
              |> set_property_values
+                  ?cache
                   authoritative
                   "block/created-at"
                   [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
              |> set_property_values
+                  ?cache
                   authoritative
                   "block/updated-at"
                   [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
              |> set_property_values
+                  ?cache
                   authoritative
                   "block/journal-day"
                   [ Datascript.Int journal_day ]
@@ -2068,6 +2055,7 @@ let logical_page_at (snapshot : snapshot) uuid =
                      | None -> value.page.properties
                      | Some patch ->
                        set_uuid_property_values
+                         ?cache
                          authoritative
                          patch.property_ident
                          [ patch.replacement_uuid ]
@@ -2078,6 +2066,7 @@ let logical_page_at (snapshot : snapshot) uuid =
                    | Some patch ->
                      let properties =
                        set_property_values
+                         ?cache
                          authoritative
                          "block/updated-at"
                          [ Datascript.Int (Int64.to_int patch.updated_at_ms) ]
@@ -2166,7 +2155,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                   ~target:uuid
                   ~parent
                   ~page
-                  ~order:(Outliner_order.root ~sequence:record.sequence)
+                  ~orders:(assigned_orders record)
                   ~now:record.intent_time_ms
                   tree
               with
@@ -2342,7 +2331,6 @@ let scope_key = function
   | Types.Children_revision parent -> "children:" ^ Graph.Uuid.to_string parent
   | Page_tree_revision { page; maximum_depth } ->
     Printf.sprintf "page-tree:%s:%d" (Graph.Uuid.to_string page) maximum_depth
-  | Journal_index_revision -> "journal-index"
 ;;
 
 let block_is_tombstoned (snapshot : snapshot) uuid =
@@ -2409,11 +2397,18 @@ let local_child_facts (snapshot : snapshot) parent =
     else (
       let inserted =
         match record.mutation with
-        | Types.Insert_blocks { parent = candidate; tree; _ }
-          when Graph.Uuid.equal parent candidate ->
-          [ Outliner_order.root ~sequence:record.sequence, tree.uuid ]
+        | Types.Insert_blocks { parent = candidate; tree; _ } ->
+          let children =
+            if Graph.Uuid.equal parent candidate
+            then [ tree ]
+            else tree_children parent tree
+          in
+          let orders = assigned_orders record in
+          List.map
+            (fun (child : Types.block_tree) ->
+               assigned_order orders child.uuid, child.uuid)
+            children
         | Save_block _
-        | Insert_blocks _
         | Delete_blocks _
         | Create_journal_page _
         | Set_task_status _
@@ -2433,6 +2428,7 @@ let local_child_facts (snapshot : snapshot) parent =
         else []
       in
       inserted @ shadows))
+  |> List.filter (fun (_, uuid) -> not (block_is_tombstoned snapshot uuid))
   |> List.sort_uniq compare
 ;;
 
@@ -2478,20 +2474,7 @@ let revision_for_scope (snapshot : snapshot) scope =
         |> List.filter_map (fun (datom : Datascript.datom) ->
           uuid_of_entity (Option.get snapshot.authoritative_database) datom.e)
     in
-    let inserted =
-      Uuid_map.find_opt
-        (Graph.Uuid.to_string parent)
-        (Option.get snapshot.children_effects)
-      |> Option.value ~default:[]
-      |> List.filter_map (fun (record : outbox_record) ->
-        if not (record_is_logically_active record)
-        then None
-        else (
-          match record.mutation with
-          | Types.Insert_blocks { parent = candidate; tree; _ }
-            when Graph.Uuid.equal candidate parent -> Some tree.uuid
-          | _ -> None))
-    in
+    let inserted = local_child_facts snapshot parent |> List.map snd in
     List.sort_uniq Graph.Uuid.compare (authoritative @ inserted)
     |> List.filter_map (fun uuid ->
       match logical_block_at snapshot uuid with
@@ -2522,15 +2505,6 @@ let revision_for_scope (snapshot : snapshot) scope =
             :: walk (depth + 1) record.block.uuid)
       in
       walk 0 page
-    | Journal_index_revision ->
-      logical_pages_of_snapshot snapshot
-      |> List.filter_map (fun (_, (record : Types.page_record)) ->
-        match record.page.kind with
-        | Graph.Journal_page { journal_day } ->
-          Some
-            (Printf.sprintf "%08d:%s" journal_day (Graph.Uuid.to_string record.page.uuid))
-        | Ordinary_page | Class_page | Property_page | Hidden_page | Built_in_page -> None)
-      |> List.sort String.compare
   in
   scope_revision_from_members scope members
 ;;
@@ -2551,83 +2525,226 @@ let checked_add_nonnegative left right =
   if left < 0 || right < 0 || right > Int.max_int - left then None else Some (left + right)
 ;;
 
-let journal_cursor snapshot offset =
-  let projection = projection_number snapshot.version.projection_revision in
-  Query_cursor.create ~projection ~offset
+type journal_candidate =
+  { day : int
+  ; uuid : Graph.Uuid.t
+  ; entity : int option
+  }
+
+let compare_journal_candidates left right =
+  let day = Int.compare right.day left.day in
+  if day <> 0 then day else Graph.Uuid.compare left.uuid right.uuid
 ;;
 
-let journal_cursor_offset snapshot cursor =
-  Query_cursor.offset
-    ~projection:(projection_number snapshot.version.projection_revision)
-    cursor
-  |> Result.map_error (function
-    | Query_cursor.Invalid -> Types.Invalid_read_request "invalid journal cursor"
-    | Stale -> Types.Stale_read_cursor)
+let journal_cursor snapshot ~from_day ~through_day candidate =
+  Printf.sprintf
+    "journal:v1:%d:%d:%d:%d:%s"
+    (projection_number snapshot.version.projection_revision)
+    from_day
+    through_day
+    candidate.day
+    (Graph.Uuid.to_string candidate.uuid)
+  |> Graph.Cursor.of_string
+  |> Result.get_ok
 ;;
 
-let get_journals snapshot ~limit ~cursor =
+let journal_cursor_position snapshot ~from_day ~through_day cursor =
+  let invalid () =
+    Error (Types.Invalid_read_request "invalid journal cursor or date bounds")
+  in
+  match Graph.Cursor.to_string cursor |> String.split_on_char ':' with
+  | [ "journal"; "v1"; projection; lower; upper; day; uuid ] ->
+    (match
+       ( int_of_string_opt projection
+       , int_of_string_opt lower
+       , int_of_string_opt upper
+       , int_of_string_opt day
+       , Graph.Uuid.of_string uuid )
+     with
+     | Some projection, Some lower, Some upper, Some day, Ok uuid
+       when lower = from_day && upper = through_day && day >= lower && day <= upper ->
+       if projection <> projection_number snapshot.version.projection_revision
+       then Error Types.Stale_read_cursor
+       else Ok (Some { day; uuid; entity = None })
+     | _ -> invalid ())
+  | _ -> invalid ()
+;;
+
+let local_journal_candidates (snapshot : snapshot) =
+  List.fold_left
+    (fun candidates (record : outbox_record) ->
+       match record.mutation with
+       | Types.Create_journal_page { page; journal_day; _ }
+         when record_is_logically_active record ->
+         Uuid_map.add
+           (Graph.Uuid.to_string page)
+           { day = journal_day; uuid = page; entity = None }
+           candidates
+       | _ -> candidates)
+    Uuid_map.empty
+    (Option.get snapshot.outbox)
+;;
+
+let indexed_journal_candidates (snapshot : snapshot) ~from_day ~upper_day ~locals =
+  let database = Option.get snapshot.authoritative_database in
+  let attribute = "block/journal-day" in
+  let one entity attribute =
+    match values database entity attribute |> List.sort_uniq compare with
+    | [ value ] -> Some value
+    | _ -> None
+  in
+  let candidate day entity =
+    match
+      ( Option.bind (one entity "block/uuid") uuid_of_value
+      , Option.bind (one entity "block/name") string_of_value
+      , Option.bind (one entity "block/title") string_of_value )
+    with
+    | Some uuid, Some _, Some _
+      when (not (Uuid_map.mem (Graph.Uuid.to_string uuid) locals))
+           && Option.bind (one entity attribute) int_of_value = Some day
+           && Option.bind (one entity "logseq.property/built-in?") bool_of_value
+              <> Some true -> Some { day; uuid; entity = Some entity }
+    | _ -> None
+  in
+  let rec dates sequence () =
+    match sequence () with
+    | Seq.Nil -> Seq.Nil
+    | Seq.Cons (datom, rest) when String.equal datom.Datascript.a attribute ->
+      (match int_of_value datom.v with
+       | Some day when day < from_day -> Seq.Nil
+       | Some day ->
+         let entities = Hashtbl.create 8 in
+         Hashtbl.add entities datom.e ();
+         let rec group sequence =
+           match sequence () with
+           | Seq.Cons (next, rest)
+             when String.equal next.Datascript.a attribute && next.v = datom.v ->
+             Hashtbl.replace entities next.e ();
+             group rest
+           | node -> fun () -> node
+         in
+         let remaining = group rest in
+         let candidates =
+           Hashtbl.fold
+             (fun entity () acc ->
+                match candidate day entity with
+                | None -> acc
+                | Some value -> value :: acc)
+             entities
+             []
+           |> List.sort_uniq compare_journal_candidates
+         in
+         Seq.append (List.to_seq candidates) (dates remaining) ()
+       | None -> dates rest ())
+    | Seq.Cons _ -> Seq.Nil
+  in
+  (* Include the complete equal-date group, even across index leaf boundaries. *)
+  Datascript.rseek_datoms
+    database
+    Datascript.Avet
+    ~a:attribute
+    ~v:(Datascript.Int upper_day)
+    ~e:Int.max_int
+    ~tx:Int.max_int
+    ()
+  |> dates
+  |> Seq.memoize
+;;
+
+let get_journals snapshot ~from_day ~through_day ~limit ~cursor =
   with_snapshot_read snapshot (fun snapshot ->
     if not (valid_page_limit limit)
     then Error (Types.Invalid_read_request "limit must be between 1 and 200")
     else (
-      let offset_result =
+      let position =
         match cursor with
-        | None -> Ok 0
-        | Some cursor -> journal_cursor_offset snapshot cursor
+        | None -> Ok None
+        | Some cursor -> journal_cursor_position snapshot ~from_day ~through_day cursor
       in
-      Result.bind offset_result (fun offset ->
-        let page_rows = logical_pages_of_snapshot snapshot in
-        let journals =
-          page_rows
-          |> List.filter_map (fun (_, (record : Types.page_record)) ->
-            match record.page.kind with
-            | Graph.Journal_page { journal_day } ->
-              let revision = logical_page_revision record.page.uuid (Some record) in
-              Some Types.{ page = record; journal_day; revision }
-            | _ -> None)
-          |> List.sort (fun (left : Types.journal_item) (right : Types.journal_item) ->
-            let day = Int.compare right.journal_day left.journal_day in
-            if day <> 0
-            then day
-            else Graph.Uuid.compare left.page.page.uuid right.page.page.uuid)
+      Result.bind position (fun position ->
+        let database = Option.get snapshot.authoritative_database in
+        let indexed =
+          match List.assoc_opt "block/journal-day" (Datascript.schema database) with
+          | Some attribute -> attribute.Datascript.indexed
+          | None -> false
         in
-        let rec take count acc = function
-          | [] -> List.rev acc
-          | _ when count = 0 -> List.rev acc
-          | item :: rest -> take (count - 1) (item :: acc) rest
-        in
-        let rec drop count values =
-          match count, values with
-          | 0, _ | _, [] -> values
-          | count, _ :: rest -> drop (count - 1) rest
-        in
-        let revision_scope = Types.Journal_index_revision in
-        let items = take limit [] (drop offset journals) in
-        match checked_add_nonnegative offset (List.length items) with
-        | None -> Error (Types.Invalid_read_request "journal cursor offset overflow")
-        | Some consumed
-          when consumed < List.length journals && consumed > maximum_cursor_offset ->
-          Error Types.Read_limit_exceeded
-        | Some consumed ->
-          let scope_members =
-            List.map
-              (fun (item : Types.journal_item) ->
-                 Printf.sprintf
-                   "%08d:%s"
-                   item.journal_day
-                   (Graph.Uuid.to_string item.page.page.uuid))
-              journals
-            |> List.sort String.compare
+        if not indexed
+        then Error (Types.Invalid_read_request "block/journal-day must be indexed")
+        else if from_day > through_day
+        then Ok Types.{ items = []; next_cursor = None }
+        else (
+          let after candidate =
+            candidate.day >= from_day
+            && candidate.day <= through_day
+            &&
+            match position with
+            | None -> true
+            | Some previous -> compare_journal_candidates candidate previous > 0
           in
-          Ok
-            { Types.items
-            ; next_cursor =
-                (if consumed < List.length journals
-                 then Some (journal_cursor snapshot consumed)
-                 else None)
-            ; revision_scope
-            ; scope_revision = scope_revision_from_members revision_scope scope_members
-            })))
+          let locals = local_journal_candidates snapshot in
+          let local_items =
+            Uuid_map.bindings locals
+            |> List.map snd
+            |> List.filter after
+            |> List.sort compare_journal_candidates
+          in
+          let upper_day =
+            match position with
+            | None -> through_day
+            | Some c -> c.day
+          in
+          let authoritative =
+            indexed_journal_candidates snapshot ~from_day ~upper_day ~locals
+            |> Seq.filter after
+            |> Seq.memoize
+          in
+          let rec merge locals authoritative () =
+            match locals, authoritative () with
+            | [], node -> node
+            | values, Seq.Nil -> List.to_seq values ()
+            | local :: tail, Seq.Cons (remote, rest) ->
+              if compare_journal_candidates local remote < 0
+              then Seq.Cons (local, merge tail authoritative)
+              else Seq.Cons (remote, merge locals rest)
+          in
+          let rec select remaining reversed sequence =
+            match sequence () with
+            | Seq.Nil -> List.rev reversed, false
+            | Seq.Cons (_, _) when remaining = 0 -> List.rev reversed, true
+            | Seq.Cons (candidate, rest) ->
+              select (remaining - 1) (candidate :: reversed) rest
+          in
+          let selected, has_more = select limit [] (merge local_items authoritative) in
+          let cache = lazy (hydration_cache ~index_idents:false database) in
+          let items =
+            List.map
+              (fun candidate ->
+                 let cache = Lazy.force cache in
+                 let initial =
+                   Option.bind candidate.entity (page_record_of_entity ~cache database)
+                 in
+                 let page =
+                   logical_page_at ~cache ~initial snapshot candidate.uuid |> Option.get
+                 in
+                 Types.
+                   { page
+                   ; journal_day = candidate.day
+                   ; revision = logical_page_revision candidate.uuid (Some page)
+                   })
+              selected
+          in
+          let next_cursor =
+            if has_more
+            then
+              Some
+                (journal_cursor
+                   snapshot
+                   ~from_day
+                   ~through_day
+                   (List.hd (List.rev selected)))
+            else None
+          in
+          Ok Types.{ items; next_cursor }))))
 ;;
 
 let child_items ?cache (snapshot : snapshot) parent =
@@ -2645,18 +2762,7 @@ let child_items ?cache (snapshot : snapshot) parent =
       |> List.filter_map (fun (datom : Datascript.datom) ->
         uuid_of_entity (Option.get snapshot.authoritative_database) datom.e)
   in
-  let inserted =
-    Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
-    |> Option.value ~default:[]
-    |> List.filter_map (fun (record : outbox_record) ->
-      if not (record_is_logically_active record)
-      then None
-      else (
-        match record.mutation with
-        | Types.Insert_blocks { parent = candidate; tree; _ }
-          when Graph.Uuid.equal candidate parent -> Some tree.uuid
-        | _ -> None))
-  in
+  let inserted = local_child_facts snapshot parent |> List.map snd in
   List.sort_uniq Graph.Uuid.compare (authoritative @ inserted)
   |> List.filter_map (fun uuid ->
     match logical_block_at ?cache snapshot uuid with
@@ -2956,7 +3062,6 @@ let equal_scope left right =
   | Types.Children_revision left, Children_revision right -> Graph.Uuid.equal left right
   | Page_tree_revision left, Page_tree_revision right ->
     Graph.Uuid.equal left.page right.page && left.maximum_depth = right.maximum_depth
-  | Journal_index_revision, Journal_index_revision -> true
   | _ -> false
 ;;
 
@@ -2985,11 +3090,39 @@ let uuid_lookup uuid =
 
 let uuid_temp prefix uuid = Datascript.Temp_id (prefix ^ ":" ^ Graph.Uuid.to_string uuid)
 
+let insertion_orders snapshot = function
+  | Types.Insert_blocks { parent; tree; _ } ->
+    let lower =
+      Seq.append
+        (authoritative_child_facts snapshot parent)
+        (List.to_seq (local_child_facts snapshot parent))
+      |> Seq.fold_left
+           (fun maximum (order, _) ->
+              Some
+                (Option.fold
+                   ~none:order
+                   ~some:(fun maximum ->
+                     if String.compare order maximum > 0 then order else maximum)
+                   maximum))
+           None
+    in
+    let rec assign orders order (tree : Types.block_tree) =
+      let orders = Uuid_map.add (Graph.Uuid.to_string tree.uuid) order orders in
+      List.fold_left2
+        assign
+        orders
+        (Outliner_order.generate_n ~lower:None ~upper:None (List.length tree.children))
+        tree.children
+    in
+    assign Uuid_map.empty (Outliner_order.generate ~lower ~upper:None) tree
+  | _ -> Uuid_map.empty
+;;
+
 let local_operations
       ~fingerprint:_
       ~intent_time_ms
       ~next_tx
-      ~sequence
+      ~orders
       ~(effect_footprint : effect_footprint)
       ~delete_artifacts
       mutation
@@ -3010,7 +3143,8 @@ let local_operations
         | [] -> parent
       in
       let page_ref = uuid_lookup page in
-      let rec add_tree ~parent_ref ~order (tree : Types.block_tree) =
+      let rec add_tree ~parent_ref (tree : Types.block_tree) =
+        let order = assigned_order orders tree.uuid in
         let entity = uuid_temp "overlay-insert" tree.uuid in
         [ Datascript.Add (entity, "block/uuid", Uuid (Graph.Uuid.to_string tree.uuid))
         ; Add (entity, "block/title", String tree.title)
@@ -3022,14 +3156,10 @@ let local_operations
         ; Add (entity, "block/tx-id", Int next_tx)
         ]
         @ (tree.children
-           |> List.mapi (fun index child ->
-             add_tree ~parent_ref:entity ~order:(Outliner_order.child ~index) child)
+           |> List.map (fun child -> add_tree ~parent_ref:entity child)
            |> List.concat)
       in
-      add_tree
-        ~parent_ref:(uuid_lookup parent)
-        ~order:(Outliner_order.root ~sequence)
-        tree
+      add_tree ~parent_ref:(uuid_lookup parent) tree
     | Delete_blocks _ ->
       let artifacts = Option.get delete_artifacts in
       let block_patch_operations patch =
@@ -3103,7 +3233,7 @@ let normalized_transaction_in
       ~fingerprint
       ~intent_time_ms
       ~planned_tx
-      ~sequence
+      ~orders
       ~effect_footprint
       ~delete_artifacts
       mutation
@@ -3112,7 +3242,7 @@ let normalized_transaction_in
     ~fingerprint
     ~intent_time_ms
     ~next_tx:planned_tx
-    ~sequence
+    ~orders
     ~effect_footprint
     ~delete_artifacts
     mutation
@@ -3446,8 +3576,7 @@ let has_delete_structure_precondition database (expected : write_precondition) r
         (fun (scope, _) ->
            match scope with
            | Types.Children_revision candidate -> Graph.Uuid.equal candidate parent
-           | Page_tree_revision { page = candidate; _ } -> Graph.Uuid.equal candidate page
-           | Journal_index_revision -> false)
+           | Page_tree_revision { page = candidate; _ } -> Graph.Uuid.equal candidate page)
         expected.scopes
     in
     if found
@@ -3746,6 +3875,7 @@ let planned_effect database ~now = function
         ; page_uuids = [ page ]
         ; structure_interests =
             [ Types.Children_interest parent; Types.Page_tree_interest page ]
+            @ tree_children_interests tree
         }
       , None )
   | Delete_blocks { root; _ } ->
@@ -3905,7 +4035,7 @@ let local_candidate_record
         ~fingerprint
         ~intent_time_ms
         ~planned_tx
-        ~sequence
+        ~orders:(insertion_orders (snapshot_of_database database) mutation)
         ~effect_footprint
         ~delete_artifacts
         mutation
@@ -4869,7 +4999,7 @@ let begin_outbox_transition database ~expected transition =
                       ~fingerprint:record.fingerprint
                       ~intent_time_ms:record.intent_time_ms
                       ~next_tx:record.planned_tx
-                      ~sequence:record.sequence
+                      ~orders:(assigned_orders record)
                       ~effect_footprint:record.effect_footprint
                       ~delete_artifacts:record.delete_artifacts
                       record.mutation
@@ -5026,7 +5156,7 @@ let make_batch preparation encrypted =
               ~fingerprint:record.fingerprint
               ~intent_time_ms:record.intent_time_ms
               ~next_tx:record.planned_tx
-              ~sequence:record.sequence
+              ~orders:(assigned_orders record)
               ~effect_footprint:record.effect_footprint
               ~delete_artifacts:record.delete_artifacts
               record.mutation
@@ -5040,7 +5170,7 @@ let make_batch preparation encrypted =
               ~fingerprint:record.fingerprint
               ~intent_time_ms:record.intent_time_ms
               ~next_tx:record.planned_tx
-              ~sequence:record.sequence
+              ~orders:(assigned_orders record)
               ~effect_footprint:record.effect_footprint
               ~delete_artifacts:record.delete_artifacts
               record.mutation
@@ -5609,7 +5739,7 @@ let synchronized_record_operations (record : outbox_record) =
     ~fingerprint:record.fingerprint
     ~intent_time_ms:record.intent_time_ms
     ~next_tx:record.planned_tx
-    ~sequence:record.sequence
+    ~orders:(assigned_orders record)
     ~effect_footprint:record.effect_footprint
     ~delete_artifacts:record.delete_artifacts
     record.mutation
@@ -6318,6 +6448,7 @@ let ordinary_effect_footprint snapshot = function
     ; page_uuids = [ page ]
     ; structure_interests =
         [ Types.Children_interest parent; Types.Page_tree_interest page ]
+        @ tree_children_interests tree
     }
   | Create_journal_page { page; _ } ->
     { block_uuids = []
@@ -6505,7 +6636,7 @@ let replan_queued_ordinary database authoritative_database records =
                      ~fingerprint:record.fingerprint
                      ~intent_time_ms:record.intent_time_ms
                      ~planned_tx
-                     ~sequence:record.sequence
+                     ~orders:(assigned_orders record)
                      ~effect_footprint
                      ~delete_artifacts:None
                      mutation
