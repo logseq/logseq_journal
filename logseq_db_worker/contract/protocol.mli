@@ -96,12 +96,7 @@ and command =
       ; through : string
       }
 
-and v2_scope =
-  | V2_children_scope of Uuid.t
-  | V2_page_tree_scope of
-      { page : page_uuid
-      ; maximum_depth : int
-      }
+and v2_scope = V2_children_scope of Uuid.t
 
 and v2_task_status =
   | V2_todo
@@ -201,12 +196,7 @@ and v2_tree_member =
   ; parent : Uuid.t
   }
 
-and v2_revision_scope =
-  | V2_children_revision of Uuid.t
-  | V2_page_tree_revision of
-      { page : page_uuid
-      ; maximum_depth : int
-      }
+and v2_revision_scope = V2_children_revision of Uuid.t
 
 and v2_local_status =
   | V2_applied
@@ -240,8 +230,6 @@ and v2_outcome =
   | V2_page_tree_outcome of
       { page : page_uuid
       ; maximum_depth : int
-      ; revision_scope : v2_revision_scope
-      ; scope_revision : string
       ; items : v2_tree_member list
       ; next_cursor : Cursor.t option
       }

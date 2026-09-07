@@ -119,12 +119,7 @@ type journal_item =
   ; revision : page_state_revision
   }
 
-type structure_revision_scope =
-  | Children_revision of Graph.block_uuid
-  | Page_tree_revision of
-      { page : Graph.page_uuid
-      ; maximum_depth : int
-      }
+type structure_revision_scope = Children_revision of Graph.block_uuid
 
 type structure_interest =
   | Children_interest of Graph.block_uuid
@@ -172,8 +167,6 @@ type structure_result =
   | Page_tree_result of
       { page : Graph.page_uuid
       ; maximum_depth : int
-      ; revision_scope : structure_revision_scope
-      ; scope_revision : scope_revision
       ; items : tree_member list
       ; next_cursor : Graph.Cursor.t option
       }
@@ -295,11 +288,14 @@ type remote_won_receipt =
   ; proof : remote_won_proof
   }
 
+(** A Stale response preserves the frozen attempt until its authoritative barrier
+    is covered. Ordinary intent may return to [Queued] only after non-execution
+    is established; transport-uncertain retries remain [Submitted]. *)
 type transport_state =
   | Queued
   | Submitted of submission_batch_id
   | Accepted_pending_authoritative of submission_batch_id
-  | Delete_barrier_rejected_pending_authoritative of
+  | Stale_rejected_pending_authoritative of
       { batch_id : submission_batch_id
       ; through : server_cursor
       }
@@ -440,6 +436,9 @@ type rejection_reason =
   | Missing_dependencies
   | Operational_failure
 
+(** A Stale cursor must strictly advance the frozen submission baseline. It
+    rejects the retry attempt, but does not by itself prove that an earlier
+    transmission of the same frozen batch did not execute. *)
 type rejection_resolution =
   | Stale of { through : server_cursor }
   | Definitive of

@@ -441,8 +441,6 @@ let block_record (value : Overlay.block_record) : Protocol.v2_block_record =
 
 let revision_scope_to_protocol = function
   | Overlay.Children_revision parent -> Protocol.V2_children_revision parent
-  | Page_tree_revision { page; maximum_depth } ->
-    V2_page_tree_revision { page; maximum_depth }
 ;;
 
 let structure_interest_to_protocol = function
@@ -529,8 +527,6 @@ let close_attached t =
 
 let overlay_scope_of_protocol = function
   | Protocol.V2_children_scope parent -> Overlay.Children_revision parent
-  | V2_page_tree_scope { page; maximum_depth } ->
-    Page_tree_revision { page; maximum_depth }
 ;;
 
 let parse_preconditions (value : Protocol.v2_preconditions) =
@@ -789,22 +785,12 @@ let read_snapshot database request command =
                 snapshot
                 (Overlay.Page_tree { page; maximum_depth; limit; cursor })
             with
-            | Ok
-                (Overlay.Page_tree_result
-                   { page
-                   ; maximum_depth
-                   ; revision_scope
-                   ; scope_revision
-                   ; items
-                   ; next_cursor
-                   }) ->
+            | Ok (Overlay.Page_tree_result { page; maximum_depth; items; next_cursor }) ->
               response
                 request
                 (Protocol.V2_page_tree_outcome
                    { page
                    ; maximum_depth
-                   ; revision_scope = revision_scope_to_protocol revision_scope
-                   ; scope_revision = Overlay.Scope_revision.to_string scope_revision
                    ; items =
                        List.map
                          (fun (item : Overlay.tree_member) ->

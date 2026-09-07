@@ -7,12 +7,12 @@
     "getPage": {"interest":"pageUuid","revision":"pageRevision"},
     "getBlock": {"interest":"blockUuid","revision":"blockRevision"},
     "getChildren": {"interest":"childrenScope","revision":"structureRevision"},
-    "getPageTree": {"interest":"pageTreeDepth","revision":"structureRevision"}
+    "getPageTree": {"interest":"pageTreeDepth","revision":"blockRevision"}
   },
   "mutations": {
     "saveBlock": {"target":"blockUuid","requiredPreconditions":["block"]},
     "insertBlocks": {"target":"appendToParent","requiredPreconditions":["childrenScope"]},
-    "deleteBlocks": {"target":"singleRoot","requiredPreconditions":["block","pageTreeScope"]},
+    "deleteBlocks": {"target":"singleRoot","requiredPreconditions":["block"]},
     "createJournalPage": {"target":"journalDayAndPageUuid","requiredPreconditions":["page"]},
     "setTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]},
     "clearTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]}

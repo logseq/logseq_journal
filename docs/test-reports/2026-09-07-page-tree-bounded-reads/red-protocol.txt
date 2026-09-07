@@ -1,0 +1,1 @@
+Fatal error: exception Failure("protocol failures:\nreject retired page-tree scope: Failure(\"retired page-tree write scope was accepted\")\npage-tree result has no collection revision: Failure(\"revision-free page-tree result rejected: unknown, duplicate, or missing field\")")

@@ -143,11 +143,16 @@ let tuples db ~e2ee entity =
 ;;
 
 let entities_with_uuid db =
-  Datascript.datoms db Datascript.Eavt ~a:"block/uuid" ()
-  |> Seq.fold_left
-       (fun entities datom ->
-          if List.mem datom.Datascript.e entities then entities else datom.e :: entities)
-       []
+  let _, entities =
+    Datascript.datoms db Datascript.Aevt ~a:"block/uuid" ()
+    |> Seq.fold_left
+         (fun (previous, entities) (datom : Datascript.datom) ->
+            match previous with
+            | Some entity when Int.equal entity datom.e -> previous, entities
+            | _ -> Some datom.e, datom.e :: entities)
+         (None, [])
+  in
+  entities
 ;;
 
 let hex32 value = Printf.sprintf "%08lx" value

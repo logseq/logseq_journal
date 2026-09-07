@@ -120,8 +120,6 @@ let service =
                P.V2_page_tree_outcome
                  { page
                  ; maximum_depth
-                 ; revision_scope = V2_page_tree_revision { page; maximum_depth }
-                 ; scope_revision = "tree-1"
                  ; items =
                      (if !deleted
                       then []

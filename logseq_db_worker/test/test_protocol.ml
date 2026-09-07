@@ -1,6 +1,31 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
 
+let page_tree_contract_rejects_retired_scope () =
+  let raw =
+    Yojson.Safe.from_string
+      {|{"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000009","command":{"type":"deleteBlocks","mutationId":"30000000-0000-4000-8000-000000000003","root":"10000000-0000-4000-8000-000000000002","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000002","revision":"block-revision:v1:1"}],"pages":[],"scopes":[{"scope":{"type":"pageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":8},"revision":"obsolete"}]}}}|}
+  in
+  match P.request_of_yojson raw with
+  | Error _ -> ()
+  | Ok _ -> T.fail "retired page-tree write scope was accepted"
+;;
+
+let page_tree_result_without_collection_revision () =
+  let raw =
+    Yojson.Safe.from_string
+      {|{"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000006","outcome":{"type":"pageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":1,"items":[],"nextCursor":null}}|}
+  in
+  match P.response_of_yojson raw with
+  | Error message -> T.fail "revision-free page-tree result rejected: %s" message
+  | Ok response ->
+    T.require
+      (Yojson.Safe.equal
+         (Yojson.Safe.sort raw)
+         (Yojson.Safe.sort (P.response_to_yojson response)))
+      "page-tree result gained a revision"
+;;
+
 let fixture_has_version expected_version path =
   match T.read_json (T.fixture path) with
   | `Assoc fields ->
@@ -344,7 +369,11 @@ let causal_error_rejects_legacy_and_unsafe_values () =
 let () =
   T.run
     "protocol"
-    [ T.case "frozen protocol budgets" (fun () ->
+    [ T.case "reject retired page-tree scope" page_tree_contract_rejects_retired_scope
+    ; T.case
+        "page-tree result has no collection revision"
+        page_tree_result_without_collection_revision
+    ; T.case "frozen protocol budgets" (fun () ->
         T.require (P.api_version = 2) "api version is not v2";
         T.require (P.maximum_request_bytes = 1_048_576) "request budget changed";
         T.require (P.maximum_response_bytes = 262_144) "response budget changed";

@@ -2865,7 +2865,7 @@ let finish_recovery ~reject core connection sync wire_batch effects batch =
   let state =
     if reject
     then
-      Overlay.Delete_barrier_rejected_pending_authoritative
+      Overlay.Stale_rejected_pending_authoritative
         { batch_id; through = recovery_cursor 1 }
     else Overlay.Accepted_pending_authoritative batch_id
   in
@@ -2988,7 +2988,7 @@ let recovery_barrier_blocks_queued ~rejected () =
   let state =
     if rejected
     then
-      Overlay.Delete_barrier_rejected_pending_authoritative
+      Overlay.Stale_rejected_pending_authoritative
         { batch_id; through = recovery_cursor 1 }
     else Overlay.Accepted_pending_authoritative batch_id
   in

@@ -1,0 +1,31 @@
+Testing `Worker application integration'.
+This run has ID `8BDZRNLL'.
+
+  [OK]          v2 boundary          0   read response becomes normalized feed.
+  [OK]          v2 boundary          1   admission inspection preserves graph...
+  [OK]          v2 boundary          2   mutation uses target-local revision.
+  [OK]          v2 boundary          3   unrelated projection does not reject...
+  [OK]          v2 boundary          4   status conflict refreshes authoritat...
+> [FAIL]        v2 boundary          5   delete uses caller-observed block re...
+  [OK]          v2 boundary          6   child creation uses caller-observed ...
+  [OK]          v2 boundary          7   Capture refreshes children revision.
+  [OK]          v2 boundary          8   Capture retries revision conflicts.
+  [OK]          v2 boundary          9   Capture task retains inserted block ...
+  [OK]          v2 boundary         10   Capture task rejects a missing inser...
+  [OK]          v2 boundary         11   stale calendar generation rejects Ca...
+  [OK]          v2 boundary         12   uninterested change does not hydrate.
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ [FAIL]        v2 boundary          5   delete uses caller-observed block...  │
+└──────────────────────────────────────────────────────────────────────────────┘
+ASSERT delete did not use only its caller-observed block revision
+FAIL delete did not use only its caller-observed block revision
+Raised at Alcotest_engine__Test.check_err in file "src/alcotest-engine/test.ml", line 157, characters 20-48
+Called from Alcotest_engine__Core.Make.protect_test.(fun) in file "src/alcotest-engine/core.ml", line 181, characters 17-23
+Called from Alcotest_engine__Monad.Identity.catch in file "src/alcotest-engine/monad.ml", line 24, characters 31-35
+
+Logs saved to `~/gh-repos/logseq_journal/_build/_tests/Worker application integration/v2 boundary.005.output'.
+ ──────────────────────────────────────────────────────────────────────────────
+
+Full test results in `~/gh-repos/logseq_journal/_build/_tests/Worker application integration'.
+1 failure! in 0.003s. 13 tests run.

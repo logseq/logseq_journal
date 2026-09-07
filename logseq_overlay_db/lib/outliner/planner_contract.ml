@@ -8,7 +8,6 @@ let contains_children_scope parent scopes =
   List.exists
     (fun (scope, _) ->
        match scope with
-       | Types.Children_revision candidate -> Graph.Uuid.equal candidate parent
-       | Page_tree_revision _ -> false)
+       | Types.Children_revision candidate -> Graph.Uuid.equal candidate parent)
     scopes
 ;;

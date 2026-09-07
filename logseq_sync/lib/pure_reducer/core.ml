@@ -1256,7 +1256,7 @@ let plan_submission core =
            | Queued
            | Submitted _
            | Accepted_pending_authoritative _
-           | Delete_barrier_rejected_pending_authoritative _
+           | Stale_rejected_pending_authoritative _
            | Blocked -> None)
         descriptors
     in
@@ -1265,7 +1265,7 @@ let plan_submission core =
         (fun (item : Overlay.submission_descriptor) ->
            match item.state with
            | Overlay.Accepted_pending_authoritative _
-           | Delete_barrier_rejected_pending_authoritative _ -> true
+           | Stale_rejected_pending_authoritative _ -> true
            | Queued | Submitted _ | Blocked -> false)
         descriptors
     in

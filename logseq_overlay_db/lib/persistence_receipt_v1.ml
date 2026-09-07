@@ -24,6 +24,10 @@ type terminal_batch_receipt =
   }
 
 and terminal_batch_outcome =
+  | Terminal_stale of
+      { through : Types.server_cursor
+      ; executed_through : Types.server_cursor option
+      }
   | Terminal_accepted of Types.acceptance_barrier
   | Terminal_proven_unexecuted of
       { mutation_id : Graph.Uuid.t
@@ -272,11 +276,28 @@ type proven_unexecuted_terminal_batch_receipt_v1 =
   }
 [@@deriving yojson { strict = false }]
 
+type stale_terminal_batch_receipt_v1 =
+  { batch_id : string [@key "batchId"]
+  ; format_version : int [@key "formatVersion"]
+  ; through : string
+  ; executed_through : string option [@key "executedThrough"]
+  ; receipt_type : string [@key "receiptType"]
+  }
+[@@deriving yojson]
+
 let terminal_batch_key = Mutation_receipt.terminal_batch_key
 
 let encode_terminal_batch receipt =
   let json =
     match receipt.terminal_outcome with
+    | Terminal_stale { through; executed_through } ->
+      stale_terminal_batch_receipt_v1_to_yojson
+        { batch_id = Types.Submission_batch_id.to_string receipt.terminal_batch_id
+        ; format_version = 1
+        ; through = Types.Server_cursor.to_string through
+        ; executed_through = Option.map Types.Server_cursor.to_string executed_through
+        ; receipt_type = "staleBatch"
+        }
     | Terminal_accepted barrier ->
       accepted_terminal_batch_receipt_v1_to_yojson
         { batch_id = Types.Submission_batch_id.to_string receipt.terminal_batch_id
@@ -303,6 +324,24 @@ let decode_terminal_batch (key, source) =
     match json with
     | `Assoc fields ->
       (match List.assoc_opt "receiptType" fields with
+       | Some (`String "staleBatch") ->
+         let* receipt = stale_terminal_batch_receipt_v1_of_yojson json in
+         let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
+         let* through = Types.Server_cursor.of_string receipt.through in
+         let* executed_through =
+           match receipt.executed_through with
+           | None -> Ok None
+           | Some value -> Result.map Option.some (Types.Server_cursor.of_string value)
+         in
+         if
+           receipt.format_version <> 1
+           || not (String.equal key (terminal_batch_key terminal_batch_id))
+         then Error "invalid stale terminal batch identity or version"
+         else
+           Ok
+             { terminal_batch_id
+             ; terminal_outcome = Terminal_stale { through; executed_through }
+             }
        | Some (`String "acceptedBatch") ->
          let* receipt = accepted_terminal_batch_receipt_v1_of_yojson json in
          let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in

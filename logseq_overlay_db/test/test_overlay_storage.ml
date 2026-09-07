@@ -379,11 +379,212 @@ let snapshot_checksum_mismatch_fails_before_activation () =
         ~expected_checksum:(Some (checksum "ffffffffffffffff"))
         ~expected_rows
     with
-    | Error (Snapshot_parse_error _) -> ()
+    | Error (Snapshot_parse_error _) ->
+      (match Database.mirror_presence (inspect_mirror support behavior) with
+       | Absent _ -> ()
+       | Available _ -> Alcotest.fail "mismatching checksum published a mirror");
+      let staging_root = Filename.concat support "logseq-db-worker/synced-graphs" in
+      Alcotest.(check int)
+        "mismatch removed staging artifacts"
+        0
+        (Array.length (Sys.readdir staging_root))
     | Error _ -> Alcotest.fail "checksum mismatch returned the wrong error"
     | Ok prepared ->
       Database.cancel_snapshot_activation prepared;
       Alcotest.fail "checksum mismatch reached activation")
+;;
+
+let checksum_snapshot_fixture root ~e2ee ~empty ~duplicates ~title =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let source = Filename.concat root "source" in
+  Unix.mkdir source 0o700;
+  let database_path = T.seed_mirror source in
+  if e2ee then T.mark_snapshot_e2ee database_path;
+  let connection =
+    Storage.open_database database_path |> T.require_ok ~behavior:"open vector"
+  in
+  let original =
+    Storage.restore_database connection |> T.require_ok ~behavior:"restore vector"
+  in
+  let base =
+    Datascript.datoms original Datascript.Eavt ()
+    |> List.of_seq
+    |> List.filter (fun (d : Datascript.datom) ->
+      not
+        (List.mem
+           d.a
+           [ "block/uuid"
+           ; "block/name"
+           ; "block/title"
+           ; "block/page"
+           ; "block/parent"
+           ; "block/order"
+           ; "block/tags"
+           ]))
+  in
+  let d e a v : Datascript.datom = { e; a; v; tx = 536870913; added = true } in
+  let u n = Printf.sprintf "91000000-0000-4000-8000-%012d" n in
+  let facts =
+    if empty
+    then []
+    else
+      [ d 200000 "block/uuid" (Uuid (u 0))
+      ; d 200000 "block/name" (String "journal")
+      ; d 200000 "block/title" (String "日誌😀")
+      ; d 200001 "block/uuid" (Uuid (u 1))
+      ; d 200001 "block/page" (Ref 200000)
+      ; d 200001 "block/parent" (Ref 200000)
+      ; d 200001 "block/order" (String "a0")
+      ; d 200001 "block/title" (String title)
+      ; d 200002 "block/uuid" (Uuid (u 2))
+      ; d 200002 "block/name" (String "excluded built-in")
+      ; d 200002 "logseq.property/built-in?" (Bool true)
+      ; d 200003 "block/uuid" (Uuid (u 3))
+      ; d 200003 "block/title" (String "excluded orphan")
+      ; d 200004 "block/name" (String "excluded without UUID")
+      ; d 200005 "block/uuid" (Uuid (u 1))
+      ; d 200005 "block/page" (Ref 200004)
+      ; d 200005 "block/order" (String "a1")
+      ; d 200006 "db/ident" (Keyword "logseq.class/Page")
+      ; d 200007 "block/uuid" (Uuid (u 7))
+      ; d 200007 "block/tags" (Ref 200006)
+      ]
+  in
+  let repeated =
+    if duplicates
+    then List.map (fun (d : Datascript.datom) -> { d with tx = d.tx + 1 }) facts
+    else []
+  in
+  let database =
+    Datascript.init_db ~schema:(Datascript.schema original) (base @ facts @ repeated)
+  in
+  let callbacks = Storage.connection_callbacks connection in
+  callbacks.begin_staging () |> T.require_ok ~behavior:"begin vector";
+  Datascript.store ~storage:callbacks.storage database;
+  let batch =
+    callbacks.finish_staging
+      None
+      [ Datascript.Storage.tail_address, Datascript.Storage_tail [] ]
+    |> T.require_ok ~behavior:"finish vector"
+  in
+  Storage.commit_batch callbacks batch |> T.require_ok ~behavior:"commit vector";
+  Storage.close callbacks |> T.require_ok ~behavior:"close vector";
+  let path = Filename.concat root "snapshot.transit" in
+  let rows = T.write_snapshot_from_database ~database_path ~snapshot_path:path in
+  path, rows
+;;
+
+let checksum_vectors_preserve_snapshot_semantics () =
+  let behavior = "snapshot checksum independent vectors" in
+  List.iter
+    (fun (e2ee, empty, digest) ->
+       List.iter
+         (fun duplicates ->
+            List.iter
+              (fun expected ->
+                 T.with_temp_directory "overlay-checksum-vector-" (fun root ->
+                   let path, expected_rows =
+                     checksum_snapshot_fixture
+                       root
+                       ~e2ee
+                       ~empty
+                       ~duplicates
+                       ~title:"café é 🚀"
+                   in
+                   let support = Filename.concat root "target" in
+                   Unix.mkdir support 0o700;
+                   let dependencies, _, inspection =
+                     absent_inspection ~behavior support
+                   in
+                   let prepared =
+                     Database.prepare_snapshot_activation
+                       dependencies
+                       inspection
+                       ~path
+                       ~applied_server_cursor:(server_cursor 7)
+                       ~expected_checksum:
+                         (if expected then Some (checksum digest) else None)
+                       ~expected_rows
+                     |> T.require_ok ~behavior
+                   in
+                   Fun.protect
+                     ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
+                     (fun () ->
+                        ignore (supply_snapshot_crypto ~behavior prepared 0);
+                        ignore
+                          (Database.commit_snapshot_activation prepared
+                           |> T.require_ok ~behavior);
+                        match
+                          Database.mirror_presence (inspect_mirror support behavior)
+                        with
+                        | Available { checksum = Some actual; checkpoint; _ } ->
+                          Alcotest.(check string)
+                            "durable independently checked checksum"
+                            (Checksum.to_string (checksum digest))
+                            (Checksum.to_string actual);
+                          T.require
+                            (Server_cursor.equal checkpoint (server_cursor 7))
+                            "lost checkpoint cursor"
+                        | _ -> Alcotest.fail "activation did not persist a checksum")))
+              [ false; true ])
+         [ false; true ])
+    [ false, false, "644f8bcb33ecbfff"
+    ; true, false, "aaf8f63fd3b0dd97"
+    ; false, true, "0000000000000000"
+    ; true, true, "0000000000000000"
+    ]
+;;
+
+let unused_preparation_checksum_defers_invalid_utf8_without_publication () =
+  let behavior = "unused preparation checksum defers invalid UTF-8" in
+  T.with_temp_directory "overlay-checksum-late-failure-" (fun root ->
+    let path, expected_rows =
+      checksum_snapshot_fixture
+        root
+        ~e2ee:false
+        ~empty:false
+        ~duplicates:false
+        ~title:"\255"
+    in
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let dependencies, _, inspection = absent_inspection ~behavior support in
+    let prepared =
+      Database.prepare_snapshot_activation
+        dependencies
+        inspection
+        ~path
+        ~applied_server_cursor:(server_cursor 0)
+        ~expected_checksum:None
+        ~expected_rows
+      |> T.require_ok ~behavior
+    in
+    Fun.protect
+      ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
+      (fun () ->
+         ignore (supply_snapshot_crypto ~behavior prepared 0);
+         for _attempt = 1 to 2 do
+           (match Database.commit_snapshot_activation prepared with
+            | Error (Snapshot_parse_error message) ->
+              T.require
+                (String.starts_with ~prefix:"Invalid_argument" message)
+                "late failure was not checksum UTF-8 validation"
+            | Error _ -> Alcotest.fail "late checksum failure returned the wrong error"
+            | Ok _ -> Alcotest.fail "invalid checksum input was published");
+           match Database.mirror_presence (inspect_mirror support behavior) with
+           | Absent _ -> ()
+           | Available _ -> Alcotest.fail "failed checksum published a mirror"
+         done;
+         Database.cancel_snapshot_activation prepared;
+         Database.cancel_snapshot_activation prepared;
+         let staging_root = Filename.concat support "logseq-db-worker/synced-graphs" in
+         Alcotest.(check int)
+           "cancellation removed staging artifacts"
+           0
+           (Array.length (Sys.readdir staging_root));
+         match Database.commit_snapshot_activation prepared with
+         | Error Snapshot_preparation_canceled -> ()
+         | _ -> Alcotest.fail "canceled late failure remained usable"))
 ;;
 
 let available_mirror_is_generation_bound () =
@@ -1606,6 +1807,14 @@ let cases =
       "snapshot commit is single-use"
       `Quick
       snapshot_commit_is_single_use
+  ; Alcotest.test_case
+      "snapshot checksum independent vectors"
+      `Quick
+      checksum_vectors_preserve_snapshot_semantics
+  ; Alcotest.test_case
+      "unused preparation checksum defers invalid UTF-8"
+      `Quick
+      unused_preparation_checksum_defers_invalid_utf8_without_publication
   ; Alcotest.test_case
       "snapshot checksum mismatch fails before activation"
       `Quick

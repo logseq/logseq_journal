@@ -1,0 +1,9 @@
+{
+  "baseline": true,
+  "source_sha256": {
+    "database.ml": "a18f995df1337eb9c4094990909df2758ed403cc29183299759ab6b964e1007b",
+    "authoritative_checksum.ml": "6607b8136be974333dd73a95f00ba651aa2dca7e3e8626f53841e927cda210c2"
+  },
+  "compiler": "5.1.1",
+  "profile": "release with isolated measurement wrappers"
+}

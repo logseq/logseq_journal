@@ -176,12 +176,7 @@ type journal_item =
   ; revision : page_state_revision
   }
 
-type structure_revision_scope =
-  | Children_revision of Graph.block_uuid
-  | Page_tree_revision of
-      { page : Graph.page_uuid
-      ; maximum_depth : int
-      }
+type structure_revision_scope = Children_revision of Graph.block_uuid
 
 type structure_interest =
   | Children_interest of Graph.block_uuid
@@ -229,8 +224,6 @@ type structure_result =
   | Page_tree_result of
       { page : Graph.page_uuid
       ; maximum_depth : int
-      ; revision_scope : structure_revision_scope
-      ; scope_revision : scope_revision
       ; items : tree_member list
       ; next_cursor : Graph.Cursor.t option
       }
@@ -360,7 +353,7 @@ type transport_state =
   | Queued
   | Submitted of submission_batch_id
   | Accepted_pending_authoritative of submission_batch_id
-  | Delete_barrier_rejected_pending_authoritative of
+  | Stale_rejected_pending_authoritative of
       { batch_id : submission_batch_id
       ; through : server_cursor
       }

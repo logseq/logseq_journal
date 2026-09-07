@@ -403,12 +403,6 @@ let read_block context block_uuid =
   | V2_response _ -> fail_worker context "block-read" "unexpected-response"
 ;;
 
-let precondition_scope = function
-  | Protocol.V2_children_revision parent -> Protocol.V2_children_scope parent
-  | V2_page_tree_revision { page; maximum_depth } ->
-    V2_page_tree_scope { page; maximum_depth }
-;;
-
 let require_block context ~block_uuid ~parent_uuid ~title =
   match read_block context block_uuid with
   | Error () -> fail_worker context "block-recovery" "missing"
@@ -478,27 +472,10 @@ let insert_block context ~block_uuid ~parent_uuid ~title ~after_server_t ~on_app
 
 let delete_block context ~block_uuid ~after_server_t =
   report_phase "delete-precondition-start";
-  let block, revision =
+  let _, revision =
     match read_block context block_uuid with
     | Ok value -> value
     | Error () -> fail_worker context "delete-precondition" "block-missing"
-  in
-  let revision_scope, scope_revision =
-    match
-      graph_request
-        context
-        (V2_get_page_tree
-           { page = block.block.page
-           ; maximum_depth = 256
-           ; limit = 200
-           ; cursor = None
-           ; revision = None
-           })
-    with
-    | V2_response
-        { outcome = V2_page_tree_outcome { revision_scope; scope_revision; _ }; _ } ->
-      revision_scope, scope_revision
-    | V2_response _ -> fail_worker context "delete-precondition" "page-tree-missing"
   in
   report_phase "delete-precondition-complete";
   run_mutation
@@ -508,11 +485,7 @@ let delete_block context ~block_uuid ~after_server_t =
     (V2_delete_blocks
        { mutation_id = fresh_uuid ()
        ; root = block_uuid
-       ; preconditions =
-           { blocks = [ block_uuid, revision ]
-           ; pages = []
-           ; scopes = [ precondition_scope revision_scope, scope_revision ]
-           }
+       ; preconditions = { blocks = [ block_uuid, revision ]; pages = []; scopes = [] }
        })
 ;;
 

@@ -1,0 +1,158 @@
+{
+  "block_count": 100000,
+  "fixture_checksum": "d6f0ab746f1ca9da2d66842e9dcd834b13b757822c2fecff8a65040bbfb7e8f3",
+  "samples": [
+    {
+      "active_outbox_records": 128,
+      "active_outbox_bytes": 188552,
+      "status": "Measured",
+      "wall_time_samples": [
+        3.2570362091064453, 3.8008689880371094, 3.5271644592285156,
+        3.4379959106445312, 3.453969955444336
+      ],
+      "allocation_samples": [
+        8419660.0, 8419737.0, 8419646.0, 8419737.0, 8419667.0
+      ],
+      "rss_samples": [
+        191758336, 191758336, 191758336, 191758336, 191758336
+      ],
+      "get_blocks_64": [
+        {
+          "wall_time_ms": 3.2570362091064453,
+          "allocation_bytes": 8419660.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 3.8008689880371094,
+          "allocation_bytes": 8419737.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 3.5271644592285156,
+          "allocation_bytes": 8419646.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 3.4379959106445312,
+          "allocation_bytes": 8419737.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 3.453969955444336,
+          "allocation_bytes": 8419667.0,
+          "rss_bytes": 191758336
+        }
+      ],
+      "get_structure_200": [
+        {
+          "wall_time_ms": 10.756969451904297,
+          "allocation_bytes": 23196640.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 9.937047958374023,
+          "allocation_bytes": 23196570.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 9.904146194458008,
+          "allocation_bytes": 23196591.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 10.224103927612305,
+          "allocation_bytes": 23196570.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 9.975910186767578,
+          "allocation_bytes": 23196612.0,
+          "rss_bytes": 191758336
+        }
+      ],
+      "get_journals_200": [
+        {
+          "wall_time_ms": 2.2420883178710938,
+          "allocation_bytes": 8447233.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 2.1851062774658203,
+          "allocation_bytes": 8447163.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 2.1979808807373047,
+          "allocation_bytes": 8447184.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 2.190113067626953,
+          "allocation_bytes": 8447163.0,
+          "rss_bytes": 191758336
+        },
+        {
+          "wall_time_ms": 2.1610260009765625,
+          "allocation_bytes": 8447205.0,
+          "rss_bytes": 191758336
+        }
+      ],
+      "single_block_change_classification": [],
+      "replan_and_diff": [
+        {
+          "wall_time_ms": 71.36297225952148,
+          "allocation_bytes": 222674786.0,
+          "rss_bytes": 191823872
+        },
+        {
+          "wall_time_ms": 71.47908210754395,
+          "allocation_bytes": 222676391.0,
+          "rss_bytes": 191823872
+        },
+        {
+          "wall_time_ms": 71.13099098205566,
+          "allocation_bytes": 222676436.0,
+          "rss_bytes": 191840256
+        },
+        {
+          "wall_time_ms": 70.52898406982422,
+          "allocation_bytes": 222676693.0,
+          "rss_bytes": 191840256
+        },
+        {
+          "wall_time_ms": 70.46103477478027,
+          "allocation_bytes": 222675592.0,
+          "rss_bytes": 191840256
+        }
+      ],
+      "reopen": [
+        {
+          "wall_time_ms": 27.42910385131836,
+          "allocation_bytes": 10489737.0,
+          "rss_bytes": 182747136
+        },
+        {
+          "wall_time_ms": 23.9260196685791,
+          "allocation_bytes": 8654736.0,
+          "rss_bytes": 182829056
+        },
+        {
+          "wall_time_ms": 25.861024856567383,
+          "allocation_bytes": 8654757.0,
+          "rss_bytes": 182845440
+        },
+        {
+          "wall_time_ms": 25.899887084960938,
+          "allocation_bytes": 8654736.0,
+          "rss_bytes": 182878208
+        },
+        {
+          "wall_time_ms": 25.361061096191406,
+          "allocation_bytes": 8654778.0,
+          "rss_bytes": 182878208
+        }
+      ],
+      "delete_conflict": []
+    }
+  ]
+}

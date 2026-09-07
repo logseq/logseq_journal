@@ -99,9 +99,6 @@ let seed_feed runtime =
           (Protocol.V2_page_tree_outcome
              { page = page_uuid
              ; maximum_depth = 1
-             ; revision_scope =
-                 V2_page_tree_revision { page = page_uuid; maximum_depth = 1 }
-             ; scope_revision = "scope-tree-1"
              ; items =
                  [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid }
                  ]

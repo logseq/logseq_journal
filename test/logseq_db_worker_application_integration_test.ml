@@ -115,8 +115,6 @@ let seed_visible_block runtime =
        (Protocol.V2_page_tree_outcome
           { page = page_uuid
           ; maximum_depth = 1
-          ; revision_scope = V2_page_tree_revision { page = page_uuid; maximum_depth = 1 }
-          ; scope_revision = "tree-scope-1"
           ; items =
               [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid } ]
           ; next_cursor = None
@@ -331,9 +329,6 @@ let test_status_conflict_refreshes_authoritative_block () =
          (Protocol.V2_page_tree_outcome
             { page = page_uuid
             ; maximum_depth = 1
-            ; revision_scope =
-                V2_page_tree_revision { page = page_uuid; maximum_depth = 1 }
-            ; scope_revision = "tree-scope-2"
             ; items =
                 [ { value = record; revision = "block-2"; depth = 0; parent = page_uuid }
                 ]
@@ -370,10 +365,7 @@ let test_delete_uses_caller_observed_block_revision () =
   | [ { Protocol.command =
           V2_delete_blocks
             { preconditions =
-                { blocks = [ (precondition_block, block_revision) ]
-                ; scopes = [ (V2_page_tree_scope _, scope_revision) ]
-                ; _
-                }
+                { blocks = [ (precondition_block, block_revision) ]; scopes = []; _ }
             ; _
             }
       ; _
@@ -383,9 +375,8 @@ let test_delete_uses_caller_observed_block_revision () =
       "delete precondition target"
       (Graph.Uuid.to_string block_uuid)
       (Graph.Uuid.to_string precondition_block);
-    Alcotest.(check string) "caller-observed delete revision" "block-1" block_revision;
-    Alcotest.(check string) "retained delete scope" "tree-scope-1" scope_revision
-  | _ -> Alcotest.fail "delete did not preserve its block and structure preconditions"
+    Alcotest.(check string) "caller-observed delete revision" "block-1" block_revision
+  | _ -> Alcotest.fail "delete did not use only its caller-observed block revision"
 ;;
 
 let seed_parent_children_interest runtime =

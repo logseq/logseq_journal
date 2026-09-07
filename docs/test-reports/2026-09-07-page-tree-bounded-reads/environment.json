@@ -1,0 +1,9 @@
+{
+  "baseline_commit": "de06ba1e82be625a157aff041ff6c55bfecc8a9d",
+  "baseline_database_sha256": "d445369677584e708d6c1fb094af843f130fa4847559724980de473918599295",
+  "final_database_sha256": "a18f995df1337eb9c4094990909df2758ed403cc29183299759ab6b964e1007b",
+  "mirror_page": "00000001-2026-0527-0000-000000000000",
+  "mirror_graph_id": "f5271dfc-897a-43c7-b116-04832d13b70b",
+  "ocaml": "5.1.1",
+  "dune": "3.23.1"
+}

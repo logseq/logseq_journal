@@ -47,27 +47,12 @@ let block_precondition database block behavior =
 
 let delete_precondition database block behavior =
   current_snapshot database behavior (fun snapshot ->
-    let value, block_revision =
+    let block_revision =
       match Database.get_blocks snapshot [ block ] |> T.require_ok ~behavior with
-      | [ Present_block { value; revision } ] -> value, revision
+      | [ Present_block { revision; _ } ] -> revision
       | _ -> Alcotest.fail "delete target block is missing"
     in
-    let scope, scope_revision =
-      match
-        Database.get_structure
-          snapshot
-          (Page_tree
-             { page = value.block.page; maximum_depth = 256; limit = 200; cursor = None })
-        |> T.require_ok ~behavior
-      with
-      | Page_tree_result { revision_scope; scope_revision; _ } ->
-        revision_scope, scope_revision
-      | Children_result _ -> Alcotest.fail "page-tree request returned children"
-    in
-    Database.write_precondition
-      ~blocks:[ block, block_revision ]
-      ~pages:[]
-      ~scopes:[ scope, scope_revision ]
+    Database.write_precondition ~blocks:[ block, block_revision ] ~pages:[] ~scopes:[]
     |> T.require_ok ~behavior)
 ;;
 
@@ -299,24 +284,88 @@ let journal_creation_does_not_require_index_precondition database =
      |> require_new_commit behavior)
 ;;
 
-let delete_requires_observed_structure_scope database =
-  let behavior = "delete requires an observed page-tree or parent scope" in
+let delete_uses_root_revision_and_latest_local_subtree database =
+  let behavior = "delete freezes latest local subtree with only root revision" in
   ignore
     (commit
        database
        (insert_precondition database T.page_uuid behavior)
-       (T.insert_blocks ~ordinal:42 ())
+       (Insert_blocks
+          { mutation_id = T.mutation_uuid 42
+          ; parent = T.page_uuid
+          ; tree =
+              { uuid = T.block_uuid
+              ; title = "Root"
+              ; children = [ { uuid = T.child_uuid; title = "Child"; children = [] } ]
+              }
+          })
+       behavior
+     |> require_new_commit behavior);
+  let expected = block_precondition database T.block_uuid behavior in
+  let pinned = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot pinned)
+    (fun () ->
+       let newer = T.uuid "72000000-0000-4000-8000-000000000001" in
+       let grandchild = T.uuid "72000000-0000-4000-8000-000000000002" in
+       ignore
+         (commit
+            database
+            (block_insert_precondition database T.child_uuid behavior)
+            (Insert_blocks
+               { mutation_id = T.mutation_uuid 44
+               ; parent = T.child_uuid
+               ; tree =
+                   { uuid = newer
+                   ; title = "Later child"
+                   ; children =
+                       [ { uuid = grandchild; title = "Later grandchild"; children = [] }
+                       ]
+                   }
+               })
+            behavior
+          |> require_new_commit behavior);
+       ignore
+         (commit database expected (T.delete_blocks ~ordinal:43 ()) behavior
+          |> require_new_commit behavior);
+       current_snapshot database behavior (fun snapshot ->
+         Database.get_blocks snapshot [ T.block_uuid; T.child_uuid; newer; grandchild ]
+         |> T.require_ok ~behavior
+         |> List.iter (function
+           | Missing_block _ -> ()
+           | Present_block _ ->
+             Alcotest.fail "latest local descendant survived delete admission"));
+       match
+         Database.get_blocks pinned [ T.block_uuid; newer ] |> T.require_ok ~behavior
+       with
+       | [ Present_block _; Missing_block _ ] -> ()
+       | _ -> Alcotest.fail "delete changed the earlier snapshot")
+;;
+
+let delete_rejects_a_changed_root_revision database =
+  let behavior = "delete rejects changed root revision" in
+  let expected = block_precondition database T.authoritative_block_uuid behavior in
+  ignore
+    (commit
+       database
+       expected
+       (Save_block
+          { mutation_id = T.mutation_uuid 45
+          ; block = T.authoritative_block_uuid
+          ; title = "Root changed after observation"
+          })
        behavior
      |> require_new_commit behavior);
   match
     Database.commit_local
       database
-      ~expected:(block_precondition database T.block_uuid behavior)
-      (T.delete_blocks ~ordinal:43 ())
+      ~expected
+      (Delete_blocks
+         { mutation_id = T.mutation_uuid 46; root = T.authoritative_block_uuid })
   with
-  | Error (Missing_precondition (Some (Page_tree_revision _))) -> ()
-  | Error _ -> Alcotest.fail "missing delete scope returned the wrong typed error"
-  | Ok _ -> Alcotest.fail "delete accepted only the root block revision"
+  | Error Target_precondition_conflict -> ()
+  | Error _ -> Alcotest.fail "changed root returned the wrong conflict"
+  | Ok _ -> Alcotest.fail "delete accepted a stale root revision"
 ;;
 
 let missing_preconditions_are_constructor_specific database =
@@ -968,6 +1017,9 @@ let orders_survive_reopen_and_outbox_drain () =
 
 let cases =
   [ T.database_case
+      "delete rejects changed root revision"
+      delete_rejects_a_changed_root_revision
+  ; T.database_case
       "append uses tail beyond first page"
       append_uses_tail_beyond_first_page
   ; Alcotest.test_case
@@ -997,8 +1049,8 @@ let cases =
       "journal creation does not require Journal_index revision"
       journal_creation_does_not_require_index_precondition
   ; T.database_case
-      "delete requires a structure precondition"
-      delete_requires_observed_structure_scope
+      "delete uses root revision and latest local subtree"
+      delete_uses_root_revision_and_latest_local_subtree
   ; T.database_case
       "constructor-specific missing preconditions are rejected"
       missing_preconditions_are_constructor_specific

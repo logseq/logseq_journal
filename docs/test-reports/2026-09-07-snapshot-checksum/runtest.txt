@@ -1,0 +1,39 @@
+logseq_overlay_db package boundary: ok
+running bounded auth capability
+running sign-out capability
+running local account binding
+running Timeline presentation handshake
+running termination handshake
+running network lifecycle epochs
+source boundary is clean
+Testing `application view'.
+This run has ID `YZHX59UK'.
+
+  [OK]          block identity adapter          0   failure retains admission...
+  [OK]          block identity adapter          1   serialization and native ...
+  [OK]          worker presentation             0   phase labels.
+  [OK]          worker presentation             1   retired diagnostics are h...
+  [OK]          worker presentation             2   graph lifecycle survives ...
+  [OK]          worker presentation             3   admission rows are compact.
+  [OK]          worker presentation             4   byte formatting.
+  [OK]          worker presentation             5   admission refresh coalesc...
+
+Full test results in `~/gh-repos/logseq_journal/_build/default/test/_build/_tests/application view'.
+Test Successful in 0.004s. 8 tests run.
+Testing `logseq db worker effect runner'.
+This run has ID `QF32K7JQ'.
+
+  [OK]          ID token cache          0   caps reuse at twenty-four hours.
+  [OK]          ID token cache          1   caps reuse one hour before expira...
+  [OK]          ID token cache          2   does not retain immediately non-r...
+  [OK]          ID token cache          3   rejects invalid responses without...
+  [OK]          ID token cache          4   coalesces concurrent misses.
+  [OK]          ID token cache          5   propagates Flutter failure withou...
+  [OK]          ID token cache          6   invalidation is credential-specific.
+  [OK]          ID token cache          7   sign-out clears entry and cancels...
+  [OK]          ID token cache          8   account replacement makes delayed...
+  [OK]          ID token cache          9   shutdown clears entry and cancels...
+  [OK]          contract                0   sync and publish delegation.
+
+Full test results in `~/gh-repos/logseq_journal/_build/default/logseq_db_worker/test/_build/_tests/logseq db worker effect runner'.
+Test Successful in 0.006s. 11 tests run.

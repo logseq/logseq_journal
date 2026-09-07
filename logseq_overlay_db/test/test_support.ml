@@ -459,31 +459,12 @@ let delete_precondition database ~block ~behavior =
   Fun.protect
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
-       let value, block_revision =
+       let block_revision =
          match Database.get_blocks snapshot [ block ] |> require_ok ~behavior with
-         | [ Present_block { value; revision } ] -> value, revision
+         | [ Present_block { revision; _ } ] -> revision
          | _ -> Alcotest.fail "fixture delete target is missing"
        in
-       let revision_scope, scope_revision =
-         match
-           Database.get_structure
-             snapshot
-             (Page_tree
-                { page = value.block.page
-                ; maximum_depth = 256
-                ; limit = 200
-                ; cursor = None
-                })
-           |> require_ok ~behavior
-         with
-         | Page_tree_result { revision_scope; scope_revision; _ } ->
-           revision_scope, scope_revision
-         | Children_result _ -> Alcotest.fail "page-tree request returned children"
-       in
-       Database.write_precondition
-         ~blocks:[ block, block_revision ]
-         ~pages:[]
-         ~scopes:[ revision_scope, scope_revision ]
+       Database.write_precondition ~blocks:[ block, block_revision ] ~pages:[] ~scopes:[]
        |> require_ok ~behavior)
 ;;
 

@@ -1775,7 +1775,71 @@ let test_page_replacement_invalidates_pending_continuation () =
     "late continuation changed the replacement"
 ;;
 
+let test_capture_identity_converges_with_reconciliation () =
+  let captured = block ~task_state:Journal_model.Todo ~child_count:1 901 in
+  let updated =
+    block ~source:"Completed capture" ~task_state:Journal_model.Todo ~child_count:1 901
+  in
+  let child = block ~parent_id:(Journal_model.id captured) 902 in
+  let initial =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed ~more:true [ day_feed ~more:true 20260809 "Today" [ captured ] ])
+    |> fun state ->
+    Timeline.expand state ~parent_id:(Journal_model.id captured)
+    |> fun state ->
+    Timeline.reconcile_detail
+      state
+      { Journal_graph_projection.root = captured
+      ; children = { blocks = [ child ]; continuation = None }
+      }
+  in
+  let initial_keys = slot_keys initial in
+  let completed = Timeline.prepend_timeline_entry initial (entry updated) in
+  let repeated = Timeline.prepend_timeline_entry completed (entry updated) in
+  require_equal_string_list
+    (slot_keys repeated)
+    initial_keys
+    "Capture completion duplicated a reconciled identity or lost child/paging slots";
+  require
+    (Timeline.total_count repeated = Timeline.total_count initial)
+    "duplicate completion increased the virtualized count";
+  require
+    (Timeline.is_expanded repeated ~block_id:(Journal_model.id captured))
+    "completion collapsed the captured entry";
+  require
+    (Timeline.anchor_decision repeated = Timeline.Reset_to_top)
+    "completion did not reset the capture anchor";
+  require
+    (List.exists
+       (function
+         | Timeline.Top_level e ->
+           Journal_model.source e.block = Journal_model.source updated
+         | _ -> false)
+       (Timeline.retained_slots repeated))
+    "completion did not update the existing entry";
+  let absent = Timeline.empty ~today:20260809 in
+  let completed_first = Timeline.prepend_timeline_entry absent (entry captured) in
+  let reconciled =
+    Timeline.replace_timeline_entry_page
+      completed_first
+      ~page:(page 20260809 "Today")
+      (timeline_page [ updated ])
+  in
+  let repeated = Timeline.prepend_timeline_entry reconciled (entry updated) in
+  require_equal_string_list
+    (slot_keys repeated)
+    [ "block:" ^ Journal_model.id captured ]
+    "completion-before-reconciliation did not converge";
+  require
+    (Timeline.total_count repeated = 1)
+    "completion-before-reconciliation count changed"
+;;
+
 let () =
+  test_capture_identity_converges_with_reconciliation ();
   test_stale_day_rebuild_is_atomic_and_generation_owned ();
   test_repeated_staleness_stops_until_retry_and_does_not_block_feed ();
   test_terminal_day_failure_and_listener_supersession ();

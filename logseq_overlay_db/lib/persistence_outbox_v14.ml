@@ -503,11 +503,11 @@ let transport_state_to_yojson = function
       [ "batchId", `String (Types.Submission_batch_id.to_string id)
       ; "type", `String "acceptedPendingAuthoritative"
       ]
-  | Delete_barrier_rejected_pending_authoritative { batch_id; through } ->
+  | Stale_rejected_pending_authoritative { batch_id; through } ->
     `Assoc
       [ "batchId", `String (Types.Submission_batch_id.to_string batch_id)
       ; "through", `String (Types.Server_cursor.to_string through)
-      ; "type", `String "deleteBarrierRejectedPendingAuthoritative"
+      ; "type", `String "staleRejectedPendingAuthoritative"
       ]
   | Blocked -> `Assoc [ "type", `String "blocked" ]
 ;;
@@ -524,11 +524,11 @@ let transport_state_of_yojson = function
   | `Assoc
       [ ("batchId", `String id)
       ; ("through", `String through)
-      ; ("type", `String "deleteBarrierRejectedPendingAuthoritative")
+      ; ("type", `String "staleRejectedPendingAuthoritative")
       ] ->
     let* batch_id = Types.Submission_batch_id.of_string id in
     let* through = Types.Server_cursor.of_string through in
-    Ok (Types.Delete_barrier_rejected_pending_authoritative { batch_id; through })
+    Ok (Types.Stale_rejected_pending_authoritative { batch_id; through })
   | `Assoc [ ("type", `String "blocked") ] -> Ok Types.Blocked
   | _ -> Error "invalid transport state"
 ;;

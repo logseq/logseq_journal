@@ -2839,20 +2839,44 @@ let submitted_save_retains_required_block_shadow database =
             (String.equal value.block.title "Frozen submitted title")
             "submitted title disappeared with its authoritative entity"
         | _ -> Alcotest.fail "submitted block shadow was not visible");
+       (match
+          Database.get_structure
+            snapshot
+            (Children { parent = T.page_uuid; limit = 200; cursor = None })
+          |> T.require_ok ~behavior
+        with
+        | Children_result { items; _ } ->
+          T.require
+            (List.exists
+               (fun (item : child_member) ->
+                  Graph.Uuid.equal item.block.block.uuid T.authoritative_block_uuid)
+               items)
+            "submitted block shadow lost its required parent membership"
+        | Page_tree_result _ -> Alcotest.fail "children query returned a page tree");
        match
          Database.get_structure
            snapshot
-           (Children { parent = T.page_uuid; limit = 200; cursor = None })
+           (Page_tree
+              { page = T.page_uuid; maximum_depth = 1; limit = 200; cursor = None })
          |> T.require_ok ~behavior
        with
-       | Children_result { items; _ } ->
-         T.require
-           (List.exists
-              (fun (item : child_member) ->
-                 Graph.Uuid.equal item.block.block.uuid T.authoritative_block_uuid)
-              items)
-           "submitted block shadow lost its required parent membership"
-       | Page_tree_result _ -> Alcotest.fail "children query returned a page tree")
+       | Page_tree_result { items; _ } ->
+         let item =
+           List.find
+             (fun (item : tree_member) ->
+                Graph.Uuid.equal item.block.block.uuid T.authoritative_block_uuid)
+             items
+         in
+         (match
+            Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+            |> T.require_ok ~behavior
+          with
+          | [ Present_block { value; revision } ] ->
+            T.require
+              (value = item.block && revision = item.revision)
+              "page tree lost submitted shadow content or revision"
+          | _ -> Alcotest.fail "submitted point shadow is missing")
+       | Children_result _ -> Alcotest.fail "page tree query returned children")
 ;;
 
 let queued_delete_detects_new_remote_descendant database =
@@ -3199,6 +3223,434 @@ let reopened_submission_does_not_reuse_terminal_batch () =
                "old terminal acknowledgement changed the reopened submission"))))
 ;;
 
+let stale_view database behavior =
+  Database.inspect_sync database |> T.require_ok ~behavior
+;;
+
+let reject_stale database batch through behavior =
+  let prepared, crypto =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token (stale_view database behavior))
+      (Reject_group
+         { batch_id = submission_batch_id batch
+         ; resolution = Stale { through = server_cursor through }
+         })
+    |> T.require_ok ~behavior
+  in
+  T.require (Option.is_none crypto) "Stale recovery requested encryption";
+  Database.apply_outbox_transition database prepared ~encrypted:None
+  |> T.require_ok ~behavior
+;;
+
+let stale_apply_wires database first wires behavior =
+  let transactions =
+    List.mapi
+      (fun ordinal wire ->
+         authoritative_transaction
+           ~cursor:(server_cursor (first + ordinal))
+           ~transaction:(encoded ~maximum_bytes:16384 wire))
+      wires
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:65536
+      ~transactions
+      ~through:(server_cursor (first + List.length wires - 1))
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let prepared, request =
+    Database.begin_authoritative
+      database
+      ~expected:(sync_view_token (stale_view database behavior))
+      batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) request
+  in
+  match Database.apply_authoritative database prepared ~decrypted with
+  | Ok (Authoritative_applied commit) -> commit
+  | Ok (Authoritative_deferred _) -> Alcotest.fail "Stale recovery unexpectedly deferred"
+  | Error (Authoritative_integrity_failure message) ->
+    Alcotest.failf "Stale integrity failure: %s" message
+  | Error _ -> Alcotest.fail "Stale authoritative transition failed"
+;;
+
+let stale_remote_wire uuid attribute value =
+  let module J = Transit_core.Json in
+  Transit_native.Transit.Json.to_string
+    ~mode:Transit_native.Transit.Json.Verbose
+    (J.Array
+       [ J.Array
+           [ J.Keyword "db/add"
+           ; J.Array [ J.Keyword "block/uuid"; J.Uuid (Graph.Uuid.to_string uuid) ]
+           ; J.Keyword attribute
+           ; value
+           ]
+       ])
+;;
+
+let stale_commit database mutation behavior =
+  let expected =
+    match mutation with
+    | Insert_blocks { parent; _ } -> T.insert_precondition database ~parent ~behavior
+    | Create_journal_page { page; _ } ->
+      let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+      let revision =
+        match Database.get_pages snapshot [ page ] |> T.require_ok ~behavior with
+        | [ Missing_page { revision; _ } ] -> revision
+        | _ -> Alcotest.fail "Stale journal fixture already exists"
+      in
+      Database.release_snapshot snapshot;
+      Database.write_precondition ~blocks:[] ~pages:[ page, revision ] ~scopes:[]
+      |> T.require_ok ~behavior
+    | Save_block { block; _ }
+    | Set_task_status { block; _ }
+    | Clear_task_status { block; _ } -> block_precondition database block behavior
+    | Delete_blocks { root; _ } -> T.delete_precondition database ~block:root ~behavior
+  in
+  match T.commit_mutation database ~expected mutation ~behavior with
+  | Local_committed commit -> commit
+  | Local_existing _ -> Alcotest.fail "Stale mutation fixture already exists"
+;;
+
+let stale_mutation kind =
+  let mutation_id = T.mutation_uuid 901 in
+  match kind with
+  | "insert" -> T.insert_blocks ~ordinal:901 ()
+  | "journal" -> T.create_journal_page ~ordinal:901 ()
+  | "save" ->
+    Save_block
+      { mutation_id; block = T.authoritative_block_uuid; title = "Stale local title" }
+  | "set" ->
+    Set_task_status { mutation_id; block = T.authoritative_block_uuid; status = Todo }
+  | "clear" -> Clear_task_status { mutation_id; block = T.authoritative_block_uuid }
+  | _ -> invalid_arg "unknown Stale mutation fixture"
+;;
+
+let stale_recovery ~kind ~progress ~executed database =
+  let behavior = "Stale recovery " ^ kind in
+  let baseline =
+    if kind = "clear"
+    then (
+      ignore
+        (stale_apply_wires
+           database
+           1
+           [ stale_remote_wire
+               T.authoritative_block_uuid
+               "logseq.property/status"
+               (Transit_core.Json.Keyword "logseq.property/status.todo")
+           ]
+           behavior);
+      1)
+    else 0
+  in
+  let mutation = stale_mutation kind in
+  let local = stale_commit database mutation behavior in
+  let submitted = submit_one database local behavior in
+  let through = baseline + 1 in
+  let first_wire =
+    if executed
+    then server_transaction ~mutation_id:local.mutation_id ~operation:kind submitted
+    else stale_remote_wire T.page_uuid "block/updated-at" (Transit_core.Json.Int 99)
+  in
+  if progress > 0 then ignore (stale_apply_wires database through [ first_wire ] behavior);
+  if progress > 1
+  then
+    ignore
+      (stale_apply_wires
+         database
+         (through + 1)
+         [ stale_remote_wire T.page_uuid "block/updated-at" (Transit_core.Json.Int 100) ]
+         behavior);
+  ignore (reject_stale database submitted through behavior);
+  if progress = 0
+  then (
+    let pending = sync_view_submissions (stale_view database behavior) in
+    T.require
+      (List.for_all (fun d -> d.state <> Queued && d.state <> Blocked) pending)
+      "Stale mutation was replanned before reaching its barrier";
+    ignore (reject_stale database submitted through behavior);
+    let committed = stale_apply_wires database through [ first_wire ] behavior in
+    if executed
+    then
+      T.require
+        (List.exists
+           (fun terminal ->
+              match terminal.receipt with
+              | Applied_receipt value ->
+                Graph.Uuid.equal value.mutation_id local.mutation_id
+              | _ -> false)
+           committed.terminal_receipts)
+        "own execution was not reported as Applied");
+  let view = stale_view database behavior in
+  if executed
+  then (
+    T.require
+      (sync_view_submissions view = [])
+      "validated own execution remained in the outbox";
+    match
+      Database.commit_local database ~expected:(T.empty_precondition ~behavior) mutation
+      |> T.require_ok ~behavior
+    with
+    | Local_existing (Existing_applied _) -> ()
+    | _ -> Alcotest.fail "validated own execution did not retain Applied receipt")
+  else (
+    (match sync_view_submissions view with
+     | [ { state = Queued; attempt_count = 1; mutation_id; _ } ] ->
+       T.require
+         (Graph.Uuid.equal mutation_id local.mutation_id)
+         "replanning changed mutation identity"
+     | _ -> Alcotest.fail "proven-unexecuted mutation was not replanned as Queued");
+    let fresh = submit_one database local behavior in
+    T.require
+      (not
+         (Submission_batch_id.equal
+            (submission_batch_id fresh)
+            (submission_batch_id submitted)))
+      "replanning reused the frozen submission attempt";
+    T.require
+      (Server_cursor.equal (submission_batch_t_before fresh) (sync_view_checkpoint view))
+      "replanning reused the old baseline");
+  let before = sync_view_submissions (stale_view database behavior) in
+  ignore (reject_stale database submitted through behavior);
+  T.require
+    (before = sync_view_submissions (stale_view database behavior))
+    "repeated old rejection changed recovered work"
+;;
+
+let stale_insert_dependency ~missing database =
+  let behavior = "Stale insert dependency recovery" in
+  let inserted = stale_commit database (T.insert_blocks ~ordinal:901 ()) behavior in
+  let submitted = submit_one database inserted behavior in
+  let dependent = stale_commit database (T.set_task_status ~ordinal:902 ()) behavior in
+  ignore (reject_stale database submitted 1 behavior);
+  let wire =
+    if missing
+    then
+      let module J = Transit_core.Json in
+      Transit_native.Transit.Json.to_string
+        ~mode:Transit_native.Transit.Json.Verbose
+        (J.Array
+           [ J.Array
+               [ J.Keyword "db/retractEntity"
+               ; J.Array
+                   [ J.Keyword "block/uuid"; J.Uuid (Graph.Uuid.to_string T.page_uuid) ]
+               ]
+           ])
+    else stale_remote_wire T.page_uuid "block/updated-at" (Transit_core.Json.Int 100)
+  in
+  ignore (stale_apply_wires database 1 [ wire ] behavior);
+  let states =
+    sync_view_submissions (stale_view database behavior) |> List.map (fun d -> d.state)
+  in
+  if missing
+  then (
+    T.require (states = [ Blocked; Blocked ]) "invalid replan did not block its dependent";
+    match
+      Database.commit_local
+        database
+        ~expected:(T.empty_precondition ~behavior)
+        (T.set_task_status ~ordinal:902 ())
+      |> T.require_ok ~behavior
+    with
+    | Local_existing (Existing_blocked { reason = Dependency_blocked id; _ }) ->
+      T.require
+        (Graph.Uuid.equal id inserted.mutation_id)
+        "blocked dependency lost its owner"
+    | _ -> Alcotest.fail "invalid dependent did not expose its block reason")
+  else (
+    T.require
+      (states = [ Queued; Queued ])
+      "Stale settlement did not release dependent work";
+    ignore (submit_group database [ inserted; dependent ] behavior))
+;;
+
+let stale_group_superseding_own_members database =
+  let behavior = "Stale group own ordinal evidence" in
+  let save ordinal title =
+    stale_commit
+      database
+      (Save_block
+         { mutation_id = T.mutation_uuid ordinal
+         ; block = T.authoritative_block_uuid
+         ; title
+         })
+      behavior
+  in
+  let first = save 901 "First" in
+  let second = save 902 "Final" in
+  let submitted = submit_group database [ first; second ] behavior in
+  let wires =
+    submission_batch_wires submitted
+    |> List.map (fun wire ->
+      server_normalized_transaction
+        ~mutation_id:(submission_wire_mutation_id wire)
+        ~operation:"save"
+        (submission_wire_protected_transaction wire))
+  in
+  ignore (reject_stale database submitted 2 behavior);
+  ignore (stale_apply_wires database 1 wires behavior);
+  T.require
+    (sync_view_submissions (stale_view database behavior) = [])
+    "superseded own member was resubmitted or blocked"
+;;
+
+let stale_wrong_ordinal_is_not_own database =
+  let behavior = "Stale wrong ordinal does not prove execution" in
+  let local = stale_commit database (stale_mutation "save") behavior in
+  let submitted = submit_one database local behavior in
+  let own =
+    server_transaction ~mutation_id:local.mutation_id ~operation:"save" submitted
+  in
+  ignore
+    (stale_apply_wires
+       database
+       1
+       [ stale_remote_wire T.page_uuid "block/updated-at" (Transit_core.Json.Int 99)
+       ; own
+       ; stale_remote_wire
+           T.authoritative_block_uuid
+           "block/title"
+           (Transit_core.Json.String "encrypted:\"Later remote\"")
+       ]
+       behavior);
+  ignore (reject_stale database submitted 2 behavior);
+  match sync_view_submissions (stale_view database behavior) with
+  | [ { state = Queued; _ } ] -> ()
+  | _ -> Alcotest.fail "matching content at the wrong ordinal was treated as execution"
+;;
+
+let stale_group_remote_prefix_is_not_own database =
+  let behavior = "Stale group requires original conditional prefix" in
+  let save ordinal title =
+    stale_commit
+      database
+      (Save_block
+         { mutation_id = T.mutation_uuid ordinal
+         ; block = T.authoritative_block_uuid
+         ; title
+         })
+      behavior
+  in
+  let first = save 901 "First" in
+  let second = save 902 "Final" in
+  let submitted = submit_group database [ first; second ] behavior in
+  let second_wire =
+    List.nth (submission_batch_wires submitted) 1 |> submission_wire_protected_transaction
+  in
+  ignore
+    (stale_apply_wires
+       database
+       1
+       [ stale_remote_wire T.page_uuid "block/updated-at" (Transit_core.Json.Int 99)
+       ; second_wire
+       ; stale_remote_wire
+           T.authoritative_block_uuid
+           "block/title"
+           (Transit_core.Json.String "encrypted:\"Remote winner\"")
+       ]
+       behavior);
+  ignore (reject_stale database submitted 3 behavior);
+  T.require
+    (List.map (fun d -> d.state) (sync_view_submissions (stale_view database behavior))
+     = [ Queued; Queued ])
+    "matching suffix without the original batch prefix was treated as execution"
+;;
+
+let stale_content_equality_is_only_no_change database =
+  let behavior = "Stale content equality cannot establish own execution" in
+  let local = stale_commit database (stale_mutation "set") behavior in
+  let submitted = submit_one database local behavior in
+  ignore (reject_stale database submitted 1 behavior);
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let operations wire =
+    match Codec.of_string wire with
+    | J.Array values -> values
+    | _ -> assert false
+  in
+  let wire =
+    Codec.to_string
+      ~mode:Codec.Verbose
+      (J.Array
+         (operations
+            (stale_remote_wire
+               T.authoritative_block_uuid
+               "logseq.property/status"
+               (J.Keyword "logseq.property/status.todo"))
+          @ operations (stale_remote_wire T.page_uuid "block/updated-at" (J.Int 99))))
+  in
+  let committed = stale_apply_wires database 1 [ wire ] behavior in
+  T.require
+    (List.exists
+       (fun terminal ->
+          match terminal.receipt with
+          | No_change_receipt value ->
+            Graph.Uuid.equal value.mutation_id local.mutation_id
+          | _ -> false)
+       committed.terminal_receipts)
+    "equivalent remote content earned an Applied execution receipt";
+  T.require
+    (sync_view_submissions (stale_view database behavior) = [])
+    "No_change intent remained queued"
+;;
+
+let stale_insert_collision_blocks_intent database =
+  let behavior = "Stale insert does not overwrite a conflicting UUID" in
+  let inserted = stale_commit database (T.insert_blocks ~ordinal:901 ()) behavior in
+  let submitted = submit_one database inserted behavior in
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let rec remote_title = function
+    | J.String value when String.starts_with ~prefix:"encrypted:" value ->
+      J.String "encrypted:\"Peer owns this UUID\""
+    | J.Array values -> J.Array (List.map remote_title values)
+    | value -> value
+  in
+  let remote =
+    submitted_transaction submitted
+    |> Codec.of_string
+    |> remote_title
+    |> Codec.to_string ~mode:Codec.Verbose
+  in
+  ignore (reject_stale database submitted 1 behavior);
+  ignore (stale_apply_wires database 1 [ remote ] behavior);
+  T.require
+    (List.map (fun d -> d.state) (sync_view_submissions (stale_view database behavior))
+     = [ Blocked ])
+    "replanning a conflicting insertion overwrote the authoritative UUID";
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  (match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+   | [ Present_block { value; _ } ] ->
+     T.require
+       (value.block.title = "Peer owns this UUID")
+       "blocked insertion hid the remote title"
+   | _ -> Alcotest.fail "collision rollback lost the remote block");
+  Database.release_snapshot snapshot
+;;
+
+let stale_invalid_barrier_is_rejected database =
+  let behavior = "Stale barrier must advance the frozen baseline" in
+  let local = stale_commit database (stale_mutation "insert") behavior in
+  let batch = submit_one database local behavior in
+  match
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token (stale_view database behavior))
+      (Reject_group
+         { batch_id = submission_batch_id batch
+         ; resolution = Stale { through = server_cursor 0 }
+         })
+  with
+  | Error (Outbox_transition_invalid _) -> ()
+  | _ -> Alcotest.fail "non-advancing Stale barrier was admitted as non-execution proof"
+;;
+
 let pure_cases =
   [ Alcotest.test_case
       "revision codecs reject unknown versions"
@@ -3223,138 +3675,183 @@ let pure_cases =
   ]
 ;;
 
+let stale_cases =
+  List.concat_map
+    (fun kind ->
+       List.concat_map
+         (fun progress ->
+            List.map
+              (fun executed ->
+                 T.database_case
+                   (Printf.sprintf
+                      "Stale %s progress=%d executed=%b"
+                      kind
+                      progress
+                      executed)
+                   (stale_recovery ~kind ~progress ~executed))
+              [ false; true ])
+         [ 0; 1; 2 ])
+    [ "insert"; "save"; "journal"; "set"; "clear" ]
+  @ [ T.database_case
+        "Stale releases dependent insert"
+        (stale_insert_dependency ~missing:false)
+    ; T.database_case
+        "Stale blocks invalid intent and dependent"
+        (stale_insert_dependency ~missing:true)
+    ; T.database_case
+        "Stale own group preserves superseding ordinals"
+        stale_group_superseding_own_members
+    ; T.database_case
+        "Stale wrong ordinal is not execution"
+        stale_wrong_ordinal_is_not_own
+    ; T.database_case
+        "Stale rejects non-advancing barrier"
+        stale_invalid_barrier_is_rejected
+    ; T.database_case
+        "Stale group requires original conditional prefix"
+        stale_group_remote_prefix_is_not_own
+    ; T.database_case
+        "Stale content equality is only No_change"
+        stale_content_equality_is_only_no_change
+    ; T.database_case
+        "Stale insert blocks UUID collision"
+        stale_insert_collision_blocks_intent
+    ]
+;;
+
 let database_cases =
-  [ Alcotest.test_case
-      "reopen never reuses a terminal batch identity"
-      `Quick
-      reopened_submission_does_not_reuse_terminal_batch
-  ; T.database_case
-      "empty sync view has checkpoint and no submissions"
-      empty_sync_view_has_checkpoint_and_no_submissions
-  ; T.database_case
-      "empty submission group fails atomically"
-      empty_submission_group_fails_before_durability
-  ; T.database_case
-      "outbox crypto results are validated before application"
-      outbox_crypto_results_are_validated_before_application
-  ; T.database_case "queued local commit is queryable" queued_local_commit_is_queryable
-  ; T.database_case
-      "local submission uses normalized transaction"
-      local_submission_uses_normalized_transaction
-  ; T.database_case
-      "local submission uses server-compatible fractional indices"
-      local_submission_uses_server_compatible_fractional_indices
-  ; T.database_case
-      "submit is atomic and retry is byte-identical"
-      (atomic_submit_and_retry_are_byte_identical ~advance:false)
-  ; T.database_case
-      "retry preserves its frozen baseline after an authoritative change"
-      (atomic_submit_and_retry_are_byte_identical ~advance:true)
-  ; T.database_case
-      "submission rejects an unfrozen queued dependency"
-      submission_rejects_unfrozen_queued_dependency
-  ; T.database_case
-      "submission rejects reordered members"
-      submission_rejects_reordered_members
-  ; T.database_case
-      "stale sync token changes nothing"
-      stale_sync_token_fails_without_state_change
-  ; T.database_case
-      "delete submission is singleton-only"
-      delete_submission_requires_singleton
-  ; T.database_case
-      "delete submission freezes complete wire footprint"
-      delete_submission_freezes_complete_wire_footprint
-  ; T.database_case
-      "admission charges plaintext and protected bytes"
-      admission_charges_plaintext_and_protected_bytes
-  ; Alcotest.test_case
-      "dependency shadow is admitted at first submission"
-      `Quick
-      dependency_shadow_is_admitted_at_first_submission
-  ; T.database_case "acceptance is transport-only" acceptance_is_transport_only
-  ; T.database_case
-      "acceptance barrier cannot precede submission interval"
-      acceptance_barrier_cannot_precede_submission_interval
-  ; T.database_case
-      "matching state does not replace origin evidence"
-      matching_state_does_not_replace_origin_evidence
-  ; T.database_case
-      "definitive rejection rolls back once"
-      definitive_rejection_rolls_back_once
-  ; T.database_case
-      "authoritative batch updates logical snapshot"
-      authoritative_batch_updates_the_logical_snapshot
-  ; T.database_case
-      "authoritative rebase replans queued ordinary mutation"
-      authoritative_rebase_replans_queued_ordinary_mutation
-  ; T.database_case
-      "authoritative rebase terminalizes queued no-change"
-      authoritative_rebase_terminalizes_queued_no_change
-  ; T.database_case
-      "authoritative rebase blocks transitive queued dependency"
-      authoritative_rebase_blocks_transitive_queued_dependency
-  ; T.database_case
-      "authoritative crypto is correlated and applied"
-      authoritative_crypto_is_correlated_and_applied
-  ; T.database_case
-      "submitted delete defers authoritative batch until transport outcome"
-      submitted_delete_defers_authoritative_batch_until_transport_outcome
-  ; T.database_case
-      "Pull-first delete conflict proves non-execution"
-      pull_first_delete_conflict_proves_non_execution
-  ; T.database_case
-      "Stale delete resolves after equivalent authoritative delete"
-      stale_delete_resolves_to_no_change_after_equivalent_authoritative_delete
-  ; T.database_case
-      "Stale delete without conflict becomes blocked at barrier"
-      stale_delete_without_conflict_becomes_blocked_at_barrier
-  ; T.database_case
-      "accepted member terminalizes at authoritative barrier"
-      accepted_member_terminalizes_at_its_authoritative_barrier
-  ; T.database_case
-      "accepted member allows reordered normalized datoms"
-      accepted_member_allows_reordered_normalized_datoms
-  ; T.database_case
-      "accepted member rejects wrong payload digest"
-      accepted_member_rejects_wrong_payload
-  ; T.database_case
-      "accepted member rejects extra touched fact"
-      accepted_member_rejects_extra_touched_fact
-  ; T.database_case
-      "accepted member uses intermediate barrier root"
-      accepted_member_uses_intermediate_barrier_root
-  ; T.database_case
-      "covered acceptance uses combined group requirements"
-      covered_acceptance_uses_combined_group_requirements
-  ; T.database_case
-      "accepted delete rejects missing own incorporation"
-      accepted_delete_rejects_missing_own_incorporation
-  ; T.database_case
-      "accepted delete allows server normalized order"
-      accepted_delete_allows_server_normalized_order
-  ; T.database_case
-      "queued delete yields to remote change before submission"
-      queued_delete_yields_to_remote_change_before_submission
-  ; T.database_case
-      "queued delete detects a new remote descendant"
-      queued_delete_detects_new_remote_descendant
-  ; T.database_case
-      "queued default-property delete detects a new holder"
-      queued_default_property_delete_detects_new_holder
-  ; T.database_case
-      "submitted save retains its dependency shadow"
-      submitted_save_retains_required_block_shadow
-  ; T.database_case
-      "partial rejection preserves prefix and retries independent suffix"
-      partial_rejection_preserves_prefix_and_retries_independent_suffix
-  ; T.database_case
-      "invalid partial rejection partition fails before durability"
-      invalid_partial_rejection_partition_fails_before_durability
-  ; T.database_case
-      "partial rejection blocks suffix dependent on failed insert"
-      partial_rejection_blocks_suffix_dependent_on_failed_insert
-  ]
+  stale_cases
+  @ [ Alcotest.test_case
+        "reopen never reuses a terminal batch identity"
+        `Quick
+        reopened_submission_does_not_reuse_terminal_batch
+    ; T.database_case
+        "empty sync view has checkpoint and no submissions"
+        empty_sync_view_has_checkpoint_and_no_submissions
+    ; T.database_case
+        "empty submission group fails atomically"
+        empty_submission_group_fails_before_durability
+    ; T.database_case
+        "outbox crypto results are validated before application"
+        outbox_crypto_results_are_validated_before_application
+    ; T.database_case "queued local commit is queryable" queued_local_commit_is_queryable
+    ; T.database_case
+        "local submission uses normalized transaction"
+        local_submission_uses_normalized_transaction
+    ; T.database_case
+        "local submission uses server-compatible fractional indices"
+        local_submission_uses_server_compatible_fractional_indices
+    ; T.database_case
+        "submit is atomic and retry is byte-identical"
+        (atomic_submit_and_retry_are_byte_identical ~advance:false)
+    ; T.database_case
+        "retry preserves its frozen baseline after an authoritative change"
+        (atomic_submit_and_retry_are_byte_identical ~advance:true)
+    ; T.database_case
+        "submission rejects an unfrozen queued dependency"
+        submission_rejects_unfrozen_queued_dependency
+    ; T.database_case
+        "submission rejects reordered members"
+        submission_rejects_reordered_members
+    ; T.database_case
+        "stale sync token changes nothing"
+        stale_sync_token_fails_without_state_change
+    ; T.database_case
+        "delete submission is singleton-only"
+        delete_submission_requires_singleton
+    ; T.database_case
+        "delete submission freezes complete wire footprint"
+        delete_submission_freezes_complete_wire_footprint
+    ; T.database_case
+        "admission charges plaintext and protected bytes"
+        admission_charges_plaintext_and_protected_bytes
+    ; Alcotest.test_case
+        "dependency shadow is admitted at first submission"
+        `Quick
+        dependency_shadow_is_admitted_at_first_submission
+    ; T.database_case "acceptance is transport-only" acceptance_is_transport_only
+    ; T.database_case
+        "acceptance barrier cannot precede submission interval"
+        acceptance_barrier_cannot_precede_submission_interval
+    ; T.database_case
+        "matching state does not replace origin evidence"
+        matching_state_does_not_replace_origin_evidence
+    ; T.database_case
+        "definitive rejection rolls back once"
+        definitive_rejection_rolls_back_once
+    ; T.database_case
+        "authoritative batch updates logical snapshot"
+        authoritative_batch_updates_the_logical_snapshot
+    ; T.database_case
+        "authoritative rebase replans queued ordinary mutation"
+        authoritative_rebase_replans_queued_ordinary_mutation
+    ; T.database_case
+        "authoritative rebase terminalizes queued no-change"
+        authoritative_rebase_terminalizes_queued_no_change
+    ; T.database_case
+        "authoritative rebase blocks transitive queued dependency"
+        authoritative_rebase_blocks_transitive_queued_dependency
+    ; T.database_case
+        "authoritative crypto is correlated and applied"
+        authoritative_crypto_is_correlated_and_applied
+    ; T.database_case
+        "submitted delete defers authoritative batch until transport outcome"
+        submitted_delete_defers_authoritative_batch_until_transport_outcome
+    ; T.database_case
+        "Pull-first delete conflict proves non-execution"
+        pull_first_delete_conflict_proves_non_execution
+    ; T.database_case
+        "Stale delete resolves after equivalent authoritative delete"
+        stale_delete_resolves_to_no_change_after_equivalent_authoritative_delete
+    ; T.database_case
+        "Stale delete without conflict becomes blocked at barrier"
+        stale_delete_without_conflict_becomes_blocked_at_barrier
+    ; T.database_case
+        "accepted member terminalizes at authoritative barrier"
+        accepted_member_terminalizes_at_its_authoritative_barrier
+    ; T.database_case
+        "accepted member allows reordered normalized datoms"
+        accepted_member_allows_reordered_normalized_datoms
+    ; T.database_case
+        "accepted member rejects wrong payload digest"
+        accepted_member_rejects_wrong_payload
+    ; T.database_case
+        "accepted member rejects extra touched fact"
+        accepted_member_rejects_extra_touched_fact
+    ; T.database_case
+        "accepted member uses intermediate barrier root"
+        accepted_member_uses_intermediate_barrier_root
+    ; T.database_case
+        "covered acceptance uses combined group requirements"
+        covered_acceptance_uses_combined_group_requirements
+    ; T.database_case
+        "accepted delete rejects missing own incorporation"
+        accepted_delete_rejects_missing_own_incorporation
+    ; T.database_case
+        "accepted delete allows server normalized order"
+        accepted_delete_allows_server_normalized_order
+    ; T.database_case
+        "queued delete yields to remote change before submission"
+        queued_delete_yields_to_remote_change_before_submission
+    ; T.database_case
+        "queued delete detects a new remote descendant"
+        queued_delete_detects_new_remote_descendant
+    ; T.database_case
+        "queued default-property delete detects a new holder"
+        queued_default_property_delete_detects_new_holder
+    ; T.database_case
+        "submitted save retains its dependency shadow"
+        submitted_save_retains_required_block_shadow
+    ; T.database_case
+        "partial rejection preserves prefix and retries independent suffix"
+        partial_rejection_preserves_prefix_and_retries_independent_suffix
+    ; T.database_case
+        "invalid partial rejection partition fails before durability"
+        invalid_partial_rejection_partition_fails_before_durability
+    ; T.database_case
+        "partial rejection blocks suffix dependent on failed insert"
+        partial_rejection_blocks_suffix_dependent_on_failed_insert
+    ]
 ;;
 
 let () =

@@ -168,21 +168,16 @@ let empty_children_retain_scope _database snapshot =
   | _ -> Alcotest.fail "empty children result did not retain its parent scope"
 ;;
 
-let page_tree_scope_includes_depth _database snapshot =
+let page_tree_result_includes_depth _database snapshot =
   match
     Database.get_structure
       snapshot
       (Page_tree { page = T.page_uuid; maximum_depth = 2; limit = 200; cursor = None })
-    |> T.require_ok ~behavior:"page-tree depth scope"
+    |> T.require_ok ~behavior:"page-tree depth"
   with
-  | Page_tree_result
-      { page
-      ; maximum_depth = 2
-      ; revision_scope = Page_tree_revision { page = scoped; maximum_depth = 2 }
-      ; _
-      }
-    when Graph.Uuid.equal page T.page_uuid && Graph.Uuid.equal scoped T.page_uuid -> ()
-  | _ -> Alcotest.fail "page-tree result lost its maximum-depth revision scope"
+  | Page_tree_result { page; maximum_depth = 2; _ } when Graph.Uuid.equal page T.page_uuid
+    -> ()
+  | _ -> Alcotest.fail "page-tree result lost its maximum depth"
 ;;
 
 let released_snapshot_rejects_new_reads database =
@@ -905,8 +900,189 @@ let indexed_journals_preserve_selection database =
          items)
 ;;
 
+let page_tree_preserves_valid_windows_and_snapshots database =
+  let behavior = "page-tree valid windows and snapshots" in
+  let module Transit = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let id n = T.uuid (Printf.sprintf "73000000-0000-4000-8000-%012d" n) in
+  let page = id 99 in
+  let add e a v = Transit.Array [ Keyword "db/add"; Int e; Keyword a; v ] in
+  let lookup uuid =
+    Transit.Array [ Keyword "block/uuid"; Uuid (Graph.Uuid.to_string uuid) ]
+  in
+  let apply number ops =
+    let wire =
+      Codec.to_string ~mode:Codec.Verbose (Transit.Array ops)
+      |> encoded_transaction_of_string ~maximum_bytes:262144
+      |> T.require_ok ~behavior
+    in
+    let cursor =
+      Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" number)
+      |> T.require_ok ~behavior
+    in
+    let batch =
+      authoritative_batch
+        ~maximum_count:16
+        ~maximum_bytes:262144
+        ~transactions:[ authoritative_transaction ~cursor ~transaction:wire ]
+        ~through:cursor
+        ~checksum:None
+      |> T.require_ok ~behavior
+    in
+    let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+    let preparation, crypto =
+      Database.begin_authoritative database ~expected:(sync_view_token sync) batch
+      |> T.require_ok ~behavior
+    in
+    let decrypted =
+      Option.map
+        (fun request -> request, Database.unprotection_ciphertexts request)
+        crypto
+    in
+    match
+      Database.apply_authoritative database preparation ~decrypted
+      |> T.require_ok ~behavior
+    with
+    | Database.Authoritative_applied _ -> ()
+    | Authoritative_deferred _ -> Alcotest.fail "tree fixture was deferred"
+  in
+  let node n parent order =
+    let e = 10000 + (n * 17) in
+    [ add e "block/uuid" (Uuid (Graph.Uuid.to_string (id n)))
+    ; add e "block/title" (String (Printf.sprintf "Node %d" n))
+    ; add e "block/parent" (lookup parent)
+    ; add e "block/page" (lookup page)
+    ; add e "block/order" (String order)
+    ; add e "logseq.property/public?" (Bool true)
+    ]
+  in
+  let without attr ops =
+    List.filter
+      (function
+        | Transit.Array [ _; _; Keyword a; _ ] -> a <> attr
+        | _ -> true)
+      ops
+  in
+  apply
+    1
+    ([ add 20000 "block/uuid" (Uuid (Graph.Uuid.to_string page))
+     ; add 20000 "block/name" (String "tree-window")
+     ; add 20000 "block/title" (String "Original page")
+     ]
+     @ node 1 page "a1"
+     @ node 0 page "a1"
+     @ node 2 (id 0) "a0"
+     @ node 3 (id 2) "a0"
+     @ node 4 page "a2"
+     @ without "block/title" (node 5 page "a0")
+     @ without "block/order" (node 6 page "a0")
+     @ without "block/uuid" (node 7 page "a0")
+     @ without "block/page" (node 8 page "a3")
+     @ (without "block/page" (node 9 page "a0")
+        @ [ add (10000 + (9 * 17)) "block/page" (Int 29000) ])
+     @ node 10 (id 5) "a0");
+  let read snapshot depth limit cursor =
+    match
+      Database.get_structure
+        snapshot
+        (Page_tree { page; maximum_depth = depth; limit; cursor })
+      |> T.require_ok ~behavior
+    with
+    | Page_tree_result { items; next_cursor; _ } -> items, next_cursor
+    | Children_result _ -> Alcotest.fail "tree returned children"
+  in
+  let verify snapshot depth expected =
+    List.iter
+      (fun limit ->
+         let rec collect cursor acc =
+           let items, next = read snapshot depth limit cursor in
+           List.iter
+             (fun (item : tree_member) ->
+                match
+                  Database.get_blocks snapshot [ item.block.block.uuid ]
+                  |> T.require_ok ~behavior
+                with
+                | [ Present_block { value; revision } ] ->
+                  T.require
+                    (value = item.block && revision = item.revision)
+                    "tree content or revision differs from point read";
+                  T.require
+                    (Graph.Uuid.equal item.parent value.block.parent)
+                    "tree parent differs"
+                | _ -> Alcotest.fail "tree includes missing block")
+             items;
+           let acc = List.rev_append items acc in
+           match next with
+           | None -> List.rev acc
+           | Some c ->
+             T.require (List.length items = limit) "invalid candidates consumed slots";
+             collect (Some c) acc
+         in
+         let all = collect None [] in
+         Alcotest.(check (list (pair string int)))
+           "DFS, ties, and depth"
+           (List.map (fun (n, d) -> Graph.Uuid.to_string (id n), d) expected)
+           (List.map
+              (fun (i : tree_member) -> Graph.Uuid.to_string i.block.block.uuid, i.depth)
+              all))
+      [ 1; 2; 200 ]
+  in
+  let pinned = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot pinned)
+    (fun () ->
+       verify pinned 0 [ 0, 0; 1, 0; 4, 0 ];
+       verify pinned 1 [ 0, 0; 2, 1; 1, 0; 4, 0 ];
+       verify pinned 64 [ 0, 0; 2, 1; 3, 2; 1, 0; 4, 0 ];
+       let first, cursor = read pinned 64 1 None in
+       T.require (List.length first = 1 && Option.is_some cursor) "missing continuation";
+       let expected =
+         match Database.get_blocks pinned [ id 1 ] |> T.require_ok ~behavior with
+         | [ Present_block { revision; _ } ] ->
+           Database.write_precondition ~blocks:[ id 1, revision ] ~pages:[] ~scopes:[]
+           |> T.require_ok ~behavior
+         | _ -> Alcotest.fail "delete fixture missing"
+       in
+       ignore
+         (Database.commit_local
+            database
+            ~expected
+            (Delete_blocks { mutation_id = T.mutation_uuid 951; root = id 1 })
+          |> T.require_ok ~behavior);
+       let deleted = Database.current_snapshot database |> T.require_ok ~behavior in
+       Fun.protect
+         ~finally:(fun () -> Database.release_snapshot deleted)
+         (fun () -> verify deleted 64 [ 0, 0; 2, 1; 3, 2; 4, 0 ]);
+       apply 2 [ add 20000 "block/title" (String "Updated page") ];
+       let current = Database.current_snapshot database |> T.require_ok ~behavior in
+       Fun.protect
+         ~finally:(fun () -> Database.release_snapshot current)
+         (fun () ->
+            (* The remote page patch conflicts with the frozen delete footprint. *)
+            verify current 64 [ 0, 0; 2, 1; 3, 2; 1, 0; 4, 0 ];
+            (match
+               Database.get_structure
+                 current
+                 (Page_tree { page; maximum_depth = 64; limit = 1; cursor })
+             with
+             | Error Stale_read_cursor -> ()
+             | _ -> Alcotest.fail "old cursor accepted by new projection");
+            let latest, _ = read current 64 1 None in
+            T.require
+              ((List.hd latest).block.rendered_page_title = "Updated page")
+              "logical page title cache is stale");
+       verify pinned 64 [ 0, 0; 2, 1; 3, 2; 1, 0; 4, 0 ];
+       let old, _ = read pinned 64 1 cursor in
+       T.require
+         ((List.hd old).block.rendered_page_title = "Original page")
+         "old snapshot lost page title")
+;;
+
 let cases =
-  [ T.snapshot_case "journal offsets are obsolete" journals_reject_legacy_offsets
+  [ T.database_case
+      "page-tree preserves valid windows and snapshots"
+      page_tree_preserves_valid_windows_and_snapshots
+  ; T.snapshot_case "journal offsets are obsolete" journals_reject_legacy_offsets
   ; T.database_case
       "indexed journals preserve selection and exact hydration"
       indexed_journals_preserve_selection
@@ -929,8 +1105,8 @@ let cases =
       "empty parent retains discoverable children scope"
       empty_children_retain_scope
   ; T.snapshot_case
-      "page-tree revision scope includes maximum depth"
-      page_tree_scope_includes_depth
+      "page-tree result includes maximum depth"
+      page_tree_result_includes_depth
   ; T.database_case
       "reads started after release fail with Snapshot_released"
       released_snapshot_rejects_new_reads

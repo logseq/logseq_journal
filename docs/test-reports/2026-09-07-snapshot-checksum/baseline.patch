@@ -1,0 +1,89 @@
+--- authoritative_checksum.ml
++++ authoritative_checksum.ml
+@@ -143,16 +143,11 @@
+ ;;
+
+ let entities_with_uuid db =
+-  let _, entities =
+-    Datascript.datoms db Datascript.Aevt ~a:"block/uuid" ()
+-    |> Seq.fold_left
+-         (fun (previous, entities) (datom : Datascript.datom) ->
+-            match previous with
+-            | Some entity when Int.equal entity datom.e -> previous, entities
+-            | _ -> Some datom.e, datom.e :: entities)
+-         (None, [])
+-  in
+-  entities
++  Datascript.datoms db Datascript.Eavt ~a:"block/uuid" ()
++  |> Seq.fold_left
++       (fun entities datom ->
++          if List.mem datom.Datascript.e entities then entities else datom.e :: entities)
++       []
+ ;;
+
+ let hex32 value = Printf.sprintf "%08lx" value
+--- database.ml
++++ database.ml
+@@ -434,37 +434,32 @@
+           | Error message -> Error (Types.Snapshot_parse_error message)
+           | Ok staging ->
+             let database = Mirror.database staging in
+-            let checksum_matches =
+-              match expected_checksum with
+-              | None -> true
+-              | Some expected ->
+-                let digest =
+-                  Authoritative_checksum.recompute
+-                    ~e2ee:(Authoritative_checksum.graph_e2ee database)
+-                    database
+-                in
+-                String.equal (checksum_value expected) digest
++            let digest =
++              Authoritative_checksum.recompute
++                ~e2ee:(Authoritative_checksum.graph_e2ee database)
++                database
+             in
+-            if not checksum_matches
+-            then (
+-              Mirror.cancel staging;
+-              Error (Types.Snapshot_parse_error "snapshot checksum mismatch"))
+-            else
+-              Ok
+-                { snapshot_dependencies = dependencies
+-                ; snapshot_inspection = inspection
+-                ; snapshot_cursor = applied_server_cursor
+-                ; snapshot_staging = staging
+-                ; snapshot_remaining_protected_datoms = protected_snapshot_datoms database
+-                ; snapshot_current_protected_datoms = []
+-                ; snapshot_next_crypto_index = 0
+-                ; snapshot_crypto_revision = 0
+-                ; snapshot_awaiting_crypto = false
+-                ; snapshot_crypto_complete = false
+-                ; snapshot_persisted = None
+-                ; snapshot_committed = false
+-                ; snapshot_canceled = false
+-                })))
++            (match expected_checksum with
++             | Some expected when not (String.equal (checksum_value expected) digest) ->
++               Mirror.cancel staging;
++               Error (Types.Snapshot_parse_error "snapshot checksum mismatch")
++             | None | Some _ ->
++               Ok
++                 { snapshot_dependencies = dependencies
++                 ; snapshot_inspection = inspection
++                 ; snapshot_cursor = applied_server_cursor
++                 ; snapshot_staging = staging
++                 ; snapshot_remaining_protected_datoms =
++                     protected_snapshot_datoms database
++                 ; snapshot_current_protected_datoms = []
++                 ; snapshot_next_crypto_index = 0
++                 ; snapshot_crypto_revision = 0
++                 ; snapshot_awaiting_crypto = false
++                 ; snapshot_crypto_complete = false
++                 ; snapshot_persisted = None
++                 ; snapshot_committed = false
++                 ; snapshot_canceled = false
++                 }))))
+ ;;
+
+ let snapshot_crypto_id preparation index =

@@ -1021,29 +1021,38 @@ let collapse (state : t) ~parent_id =
 let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timeline_entry) =
   let block = entry.Journal_graph_projection.block in
   let state = invalidate_recovery_for_day state (Journal_model.journal_day block) in
-  let rec insert reversed = function
-    | [] -> List.rev (Top_level entry :: reversed), state.total_count
-    | (Top_level candidate as slot) :: tail
-      when Journal_model.journal_day candidate.block = Journal_model.journal_day block
-           && compare_blocks block candidate.block <= 0 ->
-      ( List.rev_append reversed (Top_level entry :: slot :: tail)
-      , state.first_retained_index + List.length reversed )
-    | (Day_heading page as slot) :: tail when Journal_model.journal_day block > page.day
-      ->
-      ( List.rev_append reversed (Top_level entry :: slot :: tail)
-      , state.first_retained_index + List.length reversed )
-    | (Feed_continuation _ as slot) :: tail ->
-      ( List.rev_append reversed (Top_level entry :: slot :: tail)
-      , state.first_retained_index + List.length reversed )
-    | slot :: tail -> insert (slot :: reversed) tail
-  in
-  let slots, _inserted_index = insert [] state.slots in
-  { state with
-    slots
-  ; total_count = state.total_count + 1
-  ; anchor_decision = Reset_to_top
-  }
-  |> cap_retained
+  if
+    List.exists
+      (function
+        | Top_level candidate ->
+          String.equal (Journal_model.id candidate.block) (Journal_model.id block)
+        | _ -> false)
+      state.slots
+  then { (replace_timeline_entry state entry) with anchor_decision = Reset_to_top }
+  else (
+    let rec insert reversed = function
+      | [] -> List.rev (Top_level entry :: reversed), state.total_count
+      | (Top_level candidate as slot) :: tail
+        when Journal_model.journal_day candidate.block = Journal_model.journal_day block
+             && compare_blocks block candidate.block <= 0 ->
+        ( List.rev_append reversed (Top_level entry :: slot :: tail)
+        , state.first_retained_index + List.length reversed )
+      | (Day_heading page as slot) :: tail when Journal_model.journal_day block > page.day
+        ->
+        ( List.rev_append reversed (Top_level entry :: slot :: tail)
+        , state.first_retained_index + List.length reversed )
+      | (Feed_continuation _ as slot) :: tail ->
+        ( List.rev_append reversed (Top_level entry :: slot :: tail)
+        , state.first_retained_index + List.length reversed )
+      | slot :: tail -> insert (slot :: reversed) tail
+    in
+    let slots, _inserted_index = insert [] state.slots in
+    { state with
+      slots
+    ; total_count = state.total_count + 1
+    ; anchor_decision = Reset_to_top
+    }
+    |> cap_retained)
 ;;
 
 let remove_orphan_day_headings ~today slots =

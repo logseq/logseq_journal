@@ -367,8 +367,6 @@ let mutation_context (_t : t) mutation_id = parse_uuid "mutation ID" mutation_id
 
 let scope_key = function
   | Protocol.V2_children_scope parent -> "children:" ^ Graph.Uuid.to_string parent
-  | V2_page_tree_scope { page; maximum_depth } ->
-    Printf.sprintf "pageTree:%s:%d" (Graph.Uuid.to_string page) maximum_depth
 ;;
 
 let preconditions ?(blocks = []) ?(pages = []) ?(scopes = []) () =
@@ -391,31 +389,6 @@ let scope_precondition t scope =
   match Hashtbl.find_opt t.scope_revisions (scope_key scope) with
   | None -> Error "The structure revision is not retained."
   | Some revision -> Ok (scope, revision)
-;;
-
-let delete_preconditions t block block_revision =
-  let block_id = Graph.Uuid.to_string block in
-  match Hashtbl.find_opt t.projected_blocks block_id with
-  | None -> Error "The delete target is not retained."
-  | Some projected ->
-    let parent_scope =
-      Option.bind (Journal_model.parent_id projected) (fun parent ->
-        Option.bind
-          (Result.to_option (parse_uuid "parent UUID" parent))
-          (fun parent ->
-             scope_precondition t (Protocol.V2_children_scope parent) |> Result.to_option))
-    in
-    let page_scope =
-      Option.bind
-        (Result.to_option (parse_uuid "page UUID" (Journal_model.page_id projected)))
-        (fun page ->
-           scope_precondition t (Protocol.V2_page_tree_scope { page; maximum_depth = 1 })
-           |> Result.to_option)
-    in
-    (match parent_scope, page_scope with
-     | Some scope, _ | None, Some scope ->
-       Ok (preconditions ~blocks:[ block, block_revision ] ~scopes:[ scope ] ())
-     | None, None -> Error "The delete structure revision is not retained.")
 ;;
 
 let journal_uuid day =
@@ -762,15 +735,15 @@ let submit t (request : Journal_graph_request.t) =
        mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
      with
      | Ok mutation_id, Ok block ->
-       (match delete_preconditions t block command.expected_revision with
-        | Error message -> reject message
-        | Ok preconditions ->
-          requests
-            [ mutate
-                t
-                (Delete_mutation command)
-                (Protocol.V2_delete_blocks { mutation_id; root = block; preconditions })
-            ])
+       let preconditions =
+         preconditions ~blocks:[ block, command.expected_revision ] ()
+       in
+       requests
+         [ mutate
+             t
+             (Delete_mutation command)
+             (Protocol.V2_delete_blocks { mutation_id; root = block; preconditions })
+         ]
      | Error message, _ | _, Error message -> reject message)
 ;;
 
@@ -1155,8 +1128,6 @@ let remember_scope_revision t scope revision =
   let scope =
     match scope with
     | Protocol.V2_children_revision parent -> Protocol.V2_children_scope parent
-    | V2_page_tree_revision { page; maximum_depth } ->
-      V2_page_tree_scope { page; maximum_depth }
   in
   Hashtbl.replace t.scope_revisions (scope_key scope) revision
 ;;
@@ -1566,8 +1537,7 @@ let receive t (protocol_response : Protocol.response) =
           remember_blocks t page children.items;
           capture_insert t command page conflict_retries
         | _ -> failure_output t operation request_id "Unexpected children response.")
-     | V2_page_tree_outcome { revision_scope; scope_revision; items; next_cursor; _ } ->
-       remember_scope_revision t revision_scope scope_revision;
+     | V2_page_tree_outcome { items; next_cursor; _ } ->
        List.iter
          (fun (item : Protocol.v2_tree_member) ->
             remember_block_revision t item.value.block.uuid item.revision)

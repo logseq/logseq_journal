@@ -96,12 +96,7 @@ and command =
       ; through : string
       }
 
-and v2_scope =
-  | V2_children_scope of Uuid.t
-  | V2_page_tree_scope of
-      { page : page_uuid
-      ; maximum_depth : int
-      }
+and v2_scope = V2_children_scope of Uuid.t
 
 and v2_task_status =
   | V2_todo
@@ -201,12 +196,7 @@ and v2_tree_member =
   ; parent : Uuid.t
   }
 
-and v2_revision_scope =
-  | V2_children_revision of Uuid.t
-  | V2_page_tree_revision of
-      { page : page_uuid
-      ; maximum_depth : int
-      }
+and v2_revision_scope = V2_children_revision of Uuid.t
 
 and v2_local_status =
   | V2_applied
@@ -240,8 +230,6 @@ and v2_outcome =
   | V2_page_tree_outcome of
       { page : page_uuid
       ; maximum_depth : int
-      ; revision_scope : v2_revision_scope
-      ; scope_revision : string
       ; items : v2_tree_member list
       ; next_cursor : Cursor.t option
       }
@@ -382,12 +370,6 @@ let optional_string_json = option_json (fun value -> `String value)
 let v2_scope_to_json = function
   | V2_children_scope parent ->
     `Assoc [ "type", `String "children"; "parent", uuid_json parent ]
-  | V2_page_tree_scope { page; maximum_depth } ->
-    `Assoc
-      [ "type", `String "pageTree"
-      ; "page", uuid_json page
-      ; "maximumDepth", `Int maximum_depth
-      ]
 ;;
 
 let v2_scope_of_json json =
@@ -400,12 +382,6 @@ let v2_scope_of_json json =
   | "children" ->
     let fields = exact_assoc [ "type"; "parent" ] json in
     V2_children_scope (uuid (field "parent" fields))
-  | "pageTree" ->
-    let fields = exact_assoc [ "type"; "page"; "maximumDepth" ] json in
-    V2_page_tree_scope
-      { page = uuid (field "page" fields)
-      ; maximum_depth = integer (field "maximumDepth" fields)
-      }
   | _ -> decode_error "invalid revision scope type"
 ;;
 
@@ -1200,12 +1176,6 @@ let v2_admission_fact_of_json json =
 let v2_revision_scope_to_json = function
   | V2_children_revision parent ->
     `Assoc [ "type", `String "children"; "parent", uuid_json parent ]
-  | V2_page_tree_revision { page; maximum_depth } ->
-    `Assoc
-      [ "type", `String "pageTree"
-      ; "page", uuid_json page
-      ; "maximumDepth", `Int maximum_depth
-      ]
 ;;
 
 let v2_revision_scope_of_json json =
@@ -1218,12 +1188,6 @@ let v2_revision_scope_of_json json =
   | "children" ->
     let fields = exact_assoc [ "type"; "parent" ] json in
     V2_children_revision (uuid (field "parent" fields))
-  | "pageTree" ->
-    let fields = exact_assoc [ "type"; "page"; "maximumDepth" ] json in
-    V2_page_tree_revision
-      { page = uuid (field "page" fields)
-      ; maximum_depth = integer (field "maximumDepth" fields)
-      }
   | _ -> decode_error "invalid revision scope"
 ;;
 
@@ -1509,14 +1473,11 @@ let v2_outcome_to_json = function
       ; "items", `List (List.map v2_child_member_to_json items)
       ; "nextCursor", option_json cursor_json next_cursor
       ]
-  | V2_page_tree_outcome
-      { page; maximum_depth; revision_scope; scope_revision; items; next_cursor } ->
+  | V2_page_tree_outcome { page; maximum_depth; items; next_cursor } ->
     `Assoc
       [ "type", `String "pageTree"
       ; "page", uuid_json page
       ; "maximumDepth", `Int maximum_depth
-      ; "revisionScope", v2_revision_scope_to_json revision_scope
-      ; "scopeRevision", `String scope_revision
       ; "items", `List (List.map v2_tree_member_to_json items)
       ; "nextCursor", option_json cursor_json next_cursor
       ]
@@ -1672,22 +1633,11 @@ let v2_outcome_of_json json =
       }
   | "pageTree" ->
     let fields =
-      exact_assoc
-        [ "type"
-        ; "page"
-        ; "maximumDepth"
-        ; "revisionScope"
-        ; "scopeRevision"
-        ; "items"
-        ; "nextCursor"
-        ]
-        json
+      exact_assoc [ "type"; "page"; "maximumDepth"; "items"; "nextCursor" ] json
     in
     V2_page_tree_outcome
       { page = uuid (field "page" fields)
       ; maximum_depth = integer (field "maximumDepth" fields)
-      ; revision_scope = v2_revision_scope_of_json (field "revisionScope" fields)
-      ; scope_revision = string (field "scopeRevision" fields)
       ; items =
           (match field "items" fields with
            | `List values -> List.map v2_tree_member_of_json values

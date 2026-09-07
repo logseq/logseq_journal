@@ -153,12 +153,6 @@
         "type": "pageTree",
         "page": "20000000-0000-4000-8000-000000000001",
         "maximumDepth": 8,
-        "revisionScope": {
-          "type": "pageTree",
-          "page": "20000000-0000-4000-8000-000000000001",
-          "maximumDepth": 8
-        },
-        "scopeRevision": "scope-revision:v1:page-tree",
         "items": [],
         "nextCursor": null
       }

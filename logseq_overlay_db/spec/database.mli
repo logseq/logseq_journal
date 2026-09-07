@@ -255,7 +255,11 @@ val get_journals
 (** Reads one bounded children or page-tree structure request. A continuation
     cursor is an opaque, projection-bound offset from zero through 10,000 and may
     be reused as the same numeric offset with another request shape. Each request
-    limit must be between one and 200 inclusive. *)
+    limit must be between one and 200 inclusive. Page-tree items use depth-first
+    order, with direct page children at depth zero. Only selected items are fully
+    hydrated; skipped candidates and the valid lookahead use structural fields.
+    Page-tree results carry per-block revisions but no collection revision.
+    Children results retain their membership revision. *)
 val get_structure
   :  snapshot
   -> Types.structure_request
@@ -345,7 +349,13 @@ val write_precondition
 (** Validates and durably publishes a local mutation. Reusing a mutation ID with
     the same fingerprint returns its durable outcome; reusing it for different
     intent is an error. A successful logical change advances the projection exactly
-    once. *)
+    once.
+
+    [Delete_blocks] requires the target root block revision only. After checking
+    it, admission freezes the latest logical subtree in the same serialized
+    operation, including descendants added since the caller's read. Later
+    authoritative changes follow the existing frozen-footprint conflict rules.
+    Insertion still requires the parent identity and Children revision. *)
 val commit_local
   :  t
   -> expected:write_precondition
@@ -368,7 +378,7 @@ val discard_blocked
 
 (** {2 Example: appending a block tree to a page}
 
-    Structure mutations retain both the page revision and the children revision
+    Page-level insertions retain both the page revision and the children revision
     observed while planning. An unrelated commit may advance the global projection
     without invalidating either target-local token.
 
@@ -442,7 +452,9 @@ type prepared_outbox_transition
 
 (** Validates an outbox transport transition against [expected]. Submission may
     return a protection request whose result is required by
-    [apply_outbox_transition]. *)
+    [apply_outbox_transition]. [Retry_group] is reserved for transport-uncertain
+    submitted batches and retains their identity, encrypted bytes, and baseline.
+    A duplicate Stale rejection must retain the original rejection cursor. *)
 val begin_outbox_transition
   :  t
   -> expected:Types.sync_token
@@ -453,7 +465,25 @@ val begin_outbox_transition
 
 (** Validates optional encryption and atomically applies the prepared transport
     transition. The presence and identity of [encrypted] must exactly match the
-    request returned by the begin step. *)
+    request returned by the begin step.
+
+    Stale settlement is shared with authoritative progression. Below the rejection
+    cursor, the frozen attempt remains pending. At or beyond that cursor, ordinary
+    members with validated original-baseline and ordinal-prefix origin evidence
+    are incorporated; matching current content alone never establishes execution.
+    Proven-unexecuted ordinary intent retains its mutation identity and returns
+    through queued planning, with a fresh submission attempt and current baseline.
+    Satisfied intent becomes No_change; invalid dependencies and conflicting insert
+    UUIDs become explicitly blocked, including transitive dependent intent.
+    Settlement and its terminal batch receipt are durable together, so repeated
+    old responses cannot modify a new attempt.
+
+    Deletes retain their existing historical conflict priority: Remote_won,
+    equivalent No_change, or Blocked Stale_barrier. An unresolved submitted delete
+    holds authoritative progression unless a first-cursor conflict already earns
+    a durable terminal receipt; a late rejection then confirms that receipt.
+    Equivalent deletion alone does not distinguish an own transaction candidate
+    from a remote deletion and does not earn an Applied execution receipt. *)
 val apply_outbox_transition
   :  t
   -> prepared_outbox_transition

@@ -1,0 +1,10 @@
+dune build @all: passed
+dune runtest: passed (full run and final incremental run retained)
+100000-block release benchmark: passed all declared gates
+Final probe: compiled against instrumented and uninstrumented production libraries
+Changed OCaml formatting, Python syntax, JSON validation: passed
+Obsolete page-tree revision source search: no matches
+git diff --check: passed
+spec-dev-tool check --all: passed
+Final Database source hash matches environment.json
+No Dune or spec/*.ml edits; spec edits limited to the two authorized overlay interfaces

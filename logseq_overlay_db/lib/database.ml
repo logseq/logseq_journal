@@ -87,6 +87,10 @@ type terminal_batch_receipt = Persistence_receipt_v1.terminal_batch_receipt =
   }
 
 and terminal_batch_outcome = Persistence_receipt_v1.terminal_batch_outcome =
+  | Terminal_stale of
+      { through : Types.server_cursor
+      ; executed_through : Types.server_cursor option
+      }
   | Terminal_accepted of Types.acceptance_barrier
   | Terminal_proven_unexecuted of
       { mutation_id : Graph.Uuid.t
@@ -434,32 +438,37 @@ let prepare_snapshot_activation
           | Error message -> Error (Types.Snapshot_parse_error message)
           | Ok staging ->
             let database = Mirror.database staging in
-            let digest =
-              Authoritative_checksum.recompute
-                ~e2ee:(Authoritative_checksum.graph_e2ee database)
-                database
+            let checksum_matches =
+              match expected_checksum with
+              | None -> true
+              | Some expected ->
+                let digest =
+                  Authoritative_checksum.recompute
+                    ~e2ee:(Authoritative_checksum.graph_e2ee database)
+                    database
+                in
+                String.equal (checksum_value expected) digest
             in
-            (match expected_checksum with
-             | Some expected when not (String.equal (checksum_value expected) digest) ->
-               Mirror.cancel staging;
-               Error (Types.Snapshot_parse_error "snapshot checksum mismatch")
-             | None | Some _ ->
-               Ok
-                 { snapshot_dependencies = dependencies
-                 ; snapshot_inspection = inspection
-                 ; snapshot_cursor = applied_server_cursor
-                 ; snapshot_staging = staging
-                 ; snapshot_remaining_protected_datoms =
-                     protected_snapshot_datoms database
-                 ; snapshot_current_protected_datoms = []
-                 ; snapshot_next_crypto_index = 0
-                 ; snapshot_crypto_revision = 0
-                 ; snapshot_awaiting_crypto = false
-                 ; snapshot_crypto_complete = false
-                 ; snapshot_persisted = None
-                 ; snapshot_committed = false
-                 ; snapshot_canceled = false
-                 }))))
+            if not checksum_matches
+            then (
+              Mirror.cancel staging;
+              Error (Types.Snapshot_parse_error "snapshot checksum mismatch"))
+            else
+              Ok
+                { snapshot_dependencies = dependencies
+                ; snapshot_inspection = inspection
+                ; snapshot_cursor = applied_server_cursor
+                ; snapshot_staging = staging
+                ; snapshot_remaining_protected_datoms = protected_snapshot_datoms database
+                ; snapshot_current_protected_datoms = []
+                ; snapshot_next_crypto_index = 0
+                ; snapshot_crypto_revision = 0
+                ; snapshot_awaiting_crypto = false
+                ; snapshot_crypto_complete = false
+                ; snapshot_persisted = None
+                ; snapshot_committed = false
+                ; snapshot_canceled = false
+                })))
 ;;
 
 let snapshot_crypto_id preparation index =
@@ -1033,6 +1042,7 @@ let property_summaries_of_datoms_with_class database property_class datoms =
 type hydration_cache =
   { uuids : (int, Graph.Uuid.t option) Hashtbl.t
   ; page_titles : (int, string) Hashtbl.t
+  ; logical_page_titles : (string, string) Hashtbl.t
   ; property_class : int option
   ; property_definitions : (string, Graph.property_summary option) Hashtbl.t
   ; ident_entities : (string, int) Hashtbl.t
@@ -1049,6 +1059,7 @@ let hydration_cache ?(index_idents = true) database =
       | None -> ());
   { uuids = Hashtbl.create 64
   ; page_titles = Hashtbl.create 8
+  ; logical_page_titles = Hashtbl.create 8
   ; property_class =
       (if index_idents
        then Hashtbl.find_opt ident_entities "logseq.class/Property"
@@ -1877,6 +1888,7 @@ let rec tree_children_interests (tree : Types.block_tree) =
 ;;
 
 let rec inserted_block
+          ?cache
           database
           ~target
           ~parent
@@ -1890,15 +1902,21 @@ let rec inserted_block
     let order = assigned_order orders tree.uuid in
     let properties =
       []
-      |> set_property_values database "block/title" [ Datascript.String tree.title ]
-      |> set_uuid_property_values database "block/parent" [ parent ]
-      |> set_uuid_property_values database "block/page" [ page ]
-      |> set_property_values database "block/order" [ Datascript.String order ]
       |> set_property_values
+           ?cache
+           database
+           "block/title"
+           [ Datascript.String tree.title ]
+      |> set_uuid_property_values ?cache database "block/parent" [ parent ]
+      |> set_uuid_property_values ?cache database "block/page" [ page ]
+      |> set_property_values ?cache database "block/order" [ Datascript.String order ]
+      |> set_property_values
+           ?cache
            database
            "block/created-at"
            [ Datascript.Int (Int64.to_int now) ]
       |> set_property_values
+           ?cache
            database
            "block/updated-at"
            [ Datascript.Int (Int64.to_int now) ]
@@ -1924,7 +1942,7 @@ let rec inserted_block
   else
     tree.children
     |> List.find_map (fun child ->
-      inserted_block database ~target ~parent:tree.uuid ~page ~orders ~now child)
+      inserted_block ?cache database ~target ~parent:tree.uuid ~page ~orders ~now child)
 ;;
 
 let page_record_of_shadow shadow =
@@ -2151,6 +2169,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
              in
              (match
                 inserted_block
+                  ?cache
                   authoritative
                   ~target:uuid
                   ~parent
@@ -2235,6 +2254,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                   let properties =
                     let properties =
                       set_property_values
+                        ?cache
                         authoritative
                         "block/updated-at"
                         [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
@@ -2244,6 +2264,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                     | None -> properties
                     | Some status_entity ->
                       set_property_values
+                        ?cache
                         authoritative
                         "logseq.property/status"
                         [ Datascript.Ref status_entity ]
@@ -2265,8 +2286,13 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                (fun (value : Types.block_record) ->
                   let properties =
                     value.block.properties
-                    |> set_property_values authoritative "logseq.property/status" []
                     |> set_property_values
+                         ?cache
+                         authoritative
+                         "logseq.property/status"
+                         []
+                    |> set_property_values
+                         ?cache
                          authoritative
                          "block/updated-at"
                          [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
@@ -2292,9 +2318,21 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
   Option.map
     (fun (value : Types.block_record) ->
        let rendered_page_title =
-         logical_page_at snapshot value.block.page
-         |> Option.map (fun (page : Types.page_record) -> page.page.title)
-         |> Option.value ~default:""
+         let load () =
+           logical_page_at ?cache snapshot value.block.page
+           |> Option.map (fun (page : Types.page_record) -> page.page.title)
+           |> Option.value ~default:""
+         in
+         match cache with
+         | None -> load ()
+         | Some cache ->
+           let key = Graph.Uuid.to_string value.block.page in
+           (match Hashtbl.find_opt cache.logical_page_titles key with
+            | Some title -> title
+            | None ->
+              let title = load () in
+              Hashtbl.add cache.logical_page_titles key title;
+              title)
        in
        Types.{ value with rendered_page_title })
     value
@@ -2329,8 +2367,6 @@ let get_pages snapshot uuids =
 
 let scope_key = function
   | Types.Children_revision parent -> "children:" ^ Graph.Uuid.to_string parent
-  | Page_tree_revision { page; maximum_depth } ->
-    Printf.sprintf "page-tree:%s:%d" (Graph.Uuid.to_string page) maximum_depth
 ;;
 
 let block_is_tombstoned (snapshot : snapshot) uuid =
@@ -2458,55 +2494,8 @@ let scope_revision_from_members scope members =
   token Types.Scope_revision.of_string (Printf.sprintf "scope:v1:%s:%s" digest key)
 ;;
 
-let revision_for_scope (snapshot : snapshot) scope =
-  let direct_children parent =
-    let authoritative =
-      match entity_of_uuid (Option.get snapshot.authoritative_database) parent with
-      | None -> []
-      | Some parent_entity ->
-        Datascript.datoms
-          (Option.get snapshot.authoritative_database)
-          Datascript.Avet
-          ~a:"block/parent"
-          ~v:(Datascript.Ref parent_entity)
-          ()
-        |> List.of_seq
-        |> List.filter_map (fun (datom : Datascript.datom) ->
-          uuid_of_entity (Option.get snapshot.authoritative_database) datom.e)
-    in
-    let inserted = local_child_facts snapshot parent |> List.map snd in
-    List.sort_uniq Graph.Uuid.compare (authoritative @ inserted)
-    |> List.filter_map (fun uuid ->
-      match logical_block_at snapshot uuid with
-      | Some record when Graph.Uuid.equal record.block.parent parent -> Some record
-      | Some _ | None -> None)
-    |> List.sort (fun (left : Types.block_record) (right : Types.block_record) ->
-      String.compare left.block.order right.block.order)
-  in
-  let block_member (record : Types.block_record) =
-    String.concat
-      ":"
-      [ Graph.Uuid.to_string record.block.uuid
-      ; Graph.Uuid.to_string record.block.parent
-      ; record.block.order
-      ]
-  in
-  let members =
-    match scope with
-    | Types.Children_revision parent -> [ children_membership_digest snapshot parent ]
-    | Page_tree_revision { page; maximum_depth } ->
-      let rec walk depth parent =
-        if depth > maximum_depth
-        then []
-        else
-          direct_children parent
-          |> List.concat_map (fun record ->
-            (string_of_int depth ^ ":" ^ block_member record)
-            :: walk (depth + 1) record.block.uuid)
-      in
-      walk 0 page
-  in
-  scope_revision_from_members scope members
+let revision_for_scope (snapshot : snapshot) (Types.Children_revision parent as scope) =
+  scope_revision_from_members scope [ children_membership_digest snapshot parent ]
 ;;
 
 let projection_number revision =
@@ -2791,29 +2780,274 @@ let structure_cursor_offset snapshot cursor =
     | Stale -> Types.Stale_read_cursor)
 ;;
 
-let paginate_structure snapshot ~limit ~offset items =
-  let rec take count acc = function
-    | [] -> List.rev acc
-    | _ when count = 0 -> List.rev acc
-    | item :: rest -> take (count - 1) (item :: acc) rest
+type tree_candidate =
+  { tree_uuid : Graph.block_uuid
+  ; tree_parent : Graph.Uuid.t
+  ; tree_order : string
+  }
+
+type tree_read_cache =
+  { hydration : hydration_cache
+  ; entities : (string, int option) Hashtbl.t
+  ; fields : (int, Datascript.datom list) Hashtbl.t
+  ; authoritative_candidates : (string, tree_candidate option) Hashtbl.t
+  ; logical_candidates : (string, tree_candidate option) Hashtbl.t
+  ; insert_orders : (string, string Uuid_map.t) Hashtbl.t
+  }
+
+let tree_entity snapshot cache uuid =
+  let key = Graph.Uuid.to_string uuid in
+  match Hashtbl.find_opt cache.entities key with
+  | Some entity -> entity
+  | None ->
+    let entity = entity_of_uuid (Option.get snapshot.authoritative_database) uuid in
+    Hashtbl.add cache.entities key entity;
+    entity
+;;
+
+let tree_identity_fields =
+  [ "block/uuid"; "block/title"; "block/parent"; "block/page"; "block/order" ]
+;;
+
+let authoritative_tree_candidate snapshot cache uuid =
+  let key = Graph.Uuid.to_string uuid in
+  match Hashtbl.find_opt cache.authoritative_candidates key with
+  | Some candidate -> candidate
+  | None ->
+    let database = Option.get snapshot.authoritative_database in
+    let candidate =
+      Option.bind (tree_entity snapshot cache uuid) (fun entity ->
+        let fields =
+          List.concat_map
+            (fun a ->
+               Datascript.datoms database Datascript.Eavt ~e:entity ~a () |> List.of_seq)
+            tree_identity_fields
+        in
+        Hashtbl.add cache.fields entity fields;
+        match
+          ( Option.bind (one_in_datoms fields "block/uuid") uuid_of_value
+          , Option.bind (one_in_datoms fields "block/title") string_of_value
+          , Option.bind (one_in_datoms fields "block/parent") reference_of_value
+          , Option.bind (one_in_datoms fields "block/page") reference_of_value
+          , Option.bind (one_in_datoms fields "block/order") string_of_value )
+        with
+        | Some tree_uuid, Some _, Some parent, Some page, Some tree_order ->
+          (match
+             ( cached_uuid_of_entity database cache.hydration parent
+             , cached_uuid_of_entity database cache.hydration page )
+           with
+           | Some tree_parent, Some _ -> Some { tree_uuid; tree_parent; tree_order }
+           | _ -> None)
+        | _ -> None)
+    in
+    Hashtbl.add cache.authoritative_candidates key candidate;
+    candidate
+;;
+
+let tree_insert_orders cache (record : outbox_record) =
+  let key = Graph.Uuid.to_string record.mutation_id in
+  match Hashtbl.find_opt cache.insert_orders key with
+  | Some orders -> orders
+  | None ->
+    let orders = assigned_orders record in
+    Hashtbl.add cache.insert_orders key orders;
+    orders
+;;
+
+let logical_tree_candidate snapshot cache uuid =
+  let key = Graph.Uuid.to_string uuid in
+  match Hashtbl.find_opt cache.logical_candidates key with
+  | Some candidate -> candidate
+  | None ->
+    let effects =
+      Uuid_map.find_opt key (Option.get snapshot.block_effects)
+      |> Option.value ~default:[]
+    in
+    let initial =
+      match authoritative_tree_candidate snapshot cache uuid with
+      | Some _ as candidate -> candidate
+      | None ->
+        List.find_map
+          (fun (record : outbox_record) ->
+             if record_has_active_dependency_shadows record
+             then
+               List.find_opt
+                 (fun shadow -> Graph.Uuid.equal shadow.shadow_block_uuid uuid)
+                 record.dependency_shadows.shadow_blocks
+               |> Option.map (fun shadow ->
+                 { tree_uuid = shadow.shadow_block_uuid
+                 ; tree_parent = shadow.shadow_parent
+                 ; tree_order = shadow.shadow_order
+                 })
+             else None)
+          effects
+    in
+    let candidate =
+      List.fold_left
+        (fun current (record : outbox_record) ->
+           if not (record_is_logically_active record)
+           then current
+           else (
+             match record.mutation with
+             | Types.Insert_blocks { parent; tree; _ } ->
+               let rec find parent (tree : Types.block_tree) =
+                 if Graph.Uuid.equal tree.uuid uuid
+                 then
+                   Some
+                     { tree_uuid = uuid
+                     ; tree_parent = parent
+                     ; tree_order = assigned_order (tree_insert_orders cache record) uuid
+                     }
+                 else List.find_map (find tree.uuid) tree.children
+               in
+               (match find parent tree with
+                | Some _ as inserted -> inserted
+                | None -> current)
+             | Delete_blocks _ ->
+               (match record.delete_artifacts with
+                | None -> None
+                | Some artifacts
+                  when List.exists (Graph.Uuid.equal uuid) artifacts.frontier -> None
+                | Some _ -> current)
+             | Save_block _
+             | Create_journal_page _
+             | Set_task_status _
+             | Clear_task_status _ -> current))
+        initial
+        effects
+    in
+    Hashtbl.add cache.logical_candidates key candidate;
+    candidate
+;;
+
+let ordered_tree_children snapshot cache parent =
+  let database = Option.get snapshot.authoritative_database in
+  let authoritative =
+    match tree_entity snapshot cache parent with
+    | None -> []
+    | Some entity ->
+      Datascript.datoms
+        database
+        Datascript.Avet
+        ~a:"block/parent"
+        ~v:(Datascript.Ref entity)
+        ()
+      |> Seq.filter_map (fun (d : Datascript.datom) ->
+        cached_uuid_of_entity database cache.hydration d.e)
+      |> List.of_seq
   in
-  let rec drop count values =
-    match count, values with
-    | 0, _ | _, [] -> values
-    | count, _ :: rest -> drop (count - 1) rest
+  let local =
+    Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
+    |> Option.value ~default:[]
+    |> List.concat_map (fun (record : outbox_record) ->
+      if not (record_is_logically_active record)
+      then []
+      else (
+        let inserted =
+          match record.mutation with
+          | Types.Insert_blocks { parent = candidate; tree; _ } ->
+            (if Graph.Uuid.equal parent candidate
+             then [ tree ]
+             else tree_children parent tree)
+            |> List.map (fun (tree : Types.block_tree) -> tree.uuid)
+          | Save_block _
+          | Delete_blocks _
+          | Create_journal_page _
+          | Set_task_status _
+          | Clear_task_status _ -> []
+        in
+        let shadows =
+          if record_has_active_dependency_shadows record
+          then
+            record.dependency_shadows.shadow_blocks
+            |> List.filter_map (fun shadow ->
+              if
+                Graph.Uuid.equal shadow.shadow_parent parent
+                && Option.is_none
+                     (authoritative_tree_candidate
+                        snapshot
+                        cache
+                        shadow.shadow_block_uuid)
+              then Some shadow.shadow_block_uuid
+              else None)
+          else []
+        in
+        inserted @ shadows))
+    |> List.filter (fun uuid -> not (block_is_tombstoned snapshot uuid))
   in
-  let page = take limit [] (drop offset items) in
-  match checked_add_nonnegative offset (List.length page) with
+  List.sort_uniq Graph.Uuid.compare (authoritative @ local)
+  |> List.filter_map (fun uuid ->
+    match logical_tree_candidate snapshot cache uuid with
+    | Some candidate when Graph.Uuid.equal candidate.tree_parent parent -> Some candidate
+    | Some _ | None -> None)
+  |> List.stable_sort (fun left right -> String.compare left.tree_order right.tree_order)
+;;
+
+let paginate_page_tree snapshot ~page ~maximum_depth ~limit ~offset =
+  let database = Option.get snapshot.authoritative_database in
+  let cache =
+    { hydration = hydration_cache ~index_idents:false database
+    ; entities = Hashtbl.create 64
+    ; fields = Hashtbl.create 64
+    ; authoritative_candidates = Hashtbl.create 64
+    ; logical_candidates = Hashtbl.create 64
+    ; insert_orders = Hashtbl.create 8
+    }
+  in
+  let rec walk depth parent () =
+    ordered_tree_children snapshot cache parent
+    |> List.to_seq
+    |> Seq.flat_map (fun candidate ->
+      Seq.cons
+        (candidate, depth)
+        (if depth < maximum_depth then walk (depth + 1) candidate.tree_uuid else Seq.empty))
+    |> fun sequence -> sequence ()
+  in
+  let rec select skip remaining reversed sequence =
+    match sequence () with
+    | Seq.Nil -> List.rev reversed, false
+    | Seq.Cons (item, rest) ->
+      if skip > 0
+      then select (skip - 1) remaining reversed rest
+      else if remaining = 0
+      then List.rev reversed, true
+      else select 0 (remaining - 1) (item :: reversed) rest
+  in
+  let selected, has_more = select offset limit [] (walk 0 page) in
+  match checked_add_nonnegative offset (List.length selected) with
   | None -> Error (Types.Invalid_read_request "structure cursor offset overflow")
-  | Some consumed when consumed < List.length items && consumed > maximum_cursor_offset ->
+  | Some consumed when has_more && consumed > maximum_cursor_offset ->
     Error Types.Read_limit_exceeded
   | Some consumed ->
-    let next_cursor =
-      if consumed < List.length items
-      then Some (structure_cursor snapshot consumed)
-      else None
+    let items =
+      List.map
+        (fun (candidate, depth) ->
+           let uuid = candidate.tree_uuid in
+           let initial =
+             Option.bind (tree_entity snapshot cache uuid) (fun entity ->
+               let fields = Hashtbl.find cache.fields entity in
+               let remaining =
+                 entity_datoms database entity
+                 |> List.filter (fun (datom : Datascript.datom) ->
+                   not (List.mem datom.a tree_identity_fields))
+               in
+               block_record_of_datoms_with_cache
+                 database
+                 cache.hydration
+                 (fields @ remaining))
+           in
+           let block =
+             logical_block_at ~cache:cache.hydration ~initial snapshot uuid |> Option.get
+           in
+           Types.
+             { block
+             ; revision = logical_block_revision uuid (Some block)
+             ; depth
+             ; parent = candidate.tree_parent
+             })
+        selected
     in
-    Ok (page, next_cursor)
+    Ok (items, if has_more then Some (structure_cursor snapshot consumed) else None)
 ;;
 
 let paginate_children snapshot ~parent ~limit ~offset =
@@ -2924,28 +3158,10 @@ let get_structure snapshot request =
            | Some cursor -> structure_cursor_offset snapshot cursor
          in
          Result.bind offset_result (fun offset ->
-           let cache = hydration_cache (Option.get snapshot.authoritative_database) in
-           let rec walk depth parent =
-             if depth > maximum_depth
-             then []
-             else
-               child_items ~cache snapshot parent
-               |> List.concat_map (fun (child : Types.child_member) ->
-                 Types.{ block = child.block; revision = child.revision; depth; parent }
-                 :: walk (depth + 1) child.block.block.uuid)
-           in
-           let revision_scope = Types.Page_tree_revision { page; maximum_depth } in
            Result.map
              (fun (items, next_cursor) ->
-                Types.Page_tree_result
-                  { page
-                  ; maximum_depth
-                  ; revision_scope
-                  ; scope_revision = revision_for_scope snapshot revision_scope
-                  ; items
-                  ; next_cursor
-                  })
-             (paginate_structure snapshot ~limit ~offset (walk 0 page)))))
+                Types.Page_tree_result { page; maximum_depth; items; next_cursor })
+             (paginate_page_tree snapshot ~page ~maximum_depth ~limit ~offset))))
 ;;
 
 let listen database =
@@ -3057,12 +3273,8 @@ let duplicate_by equal values =
   loop [] values
 ;;
 
-let equal_scope left right =
-  match left, right with
-  | Types.Children_revision left, Children_revision right -> Graph.Uuid.equal left right
-  | Page_tree_revision left, Page_tree_revision right ->
-    Graph.Uuid.equal left.page right.page && left.maximum_depth = right.maximum_depth
-  | _ -> false
+let equal_scope (Types.Children_revision left) (Types.Children_revision right) =
+  Graph.Uuid.equal left right
 ;;
 
 let write_precondition ~blocks ~pages ~scopes =
@@ -3351,7 +3563,7 @@ let outbox_record_is_canonical (record : outbox_record) =
       && Option.is_some record.acceptance_barrier
       && Option.is_none record.blocked_prior_state
       && Option.is_none record.blocked_reason
-    | Delete_barrier_rejected_pending_authoritative _, Some (Some _) ->
+    | Stale_rejected_pending_authoritative _, Some (Some _) ->
       Option.is_some record.protected_transaction
       && Option.is_none record.acceptance_barrier
       && Option.is_none record.blocked_prior_state
@@ -3361,7 +3573,7 @@ let outbox_record_is_canonical (record : outbox_record) =
     | ( ( Queued
         | Submitted _
         | Accepted_pending_authoritative _
-        | Delete_barrier_rejected_pending_authoritative _
+        | Stale_rejected_pending_authoritative _
         | Blocked )
       , _ ) -> false
   in
@@ -3370,7 +3582,7 @@ let outbox_record_is_canonical (record : outbox_record) =
     | Types.Queued | Blocked -> record.dependency_shadows = empty_dependency_shadows
     | Submitted _
     | Accepted_pending_authoritative _
-    | Delete_barrier_rejected_pending_authoritative _ ->
+    | Stale_rejected_pending_authoritative _ ->
       dependency_shadows_are_canonical record.mutation record.dependency_shadows
   in
   Result.is_ok (Sync_tx_codec.protected_values record.normalized_transaction)
@@ -3564,30 +3776,7 @@ let has_children_precondition (expected : write_precondition) parent =
   Outliner.Planner_contract.contains_children_scope parent expected.scopes
 ;;
 
-let has_delete_structure_precondition database (expected : write_precondition) root =
-  let snapshot = snapshot_of_database database in
-  match logical_block_at snapshot root with
-  | None -> Ok ()
-  | Some (record : Types.block_record) ->
-    let parent = record.block.parent in
-    let page = record.block.page in
-    let found =
-      List.exists
-        (fun (scope, _) ->
-           match scope with
-           | Types.Children_revision candidate -> Graph.Uuid.equal candidate parent
-           | Page_tree_revision { page = candidate; _ } -> Graph.Uuid.equal candidate page)
-        expected.scopes
-    in
-    if found
-    then Ok ()
-    else
-      Error
-        (Types.Missing_precondition
-           (Some (Types.Page_tree_revision { page; maximum_depth = 1 })))
-;;
-
-let required_preconditions database (expected : write_precondition) = function
+let required_preconditions (expected : write_precondition) = function
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
@@ -3597,7 +3786,7 @@ let required_preconditions database (expected : write_precondition) = function
   | Delete_blocks { root; _ } ->
     if not (has_block_precondition expected root)
     then Error (Types.Missing_precondition None)
-    else has_delete_structure_precondition database expected root
+    else Ok ()
   | Insert_blocks { parent; _ } ->
     if
       (has_page_precondition expected parent || has_block_precondition expected parent)
@@ -4431,7 +4620,7 @@ let commit_local database ~expected mutation =
              | Ok (Some existing) -> [], None, Ok (Types.Local_existing existing)
              | Error () -> [], None, Error Types.Mutation_identity_conflict
              | Ok None ->
-               (match required_preconditions database expected mutation with
+               (match required_preconditions expected mutation with
                 | Error error -> [], None, Error error
                 | Ok () when not (preconditions_match database expected) ->
                   [], None, Error Types.Target_precondition_conflict
@@ -4714,9 +4903,11 @@ let batch_records database id =
   List.filter
     (fun (record : outbox_record) ->
        match record.transport_state with
-       | Types.Submitted candidate | Accepted_pending_authoritative candidate ->
+       | Types.Submitted candidate
+       | Accepted_pending_authoritative candidate
+       | Stale_rejected_pending_authoritative { batch_id = candidate; _ } ->
          Types.Submission_batch_id.equal candidate id
-       | Queued | Delete_barrier_rejected_pending_authoritative _ | Blocked -> false)
+       | Queued | Blocked -> false)
     database.outbox
 ;;
 
@@ -5023,6 +5214,15 @@ let begin_outbox_transition database ~expected transition =
         then Error (Types.Outbox_transition_invalid "retry batch is missing")
         else if
           List.exists
+            (fun (record : outbox_record) ->
+               match record.transport_state with
+               | Submitted _ -> false
+               | _ -> true)
+            records
+        then
+          Error (Types.Outbox_transition_invalid "retry batch is not transport-uncertain")
+        else if
+          List.exists
             (fun (record : outbox_record) -> Option.is_none record.protected_transaction)
             records
         then Error (Types.Outbox_transition_invalid "retry batch has no protected bytes")
@@ -5030,6 +5230,18 @@ let begin_outbox_transition database ~expected transition =
       | Accept_group { batch_id = id; barrier } ->
         (match read_terminal_batch database id with
          | Error message -> Error (Types.Outbox_transition_invalid message)
+         | Ok
+             (Some { terminal_outcome = Terminal_stale { through; executed_through }; _ })
+           ->
+           (match executed_through with
+            | Some executed
+              when server_cursor_number executed <= server_cursor_number barrier.through
+                   && server_cursor_number barrier.through <= server_cursor_number through
+              -> make Duplicate_plan None
+            | _ ->
+              Error
+                (Types.Outbox_transition_invalid
+                   "acceptance contradicts settled Stale evidence"))
          | Ok (Some { terminal_outcome = Terminal_accepted accepted; _ })
            when Transition.acceptance_barriers_equal accepted barrier ->
            make Duplicate_plan None
@@ -5068,6 +5280,12 @@ let begin_outbox_transition database ~expected transition =
       | Reject_group { batch_id = id; resolution } ->
         (match read_terminal_batch database id with
          | Error message -> Error (Types.Outbox_transition_invalid message)
+         | Ok (Some { terminal_outcome = Terminal_stale { through; _ }; _ }) ->
+           (match resolution with
+            | Types.Stale current when Types.Server_cursor.equal through current.through
+              -> make Duplicate_plan None
+            | _ ->
+              Error (Types.Outbox_transition_invalid "terminal Stale rejection mismatch"))
          | Ok (Some { terminal_outcome = Terminal_accepted _; _ }) ->
            Error (Types.Outbox_transition_invalid "batch already accepted")
          | Ok (Some { terminal_outcome = Terminal_proven_unexecuted _; _ }) ->
@@ -5078,7 +5296,46 @@ let begin_outbox_transition database ~expected transition =
            then Error (Types.Outbox_transition_invalid "reject batch is missing")
            else (
              match resolution with
-             | Types.Stale _ -> make (Reject_plan (id, resolution)) None
+             | Types.Stale { through } ->
+               if
+                 List.exists
+                   (fun (record : outbox_record) ->
+                      match record.submission_t_before with
+                      | Some baseline ->
+                        server_cursor_number through <= server_cursor_number baseline
+                      | None -> true)
+                   records
+               then
+                 Error
+                   (Types.Outbox_transition_invalid
+                      "Stale barrier does not advance the submitted baseline")
+               else if
+                 List.exists
+                   (fun (record : outbox_record) ->
+                      match record.transport_state with
+                      | Accepted_pending_authoritative _ -> true
+                      | _ -> false)
+                   records
+               then
+                 Error
+                   (Types.Outbox_transition_invalid
+                      "Stale rejection contradicts acceptance")
+               else (
+                 match
+                   List.find_map
+                     (fun (record : outbox_record) ->
+                        match record.transport_state with
+                        | Stale_rejected_pending_authoritative { through; _ } ->
+                          Some through
+                        | _ -> None)
+                     records
+                 with
+                 | Some previous when Types.Server_cursor.equal previous through ->
+                   make Duplicate_plan None
+                 | Some _ ->
+                   Error
+                     (Types.Outbox_transition_invalid "pending Stale rejection mismatch")
+                 | None -> make (Reject_plan (id, resolution)) None)
              | Definitive { partition; _ } ->
                (match validate_rejection_partition records partition with
                 | Error message -> Error (Types.Outbox_transition_invalid message)
@@ -5334,319 +5591,6 @@ let update_submitted database ~capture_dependency_shadows records batch =
     records
 ;;
 
-let apply_outbox_transition database preparation ~encrypted =
-  serialize_commit database (fun () ->
-    let callbacks, change, outcome =
-      Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
-        if preparation.transition_owner != database
-        then [], None, Error Types.Outbox_commit_generation_invalidated
-        else if database.closed
-        then [], None, Error Types.Outbox_commit_database_closed
-        else if preparation.transition_consumed
-        then [], None, Error Types.Outbox_preparation_consumed
-        else (
-          match outbox_submission_batch preparation ~encrypted with
-          | Error error -> [], None, Error error
-          | Ok _ when database.sync_revision <> preparation.transition_revision ->
-            [], None, Error Types.Outbox_commit_token_conflict
-          | Ok submission_batch ->
-            preparation.transition_consumed <- true;
-            Option.iter
-              (fun request -> request.protection_consumed <- true)
-              preparation.protection_request;
-            if preparation.plan = Duplicate_plan
-            then (
-              let revision = projection_revision database.projection in
-              ( []
-              , None
-              , Ok
-                  { Types.generation = database.generation
-                  ; before_projection_revision = revision
-                  ; after_projection_revision = revision
-                  ; sync_token = sync_token database.sync_revision
-                  ; transition = preparation.transition
-                  ; activity = Logically_inactive
-                  ; logical_change_summary = No_logical_change
-                  ; submission_batch = None
-                  } ))
-            else (
-              let previous_sync_revision = database.sync_revision in
-              let previous_projection = database.projection in
-              let logical_before =
-                match preparation.plan with
-                | Accept_plan (_, barrier)
-                  when server_cursor_number barrier.through <= database.checkpoint ->
-                  Some (snapshot_of_database database)
-                | Reject_plan (_, Definitive _) -> Some (snapshot_of_database database)
-                | Submit_plan _ | Retry_plan _ | Accept_plan _
-                | Reject_plan (_, Stale _)
-                | Duplicate_plan -> None
-              in
-              let previous_outbox = database.outbox in
-              let previous_receipts = database.receipts in
-              let previous_records =
-                List.map
-                  (fun (record : outbox_record) ->
-                     ( record
-                     , record.transport_state
-                     , record.dependency_shadows
-                     , record.protected_transaction
-                     , record.attempt_count
-                     , record.blocked_prior_state
-                     , record.blocked_reason
-                     , record.same_id_retry_eligible
-                     , record.acceptance_barrier
-                     , record.submission_t_before
-                     , record.submission_ordinal
-                     , record.submission_count
-                     , record.observed_origin_cursor
-                     , record.stale_earliest_conflict_cursor
-                     , record.stale_conflicts ))
-                  database.outbox
-              in
-              let activity, affected_records =
-                match preparation.plan with
-                | Submit_plan records ->
-                  let batch = Option.get submission_batch in
-                  update_submitted database ~capture_dependency_shadows:true records batch;
-                  Types.Logically_active, []
-                | Retry_plan (id, records) ->
-                  let batch = Option.get submission_batch in
-                  if
-                    not
-                      (Types.Submission_batch_id.equal
-                         id
-                         (Types.submission_batch_id batch))
-                  then invalid_arg "retry batch identity changed";
-                  List.iter
-                    (fun (record : outbox_record) ->
-                       record.attempt_count <- record.attempt_count + 1)
-                    records;
-                  Types.Logically_active, []
-                | Accept_plan (id, barrier)
-                  when server_cursor_number barrier.through > database.checkpoint ->
-                  List.iter
-                    (fun (record : outbox_record) ->
-                       record.transport_state <- Types.Accepted_pending_authoritative id;
-                       record.acceptance_barrier <- Some barrier)
-                    (batch_records database id);
-                  Types.Logically_active, []
-                | Accept_plan (id, barrier) ->
-                  let records = batch_records database id in
-                  let current_root = authoritative_database database in
-                  let barrier_is_behind =
-                    server_cursor_number barrier.through < database.checkpoint
-                  in
-                  let incorporated, mismatched =
-                    List.partition
-                      (fun (record : outbox_record) ->
-                         match record.mutation with
-                         | Save_block _
-                         | Insert_blocks _
-                         | Create_journal_page _
-                         | Set_task_status _
-                         | Clear_task_status _
-                           when barrier_is_behind -> true
-                         | _ -> accepted_record_satisfied current_root records record)
-                      records
-                  in
-                  List.iter
-                    (fun (record : outbox_record) ->
-                       record.blocked_prior_state <- Some record.transport_state;
-                       record.blocked_reason <- Some Types.Authoritative_mismatch;
-                       record.same_id_retry_eligible <- false;
-                       record.acceptance_barrier <- None;
-                       record.dependency_shadows <- empty_dependency_shadows;
-                       record.transport_state <- Types.Blocked)
-                    mismatched;
-                  let receipt_revision = projection_revision database.projection in
-                  database.receipts
-                  <- List.fold_left
-                       (fun receipts (record : outbox_record) ->
-                          let commit =
-                            { Types.mutation_id = record.mutation_id
-                            ; status = Applied
-                            ; generation = database.generation
-                            ; before_projection_revision = receipt_revision
-                            ; after_projection_revision = receipt_revision
-                            ; logical_change_summary = No_logical_change
-                            }
-                          in
-                          (record.mutation_id, record.fingerprint, Commit_receipt commit)
-                          :: List.filter
-                               (fun (candidate, _, _) ->
-                                  not (Graph.Uuid.equal candidate record.mutation_id))
-                               receipts)
-                       database.receipts
-                       incorporated;
-                  database.outbox
-                  <- List.filter
-                       (fun (record : outbox_record) ->
-                          not
-                            (List.exists
-                               (fun incorporated_record -> incorporated_record == record)
-                               incorporated))
-                       database.outbox;
-                  Types.Logically_inactive, records
-                | Reject_plan (id, Types.Stale { through }) ->
-                  let records = batch_records database id in
-                  List.iter
-                    (fun (record : outbox_record) ->
-                       record.transport_state
-                       <- Types.Delete_barrier_rejected_pending_authoritative
-                            { batch_id = id; through };
-                       record.acceptance_barrier <- None;
-                       record.stale_earliest_conflict_cursor <- None;
-                       record.stale_conflicts <- [])
-                    records;
-                  Types.Logically_active, []
-                | Reject_plan (id, Definitive { partition; _ }) ->
-                  let records = batch_records database id in
-                  let accepted = records_for_ids records partition.accepted_prefix in
-                  let failed =
-                    records_for_ids records (Option.to_list partition.failed_member)
-                  in
-                  let dependent, independent =
-                    rejection_suffix_records records partition
-                  in
-                  List.iter
-                    (fun (record : outbox_record) ->
-                       record.transport_state <- Types.Accepted_pending_authoritative id)
-                    accepted;
-                  List.iter
-                    (fun (record : outbox_record) ->
-                       record.blocked_prior_state <- Some record.transport_state;
-                       record.blocked_reason <- Some Types.Rejected;
-                       record.same_id_retry_eligible <- false;
-                       record.acceptance_barrier <- None;
-                       record.dependency_shadows <- empty_dependency_shadows;
-                       record.transport_state <- Types.Blocked)
-                    (failed @ dependent);
-                  Option.iter
-                    (fun batch ->
-                       update_submitted
-                         database
-                         ~capture_dependency_shadows:false
-                         independent
-                         batch)
-                    submission_batch;
-                  ( (if accepted = [] && independent = []
-                     then Types.Logically_inactive
-                     else Logically_active)
-                  , failed @ dependent )
-                | Duplicate_plan -> assert false
-              in
-              let logical_change_summary =
-                match logical_before with
-                | None -> Types.No_logical_change
-                | Some before ->
-                  let after =
-                    snapshot_for_sources
-                      database
-                      (authoritative_database database)
-                      database.outbox
-                  in
-                  logical_change_for_effects
-                    database
-                    ~before
-                    ~after
-                    (List.map
-                       (fun (record : outbox_record) -> record.effect_footprint)
-                       affected_records)
-              in
-              let logical_changed = logical_change_summary <> Types.No_logical_change in
-              database.projection
-              <- (if logical_changed then previous_projection + 1 else previous_projection);
-              let terminal_batches =
-                match preparation.plan with
-                | Accept_plan (terminal_batch_id, terminal_acceptance_barrier) ->
-                  [ { terminal_batch_id
-                    ; terminal_outcome = Terminal_accepted terminal_acceptance_barrier
-                    }
-                  ]
-                | Submit_plan _ | Retry_plan _ | Reject_plan _ | Duplicate_plan -> []
-              in
-              database.sync_revision <- database.sync_revision + 1;
-              match persist_outbox ~terminal_batches database with
-              | Error message ->
-                database.sync_revision <- previous_sync_revision;
-                database.projection <- previous_projection;
-                database.outbox <- previous_outbox;
-                database.receipts <- previous_receipts;
-                List.iter
-                  (fun ( record
-                       , transport_state
-                       , dependency_shadows
-                       , protected_transaction
-                       , attempt_count
-                       , blocked_prior_state
-                       , blocked_reason
-                       , same_id_retry_eligible
-                       , acceptance_barrier
-                       , submission_t_before
-                       , submission_ordinal
-                       , submission_count
-                       , observed_origin_cursor
-                       , stale_earliest_conflict_cursor
-                       , stale_conflicts ) ->
-                     record.transport_state <- transport_state;
-                     record.dependency_shadows <- dependency_shadows;
-                     record.protected_transaction <- protected_transaction;
-                     record.attempt_count <- attempt_count;
-                     record.blocked_prior_state <- blocked_prior_state;
-                     record.blocked_reason <- blocked_reason;
-                     record.same_id_retry_eligible <- same_id_retry_eligible;
-                     record.acceptance_barrier <- acceptance_barrier;
-                     record.submission_t_before <- submission_t_before;
-                     record.submission_ordinal <- submission_ordinal;
-                     record.submission_count <- submission_count;
-                     record.observed_origin_cursor <- observed_origin_cursor;
-                     record.stale_earliest_conflict_cursor
-                     <- stale_earliest_conflict_cursor;
-                     record.stale_conflicts <- stale_conflicts)
-                  previous_records;
-                [], None, Error (Types.Outbox_commit_persistence_failed message)
-              | Ok () ->
-                refresh_queryable_outbox database;
-                database.receipts <- [];
-                let before_projection_revision =
-                  projection_revision previous_projection
-                in
-                let after_projection_revision = projection_revision database.projection in
-                let change =
-                  Change_dispatcher.event
-                    ~generation:database.generation
-                    ~before_revision:before_projection_revision
-                    ~after_revision:after_projection_revision
-                    logical_change_summary
-                in
-                let callbacks =
-                  match change with
-                  | None -> []
-                  | Some _ ->
-                    database.subscriptions
-                    |> List.filter_map (fun (subscription : subscription) ->
-                      match subscription.lifecycle, subscription.notify with
-                      | Active, Some callback -> Some callback
-                      | Active, None | Unlistened, _ -> None)
-                in
-                ( callbacks
-                , change
-                , Ok
-                    { Types.generation = database.generation
-                    ; before_projection_revision
-                    ; after_projection_revision
-                    ; sync_token = sync_token database.sync_revision
-                    ; transition = preparation.transition
-                    ; activity
-                    ; logical_change_summary
-                    ; submission_batch
-                    } ))))
-    in
-    ignore callbacks;
-    change, outcome)
-;;
-
 let authoritative_crypto_item_id database revision index =
   token
     Types.Crypto_item_id.of_string
@@ -5881,10 +5825,8 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                      ^ "; actual="
                      ^ actual))
               else Ok ())
-          | Queued
-          | Submitted _
-          | Delete_barrier_rejected_pending_authoritative _
-          | Blocked -> Ok ())
+          | Queued | Submitted _ | Stale_rejected_pending_authoritative _ | Blocked ->
+            Ok ())
       in
       Result.map
         (fun () -> validated)
@@ -6076,6 +6018,19 @@ let delete_conflict_kinds_between before after (record : outbox_record) =
   |> List.sort_uniq compare
 ;;
 
+let validated_record_origin (record : outbox_record) origins =
+  let observed =
+    match
+      List.find_opt (fun (id, _) -> Graph.Uuid.equal id record.mutation_id) origins
+    with
+    | Some (_, cursor) -> Some cursor
+    | None -> record.observed_origin_cursor
+  in
+  match expected_origin_cursor record, observed with
+  | Ok expected, Some cursor when expected = server_cursor_number cursor -> Some cursor
+  | _ -> None
+;;
+
 let classify_stale_deletes owner batch transactions roots_after =
   let cursors =
     Types.authoritative_batch_transactions batch
@@ -6160,7 +6115,10 @@ let classify_stale_deletes owner batch transactions roots_after =
       Ok (List.rev updates, List.rev remote_won, List.rev no_change, List.rev blocked)
     | (record : outbox_record) :: rest ->
       (match record.transport_state with
-       | Types.Delete_barrier_rejected_pending_authoritative { batch_id; through } ->
+       | Types.Stale_rejected_pending_authoritative { batch_id; through }
+         when match record.mutation with
+              | Delete_blocks _ -> true
+              | _ -> false ->
          Result.bind
            (classify_record
               record
@@ -6182,8 +6140,11 @@ let classify_stale_deletes owner batch transactions roots_after =
                collect updates remote_won (outcome :: no_change) blocked rest
              | `Blocked outcome ->
                collect updates remote_won no_change (outcome :: blocked) rest)
-       | Queued | Submitted _ | Accepted_pending_authoritative _ | Blocked ->
-         collect updates remote_won no_change blocked rest)
+       | Queued
+       | Submitted _
+       | Accepted_pending_authoritative _
+       | Stale_rejected_pending_authoritative _
+       | Blocked -> collect updates remote_won no_change blocked rest)
   in
   collect [] [] [] [] owner.outbox
 ;;
@@ -6288,7 +6249,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
                       | Clear_task_status _ ) ) -> None
                   | ( ( Queued
                       | Accepted_pending_authoritative _
-                      | Delete_barrier_rejected_pending_authoritative _
+                      | Stale_rejected_pending_authoritative _
                       | Blocked )
                     , _ ) -> None)
                preparation.authoritative_owner.outbox
@@ -6471,21 +6432,28 @@ let unavailable_dependency unavailable uuid =
     unavailable
 ;;
 
-let missing_replan_dependency snapshot mutation =
+let invalid_replan_dependency snapshot mutation =
   let missing uuid present = if present then None else Some uuid in
   match mutation with
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
     missing block (Option.is_some (logical_block_at snapshot block))
-  | Insert_blocks { parent; _ } ->
+  | Insert_blocks { parent; tree; _ } ->
     let block_exists = Option.is_some (logical_block_at snapshot parent) in
     let page_exists =
       match logical_page_at snapshot parent with
       | Some (record : Types.page_record) -> not record.page.recycled
       | None -> false
     in
-    missing parent (block_exists || page_exists)
+    if not (block_exists || page_exists)
+    then Some parent
+    else
+      List.find_opt
+        (fun uuid ->
+           Option.is_some (logical_block_at snapshot uuid)
+           || Option.is_some (logical_page_at snapshot uuid))
+        (tree_uuids tree)
   | Create_journal_page { page; _ } ->
     if Option.is_some (logical_page_at snapshot page) then Some page else None
   | Delete_blocks _ -> None
@@ -6601,7 +6569,7 @@ let replan_queued_ordinary database authoritative_database records =
              blocked
              rest
          else (
-           match missing_replan_dependency snapshot mutation with
+           match invalid_replan_dependency snapshot mutation with
            | Some uuid ->
              let reason =
                match unavailable_dependency unavailable uuid with
@@ -6678,7 +6646,7 @@ let replan_queued_ordinary database authoritative_database records =
            rest
        | ( ( Types.Submitted _
            | Accepted_pending_authoritative _
-           | Delete_barrier_rejected_pending_authoritative _ )
+           | Stale_rejected_pending_authoritative _ )
          , _ ) ->
          let accumulated, block_effects, page_effects, children_effects =
            add_record accumulated block_effects page_effects children_effects record
@@ -6695,6 +6663,482 @@ let replan_queued_ordinary database authoritative_database records =
            rest)
   in
   loop [] Uuid_map.empty Uuid_map.empty Uuid_map.empty [] [] [] [] records
+;;
+
+let settle_stale_records ~checkpoint ~origins records =
+  let covered (record : outbox_record) =
+    match record.transport_state with
+    | Stale_rejected_pending_authoritative { through; _ } ->
+      server_cursor_number through <= checkpoint
+    | _ -> false
+  in
+  let settled =
+    List.filter
+      (fun record ->
+         covered record
+         &&
+         match record.mutation with
+         | Delete_blocks _ -> false
+         | _ -> true)
+      records
+  in
+  let origin_with_prefix (record : outbox_record) =
+    match record.transport_state, record.submission_ordinal with
+    | Stale_rejected_pending_authoritative { batch_id; _ }, Some ordinal ->
+      let prefix =
+        List.filter
+          (fun (member : outbox_record) ->
+             match member.transport_state, member.submission_ordinal with
+             | ( Stale_rejected_pending_authoritative { batch_id = candidate; _ }
+               , Some member_ordinal ) ->
+               Types.Submission_batch_id.equal batch_id candidate
+               && member_ordinal <= ordinal
+             | _ -> false)
+          records
+      in
+      if
+        List.length prefix = ordinal + 1
+        && List.for_all
+             (fun member -> Option.is_some (validated_record_origin member origins))
+             prefix
+      then validated_record_origin record origins
+      else None
+    | _ -> None
+  in
+  let executed, unexecuted =
+    List.partition (fun record -> Option.is_some (origin_with_prefix record)) settled
+  in
+  let candidate =
+    List.filter_map
+      (fun (record : outbox_record) ->
+         if List.exists (fun item -> item == record) executed
+         then None
+         else if List.exists (fun item -> item == record) unexecuted
+         then
+           Some
+             { record with
+               transport_state = Queued
+             ; protected_transaction = None
+             ; dependency_shadows = empty_dependency_shadows
+             ; submission_t_before = None
+             ; submission_ordinal = None
+             ; submission_count = None
+             ; observed_origin_cursor = None
+             ; stale_earliest_conflict_cursor = None
+             ; stale_conflicts = []
+             }
+         else Some record)
+      records
+  in
+  let batches =
+    List.filter_map
+      (fun (record : outbox_record) ->
+         match record.transport_state with
+         | Stale_rejected_pending_authoritative { batch_id; through } ->
+           let members =
+             List.filter
+               (fun (member : outbox_record) ->
+                  match member.transport_state with
+                  | Stale_rejected_pending_authoritative { batch_id = other; _ } ->
+                    Types.Submission_batch_id.equal batch_id other
+                  | _ -> false)
+               records
+           in
+           let executed_through =
+             if
+               List.for_all
+                 (fun member -> Option.is_some (validated_record_origin member origins))
+                 members
+             then
+               List.fold_left
+                 (fun latest member ->
+                    match latest, validated_record_origin member origins with
+                    | None, cursor -> cursor
+                    | Some left, Some right ->
+                      Some
+                        (if server_cursor_number left > server_cursor_number right
+                         then left
+                         else right)
+                    | cursor, None -> cursor)
+                 None
+                 members
+             else None
+           in
+           Some
+             { terminal_batch_id = batch_id
+             ; terminal_outcome = Terminal_stale { through; executed_through }
+             }
+         | _ -> None)
+      settled
+    |> List.sort_uniq (fun left right ->
+      compare left.terminal_batch_id right.terminal_batch_id)
+  in
+  candidate, executed, batches
+;;
+
+let add_commit_receipts database ~status records receipts =
+  let revision = projection_revision database.projection in
+  List.fold_left
+    (fun receipts (record : outbox_record) ->
+       ( record.mutation_id
+       , record.fingerprint
+       , Commit_receipt
+           { Types.mutation_id = record.mutation_id
+           ; status
+           ; generation = database.generation
+           ; before_projection_revision = revision
+           ; after_projection_revision = revision
+           ; logical_change_summary = No_logical_change
+           } )
+       :: List.filter
+            (fun (id, _, _) -> not (Graph.Uuid.equal id record.mutation_id))
+            receipts)
+    receipts
+    records
+;;
+
+let apply_outbox_transition database preparation ~encrypted =
+  serialize_commit database (fun () ->
+    let callbacks, change, outcome =
+      Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+        if preparation.transition_owner != database
+        then [], None, Error Types.Outbox_commit_generation_invalidated
+        else if database.closed
+        then [], None, Error Types.Outbox_commit_database_closed
+        else if preparation.transition_consumed
+        then [], None, Error Types.Outbox_preparation_consumed
+        else (
+          match outbox_submission_batch preparation ~encrypted with
+          | Error error -> [], None, Error error
+          | Ok _ when database.sync_revision <> preparation.transition_revision ->
+            [], None, Error Types.Outbox_commit_token_conflict
+          | Ok submission_batch ->
+            preparation.transition_consumed <- true;
+            Option.iter
+              (fun request -> request.protection_consumed <- true)
+              preparation.protection_request;
+            if preparation.plan = Duplicate_plan
+            then (
+              let revision = projection_revision database.projection in
+              ( []
+              , None
+              , Ok
+                  { Types.generation = database.generation
+                  ; before_projection_revision = revision
+                  ; after_projection_revision = revision
+                  ; sync_token = sync_token database.sync_revision
+                  ; transition = preparation.transition
+                  ; activity = Logically_inactive
+                  ; logical_change_summary = No_logical_change
+                  ; submission_batch = None
+                  } ))
+            else (
+              let previous_sync_revision = database.sync_revision in
+              let previous_projection = database.projection in
+              let logical_before =
+                match preparation.plan with
+                | Accept_plan (_, barrier)
+                  when server_cursor_number barrier.through <= database.checkpoint ->
+                  Some (snapshot_of_database database)
+                | Reject_plan (_, Definitive _) -> Some (snapshot_of_database database)
+                | Reject_plan (_, Stale { through })
+                  when server_cursor_number through <= database.checkpoint ->
+                  Some (snapshot_of_database database)
+                | Submit_plan _ | Retry_plan _ | Accept_plan _
+                | Reject_plan (_, Stale _)
+                | Duplicate_plan -> None
+              in
+              let previous_outbox = database.outbox in
+              let previous_receipts = database.receipts in
+              let previous_records =
+                List.map
+                  (fun (record : outbox_record) ->
+                     ( record
+                     , record.transport_state
+                     , record.dependency_shadows
+                     , record.protected_transaction
+                     , record.attempt_count
+                     , record.blocked_prior_state
+                     , record.blocked_reason
+                     , record.same_id_retry_eligible
+                     , record.acceptance_barrier
+                     , record.submission_t_before
+                     , record.submission_ordinal
+                     , record.submission_count
+                     , record.observed_origin_cursor
+                     , record.stale_earliest_conflict_cursor
+                     , record.stale_conflicts ))
+                  database.outbox
+              in
+              let activity, affected_records =
+                match preparation.plan with
+                | Submit_plan records ->
+                  let batch = Option.get submission_batch in
+                  update_submitted database ~capture_dependency_shadows:true records batch;
+                  Types.Logically_active, []
+                | Retry_plan (id, records) ->
+                  let batch = Option.get submission_batch in
+                  if
+                    not
+                      (Types.Submission_batch_id.equal
+                         id
+                         (Types.submission_batch_id batch))
+                  then invalid_arg "retry batch identity changed";
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.attempt_count <- record.attempt_count + 1)
+                    records;
+                  Types.Logically_active, []
+                | Accept_plan (id, barrier)
+                  when server_cursor_number barrier.through > database.checkpoint ->
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.transport_state <- Types.Accepted_pending_authoritative id;
+                       record.acceptance_barrier <- Some barrier)
+                    (batch_records database id);
+                  Types.Logically_active, []
+                | Accept_plan (id, barrier) ->
+                  let records = batch_records database id in
+                  let current_root = authoritative_database database in
+                  let barrier_is_behind =
+                    server_cursor_number barrier.through < database.checkpoint
+                  in
+                  let incorporated, mismatched =
+                    List.partition
+                      (fun (record : outbox_record) ->
+                         match record.mutation with
+                         | Save_block _
+                         | Insert_blocks _
+                         | Create_journal_page _
+                         | Set_task_status _
+                         | Clear_task_status _
+                           when barrier_is_behind -> true
+                         | _ -> accepted_record_satisfied current_root records record)
+                      records
+                  in
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.blocked_prior_state <- Some record.transport_state;
+                       record.blocked_reason <- Some Types.Authoritative_mismatch;
+                       record.same_id_retry_eligible <- false;
+                       record.acceptance_barrier <- None;
+                       record.dependency_shadows <- empty_dependency_shadows;
+                       record.transport_state <- Types.Blocked)
+                    mismatched;
+                  let receipt_revision = projection_revision database.projection in
+                  database.receipts
+                  <- List.fold_left
+                       (fun receipts (record : outbox_record) ->
+                          let commit =
+                            { Types.mutation_id = record.mutation_id
+                            ; status = Applied
+                            ; generation = database.generation
+                            ; before_projection_revision = receipt_revision
+                            ; after_projection_revision = receipt_revision
+                            ; logical_change_summary = No_logical_change
+                            }
+                          in
+                          (record.mutation_id, record.fingerprint, Commit_receipt commit)
+                          :: List.filter
+                               (fun (candidate, _, _) ->
+                                  not (Graph.Uuid.equal candidate record.mutation_id))
+                               receipts)
+                       database.receipts
+                       incorporated;
+                  database.outbox
+                  <- List.filter
+                       (fun (record : outbox_record) ->
+                          not
+                            (List.exists
+                               (fun incorporated_record -> incorporated_record == record)
+                               incorporated))
+                       database.outbox;
+                  Types.Logically_inactive, records
+                | Reject_plan (id, Types.Stale { through }) ->
+                  let records = batch_records database id in
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.transport_state
+                       <- Types.Stale_rejected_pending_authoritative
+                            { batch_id = id; through };
+                       record.acceptance_barrier <- None;
+                       record.stale_earliest_conflict_cursor <- None;
+                       record.stale_conflicts <- [])
+                    records;
+                  Types.Logically_active, []
+                | Reject_plan (id, Definitive { partition; _ }) ->
+                  let records = batch_records database id in
+                  let accepted = records_for_ids records partition.accepted_prefix in
+                  let failed =
+                    records_for_ids records (Option.to_list partition.failed_member)
+                  in
+                  let dependent, independent =
+                    rejection_suffix_records records partition
+                  in
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.transport_state <- Types.Accepted_pending_authoritative id)
+                    accepted;
+                  List.iter
+                    (fun (record : outbox_record) ->
+                       record.blocked_prior_state <- Some record.transport_state;
+                       record.blocked_reason <- Some Types.Rejected;
+                       record.same_id_retry_eligible <- false;
+                       record.acceptance_barrier <- None;
+                       record.dependency_shadows <- empty_dependency_shadows;
+                       record.transport_state <- Types.Blocked)
+                    (failed @ dependent);
+                  Option.iter
+                    (fun batch ->
+                       update_submitted
+                         database
+                         ~capture_dependency_shadows:false
+                         independent
+                         batch)
+                    submission_batch;
+                  ( (if accepted = [] && independent = []
+                     then Types.Logically_inactive
+                     else Logically_active)
+                  , failed @ dependent )
+                | Duplicate_plan -> assert false
+              in
+              let stale_batches, affected_records =
+                match preparation.plan with
+                | Reject_plan (_, Stale _) ->
+                  let candidate, executed, batches =
+                    settle_stale_records
+                      ~checkpoint:database.checkpoint
+                      ~origins:[]
+                      database.outbox
+                  in
+                  let candidate, _, no_change, _ =
+                    replan_queued_ordinary
+                      database
+                      (authoritative_database database)
+                      candidate
+                  in
+                  database.outbox <- candidate;
+                  database.receipts
+                  <- add_commit_receipts
+                       database
+                       ~status:Applied
+                       executed
+                       database.receipts
+                     |> add_commit_receipts database ~status:No_change no_change;
+                  batches, previous_outbox
+                | _ -> [], affected_records
+              in
+              let logical_change_summary =
+                match logical_before with
+                | None -> Types.No_logical_change
+                | Some before ->
+                  let after =
+                    snapshot_for_sources
+                      database
+                      (authoritative_database database)
+                      database.outbox
+                  in
+                  logical_change_for_effects
+                    database
+                    ~before
+                    ~after
+                    (List.map
+                       (fun (record : outbox_record) -> record.effect_footprint)
+                       affected_records)
+              in
+              let logical_changed = logical_change_summary <> Types.No_logical_change in
+              database.projection
+              <- (if logical_changed then previous_projection + 1 else previous_projection);
+              let terminal_batches =
+                stale_batches
+                @
+                match preparation.plan with
+                | Accept_plan (terminal_batch_id, terminal_acceptance_barrier) ->
+                  [ { terminal_batch_id
+                    ; terminal_outcome = Terminal_accepted terminal_acceptance_barrier
+                    }
+                  ]
+                | Submit_plan _ | Retry_plan _ | Reject_plan _ | Duplicate_plan -> []
+              in
+              database.sync_revision <- database.sync_revision + 1;
+              match persist_outbox ~terminal_batches database with
+              | Error message ->
+                database.sync_revision <- previous_sync_revision;
+                database.projection <- previous_projection;
+                database.outbox <- previous_outbox;
+                database.receipts <- previous_receipts;
+                List.iter
+                  (fun ( record
+                       , transport_state
+                       , dependency_shadows
+                       , protected_transaction
+                       , attempt_count
+                       , blocked_prior_state
+                       , blocked_reason
+                       , same_id_retry_eligible
+                       , acceptance_barrier
+                       , submission_t_before
+                       , submission_ordinal
+                       , submission_count
+                       , observed_origin_cursor
+                       , stale_earliest_conflict_cursor
+                       , stale_conflicts ) ->
+                     record.transport_state <- transport_state;
+                     record.dependency_shadows <- dependency_shadows;
+                     record.protected_transaction <- protected_transaction;
+                     record.attempt_count <- attempt_count;
+                     record.blocked_prior_state <- blocked_prior_state;
+                     record.blocked_reason <- blocked_reason;
+                     record.same_id_retry_eligible <- same_id_retry_eligible;
+                     record.acceptance_barrier <- acceptance_barrier;
+                     record.submission_t_before <- submission_t_before;
+                     record.submission_ordinal <- submission_ordinal;
+                     record.submission_count <- submission_count;
+                     record.observed_origin_cursor <- observed_origin_cursor;
+                     record.stale_earliest_conflict_cursor
+                     <- stale_earliest_conflict_cursor;
+                     record.stale_conflicts <- stale_conflicts)
+                  previous_records;
+                [], None, Error (Types.Outbox_commit_persistence_failed message)
+              | Ok () ->
+                refresh_queryable_outbox database;
+                database.receipts <- [];
+                let before_projection_revision =
+                  projection_revision previous_projection
+                in
+                let after_projection_revision = projection_revision database.projection in
+                let change =
+                  Change_dispatcher.event
+                    ~generation:database.generation
+                    ~before_revision:before_projection_revision
+                    ~after_revision:after_projection_revision
+                    logical_change_summary
+                in
+                let callbacks =
+                  match change with
+                  | None -> []
+                  | Some _ ->
+                    database.subscriptions
+                    |> List.filter_map (fun (subscription : subscription) ->
+                      match subscription.lifecycle, subscription.notify with
+                      | Active, Some callback -> Some callback
+                      | Active, None | Unlistened, _ -> None)
+                in
+                ( callbacks
+                , change
+                , Ok
+                    { Types.generation = database.generation
+                    ; before_projection_revision
+                    ; after_projection_revision
+                    ; sync_token = sync_token database.sync_revision
+                    ; transition = preparation.transition
+                    ; activity
+                    ; logical_change_summary
+                    ; submission_batch
+                    } ))))
+    in
+    ignore callbacks;
+    change, outcome)
 ;;
 
 let changed_entity_uuids before after transaction_data =
@@ -7108,6 +7552,13 @@ let commit_authoritative_candidate database prepared =
                          }))
                 database.outbox
             in
+            let candidate_outbox, stale_executed, stale_batches =
+              settle_stale_records
+                ~checkpoint:through
+                ~origins:prepared.validated_origins
+                candidate_outbox
+            in
+            let resolved_records = resolved_records @ stale_executed in
             let candidate_outbox, replanned_queued, no_change_queued, blocked_queued =
               replan_queued_ordinary database authoritative_after candidate_outbox
             in
@@ -7290,16 +7741,17 @@ let commit_authoritative_candidate database prepared =
                   no_change_queued
             in
             let terminal_batches =
-              List.map
-                (fun (record, batch_id, _cursor, _conflicts) ->
-                   { terminal_batch_id = batch_id
-                   ; terminal_outcome =
-                       Terminal_proven_unexecuted
-                         { mutation_id = record.mutation_id
-                         ; fingerprint = record.fingerprint
-                         }
-                   })
-                remote_won_submitted
+              stale_batches
+              @ List.map
+                  (fun (record, batch_id, _cursor, _conflicts) ->
+                     { terminal_batch_id = batch_id
+                     ; terminal_outcome =
+                         Terminal_proven_unexecuted
+                           { mutation_id = record.mutation_id
+                           ; fingerprint = record.fingerprint
+                           }
+                     })
+                  remote_won_submitted
               @ List.map
                   (fun (record, batch_id, _, _, _) ->
                      { terminal_batch_id = batch_id
