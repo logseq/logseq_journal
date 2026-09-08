@@ -23,6 +23,7 @@
   journal_visual_tokens
   material_icon_catalog)
  (libraries
+  rrbvec
   bonsai_flutter.spec_impl
   base
   bonsai

@@ -1,0 +1,189 @@
+--- a/logseq_overlay_db/lib/database.ml
++++ b/logseq_overlay_db/lib/database.ml
+@@ -125,8 +125,8 @@
+   ; mutable receipts : (Graph.Uuid.t * string * receipt_entry) list
+   ; mutable outbox : outbox_record list
+   ; mutable queryable_outbox : outbox_record list
+-  ; mutable queryable_block_effects : outbox_record list Uuid_map.t
+-  ; mutable queryable_page_effects : outbox_record list Uuid_map.t
++  ; mutable queryable_block_effects : outbox_record Rrbvec.t Uuid_map.t
++  ; mutable queryable_page_effects : outbox_record Rrbvec.t Uuid_map.t
+   ; mutable queryable_children_effects : outbox_record list Uuid_map.t
+   ; mutable sync_revision : int
+   ; mutable checkpoint : int
+@@ -140,8 +140,8 @@
+   ; version : Types.snapshot_version
+   ; mutable authoritative_database : Datascript.db option
+   ; mutable outbox : outbox_record list option
+-  ; mutable block_effects : outbox_record list Uuid_map.t option
+-  ; mutable page_effects : outbox_record list Uuid_map.t option
++  ; mutable block_effects : outbox_record Rrbvec.t Uuid_map.t option
++  ; mutable page_effects : outbox_record Rrbvec.t Uuid_map.t option
+   ; mutable children_effects : outbox_record list Uuid_map.t option
+   ; mutable released : bool
+   ; mutable active_reads : int
+@@ -1624,6 +1624,10 @@
+     Uuid_map.empty
+ ;;
+ 
++let index_ordered_effects select records =
++  index_effects select records |> Uuid_map.map Rrbvec.of_list
++;;
++
+ let index_children_effects records =
+   index_effects
+     (fun record ->
+@@ -1651,7 +1655,7 @@
+ let queryable_outbox_root (records : outbox_record list) =
+   let outbox = frozen_outbox records in
+   ( outbox
+-  , index_effects
++  , index_ordered_effects
+       (fun record ->
+          record.effect_footprint.block_uuids
+          @
+@@ -1662,7 +1666,7 @@
+              record.dependency_shadows.shadow_blocks
+          else [])
+       outbox
+-  , index_effects
++  , index_ordered_effects
+       (fun record ->
+          record.effect_footprint.page_uuids
+          @
+@@ -1986,7 +1990,7 @@
+   let authoritative = Option.get snapshot.authoritative_database in
+   let effects =
+     Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.page_effects)
+-    |> Option.value ~default:[]
++    |> Option.value ~default:Rrbvec.empty
+   in
+   let initial =
+     match initial with
+@@ -1995,7 +1999,7 @@
+       (match page_of_database authoritative uuid with
+        | Some _ as page -> page
+        | None ->
+-         List.find_map
++         Rrbvec.find_map
+            (fun (record : outbox_record) ->
+               if record_has_active_dependency_shadows record
+               then
+@@ -2006,7 +2010,7 @@
+               else None)
+            effects)
+   in
+-  List.fold_left
++  Rrbvec.fold_left
+     (fun current (record : outbox_record) ->
+        if not (record_is_logically_active record)
+        then current
+@@ -2108,7 +2112,7 @@
+   let authoritative = Option.get snapshot.authoritative_database in
+   let effects =
+     Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
+-    |> Option.value ~default:[]
++    |> Option.value ~default:Rrbvec.empty
+   in
+   let authoritative_initial =
+     match initial, cache with
+@@ -2120,7 +2124,7 @@
+     match authoritative_initial with
+     | Some _ as block -> block
+     | None ->
+-      List.find_map
++      Rrbvec.find_map
+         (fun (record : outbox_record) ->
+            if record_has_active_dependency_shadows record
+            then
+@@ -2132,7 +2136,7 @@
+         effects
+   in
+   let value =
+-    List.fold_left
++    Rrbvec.fold_left
+       (fun current (record : outbox_record) ->
+          if not (record_is_logically_active record)
+          then current
+@@ -2371,8 +2375,8 @@
+ 
+ let block_is_tombstoned (snapshot : snapshot) uuid =
+   Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
+-  |> Option.value ~default:[]
+-  |> List.exists (fun (record : outbox_record) ->
++  |> Option.value ~default:Rrbvec.empty
++  |> Rrbvec.exists (fun (record : outbox_record) ->
+     record_is_logically_active record
+     &&
+     match record.mutation, record.delete_artifacts with
+@@ -2861,13 +2865,13 @@
+   | None ->
+     let effects =
+       Uuid_map.find_opt key (Option.get snapshot.block_effects)
+-      |> Option.value ~default:[]
++      |> Option.value ~default:Rrbvec.empty
+     in
+     let initial =
+       match authoritative_tree_candidate snapshot cache uuid with
+       | Some _ as candidate -> candidate
+       | None ->
+-        List.find_map
++        Rrbvec.find_map
+           (fun (record : outbox_record) ->
+              if record_has_active_dependency_shadows record
+              then
+@@ -2883,7 +2887,7 @@
+           effects
+     in
+     let candidate =
+-      List.fold_left
++      Rrbvec.fold_left
+         (fun current (record : outbox_record) ->
+            if not (record_is_logically_active record)
+            then current
+@@ -6478,12 +6482,12 @@
+          Int.compare left.sequence right.sequence)
+       records
+   in
+-  let add_indexed_record records index select (record : outbox_record) =
++  let add_indexed_record ~empty ~append records index select (record : outbox_record) =
+     ( List.fold_left
+         (fun index uuid ->
+            let key = Graph.Uuid.to_string uuid in
+-           let preceding = Uuid_map.find_opt key index |> Option.value ~default:[] in
+-           Uuid_map.add key (preceding @ [ record ]) index)
++           let preceding = Uuid_map.find_opt key index |> Option.value ~default:empty in
++           Uuid_map.add key (append preceding record) index)
+         index
+         (select (record.effect_footprint : effect_footprint))
+     , record :: records )
+@@ -6493,13 +6497,27 @@
+     then records, block_effects, page_effects, children_effects
+     else (
+       let block_effects, records =
+-        add_indexed_record records block_effects (fun value -> value.block_uuids) record
++        add_indexed_record
++          ~empty:Rrbvec.empty
++          ~append:Rrbvec.push_back
++          records
++          block_effects
++          (fun value -> value.block_uuids)
++          record
+       in
+       let page_effects, _ =
+-        add_indexed_record [] page_effects (fun value -> value.page_uuids) record
++        add_indexed_record
++          ~empty:Rrbvec.empty
++          ~append:Rrbvec.push_back
++          []
++          page_effects
++          (fun value -> value.page_uuids)
++          record
+       in
+       let children_effects, _ =
+         add_indexed_record
++          ~empty:[]
++          ~append:(fun records record -> records @ [ record ])
+           []
+           children_effects
+           (fun value ->

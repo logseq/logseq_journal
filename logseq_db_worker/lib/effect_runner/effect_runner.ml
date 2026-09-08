@@ -340,7 +340,7 @@ type database_session =
   ; mutable generation : string
   ; mutable next_window : int
   ; mutable acknowledged_through : string
-  ; mutable windows : change_window list
+  ; mutable windows : change_window Rrbvec.t
   }
 
 type t =
@@ -469,22 +469,22 @@ let publish_projection_change t session = function
     if not (String.equal generation session.generation)
     then (
       session.generation <- generation;
-      session.windows <- [];
+      session.windows <- Rrbvec.empty;
       session.next_window <- 1;
       session.acknowledged_through <- "change-window:v1:0");
     let id = Printf.sprintf "change-window:v1:%d" session.next_window in
     session.next_window <- session.next_window + 1;
     session.windows
-    <- session.windows
-       @ [ { id
-           ; predecessor = Overlay.Projection_revision.to_string before_revision
-           ; successor = Overlay.Projection_revision.to_string after_revision
-           ; block_uuids
-           ; page_uuids
-           ; structure_interests =
-               List.map structure_interest_to_protocol structure_interests
-           }
-         ];
+    <- Rrbvec.push_back
+         session.windows
+         { id
+         ; predecessor = Overlay.Projection_revision.to_string before_revision
+         ; successor = Overlay.Projection_revision.to_string after_revision
+         ; block_uuids
+         ; page_uuids
+         ; structure_interests =
+             List.map structure_interest_to_protocol structure_interests
+         };
     t.post
       (Core.Projection_push
          (Protocol.V2_changes_available
@@ -493,7 +493,7 @@ let publish_projection_change t session = function
     let generation = Overlay.Generation.to_string generation in
     if not (String.equal generation session.generation) then session.next_window <- 1;
     session.generation <- generation;
-    session.windows <- [];
+    session.windows <- Rrbvec.empty;
     session.acknowledged_through
     <- Printf.sprintf "change-window:v1:%d" (session.next_window - 1);
     t.post
@@ -818,15 +818,21 @@ let read_snapshot database request command =
            failure request Invalid_request "The command is not a snapshot read.")
 ;;
 
-let windows_after session cursor =
+let index_after session cursor =
   if String.equal cursor session.acknowledged_through
-  then Some session.windows
+  then Some 0
+  else if
+    match Rrbvec.peek_back_opt session.windows with
+    | Some window -> String.equal window.id cursor
+    | None -> false
+  then Some (Rrbvec.length session.windows)
   else (
-    let rec drop = function
-      | [] -> None
-      | window :: rest -> if String.equal window.id cursor then Some rest else drop rest
-    in
-    drop session.windows)
+    let position = ref 0 in
+    Rrbvec.find_map
+      (fun window ->
+         incr position;
+         if String.equal window.id cursor then Some !position else None)
+      session.windows)
 ;;
 
 let cursor_resync session request reason =
@@ -839,28 +845,23 @@ let pull_changes session request generation after limit =
   if not (String.equal generation session.generation)
   then cursor_resync session request "generationChanged"
   else (
-    let windows =
+    let start =
       match after with
-      | None -> Some session.windows
-      | Some cursor -> windows_after session cursor
+      | None -> Some 0
+      | Some cursor -> index_after session cursor
     in
-    match windows with
+    match start with
     | None -> cursor_resync session request "changeCursorUnavailable"
-    | Some windows ->
-      let rec take count reversed = function
-        | _ when count = 0 -> List.rev reversed
-        | [] -> List.rev reversed
-        | value :: rest -> take (count - 1) (value :: reversed) rest
-      in
-      let selected = take (max 0 limit) [] windows in
+    | Some start ->
+      let available = Rrbvec.length session.windows - start in
+      let count = min (max 0 limit) available in
+      let selected = Rrbvec.subvec session.windows start (start + count) |> Option.get in
       let through =
-        match List.rev selected with
-        | window :: _ -> window.id
-        | [] -> Option.value after ~default:session.acknowledged_through
+        match Rrbvec.peek_back_opt selected with
+        | Some window -> window.id
+        | None -> Option.value after ~default:session.acknowledged_through
       in
-      let next =
-        if List.length selected < List.length windows then Some through else None
-      in
+      let next = if count < available then Some through else None in
       response
         request
         (Protocol.V2_changes
@@ -869,8 +870,8 @@ let pull_changes session request generation after limit =
            ; through
            ; next
            ; windows =
-               List.map
-                 (fun (window : change_window) ->
+               Rrbvec.fold_right
+                 (fun (window : change_window) rest ->
                     Protocol.
                       { id = window.id
                       ; predecessor = window.predecessor
@@ -878,8 +879,10 @@ let pull_changes session request generation after limit =
                       ; block_uuids = window.block_uuids
                       ; page_uuids = window.page_uuids
                       ; structure_interests = window.structure_interests
-                      })
+                      }
+                    :: rest)
                  selected
+                 []
            }))
 ;;
 
@@ -887,10 +890,11 @@ let acknowledge_changes session request generation through =
   if not (String.equal generation session.generation)
   then cursor_resync session request "generationChanged"
   else (
-    match windows_after session through with
+    match index_after session through with
     | None -> cursor_resync session request "changeCursorUnavailable"
-    | Some windows ->
-      session.windows <- windows;
+    | Some start ->
+      session.windows
+      <- Rrbvec.subvec session.windows start (Rrbvec.length session.windows) |> Option.get;
       session.acknowledged_through <- through;
       response request (Protocol.V2_changes_acknowledged { generation; through }))
 ;;
@@ -1115,7 +1119,7 @@ let handle_sync_worker_effect t = function
                ; generation = Overlay.Generation.to_string version.generation
                ; next_window = 1
                ; acknowledged_through = "change-window:v1:0"
-               ; windows = []
+               ; windows = Rrbvec.empty
                }
              in
              Hashtbl.replace t.databases database_id session;

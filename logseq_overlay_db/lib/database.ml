@@ -125,8 +125,8 @@ type t =
   ; mutable receipts : (Graph.Uuid.t * string * receipt_entry) list
   ; mutable outbox : outbox_record list
   ; mutable queryable_outbox : outbox_record list
-  ; mutable queryable_block_effects : outbox_record list Uuid_map.t
-  ; mutable queryable_page_effects : outbox_record list Uuid_map.t
+  ; mutable queryable_block_effects : outbox_record Rrbvec.t Uuid_map.t
+  ; mutable queryable_page_effects : outbox_record Rrbvec.t Uuid_map.t
   ; mutable queryable_children_effects : outbox_record list Uuid_map.t
   ; mutable sync_revision : int
   ; mutable checkpoint : int
@@ -140,8 +140,8 @@ and snapshot =
   ; version : Types.snapshot_version
   ; mutable authoritative_database : Datascript.db option
   ; mutable outbox : outbox_record list option
-  ; mutable block_effects : outbox_record list Uuid_map.t option
-  ; mutable page_effects : outbox_record list Uuid_map.t option
+  ; mutable block_effects : outbox_record Rrbvec.t Uuid_map.t option
+  ; mutable page_effects : outbox_record Rrbvec.t Uuid_map.t option
   ; mutable children_effects : outbox_record list Uuid_map.t option
   ; mutable released : bool
   ; mutable active_reads : int
@@ -864,7 +864,7 @@ let rec all_options = function
   | Some value :: rest -> Option.map (fun rest -> value :: rest) (all_options rest)
 ;;
 
-let rec internal_property_value database = function
+let rec internal_property_value ?uuid_of_ref database = function
   | Datascript.Nil -> Some Graph.Internal_null
   | Bool value -> Some (Internal_bool value)
   | Int value -> Some (Internal_number (string_of_int value))
@@ -876,18 +876,20 @@ let rec internal_property_value database = function
     |> Result.to_option
     |> Option.map (fun uuid -> Graph.Internal_uuid uuid)
   | Ref entity ->
-    Option.bind (one database entity "block/uuid") uuid_of_value
+    (Option.value uuid_of_ref ~default:(uuid_of_entity database)) entity
     |> Option.map (fun uuid -> Graph.Internal_uuid uuid)
   | List values | Vector values | Set values ->
     values
-    |> List.map (internal_property_value database)
+    |> List.map (internal_property_value ?uuid_of_ref database)
     |> all_options
     |> Option.map (fun values -> Graph.Internal_list values)
   | Map entries ->
     entries
     |> List.map (fun (key, value) ->
-      Option.bind (internal_property_value database key) (fun key ->
-        Option.map (fun value -> key, value) (internal_property_value database value)))
+      Option.bind (internal_property_value ?uuid_of_ref database key) (fun key ->
+        Option.map
+          (fun value -> key, value)
+          (internal_property_value ?uuid_of_ref database value)))
     |> all_options
     |> Option.map (fun entries -> Graph.Internal_map entries)
   | Instant value -> Some (Graph.Internal_number (string_of_int value))
@@ -895,15 +897,16 @@ let rec internal_property_value database = function
   | Tuple values ->
     values
     |> List.map (Option.value ~default:Datascript.Nil)
-    |> fun values -> internal_property_value database (Datascript.Vector values)
+    |> fun values ->
+    internal_property_value ?uuid_of_ref database (Datascript.Vector values)
   | TxRef | Ref_to _ -> None
 ;;
 
-let ident_or_uuid database entity =
+let ident_or_uuid ?uuid_of_ref database entity =
   match Option.bind (one database entity "db/ident") ident_of_value with
   | Some ident -> Some ident
   | None ->
-    Option.bind (one database entity "block/uuid") uuid_of_value
+    (Option.value uuid_of_ref ~default:(uuid_of_entity database)) entity
     |> Option.map Graph.Uuid.to_string
 ;;
 
@@ -938,26 +941,30 @@ let property_value ?uuid_of_ref database property_type value =
   | Page, Ref entity ->
     Option.map (fun uuid -> Graph.Page_value uuid) (uuid_of_ref entity)
   | Property, Ref entity ->
-    Option.map (fun ident -> Graph.Property_value ident) (ident_or_uuid database entity)
+    Option.map
+      (fun ident -> Graph.Property_value ident)
+      (ident_or_uuid ~uuid_of_ref database entity)
   | Map, value ->
-    (match internal_property_value database value with
+    (match internal_property_value ~uuid_of_ref database value with
      | Some (Graph.Internal_map entries) -> Some (Graph.Map_value entries)
      | Some _ | None -> None)
   | Collection, value ->
-    (match internal_property_value database value with
+    (match internal_property_value ~uuid_of_ref database value with
      | Some (Graph.Internal_list values) -> Some (Graph.Collection_value values)
      | Some value -> Some (Graph.Collection_value [ value ])
      | None -> None)
   | Any, value ->
     Option.map
       (fun value -> Graph.Any_value value)
-      (internal_property_value database value)
+      (internal_property_value ~uuid_of_ref database value)
   | Default, Ref entity ->
-    Option.map (fun value -> Graph.Default_value value) (ident_or_uuid database entity)
+    Option.map
+      (fun value -> Graph.Default_value value)
+      (ident_or_uuid ~uuid_of_ref database entity)
   | _, value ->
     Option.map
       (fun value -> Graph.Any_value value)
-      (internal_property_value database value)
+      (internal_property_value ~uuid_of_ref database value)
 ;;
 
 let property_definition_for_entity database property_class ident property_entity =
@@ -1039,10 +1046,16 @@ let property_summaries_of_datoms_with_class database property_class datoms =
       String.compare left.ident right.ident)
 ;;
 
+(* Authoritative tables belong to one immutable root. logical_pages additionally
+   belongs to one overlay view; every caller creates this cache within its read
+   or serialized computation and uses it with that view only. *)
 type hydration_cache =
   { uuids : (int, Graph.Uuid.t option) Hashtbl.t
   ; page_titles : (int, string) Hashtbl.t
-  ; logical_page_titles : (string, string) Hashtbl.t
+  ; logical_pages : (string, Types.page_record option) Hashtbl.t
+  ; authoritative_blocks : (string, Types.block_record option) Hashtbl.t
+  ; uuid_entities : (string, int option) Hashtbl.t
+  ; block_presence : (string, bool) Hashtbl.t
   ; property_class : int option
   ; property_definitions : (string, Graph.property_summary option) Hashtbl.t
   ; ident_entities : (string, int) Hashtbl.t
@@ -1059,7 +1072,10 @@ let hydration_cache ?(index_idents = true) database =
       | None -> ());
   { uuids = Hashtbl.create 64
   ; page_titles = Hashtbl.create 8
-  ; logical_page_titles = Hashtbl.create 8
+  ; logical_pages = Hashtbl.create 8
+  ; authoritative_blocks = Hashtbl.create 16
+  ; uuid_entities = Hashtbl.create 16
+  ; block_presence = Hashtbl.create 8
   ; property_class =
       (if index_idents
        then Hashtbl.find_opt ident_entities "logseq.class/Property"
@@ -1069,6 +1085,15 @@ let hydration_cache ?(index_idents = true) database =
   }
 ;;
 
+let memoized table key load =
+  match Hashtbl.find_opt table key with
+  | Some value -> value
+  | None ->
+    let value = load () in
+    Hashtbl.add table key value;
+    value
+;;
+
 let cached_uuid_of_entity database cache entity =
   match Hashtbl.find_opt cache.uuids entity with
   | Some uuid -> uuid
@@ -1076,6 +1101,11 @@ let cached_uuid_of_entity database cache entity =
     let uuid = uuid_of_entity database entity in
     Hashtbl.add cache.uuids entity uuid;
     uuid
+;;
+
+let cached_entity_of_uuid database cache uuid =
+  memoized cache.uuid_entities (Graph.Uuid.to_string uuid) (fun () ->
+    entity_of_uuid database uuid)
 ;;
 
 let property_summary_with_cache database cache ident values =
@@ -1137,7 +1167,14 @@ let set_property_values ?cache database ident values properties =
   | _ ->
     (match existing with
      | Some definition ->
-       let replacement = property_summary_from_definition database definition values in
+       let replacement =
+         property_summary_from_definition
+           ?uuid_of_ref:
+             (Option.map (fun cache -> cached_uuid_of_entity database cache) cache)
+           database
+           definition
+           values
+       in
        List.map
          (fun (property : Graph.property_summary) ->
             if String.equal property.ident ident then replacement else property)
@@ -1287,8 +1324,8 @@ let page_record_of_entity ?cache database entity =
     entity
 ;;
 
-let page_of_database database uuid =
-  Option.bind (entity_of_uuid database uuid) (page_record_of_entity database)
+let page_of_database ?cache database uuid =
+  Option.bind (entity_of_uuid database uuid) (page_record_of_entity ?cache database)
 ;;
 
 let entity_datoms_for_ids database entities =
@@ -1360,64 +1397,69 @@ let cached_page_title database cache entity =
     title
 ;;
 
-let block_record_of_datoms_with_cache database cache datoms =
+let block_header database cache field =
   match
-    ( Option.bind (one_in_datoms datoms "block/uuid") uuid_of_value
-    , Option.bind (one_in_datoms datoms "block/title") string_of_value
-    , Option.bind (one_in_datoms datoms "block/parent") reference_of_value
-    , Option.bind (one_in_datoms datoms "block/page") reference_of_value
-    , Option.bind (one_in_datoms datoms "block/order") string_of_value )
+    ( Option.bind (field "block/uuid") uuid_of_value
+    , Option.bind (field "block/title") string_of_value
+    , Option.bind (field "block/parent") reference_of_value
+    , Option.bind (field "block/page") reference_of_value
+    , Option.bind (field "block/order") string_of_value )
   with
   | Some uuid, Some title, Some parent_entity, Some page_entity, Some order ->
     (match
        ( cached_uuid_of_entity database cache parent_entity
        , cached_uuid_of_entity database cache page_entity )
      with
-     | Some parent, Some page ->
-       let created_at_ms =
-         Option.bind (one_in_datoms datoms "block/created-at") int_of_value
-         |> Option.value ~default:0
-         |> Int64.of_int
-       in
-       let updated_at_ms =
-         Option.bind (one_in_datoms datoms "block/updated-at") int_of_value
-         |> Option.value ~default:0
-         |> Int64.of_int
-       in
-       let rendered_page_title = cached_page_title database cache page_entity in
-       Some
-         Types.
-           { block =
-               Graph.
-                 { uuid
-                 ; title
-                 ; parent
-                 ; page
-                 ; order
-                 ; created_at_ms
-                 ; updated_at_ms
-                 ; refs =
-                     values_in_datoms datoms "block/refs"
-                     |> List.filter_map (fun value ->
-                       Option.bind
-                         (reference_of_value value)
-                         (cached_uuid_of_entity database cache))
-                     |> List.sort_uniq Graph.Uuid.compare
-                 ; tags =
-                     values_in_datoms datoms "block/tags"
-                     |> List.filter_map (fun value ->
-                       Option.bind
-                         (reference_of_value value)
-                         (cached_uuid_of_entity database cache))
-                     |> List.sort_uniq Graph.Uuid.compare
-                 ; properties =
-                     property_summaries_of_datoms_with_cache database cache datoms
-                 }
-           ; task_status = task_status_of_datoms database datoms
-           ; rendered_page_title
-           }
+     | Some parent, Some page -> Some (uuid, title, parent, page, order, page_entity)
      | _ -> None)
   | _ -> None
+;;
+
+let block_record_of_datoms_with_cache database cache datoms =
+  match block_header database cache (one_in_datoms datoms) with
+  | None -> None
+  | Some (uuid, title, parent, page, order, page_entity) ->
+    let created_at_ms =
+      Option.bind (one_in_datoms datoms "block/created-at") int_of_value
+      |> Option.value ~default:0
+      |> Int64.of_int
+    in
+    let updated_at_ms =
+      Option.bind (one_in_datoms datoms "block/updated-at") int_of_value
+      |> Option.value ~default:0
+      |> Int64.of_int
+    in
+    let rendered_page_title = cached_page_title database cache page_entity in
+    Some
+      Types.
+        { block =
+            Graph.
+              { uuid
+              ; title
+              ; parent
+              ; page
+              ; order
+              ; created_at_ms
+              ; updated_at_ms
+              ; refs =
+                  values_in_datoms datoms "block/refs"
+                  |> List.filter_map (fun value ->
+                    Option.bind
+                      (reference_of_value value)
+                      (cached_uuid_of_entity database cache))
+                  |> List.sort_uniq Graph.Uuid.compare
+              ; tags =
+                  values_in_datoms datoms "block/tags"
+                  |> List.filter_map (fun value ->
+                    Option.bind
+                      (reference_of_value value)
+                      (cached_uuid_of_entity database cache))
+                  |> List.sort_uniq Graph.Uuid.compare
+              ; properties = property_summaries_of_datoms_with_cache database cache datoms
+              }
+        ; task_status = task_status_of_datoms database datoms
+        ; rendered_page_title
+        }
 ;;
 
 let block_record_of_entity_with_cache database cache entity =
@@ -1425,13 +1467,24 @@ let block_record_of_entity_with_cache database cache entity =
 ;;
 
 let block_of_database_with_cache database cache uuid =
-  Option.bind
-    (entity_of_uuid database uuid)
-    (block_record_of_entity_with_cache database cache)
+  memoized cache.authoritative_blocks (Graph.Uuid.to_string uuid) (fun () ->
+    Option.bind
+      (cached_entity_of_uuid database cache uuid)
+      (block_record_of_entity_with_cache database cache))
 ;;
 
 let block_of_database database uuid =
   block_of_database_with_cache database (hydration_cache database) uuid
+;;
+
+let authoritative_block_present database cache uuid =
+  match Hashtbl.find_opt cache.authoritative_blocks (Graph.Uuid.to_string uuid) with
+  | Some record -> Option.is_some record
+  | None ->
+    memoized cache.block_presence (Graph.Uuid.to_string uuid) (fun () ->
+      Option.bind (cached_entity_of_uuid database cache uuid) (fun entity ->
+        block_header database cache (one database entity))
+      |> Option.is_some)
 ;;
 
 let decode_outbox records =
@@ -1624,6 +1677,10 @@ let index_effects select records =
     Uuid_map.empty
 ;;
 
+let index_ordered_effects select records =
+  index_effects select records |> Uuid_map.map Rrbvec.of_list
+;;
+
 let index_children_effects records =
   index_effects
     (fun record ->
@@ -1651,7 +1708,7 @@ let frozen_outbox (records : outbox_record list) =
 let queryable_outbox_root (records : outbox_record list) =
   let outbox = frozen_outbox records in
   ( outbox
-  , index_effects
+  , index_ordered_effects
       (fun record ->
          record.effect_footprint.block_uuids
          @
@@ -1662,7 +1719,7 @@ let queryable_outbox_root (records : outbox_record list) =
              record.dependency_shadows.shadow_blocks
          else [])
       outbox
-  , index_effects
+  , index_ordered_effects
       (fun record ->
          record.effect_footprint.page_uuids
          @
@@ -1986,16 +2043,16 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
   let authoritative = Option.get snapshot.authoritative_database in
   let effects =
     Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.page_effects)
-    |> Option.value ~default:[]
+    |> Option.value ~default:Rrbvec.empty
   in
   let initial =
     match initial with
     | Some initial -> initial
     | None ->
-      (match page_of_database authoritative uuid with
+      (match page_of_database ?cache authoritative uuid with
        | Some _ as page -> page
        | None ->
-         List.find_map
+         Rrbvec.find_map
            (fun (record : outbox_record) ->
               if record_has_active_dependency_shadows record
               then
@@ -2006,7 +2063,7 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
               else None)
            effects)
   in
-  List.fold_left
+  Rrbvec.fold_left
     (fun current (record : outbox_record) ->
        if not (record_is_logically_active record)
        then current
@@ -2104,11 +2161,16 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
     effects
 ;;
 
+let cached_logical_page snapshot cache uuid =
+  memoized cache.logical_pages (Graph.Uuid.to_string uuid) (fun () ->
+    logical_page_at ~cache snapshot uuid)
+;;
+
 let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
   let authoritative = Option.get snapshot.authoritative_database in
   let effects =
     Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
-    |> Option.value ~default:[]
+    |> Option.value ~default:Rrbvec.empty
   in
   let authoritative_initial =
     match initial, cache with
@@ -2120,7 +2182,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
     match authoritative_initial with
     | Some _ as block -> block
     | None ->
-      List.find_map
+      Rrbvec.find_map
         (fun (record : outbox_record) ->
            if record_has_active_dependency_shadows record
            then
@@ -2132,7 +2194,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
         effects
   in
   let value =
-    List.fold_left
+    Rrbvec.fold_left
       (fun current (record : outbox_record) ->
          if not (record_is_logically_active record)
          then current
@@ -2318,33 +2380,52 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
   Option.map
     (fun (value : Types.block_record) ->
        let rendered_page_title =
-         let load () =
-           logical_page_at ?cache snapshot value.block.page
-           |> Option.map (fun (page : Types.page_record) -> page.page.title)
-           |> Option.value ~default:""
-         in
-         match cache with
-         | None -> load ()
-         | Some cache ->
-           let key = Graph.Uuid.to_string value.block.page in
-           (match Hashtbl.find_opt cache.logical_page_titles key with
-            | Some title -> title
-            | None ->
-              let title = load () in
-              Hashtbl.add cache.logical_page_titles key title;
-              title)
+         (match cache with
+          | None -> logical_page_at snapshot value.block.page
+          | Some cache -> cached_logical_page snapshot cache value.block.page)
+         |> Option.map (fun (page : Types.page_record) -> page.page.title)
+         |> Option.value ~default:""
        in
        Types.{ value with rendered_page_title })
     value
 ;;
 
+(* A context owns one immutable logical view within the current API call.
+   Construct it under the read lease or mutation lock; never retain it in state
+   or dispatch it. A changed overlay/root must get a separate context. *)
+type read_context =
+  { read_snapshot : snapshot
+  ; metadata : hydration_cache Lazy.t
+  ; blocks : (string, Types.block_record option) Hashtbl.t
+  ; siblings : (string, string * string option) Hashtbl.t
+  }
+
+let read_context snapshot =
+  { read_snapshot = snapshot
+  ; metadata =
+      lazy
+        (hydration_cache ~index_idents:false (Option.get snapshot.authoritative_database))
+  ; blocks = Hashtbl.create 16
+  ; siblings = Hashtbl.create 4
+  }
+;;
+
+let read_block context uuid =
+  memoized context.blocks (Graph.Uuid.to_string uuid) (fun () ->
+    logical_block_at ~cache:(Lazy.force context.metadata) context.read_snapshot uuid)
+;;
+
+let read_page context uuid =
+  cached_logical_page context.read_snapshot (Lazy.force context.metadata) uuid
+;;
+
 let get_blocks snapshot uuids =
   with_snapshot_read snapshot (fun snapshot ->
-    let cache = hydration_cache (Option.get snapshot.authoritative_database) in
+    let context = lazy (read_context snapshot) in
     Ok
       (List.map
          (fun uuid ->
-            let value = logical_block_at ~cache snapshot uuid in
+            let value = read_block (Lazy.force context) uuid in
             let revision = logical_block_revision uuid value in
             match value with
             | Some value -> Types.Present_block { value; revision }
@@ -2354,10 +2435,11 @@ let get_blocks snapshot uuids =
 
 let get_pages snapshot uuids =
   with_snapshot_read snapshot (fun snapshot ->
+    let context = lazy (read_context snapshot) in
     Ok
       (List.map
          (fun uuid ->
-            let value = logical_page_at snapshot uuid in
+            let value = read_page (Lazy.force context) uuid in
             let revision = logical_page_revision uuid value in
             match value with
             | Some value -> Types.Present_page { value; revision }
@@ -2371,8 +2453,8 @@ let scope_key = function
 
 let block_is_tombstoned (snapshot : snapshot) uuid =
   Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
-  |> Option.value ~default:[]
-  |> List.exists (fun (record : outbox_record) ->
+  |> Option.value ~default:Rrbvec.empty
+  |> Rrbvec.exists (fun (record : outbox_record) ->
     record_is_logically_active record
     &&
     match record.mutation, record.delete_artifacts with
@@ -2385,6 +2467,53 @@ let block_is_tombstoned (snapshot : snapshot) uuid =
         | Set_task_status _
         | Clear_task_status _ )
       , _ ) -> false)
+;;
+
+(* Keep one bounded lookahead while reading structural fields in EAVT order.
+   Seek over payload fields instead of consuming them. Adjacent siblings can
+   reuse the lookahead; sparse IDs seek directly to the next requested field. *)
+let structural_fields_reader database =
+  let cursor = ref Seq.empty in
+  let head = ref None in
+  let previous = ref None in
+  let peek () =
+    match !head with
+    | Some _ as datom -> datom
+    | None ->
+      (match !cursor () with
+       | Seq.Nil -> None
+       | Seq.Cons (datom, rest) ->
+         cursor := rest;
+         head := Some datom;
+         Some datom)
+  in
+  let read entity attribute =
+    let compare_target (datom : Datascript.datom) =
+      let comparison = Int.compare datom.e entity in
+      if comparison = 0 then String.compare datom.a attribute else comparison
+    in
+    (match peek () with
+     | Some datom when compare_target datom >= 0 -> ()
+     | _ ->
+       cursor := Datascript.seek_datoms database Datascript.Eavt ~e:entity ~a:attribute ();
+       head := None);
+    match peek () with
+    | Some datom when compare_target datom = 0 ->
+      head := None;
+      (match peek () with
+       | Some next when compare_target next = 0 -> None
+       | Some _ | None -> Some datom.v)
+    | Some _ | None -> None
+  in
+  fun entity ->
+    match !previous with
+    | Some (preceding, fields) when preceding = entity -> fields
+    | _ ->
+      let order = read entity "block/order" in
+      let uuid = read entity "block/uuid" in
+      let fields = uuid, order in
+      previous := Some (entity, fields);
+      fields
 ;;
 
 let authoritative_child_entity_facts ?datoms_by_uuid (snapshot : snapshot) parent =
@@ -2400,23 +2529,42 @@ let authoritative_child_entity_facts ?datoms_by_uuid (snapshot : snapshot) paren
         ~v:(Datascript.Ref parent_entity)
         ()
       |> Seq.map (fun (datom : Datascript.datom) -> datom.e)
-      |> List.of_seq
     in
-    let datoms_by_entity = entity_datoms_for_ids database entities in
-    entities
-    |> List.filter_map (fun entity ->
-      Option.bind (Hashtbl.find_opt datoms_by_entity entity) (fun datoms ->
-        match
-          ( Option.bind (one_in_datoms datoms "block/uuid") uuid_of_value
-          , Option.bind (one_in_datoms datoms "block/order") string_of_value )
-        with
-        | Some uuid, Some order when not (block_is_tombstoned snapshot uuid) ->
-          Option.iter
-            (fun table -> Hashtbl.replace table (Graph.Uuid.to_string uuid) datoms)
-            datoms_by_uuid;
-          Some (order, uuid, entity)
-        | _ -> None))
-    |> List.to_seq
+    let fields =
+      match datoms_by_uuid with
+      | None ->
+        (* Structural eligibility requires UUID and order only. Full payloads
+           are needed only by callers explicitly requesting hydration inputs. *)
+        let read = structural_fields_reader database in
+        Seq.map
+          (fun entity ->
+             let uuid, order = read entity in
+             entity, None, uuid, order)
+          entities
+      | Some _ ->
+        let entities = List.of_seq entities in
+        let datoms_by_entity = entity_datoms_for_ids database entities in
+        entities
+        |> List.to_seq
+        |> Seq.map (fun entity ->
+          let datoms =
+            Hashtbl.find_opt datoms_by_entity entity |> Option.value ~default:[]
+          in
+          ( entity
+          , Some datoms
+          , one_in_datoms datoms "block/uuid"
+          , one_in_datoms datoms "block/order" ))
+    in
+    fields
+    |> Seq.filter_map (fun (entity, datoms, uuid, order) ->
+      match Option.bind uuid uuid_of_value, Option.bind order string_of_value with
+      | Some uuid, Some order when not (block_is_tombstoned snapshot uuid) ->
+        Option.iter
+          (fun table ->
+             Hashtbl.replace table (Graph.Uuid.to_string uuid) (Option.get datoms))
+          datoms_by_uuid;
+        Some (order, uuid, entity)
+      | _ -> None)
 ;;
 
 let authoritative_child_facts snapshot parent =
@@ -2424,7 +2572,7 @@ let authoritative_child_facts snapshot parent =
   |> Seq.map (fun (order, uuid, _) -> order, uuid)
 ;;
 
-let local_child_facts (snapshot : snapshot) parent =
+let local_child_facts ?cache (snapshot : snapshot) parent =
   Uuid_map.find_opt (Graph.Uuid.to_string parent) (Option.get snapshot.children_effects)
   |> Option.value ~default:[]
   |> List.concat_map (fun (record : outbox_record) ->
@@ -2454,12 +2602,14 @@ let local_child_facts (snapshot : snapshot) parent =
         if record_has_active_dependency_shadows record
         then
           record.dependency_shadows.shadow_blocks
-          |> List.filter (fun shadow -> Graph.Uuid.equal shadow.shadow_parent parent)
           |> List.filter (fun shadow ->
-            Option.is_none
-              (block_of_database
-                 (Option.get snapshot.authoritative_database)
-                 shadow.shadow_block_uuid))
+            let database = Option.get snapshot.authoritative_database in
+            let cache =
+              match cache with
+              | Some cache -> cache
+              | None -> hydration_cache ~index_idents:false database
+            in
+            not (authoritative_block_present database cache shadow.shadow_block_uuid))
           |> List.map (fun shadow -> shadow.shadow_order, shadow.shadow_block_uuid)
         else []
       in
@@ -2478,24 +2628,34 @@ let xor_digest accumulator value =
   done
 ;;
 
-let children_membership_digest snapshot parent =
+let sibling_summary ?cache snapshot parent =
   let accumulator = Bytes.make 32 '\000' in
+  let maximum = ref None in
   let add (order, uuid) =
-    xor_digest accumulator (Graph.Uuid.to_string uuid ^ "\000" ^ order)
+    xor_digest accumulator (Graph.Uuid.to_string uuid ^ "\000" ^ order);
+    maximum
+    := Some
+         (Option.fold
+            ~none:order
+            ~some:(fun preceding ->
+              if String.compare order preceding > 0 then order else preceding)
+            !maximum)
   in
   Seq.iter add (authoritative_child_facts snapshot parent);
-  List.iter add (local_child_facts snapshot parent);
-  Bytes.to_string accumulator |> Digestif.SHA256.of_raw_string |> Digestif.SHA256.to_hex
+  List.iter add (local_child_facts ?cache snapshot parent);
+  ( Bytes.to_string accumulator |> Digestif.SHA256.of_raw_string |> Digestif.SHA256.to_hex
+  , !maximum )
+;;
+
+let read_siblings context parent =
+  memoized context.siblings (Graph.Uuid.to_string parent) (fun () ->
+    sibling_summary ~cache:(Lazy.force context.metadata) context.read_snapshot parent)
 ;;
 
 let scope_revision_from_members scope members =
   let key = scope_key scope in
   let digest = String.concat "\000" members |> Digest.string |> Digest.to_hex in
   token Types.Scope_revision.of_string (Printf.sprintf "scope:v1:%s:%s" digest key)
-;;
-
-let revision_for_scope (snapshot : snapshot) (Types.Children_revision parent as scope) =
-  scope_revision_from_members scope [ children_membership_digest snapshot parent ]
 ;;
 
 let projection_number revision =
@@ -2736,9 +2896,13 @@ let get_journals snapshot ~from_day ~through_day ~limit ~cursor =
           Ok Types.{ items; next_cursor }))))
 ;;
 
-let child_items ?cache (snapshot : snapshot) parent =
+let child_items context parent =
+  let snapshot = context.read_snapshot in
+  let cache = Lazy.force context.metadata in
   let authoritative =
-    match entity_of_uuid (Option.get snapshot.authoritative_database) parent with
+    match
+      cached_entity_of_uuid (Option.get snapshot.authoritative_database) cache parent
+    with
     | None -> []
     | Some parent_entity ->
       Datascript.datoms
@@ -2749,12 +2913,12 @@ let child_items ?cache (snapshot : snapshot) parent =
         ()
       |> List.of_seq
       |> List.filter_map (fun (datom : Datascript.datom) ->
-        uuid_of_entity (Option.get snapshot.authoritative_database) datom.e)
+        cached_uuid_of_entity (Option.get snapshot.authoritative_database) cache datom.e)
   in
-  let inserted = local_child_facts snapshot parent |> List.map snd in
+  let inserted = local_child_facts ~cache snapshot parent |> List.map snd in
   List.sort_uniq Graph.Uuid.compare (authoritative @ inserted)
   |> List.filter_map (fun uuid ->
-    match logical_block_at ?cache snapshot uuid with
+    match read_block context uuid with
     | Some record when Graph.Uuid.equal record.block.parent parent ->
       Some
         Types.
@@ -2861,13 +3025,13 @@ let logical_tree_candidate snapshot cache uuid =
   | None ->
     let effects =
       Uuid_map.find_opt key (Option.get snapshot.block_effects)
-      |> Option.value ~default:[]
+      |> Option.value ~default:Rrbvec.empty
     in
     let initial =
       match authoritative_tree_candidate snapshot cache uuid with
       | Some _ as candidate -> candidate
       | None ->
-        List.find_map
+        Rrbvec.find_map
           (fun (record : outbox_record) ->
              if record_has_active_dependency_shadows record
              then
@@ -2883,7 +3047,7 @@ let logical_tree_candidate snapshot cache uuid =
           effects
     in
     let candidate =
-      List.fold_left
+      Rrbvec.fold_left
         (fun current (record : outbox_record) ->
            if not (record_is_logically_active record)
            then current
@@ -3302,22 +3466,9 @@ let uuid_lookup uuid =
 
 let uuid_temp prefix uuid = Datascript.Temp_id (prefix ^ ":" ^ Graph.Uuid.to_string uuid)
 
-let insertion_orders snapshot = function
+let insertion_orders context = function
   | Types.Insert_blocks { parent; tree; _ } ->
-    let lower =
-      Seq.append
-        (authoritative_child_facts snapshot parent)
-        (List.to_seq (local_child_facts snapshot parent))
-      |> Seq.fold_left
-           (fun maximum (order, _) ->
-              Some
-                (Option.fold
-                   ~none:order
-                   ~some:(fun maximum ->
-                     if String.compare order maximum > 0 then order else maximum)
-                   maximum))
-           None
-    in
+    let lower = snd (read_siblings context parent) in
     let rec assign orders order (tree : Types.block_tree) =
       let orders = Uuid_map.add (Graph.Uuid.to_string tree.uuid) order orders in
       List.fold_left2
@@ -3799,43 +3950,35 @@ let required_preconditions (expected : write_precondition) = function
     else Error (Types.Missing_precondition None)
 ;;
 
-let current_block_revision database uuid =
-  let value = logical_block_at (snapshot_of_database database) uuid in
-  logical_block_revision uuid value
-;;
-
-let current_page_revision database uuid =
-  let value = logical_page_at (snapshot_of_database database) uuid in
-  logical_page_revision uuid value
-;;
-
-let current_scope_revision database scope =
-  revision_for_scope (snapshot_of_database database) scope
-;;
-
-let preconditions_match database (expected : write_precondition) =
+let preconditions_match context (expected : write_precondition) =
   List.for_all
     (fun (uuid, revision) ->
-       Types.Block_state_revision.equal revision (current_block_revision database uuid))
+       Types.Block_state_revision.equal
+         revision
+         (logical_block_revision uuid (read_block context uuid)))
     expected.blocks
   && List.for_all
        (fun (uuid, revision) ->
-          Types.Page_state_revision.equal revision (current_page_revision database uuid))
+          Types.Page_state_revision.equal
+            revision
+            (logical_page_revision uuid (read_page context uuid)))
        expected.pages
   && List.for_all
-       (fun (scope, revision) ->
-          Types.Scope_revision.equal revision (current_scope_revision database scope))
+       (fun ((Types.Children_revision parent as scope), revision) ->
+          Types.Scope_revision.equal
+            revision
+            (scope_revision_from_members scope [ fst (read_siblings context parent) ]))
        expected.scopes
 ;;
 
 let tree_uuids = Outliner.Tree.uuids
 let replace_all = Outliner.References.replace_all
 
-let hard_delete_artifacts database ~now root =
-  let snapshot = snapshot_of_database database in
+let hard_delete_artifacts database context ~now root =
   let authoritative = authoritative_database database in
+  let cache = Lazy.force context.metadata in
   let rec subtree parent =
-    child_items snapshot parent
+    child_items context parent
     |> List.concat_map (fun (child : Types.child_member) ->
       child.block.block.uuid :: subtree child.block.block.uuid)
   in
@@ -3843,7 +3986,9 @@ let hard_delete_artifacts database ~now root =
   let frontier_entities =
     List.filter_map
       (fun uuid ->
-         Option.map (fun entity -> uuid, entity) (entity_of_uuid authoritative uuid))
+         Option.map
+           (fun entity -> uuid, entity)
+           (cached_entity_of_uuid authoritative cache uuid))
       initial_frontier
   in
   let initial_entity_ids = List.map snd frontier_entities |> List.sort_uniq Int.compare in
@@ -3881,7 +4026,7 @@ let hard_delete_artifacts database ~now root =
   let comment_frontier =
     comment_sources
     |> List.filter is_orphaned_comment_area
-    |> List.filter_map (uuid_of_entity authoritative)
+    |> List.filter_map (cached_uuid_of_entity authoritative cache)
     |> List.concat_map (fun uuid -> uuid :: subtree uuid)
   in
   let frontier =
@@ -3890,7 +4035,9 @@ let hard_delete_artifacts database ~now root =
   let frontier_entities =
     List.filter_map
       (fun uuid ->
-         Option.map (fun entity -> uuid, entity) (entity_of_uuid authoritative uuid))
+         Option.map
+           (fun entity -> uuid, entity)
+           (cached_entity_of_uuid authoritative cache uuid))
       frontier
   in
   let incoming_source_entities =
@@ -3908,7 +4055,7 @@ let hard_delete_artifacts database ~now root =
   in
   let frontier_contains uuid = List.exists (Graph.Uuid.equal uuid) frontier in
   let target_title uuid =
-    logical_block_at snapshot uuid
+    read_block context uuid
     |> Option.map (fun (record : Types.block_record) -> record.block.title)
     |> Option.value ~default:""
   in
@@ -3922,7 +4069,7 @@ let hard_delete_artifacts database ~now root =
   let block_patches =
     incoming_source_entities
     |> List.filter_map (fun entity ->
-      Option.bind (uuid_of_entity authoritative entity) (fun block_uuid ->
+      Option.bind (cached_uuid_of_entity authoritative cache entity) (fun block_uuid ->
         if frontier_contains block_uuid
         then None
         else
@@ -3934,14 +4081,14 @@ let hard_delete_artifacts database ~now root =
                in
                let title = List.fold_left rewrite_title record.block.title removed in
                { block_uuid; title; refs; updated_at_ms = now })
-            (logical_block_at snapshot block_uuid)))
+            (read_block context block_uuid)))
     |> List.sort_uniq (fun left right ->
       Graph.Uuid.compare left.block_uuid right.block_uuid)
   in
   let touched_pages =
     let records =
       frontier @ List.map (fun patch -> patch.block_uuid) block_patches
-      |> List.filter_map (logical_block_at snapshot)
+      |> List.filter_map (read_block context)
     in
     records
     |> List.map (fun (record : Types.block_record) -> record.block.page)
@@ -3953,9 +4100,10 @@ let hard_delete_artifacts database ~now root =
   { frontier; block_patches; page_patches; property_guard = None; property_patches = [] }
 ;;
 
-let default_property_delete_artifacts database ~now root =
+let default_property_delete_artifacts database context ~now root =
   let authoritative = authoritative_database database in
-  match entity_of_uuid authoritative root with
+  let cache = Lazy.force context.metadata in
+  match cached_entity_of_uuid authoritative cache root with
   | None -> Ok None
   | Some root_entity ->
     (match
@@ -3975,8 +4123,8 @@ let default_property_delete_artifacts database ~now root =
         | Some default_entity, Some property_ident, Some placeholder_entity
           when default_entity <> root_entity ->
           (match
-             ( uuid_of_entity authoritative property_entity
-             , uuid_of_entity authoritative placeholder_entity )
+             ( cached_uuid_of_entity authoritative cache property_entity
+             , cached_uuid_of_entity authoritative cache placeholder_entity )
            with
            | Some property_uuid, Some replacement_uuid ->
              let holder_entities =
@@ -3991,7 +4139,7 @@ let default_property_delete_artifacts database ~now root =
              let rec collect_holders reversed = function
                | [] -> Ok (List.rev reversed)
                | holder :: rest ->
-                 (match uuid_of_entity authoritative holder with
+                 (match cached_uuid_of_entity authoritative cache holder with
                   | None -> Error Types.Delete_unsupported_for_footprint
                   | Some holder_uuid ->
                     collect_holders
@@ -4007,7 +4155,7 @@ let default_property_delete_artifacts database ~now root =
                let rec collect_pages reversed = function
                  | [] -> Ok (List.sort_uniq Graph.Uuid.compare reversed)
                  | patch :: rest ->
-                   (match entity_of_uuid authoritative patch.holder_uuid with
+                   (match cached_entity_of_uuid authoritative cache patch.holder_uuid with
                     | None -> Error Types.Delete_unsupported_for_footprint
                     | Some holder
                       when Option.is_some (one authoritative holder "block/name") ->
@@ -4018,7 +4166,7 @@ let default_property_delete_artifacts database ~now root =
                            (Option.bind
                               (one authoritative holder "block/page")
                               reference_of_value)
-                           (uuid_of_entity authoritative)
+                           (cached_uuid_of_entity authoritative cache)
                        with
                        | None -> Error Types.Delete_unsupported_for_footprint
                        | Some page_uuid -> collect_pages (page_uuid :: reversed) rest))
@@ -4043,22 +4191,21 @@ let default_property_delete_artifacts database ~now root =
      | Some _, _ :: _ | None, _ -> Ok None)
 ;;
 
-let delete_artifacts database ~now root =
+let delete_artifacts database context ~now root =
   Result.map
-    (Option.value ~default:(hard_delete_artifacts database ~now root))
-    (default_property_delete_artifacts database ~now root)
+    (function
+      | Some artifacts -> artifacts
+      | None -> hard_delete_artifacts database context ~now root)
+    (default_property_delete_artifacts database context ~now root)
 ;;
 
-let planned_effect database ~now = function
+let planned_effect database context ~now = function
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
     Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)
   | Insert_blocks { tree; parent; _ } ->
-    let snapshot = snapshot_of_database database in
-    let page =
-      Outliner.Graph_read.page_for_parent ~parent (logical_block_at snapshot parent)
-    in
+    let page = Outliner.Graph_read.page_for_parent ~parent (read_block context parent) in
     Ok
       ( { block_uuids = tree_uuids tree
         ; page_uuids = [ page ]
@@ -4068,8 +4215,7 @@ let planned_effect database ~now = function
         }
       , None )
   | Delete_blocks { root; _ } ->
-    let snapshot = snapshot_of_database database in
-    (match logical_block_at snapshot root with
+    (match read_block context root with
      | None ->
        let artifacts =
          { frontier = [ root ]
@@ -4088,7 +4234,7 @@ let planned_effect database ~now = function
             let records =
               (root :: artifacts.frontier)
               @ List.map (fun patch -> patch.holder_uuid) artifacts.property_patches
-              |> List.filter_map (logical_block_at snapshot)
+              |> List.filter_map (read_block context)
             in
             let parents =
               records
@@ -4114,7 +4260,7 @@ let planned_effect database ~now = function
                   @ List.map (fun page -> Types.Page_tree_interest page) pages
               }
             , Some artifacts ))
-         (delete_artifacts database ~now root))
+         (delete_artifacts database context ~now root))
   | Create_journal_page { page; _ } ->
     Ok
       ( { block_uuids = []
@@ -4200,6 +4346,7 @@ let dependency_shadows_for database mutation =
 
 let local_candidate_record
       database
+      context
       ~fingerprint
       ~effect_footprint
       ~delete_artifacts
@@ -4224,7 +4371,7 @@ let local_candidate_record
         ~fingerprint
         ~intent_time_ms
         ~planned_tx
-        ~orders:(insertion_orders (snapshot_of_database database) mutation)
+        ~orders:(insertion_orders context mutation)
         ~effect_footprint
         ~delete_artifacts
         mutation
@@ -4312,14 +4459,12 @@ let logical_change_for_effects database ~before ~after effects =
       ~structure_interests:(List.sort_uniq compare structure_interests)
 ;;
 
-let mutation_has_logical_effect database ~now mutation =
-  ignore now;
-  let snapshot = snapshot_of_database database in
+let mutation_has_logical_effect context mutation =
   match mutation with
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
-  | Clear_task_status { block; _ } -> Option.is_some (logical_block_at snapshot block)
-  | Delete_blocks { root; _ } -> Option.is_some (logical_block_at snapshot root)
+  | Clear_task_status { block; _ } -> Option.is_some (read_block context block)
+  | Delete_blocks { root; _ } -> Option.is_some (read_block context root)
   | Insert_blocks _ | Create_journal_page _ -> true
 ;;
 
@@ -4620,18 +4765,20 @@ let commit_local database ~expected mutation =
              | Ok (Some existing) -> [], None, Ok (Types.Local_existing existing)
              | Error () -> [], None, Error Types.Mutation_identity_conflict
              | Ok None ->
+               let context = read_context (snapshot_of_database database) in
                (match required_preconditions expected mutation with
                 | Error error -> [], None, Error error
-                | Ok () when not (preconditions_match database expected) ->
+                | Ok () when not (preconditions_match context expected) ->
                   [], None, Error Types.Target_precondition_conflict
                 | Ok () ->
                   let intent_time_ms = database.dependencies.epoch_ms () in
-                  (match planned_effect database ~now:intent_time_ms mutation with
+                  (match planned_effect database context ~now:intent_time_ms mutation with
                    | Error error -> [], None, Error error
                    | Ok (effect_footprint, delete_artifacts) ->
                      let candidate_record =
                        local_candidate_record
                          database
+                         context
                          ~fingerprint
                          ~effect_footprint
                          ~delete_artifacts
@@ -4647,9 +4794,7 @@ let commit_local database ~expected mutation =
                        let previous_sync_revision = database.sync_revision in
                        let before = database.projection in
                        let candidate_after = before + 1 in
-                       let applied =
-                         mutation_has_logical_effect database ~now:intent_time_ms mutation
-                       in
+                       let applied = mutation_has_logical_effect context mutation in
                        let after = if applied then candidate_after else before in
                        database.projection <- after;
                        let block_uuids, page_uuids, structure_interests =
@@ -4742,8 +4887,11 @@ let retry_blocked database ~expected ~mutation_id =
       | None -> Error Types.Blocked_mutation_missing
       | Some record when not record.same_id_retry_eligible ->
         Error Types.Blocked_retry_ineligible
-      | Some _ when not (preconditions_match database expected) ->
-        Error Types.Blocked_retry_precondition_conflict
+      | Some _
+        when not
+               (preconditions_match
+                  (read_context (snapshot_of_database database))
+                  expected) -> Error Types.Blocked_retry_precondition_conflict
       | Some record ->
         let previous_projection = database.projection in
         let previous_sync_revision = database.sync_revision in
@@ -6478,12 +6626,12 @@ let replan_queued_ordinary database authoritative_database records =
          Int.compare left.sequence right.sequence)
       records
   in
-  let add_indexed_record records index select (record : outbox_record) =
+  let add_indexed_record ~empty ~append records index select (record : outbox_record) =
     ( List.fold_left
         (fun index uuid ->
            let key = Graph.Uuid.to_string uuid in
-           let preceding = Uuid_map.find_opt key index |> Option.value ~default:[] in
-           Uuid_map.add key (preceding @ [ record ]) index)
+           let preceding = Uuid_map.find_opt key index |> Option.value ~default:empty in
+           Uuid_map.add key (append preceding record) index)
         index
         (select (record.effect_footprint : effect_footprint))
     , record :: records )
@@ -6493,13 +6641,27 @@ let replan_queued_ordinary database authoritative_database records =
     then records, block_effects, page_effects, children_effects
     else (
       let block_effects, records =
-        add_indexed_record records block_effects (fun value -> value.block_uuids) record
+        add_indexed_record
+          ~empty:Rrbvec.empty
+          ~append:Rrbvec.push_back
+          records
+          block_effects
+          (fun value -> value.block_uuids)
+          record
       in
       let page_effects, _ =
-        add_indexed_record [] page_effects (fun value -> value.page_uuids) record
+        add_indexed_record
+          ~empty:Rrbvec.empty
+          ~append:Rrbvec.push_back
+          []
+          page_effects
+          (fun value -> value.page_uuids)
+          record
       in
       let children_effects, _ =
         add_indexed_record
+          ~empty:[]
+          ~append:(fun records record -> records @ [ record ])
           []
           children_effects
           (fun value ->

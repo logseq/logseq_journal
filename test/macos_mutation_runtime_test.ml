@@ -20,7 +20,7 @@ type worker =
   ; pushes : P.push Queue.t
   }
 
-let with_worker run =
+let with_worker ?limits:overlay_limits run =
   Fixture.with_temp_directory "journal-mutation-regression-" (fun support ->
     ignore (Fixture.seed_mirror support);
     Eio_main.run (fun _ ->
@@ -89,7 +89,12 @@ let with_worker run =
           Runner.dependencies
             ~runtime:(Runner.runtime ~fork:(fun ~sw:_ task -> task ()) |> Result.get_ok)
             ~config
-            ~overlay:(Fixture.dependencies ~behavior:"worker change-window consumer")
+            ~overlay:
+              (Fixture.dependencies_with_limits
+                 ~behavior:"worker change-window consumer"
+                 (Option.value
+                    overlay_limits
+                    ~default:(Fixture.limits ~behavior:"worker changes")))
             ~sync_runner
             ~publish:(function
               | Core.Graph_push push -> Queue.add push pushes
@@ -276,6 +281,174 @@ let test_empty_cursor_and_unknown_ack () =
     | _ -> failwith "stale generation was admitted")
 ;;
 
+let test_retained_window_pagination () =
+  with_worker (fun worker ->
+    for index = 1 to 70 do
+      save
+        worker
+        (1000 + index)
+        Fixture.authoritative_block_uuid
+        (Printf.sprintf "Ordered change %d" index);
+      ignore (last_push worker)
+    done;
+    let generation =
+      match outcome worker 1100 P.V2_graph_info with
+      | V2_graph_info_outcome { generation; _ } -> generation
+      | _ -> failwith "missing graph generation"
+    in
+    let pull after limit =
+      outcome worker 1101 (P.V2_pull_changes { generation; after; limit })
+    in
+    let all =
+      match pull None 100 with
+      | V2_changes { windows; next = None; _ } -> windows
+      | _ -> failwith "retained window collection was truncated"
+    in
+    require (List.length all = 70) "publication lost a retained change";
+    let rec ordered = function
+      | (left : P.v2_change_window) :: ((right : P.v2_change_window) :: _ as rest) ->
+        require
+          (left.successor = right.predecessor)
+          "projection revision chain was reordered";
+        ordered rest
+      | _ -> ()
+    in
+    ordered all;
+    (match pull None 0 with
+     | V2_changes { windows = []; through; next = Some next; _ } ->
+       require
+         (through = "change-window:v1:0" && next = through)
+         "zero-limit cursor advanced"
+     | _ -> failwith "zero-limit pull did not retain continuation");
+    let rec pages after collected =
+      match pull after 7 with
+      | V2_changes { windows; through; next; _ } ->
+        let collected = collected @ windows in
+        (match next with
+         | None -> collected
+         | Some cursor ->
+           require (cursor = through && windows <> []) "page cursor failed to advance";
+           pages (Some cursor) collected)
+      | _ -> failwith "retained page cursor was rejected"
+    in
+    require (pages None [] = all) "pagination changed window contents";
+    let boundary = (List.nth all 31).id in
+    ignore (outcome worker 1102 (P.V2_ack_changes { generation; through = boundary }));
+    (match pull (Some boundary) 100 with
+     | V2_changes { windows; _ } ->
+       require (List.length windows = 38) "ack retained the wrong suffix"
+     | _ -> failwith "acknowledged boundary was rejected");
+    List.iter
+      (fun cursor ->
+         match pull (Some cursor) 1 with
+         | V2_resync_required _ -> ()
+         | _ -> failwith "nonexact or evicted cursor was accepted")
+      [ (List.hd all).id; "change-window:v1:032"; "change-window:v1:999" ];
+    require (List.length all = 70) "ack mutated an already returned page")
+;;
+
+let test_resync_clears_retained_windows () =
+  let limits =
+    { (Fixture.limits ~behavior:"window resync") with change_max_items = 16 }
+  in
+  with_worker ~limits (fun worker ->
+    for index = 1 to 64 do
+      save
+        worker
+        (3000 + index)
+        Fixture.authoritative_block_uuid
+        (Printf.sprintf "Before reset %d" index);
+      ignore (last_push worker)
+    done;
+    let generation, old_cursor =
+      match outcome worker 3100 P.V2_graph_info with
+      | V2_graph_info_outcome { generation; _ } ->
+        (match
+           outcome worker 3101 (P.V2_pull_changes { generation; after = None; limit = 1 })
+         with
+         | V2_changes { windows = [ window ]; _ } -> generation, window.id
+         | _ -> failwith "resync fixture did not retain changes")
+      | _ -> failwith "missing generation"
+    in
+    let parent = Fixture.page_uuid in
+    let page_revision =
+      match outcome worker 3102 (P.V2_get_page { page = parent; revision = None }) with
+      | V2_page_outcome (V2_present_page { revision; _ }) -> revision
+      | _ -> failwith "resync page missing"
+    in
+    let scope_revision =
+      match
+        outcome
+          worker
+          3103
+          (P.V2_get_children { parent; limit = 1; cursor = None; revision = None })
+      with
+      | V2_children_outcome { scope_revision; _ } -> scope_revision
+      | _ -> failwith "resync scope missing"
+    in
+    let roots =
+      [ P.
+          { uuid = Fixture.mutation_uuid 3200
+          ; title = "Resync tree"
+          ; children =
+              List.init 32 (fun n ->
+                P.
+                  { uuid = Fixture.mutation_uuid (3201 + n)
+                  ; title = "Child"
+                  ; children = []
+                  })
+          }
+      ]
+    in
+    Gc.full_major ();
+    let before = (Gc.stat ()).live_words in
+    (match
+       outcome
+         worker
+         3104
+         (P.V2_insert_blocks
+            { mutation_id = Fixture.mutation_uuid 3300
+            ; parent
+            ; roots
+            ; preconditions =
+                { blocks = []
+                ; pages = [ parent, page_revision ]
+                ; scopes = [ V2_children_scope parent, scope_revision ]
+                }
+            })
+     with
+     | V2_mutation_committed _ -> ()
+     | _ -> failwith "resync insertion failed");
+    (match last_push worker with
+     | P.V2_resync_required_push _ -> ()
+     | _ -> failwith "oversized publication did not request resync");
+    (match
+       outcome worker 3105 (P.V2_pull_changes { generation; after = None; limit = 100 })
+     with
+     | V2_changes { windows = []; next = None; _ } -> ()
+     | _ -> failwith "resync retained obsolete windows");
+    (match
+       outcome
+         worker
+         3106
+         (P.V2_pull_changes { generation; after = Some old_cursor; limit = 1 })
+     with
+     | V2_resync_required _ -> ()
+     | _ -> failwith "resync admitted a discarded cursor");
+    Gc.full_major ();
+    Printf.printf
+      "RESYNC_LIVE_WORDS before=%d after=%d\n%!"
+      before
+      (Gc.stat ()).live_words;
+    save worker 3400 Fixture.authoritative_block_uuid "After reset";
+    ignore (last_push worker);
+    match
+      outcome worker 3401 (P.V2_pull_changes { generation; after = None; limit = 100 })
+    with
+    | V2_changes { windows = [ _ ]; _ } -> ()
+    | _ -> failwith "resync swallowed a later publication")
+;;
+
 let runtime () =
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   let sampler =
@@ -454,7 +627,9 @@ let () =
        | exn ->
          failures := name :: !failures;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "M03 real worker acknowledged change cursor", test_acknowledged_cursor
+    [ "Resync clears retained windows", test_resync_clears_retained_windows
+    ; "Retained window pagination", test_retained_window_pagination
+    ; "M03 real worker acknowledged change cursor", test_acknowledged_cursor
     ; "M03 empty cursor and unknown acknowledgement", test_empty_cursor_and_unknown_ack
     ; "M03 reconciled capture first status", test_reconciled_capture_status
     ; "M03 captured Todo delete conflict recovery", test_delete_conflict_recovery

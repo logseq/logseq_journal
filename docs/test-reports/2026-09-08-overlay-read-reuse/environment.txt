@@ -1,0 +1,3 @@
+Baseline commit: b32baf08ef0503cc84ab5df613607b058efa9e59
+OCaml: 5.1.1
+Dune: 3.23.1

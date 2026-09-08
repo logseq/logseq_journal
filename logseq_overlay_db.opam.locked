@@ -8,6 +8,7 @@ license: "MIT"
 homepage: "https://github.com/RCmerci/logseq_journal"
 bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
 depends: [
+  "rrbvec" {= "dev"}
   "alcotest" {= "1.7.0" & with-test}
   "astring" {= "0.8.5"}
   "base-bigarray" {= "base"}
@@ -85,6 +86,7 @@ depends: [
 ]
 build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
+  ["rrbvec.dev" "git+https://github.com/RCmerci/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
   [
   "datascript-ocaml-native.dev"
   "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"

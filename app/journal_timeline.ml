@@ -606,7 +606,7 @@ let view
     let previous_slot =
       if retained_offset <= 0
       then None
-      else List.nth_opt (Timeline.retained_slots state) (retained_offset - 1)
+      else Timeline.retained_slot state (retained_offset - 1)
     in
     let items =
       let rec render offset previous_slot = function

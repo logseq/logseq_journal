@@ -110,7 +110,14 @@ val undo_delete : t -> staged_delete -> t
 val return_from_detail : t -> block_id:string -> t
 val observe_visible_range : t -> first_index:int -> last_exclusive:int -> t
 val current_window : t -> window
-val retained_slots : t -> slot list
+
+(** Read an index relative to the first retained slot. Out-of-range indices return [None]. *)
+val retained_slot : t -> int -> slot option
+
+(** Fold retained slots from first to last without materializing an intermediate collection. *)
+val fold_slots : ('a -> slot -> 'a) -> 'a -> t -> 'a
+
+val find_block : t -> block_id:string -> Journal_model.t option
 val retained_slot_count : t -> int
 val first_retained_index : t -> int
 val total_count : t -> int

@@ -29,6 +29,7 @@
  (name logseq_overlay_db)
  (allow_empty)
  (depends
+  (rrbvec (= dev))
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
   (logseq_db_types (= 0.1.0))
@@ -77,6 +78,7 @@
  (name logseq_journal)
  (allow_empty)
  (depends
+  (rrbvec (= dev))
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
   (logseq_db_worker (= 0.1.0))
@@ -105,6 +107,7 @@
  (name logseq_db_worker)
  (allow_empty)
  (depends
+  (rrbvec (= dev))
   (ocaml (= 5.1.1))
   (dune (= 3.23.1))
   (logseq_db_types (= 0.1.0))

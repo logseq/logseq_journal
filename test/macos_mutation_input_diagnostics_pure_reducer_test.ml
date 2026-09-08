@@ -330,6 +330,9 @@ let test_detail_reload_after_session_replacement () =
 
 let test_undo_keeps_reconciled_sibling () =
   let module Timeline = Journal_timeline_state in
+  let retained_slots state =
+    Timeline.fold_slots (fun slots slot -> slot :: slots) [] state |> List.rev
+  in
   let target = block () in
   let sibling_id = "70000000-0000-4000-a000-000000000002" in
   let sibling = block ~id:sibling_id () in
@@ -351,7 +354,7 @@ let test_undo_keeps_reconciled_sibling () =
   let current = Timeline.replace_block staged latest in
   let restored = Timeline.undo_delete current backup in
   let blocks =
-    Timeline.retained_slots restored
+    retained_slots restored
     |> List.filter_map (function
       | Timeline.Top_level entry -> Some entry.block
       | _ -> None)

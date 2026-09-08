@@ -8,6 +8,7 @@ license: "MIT"
 homepage: "https://github.com/RCmerci/logseq_journal"
 bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
 depends: [
+  "rrbvec" {= "dev"}
   "abstract_algebra" {= "v0.17.0"}
   "angstrom" {= "0.16.1"}
   "asn1-combinators" {= "0.3.2"}
@@ -256,6 +257,7 @@ depends: [
 ]
 build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
+  ["rrbvec.dev" "git+https://github.com/RCmerci/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
   [
   "bonsai_flutter.0.1.0~dev"
   "git+https://github.com/RCmerci/bonsai_flutter.git#84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b"

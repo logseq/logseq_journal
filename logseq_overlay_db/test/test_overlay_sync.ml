@@ -1265,6 +1265,69 @@ let authoritative_rebase_replans_queued_ordinary_mutation database =
   Database.release_snapshot snapshot
 ;;
 
+let retained_effect_order_and_frozen_snapshot database =
+  let behavior = "retained effect prefixes preserve chronology and frozen payloads" in
+  let frozen = ref None in
+  for ordinal = 1 to 40 do
+    let expected = block_precondition database T.authoritative_block_uuid behavior in
+    ignore
+      (T.commit_mutation
+         database
+         ~expected
+         (Save_block
+            { mutation_id = T.mutation_uuid (8000 + ordinal)
+            ; block = T.authoritative_block_uuid
+            ; title = Printf.sprintf "Ordered title %d" ordinal
+            })
+         ~behavior);
+    if ordinal = 20
+    then frozen := Some (Database.current_snapshot database |> T.require_ok ~behavior)
+  done;
+  let wire =
+    let module Transit = Transit_core.Json in
+    let module Codec = Transit_native.Transit.Json in
+    Transit.Array
+      [ Transit.Array
+          [ Transit.Keyword "db/add"
+          ; Transit.Array
+              [ Transit.Keyword "block/uuid"
+              ; Transit.Uuid (Graph.Uuid.to_string T.authoritative_block_uuid)
+              ]
+          ; Transit.Keyword "block/updated-at"
+          ; Transit.Int 1_704_067_201_234
+          ]
+      ]
+    |> Codec.to_string ~mode:Codec.Verbose
+  in
+  let committed =
+    commit_plain_authoritative database ~cursor:(server_cursor 1) wire behavior
+  in
+  T.require
+    (List.length committed.replanned_queued_ids = 40)
+    "replan lost an active prefix";
+  let current = Database.current_snapshot database |> T.require_ok ~behavior in
+  let title snapshot =
+    match
+      Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+      |> T.require_ok ~behavior
+    with
+    | [ Present_block { value; _ } ] -> value.block.title
+    | _ -> Alcotest.fail "ordered block disappeared"
+  in
+  T.require (title current = "Ordered title 40") "replan replayed a bucket out of order";
+  T.require
+    (title (Option.get !frozen) = "Ordered title 20")
+    "replan mutated a frozen snapshot";
+  ignore (Database.get_pages current [ T.page_uuid ] |> T.require_ok ~behavior);
+  ignore
+    (Database.get_structure
+       current
+       (Children { parent = T.page_uuid; limit = 100; cursor = None })
+     |> T.require_ok ~behavior);
+  Database.release_snapshot current;
+  Database.release_snapshot (Option.get !frozen)
+;;
+
 let authoritative_rebase_terminalizes_queued_no_change database =
   let behavior = "authoritative rebase terminalizes queued no-change" in
   let expected = block_precondition database T.authoritative_block_uuid behavior in
@@ -3785,6 +3848,9 @@ let database_cases =
     ; T.database_case
         "authoritative rebase replans queued ordinary mutation"
         authoritative_rebase_replans_queued_ordinary_mutation
+    ; T.database_case
+        "retained effect order and frozen snapshot"
+        retained_effect_order_and_frozen_snapshot
     ; T.database_case
         "authoritative rebase terminalizes queued no-change"
         authoritative_rebase_terminalizes_queued_no_change

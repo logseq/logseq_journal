@@ -55,7 +55,7 @@ type recovery =
 
 type t =
   { today : int
-  ; slots : slot list
+  ; slots : slot Rrbvec.t
   ; first_retained_index : int
   ; preceding_heading : bool
   ; total_count : int
@@ -126,7 +126,7 @@ let update_capture_fab_scroll state ~pixels ~delta =
 
 let empty ~today =
   { today
-  ; slots = []
+  ; slots = Rrbvec.empty
   ; first_retained_index = 0
   ; preceding_heading = false
   ; total_count = 0
@@ -164,16 +164,81 @@ let slot_key = function
   | Feed_continuation { before_day } -> "feed-continuation:" ^ string_of_int before_day
 ;;
 
-let drop count values =
-  let rec loop remaining values =
-    if remaining <= 0
-    then values
-    else (
-      match values with
-      | [] -> []
-      | _ :: tail -> loop (remaining - 1) tail)
-  in
-  loop count values
+let slice slots start stop = Rrbvec.subvec slots start stop |> Option.get
+
+let splice slots start stop replacement =
+  Rrbvec.append
+    (Rrbvec.append (slice slots 0 start) replacement)
+    (slice slots stop (Rrbvec.length slots))
+;;
+
+let find_slot_index predicate slots =
+  let index = ref (-1) in
+  Rrbvec.find_map
+    (fun slot ->
+       incr index;
+       if predicate slot then Some !index else None)
+    slots
+;;
+
+let span_end predicate slots start =
+  find_slot_index
+    (fun slot -> not (predicate slot))
+    (slice slots start (Rrbvec.length slots))
+  |> Option.fold ~none:(Rrbvec.length slots) ~some:(fun offset -> start + offset)
+;;
+
+let owned_by parent_id = function
+  | Child_preview preview -> String.equal preview.parent_id parent_id
+  | Children_loading loading -> String.equal loading.parent_id parent_id
+  | Children_more more -> String.equal more.parent_id parent_id
+  | Day_heading _ | Top_level _ | Day_continuation _ | Feed_continuation _ -> false
+;;
+
+let slot_block = function
+  | Top_level entry -> Some entry.Journal_graph_projection.block
+  | Child_preview { block; _ } -> Some block
+  | Day_heading _
+  | Day_continuation _
+  | Children_loading _
+  | Children_more _
+  | Feed_continuation _ -> None
+;;
+
+let filter_map_slots f slots =
+  Rrbvec.fold_right
+    (fun slot rest ->
+       match f slot with
+       | None -> rest
+       | Some value -> value :: rest)
+    slots
+    []
+;;
+
+let update_slots replacement slots =
+  let updated = ref slots in
+  Rrbvec.iteri
+    (fun index slot ->
+       match replacement slot with
+       | None -> ()
+       | Some replacement -> updated := Rrbvec.set !updated index replacement)
+    slots;
+  !updated
+;;
+
+let filter_slots keep slots =
+  let result = ref Rrbvec.empty in
+  let start = ref 0 in
+  Rrbvec.iteri
+    (fun index slot ->
+       if not (keep slot)
+       then (
+         result := Rrbvec.append !result (slice slots !start index);
+         start := index + 1))
+    slots;
+  if !start = 0
+  then slots
+  else Rrbvec.append !result (slice slots !start (Rrbvec.length slots))
 ;;
 
 let take count values =
@@ -186,17 +251,17 @@ let take count values =
 ;;
 
 let cap_retained (state : t) =
-  let extra = List.length state.slots - maximum_slots in
+  let extra = Rrbvec.length state.slots - maximum_slots in
   if extra <= 0
   then state
   else (
-    let slots = drop extra state.slots in
+    let slots = slice state.slots extra (Rrbvec.length state.slots) in
     { state with
       slots
     ; day_failures =
         List.filter
           (fun (day, _) ->
-             List.exists
+             Rrbvec.exists
                (function
                  | Day_continuation item -> item.day = day
                  | _ -> false)
@@ -204,7 +269,7 @@ let cap_retained (state : t) =
           state.day_failures
     ; first_retained_index = state.first_retained_index + extra
     ; preceding_heading =
-        (match List.nth_opt state.slots (extra - 1) with
+        (match Rrbvec.nth_opt state.slots (extra - 1) with
          | Some (Day_heading _) -> true
          | _ -> false)
     })
@@ -241,7 +306,7 @@ let terminal_day_failure (state : t) ~day message =
 
 let start_recovery (state : t) ~day =
   let day_entries =
-    List.filter_map
+    filter_map_slots
       (function
         | Top_level entry when Journal_model.journal_day entry.block = day -> Some entry
         | _ -> None)
@@ -249,12 +314,14 @@ let start_recovery (state : t) ~day =
   in
   let anchor_ids =
     let anchor_index = max 0 (state.visible_first - state.first_retained_index) in
-    List.mapi (fun index slot -> index, slot) state.slots
-    |> List.filter_map (fun (index, slot) ->
-      match slot with
-      | Top_level entry -> Some (index, Journal_model.id entry.block)
-      | Child_preview { block; _ } -> Some (index, Journal_model.id block)
-      | _ -> None)
+    let indexed = ref [] in
+    Rrbvec.iteri
+      (fun index slot ->
+         match slot_block slot with
+         | Some block -> indexed := (index, Journal_model.id block) :: !indexed
+         | None -> ())
+      state.slots;
+    !indexed
     |> List.sort (fun (left, _) (right, _) ->
       match Int.compare (abs (left - anchor_index)) (abs (right - anchor_index)) with
       | 0 -> Int.compare right left
@@ -344,7 +411,7 @@ let request_of_slot = function
 ;;
 
 let request_is_retained (state : t) request =
-  List.exists
+  Rrbvec.exists
     (fun slot ->
        match request_of_slot slot with
        | Some candidate -> candidate = request
@@ -355,15 +422,14 @@ let request_is_retained (state : t) request =
 let visible_requests (state : t) ~first_index ~last_exclusive =
   let lower = max state.first_retained_index (first_index - overscan) in
   let upper = min state.total_count (last_exclusive + overscan) in
-  let rec collect index pages = function
-    | [] -> List.rev pages
-    | _ when index >= upper -> List.rev pages
-    | slot :: tail ->
-      (match if index < lower then None else request_of_slot slot with
-       | Some ((Day _ | Feed _) as request) -> collect (index + 1) (request :: pages) tail
-       | Some (Children _) | None -> collect (index + 1) pages tail)
-  in
-  collect state.first_retained_index [] state.slots
+  let length = Rrbvec.length state.slots in
+  let start = min length (max 0 (lower - state.first_retained_index)) in
+  let stop = min length (max start (upper - state.first_retained_index)) in
+  slice state.slots start stop
+  |> filter_map_slots (fun slot ->
+    match request_of_slot slot with
+    | Some ((Day _ | Feed _) as request) -> Some request
+    | Some (Children _) | None -> None)
 ;;
 
 let next_visible_request (state : t) requests =
@@ -408,15 +474,10 @@ let stop_visible_drain state =
 ;;
 
 let replace_slot (state : t) ~predicate replacement =
-  let rec loop index reversed = function
-    | [] -> None
-    | slot :: tail when predicate slot ->
-      Some (index, List.rev_append reversed (replacement @ tail))
-    | slot :: tail -> loop (index + 1) (slot :: reversed) tail
-  in
-  match loop state.first_retained_index [] state.slots with
+  match find_slot_index predicate state.slots with
   | None -> state
-  | Some (_index, slots) ->
+  | Some index ->
+    let slots = splice state.slots index (index + 1) (Rrbvec.of_list replacement) in
     let delta = List.length replacement - 1 in
     { state with
       slots
@@ -433,9 +494,9 @@ let apply_feed (state : t) ~generation feed =
     when Int64.equal expected_generation generation ->
     let projected = feed_slots ~today:state.today feed in
     (match before_day with
-     | None when state.slots = [] ->
+     | None when Rrbvec.is_empty state.slots ->
        { state with
-         slots = projected
+         slots = Rrbvec.of_list projected
        ; first_retained_index = 0
        ; preceding_heading = false
        ; total_count = List.length projected
@@ -450,26 +511,17 @@ let apply_feed (state : t) ~generation feed =
      | None ->
        let old_slots = state.slots in
        let owned_slots parent_id =
-         let rec find = function
-           | [] -> []
-           | Top_level entry :: tail
-             when String.equal (Journal_model.id entry.block) parent_id ->
-             let rec take_owned reversed = function
-               | (Child_preview preview as slot) :: tail
-                 when String.equal preview.parent_id parent_id ->
-                 take_owned (slot :: reversed) tail
-               | (Children_loading loading as slot) :: tail
-                 when String.equal loading.parent_id parent_id ->
-                 take_owned (slot :: reversed) tail
-               | (Children_more more as slot) :: tail
-                 when String.equal more.parent_id parent_id ->
-                 take_owned (slot :: reversed) tail
-               | _ -> List.rev reversed
-             in
-             take_owned [] tail
-           | _ :: tail -> find tail
-         in
-         find old_slots
+         match
+           find_slot_index
+             (function
+               | Top_level entry -> String.equal (Journal_model.id entry.block) parent_id
+               | _ -> false)
+             old_slots
+         with
+         | None -> Rrbvec.empty
+         | Some index ->
+           let start = index + 1 in
+           slice old_slots start (span_end (owned_by parent_id) old_slots start)
        in
        let expanded_ids =
          List.filter
@@ -488,36 +540,34 @@ let apply_feed (state : t) ~generation feed =
            state.expanded_ids
        in
        let slots =
-         List.concat_map
-           (function
-             | Top_level entry as slot
-               when List.exists (String.equal (Journal_model.id entry.block)) expanded_ids
-               -> slot :: owned_slots (Journal_model.id entry.block)
-             | slot -> [ slot ])
+         List.fold_left
+           (fun slots slot ->
+              let slots = Rrbvec.push_back slots slot in
+              match slot with
+              | Top_level entry when List.mem (Journal_model.id entry.block) expanded_ids
+                -> Rrbvec.append slots (owned_slots (Journal_model.id entry.block))
+              | _ -> slots)
+           Rrbvec.empty
            projected
        in
        let anchor_key =
          let offset = state.visible_first - state.first_retained_index in
-         List.nth_opt old_slots offset |> Option.map slot_key
-       in
-       let rec find_index index key = function
-         | [] -> None
-         | slot :: _ when String.equal (slot_key slot) key -> Some index
-         | _ :: tail -> find_index (index + 1) key tail
+         Rrbvec.nth_opt old_slots offset |> Option.map slot_key
        in
        let visible_span = state.visible_last_exclusive - state.visible_first in
        let visible_first =
-         Option.bind anchor_key (fun key -> find_index 0 key slots)
-         |> Option.value ~default:(min state.visible_first (List.length slots))
+         Option.bind anchor_key (fun key ->
+           find_slot_index (fun slot -> String.equal (slot_key slot) key) slots)
+         |> Option.value ~default:(min state.visible_first (Rrbvec.length slots))
        in
        let visible_last_exclusive =
-         min (List.length slots) (visible_first + visible_span)
+         min (Rrbvec.length slots) (visible_first + visible_span)
        in
        { state with
          slots
        ; first_retained_index = 0
        ; preceding_heading = false
-       ; total_count = List.length slots
+       ; total_count = Rrbvec.length slots
        ; visible_first
        ; visible_last_exclusive
        ; visible_demand = None
@@ -594,14 +644,14 @@ let replace_block (state : t) replacement =
   let state = invalidate_recovery_for_day state (Journal_model.journal_day replacement) in
   let replacement_id = Journal_model.id replacement in
   let slots =
-    List.map
+    update_slots
       (function
         | Top_level entry when String.equal (Journal_model.id entry.block) replacement_id
-          -> Top_level { entry with block = replacement }
+          -> Some (Top_level { entry with block = replacement })
         | Child_preview preview
           when String.equal (Journal_model.id preview.block) replacement_id ->
-          Child_preview { preview with block = replacement }
-        | slot -> slot)
+          Some (Child_preview { preview with block = replacement })
+        | _ -> None)
       state.slots
   in
   { state with slots; anchor_decision = Preserve_visible_slot }
@@ -618,11 +668,11 @@ let replace_timeline_entry
   in
   let replacement_id = Journal_model.id replacement.Journal_graph_projection.block in
   let slots =
-    List.map
+    update_slots
       (function
         | Top_level entry when String.equal (Journal_model.id entry.block) replacement_id
-          -> Top_level replacement
-        | slot -> slot)
+          -> Some (Top_level replacement)
+        | _ -> None)
       state.slots
   in
   { state with slots; anchor_decision = Preserve_visible_slot }
@@ -649,7 +699,7 @@ let replace_timeline_entry_page
     }
   in
   let old_parent_ids =
-    List.filter_map
+    filter_map_slots
       (function
         | Top_level entry when Journal_model.journal_day entry.block = page.day ->
           Some (Journal_model.id entry.block)
@@ -681,23 +731,25 @@ let replace_timeline_entry_page
       List.mem parent_id old_parent_ids
     | Day_heading _ | Feed_continuation _ -> false
   in
-  let rec skip_page = function
-    | slot :: rest when belongs_to_page slot -> skip_page rest
-    | rest -> rest
+  let position =
+    find_slot_index
+      (function
+        | Day_heading candidate -> String.equal candidate.id page.id
+        | Top_level entry -> String.equal (Journal_model.page_id entry.block) page.id
+        | _ -> false)
+      state.slots
   in
-  let rec replace reversed = function
-    | (Day_heading candidate as heading) :: rest when String.equal candidate.id page.id ->
-      Some (List.rev_append reversed ((heading :: replacement_slots) @ skip_page rest))
-    | Top_level entry :: _ as rest
-      when String.equal (Journal_model.page_id entry.block) page.id ->
-      Some (List.rev_append reversed (replacement_slots @ skip_page rest))
-    | slot :: rest -> replace (slot :: reversed) rest
-    | [] -> None
-  in
-  match replace [] state.slots with
+  match position with
   | None -> state
-  | Some slots ->
-    let delta = List.length slots - List.length state.slots in
+  | Some index ->
+    let start =
+      match Rrbvec.nth state.slots index with
+      | Day_heading _ -> index + 1
+      | _ -> index
+    in
+    let stop = span_end belongs_to_page state.slots start in
+    let slots = splice state.slots start stop (Rrbvec.of_list replacement_slots) in
+    let delta = Rrbvec.length slots - Rrbvec.length state.slots in
     { state with
       slots
     ; pending
@@ -744,7 +796,7 @@ let apply_timeline_entry_page
       | [] -> true
       | anchor :: _ ->
         let anchor =
-          List.find_map
+          Rrbvec.find_map
             (function
               | Child_preview { parent_id; block }
                 when String.equal (Journal_model.id block) anchor -> Some parent_id
@@ -753,7 +805,7 @@ let apply_timeline_entry_page
           |> Option.value ~default:anchor
         in
         List.mem anchor ids
-        || List.exists
+        || Rrbvec.exists
              (function
                | Top_level entry ->
                  Journal_model.journal_day entry.block <> recovery.day
@@ -779,7 +831,7 @@ let apply_timeline_entry_page
       }
     else (
       let owner_page =
-        List.find_map
+        Rrbvec.find_map
           (function
             | Day_heading page when page.Journal_graph_projection.day = recovery.day ->
               Some page
@@ -808,7 +860,7 @@ let apply_timeline_entry_page
         let anchor_id =
           List.find_opt
             (fun id ->
-               List.exists
+               Rrbvec.exists
                  (function
                    | Top_level entry -> String.equal id (Journal_model.id entry.block)
                    | Child_preview { block; _ } ->
@@ -822,12 +874,11 @@ let apply_timeline_entry_page
           | Some id -> "block:" ^ id
           | None -> "day:" ^ string_of_int recovery.day
         in
-        let rec index n = function
-          | [] -> state.visible_first
-          | slot :: _ when slot_key slot = anchor_key -> n
-          | _ :: tail -> index (n + 1) tail
+        let visible_first =
+          find_slot_index (fun slot -> slot_key slot = anchor_key) updated.slots
+          |> Option.fold ~none:state.visible_first ~some:(fun offset ->
+            updated.first_retained_index + offset)
         in
-        let visible_first = index updated.first_retained_index updated.slots in
         { updated with
           visible_first
         ; visible_last_exclusive =
@@ -846,7 +897,7 @@ let apply_detail (state : t) ~generation (detail : Journal_graph_projection.deta
     when Int64.equal expected_generation generation
          && String.equal parent_id (Journal_model.id detail.root) ->
     let owns_loading_slot =
-      List.exists
+      Rrbvec.exists
         (function
           | Children_loading candidate ->
             String.equal candidate.parent_id parent_id
@@ -897,29 +948,20 @@ let reconcile_detail (state : t) (detail : Journal_graph_projection.detail) =
       List.map (fun block -> Child_preview { parent_id; block }) blocks
       @ if has_more then [ Children_more { parent_id } ] else []
     in
-    let rec remove_owned = function
-      | Child_preview preview :: rest when String.equal preview.parent_id parent_id ->
-        remove_owned rest
-      | Children_loading loading :: rest when String.equal loading.parent_id parent_id ->
-        remove_owned rest
-      | Children_more more :: rest when String.equal more.parent_id parent_id ->
-        remove_owned rest
-      | rest -> rest
-    in
-    let rec replace reversed = function
-      | (Top_level entry as slot) :: rest
-        when String.equal (Journal_model.id entry.block) parent_id ->
-        Some (List.rev_append reversed ((slot :: replacement) @ remove_owned rest))
-      | (Child_preview preview as slot) :: rest
-        when String.equal (Journal_model.id preview.block) parent_id ->
-        Some (List.rev_append reversed ((slot :: replacement) @ remove_owned rest))
-      | slot :: rest -> replace (slot :: reversed) rest
-      | [] -> None
-    in
-    match replace [] state.slots with
+    match
+      find_slot_index
+        (fun slot ->
+           match slot_block slot with
+           | Some block -> String.equal (Journal_model.id block) parent_id
+           | None -> false)
+        state.slots
+    with
     | None -> state
-    | Some slots ->
-      let delta = List.length slots - List.length state.slots in
+    | Some index ->
+      let start = index + 1 in
+      let stop = span_end (owned_by parent_id) state.slots start in
+      let slots = splice state.slots start stop (Rrbvec.of_list replacement) in
+      let delta = Rrbvec.length slots - Rrbvec.length state.slots in
       { state with
         slots
       ; total_count = max 0 (state.total_count + delta)
@@ -932,10 +974,10 @@ let next_request (state : t) =
   if Option.is_some state.pending
   then None
   else (
-    let rec find_children = function
-      | [] -> None
-      | Children_loading { parent_id; epoch } :: _ -> Some (Children { parent_id; epoch })
-      | _ :: tail -> find_children tail
+    let find_children =
+      Rrbvec.find_map (function
+        | Children_loading { parent_id; epoch } -> Some (Children { parent_id; epoch })
+        | _ -> None)
     in
     match state.recovery with
     | Some recovery -> Some (Day { day = recovery.day; after = recovery.next_cursor })
@@ -951,21 +993,23 @@ let expand (state : t) ~parent_id =
   if List.exists (String.equal parent_id) state.expanded_ids
   then state
   else (
-    let rec insert reversed = function
-      | [] -> None
-      | (Top_level entry as parent) :: tail
-        when String.equal (Journal_model.id entry.block) parent_id ->
-        Some
-          (List.rev_append
-             reversed
-             (parent
-              :: Children_loading { parent_id; epoch = state.next_expansion_epoch }
-              :: tail))
-      | slot :: tail -> insert (slot :: reversed) tail
-    in
-    match insert [] state.slots with
+    match
+      find_slot_index
+        (function
+          | Top_level entry -> String.equal (Journal_model.id entry.block) parent_id
+          | _ -> false)
+        state.slots
+    with
     | None -> state
-    | Some slots ->
+    | Some index ->
+      let slots =
+        splice
+          state.slots
+          (index + 1)
+          (index + 1)
+          (Rrbvec.singleton
+             (Children_loading { parent_id; epoch = state.next_expansion_epoch }))
+      in
       { state with
         slots
       ; total_count = state.total_count + 1
@@ -980,23 +1024,20 @@ let collapse (state : t) ~parent_id =
   if not (List.exists (String.equal parent_id) state.expanded_ids)
   then state
   else (
-    let rec loop index reversed = function
-      | [] -> state.slots, 0, state.total_count
-      | (Top_level entry as parent) :: tail
-        when String.equal (Journal_model.id entry.block) parent_id ->
-        let rec remove removed = function
-          | Child_preview candidate :: rest
-            when String.equal candidate.parent_id parent_id -> remove (removed + 1) rest
-          | Children_loading candidate :: rest
-            when String.equal candidate.parent_id parent_id -> remove (removed + 1) rest
-          | Children_more candidate :: rest
-            when String.equal candidate.parent_id parent_id -> remove (removed + 1) rest
-          | rest -> List.rev_append reversed (parent :: rest), removed, index
-        in
-        remove 0 tail
-      | slot :: tail -> loop (index + 1) (slot :: reversed) tail
+    let slots, removed =
+      match
+        find_slot_index
+          (function
+            | Top_level entry -> String.equal (Journal_model.id entry.block) parent_id
+            | _ -> false)
+          state.slots
+      with
+      | None -> state.slots, 0
+      | Some index ->
+        let start = index + 1 in
+        let stop = span_end (owned_by parent_id) state.slots start in
+        splice state.slots start stop Rrbvec.empty, stop - start
     in
-    let slots, removed, _parent_index = loop state.first_retained_index [] state.slots in
     if removed = 0
     then
       { state with
@@ -1022,7 +1063,7 @@ let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timelin
   let block = entry.Journal_graph_projection.block in
   let state = invalidate_recovery_for_day state (Journal_model.journal_day block) in
   if
-    List.exists
+    Rrbvec.exists
       (function
         | Top_level candidate ->
           String.equal (Journal_model.id candidate.block) (Journal_model.id block)
@@ -1030,23 +1071,19 @@ let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timelin
       state.slots
   then { (replace_timeline_entry state entry) with anchor_decision = Reset_to_top }
   else (
-    let rec insert reversed = function
-      | [] -> List.rev (Top_level entry :: reversed), state.total_count
-      | (Top_level candidate as slot) :: tail
-        when Journal_model.journal_day candidate.block = Journal_model.journal_day block
-             && compare_blocks block candidate.block <= 0 ->
-        ( List.rev_append reversed (Top_level entry :: slot :: tail)
-        , state.first_retained_index + List.length reversed )
-      | (Day_heading page as slot) :: tail when Journal_model.journal_day block > page.day
-        ->
-        ( List.rev_append reversed (Top_level entry :: slot :: tail)
-        , state.first_retained_index + List.length reversed )
-      | (Feed_continuation _ as slot) :: tail ->
-        ( List.rev_append reversed (Top_level entry :: slot :: tail)
-        , state.first_retained_index + List.length reversed )
-      | slot :: tail -> insert (slot :: reversed) tail
+    let index =
+      find_slot_index
+        (function
+          | Top_level candidate ->
+            Journal_model.journal_day candidate.block = Journal_model.journal_day block
+            && compare_blocks block candidate.block <= 0
+          | Day_heading page -> Journal_model.journal_day block > page.day
+          | Feed_continuation _ -> true
+          | _ -> false)
+        state.slots
+      |> Option.value ~default:(Rrbvec.length state.slots)
     in
-    let slots, _inserted_index = insert [] state.slots in
+    let slots = splice state.slots index index (Rrbvec.singleton (Top_level entry)) in
     { state with
       slots
     ; total_count = state.total_count + 1
@@ -1056,54 +1093,52 @@ let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timelin
 ;;
 
 let remove_orphan_day_headings ~today slots =
-  let rec has_day_content day = function
-    | [] | Day_heading _ :: _ | Feed_continuation _ :: _ -> false
-    | Top_level entry :: _ -> Journal_model.journal_day entry.block = day
-    | Day_continuation continuation :: _ -> continuation.day = day
-    | Child_preview _ :: tail | Children_loading _ :: tail | Children_more _ :: tail ->
-      has_day_content day tail
-  in
-  let rec loop reversed = function
-    | Day_heading page :: tail
-      when page.Journal_graph_projection.day <> today
-           && not (has_day_content page.day tail) -> loop reversed tail
-    | slot :: tail -> loop (slot :: reversed) tail
-    | [] -> List.rev reversed
-  in
-  loop [] slots
+  let content_day = ref None in
+  let remove = ref [] in
+  let index = ref (Rrbvec.length slots) in
+  Rrbvec.fold_right
+    (fun slot () ->
+       decr index;
+       match slot with
+       | Day_heading page ->
+         if page.Journal_graph_projection.day <> today && !content_day <> Some page.day
+         then remove := !index :: !remove;
+         content_day := None
+       | Feed_continuation _ -> content_day := None
+       | Top_level entry -> content_day := Some (Journal_model.journal_day entry.block)
+       | Day_continuation continuation -> content_day := Some continuation.day
+       | Child_preview _ | Children_loading _ | Children_more _ -> ())
+    slots
+    ();
+  List.fold_right
+    (fun index slots -> splice slots index (index + 1) Rrbvec.empty)
+    !remove
+    slots
 ;;
 
 let stage_delete (state : t) ~block_id =
-  let rec find reversed = function
-    | [] -> None
-    | (Top_level entry as slot) :: tail
-      when String.equal (Journal_model.id entry.block) block_id ->
-      Some (List.rev reversed, slot, entry.block, tail)
-    | Child_preview { block; _ } :: _ when String.equal (Journal_model.id block) block_id
-      -> None
-    | slot :: tail -> find (slot :: reversed) tail
+  let position =
+    find_slot_index
+      (fun slot ->
+         match slot_block slot with
+         | Some block -> String.equal (Journal_model.id block) block_id
+         | None -> false)
+      state.slots
   in
-  match find [] state.slots with
-  | None -> None
-  | Some (prefix, _, block, tail) ->
+  match Option.map (fun index -> index, Rrbvec.nth state.slots index) position with
+  | Some (index, Top_level entry) ->
+    let block = entry.block in
     let state = invalidate_recovery_for_day state (Journal_model.journal_day block) in
-    let rec remove_owned = function
-      | Child_preview preview :: rest when String.equal preview.parent_id block_id ->
-        remove_owned rest
-      | Children_loading continuation :: rest
-        when String.equal continuation.parent_id block_id -> remove_owned rest
-      | Children_more continuation :: rest
-        when String.equal continuation.parent_id block_id -> remove_owned rest
-      | rest -> rest
-    in
+    let stop = span_end (owned_by block_id) state.slots (index + 1) in
     let slots =
-      prefix @ remove_owned tail |> remove_orphan_day_headings ~today:state.today
+      splice state.slots index stop Rrbvec.empty
+      |> remove_orphan_day_headings ~today:state.today
     in
-    let removed = List.length state.slots - List.length slots in
+    let removed = Rrbvec.length state.slots - Rrbvec.length slots in
     let total_count = max 0 (state.total_count - removed) in
     let before = { state with pending = None } in
     let retained_ids =
-      List.filter_map
+      filter_map_slots
         (function
           | Top_level entry -> Some (Journal_model.id entry.block)
           | Child_preview { block; _ } -> Some (Journal_model.id block)
@@ -1129,11 +1164,20 @@ let stage_delete (state : t) ~block_id =
         ; focus_restore_block_id = None
         }
       , { block; before } )
+  | None
+  | Some
+      ( _
+      , ( Child_preview _
+        | Day_heading _
+        | Day_continuation _
+        | Children_loading _
+        | Children_more _
+        | Feed_continuation _ ) ) -> None
 ;;
 
 let remove_block (state : t) ~block_id =
   let state =
-    List.fold_left
+    Rrbvec.fold_left
       (fun state -> function
          | Child_preview { block; _ } when String.equal (Journal_model.id block) block_id
            -> invalidate_recovery_for_day state (Journal_model.journal_day block)
@@ -1145,7 +1189,7 @@ let remove_block (state : t) ~block_id =
   | Some (state, _) -> state
   | None ->
     let slots =
-      List.filter
+      filter_slots
         (function
           | Child_preview { block; _ } ->
             not (String.equal (Journal_model.id block) block_id)
@@ -1157,7 +1201,7 @@ let remove_block (state : t) ~block_id =
           | Feed_continuation _ -> true)
         state.slots
     in
-    let removed = List.length state.slots - List.length slots in
+    let removed = Rrbvec.length state.slots - Rrbvec.length slots in
     { state with
       slots
     ; total_count = max 0 (state.total_count - removed)
@@ -1169,24 +1213,26 @@ let remove_block (state : t) ~block_id =
 
 let undo_delete (state : t) staged =
   let target_key = "block:" ^ Journal_model.id staged.block in
-  if List.exists (fun slot -> String.equal (slot_key slot) target_key) state.slots
+  if Rrbvec.exists (fun slot -> String.equal (slot_key slot) target_key) state.slots
   then state
   else (
     match stage_delete staged.before ~block_id:(Journal_model.id staged.block) with
     | None -> state
     | Some (without_target, _) ->
-      let retained_keys = List.map slot_key without_target.slots in
-      let removed slot = not (List.mem (slot_key slot) retained_keys) in
-      let rec insert_before anchor slot = function
-        | [] -> [ slot ]
-        | head :: _ as slots when Some (slot_key head) = anchor -> slot :: slots
-        | head :: tail -> head :: insert_before anchor slot tail
+      let retained_keys = Rrbvec.map slot_key without_target.slots in
+      let removed slot = not (Rrbvec.mem (slot_key slot) retained_keys) in
+      let insert_before anchor slot slots =
+        let index =
+          find_slot_index (fun head -> Some (slot_key head) = anchor) slots
+          |> Option.value ~default:(Rrbvec.length slots)
+        in
+        splice slots index index (Rrbvec.singleton slot)
       in
       let slots, _, inserted =
-        List.fold_right
+        Rrbvec.fold_right
           (fun slot (slots, anchor, inserted) ->
              let key = slot_key slot in
-             if List.exists (fun current -> String.equal (slot_key current) key) slots
+             if Rrbvec.exists (fun current -> String.equal (slot_key current) key) slots
              then slots, Some key, inserted
              else if removed slot
              then insert_before anchor slot slots, Some key, inserted + 1
@@ -1214,7 +1260,7 @@ let undo_delete (state : t) staged =
 
 let return_from_detail (state : t) ~block_id =
   let exists =
-    List.exists
+    Rrbvec.exists
       (function
         | Top_level entry -> String.equal (Journal_model.id entry.block) block_id
         | Child_preview { block; _ } -> String.equal (Journal_model.id block) block_id
@@ -1252,7 +1298,7 @@ let synthetic_window ~total_count ~first_visible ~last_exclusive =
 ;;
 
 let current_window (state : t) =
-  if state.total_count = 0 || state.slots = []
+  if state.total_count = 0 || Rrbvec.is_empty state.slots
   then { total_count = state.total_count; first_index = 0; slots = [] }
   else (
     let desired =
@@ -1265,13 +1311,28 @@ let current_window (state : t) =
     let offset = first_index - state.first_retained_index in
     let available = state.total_count - first_index in
     let slots =
-      state.slots |> drop offset |> take (min maximum_supplied_rows available)
+      let start = min (Rrbvec.length state.slots) offset in
+      let stop =
+        min (Rrbvec.length state.slots) (start + min maximum_supplied_rows available)
+      in
+      slice state.slots start stop |> Rrbvec.to_list
     in
     { total_count = state.total_count; first_index; slots })
 ;;
 
-let retained_slots (state : t) = state.slots
-let retained_slot_count (state : t) = List.length state.slots
+let retained_slot (state : t) index = Rrbvec.nth_opt state.slots index
+let fold_slots f initial (state : t) = Rrbvec.fold_left f initial state.slots
+
+let find_block (state : t) ~block_id =
+  Rrbvec.find_map
+    (fun slot ->
+       match slot_block slot with
+       | Some block when String.equal (Journal_model.id block) block_id -> Some block
+       | _ -> None)
+    state.slots
+;;
+
+let retained_slot_count (state : t) = Rrbvec.length state.slots
 let first_retained_index (state : t) = state.first_retained_index
 let total_count (state : t) = state.total_count
 let today (state : t) = state.today
@@ -1284,24 +1345,34 @@ let is_expanded (state : t) ~block_id =
 ;;
 
 let heading_spacing (state : t) ~day =
-  let rec find preceding = function
-    | Day_heading page :: rest when page.Journal_graph_projection.day = day ->
-      let before =
-        if preceding then 22. else Journal_visual_tokens.row_geometry.day_heading_before
-      in
-      let after =
-        match rest with
-        | Day_heading _ :: _ -> 0.
-        | _ -> Journal_visual_tokens.row_geometry.day_heading_after
-      in
-      before, after
-    | Day_heading _ :: rest -> find true rest
-    | _ :: rest -> find false rest
-    | [] ->
-      ( Journal_visual_tokens.row_geometry.day_heading_before
-      , Journal_visual_tokens.row_geometry.day_heading_after )
-  in
-  find state.preceding_heading state.slots
+  match
+    find_slot_index
+      (function
+        | Day_heading page -> page.Journal_graph_projection.day = day
+        | _ -> false)
+      state.slots
+  with
+  | None ->
+    ( Journal_visual_tokens.row_geometry.day_heading_before
+    , Journal_visual_tokens.row_geometry.day_heading_after )
+  | Some index ->
+    let preceding =
+      if index = 0
+      then state.preceding_heading
+      else (
+        match Rrbvec.nth state.slots (index - 1) with
+        | Day_heading _ -> true
+        | _ -> false)
+    in
+    let before =
+      if preceding then 22. else Journal_visual_tokens.row_geometry.day_heading_before
+    in
+    let after =
+      match Rrbvec.nth_opt state.slots (index + 1) with
+      | Some (Day_heading _) -> 0.
+      | _ -> Journal_visual_tokens.row_geometry.day_heading_after
+    in
+    before, after
 ;;
 
 let extent_geometry (state : t) ~profile =
@@ -1331,16 +1402,14 @@ let extent_geometry (state : t) ~profile =
     | Feed_continuation _ ->
       Journal_visual_tokens.fixed_extent ~profile Journal_visual_tokens.Feed_continuation
   in
-  let overrides =
-    List.mapi
-      (fun offset slot ->
-         let index = state.first_retained_index + offset in
-         let extent = extent slot in
-         if Float.equal extent default_extent
-         then None
-         else Some { Ui.Widget.Sparse_extent_override.index; extent })
-      state.slots
-    |> List.filter_map Fun.id
-  in
+  let overrides = ref [] in
+  Rrbvec.iteri
+    (fun offset slot ->
+       let index = state.first_retained_index + offset in
+       let extent = extent slot in
+       if not (Float.equal extent default_extent)
+       then overrides := { Ui.Widget.Sparse_extent_override.index; extent } :: !overrides)
+    state.slots;
+  let overrides = List.rev !overrides in
   { default_extent; overrides }
 ;;

@@ -6,6 +6,7 @@
  (implements logseq_db_worker_effect_runner)
  (modules effect_runner)
  (libraries
+  rrbvec
   eio
   logseq_db_worker.contract
   logseq_db_worker.pure_reducer

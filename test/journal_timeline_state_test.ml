@@ -1,4 +1,9 @@
 module Timeline = Journal_timeline_state
+
+let retained_slots state =
+  Timeline.fold_slots (fun slots slot -> slot :: slots) [] state |> List.rev
+;;
+
 module Ui = Bonsai_flutter_ui
 module ID = Bonsai_flutter_spec.Id
 
@@ -134,7 +139,7 @@ let begin_and_apply_feed ~generation ~before_day value state =
   Timeline.apply_feed state ~generation value
 ;;
 
-let slot_keys state = Timeline.retained_slots state |> List.map Timeline.slot_key
+let slot_keys state = retained_slots state |> List.map Timeline.slot_key
 
 let test_projection_order_today_suppression_and_continuations () =
   let today_late = block ~order:"b" ~source:"Today B" 3 in
@@ -175,7 +180,7 @@ let test_projection_order_today_suppression_and_continuations () =
          | Timeline.Children_loading _
          | Timeline.Children_more _
          | Timeline.Feed_continuation _ -> true)
-       (Timeline.retained_slots state))
+       (retained_slots state))
     "Today must not render a duplicate day heading"
 ;;
 
@@ -332,7 +337,7 @@ let test_pending_day_completion_prioritizes_new_child_demand () =
           (function
             | Timeline.Children_loading _ -> true
             | _ -> false)
-          (Timeline.retained_slots expanded))
+          (retained_slots expanded))
      = 1)
     "expansion did not retain exactly one child loading slot";
   let after_day =
@@ -488,7 +493,7 @@ let test_direct_children_insert_after_parent_and_collapse () =
     ; "block:" ^ Journal_model.id sibling
     ]
     "direct children were not inserted immediately after their parent";
-  (match Timeline.retained_slots loaded with
+  (match retained_slots loaded with
    | Timeline.Top_level _
      :: Timeline.Child_preview _
      :: Timeline.Child_preview _
@@ -721,7 +726,7 @@ let test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id () =
       state
       (entry ~child_summaries:[ refreshed_summary ] parent)
   in
-  (match Timeline.retained_slots refreshed with
+  (match retained_slots refreshed with
    | Timeline.Top_level { child_summaries = [ summary ]; _ } :: _ ->
      require
        (String.equal summary.block_id refreshed_summary.block_id
@@ -1060,7 +1065,7 @@ let test_anchor_decisions_replacements_and_route_return () =
          | Timeline.Top_level entry ->
            Journal_model.task_state entry.block = Journal_model.Done
          | _ -> false)
-       (Timeline.retained_slots replaced))
+       (retained_slots replaced))
     "task replacement did not update the projected block";
   let prepended =
     Timeline.prepend_timeline_entry replaced (entry (block ~order:"0" 41))
@@ -1192,7 +1197,7 @@ let test_prepend_first_today_entry_before_older_days () =
   in
   let today = entry (block ~day:20260809 ~order:"0" 43) in
   let prepended = Timeline.prepend_timeline_entry state today in
-  match Timeline.retained_slots prepended with
+  match retained_slots prepended with
   | Timeline.Top_level actual :: Timeline.Day_heading older :: _ ->
     require
       (String.equal (Journal_model.id actual.block) (Journal_model.id today.block))
@@ -1354,7 +1359,7 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
   require
     (Timeline.stage_delete state ~block_id:(Journal_model.id child) = None)
     "static child preview exposed a stage-delete path";
-  (match Timeline.retained_slots state with
+  (match retained_slots state with
    | Timeline.Day_heading _ :: Timeline.Top_level entry :: _ ->
      require
        (Journal_model.child_count entry.block = 1)
@@ -1728,7 +1733,7 @@ let test_empty_heading_spacing_survives_retained_window_eviction () =
   require
     (Timeline.first_retained_index state > 0)
     "fixture did not cross the retention boundary";
-  match Timeline.retained_slots state with
+  match retained_slots state with
   | Day_heading page :: _ ->
     require
       (Timeline.heading_spacing state ~day:page.day = (22., 0.))
@@ -1818,7 +1823,7 @@ let test_capture_identity_converges_with_reconciliation () =
          | Timeline.Top_level e ->
            Journal_model.source e.block = Journal_model.source updated
          | _ -> false)
-       (Timeline.retained_slots repeated))
+       (retained_slots repeated))
     "completion did not update the existing entry";
   let absent = Timeline.empty ~today:20260809 in
   let completed_first = Timeline.prepend_timeline_entry absent (entry captured) in
@@ -1838,7 +1843,59 @@ let test_capture_identity_converges_with_reconciliation () =
     "completion-before-reconciliation count changed"
 ;;
 
+let test_persistent_point_updates_and_undo () =
+  let blocks = List.init 512 (fun n -> block ~order:(Printf.sprintf "%012d" n) n) in
+  let initial =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260809 "Today" blocks ])
+  in
+  let replacement = block ~order:"000000000511" ~source:"Updated sibling" 511 in
+  Gc.full_major ();
+  let live_before = (Gc.stat ()).live_words in
+  let updated = Timeline.replace_block initial replacement in
+  Gc.full_major ();
+  let retained_words = (Gc.stat ()).live_words - live_before in
+  require (slot_keys initial = slot_keys updated) "point update changed slot ordering";
+  let staged, backup = require_staged initial (id "block" 256) in
+  let changed = Timeline.replace_block staged replacement in
+  let inserted = block ~order:"000000000600" 600 |> entry in
+  let restored =
+    Timeline.undo_delete (Timeline.prepend_timeline_entry changed inserted) backup
+  in
+  let find_source state block_id =
+    retained_slots state
+    |> List.find_map (function
+      | Timeline.Top_level entry when Journal_model.id entry.block = block_id ->
+        Some (Journal_model.source entry.block)
+      | _ -> None)
+  in
+  require
+    (find_source initial (id "block" 511) = Some "Journal entry")
+    "persistent update mutated the retained old state";
+  require
+    (find_source restored (id "block" 511) = Some "Updated sibling")
+    "undo discarded an intervening point update";
+  require
+    (find_source restored (id "block" 600) = Some "Journal entry")
+    "undo discarded an intervening insertion";
+  require
+    (find_source restored (id "block" 256) = Some "Journal entry")
+    "undo did not restore the deleted target";
+  require
+    (Timeline.retained_slot_count restored = Timeline.maximum_slots)
+    "undo did not enforce the retention cap";
+  require
+    (retained_words < 600)
+    "one point update retained %d new words; expected less than 600 with structural \
+     sharing"
+    retained_words
+;;
+
 let () =
+  test_persistent_point_updates_and_undo ();
   test_capture_identity_converges_with_reconciliation ();
   test_stale_day_rebuild_is_atomic_and_generation_owned ();
   test_repeated_staleness_stops_until_retry_and_does_not_block_feed ();

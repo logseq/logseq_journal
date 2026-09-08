@@ -40,6 +40,7 @@
   sync_tx_codec
   transition)
  (libraries
+  rrbvec
   datascript-ocaml-native
   digestif
   eio

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A10000020000000000000001 /* JournalE2EECrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000010000000000000001 /* JournalE2EECrypto.swift */; };
+		A10000020000000000000002 /* JournalLocalAccountBindingStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000010000000000000002 /* JournalLocalAccountBindingStore.swift */; };
 		BF1000020000000000000001 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = BF1000010000000000000001 /* PrivacyInfo.xcprivacy */; };
 		1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */ = {isa = PBXBuildFile; fileRef = 1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */; };
 		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
@@ -45,6 +46,7 @@
 
 /* Begin PBXFileReference section */
 		A10000010000000000000001 /* JournalE2EECrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../JournalE2EECrypto.swift; sourceTree = "<group>"; };
+		A10000010000000000000002 /* JournalLocalAccountBindingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../JournalLocalAccountBindingStore.swift; sourceTree = "<group>"; };
 		BF1000010000000000000001 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GeneratedPluginRegistrant.h; sourceTree = "<group>"; };
 		1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = GeneratedPluginRegistrant.m; sourceTree = "<group>"; };
@@ -120,6 +122,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000010000000000000001 /* JournalE2EECrypto.swift */,
+				A10000010000000000000002 /* JournalLocalAccountBindingStore.swift */,
 				97C146FA1CF9000F007C117D /* Main.storyboard */,
 				97C146FD1CF9000F007C117D /* Assets.xcassets */,
 				97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */,
@@ -289,6 +292,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000020000000000000001 /* JournalE2EECrypto.swift in Sources */,
+				A10000020000000000000002 /* JournalLocalAccountBindingStore.swift in Sources */,
 				74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,

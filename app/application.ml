@@ -400,19 +400,7 @@ let worker_request generation = function
 ;;
 
 let block_in_timeline timeline block_id =
-  Journal_timeline_state.retained_slots timeline
-  |> List.find_map (function
-    | Journal_timeline_state.Top_level entry
-      when String.equal (Journal_model.id entry.block) block_id -> Some entry.block
-    | Child_preview { block; _ } when String.equal (Journal_model.id block) block_id ->
-      Some block
-    | Day_heading _
-    | Top_level _
-    | Child_preview _
-    | Day_continuation _
-    | Children_loading _
-    | Children_more _
-    | Feed_continuation _ -> None)
+  Journal_timeline_state.find_block timeline ~block_id
 ;;
 
 let open_detail_state state detail request_generation =

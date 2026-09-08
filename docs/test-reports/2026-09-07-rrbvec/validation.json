@@ -1,0 +1,27 @@
+{
+  "checks": {
+    "dune build @all": "passed",
+    "dune runtest": "passed",
+    "python3 tool/test_macos_regressions.py": "passed",
+    "changed OCaml format": "passed",
+    "full OCaml format": "three unchanged baseline failures; see format-audit.json",
+    "git diff --check": "passed",
+    "opam lint changed declarations and locks": "passed",
+    "bonsai-flutter build macos --profile debug": "passed",
+    "bonsai-flutter build ios --profile debug --no-codesign": "passed; Mach-O and app-bundle verification passed",
+    "spec-dev-tool check --all": "passed after transition to implemented"
+  },
+  "native_frameworks": [
+    {
+      "path": "flutter/build/macos/Build/Products/Debug/bonsai_flutter_logseq_journal_host.app/Contents/Frameworks/bonsai_flutter_native.framework/Versions/A/bonsai_flutter_native",
+      "sha256": "7253236babb98c0aae2cd11c6a7f4961346ecd42f1517321174e9578617dcf5c",
+      "rrbvec_linked": true
+    },
+    {
+      "path": "flutter/build/ios/Debug-iphoneos/Runner.app/Frameworks/bonsai_flutter_native.framework/bonsai_flutter_native",
+      "sha256": "1b2fe4c539a32b1f8275e211e03bc5a1ba71d2b9b859c8f7908eae5b4b157120",
+      "rrbvec_linked": true
+    }
+  ],
+  "source_digests_match_measurements": true
+}

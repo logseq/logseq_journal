@@ -1,0 +1,23 @@
+{
+  "checked": 241,
+  "failures": [
+    {
+      "file": "docs/test-reports/reproductions/probe-overlay-delete.ml",
+      "changed": false,
+      "baseline_exit": 1,
+      "stderr": ""
+    },
+    {
+      "file": "docs/test-reports/reproductions/probe-m01.ml",
+      "changed": false,
+      "baseline_exit": 1,
+      "stderr": ""
+    },
+    {
+      "file": "docs/test-reports/reproductions/probe-m02.ml",
+      "changed": false,
+      "baseline_exit": 1,
+      "stderr": ""
+    }
+  ]
+}
