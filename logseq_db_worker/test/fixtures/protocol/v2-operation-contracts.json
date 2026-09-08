@@ -1,6 +1,7 @@
 {
   "apiVersion": 2,
   "reads": {
+    "listFavorites": {"interest":"logicalProjection","revision":"projectionRevision"},
     "graphInfo": {"interest":"graphInfo","revision":"generation"},
     "inspectAdmission": {"interest":"outboxAdmission","revision":"none"},
     "listJournals": {"interest":"journalIndex","revision":"pageRevision"},

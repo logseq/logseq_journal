@@ -934,7 +934,7 @@ let test_exact_profile_extents_have_no_composer_clearance () =
   in
   check ~width:320. ~scale:1. ~default_extent:44. ~day_extent:54. ~row_extent:44.;
   check ~width:390. ~scale:1. ~default_extent:44. ~day_extent:54. ~row_extent:44.;
-  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:78. ~row_extent:100.;
+  check ~width:390. ~scale:2. ~default_extent:56. ~day_extent:67. ~row_extent:100.;
   check ~width:1_200. ~scale:3.2 ~default_extent:83. ~day_extent:107. ~row_extent:83.
 ;;
 
@@ -1381,23 +1381,23 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
 
 let require_capture_fab_state state ~presentation ~travel label =
   require
-    (Timeline.capture_fab_presentation state = presentation)
+    (Timeline.Root_scroll_trigger.presentation state = presentation)
     "%s presentation changed"
     label;
   require
-    (Float.equal (Timeline.capture_fab_accumulated_travel state) travel)
+    (Float.equal (Timeline.Root_scroll_trigger.accumulated_travel state) travel)
     "%s accumulated travel is %.3f, expected %.3f"
     label
-    (Timeline.capture_fab_accumulated_travel state)
+    (Timeline.Root_scroll_trigger.accumulated_travel state)
     travel
 ;;
 
 let apply_capture_fab_scroll state ~pixels ~delta =
-  Timeline.update_capture_fab_scroll state ~pixels ~delta
+  Timeline.Root_scroll_trigger.step state ~pixels ~delta
 ;;
 
 let test_capture_fab_scroll_threshold_direction_reversal_and_top_reset () =
-  let initial = Timeline.initial_capture_fab_scroll in
+  let initial = Timeline.Root_scroll_trigger.initial in
   require_capture_fab_state initial ~presentation:Timeline.Extended ~travel:0. "initial";
   let below =
     initial
@@ -1697,12 +1697,7 @@ let test_recovery_work_budget_and_empty_heading_context () =
          ~before_day:None
          (feed [ day_feed 20260808 "Saturday" []; day_feed 20260807 "Friday" [] ])
   in
-  require
-    (Timeline.heading_spacing empty_days ~day:20260808 = (20., 0.))
-    "empty heading retained normal trailing spacing";
-  require
-    (Timeline.heading_spacing empty_days ~day:20260807 = (22., 10.))
-    "adjacent empty headings doubled their gap"
+  require_equal_string_list (slot_keys empty_days) [] "empty days left heading spacing"
 ;;
 
 let test_empty_heading_spacing_survives_retained_window_eviction () =
@@ -1730,25 +1725,11 @@ let test_empty_heading_spacing_survives_retained_window_eviction () =
       append (batch + 1) (Some (day_at ((batch * 3) + 2))) state)
   in
   let state = append 0 None (Timeline.empty ~today:20990101) in
-  require
-    (Timeline.first_retained_index state > 0)
-    "fixture did not cross the retention boundary";
-  match retained_slots state with
-  | Day_heading page :: _ ->
-    require
-      (Timeline.heading_spacing state ~day:page.day = (22., 0.))
-      "retained boundary forgot its adjacent empty heading";
-    let scrolled =
-      Timeline.observe_visible_range
-        state
-        ~first_index:(Timeline.first_retained_index state + 20)
-        ~last_exclusive:(Timeline.first_retained_index state + 30)
-    in
-    require
-      (Timeline.heading_spacing scrolled ~day:page.day
-       = Timeline.heading_spacing state ~day:page.day)
-      "visible-window movement changed retained heading geometry"
-  | _ -> fail "expected an empty heading at the retained boundary"
+  require_equal_string_list
+    (slot_keys state)
+    [ "feed-continuation:" ^ string_of_int (day_at 539) ]
+    "rolling empty batches reserved retained headings";
+  require (Timeline.total_count state = 1) "empty batches accumulated virtual extents"
 ;;
 
 let test_page_replacement_invalidates_pending_continuation () =
@@ -1894,7 +1875,360 @@ let test_persistent_point_updates_and_undo () =
     retained_words
 ;;
 
+let test_empty_day_visibility_boundaries () =
+  let load blocks =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260808 "Saturday" blocks ])
+  in
+  require_equal_string_list (slot_keys (load [])) [] "zero-block day must disappear";
+  List.iter
+    (fun blocks ->
+       let state = load blocks in
+       require_equal_string_list (slot_keys state) [] "complete empty day must disappear";
+       require (Timeline.total_count state = 0) "hidden day reserved slots";
+       let profile =
+         Journal_visual_tokens.select_row_profile
+           ~preset:Balanced
+           ~viewport_width:390.
+           ~text_scale:1.
+       in
+       require
+         ((Timeline.extent_geometry state ~profile).overrides = [])
+         "hidden day reserved extents")
+    [ []
+    ; [ block ~day:20260808 ~source:"" 1 ]
+    ; [ block ~day:20260808 ~source:" \t\r\n " 1 ]
+    ];
+  let visible =
+    [ [ block ~day:20260808 ~source:"** **" 1 ]
+    ; [ block ~day:20260808 ~source:"" ~child_count:1 1 ]
+    ; [ block ~day:20260808 ~source:"" 1; block ~day:20260808 ~source:" " 2 ]
+    ]
+    @ List.map
+        (fun task_state -> [ block ~day:20260808 ~source:"" ~task_state 1 ])
+        Journal_model.
+          [ Todo; Doing; In_review; Now; Done; Canceled; Backlog; Waiting; Later ]
+  in
+  List.iter
+    (fun blocks ->
+       require
+         (Timeline.total_count (load blocks) = 1 + List.length blocks)
+         "qualifying day was hidden")
+    visible
+;;
+
+let test_empty_day_mutations_and_undo () =
+  let placeholder = block ~day:20260808 ~source:" " 1 in
+  let sibling = block ~day:20260808 ~order:"b" 2 in
+  let older = block ~day:20260807 3 in
+  let initial =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed 20260808 "Saturday" [ placeholder ]
+            ; day_feed 20260807 "Friday" [ older ]
+            ])
+  in
+  let older_keys = [ "day:20260807"; "block:" ^ Journal_model.id older ] in
+  require_equal_string_list
+    (slot_keys initial)
+    older_keys
+    "initial placeholder visibility";
+  require
+    (Option.is_some
+       (Timeline.find_block initial ~block_id:(Journal_model.id placeholder)))
+    "hidden placeholder lost its graph identity";
+  let content = block ~day:20260808 ~source:"Written later" 1 in
+  let visible = Timeline.replace_block initial content in
+  require
+    (Timeline.total_count visible = 4)
+    "editing hidden block did not restore its heading";
+  let hidden = Timeline.replace_timeline_entry visible (entry placeholder) in
+  require_equal_string_list (slot_keys hidden) older_keys "clearing content left a gap";
+  let task =
+    Timeline.replace_block hidden (block ~day:20260808 ~source:"" ~task_state:Todo 1)
+  in
+  require (Timeline.total_count task = 4) "task change did not restore day";
+  let child =
+    Timeline.replace_block hidden (block ~day:20260808 ~source:"" ~child_count:1 1)
+  in
+  require (Timeline.total_count child = 4) "child count did not restore day";
+  let hidden = Timeline.replace_block child placeholder in
+  let two = Timeline.prepend_timeline_entry hidden (entry sibling) in
+  require (Timeline.total_count two = 5) "creation lost the hidden sibling";
+  let deleted, backup =
+    Option.get (Timeline.stage_delete two ~block_id:(Journal_model.id sibling))
+  in
+  require_equal_string_list
+    (slot_keys deleted)
+    older_keys
+    "delete failed to hide remaining placeholder";
+  let changed = Timeline.replace_block deleted content in
+  let undone = Timeline.undo_delete changed backup in
+  require (Timeline.total_count undone = 5) "undo did not restore complete section";
+  require
+    (Journal_model.source
+       (Option.get (Timeline.find_block undone ~block_id:(Journal_model.id placeholder)))
+     = "Written later")
+    "undo overwrote a later edit to a hidden sibling";
+  let removed = Timeline.remove_block hidden ~block_id:(Journal_model.id placeholder) in
+  require
+    (Timeline.find_block removed ~block_id:(Journal_model.id placeholder) = None)
+    "removing hidden block retained its identity";
+  let recreated = Timeline.prepend_timeline_entry removed (entry sibling) in
+  require
+    (Timeline.total_count recreated = 4)
+    "creation in an empty historical day lost heading";
+  let refreshed =
+    begin_and_apply_feed
+      ~generation:2L
+      ~before_day:None
+      (feed [ day_feed 20260808 "Saturday" [] ])
+      recreated
+  in
+  require_equal_string_list
+    (slot_keys refreshed)
+    []
+    "refresh did not hide newly empty day";
+  let replaced =
+    Timeline.replace_timeline_entry_page
+      refreshed
+      ~page:(page 20260808 "Saturday")
+      (timeline_page [ content ])
+  in
+  require
+    (Timeline.total_count replaced = 2)
+    "page completion could not restore a hidden day";
+  let today =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260809 "Today" [] ])
+    |> fun state -> Timeline.prepend_timeline_entry state (entry (block 5))
+  in
+  require_equal_string_list
+    (slot_keys today)
+    [ "block:" ^ id "block" 5 ]
+    "today acquired a duplicate heading"
+;;
+
+let test_hidden_day_restoration_orders_siblings_and_releases_children () =
+  let placeholder = block ~day:20260808 ~order:"z" ~source:"" 1 in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260808 "Saturday" [ placeholder ] ])
+  in
+  let earlier = block ~day:20260808 ~order:"a" 2 in
+  let restored = Timeline.prepend_timeline_entry state (entry earlier) in
+  require_equal_string_list
+    (slot_keys restored)
+    [ "day:20260808"
+    ; "block:" ^ Journal_model.id earlier
+    ; "block:" ^ Journal_model.id placeholder
+    ]
+    "restoring a hidden sibling broke its source order";
+  let parent = block ~day:20260808 ~order:"z" ~source:"" ~child_count:1 1 in
+  let expanded =
+    Timeline.replace_block state parent
+    |> fun state -> Timeline.expand state ~parent_id:(Journal_model.id parent)
+  in
+  let pending =
+    Timeline.begin_request
+      expanded
+      ~generation:2L
+      (Option.get (Timeline.next_request expanded))
+  in
+  let hidden =
+    Timeline.apply_detail
+      pending
+      ~generation:2L
+      { root = placeholder; children = { blocks = []; continuation = None } }
+  in
+  require_equal_string_list
+    (slot_keys hidden)
+    []
+    "removing last child left its empty parent";
+  require
+    (Timeline.pending_request hidden = None)
+    "hidden parent held pending child ownership";
+  require
+    (not (Timeline.is_expanded hidden ~block_id:(Journal_model.id parent)))
+    "hidden parent retained stale expansion state"
+;;
+
+let test_empty_day_pagination_and_failure () =
+  let placeholder = block ~day:20260808 ~source:"" 1 in
+  let initial =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed ~more:true [ day_feed ~more:true 20260808 "Saturday" [ placeholder ] ])
+    |> fun state -> Timeline.observe_visible_range state ~first_index:0 ~last_exclusive:4
+  in
+  let request = Option.get (Timeline.next_request initial) in
+  let pending = Timeline.begin_request initial ~generation:2L request in
+  let failed =
+    Timeline.fail_day_request
+      pending
+      ~generation:2L
+      ~day:20260808
+      ~stale_cursor:false
+      ~message:"Offline"
+  in
+  require
+    (List.mem "day-continuation:20260808" (slot_keys failed))
+    "failed partial day lost retry affordance";
+  let completed =
+    Timeline.apply_timeline_entry_page pending ~generation:2L (timeline_page [])
+  in
+  require_equal_string_list
+    (slot_keys completed)
+    [ "feed-continuation:20260808" ]
+    "complete placeholder day was not removed";
+  require
+    (Timeline.next_request completed = Some (Feed { before_day = Some 20260808 }))
+    "hidden day stopped visible feed demand";
+  let empty_batch =
+    begin_and_apply_feed
+      ~generation:3L
+      ~before_day:(Some 20260808)
+      (feed ~more:true [ day_feed 20260807 "Friday" [] ])
+      completed
+  in
+  require
+    (Timeline.next_request empty_batch = Some (Feed { before_day = Some 20260807 }))
+    "empty batch did not advance by fetched boundary";
+  let populated =
+    begin_and_apply_feed
+      ~generation:4L
+      ~before_day:(Some 20260807)
+      (feed [ day_feed 20260807 "Friday" [ block ~day:20260807 3 ] ])
+      empty_batch
+  in
+  require (Timeline.total_count populated = 2) "older populated date became unreachable";
+  let unknown = { (day_feed 20260808 "Saturday" []) with has_more_entries = true } in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None (feed [ unknown ])
+  in
+  require_equal_string_list
+    (slot_keys state)
+    [ "day:20260808"; "day-continuation:20260808" ]
+    "unknown day was mistaken for empty"
+;;
+
+let test_empty_day_retained_fragment_and_anchor () =
+  let blocks =
+    List.init 520 (fun index ->
+      block
+        ~day:20260808
+        ~order:(Printf.sprintf "%04d" index)
+        ~source:(if index = 519 then "" else "Content")
+        (index + 1))
+  in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed [ day_feed 20260808 "Saturday" blocks ])
+  in
+  let fragment =
+    List.fold_left
+      (fun state index -> Timeline.remove_block state ~block_id:(id "block" index))
+      state
+      (List.init 511 (fun i -> i + 9))
+  in
+  require
+    (List.mem ("block:" ^ id "block" 520) (slot_keys fragment))
+    "one retained placeholder was mistaken for the full day";
+  let placeholder = block ~day:20260808 ~source:"" 701 in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed 20260808 "Saturday" [ block ~day:20260808 701 ]
+            ; day_feed
+                20260807
+                "Friday"
+                (List.init 60 (fun i -> block ~day:20260807 (i + 800)))
+            ])
+    |> fun state ->
+    Timeline.observe_visible_range state ~first_index:30 ~last_exclusive:35
+  in
+  let anchor = List.nth (Timeline.current_window state).slots 4 |> Timeline.slot_key in
+  let hidden = Timeline.replace_block state placeholder in
+  require
+    (Timeline.total_count hidden = Timeline.total_count state - 2)
+    "hidden section count was stale";
+  require
+    (Timeline.slot_key (List.nth (Timeline.current_window hidden).slots 4) = anchor)
+    "hiding a preceding day moved the visible anchor";
+  let restored = Timeline.replace_block hidden (block ~day:20260808 701) in
+  require
+    (Timeline.slot_key (List.nth (Timeline.current_window restored).slots 4) = anchor)
+    "restoring a preceding day moved the visible anchor"
+;;
+
+let test_expansion_at_retention_cap_stays_bounded () =
+  let parent = block ~order:"z" ~child_count:4 520 in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed
+                20260809
+                "Today"
+                (List.init 519 (fun index ->
+                   block ~order:(Printf.sprintf "%04d" index) (index + 1)))
+            ])
+  in
+  let state =
+    Timeline.prepend_timeline_entry state (entry parent)
+    |> fun state -> Timeline.expand state ~parent_id:(Journal_model.id parent)
+  in
+  let state =
+    Timeline.begin_request state ~generation:2L (Option.get (Timeline.next_request state))
+  in
+  let loaded =
+    Timeline.apply_detail
+      state
+      ~generation:2L
+      { root = parent
+      ; children =
+          { blocks =
+              List.init 4 (fun index ->
+                block ~parent_id:(Journal_model.id parent) (index + 600))
+          ; continuation = None
+          }
+      }
+  in
+  require
+    (Timeline.retained_slot_count loaded <= Timeline.maximum_slots)
+    "child completion exceeded the retained slot cap"
+;;
+
 let () =
+  test_expansion_at_retention_cap_stays_bounded ();
+  test_hidden_day_restoration_orders_siblings_and_releases_children ();
+  test_empty_day_visibility_boundaries ();
+  test_empty_day_mutations_and_undo ();
+  test_empty_day_pagination_and_failure ();
+  test_empty_day_retained_fragment_and_anchor ();
   test_persistent_point_updates_and_undo ();
   test_capture_identity_converges_with_reconciliation ();
   test_stale_day_rebuild_is_atomic_and_generation_owned ();

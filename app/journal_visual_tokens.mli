@@ -146,4 +146,6 @@ val fixed_extent : profile:row_profile -> fixed_extent_role -> float
 val status_rail_color : t -> Journal_model.task_state -> Ui.Style.Color.t option
 val destructive_swipe_action : t -> swipe_action_colors
 val status_swipe_action : t -> Journal_model.task_state -> swipe_action_colors
-val weekday_opacity : t -> current:bool -> float
+val weekday_opacity : t -> float
+val date_gap : float
+val date_scale : viewport_width:float -> text_scale:float -> float

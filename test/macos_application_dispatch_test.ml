@@ -69,6 +69,10 @@ let record () : P.v2_block_record =
   }
 ;;
 
+let favorites_service_failure = ref false
+let favorites_reads = ref 0
+let favorites_fail = ref false
+
 let service =
   Worker.Service.create
     ~push_topic_count:5
@@ -89,6 +93,13 @@ let service =
          then (
            incr inspections;
            Error "fixture worker failure")
+         else if
+           match request.P.command with
+           | P.V2_list_favorites _ -> !favorites_service_failure
+           | _ -> false
+         then (
+           incr favorites_reads;
+           Error "Favorites worker stopped")
          else (
            let outcome =
              match request.P.command with
@@ -111,6 +122,42 @@ let service =
                      ; wire_batch_max_bytes = 4096
                      }
                  }
+             | V2_list_favorites _ ->
+               incr favorites_reads;
+               if !favorites_fail
+               then
+                 P.V2_failed
+                   { code = "corruptStorage"; message = "Favorites fixture read failed" }
+               else
+                 P.V2_favorites_outcome
+                   { favorites_page = Some graph_id
+                   ; generation = "generation-1"
+                   ; projection_revision = "projection-1"
+                   ; next_cursor = None
+                   ; items =
+                       [ { membership_uuid = graph_id
+                         ; membership_order = "a0"
+                         ; membership_revision = "membership-1"
+                         ; target =
+                             V2_favorite_page
+                               { uuid = graph_id
+                               ; title = "Design notes"
+                               ; revision = "page-1"
+                               }
+                         }
+                       ; { membership_uuid = block_uuid
+                         ; membership_order = "a1"
+                         ; membership_revision = "membership-2"
+                         ; target =
+                             V2_favorite_block
+                               { uuid = block_uuid
+                               ; title = "Review navigation"
+                               ; task_status = Some V2_doing
+                               ; revision = "block-1"
+                               }
+                         }
+                       ]
+                   }
              | V2_list_journals _ ->
                P.V2_journals_outcome
                  { items = [ { page; journal_day = 20260831; revision = "page-1" } ]
@@ -437,5 +484,110 @@ let () =
             (Test.Query.test_id ("journal-row-slidable:" ^ block_id))
           = None)
          "committed delete restored the row";
+       ())
+;;
+
+let select_tab handle epoch sequence index =
+  let node =
+    Test.Handle.find handle (Test.Query.test_id "journal-root-navigation") |> Option.get
+  in
+  let binding =
+    Array.find_opt
+      (fun binding ->
+         Bonsai_flutter_ui.Event.Tag.equal
+           binding.Bonsai_flutter_runtime.Mounted_tree.Mounted_binding.event_tag
+           Bonsai_flutter_ui.Event.Tag.Navigation_destination_selected)
+      node.event_bindings
+    |> Option.get
+  in
+  let event : Wire.Inbound_event.t =
+    { sequence = ID.Runtime.Event_sequence.of_int64 sequence
+    ; displayed_revision = Test.Handle.revision handle
+    ; node_id = node.node_id
+    ; handler_id = binding.handler_id
+    ; event_tag = Wire.Generated_protocol.Event_tag.navigation_destination_selected
+    ; payload = Int64 index
+    }
+  in
+  Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ();
+  pump handle
+;;
+
+let () =
+  let epoch = ID.Runtime.Epoch.of_int64 8002L in
+  let handle =
+    Test.Handle.create_app
+      ~runtime_epoch:epoch
+      ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+      (Application.For_testing.app_with_service
+         ~calendar_sampler:
+           (Journal_calendar.Sampler.create
+              ~clock:(fun () -> 1_788_192_000.)
+              ~localtime:Unix.gmtime
+              ())
+         service)
+      ~application_payload
+  in
+  Fun.protect
+    ~finally:(fun () -> Test.Handle.shutdown handle)
+    (fun () ->
+       respond_preferences handle epoch;
+       pump handle;
+       !emit
+         (Service.Graph_state_changed
+            { generation = 7; graph_id = Some graph_id; phase = Graph_open; error = None });
+       pump handle;
+       require (!favorites_reads = 0) "Favorites delayed or joined Journals startup";
+       require
+         (Test.Handle.find handle (Test.Query.test_id "journal-capture-expandable")
+          <> None)
+         "Journals has no Capture";
+       select_tab handle epoch 2L 1L;
+       require (!favorites_reads = 1) "Favorites selection did not lazily read once";
+       require
+         (Test.Handle.find handle (Test.Query.visible_text "Design notes") <> None)
+         "ordinary favorite page is missing";
+       require
+         (Test.Handle.find handle (Test.Query.visible_text "Review navigation") <> None)
+         "favorite block is missing";
+       require
+         (Test.Handle.find handle (Test.Query.test_id "journal-capture-expandable") = None)
+         "Favorites displayed Capture";
+       List.iter
+         (fun id ->
+            require
+              (Test.Handle.find handle (Test.Query.test_id id) = None)
+              "Favorites rendered an interactive row")
+         [ "journal-row-slidable:" ^ block_id; "journal-row-toggle-children:" ^ block_id ];
+       select_tab handle epoch 3L 1L;
+       require (!favorites_reads = 1) "reselection restarted Favorites";
+       select_tab handle epoch 4L 0L;
+       require
+         (Test.Handle.find handle (Test.Query.test_id "journal-capture-expandable")
+          <> None)
+         "return to Journals lost Capture";
+       select_tab handle epoch 5L 1L;
+       require (!favorites_reads = 1) "clean cache was reloaded";
+       favorites_service_failure := true;
+       !emit
+         (Service.Graph_push
+            (P.V2_resync_required_push
+               { api_version = P.api_version
+               ; generation = "generation-1"
+               ; reason = "favorite refresh"
+               }));
+       pump handle;
+       require (!favorites_reads = 2) "Favorites refresh was not dispatched";
+       require
+         (Test.Handle.find handle (Test.Query.visible_text "Retry") <> None)
+         "Favorites worker failure left a pending read without Retry";
+       require
+         (Test.Handle.find handle (Test.Query.visible_text "Design notes") <> None)
+         "Favorites worker failure discarded cached rows";
+       favorites_service_failure := false;
+       press handle epoch 6L "favorites-retry-button";
+       pump handle;
+       require (!favorites_reads = 3) "Favorites did not recover from worker failure";
+       print_endline "FAVORITES_APPLICATION_VIEW_TESTS_PASSED";
        print_endline "MACOS_APPLICATION_DISPATCH_TESTS_PASSED")
 ;;

@@ -589,6 +589,7 @@ let local_mutation = function
     Ok (preconditions, Overlay.Clear_task_status { mutation_id; block })
   | V2_graph_info
   | V2_inspect_admission
+  | V2_list_favorites _
   | V2_list_journals _
   | V2_get_page _
   | V2_get_block _
@@ -700,6 +701,49 @@ let read_snapshot database request command =
                    }))
          | V2_inspect_admission ->
            failure request Invalid_request "The command is not a snapshot read."
+         | V2_list_favorites { limit; cursor } ->
+           (match Database.get_favorites snapshot ~limit ~cursor with
+            | Error error -> read_failure request error
+            | Ok result ->
+              let items =
+                List.map
+                  (fun (item : Overlay.favorite_item) ->
+                     let target =
+                       match item.target with
+                       | Overlay.Favorite_page { uuid; title; revision } ->
+                         Protocol.V2_favorite_page
+                           { uuid
+                           ; title
+                           ; revision = Overlay.Page_state_revision.to_string revision
+                           }
+                       | Overlay.Favorite_block { uuid; title; task_status; revision } ->
+                         Protocol.V2_favorite_block
+                           { uuid
+                           ; title
+                           ; task_status = Option.map task_status_to_protocol task_status
+                           ; revision = Overlay.Block_state_revision.to_string revision
+                           }
+                     in
+                     Protocol.
+                       { membership_uuid = item.membership_uuid
+                       ; membership_order = item.membership_order
+                       ; membership_revision =
+                           Overlay.Block_state_revision.to_string item.membership_revision
+                       ; target
+                       })
+                  result.items
+              in
+              response
+                request
+                (Protocol.V2_favorites_outcome
+                   { favorites_page = result.favorites_page
+                   ; generation = Overlay.Generation.to_string result.version.generation
+                   ; projection_revision =
+                       Overlay.Projection_revision.to_string
+                         result.version.projection_revision
+                   ; items
+                   ; next_cursor = result.next_cursor
+                   }))
          | V2_list_journals { from_day; through_day; limit; cursor; _ } ->
            (match
               Database.get_journals snapshot ~from_day ~through_day ~limit ~cursor

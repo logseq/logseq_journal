@@ -12,6 +12,7 @@
     "maximumUnacknowledgedWindows": 256
   },
   "requests": [
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000016","command":{"type":"listFavorites","limit":50,"cursor":null}},
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000001","command":{"type":"graphInfo"}},
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000002","command":{"type":"listJournals","fromDay":20260901,"throughDay":20260930,"limit":50,"cursor":null,"revision":null}},
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000003","command":{"type":"getPage","page":"20000000-0000-4000-8000-000000000001","revision":null}},
@@ -28,7 +29,7 @@
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000014","command":{"type":"ackChanges","generation":"generation:v1:1","through":"change-window:v1:2"}},
     {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000015","command":{"type":"inspectAdmission"}}
   ],
-  "readOperations": ["graphInfo", "inspectAdmission", "listJournals", "getPage", "getBlock", "getChildren", "getPageTree"],
+  "readOperations": ["listFavorites", "graphInfo", "inspectAdmission", "listJournals", "getPage", "getBlock", "getChildren", "getPageTree"],
   "mutationOperations": ["saveBlock", "insertBlocks", "deleteBlocks", "createJournalPage", "setTaskStatus", "clearTaskStatus"],
   "changeOperations": ["pullChanges", "ackChanges"]
 }

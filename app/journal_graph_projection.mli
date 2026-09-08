@@ -1,3 +1,14 @@
+type favorite_target =
+  | Page of string
+  | Block of string
+
+type favorite =
+  { membership_id : string
+  ; target : favorite_target
+  ; title : string
+  ; task_state : Journal_model.task_state
+  }
+
 type page =
   { id : string
   ; day : int
@@ -135,3 +146,5 @@ val detail
   -> root:block_member
   -> block_member Logseq_db_types.Graph_types.page_result
   -> (detail, string) result
+
+val favorite : Logseq_db_worker.Protocol.v2_favorite_item -> favorite

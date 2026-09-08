@@ -131,6 +131,33 @@ type journal_list_result =
   ; next_cursor : Graph.Cursor.t option
   }
 
+type favorite_target =
+  | Favorite_page of
+      { uuid : Graph.page_uuid
+      ; title : string
+      ; revision : page_state_revision
+      }
+  | Favorite_block of
+      { uuid : Graph.block_uuid
+      ; title : string
+      ; task_status : task_status option
+      ; revision : block_state_revision
+      }
+
+type favorite_item =
+  { membership_uuid : Graph.block_uuid
+  ; membership_order : string
+  ; membership_revision : block_state_revision
+  ; target : favorite_target
+  }
+
+type favorites_result =
+  { favorites_page : Graph.page_uuid option
+  ; version : snapshot_version
+  ; items : favorite_item list
+  ; next_cursor : Graph.Cursor.t option
+  }
+
 type structure_request =
   | Children of
       { parent : Graph.block_uuid

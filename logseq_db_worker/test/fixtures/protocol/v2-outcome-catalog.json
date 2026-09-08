@@ -1,6 +1,7 @@
 {
   "apiVersion": 2,
   "responses": [
+    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000016","outcome":{"type":"favorites","favoritesPage":"74000000-0000-4000-8000-000000000099","generation":"generation:v1:1","projectionRevision":"projection:v1:1","items":[{"membershipUuid":"74000000-0000-4000-8000-000000000001","membershipOrder":"a0","membershipRevision":"member:v1:1","target":{"type":"page","uuid":"74000000-0000-4000-8000-000000000098","title":"Ordinary page","revision":"page:v1:1"}},{"membershipUuid":"74000000-0000-4000-8000-000000000002","membershipOrder":"a1","membershipRevision":"member:v1:2","target":{"type":"block","uuid":"74000000-0000-4000-8000-000000000097","title":"Favorite task","taskStatus":"doing","revision":"block:v1:1"}}],"nextCursor":null}},
     {
       "apiVersion": 2,
       "requestId": "00000000-0000-4000-8000-000000000001",

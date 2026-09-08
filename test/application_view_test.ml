@@ -240,10 +240,156 @@ let test_block_identity_serialization_and_native_entropy () =
     (List.length unique)
 ;;
 
+let test_root_navigation_capture_lifecycle () =
+  let module R = Application.Root_navigation in
+  let initial = R.create ~graph_generation:3 in
+  Alcotest.(check bool)
+    "Journals on launch"
+    true
+    (R.destination initial = Journal_routes.Journals);
+  let drafted = R.step initial (Capture_edited "Retained journal draft") in
+  let favorite = R.step drafted (Select Journal_routes.Favorites) in
+  Alcotest.(check string)
+    "draft survives selection"
+    "Retained journal draft"
+    (Journal_capture.source (Option.get (R.capture favorite)));
+  let returned = R.step favorite (Select Journals) in
+  let capture = Option.get (R.capture returned) in
+  let creation_time =
+    Journal_time.create
+      ~instant_unix_ms:1_788_825_600_000L
+      ~local_day:20260908
+      ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  let capture, request =
+    Journal_capture.admit_save
+      capture
+      ~mutation_id:"76000000-0000-4000-8000-000000000001"
+      ~block_id:"76000000-0000-4000-8000-000000000002"
+      ~sibling_order:"a0"
+      ~calendar_generation:1L
+      ~creation_time
+  in
+  Alcotest.(check bool) "real save admitted" true (Option.is_some request);
+  let saving =
+    R.step returned (Capture_admitted capture)
+    |> fun state ->
+    R.step state (Scroll { destination = Journals; pixels = 24.; delta = 24. })
+    |> fun state ->
+    R.step state (Select Favorites)
+    |> fun state ->
+    R.step state (Scroll { destination = Favorites; pixels = 24.; delta = 24. })
+    |> fun state ->
+    R.step state (Root_active false) |> fun state -> R.step state (Root_active true)
+  in
+  Alcotest.(check bool)
+    "tab retains saving owner"
+    true
+    (Journal_capture.phase (Option.get (R.capture saving)) = Journal_capture.Saving);
+  let block =
+    Journal_model.create
+      ~id:"76000000-0000-4000-8000-000000000002"
+      ~page_id:"76000000-0000-4000-8000-000000000003"
+      ~journal_day:20260908
+      ~parent_id:None
+      ~sibling_order:"a0"
+      ~source:"Retained journal draft"
+      ~task_state:Journal_model.No_status
+      ~child_count:0
+      ~creation_time
+      ~revision:"saved"
+      ~last_mutation_id:"76000000-0000-4000-8000-000000000001"
+    |> Result.get_ok
+  in
+  let completed =
+    R.step
+      saving
+      (Completed { payload = Block_captured { block; timeline_entry_update = None } })
+  in
+  Alcotest.(check bool)
+    "save completion retains selected tab"
+    true
+    (R.destination completed = Favorites);
+  Alcotest.(check bool) "save completes in Journals" true (R.capture completed = None);
+  let replaced = R.step drafted (Graph_replaced 4) in
+  Alcotest.(check bool)
+    "replacement resets tab and draft"
+    true
+    (R.destination replaced = Journals
+     && R.capture replaced = None
+     && Journal_routes.Favorites.items (R.favorites replaced) = [])
+;;
+
+let test_root_navigation_scroll_lifecycle () =
+  let module R = Application.Root_navigation in
+  let module T = Journal_timeline_state in
+  let scroll destination pixels delta state =
+    R.step state (Scroll { destination; pixels; delta })
+  in
+  let check state destination presentation travel label =
+    let trigger = R.scroll_trigger state destination in
+    Alcotest.(check bool)
+      (label ^ " presentation")
+      true
+      (T.Root_scroll_trigger.presentation trigger = presentation);
+    Alcotest.(check (float 0.0001))
+      (label ^ " travel")
+      travel
+      (T.Root_scroll_trigger.accumulated_travel trigger)
+  in
+  let initial = R.create ~graph_generation:3 in
+  Alcotest.(check bool) "visible on launch" true (R.navigation_visible initial);
+  let down = initial |> scroll Journals 20. 20. |> scroll Journals 24. 4. in
+  check down Journals Compact 0. "Journals hides both controls";
+  Alcotest.(check bool) "navigation hidden" false (R.navigation_visible down);
+  let reselected = R.step down (Select Journals) in
+  check reselected Journals Compact 0. "reselection preserves";
+  let favorite = R.step down (Select Favorites) |> scroll Favorites 20. 20. in
+  check favorite Journals Compact 0. "Favorites preserves Journals";
+  check favorite Favorites Extended 20. "independent travel";
+  let ignored = scroll Journals 0. (-24.) favorite in
+  check ignored Journals Compact 0. "inactive samples ignored";
+  let favorite = ignored |> scroll Favorites 24. 4. in
+  Alcotest.(check bool) "Favorites hides" false (R.navigation_visible favorite);
+  let favorite = favorite |> scroll Favorites 20. (-4.) |> scroll Favorites 40. 20. in
+  check favorite Favorites Compact 20. "reversal";
+  let favorite = favorite |> scroll Favorites 16. (-24.) in
+  Alcotest.(check bool) "Favorites reveals" true (R.navigation_visible favorite);
+  let returned = R.step favorite (Select Journals) in
+  check returned Journals Extended 0. "tab return resets";
+  let drafted = R.step down (Capture_edited "Retained") in
+  let covered = R.step drafted (Root_active false) |> scroll Journals 0. (-30.) in
+  check covered Journals Compact 0. "covered root ignores scroll";
+  let uncovered = R.step covered (Root_active true) in
+  check uncovered Journals Extended 0. "root return resets";
+  Alcotest.(check string)
+    "draft survives visibility"
+    "Retained"
+    (Journal_capture.source (Option.get (R.capture uncovered)));
+  let empty = R.step down (Non_scrollable Journals) in
+  check empty Journals Extended 0. "non-scrollable root resets";
+  let inactive_empty = R.step down (Non_scrollable Favorites) in
+  check inactive_empty Journals Compact 0. "inactive metrics ignored";
+  let replaced = R.step down (Graph_replaced 4) in
+  check replaced Journals Extended 0. "graph replacement";
+  check replaced Favorites Extended 0. "graph replacement Favorites"
+;;
+
 let () =
   Alcotest.run
     "application view"
-    [ ( "block identity adapter"
+    [ ( "root navigation"
+      , [ Alcotest.test_case
+            "scroll visibility and lifecycle"
+            `Quick
+            test_root_navigation_scroll_lifecycle
+        ; Alcotest.test_case
+            "draft, save, and graph lifetime"
+            `Quick
+            test_root_navigation_capture_lifecycle
+        ] )
+    ; ( "block identity adapter"
       , [ Alcotest.test_case
             "failure retains admission and state"
             `Quick

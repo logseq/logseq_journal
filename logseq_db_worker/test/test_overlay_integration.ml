@@ -92,6 +92,7 @@ let () =
           ; "getPageTree"
           ; "graphInfo"
           ; "inspectAdmission"
+          ; "listFavorites"
           ; "listJournals"
           ]
           (strings "readOperations" commands);
@@ -162,7 +163,7 @@ let () =
           ])
     ; T.case "v2 command catalog is the executable protocol catalog" (fun () ->
         let expected = command_types commands in
-        T.require (List.length expected = 15) "unexpected v2 request count";
+        T.require (List.length expected = 16) "unexpected v2 request count";
         List.iter
           (fun request ->
              match Logseq_db_worker.Protocol.request_of_yojson request with

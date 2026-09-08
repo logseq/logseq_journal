@@ -2800,6 +2800,171 @@ let indexed_journal_candidates (snapshot : snapshot) ~from_day ~upper_day ~local
   |> Seq.memoize
 ;;
 
+let get_favorites snapshot ~limit ~cursor =
+  with_snapshot_read snapshot (fun snapshot ->
+    let exception Read_error of Types.read_error in
+    try
+      let reject message = raise (Read_error (Types.Invalid_read_request message)) in
+      if not (valid_page_limit limit) then reject "limit must be between 1 and 200";
+      let version_key = state_digest snapshot.version in
+      let offset =
+        match cursor with
+        | None -> 0
+        | Some cursor ->
+          (match String.split_on_char ':' (Graph.Cursor.to_string cursor) with
+           | [ "favorites"; "v1"; version; offset ]
+             when String.length version = 32
+                  && String.for_all
+                       (function
+                         | '0' .. '9' | 'a' .. 'f' -> true
+                         | _ -> false)
+                       version ->
+             (match int_of_string_opt offset with
+              | Some offset when offset >= 0 && offset <= maximum_cursor_offset ->
+                if version <> version_key then raise (Read_error Types.Stale_read_cursor);
+                offset
+              | _ -> reject "invalid favorites offset")
+           | _ -> reject "invalid favorites cursor")
+      in
+      let database = Option.get snapshot.authoritative_database in
+      let context = read_context snapshot in
+      let favorites_page =
+        match
+          Datascript.find_datom
+            database
+            Datascript.Avet
+            ~a:"block/name"
+            ~v:(Datascript.String "$$$favorites")
+            ()
+        with
+        | None -> None
+        | Some datom -> uuid_of_entity database datom.e
+      in
+      let rec live seen depth uuid =
+        if depth > 256 then raise (Read_error Types.Read_limit_exceeded);
+        let key = Graph.Uuid.to_string uuid in
+        if List.mem key seen
+        then raise (Read_error (Types.Fatal_read_state "cyclic favorite ancestry"));
+        if block_is_tombstoned snapshot uuid
+        then false
+        else (
+          let recycled =
+            Option.bind (entity_of_uuid database uuid) (fun entity ->
+              one database entity "logseq.property/deleted-at")
+            |> Option.is_some
+          in
+          if recycled
+          then false
+          else (
+            match read_page context uuid with
+            | Some page -> not page.page.recycled
+            | None ->
+              (match read_block context uuid with
+               | None -> false
+               | Some block -> live (key :: seen) (depth + 1) block.block.parent)))
+      in
+      let candidates =
+        match favorites_page with
+        | None -> []
+        | Some page ->
+          (* Count raw membership candidates before structural filtering. Missing
+             UUIDs or orders must not bypass the scan budget. *)
+          let raw_count =
+            match entity_of_uuid database page with
+            | None -> 0
+            | Some entity ->
+              Datascript.datoms
+                database
+                Datascript.Avet
+                ~a:"block/parent"
+                ~v:(Datascript.Ref entity)
+                ()
+              |> Seq.take (maximum_cursor_offset + 1)
+              |> Seq.length
+          in
+          if raw_count > maximum_cursor_offset
+          then raise (Read_error Types.Read_limit_exceeded);
+          let remote = authoritative_child_facts snapshot page |> List.of_seq in
+          let local = local_child_facts snapshot page in
+          if List.length remote + List.length local > maximum_cursor_offset
+          then raise (Read_error Types.Read_limit_exceeded);
+          List.sort_uniq compare (remote @ local)
+      in
+      if offset > List.length candidates
+      then reject "favorites offset exceeds membership count";
+      let selected =
+        candidates |> List.to_seq |> Seq.drop offset |> Seq.take limit |> List.of_seq
+      in
+      let items =
+        List.filter_map
+          (fun (order, membership_uuid) ->
+             let target_uuid =
+               Option.bind (entity_of_uuid database membership_uuid) (fun entity ->
+                 Option.bind (one database entity "block/link") reference_of_value)
+               |> fun target -> Option.bind target (uuid_of_entity database)
+             in
+             match target_uuid with
+             | Some uuid when live [] 0 uuid ->
+               let target =
+                 match read_page context uuid with
+                 | Some page ->
+                   Some
+                     (Types.Favorite_page
+                        { uuid
+                        ; title = page.page.title
+                        ; revision = logical_page_revision uuid (Some page)
+                        })
+                 | None ->
+                   Option.map
+                     (fun (block : Types.block_record) ->
+                        Types.Favorite_block
+                          { uuid
+                          ; title = block.block.title
+                          ; task_status = block.task_status
+                          ; revision = logical_block_revision uuid (Some block)
+                          })
+                     (read_block context uuid)
+               in
+               Option.map
+                 (fun target ->
+                    Types.
+                      { membership_uuid
+                      ; membership_order = order
+                      ; membership_revision =
+                          token
+                            Types.Block_state_revision.of_string
+                            ("block-state:v1:"
+                             ^ Graph.Uuid.to_string membership_uuid
+                             ^ ":"
+                             ^ state_digest (membership_uuid, order, uuid))
+                      ; target
+                      })
+                 target
+             | Some _ | None -> None)
+          selected
+      in
+      let consumed = offset + List.length selected in
+      let next_cursor =
+        if consumed < List.length candidates
+        then
+          Some
+            (token
+               Graph.Cursor.of_string
+               (Printf.sprintf "favorites:v1:%s:%d" version_key consumed))
+        else None
+      in
+      let result =
+        Types.{ favorites_page; version = snapshot.version; items; next_cursor }
+      in
+      if
+        String.length (Marshal.to_string result [])
+        > snapshot.owner.dependencies.limits.response_budget_bytes
+      then Error Types.Read_limit_exceeded
+      else Ok result
+    with
+    | Read_error error -> Error error)
+;;
+
 let get_journals snapshot ~from_day ~through_day ~limit ~cursor =
   with_snapshot_read snapshot (fun snapshot ->
     if not (valid_page_limit limit)

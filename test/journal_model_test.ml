@@ -79,7 +79,9 @@ let test_entry_preserves_domain_behavior () =
 ;;
 
 let test_literal_unicode_source_round_trips () =
-  [ "#tag @mention"
+  [ ""
+  ; "   \n\t"
+  ; "#tag @mention"
   ; "e\204\129"
   ; "עברית العربية"
   ; "👨‍👩‍👧‍👦"
@@ -98,8 +100,6 @@ let test_invalid_identity_source_and_revision_are_rejected () =
   ; create ~entry_parent_id:(Some "not-a-uuid") ()
   ; create ~entry_parent_id:(Some id) ()
   ; create ~sibling_order:"" ()
-  ; create ~source:"" ()
-  ; create ~source:"   \n\t" ()
   ; create ~source:"contains\000nul" ()
   ; create ~source:malformed_utf8 ()
   ; create ~source:(String.make 65_537 'x') ()

@@ -48,6 +48,16 @@ val format_bytes : int -> string
 val admission_rows : Admission_refresh.observation -> (string * string) list
 
 module For_testing : sig
+  val favorites_page
+    :  width:float
+    -> scale:float
+    -> dark:bool
+    -> high_contrast:bool
+    -> rtl:bool
+    -> reduced_motion:bool
+    -> Logseq_db_worker.Protocol.v2_favorite_item list
+    -> Bonsai_flutter_ui.Widget.t
+
   val read_block_entropy : unit -> bytes
 
   val with_block_identity
@@ -68,3 +78,39 @@ module For_testing : sig
 end
 
 val app : App.t
+
+module Root_navigation : sig
+  type t
+
+  type event =
+    | Scroll of
+        { destination : Journal_routes.destination
+        ; pixels : float
+        ; delta : float
+        }
+    | Root_active of bool
+    | Non_scrollable of Journal_routes.destination
+    | Select of Journal_routes.destination
+    | Capture_edited of string
+    | Capture_admitted of Journal_capture.t
+    | Completed of Journal_graph_runtime.response
+    | Graph_replaced of int
+
+  val create : graph_generation:int -> t
+
+  (** [Scroll] accepts samples filtered by the native root position. [Root_active]
+      observes route/modal coverage; returning resets only the active control.
+      [Non_scrollable] observes empty content or native scroll extent. *)
+  val step : t -> event -> t
+
+  val navigation_visible : t -> bool
+
+  val scroll_trigger
+    :  t
+    -> Journal_routes.destination
+    -> Journal_timeline_state.Root_scroll_trigger.t
+
+  val destination : t -> Journal_routes.destination
+  val capture : t -> Journal_capture.t option
+  val favorites : t -> Journal_routes.Favorites.t
+end

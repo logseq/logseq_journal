@@ -39,7 +39,6 @@ type capture_fab_presentation =
   | Extended
   | Compact
 
-type capture_fab_scroll
 type t
 
 type staged_delete =
@@ -68,15 +67,15 @@ val maximum_supplied_rows : int
 val overscan : int
 val extent_strategy : extent_strategy
 val renderer_event_surface : [ `Visible_range ] list
-val initial_capture_fab_scroll : capture_fab_scroll
-val capture_fab_presentation : capture_fab_scroll -> capture_fab_presentation
-val capture_fab_accumulated_travel : capture_fab_scroll -> float
 
-val update_capture_fab_scroll
-  :  capture_fab_scroll
-  -> pixels:float
-  -> delta:float
-  -> capture_fab_scroll
+module Root_scroll_trigger : sig
+  type t
+
+  val initial : t
+  val presentation : t -> capture_fab_presentation
+  val accumulated_travel : t -> float
+  val step : t -> pixels:float -> delta:float -> t
+end
 
 val empty : today:int -> t
 val begin_request : t -> generation:int64 -> request -> t
@@ -117,7 +116,9 @@ val retained_slot : t -> int -> slot option
 (** Fold retained slots from first to last without materializing an intermediate collection. *)
 val fold_slots : ('a -> slot -> 'a) -> 'a -> t -> 'a
 
+(** Includes a hidden placeholder while its day is retained in the bounded cache. *)
 val find_block : t -> block_id:string -> Journal_model.t option
+
 val retained_slot_count : t -> int
 val first_retained_index : t -> int
 val total_count : t -> int

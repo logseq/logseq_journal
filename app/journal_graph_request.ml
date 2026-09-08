@@ -1,9 +1,17 @@
+type favorites_request =
+  { graph_generation : int
+  ; request_generation : int64
+  ; limit : int
+  ; cursor : Logseq_db_types.Graph_types.Cursor.t option
+  }
+
 type admission_request =
   { graph_generation : int
   ; request_generation : int64
   }
 
 type t =
+  | Load_favorites of favorites_request
   | Inspect_admission of admission_request
   | Capture of
       { calendar_generation : int64

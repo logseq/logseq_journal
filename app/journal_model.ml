@@ -99,7 +99,7 @@ let create
   else if not (Journal_validation.is_uuid last_mutation_id)
   then Error "Journal mutation ID must be a UUID"
   else (
-    match Journal_validation.validate_source source with
+    match Journal_validation.validate_block_source source with
     | Error error -> Error error
     | Ok () ->
       Ok

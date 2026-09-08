@@ -23,6 +23,10 @@ type request =
 and command =
   | V2_graph_info
   | V2_inspect_admission
+  | V2_list_favorites of
+      { limit : int
+      ; cursor : Cursor.t option
+      }
   | V2_list_journals of
       { from_day : int
       ; through_day : int
@@ -184,6 +188,34 @@ and v2_journal_item =
   ; revision : string
   }
 
+and v2_favorite_target =
+  | V2_favorite_page of
+      { uuid : page_uuid
+      ; title : string
+      ; revision : string
+      }
+  | V2_favorite_block of
+      { uuid : block_uuid
+      ; title : string
+      ; task_status : v2_task_status option
+      ; revision : string
+      }
+
+and v2_favorite_item =
+  { membership_uuid : block_uuid
+  ; membership_order : string
+  ; membership_revision : string
+  ; target : v2_favorite_target
+  }
+
+and v2_favorites_result =
+  { favorites_page : page_uuid option
+  ; generation : string
+  ; projection_revision : string
+  ; items : v2_favorite_item list
+  ; next_cursor : Cursor.t option
+  }
+
 and v2_child_member =
   { value : v2_block_record
   ; revision : string
@@ -213,6 +245,7 @@ and v2_outcome =
       ; generation : string
       ; projection_revision : string
       }
+  | V2_favorites_outcome of v2_favorites_result
   | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
       { items : v2_journal_item list
@@ -489,6 +522,12 @@ let rec v2_block_tree_of_json json =
 let v2_command_to_json = function
   | V2_graph_info -> `Assoc [ "type", `String "graphInfo" ]
   | V2_inspect_admission -> `Assoc [ "type", `String "inspectAdmission" ]
+  | V2_list_favorites { limit; cursor } ->
+    `Assoc
+      [ "type", `String "listFavorites"
+      ; "limit", `Int limit
+      ; "cursor", option_json cursor_json cursor
+      ]
   | V2_list_journals { from_day; through_day; limit; cursor; revision } ->
     `Assoc
       [ "type", `String "listJournals"
@@ -599,6 +638,11 @@ let v2_command_of_json kind json =
   | "inspectAdmission" ->
     ignore (fields []);
     V2_inspect_admission
+  | "listFavorites" ->
+    let f = fields [ "limit"; "cursor" ] in
+    let limit = integer (field "limit" f) in
+    if limit < 1 || limit > maximum_page_size then decode_error "invalid favorites limit";
+    V2_list_favorites { limit; cursor = cursor (field "cursor" f) }
   | "listJournals" ->
     let f = fields [ "fromDay"; "throughDay"; "limit"; "cursor"; "revision" ] in
     V2_list_journals
@@ -1348,6 +1392,75 @@ let v2_block_lookup_of_json json =
   | _ -> decode_error "invalid block lookup type"
 ;;
 
+let v2_favorite_target_to_json = function
+  | V2_favorite_page { uuid; title; revision } ->
+    `Assoc
+      [ "type", `String "page"
+      ; "uuid", uuid_json uuid
+      ; "title", `String title
+      ; "revision", `String revision
+      ]
+  | V2_favorite_block { uuid; title; task_status; revision } ->
+    `Assoc
+      [ "type", `String "block"
+      ; "uuid", uuid_json uuid
+      ; "title", `String title
+      ; "revision", `String revision
+      ; ( "taskStatus"
+        , option_json (fun status -> `String (v2_task_status_string status)) task_status )
+      ]
+;;
+
+let v2_favorite_target_of_json json =
+  let kind =
+    match json with
+    | `Assoc f -> string (field "type" f)
+    | _ -> decode_error "invalid favorite target"
+  in
+  let names = [ "type"; "uuid"; "title"; "revision" ] in
+  let f = exact_assoc (if kind = "block" then "taskStatus" :: names else names) json in
+  let uuid = uuid (field "uuid" f)
+  and title = string (field "title" f)
+  and revision = string (field "revision" f) in
+  if String.length title > maximum_title_bytes
+  then decode_error "favorite title exceeds limit";
+  match kind with
+  | "page" -> V2_favorite_page { uuid; title; revision }
+  | "block" ->
+    V2_favorite_block
+      { uuid
+      ; title
+      ; revision
+      ; task_status =
+          (match field "taskStatus" f with
+           | `Null -> None
+           | value -> Some (v2_task_status (string value)))
+      }
+  | _ -> decode_error "invalid favorite target kind"
+;;
+
+let v2_favorite_item_to_json (item : v2_favorite_item) =
+  `Assoc
+    [ "membershipUuid", uuid_json item.membership_uuid
+    ; "membershipOrder", `String item.membership_order
+    ; "membershipRevision", `String item.membership_revision
+    ; "target", v2_favorite_target_to_json item.target
+    ]
+;;
+
+let v2_favorite_item_of_json json =
+  let f =
+    exact_assoc
+      [ "membershipUuid"; "membershipOrder"; "membershipRevision"; "target" ]
+      json
+  in
+  { membership_uuid = uuid (field "membershipUuid" f)
+  ; membership_order = string (field "membershipOrder" f)
+  ; membership_revision = string (field "membershipRevision" f)
+  ; target = v2_favorite_target_of_json (field "target" f)
+  }
+;;
+
 let v2_journal_item_to_json (item : v2_journal_item) =
   `Assoc
     [ "page", page_to_json item.page
@@ -1453,6 +1566,15 @@ let v2_outcome_to_json = function
       ; "retainedOriginEvidenceBytes", `Int retained_origin_evidence_bytes
       ; "maximumRecords", `Int maximum_records
       ; "maximumBytes", `Int maximum_bytes
+      ]
+  | V2_favorites_outcome result ->
+    `Assoc
+      [ "type", `String "favorites"
+      ; "favoritesPage", option_json uuid_json result.favorites_page
+      ; "generation", `String result.generation
+      ; "projectionRevision", `String result.projection_revision
+      ; "items", `List (List.map v2_favorite_item_to_json result.items)
+      ; "nextCursor", option_json cursor_json result.next_cursor
       ]
   | V2_journals_outcome { items; next_cursor } ->
     `Assoc
@@ -1599,6 +1721,34 @@ let v2_outcome_of_json json =
           integer (field "retainedOriginEvidenceBytes" fields)
       ; maximum_records = integer (field "maximumRecords" fields)
       ; maximum_bytes = integer (field "maximumBytes" fields)
+      }
+  | "favorites" ->
+    let f =
+      exact_assoc
+        [ "type"
+        ; "favoritesPage"
+        ; "generation"
+        ; "projectionRevision"
+        ; "items"
+        ; "nextCursor"
+        ]
+        json
+    in
+    let items =
+      match field "items" f with
+      | `List items when List.length items <= maximum_page_size ->
+        List.map v2_favorite_item_of_json items
+      | _ -> decode_error "invalid favorite items"
+    in
+    V2_favorites_outcome
+      { favorites_page =
+          (match field "favoritesPage" f with
+           | `Null -> None
+           | value -> Some (uuid value))
+      ; generation = string (field "generation" f)
+      ; projection_revision = string (field "projectionRevision" f)
+      ; items
+      ; next_cursor = cursor (field "nextCursor" f)
       }
   | "journals" ->
     let fields = exact_assoc [ "type"; "items"; "nextCursor" ] json in

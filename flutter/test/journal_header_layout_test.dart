@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'dart:ui' show Tristate, ImageByteFormat;
+import 'dart:ui' show Tristate, ImageByteFormat, SemanticsAction;
 
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:bonsai_flutter_logseq_journal_host/journal_widget_registry.dart';
@@ -13,6 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   late Directory frames;
+  favoritesVisualTests(() => frames);
   setUpAll(() async {
     var directory = File(Platform.resolvedExecutable).parent;
     while (!Directory(
@@ -43,7 +44,10 @@ void main() {
       'dune',
       ['exec', 'test/journal_semantics_test.exe'],
       workingDirectory: '..',
-      environment: {'JOURNAL_HEADER_FRAME_DIR': frames.path},
+      environment: {
+        'JOURNAL_HEADER_FRAME_DIR': frames.path,
+        'JOURNAL_FAVORITES_FRAME_DIR': frames.path,
+      },
     );
     expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
   });
@@ -56,6 +60,8 @@ void main() {
         (width: 320.0, scale: 1.0, direction: TextDirection.ltr),
         (width: 320.0, scale: 3.2, direction: TextDirection.ltr),
         (width: 320.0, scale: 3.2, direction: TextDirection.rtl),
+        (width: 390.0, scale: 3.2, direction: TextDirection.ltr),
+        (width: 720.0, scale: 3.2, direction: TextDirection.rtl),
       ]) {
         for (final withError in [false, true]) {
           testWidgets('OCaml header edge $brightness contrast=$highContrast '
@@ -160,8 +166,8 @@ void main() {
                 expect(find.text('SUN'), findsOneWidget);
                 final weekdayRect = tester.getRect(find.text('SUN'));
                 expect(
-                  weekdayRect.top,
-                  greaterThanOrEqualTo(tester.getRect(title).bottom),
+                  weekdayRect.center.dy,
+                  closeTo(tester.getRect(title).center.dy, 0.1),
                 );
                 expect(find.textContaining('Today'), findsNothing);
                 expect(tester.widget<Text>(title).maxLines, 1);
@@ -185,7 +191,10 @@ void main() {
                   expect(errorRect.height, greaterThanOrEqualTo(44));
                 }
                 if (layout.width == 390 && layout.scale == 1) {
-                  expect(titleRect.center.dx, closeTo(layout.width / 2, 0.5));
+                  expect(
+                    titleRect.expandToInclude(weekdayRect).center.dx,
+                    closeTo(layout.width / 2, 0.5),
+                  );
                 }
                 final spoken = tester.getSemantics(title).getSemanticsData();
                 expect(spoken.label, contains('2026.08.09'));
@@ -224,6 +233,7 @@ void main() {
                   expect(anchorY, closeTo(headerBottom + 2, 0.01));
                 }
                 if (layout.width == 390 &&
+                    layout.scale == 1 &&
                     !withError &&
                     offset == 0 &&
                     phase < 2) {
@@ -269,6 +279,26 @@ void main() {
                     );
                   }
                 }
+                final visualDirectory =
+                    Platform.environment['JOURNAL_DATE_VISUAL_DIR'];
+                if (visualDirectory != null &&
+                    withError &&
+                    phase == 1 &&
+                    offset == 0) {
+                  await tester.runAsync(() async {
+                    final boundary = tester.renderObject<RenderRepaintBoundary>(
+                      find.byKey(const ValueKey('header-screen')),
+                    );
+                    final image = await boundary.toImage();
+                    final png = await image.toByteData(
+                      format: ImageByteFormat.png,
+                    );
+                    await File(
+                      '$visualDirectory/actions-${brightness.name}-$highContrast-${layout.width.toInt()}-${layout.scale}-${layout.direction.name}.png',
+                    ).writeAsBytes(png!.buffer.asUint8List());
+                    image.dispose();
+                  });
+                }
                 expect(find.byType(Divider), findsNothing);
                 expect(tester.takeException(), isNull);
               }
@@ -289,13 +319,18 @@ void main() {
   }
   for (final dark in [false, true]) {
     for (final highContrast in [false, true]) {
-      for (final large in [false, true]) {
+      for (final layout in [
+        (390.0, 1.0, false),
+        (320.0, 3.2, true),
+        (390.0, 3.2, false),
+        (720.0, 3.2, true),
+      ]) {
+        final (width, scale, rtl) = layout;
+        final large = scale > 1;
         for (final preset in ['dense', 'balanced', 'comfortable']) {
           testWidgets(
-            'date and rail preview dark=$dark contrast=$highContrast large=$large $preset',
+            'date and rail preview dark=$dark contrast=$highContrast layout=$layout $preset',
             (tester) async {
-              final width = large ? 320.0 : 390.0;
-              final scale = large ? 3.2 : 1.0;
               tester.view.devicePixelRatio = 1;
               tester.view.physicalSize = Size(width, 844);
               addTearDown(tester.view.resetDevicePixelRatio);
@@ -304,7 +339,7 @@ void main() {
               store.apply(
                 FrameCodec.decode(
                   File(
-                    '${frames.path}/timeline-${width.toInt()}-${large ? '3.2' : '1'}-$highContrast-$dark-$large-$preset.bin',
+                    '${frames.path}/timeline-${width.toInt()}-${large ? '3.2' : '1'}-$highContrast-$dark-$rtl-$preset.bin',
                   ).readAsBytesSync(),
                 ),
               );
@@ -326,7 +361,7 @@ void main() {
                       highContrast: highContrast,
                     ),
                     child: Directionality(
-                      textDirection: large
+                      textDirection: rtl
                           ? TextDirection.rtl
                           : TextDirection.ltr,
                       child: RepaintBoundary(
@@ -346,6 +381,74 @@ void main() {
               await tester.pump();
               expect(find.text('2026.09.06'), findsOneWidget);
               expect(find.text('SUN'), findsOneWidget);
+              final headerDate = tester.renderObject<RenderParagraph>(
+                find.text('2026.09.06'),
+              );
+              final historyDate = tester.renderObject<RenderParagraph>(
+                find.text('2026.09.05'),
+              );
+              final headerWeekday = tester.renderObject<RenderParagraph>(
+                find.text('SUN'),
+              );
+              final historyWeekday = tester.renderObject<RenderParagraph>(
+                find.text('SAT'),
+              );
+              double renderedSize(RenderParagraph paragraph) =>
+                  paragraph.textScaler.scale(paragraph.text.style!.fontSize!);
+              expect(
+                renderedSize(headerDate),
+                closeTo(renderedSize(historyDate), 0.01),
+              );
+              expect(
+                renderedSize(headerWeekday),
+                closeTo(renderedSize(historyWeekday), 0.01),
+              );
+              expect(
+                headerDate.text.style!.fontWeight,
+                historyDate.text.style!.fontWeight,
+              );
+              expect(
+                headerWeekday.text.style!.fontWeight,
+                historyWeekday.text.style!.fontWeight,
+              );
+              expect(
+                headerDate.text.style!.color,
+                historyDate.text.style!.color,
+              );
+              expect(
+                headerDate.size.height,
+                closeTo(historyDate.size.height, 0.1),
+              );
+              expect(
+                headerWeekday.size.height,
+                closeTo(historyWeekday.size.height, 0.1),
+              );
+              for (final labels in [
+                ('2026.09.06', 'SUN'),
+                ('2026.09.05', 'SAT'),
+              ]) {
+                final dateRect = tester.getRect(find.text(labels.$1));
+                final weekdayRect = tester.getRect(find.text(labels.$2));
+                final gap = rtl
+                    ? dateRect.left - weekdayRect.right
+                    : weekdayRect.left - dateRect.right;
+                expect(gap, closeTo(14, 0.1));
+                final opacity = tester.widget<Opacity>(
+                  find
+                      .ancestor(
+                        of: find.text(labels.$2),
+                        matching: find.byType(Opacity),
+                      )
+                      .first,
+                );
+                expect(opacity.opacity, highContrast ? 0.85 : 0.50);
+              }
+              expect(headerDate.didExceedMaxLines, isFalse);
+              expect(historyDate.didExceedMaxLines, isFalse);
+              expect(
+                tester.getRect(find.text('SUN')).center.dy,
+                closeTo(tester.getRect(find.text('2026.09.06')).center.dy, 0.1),
+              );
               expect(tester.takeException(), isNull);
               final scrollable = tester.state<ScrollableState>(
                 find.byType(Scrollable).first,
@@ -369,7 +472,7 @@ void main() {
                     );
                     image.dispose();
                     await File(
-                      '$outputDirectory/timeline-$dark-$highContrast-$large-$preset-${fraction.toInt()}.png',
+                      '$outputDirectory/timeline-$dark-$highContrast-$large-${width.toInt()}-$preset-${fraction.toInt()}.png',
                     ).writeAsBytes(data!.buffer.asUint8List());
                   });
                 }
@@ -377,6 +480,188 @@ void main() {
             },
           );
         }
+      }
+    }
+  }
+}
+
+void favoritesVisualTests(Directory Function() getFrames) {
+  for (final layout in [
+    (390.0, 1.0, false),
+    (320.0, 1.0, false),
+    (320.0, 3.2, false),
+    (320.0, 3.2, true),
+    (720.0, 1.0, false),
+  ]) {
+    for (final dark in [false, true]) {
+      for (final contrast in [false, true]) {
+        testWidgets(
+          'Favorites native layout $layout dark=$dark contrast=$contrast',
+          (tester) async {
+            final (width, scale, rtl) = layout;
+            tester.view.devicePixelRatio = 1;
+            tester.view.physicalSize = Size(width, 700);
+            tester.view.viewPadding = const FakeViewPadding(
+              top: 47,
+              bottom: 34,
+            );
+            tester.view.padding = const FakeViewPadding(top: 47, bottom: 34);
+            addTearDown(tester.view.resetViewPadding);
+            addTearDown(tester.view.resetPadding);
+            addTearDown(tester.view.resetDevicePixelRatio);
+            addTearDown(tester.view.resetPhysicalSize);
+            final store = NodeStore();
+            final scaleName = scale.toString().replaceAll(RegExp(r'\.0$'), '');
+            store.apply(
+              FrameCodec.decode(
+                File(
+                  '${getFrames().path}/favorites-${width.toInt()}-$scaleName-$rtl-$dark-$contrast.bin',
+                ).readAsBytesSync(),
+              ),
+            );
+            final events = <RendererEvent>[];
+            await tester.pumpWidget(
+              MaterialApp(
+                theme: ThemeData(
+                  useMaterial3: true,
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: const Color(0xff00262f),
+                    brightness: dark ? Brightness.dark : Brightness.light,
+                    contrastLevel: contrast ? 1 : 0,
+                  ),
+                ),
+                home: MediaQuery(
+                  data: MediaQueryData(
+                    size: Size(width, 700),
+                    padding: const EdgeInsets.only(top: 47, bottom: 34),
+                    textScaler: TextScaler.linear(scale),
+                    highContrast: contrast,
+                    disableAnimations: true,
+                  ),
+                  child: Directionality(
+                    textDirection: rtl ? TextDirection.rtl : TextDirection.ltr,
+                    child: RepaintBoundary(
+                      key: const ValueKey('favorites-screen'),
+                      child: BonsaiFlutterView(
+                        store: store,
+                        registry: createJournalWidgetRegistry(),
+                        onEvent: events.add,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+            await tester.pump();
+            await tester.pump(const Duration(milliseconds: 500));
+            expect(tester.takeException(), isNull);
+            expect(find.text('Design notes'), findsOneWidget);
+            expect(find.text('Favorites'), findsNWidgets(2));
+            expect(find.text('Journals'), findsOneWidget);
+            expect(find.byTooltip('Open Capture'), findsNothing);
+            expect(find.byType(TextField), findsNothing);
+            final source = tester.renderObject<RenderParagraph>(
+              find.text('Design notes'),
+            );
+            expect(
+              source.constraints.maxWidth,
+              greaterThanOrEqualTo(width.clamp(0, 720) - 80),
+            );
+            final bar = tester.widget<NavigationBar>(
+              find.byType(NavigationBar),
+            );
+            expect(bar.height, 44);
+            expect(
+              bar.labelBehavior,
+              NavigationDestinationLabelBehavior.alwaysHide,
+            );
+            expect(find.text(String.fromCharCode(0xf495)), findsOneWidget);
+            for (final codePoint in [0xf495, 0xe5f9]) {
+              final glyph = find.text(String.fromCharCode(codePoint));
+              expect(tester.getSize(glyph), const Size(24, 24));
+              final paragraph = tester.renderObject<RenderParagraph>(glyph);
+              final foreground = paragraph.text.style!.color!
+                  .computeLuminance();
+              final theme = Theme.of(tester.element(glyph));
+              final background =
+                  (codePoint == 0xe5f9
+                          ? (tester
+                                    .widgetList<NavigationIndicator>(
+                                      find.byType(NavigationIndicator),
+                                    )
+                                    .last
+                                    .color ??
+                                theme.colorScheme.secondary)
+                          : theme.colorScheme.surfaceContainer)
+                      .computeLuminance();
+              final ratio = foreground > background
+                  ? (foreground + 0.05) / (background + 0.05)
+                  : (background + 0.05) / (foreground + 0.05);
+              expect(ratio, greaterThanOrEqualTo(3));
+            }
+            final navigation = tester.getRect(find.byType(NavigationBar));
+            expect(navigation.bottom, lessThanOrEqualTo(700 - 34));
+            final semantics = tester.ensureSemantics();
+            expect(
+              tester
+                  .getSemantics(find.text('Design notes'))
+                  .getSemanticsData()
+                  .hasAction(SemanticsAction.tap),
+              isFalse,
+            );
+            events.clear();
+            await tester.tap(find.text('Design notes'));
+            await tester.pump();
+            expect(
+              events.where(
+                (event) =>
+                    event.eventTag != EventTagId.scrollNotification &&
+                    event.eventTag != EventTagId.visibleRangeChanged,
+              ),
+              isEmpty,
+              reason: events
+                  .map(
+                    (event) => "${event.eventTag}:${event.payload.runtimeType}",
+                  )
+                  .join(","),
+            );
+            final position = tester
+                .state<ScrollableState>(find.byType(Scrollable).first)
+                .position;
+            final before = position.pixels;
+            await tester.drag(find.text('Design notes'), const Offset(-160, 0));
+            await tester.pump();
+            expect(position.pixels, before);
+            expect(tester.takeException(), isNull);
+            semantics.dispose();
+            events.clear();
+            await tester.tap(find.text(String.fromCharCode(0xf495)));
+            await tester.pump();
+            final selections = events
+                .where(
+                  (event) =>
+                      event.eventTag ==
+                      EventTagId.navigationDestinationSelected,
+                )
+                .toList();
+            expect(selections, hasLength(1));
+            expect((selections.single.payload as Int64EventPayload).value, 0);
+            final output = Platform.environment['JOURNAL_FAVORITES_VISUAL_DIR'];
+            if (output != null) {
+              await tester.runAsync(() async {
+                final boundary = tester.renderObject<RenderRepaintBoundary>(
+                  find.byKey(const ValueKey('favorites-screen')),
+                );
+                final image = await boundary.toImage();
+                final png = await image.toByteData(format: ImageByteFormat.png);
+                await File(
+                  '$output/favorites-${width.toInt()}-$scaleName-$rtl-$dark-$contrast.png',
+                ).writeAsBytes(png!.buffer.asUint8List());
+                image.dispose();
+              });
+            }
+          },
+        );
       }
     }
   }

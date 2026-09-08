@@ -23,6 +23,10 @@ type request =
 and command =
   | V2_graph_info
   | V2_inspect_admission
+  | V2_list_favorites of
+      { limit : int
+      ; cursor : Cursor.t option
+      }
   | V2_list_journals of
       { from_day : int
       ; through_day : int
@@ -184,6 +188,34 @@ and v2_journal_item =
   ; revision : string
   }
 
+and v2_favorite_target =
+  | V2_favorite_page of
+      { uuid : page_uuid
+      ; title : string
+      ; revision : string
+      }
+  | V2_favorite_block of
+      { uuid : block_uuid
+      ; title : string
+      ; task_status : v2_task_status option
+      ; revision : string
+      }
+
+and v2_favorite_item =
+  { membership_uuid : block_uuid
+  ; membership_order : string
+  ; membership_revision : string
+  ; target : v2_favorite_target
+  }
+
+and v2_favorites_result =
+  { favorites_page : page_uuid option
+  ; generation : string
+  ; projection_revision : string
+  ; items : v2_favorite_item list
+  ; next_cursor : Cursor.t option
+  }
+
 and v2_child_member =
   { value : v2_block_record
   ; revision : string
@@ -213,6 +245,7 @@ and v2_outcome =
       ; generation : string
       ; projection_revision : string
       }
+  | V2_favorites_outcome of v2_favorites_result
   | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
       { items : v2_journal_item list

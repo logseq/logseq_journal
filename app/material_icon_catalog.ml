@@ -1,6 +1,8 @@
 module Ui = Bonsai_flutter_ui
 
 type t =
+  | View_day
+  | Star
   | Account_circle
   | Add
   | Arrow_upward
@@ -25,6 +27,8 @@ let for_task_state = function
 ;;
 
 let code_point = function
+  | View_day -> 0xf495
+  | Star -> 0xe5f9
   | Account_circle -> 0xe043
   | Add -> 0xe047
   | Arrow_upward -> 0xe0a0

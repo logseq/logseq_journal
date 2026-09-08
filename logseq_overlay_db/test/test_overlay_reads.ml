@@ -1078,8 +1078,254 @@ let page_tree_preserves_valid_windows_and_snapshots database =
          "old snapshot lost page title")
 ;;
 
+let favorites_resolve_order_filter_and_snapshot database =
+  let behavior = "favorites resolved snapshot read" in
+  let module Transit = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let id n = T.uuid (Printf.sprintf "74000000-0000-4000-8000-%012d" n) in
+  let lookup uuid =
+    Transit.Array [ Keyword "block/uuid"; Uuid (Graph.Uuid.to_string uuid) ]
+  in
+  let add n a v = Transit.Array [ Keyword "db/add"; Int (30000 + n); Keyword a; v ] in
+  let apply number ops =
+    let wire =
+      Codec.to_string ~mode:Codec.Verbose (Transit.Array ops)
+      |> encoded_transaction_of_string ~maximum_bytes:4_194_304
+      |> T.require_ok ~behavior
+    in
+    let cursor =
+      Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" number)
+      |> T.require_ok ~behavior
+    in
+    let batch =
+      authoritative_batch
+        ~maximum_count:16
+        ~maximum_bytes:4_194_304
+        ~transactions:[ authoritative_transaction ~cursor ~transaction:wire ]
+        ~through:cursor
+        ~checksum:None
+      |> T.require_ok ~behavior
+    in
+    let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+    let preparation, crypto =
+      Database.begin_authoritative database ~expected:(sync_view_token sync) batch
+      |> T.require_ok ~behavior
+    in
+    let decrypted = Option.map (fun r -> r, Database.unprotection_ciphertexts r) crypto in
+    match
+      match Database.apply_authoritative database preparation ~decrypted with
+      | Error
+          (Authoritative_decode_failed message | Authoritative_integrity_failure message)
+        -> Alcotest.fail message
+      | result -> T.require_ok ~behavior result
+    with
+    | Database.Authoritative_applied commit ->
+      if number = 7
+      then (
+        match commit.logical_change_summary with
+        | Exact_logical_change { block_uuids; _ } ->
+          T.require
+            (List.exists (Graph.Uuid.equal (id 1)) block_uuids)
+            "link-only change omitted membership invalidation"
+        | _ -> Alcotest.fail "link-only change did not publish an exact change")
+    | Authoritative_deferred _ -> Alcotest.fail "favorites fixture deferred"
+  in
+  let with_snapshot f =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect
+      ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () -> f snapshot)
+  in
+  let read snapshot limit cursor =
+    Database.get_favorites snapshot ~limit ~cursor |> T.require_ok ~behavior
+  in
+  let all snapshot =
+    let rec collect count cursor acc =
+      T.require (count < 20) "favorites cursor did not terminate";
+      let page = read snapshot 1 cursor in
+      T.require (List.length page.items <= 1) "favorite scan limit exceeded";
+      let acc = acc @ page.items in
+      match page.next_cursor with
+      | None -> acc
+      | Some c -> collect (count + 1) (Some c) acc
+    in
+    collect 0 None []
+  in
+  let memberships items =
+    List.map (fun (i : favorite_item) -> Graph.Uuid.to_string i.membership_uuid) items
+  in
+  apply
+    1
+    [ Transit.Array
+        [ Keyword "db/retractEntity"
+        ; lookup (T.uuid "00000004-1018-5888-4100-000000000000")
+        ]
+    ];
+  with_snapshot (fun snapshot ->
+    let empty = read snapshot 2 None in
+    T.require
+      (empty.favorites_page = None && empty.items = [] && empty.next_cursor = None)
+      "absent favorites is not empty";
+    List.iter
+      (fun limit ->
+         Database.get_favorites snapshot ~limit ~cursor:None
+         |> require_invalid_read "favorites invalid limit")
+      [ 0; 201 ];
+    Database.get_favorites
+      snapshot
+      ~limit:1
+      ~cursor:(Some (cursor "bad-favorites-cursor"))
+    |> require_invalid_read "malformed favorite cursor");
+  let page n title name =
+    [ add n "block/uuid" (Uuid (Graph.Uuid.to_string (id n)))
+    ; add n "block/title" (String title)
+    ; add n "block/name" (String name)
+    ]
+  in
+  let member n order target =
+    [ add n "block/uuid" (Uuid (Graph.Uuid.to_string (id n)))
+    ; add n "block/title" (String "")
+    ; add n "block/parent" (lookup (id 99))
+    ; add n "block/page" (lookup (id 99))
+    ; add n "block/order" (String order)
+    ]
+    @
+    match target with
+    | None -> []
+    | Some target -> [ add n "block/link" (lookup target) ]
+  in
+  apply
+    2
+    (page 99 "$$$favorites" "$$$favorites"
+     @ page 98 "Ordinary favorite" "ordinary favorite");
+  apply
+    3
+    (member 1 "a1" (Some (id 98))
+     @ member 0 "a0" None
+     @ member 2 "a2" (Some T.authoritative_block_uuid)
+     @ member 3 "a3" (Some (id 98)));
+  with_snapshot (fun pinned ->
+    let first = read pinned 1 None in
+    T.require
+      (first.items = [] && Option.is_some first.next_cursor)
+      "filtered page lost continuation: page=%s items=%d cursor=%b"
+      (Option.fold ~none:"none" ~some:Graph.Uuid.to_string first.favorites_page)
+      (List.length first.items)
+      (Option.is_some first.next_cursor);
+    let items = all pinned in
+    Alcotest.(check (list string))
+      "membership order and duplicate targets"
+      (List.map (fun n -> Graph.Uuid.to_string (id n)) [ 1; 2; 3 ])
+      (memberships items);
+    (match items with
+     | [ { target = Favorite_page { title; _ }; _ }
+       ; { target = Favorite_block { title = block_title; _ }; _ }
+       ; _
+       ] ->
+       T.require
+         (title = "Ordinary favorite" && block_title = "Authoritative block")
+         "membership title leaked"
+     | _ -> Alcotest.fail "favorite target kinds were lost");
+    let expected =
+      match
+        Database.get_blocks pinned [ T.authoritative_block_uuid ]
+        |> T.require_ok ~behavior
+      with
+      | [ Present_block { revision; _ } ] ->
+        Database.write_precondition
+          ~blocks:[ T.authoritative_block_uuid, revision ]
+          ~pages:[]
+          ~scopes:[]
+        |> T.require_ok ~behavior
+      | _ -> Alcotest.fail "favorite block fixture missing"
+    in
+    ignore
+      (T.commit_mutation
+         database
+         ~expected
+         (Save_block
+            { mutation_id = T.mutation_uuid 980
+            ; block = T.authoritative_block_uuid
+            ; title = "Local favorite title"
+            })
+         ~behavior);
+    with_snapshot (fun latest ->
+      (match Database.get_favorites latest ~limit:1 ~cursor:first.next_cursor with
+       | Error Stale_read_cursor -> ()
+       | _ -> Alcotest.fail "favorite cursor mixed projections");
+      T.require
+        (List.exists
+           (fun (i : favorite_item) ->
+              match i.target with
+              | Favorite_block { title = "Local favorite title"; _ } -> true
+              | _ -> false)
+           (all latest))
+        "favorites missed overlay title");
+    T.require (all pinned = items) "pinned favorites changed with overlay";
+    apply 4 [ add 98 "logseq.property/deleted-at" (Int 123) ];
+    with_snapshot (fun latest ->
+      Alcotest.(check (list string))
+        "recycled page filtered"
+        [ Graph.Uuid.to_string (id 2) ]
+        (memberships (all latest)));
+    apply
+      5
+      [ Transit.Array
+          [ Keyword "db/retract"
+          ; lookup (id 98)
+          ; Keyword "logseq.property/deleted-at"
+          ; Int 123
+          ]
+      ; add 1 "block/link" (lookup T.authoritative_block_uuid)
+      ; add 2 "block/link" (lookup (id 98))
+      ; add 3 "block/order" (String "Zz")
+      ];
+    with_snapshot (fun latest ->
+      Alcotest.(check (list string))
+        "link rewrites and reordered memberships"
+        (List.map (fun n -> Graph.Uuid.to_string (id n)) [ 3; 1; 2 ])
+        (memberships (all latest)));
+    apply
+      6
+      [ Transit.Array
+          [ Keyword "db/add"
+          ; lookup T.page_uuid
+          ; Keyword "logseq.property/deleted-at"
+          ; Int 456
+          ]
+      ];
+    with_snapshot (fun latest ->
+      Alcotest.(check (list string))
+        "ancestor recycling filters block target"
+        (List.map (fun n -> Graph.Uuid.to_string (id n)) [ 3; 2 ])
+        (memberships (all latest))));
+  with_snapshot (fun before ->
+    let cursor = (read before 1 None).next_cursor in
+    apply 7 [ add 1 "block/link" (lookup (id 98)) ];
+    with_snapshot (fun after ->
+      T.require
+        (Database.snapshot_version before <> Database.snapshot_version after)
+        "link-only transaction did not advance the logical projection";
+      match Database.get_favorites after ~limit:1 ~cursor with
+      | Error Stale_read_cursor -> ()
+      | _ -> Alcotest.fail "link-only rewrite accepted stale favorite cursor"));
+  apply 8 (List.init 10_001 (fun n -> add (1000 + n) "block/parent" (lookup (id 99))));
+  with_snapshot (fun snapshot ->
+    match Database.get_favorites snapshot ~limit:1 ~cursor:None with
+    | Error Read_limit_exceeded -> ()
+    | _ -> Alcotest.fail "malformed memberships escaped the structural scan budget");
+  let released = Database.current_snapshot database |> T.require_ok ~behavior in
+  Database.release_snapshot released;
+  match Database.get_favorites released ~limit:1 ~cursor:None with
+  | Error Snapshot_released -> ()
+  | _ -> Alcotest.fail "released favorites snapshot accepted"
+;;
+
 let cases =
   [ T.database_case
+      "favorites resolve order, filtering, and snapshot consistency"
+      favorites_resolve_order_filter_and_snapshot
+  ; T.database_case
       "page-tree preserves valid windows and snapshots"
       page_tree_preserves_valid_windows_and_snapshots
   ; T.snapshot_case "journal offsets are obsolete" journals_reject_legacy_offsets

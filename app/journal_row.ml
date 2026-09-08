@@ -1,3 +1,7 @@
+type row_interaction =
+  | Display_only
+  | Toggle_children of Bonsai_flutter_ui.Event.Handler.t
+
 module Tokens = Journal_visual_tokens
 module Ui = Bonsai_flutter_ui
 module ID = Bonsai_flutter_spec.Id
@@ -11,6 +15,16 @@ module Item = struct
     ; time : string option
     ; supporting : string list
     }
+
+  let of_favorite (favorite : Journal_graph_projection.favorite) =
+    { id = favorite.membership_id
+    ; source = Some favorite.title
+    ; task_state = favorite.task_state
+    ; child_count = 0
+    ; time = None
+    ; supporting = []
+    }
+  ;;
 
   let of_block block =
     { id = Journal_model.id block
@@ -84,7 +98,21 @@ module Item = struct
     allocate 2 t.supporting
   ;;
 
+  let profile_for_item (t : t) (profile : Tokens.row_profile) =
+    match t.time with
+    | Some _ -> profile
+    | None ->
+      { profile with
+        time_slot_width = 0.
+      ; source_text_width =
+          profile.source_text_width
+          +. profile.time_slot_width
+          +. Tokens.row_geometry.disclosure_visual
+      }
+  ;;
+
   let preview (t : t) ~profile ~expanded =
+    let profile = profile_for_item t profile in
     let source = display_source t in
     let source_measurement =
       Tokens.measure_text
@@ -271,8 +299,8 @@ let time_slot typography profile item ~show_timestamp =
   Ui.Widget.constrained_box
     ~constraints:
       (Ui.Layout.Box_constraints.create
-         ~min_width:profile.Tokens.time_slot_width
-         ~max_width:profile.time_slot_width
+         ~min_width:(if item.Item.time = None then 0. else profile.Tokens.time_slot_width)
+         ~max_width:(if item.Item.time = None then 0. else profile.time_slot_width)
          ())
     child
   |> test_id ("journal-row-time-slot:" ^ Item.id item)
@@ -356,9 +384,15 @@ let view
       ~show_divider
       ~sort_base
       ~reduced_motion
-      ~on_toggle_children
+      ~interaction
   =
+  let expanded =
+    match interaction with
+    | Display_only -> false
+    | Toggle_children _ -> expanded
+  in
   let preview = Item.preview item ~profile ~expanded in
+  let profile = Item.profile_for_item item profile in
   let visible_lines = Item.preview_line_count preview in
   let row_extent = Item.preview_extent ~profile preview in
   let source =
@@ -422,7 +456,11 @@ let view
               ())
     |> test_id ("journal-row-source-gap:" ^ Item.id item)
   in
-  let disclosure = disclosure_indicator ~rtl ~expanded item in
+  let disclosure =
+    match interaction with
+    | Display_only -> None
+    | Toggle_children _ -> disclosure_indicator ~rtl ~expanded item
+  in
   let time = time_slot typography profile item ~show_timestamp in
   let inline =
     Ui.Widget.Flex.row
@@ -490,8 +528,8 @@ let view
     |> test_id ("journal-row-body-surface:" ^ Item.id item)
   in
   let body =
-    if item.Item.child_count > 0
-    then
+    match interaction with
+    | Toggle_children on_toggle_children when item.Item.child_count > 0 ->
       content
       |> pressable
            ~reduced_motion
@@ -508,7 +546,7 @@ let view
       else
         minimum_target target
         |> test_id ("journal-row-toggle-children-target:" ^ Item.id item)
-    else
+    | Display_only | Toggle_children _ ->
       content
       |> Ui.Widget.semantics
            ~properties:

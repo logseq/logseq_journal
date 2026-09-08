@@ -191,10 +191,7 @@ let resolve ~brightness ~high_contrast =
   { presentation; high_contrast }
 ;;
 
-let weekday_opacity t ~current =
-  if t.high_contrast then 0.85 else if current then 0.55 else 0.50
-;;
-
+let weekday_opacity t = if t.high_contrast then 0.85 else 0.50
 let text_token font_size line_height weight = { font_size; line_height; weight }
 
 let typography = function
@@ -292,6 +289,18 @@ let motion ~reduced_motion =
 
 let physical_divider_thickness ~device_pixel_ratio = 1. /. Float.max 1. device_pixel_ratio
 let timeline_max_width = 720.
+let date_gap = 14.
+
+let date_scale ~viewport_width ~text_scale =
+  (* Reserve both native header actions so sync/error changes do not resize dates.
+     The date and weekday occupy at most 130dp in the supported default font. *)
+  let available_width =
+    Float.min timeline_max_width viewport_width -. 56. -. 32. -. 88.
+  in
+  Float.min
+    (Float.max 1. text_scale)
+    (Float.max 1. ((available_width -. date_gap) /. 130.))
+;;
 
 let select_row_profile ~preset ~viewport_width ~text_scale =
   let typography = typography preset in
@@ -300,17 +309,7 @@ let select_row_profile ~preset ~viewport_width ~text_scale =
   let scale = Float.max 1. text_scale in
   let block_line_height = typography.entry.line_height *. scale in
   let supporting_line_height = typography.supporting.line_height *. scale in
-  let date_text_scale =
-    Float.min
-      scale
-      (Float.max
-         1.
-         ((Float.min timeline_max_width viewport_width
-           -. content_leading
-           -. spacing.x4
-           -. 14.)
-          /. 156.))
-  in
+  let date_text_scale = date_scale ~viewport_width ~text_scale in
   let day_heading_line_height = typography.day_heading.line_height *. date_text_scale in
   let day_header_extent =
     Float.ceil

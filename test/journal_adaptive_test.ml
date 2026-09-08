@@ -268,13 +268,13 @@ let test_known_row_profile_selection () =
 let test_row_profiles_cover_required_width_and_scale_matrix () =
   let cases =
     [ 320., 1., Tokens.Adaptive, 22., 48., 54., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 62., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 44., 68., 71., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 71., 24., 167.
+    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 54., 24., 68.
+    ; 320., 2., Tokens.Adaptive, 44., 68., 54., 24., 104.
+    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 54., 24., 167.
     ; 390., 1., Tokens.Compact, 22., 48., 54., 32., 52.
     ; 390., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
-    ; 390., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
-    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 81., 32., 167.
+    ; 390., 2., Tokens.Adaptive, 44., 68., 67., 32., 104.
+    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 67., 32., 167.
     ; 744., 1., Tokens.Compact, 22., 48., 54., 32., 52.
     ; 744., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
     ; 744., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
@@ -390,7 +390,7 @@ let test_every_sparse_role_has_one_authoritative_exact_extent () =
     ~block_extents:[ 83.; 153.; 224.; 294.; 364. ]
     [ Tokens.Children_loading, 83.
     ; Tokens.Children_more, 83.
-    ; Tokens.Day_heading, 71.
+    ; Tokens.Day_heading, 54.
     ; Tokens.Day_continuation, 92.
     ; Tokens.Feed_continuation, 92.
     ]

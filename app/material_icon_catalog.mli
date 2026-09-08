@@ -1,4 +1,6 @@
 type t =
+  | View_day
+  | Star
   | Account_circle
   | Add
   | Arrow_upward

@@ -1,6 +1,19 @@
+module Date_row : sig
+  val view
+    :  tokens:Journal_visual_tokens.t
+    -> typography:Journal_visual_tokens.typography
+    -> effective_scale:float
+    -> ambient_scale:float
+    -> date_id:string
+    -> weekday_id:string
+    -> Journal_calendar.date_presentation option
+    -> Bonsai_flutter_ui.Widget.t
+end
+
 module Context : sig
   type t
 
+  val favorites : t
   val today : date:Journal_calendar.date_presentation option -> t
   val date : t -> Journal_calendar.date_presentation option
   val semantics_label : t -> string

@@ -23,6 +23,11 @@ type failure_source =
   | Projection_failure of string
 
 type payload =
+  | Favorites_loaded of
+      Journal_graph_request.favorites_request
+      * Logseq_db_worker.Protocol.v2_favorites_result
+  | Favorites_failed of Journal_graph_request.favorites_request * bool * string
+  | Favorites_invalidated
   | Graph_ready of graph_info
   | Admission_inspected of
       { request : Journal_graph_request.admission_request
@@ -122,6 +127,7 @@ type children_interest =
   }
 
 type operation =
+  | List_favorites of Journal_graph_request.favorites_request
   | Graph_info
   | Admission_info of Journal_graph_request.admission_request
   | Pull_changes of
@@ -540,6 +546,13 @@ let feed_progress pending =
 
 let submit t (request : Journal_graph_request.t) =
   match request with
+  | Load_favorites request ->
+    requests
+      [ read
+          t
+          (List_favorites request)
+          (Protocol.V2_list_favorites { limit = request.limit; cursor = request.cursor })
+      ]
   | Inspect_admission request ->
     requests [ read t (Admission_info request) Protocol.V2_inspect_admission ]
   | Load_feed { before_day; day_limit; blocks_per_day; slot_limit; request_generation } ->
@@ -1133,6 +1146,7 @@ let remember_scope_revision t scope revision =
 ;;
 
 let operation_name = function
+  | List_favorites _ -> "listFavorites"
   | Graph_info -> "graphInfo"
   | Admission_info _ -> "inspectAdmission"
   | Pull_changes _ -> "pullChanges"
@@ -1172,6 +1186,9 @@ let failure_output ?(code = Error.Unsupported_semantics) t operation request_id 
   let request_id, error = worker_error code request_id message in
   let worker_failure = { operation = operation_name operation; request_id; error } in
   match operation with
+  | List_favorites request ->
+    responses
+      [ response (Favorites_failed (request, code = Error.Stale_read_cursor, message)) ]
   | List_feed_pages { request_generation; _ } ->
     responses
       [ response
@@ -1329,6 +1346,11 @@ let receive t (protocol_response : Protocol.response) =
   | Some operation ->
     Hashtbl.remove t.pending key;
     (match outcome with
+     | Protocol.V2_favorites_outcome result ->
+       (match operation with
+        | List_favorites request ->
+          responses [ response (Favorites_loaded (request, result)) ]
+        | _ -> failure_output t operation request_id "Unexpected favorites response.")
      | Protocol.V2_failed { code; message } ->
        (match Error.code_of_string code with
         | None ->
@@ -1649,19 +1671,23 @@ let abandon t (request : Protocol.request) =
   Hashtbl.remove t.pending (Graph.Uuid.to_string request.request_id)
 ;;
 
-let reconcile_push t ~request_generation = function
-  | Protocol.V2_changes_available { generation; _ } ->
-    let after =
-      match t.change_generation with
-      | Some current when String.equal current generation -> t.change_cursor
-      | None | Some _ -> None
-    in
-    requests
-      [ read
-          t
-          (Pull_changes { request_generation; generation })
-          (Protocol.V2_pull_changes { generation; after; limit = 256 })
-      ]
-  | V2_resync_required_push { generation; _ } ->
-    rehydrate_current_interests t ~request_generation ~generation
+let reconcile_push t ~request_generation push =
+  let output =
+    match push with
+    | Protocol.V2_changes_available { generation; _ } ->
+      let after =
+        match t.change_generation with
+        | Some current when String.equal current generation -> t.change_cursor
+        | None | Some _ -> None
+      in
+      requests
+        [ read
+            t
+            (Pull_changes { request_generation; generation })
+            (Protocol.V2_pull_changes { generation; after; limit = 256 })
+        ]
+    | V2_resync_required_push { generation; _ } ->
+      rehydrate_current_interests t ~request_generation ~generation
+  in
+  { output with responses = response Favorites_invalidated :: output.responses }
 ;;

@@ -1319,9 +1319,9 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Material_icon_catalog.Add"
-    ; "Material_icon_catalog.Arrow_upward"
-    ; "Material_icon_catalog.Refresh"
+    [ "Material_icon_catalog.Refresh"
+    ; "Ui.Material.navigation_bar"
+    ; "Ui.Native_widget.Expandable_message_composer.create_with_handler"
     ];
   require_text root "app/journal_header.ml" [ "Material_icon_catalog.Account_circle" ];
   require_text
@@ -1361,14 +1361,11 @@ let () =
     ; "Ui.Material.Tooltip.plain"
     ; "Ui.Widget.Scroll_view.vertical"
     ; "journal-scroll"
-    ; "~floating_action_button:capture"
+    ; "?floating_action_button:(if favorites_selected then None else Some capture)"
     ; "~floating_action_button_location:Ui.Material.End_float"
     ];
   forbid_text root "app/journal_header.ml" [ "~variant:Ui.Material.App_bar.Medium" ];
-  forbid_text
-    root
-    "app/application.ml"
-    [ "Journal_header.view"; "~bottom_navigation_bar"; "let bottom_navigation_bar" ];
+  forbid_text root "app/application.ml" [ "Journal_header.view" ];
   forbid_text root "app/journal_timeline.ml" [ "Ui.Widget.Scroll_view.vertical" ];
   require_text root "app/journal_timeline.ml" [ "Ui.Widget.Sliver.padding" ];
   require_text
@@ -1436,6 +1433,8 @@ let () =
     [ "flutter/lib/application_host_adapter.dart"
     ; "flutter/lib/journal_platform_menu.dart"
     ; "flutter/lib/journal_tail_fade.dart"
+    ; "flutter/lib/journal_date_row.dart"
+    ; "flutter/lib/journal_root_navigation.dart"
     ; "flutter/lib/journal_widget_registry.dart"
     ; "flutter/lib/main.dart"
     ];
@@ -1445,6 +1444,7 @@ let () =
     [ "flutter/test/application_host_adapter_test.dart"
     ; "flutter/test/macos_edit_menu_test.dart"
     ; "flutter/test/journal_tail_fade_test.dart"
+    ; "flutter/test/journal_root_navigation_test.dart"
     ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
     ; "flutter/test/journal_runtime_golden_test.dart"
     ; "flutter/test/journal_header_layout_test.dart"
@@ -1512,8 +1512,8 @@ let () =
     [ "Ui.Theme.System"
     ; "~high_contrast_dark"
     ; "Ui.Material.text_button"
-    ; "Ui.Native_widget.Expandable_message_composer"
-    ; "~floating_action_button:capture"
+    ; "Ui.Native_widget.Expandable_message_composer.create_with_handler"
+    ; "?floating_action_button:(if favorites_selected then None else Some capture)"
     ];
   require_text root "app/journal_timeline.ml" [ "Ui.Material.divider" ];
   forbid_text root "app/journal_header.ml" [ "Ui.Material.divider" ];
@@ -1583,6 +1583,10 @@ let () =
   @ dart_files root "flutter/test"
   @ dart_files root "flutter/integration_test"
   |> List.iter (fun relative -> forbid_text root relative forbidden_dart_text);
+  require_text
+    root
+    "flutter/lib/journal_root_navigation.dart"
+    [ "PrimaryScrollController(" ];
   dart_files root "flutter/lib"
   |> List.iter (fun relative -> forbid_text root relative [ "CustomScrollView" ]);
   forbid_text

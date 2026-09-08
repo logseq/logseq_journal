@@ -20,36 +20,15 @@ let day_heading
       ~presentation
       (page : Journal_graph_projection.page)
   =
-  let date_text, weekday_text =
-    match presentation with
-    | None -> "Date unavailable", None
-    | Some (date : Journal_calendar.date_presentation) ->
-      date.date_text, Some date.weekday_text
-  in
-  let line (token : Tokens.text_token) label =
-    let ratio = profile.Tokens.date_text_scale /. profile.text_scale in
-    let token =
-      { token with
-        font_size = token.font_size *. ratio
-      ; line_height = token.line_height *. ratio
-      }
-    in
-    Ui.Widget.text ~style:(text_style token) ~max_lines:1 label
-  in
   let before, after = Timeline.heading_spacing state ~day:page.day in
-  Ui.Widget.row
-    ((line typography.Tokens.day_heading date_text
-      |> Ui.Widget.with_test_id
-           (Ui.Test_id.string ("journal-day-heading-label:" ^ string_of_int page.day)))
-     ::
-     (match weekday_text with
-      | None -> []
-      | Some weekday ->
-        [ Ui.Widget.empty () |> Ui.Widget.sized_box ~width:14.
-        ; line typography.date_weekday weekday
-          |> Ui.Widget.opacity (Tokens.weekday_opacity tokens ~current:false)
-        ]))
-  |> Ui.Widget.sized_box ~height:(24. *. profile.Tokens.date_text_scale)
+  Journal_header.Date_row.view
+    ~tokens
+    ~typography
+    ~effective_scale:profile.Tokens.date_text_scale
+    ~ambient_scale:profile.text_scale
+    ~date_id:("journal-day-heading-label:" ^ string_of_int page.day)
+    ~weekday_id:("journal-day-weekday:" ^ string_of_int page.day)
+    presentation
   |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
   |> Ui.Widget.padding
        ~insets:
@@ -461,7 +440,7 @@ let render_slot
         ~show_divider:false
         ~sort_base
         ~reduced_motion
-        ~on_toggle_children:(for_block on_toggle_children id)
+        ~interaction:(Journal_row.Toggle_children (for_block on_toggle_children id))
     in
     let row =
       if delete_enabled

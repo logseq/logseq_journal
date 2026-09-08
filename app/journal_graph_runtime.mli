@@ -18,6 +18,11 @@ type failure_source =
   | Projection_failure of string
 
 type payload =
+  | Favorites_loaded of
+      Journal_graph_request.favorites_request
+      * Logseq_db_worker.Protocol.v2_favorites_result
+  | Favorites_failed of Journal_graph_request.favorites_request * bool * string
+  | Favorites_invalidated
   | Graph_ready of graph_info
   | Admission_inspected of
       { request : Journal_graph_request.admission_request

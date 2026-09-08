@@ -1,3 +1,14 @@
+type favorite_target =
+  | Page of string
+  | Block of string
+
+type favorite =
+  { membership_id : string
+  ; target : favorite_target
+  ; title : string
+  ; task_state : Journal_model.task_state
+  }
+
 module Graph = Logseq_db_types.Graph_types
 
 type page =
@@ -299,4 +310,30 @@ let detail
          | Ok child -> project (child :: reversed) rest)
     in
     project [] children.items
+;;
+
+let favorite (item : Logseq_db_worker.Protocol.v2_favorite_item) =
+  let module P = Logseq_db_worker.Protocol in
+  let id = Logseq_db_types.Graph_types.Uuid.to_string in
+  let target, title, task_state =
+    match item.target with
+    | P.V2_favorite_page { uuid; title; _ } ->
+      Page (id uuid), title, Journal_model.No_status
+    | V2_favorite_block { uuid; title; task_status; _ } ->
+      let status =
+        match task_status with
+        | None -> Journal_model.No_status
+        | Some P.V2_todo -> Todo
+        | Some V2_doing -> Doing
+        | Some V2_in_review -> In_review
+        | Some V2_now -> Now
+        | Some V2_done -> Done
+        | Some V2_canceled -> Canceled
+        | Some V2_backlog -> Backlog
+        | Some V2_waiting -> Waiting
+        | Some V2_later -> Later
+      in
+      Block (id uuid), title, status
+  in
+  { membership_id = id item.membership_uuid; target; title; task_state }
 ;;

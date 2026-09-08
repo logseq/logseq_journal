@@ -1,6 +1,11 @@
+type row_interaction =
+  | Display_only
+  | Toggle_children of Bonsai_flutter_ui.Event.Handler.t
+
 module Item : sig
   type t
 
+  val of_favorite : Journal_graph_projection.favorite -> t
   val of_block : Journal_model.t -> t
   val of_timeline_entry : Journal_graph_projection.timeline_entry -> t
   val corrupt : id:string -> source:string option -> t
@@ -36,7 +41,7 @@ val view
   -> show_divider:bool
   -> sort_base:float
   -> reduced_motion:bool
-  -> on_toggle_children:Bonsai_flutter_ui.Event.Handler.t
+  -> interaction:row_interaction
   -> Bonsai_flutter_ui.Widget.t
 
 val rail_body

@@ -432,8 +432,102 @@ let test_route_generation_anchor_background_and_runtime_replacement () =
     "Detail Back did not restore its Timeline anchor"
 ;;
 
+let test_favorites_state_isolates_requests_and_refreshes () =
+  let module F = Journal_routes.Favorites in
+  let module P = Logseq_db_worker.Protocol in
+  let module G = Logseq_db_types.Graph_types in
+  let uuid n =
+    G.Uuid.of_string (Printf.sprintf "75000000-0000-4000-8000-%012d" n) |> Result.get_ok
+  in
+  let item n : P.v2_favorite_item =
+    { membership_uuid = uuid n
+    ; membership_order = string_of_int n
+    ; membership_revision = "member"
+    ; target =
+        V2_favorite_page
+          { uuid = uuid (n + 100); title = string_of_int n; revision = "page" }
+    }
+  in
+  let result ?(cursor = None) items : P.v2_favorites_result =
+    { favorites_page = Some (uuid 99)
+    ; generation = "generation:v1:1"
+    ; projection_revision = "projection:v1:1"
+    ; items
+    ; next_cursor = cursor
+    }
+  in
+  let request = function
+    | [ r ] -> r
+    | _ -> fail "expected exactly one favorites request"
+  in
+  let original = F.create ~graph_generation:7 in
+  let inactive, commands = F.step original F.Invalidate in
+  require (commands = []) "inactive favorites read eagerly";
+  let selected, commands = F.step inactive (Select true) in
+  let first = request commands in
+  require
+    (first.graph_generation = 7 && first.cursor = None)
+    "first request lost graph identity";
+  let selected, commands = F.step selected (Select true) in
+  require (commands = []) "reselection duplicated a request";
+  let cursor = G.Cursor.of_string "favorites-test:next" |> Result.get_ok in
+  let selected, commands =
+    F.step selected (Loaded (first, result ~cursor:(Some cursor) []))
+  in
+  let second = request commands in
+  require (second.cursor = Some cursor) "empty filtered page did not continue";
+  let loaded, commands =
+    F.step selected (Loaded (second, result [ item 1; item 2; item 3 ]))
+  in
+  require
+    (F.initialized loaded && List.length (F.items loaded) = 3 && commands = [])
+    "loaded favorites missing";
+  let loaded, _ = F.step loaded (Visible { first_index = 1; last_exclusive = 3 }) in
+  let hidden, _ = F.step loaded (Select false) in
+  let dirty, commands = F.step hidden Invalidate in
+  require
+    (commands = [] && F.items dirty = F.items loaded)
+    "inactive invalidation lost cache";
+  let refreshing, commands = F.step dirty (Select true) in
+  let refresh = request commands in
+  require (F.items refreshing = F.items loaded) "refresh cleared visible rows";
+  let refreshed, _ = F.step refreshing (Loaded (refresh, result [ item 3; item 1 ])) in
+  require
+    ((F.anchor refreshed).block_id = Some (G.Uuid.to_string (uuid 3)))
+    "removed anchor did not choose nearest survivor";
+  let refreshed, commands = F.step refreshed Invalidate in
+  let refresh = request commands in
+  let coalesced, commands = F.step refreshed Invalidate in
+  require (commands = []) "in-flight refresh was not coalesced";
+  let coalesced, commands = F.step coalesced (Loaded (refresh, result [ item 1 ])) in
+  let followup = request commands in
+  let failed, _ = F.step coalesced (Failed (followup, false, "Read failed")) in
+  require
+    (F.error failed = Some "Read failed" && F.items failed <> [])
+    "refresh failure erased cache";
+  let retrying, commands = F.step failed Retry in
+  let retry = request commands in
+  let restarted, commands = F.step retrying (Failed (retry, true, "Stale cursor")) in
+  let restart = request commands in
+  require
+    (restart.cursor = None && F.error restarted = None)
+    "stale cursor was not restarted";
+  let replaced = F.create ~graph_generation:8 in
+  let replaced, commands = F.step replaced (Loaded (restart, result [ item 1 ])) in
+  require
+    (commands = [] && F.items replaced = [])
+    "old graph completion contaminated replacement";
+  let hidden, _ = F.step restarted (Select false) in
+  let hidden, commands = F.step hidden (Loaded (restart, result [ item 1 ])) in
+  require
+    (commands = [] && List.length (F.items hidden) = 1)
+    "inactive current completion was discarded"
+;;
+
 let tests =
-  [ ( "direct Capture source and mutation identity"
+  [ ( "favorites isolated cache and refresh reducer"
+    , test_favorites_state_isolates_requests_and_refreshes )
+  ; ( "direct Capture source and mutation identity"
     , test_direct_capture_preserves_source_and_mutation_identity )
   ; ( "direct Capture task intent lifecycle"
     , test_direct_capture_task_intent_survives_edit_failure_and_retry )

@@ -186,7 +186,9 @@ type sync_error_notice =
   }
 
 type state =
-  { routes : Journal_routes.t
+  { favorites : Journal_routes.Favorites.t
+  ; favorites_requests : Journal_graph_request.favorites_request list
+  ; routes : Journal_routes.t
   ; timeline : Journal_timeline_state.t
   ; next_request_generation : int64
   ; next_local_sequence : int64
@@ -195,7 +197,9 @@ type state =
   ; pending_status : pending_status option
   ; direct_capture : Journal_capture.t option
   ; capture_affordance_key : int64
-  ; capture_fab_scroll : Journal_timeline_state.capture_fab_scroll
+  ; journals_scroll : Journal_timeline_state.Root_scroll_trigger.t
+  ; favorites_scroll : Journal_timeline_state.Root_scroll_trigger.t
+  ; root_active : bool
   ; capture_error : capture_failure option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
@@ -218,12 +222,37 @@ type state =
   ; modal : modal
   }
 
+let favorites_event state event =
+  let favorites, requests = Journal_routes.Favorites.step state.favorites event in
+  { state with favorites; favorites_requests = state.favorites_requests @ requests }
+;;
+
+let reset_destination_scroll state =
+  match Journal_routes.destination state.routes with
+  | Journals ->
+    { state with journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial }
+  | Favorites ->
+    { state with favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial }
+;;
+
+let select_destination state destination =
+  if Journal_routes.destination state.routes = destination
+  then state
+  else
+    { state with routes = Journal_routes.select_destination state.routes destination }
+    |> fun state ->
+    favorites_event state (Select (destination = Journal_routes.Favorites))
+    |> reset_destination_scroll
+;;
+
 let initial_anchor : Journal_routes.anchor = { block_id = None; first_index = 0 }
 let feed_day_limit = 7
 let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5.
 
 let initial_state =
-  { routes = Journal_routes.create ~anchor:initial_anchor
+  { favorites = Journal_routes.Favorites.create ~graph_generation:(-1)
+  ; favorites_requests = []
+  ; routes = Journal_routes.create ~anchor:initial_anchor
   ; timeline = Journal_timeline_state.empty ~today:0
   ; next_request_generation = 1L
   ; next_local_sequence = 1L
@@ -232,7 +261,9 @@ let initial_state =
   ; pending_status = None
   ; direct_capture = None
   ; capture_affordance_key = 1L
-  ; capture_fab_scroll = Journal_timeline_state.initial_capture_fab_scroll
+  ; journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial
+  ; favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial
+  ; root_active = true
   ; capture_error = None
   ; timeline_notice = None
   ; write_enabled = false
@@ -292,7 +323,16 @@ let local_deletion_active state =
 
 let discard_local_graph_state state =
   { state with
-    routes = Journal_routes.graph_unavailable state.routes
+    journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial
+  ; favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial
+  ; root_active = true
+  ; favorites =
+      Journal_routes.Favorites.create ~graph_generation:state.graph_state.generation
+  ; favorites_requests = []
+  ; routes = Journal_routes.graph_unavailable state.routes
+  ; timeline = Journal_timeline_state.empty ~today:0
+  ; feed_loaded = false
+  ; capture_affordance_key = Int64.succ state.capture_affordance_key
   ; direct_capture = None
   ; pending_delete = None
   ; pending_status = None
@@ -339,6 +379,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
            previous.selected_graph
            snapshot.selected_graph)
   in
+  let state = if graph_context_changed then discard_local_graph_state state else state in
   let was_awaiting_password =
     match state.manager with
     | Some { startup = { awaiting_e2ee_password = true; _ }; _ } -> true
@@ -368,10 +409,6 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     ; e2ee_password
     ; next_local_sequence
     ; modal
-    ; capture_fab_scroll =
-        (if graph_context_changed
-         then Journal_timeline_state.initial_capture_fab_scroll
-         else state.capture_fab_scroll)
     ; graph_ready = state.graph_ready && not graph_context_changed
     ; graph_error = state.graph_error
     }
@@ -618,6 +655,10 @@ let back_state state =
 
 let apply_worker_response_unstaged state (response : Journal_graph_runtime.response) =
   match response.payload with
+  | Favorites_loaded (request, result) -> favorites_event state (Loaded (request, result))
+  | Favorites_failed (request, stale, message) ->
+    favorites_event state (Failed (request, stale, message))
+  | Favorites_invalidated -> favorites_event state Invalidate
   | Journal_graph_runtime.Graph_ready info ->
     ignore info.admission_facts;
     let state = resolve_worker_errors state in
@@ -936,6 +977,103 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
         | None -> { state with pending_delete = None; timeline_notice = None }))
 ;;
 
+module Root_navigation = struct
+  type t = state
+
+  type event =
+    | Scroll of
+        { destination : Journal_routes.destination
+        ; pixels : float
+        ; delta : float
+        }
+    | Root_active of bool
+    | Non_scrollable of Journal_routes.destination
+    | Select of Journal_routes.destination
+    | Capture_edited of string
+    | Capture_admitted of Journal_capture.t
+    | Completed of Journal_graph_runtime.response
+    | Graph_replaced of int
+
+  let replace_graph state generation =
+    { state with
+      journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial
+    ; favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial
+    ; root_active = true
+    ; favorites = Journal_routes.Favorites.create ~graph_generation:generation
+    ; favorites_requests = []
+    ; routes = Journal_routes.create ~anchor:initial_anchor
+    ; direct_capture = None
+    ; pending_delete = None
+    ; pending_status = None
+    ; timeline = Journal_timeline_state.empty ~today:0
+    ; graph_state = { state.graph_state with generation }
+    ; graph_ready = false
+    ; feed_loaded = false
+    ; capture_error = None
+    ; capture_affordance_key = Int64.succ state.capture_affordance_key
+    }
+  ;;
+
+  let create ~graph_generation = replace_graph initial_state graph_generation
+
+  let step state = function
+    | Root_active active ->
+      if active = state.root_active
+      then state
+      else (
+        let state = { state with root_active = active } in
+        if active then reset_destination_scroll state else state)
+    | Non_scrollable destination ->
+      if state.root_active && Journal_routes.destination state.routes = destination
+      then reset_destination_scroll state
+      else state
+    | Scroll { destination; pixels; delta } ->
+      if (not state.root_active) || Journal_routes.destination state.routes <> destination
+      then state
+      else (
+        let step trigger =
+          Journal_timeline_state.Root_scroll_trigger.step trigger ~pixels ~delta
+        in
+        match destination with
+        | Journals -> { state with journals_scroll = step state.journals_scroll }
+        | Favorites -> { state with favorites_scroll = step state.favorites_scroll })
+    | Select destination -> select_destination state destination
+    | Capture_edited source ->
+      let capture, next_local_sequence =
+        match state.direct_capture with
+        | None ->
+          ( Journal_capture.create ~session_number:state.next_local_sequence ~source
+          , Int64.succ state.next_local_sequence )
+        | Some capture ->
+          Journal_capture.update_source capture ~source, state.next_local_sequence
+      in
+      { state with
+        direct_capture = Some capture
+      ; next_local_sequence
+      ; capture_error = None
+      }
+    | Capture_admitted capture ->
+      { state with direct_capture = Some capture; capture_error = None }
+    | Completed response -> apply_worker_response state response
+    | Graph_replaced generation -> replace_graph state generation
+  ;;
+
+  let scroll_trigger state = function
+    | Journal_routes.Journals -> state.journals_scroll
+    | Favorites -> state.favorites_scroll
+  ;;
+
+  let navigation_visible state =
+    Journal_timeline_state.Root_scroll_trigger.presentation
+      (scroll_trigger state (Journal_routes.destination state.routes))
+    = Extended
+  ;;
+
+  let destination state = Journal_routes.destination state.routes
+  let capture state = state.direct_capture
+  let favorites state = state.favorites
+end
+
 let application_theme preset =
   let seed = Ui.Style.Color.rgb ~red:0 ~green:38 ~blue:47 in
   let theme_text_style (token : Journal_visual_tokens.text_token) =
@@ -1245,7 +1383,199 @@ let prefix_action handler prefix =
     | _ -> ())
 ;;
 
+module Root_scroll = struct
+  type props =
+    { destination : int
+    ; revision : int
+    ; anchor_offset : float
+    ; visible : bool
+    ; duration_ms : int
+    ; active : bool
+    }
+
+  let kind_id = ID.Native_widget.Kind_id.of_int 1003
+
+  let decode_event ~event_id payload =
+    if Bytes.length payload <> 24
+    then Error "Invalid root scroll event"
+    else (
+      let destination =
+        match Bytes.get_int32_le payload 0 with
+        | 0l -> Some Journal_routes.Journals
+        | 1l -> Some Journal_routes.Favorites
+        | _ -> None
+      in
+      let pixels = Int64.float_of_bits (Bytes.get_int64_le payload 8) in
+      let delta = Int64.float_of_bits (Bytes.get_int64_le payload 16) in
+      match destination, ID.Native_widget.Event_id.to_int event_id with
+      | Some destination, 1 when Float.is_finite pixels && Float.is_finite delta ->
+        Ok (Root_navigation.Scroll { destination; pixels; delta })
+      | Some destination, 2 -> Ok (Root_navigation.Non_scrollable destination)
+      | _ -> Error "Unknown root scroll event")
+  ;;
+
+  let event_of_payload = function
+    | Ui.Event.Payload.Native_event event
+      when event.kind_id = kind_id && event.version = 1 ->
+      decode_event ~event_id:event.event_id event.payload |> Result.to_option
+    | _ -> None
+  ;;
+
+  let extension =
+    Ui.Native_widget.Extension.create
+      ~kind_id
+      ~version:1
+      ~capabilities:[]
+      ~encode_props:(fun props ->
+        let bytes = Bytes.make 32 '\000' in
+        Bytes.set_int32_le bytes 0 (Int32.of_int props.destination);
+        Bytes.set_int32_le bytes 4 (if props.visible then 1l else 0l);
+        Bytes.set_int32_le bytes 24 (Int32.of_int props.duration_ms);
+        Bytes.set_int32_le bytes 28 (if props.active then 1l else 0l);
+        Bytes.set_int64_le bytes 8 (Int64.of_int props.revision);
+        Bytes.set_int64_le bytes 16 (Int64.bits_of_float props.anchor_offset);
+        bytes)
+      ~decode_event
+      ()
+  ;;
+
+  let wrap
+        ~graph_generation
+        ~destination
+        ~favorites
+        ~profile
+        ~visible
+        ~duration_ms
+        ~active
+        ~on_event
+        child
+    =
+    let rows = Journal_routes.Favorites.items favorites in
+    let anchor = Journal_routes.Favorites.anchor favorites in
+    let anchor_offset =
+      rows
+      |> List.to_seq
+      |> Seq.take anchor.first_index
+      |> Seq.fold_left
+           (fun sum item ->
+              sum
+              +. Journal_row.Item.visible_extent
+                   (Journal_row.Item.of_favorite (Journal_graph_projection.favorite item))
+                   ~profile
+                   ~expanded:false)
+           0.
+    in
+    Ui.Native_widget.widget_with_handler
+      extension
+      ~key:(Ui.Key.string ("journal-root-scroll:" ^ string_of_int graph_generation))
+      ~props:
+        { destination = (if destination = Journal_routes.Journals then 0 else 1)
+        ; revision = Journal_routes.Favorites.revision favorites
+        ; anchor_offset
+        ; visible
+        ; duration_ms
+        ; active
+        }
+      ~on_event
+      ~children:[ child ]
+      ()
+  ;;
+end
+
+let favorites_sliver
+      ~tokens
+      ~typography
+      ~profile
+      ~device_pixel_ratio
+      ~rtl
+      ~reduced_motion
+      ~state
+      ~on_visible_range
+      ~on_retry
+  =
+  let module F = Journal_routes.Favorites in
+  let status message =
+    Ui.Widget.text message |> Ui.Widget.center |> Ui.Widget.Sliver.fill
+  in
+  let rows = F.items state in
+  let notice =
+    match F.error state with
+    | Some message ->
+      Some
+        (Ui.Widget.column
+           [ live_region_text message
+           ; Ui.Material.text_button ~on_press:on_retry ~child:(Ui.Widget.text "Retry") ()
+             |> Ui.Widget.with_test_id (Ui.Test_id.string "favorites-retry-button")
+           ]
+         |> Ui.Widget.with_test_id (Ui.Test_id.string "favorites-retry")
+         |> Ui.Widget.Sliver.box)
+    | None -> None
+  in
+  let body =
+    if rows = []
+    then (
+      match F.error state with
+      | Some _ -> []
+      | None when (not (F.initialized state)) || F.loading state ->
+        [ status "Loading favorites…" ]
+      | None -> [ status "No favorites yet" ])
+    else (
+      let first_index, window = F.window state in
+      let item value =
+        value |> Journal_graph_projection.favorite |> Journal_row.Item.of_favorite
+      in
+      let extent value =
+        Journal_row.Item.visible_extent (item value) ~profile ~expanded:false
+      in
+      let items =
+        List.mapi
+          (fun index (value : Logseq_db_worker.Protocol.v2_favorite_item) ->
+             Journal_row.view
+               ~tokens
+               ~typography
+               ~profile
+               ~device_pixel_ratio
+               ~rtl
+               ~item:(item value)
+               ~show_timestamp:false
+               ~expanded:false
+               ~show_divider:false
+               ~sort_base:(100. +. (float_of_int (first_index + index) *. 10.))
+               ~reduced_motion
+               ~interaction:Journal_row.Display_only
+             |> Ui.Widget.Keyed.create
+                  ~key:
+                    (Ui.Key.string
+                       (Logseq_db_types.Graph_types.Uuid.to_string value.membership_uuid)))
+          window
+      in
+      [ Ui.Widget.Sliver.varied_extent
+          ~key:(Ui.Key.string "favorites-list")
+          ~total_count:(List.length rows)
+          ~first_index
+          ~default_item_extent:profile.Journal_visual_tokens.block_line_height
+          ~extent_overrides:
+            (List.mapi
+               (fun index value ->
+                  Ui.Widget.Sparse_extent_override.{ index; extent = extent value })
+               rows)
+          ~overscan:12
+          ~items
+          ~on_visible_range
+          ()
+        |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "favorites-list")
+      ])
+  in
+  body @ Option.to_list notice
+;;
+
 let timeline_page
+      ~graph_generation
+      ~destination
+      ~favorites
+      ~on_select_destination
+      ~on_favorites_visible_range
+      ~on_favorites_retry
       ~viewport_width
       ~tokens
       ~typography
@@ -1270,6 +1600,8 @@ let timeline_page
       ~capture_task_selected
       ~capture_affordance_key
       ~capture_fab_presentation
+      ~navigation_visible
+      ~root_active
       ~on_capture_event
       ~on_scroll
       ~on_visible_range
@@ -1292,7 +1624,10 @@ let timeline_page
       ~text_scale
       ~top_inset
       ~device_pixel_ratio
-      ~context:(Journal_header.Context.today ~date:today_date)
+      ~context:
+        (match destination with
+         | Journal_routes.Journals -> Journal_header.Context.today ~date:today_date
+         | Favorites -> Journal_header.Context.favorites)
       ~sync_phase
       ~on_error_info:(if error_info_available then Some on_error_info else None)
       ~on_account_menu:(if account_menu_available then Some on_account_menu else None)
@@ -1395,11 +1730,31 @@ let timeline_page
         ~on_retry_day
         ~on_toggle_children
   in
+  let favorites_selected = destination = Journal_routes.Favorites in
+  let slivers =
+    if favorites_selected
+    then
+      favorites_sliver
+        ~tokens
+        ~typography
+        ~profile
+        ~device_pixel_ratio
+        ~rtl
+        ~reduced_motion
+        ~state:favorites
+        ~on_visible_range:on_favorites_visible_range
+        ~on_retry:on_favorites_retry
+    else [ timeline ]
+  in
   let timeline =
     Ui.Widget.Scroll_view.vertical
-      ~key:(Ui.Key.string "journal-scroll")
-      ~on_scroll
-      [ header; timeline ]
+      ~key:
+        (Ui.Key.string
+           (if favorites_selected then "favorites-scroll" else "journal-scroll"))
+      ~primary:true
+      ~on_scroll:
+        (Ui.Event.Handler.create ~name:"root-scroll-owned-natively" (fun _ -> ()))
+      (header :: slivers)
       ()
     |> Ui.Widget.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-scroll")
   in
@@ -1427,11 +1782,39 @@ let timeline_page
          ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:content_horizontal_inset ())
     |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-content-width-padding")
   in
+  let navigation =
+    Ui.Material.navigation_bar
+      ~layout:Ui.Material.Compact
+      ~selected_index:(if favorites_selected then 1 else 0)
+      ~label_behavior:Ui.Material.Never
+      ~on_select:on_select_destination
+      [ Ui.Material.Navigation_destination.create
+          ~label:"Journals"
+          ~icon:(Material_icon_catalog.create ~size:24. View_day)
+          ()
+      ; Ui.Material.Navigation_destination.create
+          ~label:"Favorites"
+          ~icon:(Material_icon_catalog.create ~size:24. Star)
+          ()
+      ]
+      ()
+    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-root-navigation")
+  in
   Ui.Material.scaffold
     ~body
-    ~floating_action_button:capture
+    ~bottom_navigation_bar:navigation
+    ?floating_action_button:(if favorites_selected then None else Some capture)
     ~floating_action_button_location:Ui.Material.End_float
     ()
+  |> Root_scroll.wrap
+       ~graph_generation
+       ~destination
+       ~favorites
+       ~profile
+       ~visible:navigation_visible
+       ~duration_ms:capture_motion.route_transition_ms
+       ~active:root_active
+       ~on_event:on_scroll
   |> Ui.Widget.page
        ~key:(Ui.Key.string "journal-timeline")
        ~page_key:(ID.Navigation.Page_key.of_string "journal-timeline")
@@ -2647,6 +3030,22 @@ let component ~calendar_sampler client handlers graph =
       ~default_model:initial_state
       ~apply_action:(fun context state update ->
         let state, scheduled_effect = update state in
+        let active =
+          Journal_routes.route state.routes = Timeline && state.modal = No_modal
+        in
+        let state = Root_navigation.step state (Root_active active) in
+        let destination = Journal_routes.destination state.routes in
+        let empty =
+          match destination with
+          | Journals ->
+            (not state.feed_loaded)
+            || Option.is_some state.graph_error
+            || Journal_timeline_state.total_count state.timeline = 0
+          | Favorites -> Journal_routes.Favorites.items state.favorites = []
+        in
+        let state =
+          if empty then Root_navigation.step state (Non_scrollable destination) else state
+        in
         Bonsai.Cont.Apply_action_context.schedule_event context scheduled_effect;
         state)
       graph
@@ -2684,6 +3083,7 @@ let component ~calendar_sampler client handlers graph =
       output
   in
   let admission_worker_requests = Hashtbl.create 4 in
+  let favorites_worker_requests = Hashtbl.create 2 in
   let rec run_admission_directive set_state_and_effect = function
     | Admission_refresh.No_request -> Bonsai.Effect.Ignore
     | Request request ->
@@ -2780,6 +3180,13 @@ let component ~calendar_sampler client handlers graph =
           | Graph_open, _
           | Graph_closing, _ -> None
         in
+        let state =
+          if
+            state.graph_state.generation <> graph_state.generation
+            || state.graph_state.graph_id <> graph_state.graph_id
+          then Root_navigation.step state (Graph_replaced graph_state.generation)
+          else state
+        in
         { state with
           graph_state
         ; write_enabled =
@@ -2801,6 +3208,7 @@ let component ~calendar_sampler client handlers graph =
         else (
           started_graph_generation := Some (graph_key, graph_state.generation);
           Journal_graph_runtime.reset graph_runtime;
+          Hashtbl.clear favorites_worker_requests;
           let current = !state_ref in
           let graph_info = Journal_graph_runtime.start graph_runtime in
           let feed_generation = current.next_request_generation in
@@ -2827,7 +3235,13 @@ let component ~calendar_sampler client handlers graph =
             set_state (fun state ->
               let state =
                 { state with
-                  graph_ready = false
+                  favorites =
+                    Journal_routes.Favorites.create
+                      ~graph_generation:graph_state.generation
+                ; favorites_requests = []
+                ; routes = Journal_routes.create ~anchor:initial_anchor
+                ; direct_capture = None
+                ; graph_ready = false
                 ; feed_loaded = false
                 ; presented_feed_context = None
                 ; feed_refresh = None
@@ -2925,6 +3339,7 @@ let component ~calendar_sampler client handlers graph =
     if Option.is_some manager.local_deletion
     then (
       Journal_graph_runtime.reset graph_runtime;
+      Hashtbl.clear favorites_worker_requests;
       Hashtbl.clear admission_worker_requests;
       started_graph_generation := None);
     let update = set_state (fun state -> apply_manager_state state manager_state) in
@@ -3060,6 +3475,7 @@ let component ~calendar_sampler client handlers graph =
                 ; _
                 } ->
               Hashtbl.remove admission_worker_requests request_id;
+              Hashtbl.remove favorites_worker_requests request_id;
               let output = Journal_graph_runtime.receive graph_runtime response in
               Bonsai.Effect.bind
                 (Bonsai.Effect.of_thunk (fun () -> deliver_output output))
@@ -3078,7 +3494,8 @@ let component ~calendar_sampler client handlers graph =
                                | _ -> None
                              in
                              match completion with
-                             | None -> apply_worker_response state response, effects
+                             | None ->
+                               Root_navigation.step state (Completed response), effects
                              | Some (request, result) ->
                                let admission_refresh, directive =
                                  Admission_refresh.complete
@@ -3145,6 +3562,17 @@ let component ~calendar_sampler client handlers graph =
                 | Some manager when manager.selected_graph = Some progress.graph_id ->
                   { state with bootstrap_progress = Some progress }
                 | None | Some _ -> state)
+            | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
+              when Hashtbl.mem favorites_worker_requests request_id ->
+              let request, protocol_request =
+                Hashtbl.find favorites_worker_requests request_id
+              in
+              Journal_graph_runtime.abandon graph_runtime protocol_request;
+              Hashtbl.remove favorites_worker_requests request_id;
+              set_state (fun state ->
+                favorites_event
+                  state
+                  (Failed (request, false, "Favorites read was interrupted. Try again.")))
             | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
               when Hashtbl.mem admission_worker_requests request_id ->
               let request, protocol_request =
@@ -3398,7 +3826,11 @@ let component ~calendar_sampler client handlers graph =
             ~f:(fun delivery ->
               set_state (fun state ->
                 let state =
-                  List.fold_left apply_worker_response state delivery.responses
+                  List.fold_left
+                    (fun state response ->
+                       Root_navigation.step state (Completed response))
+                    state
+                    delivery.responses
                 in
                 match delivery.error with
                 | Some message -> fail_feed_transport state message
@@ -3440,6 +3872,62 @@ let component ~calendar_sampler client handlers graph =
     ~equal:(Option.equal (fun left right -> left = right))
     timeline_presentation_key
     ~callback:timeline_presentation_callback
+    graph;
+  let favorites_drain_key =
+    Bonsai.Cont.map state ~f:(fun state -> state.favorites_requests)
+  in
+  let favorites_drain_callback =
+    Bonsai.Cont.map set_state ~f:(fun set_state requests ->
+      let deliver (request : Journal_graph_request.favorites_request) =
+        if request.graph_generation <> !state_ref.graph_state.generation
+        then Bonsai.Effect.Ignore
+        else
+          Bonsai.Effect.bind
+            (Bonsai.Effect.of_thunk (fun () ->
+               let output = submit (Journal_graph_request.Load_favorites request) in
+               Journal_graph_transport.deliver
+                 ~runtime:graph_runtime
+                 ~send:(fun protocol_request ->
+                   match
+                     Worker.send client (Graph_service.Graph_request protocol_request)
+                   with
+                   | Accepted worker_request_id ->
+                     Hashtbl.replace
+                       favorites_worker_requests
+                       worker_request_id
+                       (request, protocol_request);
+                     Journal_graph_transport.Accepted
+                   | Full -> Full
+                   | Not_ready -> Not_ready
+                   | Stopping -> Stopping)
+                 output))
+            ~f:(fun delivery ->
+              set_state (fun state ->
+                let state =
+                  List.fold_left
+                    (fun state response ->
+                       Root_navigation.step state (Completed response))
+                    state
+                    delivery.responses
+                in
+                match delivery.error with
+                | None -> state
+                | Some message -> favorites_event state (Failed (request, false, message))))
+      in
+      Bonsai.Effect.bind
+        (set_state (fun state ->
+           { state with
+             favorites_requests =
+               List.filter
+                 (fun request -> not (List.mem request requests))
+                 state.favorites_requests
+           }))
+        ~f:(fun () -> Bonsai.Effect.Many (List.map deliver requests)))
+  in
+  Bonsai.Cont.Edge.on_change
+    ~equal:( = )
+    favorites_drain_key
+    ~callback:favorites_drain_callback
     graph;
   let timeline_drain_key =
     Bonsai.Cont.map state ~f:(fun state ->
@@ -3593,7 +4081,7 @@ let component ~calendar_sampler client handlers graph =
                 | None -> Bonsai.Effect.Ignore
                 | Some request ->
                   with_direct_request
-                    { snapshot with direct_capture = Some capture; capture_error = None }
+                    (Root_navigation.step snapshot (Capture_admitted capture))
                     request)
              | Editing ->
                if String.equal (String.trim source) ""
@@ -3636,12 +4124,12 @@ let component ~calendar_sampler client handlers graph =
                     | Ok (_, None) -> Bonsai.Effect.Ignore
                     | Ok (capture, Some request) ->
                       with_direct_request
-                        { snapshot with
-                          calendar = Some calendar
-                        ; direct_capture = Some capture
-                        ; capture_error = None
-                        ; next_local_sequence = Int64.succ number
-                        }
+                        (Root_navigation.step
+                           { snapshot with
+                             calendar = Some calendar
+                           ; next_local_sequence = Int64.succ number
+                           }
+                           (Capture_admitted capture))
                         request)))
         in
         match payload with
@@ -3677,6 +4165,26 @@ let component ~calendar_sampler client handlers graph =
                      Journal_capture.apply_text_edit state.e2ee_password edit
                  }
                | None | Some _ -> state))
+        | Ui.Event.Payload.Text "select-journals" ->
+          update (fun state ->
+            Root_navigation.step state (Select Journal_routes.Journals))
+        | Ui.Event.Payload.Text "select-favorites" ->
+          update (fun state ->
+            Root_navigation.step state (Select Journal_routes.Favorites))
+        | Ui.Event.Payload.Text "favorites-retry" ->
+          update (fun state -> favorites_event state Retry)
+        | Ui.Event.Payload.Int64_pair { first = first_index; second = last_exclusive }
+          when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
+          update (fun state ->
+            favorites_event
+              state
+              (Visible
+                 { first_index = Int64.to_int first_index
+                 ; last_exclusive = Int64.to_int last_exclusive
+                 }))
+        | Ui.Event.Payload.Visible_range _
+          when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
+          Bonsai.Effect.Ignore
         | Ui.Event.Payload.Visible_range range ->
           let observe timeline =
             let total_count = Journal_timeline_state.total_count timeline in
@@ -3694,32 +4202,17 @@ let component ~calendar_sampler client handlers graph =
               ~last_exclusive
           in
           update (fun state -> { state with timeline = observe state.timeline })
-        | Ui.Event.Payload.Scroll { pixels; delta } ->
+        | Ui.Event.Payload.Scroll _ -> Bonsai.Effect.Ignore
+        | Ui.Event.Payload.Native_event _ as payload
+          when Option.is_some (Root_scroll.event_of_payload payload) ->
           update (fun state ->
-            let capture_fab_scroll =
-              Journal_timeline_state.update_capture_fab_scroll
-                state.capture_fab_scroll
-                ~pixels
-                ~delta
-            in
-            if capture_fab_scroll = state.capture_fab_scroll
-            then state
-            else { state with capture_fab_scroll })
+            Root_navigation.step state (Option.get (Root_scroll.event_of_payload payload)))
         | Ui.Event.Payload.Native_event _ as payload ->
           (match
              Ui.Native_widget.Expandable_message_composer.event_of_payload payload
            with
            | Some (Text_changed text) ->
-             update (fun state ->
-               match state.direct_capture with
-               | None -> state
-               | Some capture ->
-                 let changed = not (String.equal (Journal_capture.source capture) text) in
-                 { state with
-                   direct_capture =
-                     Some (Journal_capture.update_source capture ~source:text)
-                 ; capture_error = (if changed then None else state.capture_error)
-                 })
+             update (fun state -> Root_navigation.step state (Capture_edited text))
            | Some (Button_pressed { button_id = 1; text }) -> admit_direct_capture text
            | Some (Button_pressed { button_id = 2; text }) ->
              (match
@@ -4274,6 +4767,25 @@ let component ~calendar_sampler client handlers graph =
              /. 2.)
         in
         timeline_page
+          ~graph_generation:state.graph_state.generation
+          ~destination:(Journal_routes.destination state.routes)
+          ~favorites:state.favorites
+          ~on_select_destination:
+            (Ui.Event.Handler.create ~name:"select-root-destination" (function
+               | Ui.Event.Payload.Int64 0L ->
+                 Ui.Event.Handler.Private.invoke dispatch (Text "select-journals")
+               | Int64 1L ->
+                 Ui.Event.Handler.Private.invoke dispatch (Text "select-favorites")
+               | _ -> ()))
+          ~on_favorites_visible_range:
+            (Ui.Event.Handler.create ~name:"favorites-visible-range" (function
+               | Ui.Event.Payload.Visible_range range ->
+                 Ui.Event.Handler.Private.invoke
+                   dispatch
+                   (Int64_pair
+                      { first = range.first_index; second = range.last_exclusive })
+               | _ -> ()))
+          ~on_favorites_retry:(bind_action dispatch "favorites-retry")
           ~viewport_width:environment.viewport_width
           ~tokens
           ~typography
@@ -4309,7 +4821,10 @@ let component ~calendar_sampler client handlers graph =
           ~capture_task_selected
           ~capture_affordance_key:state.capture_affordance_key
           ~capture_fab_presentation:
-            (Journal_timeline_state.capture_fab_presentation state.capture_fab_scroll)
+            (Journal_timeline_state.Root_scroll_trigger.presentation
+               state.journals_scroll)
+          ~navigation_visible:(Root_navigation.navigation_visible state)
+          ~root_active:state.root_active
           ~on_capture_event:dispatch
           ~on_scroll:dispatch
           ~on_visible_range:dispatch
@@ -4443,6 +4958,87 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
 module For_testing = struct
   let read_block_entropy = read_block_entropy
   let with_block_identity = with_block_identity
+
+  let favorites_page ~width ~scale ~dark ~high_contrast ~rtl ~reduced_motion items =
+    let profile =
+      Journal_visual_tokens.select_row_profile
+        ~preset:Balanced
+        ~viewport_width:width
+        ~text_scale:scale
+    in
+    let tokens =
+      Journal_visual_tokens.resolve
+        ~brightness:(if dark then Dark else Light)
+        ~high_contrast
+    in
+    let typography = Journal_visual_tokens.typography Balanced in
+    let favorites, requests =
+      Journal_routes.Favorites.step
+        (Journal_routes.Favorites.create ~graph_generation:1)
+        (Select true)
+    in
+    let favorites, _ =
+      Journal_routes.Favorites.step
+        favorites
+        (Loaded
+           ( List.hd requests
+           , { favorites_page = None
+             ; generation = "fixture"
+             ; projection_revision = "fixture"
+             ; items
+             ; next_cursor = None
+             } ))
+    in
+    let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
+    timeline_page
+      ~graph_generation:1
+      ~destination:Journal_routes.Favorites
+      ~favorites
+      ~on_select_destination:handler
+      ~on_favorites_visible_range:handler
+      ~on_favorites_retry:handler
+      ~viewport_width:width
+      ~tokens
+      ~typography
+      ~profile
+      ~text_scale:scale
+      ~top_inset:47.
+      ~bottom_inset:34.
+      ~device_pixel_ratio:1.
+      ~timeline_state:(Journal_timeline_state.empty ~today:20260908)
+      ~loading:false
+      ~graph_error:None
+      ~sync_error:None
+      ~sync_phase:(Some Graph_service.Connecting)
+      ~today_date:None
+      ~day_presentation:(fun _ -> None)
+      ~reduced_motion
+      ~rtl
+      ~content_horizontal_inset:
+        (Float.max 0. ((width -. Journal_visual_tokens.timeline_max_width) /. 2.))
+      ~capture_enabled:false
+      ~capture_save_enabled:false
+      ~capture_saving:false
+      ~capture_task_selected:false
+      ~capture_affordance_key:1L
+      ~capture_fab_presentation:Journal_timeline_state.Extended
+      ~navigation_visible:true
+      ~root_active:true
+      ~on_capture_event:handler
+      ~on_scroll:handler
+      ~on_visible_range:handler
+      ~on_retry_day:handler
+      ~on_toggle_children:handler
+      ~delete_enabled:false
+      ~actions_enabled:false
+      ~on_status:handler
+      ~on_delete:handler
+      ~error_info_available:true
+      ~on_error_info:handler
+      ~account_menu_available:true
+      ~on_account_menu:handler
+    |> fun page -> Ui.Widget.navigator ~on_pop:handler [ page ]
+  ;;
 
   let app_with_service ?calendar_sampler service =
     let calendar_sampler = Option.map (fun sampler () -> sampler) calendar_sampler in

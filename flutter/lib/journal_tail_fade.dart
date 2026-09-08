@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:bonsai_flutter/bonsai_flutter.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 const int journalTailFadeKindId = 1001;
 

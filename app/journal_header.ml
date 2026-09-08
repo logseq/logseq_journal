@@ -5,18 +5,65 @@ module Tokens = Journal_visual_tokens
 let sync_progress_height = 2.
 
 module Context = struct
-  type t = Journal_calendar.date_presentation option
+  type t =
+    | Today of Journal_calendar.date_presentation option
+    | Favorites
 
-  let today ~date = date
-  let date t = t
+  let today ~date = Today date
+  let favorites = Favorites
+
+  let date = function
+    | Today date -> date
+    | Favorites -> None
+  ;;
 
   let semantics_label = function
-    | None -> "Date unavailable"
-    | Some date -> date.Journal_calendar.accessibility_label
+    | Favorites -> "Favorites"
+    | Today None -> "Date unavailable"
+    | Today (Some date) -> date.Journal_calendar.accessibility_label
   ;;
 end
 
 let test_id value widget = Ui.Widget.with_test_id (Ui.Test_id.string value) widget
+
+module Date_row = struct
+  let extension =
+    Ui.Native_widget.Extension.create
+      ~kind_id:(Bonsai_flutter_spec.Id.Native_widget.Kind_id.of_int 1004)
+      ~version:1
+      ~capabilities:[]
+      ~encode_props:(fun () -> Bytes.empty)
+      ~decode_event:(fun ~event_id:_ _ -> Error "Date rows emit no events")
+      ()
+  ;;
+
+  let view ~tokens ~typography ~effective_scale ~ambient_scale ~date_id ~weekday_id date =
+    let line (token : Tokens.text_token) label =
+      Ui.Widget.text
+        ~max_lines:1
+        ~style:
+          (Ui.Style.Text_style.create
+             ~font_size:(token.font_size *. effective_scale /. ambient_scale)
+             ~font_weight:token.weight
+             ~line_height:(token.line_height /. token.font_size)
+             ())
+        label
+    in
+    let children =
+      match date with
+      | None -> [ line typography.Tokens.header_subtitle "Date unavailable" ]
+      | Some date ->
+        [ line typography.day_heading date.Journal_calendar.date_text |> test_id date_id
+        ; Ui.Widget.empty () |> Ui.Widget.sized_box ~width:Tokens.date_gap
+        ; line typography.date_weekday date.weekday_text
+          |> Ui.Widget.opacity (Tokens.weekday_opacity tokens)
+          |> test_id weekday_id
+        ]
+    in
+    Ui.Native_widget.widget extension ~props:() ~on_event:(fun _ -> ()) ~children ()
+    |> Ui.Widget.sized_box ~height:(typography.day_heading.line_height *. effective_scale)
+  ;;
+end
 
 let glyph ~scale ~id icon =
   Material_icon_catalog.create ~size:(18. /. scale) icon
@@ -60,41 +107,50 @@ let sliver
       ~on_account_menu
   =
   let leading = Ui.Widget.empty () |> shell ~id:"journal-header-leading-placeholder" in
-  let available_width =
-    viewport_width -. 56. -. 32. -. if Option.is_some on_error_info then 88. else 44.
-  in
   let requested_scale = Float.max 1. text_scale in
-  (* The native Material app bar clamps title scaling before laying out Text. *)
+  (* Compensate for the native Material app bar's title scale clamp. *)
   let native_title_scale = Float.min 1.34 requested_scale in
-  let date_scale =
-    Float.min native_title_scale (Float.max 1. (available_width /. 140.))
+  let effective_scale = Tokens.date_scale ~viewport_width ~text_scale in
+  let title_height, title =
+    match context with
+    | Context.Favorites ->
+      let token = typography.Tokens.header_title in
+      let scale =
+        Float.min
+          native_title_scale
+          (Float.max
+             1.
+             ((viewport_width
+               -. 56.
+               -. 32.
+               -. if Option.is_some on_error_info then 88. else 44.)
+              /. 140.))
+      in
+      ( (42. *. scale) +. 2.
+      , Ui.Widget.text
+          ~max_lines:1
+          ~style:
+            (Ui.Style.Text_style.create
+               ~font_size:(token.font_size *. scale /. native_title_scale)
+               ~font_weight:token.weight
+               ~line_height:(token.line_height /. token.font_size)
+               ())
+          "Favorites"
+        |> test_id "favorites-header-title" )
+    | Today date ->
+      ( typography.day_heading.line_height *. effective_scale
+      , Date_row.view
+          ~tokens
+          ~typography
+          ~effective_scale
+          ~ambient_scale:native_title_scale
+          ~date_id:"journal-header-title"
+          ~weekday_id:"journal-header-weekday"
+          date )
   in
-  let line token label =
-    Ui.Widget.text
-      ~max_lines:1
-      ~style:
-        (Ui.Style.Text_style.create
-           ~font_size:(token.Tokens.font_size *. date_scale /. native_title_scale)
-           ~font_weight:token.weight
-           ~line_height:(token.line_height /. token.font_size)
-           ())
-      label
-    |> Ui.Widget.center ~width_factor:1. ~height_factor:1.
-  in
-  let title_height = (42. *. date_scale) +. 2. in
   let toolbar_height = Float.max 56. (title_height +. 12.) in
   let date_context =
-    (match Context.date context with
-     | None -> line typography.Tokens.header_subtitle "Date unavailable"
-     | Some date ->
-       Ui.Widget.column
-         [ line typography.header_title date.Journal_calendar.date_text
-           |> test_id "journal-header-title"
-         ; Ui.Widget.empty () |> Ui.Widget.sized_box ~height:2.
-         ; line typography.date_weekday date.weekday_text
-           |> Ui.Widget.opacity (Tokens.weekday_opacity tokens ~current:true)
-           |> test_id "journal-header-weekday"
-         ])
+    title
     |> Ui.Widget.sized_box ~height:title_height
     |> Ui.Widget.semantics ~properties:(Ui.Semantics.create ~sort_key:2. ())
     |> test_id "journal-date-context"

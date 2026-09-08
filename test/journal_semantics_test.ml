@@ -95,7 +95,7 @@ type counters =
   ; toggle : int
   }
 
-let component ~tokens ~profile ~rtl ~item ~expanded handlers graph =
+let component ~display_only ~tokens ~profile ~rtl ~item ~expanded handlers graph =
   let counters, set_counters =
     Bonsai_v017.state ~equal:( = ) { task = 0; toggle = 0 } graph
   in
@@ -127,7 +127,8 @@ let component ~tokens ~profile ~rtl ~item ~expanded handlers graph =
              ~show_divider:true
              ~sort_base:0.
              ~reduced_motion:false
-             ~on_toggle_children:toggle)
+             ~interaction:
+               (if display_only then Journal_row.Display_only else Toggle_children toggle))
       ; Ui.Widget.Flex.fixed
           (Ui.Widget.text
              (Printf.sprintf "task=%d toggle=%d" counters.task counters.toggle))
@@ -135,6 +136,7 @@ let component ~tokens ~profile ~rtl ~item ~expanded handlers graph =
 ;;
 
 let create_handle
+      ?(display_only = false)
       ?(width = 390.)
       ?(scale = 1.)
       ?(rtl = false)
@@ -156,7 +158,7 @@ let create_handle
     Test.Handle.create
       ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7_001L)
       ~time_source
-      (component ~tokens ~profile ~rtl ~item ~expanded)
+      (component ~display_only ~tokens ~profile ~rtl ~item ~expanded)
   in
   Test.Handle.present handle;
   handle, profile
@@ -1370,7 +1372,7 @@ let export_timeline_preview directory =
                  List.iter
                    (fun preset -> render ~width ~scale ~high_contrast ~dark ~rtl ~preset)
                    [ Tokens.Dense; Balanced; Comfortable ])
-              [ 390., 1., false; 320., 3.2, true ])
+              [ 390., 1., false; 320., 3.2, true; 390., 3.2, false; 720., 3.2, true ])
          [ false; true ])
     [ false; true ]
 ;;
@@ -1463,7 +1465,7 @@ let export_header_frames directory =
     (fun high_contrast ->
        List.iter
          (fun (width, scale) -> export width scale high_contrast)
-         [ 390., 1.; 320., 1.; 320., 3.2 ])
+         [ 390., 1.; 320., 1.; 320., 3.2; 390., 3.2; 720., 3.2 ])
     [ false; true ]
 ;;
 
@@ -2101,13 +2103,127 @@ let test_foreground_resume_resamples_calendar_in_ocaml () =
     require (!samples = 2) "foreground resume did not re-sample the OCaml calendar")
 ;;
 
+let test_display_only_rows_have_no_activation () =
+  let handle, _ =
+    create_handle ~display_only:true ~expanded:true (Journal_row.Item.of_block (block ()))
+  in
+  Fun.protect
+    ~finally:(fun () -> Test.Handle.shutdown handle)
+    (fun () ->
+       Test.Handle.present handle;
+       List.iter
+         (fun prefix ->
+            require
+              (Test.Handle.find_all handle (Test.Query.test_id (prefix ^ block_id)) = [])
+              "display-only row exposed %s"
+              prefix)
+         [ "journal-row-toggle-children:"
+         ; "journal-row-disclosure-indicator:"
+         ; "journal-row-slidable:"
+         ])
+;;
+
+let export_favorites_frames directory =
+  let module P = Logseq_db_worker.Protocol in
+  let uuid n =
+    Graph.Uuid.of_string (Printf.sprintf "77000000-0000-4000-8000-%012d" n)
+    |> Result.get_ok
+  in
+  let items =
+    List.init 100 (fun n ->
+      P.
+        { membership_uuid = uuid n
+        ; membership_order = string_of_int n
+        ; membership_revision = "membership"
+        ; target =
+            (if n mod 2 = 0
+             then
+               V2_favorite_page
+                 { uuid = uuid (100 + n)
+                 ; title =
+                     (if n = 0
+                      then "Design notes"
+                      else
+                        "A favorite page with a longer title that wraps across several \
+                         lines")
+                 ; revision = "page"
+                 }
+             else
+               V2_favorite_block
+                 { uuid = uuid (100 + n)
+                 ; title =
+                     "Review navigation and keyboard layout in 中文 with a long task title"
+                 ; task_status = Some V2_doing
+                 ; revision = "block"
+                 })
+        })
+  in
+  List.iter
+    (fun (width, scale, rtl) ->
+       List.iter
+         (fun dark ->
+            List.iter
+              (fun high_contrast ->
+                 let component _handlers _graph =
+                   Bonsai.Cont.return
+                     (Application.For_testing.favorites_page
+                        ~width
+                        ~scale
+                        ~dark
+                        ~high_contrast
+                        ~rtl
+                        ~reduced_motion:true
+                        items)
+                 in
+                 let handle =
+                   Test.Handle.create
+                     ~runtime_epoch:(ID.Runtime.Epoch.of_int64 7010L)
+                     ~time_source:(Bonsai.Time_source.create ~start:Core.Time_ns.epoch)
+                     component
+                 in
+                 Fun.protect
+                   ~finally:(fun () -> Test.Handle.shutdown handle)
+                   (fun () ->
+                      Test.Handle.present handle;
+                      let path =
+                        Filename.concat
+                          directory
+                          (Printf.sprintf
+                             "favorites-%g-%g-%b-%b-%b.bin"
+                             width
+                             scale
+                             rtl
+                             dark
+                             high_contrast)
+                      in
+                      let channel = open_out_bin path in
+                      Fun.protect
+                        ~finally:(fun () -> close_out channel)
+                        (fun () ->
+                           output_bytes
+                             channel
+                             (Option.get (Test.Handle.last_frame handle)).bytes)))
+              [ false; true ])
+         [ false; true ])
+    [ 390., 1., false
+    ; 320., 1., false
+    ; 320., 3.2, false
+    ; 320., 3.2, true
+    ; 720., 1., false
+    ]
+;;
+
 let () =
-  (match Sys.getenv_opt "JOURNAL_HEADER_FRAME_DIR" with
-   | None -> ()
-   | Some directory ->
-     export_header_frames directory;
-     export_timeline_preview directory;
-     exit 0);
+  let favorites_directory = Sys.getenv_opt "JOURNAL_FAVORITES_FRAME_DIR" in
+  let header_directory = Sys.getenv_opt "JOURNAL_HEADER_FRAME_DIR" in
+  Option.iter export_favorites_frames favorites_directory;
+  Option.iter
+    (fun directory ->
+       export_header_frames directory;
+       export_timeline_preview directory)
+    header_directory;
+  if Option.is_some favorites_directory || Option.is_some header_directory then exit 0;
+  test_display_only_rows_have_no_activation ();
   test_literal_source_time_completion_and_full_access ();
   test_long_source_and_corrupt_surfaces ();
   test_todo_rails_have_complete_equal_dashes ();

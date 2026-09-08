@@ -252,6 +252,21 @@ val get_journals
   -> cursor:Graph.Cursor.t option
   -> (Types.journal_list_result, Types.read_error) result
 
+(** Resolves ordered direct memberships of the exact [$$$favorites] graph page
+    and their page or block targets in this immutable logical projection.
+    Missing pages and unresolved or recycled targets produce no items. Ancestor
+    recycling is included. Duplicate targets preserve separate membership slots.
+    [limit] bounds scanned memberships, from one through 200, so an empty result
+    can have a continuation. Cursors bind to generation and projection; stale
+    cursors return [Stale_read_cursor]. Structural enumeration is bounded at
+    10,000 memberships and ancestry at 256 entities; exceeding either bound
+    returns [Read_limit_exceeded]. No graph writes or child expansion reads occur. *)
+val get_favorites
+  :  snapshot
+  -> limit:int
+  -> cursor:Graph.Cursor.t option
+  -> (Types.favorites_result, Types.read_error) result
+
 (** Reads one bounded children or page-tree structure request. A continuation
     cursor is an opaque, projection-bound offset from zero through 10,000 and may
     be reused as the same numeric offset with another request shape. Each request
