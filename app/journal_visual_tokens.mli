@@ -12,8 +12,7 @@ type text_token =
   }
 
 type typography =
-  { header_title : text_token
-  ; header_subtitle : text_token
+  { header_subtitle : text_token
   ; day_heading : text_token
   ; date_weekday : text_token
   ; entry : text_token

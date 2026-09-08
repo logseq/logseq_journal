@@ -15,8 +15,28 @@ class _RootScrollPosition extends ScrollPositionWithSingleContext {
   final void Function(double, double) onSample;
   bool _userMotion = false;
   bool _pointerMotion = false;
+  double? _pendingOffset;
 
-  void clearUserIntent() => _userMotion = false;
+  void restoreBeforePaint(double offset) {
+    goIdle();
+    _pendingOffset = offset;
+    // Invalidate the viewport even when the destination has equal dimensions.
+    notifyListeners();
+  }
+
+  @override
+  bool applyContentDimensions(double minScrollExtent, double maxScrollExtent) {
+    final pending = _pendingOffset;
+    if (pending != null) {
+      _pendingOffset = null;
+      final target = pending.clamp(minScrollExtent, maxScrollExtent);
+      if (target != pixels) {
+        correctPixels(target);
+        return false;
+      }
+    }
+    return super.applyContentDimensions(minScrollExtent, maxScrollExtent);
+  }
 
   @override
   void applyUserOffset(double delta) {
@@ -104,7 +124,7 @@ class _RootNavigationConfiguration extends InheritedWidget {
       visible != oldWidget.visible || duration != oldWidget.duration;
 }
 
-/// One graph lifetime owns two independent native scroll positions.
+/// One graph lifetime owns a retained position and independent saved offsets.
 class JournalRootScroll extends StatefulWidget {
   const JournalRootScroll({
     required this.navigationVisible,
@@ -131,58 +151,45 @@ class JournalRootScroll extends StatefulWidget {
 
 class _JournalRootScrollState extends State<JournalRootScroll> {
   final _offsets = [0.0, 0.0];
-  late final List<ScrollController> _controllers = List.generate(2, (index) {
-    final controller = _RootScrollController((pixels, delta) {
-      if (mounted && widget.active && widget.destination == index) {
-        widget.onScroll(index, pixels, delta);
-      }
-    });
-    controller.addListener(() {
-      if (controller.hasClients) _offsets[index] = controller.position.pixels;
-    });
-    return controller;
+  late final _controller = _RootScrollController((pixels, delta) {
+    if (mounted && widget.active) {
+      widget.onScroll(widget.destination, pixels, delta);
+    }
   });
+
+  _RootScrollPosition? get _position => _controller.hasClients
+      ? _controller.position as _RootScrollPosition
+      : null;
 
   @override
   void didUpdateWidget(JournalRootScroll oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.active != widget.active ||
-        oldWidget.destination != widget.destination) {
-      for (final controller in _controllers) {
-        for (final position
-            in controller.positions.cast<_RootScrollPosition>()) {
-          position.clearUserIntent();
-        }
-      }
+    final position = _position;
+    final changedDestination = oldWidget.destination != widget.destination;
+    // Read the outgoing position before assigning any incoming correction.
+    if (position != null && position._pendingOffset == null) {
+      _offsets[oldWidget.destination] = position.pixels;
     }
-    if (oldWidget.favoritesRevision != widget.favoritesRevision) {
+    if (oldWidget.active != widget.active || changedDestination) {
+      position?.goIdle();
+    }
+    final changedFavorites =
+        oldWidget.favoritesRevision != widget.favoritesRevision;
+    if (changedFavorites) {
       _offsets[1] =
           (_offsets[1] +
                   widget.favoritesAnchorOffset -
                   oldWidget.favoritesAnchorOffset)
               .clamp(0.0, double.infinity);
     }
-    final destination = widget.destination;
-    final offset = _offsets[destination];
-    if (oldWidget.destination != destination ||
-        oldWidget.favoritesRevision != widget.favoritesRevision) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || widget.destination != destination) return;
-        final controller = _controllers[destination];
-        if (controller.hasClients) {
-          controller.jumpTo(
-            offset.clamp(0.0, controller.position.maxScrollExtent),
-          );
-        }
-      });
+    if (changedDestination || (changedFavorites && widget.destination == 1)) {
+      position?.restoreBeforePaint(_offsets[widget.destination]);
     }
   }
 
   @override
   void dispose() {
-    for (final controller in _controllers) {
-      controller.dispose();
-    }
+    _controller.dispose();
     super.dispose();
   }
 
@@ -202,7 +209,7 @@ class _JournalRootScrollState extends State<JournalRootScroll> {
         return false;
       },
       child: PrimaryScrollController(
-        controller: _controllers[widget.destination],
+        controller: _controller,
         child: widget.child,
       ),
     ),

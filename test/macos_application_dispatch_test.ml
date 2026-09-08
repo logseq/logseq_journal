@@ -233,6 +233,28 @@ let envelope tag source =
   bytes
 ;;
 
+(* Export every accepted frame from one application session for native checks. *)
+let frame_directory = Sys.getenv_opt "JOURNAL_ROOT_FRAME_DIR"
+let frame_phase = ref "disabled"
+let frame_number = ref 0
+let previous_frame = ref None
+
+let export_frame handle =
+  match frame_directory, Test.Handle.last_frame handle with
+  | Some directory, Some frame
+    when !frame_phase <> "disabled" && !previous_frame <> Some frame.bytes ->
+    previous_frame := Some frame.bytes;
+    let path =
+      Filename.concat directory (Printf.sprintf "%04d-%s.bin" !frame_number !frame_phase)
+    in
+    incr frame_number;
+    let channel = open_out_bin path in
+    Fun.protect
+      ~finally:(fun () -> close_out channel)
+      (fun () -> output_bytes channel frame.bytes)
+  | _ -> ()
+;;
+
 let respond_preferences handle epoch =
   let frame = Test.Handle.last_frame handle |> Option.get in
   let wire = Wire.Binary_codec.decode frame.bytes |> Result.get_ok in
@@ -260,7 +282,8 @@ let respond_preferences handle epoch =
           }
     }
   in
-  Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ()
+  Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ();
+  export_frame handle
 ;;
 
 let press handle epoch sequence test_id =
@@ -284,6 +307,7 @@ let press handle epoch sequence test_id =
     }
   in
   Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ();
+  export_frame handle;
   Test.Handle.present handle
 ;;
 
@@ -319,6 +343,7 @@ let native_delete handle epoch sequence =
     }
   in
   Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ();
+  export_frame handle;
   Test.Handle.present handle
 ;;
 
@@ -334,6 +359,7 @@ let undo handle epoch sequence request_id =
     }
   in
   Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ();
+  export_frame handle;
   Test.Handle.present handle
 ;;
 
@@ -364,7 +390,8 @@ let undo_request handle =
 let pump handle =
   for _ = 1 to 20 do
     Test.Handle.present handle;
-    Test.Handle.pump_next handle ()
+    Test.Handle.pump_next handle ();
+    export_frame handle
   done;
   Test.Handle.present handle
 ;;
@@ -388,6 +415,7 @@ let () =
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
+       export_frame handle;
        respond_preferences handle epoch;
        pump handle;
        !emit
@@ -510,11 +538,13 @@ let select_tab handle epoch sequence index =
     }
   in
   Test.Handle.pump_next handle ~events:{ runtime_epoch = epoch; events = [ event ] } ();
+  export_frame handle;
   pump handle
 ;;
 
 let () =
   let epoch = ID.Runtime.Epoch.of_int64 8002L in
+  frame_phase := "startup";
   let handle =
     Test.Handle.create_app
       ~runtime_epoch:epoch
@@ -531,17 +561,50 @@ let () =
   Fun.protect
     ~finally:(fun () -> Test.Handle.shutdown handle)
     (fun () ->
+       export_frame handle;
        respond_preferences handle epoch;
        pump handle;
+       if Option.is_some frame_directory
+       then (
+         !emit
+           (Service.Client_state_changed
+              { snapshot =
+                  { sync_phase = Connecting
+                  ; catalog = []
+                  ; selected_graph = Some graph_id
+                  ; applied_server_t = Some 0
+                  ; timeline_presentation_pending = false
+                  ; startup =
+                      { authenticated = true
+                      ; catalog_loading = false
+                      ; awaiting_selection = false
+                      ; restoring_local = false
+                      ; bootstrapping = false
+                      ; awaiting_e2ee_password = false
+                      ; failure = None
+                      ; account_generation = 1
+                      ; graph_generation = 7
+                      ; presentation_generation = 1
+                      }
+                  ; last_error = None
+                  ; local_deletion = None
+                  }
+              ; diagnostics = { groups = [] }
+              });
+         pump handle);
+       frame_phase := "journals";
        !emit
          (Service.Graph_state_changed
             { generation = 7; graph_id = Some graph_id; phase = Graph_open; error = None });
        pump handle;
+       frame_phase := "journals";
+       export_frame handle;
        require (!favorites_reads = 0) "Favorites delayed or joined Journals startup";
        require
          (Test.Handle.find handle (Test.Query.test_id "journal-capture-expandable")
           <> None)
          "Journals has no Capture";
+       frame_phase := "favorites";
        select_tab handle epoch 2L 1L;
        require (!favorites_reads = 1) "Favorites selection did not lazily read once";
        require
@@ -561,11 +624,13 @@ let () =
          [ "journal-row-slidable:" ^ block_id; "journal-row-toggle-children:" ^ block_id ];
        select_tab handle epoch 3L 1L;
        require (!favorites_reads = 1) "reselection restarted Favorites";
+       frame_phase := "returned";
        select_tab handle epoch 4L 0L;
        require
          (Test.Handle.find handle (Test.Query.test_id "journal-capture-expandable")
           <> None)
          "return to Journals lost Capture";
+       frame_phase := "favorites-again";
        select_tab handle epoch 5L 1L;
        require (!favorites_reads = 1) "clean cache was reloaded";
        favorites_service_failure := true;
@@ -588,6 +653,12 @@ let () =
        press handle epoch 6L "favorites-retry-button";
        pump handle;
        require (!favorites_reads = 3) "Favorites did not recover from worker failure";
+       if Option.is_some frame_directory
+       then (
+         frame_phase := "returned-sync";
+         select_tab handle epoch 7L 0L;
+         frame_phase := "favorites-sync";
+         select_tab handle epoch 8L 1L);
        print_endline "FAVORITES_APPLICATION_VIEW_TESTS_PASSED";
        print_endline "MACOS_APPLICATION_DISPATCH_TESTS_PASSED")
 ;;

@@ -73,9 +73,9 @@ let test_every_exact_status_maps_to_the_decided_rail_category () =
 let test_typography_spacing_motion_and_hit_regions () =
   let typography = Tokens.typography Tokens.Balanced in
   require
-    (typography.header_title.font_size = 24.
-     && typography.header_title.line_height = 27.6
-     && typography.header_title.weight = Ui.Style.Font_weight.Semi_bold)
+    (typography.day_heading.font_size = 20.
+     && typography.day_heading.line_height = 24.
+     && typography.day_heading.weight = Ui.Style.Font_weight.Normal)
     "header title typography changed";
   require
     (typography.entry.font_size = 16.
@@ -91,8 +91,8 @@ let test_typography_spacing_motion_and_hit_regions () =
     (fun preset ->
        let typography = Tokens.typography preset in
        require
-         (typography.day_heading.font_size < typography.header_title.font_size
-          && typography.day_heading.line_height < typography.header_title.line_height
+         (typography.day_heading.font_size = 20.
+          && typography.day_heading.line_height = 24.
           && typography.day_heading.weight = Ui.Style.Font_weight.Normal)
          "day heading typography changed")
     [ Tokens.Dense; Balanced; Comfortable ];

@@ -1748,9 +1748,7 @@ let timeline_page
   in
   let timeline =
     Ui.Widget.Scroll_view.vertical
-      ~key:
-        (Ui.Key.string
-           (if favorites_selected then "favorites-scroll" else "journal-scroll"))
+      ~key:(Ui.Key.string "journal-scroll")
       ~primary:true
       ~on_scroll:
         (Ui.Event.Handler.create ~name:"root-scroll-owned-natively" (fun _ -> ()))
@@ -1761,6 +1759,9 @@ let timeline_page
   let base =
     Ui.Widget.Body.Vertical.create [ Ui.Widget.Body.Vertical.fill timeline ]
     |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-root-surface")
+    |> Ui.Widget.Body.padding
+         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:content_horizontal_inset ())
+    |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-content-width-padding")
   in
   let overlays =
     match sync_error with
@@ -1771,19 +1772,20 @@ let timeline_page
         |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 12.)
         |> Ui.Material.card ~elevation:2.
         |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-sync-error")
-        |> Ui.Widget.Stack.positioned ~left:16. ~right:16. ~top:64.
+        |> Ui.Widget.Stack.positioned
+             ~left:(content_horizontal_inset +. 16.)
+             ~right:(content_horizontal_inset +. 16.)
+             ~top:64.
       in
       [ banner ]
   in
   let body =
-    Ui.Widget.Body.overlay ~base ~overlays ()
+    Ui.Widget.Body.overlay ~key:(Ui.Key.string "journal-root-body") ~base ~overlays ()
     |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-root-overlay")
-    |> Ui.Widget.Body.padding
-         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:content_horizontal_inset ())
-    |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-content-width-padding")
   in
   let navigation =
     Ui.Material.navigation_bar
+      ~key:(Ui.Key.string "journal-root-navigation")
       ~layout:Ui.Material.Compact
       ~selected_index:(if favorites_selected then 1 else 0)
       ~label_behavior:Ui.Material.Never

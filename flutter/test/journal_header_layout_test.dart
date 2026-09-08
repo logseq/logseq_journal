@@ -14,6 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   late Directory frames;
   favoritesVisualTests(() => frames);
+  retainedApplicationHeaderTests(() => frames);
   setUpAll(() async {
     var directory = File(Platform.resolvedExecutable).parent;
     while (!Directory(
@@ -48,6 +49,17 @@ void main() {
         'JOURNAL_HEADER_FRAME_DIR': frames.path,
         'JOURNAL_FAVORITES_FRAME_DIR': frames.path,
       },
+    );
+    final rootResult = await Process.run(
+      'python3',
+      ['tool/test_macos_regressions.py', '--case', 'application_dispatch'],
+      workingDirectory: '..',
+      environment: {'JOURNAL_ROOT_FRAME_DIR': frames.path},
+    );
+    expect(
+      rootResult.exitCode,
+      0,
+      reason: '${rootResult.stdout}\n${rootResult.stderr}',
     );
     expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
   });
@@ -665,4 +677,110 @@ void favoritesVisualTests(Directory Function() getFrames) {
       }
     }
   }
+}
+
+void retainedApplicationHeaderTests(Directory Function() getFrames) {
+  testWidgets('Consecutive application destinations retain header at the top', (
+    tester,
+  ) async {
+    final store = NodeStore();
+    final files =
+        getFrames()
+            .listSync()
+            .whereType<File>()
+            .where((file) => RegExp(r'/[0-9]{4}-').hasMatch(file.path))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
+    expect(files, isNotEmpty);
+    State? header;
+    Element? account;
+    Element? progress;
+    ScrollPosition? position;
+    final observations = <String>[];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RepaintBoundary(
+          key: const ValueKey('retained-header-screen'),
+          child: BonsaiFlutterView(
+            store: store,
+            registry: createJournalWidgetRegistry(),
+            onEvent: (_) {},
+          ),
+        ),
+      ),
+    );
+    for (final file in files) {
+      store.apply(FrameCodec.decode(file.readAsBytesSync()));
+      await tester.pump();
+      if (find.byType(SliverAppBar).evaluate().isEmpty) continue;
+      if (file.path.contains('-startup')) {
+        await tester.pump(const Duration(milliseconds: 300));
+        continue;
+      }
+      final currentHeader = tester.state(find.byType(SliverAppBar));
+      final currentAccount = tester.element(
+        find
+            .descendant(
+              of: find.byType(SliverAppBar),
+              matching: find.byType(IconButton),
+            )
+            .last,
+      );
+      final currentPosition = tester
+          .state<ScrollableState>(find.byType(Scrollable).first)
+          .position;
+      header ??= currentHeader;
+      account ??= currentAccount;
+      position ??= currentPosition;
+      expect(currentHeader, same(header), reason: file.path);
+      expect(currentAccount, same(account), reason: file.path);
+      expect(currentPosition, same(position), reason: file.path);
+      expect(currentPosition.pixels, 0);
+      if (file.path.contains('-sync')) {
+        final currentProgress = tester.element(
+          find.byType(M3EProgressIndicator),
+        );
+        progress ??= currentProgress;
+        expect(currentProgress, same(progress));
+      }
+      final favorites = file.path.contains('-favorites');
+      expect(
+        find.descendant(
+          of: find.byType(SliverAppBar),
+          matching: find.text('Favorites'),
+        ),
+        favorites ? findsOneWidget : findsNothing,
+      );
+      Future<List<int>> headerPixels() async {
+        return (await tester.runAsync(() async {
+          final boundary = tester.renderObject<RenderRepaintBoundary>(
+            find.byKey(const ValueKey('retained-header-screen')),
+          );
+          final image = await boundary.toImage();
+          final bytes = await image.toByteData(format: ImageByteFormat.rawRgba);
+          final rows = bytes!.buffer
+              .asUint8List()
+              .take(image.width * 56 * 4)
+              .toList();
+          image.dispose();
+          return rows;
+        }))!;
+      }
+
+      final firstPaint = await headerPixels();
+      for (final elapsed in [16, 16, 168]) {
+        await tester.pump(Duration(milliseconds: elapsed));
+        expect(
+          await headerPixels(),
+          firstPaint,
+          reason: 'Header changed after its first painted frame: ${file.path}',
+        );
+      }
+      observations.add(file.path);
+      expect(tester.takeException(), isNull);
+    }
+    expect(observations.any((path) => path.contains('-favorites')), isTrue);
+    expect(observations.any((path) => path.contains('-returned')), isTrue);
+    expect(progress, isNotNull);
+  });
 }

@@ -79,8 +79,7 @@ type text_token =
   }
 
 type typography =
-  { header_title : text_token
-  ; header_subtitle : text_token
+  { header_subtitle : text_token
   ; day_heading : text_token
   ; date_weekday : text_token
   ; entry : text_token
@@ -196,8 +195,7 @@ let text_token font_size line_height weight = { font_size; line_height; weight }
 
 let typography = function
   | Dense ->
-    { header_title = text_token 24. 27.6 Ui.Style.Font_weight.Semi_bold
-    ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
+    { header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
     ; day_heading = text_token 20. 24. Ui.Style.Font_weight.Normal
     ; date_weekday = text_token 12. 14.4 Ui.Style.Font_weight.Medium
     ; entry = text_token 15. 20. Ui.Style.Font_weight.Normal
@@ -209,8 +207,7 @@ let typography = function
     ; manager_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     }
   | Balanced ->
-    { header_title = text_token 24. 27.6 Ui.Style.Font_weight.Semi_bold
-    ; header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
+    { header_subtitle = text_token 15. 20. Ui.Style.Font_weight.Medium
     ; day_heading = text_token 20. 24. Ui.Style.Font_weight.Normal
     ; date_weekday = text_token 12. 14.4 Ui.Style.Font_weight.Medium
     ; entry = text_token 16. 22. Ui.Style.Font_weight.Normal
@@ -222,8 +219,7 @@ let typography = function
     ; manager_title = text_token 24. 32. Ui.Style.Font_weight.Semi_bold
     }
   | Comfortable ->
-    { header_title = text_token 24. 27.6 Ui.Style.Font_weight.Semi_bold
-    ; header_subtitle = text_token 16. 22. Ui.Style.Font_weight.Medium
+    { header_subtitle = text_token 16. 22. Ui.Style.Font_weight.Medium
     ; day_heading = text_token 20. 24. Ui.Style.Font_weight.Normal
     ; date_weekday = text_token 12. 14.4 Ui.Style.Font_weight.Medium
     ; entry = text_token 17. 24. Ui.Style.Font_weight.Normal

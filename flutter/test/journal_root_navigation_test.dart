@@ -2,6 +2,7 @@ import 'package:bonsai_flutter_logseq_journal_host/journal_widget_registry.dart'
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'dart:ui' show SemanticsAction, Tristate;
 import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -112,6 +113,7 @@ void main() {
   }
 
   compactNavigationTests();
+  retainedRootScrollTests();
   for (final enlarged in [false, true]) {
     testWidgets(
       'Capture modal dismissal, destination removal, and save reset enlarged=$enlarged',
@@ -272,7 +274,7 @@ void main() {
                 child: Builder(
                   builder: (context) => Scaffold(
                     body: ListView.builder(
-                      key: ValueKey(destination),
+                      key: const ValueKey("root-scroll"),
                       controller: PrimaryScrollController.of(context),
                       itemExtent: 60,
                       itemCount: 100,
@@ -532,7 +534,7 @@ void compactNavigationTests() {
                 child: Builder(
                   builder: (context) => Scaffold(
                     body: ListView.builder(
-                      key: ValueKey(destination),
+                      key: const ValueKey("root-scroll"),
                       controller: PrimaryScrollController.of(context),
                       itemExtent: 60,
                       itemCount: count,
@@ -684,6 +686,236 @@ void compactNavigationTests() {
       expect(empty, contains(1));
       expect(samples, isEmpty);
       expect(tester.takeException(), isNull);
+    },
+  );
+}
+
+class _PaintOffset extends SingleChildRenderObjectWidget {
+  const _PaintOffset({required this.record, required super.child});
+  final VoidCallback record;
+  @override
+  RenderObject createRenderObject(BuildContext context) => _Recorder(record);
+  @override
+  void updateRenderObject(BuildContext context, _Recorder renderObject) {
+    renderObject.record = record;
+    renderObject.markNeedsPaint();
+  }
+}
+
+class _Recorder extends RenderProxyBox {
+  _Recorder(this.record);
+  VoidCallback record;
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    record();
+    super.paint(context, offset);
+  }
+}
+
+class _Session {
+  int destination = 0, revision = 0, graph = 0;
+  double anchor = 0;
+  bool active = true;
+  final lengths = [3000.0, 3000.0];
+  final samples = <(int, double, double)>[];
+  final paints = <double>[];
+  late StateSetter update;
+  late ScrollController controller;
+  ScrollPosition get position => controller.position;
+
+  Widget app() => MaterialApp(
+    home: StatefulBuilder(
+      builder: (context, setState) {
+        update = setState;
+        return JournalRootScroll(
+          key: ValueKey(graph),
+          navigationVisible: true,
+          duration: Duration.zero,
+          active: active,
+          destination: destination,
+          favoritesRevision: revision,
+          favoritesAnchorOffset: anchor,
+          onScroll: (d, p, delta) => samples.add((d, p, delta)),
+          onNonScrollable: (_) {},
+          child: Builder(
+            builder: (context) {
+              controller = PrimaryScrollController.of(context);
+              return Scaffold(
+                body: _PaintOffset(
+                  record: () => paints.add(position.pixels),
+                  child: CustomScrollView(
+                    key: const ValueKey('root-scroll'),
+                    controller: controller,
+                    slivers: [
+                      SliverAppBar(
+                        key: const ValueKey('header'),
+                        pinned: true,
+                        title: Text(
+                          destination == 0 ? 'Journals' : 'Favorites',
+                        ),
+                        actions: [
+                          IconButton(
+                            onPressed: () {},
+                            icon: const Icon(Icons.person),
+                          ),
+                        ],
+                      ),
+                      SliverToBoxAdapter(
+                        child: SizedBox(height: lengths[destination]),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    ),
+  );
+
+  Future<void> change(WidgetTester tester, VoidCallback action) async {
+    paints.clear();
+    samples.clear();
+    update(action);
+    await tester.pump();
+  }
+
+  void paintedAt(double offset) {
+    expect(paints, isNotEmpty);
+    expect(paints, everyElement(closeTo(offset, 0.01)));
+    expect(position.pixels, closeTo(offset, 0.01));
+    expect(samples, isEmpty, reason: 'Restoration is not user scroll intent');
+  }
+}
+
+void retainedRootScrollTests() {
+  testWidgets(
+    'One native position restores equal-size destinations before paint',
+    (tester) async {
+      final session = _Session();
+      await tester.pumpWidget(session.app());
+      final position = session.position;
+      final header = tester.state(find.byType(SliverAppBar));
+      final account = tester.element(find.byType(IconButton));
+      session.position.jumpTo(700);
+      await tester.pump();
+      await session.change(tester, () => session.destination = 1);
+      session.paintedAt(0);
+      expect(session.position, same(position));
+      expect(tester.state(find.byType(SliverAppBar)), same(header));
+      expect(tester.element(find.byType(IconButton)), same(account));
+      session.position.jumpTo(350);
+      await tester.pump();
+      await session.change(tester, () => session.destination = 0);
+      session.paintedAt(700);
+      await session.change(tester, () => session.destination = 1);
+      session.paintedAt(350);
+    },
+  );
+
+  for (final length in [0.0, 200.0, 1000.0, 5000.0]) {
+    testWidgets('Restoration clamps against target content length $length', (
+      tester,
+    ) async {
+      final session = _Session();
+      await tester.pumpWidget(session.app());
+      session.position.jumpTo(1800);
+      await tester.pump();
+      await session.change(tester, () => session.destination = 1);
+      session.position.jumpTo(900);
+      await tester.pump();
+      await session.change(tester, () {
+        session.destination = 0;
+        session.lengths[0] = length;
+      });
+      session.paintedAt(1800.0.clamp(0, session.position.maxScrollExtent));
+      await session.change(tester, () => session.destination = 1);
+      session.paintedAt(900);
+    });
+  }
+
+  testWidgets(
+    'Favorites revisions correct active and inactive offsets before paint',
+    (tester) async {
+      final session = _Session();
+      await tester.pumpWidget(session.app());
+      session.position.jumpTo(700);
+      await tester.pump();
+      await session.change(tester, () => session.destination = 1);
+      session.position.jumpTo(300);
+      await tester.pump();
+      await session.change(tester, () {
+        session.revision++;
+        session.anchor = 120;
+      });
+      session.paintedAt(420);
+      await session.change(tester, () => session.destination = 0);
+      session.paintedAt(700);
+      await session.change(tester, () {
+        session.revision++;
+        session.anchor = 200;
+      });
+      expect(session.position.pixels, 700);
+      expect(session.samples, isEmpty);
+      await session.change(tester, () => session.destination = 1);
+      session.paintedAt(500);
+      await session.change(tester, () {
+        session.revision++;
+        session.anchor = -1000;
+      });
+      session.paintedAt(0);
+    },
+  );
+
+  testWidgets(
+    'Rapid selection replaces pending correction and graph resets both offsets',
+    (tester) async {
+      final session = _Session();
+      await tester.pumpWidget(session.app());
+      session.position.jumpTo(700);
+      await tester.pump();
+      await session.change(tester, () => session.destination = 1);
+      session.position.jumpTo(300);
+      await tester.pump();
+      session.update(() => session.destination = 0);
+      await tester.pump(Duration.zero, EnginePhase.build);
+      session.update(() => session.destination = 1);
+      await tester.pump(Duration.zero, EnginePhase.build);
+      await session.change(tester, () => session.destination = 0);
+      session.paintedAt(700);
+      await session.change(tester, () => session.destination = 1);
+      session.paintedAt(300);
+      final oldPosition = session.position;
+      await session.change(tester, () => session.graph++);
+      session.paintedAt(0);
+      expect(session.position, isNot(same(oldPosition)));
+      await session.change(tester, () => session.destination = 0);
+      session.paintedAt(0);
+    },
+  );
+
+  testWidgets(
+    'Switching during a fling cancels outgoing motion and user samples',
+    (tester) async {
+      final session = _Session();
+      await tester.pumpWidget(session.app());
+      await tester.fling(
+        find.byType(CustomScrollView),
+        const Offset(0, -400),
+        1800,
+      );
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(session.position.isScrollingNotifier.value, isTrue);
+      final outgoing = session.position.pixels;
+      await session.change(tester, () => session.destination = 1);
+      session.paintedAt(0);
+      await tester.pump(const Duration(milliseconds: 80));
+      expect(session.position.pixels, 0);
+      expect(session.position.isScrollingNotifier.value, isFalse);
+      expect(session.samples, isEmpty);
+      await session.change(tester, () => session.destination = 0);
+      session.paintedAt(outgoing);
     },
   );
 }

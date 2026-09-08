@@ -26,6 +26,18 @@ end
 
 let test_id value widget = Ui.Widget.with_test_id (Ui.Test_id.string value) widget
 
+let title_line ~effective_scale ~ambient_scale (token : Tokens.text_token) label =
+  Ui.Widget.text
+    ~max_lines:1
+    ~style:
+      (Ui.Style.Text_style.create
+         ~font_size:(token.font_size *. effective_scale /. ambient_scale)
+         ~font_weight:token.weight
+         ~line_height:(token.line_height /. token.font_size)
+         ())
+    label
+;;
+
 module Date_row = struct
   let extension =
     Ui.Native_widget.Extension.create
@@ -38,17 +50,7 @@ module Date_row = struct
   ;;
 
   let view ~tokens ~typography ~effective_scale ~ambient_scale ~date_id ~weekday_id date =
-    let line (token : Tokens.text_token) label =
-      Ui.Widget.text
-        ~max_lines:1
-        ~style:
-          (Ui.Style.Text_style.create
-             ~font_size:(token.font_size *. effective_scale /. ambient_scale)
-             ~font_weight:token.weight
-             ~line_height:(token.line_height /. token.font_size)
-             ())
-        label
-    in
+    let line = title_line ~effective_scale ~ambient_scale in
     let children =
       match date with
       | None -> [ line typography.Tokens.header_subtitle "Date unavailable" ]
@@ -111,42 +113,25 @@ let sliver
   (* Compensate for the native Material app bar's title scale clamp. *)
   let native_title_scale = Float.min 1.34 requested_scale in
   let effective_scale = Tokens.date_scale ~viewport_width ~text_scale in
-  let title_height, title =
+  let title_height = typography.Tokens.day_heading.line_height *. effective_scale in
+  let title =
     match context with
     | Context.Favorites ->
-      let token = typography.Tokens.header_title in
-      let scale =
-        Float.min
-          native_title_scale
-          (Float.max
-             1.
-             ((viewport_width
-               -. 56.
-               -. 32.
-               -. if Option.is_some on_error_info then 88. else 44.)
-              /. 140.))
-      in
-      ( (42. *. scale) +. 2.
-      , Ui.Widget.text
-          ~max_lines:1
-          ~style:
-            (Ui.Style.Text_style.create
-               ~font_size:(token.font_size *. scale /. native_title_scale)
-               ~font_weight:token.weight
-               ~line_height:(token.line_height /. token.font_size)
-               ())
-          "Favorites"
-        |> test_id "favorites-header-title" )
+      title_line
+        ~effective_scale
+        ~ambient_scale:native_title_scale
+        typography.day_heading
+        "Favorites"
+      |> test_id "favorites-header-title"
     | Today date ->
-      ( typography.day_heading.line_height *. effective_scale
-      , Date_row.view
-          ~tokens
-          ~typography
-          ~effective_scale
-          ~ambient_scale:native_title_scale
-          ~date_id:"journal-header-title"
-          ~weekday_id:"journal-header-weekday"
-          date )
+      Date_row.view
+        ~tokens
+        ~typography
+        ~effective_scale
+        ~ambient_scale:native_title_scale
+        ~date_id:"journal-header-title"
+        ~weekday_id:"journal-header-weekday"
+        date
   in
   let toolbar_height = Float.max 56. (title_height +. 12.) in
   let date_context =
