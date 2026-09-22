@@ -16,7 +16,11 @@
  (ios
   (bundle_identifier com.example.bonsaiFlutterLogseqJournalHost)
   (minimum_version 26.0)
-  (architectures arm64))
+  (architectures arm64)
+  (entitlements
+   (debug config/entitlements/ios-debug-profile.entitlements)
+   (profile config/entitlements/ios-debug-profile.entitlements)
+   (release config/entitlements/ios-release.entitlements)))
  (swift_packages
   (package
    (id amplify-swift)
