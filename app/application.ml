@@ -1465,7 +1465,7 @@ let graph_unavailable_view ~message ~on_details ~on_diagnostics ~on_choose_graph
   in
   Presentation.unavailable
     ~title:"Unable to open journal"
-    ~symbol:"exclamationmark.folder"
+    ~symbol:"questionmark.folder"
     ~message
     ~actions:
       (V.column
@@ -2644,7 +2644,7 @@ let manager_page state dispatch =
          in
          unavailable
            ~title:"Unable to open graph"
-           ~symbol:"exclamationmark.folder"
+           ~symbol:"questionmark.folder"
            ~message
            ~actions
          |> toolbar "Journals" [])
