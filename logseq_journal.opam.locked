@@ -261,11 +261,11 @@ pin-depends: [
   ["rrbvec.dev" "git+https://github.com/RCmerci/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
   [
   "bonsai_swiftui.0.1.0~dev"
-  "file:///Users/rcmerci/.local/share/bonsai-swiftui/releases/2026-09-18-journal-native-210435/final/bonsai-swiftui-0.1.0~dev.tar.gz"
+  "git+https://github.com/logseq/bonsai-ui.git#9e51259c4adf7eaf8b3595b98a674f1174662af6"
 ]
   [
   "bonsai_swiftui_test.0.1.0~dev"
-  "file:///Users/rcmerci/.local/share/bonsai-swiftui/releases/2026-09-18-journal-native-210435/final/bonsai-swiftui-0.1.0~dev.tar.gz"
+  "git+https://github.com/logseq/bonsai-ui.git#9e51259c4adf7eaf8b3595b98a674f1174662af6"
 ]
   [
     "datascript-ocaml-native.dev"
