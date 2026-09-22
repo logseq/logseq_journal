@@ -1485,6 +1485,171 @@ let test_feed_with_blank_root_continues () =
   | _ -> Alcotest.fail "lost initial feed"
 ;;
 
+let graph_info_outcome ~journal_title_format =
+  Protocol.V2_graph_info_outcome
+    { graph_uuid = uuid "a1000000-0000-4000-8000-0000000000ff"
+    ; graph_name = "Journal"
+    ; schema = { major = 65; minor = 33 }
+    ; admission_facts = []
+    ; journal_title_format
+    ; limits =
+        { response_budget_bytes = 4_096
+        ; outbox_max_records = 4_096
+        ; outbox_max_bytes = 8 * 1_024 * 1_024
+        ; change_max_items = 4_096
+        ; change_max_bytes = 4 * 1_024 * 1_024
+        ; dispatcher_capacity = 32
+        ; wire_batch_max_bytes = 4 * 1_024 * 1_024
+        }
+    ; generation = "generation-1"
+    ; projection_revision = "projection-1"
+    }
+;;
+
+let capture_format_read ~journal_day =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  let calendar = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  Runtime.set_calendar runtime calendar;
+  let creation_time =
+    Journal_time.create
+      ~instant_unix_ms:1_788_192_000_000L
+      ~local_day:journal_day
+      ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  let lookup =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Capture
+         { calendar_generation = Journal_calendar.generation calendar
+         ; command =
+             { mutation_id = "a1000000-0000-4000-a000-0000000000c1"
+             ; block_id = Graph.Uuid.to_string block_uuid
+             ; sibling_order = "a1"
+             ; source = "Captured block"
+             ; task_state = Journal_model.No_status
+             ; creation_time
+             ; children = []
+             }
+         })
+    |> fun output -> only "capture page lookup" output.requests
+  in
+  let page =
+    match lookup.command with
+    | V2_get_page { page; _ } -> page
+    | _ -> Alcotest.fail "capture did not request its journal page"
+  in
+  let format_read =
+    Runtime.receive
+      runtime
+      (response
+         lookup
+         (Protocol.V2_page_outcome
+            (V2_missing_page { uuid = page; revision = "page-1" })))
+    |> fun output -> only "journal title format read" output.requests
+  in
+  (match format_read.command with
+   | V2_graph_info -> ()
+   | _ -> Alcotest.fail "missing journal page did not read the title format");
+  runtime, page, format_read
+;;
+
+let create_journal_title ~journal_day ~journal_title_format =
+  let runtime, page, format_read = capture_format_read ~journal_day in
+  let creation =
+    Runtime.receive
+      runtime
+      (response format_read (graph_info_outcome ~journal_title_format))
+    |> fun output -> only "journal page creation" output.requests
+  in
+  match creation.command with
+  | V2_create_journal_page { page = created; journal_day = day; title; _ } ->
+    Alcotest.(check bool)
+      "journal page identity"
+      true
+      (Graph.Uuid.equal created page);
+    Alcotest.(check int) "journal day" journal_day day;
+    title
+  | _ -> Alcotest.fail "format read did not continue to journal page creation"
+;;
+
+let test_journal_title_defaults_to_upstream_format () =
+  Alcotest.(check string)
+    "default format"
+    "Sep 19th, 2026"
+    (create_journal_title ~journal_day:20260919 ~journal_title_format:None)
+;;
+
+let test_journal_title_uses_configured_format () =
+  Alcotest.(check string)
+    "configured ISO format"
+    "2026-09-19"
+    (create_journal_title ~journal_day:20260919 ~journal_title_format:(Some "yyyy-MM-dd"));
+  Alcotest.(check string)
+    "weekday and ordinal tokens"
+    "Saturday, Sep 19th, 2026"
+    (create_journal_title
+       ~journal_day:20260919
+       ~journal_title_format:(Some "EEEE, MMM do, yyyy"))
+;;
+
+let test_journal_title_falls_back_on_invalid_format () =
+  Alcotest.(check string)
+    "unsupported token falls back to the upstream default"
+    "Sep 19th, 2026"
+    (create_journal_title
+       ~journal_day:20260919
+       ~journal_title_format:(Some "yyyy-QQ-dd"))
+;;
+
+let test_journal_title_failed_format_read_rejects () =
+  let runtime, _, format_read = capture_format_read ~journal_day:20260919 in
+  let completed =
+    Runtime.receive
+      runtime
+      (response
+         format_read
+         (Protocol.V2_failed
+            { code = Logseq_db_worker.Error.code_string Closed_session
+            ; message = "Snapshot unavailable"
+            }))
+  in
+  Alcotest.(check int) "no creation after a failed read" 0 (List.length completed.requests);
+  match (only "capture rejected" completed.responses).payload with
+  | Rejected (Worker_failure _) -> ()
+  | _ -> Alcotest.fail "a failed format read was not rejected"
+;;
+
+let test_journal_title_ordinals_and_boundaries () =
+  List.iter
+    (fun (journal_day, expected) ->
+       Alcotest.(check string)
+         (Printf.sprintf "%d" journal_day)
+         expected
+         (create_journal_title ~journal_day ~journal_title_format:None))
+    [ 20260901, "Sep 1st, 2026"
+    ; 20260902, "Sep 2nd, 2026"
+    ; 20260903, "Sep 3rd, 2026"
+    ; 20260911, "Sep 11th, 2026"
+    ; 20260912, "Sep 12th, 2026"
+    ; 20260913, "Sep 13th, 2026"
+    ; 20260921, "Sep 21st, 2026"
+    ; 20260922, "Sep 22nd, 2026"
+    ; 20260923, "Sep 23rd, 2026"
+    ; 20260831, "Aug 31st, 2026"
+    ; 20261001, "Oct 1st, 2026"
+    ; 20261231, "Dec 31st, 2026"
+    ; 20270101, "Jan 1st, 2027"
+    ; 20280229, "Feb 29th, 2028"
+    ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
@@ -1536,6 +1701,28 @@ let () =
             "read categories and ownership survive conversion"
             `Quick
             test_read_failure_conversion_preserves_category_and_ownership
+        ] )
+    ; ( "journal title format"
+      , [ Alcotest.test_case
+            "missing format uses the upstream default"
+            `Quick
+            test_journal_title_defaults_to_upstream_format
+        ; Alcotest.test_case
+            "configured format"
+            `Quick
+            test_journal_title_uses_configured_format
+        ; Alcotest.test_case
+            "invalid format falls back to the upstream default"
+            `Quick
+            test_journal_title_falls_back_on_invalid_format
+        ; Alcotest.test_case
+            "failed format read rejects the capture"
+            `Quick
+            test_journal_title_failed_format_read_rejects
+        ; Alcotest.test_case
+            "ordinal and calendar boundaries"
+            `Quick
+            test_journal_title_ordinals_and_boundaries
         ] )
     ; ( "mutation conversion"
       , [ Alcotest.test_case
