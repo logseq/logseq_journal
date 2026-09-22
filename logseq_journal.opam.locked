@@ -150,6 +150,7 @@ depends: [
   "num" {= "1.6"}
   "ocaml" {= "5.1.1"}
   "ocaml-ios64" {= "5.1.1"}
+  "ocaml-ios64-simulator" {= "5.1.1"}
   "ocaml-base-compiler" {= "5.1.1"}
   "ocaml-compiler-libs" {= "v0.12.4"}
   "ocaml-config" {= "3"}
@@ -177,6 +178,8 @@ depends: [
   "ppx_css" {= "v0.17.0"}
   "ppx_custom_printf" {= "v0.17.0"}
   "ppx_derivers" {= "1.2.1"}
+  "ppx_deriving" {= "6.0.3"}
+  "ppx_deriving_yojson" {= "3.9.1"}
   "ppx_diff" {= "v0.17.0"}
   "ppx_disable_unused_warnings" {= "v0.17.0"}
   "ppx_enumerate" {= "v0.17.0"}
