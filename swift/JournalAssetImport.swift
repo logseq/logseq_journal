@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
     let enabled: Bool
     let completion: String?
     let error: String?
+    let replace: String?
+    let request: Int
   }
 
   @Observable final class Selection {
@@ -35,6 +37,13 @@ import UniformTypeIdentifiers
     @State private var presented = false
     @State private var error: String?
 
+    private func emitDismissed() {
+      guard context.canInteract(),
+        let data = try? JSONSerialization.data(withJSONObject: ["action": "dismissed"])
+      else { return }
+      _ = context.emit(data)
+    }
+
     var body: some View {
       Button {
         guard context.canInteract() else { return }
@@ -47,7 +56,10 @@ import UniformTypeIdentifiers
       .fileImporter(isPresented: $presented, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
         guard context.canInteract() else { return }
         do {
-          guard let source = try result.get().first else { return }
+          guard let source = try result.get().first else {
+            if context.properties.replace != nil { emitDismissed() }
+            return
+          }
           let operation = UUID().uuidString.lowercased()
           context.resource.retain(source, operation: operation)
           let extensionName = source.pathExtension.lowercased()
@@ -55,7 +67,7 @@ import UniformTypeIdentifiers
             "operation": operation, "asset": UUID().uuidString.lowercased(),
             "localMutation": UUID().uuidString.lowercased(), "metadataMutation": UUID().uuidString.lowercased(),
             "path": source.path, "title": source.lastPathComponent,
-            "replaceReference": NSNull(),
+            "replaceReference": context.properties.replace ?? NSNull(),
             "type": extensionName.isEmpty ? "bin" : extensionName,
           ])
           if !context.emit(payload) {
@@ -64,10 +76,16 @@ import UniformTypeIdentifiers
           }
         } catch {
           context.resource.release()
-          if (error as NSError).code != NSUserCancelledError {
+          if (error as NSError).code == NSUserCancelledError {
+            if context.properties.replace != nil { emitDismissed() }
+          } else {
             self.error = "Unable to access the selected file. Please try again."
           }
         }
+      }
+      .onChange(of: context.properties.request) { _, _ in
+        guard context.canInteract(), context.isPresented, context.properties.replace != nil else { return }
+        presented = true
       }
       .onChange(of: context.properties.completion) { _, operation in
         guard let operation, operation == context.resource.operation else { return }

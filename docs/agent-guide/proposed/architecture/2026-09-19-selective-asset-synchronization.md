@@ -437,18 +437,39 @@ Implemented foundations:
   remain available, but native rows currently do not initiate media discovery or
   foreground download. Background recent-journal/Favorites demand is independent.
 
+- Downloaded remote cache filenames are now audited and fixed. The asset cache
+  records each version's validated `file_type` and stores payloads as
+  `<checksum>.<file_type>`, so deferred remote presentation hands native viewers
+  a correctly suffixed path, matching the staged-import filename fix. Legacy
+  `.bin` payloads are evicted on cache open. Filesystem tests cover extension
+  naming and legacy cleanup.
+
+- Binary transfers now share a bounded byte budget in addition to the lane and
+  codec semaphores. Each admitted download or upload reserves its worst-case
+  wire-plus-plaintext footprint in 64 KiB units against a shared 64 MiB budget,
+  so the transfer lanes bound request counts while the semaphore bounds
+  in-flight bytes. Reservation sits inside the lane slot and shares the codec
+  permit ordering, so no new deadlock order exists. A public runner test
+  observes the three download slots admit only two concurrent 16 MiB
+  reservations under the budget and admits the rest after release.
+
+- Binary replacement and reuse-existing-reference flows are now wired to native
+  UI. The detail media group exposes a native `Menu` with "Replace file…" and
+  "Reuse existing…" when the group is the editable detail root. Replace arms the
+  existing import picker with the replacement target — the durable import intent
+  already carries the expected previous reference — and picker dismissal clears
+  the armed state. Reuse reads the holder block through the worker for its page
+  and expected reference, enumerates managed assets under that page through
+  `V2_list_assets {recursive}`, and commits `V2_set_asset_reference` with the
+  holder's block-revision precondition; a successful commit re-queries the group
+  through the ordinary completion path. Media-runtime boundary tests cover
+  holder lookup, page-scoped candidate enumeration, atomic repointing with the
+  exact previous reference, and picker teardown.
+
 Remaining delivery work:
 
-- Audit and complete binary replacement and reuse-existing-reference flows; the
-  current native picker exposes only Attach file.
 - Verify the connected local import preview in representative native UI flows.
-- The configurable background policy and offline completeness are connected.
-  Native automatic visible demand is explicitly
-  deferred by the user; do not reintroduce a visibility workaround without approval.
-  Day-rollover delivery is connected separately from foreground calendar refresh.
-- Finish representative native local-preview acceptance checks.
-- Finish shared byte/decode accounting under the now-bounded transfer lanes.
-  Verify deployed import limits; encrypted envelope overhead is fixture-verified.
+- Verify deployed import limits; encrypted envelope overhead is fixture-verified.
 - Complete representative native UI verification, then audit every acceptance
   criterion before lifecycle transition.
 

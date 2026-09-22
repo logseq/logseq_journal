@@ -56,7 +56,16 @@ let extension =
     ()
 ;;
 
-let view ~key ~enabled ~completion ~on_select =
+let is_dismissal payload =
+  match (try Yojson.Basic.from_string payload with _ -> `Null) with
+  | `Assoc fields ->
+    (match List.assoc_opt "action" fields with
+     | Some (`String "dismissed") -> true
+     | _ -> false)
+  | _ -> false
+;;
+
+let view ~key ~enabled ~completion ~replacement ~request ~on_select =
   let operation, error =
     match completion with
     | None -> `Null, `Null
@@ -69,7 +78,17 @@ let view ~key ~enabled ~completion ~on_select =
   Ui.Native_widget.widget
     extension
     ~key
-    ~props:(`Assoc [ "enabled", `Bool enabled; "completion", operation; "error", error ])
+    ~props:
+      (`Assoc
+          [ "enabled", `Bool enabled
+          ; "completion", operation
+          ; "error", error
+          ; ( "replace"
+            , match replacement with
+              | None -> `Null
+              | Some root -> `String root )
+          ; "request", `Int request
+          ])
     ~on_event:on_select
     ~children:[]
     ()

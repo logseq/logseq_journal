@@ -3,9 +3,13 @@ val decode
   -> string
   -> (Logseq_db_types.Asset_import.t, string) result
 
+val is_dismissal : string -> bool
+
 val view
   :  key:Bonsai_swiftui_ui.Key.t
   -> enabled:bool
   -> completion:(string * string option) option
+  -> replacement:string option
+  -> request:int
   -> on_select:(string -> unit)
   -> Bonsai_swiftui_ui.View.t

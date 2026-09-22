@@ -13,6 +13,7 @@ type error =
 
 type record =
   { name : string
+  ; file_type : string
   ; checksum : string
   ; size : int64
   ; mutable touched : float
@@ -61,7 +62,12 @@ let unlink path =
   | Unix.Unix_error (Unix.ENOENT, _, _) -> ()
 ;;
 
-let data_path t name = Filename.concat t.directory (name ^ ".bin")
+(* Data files carry the validated attachment type so native presentation
+   (for example Quick Look) classifies them correctly. *)
+let data_path t record =
+  Filename.concat t.directory (record.name ^ "." ^ record.file_type)
+;;
+
 let manifest_path t name = Filename.concat t.directory (name ^ ".json")
 
 let name asset (version : Asset.version) =
@@ -109,7 +115,7 @@ let checksum_file path =
 
 let remove_record t record =
   unlink (manifest_path t record.name);
-  unlink (data_path t record.name);
+  unlink (data_path t record);
   Hashtbl.remove t.records record.name
 ;;
 
@@ -148,7 +154,14 @@ let read_manifest directory file =
             | Ok asset, Ok version, Some size
               when size >= 0L && name asset version ^ ".json" = file ->
               let name = name asset version in
-              Some { name; checksum; size; touched = (Unix.stat path).st_mtime; pins = 0 }
+              Some
+                { name
+                ; file_type = version.file_type
+                ; checksum
+                ; size
+                ; touched = (Unix.stat path).st_mtime
+                ; pins = 0
+                }
             | _ -> None)
          | _ -> None)
       | _ -> None)
@@ -208,18 +221,23 @@ let create ~root ~(scope : Core.graph_scope) ~budget_bytes ~maximum_file_bytes =
              match read_manifest directory file with
              | Some record
                when record.size <= Int64.of_int maximum_file_bytes
-                    && Sys.file_exists (data_path t record.name) ->
+                    && Sys.file_exists (data_path t record) ->
                Hashtbl.replace t.records record.name record
              | _ -> unlink (Filename.concat directory file))
            else if Filename.check_suffix file ".part"
            then unlink (Filename.concat directory file))
         (Sys.readdir directory);
+      let kept = Hashtbl.create (2 * Hashtbl.length t.records) in
+      Hashtbl.iter
+        (fun _ record ->
+           Hashtbl.replace kept (record.name ^ ".json") ();
+           Hashtbl.replace kept (record.name ^ "." ^ record.file_type) ())
+        t.records;
       Array.iter
         (fun file ->
-           if
-             Filename.check_suffix file ".bin"
-             && not (Hashtbl.mem t.records (Filename.chop_suffix file ".bin"))
-           then unlink (Filename.concat directory file))
+           let path = Filename.concat directory file in
+           if (not (Hashtbl.mem kept file)) && not (Sys.is_directory path)
+           then unlink path)
         (Sys.readdir directory);
       Ok t))
 ;;
@@ -232,7 +250,7 @@ let lookup t ~asset ~version =
       match Hashtbl.find_opt t.records (name asset version) with
       | None -> Ok None
       | Some record ->
-        let path = data_path t record.name in
+        let path = data_path t record in
         let valid =
           try
             let stat = Unix.stat path in
@@ -291,7 +309,16 @@ let publish t ~asset ~(version : Asset.version) ~current ~plaintext =
         if Hashtbl.mem t.records name
         then Error Full
         else (
-          let data = data_path t name
+          let record =
+            { name
+            ; file_type = version.file_type
+            ; checksum = version.checksum
+            ; size
+            ; touched = Unix.gettimeofday ()
+            ; pins = 0
+            }
+          in
+          let data = data_path t record
           and manifest = manifest_path t name in
           let temporary = data ^ ".part"
           and temporary_manifest = manifest ^ ".part" in
@@ -316,14 +343,6 @@ let publish t ~asset ~(version : Asset.version) ~current ~plaintext =
                  Unix.rename temporary data;
                  Unix.rename temporary_manifest manifest;
                  sync_directory t;
-                 let record =
-                   { name
-                   ; checksum = version.checksum
-                   ; size
-                   ; touched = Unix.gettimeofday ()
-                   ; pins = 0
-                   }
-                 in
                  Hashtbl.replace t.records name record;
                  Ok (pin t record)))))
 ;;
@@ -355,7 +374,7 @@ let path t handle =
   then None
   else (
     match Hashtbl.find_opt t.handles handle with
-    | Some record -> Some (data_path t record.name)
+    | Some record -> Some (data_path t record)
     | None ->
       Option.map
         (fun record -> record.staged_location)

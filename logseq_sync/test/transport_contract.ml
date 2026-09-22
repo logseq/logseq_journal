@@ -1991,6 +1991,116 @@ let scenarios =
     ]
 ;;
 
+let shared_asset_byte_budget () =
+  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+  let module Asset = Logseq_db_types.Asset_descriptor in
+  let module Cache = Logseq_sync_effect_runner.Asset_cache in
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let entered = ref 0
+        and completed = ref 0 in
+        let gate, release = Eio.Promise.create () in
+        let acquire _ =
+          incr entered;
+          Eio.Promise.await gate;
+          Error "offline"
+        in
+        let t =
+          runner
+            ~acquire
+            ~environment
+            ~sw
+            ~support
+            ~posted:(ref [])
+            ~invalidations:(ref 0)
+            ()
+        in
+        let _, base = bootstrap (Uri.of_string "https://localhost") in
+        let version =
+          Asset.version ~checksum:(String.make 64 '0') ~file_type:"bin" |> Result.get_ok
+        in
+        let caches =
+          List.init 5 (fun generation ->
+            let scope = Core.{ base with graph_generation = generation } in
+            let cache =
+              Cache.create
+                ~root:support
+                ~scope
+                ~budget_bytes:32L
+                ~maximum_file_bytes:16777216
+              |> Result.get_ok
+            in
+            let asset =
+              Asset.create
+                ~uuid:scope.graph_id
+                ~source:(Managed (Some version))
+                ~current_checksum:None
+                ~size:None
+                ~dimensions:None
+              |> Result.get_ok
+            in
+            let state =
+              Transfer.create
+                (Transfer.config ~active:1 ~foreground_reserved:0 ~pending:1 ~retries:0
+                 |> Result.get_ok)
+                ~scope
+                ~online:true
+                ~unlocked:true
+            in
+            let state, effects =
+              Transfer.step
+                state
+                (Replace { consumer = "test"; priority = Foreground; assets = [ asset ] })
+            in
+            let ticket =
+              List.find_map
+                (function
+                  | Transfer.Check_cache t -> Some t
+                  | _ -> None)
+                effects
+              |> Option.get
+            in
+            let _, effects = Transfer.step state (Cache_checked (ticket, Ok None)) in
+            List.iter
+              (function
+                | Transfer.Fetch _ as instruction ->
+                  Runner.submit_asset
+                    t
+                    ~scope
+                    ~cache
+                    ~encryption:Plaintext
+                    ~maximum_plaintext_bytes:16777216
+                    ~current:(fun _ -> true)
+                    ~post:(fun _ -> incr completed)
+                    instruction
+                | _ -> ())
+              effects;
+            cache)
+        in
+        for _ = 1 to 10 do
+          Eio.Fiber.yield ()
+        done;
+        let initial = !entered in
+        Eio.Promise.resolve release ();
+        wait (Eio.Stdenv.clock environment) (fun () -> !completed = 5);
+        (* Each 16 MiB request reserves 32 MiB of wire plus plaintext footprint,
+           so only two of the three download permits admit work concurrently. *)
+        Alcotest.(check int) "byte budget admits two large downloads" 2 initial;
+        Alcotest.(check int) "all failed requests release their bytes" 5 !entered;
+        Runner.shutdown t;
+        List.iter Cache.close caches)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "shared asset byte budget"
+        `Quick
+        shared_asset_byte_budget
+    ]
+;;
+
 let shared_asset_codec_admission () =
   let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let module Asset = Logseq_db_types.Asset_descriptor in

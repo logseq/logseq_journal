@@ -10,6 +10,21 @@ type ticket =
       ; epoch : int
       ; request_id : G.Uuid.t
       }
+  | Reference of
+      { root : string
+      ; epoch : int
+      ; request_id : G.Uuid.t
+      }
+  | Picker of
+      { root : string
+      ; epoch : int
+      ; request_id : G.Uuid.t
+      }
+  | Reference_commit of
+      { root : string
+      ; epoch : int
+      ; request_id : G.Uuid.t
+      }
   | Lease of
       { root : string
       ; epoch : int
@@ -24,10 +39,30 @@ type item =
   ; presentation : P.presentation
   }
 
+type reference =
+  { page : G.Uuid.t
+  ; revision : string
+  ; previous : G.Uuid.t option
+  }
+
+type reuse =
+  { mutable pending : bool
+  ; mutable committing : bool
+  ; mutable items : item list
+  ; mutable cursor : G.Cursor.t option
+  }
+
+type picker =
+  { candidates : item list
+  ; candidates_more : bool
+  ; busy : bool
+  }
+
 type view =
   { items : item list
   ; more : bool
   ; error : string option
+  ; picker : picker option
   }
 
 type controller =
@@ -46,6 +81,8 @@ type group =
   ; mutable error : string option
   ; mutable local : Logseq_db_worker.import_receipt list
   ; mutable controllers : controller list
+  ; mutable reference : reference option
+  ; mutable reuse : reuse option
   }
 
 type outgoing =
@@ -75,7 +112,7 @@ let create ~send ~changed =
   }
 ;;
 
-let empty_view = { items = []; more = false; error = None }
+let empty_view = { items = []; more = false; error = None; picker = None }
 
 let notify t g =
   t.changed
@@ -112,6 +149,14 @@ let notify t g =
                g.controllers)
     ; more = Option.is_some g.cursor
     ; error = g.error
+    ; picker =
+        Option.map
+          (fun (reuse : reuse) ->
+             { candidates = reuse.items
+             ; candidates_more = Option.is_some reuse.cursor
+             ; busy = reuse.pending || reuse.committing
+             })
+          g.reuse
     }
 ;;
 
@@ -203,14 +248,16 @@ let clear t g =
   g.controllers <- []
 ;;
 
+let next_request_id t =
+  t.serial <- t.serial + 1;
+  G.Uuid.of_string (Printf.sprintf "a55e8000-0000-4000-8000-%012x" t.serial)
+  |> Result.get_ok
+;;
+
 let read t g cursor =
   if List.length t.queued < 1024
   then (
-    t.serial <- t.serial + 1;
-    let request_id =
-      G.Uuid.of_string (Printf.sprintf "a55e8000-0000-4000-8000-%012x" t.serial)
-      |> Result.get_ok
-    in
+    let request_id = next_request_id t in
     let root = G.Uuid.of_string g.root |> Result.get_ok in
     g.pending <- Some request_id;
     g.error <- None;
@@ -286,6 +333,8 @@ let root_visible t ~root visible =
          ; error = None
          ; local = []
          ; controllers = []
+         ; reference = None
+         ; reuse = None
          }
        in
        Hashtbl.add t.groups root g;
@@ -347,6 +396,147 @@ let release_stale t ticket result =
     enqueue t (Service.Release_asset_file { scope = ticket.P.scope; handle = lease })
 ;;
 
+let request_reference t g =
+  match G.Uuid.of_string g.root with
+  | Error _ ->
+    g.reuse <- None;
+    g.error <- Some "The attachment holder is unavailable."
+  | Ok block ->
+    let request_id = next_request_id t in
+    enqueue
+      t
+      ~ticket:(Reference { root = g.root; epoch = g.epoch; request_id })
+      ~current:(fun () -> current_group t g && g.reuse <> None)
+      (Service.Graph_request
+         { api_version = 2
+         ; request_id
+         ; command = Protocol.V2_get_block { block; revision = None }
+         })
+;;
+
+let request_candidates t g page cursor =
+  (match g.reuse with
+   | Some reuse -> reuse.pending <- true
+   | None -> ());
+  let request_id = next_request_id t in
+  enqueue
+    t
+    ~ticket:(Picker { root = g.root; epoch = g.epoch; request_id })
+    ~current:(fun () -> current_group t g && g.reuse <> None)
+    (Service.Graph_request
+       { api_version = 2
+       ; request_id
+       ; command =
+           Protocol.V2_list_assets
+             { recursive = true; roots = [ page ]; limit = 16; cursor }
+       })
+;;
+
+let candidate (asset : Asset.t) =
+  match asset.source with
+  | Asset.Managed (Some version) ->
+    Some
+      { token = "reuse:" ^ G.Uuid.to_string asset.uuid
+      ; asset
+      ; file_type = version.file_type
+      ; presentation = P.Placeholder ""
+      }
+  | _ -> None
+;;
+
+let begin_reuse t ~root =
+  match Hashtbl.find_opt t.groups root, t.generation with
+  | Some g, Some _ when List.length t.queued < 1024 ->
+    g.reference <- None;
+    g.reuse
+    <- Some { pending = true; committing = false; items = []; cursor = None };
+    request_reference t g;
+    notify t g;
+    pump t
+  | _ -> ()
+;;
+
+let reuse_next t ~root =
+  match Hashtbl.find_opt t.groups root with
+  | Some g ->
+    (match g.reference, g.reuse with
+     | Some { page; _ }
+     , Some { pending = false; committing = false; cursor = Some cursor; _ } ->
+       request_candidates t g page (Some cursor);
+       notify t g;
+       pump t
+     | _ -> ())
+  | None -> ()
+;;
+
+let reuse_select t ~root ~asset =
+  match Hashtbl.find_opt t.groups root with
+  | Some g ->
+    (match g.reference, g.reuse with
+     | Some reference, Some { committing = false; _ } ->
+       let candidate_uuid =
+         if String.starts_with ~prefix:"reuse:" asset
+         then String.sub asset 6 (String.length asset - 6)
+         else asset
+       in
+       (match G.Uuid.of_string candidate_uuid, G.Uuid.of_string g.root with
+        | Ok asset_uuid, Ok block ->
+          let request_id = next_request_id t in
+          (match g.reuse with
+           | Some reuse -> reuse.committing <- true
+           | None -> ());
+          enqueue
+            t
+            ~ticket:(Reference_commit { root = g.root; epoch = g.epoch; request_id })
+            ~current:(fun () -> current_group t g && g.reuse <> None)
+            (Service.Graph_request
+               { api_version = 2
+               ; request_id
+               ; command =
+                   Protocol.V2_set_asset_reference
+                     { mutation_id = request_id
+                     ; block
+                     ; previous = reference.previous
+                     ; asset = asset_uuid
+                     ; preconditions =
+                         Protocol.
+                           { blocks = [ block, reference.revision ]
+                           ; pages = []
+                           ; scopes = []
+                           }
+                     }
+               })
+        | _ -> ());
+       notify t g;
+       pump t
+     | _ -> ())
+  | None -> ()
+;;
+
+let end_reuse t ~root =
+  match Hashtbl.find_opt t.groups root with
+  | Some g when g.reuse <> None || g.reference <> None ->
+    g.reuse <- None;
+    g.reference <- None;
+    notify t g;
+    pump t
+  | _ -> ()
+;;
+
+let previous_reference (block : G.block) =
+  List.find_map
+    (fun (property : G.property_summary) ->
+       if String.equal property.ident "logseq.property/asset"
+       then
+         List.find_map
+           (function
+             | G.Asset_value asset -> Some asset
+             | _ -> None)
+           property.values
+       else None)
+    block.properties
+;;
+
 let receive t ticket response =
   (match ticket with
    | Query { root; epoch; request_id } ->
@@ -390,6 +580,82 @@ let receive t ticket response =
            List.iter (fun c -> Hashtbl.replace t.consumers c.consumer (g, c)) controllers
          | _ -> g.error <- Some "Unable to load attachments. Retry.");
         notify t g
+      | _ -> ())
+   | Reference { root; epoch; _ } ->
+     (match Hashtbl.find_opt t.groups root with
+      | Some g when g.epoch = epoch && g.reuse <> None ->
+        (match response with
+         | Service.Graph_response
+             (Protocol.V2_response
+                { outcome =
+                    V2_block_outcome (V2_present_block { value; revision })
+                ; _
+                }) ->
+           let reference =
+             { page = value.block.page
+             ; revision
+             ; previous = previous_reference value.block
+             }
+           in
+           g.reference <- Some reference;
+           request_candidates t g value.block.page None;
+           notify t g
+         | _ ->
+           g.reuse <- None;
+           g.error <- Some "Unable to open the attachment reference. Retry.";
+           notify t g)
+      | _ -> ())
+   | Picker { root; epoch; _ } ->
+     (match Hashtbl.find_opt t.groups root with
+      | Some g when g.epoch = epoch ->
+        (match g.reuse, response with
+         | Some reuse
+         , Service.Graph_response
+             (Protocol.V2_response
+                { outcome = V2_assets_outcome { items; next_cursor; _ }
+                ; _
+                }) ->
+           reuse.items
+           <- List.filteri
+                (fun index _ -> index < 64)
+                (reuse.items
+                 @ List.filter
+                     (fun (incoming : item) ->
+                        not
+                          (List.exists
+                             (fun (existing : item) ->
+                                existing.asset.uuid = incoming.asset.uuid)
+                             reuse.items))
+                     (List.filter_map candidate items));
+           reuse.cursor <- next_cursor;
+           reuse.pending <- false;
+           g.error <- None;
+           notify t g
+         | Some reuse, _ ->
+           reuse.pending <- false;
+           g.reuse <- None;
+           g.error <- Some "Unable to list reusable attachments. Retry.";
+           notify t g
+         | None, _ -> ())
+      | _ -> ())
+   | Reference_commit { root; epoch; _ } ->
+     (match Hashtbl.find_opt t.groups root with
+      | Some g when g.epoch = epoch ->
+        (match g.reuse, response with
+         | Some _
+         , Service.Graph_response
+             (Protocol.V2_response
+                { outcome = V2_mutation_committed _; _ }) ->
+           g.reuse <- None;
+           g.reference <- None;
+           read t g None;
+           notify t g
+         | Some reuse, _ ->
+           reuse.committing <- false;
+           g.reuse <- None;
+           g.error <- Some "Unable to reuse the attachment. Retry.";
+           notify t g
+         | None, _ -> ())
       | _ -> ())
    | Lease { root; epoch; consumer; ticket } ->
      let result =
@@ -451,6 +717,8 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           ; error = None
           ; local = []
           ; controllers = []
+          ; reference = None
+          ; reuse = None
           }
         in
         Hashtbl.add t.groups root g;

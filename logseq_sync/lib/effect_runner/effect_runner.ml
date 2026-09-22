@@ -277,6 +277,14 @@ type key_entry =
   ; bytes : bytes
   }
 
+(* Transfer lanes bound request counts; this shared semaphore bounds the
+   in-flight byte footprint of those lanes. Each admitted download or upload
+   reserves its worst-case wire plus plaintext footprint before buffers are
+   held, in 64 KiB units, so total asset memory stays bounded independently
+   of the lane permits. *)
+let asset_byte_unit = 65536
+let asset_byte_budget_units = 1024
+
 type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
@@ -287,6 +295,7 @@ type t =
   ; asset_download_slots : Eio.Semaphore.t
   ; asset_upload_slots : Eio.Semaphore.t
   ; asset_codec_slot : Eio.Semaphore.t
+  ; asset_byte_budget : Eio.Semaphore.t
   ; secret_lock : Eio.Mutex.t
   ; asset_caches : (Core.graph_scope, Asset_cache.t) Hashtbl.t
   ; mutable closed : bool
@@ -303,6 +312,7 @@ let create ~sw dependencies ~post =
     ; asset_download_slots = Eio.Semaphore.make 3
     ; asset_upload_slots = Eio.Semaphore.make 1
     ; asset_codec_slot = Eio.Semaphore.make 1
+    ; asset_byte_budget = Eio.Semaphore.make asset_byte_budget_units
     ; secret_lock = Eio.Mutex.create ()
     ; asset_caches = Hashtbl.create 4
     ; closed = false
@@ -973,6 +983,29 @@ let with_asset_slot slots work =
   Fun.protect ~finally:(fun () -> Eio.Semaphore.release slots) work
 ;;
 
+let asset_wire_bytes ~maximum_plaintext_bytes encrypted =
+  if encrypted
+  then (4 * ((maximum_plaintext_bytes + 18) / 3)) + 128
+  else maximum_plaintext_bytes
+;;
+
+let with_byte_reservation t bytes work =
+  let units =
+    min
+      asset_byte_budget_units
+      ((max bytes 0 + asset_byte_unit - 1) / asset_byte_unit)
+  in
+  for _ = 1 to units do
+    Eio.Semaphore.acquire t.asset_byte_budget
+  done;
+  Fun.protect
+    ~finally:(fun () ->
+      for _ = 1 to units do
+        Eio.Semaphore.release t.asset_byte_budget
+      done)
+    work
+;;
+
 let fetch_asset_admitted
       t
       ~cache
@@ -1000,9 +1033,7 @@ let fetch_asset_admitted
     in
     let uri = Uri.with_path base_url path in
     let maximum_response_bytes =
-      match graph_key with
-      | None -> maximum_plaintext_bytes
-      | Some _ -> (4 * ((maximum_plaintext_bytes + 18) / 3)) + 128
+      asset_wire_bytes ~maximum_plaintext_bytes (Option.is_some graph_key)
     in
     let last_failure = ref Asset_transfer.Authentication in
     let* response =
@@ -1078,7 +1109,23 @@ let fetch_asset t ~cache ~encryption ~maximum_plaintext_bytes ~current ticket =
     if t.closed || not (current ticket)
     then Error (Asset_transfer.Invalid_content "Asset request expired")
     else
-      fetch_asset_admitted t ~cache ~encryption ~maximum_plaintext_bytes ~current ticket)
+      let encrypted =
+        match encryption with
+        | Plaintext -> false
+        | Encrypted _ -> true
+      in
+      let reservation =
+        asset_wire_bytes ~maximum_plaintext_bytes encrypted
+        + maximum_plaintext_bytes
+      in
+      with_byte_reservation t reservation (fun () ->
+        fetch_asset_admitted
+          t
+          ~cache
+          ~encryption
+          ~maximum_plaintext_bytes
+          ~current
+          ticket))
 ;;
 
 let asset_operation_id (scope : Core.graph_scope) suffix =
@@ -1421,17 +1468,31 @@ let upload_asset_admitted
       | _ -> Error Upload_invalid_content))
 ;;
 
-let upload_asset t ~context ~asset ~version ~source_file ~maximum_plaintext_bytes ~current
-  =
-  with_asset_slot t.asset_upload_slots (fun () ->
-    upload_asset_admitted
+let upload_asset
       t
-      ~context
+      ~(context : Core.asset_context)
       ~asset
       ~version
       ~source_file
       ~maximum_plaintext_bytes
-      ~current)
+      ~current
+  =
+  with_asset_slot t.asset_upload_slots (fun () ->
+    let reservation =
+      asset_wire_bytes
+        ~maximum_plaintext_bytes
+        (context.encrypted && Option.is_some context.key)
+      + maximum_plaintext_bytes
+    in
+    with_byte_reservation t reservation (fun () ->
+      upload_asset_admitted
+        t
+        ~context
+        ~asset
+        ~version
+        ~source_file
+        ~maximum_plaintext_bytes
+        ~current))
 ;;
 
 let staged_asset_path t ~scope ~file =
