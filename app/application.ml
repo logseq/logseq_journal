@@ -227,6 +227,8 @@ type state =
   ; asset_settings_open : bool
   ; media_views : Journal_media_runtime.view Media_views.t
   ; import_completion : (string * string option) option
+  ; pending_replace : string option
+  ; replace_request : int
   ; capture_error : capture_failure option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
@@ -284,6 +286,8 @@ let initial_state =
   ; asset_settings_open = false
   ; media_views = Media_views.empty
   ; import_completion = None
+  ; pending_replace = None
+  ; replace_request = 0
   ; capture_error = None
   ; timeline_notice = None
   ; write_enabled = false
@@ -1514,10 +1518,18 @@ let media_scope state =
 
 let media_label state dispatch ~root child =
   let scope = media_scope state in
+  let editable =
+    state.write_enabled
+    && (match Journal_routes.detail state.routes with
+        | Some detail ->
+          String.equal root (Journal_model.id (Journal_detail.root detail))
+        | None -> false)
+  in
   Journal_media_view.view
     ~scope
     ~root
     ~media:(Media_views.find_opt root state.media_views)
+    ~editable
     ~on_event:(fun payload ->
       Ui.Event.Handler.Private.invoke
         dispatch
@@ -2334,6 +2346,8 @@ let detail_page ~state ~on_scroll_completed dispatch =
                 ~key:(Ui.Key.string (scope ^ "import"))
                 ~enabled:(enabled && Option.is_some detail && not saving)
                 ~completion:state.import_completion
+                ~replacement:state.pending_replace
+                ~request:state.replace_request
                 ~on_select:(fun payload ->
                   Ui.Event.Handler.Private.invoke
                     dispatch
@@ -2838,6 +2852,7 @@ let component ~calendar_sampler client handlers graph =
   let media_worker_requests = Hashtbl.create 16 in
   let media_changes = Hashtbl.create 16 in
   let media_context = ref None in
+  let media_armed = ref None in
   let media_runtime =
     Journal_media_runtime.create
       ~send:(fun ticket request ->
@@ -2849,6 +2864,9 @@ let component ~calendar_sampler client handlers graph =
           true
         | Full | Not_ready | Stopping -> false)
       ~changed:(fun root view -> Hashtbl.replace media_changes root view)
+      ~armed:(fun _root previous ->
+        media_armed
+        := Some (Option.map Logseq_db_types.Graph_types.Uuid.to_string previous))
   in
   let sync_media state =
     let key = media_key state in
@@ -2860,8 +2878,10 @@ let component ~calendar_sampler client handlers graph =
   let flush_media set_state =
     let changes = Hashtbl.to_seq media_changes |> List.of_seq in
     Hashtbl.clear media_changes;
+    let armed = !media_armed in
+    media_armed := None;
     let context = !media_context in
-    if changes = []
+    if changes = [] && armed = None
     then Bonsai.Effect.Ignore
     else
       set_state (fun state ->
@@ -2872,11 +2892,23 @@ let component ~calendar_sampler client handlers graph =
             media_views =
               List.fold_left
                 (fun views (root, (view : Journal_media_runtime.view)) ->
-                   if view.items = [] && view.error = None && not view.more
+                   if
+                     view.items = []
+                     && view.error = None
+                     && (not view.more)
+                     && view.picker = None
                    then Media_views.remove root views
                    else Media_views.add root view views)
                 state.media_views
                 changes
+          ; pending_replace =
+              (match armed with
+               | None -> state.pending_replace
+               | Some previous -> Some (Option.value ~default:"" previous))
+          ; replace_request =
+              (match armed with
+               | None -> state.replace_request
+               | Some _ -> state.replace_request + 1)
           })
   in
   let import_worker_requests = Hashtbl.create 2 in
@@ -4336,7 +4368,7 @@ let component ~calendar_sampler client handlers graph =
             | Cache_reset_confirmation _ -> { state with modal = No_modal })
         | Ui.Event.Payload.Text action ->
           if String.starts_with ~prefix:"media:" action
-          then
+          then (
             Bonsai.Effect.bind
               (Bonsai.Effect.of_thunk (fun () ->
                  sync_media snapshot;
@@ -4361,33 +4393,50 @@ let component ~calendar_sampler client handlers graph =
                    | "retry" ->
                      Journal_media_runtime.retry media_runtime ~root ~asset:(text "asset")
                    | "next" -> Journal_media_runtime.next media_runtime ~root
+                   | "replace" -> Journal_media_runtime.begin_replace media_runtime ~root
+                   | "reuse" -> Journal_media_runtime.begin_reuse media_runtime ~root
+                   | "reuse-select" ->
+                     Journal_media_runtime.reuse_select
+                       media_runtime
+                       ~root
+                       ~asset:(text "asset")
+                   | "reuse-next" -> Journal_media_runtime.reuse_next media_runtime ~root
+                   | "reuse-cancel" ->
+                     Journal_media_runtime.end_reuse media_runtime ~root
                    | _ -> ()
                  with
                  | _ -> ()))
-              ~f:(fun () -> flush_media set_state)
+              ~f:(fun () -> flush_media set_state))
           else if String.starts_with ~prefix:"import-asset:" action
           then (
-            match Journal_routes.detail snapshot.routes with
-            | None -> Bonsai.Effect.Ignore
-            | Some detail ->
-              let target =
-                Logseq_db_types.Graph_types.Uuid.of_string
-                  (Journal_model.id (Journal_detail.root detail))
-              in
-              let source =
-                Result.bind target (fun target ->
-                  Journal_asset_import.decode
-                    ~target
-                    (String.sub action 13 (String.length action - 13)))
-              in
-              (match source with
-               | Error _ -> Bonsai.Effect.Ignore
-               | Ok source ->
-                 let operation =
-                   Logseq_db_types.Graph_types.Uuid.to_string source.operation
-                 in
-                 let graph_generation = snapshot.graph_state.generation in
-                 Bonsai.Effect.bind
+            let import_payload =
+              String.sub action 13 (String.length action - 13)
+            in
+            if Journal_asset_import.is_dismissal import_payload
+            then update (fun state -> { state with pending_replace = None })
+            else
+              match Journal_routes.detail snapshot.routes with
+              | None -> Bonsai.Effect.Ignore
+              | Some detail ->
+                let target =
+                  Logseq_db_types.Graph_types.Uuid.of_string
+                    (Journal_model.id (Journal_detail.root detail))
+                in
+                let source =
+                  Result.bind target (fun target ->
+                    Journal_asset_import.decode ~target import_payload)
+                in
+                (match source with
+                 | Error _ ->
+                   update (fun state -> { state with pending_replace = None })
+                 | Ok source ->
+                   let operation =
+                     Logseq_db_types.Graph_types.Uuid.to_string source.operation
+                   in
+                   let graph_generation = snapshot.graph_state.generation in
+                   Bonsai.Effect.Many
+                     [ update (fun state -> { state with pending_replace = None })
+                     ; Bonsai.Effect.bind
                    (Bonsai.Effect.of_thunk (fun () ->
                       if not snapshot.write_enabled
                       then Some "The destination is not ready for imports"
@@ -4409,7 +4458,7 @@ let component ~calendar_sampler client handlers graph =
                      | None -> Bonsai.Effect.Ignore
                      | Some message ->
                        update (fun state ->
-                         { state with import_completion = Some (operation, Some message) }))))
+                         { state with import_completion = Some (operation, Some message) }))]))
           else if String.length action > 13 && String.sub action 0 13 = "select-graph:"
           then (
             let graph_id = String.sub action 13 (String.length action - 13) in

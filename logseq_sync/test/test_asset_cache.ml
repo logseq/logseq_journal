@@ -129,6 +129,37 @@ let leases () =
     S.close cache)
 ;;
 
+let filename_extension () =
+  fixture (fun root ->
+    let cache = create root in
+    let handle = get (put cache "file") in
+    let path = Option.get (S.path cache handle) in
+    bool "downloaded file carries its type" true (Filename.check_suffix path ".png");
+    S.release cache handle;
+    S.close cache;
+    let cache = create root in
+    let handle = Option.get (lookup cache "file") in
+    let path = Option.get (S.path cache handle) in
+    bool "restart preserves typed filename" true (Filename.check_suffix path ".png");
+    S.release cache handle;
+    S.close cache)
+;;
+
+let legacy_bin_cleanup () =
+  fixture (fun root ->
+    let cache = create root in
+    let handle = get (put cache "file") in
+    let path = Option.get (S.path cache handle) in
+    let legacy = Filename.chop_extension path ^ ".bin" in
+    Sys.rename path legacy;
+    S.release cache handle;
+    S.close cache;
+    let cache = create root in
+    bool "untyped data file evicted" false (Sys.file_exists legacy);
+    bool "manifest without typed data removed" false (exists cache "file");
+    S.close cache)
+;;
+
 let isolation () =
   fixture (fun root ->
     let first = create root in
@@ -469,6 +500,8 @@ let () =
           ; "staging limits", staging_bounds
           ; "graph cleanup", graph_cleanup
           ; "account cleanup", account_cleanup
+          ; "downloaded filename", filename_extension
+          ; "legacy bin cleanup", legacy_bin_cleanup
           ; "restart", roundtrip
           ; "corruption", corrupt
           ; "atomic eligibility", stale

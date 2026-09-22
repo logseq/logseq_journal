@@ -145,7 +145,9 @@ type asset_encryption =
     A runner admits at most three binary downloads, including response decoding
     and publication, across all graph scopes. Cache-only checks bypass this gate.
     GET decoding/publication and PUT source reading/encoding share one codec permit;
-    network requests retain their independent transfer permits. *)
+    network requests retain their independent transfer permits. Every admitted
+    transfer also reserves its worst-case wire plus plaintext footprint against one
+    shared 64 MiB byte budget, bounding total in-flight asset memory across lanes. *)
 val submit_asset
   :  t
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
@@ -198,7 +200,9 @@ type upload_failure =
 (** Upload an explicit, immutable staged file. Graph publication belongs to the worker.
     A runner reserves one upload permit alongside its three download permits.
     Admission precedes source reads and encoding; cancellation or failure releases
-    the permit. Waiting callers must supply a live [current] predicate. *)
+    the permit. The upload reserves its wire plus plaintext footprint against the
+    shared 64 MiB byte budget before encoding. Waiting callers must supply a live
+    [current] predicate. *)
 val upload_asset
   :  t
   -> context:Logseq_sync_pure_reducer.Core.asset_context

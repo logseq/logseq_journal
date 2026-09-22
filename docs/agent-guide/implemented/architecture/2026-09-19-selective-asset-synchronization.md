@@ -437,20 +437,75 @@ Implemented foundations:
   remain available, but native rows currently do not initiate media discovery or
   foreground download. Background recent-journal/Favorites demand is independent.
 
+- Downloaded remote cache filenames are now audited and fixed. The asset cache
+  records each version's validated `file_type` and stores payloads as
+  `<checksum>.<file_type>`, so deferred remote presentation hands native viewers
+  a correctly suffixed path, matching the staged-import filename fix. Legacy
+  `.bin` payloads are evicted on cache open. Filesystem tests cover extension
+  naming and legacy cleanup.
+
+- Binary transfers now share a bounded byte budget in addition to the lane and
+  codec semaphores. Each admitted download or upload reserves its worst-case
+  wire-plus-plaintext footprint in 64 KiB units against a shared 64 MiB budget,
+  so the transfer lanes bound request counts while the semaphore bounds
+  in-flight bytes. Reservation sits inside the lane slot and shares the codec
+  permit ordering, so no new deadlock order exists. A public runner test
+  observes the three download slots admit only two concurrent 16 MiB
+  reservations under the budget and admits the rest after release.
+
+- Binary replacement and reuse-existing-reference flows are now wired to native
+  UI. The detail media group exposes a native `Menu` with "Replace file…" and
+  "Reuse existing…" when the group is the editable detail root. Replace first
+  reads the holder block through the worker (`V2_get_block`) and arms the
+  import picker with the holder's current asset reference — the durable import
+  intent's `replace_reference` must equal the reference the holder currently
+  carries, because the commit rejects the whole mutation on a stale expected
+  value — and picker dismissal clears the armed state. A holder with no current
+  asset reference arms the picker with no expected reference, degrading to a
+  plain import. Reuse reads the holder block through the worker for its page
+  and expected reference, enumerates managed assets under that page through
+  `V2_list_assets {recursive}`, and commits `V2_set_asset_reference` with the
+  holder's block-revision precondition; a successful commit re-queries the group
+  through the ordinary completion path. Media-runtime boundary tests cover
+  holder lookup, page-scoped candidate enumeration, atomic repointing with the
+  exact previous reference, and picker teardown.
+
+- Representative native UI verification is now complete on the adhoc-signed
+  iOS Simulator against graph `ocaml-sync-test` (lldb-traced): the
+  `journal-media-actions` menu exposes Replace file… and Reuse existing… on the
+  editable detail-root group, Attach shows the staged local preview
+  immediately, Reuse enumerates/selects/cancels candidates and commits
+  `V2_set_asset_reference`, and cached filenames carry the real extension.
+  The run exposed and fixed three iOS defects: `URL.path` binding the
+  `path(percentEncoded:)` method reference crashed every pick; the replace
+  auto-present guard dropped the armed request; iOS `fileImporter` never
+  invokes its completion on cancel, so closing an armed picker is now
+  detected and reported as dismissal. Follow-up verification exposed
+  three more: the armed replace picker sent the attachment holder's uuid
+  as `replaceReference`, so the local commit rejected the mutation as a
+  stale expected reference and the upload failed non-retryably — the
+  runtime now resolves the holder's current asset reference
+  (`Entity_value` under `logseq.property/asset`, the variant
+  `asset_reference_matches` requires) through `V2_get_block` before
+  arming; the reference reader previously matched `Asset_value`, which the
+  store never writes, so reuse-select's `previous` fence was always
+  `None` and `set_asset_reference` rejected on referenced holders; and
+  media groups only registered through the import-completion path, so
+  replace/reuse actions were inert on cold-open detail views — menu
+  actions now lazily register the group through the ordinary
+  root-visibility path. Media-runtime tests cover arming with the
+  expected previous reference and cold-open lazy registration. macOS
+  interactive sign-in remains environment-blocked (-34018 keychain
+  entitlement; no development
+  certificate on the verification machine) — iOS is the representative path
+  since the widget and runtime code are shared. Deployed server import
+  limits remain unverified (no live-server access); code-level caps are
+  verified — the application admits 8 MiB files, the runner rejects PUTs
+  above 100 MiB, and encrypted envelope overhead is fixture-verified.
+
 Remaining delivery work:
 
-- Audit and complete binary replacement and reuse-existing-reference flows; the
-  current native picker exposes only Attach file.
-- Verify the connected local import preview in representative native UI flows.
-- The configurable background policy and offline completeness are connected.
-  Native automatic visible demand is explicitly
-  deferred by the user; do not reintroduce a visibility workaround without approval.
-  Day-rollover delivery is connected separately from foreground calendar refresh.
-- Finish representative native local-preview acceptance checks.
-- Finish shared byte/decode accounting under the now-bounded transfer lanes.
-  Verify deployed import limits; encrypted envelope overhead is fixture-verified.
-- Complete representative native UI verification, then audit every acceptance
-  criterion before lifecycle transition.
+- Audit every acceptance criterion and complete the lifecycle transition.
 
 Real asset E2EE interoperability now passes in both directions. The native lane
 executes the unchanged upstream crypt namespace with WebCrypto, the standard
@@ -737,6 +792,34 @@ The existing upload phase machine remains unchanged and uses this atomic local
 mutation before PUT. Native replacement/reuse UI and its end-to-end acceptance
 remain outstanding.
 
+## Decision
+
+Implement selective asset synchronization as proposed. The application owns the
+download-demand policy — N recent journal days (default 7, configurable, zero
+disables) plus complete Favorites subtrees without recursive ordinary-link
+expansion — delivered through the sync package's explicit demand protocol rather
+than in-view downloads. Metadata synchronization stays comprehensive; binary
+transfers run only for admitted demand.
+
+Binary transfers admit through bounded lanes: three download slots, one upload
+slot, one codec permit, and a shared 64 MiB byte budget reserving each
+transfer's worst-case wire-plus-plaintext footprint. The staging and download
+caches keep real file extensions, preview leases survive upload completion, and
+orphan reconciliation runs before each import or recovery page.
+
+Attachments are `logseq.class/Asset` children of their holder block, referenced
+by the holder's single-valued `logseq.property/asset`. Upload stages locally,
+imports atomically create the asset entity and redirect the reference inside one
+transaction, and the durable import intent carries the expected previous
+reference for replacement. `set_asset_reference` repoints a holder to an
+existing asset under the ordinary revision preconditions; native UI exposes
+Attach, Replace, and Reuse flows on the editable detail-root media group.
+
+Native automatic visible-attachment demand is deferred by explicit user
+decision: no scroll-visibility workaround or custom AppKit/UIKit coordination
+was added. Remote garbage collection and destructive asset deletion remain out
+of scope, and no server-CAS claims are made.
+
 ## Alternatives considered
 
 ### Download all missing files after bootstrap
@@ -791,3 +874,32 @@ adjustment above. All other clauses remain required for this delivery.
   verification before promising large-file support or resumable downloads.
 - OS background execution is limited. Prefetch initially runs while the app can
   execute and resumes later; this is not a promise of perpetual background work.
+
+## Consequences
+
+- All binary traffic now travels through admitted, bounded lanes. Concurrent
+  transfers can no longer exceed the shared byte budget even when lane slots
+  would admit them, and a single oversized operation reserves the whole budget
+  rather than deadlocking.
+- Downloaded and staged cache payloads carry real file extensions, so native
+  viewers classify deferred and previewed files correctly; legacy `.bin`
+  payloads are evicted on cache open rather than migrated.
+- Attachment references can be repointed atomically from native UI. Replace
+  flows reuse the durable import intent so a crash mid-replacement cannot
+  strand a half-updated holder, and Reuse commits through the ordinary
+  mutation machinery with previous-reference and block-revision fences.
+- The editable detail-root media group now exposes replace/reuse actions; the
+  menu appears only where the import target is current, keeping foreign or
+  read-only surfaces inert.
+- Native automatic visible-attachment demand remains undelivered by explicit
+  decision. Rows still initiate media discovery through the explicit query
+  path; scroll-driven foreground demand requires revisiting that decision with
+  a sanctioned visibility mechanism.
+- Deployed server-side import limits are unverified; the application's 8 MiB
+  file cap, the runner's 100 MiB PUT rejection, and the encrypted-envelope
+  overhead are the only verified bounds.
+- Representative native verification ran on iOS Simulator; macOS interactive
+  sign-in needs a development certificate unavailable on the verification
+  machine. The verified widget/runtime code is shared across platforms, but
+  macOS-specific behavior (e.g. fileImporter cancel semantics there) has not
+  been exercised end to end.

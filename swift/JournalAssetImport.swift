@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
     let enabled: Bool
     let completion: String?
     let error: String?
+    let replace: String?
+    let request: Int
   }
 
   @Observable final class Selection {
@@ -33,7 +35,16 @@ import UniformTypeIdentifiers
   private struct ImportButton: View {
     let context: BonsaiNativeContext<Properties, Data, Selection>
     @State private var presented = false
+    @State private var handled = false
     @State private var error: String?
+
+    private func emitDismissed() {
+      guard !handled,
+        let data = try? JSONSerialization.data(withJSONObject: ["action": "dismissed"])
+      else { return }
+      handled = true
+      _ = context.emit(data)
+    }
 
     var body: some View {
       Button {
@@ -47,27 +58,45 @@ import UniformTypeIdentifiers
       .fileImporter(isPresented: $presented, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
         guard context.canInteract() else { return }
         do {
-          guard let source = try result.get().first else { return }
+          guard let source = try result.get().first else {
+            if context.properties.replace != nil { emitDismissed() }
+            return
+          }
+          handled = true
           let operation = UUID().uuidString.lowercased()
           context.resource.retain(source, operation: operation)
           let extensionName = source.pathExtension.lowercased()
           let payload = try JSONSerialization.data(withJSONObject: [
             "operation": operation, "asset": UUID().uuidString.lowercased(),
             "localMutation": UUID().uuidString.lowercased(), "metadataMutation": UUID().uuidString.lowercased(),
-            "path": source.path, "title": source.lastPathComponent,
-            "replaceReference": NSNull(),
+            "path": source.path(percentEncoded: false), "title": source.lastPathComponent,
+            "replaceReference": context.properties.replace ?? NSNull(),
             "type": extensionName.isEmpty ? "bin" : extensionName,
-          ])
+          ] as [String: Any])
           if !context.emit(payload) {
             context.resource.release()
             error = "The destination is no longer available. Select the file again."
           }
         } catch {
           context.resource.release()
-          if (error as NSError).code != NSUserCancelledError {
+          if (error as NSError).code == NSUserCancelledError {
+            if context.properties.replace != nil { emitDismissed() }
+          } else {
             self.error = "Unable to access the selected file. Please try again."
           }
         }
+      }
+      .onChange(of: presented) { _, isPresented in
+        if isPresented {
+          handled = false
+        } else if context.properties.replace != nil {
+          // iOS never invokes the fileImporter completion on Cancel, so treat
+          // closing an armed picker without a pick as a dismissal.
+          emitDismissed()
+        }
+      }
+      .onChange(of: context.properties.request) { _, _ in
+        if context.properties.replace != nil { presented = true }
       }
       .onChange(of: context.properties.completion) { _, operation in
         guard let operation, operation == context.resource.operation else { return }

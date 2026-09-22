@@ -34,10 +34,17 @@ private actor JournalMediaDecoder {
     let height: Int
     var isImage: Bool { ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "avif"].contains(type) }
   }
+  struct Picker: Decodable {
+    let items: [Item]
+    let more: Bool
+    let busy: Bool
+  }
   struct Properties: Decodable {
     let root: String
     let items: [Item]
     let more: Bool
+    let editable: Bool
+    let picker: Picker?
     let error: String?
   }
   private struct MediaItem: View {
@@ -104,8 +111,40 @@ private actor JournalMediaDecoder {
     }
     var body: some View {
       VStack(alignment: .leading, spacing: 8) {
-        context.children[0]
+        HStack(alignment: .top) {
+          context.children[0]
+          Spacer(minLength: 8)
+          if context.properties.editable {
+            Menu {
+              Button("Replace file\u{2026}") { emit("replace") }
+              Button("Reuse existing\u{2026}") { emit("reuse") }
+            } label: {
+              Label("Attachment actions", systemImage: "ellipsis.circle")
+                .labelStyle(.iconOnly)
+            }
+            .menuIndicator(.hidden)
+            .accessibilityIdentifier("journal-media-actions")
+          }
+        }
         ForEach(context.properties.items) { item in MediaItem(item: item, emit: emit) }
+        if let picker = context.properties.picker {
+          if picker.busy, picker.items.isEmpty {
+            ProgressView("Loading attachments").font(.caption)
+          }
+          ForEach(picker.items) { item in
+            Button { emit("reuse-select", item.id) } label: {
+              Label(item.type.isEmpty ? "file" : item.type, systemImage: "doc")
+            }
+            .disabled(picker.busy)
+            .accessibilityIdentifier("journal-media-candidate:" + item.id)
+          }
+          if picker.more {
+            Button("More attachments") { emit("reuse-next") }
+              .disabled(picker.busy)
+          }
+          Button("Cancel", role: .cancel) { emit("reuse-cancel") }
+            .font(.caption)
+        }
         if let error = context.properties.error {
           Text(error).font(.caption).foregroundStyle(.secondary)
           Button("Retry attachments") { emit("retry") }
