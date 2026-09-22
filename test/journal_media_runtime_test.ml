@@ -13,12 +13,14 @@ let uuid n =
 let () =
   let sent = Queue.create () in
   let views = Hashtbl.create 2 in
+  let armed = ref [] in
   let runtime =
     R.create
       ~send:(fun ticket request ->
         Queue.add (ticket, request) sent;
         true)
       ~changed:(Hashtbl.replace views)
+      ~armed:(fun root previous -> armed := (root, previous) :: !armed)
   in
   R.reset runtime ~graph_generation:(Some 1);
   let root = G.Uuid.to_string (uuid 1) in
@@ -296,5 +298,46 @@ let () =
   R.end_reuse runtime ~root;
   check
     ((Hashtbl.find views root).picker = None)
-    "closing the picker clears candidate state"
+    "closing the picker clears candidate state";
+  check (!armed = []) "reuse must not arm the replacement picker";
+  R.begin_replace runtime ~root;
+  let token, request = Queue.take sent in
+  let replace_query =
+    match request with
+    | S.Graph_request
+        ({ command = P.V2_get_block { block; revision = None }; _ } as query)
+      when block = uuid 1 -> query
+    | _ -> failwith "replace must read the attachment holder before arming"
+  in
+  R.receive
+    runtime
+    (Option.get token)
+    (Graph_response
+       (P.V2_response
+          { api_version = 2
+          ; request_id = replace_query.request_id
+          ; outcome =
+              V2_block_outcome
+                (V2_present_block
+                   { value =
+                       { block = holder
+                       ; task_status = None
+                       ; rendered_page_title = "page"
+                       }
+                   ; revision = "r8"
+                   })
+          }));
+  (match !armed with
+   | [ (armed_root, Some previous) ]
+     when armed_root = root && previous = uuid 2 -> ()
+   | _ -> failwith "replace must arm the picker with the current asset reference");
+  R.begin_replace runtime ~root;
+  let token, _ = Queue.take sent in
+  R.receive runtime (Option.get token) S.Client_command_completed;
+  check
+    (List.length !armed = 1)
+    "a failed holder read must not arm the replacement picker";
+  check
+    ((Hashtbl.find views root).error <> None)
+    "a failed holder read surfaces a retryable error"
 ;;

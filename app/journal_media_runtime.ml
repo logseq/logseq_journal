@@ -25,6 +25,11 @@ type ticket =
       ; epoch : int
       ; request_id : G.Uuid.t
       }
+  | Replace_reference of
+      { root : string
+      ; epoch : int
+      ; request_id : G.Uuid.t
+      }
   | Lease of
       { root : string
       ; epoch : int
@@ -83,6 +88,7 @@ type group =
   ; mutable controllers : controller list
   ; mutable reference : reference option
   ; mutable reuse : reuse option
+  ; mutable replace : bool
   }
 
 type outgoing =
@@ -94,6 +100,7 @@ type outgoing =
 type t =
   { send : ticket option -> Service.request -> bool
   ; changed : string -> view -> unit
+  ; armed : string -> G.Uuid.t option -> unit
   ; groups : (string, group) Hashtbl.t
   ; consumers : (string, group * controller) Hashtbl.t
   ; mutable generation : int option
@@ -101,9 +108,10 @@ type t =
   ; mutable queued : outgoing list
   }
 
-let create ~send ~changed =
+let create ~send ~changed ~armed =
   { send
   ; changed
+  ; armed
   ; groups = Hashtbl.create 16
   ; consumers = Hashtbl.create 32
   ; generation = None
@@ -298,6 +306,7 @@ let root_visible t ~root visible =
   match Hashtbl.find_opt t.groups root, visible, t.generation with
   | Some g, false, _ ->
     g.visible <- false;
+    g.replace <- false;
     List.iter
       (fun c ->
          c.shown <- false;
@@ -335,6 +344,7 @@ let root_visible t ~root visible =
          ; controllers = []
          ; reference = None
          ; reuse = None
+         ; replace = false
          }
        in
        Hashtbl.add t.groups root g;
@@ -412,6 +422,30 @@ let request_reference t g =
          ; request_id
          ; command = Protocol.V2_get_block { block; revision = None }
          })
+;;
+
+let begin_replace t ~root =
+  match Hashtbl.find_opt t.groups root, t.generation with
+  | Some g, Some _ when (not g.replace) && List.length t.queued < 1024 ->
+    (match G.Uuid.of_string g.root with
+     | Error _ ->
+       g.error <- Some "The attachment holder is unavailable."
+     | Ok block ->
+       g.replace <- true;
+       g.error <- None;
+       let request_id = next_request_id t in
+       enqueue
+         t
+         ~ticket:(Replace_reference { root = g.root; epoch = g.epoch; request_id })
+         ~current:(fun () -> current_group t g && g.replace)
+         (Service.Graph_request
+            { api_version = 2
+            ; request_id
+            ; command = Protocol.V2_get_block { block; revision = None }
+            }));
+    notify t g;
+    pump t
+  | _ -> ()
 ;;
 
 let request_candidates t g page cursor =
@@ -638,6 +672,21 @@ let receive t ticket response =
            notify t g
          | None, _ -> ())
       | _ -> ())
+   | Replace_reference { root; epoch; _ } ->
+     (match Hashtbl.find_opt t.groups root with
+      | Some g when g.epoch = epoch && g.replace ->
+        g.replace <- false;
+        (match response with
+         | Service.Graph_response
+             (Protocol.V2_response
+                { outcome =
+                    V2_block_outcome (V2_present_block { value; _ })
+                ; _
+                }) ->
+           t.armed g.root (previous_reference value.block)
+         | _ -> g.error <- Some "Unable to open the attachment reference. Retry.");
+        notify t g
+      | _ -> ())
    | Reference_commit { root; epoch; _ } ->
      (match Hashtbl.find_opt t.groups root with
       | Some g when g.epoch = epoch ->
@@ -719,6 +768,7 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           ; controllers = []
           ; reference = None
           ; reuse = None
+          ; replace = false
           }
         in
         Hashtbl.add t.groups root g;
@@ -747,7 +797,8 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
       else (
         g.local <- (retained @ if receipt.preview = None then [] else [ receipt ]);
         if receipt.preview = None
-        then g.error <- Some "Local attachment preview unavailable");
+        then g.error <- Some "Local attachment preview unavailable";
+        if g.visible && g.pending = None then read t g None);
       notify t g);
   pump t
 ;;

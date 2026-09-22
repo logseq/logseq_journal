@@ -455,10 +455,14 @@ Implemented foundations:
 
 - Binary replacement and reuse-existing-reference flows are now wired to native
   UI. The detail media group exposes a native `Menu` with "Replace file…" and
-  "Reuse existing…" when the group is the editable detail root. Replace arms the
-  existing import picker with the replacement target — the durable import intent
-  already carries the expected previous reference — and picker dismissal clears
-  the armed state. Reuse reads the holder block through the worker for its page
+  "Reuse existing…" when the group is the editable detail root. Replace first
+  reads the holder block through the worker (`V2_get_block`) and arms the
+  import picker with the holder's current asset reference — the durable import
+  intent's `replace_reference` must equal the reference the holder currently
+  carries, because the commit rejects the whole mutation on a stale expected
+  value — and picker dismissal clears the armed state. A holder with no current
+  asset reference arms the picker with no expected reference, degrading to a
+  plain import. Reuse reads the holder block through the worker for its page
   and expected reference, enumerates managed assets under that page through
   `V2_list_assets {recursive}`, and commits `V2_set_asset_reference` with the
   holder's block-revision precondition; a successful commit re-queries the group
@@ -476,8 +480,14 @@ Implemented foundations:
   `path(percentEncoded:)` method reference crashed every pick; the replace
   auto-present guard dropped the armed request; iOS `fileImporter` never
   invokes its completion on cancel, so closing an armed picker is now
-  detected and reported as dismissal. macOS interactive sign-in remains
-  environment-blocked (-34018 keychain entitlement; no development
+  detected and reported as dismissal. Follow-up verification exposed a
+  fourth: the armed replace picker sent the attachment holder's uuid as
+  `replaceReference`, so the local commit rejected the mutation as a stale
+  expected reference and the upload failed non-retryably — the runtime now
+  resolves the holder's current asset reference before arming, and the
+  media-runtime test covers arming with the expected previous reference.
+  macOS interactive sign-in remains environment-blocked (-34018 keychain
+  entitlement; no development
   certificate on the verification machine) — iOS is the representative path
   since the widget and runtime code are shared. Deployed server import
   limits remain unverified (no live-server access); code-level caps are

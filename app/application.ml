@@ -2852,6 +2852,7 @@ let component ~calendar_sampler client handlers graph =
   let media_worker_requests = Hashtbl.create 16 in
   let media_changes = Hashtbl.create 16 in
   let media_context = ref None in
+  let media_armed = ref None in
   let media_runtime =
     Journal_media_runtime.create
       ~send:(fun ticket request ->
@@ -2863,6 +2864,9 @@ let component ~calendar_sampler client handlers graph =
           true
         | Full | Not_ready | Stopping -> false)
       ~changed:(fun root view -> Hashtbl.replace media_changes root view)
+      ~armed:(fun _root previous ->
+        media_armed
+        := Some (Option.map Logseq_db_types.Graph_types.Uuid.to_string previous))
   in
   let sync_media state =
     let key = media_key state in
@@ -2874,8 +2878,10 @@ let component ~calendar_sampler client handlers graph =
   let flush_media set_state =
     let changes = Hashtbl.to_seq media_changes |> List.of_seq in
     Hashtbl.clear media_changes;
+    let armed = !media_armed in
+    media_armed := None;
     let context = !media_context in
-    if changes = []
+    if changes = [] && armed = None
     then Bonsai.Effect.Ignore
     else
       set_state (fun state ->
@@ -2895,6 +2901,14 @@ let component ~calendar_sampler client handlers graph =
                    else Media_views.add root view views)
                 state.media_views
                 changes
+          ; pending_replace =
+              (match armed with
+               | None -> state.pending_replace
+               | Some previous -> Some (Option.value ~default:"" previous))
+          ; replace_request =
+              (match armed with
+               | None -> state.replace_request
+               | Some _ -> state.replace_request + 1)
           })
   in
   let import_worker_requests = Hashtbl.create 2 in
@@ -4355,7 +4369,6 @@ let component ~calendar_sampler client handlers graph =
         | Ui.Event.Payload.Text action ->
           if String.starts_with ~prefix:"media:" action
           then (
-            let armed = ref None in
             Bonsai.Effect.bind
               (Bonsai.Effect.of_thunk (fun () ->
                  sync_media snapshot;
@@ -4380,7 +4393,7 @@ let component ~calendar_sampler client handlers graph =
                    | "retry" ->
                      Journal_media_runtime.retry media_runtime ~root ~asset:(text "asset")
                    | "next" -> Journal_media_runtime.next media_runtime ~root
-                   | "replace" -> armed := Some root
+                   | "replace" -> Journal_media_runtime.begin_replace media_runtime ~root
                    | "reuse" -> Journal_media_runtime.begin_reuse media_runtime ~root
                    | "reuse-select" ->
                      Journal_media_runtime.reuse_select
@@ -4393,18 +4406,7 @@ let component ~calendar_sampler client handlers graph =
                    | _ -> ()
                  with
                  | _ -> ()))
-              ~f:(fun () ->
-                match !armed with
-                | Some root ->
-                  Bonsai.Effect.Many
-                    [ flush_media set_state
-                    ; update (fun state ->
-                        { state with
-                          pending_replace = Some root
-                        ; replace_request = state.replace_request + 1
-                        })
-                    ]
-                | None -> flush_media set_state))
+              ~f:(fun () -> flush_media set_state))
           else if String.starts_with ~prefix:"import-asset:" action
           then (
             let import_payload =

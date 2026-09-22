@@ -28,6 +28,7 @@ type t
 val create
   :  send:(ticket option -> Service.request -> bool)
   -> changed:(string -> view -> unit)
+  -> armed:(string -> Logseq_db_types.Graph_types.Uuid.t option -> unit)
   -> t
 
 val reset : t -> graph_generation:int option -> unit
@@ -35,6 +36,7 @@ val root_visible : t -> root:string -> bool -> unit
 val asset_visible : t -> root:string -> asset:string -> bool -> unit
 val next : t -> root:string -> unit
 val retry : t -> root:string -> asset:string -> unit
+val begin_replace : t -> root:string -> unit
 val begin_reuse : t -> root:string -> unit
 val reuse_next : t -> root:string -> unit
 val reuse_select : t -> root:string -> asset:string -> unit

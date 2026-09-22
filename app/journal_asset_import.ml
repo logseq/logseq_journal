@@ -22,7 +22,7 @@ let decode ~target payload =
       match json with
       | `Assoc fields ->
         (match List.assoc_opt "replaceReference" fields with
-         | Some `Null -> Ok None
+         | Some `Null | Some (`String "") -> Ok None
          | Some (`String id) -> Result.map Option.some (Uuid.of_string id)
          | _ -> Error "Invalid replacement reference")
       | _ -> Error "Invalid attachment selection"
