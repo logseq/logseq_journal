@@ -150,6 +150,7 @@ depends: [
   "num" {= "1.6"}
   "ocaml" {= "5.1.1"}
   "ocaml-ios64" {= "5.1.1"}
+  "ocaml-ios64-simulator" {= "5.1.1"}
   "ocaml-base-compiler" {= "5.1.1"}
   "ocaml-compiler-libs" {= "v0.12.4"}
   "ocaml-config" {= "3"}
