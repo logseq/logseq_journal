@@ -5,7 +5,7 @@ module Sync = Logseq_sync_pure_reducer.Core
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 module Protocol = Db.Protocol
 module Overlay = Logseq_overlay_db.Database
-module ID = Bonsai_flutter_spec.Id
+module ID = Bonsai_swiftui_spec.Id
 
 type graph_id = Logseq_db_types.Graph_types.Uuid.t
 type graph = Logseq_db_types.Managed_graph.t
@@ -163,13 +163,92 @@ type client_command =
   | Delete_local_cache of Sync.graph_id
   | Set_foreground of bool
 
+module Asset = struct
+  type priority = Logseq_sync_pure_reducer.Asset_transfer.priority =
+    | Foreground
+    | Background
+
+  type failure = Logseq_sync_pure_reducer.Asset_transfer.failure =
+    | Network
+    | Not_found
+    | Checksum_mismatch
+    | Authentication
+    | Locked
+    | Storage_full
+    | Invalid_content of string
+
+  type availability = Logseq_sync_pure_reducer.Asset_transfer.availability =
+    | Queued
+    | Downloading
+    | Ready of string
+    | Waiting_remote
+    | Waiting_network
+    | Waiting_unlock
+    | Failed of
+        { failure : failure
+        ; attempts : int
+        ; retry_scheduled : bool
+        }
+end
+
+type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
+
+type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
+  | Asset_availability of
+      { consumer : string
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      }
+  | Asset_demand_accepted of string
+  | Asset_backpressure of string
+  | Asset_capacity_available
+  | Upload_status of
+      { operation : Logseq_db_types.Graph_types.Uuid.t
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; target : Logseq_db_types.Graph_types.Uuid.t
+      ; title : string
+      ; status : Logseq_db_worker_pure_reducer.Asset_upload.status
+      }
+
+type asset_command =
+  | Replace_asset_demand of
+      { consumer : string
+      ; priority : Logseq_sync_pure_reducer.Asset_transfer.priority
+      ; assets : Logseq_db_types.Asset_descriptor.t list
+      }
+  | Release_asset_demand of string
+  | Retry_asset of Logseq_db_types.Graph_types.Uuid.t
+  | Retry_upload of Logseq_db_types.Graph_types.Uuid.t
+
 type request =
+  | Import_asset of
+      { graph_generation : int
+      ; source : Logseq_db_types.Asset_import.t
+      }
   | Client_command of client_command
   | Graph_request of Protocol.request
   | Get_graph_state
+  | Asset_command of
+      { graph_generation : int
+      ; command : asset_command
+      }
+  | Acquire_imported_file of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; operation : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Acquire_asset_file of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; handle : string
+      }
+  | Release_asset_file of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; handle : string
+      }
 
 type response =
+  | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
+  | Asset_file of (string * string) option
   | Graph_response of Protocol.response
   | Graph_state of Db.graph_state
 
@@ -179,12 +258,16 @@ type push =
   | Need_id_token of token_request
   | Bootstrap_progress of bootstrap_progress
   | Graph_state_changed of Db.graph_state
+  | Asset_notice of
+      Logseq_sync_pure_reducer.Core.graph_scope
+      * Logseq_db_worker_pure_reducer.Core.asset_notice
 
 let invalidation_topic = ID.Worker.Push_topic.of_int 0
 let manager_topic = ID.Worker.Push_topic.of_int 1
 let auth_topic = ID.Worker.Push_topic.of_int 2
 let bootstrap_topic = ID.Worker.Push_topic.of_int 3
 let graph_state_topic = ID.Worker.Push_topic.of_int 4
+let asset_topic = ID.Worker.Push_topic.of_int 5
 
 type dependencies =
   { overlay : Overlay.dependencies
@@ -223,6 +306,8 @@ let production_dependencies () =
 ;;
 
 let publish context = function
+  | Pure.Asset_notice (scope, notice) ->
+    Worker.Session_context.emit context ~topic:asset_topic (Asset_notice (scope, notice))
   | Pure.Reply _ -> ()
   | Graph_push push ->
     Worker.Session_context.emit context ~topic:invalidation_topic (Graph_push push)
@@ -336,7 +421,7 @@ let create ~(dependencies : dependencies) =
   end
   in
   Worker.Service.create
-    ~push_topic_count:5
+    ~push_topic_count:6
     ~concurrency:(Worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
     ~init:(fun context config ->
@@ -375,6 +460,44 @@ let create ~(dependencies : dependencies) =
                    Ok
                      ( sync_config
                      , Worker_runner.sync_runner
+                         ~stage_asset:(Sync_runner.stage_asset runner)
+                         ~release_staging:(Sync_runner.release_staged_asset runner)
+                         ~prune_staging:(Sync_runner.prune_staged_assets runner)
+                         ~put_upload:(fun ~context intent ~current ->
+                           match
+                             Sync_runner.staged_asset_path
+                               runner
+                               ~scope:context.scope
+                               ~file:
+                                 intent.Logseq_db_types.Asset_upload_intent.staged_file
+                           with
+                           | None ->
+                             Error
+                               Logseq_db_worker_pure_reducer.Asset_upload.Missing_source
+                           | Some source_file ->
+                             Sync_runner.upload_asset
+                               runner
+                               ~context
+                               ~asset:intent.asset
+                               ~version:intent.version
+                               ~source_file
+                               ~maximum_plaintext_bytes:(8 * 1024 * 1024)
+                               ~current
+                             |> Result.map_error (function
+                               | Sync_runner.Upload_network ->
+                                 Logseq_db_worker_pure_reducer.Asset_upload.Network
+                               | Upload_authentication | Upload_locked -> Authentication
+                               | Upload_missing_source -> Missing_source
+                               | Upload_size_rejected -> Size_rejected
+                               | Upload_revoked_access -> Revoked_access
+                               | Upload_invalid_content | Upload_cancelled ->
+                                 Invalid_content))
+                         ~submit_asset:(Sync_runner.run_scoped_asset runner)
+                         ~delete_assets:(Sync_runner.delete_graph_assets runner)
+                         ~close_assets:(Sync_runner.close_asset_scope runner)
+                         ~retain_staged_file:(Sync_runner.retain_staged_file runner)
+                         ~retain_asset_file:(Sync_runner.retain_asset_file runner)
+                         ~release_asset_file:(Sync_runner.release_asset_file runner)
                          ~submit:(Sync_runner.submit runner)
                          ~shutdown:(fun () -> Sync_runner.shutdown runner)
                          ~decrypt_protected_value:
@@ -386,7 +509,13 @@ let create ~(dependencies : dependencies) =
       match selected with
       | Error message -> Error message
       | Ok (sync_config, selected_sync_runner) ->
-        (match Worker_runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task) with
+        (match
+           Worker_runner.runtime
+             ~sleep:
+               (Eio.Time.sleep
+                  (Eio.Stdenv.clock (Worker.Session_context.environment context)))
+             ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
+         with
          | Error error -> Error (worker_dependency_error_message error)
          | Ok runtime ->
            let pure_config = Pure.config ~worker:config ~sync:sync_config in
@@ -407,7 +536,39 @@ let create ~(dependencies : dependencies) =
                  Ok Session.{ worker; token_cache }))))
     ~handle:(fun _context session request ->
       match request with
+      | Import_asset { graph_generation; source } ->
+        Ok (Asset_imported (Db.import_asset session.worker ~graph_generation source))
       | Get_graph_state -> Ok (Graph_state (Db.graph_state session.worker))
+      | Asset_command { graph_generation; command } ->
+        let event =
+          match command with
+          | Retry_upload operation ->
+            Pure.Upload_requested
+              { graph_generation
+              ; operation
+              ; event = Logseq_db_worker_pure_reducer.Asset_upload.Retry
+              }
+          | Replace_asset_demand { consumer; priority; assets } ->
+            Pure.Asset_requested
+              { graph_generation
+              ; event =
+                  Logseq_sync_pure_reducer.Asset_transfer.Replace
+                    { consumer; priority; assets }
+              }
+          | Release_asset_demand consumer ->
+            Pure.Asset_requested { graph_generation; event = Release consumer }
+          | Retry_asset asset ->
+            Pure.Asset_requested { graph_generation; event = Retry asset }
+        in
+        Db.post session.worker event;
+        Ok Client_command_completed
+      | Acquire_imported_file { scope; operation } ->
+        Ok (Asset_file (Db.retain_imported_file session.worker ~scope ~operation))
+      | Acquire_asset_file { scope; handle } ->
+        Ok (Asset_file (Db.retain_asset_file session.worker ~scope ~handle))
+      | Release_asset_file { scope; handle } ->
+        Db.release_asset_file session.worker ~scope ~handle;
+        Ok Client_command_completed
       | Client_command (Provide_token { request; token }) ->
         Worker_runner.provide_id_token session.token_cache request token;
         Ok Client_command_completed

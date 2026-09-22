@@ -23,6 +23,13 @@ type request =
 and command =
   | V2_graph_info
   | V2_inspect_admission
+  | V2_get_asset_descriptors of { assets : Uuid.t list }
+  | V2_list_assets of
+      { recursive : bool
+      ; roots : Uuid.t list
+      ; limit : int
+      ; cursor : Cursor.t option
+      }
   | V2_list_favorites of
       { limit : int
       ; cursor : Cursor.t option
@@ -54,6 +61,13 @@ and command =
       ; limit : int
       ; cursor : Cursor.t option
       ; revision : string option
+      }
+  | V2_set_asset_reference of
+      { mutation_id : Uuid.t
+      ; block : block_uuid
+      ; previous : Uuid.t option
+      ; asset : Uuid.t
+      ; preconditions : v2_preconditions
       }
   | V2_save_block of
       { mutation_id : Uuid.t
@@ -246,6 +260,12 @@ and v2_outcome =
       ; projection_revision : string
       }
   | V2_favorites_outcome of v2_favorites_result
+  | V2_assets_outcome of
+      { generation : string
+      ; projection_revision : string
+      ; items : Logseq_db_types.Asset_descriptor.t list
+      ; next_cursor : Cursor.t option
+      }
   | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
       { items : v2_journal_item list
@@ -520,6 +540,16 @@ let rec v2_block_tree_of_json json =
 ;;
 
 let v2_command_to_json = function
+  | V2_get_asset_descriptors { assets } ->
+    `Assoc [ "type", `String "getAssetDescriptors"; "assets", uuids_json assets ]
+  | V2_list_assets { recursive; roots; limit; cursor } ->
+    `Assoc
+      [ "type", `String "listAssets"
+      ; "recursive", `Bool recursive
+      ; "roots", uuids_json roots
+      ; "limit", `Int limit
+      ; "cursor", option_json cursor_json cursor
+      ]
   | V2_graph_info -> `Assoc [ "type", `String "graphInfo" ]
   | V2_inspect_admission -> `Assoc [ "type", `String "inspectAdmission" ]
   | V2_list_favorites { limit; cursor } ->
@@ -565,6 +595,15 @@ let v2_command_to_json = function
       ; "limit", `Int limit
       ; "cursor", option_json cursor_json cursor
       ; "revision", optional_string_json revision
+      ]
+  | V2_set_asset_reference { mutation_id; block; previous; asset; preconditions } ->
+    `Assoc
+      [ "type", `String "setAssetReference"
+      ; "mutationId", uuid_json mutation_id
+      ; "block", uuid_json block
+      ; "previous", Option.fold ~none:`Null ~some:uuid_json previous
+      ; "asset", uuid_json asset
+      ; "preconditions", v2_preconditions_to_json preconditions
       ]
   | V2_save_block { mutation_id; block; title; preconditions } ->
     `Assoc
@@ -632,6 +671,26 @@ let v2_command_of_json kind json =
   let fields names = exact_assoc ("type" :: names) json in
   let preconditions fields = v2_preconditions_of_json (field "preconditions" fields) in
   match kind with
+  | "getAssetDescriptors" ->
+    let f = fields [ "assets" ] in
+    let assets = uuid_list (field "assets" f) in
+    if List.length assets > 200 then decode_error "Too many asset identities";
+    V2_get_asset_descriptors { assets }
+  | "listAssets" ->
+    let f = fields [ "recursive"; "roots"; "limit"; "cursor" ] in
+    let roots = uuid_list (field "roots" f)
+    and limit = integer (field "limit" f) in
+    if List.length roots > 64 || limit < 1 || limit > maximum_page_size
+    then decode_error "Invalid asset query bounds";
+    V2_list_assets
+      { recursive =
+          (match field "recursive" f with
+           | `Bool v -> v
+           | _ -> decode_error "recursive must be boolean")
+      ; roots
+      ; limit
+      ; cursor = cursor (field "cursor" f)
+      }
   | "graphInfo" ->
     ignore (fields []);
     V2_graph_info
@@ -676,6 +735,18 @@ let v2_command_of_json kind json =
       ; limit = integer (field "limit" f)
       ; cursor = cursor (field "cursor" f)
       ; revision = optional_string (field "revision" f)
+      }
+  | "setAssetReference" ->
+    let f = fields [ "mutationId"; "block"; "previous"; "asset"; "preconditions" ] in
+    V2_set_asset_reference
+      { mutation_id = uuid (field "mutationId" f)
+      ; block = uuid (field "block" f)
+      ; previous =
+          (match field "previous" f with
+           | `Null -> None
+           | value -> Some (uuid value))
+      ; asset = uuid (field "asset" f)
+      ; preconditions = preconditions f
       }
   | "saveBlock" ->
     let f = fields [ "mutationId"; "block"; "title"; "preconditions" ] in
@@ -1530,7 +1601,97 @@ let v2_tree_member_of_json json =
   }
 ;;
 
+module Asset = Logseq_db_types.Asset_descriptor
+
+let asset_to_json (asset : Asset.t) =
+  let source =
+    match asset.source with
+    | Asset.Managed remote ->
+      `Assoc
+        [ "kind", `String "managed"
+        ; ( "remote"
+          , option_json
+              (fun (v : Asset.version) ->
+                 `Assoc [ "checksum", `String v.checksum; "type", `String v.file_type ])
+              remote )
+        ]
+    | External url -> `Assoc [ "kind", `String "external"; "url", `String url ]
+  in
+  `Assoc
+    [ "uuid", uuid_json asset.uuid
+    ; "source", source
+    ; "currentChecksum", optional_string_json asset.current_checksum
+    ; "size", option_json int64_json asset.size
+    ; ( "dimensions"
+      , option_json
+          (fun (width, height) -> `Assoc [ "width", `Int width; "height", `Int height ])
+          asset.dimensions )
+    ]
+;;
+
+let asset_of_json json =
+  let get = function
+    | Ok x -> x
+    | Error message -> decode_error message
+  in
+  let f =
+    exact_assoc [ "uuid"; "source"; "currentChecksum"; "size"; "dimensions" ] json
+  in
+  let source = field "source" f in
+  let kind =
+    match source with
+    | `Assoc s -> string (field "kind" s)
+    | _ -> decode_error "Invalid asset source"
+  in
+  let source =
+    match kind with
+    | "managed" ->
+      let fields = exact_assoc [ "kind"; "remote" ] source in
+      Asset.Managed
+        (match field "remote" fields with
+         | `Null -> None
+         | json ->
+           let v = exact_assoc [ "checksum"; "type" ] json in
+           Some
+             (get
+                (Asset.version
+                   ~checksum:(string (field "checksum" v))
+                   ~file_type:(string (field "type" v)))))
+    | "external" ->
+      let fields = exact_assoc [ "kind"; "url" ] source in
+      Asset.External (string (field "url" fields))
+    | _ -> decode_error "Invalid asset source kind"
+  in
+  let size =
+    match field "size" f with
+    | `Null -> None
+    | value -> Some (int64 value)
+  in
+  let dimensions =
+    match field "dimensions" f with
+    | `Null -> None
+    | value ->
+      let d = exact_assoc [ "width"; "height" ] value in
+      Some (integer (field "width" d), integer (field "height" d))
+  in
+  get
+    (Asset.create
+       ~uuid:(uuid (field "uuid" f))
+       ~source
+       ~current_checksum:(optional_string (field "currentChecksum" f))
+       ~size
+       ~dimensions)
+;;
+
 let v2_outcome_to_json = function
+  | V2_assets_outcome { generation; projection_revision; items; next_cursor } ->
+    `Assoc
+      [ "type", `String "assets"
+      ; "generation", `String generation
+      ; "projectionRevision", `String projection_revision
+      ; "items", `List (List.map asset_to_json items)
+      ; "nextCursor", option_json cursor_json next_cursor
+      ]
   | V2_graph_info_outcome
       { graph_uuid
       ; graph_name
@@ -1674,6 +1835,23 @@ let v2_outcome_of_json json =
     | _ -> decode_error "invalid v2 outcome"
   in
   match string (field "type" raw) with
+  | "assets" ->
+    let f =
+      exact_assoc
+        [ "type"; "generation"; "projectionRevision"; "items"; "nextCursor" ]
+        json
+    in
+    let items =
+      match field "items" f with
+      | `List items when List.length items <= 200 -> List.map asset_of_json items
+      | _ -> decode_error "Invalid asset result"
+    in
+    V2_assets_outcome
+      { generation = string (field "generation" f)
+      ; projection_revision = string (field "projectionRevision" f)
+      ; items
+      ; next_cursor = cursor (field "nextCursor" f)
+      }
   | "graphInfo" ->
     let fields =
       exact_assoc

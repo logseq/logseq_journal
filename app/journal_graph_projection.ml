@@ -192,16 +192,23 @@ let creation_time (context : time_context) instant_unix_ms =
   Journal_time.of_instant_unix_ms_with ~localtime:context.localtime ~instant_unix_ms
 ;;
 
-let block ~page ~revision ~child_count ~time_context (value : Graph.block) =
+let block_in_context
+      ~page_id
+      ~journal_day
+      ~revision
+      ~child_count
+      ~time_context
+      (value : Graph.block)
+  =
   match creation_time time_context value.created_at_ms, task_state value with
   | (Error _ as error), _ | _, (Error _ as error) -> error
   | Ok creation_time, Ok task_state ->
     let parent = Graph.Uuid.to_string value.parent in
-    Journal_model.create
+    Journal_model.create_on_page
       ~id:(Graph.Uuid.to_string value.uuid)
       ~page_id:(Graph.Uuid.to_string value.page)
-      ~journal_day:page.day
-      ~parent_id:(if String.equal parent page.id then None else Some parent)
+      ~journal_day
+      ~parent_id:(if String.equal parent page_id then None else Some parent)
       ~sibling_order:value.order
       ~source:value.title
       ~task_state
@@ -209,6 +216,31 @@ let block ~page ~revision ~child_count ~time_context (value : Graph.block) =
       ~creation_time
       ~revision
       ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
+;;
+
+let block ~page ~revision ~child_count ~time_context value =
+  block_in_context
+    ~page_id:page.id
+    ~journal_day:(Some page.day)
+    ~revision
+    ~child_count
+    ~time_context
+    value
+;;
+
+let block_on_page ~(page : Graph.page) ~revision ~child_count ~time_context value =
+  let journal_day =
+    match page.kind with
+    | Graph.Journal_page { journal_day } -> Some journal_day
+    | _ -> None
+  in
+  block_in_context
+    ~page_id:(Graph.Uuid.to_string page.uuid)
+    ~journal_day
+    ~revision
+    ~child_count
+    ~time_context
+    value
 ;;
 
 let children_of (root : Graph.block) items =
@@ -273,8 +305,8 @@ let timeline_entry_page ~page ~time_context (result : tree_member Graph.page_res
   project [] roots
 ;;
 
-let detail
-      ~page
+let project_detail
+      ~project_block
       ~time_context
       ~(root : block_member)
       (children : block_member Graph.page_result)
@@ -282,7 +314,7 @@ let detail
   let child_count =
     List.length children.items + if Option.is_some children.continuation then 1 else 0
   in
-  match block ~page ~revision:root.revision ~child_count ~time_context root.block with
+  match project_block ~revision:root.revision ~child_count ~time_context root.block with
   | Error _ as error -> error
   | Ok root ->
     let rec project reversed = function
@@ -304,12 +336,20 @@ let detail
           }
       | (child : block_member) :: rest ->
         (match
-           block ~page ~revision:child.revision ~child_count:0 ~time_context child.block
+           project_block ~revision:child.revision ~child_count:0 ~time_context child.block
          with
          | Error _ as error -> error
          | Ok child -> project (child :: reversed) rest)
     in
     project [] children.items
+;;
+
+let detail ~page ~time_context ~root children =
+  project_detail ~project_block:(block ~page) ~time_context ~root children
+;;
+
+let detail_on_page ~page ~time_context ~root children =
+  project_detail ~project_block:(block_on_page ~page) ~time_context ~root children
 ;;
 
 let favorite (item : Logseq_db_worker.Protocol.v2_favorite_item) =

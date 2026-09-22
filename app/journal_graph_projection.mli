@@ -134,6 +134,14 @@ val block
   -> Logseq_db_types.Graph_types.block
   -> (block, string) result
 
+val block_on_page
+  :  page:Logseq_db_types.Graph_types.page
+  -> revision:string
+  -> child_count:int
+  -> time_context:time_context
+  -> Logseq_db_types.Graph_types.block
+  -> (block, string) result
+
 val timeline_entry_page
   :  page:page
   -> time_context:time_context
@@ -142,6 +150,13 @@ val timeline_entry_page
 
 val detail
   :  page:page
+  -> time_context:time_context
+  -> root:block_member
+  -> block_member Logseq_db_types.Graph_types.page_result
+  -> (detail, string) result
+
+val detail_on_page
+  :  page:Logseq_db_types.Graph_types.page
   -> time_context:time_context
   -> root:block_member
   -> block_member Logseq_db_types.Graph_types.page_result

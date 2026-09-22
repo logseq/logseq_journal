@@ -6,15 +6,15 @@ destination=${1:?usage: native_static_link_flags.sh DESTINATION}
 destination_directory=$(dirname "$destination")
 mkdir -p "$destination_directory"
 
-case "${BONSAI_FLUTTER_APPLE_SDK_ROOT:-}" in
-  *iPhoneOS*)
+case "${2:-default}" in
+  *.ios)
     gmp_sha256=a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
     opam_root=${OPAMROOT:-$(opam var root)}
     switch_prefix=${OPAM_SWITCH_PREFIX:-$(opam var prefix)}
     source_archive="$opam_root/download-cache/sha256/a3/$gmp_sha256"
     target_cc="$switch_prefix/ios-sysroot/bin/ios-cc"
-    sdk_root=$BONSAI_FLUTTER_APPLE_SDK_ROOT
-    deployment_target=15.0
+    sdk_root=$BONSAI_SWIFTUI_APPLE_SDK_ROOT
+    deployment_target=18.0
 
     if test ! -f "$source_archive"; then
       printf '%s\n' "Cached GMP 6.3.0 source is missing: $source_archive" >&2

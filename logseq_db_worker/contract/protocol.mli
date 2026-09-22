@@ -23,6 +23,13 @@ type request =
 and command =
   | V2_graph_info
   | V2_inspect_admission
+  | V2_get_asset_descriptors of { assets : Uuid.t list }
+  | V2_list_assets of
+      { recursive : bool
+      ; roots : Uuid.t list
+      ; limit : int
+      ; cursor : Cursor.t option
+      }
   | V2_list_favorites of
       { limit : int
       ; cursor : Cursor.t option
@@ -54,6 +61,13 @@ and command =
       ; limit : int
       ; cursor : Cursor.t option
       ; revision : string option
+      }
+  | V2_set_asset_reference of
+      { mutation_id : Uuid.t
+      ; block : block_uuid
+      ; previous : Uuid.t option
+      ; asset : Uuid.t
+      ; preconditions : v2_preconditions
       }
   | V2_save_block of
       { mutation_id : Uuid.t
@@ -246,6 +260,12 @@ and v2_outcome =
       ; projection_revision : string
       }
   | V2_favorites_outcome of v2_favorites_result
+  | V2_assets_outcome of
+      { generation : string
+      ; projection_revision : string
+      ; items : Logseq_db_types.Asset_descriptor.t list
+      ; next_cursor : Cursor.t option
+      }
   | V2_admission_outcome of v2_admission_inspection
   | V2_journals_outcome of
       { items : v2_journal_item list

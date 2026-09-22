@@ -388,6 +388,7 @@ let mutation_history ~count =
   List.init count (fun index ->
     Types.Insert_blocks
       { mutation_id = mutation_uuid index
+      ; asset = None
       ; parent
       ; tree = { uuid = block_uuid (100_000 + index); title = "Pending"; children = [] }
       })

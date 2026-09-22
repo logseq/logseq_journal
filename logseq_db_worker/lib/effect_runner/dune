@@ -4,8 +4,12 @@
  (name logseq_db_worker_effect_runner_impl)
  (public_name logseq_db_worker.effect_runner.impl)
  (implements logseq_db_worker_effect_runner)
- (modules effect_runner)
+ (modules effect_runner upload_database)
+ (private_modules upload_database)
  (libraries
+  sqlite3
+  unix
+  logseq_db_storage
   rrbvec
   eio
   logseq_db_worker.contract

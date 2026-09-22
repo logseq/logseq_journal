@@ -1,0 +1,36 @@
+module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Asset = Logseq_db_types.Asset_descriptor
+
+type ticket
+
+type item =
+  { token : string
+  ; asset : Asset.t
+  ; file_type : string
+  ; presentation : Journal_media.presentation
+  }
+
+type view =
+  { items : item list
+  ; more : bool
+  ; error : string option
+  }
+
+type t
+
+val create
+  :  send:(ticket option -> Service.request -> bool)
+  -> changed:(string -> view -> unit)
+  -> t
+
+val reset : t -> graph_generation:int option -> unit
+val root_visible : t -> root:string -> bool -> unit
+val asset_visible : t -> root:string -> asset:string -> bool -> unit
+val next : t -> root:string -> unit
+val retry : t -> root:string -> asset:string -> unit
+val refresh : t -> unit
+val receive : t -> ticket -> Service.response -> unit
+val reject : t -> ticket -> unit
+val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
+val pump : t -> unit
+val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit

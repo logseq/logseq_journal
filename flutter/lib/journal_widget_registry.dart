@@ -1,6 +1,7 @@
 import 'package:bonsai_flutter/bonsai_flutter.dart';
 
 import 'journal_tail_fade.dart';
+import 'journal_detail_outline.dart';
 import 'journal_date_row.dart';
 import 'journal_root_navigation.dart';
 
@@ -17,6 +18,7 @@ WidgetRegistry createJournalWidgetRegistry() {
   registerJournalRootNavigation(nativeWidgets);
   registerJournalTailFade(nativeWidgets);
   registerJournalDateRow(nativeWidgets);
+  registerJournalDetailOutline(nativeWidgets);
   final standard = WidgetRegistry.standard(nativeWidgets: nativeWidgets);
   return WidgetRegistry({
     for (final kind in NodeKind.values)

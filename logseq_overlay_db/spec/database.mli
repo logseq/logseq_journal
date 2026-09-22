@@ -430,7 +430,7 @@ val discard_blocked
         commit_local
           database
           ~expected
-          (Types.Insert_blocks { mutation_id; tree; parent = page })
+          (Types.Insert_blocks { mutation_id; tree; parent = page; asset = None })
         |> require_ok
     ]} *)
 
@@ -570,3 +570,58 @@ val apply_authoritative
         in
         apply_authoritative database preparation ~decrypted |> require_ok
     ]} *)
+
+(** Reads validated metadata for explicit asset identities. Missing/non-asset
+    identities are omitted; no binary IO occurs. At most 200 identities per call. *)
+val get_asset_descriptors
+  :  snapshot
+  -> Graph.Uuid.t list
+  -> (Logseq_db_types.Asset_descriptor.t list, Types.read_error) result
+
+type asset_page =
+  { assets : Logseq_db_types.Asset_descriptor.t list
+  ; next_cursor : Graph.Cursor.t option
+  }
+
+(** Enumerates direct asset references and asset-valued properties beneath explicit
+    roots, including the roots themselves. With [recursive=false], only the
+    supplied entities and their direct references/properties are read; descendants
+    are excluded. Ordinary links are never expanded.
+    Cursors bind the root list, generation and projection. Each call scans bounded
+    work and may return an empty page with a continuation. Roots are bounded to 64,
+    ancestry to 256 and result size to [limit] (1..200). *)
+val get_assets_under_roots
+  :  snapshot
+  -> recursive:bool
+  -> roots:Graph.Uuid.t list
+  -> limit:int
+  -> cursor:Graph.Cursor.t option
+  -> (asset_page, Types.read_error) result
+
+(** Publishes the already uploaded version only while the asset checksum still matches.
+    The publication uses the ordinary durable mutation/outbox path. *)
+val publish_asset_metadata
+  :  t
+  -> expected:write_precondition
+  -> mutation_id:Graph.Uuid.t
+  -> asset:Graph.Uuid.t
+  -> version:Logseq_db_types.Asset_descriptor.version
+  -> (Types.local_commit_outcome, Types.local_commit_error) result
+
+(** Inspect a stable mutation identity without applying it. Identity reuse with
+    different content is rejected, including after restart. *)
+val inspect_local_mutation
+  :  t
+  -> Types.local_mutation
+  -> (Types.existing_mutation option, Types.local_commit_error) result
+
+(** Reuses an existing asset by changing one block's asset-valued property.
+    [previous] fences the intended reference during replanning. No bytes are uploaded. *)
+val set_asset_reference
+  :  t
+  -> expected:write_precondition
+  -> mutation_id:Graph.Uuid.t
+  -> block:Graph.Uuid.t
+  -> previous:Graph.Uuid.t option
+  -> asset:Graph.Uuid.t
+  -> (Types.local_commit_outcome, Types.local_commit_error) result

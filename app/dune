@@ -3,6 +3,11 @@
  (wrapped false)
  (modules
   application
+  journal_uploads
+  journal_asset_import
+  journal_asset_settings
+  journal_asset_runtime
+  journal_asset_policy
   journal_calendar
   journal_capture
   journal_detail
@@ -12,6 +17,10 @@
   journal_graph_transport
   journal_header
   journal_model
+  journal_media
+  journal_media_runtime
+  journal_media_view
+  journal_native_collection
   journal_platform
   journal_routes
   journal_row
@@ -21,15 +30,15 @@
   journal_timeline_state
   journal_validation
   journal_visual_tokens
-  material_icon_catalog)
+  journal_symbols)
  (libraries
   rrbvec
-  bonsai_flutter.spec_impl
+  bonsai_swiftui.spec_impl
   base
   bonsai
-  bonsai_flutter
-  bonsai_flutter.ui
-  bonsai_flutter.driver
+  bonsai_swiftui
+  bonsai_swiftui.ui
+  bonsai_swiftui.driver
   core
   datascript-ocaml-native
   incr_dom.ui_incr
@@ -38,22 +47,21 @@
   logseq_db_worker.bonsai
   threads
   unix
-  virtual_dom.ui_effect))
+  virtual_dom.ui_effect
+  yojson))
 
 (executable
  (name native_embed)
  (modules native_embed)
- (enabled_if
-  (= %{env:BONSAI_FLUTTER_EMBED_OCAML=disabled} enabled))
  (libraries
-  bonsai_flutter.spec_impl
+  bonsai_swiftui.spec_impl
   app
-  bonsai_flutter.driver
-  bonsai_flutter.native_backend)
+  bonsai_swiftui.driver
+  bonsai_swiftui.native_backend)
  (link_flags
   (:standard
    -cclib
-   -L%{env:BONSAI_FLUTTER_APPLE_SDK_ROOT=}/usr/lib
+   -L%{env:BONSAI_SWIFTUI_APPLE_SDK_ROOT=}/usr/lib
    (:include native_static_link_flags.sexp)))
  (modes
   (native object)))
@@ -63,20 +71,4 @@
  (action
   (with-stdout-to
    native_static_link_flags.sexp
-   (run ../tool/native_static_link_flags.sh libgmp.a))))
-
-; BEGIN bonsai-flutter native aliases
-
-(alias
- (name bonsai-flutter-macos)
- (enabled_if
-  (= %{context_name} default))
- (deps native_embed.exe.o))
-
-(alias
- (name bonsai-flutter-ios)
- (enabled_if
-  (= %{context_name} default.ios))
- (deps native_embed.exe.o))
-
-; END bonsai-flutter native aliases
+   (run ../tool/native_static_link_flags.sh libgmp.a %{context_name}))))

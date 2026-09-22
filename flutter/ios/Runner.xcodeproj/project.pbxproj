@@ -45,8 +45,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		A10000010000000000000001 /* JournalE2EECrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../JournalE2EECrypto.swift; sourceTree = "<group>"; };
-		A10000010000000000000002 /* JournalLocalAccountBindingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../JournalLocalAccountBindingStore.swift; sourceTree = "<group>"; };
+		A10000010000000000000001 /* JournalE2EECrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../../swift/JournalE2EECrypto.swift; sourceTree = "<group>"; };
+		A10000010000000000000002 /* JournalLocalAccountBindingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ../../../swift/JournalLocalAccountBindingStore.swift; sourceTree = "<group>"; };
 		BF1000010000000000000001 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GeneratedPluginRegistrant.h; sourceTree = "<group>"; };
 		1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = GeneratedPluginRegistrant.m; sourceTree = "<group>"; };

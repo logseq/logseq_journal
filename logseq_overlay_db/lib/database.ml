@@ -46,7 +46,7 @@ type write_precondition =
   ; scopes : (Types.structure_revision_scope * Types.scope_revision) list
   }
 
-type outbox_record = Persistence_outbox_v14.t =
+type outbox_record = Persistence_outbox_v16.t =
   { mutation_id : Graph.Uuid.t
   ; fingerprint : string
   ; mutation : Types.local_mutation
@@ -1241,6 +1241,42 @@ let set_uuid_property_values ?cache database ident uuids properties =
         | None -> insert_property_summary property properties))
 ;;
 
+let asset_reference_matches (record : Types.block_record) expected =
+  let values =
+    List.concat_map
+      (fun (p : Graph.property_summary) ->
+         if p.ident = "logseq.property/asset" then p.values else [])
+      record.block.properties
+  in
+  match values, expected with
+  | [], None -> true
+  | [ Graph.Entity_value actual ], Some expected -> Graph.Uuid.equal actual expected
+  | _ -> false
+;;
+
+let replacement_reference_matches holder asset =
+  match asset with
+  | None -> true
+  | Some (asset : Types.asset_metadata) ->
+    (match asset.replace_reference with
+     | None -> true
+     | Some previous ->
+       Option.fold
+         ~none:false
+         ~some:(fun holder -> asset_reference_matches holder (Some previous))
+         holder)
+;;
+
+let imported_block_uuids (tree : Types.block_tree) ~parent asset =
+  let rec uuids (tree : Types.block_tree) =
+    tree.uuid :: List.concat_map uuids tree.children
+  in
+  match asset with
+  | Some (asset : Types.asset_metadata) when Option.is_some asset.replace_reference ->
+    List.sort_uniq Graph.Uuid.compare (parent :: uuids tree)
+  | _ -> uuids tree
+;;
+
 let set_block_field_properties
       ?cache
       database
@@ -1491,7 +1527,7 @@ let decode_outbox records =
   let rec loop decoded seen maximum_revision = function
     | [] -> Ok (List.rev decoded, maximum_revision)
     | record :: rest ->
-      Result.bind (Persistence_outbox_v14.decode record) (fun (record, revision) ->
+      Result.bind (Persistence_outbox_v16.decode record) (fun (record, revision) ->
         if List.exists (Graph.Uuid.equal record.mutation_id) seen
         then Error "duplicate mutation UUID in overlay outbox"
         else
@@ -1869,7 +1905,7 @@ let inspect_admission database =
     else (
       let active_bytes =
         database.outbox
-        |> List.map (Persistence_outbox_v14.encode ~sync_revision:database.sync_revision)
+        |> List.map (Persistence_outbox_v16.encode ~sync_revision:database.sync_revision)
         |> List.fold_left (fun total record -> total + String.length record) 0
       in
       let protected_wire_bytes =
@@ -2104,7 +2140,11 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
                      ; kind = Journal_page { journal_day }
                      ; created_at_ms = record.intent_time_ms
                      ; updated_at_ms = record.intent_time_ms
-                     ; tags = []
+                     ; tags =
+                         Option.bind
+                           (entity_of_ident authoritative "logseq.class/Journal")
+                           (uuid_of_entity authoritative)
+                         |> Option.to_list
                      ; properties
                      ; recycled = false
                      }
@@ -2200,6 +2240,61 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
          then current
          else (
            match record.mutation with
+           | Types.Set_asset_reference { block; asset; _ }
+             when Graph.Uuid.equal block uuid ->
+             Option.map
+               (fun (value : Types.block_record) ->
+                  let properties =
+                    set_uuid_property_values
+                      ?cache
+                      authoritative
+                      "logseq.property/asset"
+                      [ asset ]
+                      value.block.properties
+                    |> set_property_values
+                         ?cache
+                         authoritative
+                         "block/updated-at"
+                         [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                  in
+                  { value with
+                    block =
+                      { value.block with
+                        properties
+                      ; updated_at_ms = record.intent_time_ms
+                      }
+                  })
+               current
+           | Types.Publish_asset { block; version; _ } when Graph.Uuid.equal block uuid ->
+             Option.map
+               (fun (value : Types.block_record) ->
+                  let properties =
+                    value.block.properties
+                    |> set_property_values
+                         ?cache
+                         authoritative
+                         "logseq.property.asset/remote-metadata"
+                         [ Datascript.Map
+                             [ Keyword "checksum", String version.checksum
+                             ; Keyword "type", String version.file_type
+                             ]
+                         ]
+                    |> set_property_values
+                         ?cache
+                         authoritative
+                         "block/updated-at"
+                         [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                  in
+                  Types.
+                    { value with
+                      block =
+                        Graph.
+                          { value.block with
+                            properties
+                          ; updated_at_ms = record.intent_time_ms
+                          }
+                    })
+               current
            | Types.Save_block { block; title; _ } when Graph.Uuid.equal block uuid ->
              Option.map
                (fun (value : Types.block_record) ->
@@ -2223,7 +2318,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                           }
                     })
                current
-           | Insert_blocks { parent; tree; _ } ->
+           | Insert_blocks { parent; tree; asset; _ } ->
              let page =
                match record.effect_footprint.page_uuids with
                | page :: _ -> page
@@ -2240,7 +2335,66 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                   ~now:record.intent_time_ms
                   tree
               with
-              | Some inserted -> Some inserted
+              | Some inserted ->
+                (match asset with
+                 | None -> Some inserted
+                 | Some asset ->
+                   let properties =
+                     inserted.block.properties
+                     |> set_property_values
+                          ?cache
+                          authoritative
+                          "logseq.property.asset/type"
+                          [ Datascript.String asset.version.file_type ]
+                     |> set_property_values
+                          ?cache
+                          authoritative
+                          "logseq.property.asset/checksum"
+                          [ Datascript.String asset.version.checksum ]
+                     |> set_property_values
+                          ?cache
+                          authoritative
+                          "logseq.property.asset/size"
+                          [ Datascript.Int (Int64.to_int asset.size) ]
+                   in
+                   let tags =
+                     Option.bind
+                       (entity_of_ident authoritative "logseq.class/Asset")
+                       (uuid_of_entity authoritative)
+                     |> Option.to_list
+                   in
+                   Some
+                     Types.
+                       { inserted with
+                         block = Graph.{ inserted.block with properties; tags }
+                       })
+              | None when Graph.Uuid.equal parent uuid ->
+                (match asset with
+                 | Some asset when Option.is_some asset.replace_reference ->
+                   Option.map
+                     (fun (value : Types.block_record) ->
+                        let properties =
+                          value.block.properties
+                          |> set_uuid_property_values
+                               ?cache
+                               authoritative
+                               "logseq.property/asset"
+                               [ tree.uuid ]
+                          |> set_property_values
+                               ?cache
+                               authoritative
+                               "block/updated-at"
+                               [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                        in
+                        { value with
+                          block =
+                            { value.block with
+                              properties
+                            ; updated_at_ms = record.intent_time_ms
+                            }
+                        })
+                     current
+                 | _ -> current)
               | None -> current)
            | Delete_blocks _ ->
              (match record.delete_artifacts with
@@ -2373,7 +2527,9 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
            | Save_block _
            | Create_journal_page _
            | Set_task_status _
-           | Clear_task_status _ -> current))
+           | Clear_task_status _
+           | Publish_asset _
+           | Set_asset_reference _ -> current))
       initial
       effects
   in
@@ -2465,7 +2621,9 @@ let block_is_tombstoned (snapshot : snapshot) uuid =
         | Delete_blocks _
         | Create_journal_page _
         | Set_task_status _
-        | Clear_task_status _ )
+        | Clear_task_status _
+        | Publish_asset _
+        | Set_asset_reference _ )
       , _ ) -> false)
 ;;
 
@@ -2596,7 +2754,9 @@ let local_child_facts ?cache (snapshot : snapshot) parent =
         | Delete_blocks _
         | Create_journal_page _
         | Set_task_status _
-        | Clear_task_status _ -> []
+        | Clear_task_status _
+        | Publish_asset _
+        | Set_asset_reference _ -> []
       in
       let shadows =
         if record_has_active_dependency_shadows record
@@ -3241,7 +3401,9 @@ let logical_tree_candidate snapshot cache uuid =
              | Save_block _
              | Create_journal_page _
              | Set_task_status _
-             | Clear_task_status _ -> current))
+             | Clear_task_status _
+             | Publish_asset _
+             | Set_asset_reference _ -> current))
         initial
         effects
     in
@@ -3283,7 +3445,9 @@ let ordered_tree_children snapshot cache parent =
           | Delete_blocks _
           | Create_journal_page _
           | Set_task_status _
-          | Clear_task_status _ -> []
+          | Clear_task_status _
+          | Publish_asset _
+          | Set_asset_reference _ -> []
         in
         let shadows =
           if record_has_active_dependency_shadows record
@@ -3646,6 +3810,133 @@ let insertion_orders context = function
   | _ -> Uuid_map.empty
 ;;
 
+module Asset_descriptor = Logseq_db_types.Asset_descriptor
+
+let authoritative_asset_descriptor_at snapshot uuid =
+  let database = Option.get snapshot.authoritative_database in
+  match entity_of_uuid database uuid, entity_of_ident database "logseq.class/Asset" with
+  | Some entity, Some asset_class
+    when (not (block_is_tombstoned snapshot uuid))
+         && one database entity "logseq.property/deleted-at" = None
+         && entity_has_ref database entity "block/tags" asset_class ->
+    let text field =
+      Option.bind (one database entity ("logseq.property.asset/" ^ field)) string_of_value
+    in
+    let number field =
+      Option.bind (one database entity ("logseq.property.asset/" ^ field)) int_of_value
+    in
+    let remote =
+      match one database entity "logseq.property.asset/remote-metadata" with
+      | None -> Ok None
+      | Some (Datascript.Map fields) ->
+        (match
+           ( List.assoc_opt (Datascript.Keyword "checksum") fields
+           , List.assoc_opt (Datascript.Keyword "type") fields )
+         with
+         | Some (String checksum), Some (String file_type) ->
+           Asset_descriptor.version ~checksum ~file_type |> Result.map Option.some
+         | _ -> Error "Malformed remote asset metadata")
+      | Some _ -> Error "Malformed remote asset metadata"
+    in
+    let source =
+      match text "external-url" with
+      | Some url when url <> "" -> Ok (Asset_descriptor.External url)
+      | Some _ | None ->
+        Result.map (fun version -> Asset_descriptor.Managed version) remote
+    in
+    Result.bind source (fun source ->
+      Asset_descriptor.create
+        ~uuid
+        ~source
+        ~current_checksum:(text "checksum")
+        ~size:(Option.map Int64.of_int (number "size"))
+        ~dimensions:
+          (match number "width", number "height" with
+           | Some w, Some h -> Some (w, h)
+           | _ -> None))
+    |> Result.map Option.some
+    |> Result.map_error (fun message ->
+      Types.Invalid_read_request ("Asset " ^ Graph.Uuid.to_string uuid ^ ": " ^ message))
+  | _ -> Ok None
+;;
+
+let asset_descriptor_at snapshot uuid =
+  if block_is_tombstoned snapshot uuid
+  then Ok None
+  else (
+    let effects =
+      Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
+      |> Option.value ~default:Rrbvec.empty
+    in
+    Rrbvec.fold_left
+      (fun current (record : outbox_record) ->
+         if not (record_is_logically_active record)
+         then current
+         else (
+           match record.mutation with
+           | Types.Insert_blocks { tree; asset = Some asset; _ }
+             when Graph.Uuid.equal tree.uuid uuid ->
+             Asset_descriptor.create
+               ~uuid
+               ~source:(Managed None)
+               ~current_checksum:(Some asset.version.checksum)
+               ~size:(Some asset.size)
+               ~dimensions:None
+             |> Result.map Option.some
+             |> Result.map_error (fun message -> Types.Invalid_read_request message)
+           | Types.Publish_asset { block; version; _ } when Graph.Uuid.equal block uuid ->
+             Result.bind current (function
+               | Some descriptor when descriptor.current_checksum = Some version.checksum
+                 ->
+                 Asset_descriptor.create
+                   ~uuid
+                   ~source:(Managed (Some version))
+                   ~current_checksum:descriptor.current_checksum
+                   ~size:descriptor.size
+                   ~dimensions:descriptor.dimensions
+                 |> Result.map Option.some
+                 |> Result.map_error (fun message -> Types.Invalid_read_request message)
+               | other -> Ok other)
+           | _ -> current))
+      (authoritative_asset_descriptor_at snapshot uuid)
+      effects)
+;;
+
+let authoritative_asset_version database uuid =
+  Option.bind (entity_of_uuid database uuid) (fun entity ->
+    match
+      ( one database entity "logseq.property.asset/type"
+      , one database entity "logseq.property.asset/checksum" )
+    with
+    | Some (Datascript.String file_type), Some (Datascript.String checksum) ->
+      Result.to_option (Asset_descriptor.version ~checksum ~file_type)
+    | _ -> None)
+;;
+
+let current_asset_version snapshot uuid =
+  let effects =
+    Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
+    |> Option.value ~default:Rrbvec.empty
+  in
+  Rrbvec.fold_left
+    (fun version (record : outbox_record) ->
+       if not (record_is_logically_active record)
+       then version
+       else (
+         match record.mutation with
+         | Types.Insert_blocks { tree; asset = Some asset; _ }
+           when Graph.Uuid.equal tree.uuid uuid -> Some asset.version
+         | _ -> version))
+    (authoritative_asset_version (Option.get snapshot.authoritative_database) uuid)
+    effects
+;;
+
+let published_asset_matches descriptor version =
+  match descriptor with
+  | Ok (Some { Asset_descriptor.source = Managed (Some actual); _ }) -> actual = version
+  | _ -> false
+;;
+
 let local_operations
       ~fingerprint:_
       ~intent_time_ms
@@ -3658,13 +3949,30 @@ let local_operations
   let now = Int64.to_int intent_time_ms in
   let operations =
     match mutation with
+    | Types.Set_asset_reference { block; asset; _ } ->
+      [ Datascript.RetractAttr (uuid_lookup block, "logseq.property/asset")
+      ; Add (uuid_lookup block, "logseq.property/asset", Ref_to (uuid_lookup asset))
+      ; Add (uuid_lookup block, "block/updated-at", Int now)
+      ; Add (uuid_lookup block, "block/tx-id", Int next_tx)
+      ]
+    | Types.Publish_asset { block; version; _ } ->
+      [ Datascript.Add
+          ( uuid_lookup block
+          , "logseq.property.asset/remote-metadata"
+          , Map
+              [ Keyword "checksum", String version.checksum
+              ; Keyword "type", String version.file_type
+              ] )
+      ; Add (uuid_lookup block, "block/updated-at", Int now)
+      ; Add (uuid_lookup block, "block/tx-id", Int next_tx)
+      ]
     | Types.Save_block { block; title; _ } ->
       let entity = uuid_lookup block in
       [ Datascript.Add (entity, "block/title", String title)
       ; Add (entity, "block/updated-at", Int now)
       ; Add (entity, "block/tx-id", Int next_tx)
       ]
-    | Insert_blocks { tree; parent; _ } ->
+    | Insert_blocks { tree; parent; asset; _ } ->
       let page =
         match effect_footprint.page_uuids with
         | page :: _ -> page
@@ -3688,6 +3996,25 @@ let local_operations
            |> List.concat)
       in
       add_tree ~parent_ref:(uuid_lookup parent) tree
+      @
+        (match asset with
+        | None -> []
+        | Some asset ->
+          let entity = uuid_temp "overlay-insert" tree.uuid in
+          [ Datascript.Add (entity, "block/tags", Ref_to (Ident "logseq.class/Asset"))
+          ; Add (entity, "logseq.property.asset/type", String asset.version.file_type)
+          ; Add (entity, "logseq.property.asset/checksum", String asset.version.checksum)
+          ; Add (entity, "logseq.property.asset/size", Int (Int64.to_int asset.size))
+          ]
+          @
+            (match asset.replace_reference with
+            | None -> []
+            | Some _ ->
+              [ Datascript.RetractAttr (uuid_lookup parent, "logseq.property/asset")
+              ; Add (uuid_lookup parent, "logseq.property/asset", Ref_to entity)
+              ; Add (uuid_lookup parent, "block/updated-at", Int now)
+              ; Add (uuid_lookup parent, "block/tx-id", Int next_tx)
+              ]))
     | Delete_blocks _ ->
       let artifacts = Option.get delete_artifacts in
       let block_patch_operations patch =
@@ -3737,6 +4064,7 @@ let local_operations
       ; Add (entity, "block/created-at", Int now)
       ; Add (entity, "block/updated-at", Int now)
       ; Add (entity, "block/journal-day", Int journal_day)
+      ; Add (entity, "block/tags", Ref_to (Ident "logseq.class/Journal"))
       ; Add (entity, "block/tx-id", Int next_tx)
       ]
     | Set_task_status { block; status; _ } ->
@@ -3826,6 +4154,8 @@ let dependency_shadows_are_canonical mutation shadows =
   in
   let expected =
     match mutation with
+    | Types.Set_asset_reference { block; _ }
+    | Types.Publish_asset { block; _ }
     | Types.Save_block { block; _ }
     | Set_task_status { block; _ }
     | Clear_task_status { block; _ } -> add_block [] [] block
@@ -3943,13 +4273,17 @@ let outbox_record_is_canonical (record : outbox_record) =
       | Insert_blocks _
       | Create_journal_page _
       | Set_task_status _
-      | Clear_task_status _ )
+      | Clear_task_status _
+      | Publish_asset _
+      | Set_asset_reference _ )
     , None ) -> true
   | ( ( Save_block _
       | Insert_blocks _
       | Create_journal_page _
       | Set_task_status _
-      | Clear_task_status _ )
+      | Clear_task_status _
+      | Publish_asset _
+      | Set_asset_reference _ )
     , Some _ ) -> false
 ;;
 
@@ -4093,6 +4427,8 @@ let has_children_precondition (expected : write_precondition) parent =
 ;;
 
 let required_preconditions (expected : write_precondition) = function
+  | Types.Set_asset_reference { block; _ }
+  | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
@@ -4365,14 +4701,33 @@ let delete_artifacts database context ~now root =
 ;;
 
 let planned_effect database context ~now = function
+  | Types.Set_asset_reference { block; previous; asset; _ } ->
+    (match read_block context block, asset_descriptor_at context.read_snapshot asset with
+     | Some holder, Ok (Some _) when asset_reference_matches holder previous ->
+       Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)
+     | _ -> Error (Types.Invalid_local_mutation "Asset reference or destination changed"))
+  | Types.Publish_asset { block; version; _ } ->
+    (match asset_descriptor_at context.read_snapshot block with
+     | Ok (Some { source = Managed _; _ })
+       when current_asset_version context.read_snapshot block = Some version ->
+       Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)
+     | _ ->
+       Error
+         (Types.Invalid_local_mutation "Uploaded version no longer matches the live asset"))
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
     Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)
-  | Insert_blocks { tree; parent; _ } ->
+  | Insert_blocks { tree; parent; asset; _ } ->
+    let ( let* ) = Result.bind in
+    let* () =
+      if replacement_reference_matches (read_block context parent) asset
+      then Ok ()
+      else Error (Types.Invalid_local_mutation "Attachment reference changed")
+    in
     let page = Outliner.Graph_read.page_for_parent ~parent (read_block context parent) in
     Ok
-      ( { block_uuids = tree_uuids tree
+      ( { block_uuids = imported_block_uuids tree ~parent asset
         ; page_uuids = [ page ]
         ; structure_interests =
             [ Types.Children_interest parent; Types.Page_tree_interest page ]
@@ -4487,6 +4842,8 @@ let dependency_shadows_for_snapshot snapshot mutation =
         then add_block record.block.parent)
   in
   (match mutation with
+   | Types.Set_asset_reference { block; _ }
+   | Types.Publish_asset { block; _ }
    | Types.Save_block { block; _ }
    | Set_task_status { block; _ }
    | Clear_task_status { block; _ } -> add_block block
@@ -4567,7 +4924,7 @@ let outbox_records_fit database ~sync_revision records =
   && records
      |> List.fold_left
           (fun bytes record ->
-             bytes + String.length (Persistence_outbox_v14.encode ~sync_revision record))
+             bytes + String.length (Persistence_outbox_v16.encode ~sync_revision record))
           0
      |> fun bytes -> bytes <= database.dependencies.limits.outbox_max_bytes
 ;;
@@ -4626,6 +4983,8 @@ let logical_change_for_effects database ~before ~after effects =
 
 let mutation_has_logical_effect context mutation =
   match mutation with
+  | Types.Set_asset_reference { block; _ }
+  | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } -> Option.is_some (read_block context block)
@@ -4848,7 +5207,7 @@ let open_ ~sw dependencies inspection ~graph_name =
 let persist_outbox ?(terminal_batches = []) database =
   let records =
     List.map
-      (Persistence_outbox_v14.encode ~sync_revision:database.sync_revision)
+      (Persistence_outbox_v16.encode ~sync_revision:database.sync_revision)
       database.outbox
   in
   let receipts =
@@ -5244,10 +5603,17 @@ let block_tree_uuids = Outliner.Tree.uuids
 let mutation_introduced_uuids = function
   | Types.Insert_blocks { tree; _ } -> block_tree_uuids tree
   | Create_journal_page { page; _ } -> [ page ]
-  | Save_block _ | Delete_blocks _ | Set_task_status _ | Clear_task_status _ -> []
+  | Save_block _
+  | Publish_asset _
+  | Set_asset_reference _
+  | Delete_blocks _
+  | Set_task_status _
+  | Clear_task_status _ -> []
 ;;
 
 let mutation_required_uuids = function
+  | Types.Set_asset_reference { block; asset; _ } -> [ block; asset ]
+  | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
   | Delete_blocks { root = block; _ }
   | Set_task_status { block; _ }
@@ -5366,13 +5732,53 @@ let option_satisfies predicate = function
   | None -> false
 ;;
 
+let authoritative_import_matches
+      ?(reference_superseded = false)
+      database
+      ~parent
+      (tree : Types.block_tree)
+  = function
+  | None -> true
+  | Some (asset : Types.asset_metadata) ->
+    (asset.replace_reference = None
+     || reference_superseded
+     || block_of_database database parent
+        |> option_satisfies (fun holder ->
+          asset_reference_matches holder (Some tree.uuid)))
+    && authoritative_asset_version database tree.uuid = Some asset.version
+    &&
+      (match
+         entity_of_uuid database tree.uuid, entity_of_ident database "logseq.class/Asset"
+       with
+      | Some entity, Some asset_class ->
+        entity_has_ref database entity "block/tags" asset_class
+        && one database entity "logseq.property.asset/size"
+           = Some (Datascript.Int (Int64.to_int asset.size))
+      | _ -> false)
+;;
+
 let authoritative_satisfies_mutation_in database = function
+  | Types.Set_asset_reference { block; asset; _ } ->
+    block_of_database database block
+    |> option_satisfies (fun holder -> asset_reference_matches holder (Some asset))
+  | Types.Publish_asset { block; version; _ } ->
+    (match entity_of_uuid database block with
+     | None -> false
+     | Some entity ->
+       (match one database entity "logseq.property.asset/remote-metadata" with
+        | Some (Datascript.Map fields) ->
+          List.assoc_opt (Datascript.Keyword "checksum") fields
+          = Some (Datascript.String version.checksum)
+          && List.assoc_opt (Datascript.Keyword "type") fields
+             = Some (Datascript.String version.file_type)
+        | _ -> false))
   | Types.Save_block { block; title; _ } ->
     block_of_database database block
     |> option_satisfies (fun (record : Types.block_record) ->
       String.equal record.block.title title)
-  | Insert_blocks { parent; tree; _ } ->
+  | Insert_blocks { parent; tree; asset; _ } ->
     authoritative_tree_is_present database ~parent tree
+    && authoritative_import_matches database ~parent tree asset
   | Delete_blocks { root; _ } -> Option.is_none (block_of_database database root)
   | Create_journal_page { page; title; journal_day; _ } ->
     page_of_database database page
@@ -5391,6 +5797,8 @@ let authoritative_satisfies_mutation_in database = function
 
 let mutation_supersedes earlier later =
   match earlier, later with
+  | ( Types.Set_asset_reference { block = earlier; _ }
+    , Set_asset_reference { block = later; _ } ) -> Graph.Uuid.equal earlier later
   | Types.Save_block { block = earlier; _ }, Save_block { block = later; _ } ->
     Graph.Uuid.equal earlier later
   | ( (Set_task_status { block = earlier; _ } | Clear_task_status { block = earlier; _ })
@@ -5427,8 +5835,24 @@ let accepted_record_satisfied database records (record : outbox_record) =
   then true
   else (
     match record.mutation with
-    | Types.Insert_blocks { parent; tree; _ } ->
+    | Types.Insert_blocks { parent; tree; asset; _ } ->
       authoritative_tree_satisfies database ~later ~parent tree
+      && authoritative_import_matches
+           database
+           ~parent
+           tree
+           asset
+           ~reference_superseded:
+             (List.exists
+                (fun (later : outbox_record) ->
+                   match later.mutation with
+                   | Types.Set_asset_reference { block; _ } ->
+                     Graph.Uuid.equal block parent
+                   | Insert_blocks { parent = holder; asset = Some metadata; _ } ->
+                     Graph.Uuid.equal holder parent
+                     && Option.is_some metadata.replace_reference
+                   | _ -> false)
+                later)
     | mutation -> authoritative_satisfies_mutation_in database mutation)
 ;;
 
@@ -6210,7 +6634,9 @@ let delete_conflict_kinds_between before after (record : outbox_record) =
     | Insert_blocks _
     | Create_journal_page _
     | Set_task_status _
-    | Clear_task_status _ -> assert false
+    | Clear_task_status _
+    | Publish_asset _
+    | Set_asset_reference _ -> assert false
   in
   let before_frontier = entities_for_uuids before frontier in
   let after_frontier = entities_for_uuids after frontier in
@@ -6559,7 +6985,9 @@ let prepare_authoritative_candidate preparation ~decrypted =
                       | Insert_blocks _
                       | Create_journal_page _
                       | Set_task_status _
-                      | Clear_task_status _ ) ) -> None
+                      | Clear_task_status _
+                      | Publish_asset _
+                      | Set_asset_reference _ ) ) -> None
                   | ( ( Queued
                       | Accepted_pending_authoritative _
                       | Stale_rejected_pending_authoritative _
@@ -6686,11 +7114,30 @@ let rec logical_tree_is_present snapshot ~parent (tree : Types.block_tree) =
 ;;
 
 let logical_snapshot_satisfies_mutation snapshot = function
+  | Types.Set_asset_reference { block; asset; _ } ->
+    logical_block_at snapshot block
+    |> option_satisfies (fun holder -> asset_reference_matches holder (Some asset))
+  | Types.Publish_asset { block; version; _ } ->
+    published_asset_matches (asset_descriptor_at snapshot block) version
   | Types.Save_block { block; title; _ } ->
     logical_block_at snapshot block
     |> option_satisfies (fun (record : Types.block_record) ->
       String.equal record.block.title title)
-  | Insert_blocks { parent; tree; _ } -> logical_tree_is_present snapshot ~parent tree
+  | Insert_blocks { parent; tree; asset; _ } ->
+    logical_tree_is_present snapshot ~parent tree
+    &&
+      (match asset with
+      | None -> true
+      | Some asset ->
+        (asset.replace_reference = None
+         || logical_block_at snapshot parent
+            |> option_satisfies (fun holder ->
+              asset_reference_matches holder (Some tree.uuid)))
+        && current_asset_version snapshot tree.uuid = Some asset.version
+        &&
+          (match asset_descriptor_at snapshot tree.uuid with
+          | Ok (Some descriptor) -> descriptor.size = Some asset.size
+          | _ -> false))
   | Delete_blocks { root; _ } -> Option.is_none (logical_block_at snapshot root)
   | Create_journal_page { page; title; journal_day; _ } ->
     logical_page_at snapshot page
@@ -6708,17 +7155,19 @@ let logical_snapshot_satisfies_mutation snapshot = function
 ;;
 
 let ordinary_effect_footprint snapshot = function
+  | Types.Set_asset_reference { block; _ }
+  | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
     { block_uuids = [ block ]; page_uuids = []; structure_interests = [] }
-  | Insert_blocks { tree; parent; _ } ->
+  | Insert_blocks { tree; parent; asset; _ } ->
     let page =
       match logical_block_at snapshot parent with
       | Some (record : Types.block_record) -> record.block.page
       | None -> parent
     in
-    { block_uuids = tree_uuids tree
+    { block_uuids = imported_block_uuids tree ~parent asset
     ; page_uuids = [ page ]
     ; structure_interests =
         [ Types.Children_interest parent; Types.Page_tree_interest page ]
@@ -6735,7 +7184,12 @@ let ordinary_effect_footprint snapshot = function
 let introduced_uuids = function
   | Types.Insert_blocks { tree; _ } -> tree_uuids tree
   | Create_journal_page { page; _ } -> [ page ]
-  | Save_block _ | Delete_blocks _ | Set_task_status _ | Clear_task_status _ -> []
+  | Save_block _
+  | Publish_asset _
+  | Set_asset_reference _
+  | Delete_blocks _
+  | Set_task_status _
+  | Clear_task_status _ -> []
 ;;
 
 let unavailable_dependency unavailable uuid =
@@ -6748,18 +7202,33 @@ let unavailable_dependency unavailable uuid =
 let invalid_replan_dependency snapshot mutation =
   let missing uuid present = if present then None else Some uuid in
   match mutation with
+  | Types.Set_asset_reference { block; previous; asset; _ } ->
+    (match logical_block_at snapshot block, asset_descriptor_at snapshot asset with
+     | Some holder, Ok (Some _) when asset_reference_matches holder previous -> None
+     | _, Ok (Some _) -> Some block
+     | _ -> Some asset)
+  | Types.Publish_asset { block; version; _ } ->
+    missing
+      block
+      (current_asset_version snapshot block = Some version
+       &&
+       match asset_descriptor_at snapshot block with
+       | Ok (Some { source = Managed _; _ }) -> true
+       | _ -> false)
   | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } ->
     missing block (Option.is_some (logical_block_at snapshot block))
-  | Insert_blocks { parent; tree; _ } ->
+  | Insert_blocks { parent; tree; asset; _ } ->
     let block_exists = Option.is_some (logical_block_at snapshot parent) in
     let page_exists =
       match logical_page_at snapshot parent with
       | Some (record : Types.page_record) -> not record.page.recycled
       | None -> false
     in
-    if not (block_exists || page_exists)
+    if
+      (not (block_exists || page_exists))
+      || not (replacement_reference_matches (logical_block_at snapshot parent) asset)
     then Some parent
     else
       List.find_opt
@@ -8116,7 +8585,7 @@ let commit_authoritative_candidate database prepared =
             in
             let outbox =
               List.map
-                (Persistence_outbox_v14.encode
+                (Persistence_outbox_v16.encode
                    ~sync_revision:(database.sync_revision + 1))
                 candidate_outbox
             in
@@ -8253,4 +8722,393 @@ let apply_authoritative database preparation ~decrypted =
     Result.map
       (fun commit -> Authoritative_applied commit)
       (commit_authoritative_candidate database candidate)
+;;
+
+type asset_page =
+  { assets : Logseq_db_types.Asset_descriptor.t list
+  ; next_cursor : Graph.Cursor.t option
+  }
+
+let get_asset_descriptors snapshot uuids =
+  with_snapshot_read snapshot (fun snapshot ->
+    if List.length uuids > 200
+    then Error Types.Read_limit_exceeded
+    else (
+      let rec read acc = function
+        | [] -> Ok (List.rev acc)
+        | uuid :: rest ->
+          Result.bind (asset_descriptor_at snapshot uuid) (function
+            | None -> read acc rest
+            | Some descriptor -> read (descriptor :: acc) rest)
+      in
+      read [] uuids))
+;;
+
+type asset_frame =
+  | Asset_reference of Graph.Uuid.t
+  | Asset_node of Graph.Uuid.t * int
+  | Asset_attributes of Graph.Uuid.t * string * int
+  | Asset_children of Graph.Uuid.t * int * int
+  | Asset_local_children of Graph.Uuid.t * int * int
+
+let asset_frame_json = function
+  | Asset_reference uuid ->
+    `List [ `String "reference"; `String (Graph.Uuid.to_string uuid) ]
+  | Asset_node (uuid, depth) ->
+    `List [ `String "node"; `String (Graph.Uuid.to_string uuid); `Int depth ]
+  | Asset_attributes (uuid, attribute, after) ->
+    `List
+      [ `String "attributes"
+      ; `String (Graph.Uuid.to_string uuid)
+      ; `String attribute
+      ; `Int after
+      ]
+  | Asset_children (uuid, depth, after) ->
+    `List
+      [ `String "children"; `String (Graph.Uuid.to_string uuid); `Int depth; `Int after ]
+  | Asset_local_children (uuid, depth, after) ->
+    `List [ `String "local"; `String (Graph.Uuid.to_string uuid); `Int depth; `Int after ]
+;;
+
+let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
+  with_snapshot_read snapshot (fun snapshot ->
+    let exception Read_error of Types.read_error in
+    let require = function
+      | Ok value -> value
+      | Error error -> raise (Read_error error)
+    in
+    let invalid message = raise (Read_error (Types.Invalid_read_request message)) in
+    try
+      if (not (valid_page_limit limit)) || List.length roots > 64
+      then invalid "Invalid asset query bounds";
+      let version = state_digest snapshot.version
+      and roots_key = state_digest (recursive, roots) in
+      let parse_uuid s =
+        match Graph.Uuid.of_string s with
+        | Ok u -> u
+        | Error _ -> invalid "Invalid asset cursor UUID"
+      in
+      let parse_frame = function
+        | `List [ `String "reference"; `String uuid ] -> Asset_reference (parse_uuid uuid)
+        | `List [ `String "node"; `String uuid; `Int depth ]
+          when depth >= 0 && depth <= 256 && (recursive || depth = 0) ->
+          Asset_node (parse_uuid uuid, depth)
+        | `List [ `String "attributes"; `String uuid; `String attribute; `Int after ]
+          when String.length attribute <= 1024 && after >= -1 && after < max_int ->
+          Asset_attributes (parse_uuid uuid, attribute, after)
+        | `List [ `String "children"; `String uuid; `Int depth; `Int after ]
+          when recursive && depth >= 0 && depth <= 256 && after >= 0 && after < max_int ->
+          Asset_children (parse_uuid uuid, depth, after)
+        | `List [ `String "local"; `String uuid; `Int depth; `Int after ]
+          when recursive && depth >= 0 && depth <= 256 && after >= 0 ->
+          Asset_local_children (parse_uuid uuid, depth, after)
+        | _ -> invalid "Invalid asset cursor frame"
+      in
+      let frames =
+        match cursor with
+        | None -> List.map (fun uuid -> Asset_node (uuid, 0)) roots
+        | Some cursor ->
+          let source = Graph.Cursor.to_string cursor in
+          if String.length source > 16384 then invalid "Oversized asset cursor";
+          let json =
+            try Yojson.Safe.from_string source with
+            | Yojson.Json_error _ -> invalid "Invalid asset cursor JSON"
+          in
+          (match json with
+           | `List
+               [ `String "assets-v1"
+               ; `String actual_version
+               ; `String actual_roots
+               ; `List frames
+               ] ->
+             if actual_version <> version then raise (Read_error Types.Stale_read_cursor);
+             if actual_roots <> roots_key then invalid "Asset cursor roots changed";
+             if List.length frames > 1024 then invalid "Oversized asset cursor stack";
+             List.map parse_frame frames
+           | _ -> invalid "Invalid asset cursor")
+      in
+      let database = Option.get snapshot.authoritative_database in
+      let tree_cache =
+        { hydration = hydration_cache ~index_idents:false database
+        ; entities = Hashtbl.create 16
+        ; fields = Hashtbl.create 16
+        ; authoritative_candidates = Hashtbl.create 16
+        ; logical_candidates = Hashtbl.create 16
+        ; insert_orders = Hashtbl.create 4
+        }
+      in
+      let rec live seen uuid =
+        if List.length seen >= 256 then raise (Read_error Types.Read_limit_exceeded);
+        if List.exists (Graph.Uuid.equal uuid) seen
+        then raise (Read_error (Types.Fatal_read_state "Cyclic asset root ancestry"));
+        if block_is_tombstoned snapshot uuid
+        then false
+        else (
+          let entity = entity_of_uuid database uuid in
+          if
+            Option.bind entity (fun e -> one database e "logseq.property/deleted-at")
+            <> None
+          then false
+          else (
+            match logical_tree_candidate snapshot tree_cache uuid with
+            | Some candidate -> live (uuid :: seen) candidate.tree_parent
+            | None -> Option.is_some entity))
+      in
+      let peek sequence =
+        match sequence () with
+        | Seq.Nil -> None
+        | Seq.Cons (value, _) -> Some value
+      in
+      let descriptor_for_entity entity =
+        match uuid_of_entity database entity with
+        | None -> None
+        | Some uuid -> require (asset_descriptor_at snapshot uuid)
+      in
+      let overrides uuid attribute =
+        let effects =
+          Uuid_map.find_opt
+            (Graph.Uuid.to_string uuid)
+            (Option.get snapshot.block_effects)
+          |> Option.value ~default:Rrbvec.empty
+        in
+        Rrbvec.fold_left
+          (fun refs (record : outbox_record) ->
+             if not (record_is_logically_active record)
+             then refs
+             else (
+               match record.mutation with
+               | Types.Insert_blocks { parent; tree; asset = Some metadata; _ }
+                 when Graph.Uuid.equal parent uuid
+                      && attribute = "logseq.property/asset"
+                      && Option.is_some metadata.replace_reference -> Some [ tree.uuid ]
+               | Types.Set_asset_reference { block; asset; _ }
+                 when Graph.Uuid.equal block uuid && attribute = "logseq.property/asset"
+                 -> Some [ asset ]
+               | _ ->
+                 (match record.delete_artifacts with
+                  | None -> refs
+                  | Some artifacts ->
+                    if attribute = "block/refs"
+                    then (
+                      match
+                        List.find_opt
+                          (fun patch -> Graph.Uuid.equal patch.block_uuid uuid)
+                          artifacts.block_patches
+                      with
+                      | Some patch -> Some patch.refs
+                      | None -> refs)
+                    else (
+                      match
+                        List.find_opt
+                          (fun patch ->
+                             Graph.Uuid.equal patch.holder_uuid uuid
+                             && patch.property_ident = attribute)
+                          artifacts.property_patches
+                      with
+                      | Some patch -> Some [ patch.replacement_uuid ]
+                      | None -> refs))))
+          None
+          effects
+      in
+      let admitted_attribute attribute =
+        attribute = "block/refs"
+        ||
+        match tree_cache.hydration.property_class with
+        | None -> false
+        | Some property_class ->
+          Option.is_some
+            (property_definition_with_class database property_class attribute)
+      in
+      let rec walk work remaining found frames =
+        if List.length frames > 1024 then raise (Read_error Types.Read_limit_exceeded);
+        if work = 0 || remaining = 0
+        then found, frames
+        else (
+          let emit item rest =
+            match item with
+            | Some item
+              when not
+                     (List.exists
+                        (fun old ->
+                           Graph.Uuid.equal
+                             old.Asset_descriptor.uuid
+                             item.Asset_descriptor.uuid)
+                        found) -> walk (work - 1) (remaining - 1) (item :: found) rest
+            | None | Some _ -> walk (work - 1) remaining found rest
+          in
+          match frames with
+          | [] -> found, []
+          | Asset_reference uuid :: rest ->
+            emit (require (asset_descriptor_at snapshot uuid)) rest
+          | Asset_node (uuid, depth) :: rest ->
+            if not (live [] uuid)
+            then walk (work - 1) remaining found rest
+            else
+              emit
+                (require (asset_descriptor_at snapshot uuid))
+                ((overrides uuid "logseq.property/asset"
+                  |> Option.value ~default:[]
+                  |> List.map (fun target -> Asset_reference target))
+                 @ (Asset_attributes (uuid, "", -1)
+                    ::
+                    (if recursive then Asset_children (uuid, depth, 0) :: rest else rest)
+                   ))
+          | Asset_attributes (uuid, attribute, after) :: rest ->
+            (match entity_of_uuid database uuid with
+             | None -> walk (work - 1) remaining found rest
+             | Some entity ->
+               if after = -1
+               then (
+                 match
+                   peek
+                     (Datascript.seek_datoms
+                        database
+                        Datascript.Eavt
+                        ~e:entity
+                        ~a:attribute
+                        ())
+                 with
+                 | Some d when d.e = entity ->
+                   let next =
+                     if
+                       admitted_attribute d.a
+                       && not
+                            (d.a = "logseq.property/asset"
+                             && Option.is_some (overrides uuid d.a))
+                     then Asset_attributes (uuid, d.a, 0)
+                     else Asset_attributes (uuid, d.a ^ "\000", -1)
+                   in
+                   walk (work - 1) remaining found (next :: rest)
+                 | _ -> walk (work - 1) remaining found rest)
+               else (
+                 let next =
+                   match overrides uuid attribute with
+                   | Some refs ->
+                     refs
+                     |> List.filter_map (entity_of_uuid database)
+                     |> List.sort_uniq Int.compare
+                     |> List.find_opt (fun target -> target > after)
+                   | None ->
+                     (match
+                        peek
+                          (Datascript.seek_datoms
+                             database
+                             Datascript.Eavt
+                             ~e:entity
+                             ~a:attribute
+                             ~v:(Datascript.Ref (after + 1))
+                             ())
+                      with
+                      | Some { e; a; v = Ref target; _ } when e = entity && a = attribute
+                        -> Some target
+                      | _ -> None)
+                 in
+                 match next with
+                 | None ->
+                   walk
+                     (work - 1)
+                     remaining
+                     found
+                     (Asset_attributes (uuid, attribute ^ "\000", -1) :: rest)
+                 | Some target ->
+                   emit
+                     (descriptor_for_entity target)
+                     (Asset_attributes (uuid, attribute, target) :: rest)))
+          | Asset_children (uuid, depth, after) :: rest ->
+            let next =
+              Option.bind (entity_of_uuid database uuid) (fun parent ->
+                match
+                  peek
+                    (Datascript.seek_datoms
+                       database
+                       Datascript.Avet
+                       ~a:"block/parent"
+                       ~v:(Datascript.Ref parent)
+                       ~e:(after + 1)
+                       ())
+                with
+                | Some { e; a = "block/parent"; v = Ref actual; _ } when actual = parent
+                  -> Some e
+                | _ -> None)
+            in
+            (match next with
+             | None ->
+               walk
+                 (work - 1)
+                 remaining
+                 found
+                 (Asset_local_children (uuid, depth, 0) :: rest)
+             | Some entity ->
+               let rest = Asset_children (uuid, depth, entity) :: rest in
+               (match uuid_of_entity database entity with
+                | None -> walk (work - 1) remaining found rest
+                | Some child ->
+                  if depth >= 256 then raise (Read_error Types.Read_limit_exceeded);
+                  walk (work - 1) remaining found (Asset_node (child, depth + 1) :: rest)))
+          | Asset_local_children (uuid, depth, offset) :: rest ->
+            (match
+               List.nth_opt
+                 (local_child_facts ~cache:tree_cache.hydration snapshot uuid)
+                 offset
+             with
+             | None -> walk (work - 1) remaining found rest
+             | Some (_, child) ->
+               if depth >= 256 then raise (Read_error Types.Read_limit_exceeded);
+               walk
+                 (work - 1)
+                 remaining
+                 found
+                 (Asset_node (child, depth + 1)
+                  :: Asset_local_children (uuid, depth, offset + 1)
+                  :: rest)))
+      in
+      let assets, remaining = walk (limit * 32) limit [] frames in
+      let next_cursor =
+        match remaining with
+        | [] -> None
+        | frames ->
+          let source =
+            Yojson.Safe.to_string
+              (`List
+                  [ `String "assets-v1"
+                  ; `String version
+                  ; `String roots_key
+                  ; `List (List.map asset_frame_json frames)
+                  ])
+          in
+          if String.length source > 16384
+          then raise (Read_error Types.Read_limit_exceeded);
+          Some (token Graph.Cursor.of_string source)
+      in
+      let result = { assets = List.rev assets; next_cursor } in
+      if
+        String.length (Marshal.to_string result [])
+        > snapshot.owner.dependencies.limits.response_budget_bytes
+      then Error Types.Read_limit_exceeded
+      else Ok result
+    with
+    | Read_error error -> Error error)
+;;
+
+let publish_asset_metadata database ~expected ~mutation_id ~asset ~version =
+  commit_local
+    database
+    ~expected
+    (Types.Publish_asset { mutation_id; block = asset; version })
+;;
+
+let inspect_local_mutation database mutation =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Local_database_closed
+    else
+      existing_mutation database (mutation_id mutation) (fingerprint mutation)
+      |> Result.map_error (fun () -> Types.Mutation_identity_conflict))
+;;
+
+let set_asset_reference database ~expected ~mutation_id ~block ~previous ~asset =
+  commit_local
+    database
+    ~expected
+    (Types.Set_asset_reference { mutation_id; block; previous; asset })
 ;;

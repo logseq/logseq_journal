@@ -2,7 +2,7 @@
  (name logseq_db_worker_bonsai)
  (public_name logseq_db_worker.bonsai)
  (libraries
-  bonsai_flutter.driver
+  bonsai_swiftui.driver
   eio
   logseq_db_worker
   logseq_db_types

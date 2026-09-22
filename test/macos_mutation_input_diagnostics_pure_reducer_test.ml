@@ -1,5 +1,5 @@
-module ID = Bonsai_flutter_spec.Id
-module Ui = Bonsai_flutter_ui
+module ID = Bonsai_swiftui_spec.Id
+module Ui = Bonsai_swiftui_ui
 
 let require condition message = if not condition then failwith message
 let equal expected actual label = require (expected = actual) label
@@ -16,13 +16,14 @@ let block
       ?(id = "70000000-0000-4000-a000-000000000001")
       ?(source = "Original")
       ?(revision = "block-1")
+      ?parent_id
       ()
   =
   Journal_model.create
     ~id
     ~page_id:"70000000-0000-4000-b000-000000000001"
     ~journal_day:20260901
-    ~parent_id:None
+    ~parent_id
     ~sibling_order:"a"
     ~source
     ~task_state:Journal_model.Todo
@@ -113,36 +114,45 @@ let test_capture_pipeline () =
 ;;
 
 let detail_source detail =
-  Journal_detail.editor_value detail |> Option.get |> Ui.Text_editing.Value.text
+  Journal_detail.child_capture detail |> Option.get |> Journal_capture.source
+;;
+
+let child_id = "70000000-0000-4000-a000-000000000002"
+
+let append_child detail =
+  Journal_detail.admit_child
+    detail
+    ~mutation_id:"append-detail"
+    ~calendar_generation:1L
+    ~block_id:child_id
+    ~sibling_order:"a"
+    ~creation_time
 ;;
 
 let test_detail_pipeline () =
-  let initial = detail () |> Journal_detail.begin_edit in
+  let initial = detail () in
   let session = Journal_detail.session_id initial in
-  let prefix = Journal_detail.apply_text_edit initial (edit session 1L 0L "Prefix") in
-  let detail = Journal_detail.apply_text_edit prefix (paste session) in
-  check_paste (Journal_detail.editor_value detail |> Option.get);
-  equal session (Journal_detail.session_id detail) "detail ack retains session";
-  equal Ui.Text_editing.Ack (Journal_detail.update_mode detail) "detail paste ack";
-  equal
-    (ID.Text_input.Document_revision.of_int64 2L)
-    (Journal_detail.document_revision detail)
-    "detail ack document revision";
-  equal
-    (ID.Text_input.Local_revision.of_int64 2L)
-    (Journal_detail.accepted_local_revision detail)
-    "detail ack local revision";
-  let detail = Journal_detail.apply_text_edit detail (edit session 3L 0L final_source) in
-  let saving, request = Journal_detail.admit_save detail ~mutation_id:"save-detail" in
+  let edited = Journal_detail.update_child_source initial pasted in
+  equal pasted (detail_source edited) "complete Unicode submission retained";
+  equal session (Journal_detail.session_id edited) "submission retains detail session";
+  let edited = Journal_detail.update_child_source edited final_source in
+  let saving, request = append_child edited in
   (match request with
-   | Some (Journal_graph_request.Update_source command) ->
-     equal final_source command.source "detail save uses last complete value";
-     equal "block-1" command.expected_revision "source save retains target precondition"
-   | _ -> failwith "detail did not emit save");
+   | Some (Journal_graph_request.Create_child command) ->
+     equal final_source command.source "append uses last complete value";
+     equal "block-1" command.expected_parent_revision "append retains parent precondition"
+   | _ -> failwith "detail did not emit append");
   equal
-    final_source
-    (detail_source (Journal_detail.apply_text_edit saving (edit session 4L 0L "late")))
-    "saving detail rejects edits"
+    saving
+    (Journal_detail.update_child_source saving "late")
+    "saving detail rejects edits";
+  let failed, effects =
+    Journal_detail.step saving (Append_failed (child_id, "offline"))
+  in
+  equal [] effects "failure does not resubmit";
+  equal final_source (detail_source failed) "failure preserves submitted text";
+  let _, retried = Journal_detail.retry failed in
+  equal request retried "retry preserves admitted append identity and precondition"
 ;;
 
 let test_invalid_edits () =
@@ -161,34 +171,16 @@ let test_invalid_edits () =
        equal capture (Journal_capture.apply_text_edit capture edit) "invalid capture edit")
     invalid;
   let initial = detail () in
-  let session = Journal_detail.session_id initial in
-  equal
-    initial
-    (Journal_detail.apply_text_edit initial (edit session 1L 0L "reading"))
-    "reading guard";
-  let detail = Journal_detail.begin_edit initial in
-  let detail = Journal_detail.apply_text_edit detail (edit session 2L 0L "kept") in
-  List.iter
-    (fun invalid ->
-       let invalid = { invalid with Ui.Event.Payload.session_id = session } in
-       equal detail (Journal_detail.apply_text_edit detail invalid) "invalid detail edit")
-    (List.filteri (fun i _ -> i < 3) invalid);
-  let _, conflict_request = Journal_detail.admit_save detail ~mutation_id:"conflict" in
-  require (Option.is_some conflict_request) "conflict fixture save";
-  let saving, _ = Journal_detail.admit_save detail ~mutation_id:"conflict" in
-  let conflict =
-    Journal_detail.apply_conflict saving (block ~source:"Remote" ~revision:"block-2" ())
+  let _, request = append_child initial in
+  equal None request "empty detail cannot append";
+  let saving, _ = append_child (Journal_detail.update_child_source initial "kept") in
+  let unchanged, effects =
+    Journal_detail.step saving (Append_failed ("unrelated", "late"))
   in
-  equal
-    conflict
-    (Journal_detail.apply_text_edit conflict (edit session 3L 0L "late"))
-    "conflict guard";
-  let _, retry = Journal_detail.retry conflict ~mutation_id:"retry" in
-  match retry with
-  | Some (Journal_graph_request.Update_source command) ->
-    equal "kept" command.source "conflict retry preserves local source";
-    equal "block-2" command.expected_revision "conflict retry uses observed remote token"
-  | _ -> failwith "conflict retry missing"
+  equal saving unchanged "unrelated append completion is fenced";
+  equal [] effects "stale failure emits no effect";
+  let _, duplicate = append_child saving in
+  equal None duplicate "saving detail rejects a duplicate submission"
 ;;
 
 let test_capture_replacement_fence () =
@@ -218,43 +210,43 @@ let test_capture_replacement_fence () =
     "new session accepts first edit"
 ;;
 
-let test_detail_discard_fence () =
-  let detail = detail () |> Journal_detail.begin_edit in
-  let session = Journal_detail.session_id detail in
-  let detail = Journal_detail.apply_text_edit detail (edit session 1L 0L "Prefix") in
-  let replaced = Journal_detail.discard_edit detail |> Journal_detail.begin_edit in
-  require
-    (not (ID.Text_input.Session_id.equal session (Journal_detail.session_id replaced)))
-    "discard must replace session before editing resumes";
-  equal "Original" (detail_source replaced) "discard restores root";
-  equal
-    replaced
-    (Journal_detail.apply_text_edit replaced (paste session))
-    "discard rejects queued paste";
-  let edited =
-    Journal_detail.apply_text_edit
-      replaced
-      (edit (Journal_detail.session_id replaced) 1L 0L "fresh")
+let test_detail_close_reopen () =
+  let edited = Journal_detail.update_child_source (detail ()) "Unsubmitted draft" in
+  equal `Close (Journal_detail.request_back edited) "ephemeral composer allows close";
+  let reopened =
+    Journal_detail.create
+      ~session_number:12L
+      { root = block (); children = { blocks = []; continuation = None } }
   in
-  equal "fresh" (detail_source edited) "new detail session accepts edit"
+  require
+    (not
+       (ID.Text_input.Session_id.equal
+          (Journal_detail.session_id edited)
+          (Journal_detail.session_id reopened)))
+    "reopened detail must have a fresh session";
+  equal None (Journal_detail.child_capture reopened) "reopen has no previous draft"
 ;;
 
 let test_detail_commit_fence () =
-  let detail = detail () |> Journal_detail.begin_edit in
-  let session = Journal_detail.session_id detail in
-  let detail = Journal_detail.apply_text_edit detail (edit session 1L 0L "Saved") in
-  let saving, _ = Journal_detail.admit_save detail ~mutation_id:"save" in
-  let committed =
-    Journal_detail.apply_block saving (block ~source:"Saved" ~revision:"block-2" ())
-    |> Journal_detail.begin_edit
+  let edited = Journal_detail.update_child_source (detail ()) "Saved" in
+  let saving, _ = append_child edited in
+  let parent = block ~revision:"block-2" () in
+  let child =
+    block ~id:child_id ~source:"Saved" ~parent_id:(Journal_model.id parent) ()
   in
-  require
-    (not (ID.Text_input.Session_id.equal session (Journal_detail.session_id committed)))
-    "committed replacement must fence edits queued while saving";
+  let committed = Journal_detail.apply_child_created saving ~child ~parent in
+  equal None (Journal_detail.child_capture committed) "commit clears submitted draft";
+  equal 1L (Journal_detail.composer_revision committed) "commit resets native composer";
+  equal (Some child_id) (Journal_detail.reveal_id committed) "commit reveals appended row";
   equal
     committed
-    (Journal_detail.apply_text_edit committed (edit session 2L 0L "queued"))
-    "committed source survives old session"
+    (Journal_detail.apply_child_created committed ~child ~parent)
+    "duplicate completion cannot reset composer twice";
+  let fresh = Journal_detail.update_child_source committed "Next" in
+  equal
+    fresh
+    (Journal_detail.apply_child_created fresh ~child ~parent)
+    "old completion cannot discard next draft"
 ;;
 
 let test_admission_reopen_fence () =
@@ -288,7 +280,7 @@ let test_detail_reload_after_session_replacement () =
     { root = block (); children = { blocks = []; continuation = None } }
   in
   let routes =
-    Journal_routes.create ~anchor:{ block_id = None; first_index = 0 }
+    Journal_routes.create ()
     |> fun routes ->
     Journal_routes.open_detail
       routes
@@ -300,8 +292,7 @@ let test_detail_reload_after_session_replacement () =
   let edited =
     Journal_routes.detail routes
     |> Option.get
-    |> Journal_detail.discard_edit
-    |> Journal_detail.begin_edit
+    |> fun detail -> Journal_detail.update_child_source detail "Pending draft"
   in
   let old_session = Journal_detail.session_id edited in
   let routes =
@@ -313,19 +304,22 @@ let test_detail_reload_after_session_replacement () =
       ~request_generation:(Journal_routes.detail_request_generation routes)
       projection
   in
-  let reloaded =
-    Journal_routes.detail routes |> Option.get |> Journal_detail.begin_edit
-  in
+  let reloaded = Journal_routes.detail routes |> Option.get in
   require
     (not
        (ID.Text_input.Session_id.equal old_session (Journal_detail.session_id reloaded)))
     "reload reused the already-replaced editor session";
   equal
-    reloaded
-    (Journal_detail.apply_text_edit
-       reloaded
-       (edit old_session 1L 0L "queued before reload"))
-    "reload admitted stale-session text"
+    (Some "Pending draft")
+    (Option.map Journal_capture.source (Journal_detail.child_capture reloaded))
+    "runtime replacement preserves the retained draft";
+  let unchanged =
+    Journal_routes.apply_detail_response
+      routes
+      ~request_generation:10L
+      { projection with root = block ~source:"Stale" () }
+  in
+  equal routes unchanged "reload rejects the previous detail request completion"
 ;;
 
 let test_undo_keeps_reconciled_sibling () =
@@ -376,10 +370,10 @@ let cases =
   ; "M05 reload after replacement session", test_detail_reload_after_session_replacement
   ; "M06 reopened request correlation", test_admission_reopen_fence
   ; "M05 Capture full-value pipeline", test_capture_pipeline
-  ; "M05 Detail full-value pipeline", test_detail_pipeline
+  ; "M05 Detail append and retry pipeline", test_detail_pipeline
   ; "M05 invalid revisions and mode guards", test_invalid_edits
   ; "M05 Capture replacement session", test_capture_replacement_fence
-  ; "M05 Detail discard session", test_detail_discard_fence
+  ; "M05 Detail close and reopen", test_detail_close_reopen
   ; "M05 Detail commit session", test_detail_commit_fence
   ]
 ;;

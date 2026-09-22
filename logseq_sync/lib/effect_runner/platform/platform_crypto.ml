@@ -3,29 +3,32 @@ open Yojson.Basic
 external call_raw : string -> string = "logseq_journal_crypto_call"
 
 let hex value =
-  let buffer = Buffer.create (String.length value * 2) in
-  String.iter
-    (fun character ->
-       Buffer.add_string buffer (Printf.sprintf "%02x" (Char.code character)))
-    value;
-  Buffer.contents buffer
+  let digits = "0123456789abcdef" in
+  String.init
+    (String.length value * 2)
+    (fun index ->
+       let byte = Char.code value.[index / 2] in
+       digits.[if index mod 2 = 0 then byte lsr 4 else byte land 15])
 ;;
 
 let unhex value =
+  let digit = function
+    | '0' .. '9' as c -> Char.code c - Char.code '0'
+    | 'a' .. 'f' as c -> Char.code c - Char.code 'a' + 10
+    | 'A' .. 'F' as c -> Char.code c - Char.code 'A' + 10
+    | _ -> invalid_arg "invalid hex digit"
+  in
   if String.length value mod 2 <> 0
   then Error "platform crypto returned invalid data"
   else (
     try
-      let result = Bytes.create (String.length value / 2) in
-      for index = 0 to Bytes.length result - 1 do
-        Bytes.set
-          result
-          index
-          (Char.chr (int_of_string ("0x" ^ String.sub value (index * 2) 2)))
-      done;
-      Ok (Bytes.unsafe_to_string result)
+      Ok
+        (String.init
+           (String.length value / 2)
+           (fun index ->
+              Char.chr ((digit value.[index * 2] lsl 4) lor digit value.[(index * 2) + 1])))
     with
-    | _ -> Error "platform crypto returned invalid data")
+    | Invalid_argument _ -> Error "platform crypto returned invalid data")
 ;;
 
 let invoke operation fields =
@@ -89,27 +92,22 @@ type crypto =
       key:string -> iv:string -> ciphertext:string -> (string, string) result
   }
 
+external call_binary
+  :  bool
+  -> string
+  -> string
+  -> string
+  -> (string, string) result
+  = "logseq_journal_crypto_binary_call"
+
 let crypto =
   { encrypt_aes_gcm =
       (fun ~key ~plaintext ->
-        bind
-          (invoke
-             "encryptAES"
-             [ "key", `String (hex key); "plaintext", `String (hex plaintext) ])
-          (fun fields ->
-             bind (binary_field "iv" fields) (fun iv ->
-               bind (binary_field "ciphertext" fields) (fun ciphertext ->
-                 Ok (iv, ciphertext)))))
-  ; decrypt_aes_gcm =
-      (fun ~key ~iv ~ciphertext ->
-        bind
-          (invoke
-             "decryptAES"
-             [ "key", `String (hex key)
-             ; "iv", `String (hex iv)
-             ; "ciphertext", `String (hex ciphertext)
-             ])
-          (binary_field "value"))
+        Result.map
+          (fun bytes ->
+             String.sub bytes 0 12, String.sub bytes 12 (String.length bytes - 12))
+          (call_binary true key "" plaintext))
+  ; decrypt_aes_gcm = (fun ~key ~iv ~ciphertext -> call_binary false key iv ciphertext)
   }
 ;;
 

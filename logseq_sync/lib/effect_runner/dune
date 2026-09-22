@@ -5,6 +5,8 @@
  (public_name logseq_sync.effect_runner.impl)
  (implements logseq_sync_effect_runner)
  (modules
+  asset_cache
+  asset_codec
   artifact_decoder
   bootstrap
   catalog

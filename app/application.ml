@@ -1,6 +1,7 @@
-module ID = Bonsai_flutter_spec.Id
-module Platform = Bonsai_flutter.Application_platform
-module Ui = Bonsai_flutter_ui
+module ID = Bonsai_swiftui_spec.Id
+module Platform = Bonsai_swiftui.Application_platform
+module Ui = Bonsai_swiftui_ui
+module V = Ui.View
 module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 
 module Admission_refresh = struct
@@ -113,7 +114,8 @@ type pending_delete =
   { mutation_id : string
   ; block_id : string
   ; expected_revision : string
-  ; staged : Journal_timeline_state.staged_delete
+  ; staged : Journal_timeline_state.staged_delete option
+  ; detail_staged : (int64 * Journal_detail.staged_delete) option
   ; deadline : Core.Time_ns.t
   ; phase : delete_phase
   }
@@ -127,8 +129,22 @@ type pending_status =
 
 type timeline_notice =
   | Delete_undo
-  | Delete_failed
+  | Delete_failed of string
   | Status_failed of string
+
+let operation_failure = function
+  | Some (Delete_failed message) ->
+    Some
+      ( "Delete failed"
+      , message
+      , "The block has been restored. Review it before trying Delete again." )
+  | Some (Status_failed message) ->
+    Some
+      ( "Status not changed"
+      , message
+      , "The block keeps its current status. Open its Status menu to try again." )
+  | None | Some Delete_undo -> None
+;;
 
 type feed_projection_context =
   { local_day : int
@@ -148,9 +164,9 @@ type feed_refresh =
 
 type modal =
   | No_modal
+  | Capture_sheet
+  | Append_sheet
   | Status_sheet of string
-  | Account
-  | Settings
   | Diagnostics
   | Error_info
   | Cache_reset_confirmation of Logseq_db_types.Graph_types.Uuid.t
@@ -185,6 +201,14 @@ type sync_error_notice =
   ; failure : sync_failure
   }
 
+module Graph_drafts = Map.Make (String)
+module Media_views = Map.Make (String)
+
+type graph_drafts =
+  { capture_draft : Journal_capture.t option
+  ; append_drafts : Journal_routes.retained_drafts
+  }
+
 type state =
   { favorites : Journal_routes.Favorites.t
   ; favorites_requests : Journal_graph_request.favorites_request list
@@ -196,10 +220,13 @@ type state =
   ; pending_delete : pending_delete option
   ; pending_status : pending_status option
   ; direct_capture : Journal_capture.t option
-  ; capture_affordance_key : int64
-  ; journals_scroll : Journal_timeline_state.Root_scroll_trigger.t
-  ; favorites_scroll : Journal_timeline_state.Root_scroll_trigger.t
-  ; root_active : bool
+  ; draft_graph : Graph_service.graph_id option
+  ; graph_drafts : graph_drafts Graph_drafts.t
+  ; asset_offline : (Journal_asset_policy.offline * Journal_asset_policy.offline) option
+  ; uploads : Journal_uploads.t
+  ; asset_settings_open : bool
+  ; media_views : Journal_media_runtime.view Media_views.t
+  ; import_completion : (string * string option) option
   ; capture_error : capture_failure option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
@@ -218,21 +245,13 @@ type state =
   ; worker_errors : worker_error_occurrence list
   ; next_sync_error_sequence : int64
   ; e2ee_password : Journal_capture.t
-  ; typography_preset : Journal_visual_tokens.typography_preset option
   ; modal : modal
+  ; confirmation_sequence : int64
   }
 
 let favorites_event state event =
   let favorites, requests = Journal_routes.Favorites.step state.favorites event in
   { state with favorites; favorites_requests = state.favorites_requests @ requests }
-;;
-
-let reset_destination_scroll state =
-  match Journal_routes.destination state.routes with
-  | Journals ->
-    { state with journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial }
-  | Favorites ->
-    { state with favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial }
 ;;
 
 let select_destination state destination =
@@ -242,17 +261,15 @@ let select_destination state destination =
     { state with routes = Journal_routes.select_destination state.routes destination }
     |> fun state ->
     favorites_event state (Select (destination = Journal_routes.Favorites))
-    |> reset_destination_scroll
 ;;
 
-let initial_anchor : Journal_routes.anchor = { block_id = None; first_index = 0 }
 let feed_day_limit = 7
 let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5.
 
 let initial_state =
   { favorites = Journal_routes.Favorites.create ~graph_generation:(-1)
   ; favorites_requests = []
-  ; routes = Journal_routes.create ~anchor:initial_anchor
+  ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
   ; next_request_generation = 1L
   ; next_local_sequence = 1L
@@ -260,10 +277,13 @@ let initial_state =
   ; pending_delete = None
   ; pending_status = None
   ; direct_capture = None
-  ; capture_affordance_key = 1L
-  ; journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial
-  ; favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial
-  ; root_active = true
+  ; draft_graph = None
+  ; graph_drafts = Graph_drafts.empty
+  ; asset_offline = None
+  ; uploads = Journal_uploads.empty
+  ; asset_settings_open = false
+  ; media_views = Media_views.empty
+  ; import_completion = None
   ; capture_error = None
   ; timeline_notice = None
   ; write_enabled = false
@@ -282,8 +302,8 @@ let initial_state =
   ; worker_errors = []
   ; next_sync_error_sequence = 1L
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
-  ; typography_preset = None
   ; modal = No_modal
+  ; confirmation_sequence = 0L
   }
 ;;
 
@@ -321,18 +341,24 @@ let local_deletion_active state =
     state.manager
 ;;
 
-let discard_local_graph_state state =
+let track_capture_session state =
+  match state.direct_capture with
+  | None -> state
+  | Some capture ->
+    let next =
+      ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture) |> Int64.succ
+    in
+    { state with next_local_sequence = Int64.max state.next_local_sequence next }
+;;
+
+let clear_graph_surface state =
   { state with
-    journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial
-  ; favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial
-  ; root_active = true
-  ; favorites =
+    favorites =
       Journal_routes.Favorites.create ~graph_generation:state.graph_state.generation
   ; favorites_requests = []
-  ; routes = Journal_routes.graph_unavailable state.routes
+  ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
-  ; capture_affordance_key = Int64.succ state.capture_affordance_key
   ; direct_capture = None
   ; pending_delete = None
   ; pending_status = None
@@ -349,6 +375,73 @@ let discard_local_graph_state state =
   }
 ;;
 
+let discard_local_graph_state state =
+  let graph_drafts =
+    match state.draft_graph with
+    | None -> state.graph_drafts
+    | Some id ->
+      Graph_drafts.remove
+        (Logseq_db_types.Graph_types.Uuid.to_string id)
+        state.graph_drafts
+  in
+  { (clear_graph_surface state) with draft_graph = None; graph_drafts }
+;;
+
+let clear_account_drafts state =
+  { (clear_graph_surface state) with
+    draft_graph = None
+  ; graph_drafts = Graph_drafts.empty
+  }
+;;
+
+let switch_draft_graph state graph_id =
+  let graph_drafts =
+    match state.draft_graph with
+    | None -> state.graph_drafts
+    | Some id ->
+      let capture_draft =
+        Option.map
+          (fun capture ->
+             match Journal_capture.phase capture with
+             | Saving ->
+               Journal_capture.fail
+                 capture
+                 ~message:"Save was interrupted. Retry to confirm the original attempt."
+             | Editing | Failed _ -> capture)
+          state.direct_capture
+      in
+      Graph_drafts.add
+        (Logseq_db_types.Graph_types.Uuid.to_string id)
+        { capture_draft
+        ; append_drafts = Journal_routes.retain_drafts ~interrupted:true state.routes
+        }
+        state.graph_drafts
+  in
+  let state = clear_graph_surface state in
+  let retained =
+    Option.bind graph_id (fun id ->
+      Graph_drafts.find_opt (Logseq_db_types.Graph_types.Uuid.to_string id) graph_drafts)
+  in
+  let graph_drafts =
+    match graph_id with
+    | None -> graph_drafts
+    | Some id ->
+      Graph_drafts.remove (Logseq_db_types.Graph_types.Uuid.to_string id) graph_drafts
+  in
+  let direct_capture, routes =
+    match retained with
+    | None -> None, state.routes
+    | Some retained ->
+      ( Option.map
+          (fun capture ->
+             Journal_capture.rebind capture ~session_number:state.next_local_sequence)
+          retained.capture_draft
+      , Journal_routes.restore_drafts state.routes retained.append_drafts )
+  in
+  { state with draft_graph = graph_id; graph_drafts; direct_capture; routes }
+  |> track_capture_session
+;;
+
 let local_deletion_available state =
   match state.manager with
   | Some snapshot ->
@@ -361,6 +454,13 @@ let local_deletion_available state =
 
 let apply_manager_state state (manager_state : Graph_service.state) =
   let snapshot = manager_state.snapshot in
+  let state =
+    match state.manager with
+    | Some previous
+      when previous.startup.account_generation <> snapshot.startup.account_generation ->
+      clear_account_drafts state
+    | None | Some _ -> state
+  in
   let state =
     if Option.is_some snapshot.local_deletion && not (local_deletion_active state)
     then discard_local_graph_state state
@@ -379,7 +479,11 @@ let apply_manager_state state (manager_state : Graph_service.state) =
            previous.selected_graph
            snapshot.selected_graph)
   in
-  let state = if graph_context_changed then discard_local_graph_state state else state in
+  let state =
+    if graph_context_changed
+    then switch_draft_graph state snapshot.selected_graph
+    else state
+  in
   let was_awaiting_password =
     match state.manager with
     | Some { startup = { awaiting_e2ee_password = true; _ }; _ } -> true
@@ -395,11 +499,17 @@ let apply_manager_state state (manager_state : Graph_service.state) =
   in
   let modal =
     match state.modal, snapshot.selected_graph with
-    | Status_sheet _, _ when graph_context_changed -> No_modal
+    | (Status_sheet _ | Capture_sheet | Append_sheet), _ when graph_context_changed ->
+      No_modal
     | Cache_reset_confirmation confirmation, Some selected
       when Logseq_db_types.Graph_types.Uuid.equal confirmation selected -> state.modal
-    | (No_modal | Status_sheet _ | Account | Settings | Diagnostics | Error_info), _ ->
-      state.modal
+    | ( ( No_modal
+        | Capture_sheet
+        | Append_sheet
+        | Status_sheet _
+        | Diagnostics
+        | Error_info )
+      , _ ) -> state.modal
     | Cache_reset_confirmation _, (None | Some _) -> No_modal
   in
   let state =
@@ -431,9 +541,6 @@ let worker_request generation = function
   | Day { day; after } ->
     Journal_graph_request.Load_day_blocks
       { day; after; limit = 64; request_generation = generation }
-  | Children { parent_id; epoch = _ } ->
-    Journal_graph_request.Load_detail
-      { block_id = parent_id; after = None; limit = 3; request_generation = generation }
 ;;
 
 let block_in_timeline timeline block_id =
@@ -444,12 +551,6 @@ let open_detail_state state detail request_generation =
   let routes =
     Journal_routes.apply_detail_response state.routes ~request_generation detail
   in
-  let routes =
-    match Journal_routes.detail routes with
-    | None -> routes
-    | Some detail ->
-      Journal_routes.update_detail routes (Journal_detail.begin_edit detail)
-  in
   { state with routes }
 ;;
 
@@ -458,14 +559,61 @@ let capture_failure_message = function
   | Local_capture_failure message -> message
 ;;
 
+let restore_deleted state (pending : pending_delete) =
+  let timeline =
+    Option.fold
+      ~none:state.timeline
+      ~some:(Journal_timeline_state.undo_delete state.timeline)
+      pending.staged
+  in
+  let routes =
+    match pending.detail_staged, Journal_routes.detail state.routes with
+    | Some (session, staged), Some detail
+      when session = Journal_routes.detail_request_generation state.routes ->
+      Journal_routes.update_detail state.routes (Journal_detail.undo_delete detail staged)
+    | _ -> state.routes
+  in
+  favorites_event { state with timeline; routes } (Reveal_target pending.block_id)
+;;
+
+let hide_deleted state (pending : pending_delete) =
+  let timeline, staged =
+    match
+      Journal_timeline_state.stage_delete state.timeline ~block_id:pending.block_id
+    with
+    | None -> state.timeline, pending.staged
+    | Some (timeline, staged) -> timeline, Some staged
+  in
+  let routes, detail_staged =
+    match Journal_routes.detail state.routes with
+    | None -> state.routes, pending.detail_staged
+    | Some detail ->
+      (match Journal_detail.stage_delete detail ~block_id:pending.block_id with
+       | None -> state.routes, pending.detail_staged
+       | Some (hidden, staged) ->
+         let routes =
+           if Journal_model.id (Journal_detail.root detail) = pending.block_id
+           then Journal_routes.back state.routes
+           else Journal_routes.update_detail state.routes hidden
+         in
+         routes, Some (Journal_routes.detail_request_generation state.routes, staged))
+  in
+  favorites_event
+    { state with
+      timeline
+    ; routes
+    ; pending_delete = Some { pending with staged; detail_staged }
+    }
+    (Hide_target pending.block_id)
+;;
+
 let fail_active_mutation state failure =
   let message = capture_failure_message failure in
   match state.pending_delete with
   | Some pending_delete ->
-    { state with
-      timeline = Journal_timeline_state.undo_delete state.timeline pending_delete.staged
-    ; pending_delete = None
-    ; timeline_notice = Some Delete_failed
+    { (restore_deleted state pending_delete) with
+      pending_delete = None
+    ; timeline_notice = Some (Delete_failed message)
     }
   | None ->
     (match state.pending_status with
@@ -616,39 +764,14 @@ let presentation_for_day _state day =
   Journal_calendar.present_journal_day day |> Result.to_option
 ;;
 
-let today_presentation state =
-  Option.bind state.calendar (fun calendar ->
-    Journal_calendar.present_journal_day (Journal_calendar.local_day calendar)
-    |> Result.to_option)
-;;
-
-let rtl_languages = [ "ar"; "fa"; "he"; "ur" ]
-
-let is_rtl_locale locale =
-  let rec language_length index =
-    if index = String.length locale
-    then index
-    else (
-      match String.get locale index with
-      | '-' | '_' -> index
-      | _ -> language_length (index + 1))
-  in
-  let language = String.sub locale 0 (language_length 0) |> String.lowercase_ascii in
-  List.exists (String.equal language) rtl_languages
-;;
-
 let back_state state =
-  let detail_block_id = Journal_routes.detail_block_id state.routes in
   let detail_root = Option.map Journal_detail.root (Journal_routes.detail state.routes) in
   let routes = Journal_routes.back state.routes in
   let timeline =
-    match detail_block_id, detail_root, Journal_routes.route routes with
-    | Some block_id, Some root, Journal_routes.Timeline ->
-      Journal_timeline_state.replace_block state.timeline root
-      |> Journal_timeline_state.return_from_detail ~block_id
-    | Some block_id, None, Journal_routes.Timeline ->
-      Journal_timeline_state.return_from_detail state.timeline ~block_id
-    | Some _, _, _ | None, _, _ -> state.timeline
+    match detail_root, Journal_routes.route routes with
+    | Some root, Journal_routes.Timeline when Journal_model.journal_day_opt root <> None
+      -> Journal_timeline_state.replace_block state.timeline root
+    | _ -> state.timeline
   in
   { state with routes; timeline }
 ;;
@@ -664,6 +787,23 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
     let state = resolve_worker_errors state in
     { state with write_enabled = true; graph_ready = true; graph_error = None }
   | Admission_inspected _ | Admission_unavailable _ -> state
+  | Feed_refresh_started { request_generation } ->
+    (match state.calendar, state.feed_refresh with
+     | _, Some refresh when Int64.compare refresh.generation request_generation > 0 ->
+       state
+     | Some calendar, _ when state.graph_ready ->
+       { state with
+         feed_refresh =
+           Some
+             { generation = request_generation
+             ; context = feed_projection_context calendar
+             ; cause = Sync_refresh
+             ; graph_generation = current_graph_generation state
+             }
+       ; next_request_generation =
+           Int64.max state.next_request_generation (Int64.succ request_generation)
+       }
+     | None, _ | Some _, _ -> state)
   | Feed_loaded { request_generation; feed; complete } ->
     (match state.feed_refresh with
      | Some refresh when Int64.equal refresh.generation request_generation ->
@@ -684,7 +824,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
                ~generation:request_generation
                (Feed { before_day = None })
            | Sync_refresh ->
-             Journal_timeline_state.empty ~today
+             Journal_timeline_state.reset state.timeline ~today
              |> fun timeline ->
              Journal_timeline_state.begin_request
                timeline
@@ -715,10 +855,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
          match Journal_timeline_state.pending_request state.timeline with
          | Some (expected_generation, Feed { before_day = None }) ->
            Int64.equal expected_generation request_generation
-         | Some (_, Feed { before_day = Some _ })
-         | Some (_, Day _)
-         | Some (_, Children _)
-         | None -> false
+         | Some (_, Feed { before_day = Some _ }) | Some (_, Day _) | None -> false
        in
        let timeline =
          Journal_timeline_state.apply_feed
@@ -770,13 +907,37 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
     when Journal_routes.route state.routes = Journal_routes.Detail_loading ->
     open_detail_state state detail request_generation
   | Detail_loaded { request_generation; detail } ->
-    { state with
-      timeline =
-        Journal_timeline_state.apply_detail
-          state.timeline
-          ~generation:request_generation
-          detail
-    }
+    (match Journal_routes.detail state.routes with
+     | None -> state
+     | Some current ->
+       let current, _ =
+         Journal_detail.step current (Loaded (request_generation, detail))
+       in
+       { state with routes = Journal_routes.update_detail state.routes current })
+  | Detail_failed { request_generation; block_id; missing; stale_cursor; failure } ->
+    if
+      Journal_routes.detail_request_generation state.routes = request_generation
+      && Journal_routes.detail_block_id state.routes = Some block_id
+      && Journal_routes.route state.routes = Journal_routes.Detail_loading
+    then
+      { state with
+        routes =
+          Journal_routes.apply_detail_failure
+            state.routes
+            ~request_generation
+            ~missing
+            ~message:(failure_source_message failure)
+      }
+    else (
+      match Journal_routes.detail state.routes with
+      | None -> state
+      | Some detail ->
+        let detail, _ =
+          Journal_detail.step
+            detail
+            (Load_failed (request_generation, stale_cursor, failure_source_message failure))
+        in
+        { state with routes = Journal_routes.update_detail state.routes detail })
   | Feed_failed { request_generation; failure } ->
     let state = record_failure_source state failure in
     let message = failure_source_message failure in
@@ -806,15 +967,19 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
           else terminal_failure state
         | Some (_, Feed { before_day = Some _ })
         | Some (_, Day _)
-        | Some (_, Children _)
         | Some (_, Feed { before_day = None })
         | None -> state))
   | Block_captured { block; timeline_entry_update } ->
-    ignore block;
+    let completed =
+      Option.fold
+        ~none:false
+        ~some:(fun capture -> Journal_capture.completed_by capture block)
+        state.direct_capture
+    in
     { state with
-      direct_capture = None
-    ; capture_affordance_key = Int64.succ state.capture_affordance_key
-    ; capture_error = None
+      direct_capture = (if completed then None else state.direct_capture)
+    ; modal = (if completed && state.modal = Capture_sheet then No_modal else state.modal)
+    ; capture_error = (if completed then None else state.capture_error)
     ; timeline =
         Option.fold
           ~none:state.timeline
@@ -838,7 +1003,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
       | Some detail ->
         Journal_routes.update_detail
           state.routes
-          (Journal_detail.apply_block detail block |> Journal_detail.begin_edit)
+          (Journal_detail.apply_block detail block)
     in
     { state with
       routes
@@ -846,7 +1011,10 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
     ; timeline_notice
     ; timeline =
         Option.fold
-          ~none:(Journal_timeline_state.replace_block state.timeline block)
+          ~none:
+            (if Journal_model.journal_day_opt block = None
+             then state.timeline
+             else Journal_timeline_state.replace_block state.timeline block)
           ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
           timeline_entry_update
     }
@@ -866,10 +1034,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
           state.routes
           (Journal_detail.reconcile_children current detail)
     in
-    { state with
-      routes
-    ; timeline = Journal_timeline_state.reconcile_detail state.timeline detail
-    }
+    { state with routes }
   | Update_conflict latest ->
     (match state.pending_status with
      | Some pending when String.equal pending.block_id (Journal_model.id latest) ->
@@ -886,26 +1051,37 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
             routes =
               Journal_routes.update_detail
                 state.routes
-                (Journal_detail.apply_conflict detail latest)
+                (Journal_detail.apply_block detail latest)
           }))
-  | Child_created { child; timeline_entry_update } ->
-    (match Journal_routes.detail state.routes with
-     | None -> state
-     | Some detail ->
-       let detail =
-         Journal_detail.apply_child_created
-           detail
-           ~child
-           ~parent:timeline_entry_update.block
-         |> Journal_detail.begin_edit
-       in
-       { state with
-         routes = Journal_routes.update_detail state.routes detail
-       ; timeline =
-           Journal_timeline_state.replace_timeline_entry
-             state.timeline
-             timeline_entry_update
-       })
+  | Child_failed { block_id; failure } ->
+    let state = record_failure_source state failure in
+    { state with
+      routes =
+        Journal_routes.apply_child_failure
+          state.routes
+          ~block_id
+          ~message:(failure_source_message failure)
+    }
+  | Child_created { child; parent; timeline_entry_update } ->
+    let was_editing =
+      Option.bind (Journal_routes.detail state.routes) Journal_detail.child_capture
+      <> None
+    in
+    let routes = Journal_routes.apply_child_created state.routes ~child ~parent in
+    let completed_active =
+      was_editing
+      && Option.bind (Journal_routes.detail routes) Journal_detail.child_capture = None
+    in
+    { state with
+      routes
+    ; modal =
+        (if state.modal = Append_sheet && completed_active then No_modal else state.modal)
+    ; timeline =
+        Option.fold
+          ~none:state.timeline
+          ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
+          timeline_entry_update
+    }
   | Block_found _ -> state
   | Subtree_deleted { block_id; parent; timeline_entry_update; _ } ->
     (match state.pending_delete with
@@ -928,14 +1104,15 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
     (match state.pending_delete with
      | None -> state
      | Some pending ->
+       let state = restore_deleted state pending in
        { state with
          timeline =
-           (let timeline =
-              Journal_timeline_state.undo_delete state.timeline pending.staged
-            in
-            Journal_timeline_state.replace_block timeline latest)
+           (if Journal_model.journal_day_opt latest = None
+            then state.timeline
+            else Journal_timeline_state.replace_block state.timeline latest)
        ; pending_delete = None
-       ; timeline_notice = Some Delete_failed
+       ; timeline_notice =
+           Some (Delete_failed "The block changed elsewhere. Delete was not applied.")
        })
   | Open_failed worker_failure ->
     let state = record_runtime_worker_failure state worker_failure in
@@ -964,45 +1141,36 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
   match state.pending_delete, response.payload with
   | None, _ | Some _, Subtree_deleted _ -> apply_worker_response_unstaged state response
   | Some pending, _ ->
-    let timeline = Journal_timeline_state.undo_delete state.timeline pending.staged in
-    let state = apply_worker_response_unstaged { state with timeline } response in
+    let state = apply_worker_response_unstaged (restore_deleted state pending) response in
     (match state.pending_delete with
      | None -> state
-     | Some pending ->
-       (match
-          Journal_timeline_state.stage_delete state.timeline ~block_id:pending.block_id
-        with
-        | Some (timeline, staged) ->
-          { state with timeline; pending_delete = Some { pending with staged } }
-        | None -> { state with pending_delete = None; timeline_notice = None }))
+     | Some pending -> hide_deleted state pending)
 ;;
 
 module Root_navigation = struct
   type t = state
 
   type event =
-    | Scroll of
-        { destination : Journal_routes.destination
-        ; pixels : float
-        ; delta : float
-        }
-    | Root_active of bool
-    | Non_scrollable of Journal_routes.destination
     | Select of Journal_routes.destination
+    | Capture_opened
+    | Capture_closed
+    | Capture_native_edit of Ui.Event.Payload.text_edit
+    | Capture_task_intent of bool
     | Capture_edited of string
     | Capture_admitted of Journal_capture.t
     | Completed of Journal_graph_runtime.response
-    | Graph_replaced of int
+    | Graph_replaced of
+        { generation : int
+        ; graph_id : Logseq_db_types.Graph_types.Uuid.t option
+        }
+    | Account_cleared
+    | Local_copy_deleted
 
-  let replace_graph state generation =
+  let replace_graph state generation graph_id =
+    let state = switch_draft_graph state graph_id in
     { state with
-      journals_scroll = Journal_timeline_state.Root_scroll_trigger.initial
-    ; favorites_scroll = Journal_timeline_state.Root_scroll_trigger.initial
-    ; root_active = true
-    ; favorites = Journal_routes.Favorites.create ~graph_generation:generation
+      favorites = Journal_routes.Favorites.create ~graph_generation:generation
     ; favorites_requests = []
-    ; routes = Journal_routes.create ~anchor:initial_anchor
-    ; direct_capture = None
     ; pending_delete = None
     ; pending_status = None
     ; timeline = Journal_timeline_state.empty ~today:0
@@ -1010,205 +1178,173 @@ module Root_navigation = struct
     ; graph_ready = false
     ; feed_loaded = false
     ; capture_error = None
-    ; capture_affordance_key = Int64.succ state.capture_affordance_key
+    ; timeline_notice = None
     }
   ;;
 
-  let create ~graph_generation = replace_graph initial_state graph_generation
+  let create ~graph_generation = replace_graph initial_state graph_generation None
 
-  let step state = function
-    | Root_active active ->
-      if active = state.root_active
-      then state
-      else (
-        let state = { state with root_active = active } in
-        if active then reset_destination_scroll state else state)
-    | Non_scrollable destination ->
-      if state.root_active && Journal_routes.destination state.routes = destination
-      then reset_destination_scroll state
-      else state
-    | Scroll { destination; pixels; delta } ->
-      if (not state.root_active) || Journal_routes.destination state.routes <> destination
-      then state
-      else (
-        let step trigger =
-          Journal_timeline_state.Root_scroll_trigger.step trigger ~pixels ~delta
+  let step state event =
+    let state =
+      match event with
+      | Select destination -> select_destination state destination
+      | Capture_opened ->
+        let state =
+          match state.direct_capture with
+          | Some _ -> state
+          | None ->
+            { state with
+              direct_capture =
+                Some
+                  (Journal_capture.create
+                     ~session_number:state.next_local_sequence
+                     ~source:"")
+            ; next_local_sequence = Int64.succ state.next_local_sequence
+            }
         in
-        match destination with
-        | Journals -> { state with journals_scroll = step state.journals_scroll }
-        | Favorites -> { state with favorites_scroll = step state.favorites_scroll })
-    | Select destination -> select_destination state destination
-    | Capture_edited source ->
-      let capture, next_local_sequence =
-        match state.direct_capture with
-        | None ->
-          ( Journal_capture.create ~session_number:state.next_local_sequence ~source
-          , Int64.succ state.next_local_sequence )
-        | Some capture ->
-          Journal_capture.update_source capture ~source, state.next_local_sequence
-      in
-      { state with
-        direct_capture = Some capture
-      ; next_local_sequence
-      ; capture_error = None
-      }
-    | Capture_admitted capture ->
-      { state with direct_capture = Some capture; capture_error = None }
-    | Completed response -> apply_worker_response state response
-    | Graph_replaced generation -> replace_graph state generation
-  ;;
-
-  let scroll_trigger state = function
-    | Journal_routes.Journals -> state.journals_scroll
-    | Favorites -> state.favorites_scroll
-  ;;
-
-  let navigation_visible state =
-    Journal_timeline_state.Root_scroll_trigger.presentation
-      (scroll_trigger state (Journal_routes.destination state.routes))
-    = Extended
+        { state with modal = Capture_sheet }
+      | Capture_closed -> { state with modal = No_modal }
+      | Capture_native_edit edit ->
+        { state with
+          direct_capture =
+            Option.map
+              (fun capture -> Journal_capture.apply_text_edit capture edit)
+              state.direct_capture
+        }
+      | Capture_task_intent selected ->
+        { state with
+          direct_capture =
+            Option.map
+              (fun capture ->
+                 if Journal_capture.task_state capture = Journal_model.Todo = selected
+                 then capture
+                 else Journal_capture.toggle_task_intent capture)
+              state.direct_capture
+        }
+      | Capture_edited source ->
+        let capture, next_local_sequence =
+          match state.direct_capture with
+          | None ->
+            ( Journal_capture.create ~session_number:state.next_local_sequence ~source
+            , Int64.succ state.next_local_sequence )
+          | Some capture ->
+            Journal_capture.update_source capture ~source, state.next_local_sequence
+        in
+        { state with
+          direct_capture = Some capture
+        ; next_local_sequence
+        ; capture_error = None
+        }
+      | Capture_admitted capture ->
+        { state with direct_capture = Some capture; capture_error = None }
+      | Completed response -> apply_worker_response state response
+      | Graph_replaced { generation; graph_id } ->
+        let state = replace_graph state generation graph_id in
+        { state with graph_state = { state.graph_state with graph_id } }
+      | Account_cleared -> clear_account_drafts state
+      | Local_copy_deleted -> discard_local_graph_state state
+    in
+    track_capture_session state
   ;;
 
   let destination state = Journal_routes.destination state.routes
+  let capture_presented state = state.modal = Capture_sheet
   let capture state = state.direct_capture
   let favorites state = state.favorites
 end
 
-let application_theme preset =
-  let seed = Ui.Style.Color.rgb ~red:0 ~green:38 ~blue:47 in
-  let theme_text_style (token : Journal_visual_tokens.text_token) =
-    Ui.Style.Text_style.create
-      ~font_size:token.font_size
-      ~font_weight:token.weight
-      ~line_height:(token.line_height /. token.font_size)
-      ()
-  in
-  let app_typography = Journal_visual_tokens.typography preset in
-  let typography =
-    Ui.Theme.Typography.material
-      ~font_family:"PingFang SC"
-      ~font_family_fallback:[ "CupertinoSystemText"; "Apple Color Emoji" ]
-      ~title_large:(theme_text_style app_typography.dialog_title)
-      ~title_medium:(theme_text_style app_typography.header_subtitle)
-      ~body_large:(theme_text_style app_typography.input)
-      ~body_medium:(theme_text_style app_typography.supporting)
-      ~body_small:(theme_text_style app_typography.timestamp)
-      ~label_large:(theme_text_style app_typography.button_label)
-      ~label_medium:(theme_text_style app_typography.timestamp)
-      ()
-  in
-  let shape = Ui.Theme.Shape.create ~small:8. ~medium:12. ~large:16. () in
-  let data brightness contrast_level =
-    Ui.Theme.material
-      ~brightness
-      ~color_scheme:(Ui.Theme.Color_scheme.from_seed ~color:seed ~contrast_level ())
-      ~typography
-      ~shape
-      ()
-  in
-  let light = data Ui.Style.Brightness.Light 0. in
-  let dark = data Ui.Style.Brightness.Dark 0. in
-  let high_contrast_light = data Ui.Style.Brightness.Light 1. in
-  let high_contrast_dark = data Ui.Style.Brightness.Dark 1. in
-  Ui.Theme.application
-    ~mode:Ui.Theme.System
-    ~light
-    ~dark
-    ~high_contrast_light
-    ~high_contrast_dark
-    ()
-;;
+let application_theme () = Ui.Theme.create ~mode:System ()
 
-let text_style (token : Journal_visual_tokens.text_token) =
-  Ui.Style.Text_style.create
-    ~font_size:token.font_size
-    ~font_weight:token.weight
-    ~line_height:(token.line_height /. token.font_size)
-    ()
-;;
-
-let styled_text ?token value =
-  match token with
-  | None -> Ui.Widget.text value
-  | Some token -> Ui.Widget.text ~style:(text_style token) value
-;;
-
-let transparent_row_button_content
-      ~(typography : Journal_visual_tokens.typography)
-      ?leading
-      label
-  =
-  let label =
-    styled_text ~token:typography.entry label
-    |> Ui.Widget.align ~alignment:Ui.Layout.Alignment.Center_start
-  in
-  let children =
-    match leading with
-    | None -> [ Ui.Widget.Flex.expanded label ]
-    | Some leading ->
-      [ Ui.Widget.Flex.fixed leading
-      ; Ui.Widget.Flex.expanded
-          (label |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:16. ()))
-      ]
-  in
-  Ui.Widget.Flex.row children
-  |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ())
-  |> Ui.Widget.constrained_box
-       ~constraints:
-         (Ui.Layout.Box_constraints.create
-            ~min_height:Journal_visual_tokens.hit_regions.minimum_target
-            ())
-;;
-
-type action_role =
-  | Filled
-  | Filled_tonal
-  | Outlined
-  | Text
-
-let action_target
-      ?(enabled = true)
-      ?(minimum_target = 44.)
-      ?key
-      ~role
-      ~test_id
-      ~label
-      ~hint
-      ~on_press
-      child
-  =
-  let button =
-    (match role with
-     | Filled -> Ui.Material.filled_button ?key ~enabled ~on_press ~child ()
-     | Filled_tonal -> Ui.Material.filled_tonal_button ?key ~enabled ~on_press ~child ()
-     | Outlined -> Ui.Material.outlined_button ?key ~enabled ~on_press ~child ()
-     | Text -> Ui.Material.text_button ?key ~enabled ~on_press ~child ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
-  in
-  let properties =
-    Ui.Semantics.create
-      ~label
-      ~hint
-      ~role:Ui.Semantics.Role.Button
-      ~enabled
-      ~focusable:enabled
-      ~actions:(if enabled then [ Ui.Semantics.Action.Tap ] else [])
-      ()
-  in
-  (if enabled
-   then Ui.Widget.semantics ~on_action:on_press ~properties button
-   else Ui.Widget.semantics ~properties button)
-  |> Ui.Widget.constrained_box
-       ~constraints:
-         (Ui.Layout.Box_constraints.create
-            ~min_width:minimum_target
-            ~min_height:minimum_target
-            ())
+let secondary_text value =
+  V.text ~style:(Ui.Style.Text_style.create ~foreground:Secondary ()) value
 ;;
 
 let bind_action handler action =
   Ui.Event.Handler.create ~name:("journal-action:" ^ action) (fun _payload ->
     Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text action))
+;;
+
+module Presentation = struct
+  let keyed children =
+    List.mapi
+      (fun index child ->
+         let key =
+           match V.For_testing.key child, V.For_testing.test_id child with
+           | Some key, _ -> key
+           | None, Some id -> Ui.Key.string (Ui.Test_id.to_string id)
+           | None, None -> Ui.Key.int index
+         in
+         V.Keyed.create ~key child)
+      children
+  ;;
+
+  let form children =
+    V.Form.vertical ~key:(Ui.Key.string "form") (keyed children)
+    |> V.Body.Vertical.fill
+    |> fun content -> V.Body.Vertical.create [ content ]
+  ;;
+
+  let list children =
+    V.Native_list.vertical
+      ~key:(Ui.Key.string "graph-list")
+      ~style:Inset
+      [ V.Native_list.section
+          ~key:(Ui.Key.string "graphs")
+          ~separator:Hidden
+          (List.mapi
+             (fun index child ->
+                let key =
+                  match V.For_testing.test_id child with
+                  | Some id -> Ui.Key.string (Ui.Test_id.to_string id)
+                  | None -> Ui.Key.int index
+                in
+                V.Native_list.row ~key ~separator:Hidden child)
+             children)
+      ]
+    |> V.Body.Vertical.fill
+    |> fun content -> V.Body.Vertical.create [ content ]
+  ;;
+
+  let unavailable ~title ~symbol ~message ~actions =
+    V.content_unavailable
+      ~label:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
+      ~description:(V.text message |> V.text_selection ~enabled:true)
+      ~actions
+      ()
+  ;;
+
+  let section ?key title children =
+    V.Section.create
+      ~key:(Option.value key ~default:(Ui.Key.string title))
+      ~header:(V.text title)
+      [ V.Keyed.create
+          ~key:(Ui.Key.string "content")
+          (V.column ~alignment:Leading children |> V.text_selection ~enabled:true)
+      ]
+  ;;
+
+  let labeled label content =
+    V.labeled_content
+      ~key:(Ui.Key.string label)
+      ~label:(V.text label)
+      ~value:(V.text_selection ~enabled:true content)
+      ()
+  ;;
+end
+
+let dismiss_toolbar ~test_id ~command dispatch body =
+  let close =
+    V.button
+      ~role:Cancel
+      ~on_press:(bind_action dispatch command)
+      ~child:(V.text "Close")
+      ()
+    |> V.with_test_id (Ui.Test_id.string test_id)
+  in
+  V.Body.toolbar
+    ~items:
+      [ V.Toolbar.item ~key:(Ui.Key.string test_id) ~placement:Cancellation_action close ]
+    body
 ;;
 
 let status_sheet_options =
@@ -1222,158 +1358,132 @@ let status_sheet_options =
   ]
 ;;
 
-let status_sheet_sizing =
-  let semantics =
-    Ui.Navigation.Modal_bottom_sheet.Handle_semantics.create
-      ~label:"Status picker size"
-      ~medium_value:"Medium"
-      ~large_value:"Large"
-  in
-  Ui.Navigation.Modal_bottom_sheet.Detents.create
-    ~initial:Ui.Navigation.Modal_bottom_sheet.Detent.Medium
-    ~dismiss_on_drag:true
-    ~semantics
-    [ Ui.Navigation.Modal_bottom_sheet.Detent.Medium ]
-  |> fun detents -> Ui.Navigation.Modal_bottom_sheet.Sizing.Detented detents
-;;
-
-let status_sheet_page
-      ~tokens
-      ~typography
-      ~text_scale
-      ~viewport_height
-      ~bottom_inset
-      ~reduced_motion
-      ~block
-      dispatch
-  =
-  let block_id = Journal_model.id block in
-  let current = Journal_model.task_state block in
-  let minimum_target = Journal_visual_tokens.hit_regions.minimum_target in
-  let row_extent = Float.max minimum_target (minimum_target *. text_scale) in
-  let heading =
-    styled_text ~token:typography.Journal_visual_tokens.dialog_title "Set status"
-    |> Ui.Widget.padding
-         ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ~top:2. ~bottom:2. ())
-    |> Ui.Widget.semantics
-         ~properties:
-           (Ui.Semantics.create ~label:"Set status" ~role:Ui.Semantics.Role.Header ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-status-sheet-heading")
-  in
-  let rows =
-    List.map
-      (fun (tag, task_state) ->
-         let selected = current = task_state in
-         let enabled = not selected in
-         let status_palette =
-           Journal_visual_tokens.status_swipe_action tokens task_state
-         in
-         let icon_tint =
-           match task_state with
-           | Journal_model.No_status -> status_palette.foreground
-           | _ -> status_palette.background
-         in
-         let label =
-           match task_state with
-           | Journal_model.No_status -> "Clear"
-           | _ -> Journal_model.status_name task_state
-         in
-         let on_press = bind_action dispatch ("status-sheet-select:" ^ tag) in
-         let icon =
-           Material_icon_catalog.create
-             ~size:22.
-             ~color:icon_tint
-             (Material_icon_catalog.for_task_state task_state)
-           |> Ui.Widget.with_test_id
-                (Ui.Test_id.string ("journal-status-sheet-option-icon:" ^ tag))
-         in
-         let content =
-           transparent_row_button_content ~typography ~leading:icon label
-           |> Ui.Widget.with_test_id
-                (Ui.Test_id.string ("journal-status-sheet-option-label:" ^ tag))
-         in
-         let tile =
-           Ui.Material.text_button
-             ~key:(Ui.Key.string ("journal-status-sheet-option:" ^ tag))
-             ~enabled
-             ~on_press
-             ~child:content
-             ()
-           |> Ui.Widget.with_test_id
-                (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
-         in
-         let properties =
-           Ui.Semantics.create
-             ~label
-             ~role:Ui.Semantics.Role.Button
-             ~enabled
-             ~selected
-             ~focusable:enabled
-             ~actions:(if enabled then [ Ui.Semantics.Action.Tap ] else [])
-             ()
-         in
-         (if enabled
-          then Ui.Widget.semantics ~on_action:on_press ~properties tile
-          else Ui.Widget.semantics ~properties tile)
-         |> Ui.Widget.sized_box ~height:row_extent)
+let status_sheet_page ~tokens ~block dispatch =
+  let options =
+    List.mapi
+      (fun index (tag, state) -> Int64.of_int index, tag, state)
       status_sheet_options
   in
-  let heading_extent =
-    (typography.Journal_visual_tokens.dialog_title.line_height *. text_scale) +. 4.
+  let selected_id =
+    List.find_opt (fun (_, _, state) -> state = Journal_model.task_state block) options
+    |> Option.map (fun (id, _, _) -> id)
   in
-  let detent_handle_extent = 48. in
-  let available =
-    Float.max row_extent ((viewport_height *. 0.5) -. detent_handle_extent -. bottom_inset)
-  in
-  let scroll_height =
-    Float.min (float_of_int (List.length rows) *. row_extent) (available -. heading_extent)
-    |> Float.max row_extent
-  in
-  let scroll =
-    Ui.Widget.Scroll_view.vertical
-      ~key:(Ui.Key.string "journal-status-sheet-scroll")
-      ~primary:true
-      ~on_scroll:
-        (Ui.Event.Handler.create ~name:"journal-status-sheet-scroll" (fun _ -> ()))
-      [ Ui.Widget.Sliver.list rows ]
+  let picker =
+    V.Picker.create
+      ~label:"Task status"
+      ~style:Inline
+      ~selected_id
+      ~on_select:
+        (Ui.Event.Handler.create (function
+           | Ui.Event.Payload.Int64 id ->
+             List.find_opt (fun (candidate, _, _) -> candidate = id) options
+             |> Option.iter (fun (_, tag, _) ->
+               Ui.Event.Handler.Private.invoke
+                 dispatch
+                 (Ui.Event.Payload.Text ("status-sheet-select:" ^ tag)))
+           | _ -> ()))
+      (List.map
+         (fun (id, tag, state) ->
+            let palette = Journal_visual_tokens.status_swipe_action tokens state in
+            let icon_tint =
+              if state = Journal_model.No_status
+              then palette.foreground
+              else palette.background
+            in
+            let title =
+              if state = Journal_model.No_status
+              then "Clear"
+              else Journal_model.status_name state
+            in
+            let label =
+              V.label
+                ~title:(V.text title)
+                ~icon:
+                  (Journal_symbols.create
+                     ~color:icon_tint
+                     (Journal_symbols.for_task_state state))
+                ()
+              |> V.with_test_id (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
+            in
+            V.Picker.option ~id ~label ())
+         options)
       ()
-    |> Ui.Widget.Viewport.Vertical.with_test_id
-         (Ui.Test_id.string "journal-status-sheet-scroll")
-    |> Ui.Widget.Viewport.Vertical.with_height ~height:scroll_height
   in
-  let content =
-    Ui.Widget.Flex.column [ Ui.Widget.Flex.fixed heading; Ui.Widget.Flex.fixed scroll ]
-    |> Ui.Widget.safe_area ~left:false ~top:false ~right:false ~bottom:true
-    |> Ui.Widget.with_test_id
-         (Ui.Test_id.string ("journal-status-sheet-safe-area:" ^ block_id))
-  in
-  let duration = (Journal_visual_tokens.motion ~reduced_motion).route_transition_ms in
-  let presentation =
-    Ui.Navigation.Modal_bottom_sheet.create
-      ~barrier_dismissible:true
-      ~barrier_label:"Dismiss status picker"
-      ~sizing:status_sheet_sizing
-      ~use_safe_area:false
-      ~request_focus:true
-      ~transition_duration_ms:duration
-      ~reverse_transition_duration_ms:duration
-      ()
-  in
-  let route_id = "journal-status-sheet:" ^ block_id in
-  content
-  |> Ui.Widget.page
-       ~key:(Ui.Key.string route_id)
-       ~page_key:(ID.Navigation.Page_key.of_string route_id)
-       ~presentation:(Ui.Navigation.Modal_bottom_sheet presentation)
-       ~can_pop:true
-       ~restoration_id:(ID.Navigation.Restoration_id.of_string route_id)
-  |> Ui.Widget.with_test_id (Ui.Test_id.string ("journal-status-sheet-page:" ^ block_id))
+  Presentation.form [ picker ]
+  |> dismiss_toolbar ~test_id:"journal-status-close" ~command:"close-status" dispatch
+  |> V.Body.with_test_id
+       (Ui.Test_id.string ("journal-status-sheet-page:" ^ Journal_model.id block))
 ;;
 
 let live_region_text value =
-  styled_text value
-  |> Ui.Widget.semantics
-       ~properties:(Ui.Semantics.create ~label:value ~live_region:true ())
+  V.text value
+  |> V.semantics ~properties:(Ui.Semantics.create ~label:value ~live_region:true ())
+;;
+
+let operation_feedback ~scope ~state dispatch body =
+  let failure =
+    if state.graph_ready then operation_failure state.timeline_notice else None
+  in
+  let summary, actions =
+    match failure with
+    | None -> "", V.empty ()
+    | Some (summary, _, _) ->
+      let action suffix title command =
+        V.button ~on_press:(bind_action dispatch command) ~child:(V.text title) ()
+        |> V.with_test_id (Ui.Test_id.string (scope ^ "-operation-" ^ suffix))
+      in
+      ( summary
+      , V.row
+          ~spacing:16.
+          [ action "details" "Details" "open-error-info"
+          ; action "dismiss" "Dismiss" "dismiss-operation-error"
+          ] )
+  in
+  let label =
+    V.label
+      ~title:(live_region_text summary)
+      ~icon:(V.symbol ~name:"exclamationmark.circle" ())
+      ()
+  in
+  let padded view = V.padding ~insets:(Ui.Layout.Edge_insets.all 16.) view in
+  Journal_header.feedback
+    ~key:(Ui.Key.string (scope ^ "-feedback"))
+    ~top:false
+    ~visible:(summary <> "")
+    ~compact:(padded (V.row ~spacing:16. [ label; V.spacer (); actions ]))
+    ~expanded:(padded (V.column ~alignment:Leading ~spacing:8. [ label; actions ]))
+    body
+;;
+
+let graph_unavailable_view ~message ~on_details ~on_diagnostics ~on_choose_graph =
+  let action id title symbol handler =
+    V.button
+      ~on_press:handler
+      ~child:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
+      ()
+    |> V.with_test_id (Ui.Test_id.string id)
+  in
+  Presentation.unavailable
+    ~title:"Unable to open journal"
+    ~symbol:"exclamationmark.folder"
+    ~message
+    ~actions:
+      (V.column
+         (Option.to_list
+            (Option.map
+               (action "graph-failure-choose" "Choose a graph" "folder")
+               on_choose_graph)
+          @ Option.to_list
+              (Option.map
+                 (action "graph-failure-details" "Error details" "exclamationmark.circle")
+                 on_details)
+          @ [ action
+                "graph-failure-diagnostics"
+                "Diagnostics"
+                "stethoscope"
+                on_diagnostics
+            ]))
+  |> V.with_test_id (Ui.Test_id.string "logseq-graph-open-failed")
 ;;
 
 let prefix_action handler prefix =
@@ -1383,686 +1493,346 @@ let prefix_action handler prefix =
     | _ -> ())
 ;;
 
-module Root_scroll = struct
-  type props =
-    { destination : int
-    ; revision : int
-    ; anchor_offset : float
-    ; visible : bool
-    ; duration_ms : int
-    ; active : bool
-    }
+let media_scope state =
+  let route =
+    match Journal_routes.route state.routes with
+    | Timeline ->
+      (match Journal_routes.destination state.routes with
+       | Journals -> "journals"
+       | Favorites -> "favorites")
+    | Detail -> "detail"
+    | Detail_loading -> "detail-loading"
+    | Missing_detail -> "detail-missing"
+    | Failed_detail _ -> "detail-failed"
+  in
+  Printf.sprintf
+    "%d:%s:%s"
+    state.graph_state.generation
+    route
+    (Int64.to_string (Journal_routes.detail_request_generation state.routes))
+;;
 
-  let kind_id = ID.Native_widget.Kind_id.of_int 1003
+let media_label state dispatch ~root child =
+  let scope = media_scope state in
+  Journal_media_view.view
+    ~scope
+    ~root
+    ~media:(Media_views.find_opt root state.media_views)
+    ~on_event:(fun payload ->
+      Ui.Event.Handler.Private.invoke
+        dispatch
+        (Ui.Event.Payload.Text ("media-session:" ^ scope ^ ":media:" ^ payload)))
+    child
+;;
 
-  let decode_event ~event_id payload =
-    if Bytes.length payload <> 24
-    then Error "Invalid root scroll event"
-    else (
-      let destination =
-        match Bytes.get_int32_le payload 0 with
-        | 0l -> Some Journal_routes.Journals
-        | 1l -> Some Journal_routes.Favorites
-        | _ -> None
-      in
-      let pixels = Int64.float_of_bits (Bytes.get_int64_le payload 8) in
-      let delta = Int64.float_of_bits (Bytes.get_int64_le payload 16) in
-      match destination, ID.Native_widget.Event_id.to_int event_id with
-      | Some destination, 1 when Float.is_finite pixels && Float.is_finite delta ->
-        Ok (Root_navigation.Scroll { destination; pixels; delta })
-      | Some destination, 2 -> Ok (Root_navigation.Non_scrollable destination)
-      | _ -> Error "Unknown root scroll event")
-  ;;
+module Favorites_list = struct
+  module Keys = Set.Make (String)
 
-  let event_of_payload = function
-    | Ui.Event.Payload.Native_event event
-      when event.kind_id = kind_id && event.version = 1 ->
-      decode_event ~event_id:event.event_id event.payload |> Result.to_option
-    | _ -> None
-  ;;
-
-  let extension =
-    Ui.Native_widget.Extension.create
-      ~kind_id
-      ~version:1
-      ~capabilities:[]
-      ~encode_props:(fun props ->
-        let bytes = Bytes.make 32 '\000' in
-        Bytes.set_int32_le bytes 0 (Int32.of_int props.destination);
-        Bytes.set_int32_le bytes 4 (if props.visible then 1l else 0l);
-        Bytes.set_int32_le bytes 24 (Int32.of_int props.duration_ms);
-        Bytes.set_int32_le bytes 28 (if props.active then 1l else 0l);
-        Bytes.set_int64_le bytes 8 (Int64.of_int props.revision);
-        Bytes.set_int64_le bytes 16 (Int64.bits_of_float props.anchor_offset);
-        bytes)
-      ~decode_event
-      ()
-  ;;
-
-  let wrap
-        ~graph_generation
-        ~destination
-        ~favorites
-        ~profile
-        ~visible
-        ~duration_ms
-        ~active
-        ~on_event
-        child
-    =
-    let rows = Journal_routes.Favorites.items favorites in
-    let anchor = Journal_routes.Favorites.anchor favorites in
-    let anchor_offset =
-      rows
-      |> List.to_seq
-      |> Seq.take anchor.first_index
-      |> Seq.fold_left
-           (fun sum item ->
-              sum
-              +. Journal_row.Item.visible_extent
-                   (Journal_row.Item.of_favorite (Journal_graph_projection.favorite item))
-                   ~profile
-                   ~expanded:false)
-           0.
+  let view ~keys ~block_keys ~actions_enabled ~on_visible_range ~on_open ~children =
+    let block_keys = Keys.of_list block_keys in
+    let footer, children =
+      match List.rev children with
+      | footer :: rest -> footer, List.rev rest
+      | [] -> invalid_arg "Favorites_list: missing footer"
     in
-    Ui.Native_widget.widget_with_handler
-      extension
-      ~key:(Ui.Key.string ("journal-root-scroll:" ^ string_of_int graph_generation))
-      ~props:
-        { destination = (if destination = Journal_routes.Journals then 0 else 1)
-        ; revision = Journal_routes.Favorites.revision favorites
-        ; anchor_offset
-        ; visible
-        ; duration_ms
-        ; active
-        }
-      ~on_event
-      ~children:[ child ]
-      ()
+    let rows =
+      List.map2
+        (fun key label ->
+           let label =
+             if Keys.mem key block_keys
+             then
+               V.Navigation_link.create
+                 ~key:(Ui.Key.string ("favorite-open:" ^ key))
+                 ~activation_id:key
+                 ~enabled:actions_enabled
+                 ~on_activate:(bind_action on_open key)
+                 ~label
+                 ()
+             else label
+           in
+           V.Native_list.row ~key:(Ui.Key.string key) ~separator:Hidden label)
+        keys
+        children
+    in
+    V.Native_list.vertical
+      ~key:(Ui.Key.string "favorites-native-list")
+      ~style:Plain
+      ~on_visible_range
+      [ V.Native_list.section
+          ~key:(Ui.Key.string "favorites")
+          ~separator:Hidden
+          ~footer
+          rows
+      ]
+    |> V.Viewport.Vertical.with_test_id (Ui.Test_id.string "favorites-native-list")
+    |> V.Body.Vertical.fill
+    |> fun content -> V.Body.Vertical.create [ content ]
   ;;
 end
 
-let favorites_sliver
-      ~tokens
-      ~typography
-      ~profile
-      ~device_pixel_ratio
-      ~rtl
-      ~reduced_motion
+let favorites_view
+      ~render_media
       ~state
+      ~actions_enabled
       ~on_visible_range
       ~on_retry
+      ~on_open_favorite
   =
   let module F = Journal_routes.Favorites in
-  let status message =
-    Ui.Widget.text message |> Ui.Widget.center |> Ui.Widget.Sliver.fill
-  in
   let rows = F.items state in
-  let notice =
-    match F.error state with
-    | Some message ->
-      Some
-        (Ui.Widget.column
-           [ live_region_text message
-           ; Ui.Material.text_button ~on_press:on_retry ~child:(Ui.Widget.text "Retry") ()
-             |> Ui.Widget.with_test_id (Ui.Test_id.string "favorites-retry-button")
-           ]
-         |> Ui.Widget.with_test_id (Ui.Test_id.string "favorites-retry")
-         |> Ui.Widget.Sliver.box)
-    | None -> None
+  let retry =
+    V.button ~on_press:on_retry ~child:(V.text "Retry") ()
+    |> V.with_test_id (Ui.Test_id.string "favorites-retry-button")
   in
-  let body =
+  let busy = V.row [ V.progress ~style:Circular (); V.text "Loading favorites" ] in
+  let content =
     if rows = []
-    then (
-      match F.error state with
-      | Some _ -> []
-      | None when (not (F.initialized state)) || F.loading state ->
-        [ status "Loading favorites…" ]
-      | None -> [ status "No favorites yet" ])
+    then
+      (match F.error state with
+       | Some message ->
+         Presentation.unavailable
+           ~title:"Unable to load favorites"
+           ~symbol:"exclamationmark.triangle"
+           ~message
+           ~actions:retry
+       | None when (not (F.initialized state)) || F.loading state ->
+         busy |> V.frame ~max_width:Fill ~max_height:Fill
+       | None ->
+         Presentation.unavailable
+           ~title:"No favorites yet"
+           ~symbol:"star"
+           ~message:"Favorite pages and blocks appear here."
+           ~actions:(V.empty ()))
+      |> V.Body.static
     else (
-      let first_index, window = F.window state in
-      let item value =
-        value |> Journal_graph_projection.favorite |> Journal_row.Item.of_favorite
+      let keys, children =
+        List.split
+          (List.map
+             (fun value ->
+                let favorite = Journal_graph_projection.favorite value in
+                let key = favorite.membership_id in
+                let text = V.text favorite.title in
+                let label =
+                  if favorite.task_state = Journal_model.No_status
+                  then text
+                  else
+                    V.column
+                      [ text; V.text (Journal_model.status_name favorite.task_state) ]
+                in
+                let row =
+                  match favorite.target with
+                  | Page _ -> V.label ~title:label ~icon:(V.symbol ~name:"doc.text" ()) ()
+                  | Block _ -> label
+                in
+                let root =
+                  match favorite.target with
+                  | Page id | Block id -> id
+                in
+                key, V.column ~key:(Ui.Key.string key) [ render_media ~root row ])
+             rows)
       in
-      let extent value =
-        Journal_row.Item.visible_extent (item value) ~profile ~expanded:false
+      let footer =
+        match F.error state with
+        | Some message ->
+          V.column [ live_region_text message; retry ]
+          |> V.with_test_id (Ui.Test_id.string "favorites-retry")
+        | None when F.loading state -> busy
+        | None -> V.empty ()
       in
-      let items =
-        List.mapi
-          (fun index (value : Logseq_db_worker.Protocol.v2_favorite_item) ->
-             Journal_row.view
-               ~tokens
-               ~typography
-               ~profile
-               ~device_pixel_ratio
-               ~rtl
-               ~item:(item value)
-               ~show_timestamp:false
-               ~expanded:false
-               ~show_divider:false
-               ~sort_base:(100. +. (float_of_int (first_index + index) *. 10.))
-               ~reduced_motion
-               ~interaction:Journal_row.Display_only
-             |> Ui.Widget.Keyed.create
-                  ~key:
-                    (Ui.Key.string
-                       (Logseq_db_types.Graph_types.Uuid.to_string value.membership_uuid)))
-          window
-      in
-      [ Ui.Widget.Sliver.varied_extent
-          ~key:(Ui.Key.string "favorites-list")
-          ~total_count:(List.length rows)
-          ~first_index
-          ~default_item_extent:profile.Journal_visual_tokens.block_line_height
-          ~extent_overrides:
-            (List.mapi
-               (fun index value ->
-                  Ui.Widget.Sparse_extent_override.{ index; extent = extent value })
-               rows)
-          ~overscan:12
-          ~items
-          ~on_visible_range
-          ()
-        |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "favorites-list")
-      ])
+      Favorites_list.view
+        ~actions_enabled
+        ~keys
+        ~block_keys:
+          (List.filter_map
+             (fun value ->
+                let favorite = Journal_graph_projection.favorite value in
+                match favorite.target with
+                | Page _ -> None
+                | Block _ -> Some favorite.membership_id)
+             rows)
+        ~on_open:on_open_favorite
+        ~on_visible_range
+        ~children:(children @ [ footer ]))
   in
-  body @ Option.to_list notice
+  content
+;;
+
+let composer_page
+      ~scope
+      ~capture
+      ~saving
+      ~enabled
+      ~on_edit
+      ~on_toggle
+      ~on_save
+      ~on_close
+      ~error
+  =
+  let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+  let can_submit =
+    enabled
+    && (not saving)
+    && (Journal_capture.can_save capture
+        ||
+        match Journal_capture.phase capture with
+        | Failed _ -> true
+        | _ -> false)
+  in
+  let editor =
+    V.text_editor
+      ~autofocus:true
+      ~key:(Ui.Key.string (scope ^ "-editor"))
+      ~enabled:(enabled && not saving)
+      ~session_id:(Journal_capture.session_id capture)
+      ~document_revision:(Journal_capture.document_revision capture)
+      ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
+      ~update_mode:(Journal_capture.update_mode capture)
+      ~value:(Journal_capture.value capture)
+      ~on_edit
+      ~on_submit:ignored
+      ~on_focus_changed:ignored
+      ()
+    |> V.frame ~max_width:Fill ~max_height:Fill
+    |> V.semantics ~properties:(Ui.Semantics.create ~label:"Draft" ())
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-editor"))
+  in
+  let close =
+    V.button ~role:Cancel ~on_press:on_close ~child:(V.text "Close") ()
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
+  in
+  let task =
+    V.toggle
+      ~style:Button
+      ~enabled:(enabled && not saving)
+      ~value:(Journal_capture.task_state capture = Journal_model.Todo)
+      ~on_changed:on_toggle
+      ~label:
+        (V.label ~title:(V.text "Task") ~icon:(V.symbol ~name:"checkmark.square" ()) ())
+      ()
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-task"))
+  in
+  let save =
+    V.button ~enabled:can_submit ~on_press:on_save ~child:(V.text "Save") ()
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-submit"))
+  in
+  V.column
+    ~spacing:12.
+    ([ editor ]
+     @ (if saving then [ V.progress ~style:Circular (); V.text "Saving…" ] else [])
+     @ Option.to_list (Option.map live_region_text error))
+  |> V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
+  |> V.Body.static
+  |> V.Body.toolbar
+       ~items:
+         [ V.Toolbar.item
+             ~key:(Ui.Key.string "composer-close")
+             ~placement:Cancellation_action
+             close
+         ; V.Toolbar.item
+             ~key:(Ui.Key.string "composer-task")
+             ~placement:Primary_action
+             task
+         ; V.Toolbar.item
+             ~key:(Ui.Key.string "composer-save")
+             ~placement:Confirmation_action
+             save
+         ]
 ;;
 
 let timeline_page
+      ~render_media
+      ~platform
       ~graph_generation
+      ~on_scroll_completed
       ~destination
       ~favorites
       ~on_select_destination
       ~on_favorites_visible_range
       ~on_favorites_retry
-      ~viewport_width
-      ~tokens
-      ~typography
-      ~profile
-      ~text_scale
-      ~top_inset
-      ~bottom_inset
-      ~device_pixel_ratio
       ~timeline_state
       ~loading
       ~graph_error
       ~sync_error
       ~sync_phase
-      ~today_date
       ~day_presentation
-      ~reduced_motion
-      ~rtl
-      ~content_horizontal_inset
       ~capture_enabled
-      ~capture_save_enabled
-      ~capture_saving
-      ~capture_task_selected
-      ~capture_affordance_key
-      ~capture_fab_presentation
-      ~navigation_visible
-      ~root_active
       ~on_capture_event
-      ~on_scroll
       ~on_visible_range
       ~on_retry_day
-      ~on_toggle_children
+      ~on_open_block
+      ~on_open_favorite
       ~delete_enabled
       ~actions_enabled
+      ~interaction_enabled
       ~on_status
       ~on_delete
       ~error_info_available
       ~on_error_info
       ~account_menu_available
-      ~on_account_menu
+      ~cache_reset_available
+      ~on_account_action
   =
-  let header =
-    Journal_header.sliver
-      ~viewport_width
-      ~tokens
-      ~typography
-      ~text_scale
-      ~top_inset
-      ~device_pixel_ratio
-      ~context:
-        (match destination with
-         | Journal_routes.Journals -> Journal_header.Context.today ~date:today_date
-         | Favorites -> Journal_header.Context.favorites)
-      ~sync_phase
-      ~on_error_info:(if error_info_available then Some on_error_info else None)
-      ~on_account_menu:(if account_menu_available then Some on_account_menu else None)
-  in
-  let capture_button ~id ~test_id ~tooltip ~position ~visibility ~style ~enabled icon =
-    Ui.Native_widget.Expandable_message_composer.button
-      ~id
-      ~tooltip
-      ~position
-      ~visibility
-      ~style
-      ~enabled
-      ~child:
-        (Material_icon_catalog.create
-           ~key:(Ui.Key.string ("journal-capture-action-icon:" ^ string_of_int id))
-           ~size:20.
-           icon
-         |> Ui.Widget.with_test_id (Ui.Test_id.string test_id))
-      ()
-  in
-  let capture_motion = Journal_visual_tokens.motion ~reduced_motion in
-  let capture =
-    Ui.Native_widget.Expandable_message_composer.create_with_handler
-      ~key:
-        (Ui.Key.string
-           ("journal-capture-expandable:" ^ Int64.to_string capture_affordance_key))
-      ~enabled:capture_enabled
-      ~fab_presentation:
-        (match capture_fab_presentation with
-         | Journal_timeline_state.Extended ->
-           Ui.Native_widget.Expandable_message_composer.Extended
-         | Compact -> Compact)
-      ~fab_label:"Capture"
-      ~fab_tooltip:"Open Capture"
-      ~fab_icon:
-        (Material_icon_catalog.create
-           ~key:(Ui.Key.string "journal-capture-fab-icon")
-           ~size:20.
-           Material_icon_catalog.Add
-         |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-fab-icon"))
-      ~animation_duration_ms:capture_motion.route_transition_ms
-      ~animation_curve:Ui.Animation.Curve.Ease_out
-      ~max_lines:Journal_visual_tokens.composer_geometry.maximum_lines
-      ~hint_text:"Capture a thought"
-      ~buttons:
-        [ capture_button
-            ~id:2
-            ~test_id:"journal-capture-composer-task"
-            ~tooltip:
-              (if capture_task_selected
-               then "Capture as task, on"
-               else "Capture as task, off")
-            ~position:Ui.Native_widget.Expandable_message_composer.Leading
-            ~visibility:Always
-            ~style:(if capture_task_selected then Filled else Plain)
-            ~enabled:capture_enabled
-            Material_icon_catalog.Timelapse
-        ; capture_button
-            ~id:1
-            ~test_id:"journal-capture-composer-submit"
-            ~tooltip:
-              (if capture_saving then "Saving journal block" else "Save journal block")
-            ~position:Ui.Native_widget.Expandable_message_composer.Trailing
-            ~visibility:When_non_empty
-            ~style:Filled
-            ~enabled:capture_save_enabled
-            Material_icon_catalog.Arrow_upward
-        ]
-      ~on_event:on_capture_event
-      ()
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-capture-expandable")
-  in
   let timeline =
     match graph_error with
     | Some message ->
-      Ui.Widget.Sliver.fill
-        (live_region_text ("Unable to open Logseq graph: " ^ message)
-         |> Ui.Widget.center
-         |> Ui.Widget.with_test_id (Ui.Test_id.string "logseq-graph-open-failed"))
-      |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
+      graph_unavailable_view
+        ~message
+        ~on_details:(if error_info_available then Some on_error_info else None)
+        ~on_diagnostics:(bind_action on_account_action "open-diagnostics")
+        ~on_choose_graph:None
+      |> V.Body.static
     | None when loading ->
-      Ui.Widget.Sliver.fill (Journal_timeline.loading_view ~typography ())
-      |> Ui.Widget.Sliver.with_test_id (Ui.Test_id.string "journal-timeline")
+      Journal_timeline.loading_view ()
+      |> V.with_test_id (Ui.Test_id.string "journal-timeline")
+      |> V.Body.static
     | None ->
       Journal_timeline.view
-        ~tokens
-        ~typography
-        ~profile
-        ~device_pixel_ratio
-        ~end_padding:(64. +. bottom_inset)
-        ~rtl
+        ~render_media
         ~state:timeline_state
         ~day_presentation
-        ~reduced_motion
         ~delete_enabled
-        ~actions_enabled
+        ~actions_enabled:(actions_enabled && interaction_enabled)
         ~on_status
         ~on_delete
         ~on_visible_range
         ~on_retry_day
-        ~on_toggle_children
+        ~on_scroll_completed
+        ~on_open_block
   in
   let favorites_selected = destination = Journal_routes.Favorites in
-  let slivers =
+  let content =
     if favorites_selected
     then
-      favorites_sliver
-        ~tokens
-        ~typography
-        ~profile
-        ~device_pixel_ratio
-        ~rtl
-        ~reduced_motion
+      favorites_view
+        ~render_media
         ~state:favorites
+        ~actions_enabled:interaction_enabled
         ~on_visible_range:on_favorites_visible_range
         ~on_retry:on_favorites_retry
-    else [ timeline ]
+        ~on_open_favorite
+    else timeline
   in
-  let timeline =
-    Ui.Widget.Scroll_view.vertical
-      ~key:(Ui.Key.string "journal-scroll")
-      ~primary:true
-      ~on_scroll:
-        (Ui.Event.Handler.create ~name:"root-scroll-owned-natively" (fun _ -> ()))
-      (header :: slivers)
-      ()
-    |> Ui.Widget.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-scroll")
+  let destination_action index =
+    Ui.Event.Handler.create (fun _ ->
+      Ui.Event.Handler.Private.invoke on_select_destination (Ui.Event.Payload.Int64 index))
   in
-  let base =
-    Ui.Widget.Body.Vertical.create [ Ui.Widget.Body.Vertical.fill timeline ]
-    |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-root-surface")
-    |> Ui.Widget.Body.padding
-         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:content_horizontal_inset ())
-    |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-content-width-padding")
-  in
-  let overlays =
-    match sync_error with
-    | None -> []
-    | Some message ->
-      let banner =
-        live_region_text message
-        |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 12.)
-        |> Ui.Material.card ~elevation:2.
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-sync-error")
-        |> Ui.Widget.Stack.positioned
-             ~left:(content_horizontal_inset +. 16.)
-             ~right:(content_horizontal_inset +. 16.)
-             ~top:64.
-      in
-      [ banner ]
-  in
-  let body =
-    Ui.Widget.Body.overlay ~key:(Ui.Key.string "journal-root-body") ~base ~overlays ()
-    |> Ui.Widget.Body.with_test_id (Ui.Test_id.string "journal-root-overlay")
-  in
-  let navigation =
-    Ui.Material.navigation_bar
-      ~key:(Ui.Key.string "journal-root-navigation")
-      ~layout:Ui.Material.Compact
-      ~selected_index:(if favorites_selected then 1 else 0)
-      ~label_behavior:Ui.Material.Never
-      ~on_select:on_select_destination
-      [ Ui.Material.Navigation_destination.create
-          ~label:"Journals"
-          ~icon:(Material_icon_catalog.create ~size:24. View_day)
-          ()
-      ; Ui.Material.Navigation_destination.create
-          ~label:"Favorites"
-          ~icon:(Material_icon_catalog.create ~size:24. Star)
-          ()
-      ]
-      ()
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-root-navigation")
-  in
-  Ui.Material.scaffold
-    ~body
-    ~bottom_navigation_bar:navigation
-    ?floating_action_button:(if favorites_selected then None else Some capture)
-    ~floating_action_button_location:Ui.Material.End_float
-    ()
-  |> Root_scroll.wrap
-       ~graph_generation
-       ~destination
-       ~favorites
-       ~profile
-       ~visible:navigation_visible
-       ~duration_ms:capture_motion.route_transition_ms
-       ~active:root_active
-       ~on_event:on_scroll
-  |> Ui.Widget.page
-       ~key:(Ui.Key.string "journal-timeline")
-       ~page_key:(ID.Navigation.Page_key.of_string "journal-timeline")
-       ~can_pop:false
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-timeline-page")
-;;
-
-let dialog_body
-      ~(typography : Journal_visual_tokens.typography)
-      ~test_id
-      ~title
-      ~message
-      ~primary
-      ~secondary
-  =
-  Ui.Material.Dialog.alert
-    ~title
-    ~content:(styled_text ~token:typography.supporting message)
-    ~actions:[ primary; secondary ]
-    ()
-  |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
-;;
-
-let modal_dialog_page ~tokens:_ ~reduced_motion ~page_key ~test_id ~barrier_label dialog =
-  let transition_ms =
-    (Journal_visual_tokens.motion ~reduced_motion).route_transition_ms
-  in
-  let presentation =
-    Ui.Navigation.Modal_dialog.create
-      ~barrier_dismissible:false
-      ~barrier_label
-      ~use_safe_area:true
-      ~request_focus:true
-      ~transition_duration_ms:transition_ms
-      ~reverse_transition_duration_ms:transition_ms
-      ()
-  in
-  dialog
-  |> Ui.Widget.page
-       ~key:(Ui.Key.string page_key)
-       ~page_key:(ID.Navigation.Page_key.of_string page_key)
-       ~presentation:(Ui.Navigation.Modal_dialog presentation)
-       ~can_pop:false
-       ~restoration_id:(ID.Navigation.Restoration_id.of_string page_key)
-  |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
-;;
-
-let account_dialog_page
-      ~tokens
-      ~(typography : Journal_visual_tokens.typography)
-      ~reduced_motion
-      ~cache_reset_available
-      dispatch
-  =
-  let action ~role ~test_id ~label ~hint ~command text =
-    action_target
-      ~role
-      ~test_id
-      ~label
-      ~hint
-      ~on_press:(bind_action dispatch command)
-      (styled_text text)
-  in
-  let controls =
-    [ action
-        ~role:Text
-        ~test_id:"journal-account-settings"
-        ~label:"Settings"
-        ~hint:"Open application presentation settings"
-        ~command:"open-settings"
-        "Settings"
-    ; action
-        ~role:Text
-        ~test_id:"journal-account-diagnostics"
-        ~label:"Diagnostics"
-        ~hint:"Open read-only application diagnostics"
-        ~command:"open-diagnostics"
-        "Diagnostics"
-    ; action
-        ~role:Text
-        ~test_id:"journal-account-switch-graph"
-        ~label:"Switch graph"
-        ~hint:"Close the current graph and choose another authorized graph"
-        ~command:"switch-graph"
-        "Switch graph"
-    ]
-    @ (if cache_reset_available
-       then
-         [ action
-             ~role:Text
-             ~test_id:"journal-account-reset-local-copy"
-             ~label:"Delete local graph copy"
-             ~hint:"Delete this local copy and return to graph selection"
-             ~command:"request-local-cache-reset"
-             "Delete local graph copy"
-         ]
-       else [])
-    @ [ action
-          ~role:Text
-          ~test_id:"journal-account-sign-out"
-          ~label:"Sign out"
-          ~hint:"Close the current graph and return to sign in"
-          ~command:"sign-out"
-          "Sign out"
-      ]
-  in
-  let cancel =
-    action
-      ~role:Text
-      ~test_id:"journal-account-menu-dismiss"
-      ~label:"Close account menu"
-      ~hint:"Return to the journal"
-      ~command:"close-account-menu"
-      "Cancel"
-  in
-  let content =
-    Ui.Widget.column
-      (styled_text
-         ~token:typography.supporting
-         "Manage the current Logseq graph and authenticated session."
-       :: controls)
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-actions")
-  in
-  Ui.Material.Dialog.alert ~title:"Account" ~content ~actions:[ cancel ] ()
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-account-menu")
-  |> modal_dialog_page
-       ~tokens
-       ~reduced_motion
-       ~page_key:"journal-account-dialog"
-       ~test_id:"journal-account-dialog-page"
-       ~barrier_label:"Account actions"
-;;
-
-let typography_metrics preset =
-  match preset with
-  | Journal_visual_tokens.Dense ->
-    [ "Header title 22/28 SemiBold"
-    ; "Entry 15/20 Normal"
-    ; "Supporting text 14/20 Normal"
-    ; "Button label 14/20 Medium"
-    ; "Manager title 24/32 SemiBold"
-    ]
-  | Balanced ->
-    [ "Header title 22/28 SemiBold"
-    ; "Entry 16/22 Normal"
-    ; "Supporting text 14/20 Normal"
-    ; "Button label 14/20 Medium"
-    ; "Manager title 24/32 SemiBold"
-    ]
-  | Comfortable ->
-    [ "Header title 24/32 SemiBold"
-    ; "Entry 17/24 Normal"
-    ; "Supporting text 15/22 Normal"
-    ; "Button label 15/20 Medium"
-    ; "Manager title 28/34 SemiBold"
-    ]
-;;
-
-let settings_dialog_page
-      ~tokens
-      ~(typography : Journal_visual_tokens.typography)
-      ~preset
-      ~reduced_motion
-      dispatch
-  =
-  let chip option label command test_id =
-    let selected = preset = option in
-    let on_press = bind_action dispatch command in
-    Ui.Material.Chip.filter ~key:(Ui.Key.string test_id) ~selected ~on_press ~label ()
-    |> Ui.Widget.with_test_id (Ui.Test_id.string test_id)
-    |> Ui.Widget.semantics
-         ~on_action:on_press
-         ~properties:
-           (Ui.Semantics.create
-              ~label
-              ~role:Ui.Semantics.Role.Button
-              ~enabled:true
-              ~selected
-              ~focusable:true
-              ~actions:[ Ui.Semantics.Action.Tap ]
-              ())
-  in
-  let choices =
-    Ui.Widget.Flex.row
-      [ Ui.Widget.Flex.expanded
-          (chip
-             Journal_visual_tokens.Dense
-             "A Dense"
-             "select-typography:dense"
-             "typography-preset-dense")
-      ; Ui.Widget.Flex.expanded
-          (chip
-             Balanced
-             "B Balanced"
-             "select-typography:balanced"
-             "typography-preset-balanced")
-      ; Ui.Widget.Flex.expanded
-          (chip
-             Comfortable
-             "C Comfortable"
-             "select-typography:comfortable"
-             "typography-preset-comfortable")
-      ]
-    |> Ui.Widget.semantics
-         ~properties:
-           (Ui.Semantics.create
-              ~label:"Typography preset"
-              ~value:(Journal_visual_tokens.stored_value_of_typography_preset preset)
-              ())
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "typography-preset-group")
-  in
-  let metrics =
-    typography_metrics preset
-    |> List.map (fun metric ->
-      styled_text ~token:typography.supporting metric |> Ui.Widget.Flex.fixed)
-    |> Ui.Widget.Flex.column
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "typography-preset-metrics")
-  in
-  let content =
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed (styled_text ~token:typography.dialog_title "Typography")
-      ; Ui.Widget.Flex.fixed
-          (styled_text
-             ~token:typography.supporting
-             "Choose the reading density used throughout the app.")
-      ; Ui.Widget.Flex.fixed choices
-      ; Ui.Widget.Flex.fixed metrics
-      ]
-  in
-  let close =
-    action_target
-      ~role:Text
-      ~test_id:"journal-settings-close"
-      ~label:"Close Settings"
-      ~hint:"Return to the journal"
-      ~on_press:(bind_action dispatch "close-settings")
-      (styled_text "Close")
-  in
-  Ui.Material.Dialog.alert ~title:"Settings" ~content ~actions:[ close ] ()
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-settings")
-  |> modal_dialog_page
-       ~tokens
-       ~reduced_motion
-       ~page_key:"journal-settings-dialog"
-       ~test_id:"journal-settings-dialog-page"
-       ~barrier_label:"Settings"
+  Journal_header.view
+    ~platform
+    ~key:(Ui.Key.string ("journal-root:" ^ string_of_int graph_generation))
+    ~context:
+      (match destination with
+       | Journal_routes.Journals -> Journal_header.Context.journals
+       | Favorites -> Journal_header.Context.favorites)
+    ~sync_phase
+    ~sync_error
+    ~on_error_info:(if error_info_available then Some on_error_info else None)
+    ~on_account_action:(if account_menu_available then Some on_account_action else None)
+    ~local_deletion_available:cache_reset_available
+    ~on_journals:(destination_action 0L)
+    ~on_favorites:(destination_action 1L)
+    ~on_capture:(bind_action on_capture_event "open-capture")
+    ~capture_enabled
+    ~body:content
 ;;
 
 let obsolete_diagnostic_row = function
@@ -2198,61 +1968,22 @@ let worker_error_detail_value = function
     values |> List.map Logseq_db_types.Graph_types.Uuid.to_string |> String.concat ", "
 ;;
 
-let error_info_page ~(typography : Journal_visual_tokens.typography) occurrences dispatch =
-  let back =
-    action_target
-      ~role:Text
-      ~test_id:"journal-error-info-back"
-      ~label:"Back from Error info"
-      ~hint:"Return to the previous page"
-      ~on_press:(bind_action dispatch "close-error-info")
-      (styled_text "Back")
-  in
-  let header =
-    Ui.Widget.Flex.row
-      [ Ui.Widget.Flex.fixed back
-      ; Ui.Widget.Flex.expanded
-          (styled_text ~token:typography.manager_title "Error info"
-           |> Ui.Widget.semantics
-                ~properties:
-                  (Ui.Semantics.create
-                     ~label:"Error info"
-                     ~role:Ui.Semantics.Role.Header
-                     ~heading_level:1
-                     ()))
-      ]
-    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
-  in
-  let labeled_row label value =
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed (styled_text ~token:typography.button_label label)
-      ; Ui.Widget.Flex.fixed (styled_text ~token:typography.supporting value)
-      ]
-    |> Ui.Widget.padding
-         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:12. ~vertical:4. ())
-  in
-  let cause_row depth label (cause : Logseq_db_worker.Error.cause) =
+let error_info_page ~sync_error ~operation_failure occurrences dispatch =
+  let labeled_row label value = Presentation.labeled label (V.text value) in
+  let cause_row label (cause : Logseq_db_worker.Error.cause) =
     let code = Option.fold ~none:"" ~some:(fun value -> " · " ^ value) cause.code in
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed
-          (styled_text
-             ~token:typography.button_label
-             (Printf.sprintf
-                "%s · %s%s"
-                (Logseq_db_worker.Error.component_string cause.component)
-                cause.operation
-                code))
-      ; Ui.Widget.Flex.fixed (styled_text ~token:typography.supporting cause.message)
+    V.column
+      [ V.text
+          ~style:(Ui.Style.Text_style.create ~font_weight:Semi_bold ())
+          (Printf.sprintf
+             "%s · %s%s"
+             (Logseq_db_worker.Error.component_string cause.component)
+             cause.operation
+             code)
+      ; secondary_text cause.message
       ]
-    |> Ui.Widget.padding
-         ~insets:
-           (Ui.Layout.Edge_insets.only
-              ~left:(12. +. (Float.of_int depth *. 12.))
-              ~right:12.
-              ~top:4.
-              ~bottom:4.
-              ())
-    |> Ui.Widget.semantics
+    |> Presentation.labeled label
+    |> V.semantics
          ~properties:
            (Ui.Semantics.create
               ~label:
@@ -2289,656 +2020,636 @@ let error_info_page ~(typography : Journal_visual_tokens.typography) occurrences
         detail.name, worker_error_detail_value detail.value)
     in
     let causes =
-      List.mapi (fun index cause -> cause_row index "Context" cause) trace.contexts
-      @ [ cause_row (List.length trace.contexts) "Origin" trace.origin ]
+      List.mapi
+        (fun index cause -> cause_row ("Context " ^ string_of_int (index + 1)) cause)
+        trace.contexts
+      @ [ cause_row "Origin" trace.origin ]
       @
       if trace.truncated
       then [ labeled_row "Causal trace" "Earlier outer contexts were truncated." ]
       else []
     in
-    Ui.Widget.Flex.column
-      ([ Ui.Widget.Flex.fixed
-           (styled_text
-              ~token:typography.dialog_title
-              (Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code error)))
-       ; Ui.Widget.Flex.fixed
-           (styled_text ~token:typography.entry (Logseq_db_worker.Error.message error))
-       ; Ui.Widget.Flex.fixed
-           (labeled_row ("Occurrence " ^ Int64.to_string occurrence.sequence) status)
+    Presentation.section
+      ~key:(Ui.Key.int64 occurrence.sequence)
+      (Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code error))
+      ([ V.text (Logseq_db_worker.Error.message error)
+       ; labeled_row ("Occurrence " ^ Int64.to_string occurrence.sequence) status
        ]
-       @ List.map
-           (fun row -> Ui.Widget.Flex.fixed (labeled_row (fst row) (snd row)))
-           metadata
-       @ List.map
-           (fun row -> Ui.Widget.Flex.fixed (labeled_row (fst row) (snd row)))
-           details
-       @ List.map Ui.Widget.Flex.fixed causes)
-    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 12.)
-    |> Ui.Material.card ~elevation:1.
-    |> Ui.Widget.padding
-         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:16. ~vertical:8. ())
-    |> Ui.Widget.with_test_id
+       @ List.map (fun row -> labeled_row (fst row) (snd row)) metadata
+       @ List.map (fun row -> labeled_row (fst row) (snd row)) details
+       @ causes)
+    |> V.with_test_id
          (Ui.Test_id.string
             ("journal-worker-error-" ^ Int64.to_string occurrence.sequence))
   in
   let rows =
     match occurrences with
-    | [] -> [ styled_text ~token:typography.supporting "No worker errors observed." ]
+    | [] when Option.is_none operation_failure && Option.is_none sync_error ->
+      [ secondary_text "No worker errors observed." ]
     | occurrences -> List.map card occurrences
   in
-  let scroll =
-    Ui.Widget.Scroll_view.vertical
-      ~key:(Ui.Key.string "journal-error-info-scroll")
-      ~on_scroll:(Ui.Event.Handler.create ~name:"journal-error-info-scroll" (fun _ -> ()))
-      [ Ui.Widget.Sliver.list rows ]
-      ()
-    |> Ui.Widget.Viewport.Vertical.with_test_id
-         (Ui.Test_id.string "journal-error-info-scroll")
+  let operation =
+    match operation_failure with
+    | None -> []
+    | Some (title, message, recovery) ->
+      [ Presentation.section title [ V.text message; V.text recovery ] ]
   in
-  let body =
-    Ui.Widget.Body.Vertical.create
-      [ Ui.Widget.Body.Vertical.fixed header; Ui.Widget.Body.Vertical.fill scroll ]
-    |> Ui.Widget.Body.safe_area
+  let sync =
+    match sync_error with
+    | None -> []
+    | Some message -> [ Presentation.section "Sync error" [ V.text message ] ]
   in
-  Ui.Material.scaffold ~body ()
-  |> Ui.Widget.page
-       ~key:(Ui.Key.string "journal-error-info")
-       ~page_key:(ID.Navigation.Page_key.of_string "journal-error-info")
-       ~presentation:(Ui.Navigation.Standard Ui.Navigation.Fade)
-       ~can_pop:true
-  |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-error-info-page")
+  Presentation.form (sync @ operation @ rows)
+  |> dismiss_toolbar
+       ~test_id:"journal-error-info-close"
+       ~command:"close-error-info"
+       dispatch
+  |> V.Body.with_test_id (Ui.Test_id.string "journal-error-info-page")
 ;;
 
-let diagnostics_page
-      ~tokens
-      ~(typography : Journal_visual_tokens.typography)
-      ~reduced_motion
-      ~snapshot
-      ~graph
-      ~admission
-      diagnostics
-      dispatch
-  =
-  let close =
-    action_target
-      ~role:Text
-      ~test_id:"journal-diagnostics-close"
-      ~label:"Close Diagnostics"
-      ~hint:"Return to the previous screen"
-      ~on_press:(bind_action dispatch "close-diagnostics")
-      (styled_text "Close")
+let diagnostics_page ~snapshot ~graph ~admission diagnostics dispatch =
+  let groups =
+    [ "Phases", diagnostic_phase_rows ~snapshot ~graph
+    ; "Overlay DB", admission_rows admission
+    ]
+    @ diagnostic_groups diagnostics
   in
-  let heading title =
-    styled_text ~token:typography.dialog_title title
-    |> Ui.Widget.padding
-         ~insets:(Ui.Layout.Edge_insets.only ~left:16. ~right:16. ~top:16. ~bottom:8. ())
-  in
-  let row (label, value) =
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed (styled_text ~token:typography.button_label label)
-      ; Ui.Widget.Flex.fixed (styled_text ~token:typography.supporting value)
-      ]
-    |> Ui.Widget.padding
-         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:16. ~vertical:6. ())
-  in
-  let current =
-    (heading "Phases" :: List.map row (diagnostic_phase_rows ~snapshot ~graph))
-    @ (heading "Overlay DB" :: List.map row (admission_rows admission))
-    @ (diagnostic_groups diagnostics
-       |> List.concat_map (fun (title, rows) -> heading title :: List.map row rows))
-  in
-  let scroll =
-    Ui.Widget.Scroll_view.vertical
-      ~key:(Ui.Key.string "journal-diagnostics-scroll")
-      ~on_scroll:
-        (Ui.Event.Handler.create ~name:"journal-diagnostics-scroll" (fun _ -> ()))
-      [ Ui.Widget.Sliver.list current ]
-      ()
-    |> Ui.Widget.Viewport.Vertical.with_test_id
-         (Ui.Test_id.string "journal-diagnostics-scroll")
-  in
-  let header =
-    Ui.Widget.Flex.row
-      [ Ui.Widget.Flex.expanded
-          (styled_text ~token:typography.manager_title "Diagnostics"
-           |> Ui.Widget.semantics
-                ~properties:
-                  (Ui.Semantics.create
-                     ~label:"Diagnostics"
-                     ~role:Ui.Semantics.Role.Header
-                     ~heading_level:1
-                     ()))
-      ; Ui.Widget.Flex.fixed close
-      ]
-    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
-  in
-  let body =
-    Ui.Widget.Body.Vertical.create
-      [ Ui.Widget.Body.Vertical.fixed header; Ui.Widget.Body.Vertical.fill scroll ]
-    |> Ui.Widget.Body.safe_area
-  in
-  Ui.Material.scaffold ~body ()
-  |> modal_dialog_page
-       ~tokens
-       ~reduced_motion
-       ~page_key:"journal-diagnostics-dialog"
-       ~test_id:"journal-diagnostics-dialog-page"
-       ~barrier_label:"Diagnostics"
+  Presentation.form
+    (List.map
+       (fun (title, rows) ->
+          Presentation.section
+            title
+            (List.map
+               (fun (label, value) -> Presentation.labeled label (V.text value))
+               rows))
+       groups)
+  |> dismiss_toolbar
+       ~test_id:"journal-diagnostics-close"
+       ~command:"close-diagnostics"
+       dispatch
+  |> V.Body.with_test_id (Ui.Test_id.string "journal-diagnostics-dialog-page")
 ;;
 
-let local_cache_reset_dialog_page ~tokens ~typography ~reduced_motion dispatch =
-  let cancel =
-    action_target
-      ~role:Text
-      ~test_id:"cancel-local-cache-reset"
-      ~label:"Keep local graph copy"
-      ~hint:"Close without deleting local data"
-      ~on_press:(bind_action dispatch "cancel-local-cache-reset")
-      (styled_text "Cancel")
-  in
-  let confirm =
-    action_target
-      ~role:Filled
-      ~test_id:"confirm-local-cache-reset"
-      ~label:"Delete local graph copy"
-      ~hint:"Delete the local copy and return to graph selection"
-      ~on_press:(bind_action dispatch "confirm-local-cache-reset")
-      (styled_text "Delete local graph copy")
-  in
-  dialog_body
-    ~typography
-    ~test_id:"local-cache-reset-dialog"
-    ~title:"Delete local graph copy?"
-    ~message:
-      "This deletes the local copy, including unsaved drafts and pending local changes, \
-       then returns to graph selection. The remote graph and cached encryption key are \
-       retained. Select a graph to open or download it."
-    ~primary:cancel
-    ~secondary:confirm
-  |> modal_dialog_page
-       ~tokens
-       ~reduced_motion
-       ~page_key:"local-cache-reset-dialog"
-       ~test_id:"local-cache-reset-dialog-page"
-       ~barrier_label:"Delete local graph copy confirmation"
-;;
-
-let route_page ~page_key ~transition body =
-  Ui.Material.scaffold ~body ()
-  |> Ui.Widget.page
-       ~key:(Ui.Key.string page_key)
-       ~page_key:(ID.Navigation.Page_key.of_string page_key)
-       ~presentation:(Ui.Navigation.Standard transition)
-       ~can_pop:false
-  |> Ui.Widget.with_test_id (Ui.Test_id.string page_key)
-;;
-
-let detail_text_field ~typography detail dispatch =
-  match Journal_detail.editor_value detail with
-  | None ->
-    styled_text
-      ~token:typography.Journal_visual_tokens.entry
-      (Journal_model.source (Journal_detail.root detail))
-  | Some value ->
-    Ui.Material.text_field
-      ~key:(Ui.Key.string "detail-editor")
-      ~enabled:(Journal_detail.mode detail = Journal_detail.Editing)
-      ~keyboard_type:Ui.Text_editing.Multiline
-      ~input_action:Ui.Text_editing.Newline
-      ~max_utf8_bytes:65_536
-      ~session_id:(Journal_detail.session_id detail)
-      ~document_revision:(Journal_detail.document_revision detail)
-      ~accepted_local_revision:(Journal_detail.accepted_local_revision detail)
-      ~update_mode:(Journal_detail.update_mode detail)
-      ~value
-      ~on_edit:dispatch
-      ~on_submit:dispatch
-      ~on_focus_changed:dispatch
-      ~on_limit_reached:dispatch
-      ()
-    |> Ui.Widget.with_test_id (Ui.Test_id.string "detail-editor")
-;;
-
-let child_editor detail dispatch =
-  match Journal_detail.child_capture detail with
-  | None -> Ui.Widget.empty ()
-  | Some capture ->
-    let editor =
-      Ui.Material.text_field
-        ~key:(Ui.Key.string "detail-child-editor")
-        ~enabled:true
-        ~keyboard_type:Ui.Text_editing.Multiline
-        ~input_action:Ui.Text_editing.Newline
-        ~autofocus:true
-        ~max_utf8_bytes:65_536
-        ~session_id:(Journal_capture.session_id capture)
-        ~document_revision:(Journal_capture.document_revision capture)
-        ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
-        ~update_mode:(Journal_capture.update_mode capture)
-        ~value:(Journal_capture.value capture)
-        ~on_edit:dispatch
-        ~on_submit:dispatch
-        ~on_focus_changed:dispatch
-        ~on_limit_reached:dispatch
-        ()
-      |> Ui.Widget.with_test_id (Ui.Test_id.string "detail-child-editor")
-    in
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed
-          (Ui.Widget.constrained_box
-             ~constraints:
-               (Ui.Layout.Box_constraints.create ~min_height:120. ~max_height:120. ())
-             editor)
-      ; Ui.Widget.Flex.fixed
-          (action_target
-             ~enabled:(Journal_capture.can_save capture)
-             ~role:Filled
-             ~test_id:"detail-child-save"
-             ~label:"Save direct child"
-             ~hint:"Persist this direct child"
-             ~on_press:(bind_action dispatch "detail-child-save")
-             (styled_text "Save child"))
-      ]
-;;
-
-let detail_page ~(typography : Journal_visual_tokens.typography) detail dispatch =
-  let root = Journal_detail.root detail in
-  let navigation_enabled =
-    match Journal_detail.mode detail with
-    | Journal_detail.Saving | Saving_child -> false
-    | Reading | Editing | Confirm_discard | Conflict | Failed _ | Adding_child | Committed
-      -> true
-  in
-  let back =
-    action_target
-      ~enabled:navigation_enabled
-      ~role:Text
-      ~test_id:"detail-back"
-      ~label:"Back to Timeline"
-      ~hint:"Return to the Timeline anchor"
-      ~on_press:(bind_action dispatch "back")
-      (styled_text "Back")
-  in
-  let save =
-    action_target
-      ~enabled:(Journal_detail.can_save detail)
-      ~role:Filled
-      ~test_id:"detail-save"
-      ~label:"Save entry changes"
-      ~hint:"Persist the complete source"
-      ~on_press:(bind_action dispatch "detail-save")
-      (styled_text "Save")
-  in
-  let add_child =
-    action_target
-      ~role:Filled_tonal
-      ~test_id:"detail-add-child"
-      ~label:"Add direct child"
-      ~hint:"Create one direct child block"
-      ~on_press:(bind_action dispatch "detail-add-child")
-      (styled_text "Add child")
-  in
-  let task =
-    action_target
-      ~role:Outlined
-      ~test_id:"detail-task"
-      ~label:"Toggle task completion"
-      ~hint:"Persist task state without leaving Detail"
-      ~on_press:(bind_action dispatch "detail-task")
-      (styled_text
-         (match Journal_model.task_state root with
-          | Journal_model.No_status -> "Make task"
-          | Done | Canceled -> "Mark todo"
-          | Todo | Doing | In_review | Now | Backlog | Waiting | Later -> "Mark done"))
-  in
-  let children =
-    Journal_detail.children detail
-    |> List.map (fun child ->
-      styled_text ~token:typography.supporting (Journal_model.source child)
-      |> Ui.Widget.with_test_id
-           (Ui.Test_id.string ("detail-child:" ^ Journal_model.id child)))
-  in
-  let status =
-    match Journal_detail.mode detail with
-    | Journal_detail.Conflict ->
-      Ui.Widget.Flex.row
-        [ Ui.Widget.Flex.expanded (live_region_text "A newer version exists")
-        ; Ui.Widget.Flex.fixed
-            (action_target
-               ~role:Filled_tonal
-               ~test_id:"detail-retry"
-               ~label:"Retry edit"
-               ~hint:"Rebase the local draft on the latest revision"
-               ~on_press:(bind_action dispatch "detail-retry")
-               (styled_text "Retry"))
-        ]
-    | Failed message ->
-      Ui.Widget.Flex.row
-        [ Ui.Widget.Flex.expanded (live_region_text message)
-        ; Ui.Widget.Flex.fixed
-            (action_target
-               ~role:Filled_tonal
-               ~test_id:"detail-retry"
-               ~label:"Retry mutation"
-               ~hint:"Retry the admitted mutation"
-               ~on_press:(bind_action dispatch "detail-retry")
-               (styled_text "Retry"))
-        ]
-    | Saving | Saving_child -> live_region_text "Saving"
-    | Reading | Editing | Confirm_discard | Adding_child | Committed -> Ui.Widget.empty ()
-  in
-  let content =
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed
-          (Ui.Widget.Flex.row
-             [ Ui.Widget.Flex.expanded back
-             ; Ui.Widget.Flex.fixed
-                 (styled_text
-                    ~token:typography.Journal_visual_tokens.dialog_title
-                    "Entry detail")
-             ; Ui.Widget.Flex.expanded save
+module Cache_confirmation = struct
+  let local_cache ~token dispatch body =
+    let request =
+      Option.map
+        (fun token ->
+           V.Confirmation.request
+             ~token
+             ~title:"Delete local graph copy?"
+             ~message:
+               "This deletes the local copy, including unsaved drafts and pending local \
+                changes, then returns to graph selection. The remote graph and cached \
+                encryption key are retained. Select a graph to open or download it."
+             [ V.Confirmation.action ~key:"cancel" ~title:"Cancel" ~role:Cancel ()
+             ; V.Confirmation.action
+                 ~key:"delete"
+                 ~title:"Delete local graph copy"
+                 ~role:Destructive
+                 ()
              ])
-      ; Ui.Widget.Flex.fixed
-          (styled_text ~token:typography.entry (Journal_model.source root))
-      ; Ui.Widget.Flex.fixed
-          (Ui.Widget.Flex.row
-             [ Ui.Widget.Flex.expanded task; Ui.Widget.Flex.expanded add_child ])
-      ; Ui.Widget.Flex.expanded (detail_text_field ~typography detail dispatch)
-      ; Ui.Widget.Flex.fixed
-          (Ui.Widget.Flex.column (List.map Ui.Widget.Flex.fixed children))
-      ; Ui.Widget.Flex.fixed (child_editor detail dispatch)
-      ; Ui.Widget.Flex.fixed status
-      ]
-    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
-    |> Ui.Widget.safe_area
-  in
-  route_page
-    ~page_key:"journal-detail-route"
-    ~transition:Ui.Navigation.None
-    (Ui.Widget.Body.static content)
-;;
+        token
+    in
+    V.Confirmation.alert
+      ~key:(Ui.Key.string "local-cache-confirmation")
+      ~request
+      ~on_response:dispatch
+      body
+    |> V.with_test_id (Ui.Test_id.string "local-cache-reset-confirmation")
+  ;;
+end
 
-let detail_discard_dialog_page ~tokens ~typography ~reduced_motion dispatch =
-  let keep =
-    action_target
-      ~role:Text
-      ~test_id:"detail-keep-editing"
-      ~label:"Keep editing"
-      ~hint:"Return to the local draft"
-      ~on_press:(bind_action dispatch "keep-editing")
-      (styled_text "Keep editing")
-  in
-  let discard =
-    action_target
-      ~role:Filled
-      ~test_id:"detail-discard"
-      ~label:"Discard Detail changes"
-      ~hint:"Return to the saved Detail"
-      ~on_press:(bind_action dispatch "discard")
-      (styled_text "Discard")
-  in
-  dialog_body
-    ~typography
-    ~test_id:"detail-discard-dialog"
-    ~title:"Discard changes?"
-    ~message:"The edited source has not been saved."
-    ~primary:keep
-    ~secondary:discard
-  |> modal_dialog_page
-       ~tokens
-       ~reduced_motion
-       ~page_key:"detail-discard-dialog"
-       ~test_id:"detail-discard-dialog-page"
-       ~barrier_label:"Discard Detail changes confirmation"
-;;
+module Detail_outline = struct
+  let scope routes =
+    Printf.sprintf "detail-session:%Ld:" (Journal_routes.detail_request_generation routes)
+  ;;
+end
 
-let message_page ~typography ~page_key ~title dispatch =
+module Detail_list = struct
+  let view ~key ~detail ~enabled ~on_action ~on_scroll_completed ~children =
+    let depth = function
+      | Journal_detail.Block row -> row.depth
+      | More row -> row.depth
+    in
+    let rec siblings level items =
+      match items with
+      | (row, label) :: rest when depth row = level ->
+        let nested, rest = siblings (level + 1) rest in
+        let row_key = Ui.Key.string (Journal_detail.row_key row) in
+        let item =
+          match row with
+          | Journal_detail.More _ ->
+            V.Native_list.row ~key:row_key ~separator:Hidden label
+          | Block { block; expanded; leaf; _ } ->
+            let id = Journal_model.id block in
+            let delete = bind_action on_action ("detail-delete:" ^ id) in
+            let swipe_actions =
+              V.Swipe_actions.create
+                ~allows_full_swipe:false
+                ~actions:
+                  [ V.Swipe_actions.action
+                      ~key:(Ui.Key.string ("delete:" ^ id))
+                      ~enabled
+                      ~side:End
+                      ~title:"Delete"
+                      ~symbol:"trash"
+                      ~role:Destructive
+                      ~background:Journal_visual_tokens.delete_action_background
+                      ~on_press:delete
+                      ()
+                  ]
+                ()
+            in
+            let context_menu =
+              V.Context_menu.create
+                ~actions:
+                  [ V.Context_menu.action
+                      ~key:(Ui.Key.string "delete")
+                      ~enabled
+                      ~role:Destructive
+                      ~title:"Delete block and descendants"
+                      ~symbol:"trash"
+                      ~on_press:delete
+                      ()
+                  ]
+                ()
+            in
+            if leaf
+            then
+              V.Native_list.row
+                ~key:row_key
+                ~separator:Hidden
+                ~swipe_actions
+                ~context_menu
+                label
+            else
+              V.Native_list.disclosure_row
+                ~key:row_key
+                ~separator:Hidden
+                ~swipe_actions
+                ~context_menu
+                ~test_id:(Ui.Test_id.string ("detail-disclosure:" ^ id))
+                ~expanded
+                ~on_expanded_changed:
+                  (Ui.Event.Handler.create (function
+                     | Ui.Event.Payload.Bool expanded ->
+                       Ui.Event.Handler.Private.invoke
+                         on_action
+                         (Text
+                            ((if expanded then "detail-expand:" else "detail-collapse:")
+                             ^ id))
+                     | _ -> ()))
+                ~label
+                nested
+        in
+        let siblings, rest = siblings level rest in
+        item :: siblings, rest
+      | _ -> [], items
+    in
+    let rows, _ = siblings 0 (List.combine (Journal_detail.rows detail) children) in
+    let scroll_request =
+      Option.map
+        (fun id ->
+           V.Native_list.scroll_request
+             ~token:(Journal_detail.composer_revision detail)
+             ~target:
+               (V.Native_list.target
+                  ~section:(Ui.Key.string "outline")
+                  ~row_path:
+                    [ Ui.Key.string
+                        ("block:" ^ Journal_model.id (Journal_detail.root detail))
+                    ; Ui.Key.string ("block:" ^ id)
+                    ])
+             ~anchor:Bottom
+             ~animated:false
+             ())
+        (Journal_detail.reveal_id detail)
+    in
+    V.Native_list.vertical
+      ~key
+      ~style:Plain
+      ?scroll_request
+      ~on_scroll_completed
+      [ V.Native_list.section ~key:(Ui.Key.string "outline") ~separator:Hidden rows ]
+    |> V.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-detail-outline")
+    |> V.Body.Vertical.fill
+    |> fun content -> V.Body.Vertical.create [ content ]
+  ;;
+end
+
+let detail_page ~state ~on_scroll_completed dispatch =
+  let detail = Journal_routes.detail state.routes in
+  let enabled =
+    state.write_enabled && state.pending_delete = None && state.pending_status = None
+  in
+  let saving =
+    Option.fold
+      ~none:false
+      ~some:(fun detail -> Journal_detail.mode detail = Saving_child)
+      detail
+  in
+  let scope = Detail_outline.scope state.routes in
+  let on_action action = bind_action dispatch (scope ^ action) in
+  let button ~id ~command title =
+    V.button ~on_press:(on_action command) ~child:(V.text title) ()
+    |> V.with_test_id (Ui.Test_id.string id)
+  in
+  let rows detail =
+    List.map
+      (function
+        | Journal_detail.More { parent_id; loading; error; _ } ->
+          if loading
+          then V.row [ V.progress ~style:Circular (); V.text "Loading children" ]
+          else
+            V.column
+              (Option.to_list (Option.map live_region_text error)
+               @ [ button
+                     ~id:("detail-more:" ^ parent_id)
+                     ~command:("detail-more:" ^ parent_id)
+                     (if Option.is_some error
+                      then "Retry loading children"
+                      else "Load more")
+                 ])
+        | Block { block; _ } ->
+          let source =
+            if Journal_model.task_state block = No_status
+            then Journal_model.source block
+            else
+              Journal_model.status_name (Journal_model.task_state block)
+              ^ "  "
+              ^ Journal_model.source block
+          in
+          V.text ~key:(Ui.Key.string ("detail-label:" ^ Journal_model.id block)) source
+          |> V.with_test_id (Ui.Test_id.string ("detail-block:" ^ Journal_model.id block))
+          |> media_label state dispatch ~root:(Journal_model.id block))
+      (Journal_detail.rows detail)
+  in
   let content =
-    Ui.Widget.Flex.column
-      [ Ui.Widget.Flex.fixed
-          (action_target
-             ~role:Text
-             ~test_id:(page_key ^ "-back")
-             ~label:"Back to Timeline"
-             ~hint:"Return to the Timeline anchor"
-             ~on_press:(bind_action dispatch "back")
-             (styled_text "Back"))
-      ; Ui.Widget.Flex.expanded
-          (styled_text ~token:typography.Journal_visual_tokens.dialog_title title
-           |> Ui.Widget.center
-           |> Ui.Widget.semantics
-                ~properties:(Ui.Semantics.create ~label:title ~live_region:true ()))
-      ]
-    |> Ui.Widget.safe_area
+    match detail with
+    | Some detail ->
+      Detail_list.view
+        ~key:(Ui.Key.string scope)
+        ~detail
+        ~enabled:(enabled && not saving)
+        ~on_action:(prefix_action dispatch scope)
+        ~on_scroll_completed
+        ~children:(rows detail)
+    | None ->
+      (match Journal_routes.route state.routes with
+       | Detail_loading ->
+         V.column [ V.progress ~style:Circular (); V.text "Loading block" ]
+         |> V.frame ~max_width:Fill ~max_height:Fill
+       | Missing_detail ->
+         Presentation.unavailable
+           ~title:"Block unavailable"
+           ~symbol:"doc"
+           ~message:"This block may have been deleted or moved."
+           ~actions:(V.empty ())
+       | Failed_detail message ->
+         Presentation.unavailable
+           ~title:"Unable to open block"
+           ~symbol:"exclamationmark.triangle"
+           ~message
+           ~actions:(button ~id:"detail-retry" ~command:"detail-retry" "Retry")
+       | Detail | Timeline -> V.empty ())
+      |> V.Body.static
   in
-  route_page ~page_key ~transition:Ui.Navigation.Fade (Ui.Widget.Body.static content)
+  let composer =
+    V.button
+      ~enabled:(enabled && Option.is_some detail && not saving)
+      ~on_press:(bind_action dispatch "open-append")
+      ~child:(V.label ~title:(V.text "Append") ~icon:(V.symbol ~name:"plus" ()) ())
+      ()
+    |> V.with_test_id (Ui.Test_id.string "journal-append-open")
+  in
+  content
+  |> V.Body.toolbar
+       ~items:
+         [ V.Toolbar.item ~key:(Ui.Key.string "append") ~placement:Primary_action composer
+         ; V.Toolbar.item
+             ~key:(Ui.Key.string "attach")
+             ~placement:Primary_action
+             (Journal_asset_import.view
+                ~key:(Ui.Key.string (scope ^ "import"))
+                ~enabled:(enabled && Option.is_some detail && not saving)
+                ~completion:state.import_completion
+                ~on_select:(fun payload ->
+                  Ui.Event.Handler.Private.invoke
+                    dispatch
+                    (Ui.Event.Payload.Text (scope ^ "import-asset:" ^ payload))))
+         ]
+  |> V.Body.with_test_id (Ui.Test_id.string "journal-detail-route")
 ;;
 
-let manager_page ~(typography : Journal_visual_tokens.typography) state dispatch =
-  let title_widget title =
-    styled_text ~token:typography.Journal_visual_tokens.manager_title title
-    |> Ui.Widget.semantics
-         ~properties:(Ui.Semantics.create ~label:title ~live_region:true ())
+let manager_page state dispatch =
+  let button ?(role = V.Button_role.Normal) ?(enabled = true) ~id ~command title symbol =
+    V.button
+      ~key:(Ui.Key.string id)
+      ~role
+      ~enabled
+      ~on_press:(bind_action dispatch command)
+      ~child:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
+      ()
+    |> V.with_test_id (Ui.Test_id.string id)
   in
-  let diagnostics_entry () =
-    action_target
-      ~role:Outlined
-      ~test_id:"journal-startup-diagnostics"
-      ~label:"Diagnostics"
-      ~hint:"Open read-only application diagnostics"
-      ~on_press:(bind_action dispatch "open-diagnostics")
-      (styled_text "Diagnostics")
-    |> Ui.Widget.padding
-         ~insets:(Ui.Layout.Edge_insets.symmetric ~horizontal:24. ~vertical:12. ())
+  let diagnostics =
+    button
+      ~id:"journal-startup-diagnostics"
+      ~command:"open-diagnostics"
+      "Diagnostics"
+      "stethoscope"
+  in
+  let toolbar title actions body =
+    body
+    |> V.Body.toolbar
+         ~items:
+           (V.Toolbar.item
+              ~key:(Ui.Key.string "startup-title")
+              ~placement:Principal
+              (V.text title)
+            :: V.Toolbar.item
+                 ~key:(Ui.Key.string "startup-diagnostics")
+                 ~placement:Secondary_action
+                 diagnostics
+            :: actions)
+  in
+  let unavailable ~title ~symbol ~message ~actions =
+    Presentation.unavailable ~title ~symbol ~message ~actions
+    |> V.frame ~max_width:Fill ~max_height:Fill
+    |> V.Body.static
+  in
+  let choose_graph =
+    button
+      ~id:"graph-picker-choose"
+      ~command:"switch-graph"
+      "Choose another graph"
+      "folder"
+  in
+  let can_choose_graph =
+    Option.fold
+      ~none:false
+      ~some:(fun (snapshot : Graph_service.snapshot) ->
+        snapshot.startup.authenticated
+        && Option.is_some snapshot.selected_graph
+        && Option.is_none snapshot.local_deletion)
+      state.manager
+  in
+  let busy ?value ?(allow_graph_selection = false) title message =
+    V.column
+      ~spacing:12.
+      [ V.progress ?value ~style:(if Option.is_some value then Linear else Circular) ()
+      ; V.text title
+      ; V.text message
+      ; (if allow_graph_selection && can_choose_graph then choose_graph else V.empty ())
+      ]
+    |> V.frame ~max_width:Fill ~max_height:Fill
+    |> V.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
+    |> V.Body.static
   in
   let graph_picker snapshot =
     let refresh =
-      let on_press = bind_action dispatch "refresh-catalog" in
-      let icon =
-        Material_icon_catalog.create ~size:22. Material_icon_catalog.Refresh
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-refresh-icon")
-      in
-      Ui.Material.icon_button
-        ~key:(Ui.Key.string "graph-picker-refresh")
-        ~on_press
-        ~icon
-        ()
-      |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-refresh")
-      |> Ui.Widget.semantics
-           ~on_action:on_press
-           ~properties:
-             (Ui.Semantics.create
-                ~label:"Refresh graphs"
-                ~hint:"Refresh the authorized graph catalog"
-                ~role:Ui.Semantics.Role.Button
-                ~enabled:true
-                ~focusable:true
-                ~actions:[ Ui.Semantics.Action.Tap ]
-                ())
-      |> Ui.Material.Tooltip.plain ~message:"Refresh graphs"
-      |> Ui.Widget.sized_box ~width:48. ~height:48.
+      button
+        ~id:"graph-picker-refresh"
+        ~command:"refresh-catalog"
+        "Refresh graphs"
+        "arrow.clockwise"
+      |> V.help ~message:"Refresh the authorized graph catalog"
     in
-    let toolbar =
-      Ui.Widget.Flex.row
-        [ Ui.Widget.Flex.expanded (title_widget "Choose a graph")
-        ; Ui.Widget.Flex.fixed refresh
-        ]
-      |> Ui.Widget.with_test_id (Ui.Test_id.string "graph-picker-toolbar")
+    let content =
+      match snapshot.Graph_service.catalog with
+      | [] ->
+        unavailable
+          ~title:"No graphs available"
+          ~symbol:"folder"
+          ~message:"Refresh to check for graphs available to your account."
+          ~actions:(V.empty ())
+      | graphs ->
+        Presentation.list
+          (List.map
+             (fun (graph : Graph_service.graph) ->
+                let graph_id =
+                  Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id
+                in
+                button
+                  ~id:("graph-picker:" ^ graph_id)
+                  ~command:("select-graph:" ^ graph_id)
+                  graph.name
+                  (if graph.encrypted then "lock.doc" else "folder"))
+             graphs)
+        |> V.Body.with_test_id (Ui.Test_id.string "graph-picker-list")
     in
-    let rows =
-      List.map
-        (fun (graph : Graph_service.graph) ->
-           let graph_id = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
-           let on_press = bind_action dispatch ("select-graph:" ^ graph_id) in
-           Ui.Material.text_button
-             ~key:(Ui.Key.string ("graph-picker:" ^ graph_id))
-             ~on_press
-             ~child:(transparent_row_button_content ~typography graph.name)
-             ()
-           |> Ui.Widget.with_test_id (Ui.Test_id.string ("graph-picker:" ^ graph_id))
-           |> Ui.Widget.semantics
-                ~on_action:on_press
-                ~properties:
-                  (Ui.Semantics.create
-                     ~label:("Open " ^ graph.name)
-                     ~hint:"Open this authorized graph"
-                     ~role:Ui.Semantics.Role.Button
-                     ~enabled:true
-                     ~focusable:true
-                     ~actions:[ Ui.Semantics.Action.Tap ]
-                     ()))
-        snapshot.Graph_service.catalog
-    in
-    let scroll =
-      Ui.Widget.Scroll_view.vertical
-        ~key:(Ui.Key.string "graph-picker-scroll")
-        ~on_scroll:(Ui.Event.Handler.create ~name:"graph-picker-scroll" (fun _ -> ()))
-        [ Ui.Widget.Sliver.list rows ]
-        ()
-      |> Ui.Widget.Viewport.Vertical.with_test_id
-           (Ui.Test_id.string "graph-picker-scroll")
-      |> Ui.Widget.Viewport.Vertical.padding
-           ~insets:(Ui.Layout.Edge_insets.symmetric ~vertical:8. ())
-    in
-    Ui.Widget.Body.Vertical.create
-      [ Ui.Widget.Body.Vertical.fixed toolbar
-      ; Ui.Widget.Body.Vertical.fill scroll
-      ; Ui.Widget.Body.Vertical.fixed (diagnostics_entry ())
+    toolbar
+      "Choose a graph"
+      [ V.Toolbar.item
+          ~key:(Ui.Key.string "graph-picker-refresh")
+          ~placement:Primary_action
+          refresh
       ]
-    |> Ui.Widget.Body.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
-    |> Ui.Widget.Body.safe_area
+      content
   in
-  let compact_body () =
-    let title, controls =
-      match state.manager with
-      | None -> "Preparing your account", []
-      | Some snapshot ->
-        let startup = Journal_startup.derive ~snapshot ~graph:state.graph_state in
-        (match startup.phase with
-         | Journal_startup.Signed_out -> "Sign in to open a graph", []
-         | Loading_catalog -> "Loading your graphs", []
-         | Awaiting_selection -> assert false
-         | Restoring_local -> "Restoring your graph", []
-         | Deleting_local ->
-           let message =
-             match snapshot.local_deletion with
-             | Some (Deletion_in_progress Closing_graph) -> "Closing the local graph"
-             | Some (Deletion_in_progress Deleting_mirror) -> "Deleting the local copy"
-             | Some (Deletion_in_progress Clearing_selection) ->
-               "Clearing the saved selection"
-             | None | Some (Deletion_failed _) -> "Deleting the local copy"
-           in
-           message, []
-         | Bootstrapping ->
-           let progress_text =
-             match state.bootstrap_progress with
-             | None -> "Preparing the local mirror"
-             | Some progress ->
-               Printf.sprintf "Downloaded %Ld bytes" progress.Graph_service.received_bytes
-           in
-           ( "Downloading graph"
-           , [ Ui.Widget.Flex.fixed
-                 (styled_text ~token:typography.supporting progress_text)
-             ] )
-         | Awaiting_e2ee_password ->
-           let password = state.e2ee_password in
-           let editor =
-             Ui.Material.text_field
-               ~key:(Ui.Key.string "e2ee-password-editor")
-               ~enabled:true
-               ~obscure_text:true
-               ~keyboard_type:Ui.Text_editing.Text
-               ~input_action:Ui.Text_editing.Done
-               ~autofocus:true
-               ~max_utf8_bytes:4096
-               ~session_id:(Journal_capture.session_id password)
-               ~document_revision:(Journal_capture.document_revision password)
-               ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
-               ~update_mode:(Journal_capture.update_mode password)
-               ~value:(Journal_capture.value password)
-               ~on_edit:dispatch
-               ~on_submit:(bind_action dispatch "submit-e2ee-password")
-               ~on_focus_changed:dispatch
-               ~on_limit_reached:dispatch
-               ()
-             |> Ui.Widget.with_test_id (Ui.Test_id.string "e2ee-password-editor")
-           in
-           let submit =
-             action_target
-               ~enabled:(Journal_capture.can_save password)
-               ~role:Filled
-               ~test_id:"e2ee-password-submit"
-               ~label:"Unlock encrypted graph"
-               ~hint:"Submit the encryption password"
-               ~on_press:(bind_action dispatch "submit-e2ee-password")
-               (styled_text "Unlock")
-           in
-           ( "Unlock encrypted graph"
-           , [ Ui.Widget.Flex.fixed
-                 (styled_text
-                    ~token:typography.supporting
-                    "Enter your encryption password to continue.")
-             ; Ui.Widget.Flex.fixed editor
-             ; Ui.Widget.Flex.fixed submit
-             ] )
-         | Ready -> "Opening journal", []
-         | Failed ->
-           let message, recovery =
-             match startup.error with
-             | None -> "Unable to open graph", None
-             | Some error -> error.message, error.recovery
-           in
-           let action =
-             match recovery with
-             | Some Journal_startup.Refresh_catalog ->
-               Some ("refresh-catalog", "Retry", "Retry startup")
-             | Some Begin_online_recovery ->
-               Some
-                 ( "begin-online-recovery"
-                 , "Continue online"
-                 , "Continue startup with online recovery" )
-             | Some Retry_graph_open ->
-               Some ("begin-online-recovery", "Retry", "Retry startup")
-             | Some Submit_e2ee_password | Some Sign_in | None -> None
-           in
-           let action_name, action_label, action_hint =
-             match action with
-             | Some (name, label, hint) -> Some name, label, hint
-             | None -> None, "Retry", "Retry startup"
-           in
-           ( message
-           , if Option.is_none action_name
-             then []
-             else
-               [ Ui.Widget.Flex.fixed
-                   (action_target
-                      ~role:Filled_tonal
-                      ~test_id:"graph-picker-retry"
-                      ~label:action_label
-                      ~hint:action_hint
-                      ~enabled:(Option.is_some action_name)
-                      ~on_press:
-                        (bind_action
-                           dispatch
-                           (Option.value action_name ~default:"retry-disabled"))
-                      (styled_text action_label))
-               ] ))
+  let unlock error =
+    let password = state.e2ee_password in
+    let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+    let submit = bind_action dispatch "submit-e2ee-password" in
+    let editor =
+      V.secure_field
+        ~label:"Encryption password"
+        ~prompt:"Enter password"
+        ~appearance:Ui.Text_editing.Field_appearance.Plain
+        ~key:(Ui.Key.string "e2ee-password-editor")
+        ~enabled:true
+        ~keyboard:Ui.Text_editing.Keyboard.Text
+        ~submit_label:Ui.Text_editing.Submit_label.Go
+        ~autofocus:true
+        ~max_utf8_bytes:4096
+        ~session_id:(Journal_capture.session_id password)
+        ~document_revision:(Journal_capture.document_revision password)
+        ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
+        ~update_mode:(Journal_capture.update_mode password)
+        ~value:(Journal_capture.value password)
+        ~on_edit:dispatch
+        ~on_submit:submit
+        ~on_focus_changed:ignored
+        ~on_limit_reached:ignored
+        ()
+      |> V.with_test_id (Ui.Test_id.string "e2ee-password-editor")
     in
-    Ui.Widget.Flex.column
-      ((Ui.Widget.Flex.fixed (title_widget title) :: controls)
-       @ [ Ui.Widget.Flex.fixed (diagnostics_entry ()) ])
-    |> Ui.Widget.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
-    |> Ui.Widget.safe_area
-    |> Ui.Widget.Body.static
+    let graph_name =
+      Option.bind state.manager (fun snapshot ->
+        Option.bind snapshot.selected_graph (fun selected ->
+          List.find_opt
+            (fun (graph : Graph_service.graph) ->
+               Logseq_db_types.Graph_types.Uuid.equal graph.graph_id selected)
+            snapshot.catalog))
+      |> Option.map (fun (graph : Graph_service.graph) -> graph.name)
+      |> Option.value ~default:"Encrypted graph"
+    in
+    let unlock_button =
+      V.button
+        ~key:(Ui.Key.string "unlock-submit")
+        ~style:Prominent
+        ~enabled:(Journal_capture.can_save password)
+        ~on_press:submit
+        ~child:(V.text "Unlock graph" |> V.frame ~max_width:Fill)
+        ()
+      |> V.with_test_id (Ui.Test_id.string "e2ee-password-submit")
+    in
+    let choose_graph =
+      V.button
+        ~key:(Ui.Key.string "unlock-cancel")
+        ~role:Cancel
+        ~style:Plain
+        ~on_press:(bind_action dispatch "switch-graph")
+        ~child:(V.text "Choose another graph")
+        ()
+      |> V.with_test_id (Ui.Test_id.string "e2ee-password-cancel")
+    in
+    Presentation.form
+      [ Presentation.section
+          "Unlock your graph"
+          [ V.symbol ~name:"lock.shield" ()
+          ; V.text ~key:(Ui.Key.string "graph-name") graph_name
+            |> V.text_selection ~enabled:true
+          ; V.text "Enter your encryption password to access your notes."
+          ]
+      ; Presentation.section
+          "Encryption password"
+          [ editor
+          ; (match error with
+             | None -> V.empty ()
+             | Some message -> live_region_text message)
+          ; unlock_button
+          ; V.text "Use the encryption password you set up in Logseq."
+          ; choose_graph
+          ]
+      ]
+    |> V.Body.toolbar
+         ~items:
+           [ V.Toolbar.item
+               ~key:(Ui.Key.string "startup-diagnostics")
+               ~placement:Secondary_action
+               diagnostics
+           ]
   in
   let body =
     match state.manager with
-    | Some snapshot
-      when (Journal_startup.derive ~snapshot ~graph:state.graph_state).phase
-           = Awaiting_selection -> graph_picker snapshot
-    | None | Some _ -> compact_body ()
+    | None -> busy "Preparing your account" "" |> toolbar "Journals" []
+    | Some snapshot ->
+      let startup = Journal_startup.derive ~snapshot ~graph:state.graph_state in
+      (match startup.phase with
+       | Awaiting_selection -> graph_picker snapshot
+       | Awaiting_e2ee_password -> unlock None
+       | Failed
+         when Option.fold
+                ~none:false
+                ~some:(fun (error : Journal_startup.startup_error) ->
+                  error.recovery = Some Submit_e2ee_password)
+                startup.error ->
+         unlock
+           (Option.map
+              (fun (error : Journal_startup.startup_error) -> error.message)
+              startup.error)
+       | Signed_out ->
+         unavailable
+           ~title:"Sign in to open a graph"
+           ~symbol:"person.crop.circle"
+           ~message:"Connect your account to access your graphs."
+           ~actions:(V.empty ())
+         |> toolbar "Journals" []
+       | Loading_catalog ->
+         busy ~allow_graph_selection:true "Loading your graphs" ""
+         |> toolbar "Journals" []
+       | (Ready | Restoring_local)
+         when Option.is_some state.graph_error
+              && state.graph_state.phase = Graph_open
+              && state.graph_state.generation = snapshot.startup.graph_generation
+              && Option.equal
+                   Logseq_db_types.Graph_types.Uuid.equal
+                   state.graph_state.graph_id
+                   snapshot.selected_graph ->
+         graph_unavailable_view
+           ~message:(graph_error_message (Option.get state.graph_error))
+           ~on_details:
+             (if state.worker_errors = []
+              then None
+              else Some (bind_action dispatch "open-error-info"))
+           ~on_diagnostics:(bind_action dispatch "open-diagnostics")
+           ~on_choose_graph:(Some (bind_action dispatch "switch-graph"))
+         |> V.frame ~max_width:Fill ~max_height:Fill
+         |> V.Body.static
+         |> toolbar "Journals" []
+       | Ready ->
+         busy ~allow_graph_selection:true "Opening journal" "" |> toolbar "Journals" []
+       | Restoring_local ->
+         busy ~allow_graph_selection:true "Restoring your graph" ""
+         |> toolbar "Journals" []
+       | Deleting_local ->
+         let message =
+           match snapshot.local_deletion with
+           | Some (Deletion_in_progress Closing_graph) -> "Closing the local graph"
+           | Some (Deletion_in_progress Deleting_mirror) -> "Deleting the local copy"
+           | Some (Deletion_in_progress Clearing_selection) ->
+             "Clearing the saved selection"
+           | None | Some (Deletion_failed _) -> "Deleting the local copy"
+         in
+         busy message "" |> toolbar "Journals" []
+       | Bootstrapping ->
+         let value, message =
+           match state.bootstrap_progress with
+           | None -> None, "Preparing the local mirror"
+           | Some progress ->
+             let value =
+               Option.bind progress.Graph_service.total_bytes (fun total ->
+                 if total <= 0L || progress.received_bytes < 0L
+                 then None
+                 else
+                   Some
+                     (Float.min
+                        1.
+                        (Int64.to_float progress.received_bytes /. Int64.to_float total)))
+             in
+             value, Printf.sprintf "Downloaded %Ld bytes" progress.received_bytes
+         in
+         busy ?value ~allow_graph_selection:true "Downloading graph" message
+         |> toolbar "Journals" []
+       | Failed ->
+         let message, recovery =
+           match startup.error with
+           | None -> "Unable to open graph", None
+           | Some error -> error.message, error.recovery
+         in
+         let actions =
+           match recovery with
+           | Some Refresh_catalog ->
+             button
+               ~id:"graph-picker-retry"
+               ~command:"refresh-catalog"
+               "Retry"
+               "arrow.clockwise"
+           | Some Begin_online_recovery | Some Retry_graph_open ->
+             button
+               ~id:"graph-picker-retry"
+               ~command:"begin-online-recovery"
+               "Retry"
+               "arrow.clockwise"
+           | Some Submit_e2ee_password | Some Sign_in | None -> V.empty ()
+         in
+         let actions =
+           if
+             Option.is_some snapshot.selected_graph
+             && Option.is_none snapshot.local_deletion
+           then V.column ~spacing:12. [ actions; choose_graph ]
+           else actions
+         in
+         unavailable
+           ~title:"Unable to open graph"
+           ~symbol:"exclamationmark.folder"
+           ~message
+           ~actions
+         |> toolbar "Journals" [])
   in
-  route_page ~page_key:"sync-manager-route" ~transition:Ui.Navigation.None body
+  body |> V.Body.with_test_id (Ui.Test_id.string "sync-manager-route")
 ;;
 
 let identity_sequence = ref 0L
@@ -3025,6 +2736,26 @@ let with_block_identity ?(entropy = read_block_entropy) ~creation_time ~f () =
 
 let sibling_order value = Printf.sprintf "%012Ld" value
 
+let media_key state =
+  if
+    state.graph_state.phase = Logseq_db_worker.Graph_open
+    &&
+    match Journal_routes.route state.routes with
+    | Timeline | Detail -> true
+    | _ -> false
+  then Some (state.graph_state.generation, media_scope state)
+  else None
+;;
+
+let upload_context state =
+  if state.graph_state.phase = Logseq_db_worker.Graph_open
+  then
+    Option.map
+      (fun graph -> state.graph_state.generation, graph)
+      state.graph_state.graph_id
+  else None
+;;
+
 let component ~calendar_sampler client handlers graph =
   let state, set_state_and_effect =
     Bonsai.Cont.state_machine0
@@ -3032,22 +2763,7 @@ let component ~calendar_sampler client handlers graph =
       ~default_model:initial_state
       ~apply_action:(fun context state update ->
         let state, scheduled_effect = update state in
-        let active =
-          Journal_routes.route state.routes = Timeline && state.modal = No_modal
-        in
-        let state = Root_navigation.step state (Root_active active) in
-        let destination = Journal_routes.destination state.routes in
-        let empty =
-          match destination with
-          | Journals ->
-            (not state.feed_loaded)
-            || Option.is_some state.graph_error
-            || Journal_timeline_state.total_count state.timeline = 0
-          | Favorites -> Journal_routes.Favorites.items state.favorites = []
-        in
-        let state =
-          if empty then Root_navigation.step state (Non_scrollable destination) else state
-        in
+        let state = track_capture_session state in
         Bonsai.Cont.Apply_action_context.schedule_event context scheduled_effect;
         state)
       graph
@@ -3056,12 +2772,149 @@ let component ~calendar_sampler client handlers graph =
     Bonsai.Cont.map set_state_and_effect ~f:(fun update ->
       fun f -> update (fun state -> f state, Bonsai.Effect.Ignore))
   in
+  let timeline_scroll_completed =
+    Driver.Handler.create
+      handlers
+      ~name:"timeline-scroll-completed"
+      ~equal:(fun (a, set_a) (b, set_b) -> a = b && set_a == set_b)
+      (Bonsai.Cont.map2 state set_state ~f:(fun state set ->
+         state.graph_state.generation, set))
+      ~f:(fun (generation, set) payload ->
+        match V.Native_list.completion_of_payload payload with
+        | None -> Bonsai.Effect.Ignore
+        | Some completion ->
+          set (fun state ->
+            if state.graph_state.generation <> generation
+            then state
+            else
+              { state with
+                timeline =
+                  Journal_timeline_state.complete_scroll
+                    state.timeline
+                    ~token:completion.token
+                    ~outcome:completion.outcome
+              }))
+  in
+  let detail_scroll_completed =
+    Driver.Handler.create
+      handlers
+      ~name:"detail-scroll-completed"
+      ~equal:(fun (a, route_a, set_a) (b, route_b, set_b) ->
+        a = b && route_a = route_b && set_a == set_b)
+      (Bonsai.Cont.map2 state set_state ~f:(fun state set ->
+         ( state.graph_state.generation
+         , Journal_routes.detail_request_generation state.routes
+         , set )))
+      ~f:(fun (generation, route, set) payload ->
+        match V.Native_list.completion_of_payload payload with
+        | None -> Bonsai.Effect.Ignore
+        | Some completion ->
+          set (fun state ->
+            if
+              state.graph_state.generation <> generation
+              || Journal_routes.detail_request_generation state.routes <> route
+            then state
+            else (
+              match Journal_routes.detail state.routes with
+              | None -> state
+              | Some detail ->
+                { state with
+                  routes =
+                    Journal_routes.update_detail
+                      state.routes
+                      (Journal_detail.complete_reveal
+                         detail
+                         ~token:completion.token
+                         ~outcome:completion.outcome)
+                })))
+  in
   let set_state_ref = ref None in
   let state_ref = ref initial_state in
   let graph_runtime =
     Journal_graph_runtime.create
       ~localtime:(Journal_calendar.Sampler.localtime calendar_sampler)
       ()
+  in
+  let media_worker_requests = Hashtbl.create 16 in
+  let media_changes = Hashtbl.create 16 in
+  let media_context = ref None in
+  let media_runtime =
+    Journal_media_runtime.create
+      ~send:(fun ticket request ->
+        match Worker.send client request with
+        | Accepted id ->
+          Option.iter
+            (fun ticket -> Hashtbl.replace media_worker_requests id ticket)
+            ticket;
+          true
+        | Full | Not_ready | Stopping -> false)
+      ~changed:(fun root view -> Hashtbl.replace media_changes root view)
+  in
+  let sync_media state =
+    let key = media_key state in
+    if key <> !media_context
+    then (
+      media_context := key;
+      Journal_media_runtime.reset media_runtime ~graph_generation:(Option.map fst key))
+  in
+  let flush_media set_state =
+    let changes = Hashtbl.to_seq media_changes |> List.of_seq in
+    Hashtbl.clear media_changes;
+    let context = !media_context in
+    if changes = []
+    then Bonsai.Effect.Ignore
+    else
+      set_state (fun state ->
+        if media_key state <> context
+        then state
+        else
+          { state with
+            media_views =
+              List.fold_left
+                (fun views (root, (view : Journal_media_runtime.view)) ->
+                   if view.items = [] && view.error = None && not view.more
+                   then Media_views.remove root views
+                   else Media_views.add root view views)
+                state.media_views
+                changes
+          })
+  in
+  let import_worker_requests = Hashtbl.create 2 in
+  let asset_worker_requests = Hashtbl.create 2 in
+  let asset_runtime =
+    Journal_asset_runtime.create
+      ~changed:(fun generation recent favorites ->
+        Option.iter
+          (fun set_state ->
+             Bonsai.Effect.Expert.handle
+               (set_state (fun state ->
+                  match generation with
+                  | Some generation when state.graph_state.generation = generation ->
+                    { state with asset_offline = Some (recent, favorites) }
+                  | None -> { state with asset_offline = None }
+                  | Some _ -> state)))
+          !set_state_ref)
+      ~send:(fun request ->
+        match Worker.send client request with
+        | Worker.Accepted worker_id ->
+          (match request with
+           | Graph_service.Graph_request request ->
+             Hashtbl.replace asset_worker_requests worker_id request.request_id
+           | _ -> ());
+          true
+        | Full | Not_ready | Stopping -> false)
+  in
+  let asset_settings = ref None in
+  let refresh_assets ~graph_generation calendar =
+    Option.iter
+      (fun (calendar, settings) ->
+         Journal_asset_runtime.refresh
+           asset_runtime
+           ~graph_generation
+           ~today:(Journal_calendar.local_day calendar)
+           ~settings)
+      (Option.bind calendar (fun calendar ->
+         Option.map (fun settings -> calendar, settings) !asset_settings))
   in
   let started_graph_generation = ref None in
   let send_manager command =
@@ -3186,7 +3039,11 @@ let component ~calendar_sampler client handlers graph =
           if
             state.graph_state.generation <> graph_state.generation
             || state.graph_state.graph_id <> graph_state.graph_id
-          then Root_navigation.step state (Graph_replaced graph_state.generation)
+          then
+            Root_navigation.step
+              state
+              (Graph_replaced
+                 { generation = graph_state.generation; graph_id = graph_state.graph_id })
           else state
         in
         { state with
@@ -3212,6 +3069,7 @@ let component ~calendar_sampler client handlers graph =
           Journal_graph_runtime.reset graph_runtime;
           Hashtbl.clear favorites_worker_requests;
           let current = !state_ref in
+          refresh_assets ~graph_generation:graph_state.generation current.calendar;
           let graph_info = Journal_graph_runtime.start graph_runtime in
           let feed_generation = current.next_request_generation in
           let feed_output =
@@ -3241,8 +3099,6 @@ let component ~calendar_sampler client handlers graph =
                     Journal_routes.Favorites.create
                       ~graph_generation:graph_state.generation
                 ; favorites_requests = []
-                ; routes = Journal_routes.create ~anchor:initial_anchor
-                ; direct_capture = None
                 ; graph_ready = false
                 ; feed_loaded = false
                 ; presented_feed_context = None
@@ -3272,6 +3128,7 @@ let component ~calendar_sampler client handlers graph =
                 set_state (fun state -> apply_delivery_responses state delivery))))
       | Graph_closed | Graph_opening | Graph_closing | Graph_failed ->
         started_graph_generation := None;
+        Journal_asset_runtime.shutdown asset_runtime;
         Bonsai.Effect.Ignore
     in
     Bonsai.Effect.bind update ~f:(fun () ->
@@ -3403,9 +3260,30 @@ let component ~calendar_sampler client handlers graph =
           registered := true;
           ignore (Worker.send client Graph_service.Get_graph_state : Worker.send_result);
           Worker.on_event client (fun event ->
+            Journal_asset_runtime.pump asset_runtime;
+            sync_media !state_ref;
+            Journal_media_runtime.pump media_runtime;
             match event with
+            | Worker.Response { request_id; outcome = Completed response; _ }
+              when Hashtbl.mem media_worker_requests request_id ->
+              let ticket = Hashtbl.find media_worker_requests request_id in
+              Hashtbl.remove media_worker_requests request_id;
+              Journal_media_runtime.receive media_runtime ticket response;
+              flush_media set_state
+            | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
+              when Hashtbl.mem media_worker_requests request_id ->
+              let ticket = Hashtbl.find media_worker_requests request_id in
+              Hashtbl.remove media_worker_requests request_id;
+              Journal_media_runtime.reject media_runtime ticket;
+              flush_media set_state
             | Worker.Push { payload = Graph_service.Graph_push push; _ } ->
+              Journal_media_runtime.refresh media_runtime;
               let snapshot = !state_ref in
+              if snapshot.graph_state.phase = Graph_open
+              then
+                refresh_assets
+                  ~graph_generation:snapshot.graph_state.generation
+                  snapshot.calendar;
               let admission_refresh =
                 trigger_admission
                   set_state_and_effect
@@ -3425,33 +3303,16 @@ let component ~calendar_sampler client handlers graph =
                 if output.requests = [] && output.responses = []
                 then Bonsai.Effect.Ignore
                 else (
-                  let reloads_feed =
-                    List.exists
-                      (fun (request : Logseq_db_worker.Protocol.request) ->
-                         match request.command with
-                         | V2_list_journals _ -> true
-                         | _ -> false)
-                      output.requests
-                  in
-                  let sent_request = output.requests <> [] in
                   let prepare =
-                    if sent_request && reloads_feed
+                    if output.requests <> []
                     then
                       set_state (fun state ->
-                        match state.calendar with
-                        | Some calendar when state.graph_ready ->
-                          let context = feed_projection_context calendar in
-                          { state with
-                            feed_refresh =
-                              Some
-                                { generation
-                                ; context
-                                ; cause = Sync_refresh
-                                ; graph_generation = current_graph_generation state
-                                }
-                          ; next_request_generation = Int64.succ generation
-                          }
-                        | None | Some _ -> state)
+                        { state with
+                          next_request_generation =
+                            Int64.max
+                              state.next_request_generation
+                              (Int64.succ generation)
+                        })
                     else Bonsai.Effect.Ignore
                   in
                   Bonsai.Effect.Many
@@ -3471,6 +3332,15 @@ let component ~calendar_sampler client handlers graph =
                               | Some message -> fail_feed_transport state message
                               | None -> state)))
                     ]))
+            | Worker.Response
+                { request_id = worker_id
+                ; outcome = Worker.Completed (Graph_service.Graph_response response)
+                ; _
+                }
+              when Hashtbl.mem asset_worker_requests worker_id ->
+              Hashtbl.remove asset_worker_requests worker_id;
+              ignore (Journal_asset_runtime.receive asset_runtime response : bool);
+              Bonsai.Effect.Ignore
             | Worker.Response
                 { request_id
                 ; outcome = Worker.Completed (Graph_service.Graph_response response)
@@ -3535,6 +3405,80 @@ let component ~calendar_sampler client handlers graph =
                       | _ -> Bonsai.Effect.Ignore
                     in
                     refresh_after_worker_event))
+            | Worker.Push { payload = Asset_notice (scope, notice); _ } ->
+              Journal_asset_runtime.notice asset_runtime scope notice;
+              Journal_media_runtime.notice media_runtime scope notice;
+              Bonsai.Effect.Many
+                [ flush_media set_state
+                ; set_state (fun state ->
+                    { state with
+                      uploads =
+                        Journal_uploads.notice
+                          (Journal_uploads.sync state.uploads (upload_context state))
+                          scope
+                          notice
+                    })
+                ]
+            | Worker.Response
+                { request_id; outcome = Completed (Asset_imported result); _ } ->
+              let pending = Hashtbl.find_opt import_worker_requests request_id in
+              Hashtbl.remove import_worker_requests request_id;
+              let current =
+                match pending with
+                | Some (generation, _) ->
+                  let snapshot = !state_ref in
+                  generation = snapshot.graph_state.generation
+                  &&
+                    (match result, Journal_routes.detail snapshot.routes with
+                    | Ok receipt, Some detail ->
+                      Journal_model.id (Journal_detail.root detail)
+                      = Logseq_db_types.Graph_types.Uuid.to_string receipt.target
+                    | Error _, _ -> true
+                    | _ -> false)
+                | None -> false
+              in
+              Bonsai.Effect.bind
+                (Bonsai.Effect.of_thunk (fun () ->
+                   sync_media !state_ref;
+                   Result.iter
+                     (Journal_media_runtime.imported media_runtime ~current)
+                     result))
+                ~f:(fun () ->
+                  Bonsai.Effect.Many
+                    [ flush_media set_state
+                    ; (match pending with
+                       | None -> Bonsai.Effect.Ignore
+                       | Some (generation, operation) ->
+                         set_state (fun state ->
+                           if state.graph_state.generation <> generation
+                           then state
+                           else
+                             { state with
+                               import_completion =
+                                 Some
+                                   ( operation
+                                   , match result with
+                                     | Ok _ -> None
+                                     | Error message -> Some message )
+                             }))
+                    ])
+            | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
+              when Hashtbl.mem import_worker_requests request_id ->
+              let generation, operation =
+                Hashtbl.find import_worker_requests request_id
+              in
+              Hashtbl.remove import_worker_requests request_id;
+              set_state (fun state ->
+                if state.graph_state.generation <> generation
+                then state
+                else
+                  { state with
+                    import_completion =
+                      Some
+                        (operation, Some "Import was interrupted. Select the file again.")
+                  })
+            | Worker.Response { outcome = Completed (Asset_file _); _ } ->
+              Bonsai.Effect.Ignore
             | Worker.Response { outcome = Completed Client_command_completed; _ } ->
               Bonsai.Effect.Ignore
             | Worker.Response { outcome = Completed (Graph_state graph_state); _ }
@@ -3564,6 +3508,12 @@ let component ~calendar_sampler client handlers graph =
                 | Some manager when manager.selected_graph = Some progress.graph_id ->
                   { state with bootstrap_progress = Some progress }
                 | None | Some _ -> state)
+            | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
+              when Hashtbl.mem asset_worker_requests request_id ->
+              let protocol_id = Hashtbl.find asset_worker_requests request_id in
+              Hashtbl.remove asset_worker_requests request_id;
+              Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id;
+              Bonsai.Effect.Ignore
             | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
               when Hashtbl.mem favorites_worker_requests request_id ->
               let request, protocol_request =
@@ -3621,26 +3571,29 @@ let component ~calendar_sampler client handlers graph =
                   (Worker_graph_error (latest_worker_error state))));
           ()))
   in
+  let install_calendar set_state calendar =
+    Journal_graph_runtime.set_calendar graph_runtime calendar;
+    let snapshot = !state_ref in
+    if snapshot.graph_state.phase = Graph_open
+    then refresh_assets ~graph_generation:snapshot.graph_state.generation (Some calendar);
+    set_state (fun state ->
+      match state.calendar with
+      | Some current when not (Journal_calendar.is_newer ~than:current calendar) -> state
+      | None | Some _ ->
+        let graph_error =
+          match state.graph_error with
+          | Some (Calendar_startup_failure _) -> None
+          | other -> other
+        in
+        { state with calendar = Some calendar; graph_error })
+  in
+  let calendar_foreground = ref true in
   let platform_registered = ref false in
   let platform_subscription =
     Bonsai.Cont.map set_state ~f:(fun set_state ->
       if not !platform_registered
       then (
         platform_registered := true;
-        let install_calendar calendar =
-          Journal_graph_runtime.set_calendar graph_runtime calendar;
-          set_state (fun state ->
-            match state.calendar with
-            | Some current when not (Journal_calendar.is_newer ~than:current calendar) ->
-              state
-            | None | Some _ ->
-              let graph_error =
-                match state.graph_error with
-                | Some (Calendar_startup_failure _) -> None
-                | other -> other
-              in
-              { state with calendar = Some calendar; graph_error })
-        in
         let sample_calendar () =
           Bonsai.Effect.of_thunk (fun () ->
             Journal_calendar.Sampler.sample calendar_sampler)
@@ -3648,8 +3601,11 @@ let component ~calendar_sampler client handlers graph =
         let apply_network_lifecycle payload =
           match Journal_platform.decode_network_lifecycle payload with
           | Error _ -> Bonsai.Effect.Ignore
-          | Ok (Backgrounded _) -> send_manager (Graph_service.Set_foreground false)
+          | Ok (Backgrounded _) ->
+            calendar_foreground := false;
+            send_manager (Graph_service.Set_foreground false)
           | Ok (Foreground_resumed _) ->
+            calendar_foreground := true;
             Bonsai.Effect.bind (sample_calendar ()) ~f:(function
               | Error error ->
                 Bonsai.Effect.Many
@@ -3658,7 +3614,7 @@ let component ~calendar_sampler client handlers graph =
                   ; send_manager (Graph_service.Set_foreground true)
                   ]
               | Ok calendar ->
-                Bonsai.Effect.bind (install_calendar calendar) ~f:(fun () ->
+                Bonsai.Effect.bind (install_calendar set_state calendar) ~f:(fun () ->
                   send_manager (Graph_service.Set_foreground true)))
         in
         let apply_authenticated_user payload =
@@ -3682,20 +3638,6 @@ let component ~calendar_sampler client handlers graph =
                  send_manager
                    (Graph_service.Restore_local_account { user_id = binding.user_id })
                else Bonsai.Effect.Ignore)
-        in
-        let apply_typography_preference result =
-          let stored_value =
-            match result with
-            | Ok payload ->
-              (match Journal_platform.decode_typography_preset_preference payload with
-               | Ok value -> value
-               | Error _ -> None)
-            | Error _ -> None
-          in
-          let preset =
-            Journal_visual_tokens.typography_preset_of_stored_value stored_value
-          in
-          set_state (fun state -> { state with typography_preset = Some preset })
         in
         let apply_platform payload =
           if Journal_platform.is_prepare_to_terminate_event payload
@@ -3739,19 +3681,37 @@ let component ~calendar_sampler client handlers graph =
               set_state (fun state ->
                 { state with graph_error = Some (Calendar_startup_failure error) })
             | Ok calendar ->
-              Bonsai.Effect.bind (install_calendar calendar) ~f:(fun () ->
+              Bonsai.Effect.bind (install_calendar set_state calendar) ~f:(fun () ->
                 managed_startup))
         in
-        Bonsai.Effect.Many
-          [ calendar_startup
-          ; Platform.request
-              application_platform
-              Journal_platform.typography_preset_preference_request
-            |> Bonsai.Effect.bind ~f:apply_typography_preference
-          ]
-        |> Bonsai.Effect.Expert.handle);
+        calendar_startup |> Bonsai.Effect.Expert.handle);
       ())
   in
+  let calendar_tick =
+    Bonsai.Cont.map set_state ~f:(fun set_state ->
+      Bonsai.Effect.bind
+        (Bonsai.Effect.of_thunk (fun () ->
+           if (not !calendar_foreground) || !termination_in_flight
+           then None
+           else (
+             match Journal_calendar.Sampler.sample calendar_sampler with
+             | Error _ -> None
+             | Ok calendar ->
+               (match !state_ref.calendar with
+                | Some previous
+                  when Journal_calendar.classify_change ~previous calendar
+                       = Current_time_changed -> None
+                | None | Some _ -> Some calendar))))
+        ~f:(function
+          | None -> Bonsai.Effect.Ignore
+          | Some calendar -> install_calendar set_state calendar))
+  in
+  Bonsai.Cont.Clock.every
+    ~when_to_start_next_effect:`Every_multiple_of_period_non_blocking
+    ~trigger_on_activate:false
+    (Core.Time_ns.Span.of_sec 60.)
+    calendar_tick
+    graph;
   let feed_key =
     Bonsai.Cont.map state ~f:(fun state ->
       match state.graph_ready, state.calendar with
@@ -3767,10 +3727,7 @@ let component ~calendar_sampler client handlers graph =
         else if
           match Journal_timeline_state.pending_request state.timeline with
           | Some (_, Feed { before_day = None }) -> true
-          | Some (_, Feed { before_day = Some _ })
-          | Some (_, Day _)
-          | Some (_, Children _)
-          | None -> false
+          | Some (_, Feed { before_day = Some _ }) | Some (_, Day _) | None -> false
         then None
         else Some context
       | false, _ | true, None -> None)
@@ -3985,7 +3942,7 @@ let component ~calendar_sampler client handlers graph =
     ~callback:timeline_drain_callback
     graph;
   let environment =
-    Driver.Handler.environment handlers |> Bonsai_flutter.Environment.value
+    Driver.Handler.environment handlers |> Bonsai_swiftui.Environment.value
   in
   let current_time = Bonsai.Cont.Clock.get_current_time graph in
   let sync_error_timer_key =
@@ -4020,6 +3977,21 @@ let component ~calendar_sampler client handlers graph =
     sync_error_timer_key
     ~callback:sync_error_timer_callback
     graph;
+  let upload_lifecycle = Bonsai.Cont.map state ~f:upload_context in
+  let upload_callback =
+    Bonsai.Cont.map set_state ~f:(fun set_state _ ->
+      set_state (fun state ->
+        { state with uploads = Journal_uploads.sync state.uploads (upload_context state) }))
+  in
+  Bonsai.Cont.Edge.on_change ~equal:( = ) upload_lifecycle ~callback:upload_callback graph;
+  let media_lifecycle = Bonsai.Cont.map state ~f:media_key in
+  let media_callback =
+    Bonsai.Cont.map2 state set_state ~f:(fun state set_state _ ->
+      Bonsai.Effect.bind
+        (Bonsai.Effect.of_thunk (fun () -> sync_media state))
+        ~f:(fun () -> flush_media set_state))
+  in
+  Bonsai.Cont.Edge.on_change ~equal:( = ) media_lifecycle ~callback:media_callback graph;
   let dependencies =
     Bonsai.Cont.map5
       state
@@ -4054,6 +4026,72 @@ let component ~calendar_sampler client handlers graph =
         in
         let with_direct_request next request =
           Bonsai.Effect.bind (update (fun _ -> next)) ~f:(fun () -> send request)
+        in
+        let open_block block_id =
+          let generation = snapshot.next_request_generation in
+          let routes =
+            Journal_routes.open_detail
+              snapshot.routes
+              ~block_id
+              ~request_generation:generation
+          in
+          with_direct_request
+            { snapshot with routes; next_request_generation = Int64.succ generation }
+            (Journal_graph_request.Load_detail
+               { block_id; after = None; limit = 64; request_generation = generation })
+        in
+        let open_favorite membership_id =
+          match
+            List.find_opt
+              (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+                 Logseq_db_types.Graph_types.Uuid.to_string item.membership_uuid
+                 = membership_id)
+              (Journal_routes.Favorites.items snapshot.favorites)
+          with
+          | Some item ->
+            let routes, request =
+              Journal_routes.open_favorite
+                snapshot.routes
+                ~request_generation:snapshot.next_request_generation
+                item
+            in
+            (match request with
+             | None -> Bonsai.Effect.Ignore
+             | Some request ->
+               with_direct_request
+                 { snapshot with
+                   routes
+                 ; next_request_generation = Int64.succ snapshot.next_request_generation
+                 }
+                 request)
+          | None -> Bonsai.Effect.Ignore
+        in
+        let detail_event event =
+          match Journal_routes.detail snapshot.routes with
+          | None -> Bonsai.Effect.Ignore
+          | Some detail ->
+            let detail, requests = Journal_detail.step detail event in
+            Bonsai.Effect.bind
+              (update (fun state ->
+                 { state with routes = Journal_routes.update_detail state.routes detail }))
+              ~f:(fun () -> Bonsai.Effect.Many (List.map send requests))
+        in
+        let update_draft ~toggle source =
+          if
+            (not snapshot.write_enabled)
+            || snapshot.pending_delete <> None
+            || snapshot.pending_status <> None
+          then Bonsai.Effect.Ignore
+          else
+            update (fun state ->
+              match Journal_routes.detail state.routes with
+              | None -> state
+              | Some detail ->
+                let detail = Journal_detail.update_child_source detail source in
+                let detail =
+                  if toggle then Journal_detail.toggle_child_task detail else detail
+                in
+                { state with routes = Journal_routes.update_detail state.routes detail })
         in
         let admit_direct_capture source =
           match
@@ -4134,39 +4172,112 @@ let component ~calendar_sampler client handlers graph =
                            (Capture_admitted capture))
                         request)))
         in
+        let payload =
+          match payload with
+          | Ui.Event.Payload.Text action
+            when String.starts_with ~prefix:"media-session:" action ->
+            let prefix = "media-session:" ^ media_scope snapshot ^ ":" in
+            if String.starts_with ~prefix action
+            then
+              Ui.Event.Payload.Text
+                (String.sub
+                   action
+                   (String.length prefix)
+                   (String.length action - String.length prefix))
+            else Ui.Event.Payload.Unit
+          | Ui.Event.Payload.Text action
+            when String.starts_with ~prefix:"detail-session:" action ->
+            let prefix = Detail_outline.scope snapshot.routes in
+            if String.starts_with ~prefix action
+            then
+              Ui.Event.Payload.Text
+                (String.sub
+                   action
+                   (String.length prefix)
+                   (String.length action - String.length prefix))
+            else Ui.Event.Payload.Unit
+          | payload -> payload
+        in
         match payload with
         | payload
           when local_deletion_active snapshot
                &&
                match payload with
                | Ui.Event.Payload.Text ("open-diagnostics" | "close-diagnostics")
-               | Ui.Event.Payload.Route_pop _ -> false
+               | Ui.Event.Payload.Navigation_path_changed _ -> false
+               | Ui.Event.Payload.Text text
+                 when String.starts_with ~prefix:"asset-settings:" text -> false
                | _ -> true -> Bonsai.Effect.Ignore
+        | Ui.Event.Payload.Text "open-asset-settings" ->
+          update (fun state -> { state with asset_settings_open = true })
+        | Ui.Event.Payload.Text text
+          when String.starts_with ~prefix:"asset-settings:" text ->
+          (match
+             Journal_asset_settings.decode (String.sub text 15 (String.length text - 15))
+           with
+           | None -> Bonsai.Effect.Ignore
+           | Some Dismissed ->
+             update (fun state -> { state with asset_settings_open = false })
+           | Some (Retry_upload operation) ->
+             if local_deletion_active snapshot
+             then Bonsai.Effect.Ignore
+             else
+               Bonsai.Effect.of_thunk (fun () ->
+                 let current = !state_ref in
+                 let uploads =
+                   Journal_uploads.sync current.uploads (upload_context current)
+                 in
+                 Option.iter
+                   (fun request ->
+                      ignore (Worker.send client request : Worker.send_result))
+                   (Journal_uploads.retry uploads operation))
+           | Some (Days settings) ->
+             Bonsai.Effect.of_thunk (fun () ->
+               asset_settings := Some settings;
+               let current = !state_ref in
+               if current.graph_state.phase = Graph_open
+               then
+                 refresh_assets
+                   ~graph_generation:current.graph_state.generation
+                   current.calendar))
+        | Ui.Event.Payload.Confirmation_response response ->
+          set_state_and_effect (fun state ->
+            match state.modal with
+            | Cache_reset_confirmation graph_id
+              when response.token = state.confirmation_sequence ->
+              (match response.result with
+               | Action "delete" when local_deletion_available state ->
+                 ( Root_navigation.step state Local_copy_deleted
+                 , send_manager (Graph_service.Delete_local_cache graph_id) )
+               | Action "cancel" | Dismissed ->
+                 { state with modal = No_modal }, Bonsai.Effect.Ignore
+               | Action _ -> state, Bonsai.Effect.Ignore)
+            | _ -> state, Bonsai.Effect.Ignore)
         | Ui.Event.Payload.Text_edit edit ->
           update (fun state ->
-            match Journal_routes.detail state.routes with
-            | Some detail when Option.is_some (Journal_detail.child_capture detail) ->
-              { state with
-                routes =
-                  Journal_routes.update_detail
-                    state.routes
-                    (Journal_detail.apply_child_text_edit detail edit)
-              }
-            | Some detail ->
-              { state with
-                routes =
-                  Journal_routes.update_detail
-                    state.routes
-                    (Journal_detail.apply_text_edit detail edit)
-              }
-            | None ->
-              (match state.manager with
-               | Some { startup = { awaiting_e2ee_password = true; _ }; _ } ->
+            match state.modal, state.manager with
+            | Capture_sheet, _ -> Root_navigation.step state (Capture_native_edit edit)
+            | Append_sheet, _ ->
+              (match Journal_routes.detail state.routes with
+               | None -> state
+               | Some detail ->
                  { state with
-                   e2ee_password =
-                     Journal_capture.apply_text_edit state.e2ee_password edit
-                 }
-               | None | Some _ -> state))
+                   routes =
+                     Journal_routes.update_detail
+                       state.routes
+                       (Journal_detail.apply_child_edit detail edit)
+                 })
+            | _, Some { startup = { awaiting_e2ee_password = true; _ }; _ }
+            | _, Some { startup = { failure = Some During_e2ee; _ }; _ } ->
+              { state with
+                e2ee_password = Journal_capture.apply_text_edit state.e2ee_password edit
+              }
+            | _ -> state)
+        | Ui.Event.Payload.Text "capture-submit" ->
+          (match snapshot.modal, snapshot.direct_capture with
+           | Capture_sheet, Some capture ->
+             admit_direct_capture (Journal_capture.source capture)
+           | _ -> Bonsai.Effect.Ignore)
         | Ui.Event.Payload.Text "select-journals" ->
           update (fun state ->
             Root_navigation.step state (Select Journal_routes.Journals))
@@ -4203,55 +4314,103 @@ let component ~calendar_sampler client handlers graph =
               ~first_index
               ~last_exclusive
           in
-          update (fun state -> { state with timeline = observe state.timeline })
-        | Ui.Event.Payload.Scroll _ -> Bonsai.Effect.Ignore
-        | Ui.Event.Payload.Native_event _ as payload
-          when Option.is_some (Root_scroll.event_of_payload payload) ->
-          update (fun state ->
-            Root_navigation.step state (Option.get (Root_scroll.event_of_payload payload)))
-        | Ui.Event.Payload.Native_event _ as payload ->
-          (match
-             Ui.Native_widget.Expandable_message_composer.event_of_payload payload
-           with
-           | Some (Text_changed text) ->
-             update (fun state -> Root_navigation.step state (Capture_edited text))
-           | Some (Button_pressed { button_id = 1; text }) -> admit_direct_capture text
-           | Some (Button_pressed { button_id = 2; text }) ->
-             (match
-                snapshot.write_enabled, snapshot.pending_delete, snapshot.pending_status
-              with
-              | true, None, None ->
-                update (fun state ->
-                  let capture =
-                    match state.direct_capture with
-                    | None ->
-                      Journal_capture.create
-                        ~session_number:state.next_local_sequence
-                        ~source:text
-                    | Some capture -> Journal_capture.update_source capture ~source:text
-                  in
-                  { state with
-                    direct_capture = Some (Journal_capture.toggle_task_intent capture)
-                  ; capture_error = None
-                  })
-              | false, _, _ | true, Some _, _ | true, None, Some _ -> Bonsai.Effect.Ignore)
-           | Some (Button_pressed _) -> Bonsai.Effect.Ignore
-           | None -> Bonsai.Effect.Ignore)
-        | Ui.Event.Payload.Route_pop { page_key; _ } ->
+          (* Redelivery does not change the pure timeline. Avoid scheduling a
+             no-op model update, which would recreate native menu bindings. *)
+          if observe snapshot.timeline = snapshot.timeline
+          then Bonsai.Effect.Ignore
+          else update (fun state -> { state with timeline = observe state.timeline })
+        | Ui.Event.Payload.Navigation_path_changed [] -> update back_state
+        | Ui.Event.Payload.Bool false ->
           update (fun state ->
             match state.modal with
-            | Status_sheet block_id ->
-              let expected =
-                ID.Navigation.Page_key.of_string ("journal-status-sheet:" ^ block_id)
-              in
-              if ID.Navigation.Page_key.equal page_key expected
-              then { state with modal = No_modal }
-              else state
-            | Error_info -> { state with modal = No_modal }
-            | No_modal | Account | Settings | Diagnostics | Cache_reset_confirmation _ ->
-              back_state state)
+            | Diagnostics ->
+              { state with
+                modal = No_modal
+              ; admission_refresh = Admission_refresh.close state.admission_refresh
+              }
+            | No_modal -> state
+            | Capture_sheet
+            | Append_sheet
+            | Status_sheet _
+            | Error_info
+            | Cache_reset_confirmation _ -> { state with modal = No_modal })
         | Ui.Event.Payload.Text action ->
-          if String.length action > 13 && String.sub action 0 13 = "select-graph:"
+          if String.starts_with ~prefix:"media:" action
+          then
+            Bonsai.Effect.bind
+              (Bonsai.Effect.of_thunk (fun () ->
+                 sync_media snapshot;
+                 try
+                   let json =
+                     Yojson.Basic.from_string
+                       (String.sub action 6 (String.length action - 6))
+                   in
+                   let field name = Yojson.Basic.Util.member name json in
+                   let text name = Yojson.Basic.Util.to_string (field name) in
+                   let root = text "root" in
+                   let visible = Yojson.Basic.Util.to_bool (field "visible") in
+                   match text "action" with
+                   | "root" ->
+                     Journal_media_runtime.root_visible media_runtime ~root visible
+                   | "asset" ->
+                     Journal_media_runtime.asset_visible
+                       media_runtime
+                       ~root
+                       ~asset:(text "asset")
+                       visible
+                   | "retry" ->
+                     Journal_media_runtime.retry media_runtime ~root ~asset:(text "asset")
+                   | "next" -> Journal_media_runtime.next media_runtime ~root
+                   | _ -> ()
+                 with
+                 | _ -> ()))
+              ~f:(fun () -> flush_media set_state)
+          else if String.starts_with ~prefix:"import-asset:" action
+          then (
+            match Journal_routes.detail snapshot.routes with
+            | None -> Bonsai.Effect.Ignore
+            | Some detail ->
+              let target =
+                Logseq_db_types.Graph_types.Uuid.of_string
+                  (Journal_model.id (Journal_detail.root detail))
+              in
+              let source =
+                Result.bind target (fun target ->
+                  Journal_asset_import.decode
+                    ~target
+                    (String.sub action 13 (String.length action - 13)))
+              in
+              (match source with
+               | Error _ -> Bonsai.Effect.Ignore
+               | Ok source ->
+                 let operation =
+                   Logseq_db_types.Graph_types.Uuid.to_string source.operation
+                 in
+                 let graph_generation = snapshot.graph_state.generation in
+                 Bonsai.Effect.bind
+                   (Bonsai.Effect.of_thunk (fun () ->
+                      if not snapshot.write_enabled
+                      then Some "The destination is not ready for imports"
+                      else (
+                        match
+                          Worker.send
+                            client
+                            (Graph_service.Import_asset { graph_generation; source })
+                        with
+                        | Accepted id ->
+                          Hashtbl.replace
+                            import_worker_requests
+                            id
+                            (graph_generation, operation);
+                          None
+                        | Full | Not_ready | Stopping ->
+                          Some "Import is temporarily unavailable. Select the file again.")))
+                   ~f:(function
+                     | None -> Bonsai.Effect.Ignore
+                     | Some message ->
+                       update (fun state ->
+                         { state with import_completion = Some (operation, Some message) }))))
+          else if String.length action > 13 && String.sub action 0 13 = "select-graph:"
           then (
             let graph_id = String.sub action 13 (String.length action - 13) in
             match Logseq_db_types.Graph_types.Uuid.of_string graph_id with
@@ -4261,14 +4420,47 @@ let component ~calendar_sampler client handlers graph =
           then send_manager Graph_service.Refresh_catalog
           else if String.equal action "begin-online-recovery"
           then send_manager Graph_service.Begin_online_recovery
-          else if String.equal action "open-account-menu"
-          then update (fun state -> { state with modal = Account })
-          else if String.equal action "close-account-menu"
+          else if
+            String.equal action "open-capture"
+            && snapshot.write_enabled
+            && snapshot.pending_delete = None
+            && snapshot.pending_status = None
+          then update (fun state -> Root_navigation.step state Capture_opened)
+          else if String.equal action "close-composer"
           then update (fun state -> { state with modal = No_modal })
-          else if String.equal action "open-settings"
-          then update (fun state -> { state with modal = Settings })
-          else if String.equal action "close-settings"
-          then update (fun state -> { state with modal = No_modal })
+          else if
+            String.equal action "capture-task-on"
+            || String.equal action "capture-task-off"
+          then
+            update (fun state ->
+              Root_navigation.step
+                state
+                (Capture_task_intent (action = "capture-task-on")))
+          else if
+            String.equal action "open-append"
+            && snapshot.write_enabled
+            && snapshot.pending_delete = None
+            && snapshot.pending_status = None
+          then
+            update (fun state ->
+              match Journal_routes.detail state.routes with
+              | None -> state
+              | Some detail ->
+                let detail =
+                  if Journal_detail.child_capture detail = None
+                  then Journal_detail.update_child_source detail ""
+                  else detail
+                in
+                { state with
+                  modal = Append_sheet
+                ; routes = Journal_routes.update_detail state.routes detail
+                })
+          else if String.equal action "close-status"
+          then
+            update (fun state ->
+              match state.modal with
+              | Status_sheet _ -> { state with modal = No_modal }
+              | _ -> state)
           else if String.equal action "open-diagnostics"
           then
             set_state_and_effect (fun state ->
@@ -4290,40 +4482,22 @@ let component ~calendar_sampler client handlers graph =
           else if String.equal action "open-error-info"
           then
             update (fun state ->
-              if state.worker_errors = []
+              if
+                state.worker_errors = []
+                && Option.is_none
+                     (Option.bind state.manager (fun manager -> manager.last_error))
+                && Option.is_none (operation_failure state.timeline_notice)
               then state
               else { state with modal = Error_info })
+          else if String.equal action "dismiss-operation-error"
+          then
+            update (fun state ->
+              match state.timeline_notice with
+              | Some (Delete_failed _ | Status_failed _) ->
+                { state with timeline_notice = None }
+              | None | Some Delete_undo -> state)
           else if String.equal action "close-error-info"
           then update (fun state -> { state with modal = No_modal })
-          else if
-            String.length action > 18 && String.sub action 0 18 = "select-typography:"
-          then (
-            let stored_value = String.sub action 18 (String.length action - 18) in
-            let preset =
-              Journal_visual_tokens.typography_preset_of_stored_value (Some stored_value)
-            in
-            if
-              (not
-                 (String.equal
-                    stored_value
-                    (Journal_visual_tokens.stored_value_of_typography_preset preset)))
-              || snapshot.typography_preset = Some preset
-            then Bonsai.Effect.Ignore
-            else
-              Bonsai.Effect.Many
-                [ update (fun state -> { state with typography_preset = Some preset })
-                ; Platform.request
-                    application_platform
-                    (Journal_platform.set_typography_preset_preference_request
-                       stored_value)
-                  |> Bonsai.Effect.bind ~f:(fun result ->
-                    match result with
-                    | Ok payload
-                      when Result.is_ok
-                             (Journal_platform.decode_set_typography_preset_preference
-                                payload) -> Bonsai.Effect.Ignore
-                    | Error _ | Ok _ -> Bonsai.Effect.Ignore)
-                ])
           else if String.equal action "switch-graph"
           then
             Bonsai.Effect.Many
@@ -4334,7 +4508,7 @@ let component ~calendar_sampler client handlers graph =
           then (
             sign_out_in_flight := true;
             Bonsai.Effect.Many
-              [ update (fun state -> { state with modal = No_modal })
+              [ update (fun state -> Root_navigation.step state Account_cleared)
               ; send_manager
                   (Graph_service.Reconcile_authenticated_user { user_id = None })
               ])
@@ -4361,60 +4535,23 @@ let component ~calendar_sampler client handlers graph =
               match state.manager with
               | Some { selected_graph = Some graph_id; _ }
                 when local_deletion_available state ->
-                { state with modal = Cache_reset_confirmation graph_id }
+                { state with
+                  modal = Cache_reset_confirmation graph_id
+                ; confirmation_sequence = Int64.succ state.confirmation_sequence
+                }
               | None | Some _ -> state)
-          else if String.equal action "cancel-local-cache-reset"
-          then update (fun state -> { state with modal = No_modal })
-          else if String.equal action "confirm-local-cache-reset"
-          then (
-            match snapshot.modal with
-            | No_modal | Status_sheet _ | Account | Settings | Diagnostics | Error_info ->
-              Bonsai.Effect.Ignore
-            | Cache_reset_confirmation graph_id ->
-              if not (local_deletion_available snapshot)
-              then Bonsai.Effect.Ignore
-              else
-                Bonsai.Effect.bind (update discard_local_graph_state) ~f:(fun () ->
-                  send_manager (Graph_service.Delete_local_cache graph_id)))
           else if String.equal action "delete-undo"
           then
             update (fun state ->
               match state.pending_delete with
-              | Some { phase = Undoable; staged; _ } ->
-                { state with
-                  timeline = Journal_timeline_state.undo_delete state.timeline staged
-                ; pending_delete = None
+              | Some ({ phase = Undoable; _ } as pending) ->
+                { (restore_deleted state pending) with
+                  pending_delete = None
                 ; timeline_notice = None
                 }
               | None | Some { phase = Committing; _ } -> state)
           else if String.equal action "back"
           then update back_state
-          else if String.equal action "keep-editing"
-          then
-            update (fun state ->
-              { state with routes = Journal_routes.keep_editing state.routes })
-          else if String.equal action "discard"
-          then
-            update (fun state ->
-              { state with routes = Journal_routes.discard state.routes })
-          else if String.equal action "detail-save"
-          then (
-            match Journal_routes.detail snapshot.routes with
-            | None -> Bonsai.Effect.Ignore
-            | Some detail ->
-              let number = snapshot.next_local_sequence in
-              let detail, request =
-                Journal_detail.admit_save detail ~mutation_id:(fresh_identity ())
-              in
-              (match request with
-               | None -> Bonsai.Effect.Ignore
-               | Some request ->
-                 with_request
-                   { snapshot with
-                     routes = Journal_routes.update_detail snapshot.routes detail
-                   ; next_local_sequence = Int64.succ number
-                   }
-                   request))
           else if String.starts_with ~prefix:"timeline-retry:" action
           then (
             match
@@ -4426,60 +4563,55 @@ let component ~calendar_sampler client handlers graph =
                 { state with
                   timeline = Journal_timeline_state.retry_day state.timeline ~day
                 }))
+          else if String.starts_with ~prefix:"detail-expand:" action
+          then
+            detail_event
+              (Set_branch_expanded (String.sub action 14 (String.length action - 14), true))
+          else if String.starts_with ~prefix:"detail-collapse:" action
+          then
+            detail_event
+              (Set_branch_expanded
+                 (String.sub action 16 (String.length action - 16), false))
+          else if String.starts_with ~prefix:"detail-more:" action
+          then detail_event (Load_more (String.sub action 12 (String.length action - 12)))
+          else if String.starts_with ~prefix:"detail-draft:" action
+          then
+            update_draft ~toggle:false (String.sub action 13 (String.length action - 13))
+          else if String.starts_with ~prefix:"detail-task-intent:" action
+          then
+            update_draft ~toggle:true (String.sub action 19 (String.length action - 19))
           else if String.equal action "detail-retry"
           then (
             match Journal_routes.detail snapshot.routes with
-            | None -> Bonsai.Effect.Ignore
+            | None ->
+              (match Journal_routes.detail_block_id snapshot.routes with
+               | Some id -> open_block id
+               | None -> Bonsai.Effect.Ignore)
             | Some detail ->
               let number = snapshot.next_local_sequence in
-              let detail, request =
-                Journal_detail.retry detail ~mutation_id:(fresh_identity ())
-              in
+              let detail, request = Journal_detail.retry detail in
               (match request with
                | None -> Bonsai.Effect.Ignore
                | Some request ->
-                 with_request
+                 with_direct_request
                    { snapshot with
                      routes = Journal_routes.update_detail snapshot.routes detail
                    ; next_local_sequence = Int64.succ number
                    }
                    request))
-          else if String.equal action "detail-task"
-          then (
-            match Journal_routes.detail snapshot.routes with
-            | None -> Bonsai.Effect.Ignore
-            | Some detail ->
-              let number = snapshot.next_local_sequence in
-              let detail, request =
-                Journal_detail.admit_task_toggle detail ~mutation_id:(fresh_identity ())
-              in
-              (match request with
-               | None -> Bonsai.Effect.Ignore
-               | Some request ->
-                 with_request
-                   { snapshot with
-                     routes = Journal_routes.update_detail snapshot.routes detail
-                   ; next_local_sequence = Int64.succ number
-                   }
-                   request))
-          else if String.equal action "detail-add-child"
-          then
-            update (fun state ->
-              match Journal_routes.detail state.routes with
-              | None -> state
-              | Some detail ->
-                let number = state.next_local_sequence in
-                { state with
-                  routes =
-                    Journal_routes.update_detail
-                      state.routes
-                      (Journal_detail.begin_child detail ~session_number:number)
-                ; next_local_sequence = Int64.succ number
-                })
-          else if String.equal action "detail-child-save"
+          else if
+            String.starts_with ~prefix:"detail-submit:" action
+            && snapshot.write_enabled
+            && snapshot.pending_delete = None
+            && snapshot.pending_status = None
           then (
             match Journal_routes.detail snapshot.routes, snapshot.calendar with
             | Some detail, Some _ ->
+              let detail =
+                Journal_detail.update_child_source
+                  detail
+                  (String.sub action 14 (String.length action - 14))
+              in
               (match Journal_calendar.Sampler.sample calendar_sampler with
                | Error error ->
                  update (fun state ->
@@ -4495,13 +4627,19 @@ let component ~calendar_sampler client handlers graph =
                    with_block_identity
                      ~creation_time
                      ~f:(fun block_id ->
-                       Journal_detail.admit_child
-                         detail
-                         ~mutation_id:(fresh_identity ())
-                         ~calendar_generation:(Journal_calendar.generation calendar)
-                         ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
-                         ~sibling_order:(sibling_order number)
-                         ~creation_time)
+                       if
+                         match Journal_detail.mode detail with
+                         | Failed _ -> true
+                         | _ -> false
+                       then Journal_detail.retry detail
+                       else
+                         Journal_detail.admit_child
+                           detail
+                           ~mutation_id:(fresh_identity ())
+                           ~calendar_generation:(Journal_calendar.generation calendar)
+                           ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
+                           ~sibling_order:(sibling_order number)
+                           ~creation_time)
                      ()
                  in
                  (match admission with
@@ -4510,7 +4648,7 @@ let component ~calendar_sampler client handlers graph =
                       { state with capture_error = Some (Local_capture_failure message) })
                   | Ok (_, None) -> Bonsai.Effect.Ignore
                   | Ok (detail, Some request) ->
-                    with_request
+                    with_direct_request
                       { snapshot with
                         calendar = Some calendar
                       ; routes = Journal_routes.update_detail snapshot.routes detail
@@ -4575,8 +4713,8 @@ let component ~calendar_sampler client handlers graph =
                    }
                    request)
             | No_modal, _, _, _, _
-            | Account, _, _, _, _
-            | Settings, _, _, _, _
+            | Capture_sheet, _, _, _, _
+            | Append_sheet, _, _, _, _
             | Diagnostics, _, _, _, _
             | Error_info, _, _, _, _
             | Cache_reset_confirmation _, _, _, _, _
@@ -4584,115 +4722,106 @@ let component ~calendar_sampler client handlers graph =
             | Status_sheet _, true, Some _, _, _
             | Status_sheet _, true, None, Some _, _
             | Status_sheet _, true, None, None, None -> Bonsai.Effect.Ignore)
-          else if String.length action > 16 && String.sub action 0 16 = "timeline-delete:"
+          else if
+            String.starts_with ~prefix:"timeline-delete:" action
+            || String.starts_with ~prefix:"detail-delete:" action
           then (
-            let block_id = String.sub action 16 (String.length action - 16) in
+            let prefix_length =
+              if String.starts_with ~prefix:"detail-delete:" action then 14 else 16
+            in
+            let block_id =
+              String.sub action prefix_length (String.length action - prefix_length)
+            in
+            let block =
+              match Journal_routes.detail snapshot.routes with
+              | Some detail -> Journal_detail.find_block detail ~block_id
+              | None -> block_in_timeline snapshot.timeline block_id
+            in
             match
               ( snapshot.write_enabled
               , snapshot.pending_delete
               , snapshot.pending_status
-              , block_in_timeline snapshot.timeline block_id )
+              , block )
             with
             | true, None, None, Some block ->
-              (match Journal_timeline_state.stage_delete snapshot.timeline ~block_id with
-               | None -> Bonsai.Effect.Ignore
-               | Some (timeline, staged) ->
-                 let duration = if environment.accessible_navigation then 10. else 5. in
-                 Bonsai.Effect.bind current_time ~f:(fun now ->
-                   let pending_delete =
-                     { mutation_id = fresh_identity ()
-                     ; block_id
-                     ; expected_revision = Journal_model.revision block
-                     ; staged
-                     ; deadline = Core.Time_ns.add now (Core.Time_ns.Span.of_sec duration)
-                     ; phase = Undoable
-                     }
-                   in
-                   update (fun _ ->
-                     { snapshot with
-                       timeline
-                     ; pending_delete = Some pending_delete
-                     ; timeline_notice = Some Delete_undo
-                     ; next_request_generation =
-                         Int64.succ snapshot.next_request_generation
-                     })))
-            | false, _, _, _
-            | true, Some _, _, _
-            | true, None, Some _, _
-            | true, None, None, None -> Bonsai.Effect.Ignore)
-          else if
-            String.length action > 25
-            && String.sub action 0 25 = "timeline-toggle-children:"
-          then (
-            let block_id = String.sub action 25 (String.length action - 25) in
-            match
-              snapshot.pending_delete, block_in_timeline snapshot.timeline block_id
-            with
-            | Some _, _ -> Bonsai.Effect.Ignore
-            | None, None -> Bonsai.Effect.Ignore
-            | None, Some block when Journal_model.child_count block > 0 ->
-              update (fun state ->
-                let timeline = state.timeline in
-                let timeline =
-                  if Journal_timeline_state.is_expanded timeline ~block_id
-                  then Journal_timeline_state.collapse timeline ~parent_id:block_id
-                  else Journal_timeline_state.expand timeline ~parent_id:block_id
-                in
-                { state with timeline })
-            | None, Some _ -> Bonsai.Effect.Ignore)
+              let saving =
+                Option.fold
+                  ~none:false
+                  ~some:(fun detail -> Journal_detail.mode detail = Saving_child)
+                  (Journal_routes.detail snapshot.routes)
+              in
+              if saving
+              then Bonsai.Effect.Ignore
+              else (
+                let duration = if environment.accessible_navigation then 10. else 5. in
+                Bonsai.Effect.bind current_time ~f:(fun now ->
+                  let pending =
+                    { mutation_id = fresh_identity ()
+                    ; block_id
+                    ; expected_revision = Journal_model.revision block
+                    ; staged = None
+                    ; detail_staged = None
+                    ; deadline = Core.Time_ns.add now (Core.Time_ns.Span.of_sec duration)
+                    ; phase = Undoable
+                    }
+                  in
+                  update (fun state ->
+                    hide_deleted { state with timeline_notice = Some Delete_undo } pending)))
+            | _ -> Bonsai.Effect.Ignore)
+          else if String.starts_with ~prefix:"timeline-open-block:" action
+          then open_block (String.sub action 20 (String.length action - 20))
+          else if String.starts_with ~prefix:"favorite-open-block:" action
+          then open_favorite (String.sub action 20 (String.length action - 20))
           else Bonsai.Effect.Ignore
+        | Ui.Event.Payload.Native_event _
         | Unit
         | Bool _
         | Int64 _
         | Int64_bool _
-        | Int64_list _
+        | Navigation_path_changed _
+        | Navigation_split_changed _
+        | Tab_selected _
         | Int64_pair _
         | Float _
         | Float_range _
         | Civil_date _
         | Civil_time _
+        | Scroll _
         | Tap _
         | Pointer _
         | Key _ -> Bonsai.Effect.Ignore)
   in
-  let snack_bar_cancellation : Bonsai_flutter.Host_effect.Cancellation.t option ref =
+  let notice_cancellation : Bonsai_swiftui.Host_effect.Cancellation.t option ref =
     ref None
   in
-  let snack_bar_key =
+  let notice_key =
     Bonsai.Cont.map2 state environment ~f:(fun state environment ->
-      ( ( (if
-             state.graph_ready
-             && Journal_routes.route state.routes = Journal_routes.Timeline
-           then state.timeline_notice
-           else None)
+      ( ( state.graph_ready && state.timeline_notice = Some Delete_undo
         , state.capture_error )
       , environment.accessible_navigation ))
   in
-  let snack_bar_callback =
+  let notice_callback =
     Bonsai.Cont.map
       dispatch
-      ~f:(fun dispatch ((notice, capture_error), accessible_navigation) ->
-        Option.iter Bonsai_flutter.Host_effect.Cancellation.cancel !snack_bar_cancellation;
-        snack_bar_cancellation := None;
-        match capture_error, notice with
-        | None, None -> Bonsai.Effect.Ignore
+      ~f:(fun dispatch ((undo_available, capture_error), accessible_navigation) ->
+        Option.iter Bonsai_swiftui.Host_effect.Cancellation.cancel !notice_cancellation;
+        notice_cancellation := None;
+        match capture_error, undo_available with
+        | None, false -> Bonsai.Effect.Ignore
         | _, _ ->
-          let cancellation = Bonsai_flutter.Host_effect.Cancellation.create () in
-          snack_bar_cancellation := Some cancellation;
+          let cancellation = Bonsai_swiftui.Host_effect.Cancellation.create () in
+          notice_cancellation := Some cancellation;
           let message, action_label, duration_ms =
-            match capture_error, notice with
+            match capture_error, undo_available with
             | Some failure, _ -> capture_failure_message failure, None, 4_000
-            | None, Some Delete_undo ->
+            | None, true ->
               ( "Block and descendants removed"
               , Some "Undo"
               , if accessible_navigation then 10_000 else 5_000 )
-            | None, Some Delete_failed -> "Delete failed. Block restored.", None, 4_000
-            | None, Some (Status_failed message) ->
-              "Unable to change status: " ^ message, None, 4_000
-            | None, None -> assert false
+            | None, false -> assert false
           in
           Bonsai.Effect.bind
-            (Bonsai_flutter.Host_effect.show_snack_bar
+            (Bonsai_swiftui.Host_effect.show_notice
                ~cancellation
                ?action_label
                ~duration_ms
@@ -4700,242 +4829,283 @@ let component ~calendar_sampler client handlers graph =
                ~message
                ())
             ~f:(function
-            | Ok Bonsai_flutter.Host_effect.Action ->
+            | Ok Bonsai_swiftui.Host_effect.Action ->
               Bonsai.Effect.of_thunk (fun () ->
                 Ui.Event.Handler.Private.invoke
                   dispatch
                   (Ui.Event.Payload.Text "delete-undo"))
-            | Ok (Dismiss | Swipe | Hide | Remove | Timeout) | Error _ ->
-              Bonsai.Effect.Ignore))
+            | Ok (Dismiss | Swipe | Timeout) | Error _ -> Bonsai.Effect.Ignore))
   in
   Bonsai.Cont.Edge.on_change
     ~equal:(fun (left_notice, left_accessible) (right_notice, right_accessible) ->
       left_notice = right_notice && Bool.equal left_accessible right_accessible)
-    snack_bar_key
-    ~callback:snack_bar_callback
+    notice_key
+    ~callback:notice_callback
     graph;
   let state = Bonsai.Cont.map2 state delete_timer ~f:(fun state () -> state) in
   let state =
     Bonsai.Cont.map3 state event_subscription platform_subscription ~f:(fun state () () ->
       state)
   in
-  Bonsai.Cont.map3 state dispatch environment ~f:(fun state dispatch environment ->
-    let reduced_motion =
-      environment.reduced_motion
-      || environment.disable_animations
-      || environment.accessible_navigation
-    in
-    let preset =
-      Option.value state.typography_preset ~default:Journal_visual_tokens.Balanced
-    in
-    let typography = Journal_visual_tokens.typography preset in
-    let tokens =
-      Journal_visual_tokens.resolve
-        ~brightness:environment.brightness
-        ~high_contrast:environment.high_contrast
-    in
-    let profile =
-      Journal_visual_tokens.select_row_profile
-        ~preset
-        ~viewport_width:environment.viewport_width
-        ~text_scale:environment.text_scale
-    in
-    let capture_saving =
-      match state.direct_capture with
-      | Some capture -> Journal_capture.phase capture = Journal_capture.Saving
-      | None -> false
-    in
-    let capture_task_selected =
-      match state.direct_capture with
-      | Some capture -> Journal_capture.task_state capture = Journal_model.Todo
-      | None -> false
-    in
-    let row_actions_enabled =
-      state.write_enabled
-      && Option.is_none state.pending_delete
-      && Option.is_none state.pending_status
-    in
-    let sync_error =
-      Option.map (fun notice -> sync_failure_message notice.failure) state.sync_error
-    in
-    let root =
-      match state.graph_ready, state.manager with
-      | false, Some _ -> manager_page ~typography state dispatch
-      | false, None | true, _ ->
-        let content_horizontal_inset =
-          Float.max
-            0.
-            ((environment.viewport_width -. Journal_visual_tokens.timeline_max_width)
-             /. 2.)
+  let view_handlers =
+    Bonsai.Cont.map3
+      dispatch
+      timeline_scroll_completed
+      detail_scroll_completed
+      ~f:(fun dispatch timeline detail -> dispatch, timeline, detail)
+  in
+  Bonsai.Cont.map3
+    state
+    view_handlers
+    environment
+    ~f:
+      (fun
+        state
+        (dispatch, timeline_scroll_completed, detail_scroll_completed)
+        environment
+      ->
+      let tokens =
+        Journal_visual_tokens.resolve
+          ~brightness:environment.brightness
+          ~high_contrast:environment.high_contrast
+      in
+      let capture_saving =
+        match state.direct_capture with
+        | Some capture -> Journal_capture.phase capture = Journal_capture.Saving
+        | None -> false
+      in
+      let row_actions_enabled =
+        state.write_enabled
+        && Option.is_none state.pending_delete
+        && Option.is_none state.pending_status
+      in
+      let sync_error =
+        Option.map (fun notice -> sync_failure_message notice.failure) state.sync_error
+      in
+      let root =
+        match state.graph_ready, state.manager with
+        | false, Some _ -> manager_page state dispatch
+        | false, None | true, _ ->
+          timeline_page
+            ~render_media:(media_label state dispatch)
+            ~platform:environment.platform
+            ~graph_generation:state.graph_state.generation
+            ~on_scroll_completed:timeline_scroll_completed
+            ~destination:(Journal_routes.destination state.routes)
+            ~favorites:state.favorites
+            ~on_select_destination:
+              (Ui.Event.Handler.create ~name:"select-root-destination" (function
+                 | Ui.Event.Payload.Int64 0L ->
+                   Ui.Event.Handler.Private.invoke dispatch (Text "select-journals")
+                 | Int64 1L ->
+                   Ui.Event.Handler.Private.invoke dispatch (Text "select-favorites")
+                 | _ -> ()))
+            ~on_favorites_visible_range:
+              (Ui.Event.Handler.create ~name:"favorites-visible-range" (function
+                 | Ui.Event.Payload.Visible_range range ->
+                   Ui.Event.Handler.Private.invoke
+                     dispatch
+                     (Int64_pair
+                        { first = range.first_index; second = range.last_exclusive })
+                 | _ -> ()))
+            ~on_favorites_retry:(bind_action dispatch "favorites-retry")
+            ~timeline_state:state.timeline
+            ~loading:(not state.feed_loaded)
+            ~graph_error:(Option.map graph_error_message state.graph_error)
+            ~sync_error
+            ~sync_phase:
+              (Option.map
+                 (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
+                 state.manager)
+            ~day_presentation:(presentation_for_day state)
+            ~capture_enabled:
+              (state.write_enabled
+               && Option.is_none state.pending_delete
+               && Option.is_none state.pending_status
+               && not capture_saving)
+            ~on_capture_event:dispatch
+            ~on_visible_range:dispatch
+            ~on_retry_day:(prefix_action dispatch "timeline-retry:")
+            ~on_open_block:(prefix_action dispatch "timeline-open-block:")
+            ~on_open_favorite:(prefix_action dispatch "favorite-open-block:")
+            ~delete_enabled:state.write_enabled
+            ~actions_enabled:row_actions_enabled
+            ~interaction_enabled:(state.modal = No_modal)
+            ~on_status:(prefix_action dispatch "timeline-status:")
+            ~on_delete:(prefix_action dispatch "timeline-delete:")
+            ~error_info_available:
+              (state.worker_errors <> []
+               || Option.is_some
+                    (Option.bind state.manager (fun manager -> manager.last_error))
+               || Option.is_some (operation_failure state.timeline_notice))
+            ~on_error_info:(bind_action dispatch "open-error-info")
+            ~account_menu_available:true
+            ~on_account_action:dispatch
+            ~cache_reset_available:(local_deletion_available state)
+      in
+      let root = operation_feedback ~scope:"root" ~state dispatch root in
+      let path =
+        match Journal_routes.route state.routes with
+        | Journal_routes.Timeline -> []
+        | Detail_loading | Detail | Missing_detail | Failed_detail _ ->
+          [ V.Navigation_stack.destination
+              ~page_key:(ID.Navigation.Page_key.of_string "journal-detail-route")
+              ~title:"Block"
+              ~can_pop:true
+              (detail_page ~state ~on_scroll_completed:detail_scroll_completed dispatch
+               |> operation_feedback ~scope:"detail" ~state dispatch)
+          ]
+      in
+      let modal =
+        match state.modal with
+        | No_modal -> None
+        | Capture_sheet ->
+          Option.map
+            (fun capture ->
+               composer_page
+                 ~scope:"journal-capture"
+                 ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+                 ~capture
+                 ~enabled:state.write_enabled
+                 ~on_edit:dispatch
+                 ~on_toggle:
+                   (Ui.Event.Handler.create (function
+                      | Ui.Event.Payload.Bool selected ->
+                        Ui.Event.Handler.Private.invoke
+                          dispatch
+                          (Text
+                             (if selected then "capture-task-on" else "capture-task-off"))
+                      | _ -> ()))
+                 ~on_save:(bind_action dispatch "capture-submit")
+                 ~on_close:(bind_action dispatch "close-composer")
+                 ~error:
+                   (match state.capture_error with
+                    | Some failure -> Some (capture_failure_message failure)
+                    | None ->
+                      (match Journal_capture.phase capture with
+                       | Failed message -> Some message
+                       | Editing | Saving -> None)))
+            state.direct_capture
+        | Append_sheet ->
+          Option.bind (Journal_routes.detail state.routes) (fun detail ->
+            Option.map
+              (fun capture ->
+                 composer_page
+                   ~scope:"journal-append"
+                   ~saving:(Journal_detail.mode detail = Journal_detail.Saving_child)
+                   ~capture
+                   ~enabled:state.write_enabled
+                   ~on_edit:dispatch
+                   ~on_toggle:
+                     (Ui.Event.Handler.create (function
+                        | Ui.Event.Payload.Bool selected
+                          when selected
+                               <> (Journal_capture.task_state capture = Journal_model.Todo)
+                          ->
+                          Ui.Event.Handler.Private.invoke
+                            dispatch
+                            (Text
+                               (Detail_outline.scope state.routes
+                                ^ "detail-task-intent:"
+                                ^ Journal_capture.source capture))
+                        | _ -> ()))
+                   ~on_save:
+                     (bind_action
+                        dispatch
+                        (Detail_outline.scope state.routes
+                         ^
+                         match Journal_detail.mode detail with
+                         | Failed _ -> "detail-retry"
+                         | _ -> "detail-submit:" ^ Journal_capture.source capture))
+                   ~on_close:(bind_action dispatch "close-composer")
+                   ~error:
+                     (match Journal_detail.mode detail with
+                      | Failed message -> Some message
+                      | _ -> Option.map capture_failure_message state.capture_error))
+              (Journal_detail.child_capture detail))
+        | Status_sheet block_id ->
+          Option.map
+            (fun block -> status_sheet_page ~tokens ~block dispatch)
+            (block_in_timeline state.timeline block_id)
+        | Cache_reset_confirmation _ -> None
+        | Diagnostics ->
+          Some
+            (diagnostics_page
+               ~snapshot:state.manager
+               ~graph:state.graph_state
+               ~admission:(Admission_refresh.observation state.admission_refresh)
+               state.diagnostics
+               dispatch)
+        | Error_info ->
+          Some
+            (error_info_page
+               ~sync_error:(Option.bind state.manager (fun manager -> manager.last_error))
+               ~operation_failure:(operation_failure state.timeline_notice)
+               (newest_first_worker_errors state)
+               dispatch)
+      in
+      let body =
+        let base =
+          V.Navigation_stack.create
+            ~key:(Ui.Key.string "journal-navigator")
+            ~title:""
+            ~on_path_change:dispatch
+            ~path
+            root
+          |> Cache_confirmation.local_cache
+               ~token:
+                 (match state.modal with
+                  | Cache_reset_confirmation _ -> Some state.confirmation_sequence
+                  | _ -> None)
+               dispatch
         in
-        timeline_page
-          ~graph_generation:state.graph_state.generation
-          ~destination:(Journal_routes.destination state.routes)
-          ~favorites:state.favorites
-          ~on_select_destination:
-            (Ui.Event.Handler.create ~name:"select-root-destination" (function
-               | Ui.Event.Payload.Int64 0L ->
-                 Ui.Event.Handler.Private.invoke dispatch (Text "select-journals")
-               | Int64 1L ->
-                 Ui.Event.Handler.Private.invoke dispatch (Text "select-favorites")
-               | _ -> ()))
-          ~on_favorites_visible_range:
-            (Ui.Event.Handler.create ~name:"favorites-visible-range" (function
-               | Ui.Event.Payload.Visible_range range ->
-                 Ui.Event.Handler.Private.invoke
-                   dispatch
-                   (Int64_pair
-                      { first = range.first_index; second = range.last_exclusive })
-               | _ -> ()))
-          ~on_favorites_retry:(bind_action dispatch "favorites-retry")
-          ~viewport_width:environment.viewport_width
-          ~tokens
-          ~typography
-          ~profile
-          ~text_scale:environment.text_scale
-          ~top_inset:environment.safe_area.top
-          ~bottom_inset:environment.safe_area.bottom
-          ~device_pixel_ratio:environment.device_pixel_ratio
-          ~timeline_state:state.timeline
-          ~loading:(not state.feed_loaded)
-          ~graph_error:(Option.map graph_error_message state.graph_error)
-          ~sync_error
-          ~sync_phase:
-            (Option.map
-               (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
-               state.manager)
-          ~today_date:(today_presentation state)
-          ~day_presentation:(presentation_for_day state)
-          ~reduced_motion
-          ~rtl:(is_rtl_locale environment.locale)
-          ~content_horizontal_inset
-          ~capture_enabled:
-            (state.write_enabled
-             && Option.is_none state.pending_delete
-             && Option.is_none state.pending_status
-             && not capture_saving)
-          ~capture_save_enabled:
-            (state.write_enabled
-             && Option.is_none state.pending_delete
-             && Option.is_none state.pending_status
-             && not capture_saving)
-          ~capture_saving
-          ~capture_task_selected
-          ~capture_affordance_key:state.capture_affordance_key
-          ~capture_fab_presentation:
-            (Journal_timeline_state.Root_scroll_trigger.presentation
-               state.journals_scroll)
-          ~navigation_visible:(Root_navigation.navigation_visible state)
-          ~root_active:state.root_active
-          ~on_capture_event:dispatch
-          ~on_scroll:dispatch
-          ~on_visible_range:dispatch
-          ~on_retry_day:(prefix_action dispatch "timeline-retry:")
-          ~on_toggle_children:(prefix_action dispatch "timeline-toggle-children:")
-          ~delete_enabled:state.write_enabled
-          ~actions_enabled:row_actions_enabled
-          ~on_status:(prefix_action dispatch "timeline-status:")
-          ~on_delete:(prefix_action dispatch "timeline-delete:")
-          ~error_info_available:(state.worker_errors <> [])
-          ~on_error_info:(bind_action dispatch "open-error-info")
-          ~account_menu_available:true
-          ~on_account_menu:(bind_action dispatch "open-account-menu")
-    in
-    let pages =
-      match Journal_routes.route state.routes with
-      | Journal_routes.Timeline -> [ root ]
-      | Detail_loading ->
-        [ root
-        ; message_page
-            ~typography
-            ~page_key:"journal-detail-loading"
-            ~title:"Loading entry"
-            dispatch
-        ]
-      | Detail ->
-        (match Journal_routes.detail state.routes with
-         | Some detail ->
-           [ root; detail_page ~typography detail dispatch ]
-           @
-           if Journal_detail.mode detail = Journal_detail.Confirm_discard
-           then
-             [ detail_discard_dialog_page ~tokens ~typography ~reduced_motion dispatch ]
-           else []
-         | None -> [ root ])
-      | Missing_detail ->
-        [ root
-        ; message_page
-            ~typography
-            ~page_key:"journal-detail-missing"
-            ~title:"Entry unavailable"
-            dispatch
-        ]
-    in
-    let pages =
-      match state.modal with
-      | Status_sheet block_id ->
-        (match block_in_timeline state.timeline block_id with
-         | None -> pages
-         | Some block ->
-           pages
-           @ [ status_sheet_page
-                 ~tokens
-                 ~typography
-                 ~text_scale:environment.text_scale
-                 ~viewport_height:environment.viewport_height
-                 ~bottom_inset:environment.safe_area.bottom
-                 ~reduced_motion
-                 ~block
-                 dispatch
-             ])
-      | Cache_reset_confirmation _ ->
-        pages
-        @ [ local_cache_reset_dialog_page ~tokens ~typography ~reduced_motion dispatch ]
-      | Account ->
-        let cache_reset_available = local_deletion_available state in
-        pages
-        @ [ account_dialog_page
-              ~tokens
-              ~typography
-              ~reduced_motion
-              ~cache_reset_available
+        let status =
+          match state.modal with
+          | Status_sheet _ -> true
+          | _ -> false
+        in
+        let title =
+          match state.modal with
+          | No_modal -> ""
+          | Capture_sheet -> "Capture"
+          | Append_sheet -> "Append"
+          | Status_sheet _ -> "Set status"
+          | Cache_reset_confirmation _ -> "Delete local graph copy?"
+          | Diagnostics -> "Diagnostics"
+          | Error_info -> "Error info"
+        in
+        V.Sheet.create
+          ~key:(Ui.Key.string "journal-sheet")
+          ~presented:(Option.is_some modal)
+          ~on_presented_changed:dispatch
+          ~interactive_dismiss:true
+          ~sizing:Form
+          ~detents:(if status then [ Medium; Large ] else [ Large ])
+          ~content:
+            (match modal with
+             | None -> V.empty ()
+             | Some content ->
+               V.Navigation_stack.create
+                 ~title
+                 ~on_path_change:(Ui.Event.Handler.create (fun _ -> ()))
+                 ~path:[]
+                 content)
+          base
+      in
+      let body =
+        Journal_asset_settings.view
+          ~uploads:
+            (Journal_uploads.rows
+               (Journal_uploads.sync state.uploads (upload_context state)))
+          ~offline:state.asset_offline
+          ~presented:state.asset_settings_open
+          ~on_event:(fun value ->
+            Ui.Event.Handler.Private.invoke
               dispatch
-          ]
-      | Settings ->
-        pages
-        @ [ settings_dialog_page ~tokens ~typography ~preset ~reduced_motion dispatch ]
-      | Diagnostics ->
-        pages
-        @ [ diagnostics_page
-              ~tokens
-              ~typography
-              ~reduced_motion
-              ~snapshot:state.manager
-              ~graph:state.graph_state
-              ~admission:(Admission_refresh.observation state.admission_refresh)
-              state.diagnostics
-              dispatch
-          ]
-      | Error_info ->
-        pages
-        @ [ error_info_page ~typography (newest_first_worker_errors state) dispatch ]
-      | No_modal -> pages
-    in
-    let body =
-      match state.typography_preset with
-      | None ->
-        Ui.Widget.empty ()
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "typography-preference-loading")
-      | Some _ ->
-        Ui.Widget.navigator
-          ~key:(Ui.Key.string "journal-navigator")
-          ~restoration_scope_id:
-            (ID.Navigation.Restoration_scope_id.of_string "logseq-journal")
-          ~on_pop:dispatch
-          pages
-        |> Ui.Widget.with_test_id (Ui.Test_id.string "journal-navigator")
-    in
-    App.View.create ~theme:(application_theme preset) ~body)
+              (Ui.Event.Payload.Text ("asset-settings:" ^ value)))
+          body
+      in
+      App.View.create ~theme:(application_theme ()) ~body:(V.Body.static body))
 ;;
 
 let decode_config payload =
@@ -4958,22 +5128,19 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
 ;;
 
 module For_testing = struct
+  let diagnostics_page dispatch =
+    diagnostics_page
+      ~snapshot:None
+      ~graph:{ generation = 0; graph_id = None; phase = Graph_closed; error = None }
+      ~admission:Admission_refresh.Unavailable
+      (Some { groups = [] })
+      dispatch
+  ;;
+
   let read_block_entropy = read_block_entropy
   let with_block_identity = with_block_identity
 
-  let favorites_page ~width ~scale ~dark ~high_contrast ~rtl ~reduced_motion items =
-    let profile =
-      Journal_visual_tokens.select_row_profile
-        ~preset:Balanced
-        ~viewport_width:width
-        ~text_scale:scale
-    in
-    let tokens =
-      Journal_visual_tokens.resolve
-        ~brightness:(if dark then Dark else Light)
-        ~high_contrast
-    in
-    let typography = Journal_visual_tokens.typography Balanced in
+  let favorites_page items =
     let favorites, requests =
       Journal_routes.Favorites.step
         (Journal_routes.Favorites.create ~graph_generation:1)
@@ -4993,53 +5160,39 @@ module For_testing = struct
     in
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page
+      ~render_media:(media_label initial_state handler)
+      ~platform:"ios"
       ~graph_generation:1
+      ~on_scroll_completed:handler
       ~destination:Journal_routes.Favorites
       ~favorites
       ~on_select_destination:handler
       ~on_favorites_visible_range:handler
       ~on_favorites_retry:handler
-      ~viewport_width:width
-      ~tokens
-      ~typography
-      ~profile
-      ~text_scale:scale
-      ~top_inset:47.
-      ~bottom_inset:34.
-      ~device_pixel_ratio:1.
       ~timeline_state:(Journal_timeline_state.empty ~today:20260908)
       ~loading:false
       ~graph_error:None
       ~sync_error:None
       ~sync_phase:(Some Graph_service.Connecting)
-      ~today_date:None
       ~day_presentation:(fun _ -> None)
-      ~reduced_motion
-      ~rtl
-      ~content_horizontal_inset:
-        (Float.max 0. ((width -. Journal_visual_tokens.timeline_max_width) /. 2.))
       ~capture_enabled:false
-      ~capture_save_enabled:false
-      ~capture_saving:false
-      ~capture_task_selected:false
-      ~capture_affordance_key:1L
-      ~capture_fab_presentation:Journal_timeline_state.Extended
-      ~navigation_visible:true
-      ~root_active:true
       ~on_capture_event:handler
-      ~on_scroll:handler
       ~on_visible_range:handler
       ~on_retry_day:handler
-      ~on_toggle_children:handler
+      ~on_open_block:handler
+      ~on_open_favorite:handler
       ~delete_enabled:false
       ~actions_enabled:false
+      ~interaction_enabled:true
       ~on_status:handler
       ~on_delete:handler
       ~error_info_available:true
       ~on_error_info:handler
       ~account_menu_available:true
-      ~on_account_menu:handler
-    |> fun page -> Ui.Widget.navigator ~on_pop:handler [ page ]
+      ~on_account_action:handler
+      ~cache_reset_available:false
+    |> fun page ->
+    V.Navigation_stack.create ~title:"" ~on_path_change:handler ~path:[] page
   ;;
 
   let app_with_service ?calendar_sampler service =

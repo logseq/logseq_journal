@@ -7,3 +7,4 @@
 - Do not modify any dune file during development unless explicitly asked.
 - If development is blocked because the `.mli` definitions under `spec/` are unclear or unreasonable, stop development immediately and report the specific spec issue, suggested changes, and rationale.
 - Do not modify any ocaml files in bonsai_flutter repo
+- Prefer native bonsai-ui/SwiftUI components and their built-in layout, scrolling, and animation behavior. Do not recreate these behaviors using per-row geometry tracking, shared observable geometry state, or repeated collection scans during scrolling. If native APIs cannot satisfy a requirement, explain the limitation and obtain explicit approval before implementing custom UI coordination.

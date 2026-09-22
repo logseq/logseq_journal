@@ -23,7 +23,8 @@
   (source_tree ../logseq_overlay_db)
   (source_tree ../logseq_sync)
   (source_tree ../tool)
-  ../bonsai-flutter.sexp
+  (source_tree ../swift)
+  ../bonsai-swiftui.sexp
   ../dune-project
   ../flutter/ios/Flutter/Debug.xcconfig
   ../flutter/ios/Flutter/Release.xcconfig
@@ -32,9 +33,10 @@
   ../flutter/macos/Flutter/Flutter-Release.xcconfig
   ../flutter/macos/Flutter/GeneratedPluginRegistrant.swift
   ../flutter/macos/Runner/AppDelegate.swift
-  ../flutter/macos/Runner/DebugProfile.entitlements
-  ../flutter/macos/Runner/Release.entitlements
+  ../config/entitlements/macos-debug-profile.entitlements
+  ../config/entitlements/macos-release.entitlements
   ../flutter/pubspec.yaml
+  ../swift/JournalE2EECrypto.swift
   ../logseq_db_storage.opam
   ../logseq_db_storage.opam.locked
   ../logseq_db_types.opam
@@ -71,7 +73,7 @@
 (test
  (name journal_adaptive_test)
  (modules journal_adaptive_test)
- (libraries app bonsai_flutter bonsai_flutter.driver bonsai_flutter.ui))
+ (libraries app bonsai_swiftui bonsai_swiftui.driver bonsai_swiftui.ui))
 
 (test
  (name journal_semantics_test)
@@ -79,11 +81,11 @@
  (libraries
   app
   bonsai
-  bonsai_flutter
-  bonsai_flutter.driver
-  bonsai_flutter.spec
-  bonsai_flutter.ui
-  bonsai_flutter_test
+  bonsai_swiftui
+  bonsai_swiftui.driver
+  bonsai_swiftui.spec
+  bonsai_swiftui.ui
+  bonsai_swiftui_test
   core))
 
 (test
@@ -109,7 +111,7 @@
 (test
  (name journal_timeline_state_test)
  (modules journal_timeline_state_test)
- (libraries app bonsai_flutter.ui datascript-ocaml-native unix))
+ (libraries app bonsai_swiftui.ui datascript-ocaml-native unix))
 
 (test
  (name journal_time_test)
@@ -124,22 +126,13 @@
 (test
  (name journal_routes_test)
  (modules journal_routes_test)
- (libraries app bonsai_flutter.spec bonsai_flutter.ui))
+ (libraries app bonsai_swiftui.spec bonsai_swiftui.ui))
 
 (rule
  (alias runtest)
- (deps
-  test_material_icons_artifact.sh
-  test_native_static_gmp.sh
-  ../tool/verify_material_icons_font.sh
-  ../tool/native_static_link_flags.sh)
+ (deps test_native_static_gmp.sh ../tool/native_static_link_flags.sh)
  (action
-  (progn
-   (run
-    sh
-    %{dep:test_native_static_gmp.sh}
-    %{dep:../tool/native_static_link_flags.sh})
-   (run sh %{dep:test_material_icons_artifact.sh} %{workspace_root}))))
+  (run sh %{dep:test_native_static_gmp.sh} %{dep:../tool/native_static_link_flags.sh})))
 
 (rule
  (alias runtest)
@@ -148,6 +141,25 @@
  (deps
   test_wrapped_graph_key_crypto.sh
   wrapped_graph_key_crypto_test.swift
-  ../flutter/JournalE2EECrypto.swift)
+  ../swift/JournalE2EECrypto.swift)
  (action
   (run sh %{dep:test_wrapped_graph_key_crypto.sh} %{workspace_root})))
+
+(test
+ (name journal_asset_policy_test)
+ (modules journal_asset_policy_test)
+ (libraries app))
+
+(test (name journal_media_test) (modules journal_media_test) (libraries app uri))
+
+(test (name journal_media_runtime_test) (modules journal_media_runtime_test) (libraries app uri))
+
+(test (name journal_asset_settings_test) (modules journal_asset_settings_test) (libraries app))
+
+(rule
+ (alias runtest)
+ (enabled_if (= %{system} macosx))
+ (deps test_asset_preferences.sh asset_preferences_test.swift ../swift/JournalAssetPreferences.swift)
+ (action (run sh %{dep:test_asset_preferences.sh} %{workspace_root})))
+
+(test (name journal_uploads_test) (modules journal_uploads_test) (libraries app))

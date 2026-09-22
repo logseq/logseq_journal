@@ -1,5 +1,5 @@
-module ID = Bonsai_flutter_spec.Id
-module Ui = Bonsai_flutter_ui
+module ID = Bonsai_swiftui_spec.Id
+module Ui = Bonsai_swiftui_ui
 
 type phase =
   | Editing
@@ -30,6 +30,10 @@ val update_mode : t -> Ui.Text_editing.update_mode
 val value : t -> Ui.Text_editing.Value.t
 val source : t -> string
 val task_state : t -> Journal_model.task_state
+
+(** Remount the same owned draft with a fresh editor session and unchanged value. *)
+val rebind : t -> session_number:int64 -> t
+
 val phase : t -> phase
 val can_save : t -> bool
 val update_source : t -> source:string -> t
@@ -47,3 +51,4 @@ val admit_save
 
 val fail : t -> message:string -> t
 val retry : t -> t * Journal_graph_request.t option
+val completed_by : t -> Journal_model.t -> bool

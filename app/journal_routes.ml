@@ -1,17 +1,15 @@
+module Drafts = Map.Make (String)
+
 type destination =
   | Journals
   | Favorites
-
-type anchor =
-  { block_id : string option
-  ; first_index : int
-  }
 
 type route =
   | Timeline
   | Detail_loading
   | Detail
   | Missing_detail
+  | Failed_detail of string
 
 type view =
   | Timeline_view
@@ -25,6 +23,11 @@ type view =
       ; request_generation : int64
       ; detail : Journal_detail.t
       }
+  | Failed_detail_view of
+      { block_id : string
+      ; request_generation : int64
+      ; message : string
+      }
   | Missing_detail_view of
       { block_id : string
       ; request_generation : int64
@@ -33,10 +36,18 @@ type view =
 type t =
   { destination : destination
   ; view : view
-  ; anchor : anchor
+  ; next_session : int64
+  ; drafts : Journal_detail.retained_composer Drafts.t
   }
 
-let create ~anchor = { destination = Journals; view = Timeline_view; anchor }
+let create () =
+  { destination = Journals
+  ; view = Timeline_view
+  ; next_session = 1L
+  ; drafts = Drafts.empty
+  }
+;;
+
 let destination t = t.destination
 let select_destination t destination = { t with destination }
 
@@ -46,23 +57,89 @@ let route t =
   | Detail_loading_view _ -> Detail_loading
   | Detail_view _ -> Detail
   | Missing_detail_view _ -> Missing_detail
+  | Failed_detail_view { message; _ } -> Failed_detail message
 ;;
 
-let anchor_to_restore t = Some t.anchor
-let set_anchor t anchor = { t with anchor }
+let track_detail_session t detail =
+  let session =
+    match Journal_detail.child_capture detail with
+    | None -> Journal_detail.session_id detail
+    | Some capture -> Journal_capture.session_id capture
+  in
+  { t with
+    next_session =
+      Int64.max
+        t.next_session
+        (Int64.succ (Bonsai_swiftui_spec.Id.Text_input.Session_id.to_int64 session))
+  }
+;;
+
+let retain_active_composer t =
+  match t.view with
+  | Detail_view { block_id; detail; _ } ->
+    let t = track_detail_session t detail in
+    { t with
+      drafts =
+        (match Journal_detail.retain_composer detail with
+         | None -> Drafts.remove block_id t.drafts
+         | Some draft -> Drafts.add block_id draft t.drafts)
+    }
+  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
+    -> t
+;;
+
+type retained_drafts =
+  { composers : Journal_detail.retained_composer Drafts.t
+  ; next_editor_session : int64
+  }
+
+let retain_drafts ~interrupted t =
+  let t = retain_active_composer t in
+  { composers =
+      (if interrupted
+       then Drafts.map Journal_detail.interrupt_retained_composer t.drafts
+       else t.drafts)
+  ; next_editor_session = t.next_session
+  }
+;;
+
+let restore_drafts t retained =
+  { t with
+    drafts = retained.composers
+  ; next_session = Int64.max t.next_session retained.next_editor_session
+  }
+;;
 
 let open_detail t ~block_id ~request_generation =
+  let t = retain_active_composer t in
+  let session_number = Int64.max t.next_session (Int64.succ request_generation) in
   { t with
-    view =
-      Detail_loading_view
-        { block_id; request_generation; session_number = Int64.succ request_generation }
+    next_session = Int64.succ session_number
+  ; view = Detail_loading_view { block_id; request_generation; session_number }
   }
+;;
+
+let open_favorite
+      t
+      ~request_generation
+      (item : Logseq_db_worker.Protocol.v2_favorite_item)
+  =
+  match item.target with
+  | V2_favorite_page _ -> t, None
+  | V2_favorite_block { uuid; _ } ->
+    let block_id = Logseq_db_types.Graph_types.Uuid.to_string uuid in
+    let t = open_detail t ~block_id ~request_generation in
+    ( t
+    , Some
+        (Journal_graph_request.Load_detail
+           { block_id; after = None; limit = 64; request_generation }) )
 ;;
 
 let detail_block_id t =
   match t.view with
   | Detail_loading_view { block_id; _ }
   | Detail_view { block_id; _ }
+  | Failed_detail_view { block_id; _ }
   | Missing_detail_view { block_id; _ } -> Some block_id
   | Timeline_view -> None
 ;;
@@ -71,6 +148,7 @@ let detail_request_generation t =
   match t.view with
   | Detail_loading_view { request_generation; _ }
   | Detail_view { request_generation; _ }
+  | Failed_detail_view { request_generation; _ }
   | Missing_detail_view { request_generation; _ } -> request_generation
   | Timeline_view -> 0L
 ;;
@@ -78,16 +156,25 @@ let detail_request_generation t =
 let apply_detail_response t ~request_generation detail =
   match t.view with
   | Detail_loading_view loading
-    when Int64.equal request_generation loading.request_generation ->
+    when Int64.equal request_generation loading.request_generation
+         && String.equal
+              loading.block_id
+              (Journal_model.id detail.Journal_graph_projection.root) ->
+    let detail = Journal_detail.create ~session_number:loading.session_number detail in
+    let detail =
+      match Drafts.find_opt loading.block_id t.drafts with
+      | None -> detail
+      | Some draft -> Journal_detail.restore_composer detail draft
+    in
     { t with
-      view =
-        Detail_view
-          { block_id = loading.block_id
-          ; request_generation
-          ; detail = Journal_detail.create ~session_number:loading.session_number detail
-          }
+      drafts = Drafts.remove loading.block_id t.drafts
+    ; view = Detail_view { block_id = loading.block_id; request_generation; detail }
     }
-  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ -> t
+  | Timeline_view
+  | Detail_loading_view _
+  | Detail_view _
+  | Failed_detail_view _
+  | Missing_detail_view _ -> t
 ;;
 
 let apply_missing_detail t ~request_generation =
@@ -97,53 +184,89 @@ let apply_missing_detail t ~request_generation =
     { t with
       view = Missing_detail_view { block_id = loading.block_id; request_generation }
     }
-  | Timeline_view | Detail_loading_view _ | Detail_view _ | Missing_detail_view _ -> t
+  | Timeline_view
+  | Detail_loading_view _
+  | Detail_view _
+  | Failed_detail_view _
+  | Missing_detail_view _ -> t
+;;
+
+let apply_detail_failure t ~request_generation ~missing ~message =
+  if missing
+  then apply_missing_detail t ~request_generation
+  else (
+    match t.view with
+    | Detail_loading_view loading when loading.request_generation = request_generation ->
+      { t with
+        view =
+          Failed_detail_view { block_id = loading.block_id; request_generation; message }
+      }
+    | _ -> t)
 ;;
 
 let detail t =
   match t.view with
   | Detail_view { detail; _ } -> Some detail
-  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> None
+  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
+    -> None
 ;;
 
 let update_detail t detail =
   match t.view with
-  | Detail_view view -> { t with view = Detail_view { view with detail } }
-  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t
+  | Detail_view view ->
+    let t = track_detail_session t detail in
+    { t with view = Detail_view { view with detail } }
+  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
+    -> t
+;;
+
+let apply_child_created t ~child ~parent =
+  let parent_id = Journal_model.id parent in
+  let drafts =
+    Drafts.update
+      parent_id
+      (fun draft ->
+         Option.bind draft (fun draft ->
+           Journal_detail.complete_retained_composer draft ~child ~parent))
+      t.drafts
+  in
+  let t = { t with drafts } in
+  match detail t with
+  | None -> t
+  | Some owner ->
+    update_detail t (Journal_detail.apply_child_created owner ~child ~parent)
+;;
+
+let apply_child_failure t ~block_id ~message =
+  let t =
+    { t with
+      drafts =
+        Drafts.map
+          (fun draft -> Journal_detail.fail_retained_composer draft ~block_id ~message)
+          t.drafts
+    }
+  in
+  match detail t with
+  | None -> t
+  | Some owner ->
+    let owner, _ = Journal_detail.step owner (Append_failed (block_id, message)) in
+    update_detail t owner
 ;;
 
 let back t =
+  let t = retain_active_composer t in
   match t.view with
   | Timeline_view -> t
-  | Detail_loading_view _ | Missing_detail_view _ -> { t with view = Timeline_view }
-  | Detail_view view ->
-    (match Journal_detail.request_back view.detail with
-     | `Close -> { t with view = Timeline_view }
-     | `State detail -> { t with view = Detail_view { view with detail } })
-;;
-
-let keep_editing t =
-  match t.view with
-  | Detail_view view ->
-    { t with
-      view = Detail_view { view with detail = Journal_detail.keep_editing view.detail }
-    }
-  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t
-;;
-
-let discard t =
-  match t.view with
-  | Detail_view view ->
-    { t with
-      view = Detail_view { view with detail = Journal_detail.discard_edit view.detail }
-    }
-  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t
+  | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _ ->
+    { t with view = Timeline_view }
+  | Detail_view _ -> { t with view = Timeline_view }
 ;;
 
 let background t = t
-let graph_unavailable _t = create ~anchor:{ block_id = None; first_index = 0 }
+let graph_unavailable t = restore_drafts (create ()) (retain_drafts ~interrupted:true t)
 
 let runtime_replaced t =
+  let t = retain_active_composer t in
   match t.view with
   | Detail_view view ->
     { t with
@@ -153,11 +276,12 @@ let runtime_replaced t =
           ; request_generation = Int64.succ view.request_generation
           ; session_number =
               Int64.succ
-                (Bonsai_flutter_spec.Id.Text_input.Session_id.to_int64
+                (Bonsai_swiftui_spec.Id.Text_input.Session_id.to_int64
                    (Journal_detail.session_id view.detail))
           }
     }
-  | Timeline_view | Detail_loading_view _ | Missing_detail_view _ -> t
+  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
+    -> t
 ;;
 
 module Favorites = struct
@@ -167,6 +291,8 @@ module Favorites = struct
   type event =
     | Select of bool
     | Invalidate
+    | Hide_target of string
+    | Reveal_target of string
     | Retry
     | Visible of
         { first_index : int
@@ -183,11 +309,10 @@ module Favorites = struct
     ; dirty : bool
     ; initialized : bool
     ; items : P.v2_favorite_item list
+    ; hidden_targets : string list
     ; cursor : G.Cursor.t option
     ; pending : Journal_graph_request.favorites_request option
     ; error : string option
-    ; anchor : anchor
-    ; last_exclusive : int
     ; staging : P.v2_favorite_item list option
     ; refresh_count : int
     }
@@ -200,63 +325,32 @@ module Favorites = struct
     ; dirty = true
     ; initialized = false
     ; items = []
+    ; hidden_targets = []
     ; cursor = None
     ; pending = None
     ; error = None
-    ; anchor = { block_id = None; first_index = 0 }
-    ; last_exclusive = 20
     ; staging = None
     ; refresh_count = 0
     }
   ;;
 
   let revision t = t.revision
-  let items t = t.items
+
+  let visible_items t =
+    List.filter
+      (fun (item : P.v2_favorite_item) ->
+         match item.target with
+         | V2_favorite_page _ -> true
+         | V2_favorite_block { uuid; _ } ->
+           not (List.mem (G.Uuid.to_string uuid) t.hidden_targets))
+      t.items
+  ;;
+
+  let items = visible_items
   let loading t = Option.is_some t.pending
   let error t = t.error
   let initialized t = t.initialized
-  let anchor t = t.anchor
   let has_more t = Option.is_some t.cursor
-
-  let window t =
-    let first = max 0 (t.anchor.first_index - 12) in
-    ( first
-    , t.items
-      |> List.to_seq
-      |> Seq.drop first
-      |> Seq.take (min 128 (max 64 (t.last_exclusive - first + 12)))
-      |> List.of_seq )
-  ;;
-
-  let key (item : P.v2_favorite_item) = G.Uuid.to_string item.membership_uuid
-
-  let reconcile_anchor t items =
-    let surviving id = List.exists (fun item -> key item = id) items in
-    let id =
-      match t.anchor.block_id with
-      | Some id when surviving id -> Some id
-      | _ ->
-        let after =
-          t.items |> List.to_seq |> Seq.drop t.anchor.first_index |> List.of_seq
-        in
-        let before =
-          t.items
-          |> List.to_seq
-          |> Seq.take t.anchor.first_index
-          |> List.of_seq
-          |> List.rev
-        in
-        List.find_opt (fun item -> surviving (key item)) (after @ before)
-        |> Option.map key
-    in
-    let index =
-      match id with
-      | Some id ->
-        List.find_index (fun item -> key item = id) items |> Option.value ~default:0
-      | None -> min t.anchor.first_index (max 0 (List.length items - 1))
-    in
-    { first_index = index; block_id = Option.map key (List.nth_opt items index) }
-  ;;
 
   let request t cursor =
     let request : Journal_graph_request.favorites_request =
@@ -285,26 +379,43 @@ module Favorites = struct
   ;;
 
   let start_if_needed t =
-    if t.active && t.pending = None && t.error = None && (t.dirty || not t.initialized)
+    if (not t.active) || t.pending <> None || t.error <> None
+    then t, []
+    else if t.dirty || not t.initialized
     then refresh t
+    else if t.cursor <> None && visible_items t = []
+    then request t t.cursor
     else t, []
   ;;
 
   let step t = function
     | Select active -> start_if_needed { t with active }
     | Invalidate -> start_if_needed { t with dirty = true }
+    | Hide_target id ->
+      if List.mem id t.hidden_targets
+      then t, []
+      else (
+        let next =
+          { t with hidden_targets = id :: t.hidden_targets; revision = t.revision + 1 }
+        in
+        start_if_needed next)
+    | Reveal_target id ->
+      if not (List.mem id t.hidden_targets)
+      then t, []
+      else
+        ( { t with
+            hidden_targets = List.filter (( <> ) id) t.hidden_targets
+          ; revision = t.revision + 1
+          }
+        , [] )
     | Retry -> if t.pending = None then refresh t else t, []
-    | Visible { first_index; last_exclusive } ->
-      let first_index = max 0 (min first_index (max 0 (List.length t.items - 1))) in
-      let anchor =
-        { first_index; block_id = Option.map key (List.nth_opt t.items first_index) }
-      in
-      let t = { t with anchor; last_exclusive = max first_index last_exclusive } in
+    | Visible { first_index = _; last_exclusive } ->
+      let visible = visible_items t in
       if
         t.active
         && t.pending = None
         && t.error = None
-        && last_exclusive + 12 >= List.length t.items
+        && last_exclusive + 12 >= List.length visible
       then (
         match t.cursor with
         | None -> t, []
@@ -322,13 +433,11 @@ module Favorites = struct
       if needs_continuation && result.next_cursor <> None
       then request { t with staging = Some staged } result.next_cursor
       else (
-        let anchor = reconcile_anchor t staged in
         let t =
           { t with
             items = staged
           ; staging = None
           ; initialized = true
-          ; anchor
           ; error = None
           ; revision = t.revision + 1
           }

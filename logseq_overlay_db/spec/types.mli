@@ -234,7 +234,24 @@ type block_tree =
   ; children : block_tree list
   }
 
+type asset_metadata =
+  { version : Logseq_db_types.Asset_descriptor.version
+  ; replace_reference : Graph.Uuid.t option
+  ; size : int64
+  }
+
 type local_mutation =
+  | Set_asset_reference of
+      { mutation_id : Graph.Uuid.t
+      ; block : Graph.Uuid.t
+      ; previous : Graph.Uuid.t option
+      ; asset : Graph.Uuid.t
+      }
+  | Publish_asset of
+      { mutation_id : Graph.Uuid.t
+      ; block : Graph.Uuid.t
+      ; version : Logseq_db_types.Asset_descriptor.version
+      }
   | Save_block of
       { mutation_id : Graph.Uuid.t
       ; block : Graph.block_uuid
@@ -244,6 +261,7 @@ type local_mutation =
       { mutation_id : Graph.Uuid.t
       ; tree : block_tree
       ; parent : Graph.Uuid.t
+      ; asset : asset_metadata option
       }
   | Delete_blocks of
       { mutation_id : Graph.Uuid.t
@@ -374,6 +392,8 @@ type outliner_operation =
   | Create_journal_page_operation
   | Set_task_status_operation
   | Clear_task_status_operation
+  | Publish_asset_operation
+  | Set_asset_reference_operation
 
 val remote_won_proof
   :  reason:remote_won_reason

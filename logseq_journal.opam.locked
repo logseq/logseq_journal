@@ -1,7 +1,7 @@
 opam-version: "2.0"
 name: "logseq_journal"
 version: "0.1.0"
-synopsis: "Logseq Journal Bonsai Flutter application"
+synopsis: "Logseq Journal Bonsai SwiftUI application"
 maintainer: "application authors"
 authors: "application authors"
 license: "MIT"
@@ -39,8 +39,8 @@ depends: [
   "bigstringaf" {= "0.10.0"}
   "bin_prot" {= "v0.17.0-1"}
   "bonsai" {= "v0.17.0"}
-  "bonsai_flutter" {= "0.1.0~dev"}
-  "bonsai_flutter_test" {= "0.1.0~dev" & with-test}
+  "bonsai_swiftui" {= "0.1.0~dev"}
+  "bonsai_swiftui_test" {= "0.1.0~dev" & with-test}
   "bos" {= "0.3.0"}
   "ca-certs-nss" {= "3.126"}
   "camlp-streams" {= "5.0.1"}
@@ -260,12 +260,12 @@ build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
   ["rrbvec.dev" "git+https://github.com/RCmerci/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
   [
-  "bonsai_flutter.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b"
+  "bonsai_swiftui.0.1.0~dev"
+  "file:///Users/rcmerci/.local/share/bonsai-swiftui/releases/2026-09-18-journal-native-210435/final/bonsai-swiftui-0.1.0~dev.tar.gz"
 ]
   [
-  "bonsai_flutter_test.0.1.0~dev"
-  "git+https://github.com/RCmerci/bonsai_flutter.git#84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b"
+  "bonsai_swiftui_test.0.1.0~dev"
+  "file:///Users/rcmerci/.local/share/bonsai-swiftui/releases/2026-09-18-journal-native-210435/final/bonsai-swiftui-0.1.0~dev.tar.gz"
 ]
   [
     "datascript-ocaml-native.dev"

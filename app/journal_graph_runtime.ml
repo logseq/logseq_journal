@@ -38,9 +38,14 @@ type payload =
       { block : Projection.block
       ; timeline_entry_update : Projection.timeline_entry option
       }
+  | Child_failed of
+      { block_id : string
+      ; failure : failure_source
+      }
   | Child_created of
       { child : Projection.block
-      ; timeline_entry_update : Projection.timeline_entry
+      ; parent : Projection.block
+      ; timeline_entry_update : Projection.timeline_entry option
       }
   | Block_updated of
       { block : Projection.block
@@ -61,6 +66,7 @@ type payload =
       }
   | Delete_conflict of Projection.block
   | Block_found of Projection.block option
+  | Feed_refresh_started of { request_generation : int64 }
   | Feed_loaded of
       { request_generation : int64
       ; feed : Projection.feed
@@ -79,6 +85,13 @@ type payload =
   | Detail_loaded of
       { request_generation : int64
       ; detail : Projection.detail
+      }
+  | Detail_failed of
+      { request_generation : int64
+      ; block_id : string
+      ; missing : bool
+      ; stale_cursor : bool
+      ; failure : failure_source
       }
   | Feed_failed of
       { request_generation : int64
@@ -110,10 +123,6 @@ type refresh =
   | Updated of { block_id : string }
   | Update_conflict_refresh of { block_id : string }
   | Delete_conflict_refresh of { block_id : string }
-  | Child_created_refresh of
-      { child_id : string
-      ; parent_id : string
-      }
 
 type page_tree_interest =
   { page : Projection.page
@@ -121,7 +130,7 @@ type page_tree_interest =
   }
 
 type children_interest =
-  { page : Projection.page
+  { page : Graph.page
   ; root : Projection.block_member
   ; limit : int
   }
@@ -151,12 +160,24 @@ type operation =
   | Day_page_tree of
       { page : Projection.page
       ; generation : int64
+      ; limit : int
       }
   | Detail_block of
       { generation : int64
       ; block_id : string
       ; limit : int
+      ; after : Graph.Cursor.t option
       }
+  | Detail_page of
+      { generation : int64
+      ; root : Projection.block_member
+      ; limit : int
+      ; after : Graph.Cursor.t option
+      }
+  | Child_insert of Projection.create_child * Graph.page
+  | Child_read of Projection.create_child * Graph.page
+  | Child_status of Projection.create_child * Graph.page
+  | Child_parent of Projection.create_child * Graph.page * Projection.block_member
   | Changed_block of
       { block_id : string
       ; page : Projection.page
@@ -164,7 +185,7 @@ type operation =
   | Find_block_result
   | Detail_children of
       { generation : int64
-      ; page : Projection.page
+      ; page : Graph.page
       ; root : Projection.block_member
       }
   | Changed_children of children_interest
@@ -194,6 +215,7 @@ type operation =
   | Refresh_page_tree of
       { page : Projection.page
       ; refresh : refresh
+      ; retained_rev : Projection.tree_member list
       }
   | Changed_page_tree of Projection.page
   | Mutation_refresh of
@@ -204,6 +226,8 @@ type operation =
 
 type t =
   { pending : (string, operation) Hashtbl.t
+  ; hydration_queue : Protocol.request Queue.t
+  ; hydration_active : (string, unit) Hashtbl.t
   ; mutable next_request : int64
   ; mutable change_generation : string option
   ; mutable change_cursor : string option
@@ -212,6 +236,7 @@ type t =
   ; scope_revisions : (string, string) Hashtbl.t
   ; mutable calendar : Journal_calendar.t option
   ; localtime : float -> Unix.tm
+  ; graph_pages : (string, Graph.page) Hashtbl.t
   ; mutable pages : (string * Projection.page) list
   ; mutable block_pages : (string * Projection.page) list
   ; projected_blocks : (string, Projection.block) Hashtbl.t
@@ -250,6 +275,8 @@ let day_failure ~day request_generation message =
 
 let create ?(localtime = Unix.localtime) () =
   { pending = Hashtbl.create 32
+  ; hydration_queue = Queue.create ()
+  ; hydration_active = Hashtbl.create 4
   ; next_request = 1L
   ; change_generation = None
   ; change_cursor = None
@@ -258,6 +285,7 @@ let create ?(localtime = Unix.localtime) () =
   ; scope_revisions = Hashtbl.create 32
   ; calendar = None
   ; localtime
+  ; graph_pages = Hashtbl.create 32
   ; pages = []
   ; block_pages = []
   ; projected_blocks = Hashtbl.create 64
@@ -269,11 +297,14 @@ let create ?(localtime = Unix.localtime) () =
 
 let reset t =
   Hashtbl.clear t.pending;
+  Queue.clear t.hydration_queue;
+  Hashtbl.clear t.hydration_active;
   t.change_generation <- None;
   t.change_cursor <- None;
   Hashtbl.clear t.block_revisions;
   Hashtbl.clear t.page_revisions;
   Hashtbl.clear t.scope_revisions;
+  Hashtbl.clear t.graph_pages;
   t.pages <- [];
   t.block_pages <- [];
   Hashtbl.clear t.projected_blocks;
@@ -591,14 +622,14 @@ let submit t (request : Journal_graph_request.t) =
        (match
           page_tree
             t
-            (Day_page_tree { page; generation = request_generation })
+            (Day_page_tree { page; generation = request_generation; limit })
             page
             ?cursor
             limit
         with
         | Ok request -> requests [ request ]
         | Error message -> day_failure ~day request_generation message))
-  | Load_detail { block_id; request_generation; limit; _ } ->
+  | Load_detail { block_id; request_generation; limit; after } ->
     (match parse_uuid "block UUID" block_id with
      | Error message -> reject message
      | Ok block ->
@@ -609,6 +640,8 @@ let submit t (request : Journal_graph_request.t) =
                 { generation = request_generation
                 ; block_id
                 ; limit = max 1 (min Protocol.maximum_page_size limit)
+                ; after =
+                    Option.bind after (fun cursor -> cursor.Projection.protocol_cursor)
                 })
              (Protocol.V2_get_block { block; revision = None })
          ])
@@ -701,6 +734,13 @@ let submit t (request : Journal_graph_request.t) =
             ])
      | Error message, _ | _, Error message -> reject message)
   | Create_child command ->
+    let reject message =
+      responses
+        [ response
+            (Child_failed
+               { block_id = command.block_id; failure = Projection_failure message })
+        ]
+    in
     if not (calendar_generation_is_current t command.calendar_generation)
     then reject "The local calendar changed before child admission."
     else (
@@ -710,38 +750,35 @@ let submit t (request : Journal_graph_request.t) =
         , parse_uuid "parent UUID" command.parent_block_id )
       with
       | Ok mutation_id, Ok child, Ok parent ->
-        (match page_by_block t command.parent_block_id with
-         | None -> reject "The parent page is not retained."
+        let page =
+          Hashtbl.to_seq_values t.children_interests
+          |> Seq.find_map (fun interest ->
+            if Graph.Uuid.to_string interest.root.block.uuid = command.parent_block_id
+            then Some interest.page
+            else None)
+        in
+        (match page with
+         | None -> reject "The append parent is unavailable."
          | Some page ->
-           let scope = Protocol.V2_children_scope parent in
-           (match scope_precondition t scope with
+           (match scope_precondition t (Protocol.V2_children_scope parent) with
+            | Error message -> reject message
             | Ok scope_revision ->
-              let tree : Protocol.v2_block_tree =
-                { uuid = child; title = command.source; children = [] }
-              in
               requests
                 [ mutate
                     t
-                    (Mutation_refresh
-                       { page
-                       ; refresh =
-                           Child_created_refresh
-                             { child_id = command.block_id
-                             ; parent_id = command.parent_block_id
-                             }
-                       })
+                    (Child_insert (command, page))
                     (Protocol.V2_insert_blocks
                        { mutation_id
                        ; parent
-                       ; roots = [ tree ]
+                       ; roots =
+                           [ { uuid = child; title = command.source; children = [] } ]
                        ; preconditions =
                            preconditions
                              ~blocks:[ parent, command.expected_parent_revision ]
                              ~scopes:[ scope_revision ]
                              ()
                        })
-                ]
-            | Error message -> reject message))
+                ]))
       | Error message, _, _ | _, Error message, _ | _, _, Error message -> reject message)
   | Delete_subtree command ->
     (match
@@ -774,7 +811,11 @@ let page_of_graph_page (page : Graph.page) =
 
 let request_refresh t page refresh =
   match
-    page_tree t (Refresh_page_tree { page; refresh }) page Protocol.maximum_page_size
+    page_tree
+      t
+      (Refresh_page_tree { page; refresh; retained_rev = [] })
+      page
+      Protocol.maximum_page_size
   with
   | Ok request -> requests [ request ]
   | Error message -> reject message
@@ -946,31 +987,7 @@ let refresh_response t page refresh result =
         | Update_conflict_refresh { block_id } ->
           (match find block_id with
            | Some entry -> responses [ response (Update_conflict entry.block) ]
-           | None -> reject "The conflicted block was not visible during reconciliation.")
-        | Child_created_refresh { child_id; parent_id } ->
-          (match find parent_id with
-           | None -> reject "The parent block was not visible after child creation."
-           | Some parent ->
-             let child =
-               List.find_map
-                 (fun (item : Projection.tree_member) ->
-                    if String.equal (Graph.Uuid.to_string item.block.uuid) child_id
-                    then
-                      Projection.block
-                        ~page
-                        ~revision:item.revision
-                        ~child_count:0
-                        ~time_context
-                        item.block
-                      |> Result.to_option
-                    else None)
-                 result.Graph.items
-             in
-             (match child with
-              | None -> reject "The child block was not visible after commit."
-              | Some child ->
-                responses
-                  [ response (Child_created { child; timeline_entry_update = parent }) ]))))
+           | None -> reject "The conflicted block was not visible during reconciliation.")))
 ;;
 
 let append_unique equal value values =
@@ -1004,6 +1021,32 @@ let registered_tree t uuid =
 
 let registered_children t uuid =
   Hashtbl.find_opt t.children_interests (Graph.Uuid.to_string uuid)
+;;
+
+(* Keep reconciliation bursts below the worker budget without delaying foreground reads. *)
+let maximum_active_hydration = 4
+
+let drain_hydration t =
+  let rec drain reversed =
+    if
+      Hashtbl.length t.hydration_active >= maximum_active_hydration
+      || Queue.is_empty t.hydration_queue
+    then List.rev reversed
+    else (
+      let request = Queue.pop t.hydration_queue in
+      let key = Graph.Uuid.to_string request.Protocol.request_id in
+      if not (Hashtbl.mem t.pending key)
+      then drain reversed
+      else (
+        Hashtbl.replace t.hydration_active key ();
+        drain (request :: reversed)))
+  in
+  drain []
+;;
+
+let schedule_hydration t output =
+  List.iter (fun request -> Queue.push request t.hydration_queue) output.requests;
+  { output with requests = drain_hydration t }
 ;;
 
 let hydration_for_changes t ~request_generation windows =
@@ -1057,20 +1100,28 @@ let hydration_for_changes t ~request_generation windows =
   let journal =
     match journal_changed, t.initial_feed with
     | true, Some feed ->
-      submit
-        t
-        (Journal_graph_request.Load_feed
-           { before_day = None
-           ; day_limit = feed.day_limit
-           ; blocks_per_day = feed.blocks_per_day
-           ; slot_limit = feed.slot_limit
-           ; request_generation
-           })
+      let output =
+        submit
+          t
+          (Journal_graph_request.Load_feed
+             { before_day = None
+             ; day_limit = feed.day_limit
+             ; blocks_per_day = feed.blocks_per_day
+             ; slot_limit = feed.slot_limit
+             ; request_generation
+             })
+      in
+      { output with
+        responses =
+          response (Feed_refresh_started { request_generation }) :: output.responses
+      }
     | false, _ | true, None -> empty
   in
-  { requests = point_reads @ tree_reads @ children_reads @ journal.requests
-  ; responses = journal.responses
-  }
+  schedule_hydration
+    t
+    { requests = point_reads @ tree_reads @ children_reads @ journal.requests
+    ; responses = journal.responses
+    }
 ;;
 
 let rehydrate_current_interests t ~request_generation ~generation =
@@ -1081,15 +1132,21 @@ let rehydrate_current_interests t ~request_generation ~generation =
     match t.initial_feed with
     | None -> empty
     | Some feed ->
-      submit
-        t
-        (Journal_graph_request.Load_feed
-           { before_day = None
-           ; day_limit = feed.day_limit
-           ; blocks_per_day = feed.blocks_per_day
-           ; slot_limit = feed.slot_limit
-           ; request_generation
-           })
+      let output =
+        submit
+          t
+          (Journal_graph_request.Load_feed
+             { before_day = None
+             ; day_limit = feed.day_limit
+             ; blocks_per_day = feed.blocks_per_day
+             ; slot_limit = feed.slot_limit
+             ; request_generation
+             })
+      in
+      { output with
+        responses =
+          response (Feed_refresh_started { request_generation }) :: output.responses
+      }
   in
   let tree_requests =
     Hashtbl.to_seq_values t.page_tree_interests
@@ -1124,9 +1181,11 @@ let rehydrate_current_interests t ~request_generation ~generation =
              (Protocol.V2_get_children
                 { parent; limit = interest.limit; cursor = None; revision = None })))
   in
-  { requests = (graph_info :: journal.requests) @ tree_requests @ children_requests
-  ; responses = journal.responses
-  }
+  schedule_hydration
+    t
+    { requests = (graph_info :: journal.requests) @ tree_requests @ children_requests
+    ; responses = journal.responses
+    }
 ;;
 
 let remember_block_revision t uuid revision =
@@ -1145,6 +1204,46 @@ let remember_scope_revision t scope revision =
   Hashtbl.replace t.scope_revisions (scope_key scope) revision
 ;;
 
+let detail_children t ~generation ~page ~root ~limit ~after =
+  let interest = { page; root; limit } in
+  Hashtbl.replace
+    t.children_interests
+    (Graph.Uuid.to_string root.Projection.block.uuid)
+    interest;
+  requests
+    [ read
+        t
+        (Detail_children { generation; page; root })
+        (Protocol.V2_get_children
+           { parent = root.block.uuid; limit; cursor = after; revision = None })
+    ]
+;;
+
+let read_child t command page =
+  requests
+    [ read
+        t
+        (Child_read (command, page))
+        (Protocol.V2_get_block
+           { block = Graph.Uuid.of_string command.Projection.block_id |> Result.get_ok
+           ; revision = None
+           })
+    ]
+;;
+
+let read_child_parent t command page child =
+  requests
+    [ read
+        t
+        (Child_parent (command, page, child))
+        (Protocol.V2_get_block
+           { block =
+               Graph.Uuid.of_string command.Projection.parent_block_id |> Result.get_ok
+           ; revision = None
+           })
+    ]
+;;
+
 let operation_name = function
   | List_favorites _ -> "listFavorites"
   | Graph_info -> "graphInfo"
@@ -1155,6 +1254,11 @@ let operation_name = function
   | Feed_page_tree _ -> "loadFeedPageTree"
   | Day_page_tree _ -> "loadDayPageTree"
   | Detail_block _ -> "loadDetailBlock"
+  | Detail_page _ -> "loadDetailPage"
+  | Child_insert _ -> "appendChild"
+  | Child_read _ -> "readAppendedChild"
+  | Child_status _ -> "setAppendedChildStatus"
+  | Child_parent _ -> "readAppendParent"
   | Changed_block _ -> "reconcileChangedBlock"
   | Find_block_result -> "findBlock"
   | Detail_children _ -> "loadDetailChildren"
@@ -1207,13 +1311,13 @@ let failure_output ?(code = Error.Unsupported_semantics) t operation request_id 
                  })
           ]
     }
-  | Mutation_refresh { page; refresh = Updated { block_id } } ->
-    request_refresh t page (Update_conflict_refresh { block_id })
+  | Mutation_refresh { page; refresh = Updated { block_id } } when code = Error.Conflict
+    -> request_refresh t page (Update_conflict_refresh { block_id })
   | Graph_info -> responses [ response (Open_failed worker_failure) ]
   | Admission_info request -> responses [ response (Admission_unavailable request) ]
   | Pull_changes _ | Acknowledge_changes ->
     responses [ response (Rejected (Worker_failure worker_failure)) ]
-  | Day_page_tree { page; generation } ->
+  | Day_page_tree { page; generation; _ } ->
     responses
       [ response
           (Day_blocks_failed
@@ -1223,10 +1327,39 @@ let failure_output ?(code = Error.Unsupported_semantics) t operation request_id 
              ; failure = Worker_failure worker_failure
              })
       ]
-  | Detail_block _
+  | Detail_block { generation; block_id; _ } ->
+    responses
+      [ response
+          (Detail_failed
+             { request_generation = generation
+             ; block_id
+             ; missing = false
+             ; stale_cursor = code = Error.Stale_read_cursor
+             ; failure = Worker_failure worker_failure
+             })
+      ]
+  | Detail_page { generation; root; _ } | Detail_children { generation; root; _ } ->
+    responses
+      [ response
+          (Detail_failed
+             { request_generation = generation
+             ; block_id = Graph.Uuid.to_string root.block.uuid
+             ; missing = false
+             ; stale_cursor = code = Error.Stale_read_cursor
+             ; failure = Worker_failure worker_failure
+             })
+      ]
+  | Child_insert (command, _)
+  | Child_read (command, _)
+  | Child_status (command, _)
+  | Child_parent (command, _, _) ->
+    responses
+      [ response
+          (Child_failed
+             { block_id = command.block_id; failure = Worker_failure worker_failure })
+      ]
   | Changed_block _
   | Find_block_result
-  | Detail_children _
   | Changed_children _
   | Capture_page _
   | Capture_create_page _
@@ -1338,7 +1471,7 @@ let feed_pages_response
       enqueue [] queued_pages))
 ;;
 
-let receive t (protocol_response : Protocol.response) =
+let receive_response t (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -1346,6 +1479,8 @@ let receive t (protocol_response : Protocol.response) =
   | Some operation ->
     Hashtbl.remove t.pending key;
     (match outcome with
+     | Protocol.V2_assets_outcome _ ->
+       failure_output t operation request_id "Unexpected asset query response."
      | Protocol.V2_favorites_outcome result ->
        (match operation with
         | List_favorites request ->
@@ -1412,6 +1547,7 @@ let receive t (protocol_response : Protocol.response) =
      | V2_journals_outcome { items; next_cursor } ->
        List.iter
          (fun (item : Protocol.v2_journal_item) ->
+            Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
             remember_page_revision t item.page.uuid item.revision)
          items;
        (match operation with
@@ -1436,6 +1572,14 @@ let receive t (protocol_response : Protocol.response) =
         | _ -> failure_output t operation request_id "Unexpected journal response.")
      | V2_page_outcome lookup ->
        (match lookup, operation with
+        | ( V2_present_page { page; revision }
+          , Detail_page { generation; root; limit; after } ) ->
+          remember_page_revision t page.uuid revision;
+          if page.recycled
+          then failure_output t operation request_id "The block page is unavailable."
+          else (
+            Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
+            detail_children t ~generation ~page ~root ~limit ~after)
         | V2_present_page { page; revision }, Capture_page command ->
           remember_page_revision t page.uuid revision;
           (match page_of_graph_page page with
@@ -1443,6 +1587,17 @@ let receive t (protocol_response : Protocol.response) =
            | Some page ->
              remember_page t page;
              capture_children t command page 0)
+        | V2_missing_page _, Detail_page { generation; root; _ } ->
+          responses
+            [ response
+                (Detail_failed
+                   { request_generation = generation
+                   ; block_id = Graph.Uuid.to_string root.block.uuid
+                   ; missing = true
+                   ; stale_cursor = false
+                   ; failure = Projection_failure "This block's page is unavailable."
+                   })
+            ]
         | V2_missing_page { uuid; revision }, Capture_page command ->
           remember_page_revision t uuid revision;
           let journal_day = Journal_time.local_day command.creation_time in
@@ -1461,24 +1616,97 @@ let receive t (protocol_response : Protocol.response) =
         | _ -> failure_output t operation request_id "Unexpected page response.")
      | V2_block_outcome lookup ->
        (match lookup, operation with
-        | V2_present_block { value; revision }, Detail_block { generation; limit; _ } ->
+        | ( V2_present_block { value; revision }
+          , Detail_block { generation; limit; after; _ } ) ->
           remember_block_revision t value.block.uuid revision;
-          (match page_by_uuid t value.block.page with
-           | None -> reject "The block page is not retained."
-           | Some page ->
-             let root = Projection.{ block = value.block; revision } in
-             let interest = { page; root; limit } in
-             Hashtbl.replace
-               t.children_interests
-               (Graph.Uuid.to_string value.block.uuid)
-               interest;
+          let root = Projection.{ block = value.block; revision } in
+          (match
+             Hashtbl.find_opt t.graph_pages (Graph.Uuid.to_string value.block.page)
+           with
+           | Some page -> detail_children t ~generation ~page ~root ~limit ~after
+           | None ->
              requests
                [ read
                    t
-                   (Detail_children { generation; page; root })
-                   (Protocol.V2_get_children
-                      { parent = value.block.uuid; limit; cursor = None; revision = None })
+                   (Detail_page { generation; root; limit; after })
+                   (Protocol.V2_get_page { page = value.block.page; revision = None })
                ])
+        | V2_missing_block _, Detail_block { generation; block_id; _ } ->
+          responses
+            [ response
+                (Detail_failed
+                   { request_generation = generation
+                   ; block_id
+                   ; missing = true
+                   ; stale_cursor = false
+                   ; failure = Projection_failure "This block is unavailable."
+                   })
+            ]
+        | V2_present_block { value; revision }, Child_read (command, page) ->
+          remember_block_revision t value.block.uuid revision;
+          let child = Projection.{ block = value.block; revision } in
+          if
+            command.task_state = Journal_model.No_status
+            || value.task_status = Some Protocol.V2_todo
+          then read_child_parent t command page child
+          else
+            requests
+              [ mutate
+                  t
+                  (Child_status (command, page))
+                  (Protocol.V2_set_task_status
+                     { mutation_id = request_uuid t
+                     ; block = value.block.uuid
+                     ; status = Protocol.V2_todo
+                     ; preconditions =
+                         preconditions ~blocks:[ value.block.uuid, revision ] ()
+                     })
+              ]
+        | V2_present_block { value; revision }, Child_parent (command, page, child) ->
+          remember_block_revision t value.block.uuid revision;
+          (match projection_time_context t with
+           | Error message -> reject message
+           | Ok time_context ->
+             let old_count =
+               Hashtbl.find_opt t.projected_blocks command.parent_block_id
+               |> Option.map Journal_model.child_count
+               |> Option.value ~default:0
+             in
+             (match
+                ( Projection.block_on_page
+                    ~page
+                    ~revision
+                    ~child_count:(old_count + 1)
+                    ~time_context
+                    value.block
+                , Projection.block_on_page
+                    ~page
+                    ~revision:child.revision
+                    ~child_count:0
+                    ~time_context
+                    child.block )
+              with
+              | Ok parent, Ok child ->
+                Hashtbl.replace t.projected_blocks command.parent_block_id parent;
+                let completion =
+                  response (Child_created { child; parent; timeline_entry_update = None })
+                in
+                let refresh =
+                  match page_by_uuid t page.uuid with
+                  | None -> empty
+                  | Some page ->
+                    (match
+                       page_tree
+                         t
+                         (Changed_page_tree page)
+                         page
+                         Protocol.maximum_page_size
+                     with
+                     | Ok request -> requests [ request ]
+                     | Error _ -> empty)
+                in
+                { refresh with responses = completion :: refresh.responses }
+              | Error message, _ | _, Error message -> reject message))
         | V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
@@ -1534,24 +1762,34 @@ let receive t (protocol_response : Protocol.response) =
        (match operation with
         | Detail_children { generation; page; root } ->
           let children = children_result items next_cursor in
-          remember_block_page t page (Graph.Uuid.to_string root.block.uuid);
-          remember_blocks t page children.items;
+          Option.iter
+            (fun journal_page ->
+               remember_block_page t journal_page (Graph.Uuid.to_string root.block.uuid);
+               remember_blocks t journal_page children.items)
+            (page_of_graph_page page);
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match Projection.detail ~page ~time_context ~root children with
+             (match Projection.detail_on_page ~page ~time_context ~root children with
               | Ok detail ->
+                Hashtbl.replace
+                  t.projected_blocks
+                  (Journal_model.id detail.root)
+                  detail.root;
                 responses
                   [ response (Detail_loaded { request_generation = generation; detail }) ]
               | Error message -> reject message))
         | Changed_children { page; root; _ } ->
           let children = children_result items next_cursor in
-          remember_block_page t page (Graph.Uuid.to_string root.block.uuid);
-          remember_blocks t page children.items;
+          Option.iter
+            (fun journal_page ->
+               remember_block_page t journal_page (Graph.Uuid.to_string root.block.uuid);
+               remember_blocks t journal_page children.items)
+            (page_of_graph_page page);
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match Projection.detail ~page ~time_context ~root children with
+             (match Projection.detail_on_page ~page ~time_context ~root children with
               | Ok detail -> responses [ response (Children_reconciled detail) ]
               | Error message -> reject message))
         | Capture_children { command; page; conflict_retries } ->
@@ -1567,8 +1805,14 @@ let receive t (protocol_response : Protocol.response) =
        let result = tree_result items next_cursor in
        (match operation with
         | Feed_page_tree { page; pending; allocated_blocks } ->
-          pending.remaining <- pending.remaining - 1;
-          pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids;
+          let finish_page () =
+            pending.remaining <- pending.remaining - 1;
+            pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids
+          in
+          let fail_page message =
+            finish_page ();
+            feed_failure pending.generation message
+          in
           let roots =
             List.fold_left
               (fun count (item : Projection.tree_member) ->
@@ -1577,41 +1821,86 @@ let receive t (protocol_response : Protocol.response) =
               result.items
           in
           if roots > allocated_blocks
-          then
-            feed_failure
-              pending.generation
-              "The Worker page response exceeded its budget."
+          then fail_page "The Worker page response exceeded its budget."
           else (
             remember_tree_items t page result.items;
             match projection_time_context t with
-            | Error message -> feed_failure pending.generation message
+            | Error message -> fail_page message
             | Ok time_context ->
               (match Projection.timeline_entry_page ~page ~time_context result with
-               | Error message -> feed_failure pending.generation message
+               | Error message -> fail_page message
                | Ok projected ->
-                 remember_entries t page projected.entries;
-                 pending.days
-                 <- { Projection.page
-                    ; entries = projected.entries
-                    ; has_more_entries = Option.is_some projected.continuation
-                    ; continuation = projected.continuation
-                    }
-                    :: pending.days;
-                 { requests = []; responses = feed_progress pending }))
-        | Day_page_tree { page; generation } ->
+                 (match projected.entries, result.continuation with
+                  | [], Some cursor ->
+                    (match page_tree t operation page ~cursor allocated_blocks with
+                     | Ok request -> requests [ request ]
+                     | Error message -> fail_page message)
+                  | _ ->
+                    finish_page ();
+                    remember_entries t page projected.entries;
+                    pending.days
+                    <- { Projection.page
+                       ; entries = projected.entries
+                       ; has_more_entries = Option.is_some projected.continuation
+                       ; continuation = projected.continuation
+                       }
+                       :: pending.days;
+                    { requests = []; responses = feed_progress pending })))
+        | Day_page_tree { page; generation; limit } ->
           remember_tree_items t page result.items;
           (match projection_time_context t with
            | Error message -> day_failure ~day:page.Projection.day generation message
            | Ok time_context ->
              (match Projection.timeline_entry_page ~page ~time_context result with
-              | Ok page ->
-                responses
-                  [ response (Day_blocks_loaded { request_generation = generation; page })
-                  ]
+              | Ok projected ->
+                (match projected.entries, result.continuation with
+                 | [], Some cursor ->
+                   (match page_tree t operation page ~cursor limit with
+                    | Ok request -> requests [ request ]
+                    | Error message ->
+                      day_failure ~day:page.Projection.day generation message)
+                 | _ ->
+                   responses
+                     [ response
+                         (Day_blocks_loaded
+                            { request_generation = generation; page = projected })
+                     ])
               | Error message -> day_failure ~day:page.Projection.day generation message))
-        | Refresh_page_tree { page; refresh } ->
+        | Refresh_page_tree { page; refresh; retained_rev } ->
           remember_tree_items t page result.items;
-          refresh_response t page refresh result
+          let block_id =
+            match refresh with
+            | Captured { block_id }
+            | Updated { block_id }
+            | Update_conflict_refresh { block_id }
+            | Delete_conflict_refresh { block_id } -> block_id
+          in
+          let found =
+            List.exists
+              (fun (member : Projection.tree_member) ->
+                 member.depth = 0
+                 && String.equal (Graph.Uuid.to_string member.block.uuid) block_id)
+              result.items
+          in
+          (match result.continuation with
+           | Some cursor when not found ->
+             let retained_rev = List.rev_append result.items retained_rev in
+             (match
+                page_tree
+                  t
+                  (Refresh_page_tree { page; refresh; retained_rev })
+                  page
+                  ~cursor
+                  Protocol.maximum_page_size
+              with
+              | Ok request -> requests [ request ]
+              | Error message -> reject message)
+           | None | Some _ ->
+             refresh_response
+               t
+               page
+               refresh
+               { result with items = List.rev_append retained_rev result.items })
         | Changed_page_tree page ->
           remember_tree_items t page result.items;
           (match projection_time_context t with
@@ -1625,6 +1914,8 @@ let receive t (protocol_response : Protocol.response) =
         | _ -> failure_output t operation request_id "Unexpected page-tree response.")
      | V2_mutation_committed _ ->
        (match operation with
+        | Child_insert (command, page) | Child_status (command, page) ->
+          read_child t command page
         | Capture_create_page { command; page_uuid } ->
           requests
             [ read
@@ -1667,8 +1958,24 @@ let receive t (protocol_response : Protocol.response) =
           failure_output t operation request_id "Unexpected acknowledgement response."))
 ;;
 
+let receive t (protocol_response : Protocol.response) =
+  let (Protocol.V2_response { request_id; _ }) = protocol_response in
+  let key = Graph.Uuid.to_string request_id in
+  let owned = Hashtbl.mem t.pending key in
+  let background = Hashtbl.mem t.hydration_active key in
+  Hashtbl.remove t.hydration_active key;
+  let output = receive_response t protocol_response in
+  if background
+  then schedule_hydration t output
+  else if owned
+  then { output with requests = output.requests @ drain_hydration t }
+  else output
+;;
+
 let abandon t (request : Protocol.request) =
-  Hashtbl.remove t.pending (Graph.Uuid.to_string request.request_id)
+  let key = Graph.Uuid.to_string request.request_id in
+  Hashtbl.remove t.pending key;
+  Hashtbl.remove t.hydration_active key
 ;;
 
 let reconcile_push t ~request_generation push =

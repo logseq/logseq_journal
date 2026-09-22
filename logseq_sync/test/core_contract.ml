@@ -2283,7 +2283,9 @@ let local_deletion_orders_cleanup encrypted () =
   check_no_work
     deleting.next
     [ Core.Graph_detached (stale_scope, Ok ())
-    ; Core.Mirror_deleted ({ graph_id; scope = Core.effect_scope_of_graph scope }, Ok ())
+    ; Core.Mirror_deleted
+        ( { account = scope.account; graph_id; scope = Core.effect_scope_of_graph scope }
+        , Ok () )
     ];
   let closed = Core.step deleting.next (Core.Graph_detached (scope, Ok ())) in
   check_deletion_stage Deleting_mirror closed.next;
@@ -3208,8 +3210,126 @@ let sync_recovery_reproductions =
   ]
 ;;
 
+let rejected_submission_feedback () =
+  let core, connection = submitted_core () in
+  let rejection : Protocol.rejection =
+    { reason = Db_transact_failed
+    ; t = Some 0
+    ; checksum = None
+    ; success_tx_ids = []
+    ; failed_tx_id = Some (List.hd mutation_ids)
+    ; missing_block_uuids = []
+    ; error_detail = Some "transaction validation failed"
+    ; data = None
+    }
+  in
+  let rejected =
+    Core.step
+      core
+      (Core.Websocket_message (connection, Protocol.Server.Tx_reject rejection))
+  in
+  let message = (Core.state rejected.next).snapshot.last_error in
+  Alcotest.(check bool) "definitive rejection is visible" true (Option.is_some message);
+  Alcotest.(check bool)
+    "rejection publishes feedback"
+    true
+    (List.exists
+       (function
+         | Core.Publish (Core.State_changed state) -> state.snapshot.last_error = message
+         | _ -> false)
+       rejected.effects);
+  Alcotest.(check bool)
+    "rejection does not turn a usable graph into startup failure"
+    true
+    ((Core.state rejected.next).snapshot.startup.failure = None);
+  let request = recovery_request rejected.effects in
+  let submissions =
+    List.map
+      (fun mutation_id ->
+         { Overlay.mutation_id
+         ; fingerprint =
+             Overlay.Mutation_fingerprint.of_string
+               ("mutation-fingerprint:v1:"
+                ^ Logseq_db_types.Graph_types.Uuid.to_string mutation_id)
+             |> Result.get_ok
+         ; state = Overlay.Blocked
+         ; dependency_eligible = false
+         ; attempt_count = 1
+         ; plaintext_bytes = 16
+         ; protected_bytes = Some 16
+         })
+      mutation_ids
+  in
+  let sync =
+    Overlay.sync_view
+      ~token:(Overlay.sync_token_of_string "sync-token:v1:feedback" |> Result.get_ok)
+      ~checkpoint:(recovery_cursor 0)
+      ~submissions
+  in
+  let committed = Core.step rejected.next (recovery_commit request sync None) in
+  let pulled =
+    Core.step
+      committed.next
+      (Core.Websocket_message
+         (connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] }))
+  in
+  Alcotest.(check bool)
+    "empty catch-up does not hide the rejected write"
+    true
+    (Option.is_some (Core.state pulled.next).snapshot.last_error);
+  require_no_new_submission pulled.effects;
+  let restored, restored_connection = restore_recovery_core sync in
+  let caught_up =
+    Core.step
+      restored
+      (Core.Websocket_message
+         ( restored_connection
+         , Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] } ))
+  in
+  Alcotest.(check bool)
+    "restored blocked writes retain visible feedback"
+    true
+    (Option.is_some (Core.state caught_up.next).snapshot.last_error);
+  require_no_new_submission caught_up.effects
+;;
+
+let stale_rejection_is_not_a_failed_save_notice () =
+  let core, connection = submitted_core () in
+  let rejection : Protocol.rejection =
+    { reason = Stale
+    ; t = Some 1
+    ; checksum = None
+    ; success_tx_ids = []
+    ; failed_tx_id = None
+    ; missing_block_uuids = []
+    ; error_detail = None
+    ; data = None
+    }
+  in
+  let transition =
+    Core.step
+      core
+      (Core.Websocket_message (connection, Protocol.Server.Tx_reject rejection))
+  in
+  Alcotest.(check (option string))
+    "stale catch-up is recoverable"
+    None
+    (Core.state transition.next).snapshot.last_error;
+  Alcotest.(check bool)
+    "stale transition remains delegated"
+    true
+    (match rejection_transition transition.effects with
+     | Overlay.Stale _ -> true
+     | _ -> false)
+;;
+
 let scenarios =
-  [ Alcotest.test_case
+  [ Alcotest.test_case "rejected submission feedback" `Quick rejected_submission_feedback
+  ; Alcotest.test_case
+      "stale rejection remains recoverable"
+      `Quick
+      stale_rejection_is_not_a_failed_save_notice
+  ; Alcotest.test_case
       "pure reducer canonical overlay happy path"
       `Quick
       canonical_overlay_happy_path

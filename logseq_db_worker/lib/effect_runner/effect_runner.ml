@@ -1,3 +1,4 @@
+module Upload = Logseq_db_worker_pure_reducer.Asset_upload
 module Core = Logseq_db_worker_pure_reducer.Core
 module Database = Logseq_overlay_db.Database
 module Overlay = Logseq_overlay_db.Types
@@ -299,10 +300,41 @@ let shutdown_id_token_cache cache =
       clear_id_token_cache cache "ID token cache is stopped."))
 ;;
 
-type runtime = { fork : sw:Eio.Switch.t -> (unit -> unit) -> unit }
+type runtime =
+  { fork : sw:Eio.Switch.t -> (unit -> unit) -> unit
+  ; sleep : float -> unit
+  }
 
 type sync_runner =
-  { submit : Sync.runner_effect -> unit
+  { stage_asset :
+      scope:Sync.graph_scope
+      -> operation:Graph.Uuid.t
+      -> file_type:string
+      -> source_file:string
+      -> (string * string * int64, string) result
+  ; put_upload :
+      context:Sync.asset_context
+      -> Logseq_db_types.Asset_upload_intent.t
+      -> current:(unit -> bool)
+      -> (unit, Upload.failure) result
+  ; prune_staging :
+      scope:Sync.graph_scope
+      -> keep:(Graph.Uuid.t -> (bool, string) result)
+      -> (int, string) result
+  ; release_staging : scope:Sync.graph_scope -> file:string -> (unit, string) result
+  ; submit_asset :
+      context:Sync.asset_context
+      -> current:(Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool)
+      -> post:(Logseq_sync_pure_reducer.Asset_transfer.event -> unit)
+      -> Logseq_sync_pure_reducer.Asset_transfer.instruction
+      -> unit
+  ; delete_assets : Sync.mirror_deletion -> (unit, string) result
+  ; close_assets : Sync.graph_scope -> unit
+  ; retain_staged_file : scope:Sync.graph_scope -> file:string -> (string * string) option
+  ; retain_asset_file :
+      scope:Sync.graph_scope -> handle:string -> (string * string) option
+  ; release_asset_file : scope:Sync.graph_scope -> handle:string -> unit
+  ; submit : Sync.runner_effect -> unit
   ; shutdown : unit -> unit
   ; decrypt_protected_value : Sync.graph_key_handle -> string -> (string, string) result
   ; encrypt_protected_values :
@@ -347,6 +379,12 @@ type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
   ; post : Core.event -> unit
+  ; upload_operations : (Upload.ticket, unit Eio.Promise.u) Hashtbl.t
+  ; upload_staging_lock : Eio.Mutex.t
+  ; mutable staging_reconciled : Sync.graph_scope option
+  ; recovery_current : Core.upload_recovery_ticket -> bool
+  ; upload_current : Upload.ticket -> bool
+  ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
   ; waiters : (int64, waiter) Hashtbl.t
@@ -356,28 +394,58 @@ type t =
   ; mutable stopped : bool
   }
 
-let runtime ~fork = Ok { fork }
+let runtime ~fork ~sleep = Ok { fork; sleep }
 
 let sync_runner
       ?(decrypt_protected_value = fun _ _ -> Error "sync decryption is unavailable")
       ?(encrypt_protected_values = fun _ _ -> Error "sync encryption is unavailable")
+      ~stage_asset
+      ~put_upload
+      ~prune_staging
+      ~release_staging
+      ~submit_asset
+      ~delete_assets
+      ~close_assets
+      ~retain_staged_file
+      ~retain_asset_file
+      ~release_asset_file
       ~submit
       ~shutdown
       ()
   =
-  { submit; shutdown; decrypt_protected_value; encrypt_protected_values }
+  { stage_asset
+  ; put_upload
+  ; release_staging
+  ; prune_staging
+  ; submit
+  ; shutdown
+  ; decrypt_protected_value
+  ; encrypt_protected_values
+  ; submit_asset
+  ; delete_assets
+  ; close_assets
+  ; retain_staged_file
+  ; retain_asset_file
+  ; release_asset_file
+  }
 ;;
 
 let dependencies ~runtime ~config ~overlay ~sync_runner ~publish =
   Ok { runtime; config; overlay; sync_runner; publish }
 ;;
 
-let create ~sw dependencies ~post =
+let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_current =
   ignore dependencies.sync_runner.encrypt_protected_values;
   Ok
     { sw
     ; dependencies
     ; post
+    ; asset_current
+    ; upload_current
+    ; recovery_current
+    ; upload_operations = Hashtbl.create 32
+    ; upload_staging_lock = Eio.Mutex.create ()
+    ; staging_reconciled = None
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
     ; waiters = Hashtbl.create 32
@@ -386,6 +454,58 @@ let create ~sw dependencies ~post =
     ; next_database_id = 0L
     ; stopped = false
     }
+;;
+
+let with_upload_store t action =
+  let root = t.dependencies.config.application_support_directory in
+  let path = Filename.concat root "asset-upload-intents.sqlite" in
+  try
+    let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+    Unix.close fd;
+    let db = Sqlite3.db_open path in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close db))
+      (fun () ->
+         Unix.chmod path 0o600;
+         Result.bind
+           (Logseq_db_storage.Asset_upload_store.initialize_database db)
+           (fun () -> action db))
+    |> Result.map (fun value ->
+      let fd = Unix.openfile root [ Unix.O_RDONLY ] 0 in
+      Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd);
+      value)
+  with
+  | exn -> Error (Printexc.to_string exn)
+;;
+
+let reconcile_staging t (scope : Sync.graph_scope) ~current =
+  if (not (current ())) || t.stopped
+  then Error "Stale staging recovery"
+  else if t.staging_reconciled = Some scope
+  then Ok ()
+  else
+    with_upload_store t (fun db ->
+      t.dependencies.sync_runner.prune_staging ~scope ~keep:(fun operation ->
+        if (not (current ())) || t.stopped
+        then Error "Stale staging recovery"
+        else
+          Result.bind (Logseq_db_storage.Asset_upload_store.read db ~operation) (function
+            | None -> Ok false
+            | Some intent
+              when intent.origin = Uri.to_string scope.account.managed_sync_origin
+                   && intent.account = scope.account.user_id
+                   && intent.graph = scope.graph_id
+                   && intent.staged_file
+                      = Graph.Uuid.to_string operation ^ "." ^ intent.version.file_type ->
+              Ok true
+            | Some _ -> Error "Staging checkpoint scope mismatch")))
+    |> Result.map (fun _ -> t.staging_reconciled <- Some scope)
+;;
+
+let save_upload t intent expected =
+  with_upload_store t (fun db ->
+    Logseq_db_storage.Asset_upload_store.save db ~expected intent)
+  |> Result.map_error (fun message -> Upload.Persistence_failed message)
 ;;
 
 let worker_error ~code message =
@@ -567,12 +687,16 @@ let rec block_tree (value : Protocol.v2_block_tree) : Overlay.block_tree =
 ;;
 
 let local_mutation = function
+  | Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
+    ->
+    Ok (preconditions, Overlay.Set_asset_reference { mutation_id; block; previous; asset })
   | Protocol.V2_save_block { mutation_id; block; title; preconditions } ->
     Ok (preconditions, Overlay.Save_block { mutation_id; block; title })
   | V2_insert_blocks { mutation_id; parent; roots = [ root ]; preconditions } ->
     Ok
       ( preconditions
-      , Overlay.Insert_blocks { mutation_id; parent; tree = block_tree root } )
+      , Overlay.Insert_blocks
+          { mutation_id; parent; tree = block_tree root; asset = None } )
   | V2_insert_blocks _ -> Error "insertBlocks requires exactly one root"
   | V2_delete_blocks { mutation_id; root; preconditions } ->
     Ok (preconditions, Overlay.Delete_blocks { mutation_id; root })
@@ -589,6 +713,8 @@ let local_mutation = function
     Ok (preconditions, Overlay.Clear_task_status { mutation_id; block })
   | V2_graph_info
   | V2_inspect_admission
+  | V2_get_asset_descriptors _
+  | V2_list_assets _
   | V2_list_favorites _
   | V2_list_journals _
   | V2_get_page _
@@ -744,6 +870,36 @@ let read_snapshot database request command =
                    ; items
                    ; next_cursor = result.next_cursor
                    }))
+         | V2_get_asset_descriptors { assets } ->
+           (match Database.get_asset_descriptors snapshot assets with
+            | Error error -> read_failure request error
+            | Ok items ->
+              let version = Database.snapshot_version snapshot in
+              response
+                request
+                (Protocol.V2_assets_outcome
+                   { items
+                   ; next_cursor = None
+                   ; generation = Overlay.Generation.to_string version.generation
+                   ; projection_revision =
+                       Overlay.Projection_revision.to_string version.projection_revision
+                   }))
+         | V2_list_assets { recursive; roots; limit; cursor } ->
+           (match
+              Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor
+            with
+            | Error error -> read_failure request error
+            | Ok result ->
+              let version = Database.snapshot_version snapshot in
+              response
+                request
+                (Protocol.V2_assets_outcome
+                   { items = result.assets
+                   ; next_cursor = result.next_cursor
+                   ; generation = Overlay.Generation.to_string version.generation
+                   ; projection_revision =
+                       Overlay.Projection_revision.to_string version.projection_revision
+                   }))
          | V2_list_journals { from_day; through_day; limit; cursor; _ } ->
            (match
               Database.get_journals snapshot ~from_day ~through_day ~limit ~cursor
@@ -851,6 +1007,7 @@ let read_snapshot database request command =
             | Error error -> read_failure request error
             | Ok (Children_result _) ->
               failure request Invalid_request "The page-tree query returned children.")
+         | V2_set_asset_reference _
          | V2_save_block _
          | V2_insert_blocks _
          | V2_delete_blocks _
@@ -950,7 +1107,8 @@ let execute_database session request =
   | V2_ack_changes { generation; through } ->
     acknowledge_changes session request generation through
   | V2_inspect_admission -> inspect_admission session.database request
-  | ( V2_save_block _
+  | ( V2_set_asset_reference _
+    | V2_save_block _
     | V2_insert_blocks _
     | V2_delete_blocks _
     | V2_create_journal_page _
@@ -1128,7 +1286,20 @@ let handle_sync_worker_effect t = function
     (match Hashtbl.find_opt t.inspections key with
      | None -> Error (effect_error "The mirror deletion inspection is unavailable.")
      | Some inspection ->
-       (match Database.delete_mirror inspection with
+       (match
+          Result.bind
+            (Result.bind
+               (with_upload_store t (fun db ->
+                  Logseq_db_storage.Asset_upload_store.delete_graph
+                    db
+                    ~origin:(Uri.to_string request.account.managed_sync_origin)
+                    ~account:request.account.user_id
+                    ~graph:request.graph_id))
+               (fun () -> t.dependencies.sync_runner.delete_assets request)
+             |> Result.map_error (fun _ -> ()))
+            (fun () ->
+               Database.delete_mirror inspection |> Result.map_error (fun _ -> ()))
+        with
         | Error _ -> Error (effect_error "The overlay mirror could not be deleted.")
         | Ok _ ->
           Hashtbl.remove t.inspections key;
@@ -1329,10 +1500,174 @@ let complete t (Core.Request (ticket, request)) =
     t.post (Core.Runner_completed (Core.Sync_worker_effect_completed (ticket, result)))
 ;;
 
+let run_upload t (context : Sync.asset_context) instruction =
+  let current ticket = (not t.stopped) && t.upload_current ticket in
+  let database ticket f =
+    if not (current ticket)
+    then Error Upload.Invalid_content
+    else (
+      match attached_session t ticket.Upload.scope with
+      | None -> Error Upload.Invalid_content
+      | Some session -> f session.database)
+  in
+  let finish ticket result success =
+    if current ticket
+    then
+      t.post
+        (Core.Upload_completed
+           ( ticket
+           , match result with
+             | Ok () -> success
+             | Error error -> Upload.Failed error ))
+  in
+  let changed () = t.post (Core.Sync_event Sync.Local_outbox_changed) in
+  match instruction with
+  | Upload.Cancel_operation _ -> ()
+  | Release_staging intent ->
+    (match
+       t.dependencies.sync_runner.release_staging
+         ~scope:context.scope
+         ~file:intent.staged_file
+     with
+     | Ok () -> ()
+     | Error message -> t.dependencies.publish (Core.Diagnostic message))
+  | Persist (ticket, intent, expected) ->
+    if current ticket then finish ticket (save_upload t intent expected) Upload.Persisted
+  | Inspect (ticket, intent) ->
+    if current ticket
+    then (
+      let result = database ticket (fun db -> Upload_database.inspect db intent) in
+      if current ticket
+      then
+        t.post
+          (Core.Upload_completed
+             ( ticket
+             , match result with
+               | Ok observation -> Upload.Inspected observation
+               | Error error -> Upload.Failed error )))
+  | Apply_local (ticket, intent) ->
+    if current ticket
+    then (
+      let result = database ticket (fun db -> Upload_database.apply_local db intent) in
+      (match result with
+       | Ok () -> changed ()
+       | Error _ -> ());
+      finish ticket result Upload.Local_applied)
+  | Apply_metadata (ticket, intent) ->
+    if current ticket
+    then (
+      let result = database ticket (fun db -> Upload_database.apply_metadata db intent) in
+      (match result with
+       | Ok () -> changed ()
+       | Error _ -> ());
+      finish ticket result Upload.Metadata_applied)
+  | Put (ticket, intent) ->
+    if current ticket
+    then
+      finish
+        ticket
+        (t.dependencies.sync_runner.put_upload ~context intent ~current:(fun () ->
+           current ticket))
+        Upload.Put_succeeded
+  | Await_publication (ticket, intent) ->
+    let rec await () =
+      if current ticket
+      then (
+        match database ticket (fun db -> Upload_database.inspect db intent) with
+        | Ok Upload.Publication_acknowledged ->
+          finish ticket (Ok ()) Upload.Publication_acked
+        | Ok (Local_present | Metadata_present) ->
+          t.dependencies.runtime.sleep 0.5;
+          await ()
+        | Ok (Absent | Entity_cancelled) ->
+          finish ticket (Error Upload.Invalid_content) Upload.Publication_acked
+        | Error error -> finish ticket (Error error) Upload.Publication_acked)
+    in
+    await ()
+;;
+
+let submit_upload t context instruction =
+  match instruction with
+  | Upload.Cancel_operation ticket ->
+    Option.iter
+      (fun resolver -> ignore (Eio.Promise.try_resolve resolver () : bool))
+      (Hashtbl.find_opt t.upload_operations ticket)
+  | Release_staging _ -> run_upload t context instruction
+  | Persist (ticket, _, _)
+  | Inspect (ticket, _)
+  | Apply_local (ticket, _)
+  | Put (ticket, _)
+  | Apply_metadata (ticket, _)
+  | Await_publication (ticket, _) ->
+    if t.upload_current ticket && not (Hashtbl.mem t.upload_operations ticket)
+    then (
+      let cancelled, resolve = Eio.Promise.create () in
+      Hashtbl.add t.upload_operations ticket resolve;
+      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+        Fun.protect
+          ~finally:(fun () -> Hashtbl.remove t.upload_operations ticket)
+          (fun () ->
+             Eio.Fiber.first
+               (fun () -> run_upload t context instruction)
+               (fun () -> Eio.Promise.await cancelled))))
+;;
+
 let submit t = function
+  | Core.Read_uploads ticket ->
+    if (not t.stopped) && t.recovery_current ticket
+    then
+      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+        if (not t.stopped) && t.recovery_current ticket
+        then (
+          let result =
+            Eio.Mutex.use_rw ~protect:true t.upload_staging_lock (fun () ->
+              Result.bind
+                (reconcile_staging t ticket.scope ~current:(fun () ->
+                   t.recovery_current ticket))
+                (fun () ->
+                   with_upload_store t (fun db ->
+                     Logseq_db_storage.Asset_upload_store.list
+                       db
+                       ~origin:(Uri.to_string ticket.scope.account.managed_sync_origin)
+                       ~account:ticket.scope.account.user_id
+                       ~graph:ticket.scope.graph_id
+                       ~after:ticket.after
+                       ~limit:ticket.limit)))
+          in
+          if (not t.stopped) && t.recovery_current ticket
+          then t.post (Core.Uploads_loaded (ticket, result))))
+  | Core.Run_upload (context, instruction) ->
+    if not t.stopped then submit_upload t context instruction
+  | Core.Run_asset (context, instruction) ->
+    if not t.stopped
+    then
+      t.dependencies.sync_runner.submit_asset
+        ~context
+        ~current:(fun ticket -> (not t.stopped) && t.asset_current ticket)
+        ~post:(fun event ->
+          if not t.stopped then t.post (Core.Asset_completed (context.scope, event)))
+        instruction
+  | Close_asset_scope scope -> t.dependencies.sync_runner.close_assets scope
   | Core.Run_worker request ->
     if not t.stopped
     then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
+  | Run_sync (Sync.Request (ticket, Sync.Delete_account_secrets account) as sync_effect)
+    ->
+    if not t.stopped
+    then (
+      match
+        with_upload_store t (fun db ->
+          Logseq_db_storage.Asset_upload_store.delete_account
+            db
+            ~origin:(Uri.to_string account.managed_sync_origin)
+            ~account:account.user_id)
+      with
+      | Ok () -> t.dependencies.sync_runner.submit sync_effect
+      | Error message ->
+        t.post
+          (Core.Sync_event
+             (Sync.Runner_completed
+                (Sync.Completion (ticket, Error (Sync.Effect_failed message))))))
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect
   | Publish output -> if not t.stopped then t.dependencies.publish output
@@ -1364,6 +1699,9 @@ let shutdown t =
   if not t.stopped
   then (
     t.stopped <- true;
+    Hashtbl.iter
+      (fun _ resolve -> ignore (Eio.Promise.try_resolve resolve () : bool))
+      t.upload_operations;
     ignore (close_attached t);
     Hashtbl.iter (fun id _ -> ignore (close_database_by_id t id)) t.databases;
     t.dependencies.sync_runner.shutdown ();
@@ -1374,4 +1712,114 @@ let shutdown t =
            Eio.Promise.resolve waiter.resolve response)
         t.waiters;
       Hashtbl.clear t.waiters))
+;;
+
+let retain_asset_file t ~scope ~handle =
+  if t.stopped then None else t.dependencies.sync_runner.retain_asset_file ~scope ~handle
+;;
+
+let release_asset_file t ~scope ~handle =
+  t.dependencies.sync_runner.release_asset_file ~scope ~handle
+;;
+
+let prepare_import_unlocked
+      t
+      ~(context : Sync.asset_context)
+      (request : Logseq_db_types.Asset_import.t)
+      ~current
+  =
+  let module I = Logseq_db_types.Asset_upload_intent in
+  let module A = Logseq_db_types.Asset_descriptor in
+  let ( let* ) = Result.bind in
+  let prepare version size staged_file =
+    I.prepare
+      ~replace_reference:request.replace_reference
+      ~operation_id:request.operation
+      ~origin:(Uri.to_string context.scope.account.managed_sync_origin)
+      ~account:context.scope.account.user_id
+      ~graph:context.scope.graph_id
+      ~asset:request.asset
+      ~target:request.target
+      ~local_mutation:request.local_mutation
+      ~metadata_mutation:request.metadata_mutation
+      ~title:request.title
+      ~version
+      ~size
+      ~staged_file
+  in
+  let* version = A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type in
+  let* _ = prepare version 0L "validation.bin" in
+  if (not (current ())) || t.stopped
+  then Error "The selected graph is no longer active"
+  else
+    let* () = reconcile_staging t context.scope ~current in
+    let* existing =
+      with_upload_store t (fun db ->
+        Logseq_db_storage.Asset_upload_store.read db ~operation:request.operation)
+    in
+    match existing with
+    | Some intent
+      when intent.origin = Uri.to_string context.scope.account.managed_sync_origin
+           && intent.account = context.scope.account.user_id
+           && intent.graph = context.scope.graph_id
+           && intent.asset = request.asset
+           && intent.target = request.target
+           && intent.title = request.title
+           && intent.version.file_type = request.file_type
+           && intent.local_mutation = request.local_mutation
+           && intent.replace_reference = request.replace_reference
+           && intent.metadata_mutation = request.metadata_mutation -> Ok intent
+    | Some _ -> Error "This import identity is already in use"
+    | None ->
+      let* file, checksum, size =
+        t.dependencies.sync_runner.stage_asset
+          ~scope:context.scope
+          ~operation:request.operation
+          ~file_type:request.file_type
+          ~source_file:request.source_file
+      in
+      let persistence_attempted = ref false in
+      let result =
+        let* version = A.version ~checksum ~file_type:request.file_type in
+        let* intent = prepare version size file in
+        if (not (current ())) || t.stopped
+        then Error "The selected graph is no longer active"
+        else (
+          persistence_attempted := true;
+          let* () =
+            with_upload_store t (fun db ->
+              Logseq_db_storage.Asset_upload_store.save db ~expected:None intent)
+          in
+          Ok intent)
+      in
+      (match result with
+       | Ok _ -> ()
+       | Error _ when not !persistence_attempted ->
+         ignore (t.dependencies.sync_runner.release_staging ~scope:context.scope ~file)
+       | Error _ -> ());
+      result
+;;
+
+let prepare_import t ~context request ~current =
+  Eio.Mutex.use_rw ~protect:true t.upload_staging_lock (fun () ->
+    let result = prepare_import_unlocked t ~context request ~current in
+    if Result.is_error result then t.staging_reconciled <- None;
+    result)
+;;
+
+let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
+  if t.stopped
+  then None
+  else (
+    match
+      with_upload_store t (fun db ->
+        Logseq_db_storage.Asset_upload_store.read db ~operation)
+    with
+    | Ok (Some intent)
+      when intent.origin = Uri.to_string scope.account.managed_sync_origin
+           && intent.account = scope.account.user_id
+           && intent.graph = scope.graph_id
+           && intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled ->
+      t.dependencies.sync_runner.retain_staged_file ~scope ~file:intent.staged_file
+    | Ok _ | Error _ -> None)
 ;;

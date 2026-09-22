@@ -159,51 +159,6 @@ let decode_authenticated_user bytes =
       | _ -> Error "authenticated-user response fields are invalid"))
 ;;
 
-let typography_preset_preference_key = "typographyPreset"
-
-let typography_preset_preference_request =
-  Yojson.Safe.to_string (`Assoc [ "key", `String typography_preset_preference_key ])
-  |> Bytes.of_string
-  |> encode_envelope 16
-  |> Result.get_ok
-;;
-
-let decode_typography_preset_preference bytes =
-  Result.bind (decode_envelope [ 17 ] bytes) (fun payload ->
-    decode_json_object "typography-preset preference response" payload (function
-      | [ ("key", `String key); ("value", `Null) ]
-      | [ ("value", `Null); ("key", `String key) ]
-        when String.equal key typography_preset_preference_key -> Ok None
-      | [ ("key", `String key); ("value", value) ]
-      | [ ("value", value); ("key", `String key) ]
-        when String.equal key typography_preset_preference_key ->
-        Result.map Option.some (bounded_string 64 value)
-      | _ -> Error "typography-preset preference response fields are invalid"))
-;;
-
-let set_typography_preset_preference_request value =
-  if
-    not
-      (String.equal value "dense"
-       || String.equal value "balanced"
-       || String.equal value "comfortable")
-  then invalid_arg "typography preset preference is invalid";
-  Yojson.Safe.to_string
-    (`Assoc [ "key", `String typography_preset_preference_key; "value", `String value ])
-  |> Bytes.of_string
-  |> encode_envelope 18
-  |> Result.get_ok
-;;
-
-let decode_set_typography_preset_preference bytes =
-  Result.bind (decode_envelope [ 19 ] bytes) (fun payload ->
-    decode_json_object "set typography-preset preference response" payload (function
-      | [ ("key", `String key); ("stored", `Bool true) ]
-      | [ ("stored", `Bool true); ("key", `String key) ]
-        when String.equal key typography_preset_preference_key -> Ok ()
-      | _ -> Error "set typography-preset preference response fields are invalid"))
-;;
-
 let id_token_request (challenge : Graph_service.token_request) =
   Yojson.Safe.to_string
     (`Assoc [ "challengeId", `String (Graph_service.token_request_id challenge) ])

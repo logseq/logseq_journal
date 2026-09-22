@@ -68,14 +68,45 @@ type runner_completion =
   | Close_database_completed of ticket * (unit, effect_error) result
   | Sync_worker_effect_completed of ticket * (sync_worker_result, effect_error) result
 
+type asset_notice =
+  | Asset_availability of
+      { consumer : string
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      }
+  | Asset_demand_accepted of string
+  | Asset_backpressure of string
+  | Asset_capacity_available
+  | Upload_status of
+      { operation : Logseq_db_types.Graph_types.Uuid.t
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; target : Logseq_db_types.Graph_types.Uuid.t
+      ; title : string
+      ; status : Asset_upload.status
+      }
+
 type output =
+  | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
   | Reply of request_id * Logseq_db_worker_contract.Protocol.response
   | Graph_push of Logseq_db_worker_contract.Protocol.push
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
   | Diagnostic of string
 
+type upload_recovery_ticket = private
+  { scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; after : Logseq_db_types.Graph_types.Uuid.t option
+  ; limit : int
+  ; serial : int
+  }
+
 type instruction =
+  | Read_uploads of upload_recovery_ticket
+  | Run_upload of Logseq_sync_pure_reducer.Core.asset_context * Asset_upload.instruction
+  | Run_asset of
+      Logseq_sync_pure_reducer.Core.asset_context
+      * Logseq_sync_pure_reducer.Asset_transfer.instruction
+  | Close_asset_scope of Logseq_sync_pure_reducer.Core.graph_scope
   | Run_worker of runner_effect
   | Run_sync of Logseq_sync_pure_reducer.Core.runner_effect
   | Publish of output
@@ -108,6 +139,21 @@ val initial : config -> (state, create_error) result
 val view : state -> view
 
 type event =
+  | Upload_requested of
+      { graph_generation : int
+      ; operation : Logseq_db_types.Graph_types.Uuid.t
+      ; event : Asset_upload.event
+      }
+  | Uploads_loaded of
+      upload_recovery_ticket * (Logseq_db_types.Asset_upload_intent.t list, string) result
+  | Upload_completed of Asset_upload.ticket * Asset_upload.completion
+  | Asset_requested of
+      { graph_generation : int
+      ; event : Logseq_sync_pure_reducer.Asset_transfer.event
+      }
+  | Asset_completed of
+      Logseq_sync_pure_reducer.Core.graph_scope
+      * Logseq_sync_pure_reducer.Asset_transfer.event
   | Start
   | Graph_request of
       { id : request_id
@@ -130,3 +176,13 @@ val complete_execute
   :  runner_effect
   -> (Logseq_db_worker_contract.Protocol.response, effect_error) result
   -> event option
+
+val asset_ticket_current : state -> Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
+val asset_scope_current : state -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+val upload_ticket_current : state -> Asset_upload.ticket -> bool
+val upload_recovery_current : state -> upload_recovery_ticket -> bool
+
+val import_context
+  :  state
+  -> graph_generation:int
+  -> Logseq_sync_pure_reducer.Core.asset_context option

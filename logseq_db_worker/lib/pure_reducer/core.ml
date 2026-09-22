@@ -70,14 +70,45 @@ type runner_completion =
   | Close_database_completed of ticket * (unit, effect_error) result
   | Sync_worker_effect_completed of ticket * (sync_worker_result, effect_error) result
 
+type asset_notice =
+  | Asset_availability of
+      { consumer : string
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      }
+  | Asset_demand_accepted of string
+  | Asset_backpressure of string
+  | Asset_capacity_available
+  | Upload_status of
+      { operation : Logseq_db_types.Graph_types.Uuid.t
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; target : Logseq_db_types.Graph_types.Uuid.t
+      ; title : string
+      ; status : Asset_upload.status
+      }
+
 type output =
+  | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
   | Reply of request_id * Logseq_db_worker_contract.Protocol.response
   | Graph_push of Logseq_db_worker_contract.Protocol.push
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
   | Diagnostic of string
 
+type upload_recovery_ticket =
+  { scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; after : Logseq_db_types.Graph_types.Uuid.t option
+  ; limit : int
+  ; serial : int
+  }
+
 type instruction =
+  | Read_uploads of upload_recovery_ticket
+  | Run_upload of Logseq_sync_pure_reducer.Core.asset_context * Asset_upload.instruction
+  | Run_asset of
+      Logseq_sync_pure_reducer.Core.asset_context
+      * Logseq_sync_pure_reducer.Asset_transfer.instruction
+  | Close_asset_scope of Logseq_sync_pure_reducer.Core.graph_scope
   | Run_worker of runner_effect
   | Run_sync of Logseq_sync_pure_reducer.Core.runner_effect
   | Publish of output
@@ -85,6 +116,11 @@ type instruction =
 module Sync = Logseq_sync_pure_reducer.Core
 
 let instruction_diagnostic = function
+  | Read_uploads _ -> "read-uploads"
+  | Run_upload _ -> "run-upload"
+  | Run_asset _ -> "run-asset"
+  | Close_asset_scope _ -> "close-asset-scope"
+  | Publish (Asset_notice _) -> "publish:asset-notice"
   | Run_worker (Request (_, Execute_request _)) -> "run-worker:Execute_request"
   | Run_worker (Request (_, Close_database _)) -> "run-worker:Close_database"
   | Run_worker (Request (_, Handle_sync_worker_effect _)) ->
@@ -99,10 +135,21 @@ let instruction_diagnostic = function
 
 let equal_instruction left right =
   match left, right with
+  | Read_uploads l, Read_uploads r -> l = r
+  | Run_upload (lc, li), Run_upload (rc, ri) -> lc = rc && li = ri
+  | Run_asset (lc, li), Run_asset (rc, ri) -> lc = rc && li = ri
+  | Close_asset_scope left, Close_asset_scope right -> left = right
   | Run_sync left, Run_sync right -> Sync.equal_runner_effect left right
   | Run_worker left, Run_worker right -> left = right
   | Publish left, Publish right -> left = right
-  | (Run_worker _ | Run_sync _ | Publish _), _ -> false
+  | ( ( Run_worker _
+      | Run_sync _
+      | Run_asset _
+      | Run_upload _
+      | Read_uploads _
+      | Close_asset_scope _
+      | Publish _ )
+    , _ ) -> false
 ;;
 
 let equal_instructions left right =
@@ -128,6 +175,14 @@ type pending =
 type state =
   { graph : graph_state
   ; sync_core : Sync.t
+  ; assets : (Sync.asset_context * Logseq_sync_pure_reducer.Asset_transfer.t) option
+  ; recovery :
+      (Sync.graph_scope * Logseq_db_types.Graph_types.Uuid.t option * bool) option
+  ; recovery_pending : upload_recovery_ticket option
+  ; recovery_serial : int
+  ; uploads :
+      (Sync.asset_context * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.t) list
+  ; foreground : bool
   ; database : database_handle option
   ; deferred_detach : Sync.graph_scope option
   ; pending : pending list
@@ -144,6 +199,12 @@ let initial config =
   |> Result.map (fun sync_core ->
     { graph = { generation = 0; graph_id = None; phase = Graph_closed; error = None }
     ; sync_core
+    ; assets = None
+    ; recovery = None
+    ; recovery_pending = None
+    ; recovery_serial = 0
+    ; uploads = []
+    ; foreground = true
     ; database = None
     ; deferred_detach = None
     ; pending = []
@@ -171,6 +232,21 @@ let view state =
 let equal_view left right = left = right
 
 type event =
+  | Upload_requested of
+      { graph_generation : int
+      ; operation : Logseq_db_types.Graph_types.Uuid.t
+      ; event : Asset_upload.event
+      }
+  | Uploads_loaded of
+      upload_recovery_ticket * (Logseq_db_types.Asset_upload_intent.t list, string) result
+  | Upload_completed of Asset_upload.ticket * Asset_upload.completion
+  | Asset_requested of
+      { graph_generation : int
+      ; event : Logseq_sync_pure_reducer.Asset_transfer.event
+      }
+  | Asset_completed of
+      Logseq_sync_pure_reducer.Core.graph_scope
+      * Logseq_sync_pure_reducer.Asset_transfer.event
   | Start
   | Graph_request of
       { id : request_id
@@ -299,6 +375,11 @@ let step state event =
   then no_effects state
   else (
     match event with
+    | Uploads_loaded _
+    | Upload_requested _
+    | Upload_completed _
+    | Asset_requested _
+    | Asset_completed _ -> no_effects state
     | Start -> no_effects state
     | Projection_push push ->
       if
@@ -327,7 +408,7 @@ let step state event =
     | Sync_event event -> translate_sync (Sync.step state.sync_core event) state
     | Set_foreground foreground ->
       let lifecycle_generation = Int64.succ state.lifecycle_generation in
-      let state = { state with lifecycle_generation } in
+      let state = { state with lifecycle_generation; foreground } in
       translate_sync
         (Sync.step
            state.sync_core
@@ -453,4 +534,401 @@ let complete_execute runner_effect result =
   | Request (ticket, Execute_request _) ->
     Some (Runner_completed (Execute_request_completed (ticket, result)))
   | Request (_, Close_database _) | Request (_, Handle_sync_worker_effect _) -> None
+;;
+
+module Transfer = Logseq_sync_pure_reducer.Asset_transfer
+
+let asset_scope state =
+  if state.shutdown || state.graph.phase <> Graph_open
+  then None
+  else Sync.asset_context state.sync_core
+;;
+
+let asset_online state =
+  state.foreground
+  &&
+  match (Sync.state state.sync_core).snapshot.sync_phase with
+  | Offline | Paused | Failed -> false
+  | Connecting | Pulling | Submitting | Current -> true
+;;
+
+let asset_unlocked (context : Sync.asset_context) =
+  (not context.encrypted) || Option.is_some context.key
+;;
+
+let asset_instructions (context : Sync.asset_context) instructions =
+  List.map
+    (function
+      | Transfer.Notify { consumer; asset; availability } ->
+        Publish
+          (Asset_notice
+             (context.scope, Asset_availability { consumer; asset; availability }))
+      | Backpressure consumer ->
+        Publish (Asset_notice (context.scope, Asset_backpressure consumer))
+      | Capacity_available ->
+        Publish (Asset_notice (context.scope, Asset_capacity_available))
+      | instruction -> Run_asset (context, instruction))
+    instructions
+;;
+
+let reconcile_assets state =
+  match state.assets, asset_scope state with
+  | None, _ -> state, []
+  | Some (old, transfer), Some context when old.scope = context.scope ->
+    let transfer, network =
+      Transfer.step transfer (Network_changed (asset_online state))
+    in
+    let transfer, unlock =
+      Transfer.step transfer (Unlock_changed (asset_unlocked context))
+    in
+    ( { state with assets = Some (context, transfer) }
+    , asset_instructions context (network @ unlock) )
+  | Some (context, transfer), _ ->
+    let _, instructions = Transfer.step transfer Shutdown in
+    ( { state with assets = None }
+    , asset_instructions context instructions @ [ Close_asset_scope context.scope ] )
+;;
+
+let asset_ticket_current state ticket =
+  match state.assets, asset_scope state with
+  | Some (context, transfer), Some current when context.scope = current.scope ->
+    Transfer.ticket_current transfer ticket
+  | _ -> false
+;;
+
+let asset_scope_current state scope =
+  match state.assets, asset_scope state with
+  | Some (context, _), Some current -> context.scope = scope && current.scope = scope
+  | _ -> false
+;;
+
+let apply_asset state context transfer event =
+  let transfer, instructions = Transfer.step transfer event in
+  let accepted =
+    match event with
+    | Transfer.Replace { consumer; _ }
+      when not
+             (List.exists
+                (function
+                  | Transfer.Backpressure _ -> true
+                  | _ -> false)
+                instructions) ->
+      [ Publish (Asset_notice (context.Sync.scope, Asset_demand_accepted consumer)) ]
+    | _ -> []
+  in
+  { next = { state with assets = Some (context, transfer) }
+  ; effects = asset_instructions context instructions @ accepted
+  }
+;;
+
+let step state event =
+  let transition = step state event in
+  let state, effects = reconcile_assets transition.next in
+  let asset_transition =
+    match event, asset_scope state with
+    | Asset_requested { graph_generation; event }, Some context
+      when graph_generation = context.scope.graph_generation ->
+      let transfer =
+        match state.assets with
+        | Some (_, transfer) -> transfer
+        | None ->
+          Transfer.create
+            (Transfer.config ~active:3 ~foreground_reserved:1 ~pending:128 ~retries:3
+             |> Result.get_ok)
+            ~scope:context.scope
+            ~online:(asset_online state)
+            ~unlocked:(asset_unlocked context)
+      in
+      apply_asset state context transfer event
+    | Asset_completed (scope, event), Some context when context.scope = scope ->
+      (match state.assets with
+       | Some (_, transfer) -> apply_asset state context transfer event
+       | None -> no_effects state)
+    | _ -> no_effects state
+  in
+  { asset_transition with
+    effects = transition.effects @ effects @ asset_transition.effects
+  }
+;;
+
+let upload_ticket_current state (ticket : Asset_upload.ticket) =
+  match asset_scope state with
+  | Some context when context.scope = ticket.scope ->
+    List.exists
+      (fun (_, operation, upload) ->
+         operation = ticket.operation && Asset_upload.ticket_current upload ticket)
+      state.uploads
+  | _ -> false
+;;
+
+let upload_presentation upload =
+  Option.bind (Asset_upload.checkpoint upload) (fun intent ->
+    Option.map
+      (fun status ->
+         ( intent.Logseq_db_types.Asset_upload_intent.operation_id
+         , intent.asset
+         , intent.target
+         , intent.title
+         , status ))
+      (Asset_upload.status upload))
+;;
+
+let upload_notices (context : Sync.asset_context) before after =
+  let previous = upload_presentation before
+  and next = upload_presentation after in
+  match next with
+  | Some (operation, asset, target, title, status) when previous <> next ->
+    [ Publish
+        (Asset_notice
+           (context.scope, Upload_status { operation; asset; target; title; status }))
+    ]
+  | _ -> []
+;;
+
+let step state event =
+  let transition = step state event in
+  let current = asset_scope transition.next in
+  let retained, retired =
+    List.partition
+      (fun (context, _, _) ->
+         match current with
+         | Some active -> context.Sync.scope = active.scope
+         | None -> false)
+      transition.next.uploads
+  in
+  let cancellations =
+    List.concat_map
+      (fun (context, _, upload) ->
+         let _, instructions = Asset_upload.step upload Shutdown in
+         List.map (fun instruction -> Run_upload (context, instruction)) instructions)
+      retired
+  in
+  let cache_closes =
+    retired
+    |> List.map (fun (context, _, _) -> context.Sync.scope)
+    |> List.sort_uniq compare
+    |> List.map (fun scope -> Close_asset_scope scope)
+  in
+  let retained, availability_effects =
+    match current with
+    | None -> retained, []
+    | Some context ->
+      let available = asset_online transition.next && asset_unlocked context in
+      let uploads, instructions =
+        List.fold_left
+          (fun (uploads, effects) (_, operation, upload) ->
+             let previous = upload in
+             let upload, instructions =
+               Asset_upload.step upload (Availability_changed available)
+             in
+             ( (context, operation, upload) :: uploads
+             , effects
+               @ upload_notices context previous upload
+               @ List.map
+                   (fun instruction -> Run_upload (context, instruction))
+                   instructions ))
+          ([], [])
+          retained
+      in
+      List.rev uploads, instructions
+  in
+  let state = { transition.next with uploads = retained } in
+  let apply context operation upload upload_event =
+    let previous = upload in
+    let upload, instructions = Asset_upload.step upload upload_event in
+    let remaining = List.filter (fun (_, id, _) -> id <> operation) state.uploads in
+    let terminal =
+      match Asset_upload.checkpoint upload with
+      | Some { phase = Complete | Cancelled; _ } -> true
+      | _ -> false
+    in
+    let uploads =
+      if terminal then remaining else (context, operation, upload) :: remaining
+    in
+    { next = { state with uploads }
+    ; effects =
+        upload_notices context previous upload
+        @ List.map (fun instruction -> Run_upload (context, instruction)) instructions
+    }
+  in
+  let changed =
+    match event, current with
+    | Upload_requested { graph_generation; operation; event }, Some context
+      when graph_generation = context.scope.graph_generation ->
+      (match List.find_opt (fun (_, id, _) -> id = operation) state.uploads with
+       | Some (_, _, upload) -> apply context operation upload event
+       | None ->
+         (match event with
+          | (Asset_upload.Start intent | Restore intent)
+            when intent.operation_id = operation
+                 && intent.graph = context.scope.graph_id
+                 && intent.account = context.scope.account.user_id
+                 && intent.origin
+                    = Uri.to_string context.scope.account.managed_sync_origin ->
+            if
+              (List.length state.uploads
+               +
+               match state.recovery_pending with
+               | Some ticket -> ticket.limit
+               | None -> 0)
+              >= 32
+            then
+              { next = state
+              ; effects = [ Publish (Diagnostic "Upload queue capacity reached") ]
+              }
+            else
+              apply
+                context
+                operation
+                (Asset_upload.create
+                   ~scope:context.scope
+                   ~available:(asset_online state && asset_unlocked context))
+                event
+          | _ -> no_effects state))
+    | Upload_completed (ticket, completion), Some context
+      when context.scope = ticket.scope ->
+      (match List.find_opt (fun (_, id, _) -> id = ticket.operation) state.uploads with
+       | Some (_, _, upload) ->
+         apply
+           context
+           ticket.operation
+           upload
+           (Asset_upload.Completed (ticket, completion))
+       | None -> no_effects state)
+    | _ -> no_effects state
+  in
+  { changed with
+    effects =
+      transition.effects
+      @ cancellations
+      @ cache_closes
+      @ availability_effects
+      @ changed.effects
+  }
+;;
+
+let upload_recovery_current state ticket =
+  state.recovery_pending = Some ticket
+  &&
+  match asset_scope state with
+  | Some context -> context.scope = ticket.scope
+  | None -> false
+;;
+
+let step state event =
+  let transition = step state event in
+  let state = transition.next in
+  let state =
+    match asset_scope state, state.recovery with
+    | None, _ -> { state with recovery = None; recovery_pending = None }
+    | Some context, Some (scope, _, _) when scope = context.scope -> state
+    | Some context, _ ->
+      { state with recovery = Some (context.scope, None, false); recovery_pending = None }
+  in
+  let state, recovered =
+    match event with
+    | Uploads_loaded (ticket, result) when upload_recovery_current state ticket ->
+      let state = { state with recovery_pending = None } in
+      let valid intents =
+        let rec ordered previous = function
+          | [] -> true
+          | (i : Logseq_db_types.Asset_upload_intent.t) :: rest ->
+            i.origin = Uri.to_string ticket.scope.account.managed_sync_origin
+            && i.account = ticket.scope.account.user_id
+            && i.graph = ticket.scope.graph_id
+            && (match previous with
+                | None -> true
+                | Some previous ->
+                  String.compare
+                    (Logseq_db_types.Graph_types.Uuid.to_string previous)
+                    (Logseq_db_types.Graph_types.Uuid.to_string i.operation_id)
+                  < 0)
+            && ordered (Some i.operation_id) rest
+        in
+        List.length intents <= ticket.limit && ordered ticket.after intents
+      in
+      (match result with
+       | Ok intents when valid intents ->
+         let after =
+           List.fold_left
+             (fun _ i -> Some i.Logseq_db_types.Asset_upload_intent.operation_id)
+             ticket.after
+             intents
+         in
+         let state =
+           { state with
+             recovery = Some (ticket.scope, after, List.length intents < ticket.limit)
+           }
+         in
+         List.fold_left
+           (fun (state, effects) i ->
+              let restored =
+                step
+                  state
+                  (Upload_requested
+                     { graph_generation = ticket.scope.graph_generation
+                     ; operation = i.Logseq_db_types.Asset_upload_intent.operation_id
+                     ; event = Asset_upload.Restore i
+                     })
+              in
+              restored.next, effects @ restored.effects)
+           (state, [])
+           intents
+       | Ok _ | Error _ ->
+         ( { state with recovery = Some (ticket.scope, ticket.after, true) }
+         , [ Publish (Diagnostic "Upload recovery could not read a valid checkpoint page")
+           ] ))
+    | Sync_event Sync.Online_recovery_requested ->
+      (match asset_scope state with
+       | None -> state, []
+       | Some context ->
+         let state =
+           if state.recovery_pending = None
+           then { state with recovery = Some (context.scope, None, false) }
+           else state
+         in
+         List.fold_left
+           (fun (state, effects) (_, operation, _) ->
+              let retried =
+                step
+                  state
+                  (Upload_requested
+                     { graph_generation = context.scope.graph_generation
+                     ; operation
+                     ; event = Asset_upload.Retry
+                     })
+              in
+              retried.next, effects @ retried.effects)
+           (state, [])
+           state.uploads)
+    | _ -> state, []
+  in
+  let state, reads =
+    match state.recovery, state.recovery_pending with
+    | Some (scope, after, false), None when List.length state.uploads < 32 ->
+      let ticket =
+        { scope
+        ; after
+        ; limit = min 16 (32 - List.length state.uploads)
+        ; serial = state.recovery_serial + 1
+        }
+      in
+      ( { state with recovery_pending = Some ticket; recovery_serial = ticket.serial }
+      , [ Read_uploads ticket ] )
+    | _ -> state, []
+  in
+  { next = state; effects = transition.effects @ recovered @ reads }
+;;
+
+let import_context state ~graph_generation =
+  let reserved =
+    match state.recovery_pending with
+    | Some ticket -> ticket.limit
+    | None -> 0
+  in
+  match asset_scope state with
+  | Some context
+    when context.scope.graph_generation = graph_generation
+         && List.length state.uploads + reserved < 32 -> Some context
+  | _ -> None
 ;;

@@ -46,7 +46,7 @@ let status_default_value = function
 type t =
   { id : string
   ; page_id : string
-  ; journal_day : int
+  ; journal_day : int option
   ; parent_id : string option
   ; sibling_order : string
   ; source : string
@@ -57,7 +57,7 @@ type t =
   ; last_mutation_id : string
   }
 
-let create
+let create_on_page
       ~id
       ~page_id
       ~journal_day
@@ -74,7 +74,11 @@ let create
   then Error "Journal entry ID must be a UUID"
   else if not (Journal_validation.is_uuid page_id)
   then Error "Journal page ID must be a UUID"
-  else if not (Journal_validation.is_journal_day journal_day)
+  else if
+    Option.fold
+      ~none:false
+      ~some:(fun day -> not (Journal_validation.is_journal_day day))
+      journal_day
   then Error "Journal day must be a valid YYYYMMDD date"
   else if
     match parent_id with
@@ -117,6 +121,33 @@ let create
         })
 ;;
 
+let create
+      ~id
+      ~page_id
+      ~journal_day
+      ~parent_id
+      ~sibling_order
+      ~source
+      ~task_state
+      ~child_count
+      ~creation_time
+      ~revision
+      ~last_mutation_id
+  =
+  create_on_page
+    ~id
+    ~page_id
+    ~journal_day:(Some journal_day)
+    ~parent_id
+    ~sibling_order
+    ~source
+    ~task_state
+    ~child_count
+    ~creation_time
+    ~revision
+    ~last_mutation_id
+;;
+
 let id value = value.id
 let page_id value = value.page_id
 let parent_id value = value.parent_id
@@ -125,7 +156,14 @@ let source value = value.source
 let task_state value = value.task_state
 let child_count value = value.child_count
 let creation_time value = value.creation_time
-let journal_day value = value.journal_day
+let journal_day_opt value = value.journal_day
+
+let journal_day value =
+  match value.journal_day with
+  | Some day -> day
+  | None -> invalid_arg "Non-journal block in journal feed"
+;;
+
 let revision value = value.revision
 let last_mutation_id value = value.last_mutation_id
 

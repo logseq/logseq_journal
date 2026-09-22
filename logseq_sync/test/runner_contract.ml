@@ -47,7 +47,7 @@ let crypto () =
   |> Result.get_ok
 ;;
 
-let core () =
+let core ?(origin = Uri.of_string "https://api.logseq.io") () =
   let limits =
     Core.limits
       ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
@@ -55,7 +55,7 @@ let core () =
       ~submission_batch_size:32
     |> Result.get_ok
   in
-  Core.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
+  Core.config ~managed_sync_origin:origin ~limits
   |> Result.get_ok
   |> Core.initial
   |> Result.get_ok
@@ -223,9 +223,9 @@ let test_cancelled_queued_catalog_save_does_not_write () =
         Alcotest.(check int) "cancelled save posts no completion" 0 (List.length !posted))))
 ;;
 
-let cached_key_effect () =
+let cached_key_effect ?origin () =
   let authenticated =
-    Core.step (core ()) (Account_authenticated { user_id = Some "user-1" })
+    Core.step (core ?origin ()) (Account_authenticated { user_id = Some "user-1" })
   in
   let graph = encrypted_graph () in
   let catalog =

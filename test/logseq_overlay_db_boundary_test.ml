@@ -293,20 +293,20 @@ let test_persistence_codec_ownership root =
   List.iter
     (require_file root)
     [ "logseq_overlay_db/lib/persistence_json.ml"
-    ; "logseq_overlay_db/lib/persistence_outbox_v14.ml"
+    ; "logseq_overlay_db/lib/persistence_outbox_v16.ml"
     ; "logseq_overlay_db/lib/persistence_receipt_v1.ml"
     ];
   require_text
     root
     "logseq_overlay_db/lib/dune"
     [ "persistence_json"
-    ; "persistence_outbox_v14"
+    ; "persistence_outbox_v16"
     ; "persistence_receipt_v1"
     ; "(pps ppx_deriving_yojson)"
     ];
   require_text
     root
-    "logseq_overlay_db/lib/persistence_outbox_v14.ml"
+    "logseq_overlay_db/lib/persistence_outbox_v16.ml"
     [ "[@@deriving yojson]"; "let encode"; "let decode" ];
   require_text
     root
@@ -323,8 +323,8 @@ let test_persistence_codec_ownership root =
   require_text
     root
     "logseq_overlay_db/lib/database.ml"
-    [ "Persistence_outbox_v14.encode"
-    ; "Persistence_outbox_v14.decode"
+    [ "Persistence_outbox_v16.encode"
+    ; "Persistence_outbox_v16.decode"
     ; "Persistence_receipt_v1.encode_mutation"
     ; "Persistence_receipt_v1.decode_mutation"
     ; "Persistence_receipt_v1.encode_terminal_batch"
@@ -352,7 +352,7 @@ let test_persistence_codec_ownership root =
          root
          relative
          [ "Persistence_json"
-         ; "Persistence_outbox_v14"
+         ; "Persistence_outbox_v16"
          ; "Persistence_receipt_v1"
          ; "ppx_deriving_yojson"
          ])
@@ -383,7 +383,7 @@ let test_install_manifest root install_manifest =
          in
          if not (contains contents compiled)
          then fail "install manifest does not keep %s private" private_module)
-      [ "Persistence_json"; "Persistence_outbox_v14"; "Persistence_receipt_v1" ])
+      [ "Persistence_json"; "Persistence_outbox_v16"; "Persistence_receipt_v1" ])
 ;;
 
 let () =

@@ -20,11 +20,12 @@ type worker =
   ; pushes : P.push Queue.t
   }
 
-let with_worker ?limits:overlay_limits run =
+let with_worker ?limits:overlay_limits ?(prepare = fun ~sw:_ ~support:_ -> ()) run =
   Fixture.with_temp_directory "journal-mutation-regression-" (fun support ->
     ignore (Fixture.seed_mirror support);
     Eio_main.run (fun _ ->
       Eio.Switch.run (fun sw ->
+        prepare ~sw ~support;
         let config =
           Logseq_db_worker.Config.create
             ~application_support_directory:support
@@ -63,6 +64,21 @@ let with_worker ?limits:overlay_limits run =
         in
         let sync_runner =
           Runner.sync_runner
+            ~stage_asset:(fun ~scope:_ ~operation:_ ~file_type:_ ~source_file:_ ->
+              Error "unexpected staging")
+            ~put_upload:(fun ~context:_ _ ~current:_ -> failwith "unexpected upload")
+            ~prune_staging:(fun ~scope:_ ~keep:_ -> Ok 0)
+            ~release_staging:(fun ~scope:_ ~file:_ -> Ok ())
+            ~submit_asset:(fun ~context:_ ~current:_ ~post:_ _ ->
+              failwith "unexpected asset IO")
+            ~delete_assets:(fun _ -> Ok ())
+            ~close_assets:(fun _ -> ())
+            ~retain_staged_file:(fun ~scope:_ ~file:_ ->
+              failwith "unexpected staged preview")
+            ~retain_asset_file:(fun ~scope:_ ~handle:_ ->
+              failwith "unexpected asset preview")
+            ~release_asset_file:(fun ~scope:_ ~handle:_ ->
+              failwith "unexpected preview release")
             ~submit:(function
               | Sync.Request (ticket, Sync.Load_catalog _) ->
                 let cache =
@@ -87,7 +103,11 @@ let with_worker ?limits:overlay_limits run =
         in
         let dependencies =
           Runner.dependencies
-            ~runtime:(Runner.runtime ~fork:(fun ~sw:_ task -> task ()) |> Result.get_ok)
+            ~runtime:
+              (Runner.runtime
+                 ~sleep:(fun _ -> failwith "unexpected wait")
+                 ~fork:(fun ~sw:_ task -> task ())
+               |> Result.get_ok)
             ~config
             ~overlay:
               (Fixture.dependencies_with_limits
@@ -101,7 +121,16 @@ let with_worker ?limits:overlay_limits run =
               | _ -> ())
           |> Result.get_ok
         in
-        let runner = Runner.create ~sw dependencies ~post |> Result.get_ok in
+        let runner =
+          Runner.create
+            ~sw
+            dependencies
+            ~post
+            ~recovery_current:(fun ticket -> Core.upload_recovery_current !state ticket)
+            ~upload_current:(fun ticket -> Core.upload_ticket_current !state ticket)
+            ~asset_current:(fun ticket -> Core.asset_ticket_current !state ticket)
+          |> Result.get_ok
+        in
         let rec drain_events () =
           if not (Queue.is_empty events)
           then (
@@ -192,6 +221,82 @@ let last_push worker =
     else take (Some (Queue.take worker.pushes))
   in
   take None
+;;
+
+let test_asset_reference_command () =
+  let module D = Logseq_overlay_db.Database in
+  let module O = Logseq_overlay_db.Types in
+  let asset = Fixture.mutation_uuid 980 in
+  let prepare ~sw ~support =
+    let inspection =
+      D.inspect_mirror ~application_support_directory:support ~graph_id:Fixture.graph_uuid
+      |> Result.get_ok
+    in
+    let db =
+      D.open_
+        ~sw
+        (Fixture.dependencies ~behavior:"reference wire fixture")
+        inspection
+        ~graph_name:"asset reference"
+      |> Result.get_ok
+    in
+    Fun.protect
+      ~finally:(fun () -> D.close db |> Result.get_ok)
+      (fun () ->
+         let version =
+           Logseq_db_types.Asset_descriptor.version
+             ~checksum:(String.make 64 'a')
+             ~file_type:"png"
+           |> Result.get_ok
+         in
+         let parent = Fixture.page_uuid in
+         let expected =
+           Fixture.insert_precondition db ~parent ~behavior:"reference wire fixture"
+         in
+         ignore
+           (D.commit_local
+              db
+              ~expected
+              (O.Insert_blocks
+                 { mutation_id = Fixture.mutation_uuid 981
+                 ; parent
+                 ; tree = { uuid = asset; title = "Reusable attachment"; children = [] }
+                 ; asset = Some { replace_reference = None; version; size = 4L }
+                 })
+            |> Result.get_ok))
+  in
+  with_worker ~prepare (fun worker ->
+    let block = Fixture.reference_source_uuid in
+    let revision = block_revision worker block in
+    let request =
+      P.V2_set_asset_reference
+        { mutation_id = Fixture.mutation_uuid 982
+        ; block
+        ; previous = None
+        ; asset
+        ; preconditions = { blocks = [ block, revision ]; pages = []; scopes = [] }
+        }
+    in
+    (match outcome worker 983 request with
+     | P.V2_mutation_committed _ -> ()
+     | _ -> failwith "worker did not execute reference mutation");
+    (match last_push worker with
+     | P.V2_changes_available _ -> ()
+     | _ -> failwith "reference mutation did not notify graph consumers");
+    match
+      outcome
+        worker
+        984
+        (P.V2_list_assets
+           { recursive = false; roots = [ block ]; limit = 10; cursor = None })
+    with
+    | P.V2_assets_outcome { items; _ } ->
+      require
+        (List.exists
+           (fun (a : Logseq_db_types.Asset_descriptor.t) -> a.uuid = asset)
+           items)
+        "worker reference query missed the committed asset"
+    | _ -> failwith "worker reference query failed")
 ;;
 
 let test_acknowledged_cursor () =
@@ -627,7 +732,8 @@ let () =
        | exn ->
          failures := name :: !failures;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "Resync clears retained windows", test_resync_clears_retained_windows
+    [ "Asset reference command without upload", test_asset_reference_command
+    ; "Resync clears retained windows", test_resync_clears_retained_windows
     ; "Retained window pagination", test_retained_window_pagination
     ; "M03 real worker acknowledged change cursor", test_acknowledged_cursor
     ; "M03 empty cursor and unknown acknowledgement", test_empty_cursor_and_unknown_ack

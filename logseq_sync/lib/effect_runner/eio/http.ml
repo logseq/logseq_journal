@@ -1,9 +1,15 @@
+type operation =
+  | Get
+  | Put of string
+
 type expected_content_type =
   | Structured_response
   | Snapshot_artifact
+  | Asset_binary
 
 type request =
-  { uri : Uri.t
+  { operation : operation
+  ; uri : Uri.t
   ; headers : (string * string) list
   ; maximum_response_bytes : int
   ; expected_content_type : expected_content_type
@@ -41,7 +47,8 @@ let create
   =
   require_base_url base_url;
   let uri = Uri.with_path base_url path |> fun uri -> Uri.with_query' uri query in
-  { uri
+  { operation = Get
+  ; uri
   ; headers = authorization token
   ; maximum_response_bytes
   ; expected_content_type = Structured_response
@@ -103,7 +110,8 @@ let artifact ~base_url ~uri ~token =
     | Some token when same_origin base_url uri -> authorization token
     | Some _ | None -> [ "accept", "application/octet-stream" ]
   in
-  { uri
+  { operation = Get
+  ; uri
   ; headers
   ; maximum_response_bytes = max_int
   ; expected_content_type = Snapshot_artifact
@@ -143,13 +151,14 @@ let validate_response_content_type request headers =
     ( request.expected_content_type
     , Option.map media_type (response_header "content-type" headers) )
   with
-  | Snapshot_artifact, None -> Ok ()
+  | (Snapshot_artifact | Asset_binary), None -> Ok ()
   | Structured_response, None -> Error "sync HTTP response is missing Content-Type"
   | expected_content_type, Some value ->
     let accepted =
       match expected_content_type with
       | Structured_response -> structured_media_type value
       | Snapshot_artifact -> artifact_media_type value
+      | Asset_binary -> true
     in
     if accepted
     then Ok ()

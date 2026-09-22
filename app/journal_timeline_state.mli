@@ -1,43 +1,18 @@
-module Ui = Bonsai_flutter_ui
-
 type request =
   | Feed of { before_day : int option }
   | Day of
       { day : int
       ; after : Journal_graph_projection.block_cursor option
       }
-  | Children of
-      { parent_id : string
-      ; epoch : int64
-      }
 
 type slot =
   | Day_heading of Journal_graph_projection.page
   | Top_level of Journal_graph_projection.timeline_entry
-  | Child_preview of
-      { parent_id : string
-      ; block : Journal_model.t
-      }
   | Day_continuation of
       { day : int
       ; after : Journal_graph_projection.block_cursor option
       }
-  | Children_loading of
-      { parent_id : string
-      ; epoch : int64
-      }
-  | Children_more of { parent_id : string }
   | Feed_continuation of { before_day : int }
-
-type anchor_decision =
-  | Preserve_visible_slot
-  | Reset_to_top
-
-type extent_strategy = Known_profile_extents
-
-type capture_fab_presentation =
-  | Extended
-  | Compact
 
 type t
 
@@ -46,38 +21,8 @@ type staged_delete =
   ; before : t
   }
 
-type window =
-  { total_count : int
-  ; first_index : int
-  ; slots : slot list
-  }
-
-type synthetic_window =
-  { first_index : int
-  ; count : int
-  }
-
-type extent_geometry =
-  { default_extent : float
-  ; overrides : Ui.Widget.Sparse_extent_override.t list
-  }
-
-val maximum_slots : int
-val maximum_supplied_rows : int
-val overscan : int
-val extent_strategy : extent_strategy
-val renderer_event_surface : [ `Visible_range ] list
-
-module Root_scroll_trigger : sig
-  type t
-
-  val initial : t
-  val presentation : t -> capture_fab_presentation
-  val accumulated_travel : t -> float
-  val step : t -> pixels:float -> delta:float -> t
-end
-
 val empty : today:int -> t
+val reset : t -> today:int -> t
 val begin_request : t -> generation:int64 -> request -> t
 val apply_feed : t -> generation:int64 -> Journal_graph_projection.feed -> t
 
@@ -87,12 +32,8 @@ val apply_timeline_entry_page
   -> Journal_graph_projection.timeline_entry_page
   -> t
 
-val apply_detail : t -> generation:int64 -> Journal_graph_projection.detail -> t
-val reconcile_detail : t -> Journal_graph_projection.detail -> t
 val next_request : t -> request option
 val pending_request : t -> (int64 * request) option
-val expand : t -> parent_id:string -> t
-val collapse : t -> parent_id:string -> t
 val replace_block : t -> Journal_model.t -> t
 val remove_block : t -> block_id:string -> t
 val replace_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
@@ -106,9 +47,7 @@ val replace_timeline_entry_page
 val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
 val stage_delete : t -> block_id:string -> (t * staged_delete) option
 val undo_delete : t -> staged_delete -> t
-val return_from_detail : t -> block_id:string -> t
 val observe_visible_range : t -> first_index:int -> last_exclusive:int -> t
-val current_window : t -> window
 
 (** Read an index relative to the first retained slot. Out-of-range indices return [None]. *)
 val retained_slot : t -> int -> slot option
@@ -116,7 +55,7 @@ val retained_slot : t -> int -> slot option
 (** Fold retained slots from first to last without materializing an intermediate collection. *)
 val fold_slots : ('a -> slot -> 'a) -> 'a -> t -> 'a
 
-(** Includes a hidden placeholder while its day is retained in the bounded cache. *)
+(** Includes a hidden placeholder while its day remains known. *)
 val find_block : t -> block_id:string -> Journal_model.t option
 
 val retained_slot_count : t -> int
@@ -124,19 +63,7 @@ val first_retained_index : t -> int
 val total_count : t -> int
 val today : t -> int
 val set_today : t -> today:int -> t
-val anchor_decision : t -> anchor_decision
-val focus_restore_block_id : t -> string option
-val is_expanded : t -> block_id:string -> bool
 val slot_key : slot -> string
-val extent_geometry : t -> profile:Journal_visual_tokens.row_profile -> extent_geometry
-
-val synthetic_window
-  :  total_count:int
-  -> first_visible:int
-  -> last_exclusive:int
-  -> synthetic_window
-
-val heading_spacing : t -> day:int -> float * float
 val day_error : t -> day:int -> string option
 
 val fail_day_request
@@ -148,3 +75,13 @@ val fail_day_request
   -> t
 
 val retry_day : t -> day:int -> t
+val first_visible_index : t -> int
+val scroll_generation : t -> int64
+val scroll_target : t -> (int64 * int * string) option
+val scroll_outcome : t -> Bonsai_swiftui_ui.View.Native_list.outcome option
+
+val complete_scroll
+  :  t
+  -> token:int64
+  -> outcome:Bonsai_swiftui_ui.View.Native_list.outcome
+  -> t

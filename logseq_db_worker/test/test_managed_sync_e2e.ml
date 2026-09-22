@@ -4,7 +4,7 @@ module Protocol = Logseq_db_worker.Protocol
 module Support = Managed_sync_e2e_support
 module Probe = Managed_sync_protocol_probe
 module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
-module ID = Bonsai_flutter_spec.Id
+module ID = Bonsai_swiftui_spec.Id
 
 exception E2e_failure of string
 
@@ -273,6 +273,8 @@ let handle_push context = function
     context.saw_bootstrap <- true;
     context.last_event <- "bootstrap-progress"
   | Graph_state_changed state -> handle_graph_state context state
+  | Asset_notice _ ->
+    fail_worker context "assets" "unexpected asset notice without demand"
   | Graph_push _ -> context.last_event <- "graph-push"
 ;;
 
@@ -280,6 +282,9 @@ let handle_event context = function
   | Worker.Push { payload; _ } ->
     handle_push context payload;
     None
+  | Response { outcome = Completed (Service.Asset_imported _); _ }
+  | Response { outcome = Completed (Service.Asset_file _); _ } ->
+    fail_worker context "assets" "unexpected file response"
   | Response { outcome = Completed Service.Client_command_completed; _ } -> None
   | Response { outcome = Completed (Service.Graph_state state); _ } ->
     handle_graph_state context state;
@@ -1100,7 +1105,7 @@ let process_exit_code = function
 
 let compile_platform_crypto_provider ~root ~output =
   let compiler = "/usr/bin/xcrun" in
-  let source = Filename.concat root "flutter/JournalE2EECrypto.swift" in
+  let source = Filename.concat root "swift/JournalE2EECrypto.swift" in
   if not (Sys.file_exists source)
   then fail "the production platform crypto provider source is unavailable";
   let arguments =

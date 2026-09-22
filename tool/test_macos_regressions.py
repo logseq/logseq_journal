@@ -43,11 +43,11 @@ def main():
         if not (line.startswith("#load ") and "/native_backend/" in line)
     )
     test_library = subprocess.run(
-        ["ocamlfind", "query", "bonsai_flutter_test"],
+        ["ocamlfind", "query", "bonsai_swiftui_test"],
         cwd=REPO, text=True, capture_output=True, check=True,
     ).stdout.strip()
     bootstrap += "\n#directory " + json.dumps(test_library) + ";;\n"
-    bootstrap += "#load " + json.dumps(str(Path(test_library) / "bonsai_flutter_test.cma")) + ";;\n"
+    bootstrap += "#load " + json.dumps(str(Path(test_library) / "bonsai_swiftui_test.cma")) + ";;\n"
     with tempfile.TemporaryDirectory(prefix="journal-macos-regressions-") as directory:
         for relative, sentinel in cases:
             entry = Path(directory) / "run.ml"

@@ -1,33 +1,34 @@
-module Date_row : sig
-  val view
-    :  tokens:Journal_visual_tokens.t
-    -> typography:Journal_visual_tokens.typography
-    -> effective_scale:float
-    -> ambient_scale:float
-    -> date_id:string
-    -> weekday_id:string
-    -> Journal_calendar.date_presentation option
-    -> Bonsai_flutter_ui.Widget.t
-end
-
 module Context : sig
   type t
 
   val favorites : t
-  val today : date:Journal_calendar.date_presentation option -> t
-  val date : t -> Journal_calendar.date_presentation option
+  val journals : t
   val semantics_label : t -> string
 end
 
-val sliver
-  :  tokens:Journal_visual_tokens.t
-  -> typography:Journal_visual_tokens.typography
-  -> text_scale:float
-  -> viewport_width:float
-  -> top_inset:float
-  -> device_pixel_ratio:float
+val view
+  :  key:Bonsai_swiftui_ui.Key.t
+  -> platform:string
   -> context:Context.t
   -> sync_phase:Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.sync_phase option
-  -> on_error_info:Bonsai_flutter_ui.Event.Handler.t option
-  -> on_account_menu:Bonsai_flutter_ui.Event.Handler.t option
-  -> Bonsai_flutter_ui.Widget.Sliver.t
+  -> sync_error:string option
+  -> on_error_info:Bonsai_swiftui_ui.Event.Handler.t option
+  -> on_account_action:Bonsai_swiftui_ui.Event.Handler.t option
+  -> local_deletion_available:bool
+  -> on_journals:Bonsai_swiftui_ui.Event.Handler.t
+  -> on_favorites:Bonsai_swiftui_ui.Event.Handler.t
+  -> on_capture:Bonsai_swiftui_ui.Event.Handler.t
+  -> capture_enabled:bool
+  -> body:Bonsai_swiftui_ui.View.Body.t
+  -> Bonsai_swiftui_ui.View.Body.t
+
+val feedback
+  :  key:Bonsai_swiftui_ui.Key.t
+  -> top:bool
+  -> visible:bool
+  -> compact:Bonsai_swiftui_ui.View.t
+  -> expanded:Bonsai_swiftui_ui.View.t
+  -> Bonsai_swiftui_ui.View.Body.t
+  -> Bonsai_swiftui_ui.View.Body.t
+
+val date_header : title:string -> Bonsai_swiftui_ui.View.t

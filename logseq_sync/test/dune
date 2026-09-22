@@ -29,3 +29,33 @@
   unix
   uri
   yojson))
+
+(test
+ (name test_asset_transfer)
+ (modules test_asset_transfer)
+ (libraries alcotest logseq_db_types logseq_sync.pure_reducer uri))
+
+(test
+ (name test_asset_codec)
+ (modules test_asset_codec)
+ (libraries alcotest logseq_sync.effect_runner melange-transit-native))
+
+(test
+ (name test_asset_cache)
+ (modules test_asset_cache)
+ (libraries alcotest logseq_sync.effect_runner logseq_sync.pure_reducer logseq_db_types unix uri))
+
+(test
+ (name test_asset_descriptor)
+ (modules test_asset_descriptor)
+ (libraries alcotest logseq_db_types))
+
+(executable
+ (name asset_native_interop)
+ (modules asset_native_interop)
+ (libraries logseq_sync.effect_runner melange-transit-native yojson))
+
+(executable
+ (name asset_adapter_memory)
+ (modules asset_adapter_memory)
+ (libraries logseq_sync.effect_runner logseq_sync.pure_reducer logseq_db_types eio_main uri melange-transit-native))

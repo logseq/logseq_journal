@@ -1,3 +1,4 @@
 - number of dividers must <= 3
 - On launch, the app must immediately open the most recently opened graph instead of showing the graph selection UI.
-- When modifying the UI, prefer the most appropriate built-in Flutter component instead of building a custom one.
+- When modifying the UI, prefer the most appropriate built-in bonsai-ui/SwiftUI component instead of building a custom one.
+- Focus UI/UX efforts primarily on mobile (currently iOS only). macOS only needs basic support for testing purposes

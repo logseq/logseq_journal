@@ -4,8 +4,9 @@
  (name logseq_db_worker_pure_reducer_impl)
  (public_name logseq_db_worker.pure_reducer.impl)
  (implements logseq_db_worker_pure_reducer)
- (modules core)
+ (modules core asset_upload)
  (libraries
   logseq_db_worker.contract
   logseq_db_types
-  logseq_sync.pure_reducer))
+  logseq_sync.pure_reducer
+  uri))

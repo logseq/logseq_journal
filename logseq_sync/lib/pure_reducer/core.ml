@@ -442,7 +442,8 @@ type snapshot_activation_request =
   }
 
 type mirror_deletion =
-  { graph_id : graph_id
+  { account : account_scope
+  ; graph_id : graph_id
   ; scope : effect_scope
   }
 
@@ -674,6 +675,19 @@ let initial config =
 
 let state core = core.public_state
 let admitted_graph_scope core = core.current_graph_scope
+
+type asset_context =
+  { scope : graph_scope
+  ; encrypted : bool
+  ; key : graph_key_handle option
+  }
+
+let asset_context core =
+  match core.current_graph_scope, core.selected_graph_value with
+  | Some scope, Some graph ->
+    Some { scope; encrypted = graph.encrypted; key = core.graph_key }
+  | _ -> None
+;;
 
 type transition =
   { next : t
@@ -1212,6 +1226,8 @@ let operation_name = function
   | Create_journal_page_operation -> "create-journal-page"
   | Set_task_status_operation -> "set-task-status"
   | Clear_task_status_operation -> "clear-task-status"
+  | Publish_asset_operation -> "publish-asset"
+  | Set_asset_reference_operation -> "set-asset-reference"
 ;;
 
 let submission_message batch =
@@ -1238,6 +1254,37 @@ let phase_transition core sync_phase =
   else (
     let next = set_snapshot core { core.public_state.snapshot with sync_phase } in
     { next; effects = [ publish next ] })
+;;
+
+let has_blocked_submissions sync =
+  List.exists
+    (fun (item : Overlay.submission_descriptor) -> item.state = Overlay.Blocked)
+    (Overlay.sync_view_submissions sync)
+;;
+
+let blocked_changes_message =
+  "Some local changes could not be synced and are not included in the journal. They \
+   remain stored on this device. Do not delete the local graph copy."
+;;
+
+let rejection_message (rejection : Sync_protocol.rejection) =
+  let reason =
+    match rejection.reason with
+    | Empty_tx_data -> "empty transaction"
+    | Invalid_tx -> "invalid transaction"
+    | Invalid_t_before -> "invalid sync version"
+    | Db_transact_failed -> "the server could not apply the transaction"
+    | Snapshot_upload_in_progress -> "a graph upload is in progress"
+    | Stale -> "the graph changed before submission"
+  in
+  "The server rejected your changes: "
+  ^ reason
+  ^ ". "
+  ^ blocked_changes_message
+  ^ Option.fold
+      ~none:""
+      ~some:(fun detail -> " Details: " ^ detail)
+      rejection.error_detail
 ;;
 
 let plan_submission core =
@@ -1314,7 +1361,25 @@ let plan_submission core =
              |> take core.config.limits.submission_batch_size []
            in
            if ids = []
-           then phase_transition core Current
+           then
+             if has_blocked_submissions sync
+             then (
+               let next =
+                 set_snapshot
+                   core
+                   { core.public_state.snapshot with
+                     sync_phase = Paused
+                   ; last_error =
+                       Some
+                         (Option.value
+                            core.public_state.snapshot.last_error
+                            ~default:blocked_changes_message)
+                   }
+               in
+               if next.public_state = core.public_state
+               then unchanged core
+               else { next; effects = [ publish next ] })
+             else phase_transition core Current
            else request (Overlay.Submit_group ids)))
   | _ -> unchanged core
 ;;
@@ -1611,13 +1676,26 @@ let apply_rejection core owner rejection =
          ; transition = Overlay.Reject_group { batch_id = owner.batch_id; resolution }
          }
        in
-       { next =
-           { core with
-             pending_outbox_transition = Some request
-           ; submission_owner = Some { owner with response_timer = None }
-           }
-       ; effects = [ Delegate (Apply_outbox_transition request) ]
-       })
+       let next =
+         { core with
+           pending_outbox_transition = Some request
+         ; submission_owner = Some { owner with response_timer = None }
+         }
+       in
+       let next, feedback =
+         match resolution with
+         | Overlay.Stale _ -> next, []
+         | Definitive _ ->
+           let next =
+             set_snapshot
+               next
+               { next.public_state.snapshot with
+                 last_error = Some (rejection_message rejection)
+               }
+           in
+           next, [ publish next ]
+       in
+       { next; effects = feedback @ [ Delegate (Apply_outbox_transition request) ] })
 ;;
 
 let websocket_message core connection message =
@@ -1721,7 +1799,10 @@ let authoritative_applied core (result : authoritative_commit_result) =
         { core.public_state.snapshot with
           sync_phase = Current
         ; applied_server_t = Some applied_server_t
-        ; last_error = None
+        ; last_error =
+            (if has_blocked_submissions result.sync
+             then core.public_state.snapshot.last_error
+             else None)
         }
     in
     let planned = plan_submission core in
@@ -2284,7 +2365,10 @@ let graph_detached core scope result =
            [ publish next
            ; Delegate
                (Delete_mirror
-                  { graph_id = scope.graph_id; scope = effect_scope_of_graph scope })
+                  { account = scope.account
+                  ; graph_id = scope.graph_id
+                  ; scope = effect_scope_of_graph scope
+                  })
            ]
        })
   | _ -> unchanged core
@@ -2293,8 +2377,9 @@ let graph_detached core scope result =
 let mirror_deleted core (request : mirror_deletion) result =
   match core.deletion_scope, core.public_state.snapshot.local_deletion with
   | Some scope, Some (Deletion_in_progress Deleting_mirror)
-    when request.graph_id = scope.graph_id && request.scope = effect_scope_of_graph scope
-    ->
+    when request.account = scope.account
+         && request.graph_id = scope.graph_id
+         && request.scope = effect_scope_of_graph scope ->
     (match result with
      | Error _ -> deletion_failed core Deleting_mirror
      | Ok () ->

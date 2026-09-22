@@ -30,8 +30,8 @@
  (name test_bonsai_service)
  (modules test_bonsai_service)
  (libraries
-  bonsai_flutter.driver
-  bonsai_flutter_test
+  bonsai_swiftui.driver
+  bonsai_swiftui_test
   datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
@@ -50,11 +50,14 @@
   datascript_ocaml.types
   eio_main
   eio.unix
+  sqlite3
+  logseq_db_storage
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.effect_runner
   logseq_db_worker.pure_reducer
   logseq_db_worker_test_support
+  logseq_sync.effect_runner
   logseq_sync.pure_reducer
   uri))
 
@@ -79,7 +82,7 @@
  (modules test_managed_sync_e2e managed_sync_protocol_probe)
  (libraries
   bigstringaf
-  bonsai_flutter.driver
+  bonsai_swiftui.driver
   ca-certs-nss
   cstruct
   datascript-ocaml-native
@@ -111,3 +114,13 @@
  (deps test_managed_sync_e2e.exe ../tool/cognito_e2e_login.sh)
  (action
   (run ./test_managed_sync_e2e.exe)))
+
+(test
+ (name test_asset_upload)
+ (modules test_asset_upload)
+ (libraries alcotest logseq_db_worker.pure_reducer logseq_db_types logseq_sync.pure_reducer uri))
+
+(test
+ (name test_asset_protocol)
+ (modules test_asset_protocol)
+ (libraries alcotest logseq_db_worker yojson))

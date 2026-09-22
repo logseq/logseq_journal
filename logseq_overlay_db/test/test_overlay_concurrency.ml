@@ -32,7 +32,8 @@ let different_fingerprint_conflicts database =
   let first = T.insert_blocks ~ordinal:301 () in
   let different =
     Types.Insert_blocks
-      { mutation_id = T.mutation_uuid 301
+      { asset = None
+      ; mutation_id = T.mutation_uuid 301
       ; parent = T.page_uuid
       ; tree = { uuid = T.child_uuid; title = "Different"; children = [] }
       }

@@ -18,11 +18,20 @@ subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_c
                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(cert,key)
-listener = socket.socket(socket.AF_INET6)
-listener.bind(('::1',0)); listener.listen(8); listener.settimeout(5)
-listener4 = socket.socket()
-listener4.bind(('127.0.0.1', listener.getsockname()[1])); listener4.listen(8)
-with open(root+'/ready','w') as f: f.write(str(listener.getsockname()[1]))
+for attempt in range(16):
+  listener = socket.socket(socket.AF_INET6)
+  listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+  listener4 = socket.socket()
+  try:
+    listener.bind(('::1',0))
+    listener4.bind(('127.0.0.1', listener.getsockname()[1]))
+    break
+  except OSError:
+    listener.close(); listener4.close()
+    if attempt == 15: raise
+listener.listen(8); listener.settimeout(5); listener4.listen(8)
+with open(root+'/ready.tmp','w') as f: f.write(str(listener.getsockname()[1]))
+os.replace(root+'/ready.tmp', root+'/ready')
 report=[]; stalled=[]
 def observe_stalled_tls(raw, item):
   try:
@@ -46,6 +55,13 @@ try:
     while b'\r\n\r\n' not in request:
       part=conn.recv(16384)
       if not part: raise RuntimeError('no request')
+      request+=part
+    header_end=request.index(b'\r\n\r\n')+4
+    request_headers=dict(line.split(b':',1) for line in request[:header_end].split(b'\r\n')[1:] if b':' in line)
+    length=next((int(v.strip()) for k,v in request_headers.items() if k.lower()==b'content-length'),0)
+    while len(request)<header_end+length:
+      part=conn.recv(16384)
+      if not part: raise RuntimeError('truncated request body')
       request+=part
     wire=bytes.fromhex(case.get('wire',''))
     if case.get('ws'):
@@ -243,6 +259,9 @@ let operation ~download origin =
 let runner
       ?(websocket_liveness = Runner.Disabled)
       ?network
+      ?secrets_dependency
+      ?crypto_dependency
+      ?(acquire = fun _ -> Ok "fixture-token")
       ~environment
       ~sw
       ~support
@@ -271,12 +290,11 @@ let runner
       ~artifact_store:
         (Runner.artifact_store ~staging_directory:(Filename.concat support "staging")
          |> Result.get_ok)
-      ~secrets:(secrets ())
-      ~crypto:(crypto ())
+      ~secrets:(Option.value secrets_dependency ~default:(secrets ()))
+      ~crypto:(Option.value crypto_dependency ~default:(crypto ()))
       ~id_token_provider:
-        (Runner.id_token_provider
-           ~acquire:(fun _ -> Ok "fixture-token")
-           ~invalidate:(fun _ ~token:_ -> incr invalidations))
+        (Runner.id_token_provider ~acquire ~invalidate:(fun _ ~token:_ ->
+           incr invalidations))
     |> Result.get_ok
   in
   Runner.create ~sw dependencies ~post:(fun event -> posted := !posted @ [ event ])
@@ -1516,5 +1534,639 @@ let scenarios =
         "WebSocket pending Pong preserves silent-peer close grace"
         `Quick
         (test_close_with_pending_pong ~reply:false)
+    ]
+;;
+
+let asset_download ~mismatch ~refresh () =
+  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+  let module Asset = Logseq_db_types.Asset_descriptor in
+  let module Cache = Logseq_sync_effect_runner.Asset_cache in
+  let module Codec = Logseq_sync_effect_runner.Asset_codec in
+  let bytes = "\000\255file\128" in
+  let checksum = Codec.checksum (if mismatch then "different" else bytes) in
+  let version = Asset.version ~checksum ~file_type:"png" |> Result.get_ok in
+  let wire =
+    response
+      ~headers:(Printf.sprintf "Content-Length: %d\r\n" (String.length bytes))
+      bytes
+  in
+  let cases =
+    (if refresh then [ case (response ~status:401 "x") ] else []) @ [ case wire ]
+  in
+  let report =
+    with_peer cases (fun ~environment ~sw ~support ~origin ->
+      let posted = ref []
+      and invalidations = ref 0 in
+      let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+      let _, scope = bootstrap origin in
+      let cache =
+        Cache.create
+          ~root:(Filename.concat support "assets")
+          ~scope
+          ~budget_bytes:1024L
+          ~maximum_file_bytes:32
+        |> Result.get_ok
+      in
+      let descriptor =
+        Asset.create
+          ~uuid:scope.graph_id
+          ~source:(Managed (Some version))
+          ~current_checksum:None
+          ~size:None
+          ~dimensions:None
+        |> Result.get_ok
+      in
+      let state =
+        Transfer.create
+          (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:4 ~retries:1
+           |> Result.get_ok)
+          ~scope
+          ~online:true
+          ~unlocked:true
+      in
+      let state, instructions =
+        Transfer.step
+          state
+          (Replace
+             { consumer = "visible"; priority = Foreground; assets = [ descriptor ] })
+      in
+      let lookup =
+        List.find_map
+          (function
+            | Transfer.Check_cache ticket -> Some ticket
+            | _ -> None)
+          instructions
+        |> Option.get
+      in
+      let _, instructions = Transfer.step state (Cache_checked (lookup, Ok None)) in
+      let instruction =
+        List.find
+          (function
+            | Transfer.Fetch _ -> true
+            | _ -> false)
+          instructions
+      in
+      let events = ref [] in
+      Runner.submit_asset
+        t
+        ~scope
+        ~cache
+        ~encryption:Plaintext
+        ~maximum_plaintext_bytes:32
+        ~current:(fun _ -> true)
+        ~post:(fun event -> events := event :: !events)
+        instruction;
+      wait (Eio.Stdenv.clock environment) (fun () -> !events <> []);
+      (match !events with
+       | [ Transfer.Downloaded (_, Ok handle) ] when not mismatch ->
+         Alcotest.(check string)
+           "verified binary bytes"
+           bytes
+           (read_file (Cache.path cache handle |> Option.get))
+       | [ Transfer.Downloaded (_, Error Transfer.Checksum_mismatch) ] when mismatch ->
+         Alcotest.(check bool)
+           "bad object not published"
+           true
+           (Cache.lookup cache ~asset:scope.graph_id ~version = Ok None)
+       | _ -> Alcotest.fail "unexpected asset download outcome");
+      Alcotest.(check int)
+        "same token refresh owner"
+        (if refresh then 1 else 0)
+        !invalidations;
+      Cache.close cache;
+      Runner.shutdown t)
+  in
+  check_retired report;
+  let request =
+    Yojson.Basic.Util.(report |> to_list |> List.hd |> member "request" |> to_string)
+  in
+  let expected =
+    "GET /assets/"
+    ^ Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id
+    ^ "/"
+    ^ Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id
+    ^ ".png HTTP/1.1"
+  in
+  Alcotest.(check bool)
+    "per-asset endpoint"
+    true
+    (String.starts_with ~prefix:(hex expected) request)
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "asset GET publishes verified bytes"
+        `Quick
+        (asset_download ~mismatch:false ~refresh:false)
+    ; Alcotest.test_case
+        "asset GET rejects checksum mismatch"
+        `Quick
+        (asset_download ~mismatch:true ~refresh:false)
+    ; Alcotest.test_case
+        "asset GET refreshes authentication"
+        `Quick
+        (asset_download ~mismatch:false ~refresh:true)
+    ]
+;;
+
+let asset_upload ~status ~refresh () =
+  let module Asset = Logseq_db_types.Asset_descriptor in
+  let bytes = "\000\255upload\128" in
+  let checksum = Logseq_sync_effect_runner.Asset_codec.checksum bytes in
+  let version = Asset.version ~checksum ~file_type:"png" |> Result.get_ok in
+  let cases =
+    (if refresh then [ case (response ~status:401 "x") ] else [])
+    @ [ case (response ~status "x") ]
+  in
+  let report =
+    with_peer cases (fun ~environment ~sw ~support ~origin ->
+      let posted = ref []
+      and invalidations = ref 0 in
+      let runner = runner ~environment ~sw ~support ~posted ~invalidations () in
+      let _, scope = bootstrap origin in
+      let source_file = Filename.concat support "staged.bin" in
+      let out = open_out_bin source_file in
+      output_string out bytes;
+      close_out out;
+      let result =
+        Runner.upload_asset
+          runner
+          ~context:Core.{ scope; encrypted = false; key = None }
+          ~asset:scope.graph_id
+          ~version
+          ~source_file
+          ~maximum_plaintext_bytes:32
+          ~current:(fun () -> true)
+      in
+      let expected =
+        match status with
+        | 200 -> Ok ()
+        | 403 -> Error Runner.Upload_revoked_access
+        | 413 -> Error Runner.Upload_size_rejected
+        | _ -> Error Runner.Upload_network
+      in
+      Alcotest.(check bool) "explicit upload result" true (result = expected);
+      Alcotest.(check int)
+        "upload token refresh"
+        (if refresh then 1 else 0)
+        !invalidations;
+      Runner.shutdown runner)
+  in
+  check_retired report;
+  Yojson.Basic.Util.to_list report
+  |> List.iter (fun row ->
+    let encoded = Yojson.Basic.Util.(row |> member "request" |> to_string) in
+    let request =
+      String.init
+        (String.length encoded / 2)
+        (fun n -> Char.chr (int_of_string ("0x" ^ String.sub encoded (2 * n) 2)))
+    in
+    let endpoint =
+      Printf.sprintf
+        "PUT /assets/%s/%s.png HTTP/1.1"
+        (Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
+        (Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
+    in
+    Alcotest.(check bool)
+      "immutable asset endpoint"
+      true
+      (String.starts_with ~prefix:endpoint request);
+    let headers = String.split_on_char '\n' request |> List.map String.trim in
+    List.iter
+      (fun header -> Alcotest.(check bool) header true (List.mem header headers))
+      [ "x-amz-meta-checksum: " ^ checksum
+      ; "x-amz-meta-type: png"
+      ; "content-length: " ^ string_of_int (String.length bytes)
+      ];
+    Alcotest.(check bool)
+      "raw uploaded bytes"
+      true
+      (String.ends_with ~suffix:bytes request))
+;;
+
+let asset_upload_source () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let posted = ref []
+        and invalidations = ref 0 in
+        let runner = runner ~environment ~sw ~support ~posted ~invalidations () in
+        let _, scope = bootstrap (Uri.of_string "https://localhost:1") in
+        let version =
+          Logseq_db_types.Asset_descriptor.version
+            ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "file")
+            ~file_type:"png"
+          |> Result.get_ok
+        in
+        let source_file = Filename.concat support "source.bin" in
+        let upload ~limit ~current ~encrypted =
+          Runner.upload_asset
+            runner
+            ~context:Core.{ scope; encrypted; key = None }
+            ~asset:scope.graph_id
+            ~version
+            ~source_file
+            ~maximum_plaintext_bytes:limit
+            ~current:(fun () -> current)
+        in
+        Alcotest.(check bool)
+          "missing staging file"
+          true
+          (upload ~limit:32 ~current:true ~encrypted:false
+           = Error Runner.Upload_missing_source);
+        let out = open_out_bin source_file in
+        output_string out "file";
+        close_out out;
+        Alcotest.(check bool)
+          "size bound before network"
+          true
+          (upload ~limit:3 ~current:true ~encrypted:false
+           = Error Runner.Upload_size_rejected);
+        Alcotest.(check bool)
+          "locked graph never sends plaintext"
+          true
+          (upload ~limit:32 ~current:true ~encrypted:true = Error Runner.Upload_locked);
+        Alcotest.(check bool)
+          "cancelled intent never uploads"
+          true
+          (upload ~limit:32 ~current:false ~encrypted:false
+           = Error Runner.Upload_cancelled);
+        let out = open_out_bin source_file in
+        output_string out "oops";
+        close_out out;
+        Alcotest.(check bool)
+          "changed source rejected"
+          true
+          (upload ~limit:32 ~current:true ~encrypted:false
+           = Error Runner.Upload_invalid_content);
+        Runner.shutdown runner)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "asset PUT bytes and metadata"
+        `Quick
+        (asset_upload ~status:200 ~refresh:false)
+    ; Alcotest.test_case
+        "asset PUT token refresh"
+        `Quick
+        (asset_upload ~status:200 ~refresh:true)
+    ; Alcotest.test_case
+        "asset PUT revoked access"
+        `Quick
+        (asset_upload ~status:403 ~refresh:false)
+    ; Alcotest.test_case
+        "asset PUT size rejection"
+        `Quick
+        (asset_upload ~status:413 ~refresh:false)
+    ; Alcotest.test_case
+        "asset PUT transient failure"
+        `Quick
+        (asset_upload ~status:503 ~refresh:false)
+    ; Alcotest.test_case "asset PUT validates staging" `Quick asset_upload_source
+    ]
+;;
+
+let asset_upload_admission () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let active = ref 0
+        and maximum = ref 0 in
+        let acquire _ =
+          incr active;
+          maximum := max !maximum !active;
+          Eio.Fiber.yield ();
+          decr active;
+          Error "offline"
+        in
+        let t =
+          runner
+            ~acquire
+            ~environment
+            ~sw
+            ~support
+            ~posted:(ref [])
+            ~invalidations:(ref 0)
+            ()
+        in
+        let _, scope = bootstrap (Uri.of_string "https://localhost") in
+        let source_file = Filename.concat support "pending.bin" in
+        Out_channel.with_open_bin source_file (fun out -> output_string out "file");
+        let version =
+          Logseq_db_types.Asset_descriptor.version
+            ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "file")
+            ~file_type:"bin"
+          |> Result.get_ok
+        in
+        let results =
+          Eio.Fiber.List.map
+            (fun _ ->
+               Runner.upload_asset
+                 t
+                 ~context:Core.{ scope; encrypted = false; key = None }
+                 ~asset:scope.graph_id
+                 ~version
+                 ~source_file
+                 ~maximum_plaintext_bytes:4
+                 ~current:(fun () -> true))
+            [ 1; 2; 3 ]
+        in
+        Alcotest.(check int) "one upload holds source and wire buffers" 1 !maximum;
+        Alcotest.(check bool)
+          "failed transfer releases admission"
+          true
+          (List.length results = 3 && List.for_all Result.is_error results);
+        Runner.shutdown t)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case "asset upload resource admission" `Quick asset_upload_admission ]
+;;
+
+let asset_download_admission () =
+  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+  let module Asset = Logseq_db_types.Asset_descriptor in
+  let module Cache = Logseq_sync_effect_runner.Asset_cache in
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let entered = ref 0
+        and completed = ref 0 in
+        let gate, release = Eio.Promise.create () in
+        let acquire _ =
+          incr entered;
+          Eio.Promise.await gate;
+          Error "offline"
+        in
+        let t =
+          runner
+            ~acquire
+            ~environment
+            ~sw
+            ~support
+            ~posted:(ref [])
+            ~invalidations:(ref 0)
+            ()
+        in
+        let _, base = bootstrap (Uri.of_string "https://localhost") in
+        let version =
+          Asset.version ~checksum:(String.make 64 '0') ~file_type:"bin" |> Result.get_ok
+        in
+        let caches =
+          List.init 5 (fun generation ->
+            let scope = Core.{ base with graph_generation = generation } in
+            let cache =
+              Cache.create ~root:support ~scope ~budget_bytes:32L ~maximum_file_bytes:4
+              |> Result.get_ok
+            in
+            let asset =
+              Asset.create
+                ~uuid:scope.graph_id
+                ~source:(Managed (Some version))
+                ~current_checksum:None
+                ~size:None
+                ~dimensions:None
+              |> Result.get_ok
+            in
+            let state =
+              Transfer.create
+                (Transfer.config ~active:1 ~foreground_reserved:0 ~pending:1 ~retries:0
+                 |> Result.get_ok)
+                ~scope
+                ~online:true
+                ~unlocked:true
+            in
+            let state, effects =
+              Transfer.step
+                state
+                (Replace { consumer = "test"; priority = Foreground; assets = [ asset ] })
+            in
+            let ticket =
+              List.find_map
+                (function
+                  | Transfer.Check_cache t -> Some t
+                  | _ -> None)
+                effects
+              |> Option.get
+            in
+            let _, effects = Transfer.step state (Cache_checked (ticket, Ok None)) in
+            List.iter
+              (function
+                | Transfer.Fetch _ as instruction ->
+                  Runner.submit_asset
+                    t
+                    ~scope
+                    ~cache
+                    ~encryption:Plaintext
+                    ~maximum_plaintext_bytes:4
+                    ~current:(fun _ -> true)
+                    ~post:(fun _ -> incr completed)
+                    instruction
+                | _ -> ())
+              effects;
+            cache)
+        in
+        for _ = 1 to 10 do
+          Eio.Fiber.yield ()
+        done;
+        let initial = !entered in
+        Eio.Promise.resolve release ();
+        wait (Eio.Stdenv.clock environment) (fun () -> !completed = 5);
+        Alcotest.(check int) "downloads share three permits across scopes" 3 initial;
+        Alcotest.(check int) "all failed requests release their permit" 5 !entered;
+        Runner.shutdown t;
+        List.iter Cache.close caches)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "asset download resource admission"
+        `Quick
+        asset_download_admission
+    ]
+;;
+
+let shared_asset_codec_admission () =
+  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+  let module Asset = Logseq_db_types.Asset_descriptor in
+  let module Cache = Logseq_sync_effect_runner.Asset_cache in
+  let plaintext = "file" in
+  let version =
+    Asset.version
+      ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum plaintext)
+      ~file_type:"bin"
+    |> Result.get_ok
+  in
+  let envelope =
+    Transit_native.Transit.Json.to_string
+      (Transit_core.Json.Array
+         [ Binary (String.make 12 'i'); Binary (String.make 20 'c') ])
+  in
+  let wire =
+    response
+      ~headers:(Printf.sprintf "Content-Length: %d\r\n" (String.length envelope))
+      envelope
+  in
+  let report =
+    with_peer
+      [ case wire ]
+      (fun ~environment ~sw ~support ~origin ->
+         let gate, release = Eio.Promise.create () in
+         let active = ref 0
+         and maximum = ref 0
+         and encrypted = ref false
+         and decrypted = ref false in
+         let use flag result =
+           flag := true;
+           incr active;
+           maximum := max !maximum !active;
+           Eio.Promise.await gate;
+           decr active;
+           result
+         in
+         let crypto_dependency =
+           Runner.crypto
+             ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ ->
+               use encrypted (Error "fixture encode failure"))
+             ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ ->
+               use decrypted (Ok plaintext))
+           |> Result.get_ok
+         in
+         let secrets_dependency =
+           Runner.secrets
+             ~unlock_private_key:
+               (fun
+                 ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
+               Ok ())
+             ~unlock_graph_key:
+               (fun
+                 ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+               Ok (String.make 32 'k'))
+             ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+               Ok "wrapped")
+             ~verify_and_save_wrapped_graph_key:
+               (fun
+                 ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+               Ok ())
+             ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
+           |> Result.get_ok
+         in
+         let posted = ref [] in
+         let t =
+           runner
+             ~crypto_dependency
+             ~secrets_dependency
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations:(ref 0)
+             ()
+         in
+         let _, instruction = Runner_contract.cached_key_effect ~origin () in
+         let scope, key =
+           match instruction with
+           | Core.Request (ticket, Core.Load_and_unlock_graph_key scope) ->
+             ( scope
+             , Core.graph_key_handle
+                 ~scope
+                 ~id:
+                   ("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
+             )
+           | _ -> Alcotest.fail "missing key request"
+         in
+         Runner.submit t instruction;
+         wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+         let source_file = Filename.concat support "pending.bin" in
+         Out_channel.with_open_bin source_file (fun out -> output_string out plaintext);
+         let upload = ref None in
+         Eio.Fiber.fork ~sw (fun () ->
+           upload
+           := Some
+                (Runner.upload_asset
+                   t
+                   ~context:Core.{ scope; encrypted = true; key = Some key }
+                   ~asset:scope.graph_id
+                   ~version
+                   ~source_file
+                   ~maximum_plaintext_bytes:4
+                   ~current:(fun () -> true)));
+         wait (Eio.Stdenv.clock environment) (fun () -> !encrypted);
+         let cache =
+           Cache.create ~root:support ~scope ~budget_bytes:32L ~maximum_file_bytes:4
+           |> Result.get_ok
+         in
+         let asset =
+           Asset.create
+             ~uuid:scope.graph_id
+             ~source:(Managed (Some version))
+             ~current_checksum:None
+             ~size:None
+             ~dimensions:None
+           |> Result.get_ok
+         in
+         let state =
+           Transfer.create
+             (Transfer.config ~active:1 ~foreground_reserved:0 ~pending:1 ~retries:0
+              |> Result.get_ok)
+             ~scope
+             ~online:true
+             ~unlocked:true
+         in
+         let state, effects =
+           Transfer.step
+             state
+             (Replace { consumer = "codec"; priority = Foreground; assets = [ asset ] })
+         in
+         let ticket =
+           List.find_map
+             (function
+               | Transfer.Check_cache t -> Some t
+               | _ -> None)
+             effects
+           |> Option.get
+         in
+         let _, effects = Transfer.step state (Cache_checked (ticket, Ok None)) in
+         let downloaded = ref false in
+         List.iter
+           (function
+             | Transfer.Fetch _ as instruction ->
+               Runner.submit_asset
+                 t
+                 ~scope
+                 ~cache
+                 ~encryption:(Encrypted (Some key))
+                 ~maximum_plaintext_bytes:4
+                 ~current:(fun _ -> true)
+                 ~post:(fun _ -> downloaded := true)
+                 instruction
+             | _ -> ())
+           effects;
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Sys.file_exists (Filename.concat support "report"));
+         Eio.Promise.resolve release ();
+         wait (Eio.Stdenv.clock environment) (fun () -> !downloaded && !upload <> None);
+         Alcotest.(check int) "GET and PUT share one codec permit" 1 !maximum;
+         Alcotest.(check bool)
+           "failed encoding releases the permit for decoding"
+           true
+           !decrypted;
+         Runner.shutdown t;
+         Cache.close cache)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "shared asset codec admission"
+        `Quick
+        shared_asset_codec_admission
     ]
 ;;

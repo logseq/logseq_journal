@@ -45,3 +45,9 @@
  (deps
   (source_tree fixtures)
   (source_tree ../../logseq_db_worker/test/fixtures/storage)))
+
+(test
+ (name test_asset_reads)
+ (modules test_asset_reads)
+ (libraries alcotest eio_main datascript_ocaml.types logseq_db_types logseq_overlay_db logseq_overlay_db_test_support melange-transit-native)
+ (deps (source_tree fixtures) (source_tree ../../logseq_db_worker/test/fixtures/storage)))

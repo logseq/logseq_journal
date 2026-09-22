@@ -45,6 +45,7 @@ let rec insert_tree parent blocks (tree : Types.block_tree) =
 ;;
 
 let apply_local model = function
+  | Types.Publish_asset _ | Set_asset_reference _ -> model
   | Types.Save_block { block; title; _ } ->
     { model with
       blocks =

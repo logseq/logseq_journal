@@ -445,7 +445,8 @@ let local_submission_uses_server_compatible_fractional_indices database =
       T.commit_mutation
         database
         ~expected:(T.insert_precondition database ~parent:T.page_uuid ~behavior)
-        (Insert_blocks { mutation_id = T.mutation_uuid 509; parent = T.page_uuid; tree })
+        (Insert_blocks
+           { mutation_id = T.mutation_uuid 509; parent = T.page_uuid; tree; asset = None })
         ~behavior
     with
     | Local_committed commit -> commit
@@ -1383,7 +1384,8 @@ let authoritative_rebase_blocks_transitive_queued_dependency database =
   let inserted = T.missing_block_uuid in
   let insert =
     Types.Insert_blocks
-      { mutation_id = inserted_id
+      { asset = None
+      ; mutation_id = inserted_id
       ; parent = T.page_uuid
       ; tree = { uuid = inserted; title = "Pending parent child"; children = [] }
       }
@@ -3370,6 +3372,8 @@ let stale_commit database mutation behavior =
       Database.release_snapshot snapshot;
       Database.write_precondition ~blocks:[] ~pages:[ page, revision ] ~scopes:[]
       |> T.require_ok ~behavior
+    | Set_asset_reference { block; _ }
+    | Publish_asset { block; _ }
     | Save_block { block; _ }
     | Set_task_status { block; _ }
     | Clear_task_status { block; _ } -> block_precondition database block behavior

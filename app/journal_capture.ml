@@ -1,5 +1,5 @@
-module ID = Bonsai_flutter_spec.Id
-module Ui = Bonsai_flutter_ui
+module ID = Bonsai_swiftui_spec.Id
+module Ui = Bonsai_swiftui_ui
 
 type phase =
   | Editing
@@ -111,6 +111,18 @@ let update_mode t = Editor.update_mode t.editor
 let value t = Editor.value t.editor
 let source t = Ui.Text_editing.Value.text (Editor.value t.editor)
 let task_state t = t.task_state
+
+let rebind t ~session_number =
+  let session_number =
+    Int64.max
+      session_number
+      (Int64.succ (ID.Text_input.Session_id.to_int64 (session_id t)))
+  in
+  { t with
+    editor = { (Editor.create ~session_number ~source:(source t)) with value = value t }
+  }
+;;
+
 let phase t = t.phase
 let source_is_blank source = String.equal (String.trim source) ""
 let can_save t = t.phase = Editing && not (source_is_blank (source t))
@@ -175,6 +187,13 @@ let fail t ~message =
   match t.pending with
   | Some _ -> { t with phase = Failed message }
   | None -> t
+;;
+
+let completed_by t block =
+  match t.pending with
+  | Some (Journal_graph_request.Capture { command; _ }) ->
+    command.block_id = Journal_model.id block
+  | _ -> false
 ;;
 
 let retry t =

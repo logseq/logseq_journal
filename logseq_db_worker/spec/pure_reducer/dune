@@ -1,8 +1,8 @@
 (library
  (name logseq_db_worker_pure_reducer)
  (public_name logseq_db_worker.pure_reducer)
- (modules core)
- (virtual_modules core)
+ (modules core asset_upload)
+ (virtual_modules core asset_upload)
  (default_implementation logseq_db_worker_pure_reducer_impl)
  (libraries
   logseq_db_worker.contract

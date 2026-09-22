@@ -131,7 +131,8 @@ let duplicate_insert_tree_is_rejected database =
   let duplicate = T.mutation_uuid 9_001 in
   let mutation =
     Types.Insert_blocks
-      { mutation_id = T.mutation_uuid 9_002
+      { asset = None
+      ; mutation_id = T.mutation_uuid 9_002
       ; parent = T.page_uuid
       ; tree =
           { uuid = duplicate
@@ -190,7 +191,8 @@ let pending_block_can_receive_an_inserted_child database =
      |> require_new_commit behavior);
   let mutation =
     Types.Insert_blocks
-      { mutation_id = T.mutation_uuid 13
+      { asset = None
+      ; mutation_id = T.mutation_uuid 13
       ; parent = T.block_uuid
       ; tree = { uuid = T.child_uuid; title = "Nested"; children = [] }
       }
@@ -264,15 +266,63 @@ let pending_insert_can_be_deleted database =
 let journal_creation_uses_missing_page_revision database =
   let behavior = "journal creation requires and uses Missing page revision" in
   let expected = journal_precondition database T.missing_page_uuid behavior in
-  ignore
-    (commit database expected (T.create_journal_page ()) behavior
-     |> require_new_commit behavior);
+  let committed =
+    commit database expected (T.create_journal_page ()) behavior
+    |> require_new_commit behavior
+  in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, protection =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token sync)
+      (Submit_group [ committed.mutation_id ])
+    |> T.require_ok ~behavior
+  in
+  let encrypted =
+    Option.map
+      (fun request ->
+         ( request
+         , List.map
+             (fun (id, value) -> id, "encrypted:" ^ value)
+             (Database.protection_plaintexts request) ))
+      protection
+  in
+  let submitted =
+    Database.apply_outbox_transition database prepared ~encrypted
+    |> T.require_ok ~behavior
+  in
+  let wire = submission_batch_wires (Option.get submitted.submission_batch) |> List.hd in
+  let module Transit = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let has_journal_class =
+    match Codec.of_string (submission_wire_protected_transaction wire) with
+    | Transit.Array operations ->
+      List.exists
+        (function
+          | Transit.Array
+              [ Keyword "db/add"
+              ; _
+              ; Keyword "block/tags"
+              ; Keyword "logseq.class/Journal"
+              ] -> true
+          | _ -> false)
+        operations
+    | _ -> false
+  in
+  T.require
+    has_journal_class
+    "submitted journal lacks its required Journal classification";
   current_snapshot database behavior (fun snapshot ->
     match
       Database.get_pages snapshot [ T.missing_page_uuid ] |> T.require_ok ~behavior
     with
     | [ Present_page { value; _ } ] ->
-      T.require (value.page.title = "2026-09-02") "journal title is wrong"
+      T.require (value.page.title = "2026-09-02") "journal title is wrong";
+      (* The imported Logseq schema assigns this stable UUID to Journal. *)
+      let journal_class = T.uuid "00000002-1979-7410-8100-000000000000" in
+      T.require
+        (List.exists (Graph.Uuid.equal journal_class) value.page.tags)
+        "created journal lacks the Journal class required by Logseq validation"
     | _ -> Alcotest.fail "created journal is not visible by explicit UUID")
 ;;
 
@@ -291,7 +341,8 @@ let delete_uses_root_revision_and_latest_local_subtree database =
        database
        (insert_precondition database T.page_uuid behavior)
        (Insert_blocks
-          { mutation_id = T.mutation_uuid 42
+          { asset = None
+          ; mutation_id = T.mutation_uuid 42
           ; parent = T.page_uuid
           ; tree =
               { uuid = T.block_uuid
@@ -313,7 +364,8 @@ let delete_uses_root_revision_and_latest_local_subtree database =
             database
             (block_insert_precondition database T.child_uuid behavior)
             (Insert_blocks
-               { mutation_id = T.mutation_uuid 44
+               { asset = None
+               ; mutation_id = T.mutation_uuid 44
                ; parent = T.child_uuid
                ; tree =
                    { uuid = newer
@@ -407,7 +459,8 @@ let same_id_different_payload_conflicts database =
      |> require_new_commit behavior);
   let different =
     Types.Insert_blocks
-      { mutation_id = T.mutation_uuid 60
+      { asset = None
+      ; mutation_id = T.mutation_uuid 60
       ; parent = T.page_uuid
       ; tree = { uuid = T.child_uuid; title = "Different"; children = [] }
       }
@@ -587,7 +640,8 @@ let deterministic_model_projection_matches_naive_oracle database =
     let uuid = next_uuid ordinal in
     let mutation =
       Types.Insert_blocks
-        { mutation_id = T.mutation_uuid (1_000 + ordinal)
+        { asset = None
+        ; mutation_id = T.mutation_uuid (1_000 + ordinal)
         ; parent = T.page_uuid
         ; tree = { uuid; title = Printf.sprintf "Model block %d" ordinal; children = [] }
         }
@@ -622,7 +676,8 @@ let deterministic_model_projection_matches_naive_oracle database =
       | 3 ->
         let uuid = next_uuid ordinal in
         ( Types.Insert_blocks
-            { mutation_id = T.mutation_uuid (1_000 + ordinal)
+            { asset = None
+            ; mutation_id = T.mutation_uuid (1_000 + ordinal)
             ; parent = target.uuid
             ; tree =
                 { uuid; title = Printf.sprintf "Model child %d" ordinal; children = [] }
@@ -657,7 +712,7 @@ let append_tree database ~parent ~ordinal tree =
   commit
     database
     expected
-    (Insert_blocks { mutation_id = T.mutation_uuid ordinal; parent; tree })
+    (Insert_blocks { mutation_id = T.mutation_uuid ordinal; parent; tree; asset = None })
     behavior
   |> require_new_commit behavior
 ;;

@@ -158,11 +158,11 @@ let test_sync_error_card_is_temporary_and_error_only root =
   let application = read_file (path root "app/application.ml") in
   match
     text_between
-      application
-      ~start_marker:"  let overlays =\n    match sync_error with"
-      ~end_marker:"  in\n  let body ="
+      (read_file (path root "app/journal_header.ml"))
+      ~start_marker:"let sync_feedback ="
+      ~end_marker:"let controls name placement values"
   with
-  | None -> fail "unable to locate the Timeline sync-error overlay"
+  | None -> fail "unable to locate the native safe-area sync error"
   | Some overlay ->
     List.iter
       (fun obsolete ->
@@ -489,8 +489,8 @@ let test_injected_logseq_sync_api_boundary root =
     "logseq_sync/spec/pure_reducer/dune"
     [ "(name logseq_sync_pure_reducer)"
     ; "(public_name logseq_sync.pure_reducer)"
-    ; "(modules core sync_protocol)"
-    ; "(virtual_modules core sync_protocol)"
+    ; "(modules core sync_protocol asset_transfer)"
+    ; "(virtual_modules core sync_protocol asset_transfer)"
     ; "(default_implementation logseq_sync_pure_reducer_impl)"
     ];
   require_text
@@ -498,8 +498,8 @@ let test_injected_logseq_sync_api_boundary root =
     "logseq_sync/spec/effect_runner/dune"
     [ "(name logseq_sync_effect_runner)"
     ; "(public_name logseq_sync.effect_runner)"
-    ; "(modules effect_runner)"
-    ; "(virtual_modules effect_runner)"
+    ; "(modules effect_runner asset_codec asset_cache)"
+    ; "(virtual_modules effect_runner asset_codec asset_cache)"
     ; "(default_implementation logseq_sync_effect_runner_impl)"
     ; "logseq_sync.pure_reducer"
     ];
@@ -587,7 +587,7 @@ let test_standalone_sync_protocol_boundary root =
     [ "(name logseq_sync_pure_reducer_impl)"
     ; "(public_name logseq_sync.pure_reducer.impl)"
     ; "(implements logseq_sync_pure_reducer)"
-    ; "(modules core sync_protocol)"
+    ; "(modules core sync_protocol asset_transfer)"
     ];
   List.iter
     (forbid_path root)
@@ -656,7 +656,7 @@ let test_standalone_sync_protocol_boundary root =
     ]
 ;;
 
-let test_bonsai_flutter_dune_closure_names root =
+let test_bonsai_dune_closure_names root =
   require_text root "logseq_sync/lib/effect_runner/dune" [ "logseq_sync.pure_reducer" ];
   require_text root "logseq_db_worker/lib/dune" [ "logseq_sync.pure_reducer" ];
   let pure_dune = "logseq_sync/lib/pure_reducer/dune" in
@@ -672,6 +672,17 @@ let test_bonsai_flutter_dune_closure_names root =
     ; "logseq_sync/lib/sync_protocol.ml"
     ; "logseq_sync/lib/effect_runner.ml"
     ]
+;;
+
+let forbid_worker_storage_access root relative =
+  let contents = read_file (path root relative) in
+  let permitted =
+    if relative = "logseq_db_worker/lib/effect_runner/effect_runner.ml"
+    then count_occurrences contents "Logseq_db_storage.Asset_upload_store."
+    else 0
+  in
+  if count_occurrences contents "Logseq_db_storage" <> permitted
+  then fail "worker accesses storage outside its upload intent store: %s" relative
 ;;
 
 let test_worker_owned_overlay_orchestration root =
@@ -709,12 +720,8 @@ let test_worker_owned_overlay_orchestration root =
   forbid_text
     root
     "logseq_db_worker/lib/effect_runner/effect_runner.ml"
-    [ "Logseq_db_worker_engine"
-    ; "Engine."
-    ; "Mutation."
-    ; "Datascript."
-    ; "Logseq_db_storage"
-    ];
+    [ "Logseq_db_worker_engine"; "Engine."; "Mutation."; "Datascript." ];
+  forbid_worker_storage_access root "logseq_db_worker/lib/effect_runner/effect_runner.ml";
   require_text
     root
     "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
@@ -874,6 +881,7 @@ let test_final_overlay_data_plane_boundary root =
     ];
   List.iter
     (fun relative ->
+       forbid_worker_storage_access root relative;
        forbid_text
          root
          relative
@@ -881,7 +889,6 @@ let test_final_overlay_data_plane_boundary root =
          ; "Logseq_db_worker_engine"
          ; "Engine."
          ; "Datascript."
-         ; "Logseq_db_storage"
          ; "Storage_session"
          ; "projected_db"
          ; "projected_conn"
@@ -1072,7 +1079,7 @@ let test_deployed_managed_sync_e2e_boundary root =
     ; "V2_insert_blocks"
     ; "V2_get_block"
     ; "V2_delete_blocks"
-    ; "flutter/JournalE2EECrypto.swift"
+    ; "swift/JournalE2EECrypto.swift"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_FILE_KEYCHAIN"
     ; "DYLD_INSERT_LIBRARIES"
     ; "-emit-library"
@@ -1147,7 +1154,7 @@ let () =
   test_logseq_sync_package_boundary root;
   test_injected_logseq_sync_api_boundary root;
   test_standalone_sync_protocol_boundary root;
-  test_bonsai_flutter_dune_closure_names root;
+  test_bonsai_dune_closure_names root;
   test_worker_owned_overlay_orchestration root;
   test_final_overlay_data_plane_boundary root;
   test_startup_phase_ownership root;
@@ -1159,31 +1166,18 @@ let () =
     "logseq_journal.opam.locked"
     ~package:"ocaml-ios64"
     ~version:"5.1.1";
-  let current_bonsai_flutter_revision = "84e588d0698ad3543d9a93ee2f9cf3a1ba82d05b" in
-  let obsolete_bonsai_flutter_revisions =
-    [ "5101a51d980c53bf9aab1e9420321ea8a7d58f9b"
-    ; "3d2a540d886839fb243ce78f4bcc38da13c600a9"
-    ; "f4377637a33cdc450204734d033bbcbb861e06bb"
-    ; "1755441c24d718206a3d61af0882c0727f810d46"
-    ; "6f2562e09d74d347a50b90541abdb4900e1e23da"
-    ; "9b345b90fea476391d19092675abd665655e586a"
-    ; "a6bd9aa9906c0e49f0cc365e5ba33270e89655e6"
-    ; "d5f8d36b5539550cbc2466311acda4d8c609032e"
-    ; "a51276a09eb1cdf9c87f07ac4c7558ed7c6b2d69"
-    ; "26f5bf6c3b4cdd61ccd5c1660f6cf9f72fe523da"
-    ; "066179956545cc12871862879fc906f09519788c"
-    ; "f6d27175632d26e759532f6ee81e8d1383490533"
-    ; "2dc30ce5f112eb79f84bfd238d2dd48e43e218cf"
-    ; "d182690aeaa82ad0a972756205c62e3b598e3c24"
-    ; "5f8f540e4ccfd1e1807294aec8ac5f229161e2da"
-    ; "fcde784654ee5b8557afc3c966d840f2b1331912"
-    ; "de1196c2663b43388ebf04bd0612c5050edef753"
-    ]
+  let framework_archive =
+    "file:///Users/rcmerci/.local/share/bonsai-swiftui/releases/2026-09-18-journal-native-210435/final/bonsai-swiftui-0.1.0~dev.tar.gz"
   in
   List.iter
     (fun (relative, occurrences) ->
-       require_occurrences root relative current_bonsai_flutter_revision occurrences;
-       forbid_text root relative obsolete_bonsai_flutter_revisions)
+       require_occurrences root relative framework_archive occurrences;
+       require_exact_dependency
+         root
+         relative
+         ~package:"bonsai_swiftui"
+         ~version:"0.1.0~dev";
+       forbid_text root relative [ "bonsai_flutter"; "git+file:" ])
     [ "logseq_journal.opam", 2
     ; "logseq_journal.opam.locked", 2
     ; "logseq_db_worker.opam", 2
@@ -1262,10 +1256,10 @@ let () =
     ];
   List.iter
     (require_file root)
-    [ "bonsai-flutter.sexp"
+    [ "bonsai-swiftui.sexp"
     ; "app/application.ml"
-    ; "app/material_icon_catalog.ml"
-    ; "app/material_icon_catalog.mli"
+    ; "app/journal_symbols.ml"
+    ; "app/journal_symbols.mli"
     ; "app/journal_calendar.ml"
     ; "app/journal_graph_projection.ml"
     ; "app/journal_graph_projection.mli"
@@ -1288,112 +1282,65 @@ let () =
     ; "flutter/lib/main.dart"
     ; "flutter/test/application_host_adapter_test.dart"
     ; "flutter/test/widget_test.dart"
-    ; "test/test_material_icons_artifact.sh"
-    ; "tool/verify_material_icons_font.sh"
+    ; "swift/App.swift"
+    ; "swift/JournalApplicationPlatform.swift"
+    ; "swift/JournalNativeServices.swift"
     ];
   require_text
     root
-    "app/material_icon_catalog.mli"
+    "app/journal_symbols.mli"
     [ "type t ="
-    ; "Account_circle"
+    ; "Account"
     ; "Add"
-    ; "Arrow_upward"
-    ; "Chevron_left"
-    ; "Chevron_right"
-    ; "Circle"
+    ; "Back"
+    ; "Open"
     ; "Delete"
-    ; "Expand_more"
+    ; "Expand"
     ; "Refresh"
     ; "val create"
     ];
-  require_text root "app/material_icon_catalog.ml" [ "MaterialIcons"; "Ui.Widget.icon" ];
-  require_text root "app/dune" [ "material_icon_catalog" ];
+  require_text root "app/journal_symbols.ml" [ "View.symbol" ];
+  require_text root "app/dune" [ "journal_symbols"; "bonsai_swiftui" ];
   List.iter
     (fun relative ->
-       if
-         not
-           (String.equal relative "app/material_icon_catalog.ml"
-            || String.equal relative "app/material_icon_catalog.mli")
-       then forbid_text root relative [ "MaterialIcons"; "Ui.Widget.icon"; "0xe" ])
+       forbid_text
+         root
+         relative
+         [ "MaterialIcons"; "Ui.Widget"; "Ui.Material"; "Bonsai_flutter" ])
     (ocaml_product_files root);
   require_text
     root
     "app/application.ml"
-    [ "Material_icon_catalog.Refresh"
-    ; "Ui.Material.navigation_bar"
-    ; "Ui.Native_widget.Expandable_message_composer.create_with_handler"
+    [ "Journal_header.view"
+    ; "arrow.clockwise"
+    ; "V.Navigation_stack.create"
+    ; "V.Sheet.create"
+    ; "V.text_editor"
+    ; "if favorites_selected"
+    ; "Detail_list.view"
+    ; "V.progress"
     ];
-  require_text root "app/journal_header.ml" [ "Material_icon_catalog.Account_circle" ];
   require_text
     root
     "app/journal_header.ml"
-    [ "Ui.Material.App_bar.sliver"
-    ; "Ui.Material.Tooltip.plain"
-    ; "~pinned:true"
-    ; "~floating:false"
-    ; "~snap:false"
-    ; "~center_title:true"
-    ; "~expanded_height:(toolbar_height +. 8.)"
-    ; "~collapsed_height:(toolbar_height +. 8.)"
-    ];
-  forbid_text
-    root
-    "app/journal_header.ml"
-    [ "Ui.Widget.safe_area"
-    ; "Ui.Widget.Sliver.app_bar"
-    ; "journal-header-flexible-space"
-    ; "journal-header-divider"
-    ; "journal-header-stack"
-    ; "journal-header-surface"
-    ; "journal-header-content-height"
-    ];
-  forbid_text
-    root
-    "app/application.ml"
-    [ "Ui.Widget.button"; "Ui.Material.choice_chip"; "Ui.Material.list_tile" ];
-  require_text
-    root
-    "app/application.ml"
-    [ "Journal_header.sliver"
-    ; "Ui.Material.Chip.filter"
-    ; "Ui.Material.Dialog.alert"
-    ; "Ui.Material.text_button"
-    ; "Ui.Material.Tooltip.plain"
-    ; "Ui.Widget.Scroll_view.vertical"
-    ; "journal-scroll"
-    ; "?floating_action_button:(if favorites_selected then None else Some capture)"
-    ; "~floating_action_button_location:Ui.Material.End_float"
-    ];
-  forbid_text root "app/journal_header.ml" [ "~variant:Ui.Material.App_bar.Medium" ];
-  forbid_text root "app/application.ml" [ "Journal_header.view" ];
-  forbid_text root "app/journal_timeline.ml" [ "Ui.Widget.Scroll_view.vertical" ];
-  require_text root "app/journal_timeline.ml" [ "Ui.Widget.Sliver.padding" ];
-  require_text
-    root
-    "app/journal_row.ml"
-    [ "Material_icon_catalog.Chevron_left"
-    ; "Material_icon_catalog.Chevron_right"
-    ; "Material_icon_catalog.Expand_more"
+    [ "Journal_symbols.Account"
+    ; "V.button"
+    ; "V.semantics"
+    ; "V.Menu.create"
+    ; "journal-root-navigation"
+    ; "switch-graph"
+    ; "sign-out"
+    ; "open-diagnostics"
+    ; "request-local-cache-reset"
     ];
   require_text
     root
     "app/journal_timeline.ml"
-    [ "Material_icon_catalog.Circle"
-    ; "Material_icon_catalog.Delete"
-    ; "Ui.Native_widget.Slidable.action"
-    ; "Ui.Native_widget.Slidable.action_pane"
-    ; "Ui.Native_widget.Slidable.create_with_handler"
-    ; "Ui.Native_widget.Morphing_surface.create"
-    ; "~drag_dismissible:false"
-    ];
+    [ "Journal_native_collection.view"; "Timeline.fold_slots"; "V.progress" ];
   forbid_text
     root
     "app/journal_timeline.ml"
-    [ "Ui.Native_widget.Swipe_action"
-    ; "Ui.Native_widget.Slidable.dismissible"
-    ; "quick_status_actions"
-    ; "extent_ratio:0.8"
-    ];
+    [ "~full_swipe:true"; "quick_status_actions" ];
   List.iter
     (forbid_path root)
     [ "flutter/lib/app"
@@ -1435,6 +1382,7 @@ let () =
     ; "flutter/lib/journal_tail_fade.dart"
     ; "flutter/lib/journal_date_row.dart"
     ; "flutter/lib/journal_root_navigation.dart"
+    ; "flutter/lib/journal_detail_outline.dart"
     ; "flutter/lib/journal_widget_registry.dart"
     ; "flutter/lib/main.dart"
     ];
@@ -1445,6 +1393,7 @@ let () =
     ; "flutter/test/macos_edit_menu_test.dart"
     ; "flutter/test/journal_tail_fade_test.dart"
     ; "flutter/test/journal_root_navigation_test.dart"
+    ; "flutter/test/journal_detail_outline_test.dart"
     ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
     ; "flutter/test/journal_runtime_golden_test.dart"
     ; "flutter/test/journal_header_layout_test.dart"
@@ -1467,7 +1416,7 @@ let () =
     root
     "logseq_db_worker/tool/test_macos_runtime_flow.sh"
     [ "logseq_db_worker_runtime_flow_test.dart" ];
-  require_occurrences root "app/application.ml" "Ui.Style.Color.rgb" 1;
+  forbid_text root "app/application.ml" [ "Ui.Style.Color.rgb"; "Ui.Style.Color.argb" ];
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
   forbid_text root "app/application.ml" [ "let color"; "(color " ];
   List.iter
@@ -1481,11 +1430,7 @@ let () =
   require_text
     root
     "app/journal_visual_tokens.ml"
-    [ "module Color_exceptions = struct"
-    ; "type presentation"
-    ; "let status_rail_color"
-    ; "let destructive_swipe_action"
-    ];
+    [ "module Color_exceptions = struct"; "type presentation"; "let status_swipe_action" ];
   List.iter
     (fun relative ->
        forbid_text
@@ -1509,14 +1454,8 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Ui.Theme.System"
-    ; "~high_contrast_dark"
-    ; "Ui.Material.text_button"
-    ; "Ui.Native_widget.Expandable_message_composer.create_with_handler"
-    ; "?floating_action_button:(if favorites_selected then None else Some capture)"
-    ];
-  require_text root "app/journal_timeline.ml" [ "Ui.Material.divider" ];
-  forbid_text root "app/journal_header.ml" [ "Ui.Material.divider" ];
+    [ "Ui.Theme.create"; "~mode:System"; "V.text_editor" ];
+  forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root
     "app/journal_timeline.ml"
@@ -1612,8 +1551,8 @@ let () =
   List.iter
     (fun relative ->
        forbid_text root relative [ "com.apple.security.files.user-selected" ])
-    [ "flutter/macos/Runner/DebugProfile.entitlements"
-    ; "flutter/macos/Runner/Release.entitlements"
+    [ "config/entitlements/macos-debug-profile.entitlements"
+    ; "config/entitlements/macos-release.entitlements"
     ];
   let obsolete_product_symbols =
     [ "Search_route"
@@ -1714,21 +1653,10 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Ui.Navigation.Modal_bottom_sheet.create"
-    ; "Ui.Navigation.Modal_bottom_sheet.Handle_semantics.create"
-    ; "Ui.Navigation.Modal_bottom_sheet.Detents.create"
-    ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Detented"
+    [ "V.Sheet.create"
     ; "journal-status-sheet-page:"
     ; "journal-status-sheet-option:"
     ; "Set status"
-    ];
-  forbid_text
-    root
-    "app/application.ml"
-    [ "Ui.Navigation.Modal_bottom_sheet.Sizing.Content_bounded"
-    ; "Ui.Navigation.Modal_bottom_sheet.Sizing.Scroll_controlled"
-    ; "~keyboard_inset_bottom:environment.keyboard_insets.bottom"
-    ; "~border_radius:geometry.top_corner_radius"
     ];
   List.iter
     (fun relative ->
@@ -1745,37 +1673,31 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "timeline-toggle-children:"
-    ; "Journal_model.child_count block > 0"
-    ; "~obscure_text:true"
+    [ "timeline-open-block:"
+    ; "favorite-open-block:"
+    ; "detail-expand:"
+    ; "detail-collapse:"
+    ; "detail-submit:"
+    ; "V.secure_field"
     ; "Graph_service.Submit_e2ee_password"
     ; "request-local-cache-reset"
-    ; "cancel-local-cache-reset"
-    ; "confirm-local-cache-reset"
+    ; "Action \"cancel\""
+    ; "V.Confirmation.alert"
     ; "Graph_service.Delete_local_cache"
     ; "Graph_service.Return_to_graph_picker"
-    ; "journal-account-menu"
-    ; "journal-account-switch-graph"
-    ; "journal-account-sign-out"
-    ; "Ui.Widget.Scroll_view.vertical"
-    ; "graph-picker-scroll"
-    ; "graph-picker-toolbar"
-    ; "graph-picker-refresh-icon"
+    ; "Presentation.list"
+    ; "graph-picker-list"
+    ; "e2ee-password-cancel"
     ; "Refresh the authorized graph catalog"
-    ; "pending local changes"
+    ; "pending local"
     ; "then returns to graph selection"
     ; "App.View.create"
-    ; "Ui.Theme.application"
-    ; "Ui.Material.Dialog.alert"
-    ; "Ui.Navigation.Modal_dialog"
-    ; "Bonsai_flutter.Host_effect.show_snack_bar"
-    ; "Ui.Material.filled_button"
-    ; "Ui.Material.filled_tonal_button"
-    ; "Ui.Material.outlined_button"
-    ; "Ui.Material.text_button"
-    ; "journal-account-dialog-page"
-    ; "local-cache-reset-dialog-page"
-    ; "detail-discard-dialog-page"
+    ; "application_theme"
+    ; "V.Sheet.create"
+    ; "Bonsai_swiftui.Host_effect.show_notice"
+    ; "V.button"
+    ; "local-cache-reset-confirmation"
+    ; "journal-detail-route"
     ];
   forbid_text
     root
@@ -1799,47 +1721,41 @@ let () =
     [ "sign_out_request"; "is_prepare_to_terminate_event"; "termination_ready_request" ];
   require_text
     root
-    "flutter/lib/application_host_adapter.dart"
-    [ "Amplify.Auth.signOut()"
-    ; "https://api.logseq.io"
-    ; "prepareToTerminate"
-    ; "prepareToTerminateEvent"
-    ; "terminationReadyRequest"
-    ; "SlidableAutoCloseBehavior"
-    ];
-  forbid_text
-    root
-    "flutter/lib/application_host_adapter.dart"
-    [ "String.fromEnvironment('LOGSEQ_SYNC_BASE_URL')" ];
-  require_text root "bonsai-flutter.sexp" [ "(mode custom)"; "(main lib/main.dart)" ];
-  forbid_text root "bonsai-flutter.sexp" [ "(mode managed_adapter)" ];
-  require_file root "flutter/lib/main.dart";
+    "swift/JournalAmplifySession.swift"
+    [ "Amplify.Auth.signOut()"; "Amplify.Auth.fetchAuthSession()"; "getCognitoTokens()" ];
   require_text
     root
-    "flutter/lib/main.dart"
-    [ "JournalAmplify.configure()"
-    ; "amplifyReady: amplifyReady"
-    ; "runApp"
-    ; "Unable to configure authentication"
-    ; "Retry"
+    "swift/JournalNativeServices.swift"
+    [ "https://api.logseq.io"
+    ; "applicationSupportDirectory"
+    ; "JournalLocalAccountBindingStore.load()"
     ];
-  require_occurrences root "flutter/lib/main.dart" "MaterialApp(" 1;
-  forbid_path root "flutter/lib/application.dart";
-  List.iter
-    (fun relative -> forbid_text root relative [ "FLUTTER_TARGET" ])
-    [ "flutter/macos/Flutter/Flutter-Debug.xcconfig"
-    ; "flutter/macos/Flutter/Flutter-Release.xcconfig"
-    ; "flutter/ios/Flutter/Debug.xcconfig"
-    ; "flutter/ios/Flutter/Release.xcconfig"
+  forbid_text root "swift/JournalNativeServices.swift" [ "LOGSEQ_SYNC_BASE_URL" ];
+  require_text
+    root
+    "bonsai-swiftui.sexp"
+    [ "(lang 4)"
+    ; "(native_target app/native_embed.exe.o)"
+    ; "(features network sqlite)"
+    ; "(bundle_identifier com.logseq.journal)"
+    ; "(bundle_identifier com.example.bonsaiFlutterLogseqJournalHost)"
+    ; "(minimum_version 26.0)"
+    ; "(exact 2.61.0)"
     ];
   require_text
     root
-    "flutter/macos/Runner/AppDelegate.swift"
-    [ "applicationShouldTerminate"
+    "swift/App.swift"
+    [ "BonsaiApplicationView(entrypoint: \"logseq_journal\""
+    ; "applicationShouldTerminate"
     ; ".terminateLater"
     ; "reply(toApplicationShouldTerminate:"
-    ; "Darwin.exit(EXIT_SUCCESS)"
+    ; "beginShutdown()"
     ];
+  require_text
+    root
+    "swift/JournalApplicationPlatform.swift"
+    [ "JournalPlatformEvents"; "beginShutdown"; "terminationReady" ];
+  forbid_text root "swift/App.swift" [ "Darwin.exit" ];
   require_text
     root
     "logseq_sync/lib/effect_runner/eio/http_eio.ml"
@@ -1922,8 +1838,16 @@ let () =
   require_text
     root
     "app/journal_timeline_state.mli"
-    [ "Top_level"; "Child_preview"; "Children_loading"; "Children_more"; "epoch : int64" ];
-  require_text
+    [ "Top_level"; "Day_continuation"; "Feed_continuation" ];
+  forbid_text
+    root
+    "app/journal_timeline_state.mli"
+    [ "Child_preview"; "Children_loading"; "Children_more"; "val expand"; "val collapse" ];
+  forbid_text
+    root
+    "app/application.ml"
+    [ "timeline-toggle-children:"; "detail-discard-dialog-page"; "detail-child-save" ];
+  forbid_text
     root
     "app/journal_visual_tokens.mli"
     [ "type fixed_extent_role"
@@ -2004,7 +1928,7 @@ let () =
     root
     "logseq_db_worker/spec/pure_reducer/dune"
     [ "(public_name logseq_db_worker.pure_reducer)"
-    ; "(virtual_modules core)"
+    ; "(virtual_modules core asset_upload)"
     ; "(default_implementation logseq_db_worker_pure_reducer_impl)"
     ];
   require_text
@@ -2075,7 +1999,6 @@ let () =
     "app/application.ml"
     [ "open-diagnostics"
     ; "close-diagnostics"
-    ; "journal-account-diagnostics"
     ; "journal-startup-diagnostics"
     ; "journal-diagnostics-dialog-page"
     ; "Overlay DB"
@@ -2117,7 +2040,7 @@ let () =
   require_text
     root
     "app/journal_header.ml"
-    [ "journal-error-info-button"; "Review Logseq DB worker errors" ];
+    [ "journal-error-info-button"; "Inspect application errors" ];
   forbid_text
     root
     "app/journal_graph_runtime.mli"
@@ -2192,10 +2115,7 @@ let () =
          ; "timeZoneId"
          ; "utcOffsetSeconds"
          ])
-    [ "flutter/lib/application_host_adapter.dart"
-    ; "flutter/macos/Runner/MainFlutterWindow.swift"
-    ; "flutter/ios/Runner/AppDelegate.swift"
-    ];
+    [ "swift/JournalApplicationPlatform.swift"; "swift/App.swift" ];
   require_text
     root
     "app/application.ml"

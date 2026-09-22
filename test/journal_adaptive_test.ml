@@ -1,51 +1,39 @@
 module Tokens = Journal_visual_tokens
-module Ui = Bonsai_flutter_ui
+module Ui = Bonsai_swiftui_ui
 
 let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
 ;;
 
-let test_material_icon_catalog_matches_flutter_3_44_8 () =
+let test_sf_symbols_preserve_identity_and_appearance () =
   let cases =
-    Material_icon_catalog.
-      [ Account_circle, 0xe043
-      ; Add, 0xe047
-      ; Arrow_upward, 0xe0a0
-      ; Chevron_left, 0xe15e
-      ; Chevron_right, 0xe15f
-      ; Circle, 0xe163
-      ; Delete, 0xe1b9
-      ; Expand_more, 0xe246
-      ; Refresh, 0xe514
+    Journal_symbols.
+      [ Account, "person.crop.circle"
+      ; Add, "plus"
+      ; Save, "arrow.up"
+      ; Back, "chevron.left"
+      ; Open, "chevron.right"
+      ; Dot, "circle.fill"
+      ; Delete, "trash"
+      ; Expand, "chevron.down"
+      ; Refresh, "arrow.clockwise"
       ]
   in
   List.iter
-    (fun (role, expected_code_point) ->
+    (fun (role, expected) ->
        let color = Ui.Style.Color.rgb ~red:17 ~green:34 ~blue:51 in
-       let key = Ui.Key.string (Printf.sprintf "material-icon:%x" expected_code_point) in
-       let widget = Material_icon_catalog.create ~key ~size:19. ~color role in
-       let (Av view) = Ui.Widget.Private.view widget in
+       let key = Ui.Key.string ("symbol:" ^ expected) in
+       let widget = Journal_symbols.create ~key ~size:19. ~color role in
+       let (Av view) = Ui.View.Private.view widget in
        (match view.node with
-        | Ui.Widget.Private.Icon
-            { code_point; font_family = Some font_family; size; color = Some argb } ->
-          require
-            (code_point = expected_code_point)
-            "catalog role resolved to U+%04X instead of U+%04X"
-            code_point
-            expected_code_point;
-          require
-            (String.equal font_family "MaterialIcons")
-            "catalog role uses font family %S"
-            font_family;
-          require (size = Some 19.) "catalog role did not preserve its requested size";
-          require
-            (Int32.equal argb 0xff112233l)
-            "catalog role did not preserve its requested color"
-        | Icon _ -> failwith "catalog role omitted required icon properties"
-        | _ -> failwith "catalog role did not produce an icon");
+        | Ui.View.Private.Symbol { name; size; color; _ } ->
+          require (name = expected) "Unexpected SF Symbol %s" name;
+          require (size = Some 19.) "Symbol size changed";
+          require (color = Some 0xff112233l) "Symbol tint changed"
+        | _ -> failwith "Expected a native symbol");
        require
-         (Option.equal Ui.Key.equal (Ui.Widget.For_testing.key widget) (Some key))
-         "catalog role did not preserve its requested key")
+         (Option.equal Ui.Key.equal (Ui.View.For_testing.key widget) (Some key))
+         "Symbol key changed")
     cases
 ;;
 
@@ -70,361 +58,105 @@ let test_every_exact_status_maps_to_the_decided_rail_category () =
     ]
 ;;
 
-let test_typography_spacing_motion_and_hit_regions () =
-  let typography = Tokens.typography Tokens.Balanced in
-  require
-    (typography.day_heading.font_size = 20.
-     && typography.day_heading.line_height = 24.
-     && typography.day_heading.weight = Ui.Style.Font_weight.Normal)
-    "header title typography changed";
-  require
-    (typography.entry.font_size = 16.
-     && typography.entry.line_height = 22.
-     && typography.entry.weight = Ui.Style.Font_weight.Normal)
-    "entry typography changed";
-  require
-    (typography.supporting.font_size = 14.
-     && typography.supporting.line_height = 20.
-     && typography.supporting.weight = Ui.Style.Font_weight.Normal)
-    "supporting typography changed";
-  List.iter
-    (fun preset ->
-       let typography = Tokens.typography preset in
-       require
-         (typography.day_heading.font_size = 20.
-          && typography.day_heading.line_height = 24.
-          && typography.day_heading.weight = Ui.Style.Font_weight.Normal)
-         "day heading typography changed")
-    [ Tokens.Dense; Balanced; Comfortable ];
-  require
-    (typography.timestamp.font_size = 13.
-     && typography.timestamp.line_height = 18.
-     && typography.timestamp.weight = Ui.Style.Font_weight.Normal)
-    "timestamp typography changed";
-  List.iter
-    (fun preset ->
-       let input = (Tokens.typography preset).input in
-       require
-         (input.font_size = 16.
-          && input.line_height = 24.
-          && input.weight = Ui.Style.Font_weight.Normal)
-         "text input typography changed")
-    [ Tokens.Dense; Balanced; Comfortable ];
-  let spacing = Tokens.spacing in
-  require
-    ([ spacing.x1
-     ; spacing.x2
-     ; spacing.x3
-     ; spacing.x4
-     ; spacing.x5
-     ; spacing.x6
-     ; spacing.x7
-     ]
-     = [ 4.; 8.; 12.; 16.; 20.; 24.; 28. ])
-    "spacing grid changed";
-  let hit = Tokens.hit_regions in
-  require
-    (hit.header_visual = 30. && hit.minimum_target = 44.)
-    "hit-region tokens changed";
-  let row = Tokens.row_geometry in
-  require
-    (row.time_slot_base = 52.
-     && row.day_heading_before = 20.
-     && row.day_heading_after = 10.
-     && row.entry_vertical_padding = 6.
-     && row.disclosure_visual = 14.
-     && row.status_rail_width = 4.
-     && row.status_rail_radius = 2.
-     && row.trailing_inset = 24.)
-    "row geometry tokens changed";
-  let preview = Tokens.preview_geometry in
-  require
-    (preview.connector_leading = 32.
-     && preview.bullet_center_leading = 50.
-     && preview.bullet_diameter = 3.
-     && preview.text_leading = 68.
-     && preview.narrow_leading_delta = 8.)
-    "preview geometry tokens changed";
-  let composer = Tokens.composer_geometry in
-  require
-    (composer.horizontal_margin = 12. && composer.maximum_lines = 5)
-    "Capture affordance geometry tokens changed";
-  let standard = Tokens.motion ~reduced_motion:false in
-  let reduced = Tokens.motion ~reduced_motion:true in
-  require
-    (standard.press_release_ms = 80 && standard.route_transition_ms = 180)
-    "standard motion tokens changed";
-  require
-    (reduced.press_release_ms = 0 && reduced.route_transition_ms = 0)
-    "reduced-motion tokens are not disabled"
-;;
-
-let test_dividers_resolve_to_one_physical_pixel () =
-  List.iter
-    (fun device_pixel_ratio ->
-       let logical = Tokens.physical_divider_thickness ~device_pixel_ratio in
-       require
-         (Float.equal (logical *. device_pixel_ratio) 1.)
-         "divider is not one physical pixel at %.0fx"
-         device_pixel_ratio)
-    [ 1.; 2.; 3.; 4. ];
-  require
-    (Float.equal (Tokens.physical_divider_thickness ~device_pixel_ratio:0.) 1.)
-    "invalid DPR does not retain the safe one-pixel fallback"
-;;
-
-let require_profile
-      ~width
-      ~scale
-      ~kind
-      ~block_line_height
-      ~continuation_extent
-      ~day_header_extent
-      ~content_leading
-      ~time_slot_width
-  =
-  let profile =
-    Tokens.select_row_profile
-      ~preset:Tokens.Balanced
-      ~viewport_width:width
-      ~text_scale:scale
-  in
-  require (profile.kind = kind) "profile kind changed at %.0f/%.2f" width scale;
-  require
-    (profile.block_line_height = block_line_height)
-    "block line height changed at %.0f/%.2f"
-    width
-    scale;
-  require
-    (profile.continuation_extent = continuation_extent)
-    "continuation extent changed at %.0f/%.2f"
-    width
-    scale;
-  require
-    (profile.day_header_extent = day_header_extent)
-    "day extent changed at %.0f/%.2f"
-    width
-    scale;
-  require
-    (profile.content_leading = content_leading)
-    "content leading changed at %.0f/%.2f"
-    width
-    scale;
-  require
-    (profile.time_slot_width = time_slot_width)
-    "time slot width changed at %.0f/%.2f"
-    width
-    scale
-;;
-
-let test_known_row_profile_selection () =
-  require_profile
-    ~width:360.
-    ~scale:1.3
-    ~kind:Tokens.Compact
-    ~block_line_height:28.6
-    ~continuation_extent:54.
-    ~day_header_extent:62.
-    ~content_leading:32.
-    ~time_slot_width:52.;
-  require_profile
-    ~width:359.
-    ~scale:1.
-    ~kind:Tokens.Adaptive
-    ~block_line_height:22.
-    ~continuation_extent:48.
-    ~day_header_extent:54.
-    ~content_leading:24.
-    ~time_slot_width:52.;
-  require_profile
-    ~width:390.
-    ~scale:1.3
-    ~kind:Tokens.Compact
-    ~block_line_height:28.6
-    ~continuation_extent:54.
-    ~day_header_extent:62.
-    ~content_leading:32.
-    ~time_slot_width:52.;
-  require_profile
-    ~width:744.
-    ~scale:2.
-    ~kind:Tokens.Adaptive
-    ~block_line_height:44.
-    ~continuation_extent:68.
-    ~day_header_extent:78.
-    ~content_leading:32.
-    ~time_slot_width:104.;
-  require_profile
-    ~width:1_200.
-    ~scale:3.2
-    ~kind:Tokens.Adaptive
-    ~block_line_height:70.4
-    ~continuation_extent:92.
-    ~day_header_extent:107.
-    ~content_leading:32.
-    ~time_slot_width:167.
-;;
-
-let test_row_profiles_cover_required_width_and_scale_matrix () =
-  let cases =
-    [ 320., 1., Tokens.Adaptive, 22., 48., 54., 24., 52.
-    ; 320., 1.3, Tokens.Adaptive, 28.6, 54., 54., 24., 68.
-    ; 320., 2., Tokens.Adaptive, 44., 68., 54., 24., 104.
-    ; 320., 3.2, Tokens.Adaptive, 70.4, 92., 54., 24., 167.
-    ; 390., 1., Tokens.Compact, 22., 48., 54., 32., 52.
-    ; 390., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
-    ; 390., 2., Tokens.Adaptive, 44., 68., 67., 32., 104.
-    ; 390., 3.2, Tokens.Adaptive, 70.4, 92., 67., 32., 167.
-    ; 744., 1., Tokens.Compact, 22., 48., 54., 32., 52.
-    ; 744., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
-    ; 744., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
-    ; 744., 3.2, Tokens.Adaptive, 70.4, 92., 107., 32., 167.
-    ; 1_200., 1., Tokens.Compact, 22., 48., 54., 32., 52.
-    ; 1_200., 1.3, Tokens.Compact, 28.6, 54., 62., 32., 52.
-    ; 1_200., 2., Tokens.Adaptive, 44., 68., 78., 32., 104.
-    ; 1_200., 3.2, Tokens.Adaptive, 70.4, 92., 107., 32., 167.
-    ]
-  in
-  List.iter
-    (fun ( width
-         , scale
-         , kind
-         , block_line_height
-         , continuation_extent
-         , day_header_extent
-         , content_leading
-         , time_slot_width ) ->
-       require_profile
-         ~width
-         ~scale
-         ~kind
-         ~block_line_height
-         ~continuation_extent
-         ~day_header_extent
-         ~content_leading
-         ~time_slot_width)
-    cases
-;;
-
-let test_zero_viewport_and_profile_growth_remain_known_extent () =
-  require_profile
-    ~width:0.
-    ~scale:0.
-    ~kind:Tokens.Adaptive
-    ~block_line_height:22.
-    ~continuation_extent:48.
-    ~day_header_extent:54.
-    ~content_leading:24.
-    ~time_slot_width:52.;
-  let scales = [ 1.; 1.3; 2.; 3.2 ] in
-  let profiles =
-    List.map
-      (fun text_scale ->
-         Tokens.select_row_profile
-           ~preset:Tokens.Balanced
-           ~viewport_width:320.
-           ~text_scale)
-      scales
-  in
-  let rec require_monotonic (profiles : Tokens.row_profile list) =
-    match profiles with
-    | left :: (right :: _ as rest) ->
-      require
-        (Float.compare left.block_line_height right.block_line_height <= 0
-         && Float.compare left.day_header_extent right.day_header_extent <= 0
-         && Float.compare left.time_slot_width right.time_slot_width <= 0)
-        "known extents shrink as text scale increases";
-      require_monotonic rest
-    | [] | [ _ ] -> ()
-  in
-  require_monotonic profiles;
-  require
-    (Journal_timeline_state.extent_strategy = Journal_timeline_state.Known_profile_extents)
-    "adaptive behavior introduced intrinsic measurement"
-;;
-
-let test_every_sparse_role_has_one_authoritative_exact_extent () =
-  let check ~width ~scale ~block_extents expected =
-    let profile =
-      Tokens.select_row_profile
-        ~preset:Tokens.Balanced
-        ~viewport_width:width
-        ~text_scale:scale
-    in
-    List.iteri
-      (fun index expected ->
-         require
-           (Float.equal
-              (Tokens.block_extent ~profile ~visible_lines:(index + 1))
-              expected)
-           "block extent changed for %d lines at %.0f/%.1f"
-           (index + 1)
-           width
-           scale)
-      block_extents;
-    List.iter
-      (fun (role, extent) ->
-         let actual = Tokens.fixed_extent ~profile role in
-         require
-           (Float.equal actual extent)
-           "role extent %.1f, expected %.1f at %.0f/%.1f"
-           actual
-           extent
-           width
-           scale)
-      expected
-  in
-  check
-    ~width:390.
-    ~scale:1.
-    ~block_extents:[ 44.; 56.; 78.; 100.; 122. ]
-    [ Tokens.Children_loading, 44.
-    ; Tokens.Children_more, 44.
-    ; Tokens.Day_heading, 54.
-    ; Tokens.Day_continuation, 48.
-    ; Tokens.Feed_continuation, 48.
-    ];
-  check
-    ~width:320.
-    ~scale:3.2
-    ~block_extents:[ 83.; 153.; 224.; 294.; 364. ]
-    [ Tokens.Children_loading, 83.
-    ; Tokens.Children_more, 83.
-    ; Tokens.Day_heading, 54.
-    ; Tokens.Day_continuation, 92.
-    ; Tokens.Feed_continuation, 92.
-    ]
-;;
-
 let test_header_context_copy_is_pure_product_state () =
-  let date = Journal_calendar.present_journal_day 20260809 |> Result.get_ok in
-  let today = Journal_header.Context.today ~date:(Some date) in
-  require (Journal_header.Context.date today = Some date) "header lost its date";
-  require
-    (String.equal (Journal_header.Context.semantics_label today) "2026.08.09, Sunday")
-    "header date semantics changed";
   require
     (String.equal
-       (Journal_header.Context.semantics_label (Journal_header.Context.today ~date:None))
-       "Date unavailable")
-    "missing calendar fabricated a date"
+       (Journal_header.Context.semantics_label Journal_header.Context.journals)
+       "Journals")
+    "Journals context must leave the date to the list";
+  require
+    (String.equal
+       (Journal_header.Context.semantics_label Journal_header.Context.favorites)
+       "Favorites")
+    "Favorites context changed"
+;;
+
+(* Relative luminance and contrast are independent of palette implementation. *)
+let color_luminance color =
+  let value = Ui.Style.Color.Private.to_argb32 color in
+  let channel shift =
+    let byte = Int32.(to_int (logand (shift_right_logical value shift) 0xffl)) in
+    let value = Float.of_int byte /. 255. in
+    if value <= 0.04045 then value /. 12.92 else ((value +. 0.055) /. 1.055) ** 2.4
+  in
+  (0.2126 *. channel 16) +. (0.7152 *. channel 8) +. (0.0722 *. channel 0)
+;;
+
+let color_contrast first second =
+  let first = color_luminance first in
+  let second = color_luminance second in
+  (Float.max first second +. 0.05) /. (Float.min first second +. 0.05)
+;;
+
+let test_status_palette_contrast () =
+  let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue in
+  let minimum_regular = ref Float.infinity in
+  let minimum_increased = ref Float.infinity in
+  let statuses =
+    Journal_model.
+      [ No_status; Todo; Doing; In_review; Now; Done; Canceled; Backlog; Waiting; Later ]
+  in
+  List.iter
+    (fun (brightness, surfaces) ->
+       let regular = Tokens.resolve ~brightness ~high_contrast:false in
+       let increased = Tokens.resolve ~brightness ~high_contrast:true in
+       List.iter
+         (fun status ->
+            let regular = Tokens.status_swipe_action regular status in
+            let increased = Tokens.status_swipe_action increased status in
+            let symbol (palette : Tokens.swipe_action_colors) =
+              if status = Journal_model.No_status
+              then palette.foreground
+              else palette.background
+            in
+            List.iter
+              (fun surface ->
+                 let normal = color_contrast (symbol regular) surface in
+                 let high = color_contrast (symbol increased) surface in
+                 minimum_regular := Float.min !minimum_regular normal;
+                 minimum_increased := Float.min !minimum_increased high;
+                 require
+                   (normal >= 4.5)
+                   "Regular %s symbol contrast %.3f is below 4.5"
+                   (Journal_model.status_name status)
+                   normal;
+                 require
+                   (high >= 7.)
+                   "Increased %s symbol contrast %.3f is below 7"
+                   (Journal_model.status_name status)
+                   high;
+                 require
+                   (high > normal)
+                   "Increase Contrast did not improve %s (%.3f versus %.3f)"
+                   (Journal_model.status_name status)
+                   high
+                   normal)
+              surfaces;
+            if status <> Journal_model.No_status
+            then (
+              require
+                (color_contrast regular.background regular.foreground >= 4.5)
+                "Regular status label has insufficient contrast";
+              require
+                (color_contrast increased.background increased.foreground >= 7.)
+                "Increased status label has insufficient contrast"))
+         statuses)
+    [ Bonsai_swiftui.Environment.Light, [ rgb 255 255 255; rgb 242 242 247 ]
+    ; Dark, [ rgb 0 0 0; rgb 28 28 30; rgb 44 44 46 ]
+    ];
+  Printf.printf
+    "Minimum tested symbol contrast: regular %.3f, increased %.3f\n%!"
+    !minimum_regular
+    !minimum_increased
 ;;
 
 let tests =
-  [ ( "Material icon catalog matches Flutter 3.44.8"
-    , test_material_icon_catalog_matches_flutter_3_44_8 )
+  [ ( "SF Symbols preserve identity and appearance"
+    , test_sf_symbols_preserve_identity_and_appearance )
   ; ( "exact status rail categories"
     , test_every_exact_status_maps_to_the_decided_rail_category )
-  ; ( "typography, spacing, motion, and hit regions"
-    , test_typography_spacing_motion_and_hit_regions )
-  ; "one-physical-pixel dividers", test_dividers_resolve_to_one_physical_pixel
-  ; "known row profiles", test_known_row_profile_selection
-  ; "required row profile matrix", test_row_profiles_cover_required_width_and_scale_matrix
-  ; ( "zero viewport and monotonic known extents"
-    , test_zero_viewport_and_profile_growth_remain_known_extent )
-  ; ( "authoritative role-specific exact extents"
-    , test_every_sparse_role_has_one_authoritative_exact_extent )
   ; "header context", test_header_context_copy_is_pure_product_state
+  ; "status palette contrast", test_status_palette_contrast
   ]
 ;;
 

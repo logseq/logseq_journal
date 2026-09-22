@@ -39,14 +39,23 @@ let create ~sw ~config ~runner_dependencies =
   | Error (Pure_reducer.Invalid_create message) -> Error (Invalid_create message)
   | Ok state ->
     let events = Eio.Stream.create 256 in
+    let state_ref = ref state in
     (match
-       Effect_runner.create ~sw runner_dependencies ~post:(fun event ->
-         Eio.Stream.add events event)
+       Effect_runner.create
+         ~sw
+         runner_dependencies
+         ~recovery_current:(fun ticket ->
+           Pure_reducer.upload_recovery_current !state_ref ticket)
+         ~upload_current:(fun ticket ->
+           Pure_reducer.upload_ticket_current !state_ref ticket)
+         ~asset_current:(fun ticket ->
+           Pure_reducer.asset_ticket_current !state_ref ticket)
+         ~post:(fun event -> Eio.Stream.add events event)
      with
      | Error (Effect_runner.Invalid_create message) -> Error (Invalid_create message)
      | Ok runner ->
        let t =
-         { state = ref state; runner; events; next_request_id = 0L; stopped = false }
+         { state = state_ref; runner; events; next_request_id = 0L; stopped = false }
        in
        dispatch t Pure_reducer.Start;
        Eio.Fiber.fork ~sw (fun () ->
@@ -74,4 +83,76 @@ let shutdown t =
     t.stopped <- true;
     Eio.Stream.add t.events Pure_reducer.Shutdown;
     Effect_runner.shutdown t.runner)
+;;
+
+let retain_asset_file t ~scope ~handle =
+  if t.stopped || not (Pure_reducer.asset_scope_current !(t.state) scope)
+  then None
+  else Effect_runner.retain_asset_file t.runner ~scope ~handle
+;;
+
+let release_asset_file t ~scope ~handle =
+  Effect_runner.release_asset_file t.runner ~scope ~handle
+;;
+
+type import_receipt =
+  { operation : Logseq_db_types.Graph_types.Uuid.t
+  ; graph_generation : int
+  ; scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; target : Logseq_db_types.Graph_types.Uuid.t
+  ; asset : Logseq_db_types.Asset_descriptor.t
+  ; file_type : string
+  ; preview : (string * string) option
+  }
+
+let import_asset t ~graph_generation request =
+  match Pure_reducer.import_context !(t.state) ~graph_generation with
+  | None -> Error "The graph is unavailable or its import queue is full"
+  | Some context ->
+    let current () =
+      (not t.stopped)
+      &&
+      match Pure_reducer.import_context !(t.state) ~graph_generation with
+      | Some latest -> latest.scope = context.scope
+      | None -> false
+    in
+    Result.map
+      (fun intent ->
+         let preview =
+           Effect_runner.retain_imported_file
+             t.runner
+             ~scope:context.scope
+             ~operation:intent.Logseq_db_types.Asset_upload_intent.operation_id
+         in
+         let asset =
+           Logseq_db_types.Asset_descriptor.create
+             ~uuid:intent.asset
+             ~source:(Managed None)
+             ~current_checksum:(Some intent.version.checksum)
+             ~size:(Some intent.size)
+             ~dimensions:None
+           |> Result.get_ok
+         in
+         dispatch
+           t
+           (Pure_reducer.Upload_requested
+              { graph_generation
+              ; operation = intent.Logseq_db_types.Asset_upload_intent.operation_id
+              ; event = Logseq_db_worker_pure_reducer.Asset_upload.Restore intent
+              });
+         { operation = intent.operation_id
+         ; graph_generation
+         ; scope = context.scope
+         ; target = intent.target
+         ; asset
+         ; file_type = intent.version.file_type
+         ; preview
+         })
+      (Effect_runner.prepare_import t.runner ~context request ~current)
+;;
+
+let retain_imported_file t ~scope ~operation =
+  if t.stopped || not (Pure_reducer.asset_scope_current !(t.state) scope)
+  then None
+  else Effect_runner.retain_imported_file t.runner ~scope ~operation
 ;;

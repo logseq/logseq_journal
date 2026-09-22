@@ -291,7 +291,24 @@ type block_tree =
   ; children : block_tree list
   }
 
+type asset_metadata =
+  { version : Logseq_db_types.Asset_descriptor.version
+  ; replace_reference : Graph.Uuid.t option
+  ; size : int64
+  }
+
 type local_mutation =
+  | Set_asset_reference of
+      { mutation_id : Graph.Uuid.t
+      ; block : Graph.Uuid.t
+      ; previous : Graph.Uuid.t option
+      ; asset : Graph.Uuid.t
+      }
+  | Publish_asset of
+      { mutation_id : Graph.Uuid.t
+      ; block : Graph.Uuid.t
+      ; version : Logseq_db_types.Asset_descriptor.version
+      }
   | Save_block of
       { mutation_id : Graph.Uuid.t
       ; block : Graph.block_uuid
@@ -301,6 +318,7 @@ type local_mutation =
       { mutation_id : Graph.Uuid.t
       ; tree : block_tree
       ; parent : Graph.Uuid.t
+      ; asset : asset_metadata option
       }
   | Delete_blocks of
       { mutation_id : Graph.Uuid.t
@@ -441,6 +459,8 @@ type outliner_operation =
   | Create_journal_page_operation
   | Set_task_status_operation
   | Clear_task_status_operation
+  | Publish_asset_operation
+  | Set_asset_reference_operation
 
 let remote_won_proof
       ~reason
@@ -459,6 +479,8 @@ let remote_won_proof
     | Create_journal_page_operation -> 3
     | Set_task_status_operation -> 4
     | Clear_task_status_operation -> 5
+    | Publish_asset_operation -> 6
+    | Set_asset_reference_operation -> 7
   in
   match reason with
   | Before_submission ->
@@ -508,6 +530,8 @@ let remote_won_proof_operation (_, _, _, _, _, value, _) =
   | 3 -> Create_journal_page_operation
   | 4 -> Set_task_status_operation
   | 5 -> Clear_task_status_operation
+  | 6 -> Publish_asset_operation
+  | 7 -> Set_asset_reference_operation
   | _ -> invalid_arg "invalid remote-won proof operation"
 ;;
 

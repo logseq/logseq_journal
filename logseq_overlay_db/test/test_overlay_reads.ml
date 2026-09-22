@@ -320,7 +320,8 @@ let structure_cursors_accept_request_shape_reuse_and_reject_projection database 
     let expected = T.insert_precondition database ~parent:T.page_uuid ~behavior in
     let mutation =
       Insert_blocks
-        { mutation_id = T.mutation_uuid ordinal
+        { asset = None
+        ; mutation_id = T.mutation_uuid ordinal
         ; parent = T.page_uuid
         ; tree = { uuid; title = Printf.sprintf "Child %d" ordinal; children = [] }
         }

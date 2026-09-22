@@ -1,6 +1,6 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
-module ID = Bonsai_flutter_spec.Id
+module ID = Bonsai_swiftui_spec.Id
 module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
 module Runner = Logseq_sync_effect_runner.Effect_runner
 

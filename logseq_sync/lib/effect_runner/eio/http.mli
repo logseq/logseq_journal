@@ -1,9 +1,15 @@
+type operation =
+  | Get
+  | Put of string
+
 type expected_content_type =
   | Structured_response
   | Snapshot_artifact
+  | Asset_binary
 
 type request =
-  { uri : Uri.t
+  { operation : operation
+  ; uri : Uri.t
   ; headers : (string * string) list
   ; maximum_response_bytes : int
   ; expected_content_type : expected_content_type

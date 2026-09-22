@@ -284,7 +284,11 @@ type t =
   ; operations : (string, operation) Hashtbl.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (string, Core.connection_scope * Websocket_eio.t) Hashtbl.t
+  ; asset_download_slots : Eio.Semaphore.t
+  ; asset_upload_slots : Eio.Semaphore.t
+  ; asset_codec_slot : Eio.Semaphore.t
   ; secret_lock : Eio.Mutex.t
+  ; asset_caches : (Core.graph_scope, Asset_cache.t) Hashtbl.t
   ; mutable closed : bool
   }
 
@@ -296,9 +300,33 @@ let create ~sw dependencies ~post =
     ; operations = Hashtbl.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
+    ; asset_download_slots = Eio.Semaphore.make 3
+    ; asset_upload_slots = Eio.Semaphore.make 1
+    ; asset_codec_slot = Eio.Semaphore.make 1
     ; secret_lock = Eio.Mutex.create ()
+    ; asset_caches = Hashtbl.create 4
     ; closed = false
     }
+;;
+
+let asset_root t =
+  Filename.concat
+    t.dependencies.local_store.application_support_directory
+    "logseq-db-worker/assets"
+;;
+
+let delete_account_assets t (account : Core.account_scope) =
+  Hashtbl.filter_map_inplace
+    (fun (scope : Core.graph_scope) cache ->
+       if
+         Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
+         && String.equal scope.account.user_id account.user_id
+       then (
+         Asset_cache.close cache;
+         None)
+       else Some cache)
+    t.asset_caches;
+  Asset_cache.delete_account ~root:(asset_root t) ~account
 ;;
 
 let catalog_root local_store =
@@ -624,10 +652,13 @@ let execute_request
       |> map_error)
   | Delete_account_secrets account ->
     run_secret_action t (fun () ->
-      t.dependencies.secrets.delete_account_secrets
-        ~managed_sync_origin:account.managed_sync_origin
-        ~user_id:account.user_id
-      |> map_error)
+      match delete_account_assets t account with
+      | Error _ -> Error (Core.Effect_failed "Account asset cache could not be removed.")
+      | Ok () ->
+        t.dependencies.secrets.delete_account_secrets
+          ~managed_sync_origin:account.managed_sync_origin
+          ~user_id:account.user_id
+        |> map_error)
   | Encrypt_protected_values request ->
     Result.bind
       (Result.map_error
@@ -897,6 +928,8 @@ let shutdown t =
   if not t.closed
   then (
     t.closed <- true;
+    Hashtbl.iter (fun _ cache -> Asset_cache.close cache) t.asset_caches;
+    Hashtbl.clear t.asset_caches;
     let all =
       Core.
         { account_generation = None
@@ -908,4 +941,562 @@ let shutdown t =
     in
     cancel_scope t all;
     Hashtbl.clear t.operations)
+;;
+
+type asset_encryption =
+  | Plaintext
+  | Encrypted of Core.graph_key_handle option
+
+module Asset_transfer = Logseq_sync_pure_reducer.Asset_transfer
+
+let asset_cache_failure = function
+  | Asset_cache.Full -> Asset_transfer.Storage_full
+  | Checksum_mismatch -> Asset_transfer.Checksum_mismatch
+  | Stale -> Asset_transfer.Invalid_content "Asset scope is no longer current"
+  | Invalid message | Io message -> Asset_transfer.Invalid_content message
+;;
+
+let asset_graph_key t scope = function
+  | Plaintext -> Ok None
+  | Encrypted None -> Error Asset_transfer.Locked
+  | Encrypted (Some handle) ->
+    if Core.graph_key_handle_scope handle <> scope
+    then Error Asset_transfer.Locked
+    else
+      key t handle
+      |> Result.map Option.some
+      |> Result.map_error (fun _ -> Asset_transfer.Locked)
+;;
+
+let with_asset_slot slots work =
+  Eio.Semaphore.acquire slots;
+  Fun.protect ~finally:(fun () -> Eio.Semaphore.release slots) work
+;;
+
+let fetch_asset_admitted
+      t
+      ~cache
+      ~encryption
+      ~maximum_plaintext_bytes
+      ~current
+      (ticket : Asset_transfer.ticket)
+  =
+  let ( let* ) = Result.bind in
+  if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 100 * 1024 * 1024
+  then Error (Asset_transfer.Invalid_content "Invalid asset size limit")
+  else
+    let* graph_key = asset_graph_key t ticket.scope encryption in
+    let base_url = ticket.scope.account.managed_sync_origin in
+    let* () =
+      Http.validate_base_url base_url
+      |> Result.map_error (fun message -> Asset_transfer.Invalid_content message)
+    in
+    let path =
+      Printf.sprintf
+        "/assets/%s/%s.%s"
+        (Graph_types.Uuid.to_string ticket.scope.graph_id)
+        (Graph_types.Uuid.to_string ticket.asset)
+        ticket.version.file_type
+    in
+    let uri = Uri.with_path base_url path in
+    let maximum_response_bytes =
+      match graph_key with
+      | None -> maximum_plaintext_bytes
+      | Some _ -> (4 * ((maximum_plaintext_bytes + 18) / 3)) + 128
+    in
+    let last_failure = ref Asset_transfer.Authentication in
+    let* response =
+      authenticated_operation
+        t.dependencies.id_token_provider
+        ~account:ticket.scope.account
+        ~perform:(fun token ->
+          let request : Http.request =
+            { operation = Get
+            ; uri
+            ; headers = [ "authorization", "Bearer " ^ token ]
+            ; maximum_response_bytes
+            ; expected_content_type = Asset_binary
+            }
+          in
+          match t.dependencies.transport.perform_http ~sw:t.sw request with
+          | Error message ->
+            last_failure := Asset_transfer.Network;
+            Error (Request_failed message)
+          | Ok response when response.status = 401 ->
+            last_failure := Asset_transfer.Authentication;
+            Error Unauthorized
+          | Ok response when response.status = 403 ->
+            last_failure := Asset_transfer.Invalid_content "Asset access revoked";
+            Error Forbidden
+          | Ok response -> Ok response)
+      |> Result.map_error (fun _ -> !last_failure)
+    in
+    let* () =
+      match response.status with
+      | status when status >= 200 && status < 300 -> Ok ()
+      | 404 -> Error Asset_transfer.Not_found
+      | 408 | 429 | 500 | 502 | 503 | 504 -> Error Asset_transfer.Network
+      | status ->
+        Error
+          (Asset_transfer.Invalid_content (Printf.sprintf "Asset HTTP status %d" status))
+    in
+    if t.closed || not (current ticket)
+    then Error (Asset_transfer.Invalid_content "Asset request expired")
+    else
+      with_asset_slot t.asset_codec_slot (fun () ->
+        if t.closed || not (current ticket)
+        then Error (Asset_transfer.Invalid_content "Asset request expired")
+        else (
+          let crypto : Asset_codec.crypto =
+            { encrypt = t.dependencies.crypto.encrypt_aes_gcm
+            ; decrypt = t.dependencies.crypto.decrypt_aes_gcm
+            }
+          in
+          let* plaintext =
+            Asset_codec.decode
+              ~maximum_plaintext_bytes
+              ~crypto
+              ~key:graph_key
+              ~expected_checksum:ticket.version.checksum
+              response.body
+            |> Result.map_error (fun message ->
+              if message = "Asset checksum mismatch"
+              then Asset_transfer.Checksum_mismatch
+              else Asset_transfer.Invalid_content message)
+          in
+          Asset_cache.publish
+            cache
+            ~asset:ticket.asset
+            ~version:ticket.version
+            ~current:(fun () -> (not t.closed) && current ticket)
+            ~plaintext
+          |> Result.map_error asset_cache_failure))
+;;
+
+let fetch_asset t ~cache ~encryption ~maximum_plaintext_bytes ~current ticket =
+  with_asset_slot t.asset_download_slots (fun () ->
+    if t.closed || not (current ticket)
+    then Error (Asset_transfer.Invalid_content "Asset request expired")
+    else
+      fetch_asset_admitted t ~cache ~encryption ~maximum_plaintext_bytes ~current ticket)
+;;
+
+let asset_operation_id (scope : Core.graph_scope) suffix =
+  Printf.sprintf
+    "asset:%d:%d:%Ld:%s:%s"
+    scope.Core.account.account_generation
+    scope.graph_generation
+    scope.account.lifecycle_generation
+    (Graph_types.Uuid.to_string scope.graph_id)
+    suffix
+;;
+
+let submit_asset
+      t
+      ~scope
+      ~cache
+      ~encryption
+      ~maximum_plaintext_bytes
+      ~current
+      ~post
+      instruction
+  =
+  let fork ~id work deliver =
+    if (not t.closed) && not (Hashtbl.mem t.operations id)
+    then (
+      let cancelled, resolve = Eio.Promise.create () in
+      let operation =
+        { scope = Core.effect_scope_of_graph scope
+        ; cancelled = false
+        ; cancel = (fun () -> ignore (Eio.Promise.try_resolve resolve () : bool))
+        }
+      in
+      Hashtbl.add t.operations id operation;
+      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+        Fun.protect
+          ~finally:(fun () -> Hashtbl.remove t.operations id)
+          (fun () ->
+             let result =
+               try
+                 Some
+                   (Eio.Fiber.first
+                      (fun () ->
+                         if operation.cancelled || t.closed then raise Runner_cancelled;
+                         work ())
+                      (fun () ->
+                         Eio.Promise.await cancelled;
+                         raise Runner_cancelled))
+               with
+               | Runner_cancelled -> None
+             in
+             Option.iter
+               (fun result -> deliver ((not t.closed) && not operation.cancelled) result)
+               result)))
+  in
+  let execute (ticket : Asset_transfer.ticket) cache_only =
+    if ticket.scope = scope && current ticket
+    then
+      fork
+        ~id:(asset_operation_id scope (string_of_int ticket.id))
+        (fun () ->
+           if cache_only
+           then
+             Asset_cache.lookup cache ~asset:ticket.asset ~version:ticket.version
+             |> Result.map_error asset_cache_failure
+           else
+             fetch_asset t ~cache ~encryption ~maximum_plaintext_bytes ~current ticket
+             |> Result.map Option.some)
+        (fun live result ->
+           if live && current ticket
+           then
+             post
+               (if cache_only
+                then Asset_transfer.Cache_checked (ticket, result)
+                else
+                  Asset_transfer.Downloaded
+                    ( ticket
+                    , Result.bind result (function
+                        | Some handle -> Ok handle
+                        | None -> Error Asset_transfer.Not_found) ))
+           else (
+             match result with
+             | Ok (Some handle) -> Asset_cache.release cache handle
+             | Ok None | Error _ -> ()))
+  in
+  match instruction with
+  | Asset_transfer.Check_cache ticket -> execute ticket true
+  | Fetch ticket -> execute ticket false
+  | Cancel ticket ->
+    if ticket.scope = scope
+    then
+      Option.iter
+        (fun (operation : operation) ->
+           operation.cancelled <- true;
+           operation.cancel ())
+        (Hashtbl.find_opt
+           t.operations
+           (asset_operation_id scope (string_of_int ticket.id)))
+  | Release_handle handle -> Asset_cache.release cache handle
+  | Retry_after { id; seconds } ->
+    fork
+      ~id:(asset_operation_id scope ("timer:" ^ string_of_int id))
+      (fun () -> t.dependencies.runtime.sleep seconds)
+      (fun live () -> if live then post (Asset_transfer.Retry_elapsed id))
+  | Notify _ | Backpressure _ | Capacity_available -> ()
+;;
+
+let close_asset_scope t scope =
+  Hashtbl.iter
+    (fun id (operation : operation) ->
+       if
+         String.starts_with ~prefix:"asset:" id
+         && operation.scope = Core.effect_scope_of_graph scope
+       then (
+         operation.cancelled <- true;
+         operation.cancel ()))
+    t.operations;
+  Option.iter Asset_cache.close (Hashtbl.find_opt t.asset_caches scope);
+  Hashtbl.remove t.asset_caches scope
+;;
+
+let scoped_asset_cache t scope =
+  match Hashtbl.find_opt t.asset_caches scope with
+  | Some cache -> Ok cache
+  | None ->
+    let root = asset_root t in
+    Asset_cache.create
+      ~root
+      ~scope
+      ~budget_bytes:268435456L
+      ~maximum_file_bytes:(8 * 1024 * 1024)
+    |> Result.map (fun cache ->
+      Hashtbl.add t.asset_caches scope cache;
+      cache)
+;;
+
+let run_scoped_asset t ~(context : Core.asset_context) ~current ~post instruction =
+  if not t.closed
+  then (
+    let cache =
+      match instruction with
+      | Asset_transfer.Release_handle _ | Cancel _ ->
+        (match Hashtbl.find_opt t.asset_caches context.scope with
+         | Some cache -> Ok cache
+         | None -> Error Asset_cache.Stale)
+      | _ -> scoped_asset_cache t context.scope
+    in
+    match cache with
+    | Ok cache ->
+      let encryption = if context.encrypted then Encrypted context.key else Plaintext in
+      submit_asset
+        t
+        ~scope:context.scope
+        ~cache
+        ~encryption
+        ~maximum_plaintext_bytes:(8 * 1024 * 1024)
+        ~current
+        ~post
+        instruction
+    | Error error ->
+      let failure = asset_cache_failure error in
+      (match instruction with
+       | Asset_transfer.Check_cache ticket when current ticket ->
+         post (Asset_transfer.Cache_checked (ticket, Error failure))
+       | Fetch ticket when current ticket ->
+         post (Asset_transfer.Downloaded (ticket, Error failure))
+       | _ -> ()))
+;;
+
+let retain_asset_file t ~scope ~handle =
+  if t.closed
+  then None
+  else
+    Option.bind (Hashtbl.find_opt t.asset_caches scope) (fun cache ->
+      Option.bind (Asset_cache.retain cache handle) (fun lease ->
+        match Asset_cache.path cache lease with
+        | Some path -> Some (lease, path)
+        | None ->
+          Asset_cache.release cache lease;
+          None))
+;;
+
+let release_asset_file t ~scope ~handle =
+  Option.iter
+    (fun cache -> Asset_cache.release cache handle)
+    (Hashtbl.find_opt t.asset_caches scope)
+;;
+
+let delete_graph_assets t (request : Core.mirror_deletion) =
+  let scopes =
+    Hashtbl.fold
+      (fun (scope : Core.graph_scope) _ acc ->
+         if
+           scope.graph_id = request.graph_id
+           && scope.account.user_id = request.account.user_id
+           && Uri.equal
+                scope.account.managed_sync_origin
+                request.account.managed_sync_origin
+         then scope :: acc
+         else acc)
+      t.asset_caches
+      []
+  in
+  List.iter (close_asset_scope t) scopes;
+  Asset_cache.delete_graph
+    ~root:(asset_root t)
+    ~account:request.account
+    ~graph_id:request.graph_id
+  |> Result.map_error (fun _ -> "The graph asset cache could not be removed.")
+;;
+
+type upload_failure =
+  | Upload_network
+  | Upload_authentication
+  | Upload_locked
+  | Upload_missing_source
+  | Upload_size_rejected
+  | Upload_revoked_access
+  | Upload_invalid_content
+  | Upload_cancelled
+
+let read_upload_source ~maximum_plaintext_bytes source_file =
+  try
+    let input = open_in_bin source_file in
+    Fun.protect
+      ~finally:(fun () -> close_in_noerr input)
+      (fun () ->
+         let stat = Unix.fstat (Unix.descr_of_in_channel input) in
+         if stat.st_kind <> Unix.S_REG
+         then Error Upload_invalid_content
+         else if stat.st_size > maximum_plaintext_bytes
+         then Error Upload_size_rejected
+         else (
+           let bytes = really_input_string input stat.st_size in
+           match input_char input with
+           | _ -> Error Upload_invalid_content
+           | exception End_of_file -> Ok bytes))
+  with
+  | Sys_error _ | Unix.Unix_error (Unix.ENOENT, _, _) -> Error Upload_missing_source
+  | End_of_file | Unix.Unix_error _ -> Error Upload_invalid_content
+;;
+
+let upload_asset_admitted
+      t
+      ~(context : Core.asset_context)
+      ~asset
+      ~version
+      ~source_file
+      ~maximum_plaintext_bytes
+      ~current
+  =
+  let ( let* ) = Result.bind in
+  let valid () = (not t.closed) && current () in
+  if not (valid ())
+  then Error Upload_cancelled
+  else if maximum_plaintext_bytes < 0 || maximum_plaintext_bytes > 100 * 1024 * 1024
+  then Error Upload_size_rejected
+  else (
+    let encryption = if context.encrypted then Encrypted context.key else Plaintext in
+    let* graph_key =
+      asset_graph_key t context.scope encryption
+      |> Result.map_error (fun _ -> Upload_locked)
+    in
+    let* body =
+      with_asset_slot t.asset_codec_slot (fun () ->
+        if not (valid ())
+        then Error Upload_cancelled
+        else
+          let* plaintext = read_upload_source ~maximum_plaintext_bytes source_file in
+          if
+            not
+              (String.equal
+                 (Asset_codec.checksum plaintext)
+                 version.Logseq_db_types.Asset_descriptor.checksum)
+          then Error Upload_invalid_content
+          else (
+            let crypto : Asset_codec.crypto =
+              { encrypt = t.dependencies.crypto.encrypt_aes_gcm
+              ; decrypt = t.dependencies.crypto.decrypt_aes_gcm
+              }
+            in
+            Asset_codec.encode ~maximum_plaintext_bytes ~crypto ~key:graph_key plaintext
+            |> Result.map_error (fun _ -> Upload_invalid_content)))
+    in
+    let base_url = context.scope.account.managed_sync_origin in
+    let* () =
+      Http.validate_base_url base_url
+      |> Result.map_error (fun _ -> Upload_invalid_content)
+    in
+    let path =
+      Printf.sprintf
+        "/assets/%s/%s.%s"
+        (Graph_types.Uuid.to_string context.scope.graph_id)
+        (Graph_types.Uuid.to_string asset)
+        version.file_type
+    in
+    let failure = ref Upload_authentication in
+    let* response =
+      authenticated_operation
+        t.dependencies.id_token_provider
+        ~account:context.scope.account
+        ~perform:(fun token ->
+          if not (valid ())
+          then (
+            failure := Upload_cancelled;
+            Error (Request_failed "Asset upload expired"))
+          else (
+            let request : Http.request =
+              { operation = Put body
+              ; uri = Uri.with_path base_url path
+              ; headers =
+                  [ "authorization", "Bearer " ^ token
+                  ; "x-amz-meta-checksum", version.checksum
+                  ; "x-amz-meta-type", version.file_type
+                  ; "content-type", "application/octet-stream"
+                  ]
+              ; maximum_response_bytes = 65536
+              ; expected_content_type = Asset_binary
+              }
+            in
+            match t.dependencies.transport.perform_http ~sw:t.sw request with
+            | Error message ->
+              failure := Upload_network;
+              Error (Request_failed message)
+            | Ok response when response.status = 401 ->
+              failure := Upload_authentication;
+              Error Unauthorized
+            | Ok response when response.status = 403 ->
+              failure := Upload_revoked_access;
+              Error Forbidden
+            | Ok response -> Ok response))
+      |> Result.map_error (fun _ -> !failure)
+    in
+    if not (valid ())
+    then Error Upload_cancelled
+    else (
+      match response.status with
+      | status when status >= 200 && status < 300 -> Ok ()
+      | 413 -> Error Upload_size_rejected
+      | 408 | 429 | 500 | 502 | 503 | 504 -> Error Upload_network
+      | _ -> Error Upload_invalid_content))
+;;
+
+let upload_asset t ~context ~asset ~version ~source_file ~maximum_plaintext_bytes ~current
+  =
+  with_asset_slot t.asset_upload_slots (fun () ->
+    upload_asset_admitted
+      t
+      ~context
+      ~asset
+      ~version
+      ~source_file
+      ~maximum_plaintext_bytes
+      ~current)
+;;
+
+let staged_asset_path t ~scope ~file =
+  if t.closed
+  then None
+  else (
+    match scoped_asset_cache t scope with
+    | Error _ -> None
+    | Ok cache -> Asset_cache.staged_path cache ~file)
+;;
+
+let release_staged_asset t ~scope ~file =
+  if t.closed
+  then Error "Asset storage is closed"
+  else (
+    match scoped_asset_cache t scope with
+    | Error _ -> Error "Asset staging is unavailable"
+    | Ok cache ->
+      Result.map_error
+        (fun _ -> "Unable to release staged asset")
+        (Asset_cache.release_staged cache ~file))
+;;
+
+let stage_asset t ~scope ~operation ~file_type ~source_file =
+  if t.closed
+  then Error "Asset storage is closed"
+  else (
+    match scoped_asset_cache t scope with
+    | Error _ -> Error "Asset staging is unavailable"
+    | Ok cache ->
+      Asset_cache.stage
+        cache
+        ~operation
+        ~file_type
+        ~source_file
+        ~pending_budget_bytes:268435456L
+      |> Result.map (fun staged -> staged.Asset_cache.file, staged.checksum, staged.size)
+      |> Result.map_error (function
+        | Asset_cache.Full -> "Pending attachments have reached the storage limit"
+        | Invalid message -> message
+        | Io _ | Stale | Checksum_mismatch -> "Unable to copy the selected attachment"))
+;;
+
+let prune_staged_assets t ~scope ~keep =
+  if t.closed
+  then Error "Asset storage is closed"
+  else (
+    match scoped_asset_cache t scope with
+    | Error _ -> Error "Asset staging is unavailable"
+    | Ok cache ->
+      Asset_cache.prune_staged cache ~keep
+      |> Result.map_error (fun _ -> "Unable to reconcile staged assets"))
+;;
+
+let retain_staged_file t ~scope ~file =
+  if t.closed
+  then None
+  else (
+    match scoped_asset_cache t scope with
+    | Error _ -> None
+    | Ok cache ->
+      Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
+        match Asset_cache.path cache lease with
+        | Some path -> Some (lease, path)
+        | None ->
+          Asset_cache.release cache lease;
+          None))
 ;;

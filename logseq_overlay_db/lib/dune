@@ -32,7 +32,7 @@
   overlay_read
   ownership
   persistence_json
-  persistence_outbox_v14
+  persistence_outbox_v16
   persistence_receipt_v1
   query_cursor
   queryable_outbox

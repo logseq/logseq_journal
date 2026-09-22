@@ -90,13 +90,92 @@ type client_command =
   | Delete_local_cache of graph_id
   | Set_foreground of bool
 
+module Asset : sig
+  type priority = Logseq_sync_pure_reducer.Asset_transfer.priority =
+    | Foreground
+    | Background
+
+  type failure = Logseq_sync_pure_reducer.Asset_transfer.failure =
+    | Network
+    | Not_found
+    | Checksum_mismatch
+    | Authentication
+    | Locked
+    | Storage_full
+    | Invalid_content of string
+
+  type availability = Logseq_sync_pure_reducer.Asset_transfer.availability =
+    | Queued
+    | Downloading
+    | Ready of string
+    | Waiting_remote
+    | Waiting_network
+    | Waiting_unlock
+    | Failed of
+        { failure : failure
+        ; attempts : int
+        ; retry_scheduled : bool
+        }
+end
+
+type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
+
+type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =
+  | Asset_availability of
+      { consumer : string
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
+      }
+  | Asset_demand_accepted of string
+  | Asset_backpressure of string
+  | Asset_capacity_available
+  | Upload_status of
+      { operation : Logseq_db_types.Graph_types.Uuid.t
+      ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; target : Logseq_db_types.Graph_types.Uuid.t
+      ; title : string
+      ; status : Logseq_db_worker_pure_reducer.Asset_upload.status
+      }
+
+type asset_command =
+  | Replace_asset_demand of
+      { consumer : string
+      ; priority : Logseq_sync_pure_reducer.Asset_transfer.priority
+      ; assets : Logseq_db_types.Asset_descriptor.t list
+      }
+  | Release_asset_demand of string
+  | Retry_asset of Logseq_db_types.Graph_types.Uuid.t
+  | Retry_upload of Logseq_db_types.Graph_types.Uuid.t
+
 type request =
+  | Import_asset of
+      { graph_generation : int
+      ; source : Logseq_db_types.Asset_import.t
+      }
   | Client_command of client_command
   | Graph_request of Logseq_db_worker.Protocol.request
   | Get_graph_state
+  | Asset_command of
+      { graph_generation : int
+      ; command : asset_command
+      }
+  | Acquire_imported_file of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; operation : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Acquire_asset_file of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; handle : string
+      }
+  | Release_asset_file of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; handle : string
+      }
 
 type response =
+  | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
+  | Asset_file of (string * string) option
   | Graph_response of Logseq_db_worker.Protocol.response
   | Graph_state of Logseq_db_worker.graph_state
 
@@ -106,12 +185,16 @@ type push =
   | Need_id_token of token_request
   | Bootstrap_progress of bootstrap_progress
   | Graph_state_changed of Logseq_db_worker.graph_state
+  | Asset_notice of
+      Logseq_sync_pure_reducer.Core.graph_scope
+      * Logseq_db_worker_pure_reducer.Core.asset_notice
 
-val invalidation_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
-val manager_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
-val auth_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
-val bootstrap_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
-val graph_state_topic : Bonsai_flutter_spec.Id.Worker.Push_topic.t
+val invalidation_topic : Bonsai_swiftui_spec.Id.Worker.Push_topic.t
+val manager_topic : Bonsai_swiftui_spec.Id.Worker.Push_topic.t
+val auth_topic : Bonsai_swiftui_spec.Id.Worker.Push_topic.t
+val bootstrap_topic : Bonsai_swiftui_spec.Id.Worker.Push_topic.t
+val graph_state_topic : Bonsai_swiftui_spec.Id.Worker.Push_topic.t
+val asset_topic : Bonsai_swiftui_spec.Id.Worker.Push_topic.t
 
 type dependencies
 

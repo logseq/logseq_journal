@@ -1,0 +1,3 @@
+(test
+ (name test_asset_upload_store)
+ (libraries alcotest logseq_db_storage logseq_db_types sqlite3))

@@ -103,7 +103,7 @@ let copy_storage_fixture database_path =
   require (Sqlite3.db_close db) "unable to close storage fixture"
 ;;
 
-let install_remote_identity database_path =
+let install_remote_identity ~graph_id database_path =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module Session = Logseq_db_storage.Storage_session in
   let connection =
@@ -142,10 +142,7 @@ let install_remote_identity database_path =
       session
       ~authoritative_before:database
       [ entity "remote-flag" "logseq.kv/graph-remote?" (Bool true)
-      ; entity
-          "remote-uuid"
-          "logseq.kv/graph-uuid"
-          (Uuid (Graph.Uuid.to_string graph_uuid))
+      ; entity "remote-uuid" "logseq.kv/graph-uuid" (Uuid (Graph.Uuid.to_string graph_id))
       ; Datascript.Add
           (block, "block/uuid", Uuid (Graph.Uuid.to_string authoritative_block_uuid))
       ; Add (block, "block/title", String "Authoritative block")
@@ -224,19 +221,19 @@ let install_remote_identity database_path =
   Session.close session |> require_ok ~behavior:"close lower storage fixture"
 ;;
 
-let seed_mirror support =
+let seed_mirror ?(graph_id = graph_uuid) support =
   let graph_dir =
     Filename.concat
       support
-      (Filename.concat "logseq-db-worker/synced-graphs" (Graph.Uuid.to_string graph_uuid))
+      (Filename.concat "logseq-db-worker/synced-graphs" (Graph.Uuid.to_string graph_id))
   in
   ensure_directory graph_dir;
   let database_path = Filename.concat graph_dir "db.sqlite" in
   copy_storage_fixture database_path;
-  install_remote_identity database_path;
+  install_remote_identity ~graph_id database_path;
   let checkpoint =
     Logseq_db_types.Sync_checkpoint.create
-      ~graph_id:graph_uuid
+      ~graph_id
       ~schema:Graph.{ major = 65; minor = 33 }
       ~applied_server_t:0
       ~checksum:"0000000000000000"
@@ -479,6 +476,7 @@ let save_block ?(ordinal = 1) ?(title = "Edited") () =
 let insert_blocks ?(ordinal = 2) ?(uuid = block_uuid) () =
   Types.Insert_blocks
     { mutation_id = mutation_uuid ordinal
+    ; asset = None
     ; parent = page_uuid
     ; tree = { uuid; title = "Inserted"; children = [] }
     }

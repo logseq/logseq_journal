@@ -718,7 +718,7 @@ let corrupt_outbox_fails_closed () =
         done)))
 ;;
 
-let persistence_outbox_uses_frozen_v14_json () =
+let persistence_outbox_uses_frozen_v16_json () =
   let top_level_keys =
     [ "acceptanceBarrier"
     ; "attemptCount"
@@ -758,7 +758,7 @@ let persistence_outbox_uses_frozen_v14_json () =
           , block_precondition database T.authoritative_block_uuid "freeze saveBlock JSON"
           ) )
     ; ( "insertBlocks"
-      , [ "mutationId"; "parent"; "tree"; "type" ]
+      , [ "mutationId"; "parent"; "tree"; "asset"; "type" ]
       , fun database ->
           ( T.insert_blocks ~ordinal:601 ()
           , T.insert_precondition
@@ -1841,9 +1841,9 @@ let cases =
       stale_delete_cannot_remove_replacement
   ; Alcotest.test_case "corrupt outbox fails closed" `Quick corrupt_outbox_fails_closed
   ; Alcotest.test_case
-      "persistence outbox uses frozen V14 JSON"
+      "persistence outbox uses frozen V16 JSON"
       `Quick
-      persistence_outbox_uses_frozen_v14_json
+      persistence_outbox_uses_frozen_v16_json
   ; Alcotest.test_case
       "duplicate outbox member fails closed"
       `Quick

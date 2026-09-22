@@ -126,12 +126,17 @@ let with_attempt ~sw ~authenticator ~network ~clock request ~consume =
                 in
                 settle (Error message)
               in
+              let request_method =
+                match request.Http.operation with
+                | Get -> `GET
+                | Put _ -> `PUT
+              in
               let response_handler response body =
                 guard (fun () ->
                   let status = Httpun.Status.to_code response.Httpun.Response.status in
                   let headers = Httpun.Headers.to_list response.headers in
                   let framing =
-                    match Httpun.Response.body_length ~request_method:`GET response with
+                    match Httpun.Response.body_length ~request_method response with
                     | `Fixed length -> Printf.sprintf "length:%Ld" length
                     | `Chunked -> "chunked"
                     | `Close_delimited -> "close-delimited"
@@ -145,13 +150,23 @@ let with_attempt ~sw ~authenticator ~network ~clock request ~consume =
                 then host
                 else Printf.sprintf "%s:%d" host (port request.uri)
               in
+              let request_headers =
+                match request.Http.operation with
+                | Get -> request.headers
+                | Put bytes ->
+                  ("content-length", string_of_int (String.length bytes))
+                  :: request.headers
+              in
               let headers =
                 Httpun.Headers.of_list
-                  (("host", host_header) :: ("connection", "close") :: request.headers)
+                  (("host", host_header) :: ("connection", "close") :: request_headers)
               in
               let target = Uri.path_and_query request.uri in
               let descriptor =
-                Httpun.Request.create ~headers `GET (if target = "" then "/" else target)
+                Httpun.Request.create
+                  ~headers
+                  request_method
+                  (if target = "" then "/" else target)
               in
               stage := "headers";
               let writer =
@@ -161,6 +176,9 @@ let with_attempt ~sw ~authenticator ~network ~clock request ~consume =
                   ~error_handler
                   ~response_handler
               in
+              (match request.Http.operation with
+               | Get -> ()
+               | Put bytes -> Httpun.Body.Writer.write_string writer bytes);
               Httpun.Body.Writer.close writer;
               Eio.Promise.await completed;
               Eio.Fiber.check ();
@@ -243,7 +261,12 @@ let follow_redirects attempt request =
     Result.bind (attempt request) (fun response ->
       if redirect_status response.status
       then
-        if remaining = 0
+        if
+          match request.Http.operation with
+          | Put _ -> true
+          | Get -> false
+        then Error "Asset uploads cannot redirect"
+        else if remaining = 0
         then Error "HTTP redirect limit exceeded"
         else Result.bind (redirect request response.headers) (follow (remaining - 1))
       else Ok (request, response))

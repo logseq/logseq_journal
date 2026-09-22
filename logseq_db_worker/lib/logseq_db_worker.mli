@@ -32,3 +32,37 @@ val view : t -> Pure_reducer.view
 val graph_state : t -> graph_state
 val request : t -> Protocol.request -> Protocol.response
 val shutdown : t -> unit
+
+val retain_asset_file
+  :  t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> handle:string
+  -> (string * string) option
+
+val release_asset_file
+  :  t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> handle:string
+  -> unit
+
+type import_receipt =
+  { operation : Logseq_db_types.Graph_types.Uuid.t
+  ; graph_generation : int
+  ; scope : Logseq_sync_pure_reducer.Core.graph_scope
+  ; target : Logseq_db_types.Graph_types.Uuid.t
+  ; asset : Logseq_db_types.Asset_descriptor.t
+  ; file_type : string
+  ; preview : (string * string) option
+  }
+
+val import_asset
+  :  t
+  -> graph_generation:int
+  -> Logseq_db_types.Asset_import.t
+  -> (import_receipt, string) result
+
+val retain_imported_file
+  :  t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> operation:Logseq_db_types.Graph_types.Uuid.t
+  -> (string * string) option

@@ -33,9 +33,14 @@ type payload =
       { block : Journal_graph_projection.block
       ; timeline_entry_update : Journal_graph_projection.timeline_entry option
       }
+  | Child_failed of
+      { block_id : string
+      ; failure : failure_source
+      }
   | Child_created of
       { child : Journal_graph_projection.block
-      ; timeline_entry_update : Journal_graph_projection.timeline_entry
+      ; parent : Journal_graph_projection.block
+      ; timeline_entry_update : Journal_graph_projection.timeline_entry option
       }
   | Block_updated of
       { block : Journal_graph_projection.block
@@ -56,6 +61,7 @@ type payload =
       }
   | Delete_conflict of Journal_graph_projection.block
   | Block_found of Journal_graph_projection.block option
+  | Feed_refresh_started of { request_generation : int64 }
   | Feed_loaded of
       { request_generation : int64
       ; feed : Journal_graph_projection.feed
@@ -74,6 +80,13 @@ type payload =
   | Detail_loaded of
       { request_generation : int64
       ; detail : Journal_graph_projection.detail
+      }
+  | Detail_failed of
+      { request_generation : int64
+      ; block_id : string
+      ; missing : bool
+      ; stale_cursor : bool
+      ; failure : failure_source
       }
   | Feed_failed of
       { request_generation : int64

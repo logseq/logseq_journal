@@ -331,9 +331,26 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
       Eio.Switch.run (fun sw ->
         let submitted = ref [] in
         let published = ref [] in
-        let runtime = Runner.runtime ~fork:(fun ~sw:_ task -> task ()) |> Result.get_ok in
+        let runtime =
+          Runner.runtime
+            ~sleep:(fun _ -> failwith "unexpected wait")
+            ~fork:(fun ~sw:_ task -> task ())
+          |> Result.get_ok
+        in
         let sync_runner =
           Runner.sync_runner
+            ~stage_asset:(fun ~scope:_ ~operation:_ ~file_type:_ ~source_file:_ ->
+              Error "unexpected staging")
+            ~put_upload:(fun ~context:_ _ ~current:_ -> failwith "unexpected upload")
+            ~prune_staging:(fun ~scope:_ ~keep:_ -> Ok 0)
+            ~release_staging:(fun ~scope:_ ~file:_ -> Ok ())
+            ~submit_asset:(fun ~context:_ ~current:_ ~post:_ _ ->
+              failwith "unexpected asset IO")
+            ~delete_assets:(fun _ -> Ok ())
+            ~close_assets:(fun _ -> ())
+            ~retain_staged_file:(fun ~scope:_ ~file:_ -> None)
+            ~retain_asset_file:(fun ~scope:_ ~handle:_ -> None)
+            ~release_asset_file:(fun ~scope:_ ~handle:_ -> ())
             ~submit:(fun runner_effect -> submitted := runner_effect :: !submitted)
             ~shutdown:(fun () -> ())
             ()
@@ -349,7 +366,13 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
         in
         let posted = ref [] in
         let runner =
-          Runner.create ~sw dependencies ~post:(fun event -> posted := event :: !posted)
+          Runner.create
+            ~sw
+            dependencies
+            ~recovery_current:(fun _ -> false)
+            ~upload_current:(fun _ -> false)
+            ~asset_current:(fun _ -> false)
+            ~post:(fun event -> posted := event :: !posted)
           |> Result.get_ok
         in
         let limits =
@@ -377,6 +400,352 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
         Alcotest.check Alcotest.int "host receives publish" 1 (List.length !published);
         Alcotest.check Alcotest.int "runner never calls reducer" 0 (List.length !posted);
         Runner.shutdown runner)))
+;;
+
+let test_upload_checkpoint_io () =
+  let module U = Logseq_db_worker_pure_reducer.Asset_upload in
+  let module I = Logseq_db_types.Asset_upload_intent in
+  let module Cache = Logseq_sync_effect_runner.Asset_cache in
+  let module Store = Logseq_db_storage.Asset_upload_store in
+  let uuid n =
+    Logseq_db_types.Graph_types.Uuid.of_string
+      (Printf.sprintf "00000000-0000-4000-8000-%012d" n)
+    |> Result.get_ok
+  in
+  let scope : Sync.graph_scope =
+    { account = account "user-1"; graph_id = uuid 1; graph_generation = 1 }
+  in
+  let intent =
+    I.prepare
+      ~replace_reference:None
+      ~operation_id:(uuid 2)
+      ~origin:(Uri.to_string scope.account.managed_sync_origin)
+      ~account:"user-1"
+      ~graph:(uuid 1)
+      ~asset:(uuid 3)
+      ~version:
+        (Logseq_db_types.Asset_descriptor.version
+           ~checksum:(String.make 64 'a')
+           ~file_type:"png"
+         |> Result.get_ok)
+      ~title:"Imported image"
+      ~size:4L
+      ~staged_file:"fixture.bin"
+      ~target:(uuid 4)
+      ~local_mutation:(uuid 5)
+      ~metadata_mutation:(uuid 6)
+    |> Result.get_ok
+  in
+  let state, instructions = U.step (U.create ~scope ~available:true) (Start intent) in
+  let instruction = List.hd instructions in
+  T.with_managed (fun fixture ->
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let create_cache () =
+          Cache.create
+            ~root:fixture.config.application_support_directory
+            ~scope
+            ~budget_bytes:16L
+            ~maximum_file_bytes:16
+          |> Result.get_ok
+        in
+        let cache = ref (create_cache ()) in
+        let source_file =
+          Filename.concat fixture.config.application_support_directory "picker.bin"
+        in
+        Out_channel.with_open_bin source_file (fun output -> output_string output "file");
+        let orphan =
+          Cache.stage
+            !cache
+            ~operation:(uuid 88)
+            ~file_type:"bin"
+            ~source_file
+            ~pending_budget_bytes:16L
+          |> Result.get_ok
+        in
+        let orphan_path = Option.get (Cache.staged_path !cache ~file:orphan.file) in
+        let published = ref [] in
+        let posted = ref [] in
+        let current = ref true in
+        let runtime =
+          Runner.runtime
+            ~fork:(fun ~sw:_ f -> f ())
+            ~sleep:(fun _ -> failwith "unexpected wait")
+          |> Result.get_ok
+        in
+        let stage_calls = ref 0 in
+        let sync_runner =
+          Runner.sync_runner
+            ~stage_asset:(fun ~scope:_ ~operation ~file_type ~source_file ->
+              incr stage_calls;
+              Cache.stage
+                !cache
+                ~operation
+                ~file_type
+                ~source_file
+                ~pending_budget_bytes:16L
+              |> Result.map (fun staged ->
+                staged.Cache.file, staged.checksum, staged.size)
+              |> Result.map_error (fun _ -> "stage failed"))
+            ~put_upload:(fun ~context:_ _ ~current:_ -> failwith "unexpected PUT")
+            ~prune_staging:(fun ~scope:_ ~keep ->
+              Cache.prune_staged !cache ~keep
+              |> Result.map_error (fun _ -> "prune failed"))
+            ~release_staging:(fun ~scope:release_scope ~file ->
+              Alcotest.(check bool)
+                "release uses the original scope"
+                true
+                (release_scope = scope);
+              Cache.release_staged !cache ~file
+              |> Result.map_error (fun _ -> "cache unavailable"))
+            ~submit_asset:(fun ~context:_ ~current:_ ~post:_ _ ->
+              failwith "unexpected GET")
+            ~delete_assets:(fun _ -> Ok ())
+            ~close_assets:(fun _ -> ())
+            ~retain_staged_file:(fun ~scope:_ ~file ->
+              Option.bind (Cache.retain_staged !cache ~file) (fun lease ->
+                Option.map (fun path -> lease, path) (Cache.path !cache lease)))
+            ~retain_asset_file:(fun ~scope:_ ~handle:_ -> None)
+            ~release_asset_file:(fun ~scope:_ ~handle -> Cache.release !cache handle)
+            ~submit:(fun _ -> ())
+            ~shutdown:(fun () -> ())
+            ()
+        in
+        let dependencies =
+          Runner.dependencies
+            ~runtime
+            ~config:fixture.config
+            ~overlay:fixture.overlay
+            ~sync_runner
+            ~publish:(fun output -> published := output :: !published)
+          |> Result.get_ok
+        in
+        let runner =
+          Runner.create
+            ~sw
+            dependencies
+            ~post:(fun event -> posted := event :: !posted)
+            ~recovery_current:(fun _ -> false)
+            ~upload_current:(fun ticket -> !current && U.ticket_current state ticket)
+            ~asset_current:(fun _ -> false)
+          |> Result.get_ok
+        in
+        Runner.submit
+          runner
+          (Core.Run_upload ({ scope; encrypted = false; key = None }, instruction));
+        Alcotest.(check bool)
+          "durable acknowledgement"
+          true
+          (match !posted with
+           | [ Core.Upload_completed (_, U.Persisted) ] -> true
+           | _ -> false);
+        let db =
+          Sqlite3.db_open
+            (Filename.concat
+               fixture.config.application_support_directory
+               "asset-upload-intents.sqlite")
+        in
+        let stored =
+          Logseq_db_storage.Asset_upload_store.read db ~operation:intent.operation_id
+          |> Result.get_ok
+        in
+        ignore (Sqlite3.db_close db);
+        Alcotest.(check bool)
+          "survives independent database reopen"
+          true
+          (stored = Some intent);
+        current := false;
+        posted := [];
+        Runner.submit
+          runner
+          (Core.Run_upload ({ scope; encrypted = false; key = None }, instruction));
+        Alcotest.(check int) "stale ticket performs no completion" 0 (List.length !posted);
+        let source : Logseq_db_types.Asset_import.t =
+          { operation = uuid 10
+          ; asset = uuid 11
+          ; target = uuid 4
+          ; local_mutation = uuid 12
+          ; replace_reference = None
+          ; metadata_mutation = uuid 13
+          ; source_file
+          ; title = "Imported image"
+          ; file_type = "png"
+          }
+        in
+        let context : Sync.asset_context = { scope; encrypted = false; key = None } in
+        Alcotest.(check bool)
+          "stale import does not stage"
+          true
+          (Result.is_error
+             (Runner.prepare_import runner ~context source ~current:(fun () -> false)));
+        Alcotest.(check int) "stale selection has no IO" 0 !stage_calls;
+        Alcotest.(check bool)
+          "stale import leaves orphan untouched"
+          true
+          (Sys.file_exists orphan_path);
+        let prepared =
+          Runner.prepare_import runner ~context source ~current:(fun () -> true)
+          |> Result.get_ok
+        in
+        let db =
+          Sqlite3.db_open
+            (Filename.concat
+               fixture.config.application_support_directory
+               "asset-upload-intents.sqlite")
+        in
+        Alcotest.(check bool)
+          "import reconciles orphan before staging"
+          false
+          (Sys.file_exists orphan_path);
+        let durable =
+          Logseq_db_storage.Asset_upload_store.read db ~operation:source.operation
+          |> Result.get_ok
+        in
+        ignore (Sqlite3.db_close db);
+        Alcotest.(check bool)
+          "import is durable before success"
+          true
+          (durable = Some prepared && prepared.phase = I.Prepared);
+        let lease, preview =
+          match Runner.retain_imported_file runner ~scope ~operation:source.operation with
+          | Some preview -> preview
+          | None -> Alcotest.fail "durable import preview unavailable"
+        in
+        Alcotest.(check bool) "preview uses staged bytes" true (Sys.file_exists preview);
+        Alcotest.(check bool)
+          "another graph cannot acquire import"
+          true
+          (Runner.retain_imported_file
+             runner
+             ~scope:{ scope with graph_id = uuid 90 }
+             ~operation:source.operation
+           = None);
+        Alcotest.(check bool)
+          "another account cannot acquire import"
+          true
+          (Runner.retain_imported_file
+             runner
+             ~scope:{ scope with account = { scope.account with user_id = "other" } }
+             ~operation:source.operation
+           = None);
+        Runner.release_asset_file runner ~scope ~handle:lease;
+        let duplicate =
+          Runner.prepare_import
+            runner
+            ~context
+            { source with source_file = "picker-no-longer-available" }
+            ~current:(fun () -> true)
+          |> Result.get_ok
+        in
+        Alcotest.(check bool)
+          "same identity restores its intent"
+          true
+          (duplicate = prepared);
+        Alcotest.(check int)
+          "duplicate import never recopies picker source"
+          1
+          !stage_calls;
+        Alcotest.(check bool)
+          "changed identity payload is rejected"
+          true
+          (Result.is_error
+             (Runner.prepare_import
+                runner
+                ~context
+                { source with asset = uuid 99 }
+                ~current:(fun () -> true)));
+        let source_path =
+          Option.get (Cache.staged_path !cache ~file:prepared.staged_file)
+        in
+        Sys.remove source_file;
+        let checkpoint_path =
+          Filename.concat
+            fixture.config.application_support_directory
+            "asset-upload-intents.sqlite"
+        in
+        let db = Sqlite3.db_open checkpoint_path in
+        let complete =
+          List.fold_left
+            (fun previous phase ->
+               let next = I.advance previous phase |> Result.get_ok in
+               Store.save db ~expected:(Some previous.I.revision) next |> Result.get_ok;
+               next)
+            prepared
+            [ I.Local_committed; Uploading; Remote_stored; Metadata_pending; Complete ]
+        in
+        ignore (Sqlite3.db_close db);
+        let restore_terminal () =
+          let db = Sqlite3.db_open checkpoint_path in
+          let restored =
+            Store.list
+              db
+              ~origin:complete.origin
+              ~account:complete.account
+              ~graph:complete.graph
+              ~after:None
+              ~limit:16
+            |> Result.get_ok
+          in
+          ignore (Sqlite3.db_close db);
+          let terminal =
+            List.find (fun i -> i.I.operation_id = complete.operation_id) restored
+          in
+          Alcotest.(check bool)
+            "terminal checkpoint survives database reopen"
+            true
+            (terminal = complete);
+          let _, instructions =
+            U.step (U.create ~scope ~available:false) (Restore terminal)
+          in
+          match instructions with
+          | [ (U.Release_staging _ as instruction) ] -> instruction
+          | _ -> Alcotest.fail "terminal recovery attempted non-cleanup work"
+        in
+        Cache.close !cache;
+        Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
+        Alcotest.(check bool)
+          "unavailable cache retains pending source"
+          true
+          (Sys.file_exists source_path);
+        Alcotest.(check bool)
+          "failed cleanup is observable"
+          true
+          (List.exists
+             (function
+               | Core.Diagnostic "cache unavailable" -> true
+               | _ -> false)
+             !published);
+        Runner.shutdown runner;
+        cache := create_cache ();
+        let restarted =
+          Runner.create
+            ~sw
+            dependencies
+            ~post:(fun event -> posted := event :: !posted)
+            ~recovery_current:(fun _ -> false)
+            ~upload_current:(fun _ -> false)
+            ~asset_current:(fun _ -> false)
+          |> Result.get_ok
+        in
+        let restored_import =
+          Runner.prepare_import restarted ~context source ~current:(fun () -> true)
+          |> Result.get_ok
+        in
+        Alcotest.(check bool)
+          "reconciliation retains durable terminal staging"
+          true
+          (restored_import = complete && Sys.file_exists source_path);
+        let cleanup = restore_terminal () in
+        Runner.submit restarted (Core.Run_upload (context, cleanup));
+        Alcotest.(check bool)
+          "restart completes durable terminal cleanup"
+          false
+          (Sys.file_exists source_path);
+        published := [];
+        Runner.submit restarted (Core.Run_upload (context, restore_terminal ()));
+        Alcotest.(check int) "repeated cleanup is idempotent" 0 (List.length !published);
+        Runner.shutdown restarted;
+        Cache.close !cache)))
 ;;
 
 let () =
@@ -426,6 +795,10 @@ let () =
         ] )
     ; ( "contract"
       , [ Alcotest.test_case
+            "durable upload checkpoint IO"
+            `Quick
+            test_upload_checkpoint_io
+        ; Alcotest.test_case
             "sync and publish delegation"
             `Quick
             test_sync_and_publish_instructions_are_not_reduced_recursively

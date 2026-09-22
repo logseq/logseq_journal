@@ -272,7 +272,8 @@ type snapshot_activation_request =
   }
 
 type mirror_deletion =
-  { graph_id : graph_id
+  { account : account_scope
+  ; graph_id : graph_id
   ; scope : effect_scope
   }
 
@@ -406,6 +407,14 @@ type create_error = Invalid_create of string
 val initial : config -> (t, create_error) result
 val state : t -> state
 val admitted_graph_scope : t -> graph_scope option
+
+type asset_context =
+  { scope : graph_scope
+  ; encrypted : bool
+  ; key : graph_key_handle option
+  }
+
+val asset_context : t -> asset_context option
 
 type transition =
   { next : t
