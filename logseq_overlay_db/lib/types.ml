@@ -118,6 +118,7 @@ type graph_info =
   ; graph_name : string
   ; schema : Graph.schema_version
   ; admission_facts : Graph.admission_fact list
+  ; journal_title_format : string option
   ; limits : capability_limits
   ; version : snapshot_version
   }

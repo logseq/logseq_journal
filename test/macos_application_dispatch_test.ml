@@ -119,6 +119,7 @@ let service =
                  ; graph_name = "Admission fixture"
                  ; schema = { major = 65; minor = 33 }
                  ; admission_facts = []
+                 ; journal_title_format = None
                  ; generation = "generation-1"
                  ; projection_revision = "projection-1"
                  ; limits =

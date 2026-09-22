@@ -23,6 +23,7 @@
           {"type": "losslessCodec"},
           {"type": "ownershipVerified"}
         ],
+        "journalTitleFormat": "MMM do, yyyy",
         "limits": {
           "responseBudgetBytes": 262144,
           "outboxMaxRecords": 4096,

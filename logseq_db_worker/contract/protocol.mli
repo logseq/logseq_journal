@@ -255,6 +255,7 @@ and v2_outcome =
       ; graph_name : string
       ; schema : schema_version
       ; admission_facts : admission_fact list
+      ; journal_title_format : string option
       ; limits : v2_capability_limits
       ; generation : string
       ; projection_revision : string

@@ -255,6 +255,7 @@ and v2_outcome =
       ; graph_name : string
       ; schema : schema_version
       ; admission_facts : admission_fact list
+      ; journal_title_format : string option
       ; limits : v2_capability_limits
       ; generation : string
       ; projection_revision : string
@@ -1697,6 +1698,7 @@ let v2_outcome_to_json = function
       ; graph_name
       ; schema
       ; admission_facts
+      ; journal_title_format
       ; limits
       ; generation
       ; projection_revision
@@ -1707,6 +1709,7 @@ let v2_outcome_to_json = function
       ; "graphName", `String graph_name
       ; "schema", schema_version_to_json schema
       ; "admissionFacts", `List (List.map v2_admission_fact_to_json admission_facts)
+      ; "journalTitleFormat", optional_string_json journal_title_format
       ; "limits", v2_capability_limits_to_json limits
       ; "generation", `String generation
       ; "projectionRevision", `String projection_revision
@@ -1860,6 +1863,7 @@ let v2_outcome_of_json json =
         ; "graphName"
         ; "schema"
         ; "admissionFacts"
+        ; "journalTitleFormat"
         ; "limits"
         ; "generation"
         ; "projectionRevision"
@@ -1874,6 +1878,11 @@ let v2_outcome_of_json json =
           (match field "admissionFacts" fields with
            | `List values -> List.map v2_admission_fact_of_json values
            | _ -> decode_error "admissionFacts must be a list")
+      ; journal_title_format =
+          (match field "journalTitleFormat" fields with
+           | `Null -> None
+           | `String value -> Some value
+           | _ -> decode_error "journalTitleFormat must be a string or null")
       ; limits = v2_capability_limits_of_json (field "limits" fields)
       ; generation = string (field "generation" fields)
       ; projection_revision = string (field "projectionRevision" fields)

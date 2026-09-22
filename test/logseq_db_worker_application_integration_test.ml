@@ -132,6 +132,7 @@ let observe_graph_revision runtime projection_revision =
           ; graph_name = "Journal"
           ; schema = { major = 1; minor = 0 }
           ; admission_facts = []
+          ; journal_title_format = None
           ; limits =
               { response_budget_bytes = 4_096
               ; outbox_max_records = 4_096

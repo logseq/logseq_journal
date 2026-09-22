@@ -1888,11 +1888,21 @@ let with_snapshot_read snapshot read =
 
 let graph_info snapshot =
   with_snapshot_read snapshot (fun snapshot ->
+    let journal_title_format =
+      Option.bind snapshot.authoritative_database (fun database ->
+        Option.bind
+          (entity_of_ident database "logseq.class/Journal")
+          (fun entity ->
+            Option.bind
+              (one database entity "logseq.property.journal/title-format")
+              string_of_value))
+    in
     Ok
       { Types.graph_uuid = snapshot.owner.graph_uuid
       ; graph_name = snapshot.owner.graph_name
       ; schema = snapshot.owner.schema
       ; admission_facts = snapshot.owner.admission_facts
+      ; journal_title_format
       ; limits = snapshot.owner.dependencies.limits
       ; version = snapshot.version
       })

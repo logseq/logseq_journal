@@ -811,6 +811,7 @@ let read_snapshot database request command =
                    ; graph_name = info.graph_name
                    ; schema = info.schema
                    ; admission_facts = info.admission_facts
+                   ; journal_title_format = info.journal_title_format
                    ; limits =
                        { response_budget_bytes = limits.response_budget_bytes
                        ; outbox_max_records = limits.outbox_max_records
