@@ -480,13 +480,22 @@ Implemented foundations:
   `path(percentEncoded:)` method reference crashed every pick; the replace
   auto-present guard dropped the armed request; iOS `fileImporter` never
   invokes its completion on cancel, so closing an armed picker is now
-  detected and reported as dismissal. Follow-up verification exposed a
-  fourth: the armed replace picker sent the attachment holder's uuid as
-  `replaceReference`, so the local commit rejected the mutation as a stale
-  expected reference and the upload failed non-retryably — the runtime now
-  resolves the holder's current asset reference before arming, and the
-  media-runtime test covers arming with the expected previous reference.
-  macOS interactive sign-in remains environment-blocked (-34018 keychain
+  detected and reported as dismissal. Follow-up verification exposed
+  three more: the armed replace picker sent the attachment holder's uuid
+  as `replaceReference`, so the local commit rejected the mutation as a
+  stale expected reference and the upload failed non-retryably — the
+  runtime now resolves the holder's current asset reference
+  (`Entity_value` under `logseq.property/asset`, the variant
+  `asset_reference_matches` requires) through `V2_get_block` before
+  arming; the reference reader previously matched `Asset_value`, which the
+  store never writes, so reuse-select's `previous` fence was always
+  `None` and `set_asset_reference` rejected on referenced holders; and
+  media groups only registered through the import-completion path, so
+  replace/reuse actions were inert on cold-open detail views — menu
+  actions now lazily register the group through the ordinary
+  root-visibility path. Media-runtime tests cover arming with the
+  expected previous reference and cold-open lazy registration. macOS
+  interactive sign-in remains environment-blocked (-34018 keychain
   entitlement; no development
   certificate on the verification machine) — iOS is the representative path
   since the widget and runtime code are shared. Deployed server import

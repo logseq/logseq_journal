@@ -200,12 +200,12 @@ let () =
             ; uuid = uuid 10
             ; title = "asset"
             ; schema =
-                { property_type = G.Asset
+                { property_type = G.Entity
                 ; cardinality = G.One
                 ; hidden = true
                 ; public = false
                 }
-            ; values = [ G.Asset_value (uuid 2) ]
+            ; values = [ G.Entity_value (uuid 2) ]
             ; values_truncated = false
             }
         ]
@@ -339,5 +339,58 @@ let () =
     "a failed holder read must not arm the replacement picker";
   check
     ((Hashtbl.find views root).error <> None)
-    "a failed holder read surfaces a retryable error"
+    "a failed holder read surfaces a retryable error";
+  let cold_root = G.Uuid.to_string (uuid 7) in
+  R.begin_reuse runtime ~root:cold_root;
+  let _, request = Queue.take sent in
+  (match request with
+   | S.Graph_request
+       { command =
+           P.V2_list_assets
+             { recursive = false; roots = [ u ]; limit = 16; cursor = None }
+       ; _
+       }
+     when u = uuid 7 -> ()
+   | _ ->
+     failwith
+       "menu actions on an unregistered group must register and query it");
+  let token, request = Queue.take sent in
+  let cold_reference =
+    match request with
+    | S.Graph_request
+        ({ command = P.V2_get_block { block; revision = None }; _ } as query)
+      when block = uuid 7 -> query
+    | _ -> failwith "cold-open reuse must read the attachment holder"
+  in
+  R.receive
+    runtime
+    (Option.get token)
+    (Graph_response
+       (P.V2_response
+          { api_version = 2
+          ; request_id = cold_reference.request_id
+          ; outcome =
+              V2_block_outcome
+                (V2_present_block
+                   { value =
+                       { block = { holder with uuid = uuid 7; properties = [] }
+                       ; task_status = None
+                       ; rendered_page_title = "page"
+                       }
+                   ; revision = "r9"
+                   })
+          }));
+  let _, request = Queue.take sent in
+  (match request with
+   | S.Graph_request
+       { command =
+           P.V2_list_assets
+             { recursive = true; roots = [ u ]; limit = 16; cursor = None }
+       ; _
+       }
+     when u = uuid 9 -> ()
+   | _ -> failwith "cold-open reuse must enumerate the holder page subtree");
+  check
+    (Option.is_some (Hashtbl.find views cold_root).picker)
+    "cold-open reuse opens the candidate picker"
 ;;

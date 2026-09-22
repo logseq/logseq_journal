@@ -425,6 +425,7 @@ let request_reference t g =
 ;;
 
 let begin_replace t ~root =
+  if not (Hashtbl.mem t.groups root) then root_visible t ~root true;
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some _ when (not g.replace) && List.length t.queued < 1024 ->
     (match G.Uuid.of_string g.root with
@@ -479,6 +480,7 @@ let candidate (asset : Asset.t) =
 ;;
 
 let begin_reuse t ~root =
+  if not (Hashtbl.mem t.groups root) then root_visible t ~root true;
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some _ when List.length t.queued < 1024 ->
     g.reference <- None;
@@ -564,7 +566,7 @@ let previous_reference (block : G.block) =
        then
          List.find_map
            (function
-             | G.Asset_value asset -> Some asset
+             | G.Entity_value asset -> Some asset
              | _ -> None)
            property.values
        else None)
