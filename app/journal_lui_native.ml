@@ -61,7 +61,7 @@ let registry =
     (component
        media_identifier
        all_host_profiles
-       false
+       true
        children
        [ payload_property ]
        [ event_schema ]);
@@ -79,7 +79,7 @@ let registry =
     (component
        list_identifier
        all_host_profiles
-       false
+       true
        children
        [ payload_property ]
        [ event_schema ]);

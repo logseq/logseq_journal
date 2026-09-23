@@ -167,6 +167,7 @@ type ('request, 'response, 'push) client =
   ; terminal_requests : (ID.Worker.request_id, unit) Hashtbl.t
   ; output_mutex : Mutex.t
   ; output_condition : Condition.t
+  ; output_wakeup : (unit -> unit) Atomic.t
   ; pending_output_count : int Atomic.t
   ; stopped_mutex : Mutex.t
   ; stopped_condition : Condition.t
@@ -273,6 +274,7 @@ let prepare ~runtime_epoch ~worker_generation service config =
     ; terminal_requests = Hashtbl.create request_capacity
     ; output_mutex = Mutex.create ()
     ; output_condition = Condition.create ()
+    ; output_wakeup = Atomic.make (fun () -> ())
     ; pending_output_count = Atomic.make 0
     ; stopped_mutex = Mutex.create ()
     ; stopped_condition = Condition.create ()
@@ -462,6 +464,16 @@ let forget_direct_terminal client request_id =
 
 let on_event client handler = client.subscribers <- client.subscribers @ [ handler ]
 
+(* [output_wakeup] runs outside the output lock on whichever domain produced
+   the event. Cross-thread delivery must not rely on an OCaml [Condition]
+   waited on by a systhread of a different domain: on wake the waiter re-takes
+   the shared mutex and then blocks re-acquiring its own domain lock, which a
+   native thread (the UI thread parked in its runloop) may hold indefinitely —
+   a three-way deadlock observed on iOS. The wakeup hook hops straight to the
+   host thread instead. *)
+let notify_output client = (Atomic.get client.output_wakeup) ()
+let set_output_wakeup client wakeup = Atomic.set client.output_wakeup wakeup
+
 let publish_response client request_id outcome =
   with_output_lock client (fun () ->
     Journal_bounded_mailbox.Reserved.publish
@@ -472,7 +484,8 @@ let publish_response client request_id outcome =
          ; request_id
          ; outcome
          });
-    increment_pending_output_locked client)
+    increment_pending_output_locked client);
+  notify_output client
 ;;
 
 let set_terminal_event client error =
@@ -486,7 +499,8 @@ let set_terminal_event client error =
               ; worker_generation = client.worker_generation
               ; error
               });
-      increment_pending_output_locked client))
+      increment_pending_output_locked client));
+  notify_output client
 ;;
 
 let mark_stopped client status =
@@ -615,7 +629,8 @@ let run_direct_session
       with
       | `Added -> increment_pending_output_locked client
       | `Replaced -> Condition.broadcast client.output_condition
-      | `Full -> failwith "Worker push mailbox invariant failed")
+      | `Full -> failwith "Worker push mailbox invariant failed");
+    notify_output client
   in
   let mono_clock = Journal_worker_eio_backend.mono_clock environment in
   let network = Journal_worker_eio_backend.net environment in
@@ -1095,7 +1110,8 @@ let inject_push client ~runtime_epoch ~worker_generation ~push_sequence ~topic p
   with_output_lock client (fun () ->
     match Journal_bounded_mailbox.Fifo.try_push client.injected event with
     | `Ok -> increment_pending_output_locked client
-    | `Full | `Closed -> failwith "Worker test injection mailbox is unavailable")
+    | `Full | `Closed -> failwith "Worker test injection mailbox is unavailable");
+  notify_output client
 ;;
 
 module Private = struct
@@ -1136,6 +1152,7 @@ module Private = struct
   let await_stopped_packed = await_stopped_packed
   let fail_unrecoverable = fail_unrecoverable
   let deliver = deliver
+  let set_output_wakeup = set_output_wakeup
 end
 
 module For_testing = struct

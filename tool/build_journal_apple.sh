@@ -138,6 +138,22 @@ swift_args=(
 )
 if [[ $platform == ios-simulator ]]; then
   swift_args+=(--triple "$triple" --sdk "$sdk_path")
+  # Simulator binaries exec on the host macOS kernel, so entitlements baked
+  # into the code signature are validated as macOS entitlements and the exec
+  # is killed (error 163) no matter what identity signed them. The sim reads
+  # its entitlements from the __TEXT,__entitlements section instead — embed
+  # them at link time like Xcode does, then sign adhoc. This is what makes
+  # keychain (Amplify sign-in, localAccount) work on the sim.
+  ios_entitlements="$build_dir/ios-sim-entitlements.plist"
+  cp "$entitlements_dir/ios-debug-profile.entitlements" "$ios_entitlements"
+  bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
+  ios_team_id=${JOURNAL_IOS_TEAM_ID:-K378MFWK59}
+  plutil -replace keychain-access-groups -json \
+    "[\"$ios_team_id.$bundle_id\"]" "$ios_entitlements"
+  plutil -insert application-identifier -string \
+    "$ios_team_id.$bundle_id" "$ios_entitlements"
+  swift_args+=(-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements
+    -Xlinker "$ios_entitlements")
 fi
 
 JOURNAL_LUI_PACKAGE_PATH=${JOURNAL_LUI_PACKAGE_PATH:-$repo_root/../lui/platform/apple} \
@@ -153,51 +169,37 @@ if [[ $platform == macos ]]; then
   mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
   cp "$info_plist" "$app_dir/Contents/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/Contents/MacOS/JournalApp"
-  # Adhoc signing: keychain-access-groups needs a real team id; without one the
-  # group is invalid and AMFI kills the binary, so drop the key for local builds.
+  # keychain-access-groups needs a real team id; without one the group is
+  # invalid and AMFI kills the binary, so drop the key for local builds. With a
+  # team id, sign with the Apple Development identity so the entitlement is
+  # honored (Amplify/keychain then work on macOS too).
   macos_entitlements="$build_dir/macos-entitlements.plist"
   cp "$entitlements_dir/macos-debug-profile.entitlements" "$macos_entitlements"
   bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
   if [[ -n ${JOURNAL_MACOS_TEAM_ID:-} ]]; then
     plutil -replace keychain-access-groups -json \
       "[\"$JOURNAL_MACOS_TEAM_ID.$bundle_id\"]" "$macos_entitlements"
+    # macOS rejects the iOS-style `application-identifier` entitlement key;
+    # the application id is implied by the signature + keychain-access-groups.
+    plutil -remove application-identifier "$macos_entitlements" 2>/dev/null || true
+    codesign --force --sign "${JOURNAL_MACOS_SIGN_IDENTITY:-Apple Development}" \
+      --timestamp=none --entitlements "$macos_entitlements" "$app_dir" || true
   else
     plutil -remove keychain-access-groups "$macos_entitlements"
+    codesign --force --sign - --timestamp=none \
+      --entitlements "$macos_entitlements" \
+      "$app_dir" || true
   fi
-  codesign --force --sign - --timestamp=none \
-    --entitlements "$macos_entitlements" \
-    "$app_dir" || true
 else
   # iOS bundles are flat; an empty Contents/ dir breaks install + codesign.
   mkdir -p "$app_dir"
   cp "$info_plist" "$app_dir/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/JournalApp"
-  # Signing has two modes:
-  # - With JOURNAL_IOS_TEAM_ID + a signing identity (JOURNAL_IOS_SIGN_IDENTITY,
-  #   or the first identity security reports): sign with
-  #   application-identifier + keychain-access-groups so keychain-backed flows
-  #   (Amplify sign-in, localAccount) work.
-  # - Otherwise plain adhoc: iOS >=26.5 simulators refuse to exec adhoc binaries
-  #   carrying an entitlements blob, and unentitled binaries get -34018 on every
-  #   keychain read — launchable, but sign-in cannot complete.
-  bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
-  sign_identity=${JOURNAL_IOS_SIGN_IDENTITY:-}
-  if [[ -z $sign_identity ]]; then
-    sign_identity=$(security find-identity -v -p codesigning 2>/dev/null |
-      sed -n 's/.*"\(.*\)"/\1/p' | head -1)
-  fi
-  if [[ -n ${JOURNAL_IOS_TEAM_ID:-} && -n $sign_identity ]]; then
-    ios_entitlements="$build_dir/ios-entitlements.plist"
-    cp "$entitlements_dir/ios-debug-profile.entitlements" "$ios_entitlements"
-    plutil -replace keychain-access-groups -json \
-      "[\"$JOURNAL_IOS_TEAM_ID.$bundle_id\"]" "$ios_entitlements"
-    plutil -insert application-identifier -string \
-      "$JOURNAL_IOS_TEAM_ID.$bundle_id" "$ios_entitlements"
-    codesign --force --sign "$sign_identity" --timestamp=none \
-      --entitlements "$ios_entitlements" "$app_dir"
-  else
-    codesign --force --sign - --timestamp=none "$app_dir" || true
-  fi
+  # Plain adhoc signature — the sim's entitlements already live in the
+  # __TEXT,__entitlements section embedded at link time above. Do NOT pass
+  # --entitlements here: a signature-level entitlements blob is validated by
+  # the host kernel as macOS entitlements and the exec is killed.
+  codesign --force --sign - --timestamp=none "$app_dir" || true
 fi
 
 echo "$app_dir"

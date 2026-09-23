@@ -150,7 +150,7 @@ enum JournalExtensionFingerprint {
 
   static func mediaExtension() -> LUIAppleExtension {
     journalExtension(identifier: "journal-media", profiles: allHostProfiles,
-      standardChildren: false, events: true) { context in
+      standardChildren: true, events: true) { context in
       AnyView(JournalMedia.View(context: context))
     }
   }
@@ -164,7 +164,7 @@ enum JournalExtensionFingerprint {
 
   static func listExtension() -> LUIAppleExtension {
     journalExtension(identifier: "journal-list", profiles: allHostProfiles,
-      standardChildren: false, events: true) { context in
+      standardChildren: true, events: true) { context in
       AnyView(JournalList.View(context: context))
     }
   }

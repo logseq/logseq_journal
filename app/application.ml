@@ -1305,24 +1305,28 @@ module Presentation = struct
   ;;
 
   let list children =
-    V.Native_list.vertical
-      ~key:(Ui.Key.string "graph-list")
-      ~style:Inset
-      [ V.Native_list.section
-          ~key:(Ui.Key.string "graphs")
-          ~separator:Hidden
-          (List.mapi
-             (fun index child ->
-                let key =
-                  match V.For_testing.test_id child with
-                  | Some id -> Ui.Key.string id
-                  | None -> Ui.Key.int index
-                in
-                V.Native_list.row ~key ~separator:Hidden child)
-             children)
+    V.Body.Vertical.create
+      [ V.Body.Vertical.fixed
+          (V.Native_list.vertical
+             ~key:(Ui.Key.string "graph-list")
+             ~style:Inset
+             [ V.Native_list.section
+                 ~key:(Ui.Key.string "graphs")
+                 ~separator:Hidden
+                 (List.mapi
+                    (fun index child ->
+                       let key =
+                         match V.For_testing.test_id child with
+                         | Some id -> Ui.Key.string id
+                         | None -> Ui.Key.int index
+                       in
+                       V.Native_list.row ~key ~separator:Hidden child)
+                    children)
+             ])
       ]
-    |> V.Body.Vertical.fill
-    |> fun content -> V.Body.Vertical.create [ content ]
+    |> V.Body.Private.to_widget
+    |> V.frame ~max_height:Fill
+    |> V.Body.static
   ;;
 
   let unavailable ~title ~symbol ~message ~actions =
@@ -4134,13 +4138,18 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                (Journal_uploads.retry uploads operation))
        | Some (Days settings) ->
          Effect.of_thunk (fun () ->
-           asset_settings := Some settings;
-           let current = !state_ref in
-           if current.graph_state.phase = Graph_open
-           then
-             refresh_assets
-               ~graph_generation:current.graph_state.generation
-               current.calendar))
+           (* The extension re-emits its preference on every remount; only a
+              real change may refresh (each refresh republishes the model and
+              would loop under the full-remount view). *)
+           if !asset_settings <> Some settings
+           then (
+             asset_settings := Some settings;
+             let current = !state_ref in
+             if current.graph_state.phase = Graph_open
+             then
+               refresh_assets
+                 ~graph_generation:current.graph_state.generation
+                 current.calendar)))
     | Ui.Event.Payload.Confirmation_response response ->
       set_state_and_effect (fun state ->
         match state.modal with
@@ -4169,9 +4178,13 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
              })
         | _, Some { startup = { awaiting_e2ee_password = true; _ }; _ }
         | _, Some { startup = { failure = Some During_e2ee; _ }; _ } ->
-          { state with
-            e2ee_password = Journal_capture.apply_text_edit state.e2ee_password edit
-          }
+          let e2ee_password = Journal_capture.apply_text_edit state.e2ee_password edit in
+          (* A mount-time echo produces an identical capture; rebuilding the
+             record would republish the model and remount the field, which
+             echoes again — an unbounded render loop. *)
+          if e2ee_password == state.e2ee_password
+          then state
+          else { state with e2ee_password }
         | _ -> state)
     | Ui.Event.Payload.Text "capture-submit" ->
       (match snapshot.modal, snapshot.direct_capture with
@@ -5118,7 +5131,12 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                   dispatch
                   timeline_scroll_completed
                   detail_scroll_completed))
-          model_signal
+          (* `dyn` remounts the whole tree on every publish (its key equality
+             is `fun _ _ -> false`). Reducers that return the identical record
+             must not republish — otherwise mount-time echoes (fresh text
+             fields, extension `.task` emits) loop forever: remount → echo →
+             publish → remount. *)
+          (Signal.cutoff ( == ) model_signal)
       ]
   in
   let os =
@@ -5159,17 +5177,15 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
   ignore (Worker.send client Graph_service.Get_graph_state : Worker.send_result);
   Worker.on_event client (fun event ->
     Journal_pump.enqueue pump (fun () -> Effect.run (handle_worker_event event)));
-  ignore
-    (Thread.create
-       (fun () ->
-          while !running do
-            (try Worker.For_testing.await_output client with
-             | _ -> ());
-            if !running && not (Worker.For_testing.is_stopping client)
-            then Journal_pump.enqueue pump (fun () -> ())
-            else running := false
-          done)
-       ());
+  (* The worker fires the wakeup on its own domain whenever output lands;
+     enqueueing hops through the host wakeup onto the UI thread. An OCaml
+     Condition waiter thread would deadlock against the worker domain (the
+     woken waiter holds the output mutex while blocked on its domain lock
+     which the UI thread holds inside its runloop). *)
+  Worker.Private.set_output_wakeup client (fun () ->
+    Journal_pump.enqueue pump (fun () -> ()));
+  (* Kick once to drain any output emitted before the wakeup was installed. *)
+  Journal_pump.enqueue pump (fun () -> ());
   ignore
     (Thread.create
        (fun () ->

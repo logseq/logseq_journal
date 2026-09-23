@@ -36,7 +36,10 @@ let feedback ~key ~top ~visible ~compact ~expanded body =
     ~props:
       (`Assoc [ "mode", `String "feedback"; "top", `Bool top; "visible", `Bool visible ])
     ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body; compact; expanded ]
+      (* Chrome slots are positional on the native side — absent slots must
+       still mount a (zero-size) node or the host's index lookup shifts. *)
+    ~children:
+      [ V.Body.Private.to_widget body; V.column [ compact ]; V.column [ expanded ] ]
     ()
   |> V.Body.static
 ;;
@@ -270,16 +273,20 @@ let view
               ; "error", `Bool (Option.is_some on_error_info)
               ])
         ~on_event:(fun _ -> ())
+          (* Chrome slots are positional on the native side — absent slots must
+           still mount a (zero-size) node or the host's index lookup shifts. *)
         ~children:
           [ V.Body.Private.to_widget body
-          ; (if platform = "ios" then account else V.empty ())
-          ; (if platform = "ios" then error else V.empty ())
-          ; (if sync_phase = Some Graph_service.Connecting
-             then
-               V.progress ~style:Circular ()
-               |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
-               |> test_id "journal-header-sync-progress"
-             else V.empty ())
+          ; (if platform = "ios" then V.column [ account ] else V.column [])
+          ; (if platform = "ios" then V.column [ error ] else V.column [])
+          ; V.column
+              [ (if sync_phase = Some Graph_service.Connecting
+                 then
+                   V.progress ~style:Circular ()
+                   |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
+                   |> test_id "journal-header-sync-progress"
+                 else V.empty ())
+              ]
           ]
         ()
       |> test_id "journal-floating-chrome"

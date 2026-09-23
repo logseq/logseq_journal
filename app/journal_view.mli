@@ -783,6 +783,7 @@ module View : sig
       -> ?interactive_dismiss:bool
       -> ?sizing:sizing
       -> ?detents:detent list
+      -> ?title:string
       -> content:t
       -> t
       -> t

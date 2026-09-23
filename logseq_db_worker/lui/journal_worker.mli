@@ -163,6 +163,15 @@ module Private : sig
       in drain order. Must be called on the application thread (the lui pump
       entry point), never from worker fibers. *)
   val deliver : ('request, 'response, 'push) client -> max_events:int -> unit
+
+  (** Registers the callback invoked on the producing domain whenever new
+      output (responses, pushes, terminal events) lands in the client's
+      mailboxes. Install a thread-safe thunk that hops to the application
+      thread and calls {!deliver}; do not wait on OCaml
+      [Mutex]/[Condition] from an application-domain systhread here — a
+      waiter that holds a shared mutex while blocked re-acquiring its own
+      domain lock deadlocks against producer domains. *)
+  val set_output_wakeup : ('request, 'response, 'push) client -> (unit -> unit) -> unit
 end
 
 module For_testing : sig

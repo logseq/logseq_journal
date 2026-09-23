@@ -117,6 +117,7 @@ private actor JournalMediaDecoder {
 
     var body: some SwiftUI.View {
       VStack(alignment: .leading, spacing: 8) {
+        context.content
         if let properties {
           if properties.editable {
             HStack(alignment: .top) {

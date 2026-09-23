@@ -45,7 +45,9 @@ LUIFlutterExtensionRegistry journalExtensionRegistry(
       identifier: 'journal-chrome',
       fingerprint:
           'lui-extension-v1|14:journal-chrome|profiles:ios/swiftui,macos/swiftui'
-          '|standard-children:1|children:|properties:'
+          '|standard-children:1|children:20:journal-asset-import,'
+          '22:journal-asset-settings,14:journal-chrome,12:journal-list,'
+          '13:journal-media|properties:'
           '7:payload:string:required:none|events:',
       acceptsStandardChildren: true,
       properties: const [_payloadProperty],
@@ -58,7 +60,9 @@ LUIFlutterExtensionRegistry journalExtensionRegistry(
       fingerprint:
           'lui-extension-v1|20:journal-asset-import|profiles:'
           'android/flutter,ios/flutter,ios/swiftui,macos/flutter,macos/swiftui'
-          '|standard-children:0|children:|properties:'
+          '|standard-children:0|children:20:journal-asset-import,'
+          '22:journal-asset-settings,14:journal-chrome,12:journal-list,'
+          '13:journal-media|properties:'
           '7:payload:string:required:none|events:'
           '5:event[2:id:int:required,7:payload:string:required]',
       properties: const [_payloadProperty],
@@ -72,7 +76,9 @@ LUIFlutterExtensionRegistry journalExtensionRegistry(
       fingerprint:
           'lui-extension-v1|13:journal-media|profiles:'
           'android/flutter,ios/flutter,ios/swiftui,macos/flutter,macos/swiftui'
-          '|standard-children:0|children:|properties:'
+          '|standard-children:1|children:20:journal-asset-import,'
+          '22:journal-asset-settings,14:journal-chrome,12:journal-list,'
+          '13:journal-media|properties:'
           '7:payload:string:required:none|events:'
           '5:event[2:id:int:required,7:payload:string:required]',
       properties: const [_payloadProperty],
@@ -86,7 +92,9 @@ LUIFlutterExtensionRegistry journalExtensionRegistry(
       fingerprint:
           'lui-extension-v1|22:journal-asset-settings|profiles:'
           'android/flutter,ios/flutter,ios/swiftui,macos/flutter,macos/swiftui'
-          '|standard-children:1|children:|properties:'
+          '|standard-children:1|children:20:journal-asset-import,'
+          '22:journal-asset-settings,14:journal-chrome,12:journal-list,'
+          '13:journal-media|properties:'
           '7:payload:string:required:none|events:'
           '5:event[2:id:int:required,7:payload:string:required]',
       acceptsStandardChildren: true,
@@ -101,9 +109,12 @@ LUIFlutterExtensionRegistry journalExtensionRegistry(
       fingerprint:
           'lui-extension-v1|12:journal-list|profiles:'
           'android/flutter,ios/flutter,ios/swiftui,macos/flutter,macos/swiftui'
-          '|standard-children:0|children:|properties:'
+          '|standard-children:1|children:20:journal-asset-import,'
+          '22:journal-asset-settings,14:journal-chrome,12:journal-list,'
+          '13:journal-media|properties:'
           '7:payload:string:required:none|events:'
           '5:event[2:id:int:required,7:payload:string:required]',
+      acceptsStandardChildren: true,
       properties: const [_payloadProperty],
       events: const [_journalEvent],
       builder: (context) => buildJournalList(context, renderChild),

@@ -463,8 +463,8 @@ module View = struct
 
     let variant = function
       | Destructive -> "destructive"
-      | Cancel -> "cancel"
-      | Normal -> "primary"
+      | Cancel -> "secondary"
+      | Normal -> "default"
     ;;
   end
 
@@ -477,11 +477,11 @@ module View = struct
       | Button
 
     let variant = function
-      | Plain -> "plain"
-      | Bordered -> "bordered"
-      | Prominent -> "prominent"
-      | Button -> "button"
-      | Automatic -> "automatic"
+      | Plain -> "ghost"
+      | Bordered -> "outline"
+      | Prominent -> "primary"
+      | Button -> "default"
+      | Automatic -> "default"
     ;;
   end
 
@@ -852,7 +852,7 @@ module View = struct
 
   let secure_field
         ?key
-        ~label
+        ~label:_
         ?(prompt = "")
         ?keyboard:_
         ?submit_label:_
@@ -877,7 +877,6 @@ module View = struct
       let node = Lui_ui.secure_field context in
       Lui_ui.text_property context node (Text_editing.Value.text value);
       Lui_ui.placeholder context node prompt;
-      Lui_ui.string_property context node Lui_protocol.TitleValue label;
       if not enabled then Lui_ui.disabled context node true;
       if autofocus then Lui_ui.bool_property context node Lui_protocol.Autofocus true;
       let local_revision = ref accepted_local_revision in
@@ -1047,6 +1046,8 @@ module View = struct
            set of control children and no extension children, while items here
            include menus and extension nodes. *)
         let node = Lui_ui.row context in
+        Lui_ui.gap context node 12;
+        Lui_ui.padding_horizontal context node 16;
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
@@ -1055,36 +1056,31 @@ module View = struct
              let child = item.content in
              let mounted = child.mount context (Some node) in
              Lui_ui.key context mounted item.item_key;
-             let hint property value =
-               (* Placement/spacing hints only apply to node kinds that accept
-                  them; menu items and extension nodes reject these props. *)
+             (match item.placement with
+              | Some Principal ->
+                if
+                  Lui_protocol.property_supported
+                    (Lui_ui.node_kind context mounted)
+                    Lui_protocol.GrowValue
+                then Lui_ui.grow context mounted 1.0
+              | _ -> ());
+             (* Toolbar placement/spacing/grouping have no representation in
+                the lui schema: `role` accepts only treeitem/navigation/
+                navigation-heading and `variant` only the button vocabulary.
+                The only representable hint is a navigation placement. *)
+             match item.placement with
+             | Some Navigation ->
                if
                  Lui_protocol.property_supported
                    (Lui_ui.node_kind context mounted)
-                   property
-               then Lui_ui.string_property context mounted property value
-             in
-             (match item.placement with
-              | Some placement ->
-                hint
-                  Lui_protocol.RoleValue
-                  (match placement with
-                   | Automatic -> "automatic"
-                   | Principal -> "principal"
-                   | Navigation -> "navigation"
-                   | Primary_action -> "primary_action"
-                   | Secondary_action -> "secondary_action"
-                   | Status -> "status"
-                   | Confirmation_action -> "confirmation_action"
-                   | Cancellation_action -> "cancellation_action"
-                   | Destructive_action -> "destructive_action"
-                   | Bottom_bar -> "bottom_bar")
-              | None -> ());
-             (match item.spacing with
-              | Some Fixed -> hint Lui_protocol.VariantValue "fixed_spacing"
-              | Some Flexible -> hint Lui_protocol.VariantValue "flexible_spacing"
-              | None -> ());
-             if item.is_group then hint Lui_protocol.VariantValue "item_group")
+                   Lui_protocol.RoleValue
+               then
+                 Lui_ui.string_property
+                   context
+                   mounted
+                   Lui_protocol.RoleValue
+                   "navigation"
+             | _ -> ())
           items;
         node)
     ;;
@@ -1123,7 +1119,11 @@ module View = struct
       type child = t
 
       let fixed t = t
-      let fill ?weight:_ t = t
+
+      let fill ?(weight = 1.) t =
+        modify (fun context node -> Lui_ui.grow context node weight) t
+      ;;
+
       let create ?key children = column ?key children
     end
 
@@ -1131,7 +1131,11 @@ module View = struct
       type child = t
 
       let fixed t = t
-      let fill ?weight:_ t = t
+
+      let fill ?(weight = 1.) t =
+        modify (fun context node -> Lui_ui.grow context node weight) t
+      ;;
+
       let create ?key children = row ?key children
     end
 
@@ -1742,7 +1746,10 @@ module View = struct
       element ?key (fun context parent ->
         let node = Lui_ui.list_item context in
         if not enabled then Lui_ui.disabled context node true;
-        Option.iter (set_leaf_label context node) label.label_content;
+        Lui_ui.bool_property context node Lui_protocol.PressEnabled enabled;
+        (* A list-item must carry text or children; mount the label as the
+           item content so composite labels render too. *)
+        ignore (label.mount context (Some node));
         Lui_ui.on_event context node (fun event ->
           if is_press event then invoke on_activate Event.Payload.Unit);
         (match parent with
@@ -1773,7 +1780,7 @@ module View = struct
              element (fun context parent ->
                let node = Lui_ui.button context in
                Lui_ui.text_property context node "Back";
-               Lui_ui.string_property context node Lui_protocol.VariantValue "plain";
+               Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
                Lui_ui.accessibility_identifier context node "journal-nav-back";
                Lui_ui.on_event context node (fun event ->
                  if is_press event
@@ -1806,6 +1813,7 @@ module View = struct
           ?(interactive_dismiss = true)
           ?sizing:_
           ?detents:_
+          ?(title = "")
           ~content
           base
       =
@@ -1818,6 +1826,10 @@ module View = struct
         if presented
         then (
           let sheet = Lui_ui.sheet context in
+          Lui_ui.text_property
+            context
+            sheet
+            (if String.equal title "" then "Sheet" else title);
           Lui_ui.append context node sheet;
           if interactive_dismiss
           then
