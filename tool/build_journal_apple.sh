@@ -169,12 +169,35 @@ if [[ $platform == macos ]]; then
     "$app_dir" || true
 else
   # iOS bundles are flat; an empty Contents/ dir breaks install + codesign.
-  # The iOS 27 simulator refuses to exec any binary carrying an entitlements
-  # blob ("No such process"), so sign plain-adhoc without entitlements.
   mkdir -p "$app_dir"
   cp "$info_plist" "$app_dir/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/JournalApp"
-  codesign --force --sign - --timestamp=none "$app_dir" || true
+  # Signing has two modes:
+  # - With JOURNAL_IOS_TEAM_ID + a signing identity (JOURNAL_IOS_SIGN_IDENTITY,
+  #   or the first identity security reports): sign with
+  #   application-identifier + keychain-access-groups so keychain-backed flows
+  #   (Amplify sign-in, localAccount) work.
+  # - Otherwise plain adhoc: iOS >=26.5 simulators refuse to exec adhoc binaries
+  #   carrying an entitlements blob, and unentitled binaries get -34018 on every
+  #   keychain read — launchable, but sign-in cannot complete.
+  bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
+  sign_identity=${JOURNAL_IOS_SIGN_IDENTITY:-}
+  if [[ -z $sign_identity ]]; then
+    sign_identity=$(security find-identity -v -p codesigning 2>/dev/null |
+      sed -n 's/.*"\(.*\)"/\1/p' | head -1)
+  fi
+  if [[ -n ${JOURNAL_IOS_TEAM_ID:-} && -n $sign_identity ]]; then
+    ios_entitlements="$build_dir/ios-entitlements.plist"
+    cp "$entitlements_dir/ios-debug-profile.entitlements" "$ios_entitlements"
+    plutil -replace keychain-access-groups -json \
+      "[\"$JOURNAL_IOS_TEAM_ID.$bundle_id\"]" "$ios_entitlements"
+    plutil -insert application-identifier -string \
+      "$JOURNAL_IOS_TEAM_ID.$bundle_id" "$ios_entitlements"
+    codesign --force --sign "$sign_identity" --timestamp=none \
+      --entitlements "$ios_entitlements" "$app_dir"
+  else
+    codesign --force --sign - --timestamp=none "$app_dir" || true
+  fi
 fi
 
 echo "$app_dir"
