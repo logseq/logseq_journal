@@ -66,8 +66,8 @@ ios_output=$(
     OPAM_SWITCH_PREFIX="$switch_prefix" \
     TEST_OPAM_ROOT="$opam_root" \
     TEST_SWITCH_PREFIX="$switch_prefix" \
-    BONSAI_SWIFTUI_APPLE_SDK_ROOT=/Xcode/iPhoneOS.sdk \
-    "$script" "$ios_archive" bonsai-swiftui.ios
+    JOURNAL_APPLE_SDK_ROOT=/Xcode/iPhoneOS.sdk \
+    "$script" "$ios_archive" lui-journal.ios
 )
 test "$ios_output" = '(-cclib -Lapp -cclib app/libgmp.a)'
 test "$(cat "$ios_archive")" = ios-static-gmp
@@ -81,7 +81,7 @@ macos_archive="$temporary_directory/macos/libgmp.a"
 macos_output=$(
   PATH="$fake_bin:$PATH" \
     TEST_HOST_GMP_LIBDIR="$host_library_directory" \
-    BONSAI_SWIFTUI_APPLE_SDK_ROOT=/Xcode/iPhoneOS.sdk \
+    JOURNAL_APPLE_SDK_ROOT=/Xcode/iPhoneOS.sdk \
     "$script" "$macos_archive" default
 )
 test "$macos_output" = '(-cclib -Lapp -cclib app/libgmp.a)'

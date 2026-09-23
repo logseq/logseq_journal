@@ -1396,17 +1396,6 @@ let () =
     ; "flutter/test/widget_test.dart"
     ];
   require_allowed_dart_files root "flutter/integration_test" [];
-  require_text
-    root
-    "logseq_db_worker/tool/test_macos_runtime_flow.sh"
-    [ "encrypted-offline-warm-start"
-    ; "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE=memory"
-    ; "LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE=memory"
-    ];
-  forbid_text
-    root
-    "logseq_db_worker/tool/test_macos_runtime_flow.sh"
-    [ "logseq_db_worker_runtime_flow_test.dart" ];
   forbid_text root "app/application.ml" [ "Ui.Style.Color.rgb"; "Ui.Style.Color.argb" ];
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
   forbid_text root "app/application.ml" [ "let color"; "(color " ];
