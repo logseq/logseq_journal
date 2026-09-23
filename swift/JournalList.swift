@@ -73,9 +73,10 @@ import SwiftUI
     let context: LUIAppleExtensionViewContext
     @State private var visible: Set<Int> = []
     @State private var delivered: (first: Int, last: Int)?
-    @State private var scrolledID: String?
-    @State private var scrollAnchor: UnitPoint = .top
     @State private var handledScrollToken: Int64 = 0
+    @State private var scrollProxy: ScrollViewProxy?
+    @State private var pendingScroll: (id: String, anchor: UnitPoint)?
+    @State private var visibleEmitTask: Task<Void, Never>?
 
     private var properties: Properties? {
       JournalExtensions.decode(Properties.self, context: context)
@@ -133,7 +134,14 @@ import SwiftUI
       let range = (first, last + 1)
       guard delivered?.first != range.0 || delivered?.last != range.1 else { return }
       delivered = range
-      emit(["type": "visible_range", "first": range.0, "last": range.1])
+      // Cells flicker in/out while the collection re-layouts; emit only the
+      // settled range so an oscillating boundary row cannot flood the bridge.
+      visibleEmitTask?.cancel()
+      visibleEmitTask = Task { @MainActor in
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        guard !Task.isCancelled else { return }
+        emit(["type": "visible_range", "first": range.0, "last": range.1])
+      }
     }
 
     private func completeScroll(_ token: String, _ outcome: String) {
@@ -174,16 +182,22 @@ import SwiftUI
         completeScroll(request.token, "missing_target")
         return
       }
-      scrollAnchor =
+      let anchor: UnitPoint =
         switch request.anchor {
         case "center": .center
         case "bottom": .bottom
         default: .top
         }
-      scrolledID = row.key
+      pendingScroll = (id: row.key, anchor: anchor)
       if properties.track_scroll_completion == true {
         completeScroll(request.token, "succeeded")
       }
+    }
+
+    private func performPendingScroll() {
+      guard let pending = pendingScroll, let proxy = scrollProxy else { return }
+      pendingScroll = nil
+      proxy.scrollTo(pending.id, anchor: pending.anchor)
     }
 
     private func separatorVisibility(_ name: String?) -> Visibility {
@@ -261,14 +275,18 @@ import SwiftUI
       let content = rowActions(row)
         .onAppear {
           if let position = positions[row.key] {
-            visible.insert(position)
-            updateVisibleRange()
+            DispatchQueue.main.async {
+              visible.insert(position)
+              updateVisibleRange()
+            }
           }
         }
         .onDisappear {
           if let position = positions[row.key] {
-            visible.remove(position)
-            updateVisibleRange()
+            DispatchQueue.main.async {
+              visible.remove(position)
+              updateVisibleRange()
+            }
           }
         }
       if row.isDisclosure {
@@ -298,28 +316,32 @@ import SwiftUI
     }
 
     var body: some SwiftUI.View {
-      List {
-        ForEach(properties?.sections ?? []) { section in
-          Section {
-            ForEach(section.rows) { row in
-              rowBody(row)
+      ScrollViewReader { proxy in
+        List {
+          ForEach(properties?.sections ?? []) { section in
+            Section {
+              ForEach(section.rows) { row in
+                rowBody(row)
+              }
+            } header: {
+              if let header = section.header_index {
+                childContent(header)
+              }
+            } footer: {
+              if let footer = section.footer_index {
+                childContent(footer)
+              }
             }
-          } header: {
-            if let header = section.header_index {
-              childContent(header)
-            }
-          } footer: {
-            if let footer = section.footer_index {
-              childContent(footer)
-            }
+            .listSectionSeparator(separatorVisibility(section.separator))
           }
-          .listSectionSeparator(separatorVisibility(section.separator))
         }
-      }
-      .modifier(ListStyleModifier(style: style))
-      .scrollPosition(id: $scrolledID, anchor: scrollAnchor)
-      .onAppear {
-        if let request = properties?.scroll_request { applyScrollRequest(request) }
+        .modifier(ListStyleModifier(style: style))
+        .onAppear {
+          scrollProxy = proxy
+          performPendingScroll()
+          if let request = properties?.scroll_request { applyScrollRequest(request) }
+        }
+        .onChange(of: pendingScroll?.id) { _, _ in performPendingScroll() }
       }
       .onChange(of: properties?.scroll_request?.token) { _, _ in
         if let request = properties?.scroll_request { applyScrollRequest(request) }

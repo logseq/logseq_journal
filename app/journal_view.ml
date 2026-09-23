@@ -1327,6 +1327,11 @@ module View = struct
                  (* The menu label grows to fill available space; cap it so
                     the trigger stays icon-sized inside the capsule. *)
                  Lui_ui.width context trigger 40;
+                 Lui_ui.string_property
+                   context
+                   trigger
+                   Lui_protocol.SizeValue
+                   "sm";
                  Lui_ui.append context row trigger;
                  let menu = Lui_ui.dropdown_menu context in
                  Lui_ui.append context trigger menu;
@@ -2070,9 +2075,10 @@ module View = struct
     ;;
 
     (* The lui widget set has no navigation-stack node.  The router stays in the
-       model: the topmost destination renders, and the bar chrome is emulated —
-       the "‹ Logseq Journal" container back-link every page displayed plus the
-       pop affordance [Toolbar.mount_items] renders from [nav_bar]. *)
+       model: the topmost destination renders, and the pop affordance
+       [Toolbar.mount_items] renders from [nav_bar].  [title] maps to the
+       system navigation title, which the chrome hides — an empty title
+       renders no bar content. *)
     let create ?key ~title ~on_path_change ~path root =
       element ?key (fun context parent ->
         let node = Lui_ui.column context in
@@ -2082,25 +2088,6 @@ module View = struct
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
-        if title = ""
-        then (
-          let back = Lui_ui.row context in
-          Lui_ui.gap context back 4;
-          (* The default "stretch" cross axis wraps every child in
-             maxHeight:.infinity — inside a bounded column the row then soaks up
-             its share of the parent's height and vertically centers. *)
-          Lui_ui.cross context back "center";
-          Lui_ui.padding_horizontal context back 10;
-          Lui_ui.padding_vertical context back 10;
-          Lui_ui.append context node back;
-          let icon = Lui_ui.icon context (journal_icon_name "chevron.left") in
-          Lui_ui.append context back icon;
-          let label = Lui_ui.text context "Logseq Journal" in
-          Lui_ui.append context back label;
-          Lui_ui.accessibility_identifier context back "journal-nav-back";
-          Lui_ui.on_event context back (fun event ->
-            if is_press event
-            then invoke on_path_change (Event.Payload.Navigation_path_changed [])));
         let top =
           match List.rev path with
           | [] -> None
@@ -2346,10 +2333,12 @@ module View = struct
             ()
         in
         if String.length title = 0
-        then
+        then (
           (* Icon-only trigger: keep the menu label from stretching to fill
-             the available width inside bar capsules. *)
+             the available width inside bar capsules, and use the smaller
+             menu-item icon size the system bar showed. *)
           Lui_ui.width context node 20;
+          Lui_ui.string_property context node Lui_protocol.SizeValue "sm");
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
