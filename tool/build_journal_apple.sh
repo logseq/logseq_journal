@@ -153,23 +153,28 @@ if [[ $platform == macos ]]; then
   mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
   cp "$info_plist" "$app_dir/Contents/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/Contents/MacOS/JournalApp"
+  # Adhoc signing: keychain-access-groups needs a real team id; without one the
+  # group is invalid and AMFI kills the binary, so drop the key for local builds.
+  macos_entitlements="$build_dir/macos-entitlements.plist"
+  cp "$entitlements_dir/macos-debug-profile.entitlements" "$macos_entitlements"
+  bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
+  if [[ -n ${JOURNAL_MACOS_TEAM_ID:-} ]]; then
+    plutil -replace keychain-access-groups -json \
+      "[\"$JOURNAL_MACOS_TEAM_ID.$bundle_id\"]" "$macos_entitlements"
+  else
+    plutil -remove keychain-access-groups "$macos_entitlements"
+  fi
   codesign --force --sign - --timestamp=none \
-    --entitlements "$entitlements_dir/macos-debug-profile.entitlements" \
+    --entitlements "$macos_entitlements" \
     "$app_dir" || true
 else
   # iOS bundles are flat; an empty Contents/ dir breaks install + codesign.
+  # The iOS 27 simulator refuses to exec any binary carrying an entitlements
+  # blob ("No such process"), so sign plain-adhoc without entitlements.
   mkdir -p "$app_dir"
   cp "$info_plist" "$app_dir/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/JournalApp"
-  bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
-  team_prefix=${JOURNAL_IOS_TEAM_ID:+$JOURNAL_IOS_TEAM_ID.}
-  ios_entitlements="$build_dir/ios-entitlements.plist"
-  sed -e "s|\$(AppIdentifierPrefix)|$team_prefix|g" \
-      -e "s|\$(PRODUCT_BUNDLE_IDENTIFIER)|$bundle_id|g" \
-      "$entitlements_dir/ios-debug-profile.entitlements" > "$ios_entitlements"
-  codesign --force --sign - --timestamp=none \
-    --entitlements "$ios_entitlements" \
-    "$app_dir" || true
+  codesign --force --sign - --timestamp=none "$app_dir" || true
 fi
 
 echo "$app_dir"
