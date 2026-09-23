@@ -4,7 +4,7 @@ import Foundation
 import Security
 import XCTest
 
-@testable import bonsai_flutter_logseq_journal_host
+@testable import logseq_journal_host
 
 class RunnerTests: XCTestCase {
   func testApplicationLaunchCallbackCompletesOnCurrentFlutterHost() {

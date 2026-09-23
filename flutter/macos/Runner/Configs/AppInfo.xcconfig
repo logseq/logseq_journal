@@ -5,11 +5,11 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = bonsai_flutter_logseq_journal_host
+PRODUCT_NAME = logseq_journal_host
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = com.logseq.journal
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.
-#include "BonsaiFlutter.xcconfig"
+#include "JournalHost.xcconfig"

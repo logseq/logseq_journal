@@ -3,9 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
-import 'package:bonsai_flutter_logseq_journal_host/main.dart';
-import 'package:bonsai_flutter/bonsai_flutter.dart';
+import 'package:logseq_journal_host/application_host_adapter.dart';
+import 'package:logseq_journal_host/main.dart';
 import 'package:amplify_authenticator/amplify_authenticator.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
 import 'package:flutter/services.dart';
@@ -80,7 +79,7 @@ ApplicationHostAdapter _localBindingAdapter({
   amplifyReady: amplifyReady,
 );
 
-final class _PendingHostAdapter implements BonsaiFlutterHostAdapter {
+final class _PendingHostAdapter implements JournalHostAdapter {
   final Completer<Uint8List> payload = Completer<Uint8List>();
   int payloadRequests = 0;
 
@@ -91,7 +90,7 @@ final class _PendingHostAdapter implements BonsaiFlutterHostAdapter {
   }
 
   @override
-  BonsaiFlutterApplicationPlatform? createApplicationPlatform() => null;
+  JournalApplicationPlatform? createApplicationPlatform() => null;
 
   @override
   Widget buildHost({required BuildContext context, required Widget child}) =>
@@ -108,9 +107,9 @@ Uint8List request(JournalPlatformTag tag, [Object? payload]) =>
       ),
     );
 
-Map<String, dynamic> responseJson(Uint8List response) =>
+Map<String, dynamic> responseJson(Uint8List? response) =>
     jsonDecode(
-          utf8.decode(JournalPlatformEnvelopeCodec.decode(response).payload),
+          utf8.decode(JournalPlatformEnvelopeCodec.decode(response!).payload),
         )
         as Map<String, dynamic>;
 
@@ -254,8 +253,7 @@ void main() {
           clears += 1;
         },
       );
-      final platform =
-          adapter.createApplicationPlatform() as JournalApplicationPlatform;
+      final platform = adapter.createApplicationPlatform();
       addTearDown(platform.dispose);
 
       await tester.pumpWidget(
@@ -298,8 +296,7 @@ void main() {
           clears += 1;
         },
       );
-      final platform =
-          adapter.createApplicationPlatform() as JournalApplicationPlatform;
+      final platform = adapter.createApplicationPlatform();
       addTearDown(platform.dispose);
 
       await tester.pumpWidget(
@@ -381,16 +378,16 @@ void main() {
             ),
       );
 
-      final adapter = createBonsaiFlutterHostAdapter(
+      final adapter = createJournalHostAdapter(
         baseUrl: Uri.parse('https://api.example.test'),
       );
       final platform = adapter.createApplicationPlatform();
-      addTearDown((platform as JournalApplicationPlatform).dispose);
+      addTearDown(platform.dispose);
 
       final loaded = await platform.handleRequest(
         rawJsonRequest(16, {'key': 'typographyPreset'}),
       );
-      expect(ByteData.sublistView(loaded).getUint16(6, Endian.little), 17);
+      expect(ByteData.sublistView(loaded!).getUint16(6, Endian.little), 17);
       expect(responseJson(loaded), {
         'key': 'typographyPreset',
         'value': 'dense',
@@ -399,7 +396,7 @@ void main() {
       final stored = await platform.handleRequest(
         rawJsonRequest(18, {'key': 'typographyPreset', 'value': 'comfortable'}),
       );
-      expect(ByteData.sublistView(stored).getUint16(6, Endian.little), 19);
+      expect(ByteData.sublistView(stored!).getUint16(6, Endian.little), 19);
       expect(responseJson(stored), {'key': 'typographyPreset', 'stored': true});
       expect(calls.map((call) => call.method), [
         'getStartupEnvironment',
@@ -430,7 +427,7 @@ void main() {
 
       final response = await platform.handleRequest(rawRequest(13));
       expect(
-        JournalPlatformEnvelopeCodec.decode(response).tag,
+        JournalPlatformEnvelopeCodec.decode(response!).tag,
         JournalPlatformTag.terminationReadyResponse,
       );
       expect(responseJson(response), {'ready': true});
@@ -444,7 +441,7 @@ void main() {
     expect(source, contains("Uri.parse('https://api.logseq.io')"));
     expect(source, isNot(contains('LOGSEQ_SYNC_BASE_URL')));
 
-    final injected = createBonsaiFlutterHostAdapter(
+    final injected = createJournalHostAdapter(
       baseUrl: Uri.parse('https://api.example.test'),
     );
     expect(injected.baseUrl.toString(), 'https://api.example.test');
@@ -464,9 +461,6 @@ void main() {
       source,
       isNot(contains("child: MaterialApp(title: 'Logseq Journal'")),
     );
-    final project = File('../bonsai-flutter.sexp').readAsStringSync();
-    expect(project, contains('(mode custom)'));
-    expect(project, contains('(main lib/main.dart)'));
     expect(File('lib/application.dart').existsSync(), isFalse);
   });
 
@@ -645,12 +639,11 @@ void main() {
             ),
       );
 
-      final adapter = createBonsaiFlutterHostAdapter(
+      final adapter = createJournalHostAdapter(
         baseUrl: Uri.parse('https://api.example.test'),
       );
       await adapter.createApplicationPayload();
-      final platform =
-          adapter.createApplicationPlatform() as JournalApplicationPlatform;
+      final platform = adapter.createApplicationPlatform();
       addTearDown(platform.dispose);
 
       final typography = await platform.handleRequest(

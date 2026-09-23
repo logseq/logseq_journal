@@ -1,4 +1,4 @@
-name: bonsai_flutter_logseq_journal_host
+name: logseq_journal_host
 description: Mechanical Flutter host for the OCaml-owned logseq_journal application.
 publish_to: none
 version: 0.1.0
@@ -9,27 +9,34 @@ environment:
 
 hooks:
   user_defines:
-    bonsai_flutter_native:
-      # bonsai-flutter:begin native-hook
-      native_artifact_root: ../_build/bonsai-flutter/artifacts/
+    journal_lui_native:
+      # journal-lui:begin native-hook
+      native_artifact_root: ../_build/lui/artifacts/
       macos_deployment_target: '26.0'
       ios_deployment_target: '15.0'
       require_ocaml_backend: true
       link_system_sqlite3: true
-      # bonsai-flutter:end native-hook
+      # journal-lui:end native-hook
 
 dependencies:
-  material_ui: 1.1.1
   amplify_auth_cognito: 2.15.0
   amplify_authenticator: 2.7.0
   amplify_flutter: 2.15.0
-  # bonsai-flutter:begin packages
-  bonsai_flutter:
-    path: ../.bonsai-flutter/flutter-packages/bonsai_flutter
-  # bonsai-flutter:end packages
+  file_picker: 12.3.0
+  url_launcher: 6.3.2
+  shared_preferences: 2.5.5
   flutter:
     sdk: flutter
   flutter_slidable: 4.0.3
+  journal_lui_native:
+    path: packages/journal_lui_native
+  # journal-lui:begin packages
+  lui_flutter_backend:
+    git:
+      url: https://github.com/logseq/lui.git
+      ref: c4468ffdbb0e68319b90306933db7edb066b778b
+      path: platform/flutter
+  # journal-lui:end packages
 
 dev_dependencies:
   flutter_lints: ^6.0.0

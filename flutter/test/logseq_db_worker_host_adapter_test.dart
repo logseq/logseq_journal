@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import 'package:bonsai_flutter_logseq_journal_host/application_host_adapter.dart';
+import 'package:logseq_journal_host/application_host_adapter.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
