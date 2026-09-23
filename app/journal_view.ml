@@ -54,6 +54,12 @@ let journal_icon_name name =
    their icon — matching the icon-only affordances the system chrome showed. *)
 let icon_only = ref false
 
+(* [set_leaf_label] records each bar-mounted control that actually collapsed
+   its label to an icon; only those get the uniform 40pt control cell — a
+   text button like "Close" keeps its natural width, and a grouped row of
+   controls sizes its leaves rather than the row itself. *)
+let icon_only_collapsed_nodes : int list ref = ref []
+
 (* Leaf controls carry their label/icon as properties; each kind only accepts
    a subset of them, so apply what the node kind supports. *)
 let set_leaf_label context node { title; icon } =
@@ -64,6 +70,7 @@ let set_leaf_label context node { title; icon } =
     if supported Lui_protocol.TextValue
     then Lui_ui.text_property context node title)
   else (
+    icon_only_collapsed_nodes := node :: !icon_only_collapsed_nodes;
     (* Icon-only controls keep their name on the accessibility channel; the
        schema rejects icon-only buttons with no accessible name. *)
     if supported Lui_protocol.AccessibilityLabel
@@ -1166,25 +1173,31 @@ module View = struct
        principal title, and trailing icon-only actions grouped in a capsule.
        lui has no chrome node, so the shim reproduces that layout inline. *)
     let mount_icon_only parent context (item : item) =
-      let previous = !icon_only in
+      let previous = !icon_only and previous_nodes = !icon_only_collapsed_nodes in
       icon_only := true;
-      Fun.protect ~finally:(fun () -> icon_only := previous) (fun () ->
-        let mounted = item.content.mount context (Some parent) in
-        if mounted <> 0
-        then (
-          Lui_ui.key context mounted item.item_key;
-          (* Uniform 40pt control cell so capsule widths are predictable. *)
-          if node_is_standard context mounted
-          then Lui_ui.width context mounted 40);
-        mounted)
+      icon_only_collapsed_nodes := [];
+      Fun.protect
+        ~finally:(fun () ->
+          icon_only := previous;
+          icon_only_collapsed_nodes := previous_nodes)
+        (fun () ->
+          let mounted = item.content.mount context (Some parent) in
+          if mounted <> 0
+          then (
+            Lui_ui.key context mounted item.item_key;
+            (* Uniform 40pt control cell so capsule widths are predictable —
+               applied to each leaf control that collapsed to its icon. *)
+            List.iter
+              (fun node ->
+                 if node_is_standard context node
+                 then Lui_ui.width context node 40)
+              !icon_only_collapsed_nodes);
+          mounted)
     ;;
 
-    let capsule context parent ~children_count mount_children =
-      (* lui container children always receive a flexible frame
-         (.frame(maxWidth: nil) expands like .infinity), so a row's background
-         would paint the whole region it is offered. The capsule therefore
-         pins an explicit content-sized width: the outer flexible frame still
-         takes the space, but the pill itself stays tight. *)
+    let capsule context parent mount_children =
+      (* A row child of an HStack keeps its intrinsic width unless it grows,
+         so the pill hugs its controls without a pinned width. *)
       let row = Lui_ui.row context in
       Lui_ui.gap context row 16;
       (* Hug content height; the default stretch cross would soak the
@@ -1194,8 +1207,6 @@ module View = struct
       Lui_ui.padding_vertical context row 9;
       Lui_ui.background context row "secondary";
       Lui_ui.corner_radius context row 20;
-      (* 14pt padding on each side, 40pt per child, 16pt gaps. *)
-      Lui_ui.width context row (12 + (56 * children_count));
       Lui_ui.append context parent row;
       mount_children row;
       row
@@ -1302,12 +1313,7 @@ module View = struct
         if trailing <> [] || secondary <> []
         then
           ignore
-            (capsule
-               context
-               node
-               ~children_count:
-                 (List.length trailing + if secondary <> [] then 1 else 0)
-               (fun row ->
+            (capsule context node (fun row ->
                List.iter
                  (fun item -> ignore (mount_icon_only row context item))
                  trailing;
@@ -1364,7 +1370,7 @@ module View = struct
                Lui_ui.append context node fixed
              | _ ->
                ignore
-                 (capsule context node ~children_count:1 (fun row ->
+                 (capsule context node (fun row ->
                     ignore (mount_icon_only row context item))))
           items;
         node)
