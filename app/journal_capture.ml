@@ -1,5 +1,5 @@
-module ID = Bonsai_swiftui_spec.Id
-module Ui = Bonsai_swiftui_ui
+module ID = Journal_ids
+module Ui = Journal_view
 
 type phase =
   | Editing

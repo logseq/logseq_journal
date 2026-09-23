@@ -43,7 +43,9 @@ static value copy_bytes(const char *data, int32_t length) {
 LUI_EXPORT int32_t lui_ocaml_start(
     lui_patch_callback callback,
     int32_t platform_code,
-    int32_t host_code) {
+    int32_t host_code,
+    const char *payload_data,
+    int32_t payload_length) {
   patch_callback = callback;
   if (!runtime_started) {
     char *arguments[] = {"journal_lui_ocaml", NULL};
@@ -55,10 +57,16 @@ LUI_EXPORT int32_t lui_ocaml_start(
   if (initialize == NULL) {
     return 0;
   }
-  return emit_patch(caml_callback2_exn(
+  CAMLparam0();
+  CAMLlocal2(payload_value, result);
+  payload_value = copy_bytes(payload_data, payload_length);
+  result = caml_callback3_exn(
       *initialize,
       Val_long(platform_code),
-      Val_long(host_code)));
+      Val_long(host_code),
+      payload_value);
+  int32_t accepted = emit_patch(result);
+  CAMLreturnT(int32_t, accepted);
 }
 
 static int dispatch_long(const char *name, int64_t node) {

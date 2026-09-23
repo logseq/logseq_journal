@@ -1,5 +1,5 @@
 type hooks =
-  { init : int -> int -> string
+  { init : int -> int -> string -> string
   ; dispatch : Lui_protocol.event -> string
   ; extension_event : int -> string -> string -> string
   ; pump : unit -> string
@@ -20,7 +20,9 @@ let hooks () =
   | Some hooks -> hooks
   | None -> invalid_arg "Journal_bridge.register was not called"
 
-let initialize platform_code host_code = (hooks ()).init platform_code host_code
+let initialize platform_code host_code payload =
+  (hooks ()).init platform_code host_code payload
+;;
 
 let dispatch_lui event = (hooks ()).dispatch event
 

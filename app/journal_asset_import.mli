@@ -6,10 +6,10 @@ val decode
 val is_dismissal : string -> bool
 
 val view
-  :  key:Bonsai_swiftui_ui.Key.t
+  :  key:Journal_view.Key.t
   -> enabled:bool
   -> completion:(string * string option) option
   -> replacement:string option
   -> request:int
   -> on_select:(string -> unit)
-  -> Bonsai_swiftui_ui.View.t
+  -> Journal_view.View.t

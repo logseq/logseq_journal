@@ -1,4 +1,4 @@
-module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
 type network_lifecycle =
   | Backgrounded of { generation : int64 }
@@ -199,4 +199,68 @@ let decode_termination_ready_response bytes =
     decode_json_object "termination-ready response" payload (function
       | [ ("ready", `Bool true) ] -> Ok ()
       | _ -> Error "termination-ready response fields are invalid"))
+;;
+
+type notice_result =
+  | Notice_action
+  | Notice_dismiss
+  | Notice_swipe
+  | Notice_timeout
+
+let decode_environment_event bytes =
+  Result.bind (decode_envelope [ 24 ] bytes) (fun payload ->
+    match
+      Yojson.Basic.from_string (Bytes.to_string payload)
+      |> Journal_environment.decode_json
+    with
+    | Ok snapshot -> Ok snapshot
+    | Error error -> Error ("environment event: " ^ error)
+    | exception Yojson.Json_error _ -> Error "environment event is not valid JSON")
+;;
+
+let is_environment_event bytes =
+  match decode_envelope [ 24 ] bytes with
+  | Ok _ -> true
+  | Error _ -> false
+;;
+
+let show_notice_request ~token ~message ~action_label ~duration_ms =
+  `Assoc
+    [ "token", `String (Int64.to_string token)
+    ; "message", `String message
+    ; ( "actionLabel"
+      , match action_label with
+        | Some label -> `String label
+        | None -> `Null )
+    ; "durationMs", `Int duration_ms
+    ]
+  |> Yojson.Safe.to_string
+  |> Bytes.of_string
+  |> encode_envelope 25
+  |> Result.get_ok
+;;
+
+let decode_notice_response ~token bytes =
+  Result.bind (decode_envelope [ 26 ] bytes) (fun payload ->
+    decode_json_object "notice response" payload (fun fields ->
+      match
+        List.assoc_opt "token" fields, List.assoc_opt "result" fields
+      with
+      | Some (`String actual), Some (`String result)
+        when String.equal actual (Int64.to_string token) ->
+        (match result with
+         | "action" -> Ok Notice_action
+         | "dismiss" -> Ok Notice_dismiss
+         | "swipe" -> Ok Notice_swipe
+         | "timeout" -> Ok Notice_timeout
+         | _ -> Error "notice response result is unsupported")
+      | _ -> Error "notice response fields are invalid"))
+;;
+
+let notice_cancel_request ~token =
+  `Assoc [ "token", `String (Int64.to_string token) ]
+  |> Yojson.Safe.to_string
+  |> Bytes.of_string
+  |> encode_envelope 27
+  |> Result.get_ok
 ;;

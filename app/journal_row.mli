@@ -1,5 +1,5 @@
 val view
-  :  render_media:(root:string -> Bonsai_swiftui_ui.View.t -> Bonsai_swiftui_ui.View.t)
+  :  render_media:(root:string -> Journal_view.View.t -> Journal_view.View.t)
   -> show_timestamp:bool
   -> Journal_graph_projection.timeline_entry
-  -> Bonsai_swiftui_ui.View.t
+  -> Journal_view.View.t

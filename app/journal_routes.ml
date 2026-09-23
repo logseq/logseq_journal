@@ -70,7 +70,7 @@ let track_detail_session t detail =
     next_session =
       Int64.max
         t.next_session
-        (Int64.succ (Bonsai_swiftui_spec.Id.Text_input.Session_id.to_int64 session))
+        (Int64.succ (Journal_ids.Text_input.Session_id.to_int64 session))
   }
 ;;
 
@@ -276,7 +276,7 @@ let runtime_replaced t =
           ; request_generation = Int64.succ view.request_generation
           ; session_number =
               Int64.succ
-                (Bonsai_swiftui_spec.Id.Text_input.Session_id.to_int64
+                (Journal_ids.Text_input.Session_id.to_int64
                    (Journal_detail.session_id view.detail))
           }
     }

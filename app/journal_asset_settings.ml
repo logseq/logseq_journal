@@ -1,4 +1,4 @@
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 
 type event =
   | Days of Journal_asset_policy.settings
@@ -28,7 +28,7 @@ let decode payload =
 
 let extension =
   Ui.Native_widget.Extension.create
-    ~kind_id:(Bonsai_swiftui_spec.Id.Native_widget.Kind_id.of_int 2106)
+    ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2106)
     ~version:1
     ~capabilities:[ Stateful; Semantics ]
     ~encode_props:(fun json -> Yojson.Basic.to_string json |> Bytes.of_string)

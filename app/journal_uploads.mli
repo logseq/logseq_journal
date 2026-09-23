@@ -1,4 +1,4 @@
-module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Uuid = Logseq_db_types.Graph_types.Uuid
 
 type t

@@ -18,7 +18,7 @@ val timeline_presented_request : bytes
 val decode_timeline_presented : bytes -> (unit, string) result
 
 val id_token_request
-  :  Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.token_request
+  :  Logseq_db_worker_lui.Logseq_db_worker_lui_service.token_request
   -> bytes
 
 val decode_id_token_response : challenge_id:string -> bytes -> (string, string) result
@@ -32,3 +32,29 @@ val is_prepare_to_terminate_event : bytes -> bool
 val termination_ready_request : bytes
 
 val decode_termination_ready_response : bytes -> (unit, string) result
+
+type notice_result =
+  | Notice_action
+  | Notice_dismiss
+  | Notice_swipe
+  | Notice_timeout
+
+(** Host -> OCaml environment snapshot push (tag 24). *)
+val decode_environment_event : bytes -> (Journal_environment.snapshot, string) result
+val is_environment_event : bytes -> bool
+
+(** OCaml -> host notice request (tag 25); response arrives on tag 26. *)
+val show_notice_request
+  :  token:int64
+  -> message:string
+  -> action_label:string option
+  -> duration_ms:int
+  -> bytes
+
+val decode_notice_response
+  :  token:int64
+  -> bytes
+  -> (notice_result, string) result
+
+(** OCaml -> host request cancelling a pending notice (tag 27). *)
+val notice_cancel_request : token:int64 -> bytes

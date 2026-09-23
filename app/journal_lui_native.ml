@@ -48,31 +48,6 @@ let registry =
   freeze registry;
   registry
 
-let mount ?key ~payload ~children identifier context parent =
-  let node = Lui_ui.extension context identifier in
-  Option.iter (Lui_ui.key context node) key;
-  Lui_ui.extension_property context node "payload" (StringValue payload);
-  (match parent with
-   | Some parent -> Lui_ui.append context parent node
-   | None -> ());
-  List.iter (fun child -> ignore (child context (Some node))) children;
-  node
-
-let chrome ?key ~payload children : Lui_elements.t =
- fun context parent -> mount ?key ~payload ~children chrome_identifier context parent
-
-let asset_import ?key ~payload : Lui_elements.t =
- fun context parent -> mount ?key ~payload ~children:[] asset_import_identifier context parent
-
-let media ?key ~payload : Lui_elements.t =
- fun context parent -> mount ?key ~payload ~children:[] media_identifier context parent
-
-let asset_settings ?key ~payload children : Lui_elements.t =
- fun context parent -> mount ?key ~payload ~children asset_settings_identifier context parent
-
-let list ?key ~payload : Lui_elements.t =
- fun context parent -> mount ?key ~payload ~children:[] list_identifier context parent
-
 type event =
   { identifier : string
   ; node : int
@@ -96,3 +71,41 @@ let decode_event = function
        Some { identifier; node; event_id; payload }
      | _ -> None)
   | _ -> None
+
+let mount ?key ~payload ~children ?on_event identifier context parent =
+  let node = Lui_ui.extension context identifier in
+  Option.iter (Lui_ui.key context node) key;
+  Lui_ui.extension_property context node "payload" (StringValue payload);
+  Option.iter
+    (fun handler ->
+       Lui_ui.on_event context node (fun raw ->
+         match decode_event raw with
+         | Some event -> handler event
+         | None -> ()))
+    on_event;
+  (match parent with
+   | Some parent -> Lui_ui.append context parent node
+   | None -> ());
+  List.iter (fun child -> ignore (child context (Some node))) children;
+  node
+
+let chrome ?key ~payload ?on_event children : Lui_elements.t =
+ fun context parent ->
+  mount ?key ~payload ~children ?on_event chrome_identifier context parent
+
+let asset_import ?key ~payload ?on_event () : Lui_elements.t =
+ fun context parent ->
+  mount ?key ~payload ~children:[] ?on_event asset_import_identifier context parent
+
+let media ?key ~payload ?on_event children : Lui_elements.t =
+ fun context parent ->
+  mount ?key ~payload ~children ?on_event media_identifier context parent
+
+let asset_settings ?key ~payload ?on_event children : Lui_elements.t =
+ fun context parent ->
+  mount ?key ~payload ~children ?on_event asset_settings_identifier context parent
+
+let list ?key ~payload ?on_event children : Lui_elements.t =
+ fun context parent ->
+  mount ?key ~payload ~children ?on_event list_identifier context parent
+

@@ -1,5 +1,5 @@
-module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
-module Ui = Bonsai_swiftui_ui
+module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Ui = Journal_view
 
 module Context = struct
   type t =
@@ -21,7 +21,7 @@ let test_id id view = V.with_test_id (Ui.Test_id.string id) view
 
 let chrome =
   Ui.Native_widget.Extension.create
-    ~kind_id:(Bonsai_swiftui_spec.Id.Native_widget.Kind_id.of_int 2103)
+    ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
     ~version:2
     ~capabilities:[ Stateful; Semantics ]
     ~encode_props:(fun props -> Yojson.Basic.to_string props |> Bytes.of_string)

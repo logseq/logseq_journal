@@ -1,4 +1,4 @@
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 module V = Ui.View
 
 let view ~render_media ~show_timestamp (entry : Journal_graph_projection.timeline_entry) =

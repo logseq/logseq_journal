@@ -1,7 +1,7 @@
 module Policy = Journal_asset_policy
 module Protocol = Logseq_db_worker.Protocol
 module Graph = Logseq_db_types.Graph_types
-module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
 type t =
   { send : Service.request -> bool
@@ -160,7 +160,7 @@ let reject t ~request_id =
 
 let notice
       t
-      (scope : Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.asset_scope)
+      (scope : Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope)
       notice
   =
   if t.generation = Some scope.graph_generation

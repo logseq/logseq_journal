@@ -1,5 +1,5 @@
 module Timeline = Journal_timeline_state
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 module V = Ui.View
 
 let for_block handler block_id =

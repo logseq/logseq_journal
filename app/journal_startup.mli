@@ -43,7 +43,7 @@ type startup_state =
   }
 
 val derive
-  :  snapshot:Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.snapshot
+  :  snapshot:Logseq_db_worker_lui.Logseq_db_worker_lui_service.snapshot
   -> graph:Logseq_db_worker.graph_state
   -> startup_state
 

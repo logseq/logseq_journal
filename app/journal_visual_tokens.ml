@@ -1,4 +1,4 @@
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 
 type swipe_action_colors =
   { background : Ui.Style.Color.t
@@ -86,8 +86,8 @@ type t =
 let resolve ~brightness ~high_contrast =
   let presentation =
     match brightness with
-    | Bonsai_swiftui.Environment.Light -> Color_exceptions.Light
-    | Bonsai_swiftui.Environment.Dark -> Color_exceptions.Dark
+    | Journal_environment.Light -> Color_exceptions.Light
+    | Journal_environment.Dark -> Color_exceptions.Dark
   in
   { presentation; high_contrast }
 ;;
