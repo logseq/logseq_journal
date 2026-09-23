@@ -538,7 +538,7 @@ let test_injected_logseq_sync_api_boundary root =
     [ "mutable"; " := "; "Effect.perform"; "Eio"; "Unix"; "Sys."; "Logseq_db_worker" ];
   require_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "module Pure = Logseq_db_worker_pure_reducer.Core"
     ; "module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner"
     ; "module Sync_runner = Logseq_sync_effect_runner.Effect_runner"
@@ -548,7 +548,7 @@ let test_injected_logseq_sync_api_boundary root =
     ];
   forbid_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "Logseq_sync.Api"; "Core.handle"; "Core.resume" ];
   let worker_files =
     files_with_suffixes root "logseq_db_worker" [ ".ml"; ".mli"; "dune" ]
@@ -656,7 +656,7 @@ let test_standalone_sync_protocol_boundary root =
     ]
 ;;
 
-let test_bonsai_dune_closure_names root =
+let test_worker_dune_closure_names root =
   require_text root "logseq_sync/lib/effect_runner/dune" [ "logseq_sync.pure_reducer" ];
   require_text root "logseq_db_worker/lib/dune" [ "logseq_sync.pure_reducer" ];
   let pure_dune = "logseq_sync/lib/pure_reducer/dune" in
@@ -724,14 +724,14 @@ let test_worker_owned_overlay_orchestration root =
   forbid_worker_storage_access root "logseq_db_worker/lib/effect_runner/effect_runner.ml";
   require_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "Logseq_db_worker_pure_reducer.Core"
     ; "Logseq_db_worker_effect_runner.Effect_runner"
     ; "Sync_runner.create"
     ];
   forbid_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "Core.graph_backend"
     ; "Core.mutate"
     ; "Core.Engine"
@@ -896,7 +896,7 @@ let test_final_overlay_data_plane_boundary root =
     (files_with_suffixes root "logseq_db_worker/contract" [ ".ml"; ".mli"; "dune" ]
      @ files_with_suffixes root "logseq_db_worker/spec" [ ".ml"; ".mli"; "dune" ]
      @ files_with_suffixes root "logseq_db_worker/lib" [ ".ml"; ".mli"; "dune" ]
-     @ files_with_suffixes root "logseq_db_worker/bonsai" [ ".ml"; ".mli"; "dune" ]);
+     @ files_with_suffixes root "logseq_db_worker/lui" [ ".ml"; ".mli"; "dune" ]);
   List.iter
     (fun relative -> forbid_text root relative [ "Logseq_overlay_db"; "Logseq_sync" ])
     (ocaml_product_files root);
@@ -963,7 +963,7 @@ let test_sync_transport_is_websocket_only root =
   in
   List.iter
     (fun relative -> forbid_text root relative obsolete_symbols)
-    [ "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    [ "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     ; "app/journal_platform.ml"
     ; "flutter/lib/application_host_adapter.dart"
     ];
@@ -1154,35 +1154,36 @@ let () =
   test_logseq_sync_package_boundary root;
   test_injected_logseq_sync_api_boundary root;
   test_standalone_sync_protocol_boundary root;
-  test_bonsai_dune_closure_names root;
+  test_worker_dune_closure_names root;
   test_worker_owned_overlay_orchestration root;
   test_final_overlay_data_plane_boundary root;
   test_startup_phase_ownership root;
   test_repository_local_runtime_tests root;
   test_sync_transport_is_websocket_only root;
   test_sync_error_card_is_temporary_and_error_only root;
+  require_exact_dependency root "logseq_journal.opam" ~package:"lui" ~version:"0.1.0";
   require_exact_dependency
     root
-    "logseq_journal.opam.locked"
-    ~package:"ocaml-ios64"
-    ~version:"5.1.1";
-  let framework_archive =
-    "file:///Users/rcmerci/.local/share/bonsai-swiftui/releases/2026-09-18-journal-native-210435/final/bonsai-swiftui-0.1.0~dev.tar.gz"
-  in
+    "logseq_journal.opam"
+    ~package:"ocaml-signal"
+    ~version:"0.1.0";
+  require_occurrences
+    root
+    "logseq_journal.opam"
+    "git+https://github.com/logseq/lui.git#c4468ffdbb0e68319b90306933db7edb066b778b"
+    1;
+  require_occurrences
+    root
+    "logseq_journal.opam"
+    "git+https://github.com/logseq/ocaml-signal.git#48a4a4d37f87addbb28d85a10a55bd13becf94be"
+    1;
   List.iter
-    (fun (relative, occurrences) ->
-       require_occurrences root relative framework_archive occurrences;
-       require_exact_dependency
+    (fun relative ->
+       forbid_text
          root
          relative
-         ~package:"bonsai_swiftui"
-         ~version:"0.1.0~dev";
-       forbid_text root relative [ "bonsai_flutter"; "git+file:" ])
-    [ "logseq_journal.opam", 2
-    ; "logseq_journal.opam.locked", 2
-    ; "logseq_db_worker.opam", 2
-    ; "logseq_db_worker.opam.locked", 1
-    ];
+         [ "bonsai_swiftui"; "bonsai_swiftui_test"; "bonsai_flutter"; "git+file:" ])
+    [ "logseq_journal.opam"; "logseq_db_worker.opam" ];
   let dependency_manifests =
     [ "logseq_db_storage.opam"
     ; "logseq_overlay_db.opam"
@@ -1256,8 +1257,7 @@ let () =
     ];
   List.iter
     (require_file root)
-    [ "bonsai-swiftui.sexp"
-    ; "app/application.ml"
+    [ "app/application.ml"
     ; "app/journal_symbols.ml"
     ; "app/journal_symbols.mli"
     ; "app/journal_calendar.ml"
@@ -1300,7 +1300,7 @@ let () =
     ; "val create"
     ];
   require_text root "app/journal_symbols.ml" [ "View.symbol" ];
-  require_text root "app/dune" [ "journal_symbols"; "bonsai_swiftui" ];
+  require_text root "app/dune" [ "journal_symbols"; "lui" ];
   List.iter
     (fun relative ->
        forbid_text
@@ -1694,7 +1694,7 @@ let () =
     ; "App.View.create"
     ; "application_theme"
     ; "V.Sheet.create"
-    ; "Bonsai_swiftui.Host_effect.show_notice"
+    ; "Journal_platform.show_notice_request"
     ; "V.button"
     ; "local-cache-reset-confirmation"
     ; "journal-detail-route"
@@ -1731,17 +1731,6 @@ let () =
     ; "JournalLocalAccountBindingStore.load()"
     ];
   forbid_text root "swift/JournalNativeServices.swift" [ "LOGSEQ_SYNC_BASE_URL" ];
-  require_text
-    root
-    "bonsai-swiftui.sexp"
-    [ "(lang 4)"
-    ; "(native_target app/native_embed.exe.o)"
-    ; "(features network sqlite)"
-    ; "(bundle_identifier com.logseq.journal)"
-    ; "(bundle_identifier com.example.bonsaiFlutterLogseqJournalHost)"
-    ; "(minimum_version 26.0)"
-    ; "(exact 2.61.0)"
-    ];
   require_text
     root
     "swift/App.swift"
@@ -1882,7 +1871,7 @@ let () =
     ];
   forbid_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "interpret_local_action"; "interpret_network_action"; "Local_completion" ];
   require_text
     root
@@ -1890,7 +1879,7 @@ let () =
     [ "type diagnostics"; "type state ="; "let state core = core.public_state" ];
   require_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.mli"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.mli"
     [ "Client_command_completed"; "Client_state_changed of state" ];
   forbid_text
     root
@@ -1944,7 +1933,7 @@ let () =
     [ "Eio."; "Unix."; "Sqlite3."; "Engine."; "Hashtbl"; "mutable"; "Effect.perform" ];
   forbid_text
     root
-    "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     [ "module Managed_coordinator"
     ; "Graph_bound"
     ; "Engine.open_"
@@ -2011,8 +2000,8 @@ let () =
        forbid_text root relative [ "history : string list"; "append_diagnostic_history" ])
     [ "logseq_sync/spec/pure_reducer/core.mli"
     ; "logseq_sync/lib/pure_reducer/core.ml"
-    ; "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.mli"
-    ; "logseq_db_worker/bonsai/logseq_db_worker_bonsai_service.ml"
+    ; "logseq_db_worker/lui/logseq_db_worker_lui_service.mli"
+    ; "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
     ];
   forbid_text root "app/application.ml" [ "Recent sync transitions" ];
   require_text

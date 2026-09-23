@@ -24,7 +24,6 @@
   (source_tree ../logseq_sync)
   (source_tree ../tool)
   (source_tree ../swift)
-  ../bonsai-swiftui.sexp
   ../dune-project
   ../flutter/ios/Flutter/Debug.xcconfig
   ../flutter/ios/Flutter/Release.xcconfig
@@ -73,20 +72,12 @@
 (test
  (name journal_adaptive_test)
  (modules journal_adaptive_test)
- (libraries app bonsai_swiftui bonsai_swiftui.driver bonsai_swiftui.ui))
+ (libraries app))
 
 (test
  (name journal_semantics_test)
  (modules journal_semantics_test)
- (libraries
-  app
-  bonsai
-  bonsai_swiftui
-  bonsai_swiftui.driver
-  bonsai_swiftui.spec
-  bonsai_swiftui.ui
-  bonsai_swiftui_test
-  core))
+ (libraries app))
 
 (test
  (name journal_graph_runtime_locality_test)
@@ -111,7 +102,7 @@
 (test
  (name journal_timeline_state_test)
  (modules journal_timeline_state_test)
- (libraries app bonsai_swiftui.ui datascript-ocaml-native unix))
+ (libraries app datascript-ocaml-native unix))
 
 (test
  (name journal_time_test)
@@ -126,13 +117,16 @@
 (test
  (name journal_routes_test)
  (modules journal_routes_test)
- (libraries app bonsai_swiftui.spec bonsai_swiftui.ui))
+ (libraries app))
 
 (rule
  (alias runtest)
  (deps test_native_static_gmp.sh ../tool/native_static_link_flags.sh)
  (action
-  (run sh %{dep:test_native_static_gmp.sh} %{dep:../tool/native_static_link_flags.sh})))
+  (run
+   sh
+   %{dep:test_native_static_gmp.sh}
+   %{dep:../tool/native_static_link_flags.sh})))
 
 (rule
  (alias runtest)
@@ -150,16 +144,33 @@
  (modules journal_asset_policy_test)
  (libraries app))
 
-(test (name journal_media_test) (modules journal_media_test) (libraries app uri))
+(test
+ (name journal_media_test)
+ (modules journal_media_test)
+ (libraries app uri))
 
-(test (name journal_media_runtime_test) (modules journal_media_runtime_test) (libraries app uri))
+(test
+ (name journal_media_runtime_test)
+ (modules journal_media_runtime_test)
+ (libraries app uri))
 
-(test (name journal_asset_settings_test) (modules journal_asset_settings_test) (libraries app))
+(test
+ (name journal_asset_settings_test)
+ (modules journal_asset_settings_test)
+ (libraries app))
 
 (rule
  (alias runtest)
- (enabled_if (= %{system} macosx))
- (deps test_asset_preferences.sh asset_preferences_test.swift ../swift/JournalAssetPreferences.swift)
- (action (run sh %{dep:test_asset_preferences.sh} %{workspace_root})))
+ (enabled_if
+  (= %{system} macosx))
+ (deps
+  test_asset_preferences.sh
+  asset_preferences_test.swift
+  ../swift/JournalAssetPreferences.swift)
+ (action
+  (run sh %{dep:test_asset_preferences.sh} %{workspace_root})))
 
-(test (name journal_uploads_test) (modules journal_uploads_test) (libraries app))
+(test
+ (name journal_uploads_test)
+ (modules journal_uploads_test)
+ (libraries app))

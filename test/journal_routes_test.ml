@@ -1,5 +1,5 @@
-module ID = Bonsai_swiftui_spec.Id
-module Ui = Bonsai_swiftui_ui
+module ID = Journal_ids
+module Ui = Journal_view
 
 let fail format = Printf.ksprintf failwith format
 
@@ -402,14 +402,8 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
             require
               (D.reveal_outcome completed = Some outcome)
               "reveal outcome disappeared")
-         Bonsai_swiftui_ui.View.Native_list.
-           [ Succeeded
-           ; Missing_target
-           ; Hidden_target
-           ; Cancelled
-           ; Superseded
-           ; Positioning_failed
-           ];
+         Ui.Event.Payload.
+           [ Succeeded; Missing_target; Cancelled; Superseded; Positioning_failed ];
        require
          (D.continuation created ~parent_id:root_id = None)
          "Append retained a pre-write continuation";

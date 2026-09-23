@@ -1,5 +1,5 @@
-module ID = Bonsai_swiftui_spec.Id
-module Ui = Bonsai_swiftui_ui
+module ID = Journal_ids
+module Ui = Journal_view
 
 let require condition message = if not condition then failwith message
 let equal expected actual label = require (expected = actual) label

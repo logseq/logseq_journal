@@ -1,8 +1,10 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
-module ID = Bonsai_swiftui_spec.Id
-module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module ID = Logseq_db_worker_lui.Journal_worker_ids
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Runner = Logseq_sync_effect_runner.Effect_runner
+module Worker = Logseq_db_worker_lui.Journal_worker
+module Worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
 
 let crypto =
   Runner.crypto
@@ -120,7 +122,7 @@ let test_managed_client_command_is_accepted () =
 
 let () =
   T.run
-    "bonsai worker service"
+    "lui worker service"
     [ T.case
         "managed worker starts closed with a v2 envelope"
         test_managed_worker_starts_closed_and_replies_with_v2_envelope
