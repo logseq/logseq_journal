@@ -3,6 +3,9 @@
  (wrapped false)
  (modules
   application
+  journal_bridge
+  journal_lui_native
+  journal_pump
   journal_uploads
   journal_asset_import
   journal_asset_settings
@@ -33,35 +36,31 @@
   journal_symbols)
  (libraries
   rrbvec
-  bonsai_swiftui.spec_impl
   base
-  bonsai
-  bonsai_swiftui
-  bonsai_swiftui.ui
-  bonsai_swiftui.driver
   core
+  lui
+  ocaml-signal
   datascript-ocaml-native
-  incr_dom.ui_incr
   logseq_db_types
   logseq_db_worker
-  logseq_db_worker.bonsai
+  logseq_db_worker.lui
   threads
   unix
-  virtual_dom.ui_effect
-  yojson))
+  yojson)
+ (foreign_stubs
+  (language c)
+  (names journal_lui_bridge)))
 
 (executable
  (name native_embed)
  (modules native_embed)
  (libraries
-  bonsai_swiftui.spec_impl
   app
-  bonsai_swiftui.driver
-  bonsai_swiftui.native_backend)
+  lui)
  (link_flags
   (:standard
    -cclib
-   -L%{env:BONSAI_SWIFTUI_APPLE_SDK_ROOT=}/usr/lib
+   -L%{env:JOURNAL_APPLE_SDK_ROOT=}/usr/lib
    (:include native_static_link_flags.sexp)))
  (modes
   (native object)))

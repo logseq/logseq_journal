@@ -1,0 +1,26 @@
+(library
+ (name logseq_db_worker_lui)
+ (public_name logseq_db_worker.lui)
+ (modules
+  journal_worker_ids
+  journal_bounded_mailbox
+  journal_worker_eio_backend
+  journal_worker_runtime
+  journal_worker)
+ (libraries
+  eio
+  eio.core
+  eio.unix
+  eio_posix
+  logseq_db_worker
+  logseq_db_types
+  logseq_overlay_db
+  logseq_sync.effect_runner
+  logseq_sync.pure_reducer
+  melange-transit-native
+  mtime.clock
+  mtime.clock.os
+  threads
+  unix
+  uri
+  yojson))
