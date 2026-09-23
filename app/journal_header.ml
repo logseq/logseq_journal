@@ -124,7 +124,7 @@ let view
                |> Option.iter (fun (_, _, _, action, _) ->
                  Ui.Event.Handler.Private.invoke dispatch (Ui.Event.Payload.Text action))
              | _ -> ()))
-        ~title:"Account menu"
+        ~title:""
         ~icon:(Journal_symbols.name Journal_symbols.Account)
         (List.map
            (fun (id, title, symbol, _, role) ->

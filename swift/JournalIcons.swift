@@ -5,6 +5,7 @@ import LUIAppleBackend
 /// system symbol name. Keep in sync with `journal_icon_name` call sites.
 let journalIconNames: [String] = [
     "arrow.clockwise",
+    "arrow.triangle.2.circlepath",
     "arrow.up",
     "book",
     "calendar",
@@ -18,6 +19,7 @@ let journalIconNames: [String] = [
     "clock",
     "doc",
     "doc.text",
+    "ellipsis",
     "exclamationmark.circle",
     "exclamationmark.triangle",
     "folder",
@@ -27,8 +29,11 @@ let journalIconNames: [String] = [
     "person.crop.circle",
     "plus",
     "questionmark.folder",
+    "rectangle.portrait.and.arrow.right",
+    "slider.horizontal.3",
     "square.and.pencil",
     "star",
+    "stethoscope",
     "trash",
 ]
 

@@ -57,6 +57,7 @@ import UniformTypeIdentifiers
         presented = true
       } label: {
         Label(selection.operation == nil ? "Attach file" : "Importing file", systemImage: "paperclip")
+          .labelStyle(.iconOnly)
       }
       .disabled(properties?.enabled == false || selection.operation != nil)
       .accessibilityIdentifier("journal-asset-import")

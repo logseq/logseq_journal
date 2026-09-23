@@ -1340,7 +1340,7 @@ module Presentation = struct
   let section ?key title children =
     V.Section.create
       ~key:(Option.value key ~default:(Ui.Key.string title))
-      ~header:(V.text title)
+      ~header_text:title
       [ V.Keyed.create
           ~key:"content"
           (V.column ~alignment:Leading children |> V.text_selection ~enabled:true)
@@ -5122,7 +5122,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
   let view _context model_signal _send =
     (* Dynamic elements mount under a parent, so the root must be a static
        container. *)
-    Lui_elements.stack
+    Lui_elements.column
       [ Lui_elements.dyn
           (fun model ->
              Journal_view.mount

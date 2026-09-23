@@ -33,6 +33,9 @@ import SwiftUI
     }
     var body: some SwiftUI.View {
       context.content
+        // The root column's proposal is the full viewport; expand to fill it
+        // and anchor the page at the top so bar rows don't drift to center.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task { deliver() }
         .onChange(of: days) { _, value in
           if preferences.save(recentDays: value) { deliver() }

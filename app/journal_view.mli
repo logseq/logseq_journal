@@ -474,7 +474,7 @@ module View : sig
   end
 
   module Section : sig
-    val create : ?key:Key.t -> ?header:t -> ?footer:t -> Keyed.t list -> t
+    val create : ?key:Key.t -> ?header_text:string -> ?footer:t -> Keyed.t list -> t
   end
 
   module Form : sig
