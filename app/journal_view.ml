@@ -46,8 +46,8 @@ let int_of_float_nan v = int_of_float (Float.round v)
 (* lui icon properties accept built-in names or [app:<slug>] custom names; the
    journal vocabulary is SF Symbol names, registered with the host backend under
    their [app:]-slugged form (see JournalIcons.swift). *)
-let journal_icon_name name =
-  "app:" ^ String.map (fun c -> if c = '.' then '-' else c) name
+let journal_icon name : Lui_elements.icon =
+  `app (String.map (fun c -> if c = '.' then '-' else c) name)
 ;;
 
 (* While a navigation bar or bottom bar mounts its items, labels collapse to
@@ -59,41 +59,6 @@ let icon_only = ref false
    text button like "Close" keeps its natural width, and a grouped row of
    controls sizes its leaves rather than the row itself. *)
 let icon_only_collapsed_nodes : int list ref = ref []
-
-(* Leaf controls carry their label/icon as properties; each kind only accepts
-   a subset of them, so apply what the node kind supports. *)
-let set_leaf_label context node { title; icon } =
-  let kind = Lui_ui.node_kind context node in
-  let supported property = Lui_protocol.property_supported kind property in
-  if not (!icon_only && Option.is_some icon)
-  then (
-    if supported Lui_protocol.TextValue
-    then Lui_ui.text_property context node title)
-  else (
-    icon_only_collapsed_nodes := node :: !icon_only_collapsed_nodes;
-    (* Icon-only controls keep their name on the accessibility channel; the
-       schema rejects icon-only buttons with no accessible name. *)
-    if supported Lui_protocol.AccessibilityLabel
-    then Lui_ui.accessibility_label context node (if title = "" then " " else title);
-    (* Bar glyphs render chromeless inside the capsule; the default variant
-       now maps to a bordered accent button which would double-frame the
-       pill. *)
-    if supported Lui_protocol.VariantValue
-    then
-      Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
-    if supported Lui_protocol.ForegroundValue
-    then Lui_ui.foreground context node "secondary");
-  Option.iter
-    (fun name ->
-       if supported Lui_protocol.InlineIconName
-       then
-         Lui_ui.string_property
-           context
-           node
-           Lui_protocol.InlineIconName
-           (journal_icon_name name))
-    icon
-;;
 
 (* Element mounts that don't register a standard runtime node (placeholder
    elements, extension nodes) can't carry standard properties. *)
@@ -265,10 +230,10 @@ module Layout = struct
       | Center
       | Trailing
 
-    let to_lui = function
-      | Leading -> "start"
-      | Center -> "center"
-      | Trailing -> "end"
+    let to_lui : t -> Lui_elements.cross_alignment = function
+      | Leading -> `start
+      | Center -> `center
+      | Trailing -> `end_
     ;;
   end
 
@@ -278,10 +243,10 @@ module Layout = struct
       | Center
       | Bottom
 
-    let to_lui = function
-      | Top -> "start"
-      | Center -> "center"
-      | Bottom -> "end"
+    let to_lui : t -> Lui_elements.cross_alignment = function
+      | Top -> `start
+      | Center -> `center
+      | Bottom -> `end_
     ;;
   end
 
@@ -503,9 +468,15 @@ module View = struct
       | Destructive
       | Cancel
 
-    let variant = function
+    let variant : t -> Lui_elements.variant = function
+      | Destructive -> `destructive
+      | Cancel -> `secondary
+      | Normal -> `default
+    ;;
+
+    let variant_string : t -> string = function
       | Destructive -> "destructive"
-      | Cancel -> "secondary"
+      | Cancel -> "cancel"
       | Normal -> "default"
     ;;
   end
@@ -518,12 +489,11 @@ module View = struct
       | Prominent
       | Button
 
-    let variant = function
-      | Plain -> "ghost"
-      | Bordered -> "outline"
-      | Prominent -> "primary"
-      | Button -> "default"
-      | Automatic -> "default"
+    let variant : t -> Lui_elements.variant = function
+      | Plain -> `ghost
+      | Bordered -> `outline
+      | Prominent -> `primary
+      | Button | Automatic -> `default
     ;;
   end
 
@@ -532,11 +502,6 @@ module View = struct
       | Linear
       | Circular
   end
-
-  let is_press = function
-    | Lui_protocol.Press _ -> true
-    | _ -> false
-  ;;
 
   let with_test_id test_id t =
     let mount context parent =
@@ -560,53 +525,44 @@ module View = struct
         ?truncation:_
         value
     =
-    { (element ?key (fun context parent ->
-         let node = Lui_ui.text context value in
-         Option.iter
-           (fun (style : Style.Text_style.t) ->
-              (match style.foreground with
-               | Some Style.Text_style.Secondary ->
-                 Lui_ui.foreground context node "secondary"
-               | Some Primary | None -> ());
-              match style.font_weight with
-              | Some Style.Text_style.Semi_bold ->
-                Lui_ui.style_class context node "semibold"
-              | Some Regular | None -> ())
-           style;
-         (match parent with
-          | Some parent -> Lui_ui.append context parent node
-          | None -> ());
-         node))
+    let foreground, style_class =
+      match style with
+      | Some (style : Style.Text_style.t) ->
+        ( (match style.foreground with
+           | Some Style.Text_style.Secondary -> Some "secondary"
+           | Some Primary | None -> None)
+        , match style.font_weight with
+          | Some Style.Text_style.Semi_bold -> Some "semibold"
+          | Some Regular | None -> None )
+      | None -> None, None
+    in
+    { (element ?key
+         (Lui_elements.text ?foreground ?style_class ~value []))
       with
       label_content = Some { title = value; icon = None }
     }
   ;;
 
   let symbol ?key ?size ?color ?rendering:_ ~name () =
-    { (element ?key (fun context parent ->
-         let node = Lui_ui.icon context (journal_icon_name name) in
-         Option.iter
-           (fun size -> Lui_ui.size context node (string_of_int (int_of_float_nan size)))
-           size;
-         Option.iter (fun color -> Lui_ui.foreground context node color) color;
-         (match parent with
-          | Some parent -> Lui_ui.append context parent node
-          | None -> ());
-         node))
+    (* [size] in points has no counterpart in the icon schema (only the
+       control-size vocabulary); express it as a square frame instead. *)
+    let width, height =
+      match size with
+      | Some size ->
+        let points = int_of_float_nan size in
+        Some points, Some points
+      | None -> None, None
+    in
+    { (element ?key
+         (Lui_elements.icon ~name:(journal_icon name) ?width ?height
+            ?foreground:color []))
       with
       label_content = Some { title = ""; icon = Some name }
     }
   ;;
 
   let label ?key ~title ~icon () =
-    { (element ?key (fun context parent ->
-         let node = Lui_ui.row context in
-         (match parent with
-          | Some parent -> Lui_ui.append context parent node
-          | None -> ());
-         ignore (icon.mount context (Some node));
-         ignore (title.mount context (Some node));
-         node))
+    { (element ?key (Lui_elements.row [ icon.mount; title.mount ]))
       with
       label_content =
         Some
@@ -623,47 +579,29 @@ module View = struct
   ;;
 
   let divider ?key () =
-    element ?key (fun context parent ->
-      let node = Lui_ui.separator context "horizontal" in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+    element ?key (Lui_elements.separator ~orientation:`horizontal [])
   ;;
 
   let progress ?key ?value ?(style = Progress_style.Linear) () =
-    element ?key (fun context parent ->
-      let node =
-        match style, value with
-        | Progress_style.Circular, _ -> Lui_ui.spinner context
-        | Linear, Some value -> Lui_ui.progress_literal context value
-        | Linear, None -> Lui_ui.spinner context
-      in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+    element ?key
+      (match style, value with
+       | Progress_style.Linear, Some value -> Lui_elements.progress ~value []
+       | _ -> Lui_elements.spinner [])
   ;;
 
   let spacer ?key ?min_length:_ () =
-    element ?key (fun context parent ->
-      let node = Lui_ui.spacer context in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+    element ?key (Lui_elements.spacer [])
   ;;
 
+  (* [Lui_elements] constructors take mount functions as children; journal
+     elements expose theirs as [.mount]. *)
+  let mounts children = List.map (fun (child : t) -> child.mount) children
+
   let row ?key ?(spacing = 16.) ?(alignment = Layout.Vertical_alignment.Center) children =
-    element ?key (fun context parent ->
-      let node = Lui_ui.row context in
-      Lui_ui.gap context node (int_of_float_nan spacing);
-      Lui_ui.cross context node (Layout.Vertical_alignment.to_lui alignment);
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      List.iter (fun child -> ignore (child.mount context (Some node))) children;
-      node)
+    element ?key
+      (Lui_elements.row ~gap:(int_of_float_nan spacing)
+         ~cross:(Layout.Vertical_alignment.to_lui alignment)
+         (mounts children))
   ;;
 
   let column
@@ -672,25 +610,14 @@ module View = struct
         ?(alignment = Layout.Horizontal_alignment.Center)
         children
     =
-    element ?key (fun context parent ->
-      let node = Lui_ui.column context in
-      Lui_ui.gap context node (int_of_float_nan spacing);
-      Lui_ui.cross context node (Layout.Horizontal_alignment.to_lui alignment);
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      List.iter (fun child -> ignore (child.mount context (Some node))) children;
-      node)
+    element ?key
+      (Lui_elements.column ~gap:(int_of_float_nan spacing)
+         ~cross:(Layout.Horizontal_alignment.to_lui alignment)
+         (mounts children))
   ;;
 
   let stack ?key ?alignment:_ children =
-    element ?key (fun context parent ->
-      let node = Lui_ui.stack context in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      List.iter (fun child -> ignore (child.mount context (Some node))) children;
-      node)
+    element ?key (Lui_elements.stack (mounts children))
   ;;
 
   let apply_frame_limit context node _min_prop max_prop limit =
@@ -797,90 +724,86 @@ module View = struct
         ~child
         ()
     =
+    let variant =
+      match role with
+      | Button_role.Normal -> Option.map Button_style.variant style
+      | role -> Some (Button_role.variant role)
+    in
+    let label =
+      match child.label_content with
+      | Some label -> label
+      | None -> { title = ""; icon = None }
+    in
+    (* Icon-only collapse keeps the control's name on the accessibility
+       channel instead of its text (the schema rejects icon-only buttons
+       with no accessible name). *)
+    let collapsed = !icon_only && Option.is_some label.icon in
+    let text, accessibility_label =
+      if collapsed
+      then None, Some (if String.length label.title = 0 then " " else label.title)
+      else Some label.title, None
+    in
+    (* Icon-only bar glyphs render chromeless inside the capsule; the
+       default variant maps to a bordered button which would double-frame
+       the pill. *)
+    let variant, foreground =
+      if collapsed then Some `ghost, Some "secondary" else variant, None
+    in
     element ?key (fun context parent ->
-      let node = Lui_ui.button context in
-      if not enabled then Lui_ui.disabled context node true;
-      Option.iter
-        (fun style ->
-           Lui_ui.string_property
-             context
-             node
-             Lui_protocol.VariantValue
-             (Button_style.variant style))
-        style;
-      (match role with
-       | Button_role.Normal -> ()
-       | role ->
-         Lui_ui.string_property
-           context
-           node
-           Lui_protocol.VariantValue
-           (Button_role.variant role));
-      (* lui controls are leaf nodes: their label/icon travel as properties,
-         not child elements. *)
-      Option.iter (set_leaf_label context node) child.label_content;
-      if autofocus then Lui_ui.bool_property context node Lui_protocol.Autofocus true;
-      Lui_ui.on_event context node (fun event ->
-        if is_press event then invoke on_press Event.Payload.Unit);
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
+      let node =
+        Lui_elements.button
+          ?variant
+          ?foreground
+          ?text
+          ?label:accessibility_label
+          ?icon:(Option.map journal_icon label.icon)
+          ~disabled:(not enabled)
+          ~autofocus
+          ~on_press:(fun _event -> invoke on_press Event.Payload.Unit)
+          []
+          context
+          parent
+      in
+      if collapsed then icon_only_collapsed_nodes := node :: !icon_only_collapsed_nodes;
       node)
     |> fun element_ ->
     { element_ with
       menu_item_mount =
         Some
           (fun context parent ->
-             let node = Lui_ui.menu_item context in
-             if not enabled then Lui_ui.disabled context node true;
-             Option.iter
-               (fun (label : label_content) ->
-                  Lui_ui.text_property
-                    context
-                    node
-                    (if String.length label.title = 0 then " " else label.title);
-                  Option.iter
-                    (fun name ->
-                       Lui_ui.string_property
-                         context
-                         node
-                         Lui_protocol.InlineIconName
-                         (journal_icon_name name))
-                    label.icon)
-               child.label_content;
+             let node =
+               Lui_elements.menu_item
+                 ~text:(if String.length label.title = 0 then " " else label.title)
+                 ?icon:(Option.map journal_icon label.icon)
+                 ~disabled:(not enabled)
+                 ~on_press:(fun _event -> invoke on_press Event.Payload.Unit)
+                 [] context parent
+             in
              (match role with
               | Button_role.Normal -> ()
               | role ->
                 Lui_ui.string_property
-                  context
-                  node
-                  Lui_protocol.VariantValue
-                  (Button_role.variant role));
-             Lui_ui.bool_property context node Lui_protocol.PressEnabled true;
-             Lui_ui.on_event context node (fun event ->
-               if is_press event then invoke on_press Event.Payload.Unit);
-             (match parent with
-              | Some parent -> Lui_ui.append context parent node
-              | None -> ());
+                  context node Lui_protocol.VariantValue
+                  (Button_role.variant_string role));
              node)
     }
   ;;
 
   let toggle ?key ?style:_ ?(enabled = true) ~value ~on_changed ~label () =
-    element ?key (fun context parent ->
-      let node = Lui_ui.toggle context in
-      if not enabled then Lui_ui.disabled context node true;
-      Lui_ui.bool_property context node Lui_protocol.Checked value;
-      Option.iter (set_leaf_label context node) label.label_content;
-      Lui_ui.on_event context node (fun event ->
-        match event with
-        | Lui_protocol.ToggleChanged (_, selected) ->
-          invoke on_changed (Event.Payload.Bool selected)
-        | _ -> ());
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+    let text =
+      match label.label_content with
+      | Some content -> content.title
+      | None -> ""
+    in
+    element ?key
+      (Lui_elements.toggle ~text ~checked:value
+         ~disabled:(not enabled)
+         ~on_toggle:(fun event ->
+           match event with
+           | Lui_protocol.ToggleChanged (_, selected) ->
+             invoke on_changed (Event.Payload.Bool selected)
+           | _ -> ())
+         [])
   ;;
 
   let text_editor
@@ -902,32 +825,31 @@ module View = struct
         ()
     =
     element ?key (fun context parent ->
-      let node = Lui_ui.textarea context in
-      Lui_ui.text_property context node (Text_editing.Value.text value);
-      if not (enabled && not read_only) then Lui_ui.disabled context node true;
-      if autofocus then Lui_ui.bool_property context node Lui_protocol.Autofocus true;
-      Lui_ui.bool_property context node Lui_protocol.SubmitOnEnter submit_on_return;
       let local_revision = ref accepted_local_revision in
-      Lui_ui.on_event context node (fun event ->
-        match event with
-        | Lui_protocol.TextChanged (_, text) ->
-          local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
-          invoke
-            on_edit
-            (Event.Payload.Text_edit
-               { session_id
-               ; local_revision = !local_revision
-               ; base_document_revision = document_revision
-               ; text
-               ; selection = { start_utf16 = 0; end_utf16 = 0 }
-               ; composing = None
-               })
-        | Lui_protocol.Submit _ -> invoke on_submit Event.Payload.Unit
-        | _ -> ());
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+      Lui_elements.textarea
+        ~text:(Text_editing.Value.text value)
+        ~disabled:(not (enabled && not read_only))
+        ~autofocus
+        ~submit_on_enter:submit_on_return
+        ~on_input:(fun event ->
+          match event with
+          | Lui_protocol.TextChanged (_, text) ->
+            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
+            invoke
+              on_edit
+              (Event.Payload.Text_edit
+                 { session_id
+                 ; local_revision = !local_revision
+                 ; base_document_revision = document_revision
+                 ; text
+                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
+                 ; composing = None
+                 })
+          | _ -> ())
+        ~on_submit:(fun _event -> invoke on_submit Event.Payload.Unit)
+        []
+        context
+        parent)
   ;;
 
   let secure_field
@@ -954,61 +876,44 @@ module View = struct
         ()
     =
     element ?key (fun context parent ->
-      let node = Lui_ui.secure_field context in
-      Lui_ui.text_property context node (Text_editing.Value.text value);
-      Lui_ui.placeholder context node prompt;
-      if not enabled then Lui_ui.disabled context node true;
-      if autofocus then Lui_ui.bool_property context node Lui_protocol.Autofocus true;
       let local_revision = ref accepted_local_revision in
-      Lui_ui.on_event context node (fun event ->
-        match event with
-        | Lui_protocol.TextChanged (_, text) ->
-          local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
-          invoke
-            on_edit
-            (Event.Payload.Text_edit
-               { session_id
-               ; local_revision = !local_revision
-               ; base_document_revision = document_revision
-               ; text
-               ; selection = { start_utf16 = 0; end_utf16 = 0 }
-               ; composing = None
-               })
-        | Lui_protocol.Submit _ -> invoke on_submit Event.Payload.Unit
-        | _ -> ());
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+      Lui_elements.secure_field
+        ~text:(Text_editing.Value.text value)
+        ~placeholder:prompt
+        ~disabled:(not enabled)
+        ~autofocus
+        ~on_input:(fun event ->
+          match event with
+          | Lui_protocol.TextChanged (_, text) ->
+            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
+            invoke
+              on_edit
+              (Event.Payload.Text_edit
+                 { session_id
+                 ; local_revision = !local_revision
+                 ; base_document_revision = document_revision
+                 ; text
+                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
+                 ; composing = None
+                 })
+          | _ -> ())
+        ~on_submit:(fun _event -> invoke on_submit Event.Payload.Unit)
+        []
+        context
+        parent)
   ;;
 
   let labeled_content ?key ~label ~value () =
-    element ?key (fun context parent ->
-      let node = Lui_ui.row context in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      ignore (label.mount context (Some node));
-      let spacer = Lui_ui.spacer context in
-      Lui_ui.append context node spacer;
-      ignore (value.mount context (Some node));
-      node)
+    element ?key
+      (Lui_elements.row
+         [ label.mount; Lui_elements.spacer []; value.mount ])
   ;;
 
   let content_unavailable ?key ~label ?description ?actions () =
     element ?key (fun context parent ->
-      let node = Lui_ui.column context in
       (* Grow so the column fills the page: without it the column shrinks to
          its content and the centered children end up leading-aligned. *)
-      Lui_ui.grow context node 1.0;
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      let spacer () =
-        let spacer = Lui_ui.spacer context in
-        Lui_ui.append context node spacer
-      in
-      spacer ();
+      let node = Lui_elements.column ~grow:1.0 [] context parent in
       (* Center content via per-child mechanics. A cross=center column keeps
          its natural width and lands leading under the stretch parent's
          topLeading frame, so horizontal centering instead goes through a
@@ -1016,16 +921,8 @@ module View = struct
          child between leading/trailing spacers. Text needs no wrapper — a
          set text-alignment already stretches it to full width. *)
       let center_horizontally t =
-        element (fun context parent ->
-          let row = Lui_ui.row context in
-          Lui_ui.gap context row 0;
-          Lui_ui.cross context row "center";
-          Lui_ui.main context row "center";
-          (match parent with
-           | Some parent -> Lui_ui.append context parent row
-           | None -> ());
-          ignore (t.mount context (Some row));
-          row)
+        element
+          (Lui_elements.row ~gap:0 ~cross:`center ~main:`center [ t.mount ])
       in
       (* The label is already a full-width row: center its own content rather
          than nesting it (a wrapper would split the free space with the
@@ -1054,19 +951,12 @@ module View = struct
         (fun actions ->
            ignore ((center_horizontally actions).mount context (Some node)))
         actions;
-      spacer ();
+      ignore (Lui_elements.spacer [] context (Some node));
       node)
   ;;
 
   let overlay ?key:_ ?alignment:_ ~overlay t =
-    element ?key:t.key (fun context parent ->
-      let node = Lui_ui.stack context in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      ignore (t.mount context (Some node));
-      ignore (overlay.mount context (Some node));
-      node)
+    element ?key:t.key (Lui_elements.stack [ t.mount; overlay.mount ])
   ;;
 
   module Keyed = struct
@@ -1087,19 +977,15 @@ module View = struct
            native section header, following children the rows. Entries go in
            one column so they render as a single grouped card — panel/card
            kinds would overlay every child in a ZStack. *)
-        let card = Lui_ui.column context in
-        Lui_ui.gap context card 12;
-        (match header_text, parent with
-         | Some title, Some parent ->
-           let heading = Lui_ui.heading context 4 title in
-           Lui_ui.append context parent heading
-         | _ -> ());
-        (match parent with
-         | Some parent -> Lui_ui.append context parent card
-         | None -> ());
-        List.iter
-          (fun (entry : Keyed.t) -> ignore (entry.view.mount context (Some card)))
-          entries;
+        Option.iter
+          (fun title ->
+             ignore (Lui_elements.heading ~level:4 ~value:title [] context parent))
+          header_text;
+        let card =
+          Lui_elements.column ~gap:12
+            (List.map (fun (entry : Keyed.t) -> entry.view.mount) entries)
+            context parent
+        in
         Option.iter (fun footer -> ignore (footer.mount context parent)) footer;
         card)
     ;;
@@ -1107,15 +993,9 @@ module View = struct
 
   module Form = struct
     let vertical ?key entries =
-      element ?key (fun context parent ->
-        let node = Lui_ui.list context in
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
-        List.iter
-          (fun (entry : Keyed.t) -> ignore (entry.view.mount context (Some node)))
-          entries;
-        node)
+      element ?key
+        (Lui_elements.list
+           (List.map (fun (entry : Keyed.t) -> entry.view.mount) entries))
     ;;
   end
 
@@ -1176,13 +1056,7 @@ module View = struct
     let spacer ~key ?placement spacing =
       { item_key = key
       ; placement
-      ; content =
-          element (fun context parent ->
-            let node = Lui_ui.spacer context in
-            (match parent with
-             | Some parent -> Lui_ui.append context parent node
-             | None -> ());
-            node)
+      ; content = element (Lui_elements.spacer [])
       ; spacing = Some spacing
       ; is_group = false
       }
@@ -1222,69 +1096,44 @@ module View = struct
          node — the schema semantic for a control bar — wrapped by a box
          carrying the pill chrome: a toolbar accepts only
          label/gap/orientation/style-class, and a row would auto-append a
-         trailing spacer and stretch to full width. *)
+         trailing spacer and stretch to full width. Hug content height;
+         the default stretch cross would soak the parent column's split
+         share (see Navigation_stack back row). *)
       let node =
-        if toolbar_label = "" then Lui_ui.row context else Lui_ui.box context
+        (if toolbar_label = "" then Lui_elements.row else Lui_elements.box)
+          ~gap:16 ~cross:`center ~padding_horizontal:14 ~padding_vertical:9
+          ~background:"secondary" ~corner_radius:20 [] context (Some parent)
       in
-      Lui_ui.gap context node 16;
-      (* Hug content height; the default stretch cross would soak the
-         parent column's split share (see Navigation_stack back row). *)
-      Lui_ui.cross context node "center";
-      Lui_ui.padding_horizontal context node 14;
-      Lui_ui.padding_vertical context node 9;
-      Lui_ui.background context node "secondary";
-      Lui_ui.corner_radius context node 20;
-      Lui_ui.append context parent node;
       (match toolbar_label with
        | "" -> mount_children node
        | label ->
-         let toolbar = Lui_ui.toolbar context in
-         Lui_ui.accessibility_label context toolbar label;
-         Lui_ui.gap context toolbar 16;
-         Lui_ui.append context node toolbar;
+         let toolbar =
+           Lui_elements.toolbar ~label ~gap:16 [] context (Some node)
+         in
          mount_children toolbar);
       node
     ;;
 
     let circle_button context parent ~icon ~on_press =
-      let node = Lui_ui.button context in
-      Lui_ui.text_property context node "";
       (* Icon-only button: the schema rejects empty text + icon without an
          accessibility label. *)
-      Lui_ui.accessibility_label context node "Back";
-      Lui_ui.string_property
-        context
-        node
-        Lui_protocol.InlineIconName
-        (journal_icon_name icon);
-      Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
-      Lui_ui.foreground context node "secondary";
-      Lui_ui.background context node "secondary";
-      Lui_ui.corner_radius context node 20;
-      Lui_ui.width context node 40;
-      Lui_ui.height context node 40;
-      Lui_ui.on_event context node (fun event -> if is_press event then on_press ());
-      Lui_ui.append context parent node;
-      node
+      Lui_elements.button ~label:"Back" ~icon:(journal_icon icon)
+        ~variant:`ghost ~foreground:"secondary" ~background:"secondary"
+        ~corner_radius:20 ~width:40 ~height:40
+        ~on_press:(fun _event -> on_press ())
+        [] context (Some parent)
     ;;
 
     let flexible_space context parent =
-      let node = Lui_ui.spacer context in
-      Lui_ui.grow context node 1.0;
-      Lui_ui.append context parent node;
-      node
+      Lui_elements.spacer ~grow:1.0 [] context (Some parent)
     ;;
 
     let mount_items items =
       element (fun context parent ->
-        let node = Lui_ui.row context in
-        Lui_ui.gap context node 8;
-        Lui_ui.cross context node "center";
-        Lui_ui.padding_horizontal context node 10;
-        Lui_ui.padding_vertical context node 4;
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
+        let node =
+          Lui_elements.row ~gap:8 ~cross:`center ~padding_horizontal:10
+            ~padding_vertical:4 [] context parent
+        in
         let leading =
           List.filter
             (fun (item : item) ->
@@ -1331,9 +1180,9 @@ module View = struct
          | [] ->
            (match !nav_bar with
             | Some { nav_title = title; _ } when title <> "" ->
-              let title_node = Lui_ui.text context title in
-              Lui_ui.style_class context title_node "semibold";
-              Lui_ui.append context node title_node
+              ignore
+                (Lui_elements.text ~value:title ~style_class:"semibold" []
+                   context (Some node))
             | _ -> ())
          | _ ->
            List.iter
@@ -1356,25 +1205,17 @@ module View = struct
                if secondary <> []
                then (
                  (* Secondary actions collapse into the "more" overflow the
-                    system bar showed. *)
-                 let trigger = Lui_ui.menu_item context in
-                 Lui_ui.text_property context trigger " ";
-                 (* accessibility-label is not in the menu-item schema; the
-                     whitespace text is what the validator accepts. *)
+                    system bar showed. accessibility-label is not in the
+                    menu-item schema; the whitespace text is what the
+                    validator accepts. The menu label grows to fill
+                    available space; cap it so the trigger stays icon-sized
+                    inside the capsule. *)
+                 let trigger =
+                   Lui_elements.menu_item ~text:" " ~icon:(journal_icon "ellipsis")
+                     ~width:40 [] context (Some row)
+                 in
                  Lui_ui.string_property
-                   context
-                   trigger
-                   Lui_protocol.InlineIconName
-                   (journal_icon_name "ellipsis");
-                 (* The menu label grows to fill available space; cap it so
-                    the trigger stays icon-sized inside the capsule. *)
-                 Lui_ui.width context trigger 40;
-                 Lui_ui.string_property
-                   context
-                   trigger
-                   Lui_protocol.SizeValue
-                   "sm";
-                 Lui_ui.append context row trigger;
+                   context trigger Lui_protocol.SizeValue "sm";
                  let menu = Lui_ui.dropdown_menu context in
                  Lui_ui.append context trigger menu;
                  List.iter
@@ -1388,22 +1229,16 @@ module View = struct
 
     let mount_bottom_bar items =
       element (fun context parent ->
-        let node = Lui_ui.row context in
-        Lui_ui.gap context node 10;
-        Lui_ui.cross context node "center";
-        Lui_ui.padding_horizontal context node 12;
-        Lui_ui.padding_vertical context node 8;
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
+        let node =
+          Lui_elements.row ~gap:10 ~cross:`center ~padding_horizontal:12
+            ~padding_vertical:8 [] context parent
+        in
         List.iter
           (fun (item : item) ->
              match item.spacing with
              | Some Flexible -> ignore (flexible_space context node)
              | Some Fixed ->
-               let fixed = Lui_ui.spacer context in
-               Lui_ui.width context fixed 16;
-               Lui_ui.append context node fixed
+               ignore (Lui_elements.spacer ~width:16 [] context (Some node))
              | _ ->
                ignore
                  (capsule ~toolbar_label:item.item_key context node (fun row ->
@@ -1414,11 +1249,7 @@ module View = struct
 
     let create ?key ~items t =
       element ?key (fun context parent ->
-        let node = Lui_ui.column context in
-        Lui_ui.grow context node 1.0;
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
+        let node = Lui_elements.column ~grow:1.0 [] context parent in
         let top, bottom =
           List.partition
             (fun (item : item) -> item.placement <> Some Bottom_bar)
@@ -1517,13 +1348,7 @@ module View = struct
           ?initial_anchor:_
           t
       =
-      element ?key (fun context parent ->
-        let node = Lui_ui.scroll context in
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
-        ignore (t.mount context (Some node));
-        node)
+      element ?key (Lui_elements.scroll [ t.mount ])
     ;;
   end
 
@@ -1593,29 +1418,19 @@ module View = struct
         Lui_ui.append context node menu;
         List.iter
           (fun (action : action) ->
-             let item = Lui_ui.menu_item context in
-             Lui_ui.text_property context item action.title;
-             Option.iter
-               (fun symbol ->
-                  Lui_ui.string_property
-                    context
-                    item
-                    Lui_protocol.InlineIconName
-                    (journal_icon_name symbol))
-               action.symbol;
+             let item =
+               Lui_elements.menu_item ~text:action.title
+                  ?icon:(Option.map journal_icon action.symbol)
+                  ~disabled:(not action.enabled)
+                  ~on_press:(fun _event ->
+                    invoke action.on_press Event.Payload.Unit)
+                  [] context (Some menu)
+             in
              (match action.role with
               | Normal -> ()
               | Destructive ->
                 Lui_ui.string_property
-                  context
-                  item
-                  Lui_protocol.VariantValue
-                  "destructive");
-             if not action.enabled then Lui_ui.disabled context item true;
-             Lui_ui.bool_property context item Lui_protocol.PressEnabled true;
-             Lui_ui.on_event context item (fun event ->
-               if is_press event then invoke action.on_press Event.Payload.Unit);
-             Lui_ui.append context menu item)
+                  context item Lui_protocol.VariantValue "destructive"))
           actions;
         node)
     ;;
@@ -1653,44 +1468,35 @@ module View = struct
             | None -> view.mount context None
           in
           ignore (view.mount context (Some node));
-          let dialog = Lui_ui.dialog context in
-          Lui_ui.text_property context dialog request.title;
+          let dialog =
+            Lui_elements.dialog ~text:request.title
+              ~on_dismiss:(fun _event ->
+                invoke
+                  on_response
+                  (Event.Payload.Confirmation_response
+                     { token = request.token; result = Dismissed }))
+              (List.map
+                 (fun (action : action) ->
+                    Lui_elements.button ~text:action.title
+                      ?variant:(match action.role with
+                        | Button_role.Normal -> None
+                        | role -> Some (Button_role.variant role))
+                      ~disabled:(not action.enabled)
+                      ~on_press:(fun _event ->
+                        invoke
+                          on_response
+                          (Event.Payload.Confirmation_response
+                             { token = request.token
+                             ; result = Action action.key
+                             }))
+                      [])
+                 request.actions)
+              context (Some node)
+          in
           Option.iter
             (fun message ->
                Lui_ui.string_property context dialog Lui_protocol.DescriptionValue message)
             request.message;
-          Lui_ui.append context node dialog;
-          List.iter
-            (fun (action : action) ->
-               let item = Lui_ui.button context in
-               Lui_ui.text_property context item action.title;
-               if not action.enabled then Lui_ui.disabled context item true;
-               (match action.role with
-                | Button_role.Normal -> ()
-                | role ->
-                  Lui_ui.string_property
-                    context
-                    item
-                    Lui_protocol.VariantValue
-                    (Button_role.variant role));
-               Lui_ui.on_event context item (fun event ->
-                 match event with
-                 | Lui_protocol.Press _ ->
-                   invoke
-                     on_response
-                     (Event.Payload.Confirmation_response
-                        { token = request.token; result = Action action.key })
-                 | _ -> ());
-               Lui_ui.append context dialog item)
-            request.actions;
-          Lui_ui.on_event context dialog (fun event ->
-            match event with
-            | Lui_protocol.Dismiss _ ->
-              invoke
-                on_response
-                (Event.Payload.Confirmation_response
-                   { token = request.token; result = Dismissed })
-            | _ -> ());
           node)
     ;;
 
@@ -1824,7 +1630,7 @@ module View = struct
                     `Assoc
                       [ "key", `String a.key
                       ; "enabled", `Bool a.enabled
-                      ; "role", `String (Button_role.variant a.role)
+                      ; "role", `String (Button_role.variant_string a.role)
                       ; ( "symbol"
                         , match a.symbol with
                           | Some s -> `String s
@@ -2080,27 +1886,14 @@ module View = struct
 
   module Navigation_link = struct
     let create ?key ~activation_id:_ ?(enabled = true) ~on_activate ~label () =
-      element ?key (fun context parent ->
-        let node = Lui_ui.list_item context in
-        if not enabled then Lui_ui.disabled context node true;
-        Lui_ui.bool_property context node Lui_protocol.PressEnabled enabled;
-        (* NavigationLink draws a trailing disclosure accessory; LUI list items
-           have none, so carry the chevron as an inline trailing icon. *)
-        Lui_ui.string_property
-          context
-          node
-          Lui_protocol.InlineIconName
-          (journal_icon_name "chevron.right");
-        Lui_ui.string_property context node Lui_protocol.IconPlacementValue "trailing";
-        (* A list-item must carry text or children; mount the label as the
-           item content so composite labels render too. *)
-        ignore (label.mount context (Some node));
-        Lui_ui.on_event context node (fun event ->
-          if is_press event then invoke on_activate Event.Payload.Unit);
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
-        node)
+      element ?key
+        (Lui_elements.list_item
+           ~icon:(journal_icon "chevron.right") ~icon_placement:`trailing
+           ~disabled:(not enabled)
+           ~on_press:(fun _event -> invoke on_activate Event.Payload.Unit)
+           (* A list-item must carry text or children; mount the label as
+              the item content so composite labels render too. *)
+           [ label.mount ])
     ;;
   end
 
@@ -2123,13 +1916,9 @@ module View = struct
        renders no bar content. *)
     let create ?key ~title ~on_path_change ~path root =
       element ?key (fun context parent ->
-        let node = Lui_ui.column context in
         (* Fill the hosting column so the emulated bar rows pin to the top
            instead of the whole page centering vertically. *)
-        Lui_ui.grow context node 1.0;
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
+        let node = Lui_elements.column ~grow:1.0 [] context parent in
         let top =
           match List.rev path with
           | [] -> None
@@ -2191,28 +1980,17 @@ module View = struct
           base
       =
       element ?key (fun context parent ->
-        let node = Lui_ui.column context in
-        Lui_ui.grow context node 1.0;
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
+        let node = Lui_elements.column ~grow:1.0 [] context parent in
         ignore (base.mount context (Some node));
         if presented
-        then (
-          let sheet = Lui_ui.sheet context in
-          Lui_ui.text_property
-            context
-            sheet
-            (if String.equal title "" then "Sheet" else title);
-          Lui_ui.append context node sheet;
-          if interactive_dismiss
-          then
-            Lui_ui.on_event context sheet (fun event ->
-              match event with
-              | Lui_protocol.Dismiss _ ->
-                invoke on_presented_changed (Event.Payload.Bool false)
-              | _ -> ());
-          ignore (content.mount context (Some sheet)));
+        then
+          ignore
+            (Lui_elements.sheet
+               ~text:(if String.equal title "" then "Sheet" else title)
+               ~on_dismiss:(fun _event ->
+                 if interactive_dismiss
+                 then invoke on_presented_changed (Event.Payload.Bool false))
+               [ content.mount ] context (Some node));
         node)
     ;;
   end
@@ -2242,37 +2020,51 @@ module View = struct
           choices
           ()
       =
-      element ?key (fun context parent ->
-        let node =
-          match style with
-          | Segmented -> Lui_ui.toggle_group context
-          | Automatic | Menu | Inline -> Lui_ui.radio_group context
-        in
-        if not enabled then Lui_ui.disabled context node true;
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
-        List.iter
-          (fun (choice : choice) ->
-             let item = Lui_ui.radio context in
-             Lui_ui.key context item (Int64.to_string choice.id);
-             if not choice.enabled then Lui_ui.disabled context item true;
-             (match selected_id with
-              | Some selected when selected = choice.id ->
-                Lui_ui.bool_property context item Lui_protocol.Checked true
-              | _ -> ());
-             Lui_ui.on_event context item (fun event ->
-               match event with
-               | Lui_protocol.Press _ | ToggleChanged (_, true) ->
-                 invoke on_select (Event.Payload.Int64 choice.id)
-               | _ -> ());
-             Option.iter (set_leaf_label context item) choice.label.label_content;
-             Option.iter
-               (Lui_ui.accessibility_identifier context item)
-               choice.label.test_id;
-             Lui_ui.append context node item)
-          choices;
-        node)
+      let choice_text (choice : choice) =
+        match choice.label.label_content with
+        | Some content -> content.title
+        | None -> ""
+      in
+      let on_select_event (choice : choice) event =
+        match event with
+        | Lui_protocol.ToggleChanged (_, true) | Lui_protocol.Press _ ->
+          invoke on_select (Event.Payload.Int64 choice.id)
+        | _ -> ()
+      in
+      let checked (choice : choice) = selected_id = Some choice.id in
+      let disabled (choice : choice) = not (enabled && choice.enabled) in
+      let accessibility_identifier (choice : choice) =
+        Option.map Test_id.to_string choice.label.test_id
+      in
+      element ?key
+        (match style with
+         | Segmented ->
+           Lui_elements.toggle_group
+             (List.map
+                (fun (choice : choice) ->
+                   Lui_elements.toggle_button
+                     ~key:(Int64.to_string choice.id)
+                     ~text:(choice_text choice)
+                     ~selected:(checked choice)
+                     ~disabled:(disabled choice)
+                     ?accessibility_identifier:(accessibility_identifier choice)
+                     ~on_press:(on_select_event choice)
+                     [])
+                choices)
+         | Automatic | Menu | Inline ->
+           Lui_elements.radio_group
+             (List.map
+                (fun (choice : choice) ->
+                   Lui_elements.radio
+                     ~key:(Int64.to_string choice.id)
+                     ~text:(choice_text choice)
+                     ~checked:(checked choice)
+                     ~disabled:(disabled choice)
+                     ?accessibility_identifier:(accessibility_identifier choice)
+                     ~on_toggle:(on_select_event choice)
+                     ~on_press:(on_select_event choice)
+                     [])
+                choices))
     ;;
   end
 
@@ -2330,35 +2122,25 @@ module View = struct
        child renders as a native popup menu, and menu rows carry their label
        and icon as properties (menu items accept only menu children). *)
     let menu_item context ?key_opt ~title ~icon ~enabled ~role ~selected ?on_press () =
-      let node = Lui_ui.menu_item context in
-      Option.iter (Lui_ui.key context node) key_opt;
       (* menu-item requires non-empty text; a blank space keeps icon-only
          triggers visually identical without violating the schema. *)
       let title = if String.length title = 0 then " " else title in
-      Lui_ui.string_property context node Lui_protocol.TextValue title;
-      Option.iter
-        (fun name ->
-           Lui_ui.string_property
-             context
-             node
-             Lui_protocol.InlineIconName
-             (journal_icon_name name))
-        icon;
-      if not enabled then Lui_ui.disabled context node true;
+      let on_press =
+        Option.map
+          (fun payload _event -> payload ())
+          on_press
+      in
+      let node =
+        Lui_elements.menu_item ?key:key_opt ~text:title
+          ?icon:(Option.map journal_icon icon)
+          ?selected ~disabled:(not enabled) ?on_press [] context None
+      in
       (match role with
        | Button_role.Normal -> ()
        | role ->
          Lui_ui.string_property
-           context
-           node
-           Lui_protocol.VariantValue
-           (Button_role.variant role));
-      Option.iter (Lui_ui.bool_property context node Lui_protocol.Selected) selected;
-      Option.iter
-        (fun payload ->
-           Lui_ui.bool_property context node Lui_protocol.PressEnabled true;
-           Lui_ui.on_event context node (fun event -> if is_press event then payload ()))
-        on_press;
+           context node Lui_protocol.VariantValue
+           (Button_role.variant_string role));
       node
     ;;
 
