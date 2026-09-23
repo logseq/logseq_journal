@@ -122,3 +122,64 @@ lui API, found while porting `app/journal_view.ml` + callers to
     equivalent — the DSL keeps it a raw string param. On Flutter/web they
     no-op. Suggest: a `[ `semibold | `single_line | ... ]` typography
     variant type for the portable subset.
+
+## Typed-DSL coverage gaps found while porting (journal branch)
+
+16. **`menu_item` has no `~variant`** — destructive/cancel menu actions
+    can't be expressed in the DSL; the shim falls back to
+    `Lui_ui.string_property VariantValue "destructive"` after mount
+    (`Menu.menu_item`, `Confirmation` context-menu actions,
+    `button`'s `menu_item_mount`). The prop IS supported at runtime —
+    it's just absent from the typed constructor. Same for `~size`
+    (toolbar overflow trigger wants `~size:`sm`; only `~width` exists).
+
+17. **`toggle_button`/`radio` vocabulary is inconsistent**: `toggle` uses
+    `~checked`/`~on_toggle`; `toggle_button` uses `~selected`/`~on_press`
+    with no `~checked`/`~on_toggle`; `radio` has both `~checked` and
+    `~on_toggle` but ALSO needs `~on_press` to fire on some backends —
+    callers must wire both handlers to the same action to be safe. An AI
+    guessing `~checked`/`~on_toggle` for toggle_button gets a compile
+    error; guessing only `~on_toggle` for radio gets a dead control.
+    Suggest: unify on `~checked` + `~on_toggle` (and `~selected`
+    deprecated) across toggle/toggle_button/radio/select items.
+
+18. **`dialog` has no `~description`** — the DescriptionValue prop is
+    supported but not exposed; confirmation alerts must set it post-mount
+    via `Lui_ui.string_property`. Similarly `sheet` requires `~text`
+    (title) even when the design has no title — journal passes
+    `"Sheet"` as a non-empty placeholder; consider `~title:string option`.
+
+19. **`~disabled:bool` shape is `?disabled:bool` everywhere — fine — but
+    `~selected`/`~checked`/`~expanded`/`~autofocus` are `bool` options with
+    different presence semantics per kind** (radio supports `~selected`
+    for select-style reuse? toggle wants `~checked`; menu_item wants
+    `~selected`). An AI has to learn the prop NAME per element rather
+    than a single `~active`-like convention. Minor, but real.
+
+20. **Positional/mount-time parent switching is still manual.**
+    `Lui_elements.t = context -> int option -> int` means "mount me under
+    this parent id" — callers doing imperative composition (toolbar
+    capsules built around children mounted later, `mount_items` rows that
+    mount children into a node created mid-function) must call the
+    constructor with `[]` children, then hand-mount each child with
+    `child context (Some node)`. It works, but the API reads
+    declarative-first and the imperative escape hatch is undocumented —
+    an AI's natural attempt is `row [...children]` which can't express
+    "children mounted by a callback after the row exists". Suggest: a
+    documented `~defer_children`/`~mount_into` escape or examples of the
+    `ctx (Some parent)` pattern.
+
+21. **DSL mount functions return `int` (node id) — and `element`
+    constructors are `... -> context -> int option -> int`** — no
+    distinction between "create detached" (`parent=None`) and "attach"
+    (`Some`); passing `None` silently builds an orphaned node that's easy
+    to lose. A phantom type or separate `create`/`attach` would make the
+    0-node-detached failure visible.
+
+22. **`Lui_elements` covers leaf+container kinds but NOT chrome-level
+    kinds**: `dropdown_menu`, `context_menu`, `submenu`, `nav_bar`,
+    `extension` mounts still require raw `Lui_ui` calls
+    (`Lui_ui.dropdown_menu context`, `Lui_ui.append`). The toolbar/menu
+    shim keeps ~40 `Lui_ui.*` calls for exactly these. Extending the DSL
+    to menu containers and nav plumbing would remove the last imperative
+    tier.

@@ -2171,9 +2171,9 @@ module View = struct
         let rec mount_entry parent (entry : entry) =
           match entry with
           | Divider id ->
-            let separator = Lui_ui.separator context "horizontal" in
-            Lui_ui.key context separator (Int64.to_string id);
-            Lui_ui.append context parent separator
+            ignore
+              (Lui_elements.separator ~orientation:`horizontal
+                 ~key:(Int64.to_string id) [] context (Some parent))
           | Action { id; label; enabled; role } ->
             let item =
               menu_item
