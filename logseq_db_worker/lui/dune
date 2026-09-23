@@ -6,7 +6,8 @@
   journal_bounded_mailbox
   journal_worker_eio_backend
   journal_worker_runtime
-  journal_worker)
+  journal_worker
+  logseq_db_worker_lui_service)
  (libraries
   eio
   eio.core
