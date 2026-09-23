@@ -31,6 +31,7 @@ module Test_id = struct
 end
 
 let element ?key ?test_id mount = { key; test_id; mount }
+let mount t = t.mount
 let int_of_float_nan v = int_of_float (Float.round v)
 
 let modify f t =

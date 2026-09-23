@@ -3,6 +3,8 @@
 
 type t
 
+val mount : t -> Lui_elements.t
+
 module Key : sig
   type t
 
