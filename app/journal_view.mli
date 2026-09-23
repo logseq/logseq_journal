@@ -816,22 +816,39 @@ module View : sig
 
     val action
       :  id:int64
-      -> label:t
+      -> title:string
+      -> ?icon:string
       -> ?enabled:bool
       -> ?role:Button_role.t
       -> unit
       -> entry
 
-    val choice : id:int64 -> label:t -> selected:bool -> ?enabled:bool -> unit -> entry
+    val choice
+      :  id:int64
+      -> title:string
+      -> ?icon:string
+      -> selected:bool
+      -> ?enabled:bool
+      -> unit
+      -> entry
+
     val divider : id:int64 -> entry
-    val section : id:int64 -> ?label:t -> entry list -> entry
-    val submenu : id:int64 -> label:t -> ?enabled:bool -> entry list -> entry
+    val section : id:int64 -> ?title:string -> ?icon:string -> entry list -> entry
+
+    val submenu
+      :  id:int64
+      -> title:string
+      -> ?icon:string
+      -> ?enabled:bool
+      -> entry list
+      -> entry
 
     val create
       :  ?key:Key.t
       -> ?enabled:bool
       -> on_select:Event.handler
-      -> label:t
+      -> title:string
+      -> ?icon:string
       -> entry list
       -> t
   end

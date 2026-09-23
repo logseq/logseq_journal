@@ -118,7 +118,11 @@ import Observation
     let request: JournalPlatformWire.Request
     do {
       request = try JournalPlatformWire.decodeRequest(bytes)
-    } catch { return nil }
+    } catch {
+      FileHandle.standardError.write(
+        Data("logseq_journal: decodeRequest failed bytes=\(bytes.count)\n".utf8))
+      return nil
+    }
     requestObserver?(request)
     if request == .signOut {
       refresh?.cancel()

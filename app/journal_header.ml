@@ -121,18 +121,11 @@ let view
                |> Option.iter (fun (_, _, _, action, _) ->
                  Ui.Event.Handler.Private.invoke dispatch (Ui.Event.Payload.Text action))
              | _ -> ()))
-        ~label:
-          (V.label
-             ~title:(V.text "Account menu")
-             ~icon:(Journal_symbols.create Journal_symbols.Account)
-             ())
+        ~title:"Account menu"
+        ~icon:(Journal_symbols.name Journal_symbols.Account)
         (List.map
            (fun (id, title, symbol, _, role) ->
-              V.Menu.action
-                ~id
-                ~role
-                ~label:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
-                ())
+              V.Menu.action ~id ~role ~title ~icon:symbol ())
            actions)
       |> V.semantics
            ~properties:

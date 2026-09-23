@@ -108,7 +108,10 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   ) throws {
     self.platform = platform
     self.startupPayload = startupPayload
-    backend = try LUIAppleBackend(extensionRegistry: extensionRegistry)
+    backend = try LUIAppleBackend(
+      appIcons: journalAppIcons,
+      extensionRegistry: extensionRegistry
+    )
     backend.onEvent = { [weak self] event in self?.handle(event) }
   }
 

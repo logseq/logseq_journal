@@ -9,10 +9,16 @@
    and test_id so [For_testing] can recover them like the old widget
    identity did. *)
 
+type label_content =
+  { title : string
+  ; icon : string option
+  }
+
 type t =
   { key : string option
   ; test_id : string option
   ; mount : Lui_elements.t
+  ; label_content : label_content option
   }
 
 module Key = struct
@@ -30,16 +36,48 @@ module Test_id = struct
   let to_string s = s
 end
 
-let element ?key ?test_id mount = { key; test_id; mount }
+let element ?key ?test_id mount = { key; test_id; mount; label_content = None }
 let mount t = t.mount
 let int_of_float_nan v = int_of_float (Float.round v)
+
+(* lui icon properties accept built-in names or [app:<slug>] custom names; the
+   journal vocabulary is SF Symbol names, registered with the host backend under
+   their [app:]-slugged form (see JournalIcons.swift). *)
+let journal_icon_name name =
+  "app:" ^ String.map (fun c -> if c = '.' then '-' else c) name
+;;
+
+(* Leaf controls carry their label/icon as properties; each kind only accepts
+   a subset of them, so apply what the node kind supports. *)
+let set_leaf_label context node { title; icon } =
+  let kind = Lui_ui.node_kind context node in
+  let supported property = Lui_protocol.property_supported kind property in
+  if supported Lui_protocol.TextValue then Lui_ui.text_property context node title;
+  Option.iter
+    (fun name ->
+       if supported Lui_protocol.InlineIconName
+       then
+         Lui_ui.string_property
+           context
+           node
+           Lui_protocol.InlineIconName
+           (journal_icon_name name))
+    icon
+;;
+
+(* Element mounts that don't register a standard runtime node (placeholder
+   elements, extension nodes) can't carry standard properties. *)
+let node_is_standard context node =
+  node <> 0
+  && Option.is_none (Lui_runtime.extension_identifier context.Lui_ui.ui_application node)
+;;
 
 let modify f t =
   { t with
     mount =
       (fun context parent ->
         let node = t.mount context parent in
-        f context node;
+        if node_is_standard context node then f context node;
         node)
   }
 ;;
@@ -461,7 +499,10 @@ module View = struct
   let with_test_id test_id t =
     let mount context parent =
       let node = t.mount context parent in
-      Lui_ui.accessibility_identifier context node (Test_id.to_string test_id);
+      (* Extension nodes carry only extension properties; standard props like
+         the accessibility identifier don't apply to them. *)
+      if node_is_standard context node
+      then Lui_ui.accessibility_identifier context node (Test_id.to_string test_id);
       node
     in
     { t with test_id = Some (Test_id.to_string test_id); mount }
@@ -477,46 +518,66 @@ module View = struct
         ?truncation:_
         value
     =
-    element ?key (fun context parent ->
-      let node = Lui_ui.text context value in
-      Option.iter
-        (fun (style : Style.Text_style.t) ->
-           (match style.foreground with
-            | Some Style.Text_style.Secondary ->
-              Lui_ui.foreground context node "secondary"
-            | Some Primary | None -> ());
-           match style.font_weight with
-           | Some Style.Text_style.Semi_bold -> Lui_ui.style_class context node "semibold"
-           | Some Regular | None -> ())
-        style;
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+    { (element ?key (fun context parent ->
+         let node = Lui_ui.text context value in
+         Option.iter
+           (fun (style : Style.Text_style.t) ->
+              (match style.foreground with
+               | Some Style.Text_style.Secondary ->
+                 Lui_ui.foreground context node "secondary"
+               | Some Primary | None -> ());
+              match style.font_weight with
+              | Some Style.Text_style.Semi_bold ->
+                Lui_ui.style_class context node "semibold"
+              | Some Regular | None -> ())
+           style;
+         (match parent with
+          | Some parent -> Lui_ui.append context parent node
+          | None -> ());
+         node))
+      with
+      label_content = Some { title = value; icon = None }
+    }
   ;;
 
   let symbol ?key ?size ?color ?rendering:_ ~name () =
-    element ?key (fun context parent ->
-      let node = Lui_ui.icon context name in
-      Option.iter
-        (fun size -> Lui_ui.size context node (string_of_int (int_of_float_nan size)))
-        size;
-      Option.iter (fun color -> Lui_ui.foreground context node color) color;
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      node)
+    { (element ?key (fun context parent ->
+         let node = Lui_ui.icon context (journal_icon_name name) in
+         Option.iter
+           (fun size -> Lui_ui.size context node (string_of_int (int_of_float_nan size)))
+           size;
+         Option.iter (fun color -> Lui_ui.foreground context node color) color;
+         (match parent with
+          | Some parent -> Lui_ui.append context parent node
+          | None -> ());
+         node))
+      with
+      label_content = Some { title = ""; icon = Some name }
+    }
   ;;
 
   let label ?key ~title ~icon () =
-    element ?key (fun context parent ->
-      let node = Lui_ui.row context in
-      (match parent with
-       | Some parent -> Lui_ui.append context parent node
-       | None -> ());
-      ignore (icon.mount context (Some node));
-      ignore (title.mount context (Some node));
-      node)
+    { (element ?key (fun context parent ->
+         let node = Lui_ui.row context in
+         (match parent with
+          | Some parent -> Lui_ui.append context parent node
+          | None -> ());
+         ignore (icon.mount context (Some node));
+         ignore (title.mount context (Some node));
+         node))
+      with
+      label_content =
+        Some
+          { title =
+              (match title.label_content with
+               | Some content -> content.title
+               | None -> "")
+          ; icon =
+              (match icon.label_content with
+               | Some content -> content.icon
+               | None -> None)
+          }
+    }
   ;;
 
   let divider ?key () =
@@ -652,7 +713,12 @@ module View = struct
     modify
       (fun context node ->
          Option.iter
-           (fun label -> Lui_ui.accessibility_label context node label)
+           (fun label ->
+              if
+                Lui_protocol.property_supported
+                  (Lui_ui.node_kind context node)
+                  Lui_protocol.AccessibilityLabel
+              then Lui_ui.accessibility_label context node label)
            properties.Semantics.label)
       t
   ;;
@@ -708,13 +774,15 @@ module View = struct
            node
            Lui_protocol.VariantValue
            (Button_role.variant role));
+      (* lui controls are leaf nodes: their label/icon travel as properties,
+         not child elements. *)
+      Option.iter (set_leaf_label context node) child.label_content;
       if autofocus then Lui_ui.bool_property context node Lui_protocol.Autofocus true;
       Lui_ui.on_event context node (fun event ->
         if is_press event then invoke on_press Event.Payload.Unit);
       (match parent with
        | Some parent -> Lui_ui.append context parent node
        | None -> ());
-      ignore (child.mount context (Some node));
       node)
   ;;
 
@@ -723,6 +791,7 @@ module View = struct
       let node = Lui_ui.toggle context in
       if not enabled then Lui_ui.disabled context node true;
       Lui_ui.bool_property context node Lui_protocol.Checked value;
+      Option.iter (set_leaf_label context node) label.label_content;
       Lui_ui.on_event context node (fun event ->
         match event with
         | Lui_protocol.ToggleChanged (_, selected) ->
@@ -731,7 +800,6 @@ module View = struct
       (match parent with
        | Some parent -> Lui_ui.append context parent node
        | None -> ());
-      ignore (label.mount context (Some node));
       node)
   ;;
 
@@ -975,7 +1043,10 @@ module View = struct
 
     let mount_items items =
       element (fun context parent ->
-        let node = Lui_ui.toolbar context in
+        (* A plain horizontal group: the toolbar node kind only accepts a fixed
+           set of control children and no extension children, while items here
+           include menus and extension nodes. *)
+        let node = Lui_ui.row context in
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
@@ -984,11 +1055,18 @@ module View = struct
              let child = item.content in
              let mounted = child.mount context (Some node) in
              Lui_ui.key context mounted item.item_key;
+             let hint property value =
+               (* Placement/spacing hints only apply to node kinds that accept
+                  them; menu items and extension nodes reject these props. *)
+               if
+                 Lui_protocol.property_supported
+                   (Lui_ui.node_kind context mounted)
+                   property
+               then Lui_ui.string_property context mounted property value
+             in
              (match item.placement with
               | Some placement ->
-                Lui_ui.string_property
-                  context
-                  mounted
+                hint
                   Lui_protocol.RoleValue
                   (match placement with
                    | Automatic -> "automatic"
@@ -1003,26 +1081,10 @@ module View = struct
                    | Bottom_bar -> "bottom_bar")
               | None -> ());
              (match item.spacing with
-              | Some Fixed ->
-                Lui_ui.string_property
-                  context
-                  mounted
-                  Lui_protocol.VariantValue
-                  "fixed_spacing"
-              | Some Flexible ->
-                Lui_ui.string_property
-                  context
-                  mounted
-                  Lui_protocol.VariantValue
-                  "flexible_spacing"
+              | Some Fixed -> hint Lui_protocol.VariantValue "fixed_spacing"
+              | Some Flexible -> hint Lui_protocol.VariantValue "flexible_spacing"
               | None -> ());
-             if item.is_group
-             then
-               Lui_ui.string_property
-                 context
-                 mounted
-                 Lui_protocol.VariantValue
-                 "item_group")
+             if item.is_group then hint Lui_protocol.VariantValue "item_group")
           items;
         node)
     ;;
@@ -1185,24 +1247,35 @@ module View = struct
 
     let attach ?key:_ actions (view : element_) =
       element ?key:view.key (fun context parent ->
-        let node = Lui_ui.context_menu context in
-        (match parent with
-         | Some parent -> Lui_ui.append context parent node
-         | None -> ());
+        let node = view.mount context parent in
+        let menu = Lui_ui.context_menu context in
+        Lui_ui.append context node menu;
         List.iter
           (fun (action : action) ->
              let item = Lui_ui.menu_item context in
              Lui_ui.text_property context item action.title;
              Option.iter
                (fun symbol ->
-                  ignore (Lui_ui.append context item (Lui_ui.icon context symbol)))
+                  Lui_ui.string_property
+                    context
+                    item
+                    Lui_protocol.InlineIconName
+                    (journal_icon_name symbol))
                action.symbol;
+             (match action.role with
+              | Normal -> ()
+              | Destructive ->
+                Lui_ui.string_property
+                  context
+                  item
+                  Lui_protocol.VariantValue
+                  "destructive");
              if not action.enabled then Lui_ui.disabled context item true;
+             Lui_ui.bool_property context item Lui_protocol.PressEnabled true;
              Lui_ui.on_event context item (fun event ->
                if is_press event then invoke action.on_press Event.Payload.Unit);
-             Lui_ui.append context node item)
+             Lui_ui.append context menu item)
           actions;
-        ignore (view.mount context (Some node));
         node)
     ;;
   end
@@ -1669,12 +1742,12 @@ module View = struct
       element ?key (fun context parent ->
         let node = Lui_ui.list_item context in
         if not enabled then Lui_ui.disabled context node true;
+        Option.iter (set_leaf_label context node) label.label_content;
         Lui_ui.on_event context node (fun event ->
           if is_press event then invoke on_activate Event.Payload.Unit);
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
-        ignore (label.mount context (Some node));
         node)
     ;;
   end
@@ -1807,110 +1880,184 @@ module View = struct
                | Lui_protocol.Press _ | ToggleChanged (_, true) ->
                  invoke on_select (Event.Payload.Int64 choice.id)
                | _ -> ());
-             Lui_ui.append context node item;
-             ignore (choice.label.mount context (Some item)))
+             Option.iter (set_leaf_label context item) choice.label.label_content;
+             Option.iter
+               (Lui_ui.accessibility_identifier context item)
+               choice.label.test_id;
+             Lui_ui.append context node item)
           choices;
         node)
     ;;
   end
 
   module Menu = struct
+    type label =
+      { title : string
+      ; icon : string option
+      }
+
     type entry =
       | Action of
           { id : int64
-          ; label : t
+          ; label : label
           ; enabled : bool
           ; role : Button_role.t
           }
       | Choice of
           { id : int64
-          ; label : t
+          ; label : label
           ; selected : bool
           ; enabled : bool
           }
       | Divider of int64
       | Section of
           { id : int64
-          ; label : t option
+          ; label : label option
           ; entries : entry list
           }
       | Submenu of
           { id : int64
-          ; label : t
+          ; label : label
           ; enabled : bool
           ; entries : entry list
           }
 
-    let action ~id ~label ?(enabled = true) ?(role = Button_role.Normal) () =
-      Action { id; label; enabled; role }
+    let action ~id ~title ?icon ?(enabled = true) ?(role = Button_role.Normal) () =
+      Action { id; label = { title; icon }; enabled; role }
     ;;
 
-    let choice ~id ~label ~selected ?(enabled = true) () =
-      Choice { id; label; selected; enabled }
+    let choice ~id ~title ?icon ~selected ?(enabled = true) () =
+      Choice { id; label = { title; icon }; selected; enabled }
     ;;
 
     let divider ~id = Divider id
-    let section ~id ?label entries = Section { id; label; entries }
 
-    let submenu ~id ~label ?(enabled = true) entries =
-      Submenu { id; label; enabled; entries }
+    let section ~id ?title ?icon entries =
+      Section { id; label = Option.map (fun title -> { title; icon }) title; entries }
     ;;
 
-    let create ?key ?(enabled = true) ~on_select ~label entries =
+    let submenu ~id ~title ?icon ?(enabled = true) entries =
+      Submenu { id; label = { title; icon }; enabled; entries }
+    ;;
+
+    (* lui menus are declarative: a [menu_item] holding one [dropdown_menu]
+       child renders as a native popup menu, and menu rows carry their label
+       and icon as properties (menu items accept only menu children). *)
+    let menu_item context ?key_opt ~title ~icon ~enabled ~role ~selected ?on_press () =
+      let node = Lui_ui.menu_item context in
+      Option.iter (Lui_ui.key context node) key_opt;
+      Lui_ui.string_property context node Lui_protocol.TextValue title;
+      Option.iter
+        (fun name ->
+           Lui_ui.string_property
+             context
+             node
+             Lui_protocol.InlineIconName
+             (journal_icon_name name))
+        icon;
+      if not enabled then Lui_ui.disabled context node true;
+      (match role with
+       | Button_role.Normal -> ()
+       | role ->
+         Lui_ui.string_property
+           context
+           node
+           Lui_protocol.VariantValue
+           (Button_role.variant role));
+      Option.iter (Lui_ui.bool_property context node Lui_protocol.Selected) selected;
+      Option.iter
+        (fun payload ->
+           Lui_ui.bool_property context node Lui_protocol.PressEnabled true;
+           Lui_ui.on_event context node (fun event -> if is_press event then payload ()))
+        on_press;
+      node
+    ;;
+
+    let create ?key ?(enabled = true) ~on_select ~title ?icon entries =
       element ?key (fun context parent ->
-        let node = Lui_ui.dropdown_menu context in
-        if not enabled then Lui_ui.disabled context node true;
+        let node =
+          menu_item
+            context
+            ~title
+            ~icon
+            ~enabled
+            ~role:Button_role.Normal
+            ~selected:None
+            ()
+        in
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
-        ignore (label.mount context (Some node));
+        let menu = Lui_ui.dropdown_menu context in
+        Lui_ui.append context node menu;
         let rec mount_entry parent (entry : entry) =
           match entry with
           | Divider id ->
-            let separator = Lui_ui.separator context (Int64.to_string id) in
+            let separator = Lui_ui.separator context "horizontal" in
+            Lui_ui.key context separator (Int64.to_string id);
             Lui_ui.append context parent separator
-          | entry ->
-            let item = Lui_ui.menu_item context in
-            Lui_ui.key
-              context
-              item
-              (Int64.to_string
-                 (match entry with
-                  | Action { id; _ } | Choice { id; _ } -> id
-                  | Section { id; _ } | Submenu { id; _ } -> id
-                  | Divider _ -> assert false));
-            (match entry with
-             | Action { id; label; enabled; role } ->
-               if not enabled then Lui_ui.disabled context item true;
-               (match role with
-                | Button_role.Normal -> ()
-                | role ->
-                  Lui_ui.string_property
-                    context
-                    item
-                    Lui_protocol.VariantValue
-                    (Button_role.variant role));
-               Lui_ui.on_event context item (fun event ->
-                 if is_press event then invoke on_select (Event.Payload.Int64 id));
-               ignore (label.mount context (Some item))
-             | Choice { id; label; selected; enabled } ->
-               if not enabled then Lui_ui.disabled context item true;
-               if selected
-               then Lui_ui.bool_property context item Lui_protocol.Checked true;
-               Lui_ui.on_event context item (fun event ->
-                 if is_press event then invoke on_select (Event.Payload.Int64 id));
-               ignore (label.mount context (Some item))
-             | Section { label; entries; _ } ->
-               Option.iter (fun label -> ignore (label.mount context (Some item))) label;
-               List.iter (mount_entry item) entries
-             | Submenu { label; enabled; entries; _ } ->
-               if not enabled then Lui_ui.disabled context item true;
-               ignore (label.mount context (Some item));
-               List.iter (mount_entry item) entries
-             | Divider _ -> assert false);
+          | Action { id; label; enabled; role } ->
+            let item =
+              menu_item
+                context
+                ~key_opt:(Int64.to_string id)
+                ~title:label.title
+                ~icon:label.icon
+                ~enabled
+                ~role
+                ~selected:None
+                ~on_press:(fun () -> invoke on_select (Event.Payload.Int64 id))
+                ()
+            in
             Lui_ui.append context parent item
+          | Choice { id; label; selected; enabled } ->
+            let item =
+              menu_item
+                context
+                ~key_opt:(Int64.to_string id)
+                ~title:label.title
+                ~icon:label.icon
+                ~enabled
+                ~role:Button_role.Normal
+                ~selected:(Some selected)
+                ~on_press:(fun () -> invoke on_select (Event.Payload.Int64 id))
+                ()
+            in
+            Lui_ui.append context parent item
+          | Section { label; entries; _ } ->
+            Option.iter
+              (fun label ->
+                 let heading =
+                   menu_item
+                     context
+                     ~title:label.title
+                     ~icon:label.icon
+                     ~enabled:false
+                     ~role:Button_role.Normal
+                     ~selected:None
+                     ()
+                 in
+                 Lui_ui.append context parent heading)
+              label;
+            List.iter (mount_entry parent) entries
+          | Submenu { id; label; enabled; entries } ->
+            let item =
+              menu_item
+                context
+                ~key_opt:(Int64.to_string id)
+                ~title:label.title
+                ~icon:label.icon
+                ~enabled
+                ~role:Button_role.Normal
+                ~selected:None
+                ()
+            in
+            Lui_ui.append context parent item;
+            let submenu = Lui_ui.dropdown_menu context in
+            Lui_ui.append context item submenu;
+            List.iter (mount_entry submenu) entries
         in
-        List.iter (mount_entry node) entries;
+        List.iter (mount_entry menu) entries;
         node)
     ;;
   end

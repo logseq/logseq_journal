@@ -44,7 +44,7 @@ enum JournalExtensionFingerprint {
     return "lui-extension-v1|" + token(identifier)
       + "|profiles:" + profiles.sorted().joined(separator: ",")
       + "|standard-children:" + (standardChildren ? "1" : "0")
-      + "|children:" + children.map(token).sorted().joined(separator: ",")
+      + "|children:" + children.sorted().map(token).joined(separator: ",")
       + "|properties:" + properties.map(propertyToken).sorted().joined(separator: ",")
       + "|events:" + events.map(eventToken).sorted().joined(separator: ",")
   }
@@ -68,10 +68,22 @@ enum JournalExtensionFingerprint {
   ) -> String {
     JournalExtensionFingerprint.make(
       identifier: identifier, profiles: profiles,
-      standardChildren: standardChildren, children: [],
+      standardChildren: standardChildren, children: journalChildIdentifiers,
       properties: [payloadProperty],
       events: events ? [event] : [])
   }
+
+  /// Journal native views nest (chrome slots hold page content including
+  /// other chrome sections, lists, and media; list rows hold media and
+  /// chrome section headers), so every component accepts all journal
+  /// extensions as children. Must stay in sync with `journal_lui_native.ml`.
+  private static let journalChildIdentifiers = [
+    "journal-chrome",
+    "journal-asset-import",
+    "journal-media",
+    "journal-asset-settings",
+    "journal-list",
+  ]
 
   private static let eventSchema = LUIExtensionEvent(
     name: "event",
@@ -116,6 +128,7 @@ enum JournalExtensionFingerprint {
         identifier: identifier, profiles: profiles,
         standardChildren: standardChildren, events: events),
       acceptsStandardChildren: standardChildren,
+      childIdentifiers: journalChildIdentifiers,
       properties: [.init(name: "payload", kind: .string, isRequired: true)],
       events: events ? [eventSchema] : [],
       viewFactory: viewFactory)

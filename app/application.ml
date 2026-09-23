@@ -2521,8 +2521,9 @@ let manager_page state dispatch =
         ~style:Prominent
         ~enabled:(Journal_capture.can_save password)
         ~on_press:submit
-        ~child:(V.text "Unlock graph" |> V.frame ~max_width:Fill)
+        ~child:(V.text "Unlock graph")
         ()
+      |> V.frame ~max_width:Fill
       |> V.with_test_id (Ui.Test_id.string "e2ee-password-submit")
     in
     let choose_graph =
@@ -5102,11 +5103,19 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     V.Body.theme ~data:(application_theme ()) (V.Body.static body)
   in
   let view _context model_signal _send =
-    Lui_elements.dyn
-      (fun model ->
-         Journal_view.mount
-           (body_view model dispatch timeline_scroll_completed detail_scroll_completed))
-      model_signal
+    (* Dynamic elements mount under a parent, so the root must be a static
+       container. *)
+    Lui_elements.stack
+      [ Lui_elements.dyn
+          (fun model ->
+             Journal_view.mount
+               (body_view
+                  model
+                  dispatch
+                  timeline_scroll_completed
+                  detail_scroll_completed))
+          model_signal
+      ]
   in
   let os =
     match platform_code with
@@ -5188,6 +5197,7 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
   =
   let init platform_code host_code payload =
     latest_patch := "";
+    Printexc.record_backtrace true;
     (match decode_config (Bytes.of_string payload) with
      | Error error ->
        Printf.eprintf "logseq_journal: failed to decode startup config: %s\n%!" error
@@ -5200,12 +5210,21 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
         | Error error ->
           Printf.eprintf "logseq_journal: failed to start worker: %s\n%!" error
         | Ok client ->
-          ignore
-            (start
-               ~calendar_sampler:(calendar_sampler ())
-               ~client
-               ~platform_code
-               ~host_code)));
+          (try
+             ignore
+               (start
+                  ~calendar_sampler:(calendar_sampler ())
+                  ~client
+                  ~platform_code
+                  ~host_code)
+           with
+           | exn ->
+             (* The C bridge drops exceptions during the initial patch emit,
+                so surface startup failures on stderr. *)
+             Printf.eprintf
+               "logseq_journal: app start failed: %s\n%s%!"
+               (Printexc.to_string exn)
+               (Printexc.get_backtrace ()))));
     !latest_patch
   in
   let dispatch event =

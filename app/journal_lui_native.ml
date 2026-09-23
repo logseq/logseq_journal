@@ -31,16 +31,29 @@ let event_schema =
 
 let registry =
   let registry = Lui_extension.registry () in
+  (* Journal native views nest: chrome slots hold page content (including
+     other chrome sections, lists, and media), and list rows hold media and
+     chrome section headers. Every component accepts all journal extensions
+     as children; the schema must stay in sync with the fingerprint the
+     Apple host computes in JournalExtensions.swift. *)
+  let children =
+    [ chrome_identifier
+    ; asset_import_identifier
+    ; media_identifier
+    ; asset_settings_identifier
+    ; list_identifier
+    ]
+  in
   register_component
     registry
-    (component chrome_identifier apple_profiles true [] [ payload_property ] []);
+    (component chrome_identifier apple_profiles true children [ payload_property ] []);
   register_component
     registry
     (component
        asset_import_identifier
        all_host_profiles
        false
-       []
+       children
        [ payload_property ]
        [ event_schema ]);
   register_component
@@ -49,7 +62,7 @@ let registry =
        media_identifier
        all_host_profiles
        false
-       []
+       children
        [ payload_property ]
        [ event_schema ]);
   register_component
@@ -58,7 +71,7 @@ let registry =
        asset_settings_identifier
        all_host_profiles
        true
-       []
+       children
        [ payload_property ]
        [ event_schema ]);
   register_component
@@ -67,7 +80,7 @@ let registry =
        list_identifier
        all_host_profiles
        false
-       []
+       children
        [ payload_property ]
        [ event_schema ]);
   freeze registry;
