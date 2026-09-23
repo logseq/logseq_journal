@@ -54,6 +54,8 @@ private func journalOCamlPump() -> Int32
 private func journalOCamlPlatformEvent(_ data: UnsafePointer<CChar>?, _ length: Int32)
 @_silgen_name("journal_ocaml_platform_response")
 private func journalOCamlPlatformResponse(_ data: UnsafePointer<CChar>?, _ length: Int32)
+@_silgen_name("journal_ocaml_platform_failure")
+private func journalOCamlPlatformFailure(_ data: UnsafePointer<CChar>?, _ length: Int32)
 @_silgen_name("journal_ocaml_set_wakeup_callback")
 private func journalOCamlSetWakeupCallback(_ callback: WakeupCallback?)
 @_silgen_name("journal_ocaml_set_platform_request_callback")
@@ -168,10 +170,19 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   }
 
   /// Marshals one LJP2 request onto the platform actor and ships its response
-  /// envelope back through the C entry. Errors drop the response; OCaml owns
-  /// request timeouts (matching the old bridge error path).
+  /// envelope back through the C entry. A nil response (decode or service
+  /// failure) reports the request as failed so OCaml resolves its pending
+  /// continuation instead of waiting forever.
   func deliverPlatformRequest(_ bytes: Data) async {
-    guard started, let response = await platform.request(bytes) else { return }
+    guard started else { return }
+    guard let response = await platform.request(bytes) else {
+      bytes.withUnsafeBytes { buffer in
+        journalOCamlPlatformFailure(
+          buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
+          Int32(buffer.count))
+      }
+      return
+    }
     response.withUnsafeBytes { buffer in
       journalOCamlPlatformResponse(
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),

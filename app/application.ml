@@ -2825,6 +2825,19 @@ let decode_extension_values payload =
   | _ -> Lui_protocol.String_map.empty
 ;;
 
+(* Platform request tags map to the tag carried by their response envelope;
+   continuations are registered under the response tag. *)
+let response_tag = function
+  | 6 -> 7
+  | 8 -> 9
+  | 10 -> 11
+  | 13 -> 14
+  | 20 -> 21
+  | 22 -> 23
+  | 25 -> 26
+  | tag -> tag
+;;
+
 let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
   let pump = Journal_pump.create () in
   Journal_pump.set_wakeup pump Journal_bridge.wakeup;
@@ -2864,20 +2877,11 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
   let set_state_ref = ref None in
   set_state_ref := Some set_state;
   (* Platform requests are fire-and-forget: the host replies on the
-     [platform_response] hook, which is routed back to the continuation
-     registered under the matching response tag. *)
+     [platform_response] hook, or reports a failed request through
+     [platform_failure]; both resolve the continuation registered under the
+     matching response tag. *)
   let pending_platform : (int, (bytes, string) result -> unit) Hashtbl.t =
     Hashtbl.create 8
-  in
-  let response_tag = function
-    | 6 -> 7
-    | 8 -> 9
-    | 10 -> 11
-    | 13 -> 14
-    | 20 -> 21
-    | 22 -> 23
-    | 25 -> 26
-    | tag -> tag
   in
   let emit_platform_request ?k request =
     (match k, Bytes.length request >= 8 with
@@ -5287,6 +5291,18 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
           send_action (Platform_response (tag, Ok bytes))))
     | None -> ()
   in
+  let platform_failure payload =
+    match !current_app with
+    | Some { pump; send_action; _ } ->
+      let bytes = Bytes.of_string payload in
+      if Bytes.length bytes >= 8
+      then (
+        let tag = response_tag (Bytes.get_uint16_le bytes 6) in
+        Journal_pump.enqueue pump (fun () ->
+          send_action
+            (Platform_response (tag, Error "application platform request failed"))))
+    | None -> ()
+  in
   let dispose () =
     latest_patch := "";
     (match !current_app with
@@ -5309,6 +5325,7 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
   ; pump
   ; platform_event
   ; platform_response
+  ; platform_failure
   ; dispose
   ; root_node
   }

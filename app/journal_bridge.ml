@@ -5,6 +5,7 @@ type hooks =
   ; pump : unit -> string
   ; platform_event : string -> unit
   ; platform_response : string -> unit
+  ; platform_failure : string -> unit
   ; dispose : unit -> string
   ; root_node : unit -> int
   }
@@ -43,6 +44,7 @@ let extension_event node name payload = (hooks ()).extension_event node name pay
 let pump () = (hooks ()).pump ()
 let platform_event payload = (hooks ()).platform_event payload
 let platform_response payload = (hooks ()).platform_response payload
+let platform_failure payload = (hooks ()).platform_failure payload
 let dispose () = (hooks ()).dispose ()
 let root_node () = (hooks ()).root_node ()
 
@@ -64,5 +66,6 @@ let register hooks =
   Callback.register "journal_ocaml_extension_event" extension_event;
   Callback.register "journal_ocaml_pump" pump;
   Callback.register "journal_ocaml_platform_event" platform_event;
-  Callback.register "journal_ocaml_platform_response" platform_response
+  Callback.register "journal_ocaml_platform_response" platform_response;
+  Callback.register "journal_ocaml_platform_failure" platform_failure
 ;;

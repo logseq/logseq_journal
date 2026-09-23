@@ -203,6 +203,14 @@ LUI_EXPORT void journal_ocaml_platform_response(const char *data,
   deliver_platform("journal_ocaml_platform_response", data, length);
 }
 
+/* The host reports a failed platform request by passing the original
+   request envelope; OCaml resolves the pending continuation with an
+   error instead of leaving it parked forever. */
+LUI_EXPORT void journal_ocaml_platform_failure(const char *data,
+                                               int32_t length) {
+  deliver_platform("journal_ocaml_platform_failure", data, length);
+}
+
 /* Host-installed callbacks for OCaml -> host delivery. */
 LUI_EXPORT void journal_ocaml_set_wakeup_callback(
     journal_wakeup_callback callback) {

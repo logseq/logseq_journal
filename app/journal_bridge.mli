@@ -25,6 +25,11 @@ type hooks =
   ; (* Host -> OCaml: an LJP2 response envelope completing an earlier
         platform request. Binary-safe string. *)
     platform_response : string -> unit
+  ; (* Host -> OCaml: the platform could not answer a request (decode or
+        service failure). Carries the original request envelope; the pending
+        continuation resolves with an error, matching the old bridge's
+        request-failure path. *)
+    platform_failure : string -> unit
   ; (* Tears the app down; returns the final patch batch. *)
     dispose : unit -> string
   ; root_node : unit -> int
