@@ -46,7 +46,7 @@ depends: [
 ]
 pin-depends: [
   ["rrbvec.dev" "git+https://github.com/RCmerci/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
-  ["lui.0.1.0" "git+https://github.com/logseq/lui.git#38096c4fab853e462e60fc04d4daadd1f06aa09a"]
+  ["lui.0.1.0" "git+https://github.com/logseq/lui.git#6035f9e6cd9ad788efd6324d7700f1ce1430b88c"]
   ["ocaml-signal.0.1.0" "git+https://github.com/logseq/ocaml-signal.git#48a4a4d37f87addbb28d85a10a55bd13becf94be"]
   ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"]
   ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"]
