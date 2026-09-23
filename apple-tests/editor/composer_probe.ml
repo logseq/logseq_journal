@@ -27,9 +27,7 @@ let view _context model_source send =
     ~gap:16
     ~padding:16
     [ text ~value:"Composer input probe" []
-    ; text
-        ~value_signal:(map (fun (m : model) -> "Observed: " ^ m.text) model_source)
-        []
+    ; text ~value_signal:(map (fun (m : model) -> "Observed: " ^ m.text) model_source) []
     ; text_field
         ~key:"stable-composer"
         ~text_signal:(map (fun (m : model) -> m.text) model_source)
@@ -45,7 +43,6 @@ let view _context model_source send =
 (* --- headless host bridge ------------------------------------------------ *)
 
 let latest_patch = ref ""
-
 let current_app : (model, action) Lui_app.reducer_app option ref = ref None
 
 let operating_system = function
@@ -68,8 +65,8 @@ let backend profile =
   { backend_profile = profile
   ; apply_batch =
       (fun batch ->
-         latest_patch := Lui_wire.encode_batch batch;
-         true)
+        latest_patch := Lui_wire.encode_batch batch;
+        true)
   }
 ;;
 
@@ -83,9 +80,10 @@ let init platform_code host_code _payload =
   latest_patch := "";
   let value =
     Lui_app.create
-      (backend
-         (profile (operating_system platform_code) (host_kind host_code)))
-      initial reducer view
+      (backend (profile (operating_system platform_code) (host_kind host_code)))
+      initial
+      reducer
+      view
   in
   current_app := Some value;
   ignore (Lui_app.start value);

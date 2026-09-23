@@ -12,16 +12,12 @@ type action = Nop
 let reducer () Nop = ()
 
 let view _context _model _send =
-  column
-    ~gap:16
-    ~padding:16
-    [ text ~value:"Native Hub callback acceptance" [] ]
+  column ~gap:16 ~padding:16 [ text ~value:"Native Hub callback acceptance" [] ]
 ;;
 
 (* --- headless host bridge ------------------------------------------------ *)
 
 let latest_patch = ref ""
-
 let current_app : (model, action) Lui_app.reducer_app option ref = ref None
 
 let operating_system = function
@@ -44,8 +40,8 @@ let backend profile =
   { backend_profile = profile
   ; apply_batch =
       (fun batch ->
-         latest_patch := Lui_wire.encode_batch batch;
-         true)
+        latest_patch := Lui_wire.encode_batch batch;
+        true)
   }
 ;;
 
@@ -59,9 +55,10 @@ let init platform_code host_code _payload =
   latest_patch := "";
   let value =
     Lui_app.create
-      (backend
-         (profile (operating_system platform_code) (host_kind host_code)))
-      () reducer view
+      (backend (profile (operating_system platform_code) (host_kind host_code)))
+      ()
+      reducer
+      view
   in
   current_app := Some value;
   ignore (Lui_app.start value);

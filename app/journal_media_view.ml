@@ -37,8 +37,7 @@ let view ~scope ~root ~media ~editable ~on_event child =
   let items, more, error, picker =
     match media with
     | None -> [], false, None, None
-    | Some view ->
-      view.Journal_media_runtime.items, view.more, view.error, view.picker
+    | Some view -> view.Journal_media_runtime.items, view.more, view.error, view.picker
   in
   Ui.Native_widget.widget
     extension

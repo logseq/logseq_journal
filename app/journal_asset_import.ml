@@ -57,7 +57,10 @@ let extension =
 ;;
 
 let is_dismissal payload =
-  match (try Yojson.Basic.from_string payload with _ -> `Null) with
+  match
+    try Yojson.Basic.from_string payload with
+    | _ -> `Null
+  with
   | `Assoc fields ->
     (match List.assoc_opt "action" fields with
      | Some (`String "dismissed") -> true

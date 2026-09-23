@@ -23,26 +23,29 @@ let initial = { observed = "No action"; expanded = true }
 let reducer model = function
   | Observe value -> { model with observed = value }
   | Expand value -> { model with expanded = value }
+;;
 
 let on_list_event send (event : Journal_lui_native.event) =
-  match (try Yojson.Basic.from_string event.payload with _ -> `Null) with
+  match
+    try Yojson.Basic.from_string event.payload with
+    | _ -> `Null
+  with
   | `Assoc fields ->
     (match List.assoc_opt "type" fields with
      | Some (`String "expanded") ->
-       (match
-          ( List.assoc_opt "key" fields
-          , List.assoc_opt "expanded" fields )
-        with
+       (match List.assoc_opt "key" fields, List.assoc_opt "expanded" fields with
         | Some (`String _), Some (`Bool value) -> ignore (send (Expand value))
         | _ -> ())
      | Some (`String "row_event") ->
        (match List.assoc_opt "payload" fields with
         | Some (`String inner) ->
-          (match (try Yojson.Basic.from_string inner with _ -> `Null) with
+          (match
+             try Yojson.Basic.from_string inner with
+             | _ -> `Null
+           with
            | `Assoc inner_fields ->
              (match
-                ( List.assoc_opt "row" inner_fields
-                , List.assoc_opt "key" inner_fields )
+                List.assoc_opt "row" inner_fields, List.assoc_opt "key" inner_fields
               with
               | Some (`String row), Some (`String key) ->
                 ignore (send (Observe (key ^ ":" ^ row)))
@@ -74,10 +77,8 @@ let outline_list ~expanded send : Lui_elements.t =
                   ; "symbol", `Null
                   ; "title", `String "Delete"
                   ]
-              ]
-          )
-        ]
-    )
+              ] )
+        ] )
   in
   let row ~id ~label =
     `Assoc
@@ -101,32 +102,30 @@ let outline_list ~expanded send : Lui_elements.t =
   let payload =
     Yojson.Basic.to_string
       (`Assoc
-         [ "style", `String "plain"
-         ; ( "sections"
-           , `List
-               [ `Assoc
-                   [ "key", `String "rows"
-                   ; "separator", `String "hidden"
-                   ; "header_index", `Null
-                   ; "footer_index", `Null
-                   ; ( "rows"
-                     , `List
-                         [ disclosure
-                             ~id:"parent"
-                             ~expanded
-                             [ row ~id:"child" ~label:"Child row"
-                             ; row ~id:"branch" ~label:"Unloaded branch row"
-                             ]
-                         ; row ~id:"sibling" ~label:"Sibling row"
-                         ]
-                     )
-                   ]
-               ]
-           )
-         ; "scroll_request", `Null
-         ; "track_visible_range", `Bool false
-         ; "track_scroll_completion", `Bool false
-         ])
+          [ "style", `String "plain"
+          ; ( "sections"
+            , `List
+                [ `Assoc
+                    [ "key", `String "rows"
+                    ; "separator", `String "hidden"
+                    ; "header_index", `Null
+                    ; "footer_index", `Null
+                    ; ( "rows"
+                      , `List
+                          [ disclosure
+                              ~id:"parent"
+                              ~expanded
+                              [ row ~id:"child" ~label:"Child row"
+                              ; row ~id:"branch" ~label:"Unloaded branch row"
+                              ]
+                          ; row ~id:"sibling" ~label:"Sibling row"
+                          ] )
+                    ]
+                ] )
+          ; "scroll_request", `Null
+          ; "track_visible_range", `Bool false
+          ; "track_scroll_completion", `Bool false
+          ])
   in
   Journal_lui_native.list
     ~key:"outline"
@@ -149,7 +148,6 @@ let view _context model_source send =
    Journal_bridge.register with these hooks. *)
 
 let latest_patch = ref ""
-
 let current_app : (model, action) Lui_app.reducer_app option ref = ref None
 
 let operating_system = function
@@ -172,8 +170,8 @@ let backend profile =
   { backend_profile = profile
   ; apply_batch =
       (fun batch ->
-         latest_patch := Lui_wire.encode_batch batch;
-         true)
+        latest_patch := Lui_wire.encode_batch batch;
+        true)
   }
 ;;
 
@@ -187,9 +185,10 @@ let init platform_code host_code _payload =
   latest_patch := "";
   let value =
     Lui_app.create
-      (backend
-         (profile (operating_system platform_code) (host_kind host_code)))
-      initial reducer view
+      (backend (profile (operating_system platform_code) (host_kind host_code)))
+      initial
+      reducer
+      view
   in
   current_app := Some value;
   ignore (Lui_app.start value);

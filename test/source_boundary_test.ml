@@ -179,10 +179,10 @@ let test_sync_error_card_is_temporary_and_error_only root =
          if not (contains application required)
          then fail "sync-error timeout behavior is missing %S" required)
       [ "let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5."
-      ; "let sync_error_timer_key ="
-      ; "let sync_error_timer_callback ="
-      ; "Core.Time_ns.add now sync_error_card_lifetime"
-      ; "Int64.equal current_sequence scheduled_sequence"
+      ; "let arm_sync_error_timer sequence ="
+      ; "let sync_error_timer_generation = ref 0 in"
+      ; "schedule_after (Core.Time_ns.Span.to_sec sync_error_card_lifetime)"
+      ; "!sync_error_timer_generation = generation"
       ]
 ;;
 
@@ -1665,7 +1665,7 @@ let () =
     ; "Refresh the authorized graph catalog"
     ; "pending local"
     ; "then returns to graph selection"
-    ; "App.View.create"
+    ; "Lui_app.create_with_extensions"
     ; "application_theme"
     ; "V.Sheet.create"
     ; "Journal_platform.show_notice_request"
@@ -1708,7 +1708,7 @@ let () =
   require_text
     root
     "swift/App.swift"
-    [ "BonsaiApplicationView(entrypoint: \"logseq_journal\""
+    [ "JournalRuntimeHost("
     ; "applicationShouldTerminate"
     ; ".terminateLater"
     ; "reply(toApplicationShouldTerminate:"

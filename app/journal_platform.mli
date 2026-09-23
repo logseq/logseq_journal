@@ -41,6 +41,7 @@ type notice_result =
 
 (** Host -> OCaml environment snapshot push (tag 24). *)
 val decode_environment_event : bytes -> (Journal_environment.snapshot, string) result
+
 val is_environment_event : bytes -> bool
 
 (** OCaml -> host notice request (tag 25); response arrives on tag 26. *)
@@ -51,10 +52,7 @@ val show_notice_request
   -> duration_ms:int
   -> bytes
 
-val decode_notice_response
-  :  token:int64
-  -> bytes
-  -> (notice_result, string) result
+val decode_notice_response : token:int64 -> bytes -> (notice_result, string) result
 
 (** OCaml -> host request cancelling a pending notice (tag 27). *)
 val notice_cancel_request : token:int64 -> bytes

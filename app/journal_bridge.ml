@@ -10,7 +10,6 @@ type hooks =
   }
 
 external wakeup : unit -> unit = "journal_ml_wakeup"
-
 external platform_request : string -> unit = "journal_ml_platform_request"
 
 let current : hooks option ref = ref None
@@ -19,25 +18,19 @@ let hooks () =
   match !current with
   | Some hooks -> hooks
   | None -> invalid_arg "Journal_bridge.register was not called"
+;;
 
 let initialize platform_code host_code payload =
   (hooks ()).init platform_code host_code payload
 ;;
 
 let dispatch_lui event = (hooks ()).dispatch event
-
 let appear node = dispatch_lui (Lui_protocol.Appear node)
-
 let press node = dispatch_lui (Lui_protocol.Press node)
-
 let long_press node = dispatch_lui (Lui_protocol.LongPress node)
-
 let text_changed node text = dispatch_lui (Lui_protocol.TextChanged (node, text))
-
 let submit node = dispatch_lui (Lui_protocol.Submit node)
-
 let dismiss node = dispatch_lui (Lui_protocol.Dismiss node)
-
 let double_press node = dispatch_lui (Lui_protocol.DoublePress node)
 
 let toggle_changed node checked =
@@ -45,21 +38,12 @@ let toggle_changed node checked =
 ;;
 
 let radio_changed node = dispatch_lui (Lui_protocol.Change node)
-
 let slider_changed node value = dispatch_lui (Lui_protocol.ValueChanged (node, value))
-
-let extension_event node name payload =
-  (hooks ()).extension_event node name payload
-;;
-
+let extension_event node name payload = (hooks ()).extension_event node name payload
 let pump () = (hooks ()).pump ()
-
 let platform_event payload = (hooks ()).platform_event payload
-
 let platform_response payload = (hooks ()).platform_response payload
-
 let dispose () = (hooks ()).dispose ()
-
 let root_node () = (hooks ()).root_node ()
 
 let register hooks =
@@ -81,3 +65,4 @@ let register hooks =
   Callback.register "journal_ocaml_pump" pump;
   Callback.register "journal_ocaml_platform_event" platform_event;
   Callback.register "journal_ocaml_platform_response" platform_response
+;;

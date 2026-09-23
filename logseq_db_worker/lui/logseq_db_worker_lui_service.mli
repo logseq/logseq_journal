@@ -209,4 +209,5 @@ val create
   :  dependencies:dependencies
   -> (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t
 
-val service : (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t
+val service
+  : (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t

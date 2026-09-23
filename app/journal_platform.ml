@@ -243,9 +243,7 @@ let show_notice_request ~token ~message ~action_label ~duration_ms =
 let decode_notice_response ~token bytes =
   Result.bind (decode_envelope [ 26 ] bytes) (fun payload ->
     decode_json_object "notice response" payload (fun fields ->
-      match
-        List.assoc_opt "token" fields, List.assoc_opt "result" fields
-      with
+      match List.assoc_opt "token" fields, List.assoc_opt "result" fields with
       | Some (`String actual), Some (`String result)
         when String.equal actual (Int64.to_string token) ->
         (match result with

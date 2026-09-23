@@ -162,10 +162,7 @@ module Private : sig
   (** Drains pending events and invokes every registered subscriber for each,
       in drain order. Must be called on the application thread (the lui pump
       entry point), never from worker fibers. *)
-  val deliver
-    :  ('request, 'response, 'push) client
-    -> max_events:int
-    -> unit
+  val deliver : ('request, 'response, 'push) client -> max_events:int -> unit
 end
 
 module For_testing : sig

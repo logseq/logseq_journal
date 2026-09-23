@@ -14,6 +14,7 @@ let enqueue t thunk =
   match wakeup with
   | Some wake -> wake ()
   | None -> ()
+;;
 
 let set_wakeup t wakeup =
   Mutex.lock t.mutex;
@@ -21,16 +22,18 @@ let set_wakeup t wakeup =
   let pending = t.queue <> [] in
   Mutex.unlock t.mutex;
   if pending then wakeup ()
+;;
 
 let drain t =
   let rec loop () =
     Mutex.lock t.mutex;
-    (match t.queue with
-     | [] -> Mutex.unlock t.mutex
-     | queue ->
-       t.queue <- [];
-       Mutex.unlock t.mutex;
-       List.iter (fun thunk -> thunk ()) (List.rev queue);
-       loop ())
+    match t.queue with
+    | [] -> Mutex.unlock t.mutex
+    | queue ->
+      t.queue <- [];
+      Mutex.unlock t.mutex;
+      List.iter (fun thunk -> thunk ()) (List.rev queue);
+      loop ()
   in
   loop ()
+;;

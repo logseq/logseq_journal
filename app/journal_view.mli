@@ -290,547 +290,551 @@ module View : sig
   type nonrec t = t
 
   module For_testing : sig
-  val key : t -> string option
-  val test_id : t -> string option
-end
+    val key : t -> string option
+    val test_id : t -> string option
+  end
 
-module Button_role : sig
-  type t =
-    | Normal
-    | Destructive
-    | Cancel
-end
+  module Button_role : sig
+    type t =
+      | Normal
+      | Destructive
+      | Cancel
+  end
 
-module Button_style : sig
-  type t =
-    | Automatic
-    | Plain
-    | Bordered
-    | Prominent
-    | Button
-end
+  module Button_style : sig
+    type t =
+      | Automatic
+      | Plain
+      | Bordered
+      | Prominent
+      | Button
+  end
 
-module Progress_style : sig
-  type t =
-    | Linear
-    | Circular
-end
+  module Progress_style : sig
+    type t =
+      | Linear
+      | Circular
+  end
 
-val with_test_id : Test_id.t -> t -> t
-val empty : ?key:Key.t -> unit -> t
-
-val text
-  :  ?key:Key.t
-  -> ?style:Style.Text_style.t
-  -> ?text_align:'a
-  -> ?line_limit:int
-  -> ?truncation:'b
-  -> string
-  -> t
-
-val symbol
-  :  ?key:Key.t
-  -> ?size:float
-  -> ?color:Style.Color.t
-  -> ?rendering:'a
-  -> name:string
-  -> unit
-  -> t
-
-val label : ?key:Key.t -> title:t -> icon:t -> unit -> t
-val divider : ?key:Key.t -> unit -> t
-
-val progress
-  :  ?key:Key.t
-  -> ?value:float
-  -> ?style:Progress_style.t
-  -> unit
-  -> t
-
-val spacer : ?key:Key.t -> ?min_length:float -> unit -> t
-
-val row
-  :  ?key:Key.t
-  -> ?spacing:float
-  -> ?alignment:Layout.Vertical_alignment.t
-  -> t list
-  -> t
-
-val column
-  :  ?key:Key.t
-  -> ?spacing:float
-  -> ?alignment:Layout.Horizontal_alignment.t
-  -> t list
-  -> t
-
-val stack : ?key:Key.t -> ?alignment:Layout.Alignment.t -> t list -> t
-
-val frame
-  :  ?key:Key.t
-  -> ?width:float
-  -> ?height:float
-  -> ?min_width:float
-  -> ?ideal_width:float
-  -> ?max_width:Layout.Frame_limit.t
-  -> ?min_height:float
-  -> ?ideal_height:float
-  -> ?max_height:Layout.Frame_limit.t
-  -> ?alignment:Layout.Alignment.t
-  -> t
-  -> t
-
-val padding : ?key:Key.t -> insets:Layout.Edge_insets.t -> t -> t
-val semantics : ?key:Key.t -> properties:Semantics.t -> t -> t
-val help : ?key:Key.t -> message:string -> t -> t
-val text_selection : ?key:Key.t -> enabled:bool -> t -> t
-val opacity : ?key:Key.t -> float -> t -> t
-
-val ignores_safe_area
-  :  ?regions:'a
-  -> ?edges:'b list
-  -> t
-  -> t
-
-val safe_area_padding : ?key:Key.t -> insets:Layout.Edge_insets.t -> t -> t
-val theme : ?key:Key.t -> data:Theme.t -> t -> t
-val background : ?key:Key.t -> ?corner_radius:float -> color:Style.Color.t -> t -> t
-val clip : ?key:Key.t -> ?corner_radius:float -> ?antialiased:bool -> t -> t
-val layout_priority : ?key:Key.t -> float -> t -> t
-val offset : ?key:Key.t -> ?x:float -> ?y:float -> t -> t
-val animated_opacity : ?key:Key.t -> ?duration:float -> float -> t -> t
-
-val button
-  :  ?key:Key.t
-  -> ?enabled:bool
-  -> ?role:Button_role.t
-  -> ?style:Button_style.t
-  -> ?autofocus:bool
-  -> on_press:Event.handler
-  -> child:t
-  -> unit
-  -> t
-
-val toggle
-  :  ?key:Key.t
-  -> ?style:Button_style.t
-  -> ?enabled:bool
-  -> value:bool
-  -> on_changed:Event.handler
-  -> label:t
-  -> unit
-  -> t
-
-val text_editor
-  :  ?key:Key.t
-  -> ?autofocus:bool
-  -> ?enabled:bool
-  -> ?read_only:bool
-  -> ?submit_on_return:bool
-  -> ?max_utf8_bytes:int
-  -> session_id:Journal_ids.Text_input.Session_id.t
-  -> document_revision:Journal_ids.Text_input.Document_revision.t
-  -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
-  -> update_mode:Text_editing.update_mode
-  -> value:Text_editing.Value.t
-  -> on_edit:Event.handler
-  -> on_submit:Event.handler
-  -> on_focus_changed:Event.handler
-  -> ?on_limit_reached:Event.handler
-  -> unit
-  -> t
-
-val secure_field
-  :  ?key:Key.t
-  -> label:string
-  -> ?prompt:string
-  -> ?keyboard:Text_editing.Keyboard.t
-  -> ?submit_label:Text_editing.Submit_label.t
-  -> ?appearance:Text_editing.Field_appearance.t
-  -> ?autofocus:bool
-  -> ?enabled:bool
-  -> ?read_only:bool
-  -> ?submit_on_return:bool
-  -> ?max_utf8_bytes:int
-  -> session_id:Journal_ids.Text_input.Session_id.t
-  -> document_revision:Journal_ids.Text_input.Document_revision.t
-  -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
-  -> update_mode:Text_editing.update_mode
-  -> value:Text_editing.Value.t
-  -> on_edit:Event.handler
-  -> on_submit:Event.handler
-  -> on_focus_changed:Event.handler
-  -> ?on_limit_reached:Event.handler
-  -> unit
-  -> t
-
-val labeled_content : ?key:Key.t -> label:t -> value:t -> unit -> t
-
-val content_unavailable
-  :  ?key:Key.t
-  -> label:t
-  -> ?description:t
-  -> ?actions:t
-  -> unit
-  -> t
-
-val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
-
-module Keyed : sig
-  type widget = t
-
-  type nonrec t =
-    { key : string
-    ; view : widget
-    }
-
-  val create : key:string -> widget -> t
-end
-
-module Section : sig
-  val create : ?key:Key.t -> ?header:t -> ?footer:t -> Keyed.t list -> t
-end
-
-module Form : sig
-  val vertical : ?key:Key.t -> Keyed.t list -> t
-end
-
-module Toolbar : sig
-  type placement =
-    | Automatic
-    | Principal
-    | Navigation
-    | Primary_action
-    | Secondary_action
-    | Status
-    | Confirmation_action
-    | Cancellation_action
-    | Destructive_action
-    | Bottom_bar
-
-  type spacing =
-    | Fixed
-    | Flexible
-
-  type child
-  type item
-
-  val child : key:Key.t -> t -> child
-  val item : key:Key.t -> ?placement:placement -> t -> item
-  val group : key:Key.t -> ?placement:placement -> child list -> item
-  val spacer : key:Key.t -> ?placement:placement -> spacing -> item
-  val create : ?key:Key.t -> items:item list -> t -> t
-end
-
-module Body : sig
-  type nonrec t = t
-  type widget = t
-
-  val with_size : width:float -> height:float -> t -> widget
-  val static : widget -> t
   val with_test_id : Test_id.t -> t -> t
-  val padding : insets:Layout.Edge_insets.t -> t -> t
-  val background : ?corner_radius:float -> color:Style.Color.t -> t -> t
-  val semantics : properties:Semantics.t -> t -> t
+  val empty : ?key:Key.t -> unit -> t
 
-  val ignores_safe_area
-    :  ?regions:'a
-    -> ?edges:'b list
+  val text
+    :  ?key:Key.t
+    -> ?style:Style.Text_style.t
+    -> ?text_align:'a
+    -> ?line_limit:int
+    -> ?truncation:'b
+    -> string
+    -> t
+
+  val symbol
+    :  ?key:Key.t
+    -> ?size:float
+    -> ?color:Style.Color.t
+    -> ?rendering:'a
+    -> name:string
+    -> unit
+    -> t
+
+  val label : ?key:Key.t -> title:t -> icon:t -> unit -> t
+  val divider : ?key:Key.t -> unit -> t
+  val progress : ?key:Key.t -> ?value:float -> ?style:Progress_style.t -> unit -> t
+  val spacer : ?key:Key.t -> ?min_length:float -> unit -> t
+
+  val row
+    :  ?key:Key.t
+    -> ?spacing:float
+    -> ?alignment:Layout.Vertical_alignment.t
+    -> t list
+    -> t
+
+  val column
+    :  ?key:Key.t
+    -> ?spacing:float
+    -> ?alignment:Layout.Horizontal_alignment.t
+    -> t list
+    -> t
+
+  val stack : ?key:Key.t -> ?alignment:Layout.Alignment.t -> t list -> t
+
+  val frame
+    :  ?key:Key.t
+    -> ?width:float
+    -> ?height:float
+    -> ?min_width:float
+    -> ?ideal_width:float
+    -> ?max_width:Layout.Frame_limit.t
+    -> ?min_height:float
+    -> ?ideal_height:float
+    -> ?max_height:Layout.Frame_limit.t
+    -> ?alignment:Layout.Alignment.t
     -> t
     -> t
 
-  val safe_area_padding : insets:Layout.Edge_insets.t -> t -> t
-  val theme : data:Theme.t -> t -> t
-  val toolbar : ?key:Key.t -> items:Toolbar.item list -> t -> t
+  val padding : ?key:Key.t -> insets:Layout.Edge_insets.t -> t -> t
+  val semantics : ?key:Key.t -> properties:Semantics.t -> t -> t
+  val help : ?key:Key.t -> message:string -> t -> t
+  val text_selection : ?key:Key.t -> enabled:bool -> t -> t
+  val opacity : ?key:Key.t -> float -> t -> t
+  val ignores_safe_area : ?regions:'a -> ?edges:'b list -> t -> t
+  val safe_area_padding : ?key:Key.t -> insets:Layout.Edge_insets.t -> t -> t
+  val theme : ?key:Key.t -> data:Theme.t -> t -> t
+  val background : ?key:Key.t -> ?corner_radius:float -> color:Style.Color.t -> t -> t
+  val clip : ?key:Key.t -> ?corner_radius:float -> ?antialiased:bool -> t -> t
+  val layout_priority : ?key:Key.t -> float -> t -> t
+  val offset : ?key:Key.t -> ?x:float -> ?y:float -> t -> t
+  val animated_opacity : ?key:Key.t -> ?duration:float -> float -> t -> t
 
-  module Vertical : sig
+  val button
+    :  ?key:Key.t
+    -> ?enabled:bool
+    -> ?role:Button_role.t
+    -> ?style:Button_style.t
+    -> ?autofocus:bool
+    -> on_press:Event.handler
+    -> child:t
+    -> unit
+    -> t
+
+  val toggle
+    :  ?key:Key.t
+    -> ?style:Button_style.t
+    -> ?enabled:bool
+    -> value:bool
+    -> on_changed:Event.handler
+    -> label:t
+    -> unit
+    -> t
+
+  val text_editor
+    :  ?key:Key.t
+    -> ?autofocus:bool
+    -> ?enabled:bool
+    -> ?read_only:bool
+    -> ?submit_on_return:bool
+    -> ?max_utf8_bytes:int
+    -> session_id:Journal_ids.Text_input.Session_id.t
+    -> document_revision:Journal_ids.Text_input.Document_revision.t
+    -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
+    -> update_mode:Text_editing.update_mode
+    -> value:Text_editing.Value.t
+    -> on_edit:Event.handler
+    -> on_submit:Event.handler
+    -> on_focus_changed:Event.handler
+    -> ?on_limit_reached:Event.handler
+    -> unit
+    -> t
+
+  val secure_field
+    :  ?key:Key.t
+    -> label:string
+    -> ?prompt:string
+    -> ?keyboard:Text_editing.Keyboard.t
+    -> ?submit_label:Text_editing.Submit_label.t
+    -> ?appearance:Text_editing.Field_appearance.t
+    -> ?autofocus:bool
+    -> ?enabled:bool
+    -> ?read_only:bool
+    -> ?submit_on_return:bool
+    -> ?max_utf8_bytes:int
+    -> session_id:Journal_ids.Text_input.Session_id.t
+    -> document_revision:Journal_ids.Text_input.Document_revision.t
+    -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
+    -> update_mode:Text_editing.update_mode
+    -> value:Text_editing.Value.t
+    -> on_edit:Event.handler
+    -> on_submit:Event.handler
+    -> on_focus_changed:Event.handler
+    -> ?on_limit_reached:Event.handler
+    -> unit
+    -> t
+
+  val labeled_content : ?key:Key.t -> label:t -> value:t -> unit -> t
+
+  val content_unavailable
+    :  ?key:Key.t
+    -> label:t
+    -> ?description:t
+    -> ?actions:t
+    -> unit
+    -> t
+
+  val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
+
+  module Keyed : sig
+    type widget = t
+
+    type nonrec t =
+      { key : string
+      ; view : widget
+      }
+
+    val create : key:string -> widget -> t
+  end
+
+  module Section : sig
+    val create : ?key:Key.t -> ?header:t -> ?footer:t -> Keyed.t list -> t
+  end
+
+  module Form : sig
+    val vertical : ?key:Key.t -> Keyed.t list -> t
+  end
+
+  module Toolbar : sig
+    type placement =
+      | Automatic
+      | Principal
+      | Navigation
+      | Primary_action
+      | Secondary_action
+      | Status
+      | Confirmation_action
+      | Cancellation_action
+      | Destructive_action
+      | Bottom_bar
+
+    type spacing =
+      | Fixed
+      | Flexible
+
     type child
+    type item
 
-    val fixed : widget -> child
-    val fill : ?weight:float -> widget -> child
-    val create : ?key:Key.t -> child list -> t
+    val child : key:Key.t -> t -> child
+    val item : key:Key.t -> ?placement:placement -> t -> item
+    val group : key:Key.t -> ?placement:placement -> child list -> item
+    val spacer : key:Key.t -> ?placement:placement -> spacing -> item
+    val create : ?key:Key.t -> items:item list -> t -> t
   end
 
-  module Horizontal : sig
-    type child
-
-    val fixed : widget -> child
-    val fill : ?weight:float -> widget -> child
-    val create : ?key:Key.t -> child list -> t
-  end
-
-  val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:widget -> t -> t
-
-  module Private : sig
-    val to_widget : t -> widget
-  end
-end
-
-module Viewport : sig
-  module Vertical : sig
+  module Body : sig
     type nonrec t = t
+    type widget = t
 
+    val with_size : width:float -> height:float -> t -> widget
+    val static : widget -> t
     val with_test_id : Test_id.t -> t -> t
     val padding : insets:Layout.Edge_insets.t -> t -> t
     val background : ?corner_radius:float -> color:Style.Color.t -> t -> t
     val semantics : properties:Semantics.t -> t -> t
-
-    val ignores_safe_area
-      :  ?regions:'a
-      -> ?edges:'b list
-      -> t
-      -> t
-
+    val ignores_safe_area : ?regions:'a -> ?edges:'b list -> t -> t
     val safe_area_padding : insets:Layout.Edge_insets.t -> t -> t
     val theme : data:Theme.t -> t -> t
-    val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
-    val with_height : height:float -> t -> t
+    val toolbar : ?key:Key.t -> items:Toolbar.item list -> t -> t
+
+    module Vertical : sig
+      type child
+
+      val fixed : widget -> child
+      val fill : ?weight:float -> widget -> child
+      val create : ?key:Key.t -> child list -> t
+    end
+
+    module Horizontal : sig
+      type child
+
+      val fixed : widget -> child
+      val fill : ?weight:float -> widget -> child
+      val create : ?key:Key.t -> child list -> t
+    end
+
+    val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:widget -> t -> t
+
+    module Private : sig
+      val to_widget : t -> widget
+    end
   end
 
-  module Horizontal : sig
-    type nonrec t = t
+  module Viewport : sig
+    module Vertical : sig
+      type nonrec t = t
 
-    val with_test_id : Test_id.t -> t -> t
-    val with_width : width:float -> t -> t
+      val with_test_id : Test_id.t -> t -> t
+      val padding : insets:Layout.Edge_insets.t -> t -> t
+      val background : ?corner_radius:float -> color:Style.Color.t -> t -> t
+      val semantics : properties:Semantics.t -> t -> t
+      val ignores_safe_area : ?regions:'a -> ?edges:'b list -> t -> t
+      val safe_area_padding : insets:Layout.Edge_insets.t -> t -> t
+      val theme : data:Theme.t -> t -> t
+      val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
+      val with_height : height:float -> t -> t
+    end
+
+    module Horizontal : sig
+      type nonrec t = t
+
+      val with_test_id : Test_id.t -> t -> t
+      val with_width : width:float -> t -> t
+    end
   end
-end
 
-module Scroll : sig
-  type anchor =
-    | Start
-    | End
+  module Scroll : sig
+    type anchor =
+      | Start
+      | End
 
-  val vertical
-    :  ?key:Key.t
-    -> ?on_scroll:Event.handler
-    -> ?shows_indicators:bool
-    -> ?fill_viewport:bool
-    -> ?initial_anchor:anchor
-    -> t
-    -> t
-end
+    val vertical
+      :  ?key:Key.t
+      -> ?on_scroll:Event.handler
+      -> ?shows_indicators:bool
+      -> ?fill_viewport:bool
+      -> ?initial_anchor:anchor
+      -> t
+      -> t
+  end
 
-module Swipe_actions : sig
-  type side =
-    | Start
-    | End
+  module Swipe_actions : sig
+    type side =
+      | Start
+      | End
 
-  type action
-  type nonrec t
+    type action
+    type nonrec t
 
-  val action
-    :  key:Key.t
-    -> ?enabled:bool
-    -> ?role:Button_role.t
-    -> ?symbol:string
-    -> side:side
-    -> title:string
-    -> background:Style.Color.t
-    -> on_press:Event.handler
-    -> unit
-    -> action
+    val action
+      :  key:Key.t
+      -> ?enabled:bool
+      -> ?role:Button_role.t
+      -> ?symbol:string
+      -> side:side
+      -> title:string
+      -> background:Style.Color.t
+      -> on_press:Event.handler
+      -> unit
+      -> action
 
-  val create : ?enabled:bool -> ?allows_full_swipe:bool -> actions:action list -> unit -> t
-end
+    val create
+      :  ?enabled:bool
+      -> ?allows_full_swipe:bool
+      -> actions:action list
+      -> unit
+      -> t
+  end
 
-module Context_menu : sig
-  type nonrec view = t
+  module Context_menu : sig
+    type nonrec view = t
 
-  type role =
-    | Normal
-    | Destructive
+    type role =
+      | Normal
+      | Destructive
 
-  type action
-  type nonrec t
+    type action
+    type nonrec t
 
-  val action
-    :  key:Key.t
-    -> ?enabled:bool
-    -> ?role:role
-    -> ?symbol:string
-    -> title:string
-    -> on_press:Event.handler
-    -> unit
-    -> action
+    val action
+      :  key:Key.t
+      -> ?enabled:bool
+      -> ?role:role
+      -> ?symbol:string
+      -> title:string
+      -> on_press:Event.handler
+      -> unit
+      -> action
 
-  val create : ?enabled:bool -> actions:action list -> unit -> t
-  val attach : ?key:Key.t -> t -> view -> view
-end
+    val create : ?enabled:bool -> actions:action list -> unit -> t
+    val attach : ?key:Key.t -> t -> view -> view
+  end
 
-module Confirmation : sig
-  type action
-  type request
+  module Confirmation : sig
+    type action
+    type request
 
-  val action
-    :  key:string
-    -> title:string
-    -> ?enabled:bool
-    -> ?role:Button_role.t
-    -> unit
-    -> action
+    val action
+      :  key:string
+      -> title:string
+      -> ?enabled:bool
+      -> ?role:Button_role.t
+      -> unit
+      -> action
 
-  val request : token:int64 -> title:string -> ?message:string -> action list -> request
-  val alert : ?key:Key.t -> request:request option -> on_response:Event.handler -> t -> t
-  val dialog : ?key:Key.t -> request:request option -> on_response:Event.handler -> t -> t
-end
+    val request : token:int64 -> title:string -> ?message:string -> action list -> request
 
-module Native_list : sig
-  type anchor =
-    | Top
-    | Center
-    | Bottom
+    val alert
+      :  ?key:Key.t
+      -> request:request option
+      -> on_response:Event.handler
+      -> t
+      -> t
 
-  type target
-  type scroll_request
-  type outcome = Event.Payload.native_list_outcome
-  type completion = Event.Payload.native_list_completion
+    val dialog
+      :  ?key:Key.t
+      -> request:request option
+      -> on_response:Event.handler
+      -> t
+      -> t
+  end
 
-  val target : section:Key.t -> row_path:Key.t list -> target
+  module Native_list : sig
+    type anchor =
+      | Top
+      | Center
+      | Bottom
 
-  val scroll_request
-    :  token:int64
-    -> target:target
-    -> ?anchor:anchor
-    -> ?animated:bool
-    -> unit
-    -> scroll_request
+    type target
+    type scroll_request
+    type outcome = Event.Payload.native_list_outcome
+    type completion = Event.Payload.native_list_completion
 
-  val completion_of_payload : Event.Payload.t -> completion option
+    val target : section:Key.t -> row_path:Key.t list -> target
 
-  type style =
-    | Plain
-    | Inset
-    | Inset_grouped
+    val scroll_request
+      :  token:int64
+      -> target:target
+      -> ?anchor:anchor
+      -> ?animated:bool
+      -> unit
+      -> scroll_request
 
-  type separator =
-    | Automatic
-    | Hidden
-    | Visible
+    val completion_of_payload : Event.Payload.t -> completion option
 
-  type row
-  type section
+    type style =
+      | Plain
+      | Inset
+      | Inset_grouped
 
-  val row
-    :  key:Key.t
-    -> ?test_id:Test_id.t
-    -> ?separator:separator
-    -> ?swipe_actions:Swipe_actions.t
-    -> ?context_menu:Context_menu.t
-    -> t
-    -> row
+    type separator =
+      | Automatic
+      | Hidden
+      | Visible
 
-  val disclosure_row
-    :  key:Key.t
-    -> ?test_id:Test_id.t
-    -> ?separator:separator
-    -> ?swipe_actions:Swipe_actions.t
-    -> ?context_menu:Context_menu.t
-    -> expanded:bool
-    -> on_expanded_changed:Event.handler
-    -> label:t
-    -> row list
-    -> row
+    type row
+    type section
 
-  val section : key:Key.t -> ?header:t -> ?footer:t -> ?separator:separator -> row list -> section
+    val row
+      :  key:Key.t
+      -> ?test_id:Test_id.t
+      -> ?separator:separator
+      -> ?swipe_actions:Swipe_actions.t
+      -> ?context_menu:Context_menu.t
+      -> t
+      -> row
 
-  val vertical
-    :  ?key:Key.t
-    -> style:style
-    -> ?scroll_request:scroll_request
-    -> ?on_scroll_completed:Event.handler
-    -> ?on_visible_range:Event.handler
-    -> ?on_row_event:Event.handler
-    -> section list
-    -> t
-end
+    val disclosure_row
+      :  key:Key.t
+      -> ?test_id:Test_id.t
+      -> ?separator:separator
+      -> ?swipe_actions:Swipe_actions.t
+      -> ?context_menu:Context_menu.t
+      -> expanded:bool
+      -> on_expanded_changed:Event.handler
+      -> label:t
+      -> row list
+      -> row
 
-module Navigation_link : sig
-  val create
-    :  ?key:Key.t
-    -> activation_id:string
-    -> ?enabled:bool
-    -> on_activate:Event.handler
-    -> label:t
-    -> unit
-    -> t
-end
+    val section
+      :  key:Key.t
+      -> ?header:t
+      -> ?footer:t
+      -> ?separator:separator
+      -> row list
+      -> section
 
-module Navigation_stack : sig
-  type destination
+    val vertical
+      :  ?key:Key.t
+      -> style:style
+      -> ?scroll_request:scroll_request
+      -> ?on_scroll_completed:Event.handler
+      -> ?on_visible_range:Event.handler
+      -> ?on_row_event:Event.handler
+      -> section list
+      -> t
+  end
 
-  val destination : page_key:string -> title:string -> can_pop:bool -> t -> destination
+  module Navigation_link : sig
+    val create
+      :  ?key:Key.t
+      -> activation_id:string
+      -> ?enabled:bool
+      -> on_activate:Event.handler
+      -> label:t
+      -> unit
+      -> t
+  end
 
-  val create
-    :  ?key:Key.t
-    -> title:string
-    -> on_path_change:Event.handler
-    -> path:destination list
-    -> t
-    -> t
-end
+  module Navigation_stack : sig
+    type destination
 
-module Sheet : sig
-  type sizing =
-    | Automatic
-    | Form
-    | Fitted
+    val destination : page_key:string -> title:string -> can_pop:bool -> t -> destination
 
-  type detent =
-    | Medium
-    | Large
+    val create
+      :  ?key:Key.t
+      -> title:string
+      -> on_path_change:Event.handler
+      -> path:destination list
+      -> t
+      -> t
+  end
 
-  val create
-    :  ?key:Key.t
-    -> presented:bool
-    -> on_presented_changed:Event.handler
-    -> ?interactive_dismiss:bool
-    -> ?sizing:sizing
-    -> ?detents:detent list
-    -> content:t
-    -> t
-    -> t
-end
+  module Sheet : sig
+    type sizing =
+      | Automatic
+      | Form
+      | Fitted
 
-module Picker : sig
-  type choice
+    type detent =
+      | Medium
+      | Large
 
-  type style =
-    | Automatic
-    | Menu
-    | Segmented
-    | Inline
+    val create
+      :  ?key:Key.t
+      -> presented:bool
+      -> on_presented_changed:Event.handler
+      -> ?interactive_dismiss:bool
+      -> ?sizing:sizing
+      -> ?detents:detent list
+      -> content:t
+      -> t
+      -> t
+  end
 
-  val option : id:int64 -> ?enabled:bool -> ?label:t -> unit -> choice
+  module Picker : sig
+    type choice
 
-  val create
-    :  ?key:Key.t
-    -> ?label:string
-    -> ?style:style
-    -> ?enabled:bool
-    -> selected_id:int64 option
-    -> on_select:Event.handler
-    -> choice list
-    -> unit
-    -> t
-end
+    type style =
+      | Automatic
+      | Menu
+      | Segmented
+      | Inline
 
-module Menu : sig
-  type entry
+    val option : id:int64 -> ?enabled:bool -> ?label:t -> unit -> choice
 
-  val action : id:int64 -> label:t -> ?enabled:bool -> ?role:Button_role.t -> unit -> entry
-  val choice : id:int64 -> label:t -> selected:bool -> ?enabled:bool -> unit -> entry
-  val divider : id:int64 -> entry
-  val section : id:int64 -> ?label:t -> entry list -> entry
-  val submenu : id:int64 -> label:t -> ?enabled:bool -> entry list -> entry
+    val create
+      :  ?key:Key.t
+      -> ?label:string
+      -> ?style:style
+      -> ?enabled:bool
+      -> selected_id:int64 option
+      -> on_select:Event.handler
+      -> choice list
+      -> unit
+      -> t
+  end
 
-  val create
-    :  ?key:Key.t
-    -> ?enabled:bool
-    -> on_select:Event.handler
-    -> label:t
-    -> entry list
-    -> t
-end
+  module Menu : sig
+    type entry
 
+    val action
+      :  id:int64
+      -> label:t
+      -> ?enabled:bool
+      -> ?role:Button_role.t
+      -> unit
+      -> entry
+
+    val choice : id:int64 -> label:t -> selected:bool -> ?enabled:bool -> unit -> entry
+    val divider : id:int64 -> entry
+    val section : id:int64 -> ?label:t -> entry list -> entry
+    val submenu : id:int64 -> label:t -> ?enabled:bool -> entry list -> entry
+
+    val create
+      :  ?key:Key.t
+      -> ?enabled:bool
+      -> on_select:Event.handler
+      -> label:t
+      -> entry list
+      -> t
+  end
 end
 
 module Native_widget : sig

@@ -180,7 +180,10 @@ let encode_json snapshot =
     ; "devicePixelRatio", `Float snapshot.device_pixel_ratio
     ; "textScale", `Float snapshot.text_scale
     ; ( "brightness"
-      , `String (match snapshot.brightness with Light -> "light" | Dark -> "dark") )
+      , `String
+          (match snapshot.brightness with
+           | Light -> "light"
+           | Dark -> "dark") )
     ; "platform", `String snapshot.platform
     ; "locale", `String snapshot.locale
     ; "safeArea", insets snapshot.safe_area
@@ -193,8 +196,9 @@ let encode_json snapshot =
     ; "highContrast", `Bool snapshot.high_contrast
     ; ( "orientation"
       , `String
-          (match snapshot.orientation with Portrait -> "portrait" | Landscape -> "landscape")
-      )
+          (match snapshot.orientation with
+           | Portrait -> "portrait"
+           | Landscape -> "landscape") )
     ; "pointerKinds", `Int snapshot.pointer_kinds
     ]
 ;;
