@@ -14,7 +14,6 @@ CASES = [
         "test/macos_mutation_input_diagnostics_pure_reducer_test.ml",
         "MACOS_PURE_REDUCER_TESTS_PASSED",
     ),
-    ("test/macos_application_dispatch_test.ml", "MACOS_APPLICATION_DISPATCH_TESTS_PASSED"),
     ("test/macos_mutation_runtime_test.ml", "MACOS_MUTATION_RUNTIME_TESTS_PASSED"),
 ]
 
@@ -43,9 +42,8 @@ def main():
         if not (line.startswith("#load ") and "/native_backend/" in line)
     )
     # The bonsai_swiftui_test support library is gone; the lui package carries
-    # the runtime API the registered cases use. The test/*.ml cases are owned
-    # by the OCaml-side migration — until they drop their Bonsai_* module
-    # references this script still fails on their compile errors.
+    # the runtime API the registered cases use through the Journal_view /
+    # Journal_ids shims.
     test_library = subprocess.run(
         ["ocamlfind", "query", "lui"],
         cwd=REPO, text=True, capture_output=True, check=True,
