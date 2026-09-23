@@ -15,15 +15,11 @@
 #     this script — it is produced by the dune/opam side of the workspace.
 #     Point JOURNAL_OCAML_OBJECT at the artifact:
 #       macOS:         dune builds app/native_embed.exe.o with the host switch.
-#       iOS simulator: the shared cross toolchain at
-#         ${LG_IOS_OCAML_PREFIX:-$OPAMROOT/lg-ocaml-toolchains/ocaml-<ver>/targets/arm64-apple-ios<ver>-simulator}
-#         must have produced a complete object for the target triple; pass its
-#         path through JOURNAL_OCAML_OBJECT.
+#       iOS simulator: build the macOS complete object with the host switch
+#         and restamp it for the simulator triple with vtool (see the ios-app
+#         dune rule); pass the result through JOURNAL_OCAML_OBJECT.
 #     Without JOURNAL_OCAML_OBJECT the script links a stub object so the Swift
 #     side still verifies end-to-end (link only — the binary is not runnable).
-#
-# Reuses the lui mobile conventions: LG_IOS_OCAML_PREFIX /
-# $OPAMROOT/lg-ocaml-toolchains (as in lui/tooling/mobile/build_components_*.sh).
 
 set -euo pipefail
 
@@ -35,9 +31,7 @@ info_plist=${JOURNAL_INFO_PLIST:-$repo_root/apple/Info.plist}
 entitlements_dir=${JOURNAL_ENTITLEMENTS_DIR:-$repo_root/config/entitlements}
 platform=${1:-macos}
 app_dir_arg=${2:-}
-ocaml_version=${LG_OCAML_VERSION:-5.5.0}
 opam_root=${OPAMROOT:-$(opam var root --safe 2>/dev/null || echo "$HOME/.opam")}
-shared_root=${LG_OCAML_TOOLCHAIN_ROOT:-$opam_root/lg-ocaml-toolchains}
 
 case "$platform" in
   macos)
@@ -55,16 +49,13 @@ case "$platform" in
     triple="arm64-apple-ios${deployment_target}-simulator"
     sdk_path=$(xcrun --sdk iphonesimulator --show-sdk-path)
     clang=$(xcrun --sdk iphonesimulator --find clang)
-    target_prefix=${LG_IOS_OCAML_PREFIX:-$shared_root/ocaml-$ocaml_version/targets/$triple}
-    if [[ -d $target_prefix/lib/ocaml ]]; then
-      ocaml_include="$target_prefix/lib/ocaml"
-    else
-      # journal_lui_bridge.c is a compile check only (not a link input); the
-      # host OCaml headers are platform-independent for it.
-      ocaml_prefix=${JOURNAL_OCAML_PREFIX:-$(ocamlfind printconf destdir 2>/dev/null | sed 's|/lib$||' || true)}
-      [[ -n $ocaml_prefix ]] || ocaml_prefix="$opam_root/default"
-      ocaml_include="$ocaml_prefix/lib/ocaml"
-    fi
+    # journal_lui_bridge.c is a compile check only (not a link input); the
+    # host OCaml headers are platform-independent for it. The linked object
+    # comes from the vtool-restamped macOS build, so no cross toolchain is
+    # needed.
+    ocaml_prefix=${JOURNAL_OCAML_PREFIX:-$(ocamlfind printconf destdir 2>/dev/null | sed 's|/lib$||' || true)}
+    [[ -n $ocaml_prefix ]] || ocaml_prefix="$opam_root/default"
+    ocaml_include="$ocaml_prefix/lib/ocaml"
     ;;
   *) echo "usage: $0 <macos|ios-simulator>" >&2; exit 2 ;;
 esac
