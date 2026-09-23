@@ -1,10 +1,12 @@
-module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Core = Service
+module Worker = Logseq_db_worker_lui.Journal_worker
+module Worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module Protocol = Logseq_db_worker.Protocol
 module Support = Managed_sync_e2e_support
 module Probe = Managed_sync_protocol_probe
 module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
-module ID = Bonsai_swiftui_spec.Id
+module ID = Logseq_db_worker_lui.Journal_worker_ids
 
 exception E2e_failure of string
 
