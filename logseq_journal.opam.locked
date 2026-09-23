@@ -178,6 +178,8 @@ depends: [
   "ppx_css" {= "v0.17.0"}
   "ppx_custom_printf" {= "v0.17.0"}
   "ppx_derivers" {= "1.2.1"}
+  "ppx_deriving" {= "6.0.3"}
+  "ppx_deriving_yojson" {= "3.9.1"}
   "ppx_diff" {= "v0.17.0"}
   "ppx_disable_unused_warnings" {= "v0.17.0"}
   "ppx_enumerate" {= "v0.17.0"}
