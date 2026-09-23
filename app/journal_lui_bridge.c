@@ -1,10 +1,13 @@
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <caml/alloc.h>
 #include <caml/callback.h>
+#include <caml/memory.h>
 #include <caml/mlvalues.h>
+#include <caml/printexc.h>
 #include <caml/signals.h>
 #include <caml/startup.h>
 
@@ -24,8 +27,16 @@ static lui_patch_callback patch_callback = NULL;
 static journal_wakeup_callback wakeup_callback = NULL;
 static journal_platform_request_callback platform_request_callback = NULL;
 
-static int emit_patch(value result) {
+static void report_ocaml_exception(const char *where, value result) {
+  char *message = caml_format_exception(Extract_exception(result));
+  fprintf(stderr, "journal_lui_bridge: OCaml exception in %s: %s\n",
+          where, message);
+  caml_stat_free(message);
+}
+
+static int emit_patch(const char *where, value result) {
   if (Is_exception_result(result)) {
+    report_ocaml_exception(where, result);
     return 0;
   }
   const char *json = String_val(result);
@@ -70,7 +81,7 @@ LUI_EXPORT int32_t lui_ocaml_start(
       Val_long(platform_code),
       Val_long(host_code),
       payload_value);
-  accepted = emit_patch(result);
+  accepted = emit_patch("lui_ocaml_init", result);
   CAMLdrop;
   caml_enter_blocking_section();
   return accepted;
@@ -81,7 +92,7 @@ static int dispatch_long(const char *name, int64_t node) {
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value(name);
   if (dispatch != NULL) {
-    result = emit_patch(caml_callback_exn(*dispatch, Val_long(node)));
+    result = emit_patch(name, caml_callback_exn(*dispatch, Val_long(node)));
   }
   caml_enter_blocking_section();
   return result;
@@ -104,7 +115,7 @@ LUI_EXPORT int32_t lui_ocaml_text_changed(int64_t node, const char *text) {
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_text_changed");
   if (dispatch != NULL) {
-    result = emit_patch(caml_callback2_exn(
+    result = emit_patch("lui_ocaml_text_changed", caml_callback2_exn(
         *dispatch, Val_long(node), caml_copy_string(text)));
   }
   caml_enter_blocking_section();
@@ -128,7 +139,7 @@ LUI_EXPORT int32_t lui_ocaml_toggle_changed(int64_t node, int32_t checked) {
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_toggle_changed");
   if (dispatch != NULL) {
-    result = emit_patch(caml_callback2_exn(
+    result = emit_patch("lui_ocaml_toggle_changed", caml_callback2_exn(
         *dispatch, Val_long(node), Val_bool(checked)));
   }
   caml_enter_blocking_section();
@@ -144,7 +155,7 @@ LUI_EXPORT int32_t lui_ocaml_slider_changed(int64_t node, double fraction) {
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_slider_changed");
   if (dispatch != NULL) {
-    result = emit_patch(caml_callback2_exn(
+    result = emit_patch("lui_ocaml_slider_changed", caml_callback2_exn(
         *dispatch, Val_long(node), caml_copy_double(fraction)));
   }
   caml_enter_blocking_section();
@@ -156,7 +167,8 @@ LUI_EXPORT int32_t lui_ocaml_stop(void) {
   caml_leave_blocking_section();
   const value *dispose = caml_named_value("lui_ocaml_dispose");
   if (dispose != NULL) {
-    result = emit_patch(caml_callback_exn(*dispose, Val_unit));
+    result = emit_patch("lui_ocaml_dispose",
+                        caml_callback_exn(*dispose, Val_unit));
   }
   caml_enter_blocking_section();
   return result;
@@ -168,7 +180,9 @@ LUI_EXPORT int64_t lui_ocaml_root_node(void) {
   const value *root = caml_named_value("lui_ocaml_root_node");
   if (root != NULL) {
     value result = caml_callback_exn(*root, Val_unit);
-    if (!Is_exception_result(result)) {
+    if (Is_exception_result(result)) {
+      report_ocaml_exception("lui_ocaml_root_node", result);
+    } else {
       node = (int64_t)Long_val(result);
     }
   }
@@ -188,11 +202,12 @@ LUI_EXPORT int32_t journal_ocaml_extension_event(
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("journal_ocaml_extension_event");
   if (dispatch != NULL) {
-    result = emit_patch(caml_callback3_exn(
-        *dispatch,
-        Val_long(node),
-        caml_copy_string(name),
-        caml_copy_string(payload)));
+    result = emit_patch("journal_ocaml_extension_event",
+                        caml_callback3_exn(
+                            *dispatch,
+                            Val_long(node),
+                            caml_copy_string(name),
+                            caml_copy_string(payload)));
   }
   caml_enter_blocking_section();
   return result;
@@ -206,7 +221,8 @@ LUI_EXPORT int32_t journal_ocaml_pump(void) {
   caml_leave_blocking_section();
   const value *pump = caml_named_value("journal_ocaml_pump");
   if (pump != NULL) {
-    result = emit_patch(caml_callback_exn(*pump, Val_unit));
+    result = emit_patch("journal_ocaml_pump",
+                        caml_callback_exn(*pump, Val_unit));
   }
   caml_enter_blocking_section();
   return result;
@@ -219,7 +235,10 @@ static void deliver_platform(const char *name, const char *data,
   const value *handler = caml_named_value(name);
   if (handler != NULL) {
     value payload = copy_bytes(data, length);
-    caml_callback_exn(*handler, payload);
+    value result = caml_callback_exn(*handler, payload);
+    if (Is_exception_result(result)) {
+      report_ocaml_exception(name, result);
+    }
   }
   caml_enter_blocking_section();
 }
