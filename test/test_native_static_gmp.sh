@@ -69,7 +69,7 @@ ios_output=$(
     JOURNAL_APPLE_SDK_ROOT=/Xcode/iPhoneOS.sdk \
     "$script" "$ios_archive" lui-journal.ios
 )
-test "$ios_output" = '(-cclib -Lapp -cclib app/libgmp.a)'
+test "$ios_output" = '(-cclib -Lapp -cclib app/libgmp.a -cclib -L/Xcode/iPhoneOS.sdk/usr/lib)'
 test "$(cat "$ios_archive")" = ios-static-gmp
 
 host_library_directory="$temporary_directory/host-gmp"
@@ -84,7 +84,7 @@ macos_output=$(
     JOURNAL_APPLE_SDK_ROOT=/Xcode/iPhoneOS.sdk \
     "$script" "$macos_archive" default
 )
-test "$macos_output" = '(-cclib -Lapp -cclib app/libgmp.a)'
+test "$macos_output" = '(-cclib -Lapp -cclib app/libgmp.a -cclib -L/Xcode/iPhoneOS.sdk/usr/lib)'
 test "$(cat "$macos_archive")" = macos-static-gmp
 
 printf '%s\n' 'Native static GMP tool tests passed'

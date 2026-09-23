@@ -60,8 +60,6 @@
  (libraries app lui)
  (link_flags
   (:standard
-   -cclib
-   -L%{env:JOURNAL_APPLE_SDK_ROOT=}/usr/lib
    (:include native_static_link_flags.sexp)))
  (modes
   (native object)))
@@ -72,3 +70,10 @@
   (with-stdout-to
    native_static_link_flags.sexp
    (run ../tool/native_static_link_flags.sh libgmp.a %{context_name}))))
+
+(rule
+ (alias macos-app)
+ (deps native_embed.exe.o)
+ (action
+  (system
+   "JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/native_embed.exe.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh macos")))

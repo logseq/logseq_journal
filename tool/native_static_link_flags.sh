@@ -64,6 +64,7 @@ case "${2:-default}" in
       printf '%s\n' "Built iPhoneOS GMP archive is not arm64-only" >&2
       exit 1
     fi
+    sdk_lib_dir="$sdk_root/usr/lib"
     ;;
   *)
     gmp_library_directory=$(pkg-config --variable=libdir gmp)
@@ -73,7 +74,8 @@ case "${2:-default}" in
       exit 1
     fi
     cp "$gmp_archive" "$destination"
+    sdk_lib_dir="${JOURNAL_APPLE_SDK_ROOT:-$(xcrun --show-sdk-path 2>/dev/null || printf /)}/usr/lib"
     ;;
 esac
 
-printf '%s\n' '(-cclib -Lapp -cclib app/libgmp.a)'
+printf '%s\n' "(-cclib -Lapp -cclib app/libgmp.a -cclib -L$sdk_lib_dir)"

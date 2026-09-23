@@ -21,6 +21,7 @@
 # Generated SwiftUI hosts and native artifact staging
 /apple/
 /.bonsai-swiftui/
+/swift/.build/
 
 # Local environment and cache directories
 .env

@@ -120,7 +120,7 @@ fingerprint=$(shasum -a 256 "$ocaml_object" "$build_dir/journal_lui_bridge.o" \
   | shasum -a 256 | cut -d ' ' -f 1)
 link_dir="$build_dir/native-link-inputs/$fingerprint"
 mkdir -p "$link_dir"
-cp "$ocaml_object" "$link_dir/journal_complete.o"
+cp -f "$ocaml_object" "$link_dir/journal_complete.o"
 
 extra_inputs=""
 if [[ -n ${JOURNAL_EXTRA_OBJECTS:-} ]]; then
