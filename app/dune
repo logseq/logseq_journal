@@ -77,3 +77,13 @@
  (action
   (system
    "JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/native_embed.exe.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh macos")))
+
+; vtool restamps the host complete object for the simulator triple (the app .cmx
+; are identical arm64 code; a target-toolchain recompile replaces this when the
+; deps are available as iOS objects).
+(rule
+ (alias ios-app)
+ (deps native_embed.exe.o)
+ (action
+  (system
+   "vtool -set-build-version 7 ${JOURNAL_IOS_DEPLOYMENT_TARGET:-26.0} $(xcrun --sdk iphonesimulator --show-sdk-version) -replace -output $PWD/journal_complete_iossim.o $PWD/native_embed.exe.o && JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/journal_complete_iossim.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh ios-simulator")))

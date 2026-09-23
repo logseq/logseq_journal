@@ -56,12 +56,15 @@ case "$platform" in
     sdk_path=$(xcrun --sdk iphonesimulator --show-sdk-path)
     clang=$(xcrun --sdk iphonesimulator --find clang)
     target_prefix=${LG_IOS_OCAML_PREFIX:-$shared_root/ocaml-$ocaml_version/targets/$triple}
-    [[ -d $target_prefix/lib/ocaml ]] || {
-      echo "error: shared iOS OCaml toolchain is missing: $target_prefix" >&2
-      echo "set LG_IOS_OCAML_PREFIX or provision the toolchain" >&2
-      exit 1
-    }
-    ocaml_include="$target_prefix/lib/ocaml"
+    if [[ -d $target_prefix/lib/ocaml ]]; then
+      ocaml_include="$target_prefix/lib/ocaml"
+    else
+      # journal_lui_bridge.c is a compile check only (not a link input); the
+      # host OCaml headers are platform-independent for it.
+      ocaml_prefix=${JOURNAL_OCAML_PREFIX:-$(ocamlfind printconf destdir 2>/dev/null | sed 's|/lib$||' || true)}
+      [[ -n $ocaml_prefix ]] || ocaml_prefix="$opam_root/default"
+      ocaml_include="$ocaml_prefix/lib/ocaml"
+    fi
     ;;
   *) echo "usage: $0 <macos|ios-simulator>" >&2; exit 2 ;;
 esac
@@ -146,18 +149,26 @@ product_dir="$swift_dir/.build/$triple/debug"
 [[ -f $product_dir/JournalApp ]] || product_dir="$swift_dir/.build/debug"
 app_dir=${app_dir_arg:-$build_dir/LogseqJournal.app}
 rm -rf "$app_dir"
-mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 if [[ $platform == macos ]]; then
+  mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
   cp "$info_plist" "$app_dir/Contents/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/Contents/MacOS/JournalApp"
   codesign --force --sign - --timestamp=none \
     --entitlements "$entitlements_dir/macos-debug-profile.entitlements" \
     "$app_dir" || true
 else
+  # iOS bundles are flat; an empty Contents/ dir breaks install + codesign.
+  mkdir -p "$app_dir"
   cp "$info_plist" "$app_dir/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/JournalApp"
+  bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
+  team_prefix=${JOURNAL_IOS_TEAM_ID:+$JOURNAL_IOS_TEAM_ID.}
+  ios_entitlements="$build_dir/ios-entitlements.plist"
+  sed -e "s|\$(AppIdentifierPrefix)|$team_prefix|g" \
+      -e "s|\$(PRODUCT_BUNDLE_IDENTIFIER)|$bundle_id|g" \
+      "$entitlements_dir/ios-debug-profile.entitlements" > "$ios_entitlements"
   codesign --force --sign - --timestamp=none \
-    --entitlements "$entitlements_dir/ios-debug-profile.entitlements" \
+    --entitlements "$ios_entitlements" \
     "$app_dir" || true
 fi
 
