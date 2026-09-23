@@ -52,10 +52,11 @@ successful selection persists graph 2 as the next launch target.
 
 ## Isolated iPhone host
 
-Build with an existing development signing team:
+Build the simulator host (device builds additionally need the shared iOS OCaml
+toolchain object — see tool/build_journal_apple.sh):
 
 ```sh
-python3 tool/test_swiftui_warm_start.py --platform ios --development-team TEAM_ID \
+python3 tool/test_swiftui_warm_start.py --platform ios-simulator \
   --rows 500 --children 135 --graphs 2
 ```
 
@@ -65,7 +66,7 @@ Swift source hashes. iPhone uses Release optimization with DEBUG enabled solely
 for the test host's memory-only secret stores. It is not a production keychain or
 remote performance test.
 
-Install the printed `BonsaiJournalWarmStart.app` in the distinct
+Install the printed `JournalWarmStartProbe.app` in the distinct
 `org.logseq.journal.warm-start-probe` container. Copy `valid.json` and the complete
 `support-valid` directory into that app's Documents directory using devicectl.
 Launch with:

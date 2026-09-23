@@ -6,6 +6,8 @@ enum JournalPlatformWire {
   enum Request: Equatable {
     case authenticatedUser, signOut, terminationReady, localAccount, timelinePresented
     case idToken(challengeID: String)
+    case showNotice(token: String, message: String, actionLabel: String?, durationMs: Int)
+    case cancelNotice(token: String)
   }
   enum Response: Equatable {
     case authenticatedUser(String?)
@@ -13,6 +15,10 @@ enum JournalPlatformWire {
     case signedOut, terminationReady, timelinePresented
     case localAccount(userID: String, origin: String)
     case noLocalAccount
+    case notice(token: String, result: String)
+  }
+  enum NoticeResult: String {
+    case action, dismiss, swipe, timeout
   }
   enum Lifecycle: UInt16 { case backgrounded = 1, foregroundResumed = 2 }
 
@@ -48,6 +54,25 @@ enum JournalPlatformWire {
         throw Failure.invalidPacket
       }
       return .idToken(challengeID: challenge)
+    case 25:
+      let fields = try object(payload)
+      guard let token = fields["token"] as? String,
+        let message = fields["message"] as? String,
+        let durationMs = fields["durationMs"] as? Int, durationMs > 0
+      else { throw Failure.invalidPacket }
+      let actionLabel = fields["actionLabel"] as? String
+      guard actionLabel?.isEmpty == false || fields["actionLabel"] is NSNull
+        || fields["actionLabel"] == nil
+      else { throw Failure.invalidPacket }
+      return .showNotice(
+        token: token, message: message, actionLabel: actionLabel,
+        durationMs: durationMs)
+    case 27:
+      let fields = try object(payload)
+      guard let token = fields["token"] as? String else {
+        throw Failure.invalidPacket
+      }
+      return .cancelNotice(token: token)
     default:
       throw Failure.invalidPacket
     }
@@ -75,7 +100,15 @@ enum JournalPlatformWire {
       return try json(tag: 21, ["userId": NSNull(), "managedSyncOrigin": NSNull()])
     case .timelinePresented:
       return try json(tag: 23, ["presented": true])
+    case .notice(let token, let result):
+      return try json(tag: 26, ["token": token, "result": result])
     }
+  }
+
+  /// Host -> OCaml environment snapshot (tag 24), mirroring
+  /// Journal_environment.decode_json's required fields.
+  static func environment(_ object: [String: Any]) throws -> Data {
+    try json(tag: 24, object)
   }
 
   static func prepareToTerminate() -> Data {

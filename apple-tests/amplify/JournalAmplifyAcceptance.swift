@@ -1,6 +1,6 @@
 import Amplify
 import AWSCognitoAuthPlugin
-import BonsaiSwiftUI
+import LUIAppleBackend
 import SwiftUI
 
 @MainActor private final class HubAcceptanceAuth: JournalAuthCapability {
@@ -27,7 +27,12 @@ struct JournalAmplifyAcceptance: View {
     VStack {
       Text(result).padding()
       Button("Test SDK Hub callbacks") { Task { await testHubCallbacks() } }
-      BonsaiApplicationView(entrypoint: "journal_gate", applicationBridge: platform.bridge)
+      // Boots the embedded journal app through the LUI host; the platform
+      // bridge attaches inside JournalRuntime.start().
+      JournalRuntimeHost(
+        platform: platform,
+        payload: (try? JournalNativeServices.startupPayload()) ?? Data(),
+        extensions: (try? JournalExtensions.registry()) ?? LUIAppleExtensionRegistry())
         .environment(\.scenePhase, .active)
         .frame(height: 80)
     }.task {

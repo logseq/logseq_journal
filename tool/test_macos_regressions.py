@@ -42,12 +42,16 @@ def main():
         for line in dict.fromkeys(bootstrap.splitlines())
         if not (line.startswith("#load ") and "/native_backend/" in line)
     )
+    # The bonsai_swiftui_test support library is gone; the lui package carries
+    # the runtime API the registered cases use. The test/*.ml cases are owned
+    # by the OCaml-side migration — until they drop their Bonsai_* module
+    # references this script still fails on their compile errors.
     test_library = subprocess.run(
-        ["ocamlfind", "query", "bonsai_swiftui_test"],
+        ["ocamlfind", "query", "lui"],
         cwd=REPO, text=True, capture_output=True, check=True,
     ).stdout.strip()
     bootstrap += "\n#directory " + json.dumps(test_library) + ";;\n"
-    bootstrap += "#load " + json.dumps(str(Path(test_library) / "bonsai_swiftui_test.cma")) + ";;\n"
+    bootstrap += "#load " + json.dumps(str(Path(test_library) / "lui.cma")) + ";;\n"
     with tempfile.TemporaryDirectory(prefix="journal-macos-regressions-") as directory:
         for relative, sentinel in cases:
             entry = Path(directory) / "run.ml"

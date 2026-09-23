@@ -1,4 +1,4 @@
-import BonsaiSwiftUI
+import LUIAppleBackend
 import Observation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -32,55 +32,60 @@ import UniformTypeIdentifiers
     }
   }
 
-  private struct ImportButton: View {
-    let context: BonsaiNativeContext<Properties, Data, Selection>
+  struct View: SwiftUI.View {
+    let context: LUIAppleExtensionViewContext
+    @State private var selection = Selection()
     @State private var presented = false
     @State private var handled = false
     @State private var error: String?
+
+    private var properties: Properties? {
+      JournalExtensions.decode(Properties.self, context: context)
+    }
 
     private func emitDismissed() {
       guard !handled,
         let data = try? JSONSerialization.data(withJSONObject: ["action": "dismissed"])
       else { return }
       handled = true
-      _ = context.emit(data)
+      JournalExtensions.emit(context: context, payload: data)
     }
 
-    var body: some View {
+    var body: some SwiftUI.View {
       Button {
-        guard context.canInteract() else { return }
+        guard context.isUserInteractionEnabled else { return }
         presented = true
       } label: {
-        Label(context.resource.operation == nil ? "Attach file" : "Importing file", systemImage: "paperclip")
+        Label(selection.operation == nil ? "Attach file" : "Importing file", systemImage: "paperclip")
       }
-      .disabled(!context.properties.enabled || !context.isPresented || context.resource.operation != nil)
+      .disabled(properties?.enabled == false || selection.operation != nil)
       .accessibilityIdentifier("journal-asset-import")
       .fileImporter(isPresented: $presented, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
-        guard context.canInteract() else { return }
+        guard context.isUserInteractionEnabled else { return }
         do {
           guard let source = try result.get().first else {
-            if context.properties.replace != nil { emitDismissed() }
+            if properties?.replace != nil { emitDismissed() }
             return
           }
           handled = true
           let operation = UUID().uuidString.lowercased()
-          context.resource.retain(source, operation: operation)
+          selection.retain(source, operation: operation)
           let extensionName = source.pathExtension.lowercased()
           let payload = try JSONSerialization.data(withJSONObject: [
             "operation": operation, "asset": UUID().uuidString.lowercased(),
             "localMutation": UUID().uuidString.lowercased(), "metadataMutation": UUID().uuidString.lowercased(),
             "path": source.path(percentEncoded: false), "title": source.lastPathComponent,
-            "replaceReference": context.properties.replace ?? NSNull(),
+            "replaceReference": properties?.replace ?? NSNull(),
             "type": extensionName.isEmpty ? "bin" : extensionName,
           ] as [String: Any])
-          if !context.emit(payload) {
-            context.resource.release()
+          if !JournalExtensions.emit(context: context, payload: payload) {
+            selection.release()
             error = "The destination is no longer available. Select the file again."
           }
         } catch {
-          context.resource.release()
+          selection.release()
           if (error as NSError).code == NSUserCancelledError {
-            if context.properties.replace != nil { emitDismissed() }
+            if properties?.replace != nil { emitDismissed() }
           } else {
             self.error = "Unable to access the selected file. Please try again."
           }
@@ -89,34 +94,24 @@ import UniformTypeIdentifiers
       .onChange(of: presented) { _, isPresented in
         if isPresented {
           handled = false
-        } else if context.properties.replace != nil {
+        } else if properties?.replace != nil {
           // iOS never invokes the fileImporter completion on Cancel, so treat
           // closing an armed picker without a pick as a dismissal.
           emitDismissed()
         }
       }
-      .onChange(of: context.properties.request) { _, _ in
-        if context.properties.replace != nil { presented = true }
+      .onChange(of: properties?.request) { _, _ in
+        if properties?.replace != nil { presented = true }
       }
-      .onChange(of: context.properties.completion) { _, operation in
-        guard let operation, operation == context.resource.operation else { return }
-        context.resource.release()
-        error = context.properties.error
+      .onChange(of: properties?.completion) { _, operation in
+        guard let operation, operation == selection.operation else { return }
+        selection.release()
+        error = properties?.error
       }
+      .onDisappear { selection.release() }
       .alert("Unable to import file", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
         Button("OK", role: .cancel) { error = nil }
       } message: { Text(error ?? "") }
     }
-  }
-
-  static func register(in registry: inout BonsaiNativeViews) throws {
-    try registry.register(kind: 2104, version: 1, capabilities: [.stateful, .resource, .semantics],
-      decode: { try JSONDecoder().decode(Properties.self, from: $0) },
-      validateChildren: { _, count in
-        guard count == 0 else { throw BonsaiNativeViewError.invalidRegistration }
-      },
-      encodeEvent: { (data: Data) in BonsaiNativeEvent(id: 1, payload: data) },
-      makeResource: { Selection() }, dispose: { $0.release() },
-      content: { context in ImportButton(context: context) })
   }
 }

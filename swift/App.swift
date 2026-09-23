@@ -1,4 +1,4 @@
-import BonsaiSwiftUI
+import LUIAppleBackend
 import SwiftUI
 import OSLog
 #if os(macOS)
@@ -27,15 +27,10 @@ import AppKit
 
 private struct JournalRuntimeSetup {
   let payload: Data
-  let nativeViews: BonsaiNativeViews
+  let extensions: LUIAppleExtensionRegistry
   @MainActor init() throws {
     payload = try JournalNativeServices.startupPayload()
-    var registry = BonsaiNativeViews()
-    try JournalChrome.register(in: &registry)
-    try JournalAssetImport.register(in: &registry)
-    try JournalMedia.register(in: &registry)
-    try JournalAssetSettings.register(in: &registry)
-    nativeViews = registry
+    extensions = try JournalExtensions.registry()
   }
 }
 
@@ -55,8 +50,8 @@ private struct JournalHost: View {
           Label("Unable to open local application storage", systemImage: "exclamationmark.folder")
         } actions: { Button("Retry") { setup = nil; retry += 1 } }
       case .success(let setup):
-        BonsaiApplicationView(entrypoint: "logseq_journal", payload: setup.payload,
-          nativeViews: setup.nativeViews, applicationBridge: platform.bridge)
+        JournalRuntimeHost(
+          platform: platform, payload: setup.payload, extensions: setup.extensions)
           .font(.body)
           .safeAreaInset(edge: .top, spacing: 0) {
             if platform.authenticationRequired {
@@ -127,15 +122,13 @@ private struct JournalHost: View {
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard !terminating else { return .terminateLater }
-    do {
-      guard let shutdown = try platform?.beginShutdown() else { return .terminateNow }
-      terminating = true
-      Task {
-        _ = await shutdown.result
-        sender.reply(toApplicationShouldTerminate: true)
-      }
-      return .terminateLater
-    } catch { return .terminateNow }
+    guard let shutdown = platform?.beginShutdown() else { return .terminateNow }
+    terminating = true
+    Task {
+      _ = await shutdown.result
+      sender.reply(toApplicationShouldTerminate: true)
+    }
+    return .terminateLater
   }
 }
 #endif

@@ -35,7 +35,7 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     else { app.launchArguments.append("--light-appearance") }
     app.launch()
     let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-    let wirelessPermission = springboard.alerts["允许“BonsaiJournalWarmStart”使用无线数据？"]
+    let wirelessPermission = springboard.alerts["允许“Logseq Journal”使用无线数据？"]
     if wirelessPermission.waitForExistence(timeout: 5) {
       wirelessPermission.buttons["不允许"].tap()
       XCTAssertTrue(wirelessPermission.waitForNonExistence(timeout: 5))

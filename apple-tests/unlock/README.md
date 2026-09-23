@@ -8,7 +8,7 @@ shows a sample error; Choose another graph resets preview state.
 This is visual acceptance, not another authentication regression test. Application
 ownership remains covered by `test_native_unlock_recovery` in
 `test/macos_application_dispatch_test.ml`. Native secure-field focus admission has
-its regression in the bonsai-ui SDK. The preview cannot establish correctness of
+its regression in the LUI runtime SDK. The preview cannot establish correctness of
 the OCaml bridge or physical iPhone keyboard behavior.
 
 Build the macOS preview from the repository root:

@@ -1,45 +1,65 @@
-"""Build a public Native_list disclosure probe with observable, non-destructive events."""
+"""Build a public journal-list disclosure probe with observable, non-destructive events.
+
+Stages an LUI probe host (tool/lui_probe_host.py) embedding
+apple-tests/native-outline/outline_probe.ml — a Lui_app signal+update probe
+mounting the `journal-list` extension (Journal_lui_native.list) with
+disclosure rows; expand + row events are decoded back through the extension
+event contract.
+
+The probe's OCaml complete object is produced by the workspace build (see
+tool/lui_probe_host.py): pass it via --native-object, otherwise the host links
+the stub object and only verifies the Swift side.
+"""
+import argparse
 import hashlib
 import json
 from pathlib import Path
-import shutil
-import subprocess
+import sys
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lui_probe_host
+
+root = lui_probe_host.ROOT
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--native-object', type=Path,
+                    help='Complete OCaml object embedding the probe module')
+arguments = parser.parse_args()
+
 host = Path(tempfile.mkdtemp(prefix="journal-outline-probe-")).resolve()
 print(host, flush=True)
 record = {"host": str(host), "commands": [], "inputs": {}}
 
-def run(command):
-    log = host / f"command-{len(record['commands'])}.log"
-    with log.open("w") as output:
-        result = subprocess.run(command, cwd=host, stdout=output, stderr=subprocess.STDOUT)
-    record["commands"].append({"command": command, "exitCode": result.returncode, "log": str(log)})
-    (host / "results.json").write_text(json.dumps(record, indent=2) + "\n")
-    if result.returncode:
-        raise SystemExit(log.read_text()[-8000:])
+source = root/"apple-tests/native-outline/outline_probe.ml"
+record["inputs"]["apple-tests/native-outline/outline_probe.ml"] = hashlib.sha256(source.read_bytes()).hexdigest()
 
-run(["bonsai-swiftui", "init", "--name", "journal_outline_probe",
-     "--macos-bundle-identifier", "org.logseq.journal.outline-probe",
-     "--ios-bundle-identifier", "org.logseq.journal.outline-probe"])
-for source, target in [("apple-tests/native-outline/outline_probe.ml", "app/application.ml")]:
-    shutil.copyfile(root/source, host/target)
-    record["inputs"][source] = hashlib.sha256((root/source).read_bytes()).hexdigest()
-shutil.copyfile(root/"logseq_journal.opam.locked", host/"journal_outline_probe.opam.locked")
-(host/"swift/App.swift").write_text('''import BonsaiSwiftUI
+lui_probe_host.stage(host, app_swift='''import LUIAppleBackend
 import SwiftUI
+
+@MainActor private final class ProbeAuth: JournalAuthCapability {
+  func currentUserID() async throws -> String? { nil }
+  func freshIDToken() async throws -> String { throw CancellationError() }
+  func signOut() async throws { throw CancellationError() }
+}
 
 @main struct OutlineProbe: App {
   var body: some Scene {
     Window("Outline action probe", id: "probe") {
-      BonsaiApplicationView(entrypoint: "journal_outline_probe")
+      JournalRuntimeHost(
+        platform: JournalApplicationPlatform(services: JournalPlatformServices(
+          auth: ProbeAuth(),
+          account: JournalAccountStore(load: { nil }, save: { _ in }, clear: {}),
+          managedSyncOrigin: "https://example.invalid")),
+        payload: (try? JournalNativeServices.startupPayload()) ?? Data(),
+        extensions: (try? JournalExtensions.registry()) ?? LUIAppleExtensionRegistry())
         .frame(minWidth: 480, minHeight: 320)
     }
   }
 }
-''')
-run(["bonsai-swiftui", "init", "--adopt"])
-run(["bonsai-swiftui", "sync-host", "--check"])
-run(["bonsai-swiftui", "build", "macos", "--profile", "debug"])
-print("Open", host/"apple/DerivedData/Build/Products/Debug/BonsaiJournalOutlineProbe.app", flush=True)
+''', bundle_id='org.logseq.journal.outline-probe', display_name='Journal Outline Probe')
+
+app = lui_probe_host.build(host, platform="macos", app_name="JournalOutlineProbe.app",
+                           native_object=arguments.native_object)
+record["commands"].append({"app": str(app)})
+(host/"results.json").write_text(json.dumps(record, indent=2) + "\n")
+print("Open", app, flush=True)
