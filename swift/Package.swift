@@ -17,6 +17,7 @@ let nativeLinkInputs = ProcessInfo.processInfo.environment["JOURNAL_NATIVE_LINK_
     .map(String.init) ?? []
 let nativeLinkerSettings: [LinkerSetting] = nativeLinkInputs.isEmpty ? [] : [
     .unsafeFlags(nativeLinkInputs, .when(platforms: [.iOS, .macOS])),
+    .linkedLibrary("sqlite3", .when(platforms: [.iOS, .macOS])),
 ]
 
 let package = Package(
