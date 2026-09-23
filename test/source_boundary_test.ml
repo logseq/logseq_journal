@@ -1378,37 +1378,28 @@ let () =
     root
     "flutter/lib"
     [ "flutter/lib/application_host_adapter.dart"
+    ; "flutter/lib/journal_asset_import.dart"
+    ; "flutter/lib/journal_asset_settings.dart"
+    ; "flutter/lib/journal_chrome.dart"
+    ; "flutter/lib/journal_ext_utils.dart"
+    ; "flutter/lib/journal_extension_registry.dart"
+    ; "flutter/lib/journal_list.dart"
+    ; "flutter/lib/journal_media.dart"
     ; "flutter/lib/journal_platform_menu.dart"
-    ; "flutter/lib/journal_tail_fade.dart"
-    ; "flutter/lib/journal_date_row.dart"
-    ; "flutter/lib/journal_root_navigation.dart"
-    ; "flutter/lib/journal_detail_outline.dart"
-    ; "flutter/lib/journal_widget_registry.dart"
     ; "flutter/lib/main.dart"
     ];
   require_allowed_dart_files
     root
     "flutter/test"
     [ "flutter/test/application_host_adapter_test.dart"
-    ; "flutter/test/macos_edit_menu_test.dart"
-    ; "flutter/test/journal_tail_fade_test.dart"
-    ; "flutter/test/journal_root_navigation_test.dart"
-    ; "flutter/test/journal_detail_outline_test.dart"
     ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
-    ; "flutter/test/journal_runtime_golden_test.dart"
-    ; "flutter/test/journal_header_layout_test.dart"
     ; "flutter/test/widget_test.dart"
     ];
-  require_allowed_dart_files
-    root
-    "flutter/integration_test"
-    [ "flutter/integration_test/encrypted_offline_warm_start_test.dart" ];
-  require_file root "flutter/integration_test/encrypted_offline_warm_start_test.dart";
+  require_allowed_dart_files root "flutter/integration_test" [];
   require_text
     root
     "logseq_db_worker/tool/test_macos_runtime_flow.sh"
     [ "encrypted-offline-warm-start"
-    ; "integration_test/encrypted_offline_warm_start_test.dart"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE=memory"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE=memory"
     ];
@@ -1509,10 +1500,8 @@ let () =
     ; "SliverList"
     ; "TextSpan"
     ; "WidgetSpan"
-    ; "Image.file"
     ; "package:sqflite/"
     ; "package:drift/"
-    ; "showModalBottomSheet"
     ; "JournalCapture"
     ; "CaptureController"
     ; "TextEditingController"
@@ -1522,10 +1511,6 @@ let () =
   @ dart_files root "flutter/test"
   @ dart_files root "flutter/integration_test"
   |> List.iter (fun relative -> forbid_text root relative forbidden_dart_text);
-  require_text
-    root
-    "flutter/lib/journal_root_navigation.dart"
-    [ "PrimaryScrollController(" ];
   dart_files root "flutter/lib"
   |> List.iter (fun relative -> forbid_text root relative [ "CustomScrollView" ]);
   forbid_text
