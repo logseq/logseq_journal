@@ -13,7 +13,7 @@ case "${2:-default}" in
     switch_prefix=${OPAM_SWITCH_PREFIX:-$(opam var prefix)}
     source_archive="$opam_root/download-cache/sha256/a3/$gmp_sha256"
     target_cc="$switch_prefix/ios-sysroot/bin/ios-cc"
-    sdk_root=$BONSAI_SWIFTUI_APPLE_SDK_ROOT
+    sdk_root=${JOURNAL_APPLE_SDK_ROOT:-${BONSAI_SWIFTUI_APPLE_SDK_ROOT:-}}
     deployment_target=18.0
 
     if test ! -f "$source_archive"; then
