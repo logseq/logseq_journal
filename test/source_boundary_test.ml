@@ -1170,7 +1170,7 @@ let () =
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#271fe332db6db6c0138593d75f267388b41c69b3"
+    "git+https://github.com/logseq/lui.git#38ada4a886d3d783821eba0dff58108c32284a1b"
     1;
   require_occurrences
     root
