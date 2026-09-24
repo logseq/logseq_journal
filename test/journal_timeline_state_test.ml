@@ -4,8 +4,8 @@ let retained_slots state =
   Timeline.fold_slots (fun slots slot -> slot :: slots) [] state |> List.rev
 ;;
 
-module Ui = Bonsai_swiftui_ui
-module ID = Bonsai_swiftui_spec.Id
+module Ui = Journal_view
+module ID = Journal_ids
 
 let fail format = Printf.ksprintf failwith format
 
@@ -1500,14 +1500,8 @@ let test_capture_scroll_terminal_ownership () =
        require
          (Timeline.scroll_outcome duplicate = Some outcome)
          "duplicate completion changed state")
-    Bonsai_swiftui_ui.View.Native_list.
-      [ Succeeded
-      ; Missing_target
-      ; Hidden_target
-      ; Cancelled
-      ; Superseded
-      ; Positioning_failed
-      ]
+    Ui.Event.Payload.
+      [ Succeeded; Missing_target; Cancelled; Superseded; Positioning_failed ]
 ;;
 
 let () =

@@ -7,7 +7,6 @@ import 'dart:typed_data';
 import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
 import 'package:amplify_authenticator/amplify_authenticator.dart';
 import 'package:amplify_flutter/amplify_flutter.dart';
-import 'package:bonsai_flutter/bonsai_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_slidable/flutter_slidable.dart' as fs;
@@ -62,7 +61,11 @@ enum JournalPlatformTag {
   localAccountBindingRequest(20),
   localAccountBindingResponse(21),
   timelinePresentedRequest(22),
-  timelinePresentedResponse(23);
+  timelinePresentedResponse(23),
+  environmentEvent(24),
+  noticeShowRequest(25),
+  noticeResultResponse(26),
+  noticeCancelRequest(27);
 
   const JournalPlatformTag(this.wireId);
   final int wireId;
@@ -365,8 +368,26 @@ final class JournalAmplifySession implements JournalAuthCapability {
   }
 }
 
+/// Journal-side equivalent of the old `BonsaiFlutterApplicationPlatform`:
+/// pushed host->OCaml envelopes are delivered via [events] to
+/// `journal_ocaml_platform_event`, and OCaml->host requests arrive through
+/// [handleRequest], with non-null results returned through
+/// `journal_ocaml_platform_response`.
+abstract interface class JournalPlatformServices {
+  Stream<Uint8List> get events;
+  Future<Uint8List?> handleRequest(Uint8List request);
+}
+
+typedef JournalNoticeResultCallback =
+    Future<String> Function({
+      required String token,
+      required String message,
+      required String? actionLabel,
+      required int durationMs,
+    });
+
 final class JournalApplicationPlatform extends WidgetsBindingObserver
-    implements BonsaiFlutterApplicationPlatform {
+    implements JournalPlatformServices {
   JournalApplicationPlatform({
     required this.auth,
     required this.readPreference,
@@ -436,8 +457,23 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
     if (!_disposed) _events.add(response);
   }
 
+  /// Notice plumbing, installed by the host widget once a
+  /// ScaffoldMessenger exists. Tag-25 requests resolve through
+  /// [JournalNoticeResultCallback] to `action|dismiss|swipe|timeout`; tag-27
+  /// cancels a pending notice without a response.
+  JournalNoticeResultCallback? _notice;
+  void Function(String token)? _cancelNotice;
+
+  void installNoticeSink({
+    required JournalNoticeResultCallback showNotice,
+    required void Function(String token) cancelNotice,
+  }) {
+    _notice = showNotice;
+    _cancelNotice = cancelNotice;
+  }
+
   @override
-  Future<Uint8List> handleRequest(Uint8List request) async {
+  Future<Uint8List?> handleRequest(Uint8List request) async {
     switch (JournalPlatformCodec.requestTag(request)) {
       case 6:
         JournalPlatformCodec.validateEmpty(
@@ -553,6 +589,44 @@ final class JournalApplicationPlatform extends WidgetsBindingObserver
           JournalPlatformTag.timelinePresentedResponse,
           <String, Object>{'presented': true},
         );
+      case 25:
+        final decoded = JournalPlatformCodec.decodeJsonRequest(
+          request,
+          JournalPlatformTag.noticeShowRequest,
+        );
+        final notice = _notice;
+        if (notice == null) return null;
+        final token = decoded['token'];
+        final message = decoded['message'];
+        final durationMs = decoded['durationMs'];
+        if (token is! String ||
+            message is! String ||
+            durationMs is! num ||
+            (decoded['actionLabel'] != null &&
+                decoded['actionLabel'] is! String)) {
+          throw const FormatException('notice request is invalid');
+        }
+        final result = await notice(
+          token: token,
+          message: message,
+          actionLabel: decoded['actionLabel'] as String?,
+          durationMs: durationMs.toInt(),
+        );
+        return JournalPlatformCodec.encodeJson(
+          JournalPlatformTag.noticeResultResponse,
+          <String, Object>{'token': token, 'result': result},
+        );
+      case 27:
+        final decoded = JournalPlatformCodec.decodeJsonRequest(
+          request,
+          JournalPlatformTag.noticeCancelRequest,
+        );
+        final token = decoded['token'];
+        if (token is! String) {
+          throw const FormatException('notice-cancel request is invalid');
+        }
+        _cancelNotice?.call(token);
+        return null;
       default:
         throw const FormatException('unsupported application platform request');
     }
@@ -707,7 +781,16 @@ final class _NativeStartupEnvironment {
 
 typedef ApplicationSupportDirectoryProvider = Future<Directory> Function();
 
-final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
+/// Journal-side equivalent of the old `BonsaiFlutterHostAdapter` — the
+/// factory surface the application host consumes (payload, platform bridge,
+/// host chrome).
+abstract interface class JournalHostAdapter {
+  Future<Uint8List> createApplicationPayload();
+  JournalApplicationPlatform? createApplicationPlatform();
+  Widget buildHost({required BuildContext context, required Widget child});
+}
+
+final class ApplicationHostAdapter implements JournalHostAdapter {
   ApplicationHostAdapter({
     required this.applicationSupportDirectory,
     required this.baseUrl,
@@ -746,6 +829,8 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
         },
       );
 
+  /// The LDB1 startup envelope, passed to `lui_ocaml_start` — the worker
+  /// session starts inside init so it must arrive there.
   @override
   Future<Uint8List> createApplicationPayload() async {
     final directory = await applicationSupportDirectory();
@@ -758,7 +843,7 @@ final class ApplicationHostAdapter implements BonsaiFlutterHostAdapter {
   }
 
   @override
-  BonsaiFlutterApplicationPlatform createApplicationPlatform() =>
+  JournalApplicationPlatform createApplicationPlatform() =>
       JournalApplicationPlatform(
         auth: auth,
         readPreference: readPreference,
@@ -876,7 +961,7 @@ final class _AuthenticatedJournalHost extends StatelessWidget {
   );
 }
 
-ApplicationHostAdapter createBonsaiFlutterHostAdapter({
+ApplicationHostAdapter createJournalHostAdapter({
   Uri? baseUrl,
   Future<void>? amplifyReady,
   Widget Function()? authenticationFailureBuilder,

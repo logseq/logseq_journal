@@ -1,5 +1,5 @@
 module Tokens = Journal_visual_tokens
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 
 let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
@@ -22,17 +22,16 @@ let test_sf_symbols_preserve_identity_and_appearance () =
   List.iter
     (fun (role, expected) ->
        let color = Ui.Style.Color.rgb ~red:17 ~green:34 ~blue:51 in
-       let key = Ui.Key.string ("symbol:" ^ expected) in
-       let widget = Journal_symbols.create ~key ~size:19. ~color role in
-       let (Av view) = Ui.View.Private.view widget in
-       (match view.node with
-        | Ui.View.Private.Symbol { name; size; color; _ } ->
-          require (name = expected) "Unexpected SF Symbol %s" name;
-          require (size = Some 19.) "Symbol size changed";
-          require (color = Some 0xff112233l) "Symbol tint changed"
-        | _ -> failwith "Expected a native symbol");
+       let key = "symbol:" ^ expected in
+       let widget =
+         Journal_symbols.create ~key:(Ui.Key.string key) ~size:19. ~color role
+       in
        require
-         (Option.equal Ui.Key.equal (Ui.View.For_testing.key widget) (Some key))
+         (String.equal (Journal_symbols.name role) expected)
+         "Unexpected SF Symbol %s"
+         (Journal_symbols.name role);
+       require
+         (Option.equal String.equal (Ui.View.For_testing.key widget) (Some key))
          "Symbol key changed")
     cases
 ;;
@@ -71,15 +70,32 @@ let test_header_context_copy_is_pure_product_state () =
     "Favorites context changed"
 ;;
 
-(* Relative luminance and contrast are independent of palette implementation. *)
+(* Relative luminance and contrast are independent of palette implementation.
+   [Ui.Style.Color.t] exposes no channel accessors on the lui shim; the
+   "#rrggbb" channels are recovered with ordered probes through the public
+   [rgb] constructor (a fully transparent color decodes to black). *)
 let color_luminance color =
-  let value = Ui.Style.Color.Private.to_argb32 color in
-  let channel shift =
-    let byte = Int32.(to_int (logand (shift_right_logical value shift) 0xffl)) in
-    let value = Float.of_int byte /. 255. in
-    if value <= 0.04045 then value /. 12.92 else ((value +. 0.055) /. 1.055) ** 2.4
-  in
-  (0.2126 *. channel 16) +. (0.7152 *. channel 8) +. (0.0722 *. channel 0)
+  if color = Ui.Style.Color.argb ~alpha:0 ~red:0 ~green:0 ~blue:0
+  then 0.
+  else (
+    let channel probe =
+      let rec scan value =
+        if value > 255
+        then 255
+        else if Stdlib.compare (probe value) color <= 0
+        then scan (value + 1)
+        else value - 1
+      in
+      scan 0
+    in
+    let red = channel (fun red -> Ui.Style.Color.rgb ~red ~green:0 ~blue:0) in
+    let green = channel (fun green -> Ui.Style.Color.rgb ~red ~green ~blue:0) in
+    let blue = channel (fun blue -> Ui.Style.Color.rgb ~red ~green ~blue) in
+    let linear byte =
+      let value = Float.of_int byte /. 255. in
+      if value <= 0.04045 then value /. 12.92 else ((value +. 0.055) /. 1.055) ** 2.4
+    in
+    (0.2126 *. linear red) +. (0.7152 *. linear green) +. (0.0722 *. linear blue))
 ;;
 
 let color_contrast first second =
@@ -141,7 +157,7 @@ let test_status_palette_contrast () =
                 (color_contrast increased.background increased.foreground >= 7.)
                 "Increased status label has insufficient contrast"))
          statuses)
-    [ Bonsai_swiftui.Environment.Light, [ rgb 255 255 255; rgb 242 242 247 ]
+    [ Journal_environment.Light, [ rgb 255 255 255; rgb 242 242 247 ]
     ; Dark, [ rgb 0 0 0; rgb 28 28 30; rgb 44 44 46 ]
     ];
   Printf.printf

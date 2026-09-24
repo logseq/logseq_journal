@@ -21,6 +21,7 @@
 # Generated SwiftUI hosts and native artifact staging
 /apple/
 /.bonsai-swiftui/
+/swift/.build/
 
 # Local environment and cache directories
 .env
@@ -35,3 +36,4 @@
 /journal.sqlite3-shm
 /journal.sqlite3-wal
 /.dir-locals.el
+app/journal_complete_iossim.o

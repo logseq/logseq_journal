@@ -13,7 +13,7 @@ case "${2:-default}" in
     switch_prefix=${OPAM_SWITCH_PREFIX:-$(opam var prefix)}
     source_archive="$opam_root/download-cache/sha256/a3/$gmp_sha256"
     target_cc="$switch_prefix/ios-sysroot/bin/ios-cc"
-    sdk_root=$BONSAI_SWIFTUI_APPLE_SDK_ROOT
+    sdk_root=${JOURNAL_APPLE_SDK_ROOT:-${BONSAI_SWIFTUI_APPLE_SDK_ROOT:-}}
     deployment_target=18.0
 
     if test ! -f "$source_archive"; then
@@ -64,6 +64,7 @@ case "${2:-default}" in
       printf '%s\n' "Built iPhoneOS GMP archive is not arm64-only" >&2
       exit 1
     fi
+    sdk_lib_dir="$sdk_root/usr/lib"
     ;;
   *)
     gmp_library_directory=$(pkg-config --variable=libdir gmp)
@@ -73,7 +74,8 @@ case "${2:-default}" in
       exit 1
     fi
     cp "$gmp_archive" "$destination"
+    sdk_lib_dir="${JOURNAL_APPLE_SDK_ROOT:-$(xcrun --show-sdk-path 2>/dev/null || printf /)}/usr/lib"
     ;;
 esac
 
-printf '%s\n' '(-cclib -Lapp -cclib app/libgmp.a)'
+printf '%s\n' "(-cclib -Lapp -cclib app/libgmp.a -cclib -L$sdk_lib_dir)"

@@ -10,6 +10,6 @@ root = Path(__file__).resolve().parents[1]
 for command in [
     ['dune', 'exec', 'test/journal_semantics_test.exe'],
     ['dune', 'exec', 'test/journal_timeline_state_test.exe'],
-    ['python3', 'tool/test_macos_regressions.py', '--case', 'application_dispatch'],
+    ['python3', 'tool/test_macos_regressions.py', '--case', 'mutation'],
 ]:
     subprocess.run(command, cwd=root, check=True)

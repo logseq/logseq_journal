@@ -1,4 +1,4 @@
-import BonsaiSwiftUI
+import LUIAppleBackend
 import SwiftUI
 
 /// Native chrome layout only. List sections own all date scrolling and pinning.
@@ -19,7 +19,7 @@ import SwiftUI
     static let defaultValue = CGSize.zero
   }
 
-  private struct FloatingChrome: View {
+  private struct FloatingChrome: SwiftUI.View {
     let content: AnyView
     let account: AnyView
     let error: AnyView
@@ -27,7 +27,7 @@ import SwiftUI
     let properties: Properties
     @State private var controlsSize = CGSize.zero
 
-    var body: some View {
+    var body: some SwiftUI.View {
       GeometryReader { bounds in
         content.frame(width: bounds.size.width, height: bounds.size.height)
           .scrollContentBackground(.hidden)
@@ -57,15 +57,15 @@ import SwiftUI
     }
   }
 
-  private struct SectionDate: View {
+  private struct SectionDate: SwiftUI.View {
     let title: String
     @Environment(\.journalControlsSize) private var controlsSize
 
-    var body: some View {
+    var body: some SwiftUI.View {
       HStack(spacing: 0) {
         Text(title)
           .font(.title2.weight(.semibold))
-          .foregroundStyle(.primary)
+          .foregroundStyle(Color(.label))
           .monospacedDigit()
           .textCase(nil)
           .lineLimit(1)
@@ -76,49 +76,52 @@ import SwiftUI
     }
   }
 
-  static func register(in registry: inout BonsaiNativeViews) throws {
-    try registry.register(kind: 2103, version: 2, capabilities: [.stateful, .semantics],
-      decode: { try JSONDecoder().decode(Properties.self, from: $0) },
-      validateChildren: { properties, count in
-        switch properties.mode {
-        case .feedback:
-          guard count == 3, properties.top != nil, properties.visible != nil else {
-            throw BonsaiNativeViewError.invalidRegistration
-          }
-        case .journal:
-          guard count == 4, properties.connecting != nil, properties.account != nil,
-            properties.error != nil else { throw BonsaiNativeViewError.invalidRegistration }
-        case .header:
-          guard count == 0, properties.title != nil else {
-            throw BonsaiNativeViewError.invalidRegistration
-          }
-        }
-      },
-      encodeEvent: { (event: Never) -> BonsaiNativeEvent in switch event {} },
-      makeResource: { () }, dispose: { _ in },
-      content: { context in
-        switch context.properties.mode {
-        case .feedback:
+  struct View: SwiftUI.View {
+    let context: LUIAppleExtensionViewContext
+
+    private var properties: Properties? {
+      JournalExtensions.decode(Properties.self, context: context)
+    }
+
+    private func child(_ index: Int) -> AnyView {
+      guard context.childIDs.count > index else { return AnyView(EmptyView()) }
+      return context.content(for: context.childIDs[index])
+    }
+
+    var body: some SwiftUI.View {
+      switch properties?.mode {
+      case .feedback:
+        if let properties, context.childIDs.count == 3,
+          properties.top != nil, properties.visible != nil {
           GeometryReader { bounds in
-            context.children[0].frame(width: bounds.size.width, height: bounds.size.height)
+            child(0).frame(width: bounds.size.width, height: bounds.size.height)
           }
-          .safeAreaInset(edge: context.properties.top! ? .top : .bottom, spacing: 0) {
-            if context.properties.visible! {
+          .safeAreaInset(edge: properties.top! ? .top : .bottom, spacing: 0) {
+            if properties.visible! {
               ViewThatFits(in: .horizontal) {
-                context.children[1]
-                context.children[2]
+                child(1)
+                child(2)
               }
               .frame(maxWidth: .infinity)
               .background(.bar)
             }
           }
-        case .journal:
-          FloatingChrome(content: AnyView(context.children[0]), account: AnyView(context.children[1]),
-            error: AnyView(context.children[2]), progress: AnyView(context.children[3]), properties: context.properties)
-        case .header:
-          SectionDate(title: context.properties.title!)
         }
-      })
+      case .journal:
+        if let properties, context.childIDs.count == 4,
+          properties.connecting != nil, properties.account != nil,
+          properties.error != nil {
+          FloatingChrome(content: child(0), account: child(1),
+            error: child(2), progress: child(3), properties: properties)
+        }
+      case .header:
+        if let properties, context.childIDs.isEmpty, let title = properties.title {
+          SectionDate(title: title)
+        }
+      case .none:
+        EmptyView()
+      }
+    }
   }
 }
 

@@ -1,4 +1,4 @@
-module ID = Bonsai_swiftui_spec.Id
+module ID = Journal_ids
 
 type mode =
   | Reading
@@ -46,7 +46,7 @@ val reveal_id : t -> string option
 val request_back : t -> [ `Close ]
 val child_capture : t -> Journal_capture.t option
 val update_child_source : t -> string -> t
-val apply_child_edit : t -> Bonsai_swiftui_ui.Event.Payload.text_edit -> t
+val apply_child_edit : t -> Journal_view.Event.Payload.text_edit -> t
 val toggle_child_task : t -> t
 val fail : t -> message:string -> t
 val retry : t -> t * Journal_graph_request.t option
@@ -85,10 +85,10 @@ val fail_retained_composer
   -> retained_composer
 
 val interrupt_retained_composer : retained_composer -> retained_composer
-val reveal_outcome : t -> Bonsai_swiftui_ui.View.Native_list.outcome option
+val reveal_outcome : t -> Journal_view.View.Native_list.outcome option
 
 val complete_reveal
   :  t
   -> token:int64
-  -> outcome:Bonsai_swiftui_ui.View.Native_list.outcome
+  -> outcome:Journal_view.View.Native_list.outcome
   -> t

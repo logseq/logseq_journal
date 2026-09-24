@@ -1,5 +1,5 @@
 module P = Journal_media
-module S = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module A = Logseq_db_types.Asset_descriptor
 
 let check x message = if not x then failwith message

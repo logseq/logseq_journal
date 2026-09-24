@@ -46,7 +46,7 @@ type t =
   ; visible_last_exclusive : int
   ; scroll_generation : int64
   ; scroll_target : (int64 * int * string) option
-  ; scroll_outcome : Bonsai_swiftui_ui.View.Native_list.outcome option
+  ; scroll_outcome : Journal_view.View.Native_list.outcome option
   ; visible_demand : request list option
   ; pending : (int64 * request) option
   ; recovery : recovery option

@@ -1,4 +1,4 @@
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 module Uuid = Logseq_db_types.Graph_types.Uuid
 
 let decode ~target payload =
@@ -48,7 +48,7 @@ let decode ~target payload =
 
 let extension =
   Ui.Native_widget.Extension.create
-    ~kind_id:(Bonsai_swiftui_spec.Id.Native_widget.Kind_id.of_int 2104)
+    ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2104)
     ~version:1
     ~capabilities:[ Stateful; Resource; Semantics ]
     ~encode_props:(fun props -> Bytes.of_string (Yojson.Basic.to_string props))
@@ -57,7 +57,10 @@ let extension =
 ;;
 
 let is_dismissal payload =
-  match (try Yojson.Basic.from_string payload with _ -> `Null) with
+  match
+    try Yojson.Basic.from_string payload with
+    | _ -> `Null
+  with
   | `Assoc fields ->
     (match List.assoc_opt "action" fields with
      | Some (`String "dismissed") -> true

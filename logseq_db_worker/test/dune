@@ -27,16 +27,14 @@
   uri))
 
 (test
- (name test_bonsai_service)
- (modules test_bonsai_service)
+ (name test_lui_service)
+ (modules test_lui_service)
  (libraries
-  bonsai_swiftui.driver
-  bonsai_swiftui_test
   datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
   logseq_db_worker
-  logseq_db_worker.bonsai
+  logseq_db_worker.lui
   logseq_db_worker_test_support
   logseq_sync.effect_runner))
 
@@ -82,7 +80,6 @@
  (modules test_managed_sync_e2e managed_sync_protocol_probe)
  (libraries
   bigstringaf
-  bonsai_swiftui.driver
   ca-certs-nss
   cstruct
   datascript-ocaml-native
@@ -99,7 +96,7 @@
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
-  logseq_db_worker.bonsai
+  logseq_db_worker.lui
   logseq_sync.pure_reducer
   managed_sync_e2e_support
   mirage-crypto-rng
@@ -118,7 +115,12 @@
 (test
  (name test_asset_upload)
  (modules test_asset_upload)
- (libraries alcotest logseq_db_worker.pure_reducer logseq_db_types logseq_sync.pure_reducer uri))
+ (libraries
+  alcotest
+  logseq_db_worker.pure_reducer
+  logseq_db_types
+  logseq_sync.pure_reducer
+  uri))
 
 (test
  (name test_asset_protocol)

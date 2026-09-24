@@ -1,5 +1,5 @@
-module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
-module Ui = Bonsai_swiftui_ui
+module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Ui = Journal_view
 
 module Context = struct
   type t =
@@ -21,7 +21,7 @@ let test_id id view = V.with_test_id (Ui.Test_id.string id) view
 
 let chrome =
   Ui.Native_widget.Extension.create
-    ~kind_id:(Bonsai_swiftui_spec.Id.Native_widget.Kind_id.of_int 2103)
+    ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
     ~version:2
     ~capabilities:[ Stateful; Semantics ]
     ~encode_props:(fun props -> Yojson.Basic.to_string props |> Bytes.of_string)
@@ -36,7 +36,10 @@ let feedback ~key ~top ~visible ~compact ~expanded body =
     ~props:
       (`Assoc [ "mode", `String "feedback"; "top", `Bool top; "visible", `Bool visible ])
     ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body; compact; expanded ]
+      (* Chrome slots are positional on the native side — absent slots must
+       still mount a (zero-size) node or the host's index lookup shifts. *)
+    ~children:
+      [ V.Body.Private.to_widget body; V.column [ compact ]; V.column [ expanded ] ]
     ()
   |> V.Body.static
 ;;
@@ -121,18 +124,11 @@ let view
                |> Option.iter (fun (_, _, _, action, _) ->
                  Ui.Event.Handler.Private.invoke dispatch (Ui.Event.Payload.Text action))
              | _ -> ()))
-        ~label:
-          (V.label
-             ~title:(V.text "Account menu")
-             ~icon:(Journal_symbols.create Journal_symbols.Account)
-             ())
+        ~title:""
+        ~icon:(Journal_symbols.name Journal_symbols.Account)
         (List.map
            (fun (id, title, symbol, _, role) ->
-              V.Menu.action
-                ~id
-                ~role
-                ~label:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
-                ())
+              V.Menu.action ~id ~role ~title ~icon:symbol ())
            actions)
       |> V.semantics
            ~properties:
@@ -277,16 +273,20 @@ let view
               ; "error", `Bool (Option.is_some on_error_info)
               ])
         ~on_event:(fun _ -> ())
+          (* Chrome slots are positional on the native side — absent slots must
+           still mount a (zero-size) node or the host's index lookup shifts. *)
         ~children:
           [ V.Body.Private.to_widget body
-          ; (if platform = "ios" then account else V.empty ())
-          ; (if platform = "ios" then error else V.empty ())
-          ; (if sync_phase = Some Graph_service.Connecting
-             then
-               V.progress ~style:Circular ()
-               |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
-               |> test_id "journal-header-sync-progress"
-             else V.empty ())
+          ; (if platform = "ios" then V.column [ account ] else V.column [])
+          ; (if platform = "ios" then V.column [ error ] else V.column [])
+          ; V.column
+              [ (if sync_phase = Some Graph_service.Connecting
+                 then
+                   V.progress ~style:Circular ()
+                   |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
+                   |> test_id "journal-header-sync-progress"
+                 else V.empty ())
+              ]
           ]
         ()
       |> test_id "journal-floating-chrome"

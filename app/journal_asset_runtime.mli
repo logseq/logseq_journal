@@ -1,7 +1,7 @@
 type t
 
 val create
-  :  send:(Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.request -> bool)
+  :  send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
   -> changed:
        (int option
         -> Journal_asset_policy.offline
@@ -21,8 +21,8 @@ val receive : t -> Logseq_db_worker.Protocol.response -> bool
 
 val notice
   :  t
-  -> Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.asset_scope
-  -> Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.asset_notice
+  -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope
+  -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_notice
   -> unit
 
 val visible : t -> consumer:string -> Logseq_db_types.Asset_descriptor.t list -> unit

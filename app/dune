@@ -3,6 +3,12 @@
  (wrapped false)
  (modules
   application
+  journal_bridge
+  journal_environment
+  journal_ids
+  journal_lui_native
+  journal_pump
+  journal_view
   journal_uploads
   journal_asset_import
   journal_asset_settings
@@ -33,35 +39,27 @@
   journal_symbols)
  (libraries
   rrbvec
-  bonsai_swiftui.spec_impl
   base
-  bonsai
-  bonsai_swiftui
-  bonsai_swiftui.ui
-  bonsai_swiftui.driver
   core
+  lui
+  ocaml-signal
   datascript-ocaml-native
-  incr_dom.ui_incr
   logseq_db_types
   logseq_db_worker
-  logseq_db_worker.bonsai
+  logseq_db_worker.lui
   threads
   unix
-  virtual_dom.ui_effect
-  yojson))
+  yojson)
+ (foreign_stubs
+  (language c)
+  (names journal_lui_bridge)))
 
 (executable
  (name native_embed)
  (modules native_embed)
- (libraries
-  bonsai_swiftui.spec_impl
-  app
-  bonsai_swiftui.driver
-  bonsai_swiftui.native_backend)
+ (libraries app lui)
  (link_flags
   (:standard
-   -cclib
-   -L%{env:BONSAI_SWIFTUI_APPLE_SDK_ROOT=}/usr/lib
    (:include native_static_link_flags.sexp)))
  (modes
   (native object)))
@@ -72,3 +70,20 @@
   (with-stdout-to
    native_static_link_flags.sexp
    (run ../tool/native_static_link_flags.sh libgmp.a %{context_name}))))
+
+(rule
+ (alias macos-app)
+ (deps native_embed.exe.o)
+ (action
+  (system
+   "JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/native_embed.exe.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh macos")))
+
+; vtool restamps the host complete object for the simulator triple (the app .cmx
+; are identical arm64 code; a target-toolchain recompile replaces this when the
+; deps are available as iOS objects).
+(rule
+ (alias ios-app)
+ (deps native_embed.exe.o)
+ (action
+  (system
+   "vtool -set-build-version 7 ${JOURNAL_IOS_DEPLOYMENT_TARGET:-26.0} $(xcrun --sdk iphonesimulator --show-sdk-version) -replace -output $PWD/journal_complete_iossim.o $PWD/native_embed.exe.o && JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/journal_complete_iossim.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh ios-simulator")))

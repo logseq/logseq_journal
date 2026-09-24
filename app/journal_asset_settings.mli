@@ -1,4 +1,4 @@
-module Ui = Bonsai_swiftui_ui
+module Ui = Journal_view
 
 type event =
   | Days of Journal_asset_policy.settings

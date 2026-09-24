@@ -1,4 +1,4 @@
-# bonsai_flutter_logseq_journal_host
+# logseq_journal_host
 
 A new Flutter project.
 

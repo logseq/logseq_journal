@@ -1,17 +1,17 @@
 val sync_phase_name
-  :  Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.sync_phase
+  :  Logseq_db_worker_lui.Logseq_db_worker_lui_service.sync_phase
   -> string
 
 val startup_phase_name : Journal_startup.startup_phase -> string
 val graph_phase_name : Logseq_db_worker.graph_phase -> string
 
 val diagnostic_phase_rows
-  :  snapshot:Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.snapshot option
+  :  snapshot:Logseq_db_worker_lui.Logseq_db_worker_lui_service.snapshot option
   -> graph:Logseq_db_worker.graph_state
   -> (string * string) list
 
 val diagnostic_rows
-  :  Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.diagnostics
+  :  Logseq_db_worker_lui.Logseq_db_worker_lui_service.diagnostics
   -> (string * string) list
 
 module Admission_refresh : sig
@@ -48,13 +48,11 @@ val format_bytes : int -> string
 val admission_rows : Admission_refresh.observation -> (string * string) list
 
 module For_testing : sig
-  val diagnostics_page
-    :  Bonsai_swiftui_ui.Event.Handler.t
-    -> Bonsai_swiftui_ui.View.Body.t
+  val diagnostics_page : Journal_view.Event.Handler.t -> Journal_view.View.Body.t
 
   val favorites_page
     :  Logseq_db_worker.Protocol.v2_favorite_item list
-    -> Bonsai_swiftui_ui.View.t
+    -> Journal_view.View.t
 
   val read_block_entropy : unit -> bytes
 
@@ -68,14 +66,14 @@ module For_testing : sig
   val app_with_service
     :  ?calendar_sampler:Journal_calendar.Sampler.t
     -> ( Logseq_db_worker.Config.t
-         , Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.request
-         , Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.response
-         , Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.push )
-         Bonsai_swiftui.Worker.Service.t
-    -> App.t
+         , Logseq_db_worker_lui.Logseq_db_worker_lui_service.request
+         , Logseq_db_worker_lui.Logseq_db_worker_lui_service.response
+         , Logseq_db_worker_lui.Logseq_db_worker_lui_service.push )
+         Logseq_db_worker_lui.Journal_worker.Service.t
+    -> Journal_bridge.hooks
 end
 
-val app : App.t
+val native_hooks : Journal_bridge.hooks
 
 module Root_navigation : sig
   type t
@@ -84,7 +82,7 @@ module Root_navigation : sig
     | Select of Journal_routes.destination
     | Capture_opened
     | Capture_closed
-    | Capture_native_edit of Bonsai_swiftui_ui.Event.Payload.text_edit
+    | Capture_native_edit of Journal_view.Event.Payload.text_edit
     | Capture_task_intent of bool
     | Capture_edited of string
     | Capture_admitted of Journal_capture.t

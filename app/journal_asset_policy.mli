@@ -1,6 +1,6 @@
 module Asset = Logseq_db_types.Asset_descriptor
 module Graph = Logseq_db_types.Graph_types
-module Transfer = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service.Asset
+module Transfer = Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset
 
 type reason =
   | Recent

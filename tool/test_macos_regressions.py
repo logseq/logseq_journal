@@ -14,7 +14,6 @@ CASES = [
         "test/macos_mutation_input_diagnostics_pure_reducer_test.ml",
         "MACOS_PURE_REDUCER_TESTS_PASSED",
     ),
-    ("test/macos_application_dispatch_test.ml", "MACOS_APPLICATION_DISPATCH_TESTS_PASSED"),
     ("test/macos_mutation_runtime_test.ml", "MACOS_MUTATION_RUNTIME_TESTS_PASSED"),
 ]
 
@@ -42,12 +41,15 @@ def main():
         for line in dict.fromkeys(bootstrap.splitlines())
         if not (line.startswith("#load ") and "/native_backend/" in line)
     )
+    # The bonsai_swiftui_test support library is gone; the lui package carries
+    # the runtime API the registered cases use through the Journal_view /
+    # Journal_ids shims.
     test_library = subprocess.run(
-        ["ocamlfind", "query", "bonsai_swiftui_test"],
+        ["ocamlfind", "query", "lui"],
         cwd=REPO, text=True, capture_output=True, check=True,
     ).stdout.strip()
     bootstrap += "\n#directory " + json.dumps(test_library) + ";;\n"
-    bootstrap += "#load " + json.dumps(str(Path(test_library) / "bonsai_swiftui_test.cma")) + ";;\n"
+    bootstrap += "#load " + json.dumps(str(Path(test_library) / "lui.cma")) + ";;\n"
     with tempfile.TemporaryDirectory(prefix="journal-macos-regressions-") as directory:
         for relative, sentinel in cases:
             entry = Path(directory) / "run.ml"

@@ -1,5 +1,5 @@
-module ID = Bonsai_swiftui_spec.Id
-module Ui = Bonsai_swiftui_ui
+module ID = Journal_ids
+module Ui = Journal_view
 
 type phase =
   | Editing
@@ -77,15 +77,22 @@ module Editor = struct
            editor.document_revision
          > 0
     then None
-    else
-      Some
-        { editor with
-          document_revision =
-            ID.Text_input.Document_revision.succ editor.document_revision
-        ; accepted_local_revision = edit.local_revision
-        ; update_mode = Ui.Text_editing.Ack
-        ; value = value_of_edit edit
-        }
+    else (
+      let value = value_of_edit edit in
+      (* A mount-time echo reports the identical document; treating it as an
+         edit would republish the model and (under a full-remount view) spawn
+         a fresh node that echoes again — an unbounded render loop. *)
+      if Ui.Text_editing.Value.equal value editor.value
+      then None
+      else
+        Some
+          { editor with
+            document_revision =
+              ID.Text_input.Document_revision.succ editor.document_revision
+          ; accepted_local_revision = edit.local_revision
+          ; update_mode = Ui.Text_editing.Ack
+          ; value
+          })
   ;;
 end
 

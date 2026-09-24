@@ -1,5 +1,5 @@
 module P = Journal_uploads
-module S = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module U = Logseq_db_worker_pure_reducer.Asset_upload
 
 let uuid n =

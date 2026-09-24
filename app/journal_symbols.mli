@@ -20,8 +20,8 @@ val for_task_state : Journal_model.task_state -> t
 val name : t -> string
 
 val create
-  :  ?key:Bonsai_swiftui_ui.Key.t
+  :  ?key:Journal_view.Key.t
   -> ?size:float
-  -> ?color:Bonsai_swiftui_ui.Style.Color.t
+  -> ?color:Journal_view.Style.Color.t
   -> t
-  -> Bonsai_swiftui_ui.View.t
+  -> Journal_view.View.t

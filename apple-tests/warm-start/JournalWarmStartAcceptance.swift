@@ -1,4 +1,4 @@
-import BonsaiSwiftUI
+import LUIAppleBackend
 import Foundation
 import Observation
 import SwiftUI
@@ -75,7 +75,7 @@ private struct WarmFixture: Decodable {
   let auth: OfflineAuth
   let services: JournalPlatformServices
   let reportURL: URL
-  private var sender: BonsaiApplicationEvents?
+  let platform: JournalApplicationPlatform
 
   init(fixture: WarmFixture, missing: Bool, report: URL) throws {
     self.fixture = fixture
@@ -87,6 +87,7 @@ private struct WarmFixture: Decodable {
         load: { JournalLocalAccount(userID: fixture.userId, managedSyncOrigin: fixture.baseUrl) },
         save: { _ in }, clear: { throw JournalPlatformServices.Failure.unavailable }),
       managedSyncOrigin: fixture.baseUrl)
+    platform = JournalApplicationPlatform(services: services)
     auth.isTimelinePresented = { [weak services] in services?.timelinePresented == true }
     payload = try JournalStartupConfiguration.encode(
       applicationSupportPath: fixture.supportRoot, managedSyncOrigin: fixture.baseUrl)
@@ -109,10 +110,11 @@ private struct WarmFixture: Decodable {
     }
   }
 
-  var bridge: BonsaiApplicationBridge {
-    BonsaiApplicationBridge(request: { [self] bytes in
-      let request = try JournalPlatformWire.decodeRequest(bytes)
-      let response = try await services.response(for: request)
+  /// Mirrors the old bridge callbacks through the platform's observation
+  /// hooks: `request` runs inside JournalApplicationPlatform, and connect /
+  /// disconnect transitions come from the runtime's attach/detach.
+  func observePlatform() {
+    platform.requestObserver = { [self] request in
       if request == .timelinePresented {
         presented = true
         // Startup allows network overlap, but blocked authentication must not
@@ -121,18 +123,18 @@ private struct WarmFixture: Decodable {
         status = passed ? "PASS encrypted local timeline with authentication blocked" : "FAIL warm-start presentation"
         record("timeline-presented")
       }
-      return try JournalPlatformWire.encodeResponse(response)
-    }, connected: { [self] value in
-      sender = value
-      ready = true
-      record("connected")
-    }, disconnected: { [self] in
-      sender = nil
-      ready = false
-      disconnected += 1
-      services.invalidateConnection()
-      record("disconnected")
-    })
+    }
+    platform.connectionObserver = { [self] connected in
+      if connected {
+        ready = true
+        record("connected")
+      } else {
+        ready = false
+        disconnected += 1
+        services.invalidateConnection()
+        record("disconnected")
+      }
+    }
   }
 
   func checkRecovery() {
@@ -142,32 +144,31 @@ private struct WarmFixture: Decodable {
     record("recovery-observation")
   }
 
+  /// Inspects the public runtime surface (JournalRuntime + the journal pump)
+  /// directly — the counterpart of the old NativeRuntime.open pump loop.
   func inspectFirstFrame() async {
     do {
-      let runtime = try await NativeRuntime.open(entrypoint: "logseq_journal", payload: payload)
+      let headless = JournalApplicationPlatform(services: services)
+      let runtime = try JournalRuntime(
+        platform: headless, startupPayload: payload,
+        extensionRegistry: try JournalExtensions.registry())
+      runtime.start()
       for index in 0..<5 {
-        let frame = try await runtime.pump(monotonicNanoseconds: Int64(index * 2 + 1))
-        status = "Native frame \(index): status=\(frame.status) bytes=\(frame.bytes.count) revision=\(frame.revision)"
-        try frame.bytes.write(to: reportURL.appendingPathExtension("frame-\(index)"))
+        runtime.pump()
+        try await Task.sleep(for: .milliseconds(50))
+        status = "Native frame \(index): root=\(runtime.rootID.map(String.init) ?? "pending") applied=\(runtime.appliedPatches)"
         record("native-frame")
-        try await runtime.acknowledge(frame, monotonicNanoseconds: Int64(index * 2 + 2))
       }
-      await runtime.close()
+      runtime.stop()
     } catch { status = "FAIL first frame: \(error)"; record("first-frame-error") }
   }
 
   func shutdown() async {
-    guard let sender else { return }
-    do {
-      let operation = try sender.beginShutdown(event: JournalPlatformWire.prepareToTerminate(),
-        timeout: .seconds(4),
-        accepting: { (try? JournalPlatformWire.decodeRequest($0)) == .terminationReady },
-        request: { _ in .finish(try JournalPlatformWire.encodeResponse(.terminationReady)) })
-      let outcome = await operation.result
-      status = outcome == .completed && disconnected == 1
-        ? "PASS real Journal cooperative shutdown" : "FAIL shutdown: \(outcome)"
-      record("shutdown-\(outcome)")
-    } catch { status = "FAIL shutdown: \(error)"; record("shutdown-error") }
+    guard let exchange = platform.beginShutdown() else { return }
+    let outcome = await exchange.result
+    status = outcome == .completed && disconnected == 1
+      ? "PASS real Journal cooperative shutdown" : "FAIL shutdown: \(outcome)"
+    record("shutdown-\(outcome)")
   }
 
   private func record(_ event: String) {
@@ -203,7 +204,7 @@ private struct WarmFixture: Decodable {
   #endif
   @State private var probe: WarmProbe
   @State private var activeScene = true
-  private let registry: BonsaiNativeViews
+  private let registry: LUIAppleExtensionRegistry
 
   init() {
     // This executable is test-only; never access the user's native secrets.
@@ -235,11 +236,11 @@ private struct WarmFixture: Decodable {
         fatalError("--support-root relative Documents path is required on iPhone")
       }
       #endif
-      _probe = State(initialValue: try WarmProbe(fixture: fixture,
-        missing: arguments.contains("--missing-key"), report: path.appendingPathExtension("observations.jsonl")))
-      var registry = BonsaiNativeViews()
-      try JournalChrome.register(in: &registry)
-      self.registry = registry
+      let probe = try WarmProbe(fixture: fixture,
+        missing: arguments.contains("--missing-key"), report: path.appendingPathExtension("observations.jsonl"))
+      probe.observePlatform()
+      _probe = State(initialValue: probe)
+      self.registry = try JournalExtensions.registry()
     } catch { fatalError("Fixture setup failed: \(error)") }
   }
 
@@ -288,8 +289,8 @@ private struct WarmFixture: Decodable {
         if ProcessInfo.processInfo.arguments.contains("--pump-only") {
           Text("Inspecting the public native runtime").task { await probe.inspectFirstFrame() }
         } else {
-          BonsaiApplicationView(entrypoint: "logseq_journal", payload: probe.payload,
-            nativeViews: registry, applicationBridge: probe.bridge)
+          JournalRuntimeHost(platform: probe.platform, payload: probe.payload,
+            extensions: registry)
             .font(.body)
             .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--dark-appearance") ? .dark :
               ProcessInfo.processInfo.arguments.contains("--light-appearance") ? .light : nil)

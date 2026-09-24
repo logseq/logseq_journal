@@ -83,6 +83,10 @@ struct JournalLocalAccount: Equatable, Sendable {
       return .signedOut
     case .terminationReady:
       return .terminationReady
+    case .showNotice, .cancelNotice:
+      // Notice requests are intercepted by JournalApplicationPlatform before
+      // reaching services.
+      throw Failure.unavailable
     }
   }
 

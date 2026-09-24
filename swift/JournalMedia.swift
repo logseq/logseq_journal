@@ -1,4 +1,4 @@
-import BonsaiSwiftUI
+import LUIAppleBackend
 import ImageIO
 import QuickLook
 import SwiftUI
@@ -47,13 +47,13 @@ private actor JournalMediaDecoder {
     let picker: Picker?
     let error: String?
   }
-  private struct MediaItem: View {
+  private struct MediaItem: SwiftUI.View {
     let item: Item
     let emit: (String, String, Bool) -> Void
     @State private var image: CGImage?
     @State private var preview: URL?
     @State private var decodeFailed = false
-    @ViewBuilder private var content: some View {
+    @ViewBuilder private var content: some SwiftUI.View {
       Group {
         if item.kind == "file" && item.isImage {
           Group {
@@ -87,7 +87,7 @@ private actor JournalMediaDecoder {
         }
       }
     }
-    var body: some View {
+    var body: some SwiftUI.View {
       Group {
         if item.isImage {
           Color.clear
@@ -101,66 +101,66 @@ private actor JournalMediaDecoder {
       .accessibilityIdentifier("journal-media:" + item.id)
     }
   }
-  private struct MediaGroup: View {
-    let context: BonsaiNativeContext<Properties, Data, Void>
-    private func emit(_ action: String, _ asset: String = "", _ visible: Bool = true) {
-      guard context.canInteract(), let data = try? JSONSerialization.data(withJSONObject: [
-        "action": action, "root": context.properties.root, "asset": asset, "visible": visible,
-      ]) else { return }
-      _ = context.emit(data)
+  struct View: SwiftUI.View {
+    let context: LUIAppleExtensionViewContext
+
+    private var properties: Properties? {
+      JournalExtensions.decode(Properties.self, context: context)
     }
-    var body: some View {
+
+    private func emit(_ action: String, _ asset: String = "", _ visible: Bool = true) {
+      guard let properties, let data = try? JSONSerialization.data(withJSONObject: [
+        "action": action, "root": properties.root, "asset": asset, "visible": visible,
+      ]) else { return }
+      JournalExtensions.emit(context: context, payload: data)
+    }
+
+    var body: some SwiftUI.View {
       VStack(alignment: .leading, spacing: 8) {
-        HStack(alignment: .top) {
-          context.children[0]
-          Spacer(minLength: 8)
-          if context.properties.editable {
-            Menu {
-              Button("Replace file\u{2026}") { emit("replace") }
-              Button("Reuse existing\u{2026}") { emit("reuse") }
-            } label: {
-              Label("Attachment actions", systemImage: "ellipsis.circle")
-                .labelStyle(.iconOnly)
+        context.content
+        if let properties {
+          if properties.editable {
+            HStack(alignment: .top) {
+              Spacer(minLength: 8)
+              Menu {
+                Button("Replace file\u{2026}") { emit("replace") }
+                Button("Reuse existing\u{2026}") { emit("reuse") }
+              } label: {
+                Label("Attachment actions", systemImage: "ellipsis.circle")
+                  .labelStyle(.iconOnly)
+              }
+              .menuIndicator(.hidden)
+              .accessibilityIdentifier("journal-media-actions")
             }
-            .menuIndicator(.hidden)
-            .accessibilityIdentifier("journal-media-actions")
           }
-        }
-        ForEach(context.properties.items) { item in MediaItem(item: item, emit: emit) }
-        if let picker = context.properties.picker {
-          if picker.busy, picker.items.isEmpty {
-            ProgressView("Loading attachments").font(.caption)
-          }
-          ForEach(picker.items) { item in
-            Button { emit("reuse-select", item.id) } label: {
-              Label(item.type.isEmpty ? "file" : item.type, systemImage: "doc")
+          ForEach(properties.items) { item in MediaItem(item: item, emit: emit) }
+          if let picker = properties.picker {
+            if picker.busy, picker.items.isEmpty {
+              ProgressView("Loading attachments").font(.caption)
             }
-            .disabled(picker.busy)
-            .accessibilityIdentifier("journal-media-candidate:" + item.id)
-          }
-          if picker.more {
-            Button("More attachments") { emit("reuse-next") }
+            ForEach(picker.items) { item in
+              Button { emit("reuse-select", item.id) } label: {
+                Label(item.type.isEmpty ? "file" : item.type, systemImage: "doc")
+              }
               .disabled(picker.busy)
+              .accessibilityIdentifier("journal-media-candidate:" + item.id)
+            }
+            if picker.more {
+              Button("More attachments") { emit("reuse-next") }
+                .disabled(picker.busy)
+            }
+            Button("Cancel", role: .cancel) { emit("reuse-cancel") }
+              .font(.caption)
           }
-          Button("Cancel", role: .cancel) { emit("reuse-cancel") }
-            .font(.caption)
+          if let error = properties.error {
+            Text(error).font(.caption).foregroundStyle(.secondary)
+            Button("Retry attachments") { emit("retry") }
+          }
+          if properties.more { Button("Next attachments") { emit("next") } }
         }
-        if let error = context.properties.error {
-          Text(error).font(.caption).foregroundStyle(.secondary)
-          Button("Retry attachments") { emit("retry") }
-        }
-        if context.properties.more { Button("Next attachments") { emit("next") } }
       }
       .buttonStyle(.borderless)
       .onDisappear { Task { await JournalMediaDecoder.shared.clear() } }
     }
-  }
-  static func register(in registry: inout BonsaiNativeViews) throws {
-    try registry.register(kind: 2105, version: 1, capabilities: [.stateful, .semantics],
-      decode: { try JSONDecoder().decode(Properties.self, from: $0) },
-      validateChildren: { properties, count in
-        guard count == 1, properties.items.count <= 32 else { throw BonsaiNativeViewError.invalidRegistration }
-      }, encodeEvent: { (data: Data) in BonsaiNativeEvent(id: 1, payload: data) },
-      makeResource: { () }, dispose: { _ in }, content: { context in MediaGroup(context: context) })
   }
 }

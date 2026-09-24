@@ -1,5 +1,5 @@
 module R = Journal_media_runtime
-module S = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module A = Logseq_db_types.Asset_descriptor
 module G = Logseq_db_types.Graph_types
 module P = Logseq_db_worker.Protocol
@@ -174,10 +174,7 @@ let () =
   let reference_query =
     match request with
     | S.Graph_request
-        ({ command =
-             P.V2_get_block { block; revision = None }
-         ; _
-         } as query)
+        ({ command = P.V2_get_block { block; revision = None }; _ } as query)
       when block = uuid 1 -> query
     | _ -> failwith "reuse must read the attachment holder first"
   in
@@ -247,8 +244,7 @@ let () =
       ~source:
         (Managed
            (Some
-              (A.version ~checksum:(String.make 64 'b') ~file_type:"pdf"
-               |> Result.get_ok)))
+              (A.version ~checksum:(String.make 64 'b') ~file_type:"pdf" |> Result.get_ok)))
       ~current_checksum:None
       ~size:None
       ~dimensions:None
@@ -282,12 +278,7 @@ let () =
    | S.Graph_request
        { command =
            P.V2_set_asset_reference
-             { block
-             ; previous = Some previous
-             ; asset = chosen
-             ; preconditions
-             ; _
-             }
+             { block; previous = Some previous; asset = chosen; preconditions; _ }
        ; _
        }
      when block = uuid 1
@@ -328,8 +319,7 @@ let () =
                    })
           }));
   (match !armed with
-   | [ (armed_root, Some previous) ]
-     when armed_root = root && previous = uuid 2 -> ()
+   | [ (armed_root, Some previous) ] when armed_root = root && previous = uuid 2 -> ()
    | _ -> failwith "replace must arm the picker with the current asset reference");
   R.begin_replace runtime ~root;
   let token, _ = Queue.take sent in
@@ -351,9 +341,7 @@ let () =
        ; _
        }
      when u = uuid 7 -> ()
-   | _ ->
-     failwith
-       "menu actions on an unregistered group must register and query it");
+   | _ -> failwith "menu actions on an unregistered group must register and query it");
   let token, request = Queue.take sent in
   let cold_reference =
     match request with
@@ -384,8 +372,7 @@ let () =
   (match request with
    | S.Graph_request
        { command =
-           P.V2_list_assets
-             { recursive = true; roots = [ u ]; limit = 16; cursor = None }
+           P.V2_list_assets { recursive = true; roots = [ u ]; limit = 16; cursor = None }
        ; _
        }
      when u = uuid 9 -> ()

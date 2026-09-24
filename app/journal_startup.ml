@@ -1,4 +1,4 @@
-module Graph_service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
 module Error = struct
   type t = Invalid of string

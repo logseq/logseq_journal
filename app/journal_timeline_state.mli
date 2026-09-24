@@ -78,10 +78,10 @@ val retry_day : t -> day:int -> t
 val first_visible_index : t -> int
 val scroll_generation : t -> int64
 val scroll_target : t -> (int64 * int * string) option
-val scroll_outcome : t -> Bonsai_swiftui_ui.View.Native_list.outcome option
+val scroll_outcome : t -> Journal_view.View.Native_list.outcome option
 
 val complete_scroll
   :  t
   -> token:int64
-  -> outcome:Bonsai_swiftui_ui.View.Native_list.outcome
+  -> outcome:Journal_view.View.Native_list.outcome
   -> t

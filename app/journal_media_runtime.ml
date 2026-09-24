@@ -1,4 +1,4 @@
-module Service = Logseq_db_worker_bonsai.Logseq_db_worker_bonsai_service
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
 module P = Journal_media
 module G = Logseq_db_types.Graph_types
@@ -429,8 +429,7 @@ let begin_replace t ~root =
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some _ when (not g.replace) && List.length t.queued < 1024 ->
     (match G.Uuid.of_string g.root with
-     | Error _ ->
-       g.error <- Some "The attachment holder is unavailable."
+     | Error _ -> g.error <- Some "The attachment holder is unavailable."
      | Ok block ->
        g.replace <- true;
        g.error <- None;
@@ -484,8 +483,7 @@ let begin_reuse t ~root =
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some _ when List.length t.queued < 1024 ->
     g.reference <- None;
-    g.reuse
-    <- Some { pending = true; committing = false; items = []; cursor = None };
+    g.reuse <- Some { pending = true; committing = false; items = []; cursor = None };
     request_reference t g;
     notify t g;
     pump t
@@ -496,8 +494,8 @@ let reuse_next t ~root =
   match Hashtbl.find_opt t.groups root with
   | Some g ->
     (match g.reference, g.reuse with
-     | Some { page; _ }
-     , Some { pending = false; committing = false; cursor = Some cursor; _ } ->
+     | ( Some { page; _ }
+       , Some { pending = false; committing = false; cursor = Some cursor; _ } ) ->
        request_candidates t g page (Some cursor);
        notify t g;
        pump t
@@ -623,10 +621,8 @@ let receive t ticket response =
         (match response with
          | Service.Graph_response
              (Protocol.V2_response
-                { outcome =
-                    V2_block_outcome (V2_present_block { value; revision })
-                ; _
-                }) ->
+                { outcome = V2_block_outcome (V2_present_block { value; revision }); _ })
+           ->
            let reference =
              { page = value.block.page
              ; revision
@@ -645,12 +641,10 @@ let receive t ticket response =
      (match Hashtbl.find_opt t.groups root with
       | Some g when g.epoch = epoch ->
         (match g.reuse, response with
-         | Some reuse
-         , Service.Graph_response
-             (Protocol.V2_response
-                { outcome = V2_assets_outcome { items; next_cursor; _ }
-                ; _
-                }) ->
+         | ( Some reuse
+           , Service.Graph_response
+               (Protocol.V2_response
+                  { outcome = V2_assets_outcome { items; next_cursor; _ }; _ }) ) ->
            reuse.items
            <- List.filteri
                 (fun index _ -> index < 64)
@@ -681,10 +675,7 @@ let receive t ticket response =
         (match response with
          | Service.Graph_response
              (Protocol.V2_response
-                { outcome =
-                    V2_block_outcome (V2_present_block { value; _ })
-                ; _
-                }) ->
+                { outcome = V2_block_outcome (V2_present_block { value; _ }); _ }) ->
            t.armed g.root (previous_reference value.block)
          | _ -> g.error <- Some "Unable to open the attachment reference. Retry.");
         notify t g
@@ -693,10 +684,9 @@ let receive t ticket response =
      (match Hashtbl.find_opt t.groups root with
       | Some g when g.epoch = epoch ->
         (match g.reuse, response with
-         | Some _
-         , Service.Graph_response
-             (Protocol.V2_response
-                { outcome = V2_mutation_committed _; _ }) ->
+         | ( Some _
+           , Service.Graph_response
+               (Protocol.V2_response { outcome = V2_mutation_committed _; _ }) ) ->
            g.reuse <- None;
            g.reference <- None;
            read t g None;

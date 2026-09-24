@@ -10,13 +10,15 @@ bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
 depends: [
   "base-bigarray" {= "base"}
   "base-domains" {= "base"}
+  "base-effects" {= "base"}
   "base-nnp" {= "base"}
   "base-threads" {= "base"}
   "base-unix" {= "base"}
+  "compiler-cloning" {= "disabled"}
   "dune" {= "3.23.1"}
-  "ocaml" {= "5.1.1"}
-  "ocaml-base-compiler" {= "5.1.1"}
-  "ocaml-config" {= "3"}
+  "ocaml" {= "5.5.0"}
+  "ocaml-base-compiler" {= "5.5.0"}
+  "ocaml-compiler" {= "5.5.0"}
   "ocaml-options-vanilla" {= "1"}
 ]
 build: ["dune" "build" "-p" name "-j" jobs]
