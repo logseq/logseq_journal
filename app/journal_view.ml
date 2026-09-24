@@ -74,7 +74,15 @@ let set_leaf_label context node { title; icon } =
     (* Icon-only controls keep their name on the accessibility channel; the
        schema rejects icon-only buttons with no accessible name. *)
     if supported Lui_protocol.AccessibilityLabel
-    then Lui_ui.accessibility_label context node (if title = "" then " " else title));
+    then Lui_ui.accessibility_label context node (if title = "" then " " else title);
+    (* Bar glyphs render chromeless inside the capsule; the default variant
+       now maps to a bordered accent button which would double-frame the
+       pill. *)
+    if supported Lui_protocol.VariantValue
+    then
+      Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
+    if supported Lui_protocol.ForegroundValue
+    then Lui_ui.foreground context node "secondary");
   Option.iter
     (fun name ->
        if supported Lui_protocol.InlineIconName
@@ -1223,6 +1231,8 @@ module View = struct
         node
         Lui_protocol.InlineIconName
         (journal_icon_name icon);
+      Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
+      Lui_ui.foreground context node "secondary";
       Lui_ui.background context node "secondary";
       Lui_ui.corner_radius context node 20;
       Lui_ui.width context node 40;
