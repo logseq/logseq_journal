@@ -1155,7 +1155,19 @@ module View = struct
     let group ~key ?placement children =
       { item_key = key
       ; placement
-      ; content = row ~key children
+      ; content =
+          element ~key (fun context parent ->
+            (* Groups mount their children flat into the enclosing bar: the
+               toolbar capsule already is the group, and a wrapper
+               button-group/row is either not a legal toolbar child or would
+               stretch the capsule to full width. *)
+            (match parent with
+             | Some parent ->
+               List.fold_left
+                 (fun _ child -> child.mount context (Some parent))
+                 0
+                 children
+             | None -> 0))
       ; spacing = None
       ; is_group = true
       }
@@ -1203,21 +1215,35 @@ module View = struct
           mounted)
     ;;
 
-    let capsule context parent mount_children =
+    let capsule ?(toolbar_label = "") context parent mount_children =
       (* A row child of an HStack keeps its intrinsic width unless it grows,
-         so the pill hugs its controls without a pinned width. *)
-      let row = Lui_ui.row context in
-      Lui_ui.gap context row 16;
+         so the pill hugs its controls without a pinned width. When the
+         capsule holds only controls, children mount inside a [toolbar]
+         node — the schema semantic for a control bar — wrapped by a box
+         carrying the pill chrome: a toolbar accepts only
+         label/gap/orientation/style-class, and a row would auto-append a
+         trailing spacer and stretch to full width. *)
+      let node =
+        if toolbar_label = "" then Lui_ui.row context else Lui_ui.box context
+      in
+      Lui_ui.gap context node 16;
       (* Hug content height; the default stretch cross would soak the
          parent column's split share (see Navigation_stack back row). *)
-      Lui_ui.cross context row "center";
-      Lui_ui.padding_horizontal context row 14;
-      Lui_ui.padding_vertical context row 9;
-      Lui_ui.background context row "secondary";
-      Lui_ui.corner_radius context row 20;
-      Lui_ui.append context parent row;
-      mount_children row;
-      row
+      Lui_ui.cross context node "center";
+      Lui_ui.padding_horizontal context node 14;
+      Lui_ui.padding_vertical context node 9;
+      Lui_ui.background context node "secondary";
+      Lui_ui.corner_radius context node 20;
+      Lui_ui.append context parent node;
+      (match toolbar_label with
+       | "" -> mount_children node
+       | label ->
+         let toolbar = Lui_ui.toolbar context in
+         Lui_ui.accessibility_label context toolbar label;
+         Lui_ui.gap context toolbar 16;
+         Lui_ui.append context node toolbar;
+         mount_children toolbar);
+      node
     ;;
 
     let circle_button context parent ~icon ~on_press =
@@ -1380,7 +1406,7 @@ module View = struct
                Lui_ui.append context node fixed
              | _ ->
                ignore
-                 (capsule context node (fun row ->
+                 (capsule ~toolbar_label:item.item_key context node (fun row ->
                     ignore (mount_icon_only row context item))))
           items;
         node)
