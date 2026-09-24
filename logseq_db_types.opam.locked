@@ -5,8 +5,8 @@ synopsis: "Shared Logseq graph and sync boundary values"
 maintainer: "application authors"
 authors: "application authors"
 license: "MIT"
-homepage: "https://github.com/RCmerci/logseq_journal"
-bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
+homepage: "https://github.com/logseq/logseq_journal"
+bug-reports: "https://github.com/logseq/logseq_journal/issues"
 depends: [
   "base-bigarray" {= "base"}
   "base-domains" {= "base"}
