@@ -15,7 +15,12 @@ struct JournalRuntimeHost: View {
   var body: some SwiftUI.View {
     Group {
       if let runtime, let rootID = runtime.rootID {
-        LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
+        // The lui widget set has no navigation-stack node: the shell stack
+        // supplies the system nav bar and bottom bar so toolbar nodes with a
+        // `placement` prop hoist into real platform chrome.
+        NavigationStack {
+          LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
+        }
       } else {
         ProgressView("Opening journal")
       }

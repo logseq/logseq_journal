@@ -5124,6 +5124,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
        container. *)
     Lui_elements.column
       [ Lui_elements.dyn
+          ~equal:( == )
           (fun model ->
              Journal_view.mount
                (body_view
@@ -5131,12 +5132,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                   dispatch
                   timeline_scroll_completed
                   detail_scroll_completed))
-          (* `dyn` remounts the whole tree on every publish (its key equality
-             is `fun _ _ -> false`). Reducers that return the identical record
-             must not republish — otherwise mount-time echoes (fresh text
-             fields, extension `.task` emits) loop forever: remount → echo →
-             publish → remount. *)
-          (Signal.cutoff ( == ) model_signal)
+          model_signal
       ]
   in
   let os =

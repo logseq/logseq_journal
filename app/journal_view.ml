@@ -82,7 +82,7 @@ let set_leaf_label context node { title; icon } =
     then
       Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
     if supported Lui_protocol.ForegroundValue
-    then Lui_ui.foreground context node "secondary");
+    then Lui_ui.foreground context node "foreground");
   Option.iter
     (fun name ->
        if supported Lui_protocol.InlineIconName
@@ -1215,54 +1215,19 @@ module View = struct
           mounted)
     ;;
 
-    let capsule ?(toolbar_label = "") context parent mount_children =
-      (* A row child of an HStack keeps its intrinsic width unless it grows,
-         so the pill hugs its controls without a pinned width. When the
-         capsule holds only controls, children mount inside a [toolbar]
-         node — the schema semantic for a control bar — wrapped by a box
-         carrying the pill chrome: a toolbar accepts only
-         label/gap/orientation/style-class, and a row would auto-append a
-         trailing spacer and stretch to full width. *)
-      let node =
-        if toolbar_label = "" then Lui_ui.row context else Lui_ui.box context
-      in
-      Lui_ui.gap context node 16;
-      (* Hug content height; the default stretch cross would soak the
-         parent column's split share (see Navigation_stack back row). *)
-      Lui_ui.cross context node "center";
-      Lui_ui.padding_horizontal context node 14;
-      Lui_ui.padding_vertical context node 9;
-      Lui_ui.background context node "secondary";
-      Lui_ui.corner_radius context node 20;
-      Lui_ui.append context parent node;
-      (match toolbar_label with
-       | "" -> mount_children node
-       | label ->
-         let toolbar = Lui_ui.toolbar context in
-         Lui_ui.accessibility_label context toolbar label;
-         Lui_ui.gap context toolbar 16;
-         Lui_ui.append context node toolbar;
-         mount_children toolbar);
-      node
-    ;;
-
-    let circle_button context parent ~icon ~on_press =
+    let nav_button context parent ~icon ~label ~on_press =
       let node = Lui_ui.button context in
       Lui_ui.text_property context node "";
       (* Icon-only button: the schema rejects empty text + icon without an
          accessibility label. *)
-      Lui_ui.accessibility_label context node "Back";
+      Lui_ui.accessibility_label context node label;
       Lui_ui.string_property
         context
         node
         Lui_protocol.InlineIconName
         (journal_icon_name icon);
       Lui_ui.string_property context node Lui_protocol.VariantValue "ghost";
-      Lui_ui.foreground context node "secondary";
-      Lui_ui.background context node "secondary";
-      Lui_ui.corner_radius context node 20;
-      Lui_ui.width context node 40;
-      Lui_ui.height context node 40;
+      Lui_ui.foreground context node "foreground";
       Lui_ui.on_event context node (fun event -> if is_press event then on_press ());
       Lui_ui.append context parent node;
       node
@@ -1285,129 +1250,123 @@ module View = struct
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
-        let leading =
-          List.filter
-            (fun (item : item) ->
-               match item.placement with
-               | Some (Navigation | Cancellation_action) -> true
-               | _ -> false)
-            items
-        and principal =
-          List.filter
-            (fun (item : item) -> item.placement = Some Principal)
-            items
-        and secondary =
-          List.filter
-            (fun (item : item) -> item.placement = Some Secondary_action)
+        (* Items hoist into the platform chrome by placement: each
+           `placement` toolbar emits its children as system ToolbarItems
+           (the navigation bar's leading/principal/trailing areas on iOS,
+           the window toolbar on macOS) — groups fuse into one capsule.
+           Hosts without chrome hoisting render the toolbar's inline row
+           content instead, so this row keeps the emulated arrangement. *)
+        let emit_bar placement mounts =
+          let toolbar = Lui_ui.toolbar context in
+          Lui_ui.accessibility_label context toolbar "navigation";
+          Lui_ui.placement context toolbar placement;
+          Lui_ui.gap context toolbar 16;
+          Lui_ui.append context node toolbar;
+          mounts toolbar;
+          toolbar
+        in
+        let of_placement p =
+          List.filter (fun (item : item) -> item.placement = Some p) items
+        in
+        let mount_bar_items toolbar items =
+          List.iter
+            (fun (item : item) -> ignore (mount_icon_only toolbar context item))
             items
         in
-        let trailing =
-          List.filter
-            (fun (item : item) ->
-               match item.placement with
-               | Some
-                   ( Navigation | Cancellation_action | Principal
-                   | Secondary_action | Bottom_bar )
-               | None -> false
-               | Some _ -> true)
-            items
+        let navigation = of_placement Navigation
+        and cancellation = of_placement Cancellation_action
+        and principal = of_placement Principal in
+        let nav_can_pop =
+          match !nav_bar with
+          | Some { nav_can_pop = true; _ } -> true
+          | _ -> false
         in
-        (match !nav_bar with
-         | Some { nav_can_pop = true; nav_on_change; nav_remaining; _ } ->
-           ignore
-             (circle_button
-                context
-                node
-                ~icon:"chevron.left"
-                ~on_press:(fun () ->
-                  invoke nav_on_change
-                    (Event.Payload.Navigation_path_changed nav_remaining)))
-         | _ -> ());
-        List.iter
-          (fun item -> ignore (mount_icon_only node context item))
-          leading;
-        ignore (flexible_space context node);
-        (match principal with
-         | [] ->
-           (match !nav_bar with
-            | Some { nav_title = title; _ } when title <> "" ->
-              let title_node = Lui_ui.text context title in
-              Lui_ui.style_class context title_node "semibold";
-              Lui_ui.append context node title_node
-            | _ -> ())
-         | _ ->
-           List.iter
-             (fun item ->
-                let mounted = item.content.mount context (Some node) in
-                if mounted <> 0
-                then (
-                  Lui_ui.key context mounted item.item_key;
-                  if node_is_standard context mounted
-                  then Lui_ui.style_class context mounted "semibold"))
-             principal);
-        ignore (flexible_space context node);
-        if trailing <> [] || secondary <> []
+        if nav_can_pop || navigation <> []
         then
           ignore
-            (capsule context node (fun row ->
-               List.iter
-                 (fun item -> ignore (mount_icon_only row context item))
-                 trailing;
-               if secondary <> []
-               then (
-                 (* Secondary actions collapse into the "more" overflow the
-                    system bar showed. *)
-                 let trigger = Lui_ui.menu_item context in
-                 Lui_ui.text_property context trigger " ";
-                 (* accessibility-label is not in the menu-item schema; the
-                     whitespace text is what the validator accepts. *)
-                 Lui_ui.string_property
-                   context
-                   trigger
-                   Lui_protocol.InlineIconName
-                   (journal_icon_name "ellipsis");
-                 (* The menu label grows to fill available space; cap it so
-                    the trigger stays icon-sized inside the capsule. *)
-                 Lui_ui.width context trigger 40;
-                 Lui_ui.string_property
-                   context
-                   trigger
-                   Lui_protocol.SizeValue
-                   "sm";
-                 Lui_ui.append context row trigger;
-                 let menu = Lui_ui.dropdown_menu context in
-                 Lui_ui.append context trigger menu;
-                 List.iter
-                   (fun (item : item) ->
-                      match item.content.menu_item_mount with
-                      | Some mount -> ignore (mount context (Some menu))
-                      | None -> ignore (mount_icon_only row context item))
-                   secondary)));
+            (emit_bar "navigation" (fun toolbar ->
+               (match !nav_bar with
+                | Some { nav_can_pop = true; nav_on_change; nav_remaining; _ } ->
+                  ignore
+                    (nav_button
+                       context
+                       toolbar
+                       ~icon:"chevron.left"
+                       ~label:"Back"
+                       ~on_press:(fun () ->
+                         invoke nav_on_change
+                           (Event.Payload.Navigation_path_changed nav_remaining)))
+                | _ -> ());
+               mount_bar_items toolbar navigation));
+        if cancellation <> []
+        then
+          ignore
+            (emit_bar "cancellation-action" (fun toolbar ->
+               mount_bar_items toolbar cancellation));
+        ignore (flexible_space context node);
+        (match principal, !nav_bar with
+         | [], Some { nav_title = title; _ } when title <> "" ->
+           ignore
+             (emit_bar "principal" (fun toolbar ->
+                let title_node = Lui_ui.text context title in
+                Lui_ui.style_class context title_node "semibold";
+                Lui_ui.append context toolbar title_node))
+         | [], _ -> ()
+         | _ :: _, _ ->
+           ignore
+             (emit_bar "principal" (fun toolbar ->
+                List.iter
+                  (fun (item : item) ->
+                     let mounted = item.content.mount context (Some toolbar) in
+                     if mounted <> 0
+                     then (
+                       Lui_ui.key context mounted item.item_key;
+                       if node_is_standard context mounted
+                       then Lui_ui.style_class context mounted "semibold"))
+                  principal)));
+        ignore (flexible_space context node);
+        List.iter
+          (fun (placement, items) ->
+             if items <> []
+             then
+               ignore (emit_bar placement (fun toolbar -> mount_bar_items toolbar items)))
+          [ "primary-action", of_placement Primary_action
+          ; "automatic", List.filter (fun (i : item) -> i.placement = None) items
+          ; "status", of_placement Status
+          ; "confirmation-action", of_placement Confirmation_action
+          ; "destructive-action", of_placement Destructive_action
+          ; "secondary-action", of_placement Secondary_action
+          ];
         node)
     ;;
 
     let mount_bottom_bar items =
       element (fun context parent ->
-        let node = Lui_ui.row context in
-        Lui_ui.gap context node 10;
-        Lui_ui.cross context node "center";
-        Lui_ui.padding_horizontal context node 12;
-        Lui_ui.padding_vertical context node 8;
+        (* A `placement "bottom"` toolbar maps to the platform bottom bar on
+           iOS — the system renders each group as a floating glass capsule,
+           spacers flex between them, and scroll content insets around the
+           bar. Groups need a button-group child so the bar renders one
+           capsule per group instead of one capsule per button. *)
+        let node = Lui_ui.toolbar context in
+        Lui_ui.accessibility_label context node "actions";
+        Lui_ui.placement context node "bottom";
+        Lui_ui.gap context node 16;
         (match parent with
          | Some parent -> Lui_ui.append context parent node
          | None -> ());
         List.iter
           (fun (item : item) ->
              match item.spacing with
-             | Some Flexible -> ignore (flexible_space context node)
-             | Some Fixed ->
-               let fixed = Lui_ui.spacer context in
-               Lui_ui.width context fixed 16;
-               Lui_ui.append context node fixed
-             | _ ->
-               ignore
-                 (capsule ~toolbar_label:item.item_key context node (fun row ->
-                    ignore (mount_icon_only row context item))))
+             | Some _ ->
+               let spacer = Lui_ui.spacer context in
+               Lui_ui.append context node spacer
+             | None ->
+               if item.is_group
+               then (
+                 let group = Lui_ui.button_group context in
+                 Lui_ui.append context node group;
+                 ignore (mount_icon_only group context item))
+               else ignore (mount_icon_only node context item))
           items;
         node)
     ;;
@@ -2539,10 +2498,42 @@ module Native_widget = struct
 
   let mount extension ?key ~props ~on_event ~children context parent =
     let payload = Bytes.to_string (extension.Extension.encode_props props) in
+    (* journal-chrome slots 1..3 (account / error / progress) are the floating
+       chrome affordances the old host rendered as icon-only circles. Mount
+       them under the icon-only collapse; slot 0 is page content and stays
+       uncollapsed. *)
+    let chrome_slots =
+      extension.Extension.identifier = Journal_lui_native.chrome_identifier
+    in
+    let children =
+      List.mapi
+        (fun index element ->
+           if chrome_slots && index > 0
+           then
+             fun context parent ->
+             let previous = !icon_only
+             and previous_nodes = !icon_only_collapsed_nodes in
+             icon_only := true;
+             icon_only_collapsed_nodes := [];
+             Fun.protect
+               ~finally:(fun () ->
+                 icon_only := previous;
+                 icon_only_collapsed_nodes := previous_nodes)
+               (fun () ->
+                 let mounted = element.mount context parent in
+                 List.iter
+                   (fun node ->
+                      if node_is_standard context node
+                      then Lui_ui.width context node 40)
+                   !icon_only_collapsed_nodes;
+                 mounted)
+           else element.mount)
+        children
+    in
     Journal_lui_native.mount
       ?key
       ~payload
-      ~children:(List.map (fun element -> element.mount) children)
+      ~children
       ~on_event:(fun event ->
         match decode extension event with
         | Ok decoded -> on_event decoded
