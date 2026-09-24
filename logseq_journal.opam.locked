@@ -15,11 +15,11 @@ pin-depends: [
 ]
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#c26f9adcaabe326e3edcde9bb45304ebf9bb05ad"
+    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#c26f9adcaabe326e3edcde9bb45304ebf9bb05ad"
+    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
   ]
   [
   "lui.0.1.0"
@@ -35,15 +35,15 @@ pin-depends: [
   ]
   [
     "melange-transit-core.0.1.2"
-    "git+https://github.com/logseq/melange-transit.git#38ca92e299cf34c897d9a44091fe86e55b1315ee"
+    "git+https://github.com/logseq/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"
   ]
   [
     "melange-transit-native.0.1.2"
-    "git+https://github.com/logseq/melange-transit.git#38ca92e299cf34c897d9a44091fe86e55b1315ee"
+    "git+https://github.com/logseq/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"
   ]
   [
   "ocaml-signal.0.1.0"
-  "git+https://github.com/logseq/ocaml-signal.git#48a4a4d37f87addbb28d85a10a55bd13becf94be"
+  "git+https://github.com/logseq/ocaml-signal.git#976b40f1770a65b3464df1ef38d1550f1d8a43dd"
 ]
   [
     "persistent_sorted_set_ocaml.dev"
