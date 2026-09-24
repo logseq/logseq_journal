@@ -5,8 +5,8 @@ synopsis: "Managed Logseq sync runtime"
 maintainer: "application authors"
 authors: "application authors"
 license: "MIT"
-homepage: "https://github.com/RCmerci/logseq_journal"
-bug-reports: "https://github.com/RCmerci/logseq_journal/issues"
+homepage: "https://github.com/logseq/logseq_journal"
+bug-reports: "https://github.com/logseq/logseq_journal/issues"
 depends: [
   "alcotest" {= "1.7.0" & with-test}
   "angstrom" {= "dev"}
@@ -137,31 +137,31 @@ pin-depends: [
 ]
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
+    "git+https://github.com/logseq/datascript-ocaml.git#c26f9adcaabe326e3edcde9bb45304ebf9bb05ad"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#40345cc2f59214daa88b33b8aec711337d20afa7"
+    "git+https://github.com/logseq/datascript-ocaml.git#c26f9adcaabe326e3edcde9bb45304ebf9bb05ad"
   ]
   [
     "melange-edn-core.0.5.0"
-    "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
+    "git+https://github.com/logseq/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
   ]
   [
     "melange-edn-native.0.5.0"
-    "git+https://github.com/RCmerci/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
+    "git+https://github.com/logseq/melange-edn.git#3cb79f278e972388a0a2b2ea1caec7a008a0b956"
   ]
   [
     "melange-transit-core.0.1.2"
-    "git+https://github.com/RCmerci/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"
+    "git+https://github.com/logseq/melange-transit.git#38ca92e299cf34c897d9a44091fe86e55b1315ee"
   ]
   [
     "melange-transit-native.0.1.2"
-    "git+https://github.com/RCmerci/melange-transit.git#35f8afe7d6506863c7253e67a20befb3dde5c18f"
+    "git+https://github.com/logseq/melange-transit.git#38ca92e299cf34c897d9a44091fe86e55b1315ee"
   ]
   [
     "persistent_sorted_set_ocaml.dev"
     "git+https://github.com/logseq/persistent-sorted-set-ocaml.git#4016dae1cdf4304207d8277ff9957656cdd8b177"
   ]
-  ["rrbvec.dev" "git+https://github.com/RCmerci/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
+  ["rrbvec.dev" "git+https://github.com/logseq/rrbvec.git#dd5ce904f91d53235b5136f7a771f3f074c3971d"]
 ]
