@@ -341,6 +341,14 @@ module View : sig
   val divider : ?key:Key.t -> unit -> t
   val progress : ?key:Key.t -> ?value:float -> ?style:Progress_style.t -> unit -> t
   val spacer : ?key:Key.t -> ?min_length:float -> unit -> t
+  val loading : ?key:Key.t -> ?centered:bool -> message:string -> unit -> t
+
+  val feedback_banner
+    :  ?key:Key.t
+    -> ?kind:[ `error | `info ]
+    -> message:string
+    -> unit
+    -> t
 
   val row
     :  ?key:Key.t

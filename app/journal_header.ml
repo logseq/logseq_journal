@@ -171,9 +171,7 @@ let view
     V.column
       ~spacing:4.
       [ (if sync_phase = Some Graph_service.Connecting
-         then
-           V.row [ V.progress ~style:Circular (); V.text "Connecting" ]
-           |> test_id "journal-header-sync-progress"
+         then V.loading ~message:"Connecting" () |> test_id "journal-header-sync-progress"
          else V.empty ())
       ; (match sync_error with
          | None -> V.empty ()

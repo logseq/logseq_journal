@@ -23,10 +23,7 @@ let should_show_timestamp ~today ~previous_slot = function
   | Top_level _ | Day_heading _ | Day_continuation _ | Feed_continuation _ -> false
 ;;
 
-let loading_view () =
-  V.column [ V.progress ~style:Circular (); V.text "Loading journal" ]
-  |> V.frame ~max_width:Fill ~max_height:Fill
-;;
+let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
       ~render_media
@@ -76,8 +73,7 @@ let view
           entry
       | Day_continuation { day; _ } ->
         (match Timeline.day_error state ~day with
-         | None ->
-           V.row [ V.progress ~style:Circular (); V.text "Loading more journal entries" ]
+         | None -> V.loading ~message:"Loading more journal entries" ()
          | Some message ->
            V.column
              [ V.text message
@@ -89,8 +85,7 @@ let view
                |> V.with_test_id
                     (Ui.Test_id.string ("journal-day-retry:" ^ string_of_int day))
              ])
-      | Feed_continuation _ ->
-        V.row [ V.progress ~style:Circular (); V.text "Loading older journal days" ]
+      | Feed_continuation _ -> V.loading ~message:"Loading older journal days" ()
     in
     V.column ~key:(Ui.Key.string (Timeline.slot_key slot)) [ child ]
   in

@@ -638,6 +638,14 @@ module View = struct
 
   let spacer ?key ?min_length:_ () = element ?key (Lui_elements.spacer [])
 
+  let loading ?key ?(centered = false) ~message () =
+    element ?key (Lui_element_combine.loading ~message ~centered ())
+  ;;
+
+  let feedback_banner ?key ?(kind = `error) ~message () =
+    element ?key (Lui_element_combine.feedback_banner ~kind ~message ())
+  ;;
+
   let row ?key ?(spacing = 16.) ?(alignment = Layout.Vertical_alignment.Center) children =
     element
       ?key
@@ -805,17 +813,29 @@ module View = struct
   ;;
 
   let toggle ?key ?style:_ ?(enabled = true) ~value ~on_changed ~label () =
+    let on_toggle event =
+      match event with
+      | Lui_protocol.ToggleChanged (_, selected) ->
+        invoke on_changed (Event.Payload.Bool selected)
+      | _ -> ()
+    in
     element
       ?key
-      (Lui_elements.toggle
-         ~checked:value
-         ~disabled:(not enabled)
-         ~on_toggle:(fun event ->
-           match event with
-           | Lui_protocol.ToggleChanged (_, selected) ->
-             invoke on_changed (Event.Payload.Bool selected)
-           | _ -> ())
-         [ leaf_label label.label_content ])
+      (match label.label_content with
+       (* A text-only label mounts the shared toggle-row composite. *)
+       | Some { title; icon = None } ->
+         Lui_element_combine.toggle_row
+           ~label:title
+           ~checked:value
+           ~disabled:(not enabled)
+           ~on_toggle
+           ()
+       | _ ->
+         Lui_elements.toggle
+           ~checked:value
+           ~disabled:(not enabled)
+           ~on_toggle
+           [ leaf_label label.label_content ])
   ;;
 
   let text_editor
@@ -916,21 +936,45 @@ module View = struct
   ;;
 
   let labeled_content ?key ~label ~value () =
-    element ?key (Lui_elements.row [ label.mount; Lui_elements.spacer []; value.mount ])
+    element
+      ?key
+      (match label.label_content, value.label_content with
+       (* Two plain texts mount the shared labeled settings row. *)
+       | ( Some { title = label_text; icon = None }
+         , Some { title = value_text; icon = None } ) ->
+         Lui_element_combine.labeled_row ~label:label_text ~value:value_text ()
+       | _ -> Lui_elements.row [ label.mount; Lui_elements.spacer []; value.mount ])
   ;;
 
   let content_unavailable ?key ~label ?description ?actions () =
-    element
-      ?key
-      (* Grow so the column fills the page: without it the column shrinks to
-         its content and the centered children end up leading-aligned. *)
-      (Lui_elements.column
+    (* An all-text label/description maps onto the shared empty-state
+       composite; richer content keeps the hand-rolled centered column. *)
+    let description_text =
+      match description with
+      | None -> Some None
+      | Some description ->
+        (match description.label_content with
+         | Some { title; icon = None } -> Some (Some title)
+         | _ -> None)
+    in
+    (match label.label_content, description_text with
+     | Some { title; icon }, Some description ->
+       Lui_element_combine.empty_state
+         ?icon:(Option.map journal_icon icon)
+         ~title
+         ?description
+         ?actions:(Option.map (fun actions -> [ actions.mount ]) actions)
+         ()
+     | _ ->
+       (* Grow so the column fills the page: without it the column shrinks to
+          its content and the centered children end up leading-aligned. *)
+       Lui_elements.column
          ~grow:1.0
          ((Lui_elements.spacer []
            :: (* The label is already a full-width row: center its own content
-                rather than nesting it (a wrapper would split the free space
-                with the label's own trailing spacer and leave the text
-                off-center). *)
+                 rather than nesting it (a wrapper would split the free space
+                 with the label's own trailing spacer and leave the text
+                 off-center). *)
               (modify (fun context node -> Lui_ui.main context node "center") label).mount
            :: Option.fold
                 ~none:[]
@@ -959,6 +1003,7 @@ module View = struct
                 [ Lui_elements.row ~gap:0 ~main:`center ~cross:`center [ actions.mount ] ])
               actions
           @ [ Lui_elements.spacer [] ]))
+    |> element ?key
   ;;
 
   let overlay ?key:_ ?alignment:_ ~overlay t =
@@ -979,18 +1024,11 @@ module View = struct
   module Section = struct
     let create ?key ?header_text ?footer entries =
       element ?key (fun context parent ->
-        (* Sections mount inside a `list`: a `heading` child becomes the
-           native section header, following children the rows. Entries go in
-           one column so they render as a single grouped card — panel/card
-           kinds would overlay every child in a ZStack. *)
-        (match header_text, parent with
-         | Some title, Some parent ->
-           ignore (Lui_elements.heading ~level:4 ~value:title [] context (Some parent))
-         | _ -> ());
         let card =
-          Lui_elements.column
-            ~gap:12
-            (List.map (fun (entry : Keyed.t) -> entry.view.mount) entries)
+          Lui_element_combine.settings_section
+            ?title:header_text
+            ~rows:(List.map (fun (entry : Keyed.t) -> entry.view.mount) entries)
+            ()
             context
             parent
         in
@@ -1123,17 +1161,7 @@ module View = struct
            Hosts without chrome hoisting render the toolbar's inline row
            content instead, so this row keeps the emulated arrangement. *)
         let emit_bar placement children : Lui_elements.t =
-          fun context parent ->
-          let toolbar =
-            Lui_elements.toolbar
-              ~label:"navigation"
-              ~toolbar_gap:16
-              children
-              context
-              parent
-          in
-          Lui_ui.placement context toolbar placement;
-          toolbar
+          Lui_elements.toolbar ~label:"navigation" ~toolbar_gap:16 ~placement children
         in
         let of_placement p =
           List.filter (fun (item : item) -> item.placement = Some p) items
@@ -1216,24 +1244,21 @@ module View = struct
            spacers flex between them, and scroll content insets around the
            bar. Groups need a button-group child so the bar renders one
            capsule per group instead of one capsule per button. *)
-        let toolbar =
-          Lui_elements.toolbar
-            ~label:"actions"
-            ~toolbar_gap:16
-            (List.map
-               (fun (item : item) ->
-                  match item.spacing with
-                  | Some _ -> Lui_elements.spacer []
-                  | None ->
-                    if item.is_group
-                    then Lui_elements.button_group [ mount_icon_only item ]
-                    else mount_icon_only item)
-               items)
-            context
-            parent
-        in
-        Lui_ui.placement context toolbar "bottom";
-        toolbar)
+        Lui_elements.toolbar
+          ~label:"actions"
+          ~toolbar_gap:16
+          ~placement:"bottom"
+          (List.map
+             (fun (item : item) ->
+                match item.spacing with
+                | Some _ -> Lui_elements.spacer []
+                | None ->
+                  if item.is_group
+                  then Lui_elements.button_group [ mount_icon_only item ]
+                  else mount_icon_only item)
+             items)
+          context
+          parent)
     ;;
 
     let create ?key ~items t =
@@ -1451,6 +1476,9 @@ module View = struct
     let request ~token ~title ?message actions = { token; title; message; actions }
 
     let alert ?key:_ ~request ~on_response (view : element_) =
+      let respond token result =
+        invoke on_response (Event.Payload.Confirmation_response { token; result })
+      in
       element ?key:view.key (fun context parent ->
         match request with
         | None -> view.mount context parent
@@ -1461,30 +1489,42 @@ module View = struct
             | None -> view.mount context None
           in
           ignore (view.mount context (Some node));
-          ignore
-            (Lui_elements.dialog
-               ~text:request.title
-               ?description:request.message
-               ~on_dismiss:(fun _ ->
-                 invoke
-                   on_response
-                   (Event.Payload.Confirmation_response
-                      { token = request.token; result = Dismissed }))
-               (List.map
-                  (fun (action : action) ->
-                     Lui_elements.button
-                       ~text:action.title
-                       ~disabled:(not action.enabled)
-                       ?variant:(Button_role.lui_variant action.role)
-                       ~on_press:(fun _ ->
-                         invoke
-                           on_response
-                           (Event.Payload.Confirmation_response
-                              { token = request.token; result = Action action.key }))
-                       [])
-                  request.actions)
-               context
-               (Some node));
+          let cancels, confirms =
+            List.partition
+              (fun (action : action) -> action.role = Button_role.Cancel)
+              request.actions
+          in
+          let dialog_mount =
+            match cancels, confirms with
+            (* The cancel + single-confirm request is exactly the shared
+               confirm-dialog composite. *)
+            | [ cancel ], [ confirm ] when cancel.enabled && confirm.enabled ->
+              Lui_element_combine.confirm_dialog
+                ~title:request.title
+                ?message:request.message
+                ~cancel_label:cancel.title
+                ~confirm_label:confirm.title
+                ~destructive:(confirm.role = Button_role.Destructive)
+                ~on_dismiss:(fun _ -> respond request.token Dismissed)
+                ~on_cancel:(fun _ -> respond request.token (Action cancel.key))
+                ~on_confirm:(fun _ -> respond request.token (Action confirm.key))
+                ()
+            | _ ->
+              Lui_elements.dialog
+                ~text:request.title
+                ?description:request.message
+                ~on_dismiss:(fun _ -> respond request.token Dismissed)
+                (List.map
+                   (fun (action : action) ->
+                      Lui_elements.button
+                        ~text:action.title
+                        ~disabled:(not action.enabled)
+                        ?variant:(Button_role.lui_variant action.role)
+                        ~on_press:(fun _ -> respond request.token (Action action.key))
+                        [])
+                   request.actions)
+          in
+          ignore (dialog_mount context (Some node));
           node)
     ;;
 
@@ -2175,14 +2215,13 @@ module View = struct
               ()
           ]
         | Choice { id; label; selected; enabled } ->
-          [ menu_item
+          [ Lui_element_combine.check_menu_item
               ~key:(Int64.to_string id)
-              ~title:label.title
-              ~icon:label.icon
-              ~enabled
-              ~role:Button_role.Normal
-              ~selected:(Some selected)
-              ~on_press:(fun () -> invoke on_select (Event.Payload.Int64 id))
+              ~label:(if String.length label.title = 0 then " " else label.title)
+              ?icon:(Option.map journal_icon label.icon)
+              ~checked:selected
+              ~disabled:(not enabled)
+              ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 id))
               ()
           ]
         | Section { label; entries; _ } ->
