@@ -201,7 +201,19 @@ Console via `xcrun simctl launch --console-pty <udid> com.logseq.journal > log 2
 
 - Taps: screenshots are 1024x768; sim phone content ~x 380-650, y 130-650. Bottom
   toolbar icons: calendar (~415,615), favorites star (~455,615), capture pencil
-  (~607,615); "..." account menu top-right (~616,143).
+  (~607,615); the account menu is a compact person-circle icon top-right
+  (~643,153) — a `menu-trigger`/`Menu` node whose tap opens a native UIMenu
+  anchored at the icon (entries: Attachment settings, Diagnostics, Switch
+  graph, Delete local graph copy destructive when Ready, Sign out). A
+  `Diagnostics` press opens the diagnostics sheet (verified presenting fine on
+  iOS 26.5 — no V.Sheet wedge, 0% CPU). Long-press a journal row for the
+  context menu (Change status / Delete block and descendants) — simulate via
+  move + left_mouse_down + ~1.3s wait + release; a plain click is not enough.
+- The account menu mounts in TWO places: the floating chrome slot on
+  Journals, and the nav-bar `Primary_action` toolbar group on Favorites
+  (verify both — they exercise different backend paths). The "…" beside the
+  graph picker's refresh icon is the native `Secondary_action` overflow for
+  the shared `startup-diagnostics` item, not a menu — it is inert on the sim.
 - `%cpu` from `ps` is cumulative since launch — a steady climb to ~100% after a
   timeline load indicates the render loop; an idle healthy timeline sits ~3%.
 - `xcrun simctl io <udid> recordVideo` fails with "Resource busy / Host recording
