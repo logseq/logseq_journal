@@ -394,9 +394,12 @@ module Theme = struct
     | Light
     | Dark
 
-  type t = mode
+  type t =
+    { mode : mode
+    ; tokens : (string * Lui_ui.theme_token_value) list
+    }
 
-  let create ~mode () = mode
+  let create ~mode ?(tokens = []) () = { mode; tokens }
 end
 
 module Text_editing = struct
@@ -750,7 +753,25 @@ module View = struct
   let opacity ?key:_ value t = modify (fun _ _ -> ignore value) t
   let ignores_safe_area ?regions:_ ?edges:_ t = t
   let safe_area_padding ?key:_ ~insets:_ t = t
-  let theme ?key:_ ~data:_ t = t
+  let theme ?key:_ ~data t =
+    modify
+      (fun context node ->
+         let kind = Lui_ui.node_kind context node in
+         if
+           data.Theme.tokens <> []
+           && Lui_protocol.property_supported kind Lui_protocol.ThemeValue
+         then Lui_ui.theme context node data.tokens;
+         if Lui_protocol.property_supported kind Lui_protocol.ThemeMode
+         then
+           Lui_ui.theme_mode
+             context
+             node
+             (match data.mode with
+              | Theme.System -> `system
+              | Theme.Light -> `light
+              | Theme.Dark -> `dark))
+      t
+  ;;
 
   let background ?key:_ ?corner_radius ~color t =
     modify
