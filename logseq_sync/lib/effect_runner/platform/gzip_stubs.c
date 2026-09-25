@@ -3,13 +3,44 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <zlib.h>
-
-#if defined(__APPLE__)
-__asm__(".linker_option \"-lz\"");
-#endif
+#include <dlfcn.h>
 
 #include <caml/mlvalues.h>
 #include <caml/memory.h>
+
+/* zlib is resolved at runtime (same pattern as platform_crypto_stubs.c) so
+   the stubs archive carries no link-time -lz dependency on platforms without
+   a linker_option pragma. */
+typedef int (*zlib_inflate_init2_fn)(z_streamp, int, const char *, int);
+typedef int (*zlib_inflate_fn)(z_streamp, int);
+typedef int (*zlib_inflate_end_fn)(z_streamp);
+
+static zlib_inflate_init2_fn zlib_inflate_init2;
+static zlib_inflate_fn zlib_inflate;
+static zlib_inflate_end_fn zlib_inflate_end;
+
+static int zlib_resolve(void) {
+  static int resolved = -1;
+  if (resolved < 0) {
+#if defined(__APPLE__)
+    void *handle = dlopen("libz.dylib", RTLD_LAZY);
+#else
+    void *handle = dlopen("libz.so.1", RTLD_LAZY);
+#endif
+    if (handle != NULL) {
+      zlib_inflate_init2 =
+          (zlib_inflate_init2_fn)dlsym(handle, "inflateInit2_");
+      zlib_inflate = (zlib_inflate_fn)dlsym(handle, "inflate");
+      zlib_inflate_end = (zlib_inflate_end_fn)dlsym(handle, "inflateEnd");
+    }
+    resolved =
+        (zlib_inflate_init2 != NULL && zlib_inflate != NULL &&
+         zlib_inflate_end != NULL)
+            ? 1
+            : 0;
+  }
+  return resolved;
+}
 
 CAMLprim value logseq_journal_gzip_decompress(
     value source_value,
@@ -20,6 +51,7 @@ CAMLprim value logseq_journal_gzip_decompress(
   const char *destination = String_val(destination_value);
   intnat maximum_bytes = Long_val(maximum_bytes_value);
   if (maximum_bytes <= 0) CAMLreturn(Val_int(5));
+  if (!zlib_resolve()) CAMLreturn(Val_int(3));
   FILE *input = fopen(source, "rb");
   if (input == NULL) CAMLreturn(Val_int(1));
 
@@ -34,7 +66,8 @@ CAMLprim value logseq_journal_gzip_decompress(
   z_stream stream;
   memset(&stream, 0, sizeof(stream));
   int status = 0;
-  if (inflateInit2(&stream, 15 + 16) != Z_OK) {
+  if (zlib_inflate_init2(
+          &stream, 15 + 16, ZLIB_VERSION, (int)sizeof(z_stream)) != Z_OK) {
     status = 3;
   } else {
     unsigned char input_buffer[16384];
@@ -55,7 +88,7 @@ CAMLprim value logseq_journal_gzip_decompress(
       while (stream.avail_in > 0 && status == 0) {
         stream.avail_out = sizeof(output_buffer);
         stream.next_out = output_buffer;
-        int result = inflate(&stream, Z_NO_FLUSH);
+        int result = zlib_inflate(&stream, Z_NO_FLUSH);
         if (result != Z_OK && result != Z_STREAM_END) {
           status = 3;
           break;
@@ -76,7 +109,7 @@ CAMLprim value logseq_journal_gzip_decompress(
         }
       }
     }
-    inflateEnd(&stream);
+    zlib_inflate_end(&stream);
   }
   if (fclose(input) != 0 && status == 0) status = 3;
   if (fclose(output) != 0 && status == 0) status = 4;
