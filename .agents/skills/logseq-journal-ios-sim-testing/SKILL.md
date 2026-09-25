@@ -204,3 +204,17 @@ Console via `xcrun simctl launch --console-pty <udid> com.logseq.journal > log 2
   (~607,615); "..." account menu top-right (~616,143).
 - `%cpu` from `ps` is cumulative since launch — a steady climb to ~100% after a
   timeline load indicates the render loop; an idle healthy timeline sits ~3%.
+- `xcrun simctl io <udid> recordVideo` fails with "Resource busy / Host recording
+  is already in progress" while the Devin session screen-recording is active —
+  they share the display recorder. For transient UI (loading rows, "Connecting"
+  indicators) that vanish faster than screenshot latency on a warm mirror, use
+  the `emit_patch` fprintf probe (see Debugging section) and grep stderr for the
+  expected message text + node kinds (e.g. `"Loading older journal days"` inside
+  a `row` with `spinner`+`text` ops) instead of trying to capture a frame.
+- On a warm local mirror, pagination continuation rows
+  ("Loading more journal entries"/"Loading older journal days" at
+  day-continuation/feed-continuation slots) mount and resolve in <1s — they are
+  real but effectively unphotographable; verify via the emit probe.
+- `confirm_dialog` Cancel+destructive "Delete local graph copy" → re-open of the
+  same graph skips the E2EE unlock (cached keychain key is retained per the
+  dialog copy) and re-downloads the snapshot — a quick full-cycle check.
