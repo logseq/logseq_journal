@@ -26,6 +26,17 @@ xcrun simctl install booted apple/DerivedData/Build/Products/Debug-iphonesimulat
 xcrun simctl launch booted com.example.bonsaiFlutterLogseqJournalHost
 ```
 
+Lui build path (journal_view.ml / Lui_elements): `JOURNAL_IOS_TEAM_ID=K378MFWK59
+dune build @ios-app` → flat bundle `_build/apple/ios-simulator/LogseqJournal.app`,
+bundle id `com.logseq.journal`. The bundle embeds a `__TEXT,__entitlements`
+section (verify: `otool -l <binary> | grep -A3 entitlements`) so keychain + Amplify
+sign-in DO work on the sim even adhoc-signed — the old "sign-in impossible on sim"
+note does not apply to this build.
+
+When several simulators are booted, `booted` is ambiguous — always use an
+explicit UDID (`xcrun simctl list devices | grep Booted`) for install/launch/
+screenshot/get_app_container.
+
 Notes:
 - The lock file may be missing the `ocaml-ios64-simulator` pin —
   `bonsai-swiftui build ios` fails with "no matching definition" until you add
@@ -78,11 +89,18 @@ The local mirror is at:
 ## V.Sheet render-loop bug (critical simulator blocker)
 
 Presenting any `V.Sheet` modal (Capture composer, Diagnostics, error info, status)
-on the iOS simulator wedges the app: the main thread enters a
+on the iOS simulator CAN wedge the app: the main thread enters a
 `PresentationController.nativeVisible` didSet -> `RenderTree.commit` ->
 `NativePresentationContent.body` -> `appeared` invalidation loop at ~100% CPU and
 the sheet never displays; all subsequent input is dead. Native `Menu`
 presentations (e.g. the "..." account menu) do NOT loop.
+
+Update (Lui_elements branch, iOS 26.5): the wedge did NOT reproduce — the sheet
+presents full-screen at 0% CPU, the editor works, and edge-drag dismiss works
+(grab the very top edge ~y148, not the title area). However the sheet's nav
+chrome (title + toolbar items Close/Task/Save) does not render inside the
+presented sheet — mount ops are emitted correctly; likely an iOS host
+limitation. Verify sheet chrome on the macOS app if it matters.
 
 Workaround for testing capture/modal flows — temporarily render modals inline
 (`app/application.ml`, where `V.Sheet.create` wraps `modal`):
@@ -135,6 +153,44 @@ until a background->foreground cycle or relaunch. Check socket liveness with
   swiftpm/Xcode-DerivedData caches cleared.
 - Use `xcrun simctl io <udid> screenshot out.png` to capture a specific device's
   screen when simulator windows overlap.
+
+## Known dead/inert UI paths (verified — do not misreport as regressions)
+
+- **Timeline/detail row actions are dead-wired.** `V.Native_list.vertical`
+  accepts `~on_row_event` but no call site passes it (application.ml ~1310,
+  ~1589, ~2261; journal_native_collection.ml ~172). Swipe "Status"/"Delete" and
+  context-menu "Change status"/"Delete block and descendants" presses DO reach
+  OCaml as `extension_event` (`type="row_event"` payload) but iterate over
+  `None` → emit_patch len=0 → the reducer never sees them. Consequences:
+  - Swipe-delete LOOKS like it works (Swift extension animates the row away)
+    but nothing persists — the row returns on relaunch.
+  - "Change status" taps are fully inert; the status sheet (the app's only
+    `V.Picker ~style:Inline` → radio_group path) is therefore unreachable via UI.
+  - Verified identical in the pre-refactor tree — pre-existing gap, not a
+    regression. To fix: wire a `~on_row_event` handler that decodes
+    `{"key":"status:<uuid>"|"delete:<uuid>","row":"block:<uuid>"}` into the
+    `timeline-status:`/`timeline-delete:`/`detail-delete:` action strings.
+- **Composer "Task" toggle is invisible.** `composer-task` (a `V.toggle
+  ~style:Button` in a Primary_action toolbar item) emits correctly (checked,
+  accessibility-label, width=40) but `set_leaf_label` cannot write an icon —
+  `Lui_protocol` does not support InlineIconName on kind `toggle` — so the
+  icon-only collapse yields an empty 40pt cell. Pre-existing; toggle is still
+  mounted/functional.
+
+## Debugging the lui emit/event pipeline (lui build path)
+
+`app/journal_lui_bridge.c` is the C boundary. Temporary fprintf probes that
+proved events reach OCaml and showed exact patch ops (revert after use):
+
+```c
+// in emit_patch (after caml_copy_string of the json):
+fprintf(stderr, "[PATCH-DBG] %s len=%d: %s\n", tag, (int)caml_string_length(json), String_val(json));
+// in journal_ocaml_extension_event (top of fn):
+fprintf(stderr, "[EVT-DBG] extension_event node=%d name=%s payload=%s\n", node, name, payload);
+```
+
+Console via `xcrun simctl launch --console-pty <udid> com.logseq.journal > log 2>&1`
+(stderr is the only diag channel). `git checkout` the file to revert.
 
 ## Devin Secrets Needed
 
