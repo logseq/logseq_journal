@@ -209,5 +209,24 @@ Console via `xcrun simctl launch --console-pty <udid> com.logseq.journal > log 2
   iOS 26.5 — no V.Sheet wedge, 0% CPU). Long-press a journal row for the
   context menu (Change status / Delete block and descendants) — simulate via
   move + left_mouse_down + ~1.3s wait + release; a plain click is not enough.
+- The account menu mounts in TWO places: the floating chrome slot on
+  Journals, and the nav-bar `Primary_action` toolbar group on Favorites
+  (verify both — they exercise different backend paths). The "…" beside the
+  graph picker's refresh icon is the native `Secondary_action` overflow for
+  the shared `startup-diagnostics` item, not a menu — it is inert on the sim.
 - `%cpu` from `ps` is cumulative since launch — a steady climb to ~100% after a
   timeline load indicates the render loop; an idle healthy timeline sits ~3%.
+- `xcrun simctl io <udid> recordVideo` fails with "Resource busy / Host recording
+  is already in progress" while the Devin session screen-recording is active —
+  they share the display recorder. For transient UI (loading rows, "Connecting"
+  indicators) that vanish faster than screenshot latency on a warm mirror, use
+  the `emit_patch` fprintf probe (see Debugging section) and grep stderr for the
+  expected message text + node kinds (e.g. `"Loading older journal days"` inside
+  a `row` with `spinner`+`text` ops) instead of trying to capture a frame.
+- On a warm local mirror, pagination continuation rows
+  ("Loading more journal entries"/"Loading older journal days" at
+  day-continuation/feed-continuation slots) mount and resolve in <1s — they are
+  real but effectively unphotographable; verify via the emit probe.
+- `confirm_dialog` Cancel+destructive "Delete local graph copy" → re-open of the
+  same graph skips the E2EE unlock (cached keychain key is retained per the
+  dialog copy) and re-downloads the snapshot — a quick full-cycle check.

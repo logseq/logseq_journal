@@ -2180,7 +2180,7 @@ module View = struct
       Submenu { id; label = { title; icon }; enabled; entries }
     ;;
 
-    (* lui menus are declarative: a [menu_item] holding one [dropdown_menu]
+    (* lui menus are declarative: a [menu_trigger] holding one [dropdown_menu]
        child renders as a native popup menu, and menu rows carry their label
        and icon as properties (menu items accept only menu children). *)
     let menu_item ?key ~title ~icon ~enabled ~role ~selected ?on_press () : Lui_elements.t
@@ -2198,7 +2198,7 @@ module View = struct
         []
     ;;
 
-    let create ?key ?(enabled = true) ~on_select ~title ?icon entries =
+    let create ?key ?(enabled = true) ~on_select ~title ?icon ?label entries =
       let rec entry_elements (entry : entry) : Lui_elements.t list =
         match entry with
         | Divider id ->
@@ -2248,16 +2248,12 @@ module View = struct
       in
       element
         ?key
-        (Lui_elements.menu_item
-           ~text:(if String.length title = 0 then " " else title)
+        (Lui_elements.menu
+           ?text:(if String.length title = 0 then None else Some title)
            ?icon:(Option.map journal_icon icon)
+           ?label
            ~disabled:(not enabled)
-             (* Icon-only trigger: keep the menu label from stretching to fill
-              the available width inside bar capsules, and use the smaller
-              menu-item icon size the system bar showed. *)
-           ?width:(if String.length title = 0 then Some 20 else None)
-           ?size:(if String.length title = 0 then Some `sm else None)
-           [ Lui_elements.dropdown_menu (List.concat_map entry_elements entries) ])
+           (List.concat_map entry_elements entries))
     ;;
   end
 end
