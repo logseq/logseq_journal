@@ -1341,10 +1341,7 @@ module Presentation = struct
     V.Section.create
       ~key:(Option.value key ~default:(Ui.Key.string title))
       ~header_text:title
-      [ V.Keyed.create
-          ~key:"content"
-          (V.column ~alignment:Leading children |> V.text_selection ~enabled:true)
-      ]
+      (keyed children)
   ;;
 
   let labeled label content =
@@ -1616,7 +1613,7 @@ let favorites_view
     V.button ~on_press:on_retry ~child:(V.text "Retry") ()
     |> V.with_test_id (Ui.Test_id.string "favorites-retry-button")
   in
-  let busy = V.row [ V.progress ~style:Circular (); V.text "Loading favorites" ] in
+  let busy = V.loading ~message:"Loading favorites" () in
   let content =
     if rows = []
     then
@@ -1750,7 +1747,7 @@ let composer_page
   V.column
     ~spacing:12.
     ([ editor ]
-     @ (if saving then [ V.progress ~style:Circular (); V.text "Saving…" ] else [])
+     @ (if saving then [ V.loading ~message:"Saving…" () ] else [])
      @ Option.to_list (Option.map live_region_text error))
   |> V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
   |> V.Body.static
@@ -2089,7 +2086,7 @@ let error_info_page ~sync_error ~operation_failure occurrences dispatch =
   let sync =
     match sync_error with
     | None -> []
-    | Some message -> [ Presentation.section "Sync error" [ V.text message ] ]
+    | Some message -> [ V.feedback_banner ~kind:`error ~message () ]
   in
   Presentation.form (sync @ operation @ rows)
   |> dismiss_toolbar
@@ -2292,7 +2289,7 @@ let detail_page ~state ~on_scroll_completed dispatch =
       (function
         | Journal_detail.More { parent_id; loading; error; _ } ->
           if loading
-          then V.row [ V.progress ~style:Circular (); V.text "Loading children" ]
+          then V.loading ~message:"Loading children" ()
           else
             V.column
               (Option.to_list (Option.map live_region_text error)
@@ -2329,9 +2326,7 @@ let detail_page ~state ~on_scroll_completed dispatch =
         ~children:(rows detail)
     | None ->
       (match Journal_routes.route state.routes with
-       | Detail_loading ->
-         V.column [ V.progress ~style:Circular (); V.text "Loading block" ]
-         |> V.frame ~max_width:Fill ~max_height:Fill
+       | Detail_loading -> V.loading ~centered:true ~message:"Loading block" ()
        | Missing_detail ->
          Presentation.unavailable
            ~title:"Block unavailable"
