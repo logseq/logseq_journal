@@ -126,6 +126,7 @@ let view
              | _ -> ()))
         ~title:""
         ~icon:(Journal_symbols.name Journal_symbols.Account)
+        ~label:"Account menu"
         (List.map
            (fun (id, title, symbol, _, role) ->
               V.Menu.action ~id ~role ~title ~icon:symbol ())

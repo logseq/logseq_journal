@@ -858,6 +858,7 @@ module View : sig
       -> on_select:Event.handler
       -> title:string
       -> ?icon:string
+      -> ?label:string
       -> entry list
       -> t
   end
