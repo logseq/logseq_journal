@@ -120,10 +120,8 @@ let mount ?key ~payload ~children ?on_event identifier context parent =
          | Some event -> handler event
          | None -> ()))
     on_event;
-  (match parent with
-   | Some parent -> Lui_ui.append context parent node
-   | None -> ());
-  List.iter (fun child -> ignore (child context (Some node))) children;
+  Lui_elements.attach context parent node;
+  Lui_elements.mount_children context node children;
   node
 ;;
 
