@@ -144,26 +144,31 @@ let view
     match on_error_info with
     | None -> V.empty ()
     | Some on_press ->
-      V.button
-        ~on_press
-        ~child:
-          (V.label
-             ~title:(V.text "Error info")
-             ~icon:(Journal_symbols.create Journal_symbols.Error)
-             ())
+      V.buttons
+        ~actions:
+          [ V.buttons_action
+              ~label:"Error info"
+              ~icon:(Journal_symbols.name Journal_symbols.Error)
+              ~on_press
+              ()
+          ]
         ()
       |> V.help ~message:"Inspect application errors"
       |> test_id "journal-error-info-button"
   in
   let capture =
-    V.button
-      ~enabled:capture_enabled
-      ~on_press:on_capture
-      ~child:
-        (V.label
-           ~title:(V.text "Capture")
-           ~icon:(V.symbol ~name:"square.and.pencil" ())
-           ())
+    (* buttons has no disabled state — guard the handler instead. *)
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:"Capture"
+            ~icon:"square.and.pencil"
+            ~on_press:
+              (Ui.Event.Handler.create (fun payload ->
+                 if capture_enabled
+                 then Ui.Event.Handler.Private.invoke on_capture payload))
+            ()
+        ]
       ()
     |> V.semantics ~properties:(Ui.Semantics.create ~label:"Capture" ())
     |> test_id "journal-capture-open"
