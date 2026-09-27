@@ -515,6 +515,10 @@ module View : sig
 
   val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
 
+  (** A transparent, full-area press target meant for use as an
+      {!overlay} — e.g. tap-outside-to-dismiss behind floating chrome. *)
+  val tap_area : ?key:Key.t -> on_press:Event.handler -> unit -> t
+
   module Keyed : sig
     type widget = t
 

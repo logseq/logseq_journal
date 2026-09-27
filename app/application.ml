@@ -1710,7 +1710,6 @@ let composer_content
       ~on_edit
       ~on_toggle
       ~on_save
-      ~dismiss
       ~error
   =
   let ignored = Ui.Event.Handler.create (fun _ -> ()) in
@@ -1723,27 +1722,26 @@ let composer_content
         | Failed _ -> true
         | _ -> false)
   in
+  let task_selected = Journal_capture.task_state capture = Journal_model.Todo in
   let task =
-    V.toggle
-      ~style:Button
-      ~enabled:(enabled && not saving)
-      ~value:(Journal_capture.task_state capture = Journal_model.Todo)
-      ~on_changed:on_toggle
-      ~label:
-        (V.label ~title:(V.text "Task") ~icon:(V.symbol ~name:"checkmark.square" ()) ())
+    (* Circular icon capsule matching the composer actions row — buttons has
+       no disabled state, so the guard lives in the handler. *)
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:"Task"
+            ~icon:(if task_selected then "checkmark.circle" else "circle")
+            ~on_press:
+              (Ui.Event.Handler.create (fun _ ->
+                 if enabled && not saving
+                 then
+                   Ui.Event.Handler.Private.invoke
+                     on_toggle
+                     (Ui.Event.Payload.Bool (not task_selected))))
+            ()
+        ]
       ()
     |> V.with_test_id (Ui.Test_id.string (scope ^ "-task"))
-  in
-  let dismiss_actions =
-    Option.to_list
-      (Option.map
-         (fun on_close ->
-            V.buttons
-              ~actions:
-                [ V.buttons_action ~label:"Close" ~icon:"xmark" ~on_press:on_close () ]
-              ()
-            |> V.with_test_id (Ui.Test_id.string (scope ^ "-dismiss")))
-         dismiss)
   in
   let composer =
     V.composer
@@ -1757,7 +1755,7 @@ let composer_content
       ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
       ~value:(Journal_capture.value capture)
       ~send_disabled:(not can_submit)
-      ~actions:(task :: dismiss_actions)
+      ~actions:[ task ]
       ~on_edit
       ~on_submit:ignored
       ~on_send:on_save
@@ -1796,7 +1794,6 @@ let composer_page
     ~on_edit
     ~on_toggle
     ~on_save
-    ~dismiss:None
     ~error
   |> V.Body.static
   |> V.Body.toolbar
@@ -1881,6 +1878,17 @@ let timeline_page
         ~on_retry:on_favorites_retry
         ~on_open_favorite
     else timeline
+  in
+  let content =
+    match capture_expanded, platform with
+    | Some _, "ios" ->
+      (* The floating capture composer collapses when tapping outside it —
+         the transparent press layer covers the body, not the composer
+         itself. *)
+      V.Body.overlay
+        ~overlay:(V.tap_area ~on_press:(bind_action on_capture_event "close-composer") ())
+        content
+    | _ -> content
   in
   let destination_action index =
     Ui.Event.Handler.create (fun _ ->
@@ -4983,7 +4991,6 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                         (Text (if selected then "capture-task-on" else "capture-task-off"))
                     | _ -> ()))
                ~on_save:(bind_action dispatch "capture-submit")
-               ~dismiss:(Some (bind_action dispatch "close-composer"))
                ~error:
                  (match state.capture_error with
                   | Some failure -> Some (capture_failure_message failure)

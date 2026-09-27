@@ -1122,6 +1122,22 @@ module View = struct
     element ?key:t.key (Lui_elements.stack [ t.mount; overlay.mount ])
   ;;
 
+  (* A transparent, full-area press target: PressEnabled gives the column a
+     contentShape + tap gesture covering its whole bounds (the backend's
+     LUIColumnPressModifier), and container_relative_frame expands it to fill
+     the overlay stack. Used to dismiss chrome-surface content — like the
+     floating capture composer — by tapping outside it. *)
+  let tap_area ?key ~on_press () =
+    element ?key (fun context parent ->
+      let node =
+        Lui_elements.column ~grow:1.0 ~container_relative_frame:`both [] context parent
+      in
+      Lui_ui.bool_property context node Lui_protocol.PressEnabled true;
+      Lui_ui.on_event context node (fun event ->
+        if Lui_elements.is_press event then invoke on_press Event.Payload.Unit);
+      node)
+  ;;
+
   module Keyed = struct
     type widget = t
 
