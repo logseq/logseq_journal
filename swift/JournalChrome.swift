@@ -65,7 +65,7 @@ import SwiftUI
       HStack(spacing: 0) {
         Text(title)
           .font(.title2.weight(.semibold))
-          .foregroundStyle(Color(.label))
+          .foregroundStyle(.primary)
           .monospacedDigit()
           .textCase(nil)
           .lineLimit(1)
