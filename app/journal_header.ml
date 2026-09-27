@@ -69,93 +69,113 @@ let view
       ~capture_expanded
       ~body
   =
-  let selected =
-    match context with
-    | Context.Favorites -> true
-    | Journals -> false
-  in
   let heading value =
     V.text ~style:(Ui.Style.Text_style.create ~font_weight:Semi_bold ()) value
   in
-  let navigation label symbol selected on_press =
-    V.button
-      ~on_press
-      ~child:(V.label ~title:(V.text label) ~icon:(Journal_symbols.create symbol) ())
-      ()
-    |> V.semantics ~properties:(Ui.Semantics.create ~label ~selected ())
-  in
-  let account =
-    match on_account_action with
-    | None -> V.empty ()
-    | Some dispatch ->
-      let actions =
-        [ ( 5L
-          , "Attachment settings"
-          , "slider.horizontal.3"
-          , "open-asset-settings"
-          , V.Button_role.Normal )
-        ; 1L, "Diagnostics", "stethoscope", "open-diagnostics", V.Button_role.Normal
-        ; ( 2L
-          , "Switch graph"
-          , "arrow.triangle.2.circlepath"
-          , "switch-graph"
-          , V.Button_role.Normal )
-        ]
-        @ (if local_deletion_available
-           then
-             [ ( 3L
-               , "Delete local graph copy"
-               , "trash"
-               , "request-local-cache-reset"
-               , V.Button_role.Destructive )
+  let account_action =
+    Option.map
+      (fun dispatch ->
+         let actions =
+           [ ( 5L
+             , "Attachment settings"
+             , "slider.horizontal.3"
+             , "open-asset-settings"
+             , V.Button_role.Normal )
+           ; 1L, "Diagnostics", "stethoscope", "open-diagnostics", V.Button_role.Normal
+           ; ( 2L
+             , "Switch graph"
+             , "arrow.triangle.2.circlepath"
+             , "switch-graph"
+             , V.Button_role.Normal )
+           ]
+           @ (if local_deletion_available
+              then
+                [ ( 3L
+                  , "Delete local graph copy"
+                  , "trash"
+                  , "request-local-cache-reset"
+                  , V.Button_role.Destructive )
+                ]
+              else [])
+           @ [ ( 4L
+               , "Sign out"
+               , "rectangle.portrait.and.arrow.right"
+               , "sign-out"
+               , V.Button_role.Normal )
              ]
-           else [])
-        @ [ ( 4L
-            , "Sign out"
-            , "rectangle.portrait.and.arrow.right"
-            , "sign-out"
-            , V.Button_role.Normal )
-          ]
-      in
-      V.Menu.create
-        ~on_select:
-          (Ui.Event.Handler.create (function
-             | Ui.Event.Payload.Int64 id ->
-               List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
-               |> Option.iter (fun (_, _, _, action, _) ->
-                 Ui.Event.Handler.Private.invoke dispatch (Ui.Event.Payload.Text action))
-             | _ -> ()))
-        ~title:""
-        ~icon:(Journal_symbols.name Journal_symbols.Account)
-        ~label:"Account menu"
-        (List.map
-           (fun (id, title, symbol, _, role) ->
-              V.Menu.action ~id ~role ~title ~icon:symbol ())
-           actions)
-      |> V.semantics
-           ~properties:
-             (Ui.Semantics.create
-                ~label:"Account menu"
-                ~hint:"Switch graphs, delete the local copy, or sign out"
-                ~role:Button
-                ())
-      |> test_id "journal-account-menu-button"
+         in
+         V.buttons_menu_action
+           ~label:"Account menu"
+           ~icon:(Journal_symbols.name Journal_symbols.Account)
+           ~on_select:
+             (Ui.Event.Handler.create (function
+                | Ui.Event.Payload.Int64 id ->
+                  List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
+                  |> Option.iter (fun (_, _, _, action, _) ->
+                    Ui.Event.Handler.Private.invoke
+                      dispatch
+                      (Ui.Event.Payload.Text action))
+                | _ -> ()))
+           (List.map
+              (fun (id, title, symbol, _, role) ->
+                 V.Menu.action ~id ~role ~title ~icon:symbol ())
+              actions))
+      on_account_action
   in
-  let error =
-    match on_error_info with
-    | None -> V.empty ()
-    | Some on_press ->
-      V.buttons
-        ~actions:
-          [ V.buttons_action
-              ~label:"Error info"
-              ~icon:(Journal_symbols.name Journal_symbols.Error)
-              ~on_press
-              ()
-          ]
-        ()
-      |> V.help ~message:"Inspect application errors"
-      |> test_id "journal-error-info-button"
+  let error_action =
+    Option.map
+      (fun on_press ->
+         V.buttons_action
+           ~label:"Error info"
+           ~icon:(Journal_symbols.name Journal_symbols.Error)
+           ~on_press
+           ())
+      on_error_info
+  in
+  (* The error and account chrome controls fuse into one capsule: error leads
+     so the account menu stays the trailing glyph. *)
+  let cluster =
+    match Option.to_list error_action @ Option.to_list account_action with
+    | [] -> None
+    | actions ->
+      let view = V.buttons ~actions () in
+      let view =
+        if Option.is_some error_action
+        then
+          view
+          |> V.help ~message:"Inspect application errors"
+          |> test_id "journal-error-info-button"
+        else view
+      in
+      let view =
+        if Option.is_some account_action
+        then
+          view
+          |> V.semantics
+               ~properties:
+                 (Ui.Semantics.create
+                    ~label:"Account menu"
+                    ~hint:"Switch graphs, delete the local copy, or sign out"
+                    ~role:Button
+                    ())
+          |> test_id "journal-account-menu-button"
+        else view
+      in
+      Some view
+  in
+  (* The chrome's error slot is only used when there is no account action to
+     fuse with; otherwise the error button rides inside the account capsule. *)
+  let account_slot_used = Option.is_some on_account_action in
+  let error_slot_used =
+    Option.is_none on_account_action && Option.is_some on_error_info
+  in
+  let slot_column ~used =
+    if platform <> "ios"
+    then V.column []
+    else (
+      match cluster with
+      | Some view when used -> V.column [ view ]
+      | _ -> V.column [])
   in
   let capture =
     (* buttons has no disabled state — guard the handler instead. *)
@@ -224,9 +244,9 @@ let view
          controls
            "account"
            V.Toolbar.Primary_action
-           (Option.to_list (Option.map (fun _ -> "error", error) on_error_info)
-            @ Option.to_list (Option.map (fun _ -> "account", account) on_account_action)
-           ))
+           (match cluster with
+            | Some view -> [ "account", view ]
+            | None -> []))
     @
     match capture_expanded with
     | Some _ when platform = "ios" ->
@@ -234,14 +254,27 @@ let view
          application.ml) — every toolbar item yields while it is up. *)
       []
     | _ ->
-      controls
-        "destinations"
-        navigation_placement
-        [ ( "journals"
-          , navigation "Journals" Journal_symbols.Journals (not selected) on_journals )
-        ; ( "favorites"
-          , navigation "Favorites" Journal_symbols.Favorites selected on_favorites )
-        ]
+      (* The destination pair fuses into one capsule — [buttons] has no
+         per-action selected state, so the active destination is conveyed by
+         the page content and its principal title instead. *)
+      [ V.Toolbar.item
+          ~key:(Ui.Key.string "destinations")
+          ~placement:navigation_placement
+          (V.buttons
+             ~actions:
+               [ V.buttons_action
+                   ~label:"Journals"
+                   ~icon:(Journal_symbols.name Journal_symbols.Journals)
+                   ~on_press:on_journals
+                   ()
+               ; V.buttons_action
+                   ~label:"Favorites"
+                   ~icon:(Journal_symbols.name Journal_symbols.Favorites)
+                   ~on_press:on_favorites
+                   ()
+               ]
+             ())
+      ]
       @ (if platform = "ios"
          then
            [ V.Toolbar.spacer
@@ -284,16 +317,16 @@ let view
           (`Assoc
               [ "mode", `String "journal"
               ; "connecting", `Bool (sync_phase = Some Graph_service.Connecting)
-              ; "account", `Bool (Option.is_some on_account_action)
-              ; "error", `Bool (Option.is_some on_error_info)
+              ; "account", `Bool account_slot_used
+              ; "error", `Bool error_slot_used
               ])
         ~on_event:(fun _ -> ())
           (* Chrome slots are positional on the native side — absent slots must
            still mount a (zero-size) node or the host's index lookup shifts. *)
         ~children:
           [ V.Body.Private.to_widget body
-          ; (if platform = "ios" then V.column [ account ] else V.column [])
-          ; (if platform = "ios" then V.column [ error ] else V.column [])
+          ; slot_column ~used:account_slot_used
+          ; slot_column ~used:error_slot_used
           ; V.column
               [ (if sync_phase = Some Graph_service.Connecting
                  then

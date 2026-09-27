@@ -457,13 +457,23 @@ module View : sig
     -> t
 
   (** One capsule action for {!buttons}: [label] is the accessibility name,
-      [icon] an SF Symbol name, [text] optional visible text. *)
+      [icon] an SF Symbol name, [text] optional visible text. A [Press]
+      action fires its handler; a [Menu] action opens a native dropdown menu
+      of pre-built entries. *)
   type buttons_action =
-    { buttons_action_label : string
-    ; buttons_action_icon : string
-    ; buttons_action_text : string option
-    ; buttons_action_on_press : Event.handler
-    }
+    | Press of
+        { buttons_action_label : string
+        ; buttons_action_icon : string
+        ; buttons_action_text : string option
+        ; buttons_action_on_press : Event.handler
+        }
+    | Menu of
+        { buttons_action_label : string
+        ; buttons_action_icon : string
+        ; buttons_action_text : string option
+        ; buttons_action_menu : Lui_elements.t list
+        ; buttons_action_on_dismiss : Event.handler option
+        }
 
   val buttons_action
     :  label:string
@@ -919,6 +929,19 @@ module View : sig
       -> entry list
       -> t
   end
+
+  (** A menu capsule action for {!buttons} built from {!Menu.entry} values:
+      pressing it opens the native dropdown and selecting an entry invokes
+      [on_select] with the entry's [Int64] id, same dispatch as
+      {!Menu.create}. *)
+  val buttons_menu_action
+    :  label:string
+    -> icon:string
+    -> ?text:string
+    -> on_select:Event.handler
+    -> ?on_dismiss:Event.handler
+    -> Menu.entry list
+    -> buttons_action
 end
 
 module Native_widget : sig

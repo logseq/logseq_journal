@@ -31,6 +31,7 @@ import SwiftUI
       GeometryReader { bounds in
         content.frame(width: bounds.size.width, height: bounds.size.height)
           .scrollContentBackground(.hidden)
+          .toolbarBackground(.hidden, for: .bottomBar)
           #if os(iOS)
           .environment(\.journalControlsSize, controlsSize)
           .toolbar(.hidden, for: .navigationBar)
@@ -54,6 +55,9 @@ import SwiftUI
           }
           #endif
       }
+      #if os(iOS)
+      .ignoresSafeArea(.container, edges: .bottom)
+      #endif
     }
   }
 
