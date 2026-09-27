@@ -229,14 +229,10 @@ let view
            ))
     @
     match capture_expanded with
-    | Some expanded when platform = "ios" ->
-      (* Capture open: the expanded composer takes over the bottom bar —
-         nav destinations and the capture affordance yield to it. *)
-      [ V.Toolbar.raw_item
-          ~key:(Ui.Key.string "capture-composer")
-          ~placement:Bottom_bar
-          expanded
-      ]
+    | Some _ when platform = "ios" ->
+      (* Capture open: the composer floats in a body overlay (see
+         application.ml) — every toolbar item yields while it is up. *)
+      []
     | _ ->
       controls
         "destinations"

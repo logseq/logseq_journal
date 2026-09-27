@@ -1881,12 +1881,24 @@ let timeline_page
   in
   let content =
     match capture_expanded, platform with
-    | Some _, "ios" ->
-      (* The floating capture composer collapses when tapping outside it —
-         the transparent press layer covers the body, not the composer
-         itself. *)
+    | Some expanded, "ios" ->
+      (* The composer floats at the bottom of a full-body overlay, not in the
+         page column: a grow child there becomes a flexible VStack sibling that
+         splits the leftover height with the body, so the capsule overflows
+         and gets clipped. The overlay press layer collapses the composer when
+         tapping outside it. *)
       V.Body.overlay
-        ~overlay:(V.tap_area ~on_press:(bind_action on_capture_event "close-composer") ())
+        ~overlay:
+          (V.stack
+             [ (* The tap layer sits below the composer in the stack: a spacer
+                  child expands each layer's column to the overlay bounds, taps
+                  on empty space fall through to the tap layer (collapse), and
+                  taps on the capsule hit it directly. The overlay already ends
+                  at the bottom safe-area boundary, so no extra inset is
+                  needed. *)
+               V.tap_area ~on_press:(bind_action on_capture_event "close-composer") ()
+             ; V.column ~spacing:0. [ V.spacer (); expanded ]
+             ])
         content
     | _ -> content
   in
@@ -4971,42 +4983,47 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     in
     let floating_capture =
       (* On iOS the capture composer expands directly into the bottom bar
-         instead of presenting a sheet. The page column extends to the screen's
-         physical bottom edge, so the composer needs an explicit spacer of
-         safe_area.bottom beneath it — the system does not inset raw children
-         the way it does toolbar bottomBar items. *)
+         instead of presenting a sheet. It is mounted through the body overlay
+         (see the toolbar view above) whose column already ends at the bottom
+         safe-area boundary, so the capsule needs no extra inset. *)
       match state.modal with
       | Capture_sheet when state.environment.platform = "ios" ->
         Option.map
           (fun capture ->
              V.column
                ~spacing:0.
-               [ composer_content
-                   ~scope:"journal-capture"
-                   ~placeholder:"New journal entry"
-                   ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
-                   ~capture
-                   ~enabled:state.write_enabled
-                   ~on_edit:dispatch
-                   ~on_toggle:
-                     (Ui.Event.Handler.create (function
-                        | Ui.Event.Payload.Bool selected ->
-                          Ui.Event.Handler.Private.invoke
-                            dispatch
-                            (Text
-                               (if selected then "capture-task-on" else "capture-task-off"))
-                        | _ -> ()))
-                   ~on_save:(bind_action dispatch "capture-submit")
-                   ~error:
-                     (match state.capture_error with
-                      | Some failure -> Some (capture_failure_message failure)
-                      | None ->
-                        (match Journal_capture.phase capture with
-                         | Failed message -> Some message
-                         | Editing | Saving -> None))
-               ; V.frame
-                   ~height:state.environment.safe_area.bottom
-                   (V.column ~spacing:0. [])
+               [ V.frame
+                   ~min_height:110.
+                   (* The capsule's own grow would split the overlay column's
+                      height with the tap layer; an un-grown wrapper column
+                      keeps it natural-sized, and the floor matches the
+                      single-line content (field + controls + padding ≈ 110pt)
+                      so the glass never clips it. *)
+                   (composer_content
+                      ~scope:"journal-capture"
+                      ~placeholder:"New journal entry"
+                      ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+                      ~capture
+                      ~enabled:state.write_enabled
+                      ~on_edit:dispatch
+                      ~on_toggle:
+                        (Ui.Event.Handler.create (function
+                           | Ui.Event.Payload.Bool selected ->
+                             Ui.Event.Handler.Private.invoke
+                               dispatch
+                               (Text
+                                  (if selected
+                                   then "capture-task-on"
+                                   else "capture-task-off"))
+                           | _ -> ()))
+                      ~on_save:(bind_action dispatch "capture-submit")
+                      ~error:
+                        (match state.capture_error with
+                         | Some failure -> Some (capture_failure_message failure)
+                         | None ->
+                           (match Journal_capture.phase capture with
+                            | Failed message -> Some message
+                            | Editing | Saving -> None)))
                ])
           state.direct_capture
       | _ -> None
