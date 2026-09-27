@@ -1170,7 +1170,7 @@ let () =
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#3ea3e5273b31bcce5d575b26ec03c47b728c58f0"
+    "git+https://github.com/logseq/lui.git#0c93a0000b11942c36992b1b257c3e3d5b63ede4"
     1;
   require_occurrences
     root
@@ -1324,9 +1324,9 @@ let () =
     root
     "app/journal_header.ml"
     [ "Journal_symbols.Account"
-    ; "V.button"
+    ; "V.buttons"
     ; "V.semantics"
-    ; "V.Menu.create"
+    ; "V.buttons_menu_action"
     ; "journal-root-navigation"
     ; "switch-graph"
     ; "sign-out"

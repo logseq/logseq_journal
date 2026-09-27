@@ -962,18 +962,27 @@ module View = struct
   ;;
 
   type buttons_action =
-    { buttons_action_label : string
-    ; buttons_action_icon : string
-    ; buttons_action_text : string option
-    ; buttons_action_on_press : Event.handler
-    }
+    | Press of
+        { buttons_action_label : string
+        ; buttons_action_icon : string
+        ; buttons_action_text : string option
+        ; buttons_action_on_press : Event.handler
+        }
+    | Menu of
+        { buttons_action_label : string
+        ; buttons_action_icon : string
+        ; buttons_action_text : string option
+        ; buttons_action_menu : Lui_elements.t list
+        ; buttons_action_on_dismiss : Event.handler option
+        }
 
   let buttons_action ~label ~icon ?text ~on_press () =
-    { buttons_action_label = label
-    ; buttons_action_icon = icon
-    ; buttons_action_text = text
-    ; buttons_action_on_press = on_press
-    }
+    Press
+      { buttons_action_label = label
+      ; buttons_action_icon = icon
+      ; buttons_action_text = text
+      ; buttons_action_on_press = on_press
+      }
   ;;
 
   (* The shared [Lui_element_combine.buttons] capsule: a single action gets
@@ -987,12 +996,34 @@ module View = struct
          ~actions:
            (List.map
               (fun action ->
-                 { Lui_element_combine.label = action.buttons_action_label
-                 ; icon = journal_icon action.buttons_action_icon
-                 ; text = action.buttons_action_text
-                 ; on_press =
-                     (fun _ -> invoke action.buttons_action_on_press Event.Payload.Unit)
-                 })
+                 match action with
+                 | Press
+                     { buttons_action_label = label
+                     ; buttons_action_icon = icon
+                     ; buttons_action_text = text
+                     ; buttons_action_on_press = on_press
+                     } ->
+                   Lui_element_combine.Press
+                     { label
+                     ; icon = journal_icon icon
+                     ; text
+                     ; on_press = (fun _ -> invoke on_press Event.Payload.Unit)
+                     }
+                 | Menu
+                     { buttons_action_label = label
+                     ; buttons_action_icon = icon
+                     ; buttons_action_text = text
+                     ; buttons_action_menu = menu
+                     ; buttons_action_on_dismiss = on_dismiss
+                     } ->
+                   Lui_element_combine.Menu
+                     { label
+                     ; icon = journal_icon icon
+                     ; text
+                     ; menu
+                     ; on_dismiss =
+                         Option.map (fun h _ -> invoke h Event.Payload.Unit) on_dismiss
+                     })
               actions))
   ;;
 
@@ -2353,54 +2384,61 @@ module View = struct
         []
     ;;
 
+    let rec entry_elements ~on_select (entry : entry) : Lui_elements.t list =
+      match entry with
+      | Divider id ->
+        [ Lui_elements.separator ~key:(Int64.to_string id) ~orientation:`horizontal [] ]
+      | Action { id; label; enabled; role } ->
+        [ menu_item
+            ~key:(Int64.to_string id)
+            ~title:label.title
+            ~icon:label.icon
+            ~enabled
+            ~role
+            ~selected:None
+            ~on_press:(fun () -> invoke on_select (Event.Payload.Int64 id))
+            ()
+        ]
+      | Choice { id; label; selected; enabled } ->
+        [ Lui_element_combine.check_menu_item
+            ~key:(Int64.to_string id)
+            ~label:(if String.length label.title = 0 then " " else label.title)
+            ?icon:(Option.map journal_icon label.icon)
+            ~checked:selected
+            ~disabled:(not enabled)
+            ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 id))
+            ()
+        ]
+      | Section { label; entries; _ } ->
+        (match label with
+         | Some label ->
+           [ menu_item
+               ~title:label.title
+               ~icon:label.icon
+               ~enabled:false
+               ~role:Button_role.Normal
+               ~selected:None
+               ()
+           ]
+         | None -> [])
+        @ List.concat_map (entry_elements ~on_select) entries
+      | Submenu { id; label; enabled; entries } ->
+        [ Lui_elements.submenu
+            ~key:(Int64.to_string id)
+            ~text:(if String.length label.title = 0 then " " else label.title)
+            ?icon:(Option.map journal_icon label.icon)
+            ~disabled:(not enabled)
+            (List.concat_map (entry_elements ~on_select) entries)
+        ]
+    ;;
+
+    (* Menu entries rendered as [dropdown_menu] children — for [buttons]
+       menu actions, where the capsule composite mounts the trigger. *)
+    let to_elements ~on_select entries =
+      List.concat_map (entry_elements ~on_select) entries
+    ;;
+
     let create ?key ?(enabled = true) ~on_select ~title ?icon ?label entries =
-      let rec entry_elements (entry : entry) : Lui_elements.t list =
-        match entry with
-        | Divider id ->
-          [ Lui_elements.separator ~key:(Int64.to_string id) ~orientation:`horizontal [] ]
-        | Action { id; label; enabled; role } ->
-          [ menu_item
-              ~key:(Int64.to_string id)
-              ~title:label.title
-              ~icon:label.icon
-              ~enabled
-              ~role
-              ~selected:None
-              ~on_press:(fun () -> invoke on_select (Event.Payload.Int64 id))
-              ()
-          ]
-        | Choice { id; label; selected; enabled } ->
-          [ Lui_element_combine.check_menu_item
-              ~key:(Int64.to_string id)
-              ~label:(if String.length label.title = 0 then " " else label.title)
-              ?icon:(Option.map journal_icon label.icon)
-              ~checked:selected
-              ~disabled:(not enabled)
-              ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 id))
-              ()
-          ]
-        | Section { label; entries; _ } ->
-          (match label with
-           | Some label ->
-             [ menu_item
-                 ~title:label.title
-                 ~icon:label.icon
-                 ~enabled:false
-                 ~role:Button_role.Normal
-                 ~selected:None
-                 ()
-             ]
-           | None -> [])
-          @ List.concat_map entry_elements entries
-        | Submenu { id; label; enabled; entries } ->
-          [ Lui_elements.submenu
-              ~key:(Int64.to_string id)
-              ~text:(if String.length label.title = 0 then " " else label.title)
-              ?icon:(Option.map journal_icon label.icon)
-              ~disabled:(not enabled)
-              (List.concat_map entry_elements entries)
-          ]
-      in
       element
         ?key
         (Lui_elements.menu
@@ -2408,9 +2446,22 @@ module View = struct
            ?icon:(Option.map journal_icon icon)
            ?label
            ~disabled:(not enabled)
-           (List.concat_map entry_elements entries))
+           (to_elements ~on_select entries))
     ;;
   end
+
+  (* A [buttons] action that opens a native dropdown menu — the [Menu.entry]
+     vocabulary (actions, choices, sections, submenus) carries over, with the
+     same [Int64] id dispatch as [Menu.create]. *)
+  let buttons_menu_action ~label ~icon ?text ~on_select ?on_dismiss entries =
+    Menu
+      { buttons_action_label = label
+      ; buttons_action_icon = icon
+      ; buttons_action_text = text
+      ; buttons_action_menu = Menu.to_elements ~on_select entries
+      ; buttons_action_on_dismiss = on_dismiss
+      }
+  ;;
 end
 
 module Native_widget = struct

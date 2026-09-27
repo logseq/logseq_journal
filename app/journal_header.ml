@@ -69,20 +69,8 @@ let view
       ~capture_expanded
       ~body
   =
-  let selected =
-    match context with
-    | Context.Favorites -> true
-    | Journals -> false
-  in
   let heading value =
     V.text ~style:(Ui.Style.Text_style.create ~font_weight:Semi_bold ()) value
-  in
-  let navigation label symbol selected on_press =
-    V.button
-      ~on_press
-      ~child:(V.label ~title:(V.text label) ~icon:(Journal_symbols.create symbol) ())
-      ()
-    |> V.semantics ~properties:(Ui.Semantics.create ~label ~selected ())
   in
   let account =
     match on_account_action with
@@ -117,21 +105,28 @@ let view
             , V.Button_role.Normal )
           ]
       in
-      V.Menu.create
-        ~on_select:
-          (Ui.Event.Handler.create (function
-             | Ui.Event.Payload.Int64 id ->
-               List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
-               |> Option.iter (fun (_, _, _, action, _) ->
-                 Ui.Event.Handler.Private.invoke dispatch (Ui.Event.Payload.Text action))
-             | _ -> ()))
-        ~title:""
-        ~icon:(Journal_symbols.name Journal_symbols.Account)
-        ~label:"Account menu"
-        (List.map
-           (fun (id, title, symbol, _, role) ->
-              V.Menu.action ~id ~role ~title ~icon:symbol ())
-           actions)
+      (* The capsule composite's menu action — the top-right chrome slot now
+         shares the same glass capsule the sibling [V.buttons] get. *)
+      V.buttons
+        ~actions:
+          [ V.buttons_menu_action
+              ~label:"Account menu"
+              ~icon:(Journal_symbols.name Journal_symbols.Account)
+              ~on_select:
+                (Ui.Event.Handler.create (function
+                   | Ui.Event.Payload.Int64 id ->
+                     List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
+                     |> Option.iter (fun (_, _, _, action, _) ->
+                       Ui.Event.Handler.Private.invoke
+                         dispatch
+                         (Ui.Event.Payload.Text action))
+                   | _ -> ()))
+              (List.map
+                 (fun (id, title, symbol, _, role) ->
+                    V.Menu.action ~id ~role ~title ~icon:symbol ())
+                 actions)
+          ]
+        ()
       |> V.semantics
            ~properties:
              (Ui.Semantics.create
@@ -234,14 +229,27 @@ let view
          application.ml) — every toolbar item yields while it is up. *)
       []
     | _ ->
-      controls
-        "destinations"
-        navigation_placement
-        [ ( "journals"
-          , navigation "Journals" Journal_symbols.Journals (not selected) on_journals )
-        ; ( "favorites"
-          , navigation "Favorites" Journal_symbols.Favorites selected on_favorites )
-        ]
+      (* The destination pair fuses into one capsule — [buttons] has no
+         per-action selected state, so the active destination is conveyed by
+         the page content and its principal title instead. *)
+      [ V.Toolbar.item
+          ~key:(Ui.Key.string "destinations")
+          ~placement:navigation_placement
+          (V.buttons
+             ~actions:
+               [ V.buttons_action
+                   ~label:"Journals"
+                   ~icon:(Journal_symbols.name Journal_symbols.Journals)
+                   ~on_press:on_journals
+                   ()
+               ; V.buttons_action
+                   ~label:"Favorites"
+                   ~icon:(Journal_symbols.name Journal_symbols.Favorites)
+                   ~on_press:on_favorites
+                   ()
+               ]
+             ())
+      ]
       @ (if platform = "ios"
          then
            [ V.Toolbar.spacer
