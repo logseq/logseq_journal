@@ -4971,33 +4971,43 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     in
     let floating_capture =
       (* On iOS the capture composer expands directly into the bottom bar
-         instead of presenting a sheet. *)
+         instead of presenting a sheet. The page column extends to the screen's
+         physical bottom edge, so the composer needs an explicit spacer of
+         safe_area.bottom beneath it — the system does not inset raw children
+         the way it does toolbar bottomBar items. *)
       match state.modal with
       | Capture_sheet when state.environment.platform = "ios" ->
         Option.map
           (fun capture ->
-             composer_content
-               ~scope:"journal-capture"
-               ~placeholder:"New journal entry"
-               ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
-               ~capture
-               ~enabled:state.write_enabled
-               ~on_edit:dispatch
-               ~on_toggle:
-                 (Ui.Event.Handler.create (function
-                    | Ui.Event.Payload.Bool selected ->
-                      Ui.Event.Handler.Private.invoke
-                        dispatch
-                        (Text (if selected then "capture-task-on" else "capture-task-off"))
-                    | _ -> ()))
-               ~on_save:(bind_action dispatch "capture-submit")
-               ~error:
-                 (match state.capture_error with
-                  | Some failure -> Some (capture_failure_message failure)
-                  | None ->
-                    (match Journal_capture.phase capture with
-                     | Failed message -> Some message
-                     | Editing | Saving -> None)))
+             V.column
+               ~spacing:0.
+               [ composer_content
+                   ~scope:"journal-capture"
+                   ~placeholder:"New journal entry"
+                   ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+                   ~capture
+                   ~enabled:state.write_enabled
+                   ~on_edit:dispatch
+                   ~on_toggle:
+                     (Ui.Event.Handler.create (function
+                        | Ui.Event.Payload.Bool selected ->
+                          Ui.Event.Handler.Private.invoke
+                            dispatch
+                            (Text
+                               (if selected then "capture-task-on" else "capture-task-off"))
+                        | _ -> ()))
+                   ~on_save:(bind_action dispatch "capture-submit")
+                   ~error:
+                     (match state.capture_error with
+                      | Some failure -> Some (capture_failure_message failure)
+                      | None ->
+                        (match Journal_capture.phase capture with
+                         | Failed message -> Some message
+                         | Editing | Saving -> None))
+               ; V.frame
+                   ~height:state.environment.safe_area.bottom
+                   (V.column ~spacing:0. [])
+               ])
           state.direct_capture
       | _ -> None
     in
