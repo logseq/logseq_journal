@@ -456,6 +456,29 @@ module View : sig
     -> unit
     -> t
 
+  (** One capsule action for {!buttons}: [label] is the accessibility name,
+      [icon] an SF Symbol name, [text] optional visible text. *)
+  type buttons_action =
+    { buttons_action_label : string
+    ; buttons_action_icon : string
+    ; buttons_action_text : string option
+    ; buttons_action_on_press : Event.handler
+    }
+
+  val buttons_action
+    :  label:string
+    -> icon:string
+    -> ?text:string
+    -> on_press:Event.handler
+    -> unit
+    -> buttons_action
+
+  (** The shared [Lui_element_combine.buttons] capsule: one action renders a
+      capsule button; several share one capsule. The composite carries no
+      per-action key, identifier, role, or disabled state — [button] covers
+      controls that need them. *)
+  val buttons : ?key:Key.t -> actions:buttons_action list -> unit -> t
+
   val secure_field
     :  ?key:Key.t
     -> label:string

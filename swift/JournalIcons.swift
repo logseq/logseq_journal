@@ -35,6 +35,7 @@ let journalIconNames: [String] = [
     "star",
     "stethoscope",
     "trash",
+    "xmark",
 ]
 
 let journalAppIcons: [String: LUIAppleIconSource] = Dictionary(

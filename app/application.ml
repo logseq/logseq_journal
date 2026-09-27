@@ -1449,16 +1449,22 @@ let operation_feedback ~scope ~state dispatch body =
     match failure with
     | None -> "", V.empty ()
     | Some (summary, _, _) ->
-      let action suffix title command =
-        V.button ~on_press:(bind_action dispatch command) ~child:(V.text title) ()
-        |> V.with_test_id (Ui.Test_id.string (scope ^ "-operation-" ^ suffix))
+      let action title icon command =
+        V.buttons_action
+          ~label:title
+          ~icon
+          ~text:title
+          ~on_press:(bind_action dispatch command)
+          ()
       in
       ( summary
-      , V.row
-          ~spacing:16.
-          [ action "details" "Details" "open-error-info"
-          ; action "dismiss" "Dismiss" "dismiss-operation-error"
-          ] )
+      , V.buttons
+          ~actions:
+            [ action "Details" "exclamationmark.circle" "open-error-info"
+            ; action "Dismiss" "xmark" "dismiss-operation-error"
+            ]
+          ()
+        |> V.with_test_id (Ui.Test_id.string (scope ^ "-operation-actions")) )
   in
   let label =
     V.label
@@ -1478,9 +1484,9 @@ let operation_feedback ~scope ~state dispatch body =
 
 let graph_unavailable_view ~message ~on_details ~on_diagnostics ~on_choose_graph =
   let action id title symbol handler =
-    V.button
-      ~on_press:handler
-      ~child:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
+    V.buttons
+      ~actions:
+        [ V.buttons_action ~label:title ~icon:symbol ~text:title ~on_press:handler () ]
       ()
     |> V.with_test_id (Ui.Test_id.string id)
   in
@@ -1610,7 +1616,16 @@ let favorites_view
   let module F = Journal_routes.Favorites in
   let rows = F.items state in
   let retry =
-    V.button ~on_press:on_retry ~child:(V.text "Retry") ()
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:"Retry"
+            ~icon:"arrow.clockwise"
+            ~text:"Retry"
+            ~on_press:on_retry
+            ()
+        ]
+      ()
     |> V.with_test_id (Ui.Test_id.string "favorites-retry-button")
   in
   let busy = V.loading ~message:"Loading favorites" () in
@@ -2269,8 +2284,17 @@ let detail_page ~state ~on_scroll_completed dispatch =
   in
   let scope = Detail_outline.scope state.routes in
   let on_action action = bind_action dispatch (scope ^ action) in
-  let button ~id ~command title =
-    V.button ~on_press:(on_action command) ~child:(V.text title) ()
+  let button ~id ~command ~symbol title =
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:title
+            ~icon:symbol
+            ~text:title
+            ~on_press:(on_action command)
+            ()
+        ]
+      ()
     |> V.with_test_id (Ui.Test_id.string id)
   in
   let rows detail =
@@ -2285,6 +2309,8 @@ let detail_page ~state ~on_scroll_completed dispatch =
                @ [ button
                      ~id:("detail-more:" ^ parent_id)
                      ~command:("detail-more:" ^ parent_id)
+                     ~symbol:
+                       (if Option.is_some error then "arrow.clockwise" else "ellipsis")
                      (if Option.is_some error
                       then "Retry loading children"
                       else "Load more")
@@ -2327,7 +2353,12 @@ let detail_page ~state ~on_scroll_completed dispatch =
            ~title:"Unable to open block"
            ~symbol:"exclamationmark.triangle"
            ~message
-           ~actions:(button ~id:"detail-retry" ~command:"detail-retry" "Retry")
+           ~actions:
+             (button
+                ~id:"detail-retry"
+                ~command:"detail-retry"
+                ~symbol:"arrow.clockwise"
+                "Retry")
        | Detail | Timeline -> V.empty ())
       |> V.Body.static
   in
@@ -2371,6 +2402,19 @@ let manager_page state dispatch =
       ()
     |> V.with_test_id (Ui.Test_id.string id)
   in
+  let capsule ~id ~command title symbol =
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:title
+            ~icon:symbol
+            ~text:title
+            ~on_press:(bind_action dispatch command)
+            ()
+        ]
+      ()
+    |> V.with_test_id (Ui.Test_id.string id)
+  in
   let diagnostics =
     button
       ~id:"journal-startup-diagnostics"
@@ -2398,7 +2442,7 @@ let manager_page state dispatch =
     |> V.Body.static
   in
   let choose_graph =
-    button
+    capsule
       ~id:"graph-picker-choose"
       ~command:"switch-graph"
       "Choose another graph"
@@ -2641,13 +2685,13 @@ let manager_page state dispatch =
          let actions =
            match recovery with
            | Some Refresh_catalog ->
-             button
+             capsule
                ~id:"graph-picker-retry"
                ~command:"refresh-catalog"
                "Retry"
                "arrow.clockwise"
            | Some Begin_online_recovery | Some Retry_graph_open ->
-             button
+             capsule
                ~id:"graph-picker-retry"
                ~command:"begin-online-recovery"
                "Retry"

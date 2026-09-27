@@ -961,6 +961,41 @@ module View = struct
         parent)
   ;;
 
+  type buttons_action =
+    { buttons_action_label : string
+    ; buttons_action_icon : string
+    ; buttons_action_text : string option
+    ; buttons_action_on_press : Event.handler
+    }
+
+  let buttons_action ~label ~icon ?text ~on_press () =
+    { buttons_action_label = label
+    ; buttons_action_icon = icon
+    ; buttons_action_text = text
+    ; buttons_action_on_press = on_press
+    }
+  ;;
+
+  (* The shared [Lui_element_combine.buttons] capsule: a single action gets
+     its own capsule, several share one. The composite takes no per-action
+     key, identifier, variant, or disabled state — controls that need those
+     stay on [button]. *)
+  let buttons ?key ~actions () =
+    element
+      ?key
+      (Lui_element_combine.buttons
+         ~actions:
+           (List.map
+              (fun action ->
+                 { Lui_element_combine.label = action.buttons_action_label
+                 ; icon = journal_icon action.buttons_action_icon
+                 ; text = action.buttons_action_text
+                 ; on_press =
+                     (fun _ -> invoke action.buttons_action_on_press Event.Payload.Unit)
+                 })
+              actions))
+  ;;
+
   let secure_field
         ?key
         ~label:_
