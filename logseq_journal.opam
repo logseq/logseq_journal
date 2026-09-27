@@ -9,7 +9,7 @@ homepage: "https://github.com/logseq/logseq_journal"
 bug-reports: "https://github.com/logseq/logseq_journal/issues"
 depends: [
   "rrbvec" {= "dev"}
-  "ocaml" {>= "5.4"}
+  "ocaml" {>= "5.5"}
   "dune" {= "3.23.1"}
   "logseq_db_worker" {= "0.1.0"}
   "logseq_db_types" {= "0.1.0"}
