@@ -4993,12 +4993,12 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
              V.column
                ~spacing:0.
                [ V.frame
-                   ~min_height:110.
-                   (* The capsule's own grow would split the overlay column's
-                      height with the tap layer; an un-grown wrapper column
-                      keeps it natural-sized, and the floor matches the
-                      single-line content (field + controls + padding ≈ 110pt)
-                      so the glass never clips it. *)
+                   ~height:136.
+                   (* The capsule's own grow makes it claim every point its
+                      parent offers — in the overlay stack that is the whole
+                      body frame — so pin the exact single-line height
+                      (capsule 104 + padding 32). A floor alone leaves the
+                      grow free to stretch the glass over half the screen. *)
                    (composer_content
                       ~scope:"journal-capture"
                       ~placeholder:"New journal entry"
