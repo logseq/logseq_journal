@@ -19,6 +19,7 @@ val view
   -> on_favorites:Journal_view.Event.Handler.t
   -> on_capture:Journal_view.Event.Handler.t
   -> capture_enabled:bool
+  -> capture_expanded:Journal_view.View.t option
   -> body:Journal_view.View.Body.t
   -> Journal_view.View.Body.t
 

@@ -1701,7 +1701,7 @@ let favorites_view
   content
 ;;
 
-let composer_page
+let composer_content
       ~scope
       ~placeholder
       ~capture
@@ -1710,7 +1710,7 @@ let composer_page
       ~on_edit
       ~on_toggle
       ~on_save
-      ~on_close
+      ~dismiss
       ~error
   =
   let ignored = Ui.Event.Handler.create (fun _ -> ()) in
@@ -1734,6 +1734,17 @@ let composer_page
       ()
     |> V.with_test_id (Ui.Test_id.string (scope ^ "-task"))
   in
+  let dismiss_actions =
+    Option.to_list
+      (Option.map
+         (fun on_close ->
+            V.buttons
+              ~actions:
+                [ V.buttons_action ~label:"Close" ~icon:"xmark" ~on_press:on_close () ]
+              ()
+            |> V.with_test_id (Ui.Test_id.string (scope ^ "-dismiss")))
+         dismiss)
+  in
   let composer =
     V.composer
       ~key:(Ui.Key.string (scope ^ "-composer"))
@@ -1746,15 +1757,11 @@ let composer_page
       ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
       ~value:(Journal_capture.value capture)
       ~send_disabled:(not can_submit)
-      ~actions:[ task ]
+      ~actions:(task :: dismiss_actions)
       ~on_edit
       ~on_submit:ignored
       ~on_send:on_save
       ()
-  in
-  let close =
-    V.button ~role:Cancel ~on_press:on_close ~child:(V.text "Close") ()
-    |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
   in
   V.column
     ~spacing:12.
@@ -1762,6 +1769,35 @@ let composer_page
      @ (if saving then [ V.loading ~message:"Saving…" () ] else [])
      @ Option.to_list (Option.map live_region_text error))
   |> V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
+;;
+
+let composer_page
+      ~scope
+      ~placeholder
+      ~capture
+      ~saving
+      ~enabled
+      ~on_edit
+      ~on_toggle
+      ~on_save
+      ~on_close
+      ~error
+  =
+  let close =
+    V.button ~role:Cancel ~on_press:on_close ~child:(V.text "Close") ()
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
+  in
+  composer_content
+    ~scope
+    ~placeholder
+    ~capture
+    ~saving
+    ~enabled
+    ~on_edit
+    ~on_toggle
+    ~on_save
+    ~dismiss:None
+    ~error
   |> V.Body.static
   |> V.Body.toolbar
        ~items:
@@ -1790,6 +1826,7 @@ let timeline_page
       ~day_presentation
       ~capture_enabled
       ~on_capture_event
+      ~capture_expanded
       ~on_visible_range
       ~on_retry_day
       ~on_open_block
@@ -1865,6 +1902,7 @@ let timeline_page
     ~on_favorites:(destination_action 1L)
     ~on_capture:(bind_action on_capture_event "open-capture")
     ~capture_enabled
+    ~capture_expanded
     ~body:content
 ;;
 
@@ -4923,6 +4961,39 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     let sync_error =
       Option.map (fun notice -> sync_failure_message notice.failure) state.sync_error
     in
+    let floating_capture =
+      (* On iOS the capture composer expands directly into the bottom bar
+         instead of presenting a sheet. *)
+      match state.modal with
+      | Capture_sheet when state.environment.platform = "ios" ->
+        Option.map
+          (fun capture ->
+             composer_content
+               ~scope:"journal-capture"
+               ~placeholder:"New journal entry"
+               ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+               ~capture
+               ~enabled:state.write_enabled
+               ~on_edit:dispatch
+               ~on_toggle:
+                 (Ui.Event.Handler.create (function
+                    | Ui.Event.Payload.Bool selected ->
+                      Ui.Event.Handler.Private.invoke
+                        dispatch
+                        (Text (if selected then "capture-task-on" else "capture-task-off"))
+                    | _ -> ()))
+               ~on_save:(bind_action dispatch "capture-submit")
+               ~dismiss:(Some (bind_action dispatch "close-composer"))
+               ~error:
+                 (match state.capture_error with
+                  | Some failure -> Some (capture_failure_message failure)
+                  | None ->
+                    (match Journal_capture.phase capture with
+                     | Failed message -> Some message
+                     | Editing | Saving -> None)))
+          state.direct_capture
+      | _ -> None
+    in
     let root =
       match state.graph_ready, state.manager with
       | false, Some _ -> manager_page state dispatch
@@ -4965,6 +5036,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
              && Option.is_none state.pending_status
              && not capture_saving)
           ~on_capture_event:dispatch
+          ~capture_expanded:floating_capture
           ~on_visible_range:dispatch
           ~on_retry_day:(prefix_action dispatch "timeline-retry:")
           ~on_open_block:(prefix_action dispatch "timeline-open-block:")
@@ -5001,32 +5073,36 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       match state.modal with
       | No_modal -> None
       | Capture_sheet ->
-        Option.map
-          (fun capture ->
-             composer_page
-               ~scope:"journal-capture"
-               ~placeholder:"New journal entry"
-               ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
-               ~capture
-               ~enabled:state.write_enabled
-               ~on_edit:dispatch
-               ~on_toggle:
-                 (Ui.Event.Handler.create (function
-                    | Ui.Event.Payload.Bool selected ->
-                      Ui.Event.Handler.Private.invoke
-                        dispatch
-                        (Text (if selected then "capture-task-on" else "capture-task-off"))
-                    | _ -> ()))
-               ~on_save:(bind_action dispatch "capture-submit")
-               ~on_close:(bind_action dispatch "close-composer")
-               ~error:
-                 (match state.capture_error with
-                  | Some failure -> Some (capture_failure_message failure)
-                  | None ->
-                    (match Journal_capture.phase capture with
-                     | Failed message -> Some message
-                     | Editing | Saving -> None)))
-          state.direct_capture
+        (match floating_capture with
+         | Some _ -> None
+         | None ->
+           Option.map
+             (fun capture ->
+                composer_page
+                  ~scope:"journal-capture"
+                  ~placeholder:"New journal entry"
+                  ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+                  ~capture
+                  ~enabled:state.write_enabled
+                  ~on_edit:dispatch
+                  ~on_toggle:
+                    (Ui.Event.Handler.create (function
+                       | Ui.Event.Payload.Bool selected ->
+                         Ui.Event.Handler.Private.invoke
+                           dispatch
+                           (Text
+                              (if selected then "capture-task-on" else "capture-task-off"))
+                       | _ -> ()))
+                  ~on_save:(bind_action dispatch "capture-submit")
+                  ~on_close:(bind_action dispatch "close-composer")
+                  ~error:
+                    (match state.capture_error with
+                     | Some failure -> Some (capture_failure_message failure)
+                     | None ->
+                       (match Journal_capture.phase capture with
+                        | Failed message -> Some message
+                        | Editing | Saving -> None)))
+             state.direct_capture)
       | Append_sheet ->
         Option.bind (Journal_routes.detail state.routes) (fun detail ->
           Option.map
@@ -5423,6 +5499,7 @@ module For_testing = struct
       ~day_presentation:(fun _ -> None)
       ~capture_enabled:false
       ~on_capture_event:handler
+      ~capture_expanded:None
       ~on_visible_range:handler
       ~on_retry_day:handler
       ~on_open_block:handler

@@ -1182,12 +1182,26 @@ module View = struct
       ; content : child
       ; spacing : spacing option
       ; is_group : bool
+      ; raw : bool
       }
 
     let child ~key:_ view = view
 
     let item ~key ?placement content =
-      { item_key = key; placement; content; spacing = None; is_group = false }
+      { item_key = key
+      ; placement
+      ; content
+      ; spacing = None
+      ; is_group = false
+      ; raw = false
+      }
+    ;;
+
+    (* Bar content that mounts unmodified — no icon collapsing and no
+       per-item capsule fusion. For chrome-surface elements that already
+       carry their own chrome, like the expanded composer. *)
+    let raw_item ~key ?placement content =
+      { item_key = key; placement; content; spacing = None; is_group = false; raw = true }
     ;;
 
     let group ~key ?placement children =
@@ -1209,6 +1223,7 @@ module View = struct
             | None -> 0)
       ; spacing = None
       ; is_group = true
+      ; raw = false
       }
     ;;
 
@@ -1218,6 +1233,7 @@ module View = struct
       ; content = element (Lui_elements.spacer [])
       ; spacing = Some spacing
       ; is_group = false
+      ; raw = false
       }
     ;;
 
@@ -1365,7 +1381,13 @@ module View = struct
                 match item.spacing with
                 | Some _ -> Lui_elements.spacer []
                 | None ->
-                  if item.is_group
+                  if item.raw
+                  then (
+                    fun context parent ->
+                      let mounted = item.content.mount context parent in
+                      if mounted <> 0 then Lui_ui.key context mounted item.item_key;
+                      mounted)
+                  else if item.is_group
                   then Lui_elements.button_group [ mount_icon_only item ]
                   else mount_icon_only item)
              items)

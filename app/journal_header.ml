@@ -66,6 +66,7 @@ let view
       ~on_favorites
       ~on_capture
       ~capture_enabled
+      ~capture_expanded
       ~body
   =
   let selected =
@@ -226,7 +227,18 @@ let view
            (Option.to_list (Option.map (fun _ -> "error", error) on_error_info)
             @ Option.to_list (Option.map (fun _ -> "account", account) on_account_action)
            ))
-    @ controls
+    @
+    match capture_expanded with
+    | Some expanded when platform = "ios" ->
+      (* Capture open: the expanded composer takes over the bottom bar —
+         nav destinations and the capture affordance yield to it. *)
+      [ V.Toolbar.raw_item
+          ~key:(Ui.Key.string "capture-composer")
+          ~placement:Bottom_bar
+          expanded
+      ]
+    | _ ->
+      controls
         "destinations"
         navigation_placement
         [ ( "journals"
@@ -234,16 +246,19 @@ let view
         ; ( "favorites"
           , navigation "Favorites" Journal_symbols.Favorites selected on_favorites )
         ]
-    @ (if platform = "ios"
-       then
-         [ V.Toolbar.spacer
-             ~key:(Ui.Key.string "capture-space")
-             ~placement:Bottom_bar
-             Flexible
-         ]
-       else [])
-    @ [ V.Toolbar.item ~key:(Ui.Key.string "capture") ~placement:capture_placement capture
-      ]
+      @ (if platform = "ios"
+         then
+           [ V.Toolbar.spacer
+               ~key:(Ui.Key.string "capture-space")
+               ~placement:Bottom_bar
+               Flexible
+           ]
+         else [])
+      @ [ V.Toolbar.item
+            ~key:(Ui.Key.string "capture")
+            ~placement:capture_placement
+            capture
+        ]
   in
   let body =
     match context with

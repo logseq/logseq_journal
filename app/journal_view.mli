@@ -556,6 +556,11 @@ module View : sig
 
     val child : key:Key.t -> t -> child
     val item : key:Key.t -> ?placement:placement -> t -> item
+
+    (** Bar content mounted without icon collapsing or capsule fusion —
+        for elements that carry their own chrome (e.g. the expanded composer). *)
+    val raw_item : key:Key.t -> ?placement:placement -> t -> item
+
     val group : key:Key.t -> ?placement:placement -> child list -> item
     val spacer : key:Key.t -> ?placement:placement -> spacing -> item
     val create : ?key:Key.t -> items:item list -> t -> t
