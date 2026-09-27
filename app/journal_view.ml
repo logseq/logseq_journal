@@ -812,7 +812,15 @@ module View = struct
     }
   ;;
 
-  let toggle ?key ?style:_ ?(enabled = true) ~value ~on_changed ~label () =
+  let toggle
+        ?key
+        ?(style = Button_style.Automatic)
+        ?(enabled = true)
+        ~value
+        ~on_changed
+        ~label
+        ()
+    =
     let on_toggle event =
       match event with
       | Lui_protocol.ToggleChanged (_, selected) ->
@@ -821,9 +829,21 @@ module View = struct
     in
     element
       ?key
-      (match label.label_content with
+      (match style, label.label_content with
+       (* A button-style toggle mounts the toggle-button control, whose
+          [checked] state carries the selected affordance — and unlike
+          [toggle] it can carry the label's icon. *)
+       | Button_style.Button, Some { title; icon } ->
+         Lui_elements.toggle_button
+           ~checked:value
+           ~disabled:(not enabled)
+           ~label:title
+           ~text:title
+           ?icon:(Option.map journal_icon icon)
+           ~on_toggle
+           []
        (* A text-only label mounts the shared toggle-row composite. *)
-       | Some { title; icon = None } ->
+       | _, Some { title; icon = None } ->
          Lui_element_combine.toggle_row
            ~label:title
            ~checked:value
@@ -880,6 +900,63 @@ module View = struct
           | _ -> ())
         ~on_submit:(fun _ -> invoke on_submit Event.Payload.Unit)
         []
+        context
+        parent)
+  ;;
+
+  (* The shared composer composite owns the capsule layout: a growing
+     [composer-input] textarea and a controls row of caller actions followed
+     by the send button. Journal keeps its revision-aware edit payloads by
+     translating the composer's raw [on_input] events through the same
+     per-mount local-revision bookkeeping [text_editor] uses. The composite's
+     textarea cannot be disabled, so [~enabled] state is carried only by the
+     actions and the send button (the model drops edits while saving). *)
+  let composer
+        ?key
+        ?accessibility_identifier
+        ?(autofocus = false)
+        ?label
+        ~placeholder
+        ~session_id
+        ~document_revision
+        ~accepted_local_revision
+        ~value
+        ~send_disabled
+        ~actions
+        ~on_edit
+        ~on_submit
+        ~on_send
+        ()
+    =
+    element ?key (fun context parent ->
+      let local_revision = ref accepted_local_revision in
+      Lui_element_combine.composer
+        ?accessibility_identifier
+        ?label
+        ~placeholder
+        ~text:(Text_editing.Value.text value)
+        ~autofocus
+        ~submit_on_enter:true
+        ~send_disabled_signal:(Signal.constant context.Lui_ui.ui_scheduler send_disabled)
+        ~actions:(List.map (fun action -> action.mount) actions)
+        ~on_input:(fun event ->
+          match event with
+          | Lui_protocol.TextChanged (_, text) ->
+            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
+            invoke
+              on_edit
+              (Event.Payload.Text_edit
+                 { session_id
+                 ; local_revision = !local_revision
+                 ; base_document_revision = document_revision
+                 ; text
+                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
+                 ; composing = None
+                 })
+          | _ -> ())
+        ~on_submit:(fun _ -> invoke on_submit Event.Payload.Unit)
+        ~on_send:(fun _ -> invoke on_send Event.Payload.Unit)
+        ()
         context
         parent)
   ;;

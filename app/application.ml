@@ -1688,6 +1688,7 @@ let favorites_view
 
 let composer_page
       ~scope
+      ~placeholder
       ~capture
       ~saving
       ~enabled
@@ -1707,28 +1708,6 @@ let composer_page
         | Failed _ -> true
         | _ -> false)
   in
-  let editor =
-    V.text_editor
-      ~autofocus:true
-      ~key:(Ui.Key.string (scope ^ "-editor"))
-      ~enabled:(enabled && not saving)
-      ~session_id:(Journal_capture.session_id capture)
-      ~document_revision:(Journal_capture.document_revision capture)
-      ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
-      ~update_mode:(Journal_capture.update_mode capture)
-      ~value:(Journal_capture.value capture)
-      ~on_edit
-      ~on_submit:ignored
-      ~on_focus_changed:ignored
-      ()
-    |> V.frame ~max_width:Fill ~max_height:Fill
-    |> V.semantics ~properties:(Ui.Semantics.create ~label:"Draft" ())
-    |> V.with_test_id (Ui.Test_id.string (scope ^ "-editor"))
-  in
-  let close =
-    V.button ~role:Cancel ~on_press:on_close ~child:(V.text "Close") ()
-    |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
-  in
   let task =
     V.toggle
       ~style:Button
@@ -1740,13 +1719,31 @@ let composer_page
       ()
     |> V.with_test_id (Ui.Test_id.string (scope ^ "-task"))
   in
-  let save =
-    V.button ~enabled:can_submit ~on_press:on_save ~child:(V.text "Save") ()
-    |> V.with_test_id (Ui.Test_id.string (scope ^ "-submit"))
+  let composer =
+    V.composer
+      ~key:(Ui.Key.string (scope ^ "-composer"))
+      ~accessibility_identifier:(scope ^ "-composer")
+      ~autofocus:true
+      ~label:"Draft"
+      ~placeholder
+      ~session_id:(Journal_capture.session_id capture)
+      ~document_revision:(Journal_capture.document_revision capture)
+      ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
+      ~value:(Journal_capture.value capture)
+      ~send_disabled:(not can_submit)
+      ~actions:[ task ]
+      ~on_edit
+      ~on_submit:ignored
+      ~on_send:on_save
+      ()
+  in
+  let close =
+    V.button ~role:Cancel ~on_press:on_close ~child:(V.text "Close") ()
+    |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
   in
   V.column
     ~spacing:12.
-    ([ editor ]
+    ([ composer ]
      @ (if saving then [ V.loading ~message:"Saving…" () ] else [])
      @ Option.to_list (Option.map live_region_text error))
   |> V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
@@ -1757,14 +1754,6 @@ let composer_page
              ~key:(Ui.Key.string "composer-close")
              ~placement:Cancellation_action
              close
-         ; V.Toolbar.item
-             ~key:(Ui.Key.string "composer-task")
-             ~placement:Primary_action
-             task
-         ; V.Toolbar.item
-             ~key:(Ui.Key.string "composer-save")
-             ~placement:Confirmation_action
-             save
          ]
 ;;
 
@@ -4972,6 +4961,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           (fun capture ->
              composer_page
                ~scope:"journal-capture"
+               ~placeholder:"New journal entry"
                ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
                ~capture
                ~enabled:state.write_enabled
@@ -4999,6 +4989,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
             (fun capture ->
                composer_page
                  ~scope:"journal-append"
+                 ~placeholder:"Append a block"
                  ~saving:(Journal_detail.mode detail = Journal_detail.Saving_child)
                  ~capture
                  ~enabled:state.write_enabled

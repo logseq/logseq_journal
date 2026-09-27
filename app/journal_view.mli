@@ -434,6 +434,28 @@ module View : sig
     -> unit
     -> t
 
+  (** The shared [Lui_element_combine.composer] capsule: growing textarea,
+      caller [actions] row, and a send button wired to [on_send] (disabled
+      while [send_disabled] holds). Edits arrive as [Text_edit] payloads with
+      the session/document/local-revision bookkeeping [text_editor] uses. *)
+  val composer
+    :  ?key:Key.t
+    -> ?accessibility_identifier:string
+    -> ?autofocus:bool
+    -> ?label:string
+    -> placeholder:string
+    -> session_id:Journal_ids.Text_input.Session_id.t
+    -> document_revision:Journal_ids.Text_input.Document_revision.t
+    -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
+    -> value:Text_editing.Value.t
+    -> send_disabled:bool
+    -> actions:t list
+    -> on_edit:Event.handler
+    -> on_submit:Event.handler
+    -> on_send:Event.handler
+    -> unit
+    -> t
+
   val secure_field
     :  ?key:Key.t
     -> label:string

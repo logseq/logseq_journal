@@ -34,7 +34,7 @@ dependencies:
   lui_flutter_backend:
     git:
       url: https://github.com/logseq/lui.git
-      ref: 835a80a3bd0e7dca7d26b35d0401372e591aa108
+      ref: 0771d3e9b5aa8aca18f15c6ccfa5ba94d364c5fe
       path: platform/flutter
   # journal-lui:end packages
 
