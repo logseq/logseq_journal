@@ -557,8 +557,11 @@ module View : sig
     val child : key:Key.t -> t -> child
     val item : key:Key.t -> ?placement:placement -> t -> item
 
-    (** Bar content mounted without icon collapsing or capsule fusion —
-        for elements that carry their own chrome (e.g. the expanded composer). *)
+    (** Bar content that mounts unmodified: no icon collapsing and no
+        capsule-group fusion. Unlike regular items it is not mounted inside a
+        toolbar — the schema whitelists toolbar children to interactive kinds —
+        so a raw item mounts as a direct bottom child of the page column.
+        Only [Bottom_bar] placement is supported. *)
     val raw_item : key:Key.t -> ?placement:placement -> t -> item
 
     val group : key:Key.t -> ?placement:placement -> child list -> item

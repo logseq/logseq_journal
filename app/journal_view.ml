@@ -1365,6 +1365,15 @@ module View = struct
           parent)
     ;;
 
+    (* A toolbar child is limited to the schema's interactive kinds, so raw
+       content (e.g. the expanded composer column) mounts as a direct child of
+       the page column — pinned at the bottom without bar chrome. *)
+    let mount_raw (item : item) context parent =
+      let mounted = item.content.mount context parent in
+      if mounted <> 0 then Lui_ui.key context mounted item.item_key;
+      mounted
+    ;;
+
     let mount_bottom_bar items =
       element (fun context parent ->
         (* A `placement "bottom"` toolbar maps to the platform bottom bar on
@@ -1381,13 +1390,7 @@ module View = struct
                 match item.spacing with
                 | Some _ -> Lui_elements.spacer []
                 | None ->
-                  if item.raw
-                  then (
-                    fun context parent ->
-                      let mounted = item.content.mount context parent in
-                      if mounted <> 0 then Lui_ui.key context mounted item.item_key;
-                      mounted)
-                  else if item.is_group
+                  if item.is_group
                   then Lui_elements.button_group [ mount_icon_only item ]
                   else mount_icon_only item)
              items)
@@ -1400,6 +1403,7 @@ module View = struct
         let top, bottom =
           List.partition (fun (item : item) -> item.placement <> Some Bottom_bar) items
         in
+        let bare, bar = List.partition (fun (item : item) -> item.raw) bottom in
         Lui_elements.column
           ~grow:1.0
           ((if
@@ -1412,7 +1416,8 @@ module View = struct
                  if node_is_standard context body then Lui_ui.grow context body 1.0;
                  body)
              ]
-           @ if bottom <> [] then [ (mount_bottom_bar bottom).mount ] else [])
+           @ (if bar <> [] then [ (mount_bottom_bar bar).mount ] else [])
+           @ List.map mount_raw bare)
           context
           parent)
     ;;
