@@ -434,6 +434,51 @@ module View : sig
     -> unit
     -> t
 
+  (** The shared [Lui_element_combine.composer] capsule: growing textarea,
+      caller [actions] row, and a send button wired to [on_send] (disabled
+      while [send_disabled] holds). Edits arrive as [Text_edit] payloads with
+      the session/document/local-revision bookkeeping [text_editor] uses. *)
+  val composer
+    :  ?key:Key.t
+    -> ?accessibility_identifier:string
+    -> ?autofocus:bool
+    -> ?label:string
+    -> placeholder:string
+    -> session_id:Journal_ids.Text_input.Session_id.t
+    -> document_revision:Journal_ids.Text_input.Document_revision.t
+    -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
+    -> value:Text_editing.Value.t
+    -> send_disabled:bool
+    -> actions:t list
+    -> on_edit:Event.handler
+    -> on_submit:Event.handler
+    -> on_send:Event.handler
+    -> unit
+    -> t
+
+  (** One capsule action for {!buttons}: [label] is the accessibility name,
+      [icon] an SF Symbol name, [text] optional visible text. *)
+  type buttons_action =
+    { buttons_action_label : string
+    ; buttons_action_icon : string
+    ; buttons_action_text : string option
+    ; buttons_action_on_press : Event.handler
+    }
+
+  val buttons_action
+    :  label:string
+    -> icon:string
+    -> ?text:string
+    -> on_press:Event.handler
+    -> unit
+    -> buttons_action
+
+  (** The shared [Lui_element_combine.buttons] capsule: one action renders a
+      capsule button; several share one capsule. The composite carries no
+      per-action key, identifier, role, or disabled state — [button] covers
+      controls that need them. *)
+  val buttons : ?key:Key.t -> actions:buttons_action list -> unit -> t
+
   val secure_field
     :  ?key:Key.t
     -> label:string
@@ -469,6 +514,10 @@ module View : sig
     -> t
 
   val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
+
+  (** A transparent, full-area press target meant for use as an
+      {!overlay} — e.g. tap-outside-to-dismiss behind floating chrome. *)
+  val tap_area : ?key:Key.t -> on_press:Event.handler -> unit -> t
 
   module Keyed : sig
     type widget = t
@@ -511,6 +560,14 @@ module View : sig
 
     val child : key:Key.t -> t -> child
     val item : key:Key.t -> ?placement:placement -> t -> item
+
+    (** Bar content that mounts unmodified: no icon collapsing and no
+        capsule-group fusion. Unlike regular items it is not mounted inside a
+        toolbar — the schema whitelists toolbar children to interactive kinds —
+        so a raw item mounts as a direct bottom child of the page column.
+        Only [Bottom_bar] placement is supported. *)
+    val raw_item : key:Key.t -> ?placement:placement -> t -> item
+
     val group : key:Key.t -> ?placement:placement -> child list -> item
     val spacer : key:Key.t -> ?placement:placement -> spacing -> item
     val create : ?key:Key.t -> items:item list -> t -> t

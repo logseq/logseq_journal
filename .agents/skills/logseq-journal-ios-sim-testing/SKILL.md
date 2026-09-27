@@ -176,6 +176,14 @@ until a background->foreground cycle or relaunch. Check socket liveness with
   `Lui_protocol` does not support InlineIconName on kind `toggle` — so the
   icon-only collapse yields an empty 40pt cell. Pre-existing; toggle is still
   mounted/functional.
+- **Overlay `tap_area` needs a spacer child to be hit-testable.** A
+  PressEnabled column sized via `~grow`/`~container_relative_frame` alone is a
+  zero-height strip — `grow` only fills width and `containerRelativeFrame` is a
+  no-op inside a non-scroll `V.Body.overlay` stack — so taps fall through to
+  rows (inert while `modal=Capture_sheet`) and no `lui_ocaml_press` is ever
+  emitted. Fixed by mounting `[ spacer ]` inside the column (e525e90). While the
+  composer is open the overlay swallows drag gestures: the timeline cannot
+  scroll until the composer collapses.
 
 ## Debugging the lui emit/event pipeline (lui build path)
 

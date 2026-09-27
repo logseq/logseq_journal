@@ -1170,7 +1170,7 @@ let () =
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#d89b06db934845d9a105aa52fd8df8041e57928f"
+    "git+https://github.com/logseq/lui.git#3ea3e5273b31bcce5d575b26ec03c47b728c58f0"
     1;
   require_occurrences
     root
@@ -1315,7 +1315,7 @@ let () =
     ; "arrow.clockwise"
     ; "V.Navigation_stack.create"
     ; "V.Sheet.create"
-    ; "V.text_editor"
+    ; "V.composer"
     ; "if favorites_selected"
     ; "Detail_list.view"
     ; "V.progress"
@@ -1434,7 +1434,7 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Ui.Theme.create"; "~mode:System"; "V.text_editor" ];
+    [ "Ui.Theme.create"; "~mode:System"; "V.composer" ];
   forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root

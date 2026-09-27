@@ -812,7 +812,15 @@ module View = struct
     }
   ;;
 
-  let toggle ?key ?style:_ ?(enabled = true) ~value ~on_changed ~label () =
+  let toggle
+        ?key
+        ?(style = Button_style.Automatic)
+        ?(enabled = true)
+        ~value
+        ~on_changed
+        ~label
+        ()
+    =
     let on_toggle event =
       match event with
       | Lui_protocol.ToggleChanged (_, selected) ->
@@ -821,9 +829,21 @@ module View = struct
     in
     element
       ?key
-      (match label.label_content with
+      (match style, label.label_content with
+       (* A button-style toggle mounts the toggle-button control, whose
+          [checked] state carries the selected affordance — and unlike
+          [toggle] it can carry the label's icon. *)
+       | Button_style.Button, Some { title; icon } ->
+         Lui_elements.toggle_button
+           ~checked:value
+           ~disabled:(not enabled)
+           ~label:title
+           ~text:title
+           ?icon:(Option.map journal_icon icon)
+           ~on_toggle
+           []
        (* A text-only label mounts the shared toggle-row composite. *)
-       | Some { title; icon = None } ->
+       | _, Some { title; icon = None } ->
          Lui_element_combine.toggle_row
            ~label:title
            ~checked:value
@@ -882,6 +902,98 @@ module View = struct
         []
         context
         parent)
+  ;;
+
+  (* The shared composer composite owns the capsule layout: a growing
+     [composer-input] textarea and a controls row of caller actions followed
+     by the send button. Journal keeps its revision-aware edit payloads by
+     translating the composer's raw [on_input] events through the same
+     per-mount local-revision bookkeeping [text_editor] uses. The composite's
+     textarea cannot be disabled, so [~enabled] state is carried only by the
+     actions and the send button (the model drops edits while saving). *)
+  let composer
+        ?key
+        ?accessibility_identifier
+        ?(autofocus = false)
+        ?label
+        ~placeholder
+        ~session_id
+        ~document_revision
+        ~accepted_local_revision
+        ~value
+        ~send_disabled
+        ~actions
+        ~on_edit
+        ~on_submit
+        ~on_send
+        ()
+    =
+    element ?key (fun context parent ->
+      let local_revision = ref accepted_local_revision in
+      Lui_element_combine.composer
+        ?accessibility_identifier
+        ?label
+        ~placeholder
+        ~text:(Text_editing.Value.text value)
+        ~autofocus
+        ~submit_on_enter:true
+        ~send_disabled_signal:(Signal.constant context.Lui_ui.ui_scheduler send_disabled)
+        ~actions:(List.map (fun action -> action.mount) actions)
+        ~on_input:(fun event ->
+          match event with
+          | Lui_protocol.TextChanged (_, text) ->
+            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
+            invoke
+              on_edit
+              (Event.Payload.Text_edit
+                 { session_id
+                 ; local_revision = !local_revision
+                 ; base_document_revision = document_revision
+                 ; text
+                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
+                 ; composing = None
+                 })
+          | _ -> ())
+        ~on_submit:(fun _ -> invoke on_submit Event.Payload.Unit)
+        ~on_send:(fun _ -> invoke on_send Event.Payload.Unit)
+        ()
+        context
+        parent)
+  ;;
+
+  type buttons_action =
+    { buttons_action_label : string
+    ; buttons_action_icon : string
+    ; buttons_action_text : string option
+    ; buttons_action_on_press : Event.handler
+    }
+
+  let buttons_action ~label ~icon ?text ~on_press () =
+    { buttons_action_label = label
+    ; buttons_action_icon = icon
+    ; buttons_action_text = text
+    ; buttons_action_on_press = on_press
+    }
+  ;;
+
+  (* The shared [Lui_element_combine.buttons] capsule: a single action gets
+     its own capsule, several share one. The composite takes no per-action
+     key, identifier, variant, or disabled state — controls that need those
+     stay on [button]. *)
+  let buttons ?key ~actions () =
+    element
+      ?key
+      (Lui_element_combine.buttons
+         ~actions:
+           (List.map
+              (fun action ->
+                 { Lui_element_combine.label = action.buttons_action_label
+                 ; icon = journal_icon action.buttons_action_icon
+                 ; text = action.buttons_action_text
+                 ; on_press =
+                     (fun _ -> invoke action.buttons_action_on_press Event.Payload.Unit)
+                 })
+              actions))
   ;;
 
   let secure_field
@@ -1010,6 +1122,22 @@ module View = struct
     element ?key:t.key (Lui_elements.stack [ t.mount; overlay.mount ])
   ;;
 
+  (* A transparent, full-area press target: PressEnabled gives the column a
+     contentShape + tap gesture covering its whole bounds (the backend's
+     LUIColumnPressModifier). The spacer child expands the column to fill the
+     overlay stack — grow/container_relative_frame alone leave it a
+     zero-height strip. *)
+  let tap_area ?key ~on_press () =
+    element ?key (fun context parent ->
+      let node =
+        Lui_elements.column ~grow:1.0 [ Lui_elements.spacer [] ] context parent
+      in
+      Lui_ui.bool_property context node Lui_protocol.PressEnabled true;
+      Lui_ui.on_event context node (fun event ->
+        if Lui_elements.is_press event then invoke on_press Event.Payload.Unit);
+      node)
+  ;;
+
   module Keyed = struct
     type widget = t
 
@@ -1070,12 +1198,26 @@ module View = struct
       ; content : child
       ; spacing : spacing option
       ; is_group : bool
+      ; raw : bool
       }
 
     let child ~key:_ view = view
 
     let item ~key ?placement content =
-      { item_key = key; placement; content; spacing = None; is_group = false }
+      { item_key = key
+      ; placement
+      ; content
+      ; spacing = None
+      ; is_group = false
+      ; raw = false
+      }
+    ;;
+
+    (* Bar content that mounts unmodified — no icon collapsing and no
+       per-item capsule fusion. For chrome-surface elements that already
+       carry their own chrome, like the expanded composer. *)
+    let raw_item ~key ?placement content =
+      { item_key = key; placement; content; spacing = None; is_group = false; raw = true }
     ;;
 
     let group ~key ?placement children =
@@ -1097,6 +1239,7 @@ module View = struct
             | None -> 0)
       ; spacing = None
       ; is_group = true
+      ; raw = false
       }
     ;;
 
@@ -1106,6 +1249,7 @@ module View = struct
       ; content = element (Lui_elements.spacer [])
       ; spacing = Some spacing
       ; is_group = false
+      ; raw = false
       }
     ;;
 
@@ -1237,6 +1381,15 @@ module View = struct
           parent)
     ;;
 
+    (* A toolbar child is limited to the schema's interactive kinds, so raw
+       content (e.g. the expanded composer column) mounts as a direct child of
+       the page column — pinned at the bottom without bar chrome. *)
+    let mount_raw (item : item) context parent =
+      let mounted = item.content.mount context parent in
+      if mounted <> 0 then Lui_ui.key context mounted item.item_key;
+      mounted
+    ;;
+
     let mount_bottom_bar items =
       element (fun context parent ->
         (* A `placement "bottom"` toolbar maps to the platform bottom bar on
@@ -1266,6 +1419,7 @@ module View = struct
         let top, bottom =
           List.partition (fun (item : item) -> item.placement <> Some Bottom_bar) items
         in
+        let bare, bar = List.partition (fun (item : item) -> item.raw) bottom in
         Lui_elements.column
           ~grow:1.0
           ((if
@@ -1278,7 +1432,8 @@ module View = struct
                  if node_is_standard context body then Lui_ui.grow context body 1.0;
                  body)
              ]
-           @ if bottom <> [] then [ (mount_bottom_bar bottom).mount ] else [])
+           @ (if bar <> [] then [ (mount_bottom_bar bar).mount ] else [])
+           @ List.map mount_raw bare)
           context
           parent)
     ;;
