@@ -23,7 +23,7 @@ pin-depends: [
   ]
   [
   "lui.0.1.0"
-  "git+https://github.com/logseq/lui.git#df9fddb8ad616131d710f69d152abead837e2fd6"
+  "git+https://github.com/logseq/lui.git#58ad2dcd7ea62adb86c714e3c6403872efae5b9b"
 ]
   [
     "melange-edn-core.0.5.0"

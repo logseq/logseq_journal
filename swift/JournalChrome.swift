@@ -33,6 +33,9 @@ import SwiftUI
           .scrollContentBackground(.hidden)
           .toolbarBackground(.hidden, for: .bottomBar)
           #if os(iOS)
+          .scrollEdgeEffectHidden(true, for: .bottom)
+          #endif
+          #if os(iOS)
           .environment(\.journalControlsSize, controlsSize)
           .toolbar(.hidden, for: .navigationBar)
           .overlay(alignment: .topTrailing) {
