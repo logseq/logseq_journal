@@ -52,15 +52,7 @@ import UniformTypeIdentifiers
     }
 
     var body: some SwiftUI.View {
-      Button {
-        guard context.isUserInteractionEnabled else { return }
-        presented = true
-      } label: {
-        Label(selection.operation == nil ? "Attach file" : "Importing file", systemImage: "paperclip")
-          .labelStyle(.iconOnly)
-      }
-      .disabled(properties?.enabled == false || selection.operation != nil)
-      .accessibilityIdentifier("journal-asset-import")
+      context.content
       .fileImporter(isPresented: $presented, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
         guard context.isUserInteractionEnabled else { return }
         do {
@@ -102,7 +94,9 @@ import UniformTypeIdentifiers
         }
       }
       .onChange(of: properties?.request) { _, _ in
-        if properties?.replace != nil { presented = true }
+        guard context.isUserInteractionEnabled, properties?.enabled == true,
+          selection.operation == nil else { return }
+        presented = true
       }
       .onChange(of: properties?.completion) { _, operation in
         guard let operation, operation == selection.operation else { return }

@@ -68,7 +68,7 @@ let is_dismissal payload =
   | _ -> false
 ;;
 
-let view ~key ~enabled ~completion ~replacement ~request ~on_select =
+let view ~key ~enabled ~completion ~replacement ~request ~on_select body =
   let operation, error =
     match completion with
     | None -> `Null, `Null
@@ -93,6 +93,6 @@ let view ~key ~enabled ~completion ~replacement ~request ~on_select =
           ; "request", `Int request
           ])
     ~on_event:on_select
-    ~children:[]
+    ~children:[ Ui.View.Body.Private.to_widget body ]
     ()
 ;;

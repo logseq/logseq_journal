@@ -50,6 +50,12 @@ val admission_rows : Admission_refresh.observation -> (string * string) list
 module For_testing : sig
   val diagnostics_page : Journal_view.Event.Handler.t -> Journal_view.View.Body.t
 
+  val detail_page
+    :  routes:Journal_routes.t
+    -> write_enabled:bool
+    -> Journal_view.Event.Handler.t
+    -> Journal_view.View.Body.t
+
   val favorites_page
     :  Logseq_db_worker.Protocol.v2_favorite_item list
     -> Journal_view.View.t

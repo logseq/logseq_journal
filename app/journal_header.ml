@@ -53,6 +53,24 @@ let date_header ~title =
     ()
 ;;
 
+let detail ~on_back ~actions body =
+  let back =
+    V.buttons
+      ~actions:
+        [ V.buttons_action ~label:"Back" ~icon:"chevron.left" ~on_press:on_back () ]
+      ()
+    |> test_id "BackButton"
+  in
+  Ui.Native_widget.widget
+    chrome
+    ~key:(Ui.Key.string "journal-detail-header")
+    ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
+    ~on_event:(fun _ -> ())
+    ~children:[ V.Body.Private.to_widget body; back; V.buttons ~actions () ]
+    ()
+  |> V.Body.static
+;;
+
 let view
       ~key
       ~platform
@@ -69,9 +87,6 @@ let view
       ~capture_expanded
       ~body
   =
-  let heading value =
-    V.text ~style:(Ui.Style.Text_style.create ~font_weight:Semi_bold ()) value
-  in
   let account_action =
     Option.map
       (fun dispatch ->
@@ -163,20 +178,6 @@ let view
       in
       Some view
   in
-  (* The chrome's error slot is only used when there is no account action to
-     fuse with; otherwise the error button rides inside the account capsule. *)
-  let account_slot_used = Option.is_some on_account_action in
-  let error_slot_used =
-    Option.is_none on_account_action && Option.is_some on_error_info
-  in
-  let slot_column ~used =
-    if platform <> "ios"
-    then V.column []
-    else (
-      match cluster with
-      | Some view when used -> V.column [ view ]
-      | _ -> V.column [])
-  in
   let capture =
     (* buttons has no disabled state — guard the handler instead. *)
     V.buttons
@@ -194,6 +195,22 @@ let view
     |> V.semantics ~properties:(Ui.Semantics.create ~label:"Capture" ())
     |> test_id "journal-capture-open"
   in
+  let destinations =
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:"Journals"
+            ~icon:(Journal_symbols.name Journal_symbols.Journals)
+            ~on_press:on_journals
+            ()
+        ; V.buttons_action
+            ~label:"Favorites"
+            ~icon:(Journal_symbols.name Journal_symbols.Favorites)
+            ~on_press:on_favorites
+            ()
+        ]
+      ()
+  in
   let sync_feedback =
     V.column
       ~spacing:4.
@@ -207,88 +224,6 @@ let view
       ]
     |> V.padding ~insets:(Ui.Layout.Edge_insets.all 8.)
   in
-  let controls name placement values =
-    if platform = "ios"
-    then
-      [ V.Toolbar.group
-          ~key:(Ui.Key.string name)
-          ~placement
-          (List.map
-             (fun (key, value) -> V.Toolbar.child ~key:(Ui.Key.string key) value)
-             values)
-      ]
-    else
-      List.map
-        (fun (key, value) ->
-           V.Toolbar.item ~key:(Ui.Key.string (name ^ ":" ^ key)) ~placement value)
-        values
-  in
-  let navigation_placement =
-    if platform = "ios" then V.Toolbar.Bottom_bar else Navigation
-  in
-  let capture_placement =
-    if platform = "ios" then V.Toolbar.Bottom_bar else Primary_action
-  in
-  let items =
-    (match context with
-     | Context.Journals -> []
-     | Favorites ->
-       [ V.Toolbar.item
-           ~key:(Ui.Key.string "title")
-           ~placement:Principal
-           (heading "Favorites" |> test_id "favorites-header-title")
-       ])
-    @ (match context with
-       | Context.Journals when platform = "ios" -> []
-       | Journals | Favorites ->
-         controls
-           "account"
-           V.Toolbar.Primary_action
-           (match cluster with
-            | Some view -> [ "account", view ]
-            | None -> []))
-    @
-    match capture_expanded with
-    | Some _ when platform = "ios" ->
-      (* Capture open: the composer floats in a body overlay (see
-         application.ml) — every toolbar item yields while it is up. *)
-      []
-    | _ ->
-      (* The destination pair fuses into one capsule — [buttons] has no
-         per-action selected state, so the active destination is conveyed by
-         the page content and its principal title instead. *)
-      [ V.Toolbar.item
-          ~key:(Ui.Key.string "destinations")
-          ~placement:navigation_placement
-          (V.buttons
-             ~actions:
-               [ V.buttons_action
-                   ~label:"Journals"
-                   ~icon:(Journal_symbols.name Journal_symbols.Journals)
-                   ~on_press:on_journals
-                   ()
-               ; V.buttons_action
-                   ~label:"Favorites"
-                   ~icon:(Journal_symbols.name Journal_symbols.Favorites)
-                   ~on_press:on_favorites
-                   ()
-               ]
-             ())
-      ]
-      @ (if platform = "ios"
-         then
-           [ V.Toolbar.spacer
-               ~key:(Ui.Key.string "capture-space")
-               ~placement:Bottom_bar
-               Flexible
-           ]
-         else [])
-      @ [ V.Toolbar.item
-            ~key:(Ui.Key.string "capture")
-            ~placement:capture_placement
-            capture
-        ]
-  in
   let body =
     match context with
     | Context.Journals -> body
@@ -301,44 +236,54 @@ let view
         ~expanded:sync_feedback
         body
   in
+  let body = body |> V.Body.with_test_id (Ui.Test_id.string "journal-root-navigation") in
   let body =
-    body
-    |> V.Body.toolbar ~items
-    |> V.Body.with_test_id (Ui.Test_id.string "journal-root-navigation")
+    Ui.Native_widget.widget
+      chrome
+      ~key
+      ~props:
+        (`Assoc
+            [ "mode", `String "page"
+            ; ( "title"
+              , match context with
+                | Journals -> `Null
+                | Favorites -> `String "Favorites" )
+            ; "connecting", `Bool (sync_phase = Some Graph_service.Connecting)
+            ; "controls", `Bool (Option.is_some cluster)
+            ])
+      ~on_event:(fun _ -> ())
+        (* Keep absent slots mounted so the native child indexes stay stable. *)
+      ~children:
+        [ V.Body.Private.to_widget body
+        ; V.column (Option.to_list cluster)
+        ; V.column
+            [ (if sync_phase = Some Graph_service.Connecting
+               then
+                 V.progress ~style:Circular ()
+                 |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
+                 |> test_id "journal-header-sync-progress"
+               else V.empty ())
+            ]
+        ]
+      ()
+    |> test_id "journal-floating-chrome"
+    |> V.Body.static
   in
-  let body =
-    match context with
-    | Context.Favorites -> body
-    | Journals ->
-      Ui.Native_widget.widget
-        chrome
-        ~key
-        ~props:
-          (`Assoc
-              [ "mode", `String "journal"
-              ; "connecting", `Bool (sync_phase = Some Graph_service.Connecting)
-              ; "account", `Bool account_slot_used
-              ; "error", `Bool error_slot_used
-              ])
-        ~on_event:(fun _ -> ())
-          (* Chrome slots are positional on the native side — absent slots must
-           still mount a (zero-size) node or the host's index lookup shifts. *)
-        ~children:
-          [ V.Body.Private.to_widget body
-          ; slot_column ~used:account_slot_used
-          ; slot_column ~used:error_slot_used
-          ; V.column
-              [ (if sync_phase = Some Graph_service.Connecting
-                 then
-                   V.progress ~style:Circular ()
-                   |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
-                   |> test_id "journal-header-sync-progress"
-                 else V.empty ())
-              ]
-          ]
-        ()
-      |> test_id "journal-floating-chrome"
-      |> V.Body.static
-  in
-  body
+  if platform <> "ios" || Option.is_none capture_expanded
+  then
+    (* The native inset reserves scrolling space; each buttons composite
+       supplies its own glass without system toolbar chrome. *)
+    Ui.Native_widget.widget
+      chrome
+      ~key:(Ui.Key.string "journal-bottom-controls")
+      ~props:(`Assoc [ "mode", `String "bottom-controls" ])
+      ~on_event:(fun _ -> ())
+      ~children:
+        [ V.Body.Private.to_widget body
+        ; V.row ~spacing:16. [ destinations; V.spacer (); capture ]
+          |> test_id "journal-bottom-controls"
+        ]
+      ()
+    |> V.Body.static
+  else body
 ;;

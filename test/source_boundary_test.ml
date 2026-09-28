@@ -160,7 +160,7 @@ let test_sync_error_card_is_temporary_and_error_only root =
     text_between
       (read_file (path root "app/journal_header.ml"))
       ~start_marker:"let sync_feedback ="
-      ~end_marker:"let controls name placement values"
+      ~end_marker:"let body ="
   with
   | None -> fail "unable to locate the native safe-area sync error"
   | Some overlay ->

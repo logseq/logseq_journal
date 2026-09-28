@@ -3,7 +3,10 @@ import SwiftUI
 
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
-  private enum Mode: String, Decodable { case feedback, journal, header }
+  private enum Mode: String, Decodable {
+    case feedback, page, header, detail
+    case bottomControls = "bottom-controls"
+  }
 
   private struct Properties: Decodable {
     let mode: Mode
@@ -11,8 +14,7 @@ import SwiftUI
     let visible: Bool?
     let title: String?
     let connecting: Bool?
-    let account: Bool?
-    let error: Bool?
+    let controls: Bool?
   }
 
   fileprivate struct ControlsSizeKey: EnvironmentKey {
@@ -21,8 +23,7 @@ import SwiftUI
 
   private struct FloatingChrome: SwiftUI.View {
     let content: AnyView
-    let account: AnyView
-    let error: AnyView
+    let cluster: AnyView
     let progress: AnyView
     let properties: Properties
     @State private var controlsSize = CGSize.zero
@@ -31,36 +32,44 @@ import SwiftUI
       GeometryReader { bounds in
         content.frame(width: bounds.size.width, height: bounds.size.height)
           .scrollContentBackground(.hidden)
-          .toolbarBackground(.hidden, for: .bottomBar)
           #if os(iOS)
           .scrollEdgeEffectHidden(true, for: .bottom)
           #endif
-          #if os(iOS)
           .environment(\.journalControlsSize, controlsSize)
+          #if os(iOS)
           .toolbar(.hidden, for: .navigationBar)
-          .overlay(alignment: .topTrailing) {
-            HStack(spacing: 8) {
-              if properties.connecting! { progress.controlSize(.small).fixedSize() }
-              if properties.error! { error.buttonStyle(.plain).glassEffect(.regular.interactive(), in: Circle()) }
-              if properties.account! { account.buttonStyle(.plain).glassEffect(.regular.interactive(), in: Circle()) }
-            }
-            .labelStyle(.iconOnly)
-            .controlSize(.regular)
-            .fixedSize()
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { controlsSize = $0 }
-            .padding(.trailing, 16)
-          }
-          #else
-          .toolbar {
-            if properties.connecting! {
-              ToolbarItem(placement: .primaryAction) { progress }
-            }
-          }
           #endif
+          .overlay(alignment: .topTrailing) {
+            if properties.title == nil {
+              controls.padding(.trailing, 16)
+            }
+          }
+          .safeAreaInset(edge: .top, spacing: 0) {
+            if let title = properties.title {
+              ZStack {
+                Text(title)
+                  .font(.headline)
+                  .accessibilityAddTraits(.isHeader)
+                  .accessibilityIdentifier("favorites-header-title")
+                HStack {
+                  Spacer()
+                  controls
+                }
+              }
+              .frame(minHeight: 44)
+              .padding(.horizontal, 16)
+            }
+          }
       }
-      #if os(iOS)
-      .ignoresSafeArea(.container, edges: .bottom)
-      #endif
+    }
+
+    private var controls: some SwiftUI.View {
+      HStack(spacing: 8) {
+        if properties.connecting! { progress.controlSize(.small).fixedSize() }
+        if properties.controls! { cluster }
+      }
+      .fixedSize()
+      .onGeometryChange(for: CGSize.self) { $0.size } action: { controlsSize = $0 }
     }
   }
 
@@ -114,16 +123,48 @@ import SwiftUI
             }
           }
         }
-      case .journal:
-        if let properties, context.childIDs.count == 4,
-          properties.connecting != nil, properties.account != nil,
-          properties.error != nil {
-          FloatingChrome(content: child(0), account: child(1),
-            error: child(2), progress: child(3), properties: properties)
+      case .page:
+        if let properties, context.childIDs.count == 3,
+          properties.connecting != nil, properties.controls != nil {
+          FloatingChrome(content: child(0), cluster: child(1),
+            progress: child(2), properties: properties)
         }
       case .header:
         if let properties, context.childIDs.isEmpty, let title = properties.title {
           SectionDate(title: title)
+        }
+      case .detail:
+        if let title = properties?.title, context.childIDs.count == 3 {
+          GeometryReader { bounds in
+            child(0).frame(width: bounds.size.width, height: bounds.size.height)
+          }
+          #if os(iOS)
+          .toolbar(.hidden, for: .navigationBar)
+          #endif
+          .safeAreaInset(edge: .top, spacing: 0) {
+            ZStack {
+              Text(title).font(.headline).accessibilityAddTraits(.isHeader)
+              HStack {
+                child(1).fixedSize()
+                Spacer()
+                child(2).fixedSize()
+              }
+            }
+            .frame(minHeight: 44)
+            .padding(.horizontal, 16)
+          }
+        }
+      case .bottomControls:
+        if context.childIDs.count == 2 {
+          GeometryReader { bounds in
+            child(0).frame(width: bounds.size.width, height: bounds.size.height)
+          }
+          .safeAreaInset(edge: .bottom, spacing: 0) {
+            child(1)
+              .frame(maxWidth: .infinity)
+              .padding(.horizontal, 16)
+              .padding(.vertical, 8)
+          }
         }
       case .none:
         EmptyView()

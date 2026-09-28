@@ -54,7 +54,7 @@ val asset_import
   :  ?key:string
   -> payload:string
   -> ?on_event:(event -> unit)
-  -> unit
+  -> Lui_elements.t list
   -> Lui_elements.t
 
 val media

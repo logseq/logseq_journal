@@ -12,4 +12,5 @@ val view
   -> replacement:string option
   -> request:int
   -> on_select:(string -> unit)
+  -> Journal_view.View.Body.t
   -> Journal_view.View.t

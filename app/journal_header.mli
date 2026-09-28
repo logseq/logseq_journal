@@ -33,3 +33,9 @@ val feedback
   -> Journal_view.View.Body.t
 
 val date_header : title:string -> Journal_view.View.t
+
+val detail
+  :  on_back:Journal_view.Event.Handler.t
+  -> actions:Journal_view.View.buttons_action list
+  -> Journal_view.View.Body.t
+  -> Journal_view.View.Body.t

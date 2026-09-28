@@ -2544,42 +2544,10 @@ module Native_widget = struct
 
   let mount extension ?key ~props ~on_event ~children context parent =
     let payload = Bytes.to_string (extension.Extension.encode_props props) in
-    (* journal-chrome slots 1..3 (account / error / progress) are the floating
-       chrome affordances the old host rendered as icon-only circles. Mount
-       them under the icon-only collapse; slot 0 is page content and stays
-       uncollapsed. *)
-    let chrome_slots =
-      extension.Extension.identifier = Journal_lui_native.chrome_identifier
-    in
-    let children =
-      List.mapi
-        (fun index element ->
-           if chrome_slots && index > 0
-           then (
-             fun context parent ->
-               let previous = !icon_only
-               and previous_nodes = !icon_only_collapsed_nodes in
-               icon_only := true;
-               icon_only_collapsed_nodes := [];
-               Fun.protect
-                 ~finally:(fun () ->
-                   icon_only := previous;
-                   icon_only_collapsed_nodes := previous_nodes)
-                 (fun () ->
-                    let mounted = element.mount context parent in
-                    List.iter
-                      (fun node ->
-                         if node_is_standard context node
-                         then Lui_ui.width context node 40)
-                      !icon_only_collapsed_nodes;
-                    mounted))
-           else element.mount)
-        children
-    in
     Journal_lui_native.mount
       ?key
       ~payload
-      ~children
+      ~children:(List.map (fun child -> child.mount) children)
       ~on_event:(fun event ->
         match decode extension event with
         | Ok decoded -> on_event decoded

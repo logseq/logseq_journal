@@ -2420,32 +2420,35 @@ let detail_page ~state ~on_scroll_completed dispatch =
        | Detail | Timeline -> V.empty ())
       |> V.Body.static
   in
-  let composer =
-    V.button
-      ~enabled:(enabled && Option.is_some detail && not saving)
-      ~on_press:(bind_action dispatch "open-append")
-      ~child:(V.label ~title:(V.text "Append") ~icon:(V.symbol ~name:"plus" ()) ())
+  let actions_enabled = enabled && Option.is_some detail && not saving in
+  let action ~label ~icon command =
+    V.buttons_action
+      ~label
+      ~icon
+      ~on_press:
+        (Ui.Event.Handler.create (fun _ ->
+           if actions_enabled
+           then Ui.Event.Handler.Private.invoke (on_action command) Ui.Event.Payload.Unit))
       ()
-    |> V.with_test_id (Ui.Test_id.string "journal-append-open")
   in
   content
-  |> V.Body.toolbar
-       ~items:
-         [ V.Toolbar.item ~key:(Ui.Key.string "append") ~placement:Primary_action composer
-         ; V.Toolbar.item
-             ~key:(Ui.Key.string "attach")
-             ~placement:Primary_action
-             (Journal_asset_import.view
-                ~key:(Ui.Key.string (scope ^ "import"))
-                ~enabled:(enabled && Option.is_some detail && not saving)
-                ~completion:state.import_completion
-                ~replacement:state.pending_replace
-                ~request:state.replace_request
-                ~on_select:(fun payload ->
-                  Ui.Event.Handler.Private.invoke
-                    dispatch
-                    (Ui.Event.Payload.Text (scope ^ "import-asset:" ^ payload))))
+  |> Journal_header.detail
+       ~on_back:(bind_action dispatch "back")
+       ~actions:
+         [ action ~label:"Append" ~icon:"plus" "open-append"
+         ; action ~label:"Attach file" ~icon:"paperclip" "open-asset-import"
          ]
+  |> Journal_asset_import.view
+       ~key:(Ui.Key.string (scope ^ "import"))
+       ~enabled:actions_enabled
+       ~completion:state.import_completion
+       ~replacement:state.pending_replace
+       ~request:state.replace_request
+       ~on_select:(fun payload ->
+         Ui.Event.Handler.Private.invoke
+           dispatch
+           (Ui.Event.Payload.Text (scope ^ "import-asset:" ^ payload)))
+  |> V.Body.static
   |> V.Body.with_test_id (Ui.Test_id.string "journal-detail-route")
 ;;
 
@@ -4363,6 +4366,23 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
              with
              | _ -> ()))
           ~f:(fun () -> flush_media set_state)
+      else if String.equal action "open-asset-import"
+      then
+        update (fun state ->
+          if
+            state.write_enabled
+            && Option.is_none state.pending_delete
+            && Option.is_none state.pending_status
+            && Option.fold
+                 ~none:false
+                 ~some:(fun detail -> Journal_detail.mode detail <> Saving_child)
+                 (Journal_routes.detail state.routes)
+          then
+            { state with
+              pending_replace = None
+            ; replace_request = state.replace_request + 1
+            }
+          else state)
       else if String.starts_with ~prefix:"import-asset:" action
       then (
         let import_payload = String.sub action 13 (String.length action - 13) in
@@ -5484,6 +5504,13 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
 ;;
 
 module For_testing = struct
+  let detail_page ~routes ~write_enabled dispatch =
+    detail_page
+      ~state:{ initial_state with routes; write_enabled }
+      ~on_scroll_completed:(Ui.Event.Handler.create (fun _ -> ()))
+      dispatch
+  ;;
+
   let diagnostics_page dispatch =
     diagnostics_page
       ~snapshot:None

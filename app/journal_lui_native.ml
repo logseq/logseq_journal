@@ -52,7 +52,7 @@ let registry =
     (component
        asset_import_identifier
        all_host_profiles
-       false
+       true
        children
        [ payload_property ]
        [ event_schema ]);
@@ -130,9 +130,9 @@ let chrome ?key ~payload ?on_event children : Lui_elements.t =
   mount ?key ~payload ~children ?on_event chrome_identifier context parent
 ;;
 
-let asset_import ?key ~payload ?on_event () : Lui_elements.t =
+let asset_import ?key ~payload ?on_event children : Lui_elements.t =
   fun context parent ->
-  mount ?key ~payload ~children:[] ?on_event asset_import_identifier context parent
+  mount ?key ~payload ~children ?on_event asset_import_identifier context parent
 ;;
 
 let media ?key ~payload ?on_event children : Lui_elements.t =
