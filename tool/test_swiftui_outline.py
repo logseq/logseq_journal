@@ -2,9 +2,9 @@
 
 Stages an LUI probe host (tool/lui_probe_host.py) embedding
 apple-tests/native-outline/outline_probe.ml — a Lui_app signal+update probe
-mounting the `journal-list` extension (Journal_lui_native.list) with
-disclosure rows; expand + row events are decoded back through the extension
-event contract.
+mounting the production Journal_view.Native_list builder (lui list elements)
+with disclosure rows; expand + row press events arrive through the lui
+event channel.
 
 The probe's OCaml complete object is produced by the workspace build (see
 tool/lui_probe_host.py): pass it via --native-object, otherwise the host links
@@ -50,8 +50,7 @@ import SwiftUI
           auth: ProbeAuth(),
           account: JournalAccountStore(load: { nil }, save: { _ in }, clear: {}),
           managedSyncOrigin: "https://example.invalid")),
-        payload: (try? JournalNativeServices.startupPayload()) ?? Data(),
-        extensions: (try? JournalExtensions.registry()) ?? LUIAppleExtensionRegistry())
+        payload: (try? JournalNativeServices.startupPayload()) ?? Data())
         .frame(minWidth: 480, minHeight: 320)
     }
   }

@@ -249,6 +249,7 @@ type state =
   ; asset_settings_open : bool
   ; media_views : Journal_media_runtime.view Media_views.t
   ; import_completion : (string * string option) option
+  ; media_preview : string option
   ; pending_replace : string option
   ; replace_request : int
   ; capture_pick_request : int
@@ -312,6 +313,7 @@ let initial_state =
   ; asset_settings_open = false
   ; media_views = Media_views.empty
   ; import_completion = None
+  ; media_preview = None
   ; pending_replace = None
   ; replace_request = 0
   ; capture_pick_request = 0
@@ -1737,7 +1739,7 @@ let favorites_view
 type composer_assets =
   { request : Journal_asset_import.request
   ; camera : bool
-  ; completion : (string * string option) option
+  ; pending : Journal_asset_import.staged list
   ; on_attach : Journal_asset_import.source -> unit
   ; on_event : string -> unit
   }
@@ -1844,10 +1846,10 @@ let composer_content
     Journal_asset_import.view
       ~key:(Ui.Key.string (scope ^ "-asset-import"))
       ~enabled:(enabled && not saving)
-      ~completion:assets.completion
+      ~completion:(Journal_asset_import.staged_completion assets.request assets.pending)
       ~replacement:None
       ~request:assets.request
-      ~pending:(Journal_capture.pending_attachments capture)
+      ~pending:assets.pending
       ~on_select:assets.on_event
       (V.Body.static content)
 ;;
@@ -3014,6 +3016,8 @@ let response_tag = function
   | 20 -> 21
   | 22 -> 23
   | 25 -> 26
+  | 28 -> 29
+  | 30 -> 31
   | tag -> tag
 ;;
 
@@ -3811,13 +3815,34 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
             | Error _ -> Effect.ignore
             | Ok payload -> apply_authenticated_user payload)))
   in
+  let seed_asset_settings =
+    platform_request Journal_platform.asset_recent_days_request ~f:(fun result ->
+      match Result.bind result Journal_platform.decode_asset_recent_days with
+      | Error _ -> Effect.ignore
+      | Ok days ->
+        (match Journal_asset_policy.settings ~recent_days:days with
+         | Error _ -> Effect.ignore
+         | Ok settings ->
+           Effect.of_thunk (fun () ->
+             (* A user edit that landed before the seed wins. *)
+             if Option.is_none !asset_settings
+             then (
+               asset_settings := Some settings;
+               let current = !state_ref in
+               if current.graph_state.phase = Graph_open
+               then
+                 refresh_assets
+                   ~graph_generation:current.graph_state.generation
+                   current.calendar))))
+  in
   let calendar_startup =
     Effect.bind (sample_calendar ()) ~f:(function
       | Error error ->
         set_state (fun state ->
           { state with graph_error = Some (Calendar_startup_failure error) })
       | Ok calendar ->
-        Effect.bind (install_calendar set_state calendar) ~f:(fun () -> managed_startup))
+        Effect.bind (install_calendar set_state calendar) ~f:(fun () ->
+          Effect.many [ managed_startup; seed_asset_settings ]))
   in
   let calendar_tick_effect () : unit Effect.t =
     Effect.bind
@@ -4357,6 +4382,9 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                (Journal_uploads.retry uploads operation))
        | Some (Days settings) ->
          Effect.of_thunk (fun () ->
+           emit_platform_request
+             (Journal_platform.set_asset_recent_days_request
+                (Journal_asset_policy.recent_days settings));
            (* The extension re-emits its preference on every remount; only a
               real change may refresh (each refresh republishes the model and
               would loop under the full-remount view). *)
@@ -4458,7 +4486,8 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           { state with modal = No_modal })
     | Ui.Event.Payload.Text action ->
       if String.starts_with ~prefix:"media:" action
-      then
+      then (
+        let preview_request = ref None in
         Effect.bind
           (Effect.of_thunk (fun () ->
              sync_media snapshot;
@@ -4490,10 +4519,20 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                    ~asset:(text "asset")
                | "reuse-next" -> Journal_media_runtime.reuse_next media_runtime ~root
                | "reuse-cancel" -> Journal_media_runtime.end_reuse media_runtime ~root
+               | "preview" -> preview_request := Some (text "asset")
                | _ -> ()
              with
              | _ -> ()))
-          ~f:(fun () -> flush_media set_state)
+          ~f:(fun () ->
+            Effect.many
+              [ flush_media set_state
+              ; (match !preview_request with
+                 | Some path ->
+                   update (fun state -> { state with media_preview = Some path })
+                 | None -> Effect.ignore)
+              ]))
+      else if String.equal action "media-preview-dismissed"
+      then update (fun state -> { state with media_preview = None })
       else if String.equal action "open-asset-import"
       then
         update (fun state ->
@@ -4514,7 +4553,9 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       else if String.starts_with ~prefix:"import-asset:" action
       then (
         let import_payload = String.sub action 13 (String.length action - 13) in
-        if Journal_asset_import.is_dismissal import_payload
+        if Journal_asset_import.is_error_dismissal import_payload
+        then update (fun state -> { state with import_completion = None })
+        else if Journal_asset_import.is_dismissal import_payload
         then update (fun state -> { state with pending_replace = None })
         else (
           match Journal_routes.detail snapshot.routes with
@@ -4526,7 +4567,16 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
             in
             let source =
               Result.bind target (fun target ->
-                Journal_asset_import.decode ~target import_payload)
+                Journal_asset_import.decode
+                  ~target
+                  ~replace_reference:
+                    (match snapshot.pending_replace with
+                     | Some reference ->
+                       (match Logseq_db_types.Graph_types.Uuid.of_string reference with
+                        | Ok reference -> Some reference
+                        | Error _ -> None)
+                     | None -> None)
+                  import_payload)
             in
             (match source with
              | Error _ -> update (fun state -> { state with pending_replace = None })
@@ -5179,13 +5229,13 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     let sync_error =
       Option.map (fun notice -> sync_failure_message notice.failure) state.sync_error
     in
-    let capture_assets ~camera =
+    let capture_assets ~camera ~capture =
       { request =
           Journal_asset_import.staged_request
             ~id:state.capture_pick_request
             ~source:state.capture_pick_source
       ; camera
-      ; completion = state.import_completion
+      ; pending = Journal_capture.pending_attachments capture
       ; on_attach =
           (fun source ->
             Ui.Event.Handler.Private.invoke
@@ -5246,7 +5296,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                            (match Journal_capture.phase capture with
                             | Failed message -> Some message
                             | Editing | Saving -> None))
-                      ~assets:(Some (capture_assets ~camera:true)))
+                      ~assets:(Some (capture_assets ~camera:true ~capture)))
                ])
           state.direct_capture
       | _ -> None
@@ -5360,7 +5410,10 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                         | Failed message -> Some message
                         | Editing | Saving -> None))
                   ~assets:
-                    (Some (capture_assets ~camera:(state.environment.platform = "ios"))))
+                    (Some
+                       (capture_assets
+                          ~camera:(state.environment.platform = "ios")
+                          ~capture)))
              state.direct_capture)
       | Append_sheet ->
         Option.bind (Journal_routes.detail state.routes) (fun detail ->
@@ -5477,11 +5530,31 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
              (Journal_uploads.sync state.uploads (upload_context state)))
         ~offline:state.asset_offline
         ~presented:state.asset_settings_open
+        ~days:
+          (Journal_asset_policy.recent_days
+             (Option.value ~default:Journal_asset_policy.default_settings !asset_settings))
         ~on_event:(fun value ->
           Ui.Event.Handler.Private.invoke
             dispatch
             (Ui.Event.Payload.Text ("asset-settings:" ^ value)))
         body
+    in
+    let body =
+      match state.media_preview with
+      | None -> body
+      | Some path ->
+        Ui.element
+          (Lui_elements.column
+             ~grow:1.0
+             [ Ui.mount body
+             ; Lui_elements.file_preview
+                 ~path
+                 ~on_dismiss:(fun _ ->
+                   Ui.Event.Handler.Private.invoke
+                     dispatch
+                     (Ui.Event.Payload.Text "media-preview-dismissed"))
+                 []
+             ])
     in
     V.Body.theme ~data:(application_theme ()) (V.Body.static body)
   in
@@ -5525,14 +5598,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           true)
     }
   in
-  let app =
-    Lui_app.create_with_extensions
-      backend
-      Journal_lui_native.registry
-      initial_state
-      update
-      view
-  in
+  let app = Lui_app.create backend initial_state update view in
   app_cell := Some app;
   let context = { app; pump; client; send_action; apply_platform; running } in
   current_app := Some context;

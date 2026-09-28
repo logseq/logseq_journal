@@ -8,6 +8,8 @@ enum JournalPlatformWire {
     case idToken(challengeID: String)
     case showNotice(token: String, message: String, actionLabel: String?, durationMs: Int)
     case cancelNotice(token: String)
+    case assetRecentDays
+    case setAssetRecentDays(days: Int)
   }
   enum Response: Equatable {
     case authenticatedUser(String?)
@@ -16,6 +18,8 @@ enum JournalPlatformWire {
     case localAccount(userID: String, origin: String)
     case noLocalAccount
     case notice(token: String, result: String)
+    case assetRecentDays(days: Int)
+    case assetRecentDaysStored
   }
   enum NoticeResult: String {
     case action, dismiss, swipe, timeout
@@ -39,13 +43,14 @@ enum JournalPlatformWire {
     let payload = Data(packet[headerSize...])
     let tag = integer(packet, at: 6, count: 2)
     switch tag {
-    case 6, 10, 13, 20, 22:
+    case 6, 10, 13, 20, 22, 28:
       guard payload.isEmpty else { throw Failure.invalidPacket }
       switch tag {
       case 6: return .authenticatedUser
       case 10: return .signOut
       case 13: return .terminationReady
       case 20: return .localAccount
+      case 28: return .assetRecentDays
       default: return .timelinePresented
       }
     case 8:
@@ -73,6 +78,12 @@ enum JournalPlatformWire {
         throw Failure.invalidPacket
       }
       return .cancelNotice(token: token)
+    case 30:
+      let fields = try object(payload)
+      guard fields.count == 1, let days = fields["days"] as? Int else {
+        throw Failure.invalidPacket
+      }
+      return .setAssetRecentDays(days: days)
     default:
       throw Failure.invalidPacket
     }
@@ -102,6 +113,10 @@ enum JournalPlatformWire {
       return try json(tag: 23, ["presented": true])
     case .notice(let token, let result):
       return try json(tag: 26, ["token": token, "result": result])
+    case .assetRecentDays(let days):
+      return try json(tag: 29, ["days": days])
+    case .assetRecentDaysStored:
+      return try json(tag: 31, ["stored": true])
     }
   }
 

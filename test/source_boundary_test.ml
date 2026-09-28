@@ -1170,7 +1170,7 @@ let () =
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#58ad2dcd7ea62adb86c714e3c6403872efae5b9b"
+    "git+https://github.com/logseq/lui.git#69b3ffd5730e7fd0f6a402ea80e521017c5c0a2d"
     1;
   require_occurrences
     root
@@ -1665,7 +1665,7 @@ let () =
     ; "Refresh the authorized graph catalog"
     ; "pending local"
     ; "then returns to graph selection"
-    ; "Lui_app.create_with_extensions"
+    ; "Lui_app.create"
     ; "application_theme"
     ; "V.Sheet.create"
     ; "Journal_platform.show_notice_request"

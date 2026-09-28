@@ -150,8 +150,7 @@ private struct WarmFixture: Decodable {
     do {
       let headless = JournalApplicationPlatform(services: services)
       let runtime = try JournalRuntime(
-        platform: headless, startupPayload: payload,
-        extensionRegistry: try JournalExtensions.registry())
+        platform: headless, startupPayload: payload)
       runtime.start()
       for index in 0..<5 {
         runtime.pump()
@@ -204,7 +203,6 @@ private struct WarmFixture: Decodable {
   #endif
   @State private var probe: WarmProbe
   @State private var activeScene = true
-  private let registry: LUIAppleExtensionRegistry
 
   init() {
     // This executable is test-only; never access the user's native secrets.
@@ -240,7 +238,6 @@ private struct WarmFixture: Decodable {
         missing: arguments.contains("--missing-key"), report: path.appendingPathExtension("observations.jsonl"))
       probe.observePlatform()
       _probe = State(initialValue: probe)
-      self.registry = try JournalExtensions.registry()
     } catch { fatalError("Fixture setup failed: \(error)") }
   }
 
@@ -289,8 +286,7 @@ private struct WarmFixture: Decodable {
         if ProcessInfo.processInfo.arguments.contains("--pump-only") {
           Text("Inspecting the public native runtime").task { await probe.inspectFirstFrame() }
         } else {
-          JournalRuntimeHost(platform: probe.platform, payload: probe.payload,
-            extensions: registry)
+          JournalRuntimeHost(platform: probe.platform, payload: probe.payload)
             .font(.body)
             .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--dark-appearance") ? .dark :
               ProcessInfo.processInfo.arguments.contains("--light-appearance") ? .light : nil)

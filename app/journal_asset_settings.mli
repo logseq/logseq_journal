@@ -11,6 +11,7 @@ val view
   :  uploads:Journal_uploads.row list
   -> offline:(Journal_asset_policy.offline * Journal_asset_policy.offline) option
   -> presented:bool
+  -> days:int
   -> on_event:(string -> unit)
   -> Ui.View.t
   -> Ui.View.t

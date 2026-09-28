@@ -9,7 +9,6 @@ import SwiftUI
 struct JournalRuntimeHost: View {
   let platform: JournalApplicationPlatform
   let payload: Data
-  let extensions: LUIAppleExtensionRegistry
   @State private var runtime: JournalRuntime?
 
   var body: some SwiftUI.View {
@@ -20,6 +19,9 @@ struct JournalRuntimeHost: View {
         // `placement` prop hoist into real platform chrome.
         NavigationStack {
           LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
+            #if os(iOS)
+            .toolbar(.hidden, for: .navigationBar)
+            #endif
         }
       } else {
         ProgressView("Opening journal")
@@ -32,8 +34,7 @@ struct JournalRuntimeHost: View {
         do {
           let next = try JournalRuntime(
             platform: platform,
-            startupPayload: payload,
-            extensionRegistry: extensions)
+            startupPayload: payload)
           next.start()
           runtime = next
         } catch {

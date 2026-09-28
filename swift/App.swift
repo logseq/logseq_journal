@@ -27,10 +27,8 @@ import AppKit
 
 private struct JournalRuntimeSetup {
   let payload: Data
-  let extensions: LUIAppleExtensionRegistry
   @MainActor init() throws {
     payload = try JournalNativeServices.startupPayload()
-    extensions = try JournalExtensions.registry()
   }
 }
 
@@ -51,7 +49,7 @@ private struct JournalHost: View {
         } actions: { Button("Retry") { setup = nil; retry += 1 } }
       case .success(let setup):
         JournalRuntimeHost(
-          platform: platform, payload: setup.payload, extensions: setup.extensions)
+          platform: platform, payload: setup.payload)
           .font(.body)
           .safeAreaInset(edge: .top, spacing: 0) {
             if platform.authenticationRequired {

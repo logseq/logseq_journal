@@ -29,6 +29,10 @@ val staged_path : staged -> string
 val staged_title : staged -> string
 val staged_type : staged -> string
 
+(** Completion prop value for a staged request: once the first staged pick is
+    held journal-side the picker's retained copy can be released. *)
+val staged_completion : request -> staged list -> (string * string option) option
+
 (** Build the worker import for a staged pick targeting [target]. *)
 val to_import
   :  staged
@@ -37,6 +41,7 @@ val to_import
 
 val decode
   :  target:Logseq_db_types.Graph_types.Uuid.t
+  -> replace_reference:Logseq_db_types.Graph_types.Uuid.t option
   -> string
   -> (Logseq_db_types.Asset_import.t, string) result
 
@@ -48,6 +53,9 @@ type event =
 
 val decode_event : string -> (event, string) result
 val is_dismissal : string -> bool
+
+(** Import-error alert dismissal, reported on the same channel as picks. *)
+val is_error_dismissal : string -> bool
 
 val view
   :  key:Journal_view.Key.t

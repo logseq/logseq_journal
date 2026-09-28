@@ -3,8 +3,6 @@
 
 type t
 
-val mount : t -> Lui_elements.t
-
 module Key : sig
   type t
 
@@ -19,6 +17,19 @@ module Test_id : sig
   val string : string -> t
   val to_string : t -> string
 end
+
+val element
+  :  ?key:Key.t
+  -> ?test_id:Test_id.t
+  -> ?menu_item_mount:Lui_elements.t
+  -> Lui_elements.t
+  -> t
+
+val mount : t -> Lui_elements.t
+
+(** lui icon properties accept built-in names or [app:<slug>] names registered
+    by the host; journal symbols slug onto the [app:] form. *)
+val journal_icon : string -> Lui_elements.icon
 
 module Event : sig
   module Payload : sig
@@ -811,7 +822,6 @@ module View : sig
       -> ?scroll_request:scroll_request
       -> ?on_scroll_completed:Event.handler
       -> ?on_visible_range:Event.handler
-      -> ?on_row_event:Event.handler
       -> section list
       -> t
   end
@@ -942,58 +952,4 @@ module View : sig
     -> ?on_dismiss:Event.handler
     -> Menu.entry list
     -> buttons_action
-end
-
-module Native_widget : sig
-  module Capability : sig
-    type t =
-      | Stateful
-      | Resource
-      | Semantics
-      | Semantics_canvas
-      | Virtualized
-
-    val bit : t -> int64
-    val bits : t list -> int64
-  end
-
-  module Extension : sig
-    type ('props, 'event) t
-
-    val create
-      :  kind_id:Journal_ids.Native_widget.Kind_id.t
-      -> version:int
-      -> capabilities:Capability.t list
-      -> encode_props:('props -> bytes)
-      -> decode_event:
-           (event_id:Journal_ids.Native_widget.Event_id.t
-            -> bytes
-            -> ('event, string) result)
-      -> unit
-      -> ('props, 'event) t
-  end
-
-  val event_handler
-    :  ?name:string
-    -> ('props, 'event) Extension.t
-    -> ('event -> unit)
-    -> Event.handler
-
-  val widget
-    :  ('props, 'event) Extension.t
-    -> ?key:Key.t
-    -> props:'props
-    -> on_event:('event -> unit)
-    -> ?children:View.t list
-    -> unit
-    -> View.t
-
-  val widget_with_handler
-    :  ('props, 'event) Extension.t
-    -> ?key:Key.t
-    -> props:'props
-    -> on_event:Event.handler
-    -> ?children:View.t list
-    -> unit
-    -> View.t
 end
