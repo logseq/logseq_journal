@@ -1605,19 +1605,16 @@ module Favorites_list = struct
     let rows =
       List.map2
         (fun key label ->
-           let label =
-             if Keys.mem key block_keys
-             then
-               V.Navigation_link.create
-                 ~key:(Ui.Key.string ("favorite-open:" ^ key))
-                 ~activation_id:key
-                 ~enabled:actions_enabled
-                 ~on_activate:(bind_action on_open key)
-                 ~label
-                 ()
-             else label
-           in
-           V.Native_list.row ~key:(Ui.Key.string key) ~separator:Hidden label)
+           let is_block = Keys.mem key block_keys in
+           V.Native_list.row
+             ~key:(Ui.Key.string key)
+             ~separator:Hidden
+             ?on_press:
+               (if is_block && actions_enabled
+                then Some (bind_action on_open key)
+                else None)
+             ?icon:(if is_block then Some (Ui.journal_icon "chevron.right") else None)
+             label)
         keys
         children
     in

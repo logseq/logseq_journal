@@ -333,6 +333,7 @@ let pending_chip ~on_select (item : staged) =
         `top_trailing
         (Lui_elements.button
            ~icon:(Ui.journal_icon "xmark.circle.fill")
+           ~label:("Remove " ^ item.title)
            ~accessibility_identifier:("journal-asset-remove:" ^ item.token)
            ~on_press:(fun _ ->
              emit_json

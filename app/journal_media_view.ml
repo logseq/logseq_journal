@@ -48,6 +48,10 @@ let item_view ~root ~on_event (item : Journal_media_runtime.item) =
     Ui.Event.Handler.Private.invoke handler Ui.Event.Payload.Unit
   in
   let preview = emit_handler ~root ~on_event "preview" ~asset:(item_value item) () in
+  let appear = emit_handler ~root ~on_event "asset" ~asset:item.token () in
+  let on_appear (_ : Lui_protocol.event) =
+    Ui.Event.Handler.Private.invoke appear (Ui.Event.Payload.Unit)
+  in
   let mount : Lui_elements.t =
     match item.presentation with
     | Journal_media.File path when is_image_type item.file_type ->
@@ -56,6 +60,7 @@ let item_view ~root ~on_event (item : Journal_media_runtime.item) =
         ~max_pixel_size:1024
         ~max_height:240
         ~accessibility_identifier:("journal-media:" ^ item.token)
+        ~on_appear
         ~on_press:(invoke preview)
         []
     | Journal_media.File _ ->
@@ -63,6 +68,7 @@ let item_view ~root ~on_event (item : Journal_media_runtime.item) =
         ~text:"Open attachment"
         ~icon:(Ui.journal_icon "doc")
         ~accessibility_identifier:("journal-media:" ^ item.token)
+        ~on_appear
         ~on_press:(invoke preview)
         []
     | Journal_media.External url when is_http url ->
@@ -71,12 +77,14 @@ let item_view ~root ~on_event (item : Journal_media_runtime.item) =
         ~text:"Open external attachment"
         ~icon:(Ui.journal_icon "arrow.up.right.square")
         ~accessibility_identifier:("journal-media:" ^ item.token)
+        ~on_appear
         []
     | _ ->
       let retry = emit_handler ~root ~on_event "retry" ~asset:item.token () in
       Lui_elements.column
         ~gap:8
         ~accessibility_identifier:("journal-media:" ^ item.token)
+        ~on_appear
         [ Ui.mount
             (V.row
                ~spacing:8.
@@ -168,10 +176,13 @@ let view ~scope ~root ~media ~editable ~on_event child =
       ]
     else []
   in
+  let appear = emit_handler ~root ~on_event "root" () in
   let content =
     Lui_elements.column
       ~gap:8
       ~cross:`start
+      ~on_appear:(fun _ ->
+        Ui.Event.Handler.Private.invoke appear (Ui.Event.Payload.Unit))
       ((Ui.mount child
         ::
         (match actions_menu with

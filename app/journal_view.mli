@@ -793,6 +793,8 @@ module View : sig
       -> ?separator:separator
       -> ?swipe_actions:Swipe_actions.t
       -> ?context_menu:Context_menu.t
+      -> ?on_press:Event.handler
+      -> ?icon:Lui_elements.icon
       -> t
       -> row
 
@@ -823,17 +825,6 @@ module View : sig
       -> ?on_scroll_completed:Event.handler
       -> ?on_visible_range:Event.handler
       -> section list
-      -> t
-  end
-
-  module Navigation_link : sig
-    val create
-      :  ?key:Key.t
-      -> activation_id:string
-      -> ?enabled:bool
-      -> on_activate:Event.handler
-      -> label:t
-      -> unit
       -> t
   end
 

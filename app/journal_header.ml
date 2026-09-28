@@ -231,6 +231,7 @@ let view
   let connecting = sync_phase = Some Graph_service.Connecting in
   let controls =
     Lui_elements.row
+      ~main:`end_
       ~gap:8
       ((if connecting then [ Ui.mount (V.progress ~style:Circular ()) ] else [])
        @
@@ -247,7 +248,11 @@ let view
         [ Ui.mount (V.Body.Private.to_widget body)
         ; Lui_elements.align
             `top_trailing
-            (Lui_elements.column ~padding_horizontal:16 [ controls ])
+            (Lui_elements.row
+               ~main:`end_
+               ~padding_horizontal:16
+               ~padding_vertical:8
+               [ controls ])
         ]
     | Favorites ->
       Lui_elements.edge_inset

@@ -1780,6 +1780,8 @@ module View = struct
       ; kind : row_kind
       ; content : t
       ; on_expanded_changed : Event.handler option
+      ; on_press : Event.handler option
+      ; icon : Lui_elements.icon option
       }
 
     type section =
@@ -1790,7 +1792,16 @@ module View = struct
       ; rows : row list
       }
 
-    let row ~key ?test_id ?(separator = Automatic) ?swipe_actions ?context_menu content =
+    let row
+          ~key
+          ?test_id
+          ?(separator = Automatic)
+          ?swipe_actions
+          ?context_menu
+          ?on_press
+          ?icon
+          content
+      =
       { key
       ; test_id
       ; separator
@@ -1799,6 +1810,8 @@ module View = struct
       ; kind = Row
       ; content
       ; on_expanded_changed = None
+      ; on_press
+      ; icon
       }
     ;;
 
@@ -1821,6 +1834,8 @@ module View = struct
       ; kind = Disclosure { expanded; children }
       ; content = label
       ; on_expanded_changed = Some on_expanded_changed
+      ; on_press = None
+      ; icon = None
       }
     ;;
 
@@ -1877,6 +1892,13 @@ module View = struct
           ?separator:(lui_separator row.separator)
           ?swipe_actions:(Option.map (List.map swipe_action_mount) row.swipe_actions)
           ?expanded:(Option.map fst disclosure)
+          ?on_press:
+            (Option.map
+               (fun handler (_ : Lui_protocol.event) ->
+                  invoke handler Event.Payload.Unit)
+               row.on_press)
+          ?icon:row.icon
+          ?icon_placement:(Option.map (fun _ -> `trailing) row.icon)
           ?on_toggle:
             (Option.map
                (fun handler (event : Lui_protocol.event) ->
@@ -1984,27 +2006,6 @@ module View = struct
           (List.map section_mount sections)
           context
           parent)
-    ;;
-  end
-
-  module Navigation_link = struct
-    let create ?key ~activation_id:_ ?(enabled = true) ~on_activate ~label () =
-      element
-        ?key
-        (Lui_elements.list_item
-           ~disabled:(not enabled)
-           ?on_press:
-             (if enabled
-              then Some (fun _ -> invoke on_activate Event.Payload.Unit)
-              else None)
-             (* NavigationLink draws a trailing disclosure accessory; LUI list
-              items have none, so carry the chevron as an inline trailing
-              icon. *)
-           ~icon:(journal_icon "chevron.right")
-           ~icon_placement:`trailing
-           (* A list-item must carry text or children; mount the label as the
-              item content so composite labels render too. *)
-           [ label.mount ])
     ;;
   end
 

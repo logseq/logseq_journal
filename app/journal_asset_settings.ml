@@ -90,8 +90,6 @@ let view ~uploads ~offline ~presented ~days ~on_event child =
           ~style_class:"navigation-form"
           ~detents:"medium,large"
           ~sizing:"form"
-          ~min_width:360
-          ~min_height:280
           ~on_dismiss:(fun _ -> on_event "dismissed")
           [ Lui_elements.column
               ~style_class:"form"
@@ -114,6 +112,7 @@ let view ~uploads ~offline ~presented ~days ~on_event child =
                @ List.map (upload_row ~on_event) uploads
                @ [ secondary recent; secondary favorites ])
           ; Lui_elements.toolbar
+              ~label:"Attachment settings toolbar"
               [ Lui_elements.button
                   ~text:"Done"
                   ~style_class:"confirmation-action"
