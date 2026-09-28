@@ -52,6 +52,13 @@ Implemented as proposed:
   `Graph_service.Import_asset` per staged pick against the captured block —
   covering every `Block_captured` arrival path without hooking `send`.
 - Pending clears on `Capture_closed` and when the batch drains.
+- `journal_graph_runtime.refresh_response` now projects the committed block
+  directly when it is absent from the timeline entries (empty-source roots
+  are filtered there) — otherwise `Captured`/`Updated` completions rejected
+  attachment-only captures, which this feature makes possible.
+- `photo`, `camera`, and `paperclip` were registered in `journalIconNames`
+  (`swift/JournalIcons.swift`); unregistered names render as a placeholder
+  glyph.
 
 ## Alternatives considered
 
