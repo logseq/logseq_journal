@@ -33,7 +33,7 @@ import SwiftUI
           .scrollContentBackground(.hidden)
           .toolbarBackground(.hidden, for: .bottomBar)
           #if os(iOS)
-          .scrollEdgeEffectStyle(.disabled, for: .bottom)
+          .scrollEdgeEffectHidden(true, for: .bottom)
           #endif
           #if os(iOS)
           .environment(\.journalControlsSize, controlsSize)
