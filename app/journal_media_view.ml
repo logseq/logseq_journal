@@ -50,7 +50,7 @@ let item_view ~root ~on_event (item : Journal_media_runtime.item) =
   let preview = emit_handler ~root ~on_event "preview" ~asset:(item_value item) () in
   let appear = emit_handler ~root ~on_event "asset" ~asset:item.token () in
   let on_appear (_ : Lui_protocol.event) =
-    Ui.Event.Handler.Private.invoke appear (Ui.Event.Payload.Unit)
+    Ui.Event.Handler.Private.invoke appear Ui.Event.Payload.Unit
   in
   let mount : Lui_elements.t =
     match item.presentation with
@@ -181,8 +181,7 @@ let view ~scope ~root ~media ~editable ~on_event child =
     Lui_elements.column
       ~gap:8
       ~cross:`start
-      ~on_appear:(fun _ ->
-        Ui.Event.Handler.Private.invoke appear (Ui.Event.Payload.Unit))
+      ~on_appear:(fun _ -> Ui.Event.Handler.Private.invoke appear Ui.Event.Payload.Unit)
       ((Ui.mount child
         ::
         (match actions_menu with

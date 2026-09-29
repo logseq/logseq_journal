@@ -1894,8 +1894,7 @@ module View = struct
           ?expanded:(Option.map fst disclosure)
           ?on_press:
             (Option.map
-               (fun handler (_ : Lui_protocol.event) ->
-                  invoke handler Event.Payload.Unit)
+               (fun handler (_ : Lui_protocol.event) -> invoke handler Event.Payload.Unit)
                row.on_press)
           ?icon:row.icon
           ?icon_placement:(Option.map (fun _ -> `trailing) row.icon)
