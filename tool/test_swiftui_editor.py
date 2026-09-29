@@ -54,8 +54,7 @@ import SwiftUI
           auth: ProbeAuth(),
           account: JournalAccountStore(load: { nil }, save: { _ in }, clear: {}),
           managedSyncOrigin: "https://example.invalid")),
-        payload: (try? JournalNativeServices.startupPayload()) ?? Data(),
-        extensions: (try? JournalExtensions.registry()) ?? LUIAppleExtensionRegistry())
+        payload: (try? JournalNativeServices.startupPayload()) ?? Data())
         .frame(minWidth: 480, minHeight: 300)
     }
   }

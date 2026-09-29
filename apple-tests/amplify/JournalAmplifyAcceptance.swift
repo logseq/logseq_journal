@@ -31,8 +31,7 @@ struct JournalAmplifyAcceptance: View {
       // bridge attaches inside JournalRuntime.start().
       JournalRuntimeHost(
         platform: platform,
-        payload: (try? JournalNativeServices.startupPayload()) ?? Data(),
-        extensions: (try? JournalExtensions.registry()) ?? LUIAppleExtensionRegistry())
+        payload: (try? JournalNativeServices.startupPayload()) ?? Data())
         .environment(\.scenePhase, .active)
         .frame(height: 80)
     }.task {

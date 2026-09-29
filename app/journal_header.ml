@@ -19,39 +19,23 @@ module V = Ui.View
 
 let test_id id view = V.with_test_id (Ui.Test_id.string id) view
 
-let chrome =
-  Ui.Native_widget.Extension.create
-    ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
-    ~version:2
-    ~capabilities:[ Stateful; Semantics ]
-    ~encode_props:(fun props -> Yojson.Basic.to_string props |> Bytes.of_string)
-    ~decode_event:(fun ~event_id:_ _ -> Error "Chrome uses child control events")
-    ()
-;;
-
+(* Feedback banners pin below (or above) the safe-area edge and shrink to the
+   tighter layout first, exactly like the old chrome extension's ViewThatFits
+   preference order. *)
 let feedback ~key ~top ~visible ~compact ~expanded body =
-  Ui.Native_widget.widget
-    chrome
+  Ui.element
     ~key
-    ~props:
-      (`Assoc [ "mode", `String "feedback"; "top", `Bool top; "visible", `Bool visible ])
-    ~on_event:(fun _ -> ())
-      (* Chrome slots are positional on the native side — absent slots must
-       still mount a (zero-size) node or the host's index lookup shifts. *)
-    ~children:
-      [ V.Body.Private.to_widget body; V.column [ compact ]; V.column [ expanded ] ]
-    ()
+    (Lui_elements.edge_inset
+       ~edge:(if top then `top else `bottom)
+       ~visible
+       ~background:"bar"
+       [ Ui.mount (V.Body.Private.to_widget body)
+       ; Lui_elements.view_that_fits [ Ui.mount compact; Ui.mount expanded ]
+       ])
   |> V.Body.static
 ;;
 
-let date_header ~title =
-  Ui.Native_widget.widget
-    chrome
-    ~props:(`Assoc [ "mode", `String "header"; "title", `String title ])
-    ~on_event:(fun _ -> ())
-    ~children:[]
-    ()
-;;
+let date_header ~title = Ui.element (Lui_elements.heading ~level:3 ~value:title [])
 
 let detail ~on_back ~actions body =
   let back =
@@ -61,13 +45,20 @@ let detail ~on_back ~actions body =
       ()
     |> test_id "BackButton"
   in
-  Ui.Native_widget.widget
-    chrome
+  (* Controls span the bar; the title floats centered over them. *)
+  Ui.element
     ~key:(Ui.Key.string "journal-detail-header")
-    ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
-    ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body; back; V.buttons ~actions () ]
-    ()
+    (Lui_elements.edge_inset
+       ~edge:`top
+       [ Ui.mount (V.Body.Private.to_widget body)
+       ; Lui_elements.overlay
+           [ Lui_elements.row
+               ~padding_horizontal:16
+               ~min_height:44
+               [ Ui.mount back; Lui_elements.spacer []; Ui.mount (V.buttons ~actions ()) ]
+           ; Lui_elements.align `center (Lui_elements.heading ~level:5 ~value:"Block" [])
+           ]
+       ])
   |> V.Body.static
 ;;
 
@@ -237,53 +228,71 @@ let view
         body
   in
   let body = body |> V.Body.with_test_id (Ui.Test_id.string "journal-root-navigation") in
-  let body =
-    Ui.Native_widget.widget
-      chrome
-      ~key
-      ~props:
-        (`Assoc
-            [ "mode", `String "page"
-            ; ( "title"
-              , match context with
-                | Journals -> `Null
-                | Favorites -> `String "Favorites" )
-            ; "connecting", `Bool (sync_phase = Some Graph_service.Connecting)
-            ; "controls", `Bool (Option.is_some cluster)
-            ])
-      ~on_event:(fun _ -> ())
-        (* Keep absent slots mounted so the native child indexes stay stable. *)
-      ~children:
-        [ V.Body.Private.to_widget body
-        ; V.column (Option.to_list cluster)
-        ; V.column
-            [ (if sync_phase = Some Graph_service.Connecting
-               then
-                 V.progress ~style:Circular ()
-                 |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
-                 |> test_id "journal-header-sync-progress"
-               else V.empty ())
+  let connecting = sync_phase = Some Graph_service.Connecting in
+  let controls =
+    Lui_elements.row
+      ~main:`end_
+      ~gap:8
+      ((if connecting then [ Ui.mount (V.progress ~style:Circular ()) ] else [])
+       @
+       match cluster with
+       | Some cluster -> [ Ui.mount cluster ]
+       | None -> [])
+  in
+  (* Page chrome: controls float top-trailing when there is no title; a titled
+     page pins a top bar with the centered title and trailing controls. *)
+  let chrome =
+    match context with
+    | Journals ->
+      Lui_elements.overlay
+        [ Ui.mount (V.Body.Private.to_widget body)
+        ; Lui_elements.align
+            `top_trailing
+            (Lui_elements.row
+               ~main:`end_
+               ~padding_horizontal:16
+               ~padding_vertical:8
+               [ controls ])
+        ]
+    | Favorites ->
+      Lui_elements.edge_inset
+        ~edge:`top
+        [ Ui.mount (V.Body.Private.to_widget body)
+        ; Lui_elements.overlay
+            [ Lui_elements.row
+                ~padding_horizontal:16
+                ~min_height:44
+                [ Lui_elements.spacer []; controls ]
+            ; Lui_elements.align
+                `center
+                (Lui_elements.heading
+                   ~level:5
+                   ~value:"Favorites"
+                   ~accessibility_identifier:"favorites-header-title"
+                   [])
             ]
         ]
-      ()
-    |> test_id "journal-floating-chrome"
-    |> V.Body.static
+  in
+  let body =
+    Ui.element ~key chrome |> test_id "journal-floating-chrome" |> V.Body.static
   in
   if platform <> "ios" || Option.is_none capture_expanded
   then
-    (* The native inset reserves scrolling space; each buttons composite
+    (* The inset reserves scrolling space; each buttons composite
        supplies its own glass without system toolbar chrome. *)
-    Ui.Native_widget.widget
-      chrome
+    Ui.element
       ~key:(Ui.Key.string "journal-bottom-controls")
-      ~props:(`Assoc [ "mode", `String "bottom-controls" ])
-      ~on_event:(fun _ -> ())
-      ~children:
-        [ V.Body.Private.to_widget body
-        ; V.row ~spacing:16. [ destinations; V.spacer (); capture ]
-          |> test_id "journal-bottom-controls"
-        ]
-      ()
+      (Lui_elements.edge_inset
+         ~edge:`bottom
+         [ Ui.mount (V.Body.Private.to_widget body)
+         ; Lui_elements.column
+             ~padding_horizontal:16
+             ~padding_vertical:8
+             [ Ui.mount
+                 (V.row ~spacing:16. [ destinations; V.spacer (); capture ]
+                  |> test_id "journal-bottom-controls")
+             ]
+         ])
     |> V.Body.static
   else body
 ;;

@@ -210,18 +210,19 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
     "direct Capture retry did not return to Saving"
 ;;
 
-let staged_pick ~operation ~path ~title ~file_type =
+let staged_pick ~operation:_ ~path ~title ~file_type:_ =
+  (* Staged picks copy the source into a journal-owned temp file, so the
+     fixture needs a real file on disk.  The picker payload carries the
+     staged request token plus the source path and display name. *)
+  let channel = open_out_bin path in
+  output_string channel "pick";
+  close_out channel;
   match
     Journal_asset_import.decode_event
       (Printf.sprintf
-         {|{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s","replaceReference":null}|}
-         operation
-         "70000000-0000-4000-a000-00000000a001"
-         "70000000-0000-4000-a000-00000000a002"
-         "70000000-0000-4000-a000-00000000a003"
+         {|{"request":"journal-import:7:files:1","files":[{"path":"%s","name":"%s"}]}|}
          path
-         title
-         file_type)
+         title)
   with
   | Ok (Journal_asset_import.Picked (staged, _)) -> staged
   | _ -> fail "staged pick did not decode"
@@ -290,8 +291,8 @@ let test_direct_capture_pending_attachments () =
        block_id
        "attachment imports lost the captured block";
      require_string
-       "/tmp/a.png"
-       (Journal_asset_import.staged_path staged)
+       ".png"
+       (Filename.extension (Journal_asset_import.staged_path staged))
        "attachment imports lost the staged path"
    | _ -> fail "attachment imports did not expose the pending pick");
   require

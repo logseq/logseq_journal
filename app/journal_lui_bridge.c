@@ -162,6 +162,48 @@ LUI_EXPORT int32_t lui_ocaml_slider_changed(int64_t node, double fraction) {
   return result;
 }
 
+LUI_EXPORT int32_t lui_ocaml_scroll_completed(
+    int64_t node,
+    int64_t token,
+    const char *outcome) {
+  int result = 0;
+  caml_leave_blocking_section();
+  const value *dispatch = caml_named_value("lui_ocaml_scroll_completed");
+  if (dispatch != NULL) {
+    result = emit_patch("lui_ocaml_scroll_completed", caml_callback3_exn(
+        *dispatch, Val_long(node), Val_long(token), caml_copy_string(outcome)));
+  }
+  caml_enter_blocking_section();
+  return result;
+}
+
+LUI_EXPORT int32_t lui_ocaml_visible_range(
+    int64_t node,
+    int64_t first,
+    int64_t last) {
+  int result = 0;
+  caml_leave_blocking_section();
+  const value *dispatch = caml_named_value("lui_ocaml_visible_range");
+  if (dispatch != NULL) {
+    result = emit_patch("lui_ocaml_visible_range", caml_callback3_exn(
+        *dispatch, Val_long(node), Val_long(first), Val_long(last)));
+  }
+  caml_enter_blocking_section();
+  return result;
+}
+
+LUI_EXPORT int32_t lui_ocaml_picked(int64_t node, const char *payload) {
+  int result = 0;
+  caml_leave_blocking_section();
+  const value *dispatch = caml_named_value("lui_ocaml_picked");
+  if (dispatch != NULL) {
+    result = emit_patch("lui_ocaml_picked", caml_callback2_exn(
+        *dispatch, Val_long(node), caml_copy_string(payload)));
+  }
+  caml_enter_blocking_section();
+  return result;
+}
+
 LUI_EXPORT int32_t lui_ocaml_stop(void) {
   int result = 0;
   caml_leave_blocking_section();

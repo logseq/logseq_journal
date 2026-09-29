@@ -262,3 +262,22 @@ let notice_cancel_request ~token =
   |> encode_envelope 27
   |> Result.get_ok
 ;;
+
+(* Host-owned asset preferences (tag 28 get / tag 30 set) replace the
+   UserDefaults coupling the retired asset-settings extension relied on. *)
+let asset_recent_days_request = encode_envelope 28 Bytes.empty |> Result.get_ok
+
+let decode_asset_recent_days bytes =
+  Result.bind (decode_envelope [ 29 ] bytes) (fun payload ->
+    decode_json_object "asset-recent-days response" payload (function
+      | [ ("days", `Int days) ] -> Ok days
+      | _ -> Error "asset-recent-days response fields are invalid"))
+;;
+
+let set_asset_recent_days_request days =
+  `Assoc [ "days", `Int days ]
+  |> Yojson.Safe.to_string
+  |> Bytes.of_string
+  |> encode_envelope 30
+  |> Result.get_ok
+;;

@@ -1,13 +1,15 @@
-(* Headless acceptance probe for journal-list disclosure expansion and
-   context-menu row actions, built on Lui_app + the journal extension mounts.
-   Dropped into a generated host as app/application.ml (see
-   tool/test_swiftui_outline.py). Row actions surface through the extension
-   "event" channel: the host emits {"type":"row_event","payload":<string>}
-   and {"type":"expanded","key":..,"expanded":..}; expansion and row presses
-   drive the reducer below. *)
+(* Headless acceptance probe for native disclosure expansion and
+   context-menu/swipe row actions, built on Lui_app + the production
+   [Journal_view.Native_list] builder (lui list elements).  Dropped into a
+   generated host as app/application.ml (see tool/test_swiftui_outline.py).
+   Row actions surface through the lui press channel as [Unit] payloads;
+   disclosure toggles arrive as [Bool] payloads through
+   [on_expanded_changed] and drive the reducer below. *)
 
 open Lui_protocol
 open Lui_elements
+module Ui = Journal_view
+module V = Ui.View
 
 type model =
   { observed : string
@@ -25,113 +27,79 @@ let reducer model = function
   | Expand value -> { model with expanded = value }
 ;;
 
-let on_list_event send (event : Journal_lui_native.event) =
-  match
-    try Yojson.Basic.from_string event.payload with
-    | _ -> `Null
-  with
-  | `Assoc fields ->
-    (match List.assoc_opt "type" fields with
-     | Some (`String "expanded") ->
-       (match List.assoc_opt "key" fields, List.assoc_opt "expanded" fields with
-        | Some (`String _), Some (`Bool value) -> ignore (send (Expand value))
-        | _ -> ())
-     | Some (`String "row_event") ->
-       (match List.assoc_opt "payload" fields with
-        | Some (`String inner) ->
-          (match
-             try Yojson.Basic.from_string inner with
-             | _ -> `Null
-           with
-           | `Assoc inner_fields ->
-             (match
-                List.assoc_opt "row" inner_fields, List.assoc_opt "key" inner_fields
-              with
-              | Some (`String row), Some (`String key) ->
-                ignore (send (Observe (key ^ ":" ^ row)))
-              | _ -> ())
-           | _ -> ())
-        | _ -> ())
-     | _ -> ())
-  | _ -> ()
+let key value = Ui.Key.string value
+let test_id value = Ui.Test_id.string value
+
+(* [Observed] keeps the old contract shape: {"action":"delete","row":<id>}. *)
+let delete_handler send row_id =
+  Ui.Event.Handler.create ~name:("delete-" ^ row_id) (fun _ ->
+    ignore
+      (send (Observe (Printf.sprintf "{\"action\":\"delete\",\"row\":\"%s\"}" row_id))))
 ;;
 
-(* The payload mirrors Journal_view.Native_list's build output: sections and
-   row descriptors in JSON, content elements mounted as extension children in
-   the order the payload's content_index fields reference. *)
-let outline_list ~expanded send : Lui_elements.t =
-  let contents = ref [] in
-  let push element =
-    contents := element :: !contents;
-    List.length !contents - 1
+let row_actions send row_id =
+  let swipe_actions =
+    V.Swipe_actions.create
+      ~allows_full_swipe:false
+      ~actions:
+        [ V.Swipe_actions.action
+            ~key:(key ("delete:" ^ row_id))
+            ~side:End
+            ~title:"Delete"
+            ~role:Destructive
+            ~background:Journal_visual_tokens.delete_action_background
+            ~on_press:(delete_handler send row_id)
+            ()
+        ]
+      ()
   in
-  let context_menu_json =
-    ( "context_menu"
-    , `Assoc
-        [ ( "actions"
-          , `List
-              [ `Assoc
-                  [ "key", `String "delete"
-                  ; "enabled", `Bool true
-                  ; "role", `String "destructive"
-                  ; "symbol", `Null
-                  ; "title", `String "Delete"
-                  ]
-              ] )
-        ] )
+  let context_menu =
+    V.Context_menu.create
+      ~actions:
+        [ V.Context_menu.action
+            ~key:(key "delete")
+            ~role:Destructive
+            ~title:"Delete"
+            ~on_press:(delete_handler send row_id)
+            ()
+        ]
+      ()
   in
-  let row ~id ~label =
-    `Assoc
-      [ "type", `String "row"
-      ; "key", `String id
-      ; "content_index", `Int (push (text ~value:label []))
-      ; "separator", `String "hidden"
-      ; context_menu_json
-      ]
+  swipe_actions, context_menu
+;;
+
+let outline_list ~expanded send : V.t =
+  let leaf id =
+    let swipe_actions, context_menu = row_actions send id in
+    V.Native_list.row
+      ~key:(key id)
+      ~separator:Hidden
+      ~swipe_actions
+      ~context_menu
+      (V.text id)
   in
-  let disclosure ~id ~expanded children =
-    `Assoc
-      [ "type", `String "disclosure"
-      ; "key", `String id
-      ; "content_index", `Int (push (text ~value:"Parent row" []))
-      ; "separator", `String "hidden"
-      ; "expanded", `Bool expanded
-      ; "children", `List children
-      ]
-  in
-  let payload =
-    Yojson.Basic.to_string
-      (`Assoc
-          [ "style", `String "plain"
-          ; ( "sections"
-            , `List
-                [ `Assoc
-                    [ "key", `String "rows"
-                    ; "separator", `String "hidden"
-                    ; "header_index", `Null
-                    ; "footer_index", `Null
-                    ; ( "rows"
-                      , `List
-                          [ disclosure
-                              ~id:"parent"
-                              ~expanded
-                              [ row ~id:"child" ~label:"Child row"
-                              ; row ~id:"branch" ~label:"Unloaded branch row"
-                              ]
-                          ; row ~id:"sibling" ~label:"Sibling row"
-                          ] )
-                    ]
-                ] )
-          ; "scroll_request", `Null
-          ; "track_visible_range", `Bool false
-          ; "track_scroll_completion", `Bool false
-          ])
-  in
-  Journal_lui_native.list
-    ~key:"outline"
-    ~payload
-    ~children:(List.rev !contents)
-    ~on_event:(on_list_event send)
+  let swipe_actions, context_menu = row_actions send "parent" in
+  V.Native_list.vertical
+    ~key:(key "outline")
+    ~style:Plain
+    [ V.Native_list.section
+        ~key:(key "rows")
+        ~separator:Hidden
+        [ V.Native_list.disclosure_row
+            ~key:(key "parent")
+            ~separator:Hidden
+            ~swipe_actions
+            ~context_menu
+            ~expanded
+            ~on_expanded_changed:
+              (Ui.Event.Handler.create ~name:"expand-parent" (function
+                 | Ui.Event.Payload.Bool value -> ignore (send (Expand value))
+                 | _ -> ()))
+            ~label:(V.text "Parent row")
+            [ leaf "child"; leaf "branch" ]
+        ; leaf "sibling"
+        ]
+    ]
 ;;
 
 let view _context model_source send =
@@ -139,7 +107,7 @@ let view _context model_source send =
   column
     ~gap:16
     [ text ~value:("Observed: " ^ model.observed) []
-    ; outline_list ~expanded:model.expanded send
+    ; Ui.mount (outline_list ~expanded:model.expanded send)
     ]
 ;;
 

@@ -15,6 +15,7 @@ let settings ~recent_days =
 ;;
 
 let default_settings = 7
+let recent_days settings = settings
 
 let previous_day day =
   let candidate = day - 1 in

@@ -10,6 +10,7 @@ type settings
 
 val settings : recent_days:int -> (settings, string) result
 val default_settings : settings
+val recent_days : settings -> int
 val recent_interval : settings -> today:int -> (int * int) option
 
 type query =

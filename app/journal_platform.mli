@@ -56,3 +56,11 @@ val decode_notice_response : token:int64 -> bytes -> (notice_result, string) res
 
 (** OCaml -> host request cancelling a pending notice (tag 27). *)
 val notice_cancel_request : token:int64 -> bytes
+
+(** OCaml -> host asset-preference lookup (tag 28); response arrives on tag 29. *)
+val asset_recent_days_request : bytes
+
+val decode_asset_recent_days : bytes -> (int, string) result
+
+(** OCaml -> host asset-preference write (tag 30); response arrives on tag 31. *)
+val set_asset_recent_days_request : int -> bytes

@@ -102,13 +102,9 @@ let view
         ~separator:Hidden
         ~swipe_actions
         ~context_menu
-        (V.Navigation_link.create
-           ~key:(Ui.Key.string ("open:" ^ id))
-           ~activation_id:id
-           ~enabled:actions_enabled
-           ~on_activate:(action on_open id)
-           ~label:child
-           ())
+        ?on_press:(if actions_enabled then Some (action on_open id) else None)
+        ~icon:(Ui.journal_icon "chevron.right")
+        child
   in
   let sections =
     List.map

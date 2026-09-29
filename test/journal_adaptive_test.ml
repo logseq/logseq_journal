@@ -109,9 +109,8 @@ let test_ios_capsules_mount_outside_toolbars () =
                 ~body:(V.Body.static (V.text "Page content"))
             in
             let app =
-              Lui_app.create_with_extensions
+              Lui_app.create
                 backend
-                Journal_lui_native.registry
                 ()
                 (fun () () -> ())
                 (fun _context _model _send -> Ui.mount (V.Body.Private.to_widget view))
@@ -399,9 +398,8 @@ let test_detail_capsules_mount_outside_toolbars () =
          }
        in
        let app =
-         Lui_app.create_with_extensions
+         Lui_app.create
            backend
-           Journal_lui_native.registry
            ()
            (fun () () -> ())
            (fun _context _model _send -> Ui.mount (V.Body.Private.to_widget view))

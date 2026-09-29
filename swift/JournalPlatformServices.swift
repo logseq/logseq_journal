@@ -26,6 +26,7 @@ struct JournalLocalAccount: Equatable, Sendable {
   private(set) var timelinePresented = false
   private var authenticationGeneration: UInt64 = 0
   private var signingOut = false
+  private let assetPreferences = JournalAssetPreferences(defaults: .standard)
 
   init(auth: any JournalAuthCapability, account: JournalAccountStore,
        managedSyncOrigin: String) {
@@ -87,6 +88,11 @@ struct JournalLocalAccount: Equatable, Sendable {
       // Notice requests are intercepted by JournalApplicationPlatform before
       // reaching services.
       throw Failure.unavailable
+    case .assetRecentDays:
+      return .assetRecentDays(days: assetPreferences.recentDays)
+    case .setAssetRecentDays(let days):
+      _ = assetPreferences.save(recentDays: days)
+      return .assetRecentDaysStored
     }
   }
 
