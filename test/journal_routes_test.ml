@@ -223,7 +223,7 @@ let staged_pick ~operation ~path ~title ~file_type =
          title
          file_type)
   with
-  | Ok (Journal_asset_import.Picked staged) -> staged
+  | Ok (Journal_asset_import.Picked (staged, _)) -> staged
   | _ -> fail "staged pick did not decode"
 ;;
 
@@ -276,6 +276,13 @@ let test_direct_capture_pending_attachments () =
       ~creation_time:(creation_time 543)
   in
   require (Option.is_some request) "attachment-only Capture did not admit Save";
+  (match request with
+   | Some (Journal_graph_request.Capture { command; _ }) ->
+     require_string
+       "a.png"
+       command.source
+       "attachment-only Capture did not name the block after its pick"
+   | _ -> fail "attachment-only Capture admitted a non-Capture request");
   (match Journal_capture.attachment_imports saving with
    | Some (block_id, [ staged ]) ->
      require_string

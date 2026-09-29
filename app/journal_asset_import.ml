@@ -78,6 +78,14 @@ let parse payload =
     let* source_file = field "path" in
     let* title = field "title" in
     let* file_type = field "type" in
+    let request_id =
+      match Yojson.Basic.Util.member "request" json with
+      | `Assoc request_fields ->
+        (match List.assoc_opt "id" request_fields with
+         | Some (`Int id) -> Some id
+         | _ -> None)
+      | _ -> None
+    in
     Ok
       ( { token = Uuid.to_string operation
         ; operation
@@ -88,14 +96,15 @@ let parse payload =
         ; title
         ; file_type
         }
-      , replace_reference )
+      , replace_reference
+      , request_id )
   with
   | _ -> Error "Invalid attachment selection"
 ;;
 
 let decode ~target payload =
   Result.map
-    (fun ((pick : staged), replace_reference) ->
+    (fun ((pick : staged), replace_reference, _) ->
        Logseq_db_types.Asset_import.
          { operation = pick.operation
          ; asset = pick.asset
@@ -124,7 +133,7 @@ let to_import (staged : staged) ~target : Logseq_db_types.Asset_import.t =
 ;;
 
 type event =
-  | Picked of staged
+  | Picked of staged * int option
   | Removed of string
   | Dismissed
   | Unavailable of string
@@ -147,7 +156,10 @@ let decode_event payload =
        (match List.assoc_opt "token" fields with
         | Some (`String token) -> Ok (Removed token)
         | _ -> Error "Invalid attachment selection")
-     | _ -> Result.map (fun (staged, _) -> Picked staged) (parse payload))
+     | _ ->
+       Result.map
+         (fun (staged, _, request_id) -> Picked (staged, request_id))
+         (parse payload))
   | _ -> Error "Invalid attachment selection"
 ;;
 
@@ -159,6 +171,15 @@ let extension =
     ~encode_props:(fun props -> Bytes.of_string (Yojson.Basic.to_string props))
     ~decode_event:(fun ~event_id:_ bytes -> Ok (Bytes.to_string bytes))
     ()
+;;
+
+(* Staged picks live under the host temp directory as [journal-import-*];
+   delete only files matching that contract so a user path is never removed. *)
+let discard_staged_file (staged : staged) =
+  if String.starts_with ~prefix:"journal-import-" (Filename.basename staged.source_file)
+  then (
+    try Sys.remove staged.source_file with
+    | _ -> ())
 ;;
 
 let is_dismissal payload =

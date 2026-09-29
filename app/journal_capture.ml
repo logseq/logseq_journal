@@ -210,11 +210,18 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
   if not (can_save t)
   then t, None
   else (
+    (* A blank capture only containing attachments names its block after the
+       first pick so the entry stays visible on the timeline. *)
+    let source =
+      match source_is_blank (source t), t.pending_attachments with
+      | true, first :: _ -> Journal_asset_import.staged_title first
+      | _ -> source t
+    in
     let command : Journal_graph_projection.capture =
       { mutation_id
       ; block_id
       ; sibling_order
-      ; source = source t
+      ; source
       ; task_state = t.task_state
       ; creation_time
       ; children = []

@@ -386,6 +386,12 @@ let track_capture_session state =
 ;;
 
 let clear_graph_surface state =
+  (match state.direct_capture with
+   | Some capture ->
+     List.iter
+       Journal_asset_import.discard_staged_file
+       (Journal_capture.pending_attachments capture)
+   | None -> ());
   { state with
     favorites =
       Journal_routes.Favorites.create ~graph_generation:state.graph_state.generation
@@ -1252,7 +1258,18 @@ module Root_navigation = struct
         { state with
           modal = No_modal
         ; direct_capture =
-            Option.map Journal_capture.clear_attachments state.direct_capture
+            Option.map
+              (fun capture ->
+                 match Journal_capture.phase capture with
+                 (* An admitted capture still commits while closed; keep its
+                    attachments so the drained imports can target the block. *)
+                 | Journal_capture.Saving | Journal_capture.Failed _ -> capture
+                 | Journal_capture.Editing ->
+                   List.iter
+                     Journal_asset_import.discard_staged_file
+                     (Journal_capture.pending_attachments capture);
+                   Journal_capture.clear_attachments capture)
+              state.direct_capture
         }
       | Capture_native_edit edit ->
         { state with
@@ -3141,6 +3158,8 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           })
   in
   let import_worker_requests = Hashtbl.create 2 in
+  (* operation token -> staged pick whose temp copy is removed on completion *)
+  let capture_staged_items = Hashtbl.create 2 in
   let asset_worker_requests = Hashtbl.create 2 in
   let asset_runtime =
     Journal_asset_runtime.create
@@ -3603,6 +3622,14 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     | Worker.Response { request_id; outcome = Completed (Asset_imported result); _ } ->
       let pending = Hashtbl.find_opt import_worker_requests request_id in
       Hashtbl.remove import_worker_requests request_id;
+      (match pending with
+       | Some (_, operation) ->
+         (match Hashtbl.find_opt capture_staged_items operation with
+          | Some staged ->
+            Hashtbl.remove capture_staged_items operation;
+            Journal_asset_import.discard_staged_file staged
+          | None -> ())
+       | None -> ());
       let current =
         match pending with
         | Some (generation, _) ->
@@ -3644,6 +3671,11 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       when Hashtbl.mem import_worker_requests request_id ->
       let generation, operation = Hashtbl.find import_worker_requests request_id in
       Hashtbl.remove import_worker_requests request_id;
+      (match Hashtbl.find_opt capture_staged_items operation with
+       | Some staged ->
+         Hashtbl.remove capture_staged_items operation;
+         Journal_asset_import.discard_staged_file staged
+       | None -> ());
       set_state (fun state ->
         if state.graph_state.generation <> generation
         then state
@@ -4042,7 +4074,10 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
            | _ -> state)
          ::
          (match Logseq_db_types.Graph_types.Uuid.of_string batch.batch_target with
-          | Error _ -> []
+          | Error _ ->
+            [ Effect.of_thunk (fun () ->
+                List.iter Journal_asset_import.discard_staged_file batch.batch_items)
+            ]
           | Ok target ->
             List.map
               (fun staged ->
@@ -4051,7 +4086,9 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                  Effect.bind
                    (Effect.of_thunk (fun () ->
                       if not !state_ref.write_enabled
-                      then Some "The destination is not ready for imports"
+                      then (
+                        Journal_asset_import.discard_staged_file staged;
+                        Some "The destination is not ready for imports")
                       else (
                         match
                           Worker.send
@@ -4064,8 +4101,10 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                             import_worker_requests
                             request_id
                             (batch.batch_generation, operation);
+                          Hashtbl.replace capture_staged_items operation staged;
                           None
                         | Full | Not_ready | Stopping ->
+                          Journal_asset_import.discard_staged_file staged;
                           Some "Import is temporarily unavailable. Select the file again.")))
                    ~f:(function
                      | None -> Effect.ignore
@@ -4611,6 +4650,14 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           update (fun state ->
             { state with capture_error = Some (Local_capture_failure message) })
         | Ok (Journal_asset_import.Removed token) ->
+          (match snapshot.direct_capture with
+           | Some capture ->
+             List.iter
+               (fun (staged : Journal_asset_import.staged) ->
+                  if String.equal (Journal_asset_import.staged_token staged) token
+                  then Journal_asset_import.discard_staged_file staged)
+               (Journal_capture.pending_attachments capture)
+           | None -> ());
           update (fun state ->
             { state with
               direct_capture =
@@ -4618,7 +4665,8 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                   (fun capture -> Journal_capture.remove_attachment capture ~token)
                   state.direct_capture
             })
-        | Ok (Journal_asset_import.Picked staged) ->
+        | Ok (Journal_asset_import.Picked (staged, request_id))
+          when request_id = Some snapshot.capture_pick_request ->
           update (fun state ->
             { state with
               direct_capture =
@@ -4626,7 +4674,10 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                   (fun capture -> Journal_capture.add_attachment capture staged)
                   state.direct_capture
             ; capture_error = None
-            }))
+            })
+        | Ok (Journal_asset_import.Picked (staged, _)) ->
+          Journal_asset_import.discard_staged_file staged;
+          Effect.ignore)
       else if
         String.equal action "capture-task-on" || String.equal action "capture-task-off"
       then
