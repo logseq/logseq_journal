@@ -414,6 +414,7 @@ let clear_graph_surface state =
   ; next_request_generation = Int64.succ state.next_request_generation
   ; next_local_sequence = Int64.succ state.next_local_sequence
   ; modal = No_modal
+  ; media_preview = None
   }
 ;;
 
