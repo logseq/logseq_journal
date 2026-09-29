@@ -55,6 +55,12 @@ let request_staged token =
   | _ -> false
 ;;
 
+let request_id_of_token token =
+  match String.split_on_char ':' token with
+  | [ "journal-import"; id; _; _ ] -> int_of_string_opt id
+  | _ -> None
+;;
+
 (* Staged picks are journal-owned temp copies already, so the picker can
    release its retained file as soon as the first pick lands — echoing the
    request token as the completion prop does that. *)
@@ -244,7 +250,7 @@ let to_import (staged : staged) ~target : Logseq_db_types.Asset_import.t =
 ;;
 
 type event =
-  | Picked of staged
+  | Picked of staged * int option
   | Removed of string
   | Dismissed
   | Unavailable of string
@@ -270,9 +276,20 @@ let decode_event payload =
             match stage_copy file.path with
             | Error message -> Error message
             | Ok source_file ->
-              Result.map (fun staged -> Picked staged) (staged_of_pick file ~source_file))
+              Result.map
+                (fun staged -> Picked (staged, request_id_of_token file.request))
+                (staged_of_pick file ~source_file))
           else Error "Invalid attachment selection"))
   | _ -> Error "Invalid attachment selection"
+;;
+
+(* Staged picks live under the host temp directory as [journal-import-*];
+   delete only files matching that contract so a user path is never removed. *)
+let discard_staged_file (staged : staged) =
+  if String.starts_with ~prefix:"journal-import-" (Filename.basename staged.source_file)
+  then (
+    try Sys.remove staged.source_file with
+    | _ -> ())
 ;;
 
 let is_dismissal payload =

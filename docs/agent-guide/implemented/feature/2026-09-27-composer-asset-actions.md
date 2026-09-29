@@ -23,11 +23,14 @@ echoed request fields), so OCaml needs no new decode.
 picks; the extension renders them above the composer capsule as a horizontal
 strip of thumbnails (reusing `JournalMediaDecoder` for image types,
 icon+name otherwise) with a remove (x) affordance. A capture with attachments
-but blank text is saveable (`can_save` admits `pending_attachments <> []`).
+but blank text is saveable (`can_save` admits `pending_attachments <> []`);
+the created block is named after the first pick so the entry stays visible
+on the timeline (empty-title roots are filtered out there).
 On `Block_captured` completion, each pending pick is attached to the new
 block via `Graph_service.Import_asset`, with completion/errors reported
 through the existing `import_completion` mechanism. Pending attachments are
-cleared on successful send and on composer close/cancel.
+cleared on successful send and on composer close/cancel while still editing
+(a closed mid-save capture keeps its picks so the imports still land).
 
 ## Decision
 
@@ -51,11 +54,20 @@ Implemented as proposed:
   drained by a `run_edge_callbacks` entry that issues one
   `Graph_service.Import_asset` per staged pick against the captured block —
   covering every `Block_captured` arrival path without hooking `send`.
-- Pending clears on `Capture_closed` and when the batch drains.
+- Pending clears on `Capture_closed` (editing captures only — a saving or
+  failed capture keeps its picks so a late `Block_captured` still attaches
+  them) and when the batch drains.
+- A `Picked` event carries the echoed `request.id`; the composer only
+  attaches a pick whose id matches the currently armed
+  `capture_pick_request`, so a picker finished late cannot contaminate a
+  newer draft.
+- Staged temp copies are deleted (`discard_staged_file`, guarded by the
+  `journal-import-*` naming contract) on remove, on close/cancel, on
+  drain/send failures, and when the worker import completes.
 - `journal_graph_runtime.refresh_response` now projects the committed block
   directly when it is absent from the timeline entries (empty-source roots
-  are filtered there) — otherwise `Captured`/`Updated` completions rejected
-  attachment-only captures, which this feature makes possible.
+  are filtered there) — a safety net for `Captured`/`Updated` completions
+  whose block the projection suppresses.
 - `photo`, `camera`, and `paperclip` were registered in `journalIconNames`
   (`swift/JournalIcons.swift`); unregistered names render as a placeholder
   glyph.
@@ -95,20 +107,23 @@ extension instead wraps the composer and renders the strip itself.
 
 ## Risks
 
-- Attachment-only captures create empty-source blocks; acceptable (the block
-  is the attachment container).
-- Temp copies of removed/discarded picks linger until OS temp cleanup.
+- Attachment-only captures create blocks titled by their first pick's
+  filename rather than empty-source blocks (which the timeline filters out),
+  so the entry and its attachments stay reachable.
+- Temp copies of removed/discarded picks linger only until app-quit or an
+  uncovered drop path; the common lifecycle points delete them.
 - Attachment import failures surface only via `import_completion`; the
   composer may already be closed when they arrive.
 
 ## Consequences
 
-- Blank text + attachments is saveable; an attachment-only capture creates an
-  otherwise-empty block that acts as the attachment container.
+- Blank text + attachments is saveable; an attachment-only capture creates a
+  block titled after the first pick, acting as the attachment container and
+  staying visible on the timeline.
 - Attachment import failures surface through `import_completion`, which can
   arrive after the composer closed.
-- Staged temp copies are consumed by the import and otherwise reclaimed by
-  OS temp cleanup.
+- Staged temp copies are deleted by the app when a pick is removed, a draft
+  is discarded, a drain fails, or its import completes.
 
 ## Questions
 

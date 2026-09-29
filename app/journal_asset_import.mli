@@ -46,12 +46,17 @@ val decode
   -> (Logseq_db_types.Asset_import.t, string) result
 
 type event =
-  | Picked of staged
+  | Picked of staged * int option (** the pick and the request id that armed it *)
   | Removed of string
   | Dismissed
   | Unavailable of string
 
 val decode_event : string -> (event, string) result
+
+(** Best-effort removal of a staged temp copy created for this pick; a no-op
+    for paths outside the staged temp-file naming contract. *)
+val discard_staged_file : staged -> unit
+
 val is_dismissal : string -> bool
 
 (** Import-error alert dismissal, reported on the same channel as picks. *)
