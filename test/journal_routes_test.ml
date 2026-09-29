@@ -210,6 +210,97 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
     "direct Capture retry did not return to Saving"
 ;;
 
+let staged_pick ~operation ~path ~title ~file_type =
+  match
+    Journal_asset_import.decode_event
+      (Printf.sprintf
+         {|{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s","replaceReference":null}|}
+         operation
+         "70000000-0000-4000-a000-00000000a001"
+         "70000000-0000-4000-a000-00000000a002"
+         "70000000-0000-4000-a000-00000000a003"
+         path
+         title
+         file_type)
+  with
+  | Ok (Journal_asset_import.Picked (staged, _)) -> staged
+  | _ -> fail "staged pick did not decode"
+;;
+
+let test_direct_capture_pending_attachments () =
+  let capture = Journal_capture.create ~session_number:13L ~source:"" in
+  require (not (Journal_capture.can_save capture)) "blank Capture admitted Save";
+  let pick =
+    staged_pick
+      ~operation:"70000000-0000-4000-a000-00000000a010"
+      ~path:"/tmp/a.png"
+      ~title:"a.png"
+      ~file_type:"png"
+  in
+  let attached = Journal_capture.add_attachment capture pick in
+  require
+    (Journal_capture.can_save attached)
+    "blank Capture with a pending attachment kept Save disabled";
+  let token = Journal_asset_import.staged_token pick in
+  let removed = Journal_capture.remove_attachment attached ~token in
+  require
+    (Journal_capture.pending_attachments removed = [])
+    "remove_attachment kept the picked asset";
+  require
+    (not (Journal_capture.can_save removed))
+    "removing the only attachment left a blank Capture saveable";
+  let attached = Journal_capture.add_attachment removed pick in
+  let over_limit =
+    List.init Journal_capture.attachment_limit (fun ordinal ->
+      staged_pick
+        ~operation:(Printf.sprintf "70000000-0000-4000-a000-%012x" (ordinal + 1))
+        ~path:"/tmp/x.png"
+        ~title:"x.png"
+        ~file_type:"png")
+    |> List.fold_left Journal_capture.add_attachment attached
+  in
+  require
+    (List.length (Journal_capture.pending_attachments over_limit)
+     = Journal_capture.attachment_limit)
+    "pending attachments exceeded the limit";
+  require
+    (not (Journal_capture.can_attach over_limit))
+    "Capture at the attachment limit still accepted picks";
+  let saving, request =
+    Journal_capture.admit_save
+      attached
+      ~mutation_id:"70000000-0000-4000-9000-000000000013"
+      ~block_id:"70000000-0000-4000-a000-000000000013"
+      ~sibling_order:"000000000013"
+      ~calendar_generation:7L
+      ~creation_time:(creation_time 543)
+  in
+  require (Option.is_some request) "attachment-only Capture did not admit Save";
+  (match request with
+   | Some (Journal_graph_request.Capture { command; _ }) ->
+     require_string
+       "a.png"
+       command.source
+       "attachment-only Capture did not name the block after its pick"
+   | _ -> fail "attachment-only Capture admitted a non-Capture request");
+  (match Journal_capture.attachment_imports saving with
+   | Some (block_id, [ staged ]) ->
+     require_string
+       "70000000-0000-4000-a000-000000000013"
+       block_id
+       "attachment imports lost the captured block";
+     require_string
+       "/tmp/a.png"
+       (Journal_asset_import.staged_path staged)
+       "attachment imports lost the staged path"
+   | _ -> fail "attachment imports did not expose the pending pick");
+  require
+    (Journal_capture.clear_attachments attached
+     |> Journal_capture.pending_attachments
+     |> List.is_empty)
+    "clear_attachments kept pending picks"
+;;
+
 let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   let source = "  Todo 中文 👩🏽‍💻 exact  " in
   let capture = Journal_capture.create ~session_number:12L ~source in
@@ -1630,6 +1721,7 @@ let tests =
     , test_favorites_state_isolates_requests_and_refreshes )
   ; ( "direct Capture source and mutation identity"
     , test_direct_capture_preserves_source_and_mutation_identity )
+  ; "direct Capture pending attachments", test_direct_capture_pending_attachments
   ; ( "direct Capture task intent lifecycle"
     , test_direct_capture_task_intent_survives_edit_failure_and_retry )
   ; "outline branches, append and subtree Undo", test_outline_branches_append_and_delete

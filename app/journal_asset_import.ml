@@ -1,7 +1,55 @@
 module Ui = Journal_view
 module Uuid = Logseq_db_types.Graph_types.Uuid
 
-let decode ~target payload =
+type source =
+  | Files
+  | Photos
+  | Camera
+
+let source_to_string = function
+  | Files -> "files"
+  | Photos -> "photos"
+  | Camera -> "camera"
+;;
+
+let source_of_string = function
+  | "files" -> Some Files
+  | "photos" -> Some Photos
+  | "camera" -> Some Camera
+  | _ -> None
+;;
+
+(* [request] mirrors the extension's request prop; [staged] requests copy the
+   pick into a temp file on the host so the path outlives the picker's
+   security scope — needed when the selection is attached later (composer). *)
+type request =
+  { id : int
+  ; source : source
+  ; staged : bool
+  }
+
+let file_request ~id = { id; source = Files; staged = false }
+let staged_request ~id ~source = { id; source; staged = true }
+
+(* A picked asset held for a later import: the wire pick fields plus [token],
+   which identifies the pending item for the extension's remove event. *)
+type staged =
+  { token : string
+  ; operation : Uuid.t
+  ; asset : Uuid.t
+  ; local_mutation : Uuid.t
+  ; metadata_mutation : Uuid.t
+  ; source_file : string
+  ; title : string
+  ; file_type : string
+  }
+
+let staged_token (staged : staged) = staged.token
+let staged_path (staged : staged) = staged.source_file
+let staged_title (staged : staged) = staged.title
+let staged_type (staged : staged) = staged.file_type
+
+let parse payload =
   let ( let* ) = Result.bind in
   try
     let json = Yojson.Basic.from_string payload in
@@ -30,19 +78,88 @@ let decode ~target payload =
     let* source_file = field "path" in
     let* title = field "title" in
     let* file_type = field "type" in
+    let request_id =
+      match Yojson.Basic.Util.member "request" json with
+      | `Assoc request_fields ->
+        (match List.assoc_opt "id" request_fields with
+         | Some (`Int id) -> Some id
+         | _ -> None)
+      | _ -> None
+    in
     Ok
-      Logseq_db_types.Asset_import.
-        { operation
+      ( { token = Uuid.to_string operation
+        ; operation
         ; asset
-        ; target
-        ; replace_reference
         ; local_mutation
         ; metadata_mutation
         ; source_file
         ; title
         ; file_type
         }
+      , replace_reference
+      , request_id )
   with
+  | _ -> Error "Invalid attachment selection"
+;;
+
+let decode ~target payload =
+  Result.map
+    (fun ((pick : staged), replace_reference, _) ->
+       Logseq_db_types.Asset_import.
+         { operation = pick.operation
+         ; asset = pick.asset
+         ; target
+         ; replace_reference
+         ; local_mutation = pick.local_mutation
+         ; metadata_mutation = pick.metadata_mutation
+         ; source_file = pick.source_file
+         ; title = pick.title
+         ; file_type = pick.file_type
+         })
+    (parse payload)
+;;
+
+let to_import (staged : staged) ~target : Logseq_db_types.Asset_import.t =
+  { operation = staged.operation
+  ; asset = staged.asset
+  ; target
+  ; replace_reference = None
+  ; local_mutation = staged.local_mutation
+  ; metadata_mutation = staged.metadata_mutation
+  ; source_file = staged.source_file
+  ; title = staged.title
+  ; file_type = staged.file_type
+  }
+;;
+
+type event =
+  | Picked of staged * int option
+  | Removed of string
+  | Dismissed
+  | Unavailable of string
+
+let decode_event payload =
+  match
+    try Yojson.Basic.from_string payload with
+    | _ -> `Null
+  with
+  | `Assoc fields ->
+    (match List.assoc_opt "action" fields with
+     | Some (`String "dismissed") -> Ok Dismissed
+     | Some (`String "unavailable") ->
+       Ok
+         (Unavailable
+            (match List.assoc_opt "reason" fields with
+             | Some (`String reason) -> reason
+             | _ -> "This attachment source is not available."))
+     | Some (`String "remove") ->
+       (match List.assoc_opt "token" fields with
+        | Some (`String token) -> Ok (Removed token)
+        | _ -> Error "Invalid attachment selection")
+     | _ ->
+       Result.map
+         (fun (staged, _, request_id) -> Picked (staged, request_id))
+         (parse payload))
   | _ -> Error "Invalid attachment selection"
 ;;
 
@@ -56,19 +173,22 @@ let extension =
     ()
 ;;
 
+(* Staged picks live under the host temp directory as [journal-import-*];
+   delete only files matching that contract so a user path is never removed. *)
+let discard_staged_file (staged : staged) =
+  if String.starts_with ~prefix:"journal-import-" (Filename.basename staged.source_file)
+  then (
+    try Sys.remove staged.source_file with
+    | _ -> ())
+;;
+
 let is_dismissal payload =
-  match
-    try Yojson.Basic.from_string payload with
-    | _ -> `Null
-  with
-  | `Assoc fields ->
-    (match List.assoc_opt "action" fields with
-     | Some (`String "dismissed") -> true
-     | _ -> false)
+  match decode_event payload with
+  | Ok Dismissed -> true
   | _ -> false
 ;;
 
-let view ~key ~enabled ~completion ~replacement ~request ~on_select body =
+let view ~key ~enabled ~completion ~replacement ~request ~pending ~on_select body =
   let operation, error =
     match completion with
     | None -> `Null, `Null
@@ -90,7 +210,23 @@ let view ~key ~enabled ~completion ~replacement ~request ~on_select body =
             , match replacement with
               | None -> `Null
               | Some root -> `String root )
-          ; "request", `Int request
+          ; ( "request"
+            , `Assoc
+                [ "id", `Int request.id
+                ; "source", `String (source_to_string request.source)
+                ; "staged", `Bool request.staged
+                ] )
+          ; ( "pending"
+            , `List
+                (List.map
+                   (fun (item : staged) ->
+                      `Assoc
+                        [ "token", `String item.token
+                        ; "path", `String item.source_file
+                        ; "title", `String item.title
+                        ; "type", `String item.file_type
+                        ])
+                   pending) )
           ])
     ~on_event:on_select
     ~children:[ Ui.View.Body.Private.to_widget body ]

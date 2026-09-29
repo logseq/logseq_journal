@@ -466,7 +466,7 @@ module Journal_title = struct
 
   let tokenize pattern =
     let length = String.length pattern in
-    let is_alpha c = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' in
+    let is_alpha c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') in
     let rec loop index tokens =
       if index >= length
       then List.rev tokens
@@ -489,9 +489,7 @@ module Journal_title = struct
             if stop < length && pattern.[stop] = c then scan (stop + 1) else stop
           in
           let stop = scan index in
-          loop
-            stop
-            (Pattern_token (String.sub pattern index (stop - index)) :: tokens)
+          loop stop (Pattern_token (String.sub pattern index (stop - index)) :: tokens)
         | _ ->
           let rec scan stop =
             if stop < length && not (is_alpha pattern.[stop] || pattern.[stop] = '\'')
@@ -499,9 +497,7 @@ module Journal_title = struct
             else stop
           in
           let stop = scan index in
-          loop
-            stop
-            (Pattern_quoted (String.sub pattern index (stop - index)) :: tokens))
+          loop stop (Pattern_quoted (String.sub pattern index (stop - index)) :: tokens))
     in
     loop 0 []
   ;;
@@ -575,7 +571,7 @@ module Journal_title = struct
     let year = if month <= 2 then year - 1 else year in
     let era = if year >= 0 then year / 400 else (year - 399) / 400 in
     let yoe = year - (era * 400) in
-    let doy = (((153 * (if month > 2 then month - 3 else month + 9)) + 2) / 5) + day - 1 in
+    let doy = (((153 * if month > 2 then month - 3 else month + 9) + 2) / 5) + day - 1 in
     let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
     (era * 146097) + doe - 719468
   ;;
@@ -604,7 +600,7 @@ module Journal_title = struct
 
   let context ~year ~month ~day =
     let epoch_days = days_from_civil ~year ~month ~day in
-    let day_of_week = (((epoch_days + 3) mod 7) + 7) mod 7 + 1 in
+    let day_of_week = ((((epoch_days + 3) mod 7) + 7) mod 7) + 1 in
     let thursday = epoch_days + (4 - day_of_week) in
     let weekyear, _, _ = civil_from_days thursday in
     { day
@@ -612,7 +608,8 @@ module Journal_title = struct
     ; year
     ; day_of_week
     ; weekyear
-    ; weekyear_week = (thursday - days_from_civil ~year:weekyear ~month:1 ~day:1) / 7 + 1
+    ; weekyear_week =
+        ((thursday - days_from_civil ~year:weekyear ~month:1 ~day:1) / 7) + 1
     }
   ;;
 
@@ -1232,6 +1229,37 @@ let refresh_response t page refresh result =
               String.equal (Journal_model.id entry.block) id)
            projected.entries
        in
+       (* Empty-source roots are filtered out of the timeline projection, so a
+          committed block with no title is not among the entries — project it
+          from the raw members to still confirm the completion. *)
+       let project_invisible ~block_id ~missing ~complete =
+         match
+           List.find_opt
+             (fun (item : Projection.tree_member) ->
+                String.equal (Graph.Uuid.to_string item.block.uuid) block_id)
+             result.items
+         with
+         | None -> reject missing
+         | Some item ->
+           let child_count =
+             List.length
+               (List.filter
+                  (fun (child : Projection.tree_member) ->
+                     child.depth = 1
+                     && String.equal (Graph.Uuid.to_string child.block.parent) block_id)
+                  result.items)
+           in
+           (match
+              Projection.block
+                ~page
+                ~revision:item.revision
+                ~child_count
+                ~time_context
+                item.block
+            with
+            | Error message -> reject message
+            | Ok block -> responses [ response (complete block) ])
+       in
        (match refresh with
         | Captured { block_id } ->
           (match find block_id with
@@ -1241,7 +1269,12 @@ let refresh_response t page refresh result =
                    (Block_captured
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
-           | None -> reject "The captured block was not visible after commit.")
+           | None ->
+             project_invisible
+               ~block_id
+               ~missing:"The captured block was not visible after commit."
+               ~complete:(fun block ->
+                 Block_captured { block; timeline_entry_update = None }))
         | Updated { block_id } ->
           (match find block_id with
            | Some entry ->
@@ -1250,7 +1283,12 @@ let refresh_response t page refresh result =
                    (Block_updated
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
-           | None -> reject "The updated block was not visible after commit.")
+           | None ->
+             project_invisible
+               ~block_id
+               ~missing:"The updated block was not visible after commit."
+               ~complete:(fun block ->
+                 Block_updated { block; timeline_entry_update = None }))
         | Delete_conflict_refresh { block_id } ->
           let completion =
             match find block_id with
@@ -1835,8 +1873,7 @@ let receive_response t (protocol_response : Protocol.response) =
                    ; page = page_uuid
                    ; journal_day
                    ; title = journal_title ~format:journal_title_format journal_day
-                   ; preconditions =
-                       preconditions ~pages:[ page_uuid, page_revision ] ()
+                   ; preconditions = preconditions ~pages:[ page_uuid, page_revision ] ()
                    })
             ]
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
@@ -1904,8 +1941,7 @@ let receive_response t (protocol_response : Protocol.response) =
           requests
             [ read
                 t
-                (Capture_format
-                   { command; page_uuid = uuid; page_revision = revision })
+                (Capture_format { command; page_uuid = uuid; page_revision = revision })
                 Protocol.V2_graph_info
             ]
         | _ -> failure_output t operation request_id "Unexpected page response.")

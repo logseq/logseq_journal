@@ -101,6 +101,7 @@ type t =
   ; task_state : Journal_model.task_state
   ; phase : phase
   ; pending : Journal_graph_request.t option
+  ; pending_attachments : Journal_asset_import.staged list
   }
 
 let create ~session_number ~source =
@@ -108,6 +109,7 @@ let create ~session_number ~source =
   ; task_state = Journal_model.No_status
   ; phase = Editing
   ; pending = None
+  ; pending_attachments = []
   }
 ;;
 
@@ -132,12 +134,44 @@ let rebind t ~session_number =
 
 let phase t = t.phase
 let source_is_blank source = String.equal (String.trim source) ""
-let can_save t = t.phase = Editing && not (source_is_blank (source t))
+
+let can_save t =
+  t.phase = Editing && ((not (source_is_blank (source t))) || t.pending_attachments <> [])
+;;
 
 let replace_attempt t =
   match t.phase with
   | Failed _ -> { t with phase = Editing; pending = None }
   | Editing | Saving -> t
+;;
+
+let attachment_limit = 9
+let pending_attachments t = t.pending_attachments
+
+let can_attach t =
+  t.phase <> Saving && List.length t.pending_attachments < attachment_limit
+;;
+
+let add_attachment t staged =
+  if can_attach t
+  then (
+    let t = replace_attempt t in
+    { t with pending_attachments = t.pending_attachments @ [ staged ] })
+  else t
+;;
+
+let remove_attachment t ~token =
+  { t with
+    pending_attachments =
+      List.filter
+        (fun staged ->
+           not (String.equal (Journal_asset_import.staged_token staged) token))
+        t.pending_attachments
+  }
+;;
+
+let clear_attachments t =
+  if t.pending_attachments = [] then t else { t with pending_attachments = [] }
 ;;
 
 let update_source t ~source:new_source =
@@ -176,11 +210,18 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
   if not (can_save t)
   then t, None
   else (
+    (* A blank capture only containing attachments names its block after the
+       first pick so the entry stays visible on the timeline. *)
+    let source =
+      match source_is_blank (source t), t.pending_attachments with
+      | true, first :: _ -> Journal_asset_import.staged_title first
+      | _ -> source t
+    in
     let command : Journal_graph_projection.capture =
       { mutation_id
       ; block_id
       ; sibling_order
-      ; source = source t
+      ; source
       ; task_state = t.task_state
       ; creation_time
       ; children = []
@@ -201,6 +242,13 @@ let completed_by t block =
   | Some (Journal_graph_request.Capture { command; _ }) ->
     command.block_id = Journal_model.id block
   | _ -> false
+;;
+
+let attachment_imports t =
+  match t.pending, t.pending_attachments with
+  | Some (Journal_graph_request.Capture { command; _ }), _ :: _ ->
+    Some (command.block_id, t.pending_attachments)
+  | _ -> None
 ;;
 
 let retry t =
