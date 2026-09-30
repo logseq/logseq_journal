@@ -33,9 +33,11 @@ type hooks =
   ; (* Tears the app down; returns the final patch batch. *)
     dispose : unit -> string
   ; root_node : unit -> int
+  ; loading_signal : unit -> int
   }
 
 val register : hooks -> unit
+val loading_signal : unit -> int
 val scroll_completed : int -> int -> string -> string
 val visible_range : int -> int -> int -> string
 val picked : int -> string -> string

@@ -21,11 +21,13 @@ typedef void (*lui_patch_callback)(const char *json);
 typedef void (*journal_wakeup_callback)(void);
 typedef void (*journal_platform_request_callback)(const char *data,
                                                   int32_t length);
+typedef void (*journal_loading_callback)(int32_t signal);
 
 static int runtime_started = 0;
 static lui_patch_callback patch_callback = NULL;
 static journal_wakeup_callback wakeup_callback = NULL;
 static journal_platform_request_callback platform_request_callback = NULL;
+static journal_loading_callback loading_callback = NULL;
 
 static void report_ocaml_exception(const char *where, value result) {
   char *message = caml_format_exception(Extract_exception(result));
@@ -42,6 +44,17 @@ static int emit_patch(const char *where, value result) {
   const char *json = String_val(result);
   if (patch_callback != NULL && json[0] != '\0') {
     patch_callback(json);
+  }
+  /* A patch has reached the Swift backend before its semantic readiness is
+     delivered, so the reveal cannot precede the corresponding content. */
+  if (loading_callback != NULL) {
+    const value *read_signal = caml_named_value("journal_ocaml_loading_signal");
+    if (read_signal != NULL) {
+      value signal = caml_callback_exn(*read_signal, Val_unit);
+      if (!Is_exception_result(signal)) {
+        loading_callback((int32_t)Long_val(signal));
+      }
+    }
   }
   return 1;
 }
@@ -317,6 +330,11 @@ LUI_EXPORT void journal_ocaml_set_wakeup_callback(
 LUI_EXPORT void journal_ocaml_set_platform_request_callback(
     journal_platform_request_callback callback) {
   platform_request_callback = callback;
+}
+
+LUI_EXPORT void journal_ocaml_set_loading_callback(
+    journal_loading_callback callback) {
+  loading_callback = callback;
 }
 
 CAMLprim value journal_ml_wakeup(value unit) {

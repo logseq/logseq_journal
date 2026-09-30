@@ -13,7 +13,7 @@ struct JournalRuntimeHost: View {
   @State private var runtime: JournalRuntime?
 
   var body: some SwiftUI.View {
-    Group {
+    ZStack {
       if let runtime, let rootID = runtime.rootID {
         // The lui widget set has no navigation-stack node: the shell stack
         // supplies the system nav bar and bottom bar so toolbar nodes with a
@@ -21,9 +21,11 @@ struct JournalRuntimeHost: View {
         NavigationStack {
           LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
         }
+        .accessibilityHidden(runtime.loadingSignal == .loading)
       } else {
-        ProgressView("Opening journal")
+        Color.clear
       }
+      JournalLoadingOverlay(signal: runtime?.loadingSignal ?? .loading)
     }
     .modifier(JournalNoticePresenter(controller: platform.notices))
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
@@ -42,6 +44,9 @@ struct JournalRuntimeHost: View {
         }
       }
     }
-    .onDisappear { runtime?.stop() }
+    .onDisappear {
+      runtime?.stop()
+      runtime = nil
+    }
   }
 }
