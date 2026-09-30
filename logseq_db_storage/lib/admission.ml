@@ -130,8 +130,8 @@ let map_int key entries =
   List.find_map
     (fun (entry_key, value) ->
        match entry_key, value with
-       | Datascript.Keyword actual, Datascript.Int value when String.equal actual key ->
-         Some value
+       | Datascript.Keyword actual, Datascript.Int64 value when String.equal actual key ->
+         Datascript.Util.int64_to_int value
        | _ -> None)
     entries
 ;;

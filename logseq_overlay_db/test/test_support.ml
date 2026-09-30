@@ -149,8 +149,8 @@ let install_remote_identity ~graph_id database_path =
       ; Add (block, "block/parent", Ref_to page)
       ; Add (block, "block/page", Ref_to page)
       ; Add (block, "block/order", String "a00000001")
-      ; Add (block, "block/created-at", Int 1_704_067_200_000)
-      ; Add (block, "block/updated-at", Int 1_704_067_200_000)
+      ; Add (block, "block/created-at", Int64 1_704_067_200_000L)
+      ; Add (block, "block/updated-at", Int64 1_704_067_200_000L)
       ; Datascript.Add
           ( reference_source
           , "block/uuid"
@@ -163,16 +163,16 @@ let install_remote_identity ~graph_id database_path =
       ; Add (reference_source, "block/parent", Ref_to page)
       ; Add (reference_source, "block/page", Ref_to page)
       ; Add (reference_source, "block/order", String "a00000002")
-      ; Add (reference_source, "block/created-at", Int 1_704_067_200_000)
-      ; Add (reference_source, "block/updated-at", Int 1_704_067_200_000)
+      ; Add (reference_source, "block/created-at", Int64 1_704_067_200_000L)
+      ; Add (reference_source, "block/updated-at", Int64 1_704_067_200_000L)
       ; Add (reference_source, "block/refs", Ref_to block)
       ; Add (default_value, "block/uuid", Uuid (Graph.Uuid.to_string default_value_uuid))
       ; Add (default_value, "block/title", String "Default property value")
       ; Add (default_value, "block/parent", Ref_to page)
       ; Add (default_value, "block/page", Ref_to page)
       ; Add (default_value, "block/order", String "a00000003")
-      ; Add (default_value, "block/created-at", Int 1_704_067_200_000)
-      ; Add (default_value, "block/updated-at", Int 1_704_067_200_000)
+      ; Add (default_value, "block/created-at", Int64 1_704_067_200_000L)
+      ; Add (default_value, "block/updated-at", Int64 1_704_067_200_000L)
       ; Add (default_value, "logseq.property/created-from-property", Ref_to property)
       ; Add
           (property_holder, "block/uuid", Uuid (Graph.Uuid.to_string property_holder_uuid))
@@ -180,8 +180,8 @@ let install_remote_identity ~graph_id database_path =
       ; Add (property_holder, "block/parent", Ref_to page)
       ; Add (property_holder, "block/page", Ref_to page)
       ; Add (property_holder, "block/order", String "a00000004")
-      ; Add (property_holder, "block/created-at", Int 1_704_067_200_000)
-      ; Add (property_holder, "block/updated-at", Int 1_704_067_200_000)
+      ; Add (property_holder, "block/created-at", Int64 1_704_067_200_000L)
+      ; Add (property_holder, "block/updated-at", Int64 1_704_067_200_000L)
       ; Add (property_holder, "test.property/default", Ref_to default_value)
       ; Add (property, "db/ident", Keyword "test.property/default")
       ; Add (property, "block/uuid", Uuid "33333333-3333-4333-8333-333333333331")
@@ -203,8 +203,8 @@ let install_remote_identity ~graph_id database_path =
       ; Add (malformed_default_value, "block/parent", Ref_to page)
       ; Add (malformed_default_value, "block/page", Ref_to page)
       ; Add (malformed_default_value, "block/order", String "a00000005")
-      ; Add (malformed_default_value, "block/created-at", Int 1_704_067_200_000)
-      ; Add (malformed_default_value, "block/updated-at", Int 1_704_067_200_000)
+      ; Add (malformed_default_value, "block/created-at", Int64 1_704_067_200_000L)
+      ; Add (malformed_default_value, "block/updated-at", Int64 1_704_067_200_000L)
       ; Add
           ( malformed_default_value
           , "logseq.property/created-from-property"
