@@ -36,6 +36,9 @@ type hooks =
   }
 
 val register : hooks -> unit
+val scroll_completed : int -> int -> string -> string
+val visible_range : int -> int -> int -> string
+val picked : int -> string -> string
 
 (* OCaml -> host trampolines implemented by the C stub; the host installs
     the underlying function pointers at startup. *)

@@ -42,6 +42,14 @@ private func luiOCamlToggleChanged(_ node: Int64, _ checked: Int32) -> Int32
 private func luiOCamlRadioChanged(_ node: Int64) -> Int32
 @_silgen_name("lui_ocaml_slider_changed")
 private func luiOCamlSliderChanged(_ node: Int64, _ value: Double) -> Int32
+@_silgen_name("lui_ocaml_scroll_completed")
+private func luiOCamlScrollCompleted(
+  _ node: Int64, _ token: Int64, _ outcome: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("lui_ocaml_visible_range")
+private func luiOCamlVisibleRange(_ node: Int64, _ first: Int64, _ last: Int64) -> Int32
+@_silgen_name("lui_ocaml_picked")
+private func luiOCamlPicked(_ node: Int64, _ payload: UnsafePointer<CChar>?) -> Int32
 @_silgen_name("journal_ocaml_extension_event")
 private func journalOCamlExtensionEvent(
   _ node: Int64,
@@ -216,6 +224,12 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     case let .change(node): _ = luiOCamlRadioChanged(Int64(node))
     case let .valueChanged(node, value):
       _ = luiOCamlSliderChanged(Int64(node), value)
+    case .scrollCompleted(let node, let token, let outcome):
+      outcome.withCString { _ = luiOCamlScrollCompleted(Int64(node), Int64(token), $0) }
+    case .visibleRange(let node, let first, let last):
+      _ = luiOCamlVisibleRange(Int64(node), Int64(first), Int64(last))
+    case .picked(let node, let payload):
+      payload.withCString { _ = luiOCamlPicked(Int64(node), $0) }
     case let .extension(node, _, name, values):
       guard let payload = Self.encodeExtensionValues(values) else { return }
       name.withCString { eventName in
