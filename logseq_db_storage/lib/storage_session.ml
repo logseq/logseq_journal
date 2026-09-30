@@ -44,6 +44,16 @@ let compare_attr left right =
   compare (Datascript.Util.split_keyword left) (Datascript.Util.split_keyword right)
 ;;
 
+(* [compare_datom] orders attributes by (namespace, name), which matches Datascript
+   storage index order version 1. *)
+let physical_index_order_version = 1
+
+let storage_index_metadata (metadata : Logseq_sqlite_codec.index_metadata) =
+  { Datascript.storage_index_count = metadata.count
+  ; storage_index_shift = metadata.shift
+  }
+;;
+
 let compare_datom index left right =
   let first_nonzero = Datascript.Util.first_nonzero in
   match index with
@@ -311,6 +321,10 @@ let compact_physical callbacks physical db tail =
     ; storage_max_addr = !(physical.next_address)
     ; storage_branching_factor = physical.settings.branching_factor
     ; storage_ref_type = physical.settings.ref_type
+    ; storage_eavt_metadata = Some (storage_index_metadata metadata.eavt)
+    ; storage_aevt_metadata = Some (storage_index_metadata metadata.aevt)
+    ; storage_avet_metadata = Some (storage_index_metadata metadata.avet)
+    ; storage_index_order_version = physical_index_order_version
     }
   in
   ( { physical with eavt; aevt; avet; metadata }
@@ -341,7 +355,7 @@ let stage_transact_batch ?tx_meta t ~authoritative_before transaction_batches =
        let tail_after = t.tail @ added_tail in
        let compact =
          Datascript.Storage.tail_datom_count tail_after
-         > Datascript.Storage.tail_compaction_threshold
+         > Datascript.Storage.tail_compaction_threshold db_after
        in
        match t.callbacks.begin_staging () with
        | Error message -> Error (Stage_failed message)

@@ -233,16 +233,24 @@ let schema_of_transit = function
   | _ -> []
 ;;
 
+let transit_of_int64 value =
+  if
+    Int64.compare value (Int64.of_int min_int) >= 0
+    && Int64.compare value (Int64.of_int max_int) <= 0
+  then Transit.Int (Int64.to_int value)
+  else Transit.Int64 value
+;;
+
 let rec value_to_transit = function
   | Ds.Nil -> Transit.Null
-  | Int value -> Transit.Int value
+  | Int64 value -> transit_of_int64 value
   | Float value -> Transit.Float value
   | String value -> Transit.String value
   | Symbol value -> Transit.Symbol value
   | Bool value -> Transit.Bool value
   | Keyword value -> Transit.Keyword value
   | Uuid value -> Transit.Tagged ("u", Transit.String value)
-  | Instant value -> Transit.Tagged ("m", Transit.Int value)
+  | Instant value -> Transit.Tagged ("m", transit_of_int64 value)
   | Regex value -> Transit.Tagged ("regex", Transit.String value)
   | Ref entity_id -> Transit.Int entity_id
   | List values -> Transit.List (List.map value_to_transit values)
@@ -268,18 +276,13 @@ let rec value_of_transit = function
   | Transit.Null -> Ds.Nil
   | Bool value -> Bool value
   | String value -> String value
-  | Int value -> Int value
-  | Int64 value ->
-    if
-      Int64.compare value (Int64.of_int min_int) >= 0
-      && Int64.compare value (Int64.of_int max_int) <= 0
-    then Int (Int64.to_int value)
-    else Instant (Int64.to_int value)
+  | Int value -> Int64 (Int64.of_int value)
+  | Int64 value -> Int64 value
   | Float value -> Float value
   | Binary value -> String value
   | Big_decimal value -> Float (float_of_string value)
-  | Big_int value -> Transit.Int64 (Int64.of_string value) |> value_of_transit
-  | Date value -> Instant (Int64.to_int value)
+  | Big_int value -> Int64 (Int64.of_string value)
+  | Date value -> Instant value
   | Uuid value -> Uuid value
   | Uri value -> String value
   | Keyword value -> Keyword value
@@ -293,8 +296,8 @@ let rec value_of_transit = function
   | Set values -> Set (List.map value_of_transit values)
   | List values -> List (List.map value_of_transit values)
   | Tagged ("u", Transit.String value) -> Uuid value
-  | Tagged ("m", Transit.Int value) -> Instant value
-  | Tagged ("m", Transit.Int64 value) -> Instant (Int64.to_int value)
+  | Tagged ("m", Transit.Int value) -> Instant (Int64.of_int value)
+  | Tagged ("m", Transit.Int64 value) -> Instant value
   | Tagged ("regex", Transit.String value) -> Regex value
   | Tagged (tag, value) -> Vector [ String tag; value_of_transit value ]
 ;;
@@ -354,6 +357,7 @@ let storage_root_to_transit ?metadata root =
     ; Transit.Keyword "max-addr", Transit.Int root.storage_max_addr
     ; Transit.Keyword "branching-factor", Transit.Int root.storage_branching_factor
     ; Transit.Keyword "ref-type", transit_of_ref_type root.storage_ref_type
+    ; Transit.Keyword "index-order-version", Transit.Int root.storage_index_order_version
     ]
   in
   let entries =
@@ -401,6 +405,19 @@ let optional_datoms key entries =
   | Some value -> datoms_of_transit value
 ;;
 
+let storage_index_metadata_of_transit key entries =
+  match lookup_transit_key key entries with
+  | Some (Transit.Map metadata) ->
+    (match lookup_transit_key "count" metadata, lookup_transit_key "shift" metadata with
+     | Some count, Some shift ->
+       Some
+         { Ds.storage_index_count = int_of_transit "index metadata :count" count
+         ; storage_index_shift = int_of_transit "index metadata :shift" shift
+         }
+     | _ -> None)
+  | _ -> None
+;;
+
 let storage_root_of_transit entries =
   { Ds.storage_schema = schema_of_transit (require_key "schema" entries)
   ; storage_max_eid =
@@ -417,6 +434,13 @@ let storage_root_of_transit entries =
         "storage root :branching-factor"
         (require_key "branching-factor" entries)
   ; storage_ref_type = ref_type_of_transit (require_key "ref-type" entries)
+  ; storage_eavt_metadata = storage_index_metadata_of_transit "eavt-metadata" entries
+  ; storage_aevt_metadata = storage_index_metadata_of_transit "aevt-metadata" entries
+  ; storage_avet_metadata = storage_index_metadata_of_transit "avet-metadata" entries
+  ; storage_index_order_version =
+      (match lookup_transit_key "index-order-version" entries with
+       | Some value -> int_of_transit "storage root :index-order-version" value
+       | None -> 0)
   }
 ;;
 

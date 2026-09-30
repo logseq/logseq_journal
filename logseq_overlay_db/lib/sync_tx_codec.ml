@@ -49,14 +49,19 @@ let rec transit_of_entity_ref db = function
 
 and transit_of_value db = function
   | Datascript.Nil -> Transit.Null
-  | Int value -> Transit.Int value
+  | Int64 value ->
+    if
+      Int64.compare value (Int64.of_int min_int) >= 0
+      && Int64.compare value (Int64.of_int max_int) <= 0
+    then Transit.Int (Int64.to_int value)
+    else Transit.Int64 value
   | Float value -> Transit.Float value
   | String value -> Transit.String value
   | Symbol value -> Transit.Symbol value
   | Bool value -> Transit.Bool value
   | Keyword value -> Transit.Keyword value
   | Uuid value -> Transit.Uuid value
-  | Instant value -> Transit.Date (Int64.of_int value)
+  | Instant value -> Transit.Date value
   | Regex value -> Transit.Tagged ("regex", Transit.String value)
   | Ref eid -> transit_of_entity_ref db (stable_entity_ref db eid)
   | List values -> Transit.List (List.map (transit_of_value db) values)
@@ -254,12 +259,18 @@ let integer = function
   | _ -> Error "expected a Transit integer"
 ;;
 
+let integer64 = function
+  | Transit.Int value -> Ok (Int64.of_int value)
+  | Int64 value -> Ok value
+  | _ -> Error "expected a Transit integer"
+;;
+
 let rec value_of_transit = function
   | Transit.Null -> Ok Nil
   | Bool value -> Ok (Bool value)
   | String value -> Ok (String value)
-  | Int value -> Ok (Int value)
-  | Int64 value -> bind (integer (Transit.Int64 value)) (fun value -> Ok (Int value))
+  | Int value -> Ok (Int64 (Int64.of_int value))
+  | Int64 value -> Ok (Int64 value)
   | Float value -> Ok (Float value)
   | Binary value -> Ok (String value)
   | Big_decimal value ->
@@ -270,7 +281,7 @@ let rec value_of_transit = function
     (match Int64.of_string_opt value with
      | Some value -> value_of_transit (Transit.Int64 value)
      | None -> Error "invalid Transit integer")
-  | Date value -> bind (integer (Transit.Int64 value)) (fun value -> Ok (Instant value))
+  | Date value -> Ok (Instant value)
   | Uuid value -> Ok (Uuid value)
   | Uri value -> Ok (String value)
   | Keyword value -> Ok (Keyword value)
@@ -286,7 +297,7 @@ let rec value_of_transit = function
   | Set values -> bind (map_all value_of_transit values) (fun values -> Ok (Set values))
   | List values -> bind (map_all value_of_transit values) (fun values -> Ok (List values))
   | Tagged ("u", Transit.String value) -> Ok (Uuid value)
-  | Tagged ("m", value) -> bind (integer value) (fun value -> Ok (Instant value))
+  | Tagged ("m", value) -> bind (integer64 value) (fun value -> Ok (Instant value))
   | Tagged ("regex", Transit.String value) -> Ok (Regex value)
   | Tagged (tag, value) ->
     bind (value_of_transit value) (fun value -> Ok (Vector [ String tag; value ]))

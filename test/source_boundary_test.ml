@@ -1170,12 +1170,12 @@ let () =
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#58ad2dcd7ea62adb86c714e3c6403872efae5b9b"
+    "git+https://github.com/logseq/lui.git#main"
     1;
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/ocaml-signal.git#976b40f1770a65b3464df1ef38d1550f1d8a43dd"
+    "git+https://github.com/logseq/ocaml-signal.git#main"
     1;
   List.iter
     (fun relative ->
@@ -1197,7 +1197,7 @@ let () =
     ; "logseq_db_worker.opam.locked"
     ]
   in
-  let current_datascript_revision = "40345cc2f59214daa88b33b8aec711337d20afa7" in
+  let current_datascript_revision = "datascript-ocaml.git#main" in
   List.iter
     (fun relative ->
        require_occurrences root relative current_datascript_revision 2;
@@ -1208,7 +1208,7 @@ let () =
          ; "5895af25101de15f56d7c5df383c150ca07cef90"
          ])
     dependency_manifests;
-  let current_melange_transit_revision = "35f8afe7d6506863c7253e67a20befb3dde5c18f" in
+  let current_melange_transit_revision = "melange-transit.git#main" in
   List.iter
     (fun (relative, occurrences) ->
        require_occurrences root relative current_melange_transit_revision occurrences;
