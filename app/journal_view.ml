@@ -565,6 +565,7 @@ module View = struct
     { t with test_id = Some (Test_id.to_string test_id); mount }
   ;;
 
+  let of_lui mount = element mount
   let empty ?key:_ () = element (fun _context _parent -> 0)
 
   let text
@@ -2099,7 +2100,15 @@ module View = struct
   end
 
   module Navigation_link = struct
-    let create ?key ~activation_id:_ ?(enabled = true) ~on_activate ~label () =
+    let create
+          ?key
+          ~activation_id:_
+          ?(enabled = true)
+          ?(disclosure = true)
+          ~on_activate
+          ~label
+          ()
+      =
       element
         ?key
         (Lui_elements.list_item
@@ -2108,10 +2117,8 @@ module View = struct
              (if enabled
               then Some (fun _ -> invoke on_activate Event.Payload.Unit)
               else None)
-             (* NavigationLink draws a trailing disclosure accessory; LUI list
-              items have none, so carry the chevron as an inline trailing
-              icon. *)
-           ~icon:(journal_icon "chevron.right")
+             (* Callers choose whether the native list item carries a disclosure icon. *)
+           ?icon:(if disclosure then Some (journal_icon "chevron.right") else None)
            ~icon_placement:`trailing
            (* A list-item must carry text or children; mount the label as the
               item content so composite labels render too. *)

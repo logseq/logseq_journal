@@ -317,6 +317,7 @@ module View : sig
   end
 
   val with_test_id : Test_id.t -> t -> t
+  val of_lui : Lui_elements.t -> t
   val empty : ?key:Key.t -> unit -> t
 
   val text
@@ -821,6 +822,7 @@ module View : sig
       :  ?key:Key.t
       -> activation_id:string
       -> ?enabled:bool
+      -> ?disclosure:bool
       -> on_activate:Event.handler
       -> label:t
       -> unit

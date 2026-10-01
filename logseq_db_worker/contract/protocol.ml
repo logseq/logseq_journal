@@ -184,6 +184,7 @@ and v2_block_record =
   { block : block
   ; task_status : v2_task_status option
   ; rendered_page_title : string
+  ; tag_titles : string list
   }
 
 and v2_block_lookup =
@@ -1381,15 +1382,37 @@ let v2_capability_limits_of_json json =
   }
 ;;
 
+let block_fields_without_tags = function
+  | `Assoc fields ->
+    let count = List.length (List.filter (fun (key, _) -> key = "tagTitles") fields) in
+    if count > 1 then decode_error "duplicate tagTitles";
+    `Assoc (List.filter (fun (key, _) -> key <> "tagTitles") fields)
+  | json -> json
+;;
+
+let tag_titles_of_json = function
+  | `Assoc fields ->
+    (match List.assoc_opt "tagTitles" fields with
+     | None -> []
+     | Some (`List values) -> List.map string values
+     | Some _ -> decode_error "invalid tagTitles")
+  | _ -> []
+;;
+
 let v2_block_record_to_json value =
   `Assoc
-    [ "block", block_to_json value.block
-    ; ( "taskStatus"
-      , option_json
-          (fun status -> `String (v2_task_status_string status))
-          value.task_status )
-    ; "renderedPageTitle", `String value.rendered_page_title
-    ]
+    ([ "block", block_to_json value.block
+     ; ( "taskStatus"
+       , option_json
+           (fun status -> `String (v2_task_status_string status))
+           value.task_status )
+     ; "renderedPageTitle", `String value.rendered_page_title
+     ]
+     @
+     if value.tag_titles = []
+     then []
+     else [ "tagTitles", `List (List.map (fun title -> `String title) value.tag_titles) ]
+    )
 ;;
 
 let v2_page_lookup_to_json = function
@@ -1444,7 +1467,9 @@ let v2_block_lookup_of_json json =
   match string (field "type" raw) with
   | "present" ->
     let fields =
-      exact_assoc [ "type"; "revision"; "taskStatus"; "renderedPageTitle"; "block" ] json
+      exact_assoc
+        [ "type"; "revision"; "taskStatus"; "renderedPageTitle"; "block" ]
+        (block_fields_without_tags json)
     in
     V2_present_block
       { value =
@@ -1454,6 +1479,7 @@ let v2_block_lookup_of_json json =
                | `Null -> None
                | value -> Some (v2_task_status (string value)))
           ; rendered_page_title = string (field "renderedPageTitle" fields)
+          ; tag_titles = tag_titles_of_json json
           }
       ; revision = string (field "revision" fields)
       }
@@ -1557,7 +1583,9 @@ let v2_child_member_to_json (item : v2_child_member) =
 
 let v2_child_member_of_json json =
   let fields =
-    exact_assoc [ "block"; "taskStatus"; "renderedPageTitle"; "revision" ] json
+    exact_assoc
+      [ "block"; "taskStatus"; "renderedPageTitle"; "revision" ]
+      (block_fields_without_tags json)
   in
   { value =
       { block = block_of_json (field "block" fields)
@@ -1566,6 +1594,7 @@ let v2_child_member_of_json json =
            | `Null -> None
            | value -> Some (v2_task_status (string value)))
       ; rendered_page_title = string (field "renderedPageTitle" fields)
+      ; tag_titles = tag_titles_of_json json
       }
   ; revision = string (field "revision" fields)
   }
@@ -1586,7 +1615,7 @@ let v2_tree_member_of_json json =
   let fields =
     exact_assoc
       [ "block"; "taskStatus"; "renderedPageTitle"; "revision"; "depth"; "parent" ]
-      json
+      (block_fields_without_tags json)
   in
   { value =
       { block = block_of_json (field "block" fields)
@@ -1595,6 +1624,7 @@ let v2_tree_member_of_json json =
            | `Null -> None
            | value -> Some (v2_task_status (string value)))
       ; rendered_page_title = string (field "renderedPageTitle" fields)
+      ; tag_titles = tag_titles_of_json json
       }
   ; revision = string (field "revision" fields)
   ; depth = integer (field "depth" fields)

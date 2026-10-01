@@ -33,6 +33,7 @@ val create
 
 val reset : t -> graph_generation:int option -> unit
 val root_visible : t -> root:string -> bool -> unit
+val retain_visible_roots : t -> string list -> unit
 val asset_visible : t -> root:string -> asset:string -> bool -> unit
 val next : t -> root:string -> unit
 val retry : t -> root:string -> asset:string -> unit

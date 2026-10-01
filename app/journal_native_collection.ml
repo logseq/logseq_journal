@@ -105,6 +105,7 @@ let view
         (V.Navigation_link.create
            ~key:(Ui.Key.string ("open:" ^ id))
            ~activation_id:id
+           ~disclosure:false
            ~enabled:actions_enabled
            ~on_activate:(action on_open id)
            ~label:child

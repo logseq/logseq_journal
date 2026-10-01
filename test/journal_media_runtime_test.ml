@@ -222,6 +222,7 @@ let () =
                        { block = holder
                        ; task_status = None
                        ; rendered_page_title = "page"
+                       ; tag_titles = []
                        }
                    ; revision = "r7"
                    })
@@ -314,6 +315,7 @@ let () =
                        { block = holder
                        ; task_status = None
                        ; rendered_page_title = "page"
+                       ; tag_titles = []
                        }
                    ; revision = "r8"
                    })
@@ -364,6 +366,7 @@ let () =
                        { block = { holder with uuid = uuid 7; properties = [] }
                        ; task_status = None
                        ; rendered_page_title = "page"
+                       ; tag_titles = []
                        }
                    ; revision = "r9"
                    })

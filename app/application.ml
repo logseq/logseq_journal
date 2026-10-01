@@ -4468,6 +4468,32 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
       Effect.ignore
     | Ui.Event.Payload.Visible_range range ->
+      let total = Int64.of_int (Journal_timeline_state.total_count snapshot.timeline) in
+      let bounded value = Int64.to_int (Int64.min total (Int64.max 0L value)) in
+      let first = bounded range.first_index in
+      let last = bounded range.last_exclusive in
+      let offset = Journal_timeline_state.first_retained_index snapshot.timeline in
+      let rec collect index roots =
+        if index >= last
+        then roots
+        else (
+          let roots =
+            match
+              Journal_timeline_state.retained_slot snapshot.timeline (index - offset)
+            with
+            | Some (Top_level entry) ->
+              Journal_model.id entry.block
+              :: List.rev_append
+                   (List.map
+                      (fun (child : Journal_graph_projection.child_summary) ->
+                         child.block_id)
+                      entry.child_summaries)
+                   roots
+            | _ -> roots
+          in
+          collect (index + 1) roots)
+      in
+      Journal_media_runtime.retain_visible_roots media_runtime (collect first []);
       let observe timeline =
         let total_count = Journal_timeline_state.total_count timeline in
         let bounded value =

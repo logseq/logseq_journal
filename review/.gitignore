@@ -1,0 +1,11 @@
+*.app/
+*.o
+*.png
+*-entitlements.plist
+*-link-command.json
+assets/
+native_embed.production.ml
+reading.pdf
+notes.txt
+
+library-delivery.json

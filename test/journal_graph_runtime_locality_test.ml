@@ -61,7 +61,7 @@ let block : Graph.block =
 ;;
 
 let record : Protocol.v2_block_record =
-  { block; task_status = None; rendered_page_title = page.title }
+  { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
 ;;
 
 let load_feed runtime =
@@ -1550,8 +1550,7 @@ let capture_format_read ~journal_day =
       runtime
       (response
          lookup
-         (Protocol.V2_page_outcome
-            (V2_missing_page { uuid = page; revision = "page-1" })))
+         (Protocol.V2_page_outcome (V2_missing_page { uuid = page; revision = "page-1" })))
     |> fun output -> only "journal title format read" output.requests
   in
   (match format_read.command with
@@ -1570,10 +1569,7 @@ let create_journal_title ~journal_day ~journal_title_format =
   in
   match creation.command with
   | V2_create_journal_page { page = created; journal_day = day; title; _ } ->
-    Alcotest.(check bool)
-      "journal page identity"
-      true
-      (Graph.Uuid.equal created page);
+    Alcotest.(check bool) "journal page identity" true (Graph.Uuid.equal created page);
     Alcotest.(check int) "journal day" journal_day day;
     title
   | _ -> Alcotest.fail "format read did not continue to journal page creation"
@@ -1603,9 +1599,7 @@ let test_journal_title_falls_back_on_invalid_format () =
   Alcotest.(check string)
     "unsupported token falls back to the upstream default"
     "Sep 19th, 2026"
-    (create_journal_title
-       ~journal_day:20260919
-       ~journal_title_format:(Some "yyyy-QQ-dd"))
+    (create_journal_title ~journal_day:20260919 ~journal_title_format:(Some "yyyy-QQ-dd"))
 ;;
 
 let test_journal_title_failed_format_read_rejects () =
@@ -1620,7 +1614,10 @@ let test_journal_title_failed_format_read_rejects () =
             ; message = "Snapshot unavailable"
             }))
   in
-  Alcotest.(check int) "no creation after a failed read" 0 (List.length completed.requests);
+  Alcotest.(check int)
+    "no creation after a failed read"
+    0
+    (List.length completed.requests);
   match (only "capture rejected" completed.responses).payload with
   | Rejected (Worker_failure _) -> ()
   | _ -> Alcotest.fail "a failed format read was not rejected"

@@ -253,7 +253,12 @@ let children_of (root : Graph.block) items =
     items
 ;;
 
-let timeline_entry_page ~page ~time_context (result : tree_member Graph.page_result) =
+let timeline_entry_page
+      ?(tag_titles = fun _ -> [])
+      ~page
+      ~time_context
+      (result : tree_member Graph.page_result)
+  =
   let cursor block =
     Option.map
       (fun protocol_cursor ->
@@ -292,6 +297,9 @@ let timeline_entry_page ~page ~time_context (result : tree_member Graph.page_res
        with
        | Error _ as error -> error
        | Ok block ->
+         let block =
+           Journal_model.with_tag_titles block ~tag_titles:(tag_titles root.block.uuid)
+         in
          let child_summaries =
            List.map
              (fun (child : tree_member) ->
