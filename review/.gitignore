@@ -9,3 +9,6 @@ reading.pdf
 notes.txt
 
 library-delivery.json
+
+swift-clean-build/
+*.backup

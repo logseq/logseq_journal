@@ -56,3 +56,7 @@ The existing native host remains required. Named tag metadata becomes an optiona
 
 Implemented in OCaml/LUI and validated by nine mounted-UI checks, fourteen Worker application integration cases, protocol round trips, and successful workspace build. Actual iOS simulator screenshots and native PDF preview, expansion and collapse were reviewed. See review/README.md for local artifacts, base/PR dependencies, and reproducible host linking. Full runtest has the unchanged baseline V.progress source assertion failure. Horizontal drag/swipe conflict remains an explicit manual verification item because the mouse-control tool reports noWindowsAvailable. File names are unavailable from the descriptor; type and optional actual size are used honestly. No remote publishing or physical-device installation occurred.
 
+
+## Follow-up validation
+
+Full Swift/native compilation now succeeds in a fresh isolated scratch directory; the new binary was installed and launched on the existing simulator. No old cache was deleted. Real attachment waits were traced to existing coalescing of per-asset event deltas: all asset notices share one Worker topic, and demand acceptance overwrites availability before the client drains it. Both assets were already Ready, and UI demands were issued and accepted. This independently confirms the new UI event path works while reliable asset notice delivery remains an existing integration blocker. No Swift UI change or temporary trace remains in source.
