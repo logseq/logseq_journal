@@ -1205,6 +1205,9 @@ module Root_navigation = struct
     | Select of Journal_routes.destination
     | Capture_opened
     | Capture_closed
+    | Capture_discarded
+    | Capture_picker_requested of Journal_asset_import.source
+    | Capture_asset_picked of Journal_asset_import.staged * int option
     | Capture_native_edit of Ui.Event.Payload.text_edit
     | Capture_task_intent of bool
     | Capture_edited of string
@@ -1254,23 +1257,35 @@ module Root_navigation = struct
             }
         in
         { state with modal = Capture_sheet }
-      | Capture_closed ->
+      | Capture_closed -> { state with modal = No_modal }
+      | Capture_discarded ->
+        (match state.direct_capture with
+         | Some capture when Journal_capture.phase capture = Journal_capture.Editing ->
+           List.iter
+             Journal_asset_import.discard_staged_file
+             (Journal_capture.pending_attachments capture);
+           { state with
+             modal = No_modal
+           ; direct_capture = None
+           ; capture_error = None
+           ; capture_pick_request = state.capture_pick_request + 1
+           }
+         | None | Some _ -> state)
+      | Capture_picker_requested source ->
         { state with
-          modal = No_modal
-        ; direct_capture =
-            Option.map
-              (fun capture ->
-                 match Journal_capture.phase capture with
-                 (* An admitted capture still commits while closed; keep its
-                    attachments so the drained imports can target the block. *)
-                 | Journal_capture.Saving | Journal_capture.Failed _ -> capture
-                 | Journal_capture.Editing ->
-                   List.iter
-                     Journal_asset_import.discard_staged_file
-                     (Journal_capture.pending_attachments capture);
-                   Journal_capture.clear_attachments capture)
-              state.direct_capture
+          capture_pick_source = source
+        ; capture_pick_request = state.capture_pick_request + 1
         }
+      | Capture_asset_picked (staged, request_id) ->
+        (match state.direct_capture with
+         | Some capture when request_id = Some state.capture_pick_request ->
+           { state with
+             direct_capture = Some (Journal_capture.add_attachment capture staged)
+           ; capture_error = None
+           }
+         | None | Some _ ->
+           Journal_asset_import.discard_staged_file staged;
+           state)
       | Capture_native_edit edit ->
         { state with
           direct_capture =
@@ -1829,6 +1844,55 @@ let composer_content
         |> V.with_test_id (Ui.Test_id.string (scope ^ "-attach"))
       ]
   in
+  let pending = Journal_capture.pending_attachments capture in
+  let attachments =
+    match pending with
+    | [] -> None
+    | _ ->
+      Some
+        (V.of_lui
+           (Lui_elements.row
+              ~gap:8
+              (List.map
+                 (fun staged ->
+                    Lui_element_combine.composer_attachment
+                      ~disabled:((not enabled) || saving)
+                      ~key:(Journal_asset_import.staged_token staged)
+                      ~path:(Journal_asset_import.staged_path staged)
+                      ~title:(Journal_asset_import.staged_title staged)
+                      ~file_type:(Journal_asset_import.staged_type staged)
+                      ~on_remove:(fun _ ->
+                        match assets with
+                        | None -> ()
+                        | Some assets when enabled && not saving ->
+                          assets.on_event
+                            (Yojson.Basic.to_string
+                               (`Assoc
+                                   [ "action", `String "remove"
+                                   ; ( "token"
+                                     , `String (Journal_asset_import.staged_token staged)
+                                     )
+                                   ]))
+                        | Some _ -> ())
+                      ())
+                 pending)))
+  in
+  let discard =
+    if
+      scope = "journal-capture" && Journal_capture.phase capture = Journal_capture.Editing
+    then
+      [ V.buttons
+          ~actions:
+            [ V.buttons_action
+                ~label:"Discard draft"
+                ~icon:"trash"
+                ~on_press:(bind_action on_edit "discard-capture")
+                ()
+            ]
+          ()
+      ]
+    else []
+  in
   let composer =
     V.composer
       ~key:(Ui.Key.string (scope ^ "-composer"))
@@ -1841,7 +1905,9 @@ let composer_content
       ~accepted_local_revision:(Journal_capture.accepted_local_revision capture)
       ~value:(Journal_capture.value capture)
       ~send_disabled:(not can_submit)
-      ~actions:(attach @ [ task ])
+      ?attachments
+      ?feedback:(Option.map live_region_text error)
+      ~actions:(attach @ [ task ] @ discard)
       ~on_edit
       ~on_submit:ignored
       ~on_send:on_save
@@ -1850,23 +1916,10 @@ let composer_content
   let content =
     V.column
       ~spacing:12.
-      ([ composer ]
-       @ (if saving then [ V.loading ~message:"Saving…" () ] else [])
-       @ Option.to_list (Option.map live_region_text error))
+      ([ composer ] @ if saving then [ V.loading ~message:"Saving…" () ] else [])
     |> V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
   in
-  match assets with
-  | None -> content
-  | Some assets ->
-    Journal_asset_import.view
-      ~key:(Ui.Key.string (scope ^ "-asset-import"))
-      ~enabled:(enabled && not saving)
-      ~completion:assets.completion
-      ~replacement:None
-      ~request:assets.request
-      ~pending:(Journal_capture.pending_attachments capture)
-      ~on_select:assets.on_event
-      (V.Body.static content)
+  content
 ;;
 
 let composer_page
@@ -4652,6 +4705,8 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       then update (fun state -> Root_navigation.step state Capture_opened)
       else if String.equal action "close-composer"
       then update (fun state -> Root_navigation.step state Capture_closed)
+      else if String.equal action "discard-capture"
+      then update (fun state -> Root_navigation.step state Capture_discarded)
       else if String.starts_with ~prefix:"capture-attach:" action
       then
         update (fun state ->
@@ -4665,10 +4720,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                  && Option.is_none state.pending_delete
                  && Option.is_none state.pending_status
                  && Journal_capture.can_attach capture ->
-            { state with
-              capture_pick_source = source
-            ; capture_pick_request = state.capture_pick_request + 1
-            }
+            Root_navigation.step state (Capture_picker_requested source)
           | _ -> state)
       else if String.starts_with ~prefix:"capture-asset:" action
       then (
@@ -4696,19 +4748,9 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                   (fun capture -> Journal_capture.remove_attachment capture ~token)
                   state.direct_capture
             })
-        | Ok (Journal_asset_import.Picked (staged, request_id))
-          when request_id = Some snapshot.capture_pick_request ->
+        | Ok (Journal_asset_import.Picked (staged, request_id)) ->
           update (fun state ->
-            { state with
-              direct_capture =
-                Option.map
-                  (fun capture -> Journal_capture.add_attachment capture staged)
-                  state.direct_capture
-            ; capture_error = None
-            })
-        | Ok (Journal_asset_import.Picked (staged, _)) ->
-          Journal_asset_import.discard_staged_file staged;
-          Effect.ignore)
+            Root_navigation.step state (Capture_asset_picked (staged, request_id))))
       else if
         String.equal action "capture-task-on" || String.equal action "capture-task-off"
       then
@@ -5108,23 +5150,21 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
   let cancel_notice token =
     emit_platform_request (Journal_platform.notice_cancel_request ~token)
   in
-  let notice_callback ((undo_available, capture_error), accessible_navigation) =
+  let notice_callback ((undo_available, _capture_error), accessible_navigation) =
     Option.iter cancel_notice !notice_cancellation;
     notice_cancellation := None;
-    match capture_error, undo_available with
-    | None, false -> ()
-    | _, _ ->
+    (* Composer failures are laid out above its controls. Only Undo uses
+       the platform notice, so an error never covers draft actions. *)
+    match undo_available with
+    | false -> ()
+    | true ->
       let token = Int64.succ !notice_token_sequence in
       notice_token_sequence := token;
       notice_cancellation := Some token;
       let message, action_label, duration_ms =
-        match capture_error, undo_available with
-        | Some failure, _ -> capture_failure_message failure, None, 4_000
-        | None, true ->
-          ( "Block and descendants removed"
-          , Some "Undo"
-          , if accessible_navigation then 10_000 else 5_000 )
-        | None, false -> assert false
+        ( "Block and descendants removed"
+        , Some "Undo"
+        , if accessible_navigation then 10_000 else 5_000 )
       in
       emit_platform_request
         (Journal_platform.show_notice_request ~token ~message ~action_label ~duration_ms)
@@ -5290,45 +5330,30 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           (fun capture ->
              V.column
                ~spacing:0.
-               [ V.frame
-                   ~height:
-                     (136.
-                      +.
-                      match Journal_capture.pending_attachments capture with
-                      | [] -> 0.
-                      | _ -> 76.)
-                   (* The capsule's own grow makes it claim every point its
-                      parent offers — in the overlay stack that is the whole
-                      body frame — so pin the exact single-line height
-                      (capsule 104 + padding 32, plus the pending-attachment
-                      strip when present). A floor alone leaves the grow free
-                      to stretch the glass over half the screen. *)
-                   (composer_content
-                      ~scope:"journal-capture"
-                      ~placeholder:"New journal entry"
-                      ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
-                      ~capture
-                      ~enabled:state.write_enabled
-                      ~on_edit:dispatch
-                      ~on_toggle:
-                        (Ui.Event.Handler.create (function
-                           | Ui.Event.Payload.Bool selected ->
-                             Ui.Event.Handler.Private.invoke
-                               dispatch
-                               (Text
-                                  (if selected
-                                   then "capture-task-on"
-                                   else "capture-task-off"))
-                           | _ -> ()))
-                      ~on_save:(bind_action dispatch "capture-submit")
-                      ~error:
-                        (match state.capture_error with
-                         | Some failure -> Some (capture_failure_message failure)
-                         | None ->
-                           (match Journal_capture.phase capture with
-                            | Failed message -> Some message
-                            | Editing | Saving -> None))
-                      ~assets:(Some (capture_assets ~camera:true)))
+               [ composer_content
+                   ~scope:"journal-capture"
+                   ~placeholder:"New journal entry"
+                   ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+                   ~capture
+                   ~enabled:state.write_enabled
+                   ~on_edit:dispatch
+                   ~on_toggle:
+                     (Ui.Event.Handler.create (function
+                        | Ui.Event.Payload.Bool selected ->
+                          Ui.Event.Handler.Private.invoke
+                            dispatch
+                            (Text
+                               (if selected then "capture-task-on" else "capture-task-off"))
+                        | _ -> ()))
+                   ~on_save:(bind_action dispatch "capture-submit")
+                   ~error:
+                     (match state.capture_error with
+                      | Some failure -> Some (capture_failure_message failure)
+                      | None ->
+                        (match Journal_capture.phase capture with
+                         | Failed message -> Some message
+                         | Editing | Saving -> None))
+                   ~assets:(Some (capture_assets ~camera:true))
                ])
           state.direct_capture
       | _ -> None
@@ -5396,6 +5421,24 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           ~cache_reset_available:(local_deletion_available state)
     in
     let root = operation_feedback ~scope:"root" ~state dispatch root in
+    (* Keep the picker/resource adapter mounted while the draft is hidden.
+       Collapse changes visibility only; asynchronous staging and native
+       request state continue to belong to the same draft. *)
+    let root =
+      match state.direct_capture with
+      | None -> root
+      | Some capture ->
+        let assets = capture_assets ~camera:(state.environment.platform = "ios") in
+        Journal_asset_import.view
+          ~key:(Ui.Key.string "journal-capture-asset-import")
+          ~enabled:(state.write_enabled && Journal_capture.can_attach capture)
+          ~completion:assets.completion
+          ~replacement:None
+          ~request:assets.request
+          ~pending:[]
+          ~on_select:assets.on_event
+          (V.Body.static root)
+    in
     let path =
       match Journal_routes.route state.routes with
       | Journal_routes.Timeline -> []

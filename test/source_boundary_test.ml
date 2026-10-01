@@ -66,6 +66,30 @@ let require_occurrences root relative needle expected =
       fail "expected %d occurrences of %S in %s, found %d" expected needle relative actual)
 ;;
 
+let require_commit_pin root relative url =
+  let prefix = url ^ "#" in
+  let pins =
+    read_file (path root relative)
+    |> String.split_on_char '"'
+    |> List.filter (String.starts_with ~prefix)
+  in
+  match pins with
+  | [ pin ] ->
+    let revision =
+      String.sub pin (String.length prefix) (String.length pin - String.length prefix)
+    in
+    if
+      not
+        (String.length revision = 40
+         && String.for_all
+              (function
+                | '0' .. '9' | 'a' .. 'f' -> true
+                | _ -> false)
+              revision)
+    then fail "expected an exact commit pin for %s in %s" url relative
+  | _ -> fail "expected one commit pin for %s in %s" url relative
+;;
+
 let rec dart_files root relative =
   let candidate = path root relative in
   if not (Sys.file_exists candidate)
@@ -1167,11 +1191,7 @@ let () =
     "logseq_journal.opam"
     ~package:"ocaml-signal"
     ~version:"0.1.0";
-  require_occurrences
-    root
-    "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#main"
-    1;
+  require_commit_pin root "logseq_journal.opam" "git+https://github.com/logseq/lui.git";
   require_occurrences
     root
     "logseq_journal.opam"

@@ -444,6 +444,8 @@ module View : sig
     -> ?accessibility_identifier:string
     -> ?autofocus:bool
     -> ?label:string
+    -> ?attachments:t
+    -> ?feedback:t
     -> placeholder:string
     -> session_id:Journal_ids.Text_input.Session_id.t
     -> document_revision:Journal_ids.Text_input.Document_revision.t

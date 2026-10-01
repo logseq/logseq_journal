@@ -905,9 +905,9 @@ module View = struct
         parent)
   ;;
 
-  (* The shared composer composite owns the capsule layout: a growing
-     [composer-input] textarea and a controls row of caller actions followed
-     by the send button. Journal keeps its revision-aware edit payloads by
+  (* The shared composer composite owns the content-sized capsule, bounded
+     [composer-input] textarea, attachments, feedback and action row. Journal
+     keeps its revision-aware edit payloads by
      translating the composer's raw [on_input] events through the same
      per-mount local-revision bookkeeping [text_editor] uses. The composite's
      textarea cannot be disabled, so [~enabled] state is carried only by the
@@ -917,6 +917,8 @@ module View = struct
         ?accessibility_identifier
         ?(autofocus = false)
         ?label
+        ?attachments
+        ?feedback
         ~placeholder
         ~session_id
         ~document_revision
@@ -934,6 +936,9 @@ module View = struct
       Lui_element_combine.composer
         ?accessibility_identifier
         ?label
+        ?attachments:(Option.map (fun view -> view.mount) attachments)
+        ~attachments_height:112
+        ?feedback:(Option.map (fun view -> view.mount) feedback)
         ~placeholder
         ~text:(Text_editing.Value.text value)
         ~autofocus
