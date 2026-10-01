@@ -51,6 +51,7 @@ type t =
   ; sibling_order : string
   ; source : string
   ; task_state : task_state
+  ; tag_titles : string list
   ; child_count : int
   ; creation_time : Journal_time.t
   ; revision : string
@@ -114,6 +115,7 @@ let create_on_page
         ; sibling_order
         ; source
         ; task_state
+        ; tag_titles = []
         ; child_count
         ; creation_time
         ; revision
@@ -171,4 +173,12 @@ let with_child_count value ~child_count =
   if child_count < 0
   then Error "Journal child count must not be negative"
   else Ok { value with child_count }
+;;
+
+let tag_titles value = value.tag_titles
+
+let with_tag_titles value ~tag_titles =
+  { value with
+    tag_titles = List.filter (fun title -> String.trim title <> "") tag_titles
+  }
 ;;

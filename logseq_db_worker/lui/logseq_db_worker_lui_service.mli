@@ -179,7 +179,10 @@ type response =
   | Graph_response of Logseq_db_worker.Protocol.response
   | Graph_state of Logseq_db_worker.graph_state
 
+type asset_notice_batch
+
 type push =
+  | Asset_notices of asset_notice_batch
   | Graph_push of Logseq_db_worker.Protocol.push
   | Client_state_changed of state
   | Need_id_token of token_request
@@ -195,6 +198,13 @@ val auth_topic : Journal_worker_ids.Worker.Push_topic.t
 val bootstrap_topic : Journal_worker_ids.Worker.Push_topic.t
 val graph_state_topic : Journal_worker_ids.Worker.Push_topic.t
 val asset_topic : Journal_worker_ids.Worker.Push_topic.t
+
+(** Pending latest asset facts, in arrival order. Other push kinds return []. *)
+val asset_notices : push -> (asset_scope * asset_notice) list
+
+(** Worker topic merge policy. Snapshot topics replace; independent asset facts
+    survive together, up to 4096 distinct pending facts. *)
+val coalesce_push : topic:Journal_worker_ids.Worker.push_topic -> push -> push -> push
 
 type dependencies
 

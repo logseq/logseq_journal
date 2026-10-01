@@ -552,10 +552,13 @@ let task_status_of_protocol = function
   | V2_later -> Later
 ;;
 
-let block_record (value : Overlay.block_record) : Protocol.v2_block_record =
+let block_record ?(tag_titles = []) (value : Overlay.block_record)
+  : Protocol.v2_block_record
+  =
   { block = value.block
   ; task_status = Option.map task_status_to_protocol value.task_status
   ; rendered_page_title = value.rendered_page_title
+  ; tag_titles
   }
 ;;
 
@@ -798,6 +801,36 @@ let read_snapshot database request command =
     Fun.protect
       ~finally:(fun () -> Database.release_snapshot snapshot)
       (fun () ->
+         let titles = Hashtbl.create 16 in
+         let block_record (value : Overlay.block_record) =
+           let missing =
+             List.filter
+               (fun uuid -> not (Hashtbl.mem titles (Graph.Uuid.to_string uuid)))
+               value.block.tags
+           in
+           if missing <> []
+           then (
+             match Database.get_pages snapshot missing with
+             | Ok pages ->
+               List.iter
+                 (function
+                   | Overlay.Present_page { value; _ } ->
+                     Hashtbl.replace
+                       titles
+                       (Graph.Uuid.to_string value.page.uuid)
+                       (Some value.page.title)
+                   | Overlay.Missing_page { uuid; _ } ->
+                     Hashtbl.replace titles (Graph.Uuid.to_string uuid) None)
+                 pages
+             | Error _ -> ());
+           let tag_titles =
+             List.filter_map
+               (fun uuid ->
+                  Option.join (Hashtbl.find_opt titles (Graph.Uuid.to_string uuid)))
+               value.block.tags
+           in
+           block_record ~tag_titles value
+         in
          match command with
          | Protocol.V2_graph_info ->
            (match Database.graph_info snapshot with

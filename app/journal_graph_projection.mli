@@ -143,7 +143,8 @@ val block_on_page
   -> (block, string) result
 
 val timeline_entry_page
-  :  page:page
+  :  ?tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
+  -> page:page
   -> time_context:time_context
   -> tree_member Logseq_db_types.Graph_types.page_result
   -> (timeline_entry_page, string) result

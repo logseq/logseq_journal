@@ -73,6 +73,7 @@ module Service : sig
   val create
     :  push_topic_count:int
     -> concurrency:concurrency
+    -> ?merge_push:(topic:Journal_worker_ids.Worker.push_topic -> 'push -> 'push -> 'push)
     -> ?data_directory:('config -> (string, string) result)
     -> init:('push Session_context.t -> 'config -> ('state, string) result)
     -> handle:

@@ -275,7 +275,7 @@ let handle_push context = function
     context.saw_bootstrap <- true;
     context.last_event <- "bootstrap-progress"
   | Graph_state_changed state -> handle_graph_state context state
-  | Asset_notice _ ->
+  | Asset_notice _ | Asset_notices _ ->
     fail_worker context "assets" "unexpected asset notice without demand"
   | Graph_push _ -> context.last_event <- "graph-push"
 ;;

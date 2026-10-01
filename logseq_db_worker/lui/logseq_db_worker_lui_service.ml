@@ -252,7 +252,26 @@ type response =
   | Graph_response of Protocol.response
   | Graph_state of Db.graph_state
 
+type asset_fact =
+  | Availability_fact of string * Logseq_db_types.Graph_types.Uuid.t
+  | Admission_fact of string
+  | Upload_fact of Logseq_db_types.Graph_types.Uuid.t
+  | Capacity_fact
+
+module Asset_facts = Map.Make (struct
+    type t = asset_scope * asset_fact
+
+    let compare = Stdlib.compare
+  end)
+
+type asset_notice_batch =
+  { next_order : int
+  ; distinct_count : int
+  ; facts : (int * asset_scope * asset_notice) Asset_facts.t
+  }
+
 type push =
+  | Asset_notices of asset_notice_batch
   | Graph_push of Protocol.push
   | Client_state_changed of state
   | Need_id_token of token_request
@@ -268,6 +287,55 @@ let auth_topic = ID.Worker.Push_topic.of_int 2
 let bootstrap_topic = ID.Worker.Push_topic.of_int 3
 let graph_state_topic = ID.Worker.Push_topic.of_int 4
 let asset_topic = ID.Worker.Push_topic.of_int 5
+
+let asset_notices = function
+  | Asset_notice (scope, notice) -> [ scope, notice ]
+  | Asset_notices batch ->
+    Asset_facts.bindings batch.facts
+    |> List.map snd
+    |> List.sort (fun (left, _, _) (right, _, _) -> Int.compare left right)
+    |> List.map (fun (_, scope, notice) -> scope, notice)
+  | _ -> []
+;;
+
+let add_asset_fact batch (scope, notice) =
+  let fact =
+    match notice with
+    | Asset_availability { consumer; asset; _ } -> Availability_fact (consumer, asset)
+    | Asset_demand_accepted consumer | Asset_backpressure consumer ->
+      Admission_fact consumer
+    | Upload_status { operation; _ } -> Upload_fact operation
+    | Asset_capacity_available -> Capacity_fact
+  in
+  let key = scope, fact in
+  let is_new = not (Asset_facts.mem key batch.facts) in
+  if batch.distinct_count >= 4096 && is_new
+  then failwith "Worker pending asset fact limit exceeded";
+  if batch.next_order = max_int then failwith "Worker asset fact sequence exhausted";
+  { next_order = batch.next_order + 1
+  ; distinct_count = (batch.distinct_count + if is_new then 1 else 0)
+  ; facts = Asset_facts.add key (batch.next_order, scope, notice) batch.facts
+  }
+;;
+
+let coalesce_push ~topic previous next =
+  if not (ID.Worker.Push_topic.equal topic asset_topic)
+  then next
+  else (
+    match previous, next with
+    | (Asset_notice _ | Asset_notices _), (Asset_notice _ | Asset_notices _) ->
+      let batch =
+        match previous with
+        | Asset_notices batch -> batch
+        | _ ->
+          List.fold_left
+            add_asset_fact
+            { next_order = 0; distinct_count = 0; facts = Asset_facts.empty }
+            (asset_notices previous)
+      in
+      Asset_notices (List.fold_left add_asset_fact batch (asset_notices next))
+    | _ -> next)
+;;
 
 type dependencies =
   { overlay : Overlay.dependencies
@@ -428,6 +496,7 @@ let create ~(dependencies : dependencies) =
   in
   Journal_worker.Service.create
     ~push_topic_count:6
+    ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
     ~init:(fun context config ->

@@ -45,7 +45,7 @@ let block : Graph.block =
 ;;
 
 let record : Protocol.v2_block_record =
-  { block; task_status = None; rendered_page_title = page.title }
+  { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
 ;;
 
 let capture : Journal_graph_projection.capture =
@@ -730,11 +730,124 @@ let test_uninterested_change_is_acknowledged_without_hydration () =
   | _ -> Alcotest.fail "uninterested change must only produce an acknowledgement"
 ;;
 
+let test_named_tags_reach_timeline_row () =
+  let module Ui = Journal_view in
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let journals =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 1
+         ; blocks_per_day = 2
+         ; slot_limit = 4
+         ; request_generation = 7L
+         })
+    |> fun out -> only "journals" out.requests
+  in
+  let tree =
+    Runtime.receive
+      runtime
+      (respond
+         journals
+         (Protocol.V2_journals_outcome
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            ; next_cursor = None
+            }))
+    |> fun out -> only "tree" out.requests
+  in
+  let raw =
+    Protocol.response_to_yojson
+      (respond
+         tree
+         (Protocol.V2_page_tree_outcome
+            { page = page_uuid
+            ; maximum_depth = 1
+            ; items =
+                [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid }
+                ]
+            ; next_cursor = None
+            }))
+  in
+  let rec enrich = function
+    | `Assoc fields ->
+      let fields = List.map (fun (k, v) -> k, enrich v) fields in
+      if List.mem_assoc "renderedPageTitle" fields
+      then `Assoc (("tagTitles", `List [ `String "户外"; `String "周末计划" ]) :: fields)
+      else `Assoc fields
+    | `List values -> `List (List.map enrich values)
+    | value -> value
+  in
+  let response =
+    match Protocol.response_of_yojson (enrich raw) with
+    | Ok value -> value
+    | Error message -> Alcotest.failf "tag read rejected: %s" message
+  in
+  let output = Runtime.receive runtime response in
+  let entry =
+    List.find_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Feed_loaded { feed; _ } ->
+           List.find_map
+             (fun (d : Journal_graph_projection.day_feed) ->
+                match d.entries with
+                | head :: _ -> Some head
+                | [] -> None)
+             feed.days
+         | _ -> None)
+      output.responses
+    |> Option.get
+  in
+  let batches = ref [] in
+  let backend : Lui_protocol.backend =
+    { backend_profile = Lui_protocol.profile IOS SwiftUIHost
+    ; apply_batch =
+        (fun b ->
+          batches := b :: !batches;
+          true)
+    }
+  in
+  let view =
+    Journal_row.view
+      ~show_timestamp:false
+      ~render_media:(fun ~root:_ child -> child)
+      entry
+  in
+  let app =
+    Lui_app.create_with_extensions
+      backend
+      Journal_lui_native.registry
+      ()
+      (fun () () -> ())
+      (fun _ _ _ -> Ui.mount view)
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Lui_app.dispose app))
+    (fun () ->
+       ignore (Lui_app.start app);
+       ignore (Lui_app.flush app);
+       let ops = List.concat_map (fun (b : Lui_protocol.patch_batch) -> b.ops) !batches in
+       Alcotest.(check bool)
+         "tag labels reach actual timeline UI"
+         true
+         (List.exists
+            (function
+              | Lui_protocol.SetProp (_, TextValue, StringValue "#户外  #周末计划") -> true
+              | _ -> false)
+            ops))
+;;
+
 let () =
   Alcotest.run
     "Worker application integration"
     [ ( "v2 boundary"
       , [ Alcotest.test_case
+            "named tags reach timeline row"
+            `Quick
+            test_named_tags_reach_timeline_row
+        ; Alcotest.test_case
             "read response becomes normalized feed"
             `Quick
             test_worker_read_becomes_normalized_application_feed

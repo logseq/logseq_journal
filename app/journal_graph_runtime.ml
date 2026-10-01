@@ -244,6 +244,7 @@ type t =
   ; graph_pages : (string, Graph.page) Hashtbl.t
   ; mutable pages : (string * Projection.page) list
   ; mutable block_pages : (string * Projection.page) list
+  ; tag_titles : (string, string list) Hashtbl.t
   ; projected_blocks : (string, Projection.block) Hashtbl.t
   ; page_tree_interests : (string, page_tree_interest) Hashtbl.t
   ; children_interests : (string, children_interest) Hashtbl.t
@@ -293,6 +294,7 @@ let create ?(localtime = Unix.localtime) () =
   ; graph_pages = Hashtbl.create 32
   ; pages = []
   ; block_pages = []
+  ; tag_titles = Hashtbl.create 64
   ; projected_blocks = Hashtbl.create 64
   ; page_tree_interests = Hashtbl.create 32
   ; children_interests = Hashtbl.create 32
@@ -313,6 +315,7 @@ let reset t =
   t.pages <- [];
   t.block_pages <- [];
   Hashtbl.clear t.projected_blocks;
+  Hashtbl.clear t.tag_titles;
   Hashtbl.clear t.page_tree_interests;
   Hashtbl.clear t.children_interests;
   t.initial_feed <- None
@@ -1219,7 +1222,16 @@ let refresh_response t page refresh result =
   match projection_time_context t with
   | Error message -> reject message
   | Ok time_context ->
-    (match Projection.timeline_entry_page ~page ~time_context result with
+    (match
+       Projection.timeline_entry_page
+         ~tag_titles:(fun uuid ->
+           Option.value
+             (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+             ~default:[])
+         ~page
+         ~time_context
+         result
+     with
      | Error message -> reject message
      | Ok projected ->
        remember_entries t page projected.entries;
@@ -2088,7 +2100,11 @@ let receive_response t (protocol_response : Protocol.response) =
        remember_scope_revision t revision_scope scope_revision;
        List.iter
          (fun (item : Protocol.v2_child_member) ->
-            remember_block_revision t item.value.block.uuid item.revision)
+            remember_block_revision t item.value.block.uuid item.revision;
+            Hashtbl.replace
+              t.tag_titles
+              (Graph.Uuid.to_string item.value.block.uuid)
+              item.value.tag_titles)
          items;
        (match operation with
         | Detail_children { generation; page; root } ->
@@ -2131,7 +2147,11 @@ let receive_response t (protocol_response : Protocol.response) =
      | V2_page_tree_outcome { items; next_cursor; _ } ->
        List.iter
          (fun (item : Protocol.v2_tree_member) ->
-            remember_block_revision t item.value.block.uuid item.revision)
+            remember_block_revision t item.value.block.uuid item.revision;
+            Hashtbl.replace
+              t.tag_titles
+              (Graph.Uuid.to_string item.value.block.uuid)
+              item.value.tag_titles)
          items;
        let result = tree_result items next_cursor in
        (match operation with
@@ -2158,7 +2178,16 @@ let receive_response t (protocol_response : Protocol.response) =
             match projection_time_context t with
             | Error message -> fail_page message
             | Ok time_context ->
-              (match Projection.timeline_entry_page ~page ~time_context result with
+              (match
+                 Projection.timeline_entry_page
+                   ~tag_titles:(fun uuid ->
+                     Option.value
+                       (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+                       ~default:[])
+                   ~page
+                   ~time_context
+                   result
+               with
                | Error message -> fail_page message
                | Ok projected ->
                  (match projected.entries, result.continuation with
@@ -2182,7 +2211,16 @@ let receive_response t (protocol_response : Protocol.response) =
           (match projection_time_context t with
            | Error message -> day_failure ~day:page.Projection.day generation message
            | Ok time_context ->
-             (match Projection.timeline_entry_page ~page ~time_context result with
+             (match
+                Projection.timeline_entry_page
+                  ~tag_titles:(fun uuid ->
+                    Option.value
+                      (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+                      ~default:[])
+                  ~page
+                  ~time_context
+                  result
+              with
               | Ok projected ->
                 (match projected.entries, result.continuation with
                  | [], Some cursor ->
@@ -2237,7 +2275,16 @@ let receive_response t (protocol_response : Protocol.response) =
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match Projection.timeline_entry_page ~page ~time_context result with
+             (match
+                Projection.timeline_entry_page
+                  ~tag_titles:(fun uuid ->
+                    Option.value
+                      (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+                      ~default:[])
+                  ~page
+                  ~time_context
+                  result
+              with
               | Error message -> reject message
               | Ok value ->
                 remember_entries t page value.entries;
