@@ -341,6 +341,24 @@ let initial_state =
   }
 ;;
 
+(* 0 = still loading; 1 = actual journal feed ready; 2 = user action or a
+   recoverable error must be shown. The native splash never hides a prompt. *)
+let loading_signal state =
+  if state.graph_ready && state.feed_loaded
+  then 1
+  else (
+    match state.manager with
+    | None -> 0
+    | Some snapshot ->
+      let phase : Journal_startup.startup_phase =
+        (Journal_startup.derive ~snapshot ~graph:state.graph_state).phase
+      in
+      (match phase with
+       | Signed_out | Awaiting_selection | Awaiting_e2ee_password | Failed -> 2
+       | (Ready | Restoring_local) when Option.is_some state.graph_error -> 2
+       | Loading_catalog | Restoring_local | Bootstrapping | Deleting_local | Ready -> 0))
+;;
+
 let feed_projection_context (calendar : Journal_calendar.t) =
   { local_day = Journal_calendar.local_day calendar
   ; projection_fingerprint = Journal_calendar.projection_fingerprint calendar
@@ -2996,6 +3014,7 @@ type app_context =
   ; send_action : action -> unit
   ; apply_platform : bytes -> unit Effect.t
   ; running : bool ref
+  ; loading_signal : unit -> int
   }
 
 let latest_patch = ref ""
@@ -5585,7 +5604,16 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       view
   in
   app_cell := Some app;
-  let context = { app; pump; client; send_action; apply_platform; running } in
+  let context =
+    { app
+    ; pump
+    ; client
+    ; send_action
+    ; apply_platform
+    ; running
+    ; loading_signal = (fun () -> loading_signal !state_ref)
+    }
+  in
   current_app := Some context;
   ignore (Worker.send client Graph_service.Get_graph_state : Worker.send_result);
   Worker.on_event client (fun event ->
@@ -5748,6 +5776,11 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
     | Some { app; _ } -> Lui_app.root_node app
     | None -> 0
   in
+  let loading_signal () =
+    match !current_app with
+    | Some context -> context.loading_signal ()
+    | None -> 0
+  in
   { Journal_bridge.init
   ; dispatch
   ; extension_event
@@ -5757,6 +5790,7 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
   ; platform_failure
   ; dispose
   ; root_node
+  ; loading_signal
   }
 ;;
 

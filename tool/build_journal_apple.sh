@@ -92,6 +92,7 @@ if [[ -z $ocaml_object ]]; then
 typedef void (*patch_cb)(const char *);
 typedef void (*wakeup_cb)(void);
 typedef void (*platform_request_cb)(const char *, int32_t);
+typedef void (*loading_cb)(int32_t);
 int32_t lui_ocaml_start(patch_cb cb, int32_t p, int32_t h, const char *d, int32_t l)
   { (void)p; (void)h; (void)d; (void)l; if (cb) cb(""); return 1; }
 int32_t lui_ocaml_stop(void) { return 1; }
@@ -112,6 +113,7 @@ void journal_ocaml_platform_event(const char *d, int32_t l) { (void)d; (void)l; 
 void journal_ocaml_platform_response(const char *d, int32_t l) { (void)d; (void)l; }
 void journal_ocaml_set_wakeup_callback(wakeup_cb cb) { (void)cb; }
 void journal_ocaml_set_platform_request_callback(platform_request_cb cb) { (void)cb; }
+void journal_ocaml_set_loading_callback(loading_cb cb) { (void)cb; }
 STUB
   "$clang" -target "$triple" -isysroot "$sdk_path" -fPIC \
     -c "$build_dir/ocaml_stub.c" -o "$build_dir/journal_complete_stub.o"

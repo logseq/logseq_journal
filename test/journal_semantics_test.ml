@@ -66,9 +66,13 @@ let test_timeline_media_targets () =
 
 let test_native_lui_events () =
   let received = ref [] in
+  let loading = ref 0 in
   Journal_bridge.register
     { init = (fun _ _ _ -> "")
-    ; dispatch = (fun event -> received := event :: !received; "")
+    ; dispatch =
+        (fun event ->
+          received := event :: !received;
+          "")
     ; extension_event = (fun _ _ _ -> "")
     ; pump = (fun () -> "")
     ; platform_event = (fun _ -> ())
@@ -76,7 +80,10 @@ let test_native_lui_events () =
     ; platform_failure = (fun _ -> ())
     ; dispose = (fun () -> "")
     ; root_node = (fun () -> 0)
+    ; loading_signal = (fun () -> !loading)
     };
+  loading := 1;
+  require (Journal_bridge.loading_signal () = 1) "native loading signal was not forwarded";
   ignore (Journal_bridge.scroll_completed 7 42 "unavailable");
   ignore (Journal_bridge.visible_range 8 0 14);
   ignore (Journal_bridge.picked 9 {|{"token":11,"files":[{"name":"日记.md"}]}|});
@@ -93,6 +100,7 @@ let tests =
   [ "timeline media targets", test_timeline_media_targets
   ; "native LUI events", test_native_lui_events
   ]
+;;
 
 let () =
   let failed =

@@ -8,6 +8,7 @@ type hooks =
   ; platform_failure : string -> unit
   ; dispose : unit -> string
   ; root_node : unit -> int
+  ; loading_signal : unit -> int
   }
 
 external wakeup : unit -> unit = "journal_ml_wakeup"
@@ -40,6 +41,7 @@ let toggle_changed node checked =
 
 let radio_changed node = dispatch_lui (Lui_protocol.Change node)
 let slider_changed node value = dispatch_lui (Lui_protocol.ValueChanged (node, value))
+
 let scroll_completed node token outcome =
   dispatch_lui (Lui_protocol.ScrollCompleted (node, token, outcome))
 ;;
@@ -56,6 +58,7 @@ let platform_response payload = (hooks ()).platform_response payload
 let platform_failure payload = (hooks ()).platform_failure payload
 let dispose () = (hooks ()).dispose ()
 let root_node () = (hooks ()).root_node ()
+let loading_signal () = (hooks ()).loading_signal ()
 
 let register hooks =
   current := Some hooks;
@@ -75,6 +78,7 @@ let register hooks =
   Callback.register "lui_ocaml_picked" picked;
   Callback.register "lui_ocaml_dispose" dispose;
   Callback.register "lui_ocaml_root_node" root_node;
+  Callback.register "journal_ocaml_loading_signal" loading_signal;
   Callback.register "journal_ocaml_extension_event" extension_event;
   Callback.register "journal_ocaml_pump" pump;
   Callback.register "journal_ocaml_platform_event" platform_event;

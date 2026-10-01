@@ -11,6 +11,7 @@ private typealias PatchCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
 private typealias WakeupCallback = @convention(c) () -> Void
 private typealias PlatformRequestCallback =
   @convention(c) (UnsafePointer<CChar>?, Int32) -> Void
+private typealias LoadingCallback = @convention(c) (Int32) -> Void
 
 @_silgen_name("lui_ocaml_start")
 private func luiOCamlStart(
@@ -34,6 +35,8 @@ private func journalOCamlPlatformFailure(_ data: UnsafePointer<CChar>?, _ length
 private func journalOCamlSetWakeupCallback(_ callback: WakeupCallback?)
 @_silgen_name("journal_ocaml_set_platform_request_callback")
 private func journalOCamlSetPlatformRequestCallback(_ callback: PlatformRequestCallback?)
+@_silgen_name("journal_ocaml_set_loading_callback")
+private func journalOCamlSetLoadingCallback(_ callback: LoadingCallback?)
 
 nonisolated(unsafe) private var activeRuntime: JournalRuntime?
 
@@ -66,6 +69,13 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   }
 }
 
+private let loadingStatus: LoadingCallback = { value in
+  MainActor.assumeIsolated {
+    guard let signal = JournalLoadingSignal(rawValue: value) else { return }
+    activeRuntime?.loadingSignal = signal
+  }
+}
+
 /// Owns the lui backend, the OCaml runtime, and the platform bridge for one
 /// journal session. Replaces `BonsaiApplicationView` + `BonsaiApplicationBridge`.
 @Observable @MainActor final class JournalRuntime {
@@ -73,6 +83,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   let platform: JournalApplicationPlatform
   private let startupPayload: Data
   private(set) var rootID: Int?
+  fileprivate(set) var loadingSignal: JournalLoadingSignal = .loading
   /// Count of patch batches applied from the OCaml runtime (test visibility).
   private(set) var appliedPatches = 0
   private var started = false
@@ -98,6 +109,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     guard !started else { return }
     journalOCamlSetWakeupCallback(wakeup)
     journalOCamlSetPlatformRequestCallback(platformRequest)
+    journalOCamlSetLoadingCallback(loadingStatus)
     activeRuntime = self
     #if os(macOS)
     let operatingSystem: Int32 = 1
@@ -113,6 +125,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         Int32(bytes.count))
     }
     guard accepted == 1 else {
+      journalOCamlSetLoadingCallback(nil)
       activeRuntime = nil
       return
     }
@@ -122,6 +135,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 
   func stop() {
     guard started else { return }
+    journalOCamlSetLoadingCallback(nil)
     platform.disconnect()
     _ = luiOCamlStop()
     started = false
