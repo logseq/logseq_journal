@@ -26,6 +26,7 @@ let should_show_timestamp ~today ~previous_slot = function
 let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
+      ~render_source
       ~render_media
       ~state
       ~day_presentation
@@ -68,6 +69,7 @@ let view
       | Timeline.Day_heading page -> heading page.day page.title
       | Top_level entry ->
         Journal_row.view
+          ~render_source
           ~render_media
           ~show_timestamp:(should_show_timestamp ~today ~previous_slot slot)
           entry

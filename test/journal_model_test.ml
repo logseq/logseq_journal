@@ -254,7 +254,49 @@ let test_squuid_errors_and_state_retention () =
     "maximum timestamp wrapped"
 ;;
 
+let test_reference_text () =
+  let a = id
+  and b = parent_id in
+  let link id = "[[" ^ id ^ "]]" in
+  let sources = [ a, "Target 中文\nsecond line"; b, "nested " ^ link a ] in
+  let render =
+    Journal_model.render_references ~lookup:(fun id -> List.assoc_opt id sources)
+  in
+  require
+    (render ("before " ^ link b ^ " after") = "before nested Target 中文\nsecond line after")
+    "nested UUID reference was not rendered";
+  require
+    (render (link (String.uppercase_ascii a)) = "Target 中文\nsecond line")
+    "uppercase UUID reference was not normalized";
+  let literal = "[[page]] [[not-a-uuid]] [[" ^ a ^ "x]] [[" ^ a ^ "]]" in
+  require
+    (render literal = "[[page]] [[not-a-uuid]] [[" ^ a ^ "x]] Target 中文\nsecond line")
+    "page or malformed reference changed";
+  require (render ("\\" ^ link a) = "\\" ^ link a) "escaped reference changed";
+  require (render (link mutation_id) = link mutation_id) "missing target disappeared";
+  let cycles = [ a, link b; b, link a ] in
+  require
+    (Journal_model.render_references ~lookup:(fun id -> List.assoc_opt id cycles) (link a)
+     = link a)
+    "cyclic reference did not terminate at the original token";
+  require
+    (Journal_model.render_references ~lookup:(fun _ -> Some "") (link a) = "")
+    "empty block content did not render";
+  let chain id = Some ("x" ^ link id) in
+  require
+    (String.length (Journal_model.render_references ~lookup:chain (link a)) < 100)
+    "self reference expanded without a bound";
+  let doubling = String.concat "" (List.init 400 (fun _ -> link a)) in
+  require
+    (String.length (render doubling) <= 65536)
+    "reference output exceeded text budget";
+  require
+    (Journal_model.reference_ids (link a ^ link a ^ "[[page]]" ^ "\\" ^ link b) = [ a ])
+    "reference discovery did not deduplicate UUIDs or preserve escapes"
+;;
+
 let () =
+  test_reference_text ();
   test_squuid_layout ();
   test_squuid_monotonic_transitions ();
   test_squuid_payload_carries ();

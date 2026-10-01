@@ -23,6 +23,7 @@ type failure_source =
   | Projection_failure of string
 
 type payload =
+  | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
       * Logseq_db_worker.Protocol.v2_favorites_result
@@ -136,6 +137,10 @@ type children_interest =
   }
 
 type operation =
+  | Reference_read of
+      { block_id : string
+      ; depth : int
+      }
   | List_favorites of Journal_graph_request.favorites_request
   | Graph_info
   | Admission_info of Journal_graph_request.admission_request
@@ -245,6 +250,10 @@ type t =
   ; mutable pages : (string * Projection.page) list
   ; mutable block_pages : (string * Projection.page) list
   ; tag_titles : (string, string list) Hashtbl.t
+  ; reference_sources : (string, string option) Hashtbl.t
+  ; reference_depths : (string, int) Hashtbl.t
+  ; reference_pending : (string, unit) Hashtbl.t
+  ; reference_dirty : (string, unit) Hashtbl.t
   ; projected_blocks : (string, Projection.block) Hashtbl.t
   ; page_tree_interests : (string, page_tree_interest) Hashtbl.t
   ; children_interests : (string, children_interest) Hashtbl.t
@@ -295,6 +304,10 @@ let create ?(localtime = Unix.localtime) () =
   ; pages = []
   ; block_pages = []
   ; tag_titles = Hashtbl.create 64
+  ; reference_sources = Hashtbl.create 64
+  ; reference_depths = Hashtbl.create 64
+  ; reference_pending = Hashtbl.create 64
+  ; reference_dirty = Hashtbl.create 16
   ; projected_blocks = Hashtbl.create 64
   ; page_tree_interests = Hashtbl.create 32
   ; children_interests = Hashtbl.create 32
@@ -314,6 +327,10 @@ let reset t =
   Hashtbl.clear t.graph_pages;
   t.pages <- [];
   t.block_pages <- [];
+  Hashtbl.clear t.reference_sources;
+  Hashtbl.clear t.reference_depths;
+  Hashtbl.clear t.reference_pending;
+  Hashtbl.clear t.reference_dirty;
   Hashtbl.clear t.projected_blocks;
   Hashtbl.clear t.tag_titles;
   Hashtbl.clear t.page_tree_interests;
@@ -1382,6 +1399,84 @@ let schedule_hydration t output =
   { output with requests = drain_hydration t }
 ;;
 
+(* Session bounds keep adversarial reference chains/bursts finite. Unresolved
+   tokens remain literal. Point reads use the Worker's indexed UUID lookup. *)
+let maximum_reference_targets = 4096
+let maximum_reference_sources = 8192
+
+let reference_read t block_id depth =
+  if Hashtbl.mem t.reference_pending block_id
+  then None
+  else (
+    Hashtbl.replace t.reference_pending block_id ();
+    Some
+      (read
+         t
+         (Reference_read { block_id; depth })
+         (Protocol.V2_get_block
+            { block = Graph.Uuid.of_string block_id |> Result.get_ok; revision = None })))
+;;
+
+let invalidate_reference t block_id =
+  match Hashtbl.find_opt t.reference_depths block_id with
+  | None -> None
+  | Some depth ->
+    if Hashtbl.mem t.reference_pending block_id
+    then (
+      Hashtbl.replace t.reference_dirty block_id ();
+      None)
+    else reference_read t block_id depth
+;;
+
+let observe_reference_sources t depth values =
+  let updates = ref []
+  and reads = ref [] in
+  (* Install the whole fragment before discovery, so references between members
+     of the same page do not cause duplicate point reads. *)
+  List.iter
+    (fun (id, source) ->
+       if
+         Hashtbl.mem t.reference_sources id
+         || Hashtbl.mem t.reference_depths id
+         || Hashtbl.length t.reference_sources < maximum_reference_sources
+       then
+         if Hashtbl.find_opt t.reference_sources id <> Some source
+         then (
+           Hashtbl.replace t.reference_sources id source;
+           if Hashtbl.mem t.reference_depths id then updates := (id, source) :: !updates))
+    values;
+  let rec discover depth source =
+    if depth < Journal_model.maximum_reference_depth
+    then
+      List.iter
+        (fun id ->
+           let next_depth = depth + 1 in
+           let previous = Hashtbl.find_opt t.reference_depths id in
+           if
+             match previous with
+             | Some old -> next_depth < old
+             | None -> Hashtbl.length t.reference_depths < maximum_reference_targets
+           then (
+             Hashtbl.replace t.reference_depths id next_depth;
+             match Hashtbl.find_opt t.reference_sources id with
+             | Some source ->
+               updates := (id, source) :: !updates;
+               Option.iter (discover next_depth) source
+             | None ->
+               Option.iter
+                 (fun request -> reads := request :: !reads)
+                 (reference_read t id next_depth)))
+        (Journal_model.reference_ids source)
+  in
+  List.iter (fun (_, source) -> Option.iter (discover depth) source) values;
+  { requests = List.rev !reads
+  ; responses =
+      (if !updates = []
+       then []
+       else [ response (Reference_sources_changed (List.rev !updates)) ])
+  }
+;;
+
 let hydration_for_changes t ~request_generation windows =
   let blocks, pages, structures = changed_interests windows in
   let point_reads =
@@ -1395,6 +1490,18 @@ let hydration_for_changes t ~request_generation windows =
                 (Changed_block { block_id; page })
                 (Protocol.V2_get_block { block; revision = None }))
            (page_by_block t block_id))
+      blocks
+  in
+  let reference_reads =
+    List.filter_map
+      (fun block ->
+         let id = Graph.Uuid.to_string block in
+         if Option.is_none (page_by_block t id)
+         then invalidate_reference t id
+         else (
+           if Hashtbl.mem t.reference_pending id
+           then Hashtbl.replace t.reference_dirty id ();
+           None))
       blocks
   in
   let tree_reads =
@@ -1452,7 +1559,8 @@ let hydration_for_changes t ~request_generation windows =
   in
   schedule_hydration
     t
-    { requests = point_reads @ tree_reads @ children_reads @ journal.requests
+    { requests =
+        point_reads @ reference_reads @ tree_reads @ children_reads @ journal.requests
     ; responses = journal.responses
     }
 ;;
@@ -1514,9 +1622,18 @@ let rehydrate_current_interests t ~request_generation ~generation =
              (Protocol.V2_get_children
                 { parent; limit = interest.limit; cursor = None; revision = None })))
   in
+  let reference_requests =
+    Hashtbl.to_seq_keys t.reference_depths
+    |> Seq.filter_map (invalidate_reference t)
+    |> List.of_seq
+  in
   schedule_hydration
     t
-    { requests = (graph_info :: journal.requests) @ tree_requests @ children_requests
+    { requests =
+        (graph_info :: journal.requests)
+        @ tree_requests
+        @ children_requests
+        @ reference_requests
     ; responses = journal.responses
     }
 ;;
@@ -1578,6 +1695,7 @@ let read_child_parent t command page child =
 ;;
 
 let operation_name = function
+  | Reference_read _ -> "readBlockReference"
   | List_favorites _ -> "listFavorites"
   | Graph_info -> "graphInfo"
   | Admission_info _ -> "inspectAdmission"
@@ -1692,6 +1810,15 @@ let failure_output ?(code = Error.Unsupported_semantics) t operation request_id 
           (Child_failed
              { block_id = command.block_id; failure = Worker_failure worker_failure })
       ]
+  | Reference_read { block_id; depth } ->
+    Hashtbl.remove t.reference_pending block_id;
+    if Hashtbl.mem t.reference_dirty block_id
+    then (
+      Hashtbl.remove t.reference_dirty block_id;
+      requests (Option.to_list (reference_read t block_id depth)))
+    else (
+      Hashtbl.replace t.reference_sources block_id None;
+      responses [ response (Reference_sources_changed [ block_id, None ]) ])
   | Changed_block _
   | Find_block_result
   | Changed_children _
@@ -2050,6 +2177,22 @@ let receive_response t (protocol_response : Protocol.response) =
                 in
                 { refresh with responses = completion :: refresh.responses }
               | Error message, _ | _, Error message -> reject message))
+        | (V2_present_block _ | V2_missing_block _), Reference_read { block_id; depth } ->
+          let depth =
+            Hashtbl.find_opt t.reference_depths block_id |> Option.value ~default:depth
+          in
+          Hashtbl.remove t.reference_pending block_id;
+          if Hashtbl.mem t.reference_dirty block_id
+          then (
+            Hashtbl.remove t.reference_dirty block_id;
+            requests (Option.to_list (reference_read t block_id depth)))
+          else (
+            let source =
+              match lookup with
+              | V2_present_block { value; _ } -> Some value.block.title
+              | V2_missing_block _ -> None
+            in
+            observe_reference_sources t depth [ block_id, source ])
         | V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
@@ -2339,19 +2482,68 @@ let receive_response t (protocol_response : Protocol.response) =
 let receive t (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
-  let owned = Hashtbl.mem t.pending key in
+  let operation = Hashtbl.find_opt t.pending key in
+  let owned = Option.is_some operation in
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let output = receive_response t protocol_response in
+  let references =
+    match operation, protocol_response with
+    | None, _ | Some (Reference_read _), _ -> empty
+    | Some _, Protocol.V2_response { outcome; _ } ->
+      let block (value : Protocol.v2_block_record) =
+        Graph.Uuid.to_string value.block.uuid, Some value.block.title
+      in
+      let values =
+        match outcome with
+        | V2_block_outcome (V2_present_block { value; _ }) -> [ block value ]
+        | V2_block_outcome (V2_missing_block { uuid; _ }) ->
+          [ Graph.Uuid.to_string uuid, None ]
+        | V2_children_outcome { items; _ } ->
+          List.map (fun (item : Protocol.v2_child_member) -> block item.value) items
+        | V2_page_tree_outcome { items; _ } ->
+          List.map (fun (item : Protocol.v2_tree_member) -> block item.value) items
+        | _ -> []
+      in
+      let values =
+        List.fold_left
+          (fun values response ->
+             match response.payload with
+             | Block_removed { block_id } | Subtree_deleted { block_id; _ } ->
+               (block_id, None) :: values
+             | Favorites_loaded (_, result) ->
+               List.fold_left
+                 (fun values item ->
+                    let favorite = Projection.favorite item in
+                    match favorite.target with
+                    | Page _ -> values
+                    | Block id -> (id, Some favorite.title) :: values)
+                 values
+                 result.items
+             | _ -> values)
+          values
+          output.responses
+      in
+      observe_reference_sources t 0 values
+  in
+  let output = { output with responses = output.responses @ references.responses } in
   if background
-  then schedule_hydration t output
+  then
+    schedule_hydration t { output with requests = output.requests @ references.requests }
   else if owned
-  then { output with requests = output.requests @ drain_hydration t }
+  then (
+    List.iter (fun request -> Queue.push request t.hydration_queue) references.requests;
+    { output with requests = output.requests @ drain_hydration t })
   else output
 ;;
 
 let abandon t (request : Protocol.request) =
   let key = Graph.Uuid.to_string request.request_id in
+  (match Hashtbl.find_opt t.pending key with
+   | Some (Reference_read { block_id; _ }) ->
+     Hashtbl.remove t.reference_pending block_id;
+     Hashtbl.remove t.reference_dirty block_id
+   | _ -> ());
   Hashtbl.remove t.pending key;
   Hashtbl.remove t.hydration_active key
 ;;

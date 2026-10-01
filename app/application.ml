@@ -217,6 +217,7 @@ type sync_error_notice =
 
 module Graph_drafts = Map.Make (String)
 module Media_views = Map.Make (String)
+module Reference_sources = Map.Make (String)
 
 type graph_drafts =
   { capture_draft : Journal_capture.t option
@@ -247,6 +248,7 @@ type state =
   ; asset_offline : (Journal_asset_policy.offline * Journal_asset_policy.offline) option
   ; uploads : Journal_uploads.t
   ; asset_settings_open : bool
+  ; reference_sources : string Reference_sources.t
   ; media_views : Journal_media_runtime.view Media_views.t
   ; import_completion : (string * string option) option
   ; pending_replace : string option
@@ -310,6 +312,7 @@ let initial_state =
   ; asset_offline = None
   ; uploads = Journal_uploads.empty
   ; asset_settings_open = false
+  ; reference_sources = Reference_sources.empty
   ; media_views = Media_views.empty
   ; import_completion = None
   ; pending_replace = None
@@ -399,6 +402,7 @@ let clear_graph_surface state =
   ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
+  ; reference_sources = Reference_sources.empty
   ; direct_capture = None
   ; pending_delete = None
   ; pending_status = None
@@ -818,6 +822,17 @@ let back_state state =
 
 let apply_worker_response_unstaged state (response : Journal_graph_runtime.response) =
   match response.payload with
+  | Reference_sources_changed updates ->
+    let reference_sources =
+      List.fold_left
+        (fun sources (id, source) ->
+           match source with
+           | None -> Reference_sources.remove id sources
+           | Some source -> Reference_sources.add id source sources)
+        state.reference_sources
+        updates
+    in
+    { state with reference_sources }
   | Favorites_loaded (request, result) -> favorites_event state (Loaded (request, result))
   | Favorites_failed (request, stale, message) ->
     favorites_event state (Failed (request, stale, message))
@@ -1225,6 +1240,7 @@ module Root_navigation = struct
     ; pending_delete = None
     ; pending_status = None
     ; timeline = Journal_timeline_state.empty ~today:0
+    ; reference_sources = Reference_sources.empty
     ; graph_state = { state.graph_state with generation }
     ; graph_ready = false
     ; feed_loaded = false
@@ -1652,7 +1668,13 @@ module Favorites_list = struct
   ;;
 end
 
+let render_source state =
+  Journal_model.render_references ~lookup:(fun id ->
+    Reference_sources.find_opt id state.reference_sources)
+;;
+
 let favorites_view
+      ~render_source
       ~render_media
       ~state
       ~actions_enabled
@@ -1702,7 +1724,12 @@ let favorites_view
              (fun value ->
                 let favorite = Journal_graph_projection.favorite value in
                 let key = favorite.membership_id in
-                let text = V.text favorite.title in
+                let text =
+                  V.text
+                    (match favorite.target with
+                     | Page _ -> favorite.title
+                     | Block _ -> render_source favorite.title)
+                in
                 let label =
                   if favorite.task_state = Journal_model.No_status
                   then text
@@ -1908,6 +1935,7 @@ let composer_page
 ;;
 
 let timeline_page
+      ~render_source
       ~render_media
       ~platform
       ~graph_generation
@@ -1956,6 +1984,7 @@ let timeline_page
       |> V.Body.static
     | None ->
       Journal_timeline.view
+        ~render_source
         ~render_media
         ~state:timeline_state
         ~day_presentation
@@ -1973,6 +2002,7 @@ let timeline_page
     if favorites_selected
     then
       favorites_view
+        ~render_source
         ~render_media
         ~state:favorites
         ~actions_enabled:interaction_enabled
@@ -2478,11 +2508,11 @@ let detail_page ~state ~on_scroll_completed dispatch =
         | Block { block; _ } ->
           let source =
             if Journal_model.task_state block = No_status
-            then Journal_model.source block
+            then render_source state (Journal_model.source block)
             else
               Journal_model.status_name (Journal_model.task_state block)
               ^ "  "
-              ^ Journal_model.source block
+              ^ render_source state (Journal_model.source block)
           in
           V.text ~key:(Ui.Key.string ("detail-label:" ^ Journal_model.id block)) source
           |> V.with_test_id (Ui.Test_id.string ("detail-block:" ^ Journal_model.id block))
@@ -5338,6 +5368,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       | false, Some _ -> manager_page state dispatch
       | false, None | true, _ ->
         timeline_page
+          ~render_source:(render_source state)
           ~render_media:(media_label state dispatch)
           ~platform:state.environment.platform
           ~graph_generation:state.graph_state.generation
@@ -5831,6 +5862,7 @@ module For_testing = struct
     in
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page
+      ~render_source:(render_source initial_state)
       ~render_media:(media_label initial_state handler)
       ~platform:"ios"
       ~graph_generation:1

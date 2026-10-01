@@ -18,6 +18,7 @@ type failure_source =
   | Projection_failure of string
 
 type payload =
+  | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
       * Logseq_db_worker.Protocol.v2_favorites_result

@@ -4,8 +4,8 @@ module L = Lui_elements
 
 let expanded_slot = Signal.state_slot "journal-body-expanded"
 
-let body block =
-  let source = Journal_model.source block in
+let body ~render_source block =
+  let source = render_source (Journal_model.source block) in
   let long =
     String.length source > 240 || List.length (String.split_on_char '\n' source) > 3
   in
@@ -82,15 +82,20 @@ let metadata block =
   | children -> [ V.of_lui (L.row ~gap:8 ~cross:`start children) ]
 ;;
 
-let view ~render_media ~show_timestamp (entry : Journal_graph_projection.timeline_entry) =
+let view
+      ?(render_source = Fun.id)
+      ~render_media
+      ~show_timestamp
+      (entry : Journal_graph_projection.timeline_entry)
+  =
   let block = entry.block in
   let id = Journal_model.id block in
-  let labels = [ render_media ~root:id (body block) ] in
+  let labels = [ render_media ~root:id (body ~render_source block) ] in
   let labels =
     labels
     @ List.map
         (fun (summary : Journal_graph_projection.child_summary) ->
-           render_media ~root:summary.block_id (V.text summary.source))
+           render_media ~root:summary.block_id (V.text (render_source summary.source)))
         entry.child_summaries
   in
   let labels = labels @ metadata block in
