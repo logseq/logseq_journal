@@ -28,7 +28,7 @@ The Worker now supports a pure optional merge callback under the existing mailbo
 
 - Five mailbox loss/bound regressions failed before implementation; all eight service checks pass after the fix.
 - Nine mounted UI checks cover body expansion, arrow removal, images, file metadata, unavailable-file retry, and native LUI events. Fourteen Worker/application cases include named tag propagation; protocol round trips cover new and legacy responses.
-- Full workspace build passes. Tests and native simulator build are rerun on the main-based PR branch before publication.
+- Full workspace build passes. Full runtest and native simulator compilation/linking were rerun on the main-based PR branch; simulator build passed in 201.81 seconds.
 - The combined-base simulator previously verified real graph file metadata and image rendering, full-image Quick Look, file fallback preview, and return to the timeline. Those private screenshots remain local and are excluded from Git and the PR.
 - Full runtest has an existing source_boundary_test failure: unchanged journal_timeline.ml uses V.loading while that check requires literal V.progress. No check is disabled or suppressed.
 - spec-dev-tool check --all has one existing invalid decision document, 2026-09-28-bottom-lui-capsules.md. This feature and fix decision validate.
@@ -37,3 +37,7 @@ The Worker now supports a pure optional merge callback under the existing mailbo
 ## Local verification
 
 Use the project's normal opam/dependency environment and run dune build @all, dune exec logseq_db_worker/test/test_lui_service.exe, dune exec test/journal_semantics_test.exe, dune exec test/logseq_db_worker_application_integration_test.exe, dune exec logseq_db_worker/test/test_protocol.exe, and dune runtest. Use tool/build_journal_apple.sh with the existing external LUI checkout for a simulator build. No physical-device installation or merge is part of this PR.
+
+## Draft PR checks
+
+The standalone draft PR is https://github.com/logseq/logseq_journal/pull/36. GitHub has no configured Actions workflows or build/test CI runs. Its WIP app check deliberately remains in progress with the output draft mode override because the PR is a draft. This is not a claim that remote CI passed. Local build/test results and existing failures are listed above.
