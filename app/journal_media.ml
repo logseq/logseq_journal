@@ -161,12 +161,27 @@ let external_http_url url =
       | ','
       | ';'
       | '=' -> valid_characters (index + 1)
+      | c when Char.code c >= 128 -> valid_characters (index + 1)
       | _ -> false)
   in
-  if not (valid_characters 0)
+  if not (String.is_valid_utf_8 url && valid_characters 0)
   then false
   else (
-    match Angstrom.parse_string ~consume:All Uri.Parser.uri_reference url with
+    (* Parse Unicode URL components as UTF-8 percent escapes, while retaining
+       the original string for the native host's Unicode/IDNA handling. *)
+    let encoded = Buffer.create (String.length url) in
+    String.iter
+      (fun c ->
+         if Char.code c >= 128
+         then Buffer.add_string encoded (Printf.sprintf "%%%02X" (Char.code c))
+         else Buffer.add_char encoded c)
+      url;
+    match
+      Angstrom.parse_string
+        ~consume:All
+        Uri.Parser.uri_reference
+        (Buffer.contents encoded)
+    with
     | Error _ -> false
     | Ok uri ->
       let scheme = Option.map String.lowercase_ascii (Uri.scheme uri) in

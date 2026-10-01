@@ -79,6 +79,9 @@ let test_external_urls () =
          ("external URL allowlist: " ^ url))
     [ "https://example.com/file.png", true
     ; "HTTP://example.com/file.png", true
+    ; "https://example.com/日记.png", true
+    ; "https://例子.测试/日记", true
+    ; "https://example.com/\255", false
     ; "https://[::1]:443/file", true
     ; "http://example.com:65536/file", false
     ; "hTtPs://example.com/%E6%97%A5%E8%AE%B0?q=one%20two", true
