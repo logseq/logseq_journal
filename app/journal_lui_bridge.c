@@ -110,16 +110,24 @@ LUI_EXPORT int32_t lui_ocaml_long_press(int64_t node) {
   return dispatch_long("lui_ocaml_long_press", node);
 }
 
-LUI_EXPORT int32_t lui_ocaml_text_changed(int64_t node, const char *text) {
+static int dispatch_string(const char *name, int64_t node, const char *text) {
   int result = 0;
   caml_leave_blocking_section();
-  const value *dispatch = caml_named_value("lui_ocaml_text_changed");
-  if (dispatch != NULL) {
-    result = emit_patch("lui_ocaml_text_changed", caml_callback2_exn(
-        *dispatch, Val_long(node), caml_copy_string(text)));
+  const value *dispatch = caml_named_value(name);
+  if (dispatch != NULL && text != NULL) {
+    CAMLparam0();
+    CAMLlocal2(text_value, callback_result);
+    text_value = caml_copy_string(text);
+    callback_result = caml_callback2_exn(*dispatch, Val_long(node), text_value);
+    result = emit_patch(name, callback_result);
+    CAMLdrop;
   }
   caml_enter_blocking_section();
   return result;
+}
+
+LUI_EXPORT int32_t lui_ocaml_text_changed(int64_t node, const char *text) {
+  return dispatch_string("lui_ocaml_text_changed", node, text);
 }
 
 LUI_EXPORT int32_t lui_ocaml_submit(int64_t node) {
@@ -163,7 +171,7 @@ LUI_EXPORT int32_t lui_ocaml_slider_changed(int64_t node, double fraction) {
 }
 
 LUI_EXPORT int32_t lui_ocaml_scroll_completed(int64_t node, int64_t token,
-                                               const char *outcome) {
+                                            const char *outcome) {
   int result = 0;
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_scroll_completed");
@@ -181,7 +189,7 @@ LUI_EXPORT int32_t lui_ocaml_scroll_completed(int64_t node, int64_t token,
 }
 
 LUI_EXPORT int32_t lui_ocaml_visible_range(int64_t node, int64_t first,
-                                           int64_t last) {
+                                         int64_t last) {
   int result = 0;
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_visible_range");
@@ -194,19 +202,7 @@ LUI_EXPORT int32_t lui_ocaml_visible_range(int64_t node, int64_t first,
 }
 
 LUI_EXPORT int32_t lui_ocaml_picked(int64_t node, const char *payload) {
-  int result = 0;
-  caml_leave_blocking_section();
-  const value *dispatch = caml_named_value("lui_ocaml_picked");
-  if (dispatch != NULL && payload != NULL) {
-    CAMLparam0();
-    CAMLlocal2(payload_value, callback_result);
-    payload_value = caml_copy_string(payload);
-    callback_result = caml_callback2_exn(*dispatch, Val_long(node), payload_value);
-    result = emit_patch("lui_ocaml_picked", callback_result);
-    CAMLdrop;
-  }
-  caml_enter_blocking_section();
-  return result;
+  return dispatch_string("lui_ocaml_picked", node, payload);
 }
 
 LUI_EXPORT int32_t lui_ocaml_stop(void) {
