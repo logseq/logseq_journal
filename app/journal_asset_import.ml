@@ -61,13 +61,20 @@ let request_id_of_token token =
   | _ -> None
 ;;
 
+(* Request tokens that already produced a staged pick; only those may echo
+   back as completion, or a freshly armed request is released before its
+   pick can land. *)
+let spent_requests : (string, unit) Hashtbl.t = Hashtbl.create 8
+
 (* Staged picks are journal-owned temp copies already, so the picker can
    release its retained file as soon as the first pick lands — echoing the
    request token as the completion prop does that. *)
 let staged_completion request pending =
   match pending with
   | [] -> None
-  | _ :: _ -> Some (request_token request, None)
+  | _ :: _ ->
+    let token = request_token request in
+    if Hashtbl.mem spent_requests token then Some (token, None) else None
 ;;
 
 (* A picked asset held for a later import: the pick fields plus [token], which
@@ -130,6 +137,13 @@ type picked_file =
   ; file_type : string
   }
 
+let file_extension path =
+  let ext = Filename.extension path in
+  if String.length ext > 1
+  then String.lowercase_ascii (String.sub ext 1 (String.length ext - 1))
+  else "bin"
+;;
+
 (* The lui picker reports {"request":token,"files":[{path,name,content-type}]};
    journal keeps the extension-era naming (extension of [name] for [file_type]). *)
 let decode_picked payload =
@@ -155,25 +169,13 @@ let decode_picked payload =
               { request = token_string
               ; path
               ; title = name
-              ; file_type =
-                  String.lowercase_ascii
-                    (String.sub
-                       (Filename.extension name)
-                       1
-                       (max 0 (String.length (Filename.extension name) - 1)))
+              ; file_type = file_extension name
               }
           | _ -> Error "Invalid attachment selection")
        | _ -> Error "Invalid attachment selection")
     | _ -> Error "Invalid attachment selection"
   with
   | _ -> Error "Invalid attachment selection"
-;;
-
-let file_extension path =
-  let ext = Filename.extension path in
-  if String.length ext > 1
-  then String.lowercase_ascii (String.sub ext 1 (String.length ext - 1))
-  else "bin"
 ;;
 
 (* Staged picks get an immediate journal-owned temp copy: the picker's own
@@ -186,11 +188,25 @@ let stage_copy path =
   in
   try
     let ic = open_in_bin path in
-    let length = in_channel_length ic in
-    let contents = really_input_string ic length in
-    close_in ic;
     let oc = open_out_bin dest in
-    output_string oc contents;
+    (try
+       let buffer = Bytes.create 0x10000 in
+       let rec pump () =
+         match input ic buffer 0 (Bytes.length buffer) with
+         | 0 -> ()
+         | read ->
+           output oc buffer 0 read;
+           pump ()
+       in
+       pump ()
+     with
+     | exn ->
+       close_in_noerr ic;
+       close_out_noerr oc;
+       (try Sys.remove dest with
+        | _ -> ());
+       raise exn);
+    close_in ic;
     close_out oc;
     Ok dest
   with
@@ -276,6 +292,7 @@ let decode_event payload =
             match stage_copy file.path with
             | Error message -> Error message
             | Ok source_file ->
+              Hashtbl.replace spent_requests file.request ();
               Result.map
                 (fun staged -> Picked (staged, request_id_of_token file.request))
                 (staged_of_pick file ~source_file))

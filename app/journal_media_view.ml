@@ -29,7 +29,7 @@ let is_http value =
 let is_image_type file_type =
   List.mem
     (String.lowercase_ascii file_type)
-    [ "jpg"; "jpeg"; "png"; "gif"; "webp"; "heic"; "heif"; "tiff"; "bmp" ]
+    [ "jpg"; "jpeg"; "png"; "gif"; "webp"; "heic"; "heif"; "tif"; "tiff"; "bmp"; "avif" ]
 ;;
 
 let item_value (item : Journal_media_runtime.item) =
