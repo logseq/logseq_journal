@@ -12,3 +12,5 @@ notes.txt
 
 swift-clean-build/
 *.backup
+
+relink_simulator.py
