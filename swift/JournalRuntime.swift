@@ -22,32 +22,6 @@ private func luiOCamlStart(
 ) -> Int32
 @_silgen_name("lui_ocaml_stop")
 private func luiOCamlStop() -> Int32
-@_silgen_name("lui_ocaml_appear")
-private func luiOCamlAppear(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_press")
-private func luiOCamlPress(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_long_press")
-private func luiOCamlLongPress(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_text_changed")
-private func luiOCamlTextChanged(_ node: Int64, _ text: UnsafePointer<CChar>?) -> Int32
-@_silgen_name("lui_ocaml_submit")
-private func luiOCamlSubmit(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_dismiss")
-private func luiOCamlDismiss(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_double_press")
-private func luiOCamlDoublePress(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_toggle_changed")
-private func luiOCamlToggleChanged(_ node: Int64, _ checked: Int32) -> Int32
-@_silgen_name("lui_ocaml_radio_changed")
-private func luiOCamlRadioChanged(_ node: Int64) -> Int32
-@_silgen_name("lui_ocaml_slider_changed")
-private func luiOCamlSliderChanged(_ node: Int64, _ value: Double) -> Int32
-@_silgen_name("journal_ocaml_extension_event")
-private func journalOCamlExtensionEvent(
-  _ node: Int64,
-  _ name: UnsafePointer<CChar>?,
-  _ payload: UnsafePointer<CChar>?
-) -> Int32
 @_silgen_name("journal_ocaml_pump")
 private func journalOCamlPump() -> Int32
 @_silgen_name("journal_ocaml_platform_event")
@@ -202,47 +176,6 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 
   private func handle(_ event: LUIEvent) {
     guard started else { return }
-    switch event {
-    case let .appear(node): _ = luiOCamlAppear(Int64(node))
-    case let .press(node): _ = luiOCamlPress(Int64(node))
-    case let .longPress(node): _ = luiOCamlLongPress(Int64(node))
-    case let .textChanged(node, text):
-      text.withCString { _ = luiOCamlTextChanged(Int64(node), $0) }
-    case let .submit(node): _ = luiOCamlSubmit(Int64(node))
-    case let .dismiss(node): _ = luiOCamlDismiss(Int64(node))
-    case let .doublePress(node): _ = luiOCamlDoublePress(Int64(node))
-    case let .toggleChanged(node, checked):
-      _ = luiOCamlToggleChanged(Int64(node), checked ? 1 : 0)
-    case let .change(node): _ = luiOCamlRadioChanged(Int64(node))
-    case let .valueChanged(node, value):
-      _ = luiOCamlSliderChanged(Int64(node), value)
-    case let .extension(node, _, name, values):
-      guard let payload = Self.encodeExtensionValues(values) else { return }
-      name.withCString { eventName in
-        payload.withCString { json in
-          _ = journalOCamlExtensionEvent(Int64(node), eventName, json)
-        }
-      }
-    }
-  }
-
-  /// Serializes extension event fields as the bare-scalar JSON object the
-  /// OCaml `extension_event` hook decodes into wire values.
-  private static func encodeExtensionValues(
-    _ values: [String: LUIExtensionValue]
-  ) -> String? {
-    var object: [String: Any] = [:]
-    for (name, value) in values {
-      switch value {
-      case let .string(string): object[name] = string
-      case let .bool(flag): object[name] = flag
-      case let .int(number): object[name] = number
-      case let .double(number): object[name] = number
-      }
-    }
-    guard let data = try? JSONSerialization.data(
-      withJSONObject: object, options: [.sortedKeys])
-    else { return nil }
-    return String(decoding: data, as: UTF8.self)
+    _ = JournalLUIEvents.dispatch(event)
   }
 }

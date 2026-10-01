@@ -40,6 +40,15 @@ let toggle_changed node checked =
 
 let radio_changed node = dispatch_lui (Lui_protocol.Change node)
 let slider_changed node value = dispatch_lui (Lui_protocol.ValueChanged (node, value))
+let scroll_completed node token outcome =
+  dispatch_lui (Lui_protocol.ScrollCompleted (node, token, outcome))
+;;
+
+let visible_range node first last =
+  dispatch_lui (Lui_protocol.VisibleRange (node, first, last))
+;;
+
+let picked node payload = dispatch_lui (Lui_protocol.Picked (node, payload))
 let extension_event node name payload = (hooks ()).extension_event node name payload
 let pump () = (hooks ()).pump ()
 let platform_event payload = (hooks ()).platform_event payload
@@ -61,6 +70,9 @@ let register hooks =
   Callback.register "lui_ocaml_toggle_changed" toggle_changed;
   Callback.register "lui_ocaml_radio_changed" radio_changed;
   Callback.register "lui_ocaml_slider_changed" slider_changed;
+  Callback.register "lui_ocaml_scroll_completed" scroll_completed;
+  Callback.register "lui_ocaml_visible_range" visible_range;
+  Callback.register "lui_ocaml_picked" picked;
   Callback.register "lui_ocaml_dispose" dispose;
   Callback.register "lui_ocaml_root_node" root_node;
   Callback.register "journal_ocaml_extension_event" extension_event;

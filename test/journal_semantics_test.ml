@@ -64,7 +64,35 @@ let test_timeline_media_targets () =
     "media discovery must target each displayed source, including summaries"
 ;;
 
-let tests = [ "timeline media targets", test_timeline_media_targets ]
+let test_native_lui_events () =
+  let received = ref [] in
+  Journal_bridge.register
+    { init = (fun _ _ _ -> "")
+    ; dispatch = (fun event -> received := event :: !received; "")
+    ; extension_event = (fun _ _ _ -> "")
+    ; pump = (fun () -> "")
+    ; platform_event = (fun _ -> ())
+    ; platform_response = (fun _ -> ())
+    ; platform_failure = (fun _ -> ())
+    ; dispose = (fun () -> "")
+    ; root_node = (fun () -> 0)
+    };
+  ignore (Journal_bridge.scroll_completed 7 42 "unavailable");
+  ignore (Journal_bridge.visible_range 8 0 14);
+  ignore (Journal_bridge.picked 9 {|{"token":11,"files":[{"name":"日记.md"}]}|});
+  require
+    (List.rev !received
+     = [ Lui_protocol.ScrollCompleted (7, 42, "unavailable")
+       ; Lui_protocol.VisibleRange (8, 0, 14)
+       ; Lui_protocol.Picked (9, {|{"token":11,"files":[{"name":"日记.md"}]}|})
+       ])
+    "native LUI events must preserve their node IDs and payloads"
+;;
+
+let tests =
+  [ "timeline media targets", test_timeline_media_targets
+  ; "native LUI events", test_native_lui_events
+  ]
 
 let () =
   let failed =
