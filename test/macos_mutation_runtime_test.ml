@@ -20,7 +20,12 @@ type worker =
   ; pushes : P.push Queue.t
   }
 
-let with_worker ?limits:overlay_limits ?(prepare = fun ~sw:_ ~support:_ -> ()) run =
+let with_worker
+      ?(response_budget_bytes = P.maximum_response_bytes)
+      ?limits:overlay_limits
+      ?(prepare = fun ~sw:_ ~support:_ -> ())
+      run
+  =
   Fixture.with_temp_directory "journal-mutation-regression-" (fun support ->
     ignore (Fixture.seed_mirror support);
     Eio_main.run (fun _ ->
@@ -31,7 +36,7 @@ let with_worker ?limits:overlay_limits ?(prepare = fun ~sw:_ ~support:_ -> ()) r
             ~application_support_directory:support
             ~target:(Managed_sync { base_url = "https://example.invalid" })
             ~compatibility_profile:Logseq_65_33_or_newer
-            ~response_budget_bytes:P.maximum_response_bytes
+            ~response_budget_bytes
             ~default_page_size:P.default_page_size
           |> Result.get_ok
         in
@@ -721,6 +726,123 @@ let test_reconciled_capture_status () =
       "stale graph completion survived runtime reset")
 ;;
 
+let prepare_tagged_fixture ~count ~title ~sw:_ ~support =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let path =
+    Filename.concat
+      support
+      ("logseq-db-worker/synced-graphs/"
+       ^ Graph.Uuid.to_string Fixture.graph_uuid
+       ^ "/db.sqlite")
+  in
+  let connection = Storage.open_database path |> Result.get_ok in
+  let storage = Storage.datascript_storage connection in
+  let database = Storage.restore_database connection |> Result.get_ok in
+  let session =
+    Session.create
+      ~tail:(Datascript.Storage.restore_tail_groups storage)
+      ~callbacks:(Storage.connection_callbacks connection)
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Session.close session))
+    (fun () ->
+       let open Datascript in
+       let tag = Temp_id "budget-tag" in
+       let page =
+         Lookup_ref ("block/uuid", Uuid (Graph.Uuid.to_string Fixture.page_uuid))
+       in
+       let changes =
+         Rrbvec.init count (fun n ->
+           let block = Temp_id ("budget-block-" ^ string_of_int n) in
+           [ Add
+               ( block
+               , "block/uuid"
+               , Uuid (Graph.Uuid.to_string (Fixture.mutation_uuid (10000 + n))) )
+           ; Add (block, "block/title", String "Small fixture body")
+           ; Add (block, "block/parent", Ref_to page)
+           ; Add (block, "block/page", Ref_to page)
+           ; Add (block, "block/order", String (Printf.sprintf "b%08d" n))
+           ; Add (block, "block/created-at", Int64 1704067200000L)
+           ; Add (block, "block/updated-at", Int64 1704067200000L)
+           ; Add (block, "block/tags", Ref_to tag)
+           ]
+           |> Rrbvec.of_list)
+         |> Rrbvec.concat_map Fun.id
+         |> Rrbvec.to_list
+       in
+       let staged =
+         Session.stage_transact
+           session
+           ~authoritative_before:database
+           (Add
+              (tag, "block/uuid", Uuid (Graph.Uuid.to_string (Fixture.mutation_uuid 9999)))
+            :: Add (tag, "block/name", String "budget-fixture-tag")
+            :: Add (tag, "block/title", String title)
+            :: changes)
+         |> Result.get_ok
+       in
+       Session.commit_staged session staged |> Result.get_ok)
+;;
+
+let require_response_limit label budget response =
+  require
+    (P.encoded_response_bytes response <= budget)
+    (label ^ " must fit final encoded byte budget");
+  match response with
+  | P.V2_response { outcome = V2_failed { code; _ }; _ } ->
+    require (code = "responseTooLarge") (label ^ " must return Response_too_large")
+  | _ -> failwith (label ^ " oversized response was accepted")
+;;
+
+let test_enriched_response_budget () =
+  with_worker
+    ~prepare:(prepare_tagged_fixture ~count:195 ~title:(String.make 4096 't'))
+    (fun worker ->
+       List.iteri
+         (fun n query ->
+            worker.request (command (1100 + n) query)
+            |> require_response_limit "enriched structural read" P.maximum_response_bytes)
+         [ P.V2_get_children
+             { parent = Fixture.page_uuid; limit = 200; cursor = None; revision = None }
+         ; P.V2_get_page_tree
+             { page = Fixture.page_uuid
+             ; maximum_depth = 1
+             ; limit = 200
+             ; cursor = None
+             ; revision = None
+             }
+         ])
+;;
+
+let test_encoded_utf8_budget_boundary () =
+  let title = String.concat "" (List.init 300 (fun _ -> "日\"\n")) in
+  let prepare = prepare_tagged_fixture ~count:1 ~title in
+  let request =
+    command 1110 (P.V2_get_block { block = Fixture.mutation_uuid 10000; revision = None })
+  in
+  let size = ref 0 in
+  with_worker ~prepare (fun worker ->
+    let response = worker.request request in
+    size := P.encoded_response_bytes response;
+    match response with
+    | P.V2_response { outcome = V2_block_outcome (V2_present_block { value; _ }); _ } ->
+      require
+        (value.tag_titles = [ title ])
+        "actual read must resolve the UTF-8 tag title"
+    | _ -> failwith "UTF-8 fixture read failed");
+  with_worker ~prepare ~response_budget_bytes:!size (fun worker ->
+    let response = worker.request request in
+    require
+      (P.encoded_response_bytes response = !size)
+      "exact final byte budget must succeed";
+    match response with
+    | P.V2_response { outcome = V2_block_outcome _; _ } -> ()
+    | _ -> failwith "exact final byte budget rejected");
+  with_worker ~prepare ~response_budget_bytes:(!size - 1) (fun worker ->
+    require_response_limit "UTF-8 plus escaped JSON" (!size - 1) (worker.request request))
+;;
+
 let () =
   let failures = ref [] in
   List.iter
@@ -732,7 +854,9 @@ let () =
        | exn ->
          failures := name :: !failures;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "Asset reference command without upload", test_asset_reference_command
+    [ "Enriched structural read final bytes", test_enriched_response_budget
+    ; "UTF-8 and escaping exact final budget", test_encoded_utf8_budget_boundary
+    ; "Asset reference command without upload", test_asset_reference_command
     ; "Resync clears retained windows", test_resync_clears_retained_windows
     ; "Retained window pagination", test_retained_window_pagination
     ; "M03 real worker acknowledged change cursor", test_acknowledged_cursor
