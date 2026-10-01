@@ -3605,18 +3605,23 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
               | _ -> Effect.ignore
             in
             refresh_after_worker_event))
-    | Worker.Push { payload = Asset_notice (scope, notice); _ } ->
-      Journal_asset_runtime.notice asset_runtime scope notice;
-      Journal_media_runtime.notice media_runtime scope notice;
+    | Worker.Push { payload = (Asset_notice _ | Asset_notices _) as payload; _ } ->
+      let notices = Graph_service.asset_notices payload in
+      List.iter
+        (fun (scope, notice) ->
+           Journal_asset_runtime.notice asset_runtime scope notice;
+           Journal_media_runtime.notice media_runtime scope notice)
+        notices;
       Effect.many
         [ flush_media set_state
         ; set_state (fun state ->
             { state with
               uploads =
-                Journal_uploads.notice
+                List.fold_left
+                  (fun uploads (scope, notice) ->
+                     Journal_uploads.notice uploads scope notice)
                   (Journal_uploads.sync state.uploads (upload_context state))
-                  scope
-                  notice
+                  notices
             })
         ]
     | Worker.Response { request_id; outcome = Completed (Asset_imported result); _ } ->
