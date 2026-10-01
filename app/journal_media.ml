@@ -119,9 +119,77 @@ let demand selected =
     }
 ;;
 
+let external_http_url url =
+  (* Uri.of_string intentionally parses only a prefix. Attachments must be
+     complete HTTP(S) URLs before handing them to the native Link. *)
+  let hex = function
+    | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
+    | _ -> false
+  in
+  let rec valid_characters index =
+    if index = String.length url
+    then true
+    else (
+      match url.[index] with
+      | '%' ->
+        index + 2 < String.length url
+        && hex url.[index + 1]
+        && hex url.[index + 2]
+        && valid_characters (index + 3)
+      | 'a' .. 'z'
+      | 'A' .. 'Z'
+      | '0' .. '9'
+      | '-'
+      | '.'
+      | '_'
+      | '~'
+      | ':'
+      | '/'
+      | '?'
+      | '#'
+      | '['
+      | ']'
+      | '@'
+      | '!'
+      | '$'
+      | '&'
+      | '\''
+      | '('
+      | ')'
+      | '*'
+      | '+'
+      | ','
+      | ';'
+      | '=' -> valid_characters (index + 1)
+      | _ -> false)
+  in
+  if not (valid_characters 0)
+  then false
+  else (
+    match Angstrom.parse_string ~consume:All Uri.Parser.uri_reference url with
+    | Error _ -> false
+    | Ok uri ->
+      let scheme = Option.map String.lowercase_ascii (Uri.scheme uri) in
+      (scheme = Some "http" || scheme = Some "https")
+      && (match Uri.host uri with
+          | Some host ->
+            host <> ""
+            && not (String.exists (fun c -> Char.code c <= 32 || Char.code c = 127) host)
+          | None -> false)
+      && (let path = Uri.path uri in
+          path = "" || String.starts_with ~prefix:"/" path)
+      &&
+        (match Uri.port uri with
+        | None -> true
+        | Some port -> port >= 0 && port <= 65535))
+;;
+
 let initial_status asset =
   match asset.Asset.source with
-  | External url -> External url
+  | External url ->
+    if external_http_url url
+    then External url
+    else Placeholder "External attachment is unavailable"
   | Managed None -> Placeholder "Waiting for upload"
   | Managed (Some _) -> Placeholder "Waiting for file"
 ;;
