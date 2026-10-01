@@ -83,7 +83,7 @@ let set_calendar runtime =
   Runtime.set_calendar runtime calendar
 ;;
 
-let seed_visible_block runtime =
+let seed_visible_block ?(record = record) runtime =
   set_calendar runtime;
   let journals =
     Runtime.submit
@@ -839,11 +839,98 @@ let test_named_tags_reach_timeline_row () =
             ops))
 ;;
 
+let test_point_read_tag_metadata () =
+  List.iter
+    (fun titles ->
+       let runtime = Runtime.create ~localtime:Unix.gmtime () in
+       let tagged =
+         { record with
+           block = { block with tags = [ page_uuid ] }
+         ; tag_titles = [ "before" ]
+         }
+       in
+       ignore (seed_visible_block ~record:tagged runtime);
+       let pull =
+         Runtime.reconcile_push
+           runtime
+           ~request_generation:11L
+           (Protocol.V2_changes_available
+              { api_version = 2; generation = "generation-1"; through = "revision-2" })
+         |> fun output -> only "change request" output.requests
+       in
+       let hydrated =
+         Runtime.receive
+           runtime
+           (respond
+              pull
+              (V2_changes
+                 { generation = "generation-1"
+                 ; from_exclusive = None
+                 ; through = "revision-2"
+                 ; windows =
+                     [ { id = "change-1"
+                       ; predecessor = "revision-1"
+                       ; successor = "revision-2"
+                       ; block_uuids = [ block_uuid ]
+                       ; page_uuids = []
+                       ; structure_interests = []
+                       }
+                     ]
+                 ; next = None
+                 }))
+       in
+       let point =
+         List.find
+           (fun (request : Protocol.request) ->
+              match request.command with
+              | V2_get_block _ -> true
+              | _ -> false)
+           hydrated.requests
+       in
+       let updated =
+         { tagged with
+           block =
+             { block with
+               title = "Remote edit"
+             ; tags = (if titles = [] then [] else [ page_uuid ])
+             }
+         ; tag_titles = titles
+         }
+       in
+       let output =
+         Runtime.receive
+           runtime
+           (respond
+              point
+              (V2_block_outcome
+                 (V2_present_block { value = updated; revision = "block-2" })))
+       in
+       let projected =
+         List.find_map
+           (fun (response : Runtime.response) ->
+              match response.payload with
+              | Block_updated { block; _ } -> Some block
+              | _ -> None)
+           output.responses
+         |> Option.get
+       in
+       Alcotest.(check (list string))
+         "point read replaces tag metadata"
+         titles
+         (Journal_model.tag_titles projected);
+       Alcotest.(check string)
+         "updated body"
+         "Remote edit"
+         (Journal_model.source projected))
+    [ [ "before" ]; [ "after"; "中文" ]; [] ]
+;;
+
 let () =
   Alcotest.run
     "Worker application integration"
     [ ( "v2 boundary"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "point read tag metadata" `Quick test_point_read_tag_metadata
+        ; Alcotest.test_case
             "named tags reach timeline row"
             `Quick
             test_named_tags_reach_timeline_row
