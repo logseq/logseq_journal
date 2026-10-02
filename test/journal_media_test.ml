@@ -60,7 +60,49 @@ let releases effects =
     effects
 ;;
 
+let test_external_urls () =
+  List.iter
+    (fun (url, allowed) ->
+       let asset =
+         A.create
+           ~uuid:(uuid 3)
+           ~source:(External url)
+           ~current_checksum:None
+           ~size:None
+           ~dimensions:None
+         |> Result.get_ok
+       in
+       let state, effects = P.step P.empty (show asset) in
+       check (effects = []) "external URLs never create managed demands";
+       check
+         (P.presentation state = External url = allowed)
+         ("external URL allowlist: " ^ url))
+    [ "https://example.com/file.png", true
+    ; "HTTP://example.com/file.png", true
+    ; "https://example.com/日记.png", true
+    ; "https://例子.测试/日记", true
+    ; "https://example.com/\255", false
+    ; "https://[::1]:443/file", true
+    ; "http://example.com:65536/file", false
+    ; "hTtPs://example.com/%E6%97%A5%E8%AE%B0?q=one%20two", true
+    ; "logseq://fixture", false
+    ; "file:///tmp/fixture", false
+    ; "javascript:alert(1)", false
+    ; "data:text/plain,fixture", false
+    ; "//example.com/file", false
+    ; "https://", false
+    ; "https:/example.com/file", false
+    ; "https://exa mple.com/file", false
+    ; "https://example.com/line\nnext", false
+    ; "https://[broken/file", false
+    ; "https://example.com:bad/file", false
+    ; "https://example.com/%ZZ", false
+    ; "", false
+    ]
+;;
+
 let () =
+  test_external_urls ();
   let state, effects = P.step P.empty (show (asset 'a')) in
   check
     (List.exists

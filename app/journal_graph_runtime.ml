@@ -1958,6 +1958,13 @@ let receive_response t (protocol_response : Protocol.response) =
             ]
         | _ -> failure_output t operation request_id "Unexpected page response.")
      | V2_block_outcome lookup ->
+       (match lookup with
+        | V2_present_block { value; _ } ->
+          Hashtbl.replace
+            t.tag_titles
+            (Graph.Uuid.to_string value.block.uuid)
+            value.tag_titles
+        | V2_missing_block _ -> ());
        (match lookup, operation with
         | ( V2_present_block { value; revision }
           , Detail_block { generation; limit; after; _ } ) ->
@@ -2057,7 +2064,11 @@ let receive_response t (protocol_response : Protocol.response) =
              (match
                 Projection.block ~page ~revision ~child_count:0 ~time_context value.block
               with
-              | Ok block -> responses [ response (Block_found (Some block)) ]
+              | Ok block ->
+                let block =
+                  Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
+                in
+                responses [ response (Block_found (Some block)) ]
               | Error message -> reject message)
            | None, _ -> responses [ response (Block_found None) ]
            | _, Error message -> reject message)
@@ -2078,6 +2089,9 @@ let receive_response t (protocol_response : Protocol.response) =
               with
               | Error message -> reject message
               | Ok block ->
+                let block =
+                  Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
+                in
                 remember_block_page t page block_id;
                 Hashtbl.replace t.projected_blocks block_id block;
                 responses

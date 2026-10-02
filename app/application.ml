@@ -233,6 +233,7 @@ type capture_import_batch =
 
 type state =
   { favorites : Journal_routes.Favorites.t
+  ; favorites_media_roots : string Rrbvec.t
   ; favorites_requests : Journal_graph_request.favorites_request list
   ; routes : Journal_routes.t
   ; timeline : Journal_timeline_state.t
@@ -279,7 +280,24 @@ type state =
 
 let favorites_event state event =
   let favorites, requests = Journal_routes.Favorites.step state.favorites event in
-  { state with favorites; favorites_requests = state.favorites_requests @ requests }
+  let favorites_media_roots =
+    if
+      Journal_routes.Favorites.revision favorites
+      = Journal_routes.Favorites.revision state.favorites
+    then state.favorites_media_roots
+    else
+      Journal_routes.Favorites.items favorites
+      |> List.map (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+        match item.target with
+        | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+          Logseq_db_types.Graph_types.Uuid.to_string uuid)
+      |> Rrbvec.of_list
+  in
+  { state with
+    favorites
+  ; favorites_media_roots
+  ; favorites_requests = state.favorites_requests @ requests
+  }
 ;;
 
 let select_destination state destination =
@@ -296,6 +314,7 @@ let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5.
 
 let initial_state =
   { favorites = Journal_routes.Favorites.create ~graph_generation:(-1)
+  ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
@@ -395,6 +414,7 @@ let clear_graph_surface state =
   { state with
     favorites =
       Journal_routes.Favorites.create ~graph_generation:state.graph_state.generation
+  ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
   ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
@@ -1224,6 +1244,7 @@ module Root_navigation = struct
     let state = switch_draft_graph state graph_id in
     { state with
       favorites = Journal_routes.Favorites.create ~graph_generation:generation
+    ; favorites_media_roots = Rrbvec.empty
     ; favorites_requests = []
     ; pending_delete = None
     ; pending_status = None
@@ -3431,6 +3452,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                   favorites =
                     Journal_routes.Favorites.create
                       ~graph_generation:graph_state.generation
+                ; favorites_media_roots = Rrbvec.empty
                 ; favorites_requests = []
                 ; graph_ready = false
                 ; feed_loaded = false
@@ -4515,13 +4537,20 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       update (fun state -> favorites_event state Retry)
     | Ui.Event.Payload.Int64_pair { first = first_index; second = last_exclusive }
       when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
+      let total = Rrbvec.length snapshot.favorites_media_roots in
+      let bounded value =
+        Int64.to_int (Int64.min (Int64.of_int total) (Int64.max 0L value))
+      in
+      let first_index = bounded first_index in
+      let last_exclusive = max first_index (bounded last_exclusive) in
+      let roots =
+        Rrbvec.subvec snapshot.favorites_media_roots first_index last_exclusive
+        |> Option.get
+        |> Rrbvec.to_list
+      in
+      Journal_media_runtime.retain_visible_roots media_runtime roots;
       update (fun state ->
-        favorites_event
-          state
-          (Visible
-             { first_index = Int64.to_int first_index
-             ; last_exclusive = Int64.to_int last_exclusive
-             }))
+        favorites_event state (Visible { first_index; last_exclusive }))
     | Ui.Event.Payload.Visible_range _
       when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
       Effect.ignore
