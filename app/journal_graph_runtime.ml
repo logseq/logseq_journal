@@ -234,8 +234,13 @@ type operation =
       }
   | Delete_mutation of Projection.delete_subtree
 
+type pending_operation =
+  { operation : operation
+  ; source_epoch : int64
+  }
+
 type t =
-  { pending : (string, operation) Hashtbl.t
+  { pending : (string, pending_operation) Hashtbl.t
   ; hydration_queue : Protocol.request Queue.t
   ; hydration_active : (string, unit) Hashtbl.t
   ; mutable next_request : int64
@@ -250,7 +255,7 @@ type t =
   ; mutable pages : (string * Projection.page) list
   ; mutable block_pages : (string * Projection.page) list
   ; tag_titles : (string, string list) Hashtbl.t
-  ; reference_sources : (string, string option) Hashtbl.t
+  ; reference_sources : (string, int64 * string option) Hashtbl.t
   ; reference_depths : (string, int) Hashtbl.t
   ; reference_pending : (string, unit) Hashtbl.t
   ; reference_dirty : (string, unit) Hashtbl.t
@@ -365,8 +370,9 @@ let request_uuid t =
 let uuid value = Graph.Uuid.of_string value
 
 let make_request t operation command =
+  let source_epoch = t.next_request in
   let request_id = request_uuid t in
-  Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) operation;
+  Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) { operation; source_epoch };
   Protocol.{ api_version; request_id; command }
 ;;
 
@@ -1417,7 +1423,17 @@ let reference_read t block_id depth =
             { block = Graph.Uuid.of_string block_id |> Result.get_ok; revision = None })))
 ;;
 
+let fence_reference t block_id =
+  match Hashtbl.find_opt t.reference_sources block_id with
+  | Some (_, source) ->
+    Hashtbl.replace t.reference_sources block_id (t.next_request, source)
+  | None when Hashtbl.mem t.reference_depths block_id ->
+    Hashtbl.replace t.reference_sources block_id (t.next_request, None)
+  | None -> ()
+;;
+
 let invalidate_reference t block_id =
+  fence_reference t block_id;
   match Hashtbl.find_opt t.reference_depths block_id with
   | None -> None
   | Some depth ->
@@ -1428,23 +1444,30 @@ let invalidate_reference t block_id =
     else reference_read t block_id depth
 ;;
 
-let observe_reference_sources t depth values =
+let observe_reference_sources t ~source_epoch depth values =
   let updates = ref []
   and reads = ref [] in
-  (* Install the whole fragment before discovery, so references between members
-     of the same page do not cause duplicate point reads. *)
-  List.iter
-    (fun (id, source) ->
-       if
-         Hashtbl.mem t.reference_sources id
-         || Hashtbl.mem t.reference_depths id
-         || Hashtbl.length t.reference_sources < maximum_reference_sources
-       then
-         if Hashtbl.find_opt t.reference_sources id <> Some source
+  (* Install the whole fragment before discovery. Epochs belong to request
+     issuance, not completion order; revision strings are opaque. Advance the
+     fence even when the title did not change. *)
+  let values =
+    List.filter
+      (fun (id, source) ->
+         let previous = Hashtbl.find_opt t.reference_sources id in
+         if
+           match previous with
+           | Some (epoch, _) -> Int64.compare source_epoch epoch >= 0
+           | None ->
+             Hashtbl.mem t.reference_depths id
+             || Hashtbl.length t.reference_sources < maximum_reference_sources
          then (
-           Hashtbl.replace t.reference_sources id source;
-           if Hashtbl.mem t.reference_depths id then updates := (id, source) :: !updates))
-    values;
+           Hashtbl.replace t.reference_sources id (source_epoch, source);
+           if Option.map snd previous <> Some source && Hashtbl.mem t.reference_depths id
+           then updates := (id, source) :: !updates;
+           true)
+         else false)
+      values
+  in
   let rec discover depth source =
     if depth < Journal_model.maximum_reference_depth
     then
@@ -1459,7 +1482,7 @@ let observe_reference_sources t depth values =
            then (
              Hashtbl.replace t.reference_depths id next_depth;
              match Hashtbl.find_opt t.reference_sources id with
-             | Some source ->
+             | Some (_, source) ->
                updates := (id, source) :: !updates;
                Option.iter (discover next_depth) source
              | None ->
@@ -1479,6 +1502,8 @@ let observe_reference_sources t depth values =
 
 let hydration_for_changes t ~request_generation windows =
   let blocks, pages, structures = changed_interests windows in
+  (* Fence old fragments before issuing the shared or dedicated point reads. *)
+  List.iter (fun block -> fence_reference t (Graph.Uuid.to_string block)) blocks;
   let point_reads =
     List.filter_map
       (fun block ->
@@ -1738,7 +1763,14 @@ let worker_error code request_id message =
   |> fun error -> request_id, error
 ;;
 
-let failure_output ?(code = Error.Unsupported_semantics) t operation request_id message =
+let failure_output
+      ~source_epoch
+      ?(code = Error.Unsupported_semantics)
+      t
+      operation
+      request_id
+      message
+  =
   let request_id, error = worker_error code request_id message in
   let worker_failure = { operation = operation_name operation; request_id; error } in
   match operation with
@@ -1816,10 +1848,17 @@ let failure_output ?(code = Error.Unsupported_semantics) t operation request_id 
     then (
       Hashtbl.remove t.reference_dirty block_id;
       requests (Option.to_list (reference_read t block_id depth)))
-    else (
-      Hashtbl.replace t.reference_sources block_id None;
-      responses [ response (Reference_sources_changed [ block_id, None ]) ])
-  | Changed_block _
+    else observe_reference_sources t ~source_epoch depth [ block_id, None ]
+  | Changed_block { block_id; _ } ->
+    let invalidation =
+      if Hashtbl.mem t.reference_depths block_id
+      then observe_reference_sources t ~source_epoch 0 [ block_id, None ]
+      else empty
+    in
+    { invalidation with
+      responses =
+        response (Rejected (Worker_failure worker_failure)) :: invalidation.responses
+    }
   | Find_block_result
   | Changed_children _
   | Capture_page _
@@ -1938,7 +1977,8 @@ let receive_response t (protocol_response : Protocol.response) =
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
-  | Some operation ->
+  | Some { operation; source_epoch } ->
+    let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
     (match outcome with
      | Protocol.V2_assets_outcome _ ->
@@ -2199,7 +2239,7 @@ let receive_response t (protocol_response : Protocol.response) =
               | V2_present_block { value; _ } -> Some value.block.title
               | V2_missing_block _ -> None
             in
-            observe_reference_sources t depth [ block_id, source ])
+            observe_reference_sources t ~source_epoch depth [ block_id, source ])
         | V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
@@ -2496,15 +2536,15 @@ let receive_response t (protocol_response : Protocol.response) =
 let receive t (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
-  let operation = Hashtbl.find_opt t.pending key in
-  let owned = Option.is_some operation in
+  let pending = Hashtbl.find_opt t.pending key in
+  let owned = Option.is_some pending in
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let output = receive_response t protocol_response in
   let references =
-    match operation, protocol_response with
-    | None, _ | Some (Reference_read _), _ -> empty
-    | Some _, Protocol.V2_response { outcome; _ } ->
+    match pending, protocol_response with
+    | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
+    | Some { source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
       let block (value : Protocol.v2_block_record) =
         Graph.Uuid.to_string value.block.uuid, Some value.block.title
       in
@@ -2538,7 +2578,7 @@ let receive t (protocol_response : Protocol.response) =
           values
           output.responses
       in
-      observe_reference_sources t 0 values
+      observe_reference_sources t ~source_epoch 0 values
   in
   let output = { output with responses = output.responses @ references.responses } in
   if background
@@ -2551,10 +2591,24 @@ let receive t (protocol_response : Protocol.response) =
   else output
 ;;
 
+(* Route accepted Worker terminal failures through the same owner as protocol
+   failures. This removes pending/active markers and drains queued hydration;
+   a later completion for the request is then unowned and ignored. *)
+let fail_request t (request : Protocol.request) ~message =
+  receive
+    t
+    (Protocol.V2_response
+       { api_version = Protocol.api_version
+       ; request_id = request.request_id
+       ; outcome =
+           Protocol.V2_failed { code = Error.code_string Error.Closed_session; message }
+       })
+;;
+
 let abandon t (request : Protocol.request) =
   let key = Graph.Uuid.to_string request.request_id in
   (match Hashtbl.find_opt t.pending key with
-   | Some (Reference_read { block_id; _ }) ->
+   | Some { operation = Reference_read { block_id; _ }; _ } ->
      Hashtbl.remove t.reference_pending block_id;
      Hashtbl.remove t.reference_dirty block_id
    | _ -> ());

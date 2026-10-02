@@ -3310,12 +3310,15 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
   let fail_graph_transport state message =
     terminal_graph_state state (Transport_graph_error message)
   in
+  let graph_worker_requests = Hashtbl.create 16 in
   let deliver_output output =
     Journal_graph_transport.deliver
       ~runtime:graph_runtime
       ~send:(fun request ->
         match Worker.send client (Graph_service.Graph_request request) with
-        | Accepted _ -> Journal_graph_transport.Accepted
+        | Accepted worker_id ->
+          Hashtbl.replace graph_worker_requests worker_id request;
+          Journal_graph_transport.Accepted
         | Full -> Full
         | Not_ready -> Not_ready
         | Stopping -> Stopping)
@@ -3451,6 +3454,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
         else (
           started_graph_generation := Some (graph_key, graph_state.generation);
           Journal_graph_runtime.reset graph_runtime;
+          Hashtbl.clear graph_worker_requests;
           Hashtbl.clear favorites_worker_requests;
           let current = !state_ref in
           refresh_assets ~graph_generation:graph_state.generation current.calendar;
@@ -3532,6 +3536,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     if Option.is_some manager.local_deletion
     then (
       Journal_graph_runtime.reset graph_runtime;
+      Hashtbl.clear graph_worker_requests;
       Hashtbl.clear favorites_worker_requests;
       Hashtbl.clear admission_worker_requests;
       started_graph_generation := None);
@@ -3654,6 +3659,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
         ; outcome = Worker.Completed (Graph_service.Graph_response response)
         ; _
         } ->
+      Hashtbl.remove graph_worker_requests request_id;
       Hashtbl.remove admission_worker_requests request_id;
       Hashtbl.remove favorites_worker_requests request_id;
       let output = Journal_graph_runtime.receive graph_runtime response in
@@ -3841,6 +3847,29 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           state.admission_refresh
           ~request
           ~result:Inspection_unavailable)
+    | Worker.Response
+        { request_id; outcome = (Failed _ | Cancelled | Shutdown) as outcome; _ }
+      when Hashtbl.mem graph_worker_requests request_id ->
+      let request = Hashtbl.find graph_worker_requests request_id in
+      Hashtbl.remove graph_worker_requests request_id;
+      let message =
+        match outcome with
+        | Failed message -> message
+        | Cancelled -> "Worker request cancelled"
+        | Shutdown -> "Worker request interrupted by shutdown"
+        | Completed _ -> assert false
+      in
+      let output = Journal_graph_runtime.fail_request graph_runtime request ~message in
+      Effect.bind
+        (Effect.of_thunk (fun () -> deliver_output output))
+        ~f:(fun delivery ->
+          set_state (fun state ->
+            let state = List.fold_left apply_worker_response state delivery.responses in
+            match delivery.error with
+            | None -> state
+            | Some message when Option.is_some state.feed_refresh ->
+              fail_feed_transport state message
+            | Some message -> fail_graph_transport state message))
     | Worker.Response { outcome = Failed error; _ } ->
       set_state (fun state ->
         let worker_error = service_error ~operation:"handleRequest" error in
@@ -5759,7 +5788,11 @@ let decode_config payload =
   | Error error -> Error (Journal_startup.Error.to_string error)
 ;;
 
-let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~service ()
+let create
+      ?on_client
+      ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ())
+      ~service
+      ()
   : Journal_bridge.hooks
   =
   let init platform_code host_code payload =
@@ -5783,7 +5816,8 @@ let create ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ()) ~s
                   ~calendar_sampler:(calendar_sampler ())
                   ~client
                   ~platform_code
-                  ~host_code)
+                  ~host_code);
+             Option.iter (fun observe -> observe client) on_client
            with
            | exn ->
              (* The C bridge drops exceptions during the initial patch emit,
@@ -5971,9 +6005,9 @@ module For_testing = struct
     V.Navigation_stack.create ~title:"" ~on_path_change:handler ~path:[] page
   ;;
 
-  let app_with_service ?calendar_sampler service =
+  let app_with_service ?on_client ?calendar_sampler service =
     let calendar_sampler = Option.map (fun sampler () -> sampler) calendar_sampler in
-    create ?calendar_sampler ~service ()
+    create ?on_client ?calendar_sampler ~service ()
   ;;
 end
 

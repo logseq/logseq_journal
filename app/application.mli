@@ -70,7 +70,13 @@ module For_testing : sig
     -> ('a, string) result
 
   val app_with_service
-    :  ?calendar_sampler:Journal_calendar.Sampler.t
+    :  ?on_client:
+         (( Logseq_db_worker_lui.Logseq_db_worker_lui_service.request
+            , Logseq_db_worker_lui.Logseq_db_worker_lui_service.response
+            , Logseq_db_worker_lui.Logseq_db_worker_lui_service.push )
+            Logseq_db_worker_lui.Journal_worker.client
+          -> unit)
+    -> ?calendar_sampler:Journal_calendar.Sampler.t
     -> ( Logseq_db_worker.Config.t
          , Logseq_db_worker_lui.Logseq_db_worker_lui_service.request
          , Logseq_db_worker_lui.Logseq_db_worker_lui_service.response
