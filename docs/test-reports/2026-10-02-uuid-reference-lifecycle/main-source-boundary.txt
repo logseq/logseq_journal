@@ -1,1 +1,0 @@
-required text "V.progress" is missing from app/journal_timeline.ml
