@@ -44,6 +44,12 @@ Final `dune runtest` exits 1 solely because of the same main-baseline `V.progres
 
 Evidence files in this directory preserve the pre-fix runtime/application failures, final passing checks, full-suite rerun and clean-main source-boundary control. Additional first-run diagnostics and all build logs remain in the parent task directory.
 
+- [Runtime RED](red-runtime.txt), [application RED](red-application.txt)
+- [Runtime GREEN](green-runtime.txt), [application GREEN before teardown-only correction](green-application.txt)
+- [Final full-suite rerun, including final application teardown](full-runtest-final.txt)
+- [Clean-main source-boundary control](main-source-boundary.txt)
+
+
 ## Build environment and remaining limits
 
 LUI was freshly resolved from its existing main-tracked repository: checkout and origin/main both `17ca74628e4f6577b7bef3c765d9ba003842eaa8`. It was built and installed into this task's isolated `lifecycle-prefix`, leaving the shared opam switch and other task dependency trees unchanged. Datascript uses this task's existing copied dependency prefix. No package declaration or lockfile changed; no temporary PR SHA was pinned.
