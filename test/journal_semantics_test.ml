@@ -188,6 +188,67 @@ let has_text ops expected =
     ops
 ;;
 
+(* Loading layout is owned by the mounted shared component, not a reducer.
+   Check its public wire output alongside the source-boundary contract. *)
+let test_loading_keeps_indicator_and_message () =
+  let cases =
+    [ Journal_timeline.loading_view (), "Loading journal", Lui_protocol.Column, true
+    ; ( V.loading ~message:"Loading more journal entries" ()
+      , "Loading more journal entries"
+      , Lui_protocol.Row
+      , false )
+    ]
+  in
+  List.iter
+    (fun (view, message, container_kind, centered) ->
+       with_mounted view (fun _ ops ->
+         let ops = ops () in
+         let node kind =
+           List.find_map
+             (function
+               | Lui_protocol.CreateNode (node, actual) when actual = kind -> Some node
+               | _ -> None)
+             ops
+           |> Option.get
+         in
+         let container = node container_kind in
+         let spinner = node Lui_protocol.Spinner in
+         let text =
+           List.find_map
+             (function
+               | Lui_protocol.SetProp (node, TextValue, StringValue value)
+                 when value = message -> Some node
+               | _ -> None)
+             ops
+           |> Option.get
+         in
+         List.iter
+           (fun child ->
+              require
+                (List.exists
+                   (function
+                     | Lui_protocol.InsertChild (parent, actual, _) ->
+                       parent = container && actual = child
+                     | _ -> false)
+                   ops)
+                "loading indicator and message must share their layout")
+           [ spinner; text ];
+         if centered
+         then
+           List.iter
+             (fun property ->
+                require
+                  (List.exists
+                     (function
+                       | Lui_protocol.SetProp (node, key, StringValue "center") ->
+                         node = container && key = property
+                       | _ -> false)
+                     ops)
+                  "initial journal loading must stay centered")
+             [ Lui_protocol.MainAlignment; CrossAlignment ]))
+    cases
+;;
+
 let test_timeline_has_no_chevron () =
   let handler = Ui.Event.Handler.create (fun _ -> ()) in
   let row : Journal_native_collection.row =
@@ -426,6 +487,7 @@ let test_reference_body_and_summary () =
 
 let tests =
   [ "scoped theme wire properties", test_scoped_theme_wire_properties
+  ; "loading indicator and message", test_loading_keeps_indicator_and_message
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron

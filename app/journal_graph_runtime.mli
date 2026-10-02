@@ -110,6 +110,7 @@ val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
 val submit : t -> Journal_graph_request.t -> output
 val receive : t -> Logseq_db_worker.Protocol.response -> output
+val fail_request : t -> Logseq_db_worker.Protocol.request -> message:string -> output
 val abandon : t -> Logseq_db_worker.Protocol.request -> unit
 
 val reconcile_push

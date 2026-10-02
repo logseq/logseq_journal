@@ -1336,7 +1336,7 @@ let () =
   require_text
     root
     "app/journal_timeline.ml"
-    [ "Journal_native_collection.view"; "Timeline.fold_slots"; "V.progress" ];
+    [ "Journal_native_collection.view"; "Timeline.fold_slots"; "V.loading" ];
   forbid_text
     root
     "app/journal_timeline.ml"
