@@ -59,9 +59,10 @@ let view ~scope ~root ~media ~editable ~on_event child =
           ~key:item.token
           ~path
           ~max_pixel_size:1024
-          ?width:(if gallery then Some 216 else None)
-          ~height:(if gallery then 151 else 190)
-          ~corner_radius:12
+          ~width:(if gallery then 190 else 102)
+          ~height:(if gallery then 90 else 102)
+          ~fit:`fill
+          ~corner_radius:10
           ~accessibility_identifier:id
           ~on_appear:visible
           ~on_press:(fun _ -> preview_file path)
@@ -144,12 +145,23 @@ let view ~scope ~root ~media ~editable ~on_event child =
     let gallery =
       match images with
       | [] -> []
-      | [ item ] -> [ render_item ~gallery:false item ]
+      | [ _ ] -> []
       | items ->
         [ L.scroll
             ~orientation:`horizontal
             [ L.row ~gap:8 (List.map (render_item ~gallery:true) items) ]
         ]
+    in
+    let body =
+      match images with
+      | [ item ] ->
+        L.row
+          ~gap:15
+          ~cross:`start
+          [ L.column ~grow:1. ~cross:`start [ Ui.mount child ]
+          ; L.column ~width:102 ~cross:`start [ render_item ~gallery:false item ]
+          ]
+      | [] | _ :: _ :: _ -> Ui.mount child
     in
     let file_rows = List.map (render_item ~gallery:false) files in
     let actions =
@@ -211,7 +223,7 @@ let view ~scope ~root ~media ~editable ~on_event child =
       ~gap:12
       ~cross:`start
       ~on_appear:(fun _ -> emit "root")
-      ([ Ui.mount child ]
+      ([ body ]
        @ gallery
        @ file_rows
        @ actions

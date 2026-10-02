@@ -367,6 +367,62 @@ let media_view items =
     (V.text "Example body")
 ;;
 
+let test_single_image_beside_body () =
+  with_mounted
+    (media_view [ media_item 1 "jpg" (File "/tmp/portrait.jpg") None ])
+    (fun _ ops ->
+       let operations = ops () in
+       let image =
+         List.find_map
+           (function
+             | Lui_protocol.CreateNode (node, FileImage) -> Some node
+             | _ -> None)
+           operations
+         |> Option.get
+       in
+       let value property =
+         List.find_map
+           (function
+             | Lui_protocol.SetProp (node, p, value) when node = image && p = property ->
+               Some value
+             | _ -> None)
+           operations
+       in
+       require
+         (value Lui_protocol.WidthValue = Some (Lui_protocol.IntValue 102))
+         "single image must be a compact right-hand thumbnail";
+       require
+         (value Lui_protocol.HeightValue = Some (Lui_protocol.IntValue 102))
+         "single thumbnail must have a square frame";
+       let parent =
+         List.find_map
+           (function
+             | Lui_protocol.InsertChild (parent, child, _) when child = image ->
+               Some parent
+             | _ -> None)
+           operations
+         |> Option.get
+       in
+       let row =
+         List.find_map
+           (function
+             | Lui_protocol.InsertChild (row, child, _) when child = parent -> Some row
+             | _ -> None)
+           operations
+         |> Option.get
+       in
+       require
+         (List.exists
+            (function
+              | Lui_protocol.CreateNode (node, Row) -> node = row
+              | _ -> false)
+            operations)
+         "single image and text must share a horizontal row";
+       require
+         (value Lui_protocol.ImageFitValue = Some (Lui_protocol.StringValue "fill"))
+         "thumbnail must use proportional crop")
+;;
+
 let test_images_use_lui_gallery_and_preview () =
   let view =
     media_view
@@ -382,6 +438,23 @@ let test_images_use_lui_gallery_and_preview () =
           | _ -> None)
         (ops ())
     in
+    List.iter
+      (fun image ->
+         require
+           (List.exists
+              (function
+                | Lui_protocol.SetProp (node, WidthValue, IntValue 190) -> node = image
+                | _ -> false)
+              (ops ()))
+           "gallery tiles must be 190pt wide";
+         require
+           (List.exists
+              (function
+                | Lui_protocol.SetProp (node, HeightValue, IntValue 90) -> node = image
+                | _ -> false)
+              (ops ()))
+           "gallery tiles must be compact 90pt high")
+      images;
     require (List.length images = 2) "real images do not use LUI file_image";
     require
       (List.exists
@@ -492,6 +565,7 @@ let tests =
   ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron
   ; "expand long body", test_long_body_can_expand
+  ; "single image beside body", test_single_image_beside_body
   ; "LUI image gallery and preview", test_images_use_lui_gallery_and_preview
   ; "file card metadata", test_file_cards_use_actual_metadata
   ; "unavailable attachment retry", test_attachment_unavailable_keeps_retry

@@ -9,7 +9,9 @@ let body ~render_source block =
   let long =
     String.length source > 240 || List.length (String.split_on_char '\n' source) > 3
   in
-  if not long
+  if String.trim source = ""
+  then V.column []
+  else if not long
   then V.of_lui (L.text ~value:source [])
   else
     V.of_lui (fun context parent ->
@@ -72,6 +74,7 @@ let metadata block =
     else
       [ L.text
           ~value:(String.concat "  " (List.map (fun title -> "#" ^ title) titles))
+          ~grow:1.
           ~style_class:"caption"
           ~foreground:"secondary"
           []
@@ -90,7 +93,10 @@ let view
   =
   let block = entry.block in
   let id = Journal_model.id block in
-  let labels = [ render_media ~root:id (body ~render_source block) ] in
+  let content =
+    V.column ~spacing:8. ~alignment:Leading (body ~render_source block :: metadata block)
+  in
+  let labels = [ render_media ~root:id content ] in
   let labels =
     labels
     @ List.map
@@ -98,7 +104,6 @@ let view
            render_media ~root:summary.block_id (V.text (render_source summary.source)))
         entry.child_summaries
   in
-  let labels = labels @ metadata block in
   let labels =
     if show_timestamp
     then
