@@ -812,7 +812,7 @@ let test_named_tags_reach_timeline_row () =
   let view =
     Journal_row.view
       ~show_timestamp:false
-      ~render_media:(fun ~root:_ child -> child)
+      ~render_media:(fun ~root:_ ~image_children:_ child -> child)
       entry
   in
   let app =

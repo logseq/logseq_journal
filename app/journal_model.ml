@@ -50,6 +50,7 @@ type t =
   ; parent_id : string option
   ; sibling_order : string
   ; source : string
+  ; asset_file_type : string option
   ; task_state : task_state
   ; tag_titles : string list
   ; child_count : int
@@ -114,6 +115,7 @@ let create_on_page
         ; parent_id
         ; sibling_order
         ; source
+        ; asset_file_type = None
         ; task_state
         ; tag_titles = []
         ; child_count
@@ -155,6 +157,25 @@ let page_id value = value.page_id
 let parent_id value = value.parent_id
 let sibling_order value = value.sibling_order
 let source value = value.source
+
+let is_image_file_type value =
+  match String.lowercase_ascii (String.trim value) with
+  | "png"
+  | "jpg"
+  | "jpeg"
+  | "gif"
+  | "webp"
+  | "heic"
+  | "heif"
+  | "tif"
+  | "tiff"
+  | "bmp"
+  | "avif" -> true
+  | _ -> false
+;;
+
+let asset_file_type value = value.asset_file_type
+let with_asset_file_type value ~asset_file_type = { value with asset_file_type }
 let task_state value = value.task_state
 let child_count value = value.child_count
 let creation_time value = value.creation_time

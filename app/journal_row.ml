@@ -93,16 +93,37 @@ let view
   =
   let block = entry.block in
   let id = Journal_model.id block in
-  let content =
-    V.column ~spacing:8. ~alignment:Leading (body ~render_source block :: metadata block)
+  let is_image_asset file_type =
+    Option.fold ~none:false ~some:Journal_media_view.is_image_type file_type
   in
-  let labels = [ render_media ~root:id content ] in
+  let image_children, text_children =
+    List.partition
+      (fun (summary : Journal_graph_projection.child_summary) ->
+         is_image_asset summary.asset_file_type)
+      entry.child_summaries
+  in
+  let image_children =
+    List.map
+      (fun (summary : Journal_graph_projection.child_summary) ->
+         summary.block_id, Option.get summary.asset_file_type)
+      image_children
+  in
+  let body =
+    if is_image_asset (Journal_model.asset_file_type block)
+    then V.column []
+    else body ~render_source block
+  in
+  let content = V.column ~spacing:8. ~alignment:Leading (body :: metadata block) in
+  let labels = [ render_media ~root:id ~image_children content ] in
   let labels =
     labels
     @ List.map
         (fun (summary : Journal_graph_projection.child_summary) ->
-           render_media ~root:summary.block_id (V.text (render_source summary.source)))
-        entry.child_summaries
+           render_media
+             ~root:summary.block_id
+             ~image_children:[]
+             (V.text (render_source summary.source)))
+        text_children
   in
   let labels =
     if show_timestamp

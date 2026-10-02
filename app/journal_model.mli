@@ -55,6 +55,9 @@ val page_id : t -> string
 val parent_id : t -> string option
 val sibling_order : t -> string
 val source : t -> string
+val is_image_file_type : string -> bool
+val asset_file_type : t -> string option
+val with_asset_file_type : t -> asset_file_type:string option -> t
 val task_state : t -> task_state
 val child_count : t -> int
 val creation_time : t -> Journal_time.t

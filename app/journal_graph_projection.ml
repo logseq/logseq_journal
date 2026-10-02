@@ -80,6 +80,7 @@ type block_cursor =
 type child_summary =
   { block_id : string
   ; source : string
+  ; asset_file_type : string option
   }
 
 type timeline_entry =
@@ -192,6 +193,20 @@ let creation_time (context : time_context) instant_unix_ms =
   Journal_time.of_instant_unix_ms_with ~localtime:context.localtime ~instant_unix_ms
 ;;
 
+let asset_file_type (block : Graph.block) =
+  List.find_map
+    (fun (property : Graph.property_summary) ->
+       if property.ident = "logseq.property.asset/type"
+       then
+         List.find_map
+           (function
+             | Graph.String_value value -> Some value
+             | _ -> None)
+           property.values
+       else None)
+    block.properties
+;;
+
 let block_in_context
       ~page_id
       ~journal_day
@@ -216,6 +231,8 @@ let block_in_context
       ~creation_time
       ~revision
       ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
+    |> Result.map (fun block ->
+      Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value))
 ;;
 
 let block ~page ~revision ~child_count ~time_context value =
@@ -243,16 +260,6 @@ let block_on_page ~(page : Graph.page) ~revision ~child_count ~time_context valu
     value
 ;;
 
-let children_of (root : Graph.block) items =
-  let root_id = Graph.Uuid.to_string root.Graph.uuid in
-  List.filter_map
-    (fun (item : tree_member) ->
-       if item.depth = 1 && String.equal (Graph.Uuid.to_string item.block.parent) root_id
-       then Some item
-       else None)
-    items
-;;
-
 let timeline_entry_page
       ?(tag_titles = fun _ -> [])
       ~page
@@ -269,10 +276,39 @@ let timeline_entry_page
       result.continuation
   in
   let roots =
+    let children = Hashtbl.create 16 in
+    List.iter
+      (fun (item : tree_member) ->
+         if item.depth = 1
+         then (
+           let parent = Graph.Uuid.to_string item.block.parent in
+           let previous = Hashtbl.find_opt children parent |> Option.value ~default:[] in
+           Hashtbl.replace children parent (item :: previous)))
+      result.items;
+    let direct_children (root : Graph.block) =
+      Hashtbl.find_opt children (Graph.Uuid.to_string root.uuid)
+      |> Option.value ~default:[]
+      |> List.sort (fun (left : tree_member) right ->
+        let order = String.compare left.block.order right.block.order in
+        if order = 0 then Graph.Uuid.compare left.block.uuid right.block.uuid else order)
+    in
+    let image_asset (block : Graph.block) =
+      Option.fold
+        ~none:false
+        ~some:Journal_model.is_image_file_type
+        (asset_file_type block)
+    in
     List.filter_map
       (fun (item : tree_member) ->
-         if item.depth = 0 && not (String.equal (String.trim item.block.title) "")
-         then Some item
+         let children = if item.depth = 0 then direct_children item.block else [] in
+         if
+           item.depth = 0
+           && (String.trim item.block.title <> ""
+               || List.exists
+                    (fun (child : tree_member) -> image_asset child.block)
+                    children
+               || image_asset item.block)
+         then Some (item, children)
          else None)
       result.items
   in
@@ -285,8 +321,7 @@ let timeline_entry_page
              | [] -> None
              | entry :: _ -> cursor entry.block)
         }
-    | (root : tree_member) :: rest ->
-      let children = children_of root.block result.items in
+    | ((root : tree_member), children) :: rest ->
       (match
          block
            ~page
@@ -305,6 +340,7 @@ let timeline_entry_page
              (fun (child : tree_member) ->
                 { block_id = Graph.Uuid.to_string child.block.uuid
                 ; source = child.block.title
+                ; asset_file_type = asset_file_type child.block
                 })
              children
          in

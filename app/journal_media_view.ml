@@ -2,21 +2,7 @@ module Ui = Journal_view
 module L = Lui_elements
 
 let preview_slot = Signal.state_slot "journal-media-preview"
-
-let is_image_type = function
-  | "png"
-  | "jpg"
-  | "jpeg"
-  | "gif"
-  | "webp"
-  | "heic"
-  | "heif"
-  | "tif"
-  | "tiff"
-  | "bmp"
-  | "avif" -> true
-  | _ -> false
-;;
+let is_image_type = Journal_model.is_image_file_type
 
 let size_text size =
   if size < 1000L
@@ -28,13 +14,15 @@ let size_text size =
   else Printf.sprintf "%.1f GB" (Int64.to_float size /. 1_000_000_000.)
 ;;
 
-let view ~scope ~root ~media ~editable ~on_event child =
-  let emit ?(asset = "") ?(visible = true) action =
+let view ?(observed_roots = []) ?asset_root ~scope ~root ~media ~editable ~on_event child =
+  let asset_root = Option.value asset_root ~default:(fun _ -> root) in
+  let observed_roots = if observed_roots = [] then [ root ] else observed_roots in
+  let emit ?(target_root = root) ?(asset = "") ?(visible = true) action =
     on_event
       (Yojson.Basic.to_string
          (`Assoc
              [ "action", `String action
-             ; "root", `String root
+             ; "root", `String target_root
              ; "asset", `String asset
              ; "visible", `Bool visible
              ]))
@@ -51,7 +39,9 @@ let view ~scope ~root ~media ~editable ~on_event child =
     in
     let preview_file path = Signal.set preview (Some path) in
     let render_item ~gallery (item : Journal_media_runtime.item) =
-      let visible _ = emit ~asset:item.token "asset" in
+      let visible _ =
+        emit ~target_root:(asset_root item.token) ~asset:item.token "asset"
+      in
       let id = "journal-media:" ^ item.token in
       match item.presentation with
       | Journal_media.File path when is_image_type item.file_type ->
@@ -125,7 +115,8 @@ let view ~scope ~root ~media ~editable ~on_event child =
           ; L.text
               ~value:"Retry"
               ~style_class:"caption"
-              ~on_press:(fun _ -> emit ~asset:item.token "retry")
+              ~on_press:(fun _ ->
+                emit ~target_root:(asset_root item.token) ~asset:item.token "retry")
               []
           ]
       | Hidden ->
@@ -210,7 +201,11 @@ let view ~scope ~root ~media ~editable ~on_event child =
       | None -> []
       | Some message ->
         [ L.text ~value:message ~style_class:"caption" ~foreground:"secondary" []
-        ; L.text ~value:"Retry attachments" ~on_press:(fun _ -> emit "retry") []
+        ; L.text
+            ~value:"Retry attachments"
+            ~on_press:(fun _ ->
+              List.iter (fun target_root -> emit ~target_root "retry") observed_roots)
+            []
         ]
     in
     let more_rows =
@@ -218,30 +213,147 @@ let view ~scope ~root ~media ~editable ~on_event child =
       then [ L.text ~value:"Next attachments" ~on_press:(fun _ -> emit "next") [] ]
       else []
     in
-    L.column
-      ~key:("media:" ^ scope ^ ":" ^ root)
-      ~gap:12
-      ~cross:`start
-      ~on_appear:(fun _ -> emit "root")
-      ([ body ]
-       @ gallery
-       @ file_rows
-       @ actions
-       @ picker_rows
-       @ errors
-       @ more_rows
-       @
-       if items = []
-       then []
-       else
-         [ L.dyn
-             ~equal:( = )
-             (function
-               | None -> L.column []
-               | Some path ->
-                 L.file_preview ~path ~on_dismiss:(fun _ -> Signal.set preview None) [])
-             (Signal.value preview)
-         ])
-      context
-      parent)
+    let content =
+      L.column
+        ~key:("media:" ^ scope ^ ":" ^ root)
+        ~gap:12
+        ~cross:`start
+        ~on_appear:(fun _ -> emit "root")
+        ([ body ]
+         @ gallery
+         @ file_rows
+         @ actions
+         @ picker_rows
+         @ errors
+         @ more_rows
+         @
+         if items = []
+         then []
+         else
+           [ L.dyn
+               ~equal:( = )
+               (function
+                 | None -> L.column []
+                 | Some path ->
+                   L.file_preview ~path ~on_dismiss:(fun _ -> Signal.set preview None) [])
+               (Signal.value preview)
+           ])
+    in
+    let observers =
+      List.filter_map
+        (fun target_root ->
+           if target_root = root
+           then None
+           else
+             Some
+               (L.column
+                  ~key:("observe-media:" ^ target_root)
+                  ~height:0
+                  ~on_appear:(fun _ -> emit ~target_root "root")
+                  []))
+        observed_roots
+    in
+    let content =
+      if observers = []
+      then content
+      else
+        (* Each new child has its own native appearance lifecycle. A retained
+           parent's onAppear alone does not run when lazy children arrive. The
+           zero-height overlay does not add gallery gaps or intercept presses. *)
+        L.stack [ content; L.column ~key:"media-observers" ~gap:0 ~height:0 observers ]
+    in
+    content context parent)
+;;
+
+(* Aggregate only the known direct image asset children. Their own descriptors
+   keep their lease/event owner, even when the parent references the same asset. *)
+let row ~scope ~root ~image_children ~media_for_root ~on_event child =
+  let module Runtime = Journal_media_runtime in
+  let uuid (item : Runtime.item) =
+    Logseq_db_types.Graph_types.Uuid.to_string item.asset.uuid
+  in
+  let child_ids = Hashtbl.create (List.length image_children) in
+  let image_children =
+    List.filter
+      (fun (id, _) ->
+         if Hashtbl.mem child_ids id
+         then false
+         else (
+           Hashtbl.add child_ids id ();
+           true))
+      image_children
+  in
+  let parent = media_for_root root in
+  let parent_items =
+    Option.fold ~none:[] ~some:(fun (v : Runtime.view) -> v.items) parent
+  in
+  let parent_by_asset = Hashtbl.create (List.length parent_items) in
+  List.iter (fun item -> Hashtbl.replace parent_by_asset (uuid item) item) parent_items;
+  let owners = Hashtbl.create 16 in
+  let seen = Hashtbl.create 16 in
+  let add acc owner (item : Runtime.item) =
+    let id = uuid item in
+    if Hashtbl.mem seen id
+    then acc
+    else (
+      Hashtbl.add seen id ();
+      Hashtbl.replace owners item.token owner;
+      item :: acc)
+  in
+  let initial =
+    List.fold_left
+      (fun acc item ->
+         if Hashtbl.mem child_ids (uuid item) then acc else add acc root item)
+      []
+      parent_items
+  in
+  let items, errors =
+    List.fold_left
+      (fun (items, errors) (id, file_type) ->
+         let media = media_for_root id in
+         let own =
+           Option.bind media (fun (v : Runtime.view) ->
+             List.find_opt (fun item -> uuid item = id) v.items)
+         in
+         let own, owner =
+           match own with
+           | Some item -> Some item, id
+           | None -> Hashtbl.find_opt parent_by_asset id, root
+         in
+         let items =
+           match own with
+           | None -> items
+           | Some item -> add items owner { item with file_type }
+         in
+         let errors =
+           match Option.bind media (fun (v : Runtime.view) -> v.error) with
+           | None -> errors
+           | Some message -> message :: errors
+         in
+         items, errors)
+      (initial, [])
+      image_children
+  in
+  let base =
+    Option.value
+      parent
+      ~default:{ Runtime.items = []; more = false; error = None; picker = None }
+  in
+  let errors = Option.to_list base.error @ List.rev errors in
+  let media =
+    Some
+      { base with
+        items = List.rev items
+      ; error = (if errors = [] then None else Some (String.concat "\n" errors))
+      }
+  in
+  view
+    ~observed_roots:(root :: List.map fst image_children)
+    ~asset_root:(fun token -> Hashtbl.find_opt owners token |> Option.value ~default:root)
+    ~scope
+    ~root
+    ~media
+    ~editable:false
+    ~on_event
+    child
 ;;
