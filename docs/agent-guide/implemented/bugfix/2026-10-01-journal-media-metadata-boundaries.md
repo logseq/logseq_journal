@@ -6,7 +6,7 @@ PR36's merged media presentation has four independently reproduced defects: poin
 
 ## Decision
 
-Fix these defects in an isolated checkout of current GitHub main. Deliver local commits and regression evidence only. Do not publish a PR, install an app, operate simulators, use mouse automation, or change the composer/UUID renderer work.
+Fix these defects in an isolated checkout of current GitHub main. The initial delivery consisted of local commits and regression evidence. On 2026-10-02 the user authorized pushing this independent branch and creating a draft PR against current main. Do not merge, deploy, install an app, operate simulators, use mouse automation, or change the composer/UUID renderer work.
 
 Ownership and regression boundaries:
 - Journal_media owns external attachment presentation. Its public Show event reproduces unsupported links, so test only the pure reducer, including mixed-case schemes and malformed URLs.
@@ -42,8 +42,8 @@ An empty list is a legitimate tag removal and must replace prior metadata.
 
 ## Questions
 
-- Scope and permission are already answered by the user's request: fix all four locally, require before/after regressions and specified edge cases, and do not publish or touch active QA devices.
+- Scope and permission are already answered by the user's request: fix all four locally, require before/after regressions and specified edge cases, initially without publication or touching active QA devices. On 2026-10-02 the user separately authorized draft PR publication; device/merge/deployment restrictions remain.
 
 ## Implementation evidence
 
-All four defects have behavioral RED then GREEN evidence at the documented public boundaries. The fixes and regressions are committed locally. The complete report is [local media verification](../../../test-reports/2026-10-01-journal-media-fixes/README.md). Build, formatting and affected regressions pass; existing source-boundary and historical-document failures remain explicit. No external publication or device installation occurred.
+All four defects have behavioral RED then GREEN evidence at the documented public boundaries. The fixes and regressions are committed locally. The complete report is [local media verification](../../../test-reports/2026-10-01-journal-media-fixes/README.md). Build, formatting and affected regressions pass; existing source-boundary and historical-document failures remain explicit. The initial local round had no external publication or device installation. The subsequent authorized publication round packages the native regression runner for review and rechecks the exact PR head; device installation remains outside scope.
