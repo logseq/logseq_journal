@@ -301,6 +301,105 @@ let test_direct_capture_pending_attachments () =
     "clear_attachments kept pending picks"
 ;;
 
+let test_collapse_retains_complete_capture () =
+  let module R = Application.Root_navigation in
+  let state = R.create ~graph_generation:3 |> fun s -> R.step s Capture_opened in
+  let original = Option.get (R.capture state) in
+  let edited =
+    Journal_capture.apply_text_edit
+      original
+      (edit
+         ~session_id:(Journal_capture.session_id original)
+         ~local_revision:1L
+         ~base_document_revision:0L
+         ~text:"Draft 中文"
+         ~selection_start:7
+         ~selection_end:8
+         ~composing:(6, 8)
+         ())
+  in
+  let picks =
+    List.init 2 (fun index ->
+      staged_pick
+        ~operation:(Printf.sprintf "70000000-0000-4000-a000-%012d" (100 + index))
+        ~path:(if index = 0 then "/tmp/synthetic.png" else "/tmp/synthetic.pdf")
+        ~title:(if index = 0 then "synthetic.png" else "synthetic.pdf")
+        ~file_type:(if index = 0 then "png" else "pdf"))
+  in
+  let editing =
+    List.fold_left
+      Journal_capture.add_attachment
+      (Journal_capture.toggle_task_intent edited)
+      picks
+  in
+  let saving, request =
+    Journal_capture.admit_save
+      editing
+      ~mutation_id:"70000000-0000-4000-9000-000000000099"
+      ~block_id:"70000000-0000-4000-a000-000000000099"
+      ~sibling_order:"z"
+      ~calendar_generation:1L
+      ~creation_time:(creation_time 550)
+  in
+  require (Option.is_some request) "fixture save admission failed";
+  List.iter
+    (fun expected ->
+       let start = R.step state (Capture_admitted expected) in
+       let final =
+         List.fold_left
+           (fun s _ ->
+              let hidden = R.step s Capture_closed in
+              require (not (R.capture_presented hidden)) "collapse remained visible";
+              require
+                (R.capture hidden = Some expected)
+                "collapse changed owned draft state";
+              R.step hidden Capture_opened)
+           start
+           [ 1; 2; 3 ]
+       in
+       let actual = Option.get (R.capture final) in
+       require
+         (actual = expected)
+         "repeated expansion changed draft, phase, selection or staging";
+       require
+         (Journal_capture.pending_attachments actual = picks)
+         "collapse lost ordered staged attachments")
+    [ editing
+    ; saving
+    ; Journal_capture.fail saving ~message:"synthetic admission failure"
+    ];
+  let discarded = R.step (R.step state (Capture_admitted editing)) Capture_discarded in
+  require
+    (R.capture discarded = None && not (R.capture_presented discarded))
+    "explicit discard retained draft state";
+  let fresh = R.step discarded Capture_opened |> R.capture |> Option.get in
+  require
+    (Journal_capture.source fresh = ""
+     && Journal_capture.task_state fresh = No_status
+     && Journal_capture.pending_attachments fresh = [])
+    "discard did not reset complete draft";
+  let admitted = R.step state (Capture_admitted saving) in
+  require
+    (R.capture (R.step admitted Capture_discarded) = Some saving)
+    "discard cancelled an admitted save";
+  let picking = R.step state (Capture_picker_requested Journal_asset_import.Files) in
+  let staged = List.hd picks in
+  let hidden_completion =
+    R.step (R.step picking Capture_closed) (Capture_asset_picked (staged, Some 1))
+  in
+  require
+    (Journal_capture.pending_attachments (Option.get (R.capture hidden_completion))
+     = [ staged ])
+    "collapse rejected its existing picker completion";
+  let replacement =
+    R.step (R.step picking Capture_discarded) Capture_opened
+    |> fun next -> R.step next (Capture_asset_picked (staged, Some 1))
+  in
+  require
+    (Journal_capture.pending_attachments (Option.get (R.capture replacement)) = [])
+    "discard allowed a late picker completion into the next draft"
+;;
+
 let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   let source = "  Todo 中文 👩🏽‍💻 exact  " in
   let capture = Journal_capture.create ~session_number:12L ~source in
@@ -1731,6 +1830,7 @@ let tests =
 ;;
 
 let () = test_native_composer_dismissal_and_edit_fences ()
+let () = test_collapse_retains_complete_capture ()
 
 let () =
   List.iter
