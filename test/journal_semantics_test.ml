@@ -68,7 +68,10 @@ let test_native_lui_events () =
   let received = ref [] in
   Journal_bridge.register
     { init = (fun _ _ _ -> "")
-    ; dispatch = (fun event -> received := event :: !received; "")
+    ; dispatch =
+        (fun event ->
+          received := event :: !received;
+          "")
     ; extension_event = (fun _ _ _ -> "")
     ; pump = (fun () -> "")
     ; platform_event = (fun _ -> ())
@@ -333,8 +336,40 @@ let test_status_and_tags_mount () =
     require (has_text (ops ()) "#阅读  #工作") "named tags must accompany status")
 ;;
 
+let test_reference_body_and_summary () =
+  let target = "20000000-0000-4000-a000-000000000099" in
+  let token = "[[" ^ target ^ "]]" in
+  let source = String.concat "\n" [ "Resolved 中文"; "Second"; "Third"; "Fourth" ] in
+  let entry =
+    { Journal_graph_projection.block = block ~source:token ~task_state:No_status ()
+    ; child_summaries = [ { block_id = "visible-child"; source = "child " ^ token } ]
+    }
+  in
+  let render_source =
+    Journal_model.render_references ~lookup:(fun id ->
+      if id = target then Some source else None)
+  in
+  let view =
+    Journal_row.view
+      ~render_source
+      ~show_timestamp:false
+      ~render_media:(fun ~root:_ child -> child)
+      entry
+  in
+  with_mounted view (fun _ ops ->
+    require (has_text (ops ()) source) "root reference did not mount resolved content";
+    require
+      (has_text (ops ()) ("child " ^ source))
+      "summary reference did not mount resolved content";
+    require (has_text (ops ()) "Show more") "resolved long content did not clamp";
+    require
+      (Journal_model.source entry.block = token)
+      "rendering changed persisted source")
+;;
+
 let tests =
-  [ "status and tags mount", test_status_and_tags_mount
+  [ "UUID reference body and summary", test_reference_body_and_summary
+  ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron
   ; "expand long body", test_long_body_can_expand
   ; "LUI image gallery and preview", test_images_use_lui_gallery_and_preview
@@ -344,6 +379,7 @@ let tests =
   ; "timeline media targets", test_timeline_media_targets
   ; "native LUI events", test_native_lui_events
   ]
+;;
 
 let () =
   let failed =

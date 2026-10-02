@@ -9,7 +9,14 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
     |> Result.get_ok
   in
   let database_path = Test_support.seed_mirror ~graph_id support in
+  let references = Array.length Sys.argv > 6 && Sys.argv.(6) = "references" in
   let expected = Printf.sprintf "Graph %d — Encrypted offline Journal — 中文 👩🏽‍💻" index in
+  let target_id n = Printf.sprintf "82000000-0000-4000-a000-%012d" n in
+  let target_link n = "[[" ^ target_id n ^ "]]" in
+  let expected =
+    if references then "Resolved UUID: Outer: Referenced target 中文" else expected
+  in
+  let root_source = if references then "Resolved UUID: " ^ target_link 1 else expected in
   let now = Unix.localtime (Unix.time ()) in
   let day = ((now.tm_year + 1900) * 10_000) + ((now.tm_mon + 1) * 100) + now.tm_mday in
   let page_uuid =
@@ -58,6 +65,12 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
                     "Long paragraph %d: Native text must wrap and remain readable at \
                      every supported width."
                     (line + 1))))
+        else if references && index = 2
+        then "Ordinary [[page name]] remains literal"
+        else if references && index = 3
+        then "Missing: " ^ target_link 99
+        else if references && index = 4
+        then "Cycle: " ^ target_link 3
         else Printf.sprintf "Native row %04d — readable content" index
       in
       row
@@ -74,7 +87,10 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
       row
         ~key:(Printf.sprintf "native-child-%d" index)
         ~uuid:(Printf.sprintf "80000000-0000-4000-b000-%012d" (index + 1))
-        ~title:(Printf.sprintf "Native child %02d — nested content" index)
+        ~title:
+          (if references && index = 1
+           then "Child: " ^ target_link 2
+           else Printf.sprintf "Native child %02d — nested content" index)
         ~order:(Printf.sprintf "a0U%06dU" index)
         ~parent:block)
     |> List.concat
@@ -109,7 +125,7 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
                    date.tm_mday) )
         ; Add (page, "block/name", String title)
         ; Add (page, "block/title", String title)
-        ; Add (page, "block/journal-day", Int day)
+        ; Add (page, "block/journal-day", Int64 (Int64.of_int day))
         ]
       @ (List.init 12 (fun index ->
            let key = Datascript.Temp_id (Printf.sprintf "history-%d-%d" days_ago index) in
@@ -145,6 +161,31 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
          |> List.concat))
     |> List.concat
   in
+  let reference_targets =
+    if not references
+    then []
+    else (
+      let target_page = Datascript.Temp_id "reference-target-page" in
+      let target n title =
+        let id = Datascript.Temp_id ("reference-target-" ^ string_of_int n) in
+        Datascript.
+          [ Add (id, "block/uuid", Uuid (target_id n))
+          ; Add (id, "block/title", String title)
+          ; Add (id, "block/order", String (string_of_int n))
+          ; Add (id, "block/parent", Ref_to target_page)
+          ; Add (id, "block/page", Ref_to target_page)
+          ]
+      in
+      Datascript.
+        [ Add (target_page, "block/uuid", Uuid "82000000-0000-4000-b000-000000000001")
+        ; Add (target_page, "block/name", String "isolated reference targets")
+        ; Add (target_page, "block/title", String "Isolated reference targets")
+        ]
+      @ target 1 ("Outer: " ^ target_link 2)
+      @ target 2 "Referenced target 中文"
+      @ target 3 (target_link 4)
+      @ target 4 (target_link 3))
+  in
   let staged =
     Session.stage_transact
       session
@@ -153,16 +194,17 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
          [ Add (page, "block/uuid", Uuid page_uuid)
          ; Add (page, "block/name", String page_title)
          ; Add (page, "block/title", String page_title)
-         ; Add (page, "block/journal-day", Int day)
+         ; Add (page, "block/journal-day", Int64 (Int64.of_int day))
          ; Add (block, "block/uuid", Uuid "80000000-0000-4000-a000-000000000001")
-         ; Add (block, "block/title", String expected)
+         ; Add (block, "block/title", String root_source)
          ; Add (block, "block/order", String "a0")
          ; Add (block, "block/parent", Ref_to page)
          ; Add (block, "block/page", Ref_to page)
          ]
        @ extra_rows
        @ children
-       @ history)
+       @ history
+       @ reference_targets)
     |> Result.get_ok
   in
   Session.commit_staged session staged |> Result.get_ok;

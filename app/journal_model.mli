@@ -65,3 +65,6 @@ val last_mutation_id : t -> string
 val with_child_count : t -> child_count:int -> (t, string) result
 val tag_titles : t -> string list
 val with_tag_titles : t -> tag_titles:string list -> t
+val maximum_reference_depth : int
+val reference_ids : string -> string list
+val render_references : lookup:(string -> string option) -> string -> string

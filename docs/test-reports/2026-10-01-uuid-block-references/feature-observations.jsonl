@@ -1,0 +1,2 @@
+{"active":false,"disconnects":0,"event":"connected","hidden":false,"missingWrappedKey":false,"recoveryObserved":false,"requestedBeforeTimeline":false,"status":"Opening encrypted offline graph","timelinePresented":false,"tokenRequests":0}
+{"active":true,"disconnects":0,"event":"timeline-presented","hidden":false,"missingWrappedKey":false,"recoveryObserved":false,"requestedBeforeTimeline":true,"status":"FAIL warm-start presentation","timelinePresented":true,"tokenRequests":1}

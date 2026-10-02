@@ -3,7 +3,8 @@ module Ui = Journal_view
 val loading_view : unit -> Ui.View.t
 
 val view
-  :  render_media:(root:string -> Ui.View.t -> Ui.View.t)
+  :  render_source:(string -> string)
+  -> render_media:(root:string -> Ui.View.t -> Ui.View.t)
   -> state:Journal_timeline_state.t
   -> day_presentation:(int -> Journal_calendar.date_presentation option)
   -> on_visible_range:Ui.Event.Handler.t
