@@ -123,6 +123,63 @@ let with_mounted view run =
        run app ops)
 ;;
 
+let test_scoped_theme_wire_properties () =
+  let tokens =
+    [ "accent", Lui_ui.Fixed "#123456"
+    ; "foreground", Lui_ui.Adaptive { light = "#112233"; dark = "#ddeeff" }
+    ]
+  in
+  let expected_tokens =
+    `Assoc
+      [ "accent", `String "#123456"
+      ; "foreground", `Assoc [ "light", `String "#112233"; "dark", `String "#ddeeff" ]
+      ]
+  in
+  let cases =
+    [ (fun ~data view -> V.theme ~data view), Ui.Theme.Light, "light", tokens
+    ; V.Body.theme, Ui.Theme.Dark, "dark", tokens
+    ; V.Viewport.Vertical.theme, Ui.Theme.System, "system", []
+    ]
+  in
+  List.iter
+    (fun (apply, mode, expected_mode, tokens) ->
+       let data = Ui.Theme.create ~mode ~tokens () in
+       let view =
+         V.column [ V.text "Theme text"; V.divider () |> V.theme ~data ] |> apply ~data
+       in
+       with_mounted view (fun _ ops ->
+         let ops = ops () in
+         let scope =
+           List.find_map
+             (function
+               | Lui_protocol.CreateNode (node, Column) -> Some node
+               | _ -> None)
+             ops
+           |> Option.get
+         in
+         let properties =
+           List.filter_map
+             (function
+               | Lui_protocol.SetProp (node, ((ThemeValue | ThemeMode) as key), value) ->
+                 require (node = scope) "theme property reached an unsupported leaf";
+                 Some (key, value)
+               | _ -> None)
+             ops
+         in
+         require
+           (List.assoc_opt Lui_protocol.ThemeMode properties
+            = Some (Lui_protocol.StringValue expected_mode))
+           "scoped theme mode was dropped";
+         match tokens, List.assoc_opt Lui_protocol.ThemeValue properties with
+         | [], None -> ()
+         | _ :: _, Some (Lui_protocol.StringValue encoded) ->
+           require
+             (Yojson.Safe.from_string encoded = expected_tokens)
+             "fixed/adaptive theme tokens were dropped or changed"
+         | _ -> fail "empty defaults or supplied theme tokens were changed"))
+    cases
+;;
+
 let has_text ops expected =
   List.exists
     (function
@@ -429,7 +486,8 @@ let test_reference_body_and_summary () =
 ;;
 
 let tests =
-  [ "loading indicator and message", test_loading_keeps_indicator_and_message
+  [ "scoped theme wire properties", test_scoped_theme_wire_properties
+  ; "loading indicator and message", test_loading_keeps_indicator_and_message
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron

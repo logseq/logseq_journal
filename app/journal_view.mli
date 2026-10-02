@@ -231,7 +231,11 @@ module Theme : sig
 
   type t
 
-  val create : mode:mode -> unit -> t
+  val create :
+       mode:mode
+    -> ?tokens:(string * Lui_ui.theme_token_value) list
+    -> unit
+    -> t
 end
 
 module Text_editing : sig
