@@ -1,11 +1,10 @@
 # Paired local composer development
 
-This Journal branch uses LUI commit
-`f73927380d7138003d2ad2f434a48f20d9d8c323` for its shared composer.
-The commit is published on the LUI Composer branch in
-[LUI PR #93](https://github.com/logseq/lui/pull/93), and the exact GitHub pin in
-`logseq_journal.opam` resolves independently of the PR's merge state.
-Merge LUI PR #93 before the Journal integration PR.
+Journal follows LUI `main` through the project's existing
+`pin-depends` entry in `logseq_journal.opam`.
+[LUI PR #93](https://github.com/logseq/lui/pull/93) is merged into `main`;
+the Journal integration no longer needs a temporary PR commit pin or waits
+for that upstream merge. Resolve the current `main` revision before testing.
 For paired local development, use a dedicated development opam switch:
 
 ```sh
@@ -13,7 +12,9 @@ opam pin add --no-action lui.0.1.0 ../lui
 opam install lui.0.1.0
 ```
 
-Verify `git -C ../lui rev-parse HEAD` against the pin before building.
+Fetch LUI `origin/main` and use a checkout of that revision.
+Verify `git -C ../lui rev-parse HEAD` matches
+`git -C ../lui rev-parse origin/main` before building.
 Apple builds must use the same checkout's backend package:
 
 ```sh
