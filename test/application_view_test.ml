@@ -585,10 +585,362 @@ let test_favorites_native_visibility_retires_media () =
             (List.filter (G.Uuid.equal (List.nth roots 64)) (Atomic.get queried))))
 ;;
 
+(* The root reducer has no Worker accepted-ID/terminal-event boundary. This
+   fixture exercises the production adapter with a real Worker Domain and a
+   controlled service, without a database, native host, or cloud peer. *)
+let test_reference_outer_terminals cancel =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module P = Logseq_db_worker.Protocol in
+  let module G = Logseq_db_types.Graph_types in
+  let uuid n =
+    G.Uuid.of_string (Printf.sprintf "83000000-0000-4000-8000-%012d" n) |> Result.get_ok
+  in
+  let targets = Array.init 8 (fun n -> uuid (n + 1)) in
+  let attempts = Array.init 8 (fun _ -> Atomic.make 0) in
+  let worker_ids = Array.init 4 (fun _ -> Atomic.make None) in
+  let release = Atomic.make false in
+  let refresh = Atomic.make false in
+  let late_returns = Atomic.make 0 in
+  let terminal_count = ref 0 in
+  let client = ref None in
+  let page : G.page =
+    { uuid = uuid 100
+    ; name = "20260901"
+    ; title = "Sep 1st, 2026"
+    ; kind = Journal_page { journal_day = 20260901 }
+    ; created_at_ms = 1_788_192_000_000L
+    ; updated_at_ms = 1_788_192_000_000L
+    ; recycled = false
+    ; tags = []
+    ; properties = []
+    }
+  in
+  let source =
+    String.concat
+      " | "
+      (Array.to_list targets |> List.map (fun id -> "[[" ^ G.Uuid.to_string id ^ "]]"))
+  in
+  let block : G.block =
+    { uuid = uuid 200
+    ; title = source
+    ; parent = page.uuid
+    ; page = page.uuid
+    ; order = "a"
+    ; created_at_ms = 1_788_192_000_000L
+    ; updated_at_ms = 1_788_192_000_000L
+    ; refs = []
+    ; tags = []
+    ; properties = []
+    }
+  in
+  let record block : P.v2_block_record =
+    { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
+  in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Current
+        ; catalog = []
+        ; selected_graph = Some (uuid 900)
+        ; applied_server_t = Some 0
+        ; timeline_presentation_pending = false
+        ; startup =
+            { authenticated = true
+            ; catalog_loading = false
+            ; awaiting_selection = false
+            ; restoring_local = false
+            ; bootstrapping = false
+            ; awaiting_e2ee_password = false
+            ; failure = None
+            ; account_generation = 1
+            ; graph_generation = 1
+            ; presentation_generation = 1
+            }
+        ; last_error = None
+        ; local_deletion = None
+        }
+    ; diagnostics = { groups = [] }
+    }
+  in
+  let graph_state : Logseq_db_worker.graph_state =
+    { generation = 1; graph_id = Some (uuid 900); phase = Graph_open; error = None }
+  in
+  let service =
+    W.Service.create
+      ~push_topic_count:6
+      ~concurrency:(Concurrent { max_in_flight = 16 })
+      ~init:(fun context _ ->
+        W.Session_context.emit
+          context
+          ~topic:Service.manager_topic
+          (Service.Client_state_changed manager);
+        Ok ())
+      ~handle:(fun context () request ->
+        let completed request outcome =
+          Ok
+            (Service.Graph_response
+               (P.V2_response
+                  { api_version = P.api_version
+                  ; request_id = request.P.request_id
+                  ; outcome
+                  }))
+        in
+        match request with
+        | Service.Get_graph_state ->
+          if Atomic.exchange refresh false
+          then
+            W.Request_context.emit
+              context
+              ~topic:Service.invalidation_topic
+              (Service.Graph_push
+                 (P.V2_changes_available
+                    { api_version = P.api_version; generation = "g"; through = "r2" }));
+          Ok (Service.Graph_state graph_state)
+        | Client_command _ | Asset_command _ | Release_asset_file _ ->
+          Ok Service.Client_command_completed
+        | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Import_asset _ -> Error "unused import"
+        | Graph_request request ->
+          (match request.command with
+           | P.V2_get_block { block = target; _ } ->
+             let index =
+               Array.to_list targets
+               |> List.mapi (fun i id -> i, id)
+               |> List.find (fun (_, id) -> G.Uuid.equal id target)
+               |> fst
+             in
+             let attempt = Atomic.fetch_and_add attempts.(index) 1 in
+             if index < 4 && attempt = 0
+             then (
+               Atomic.set worker_ids.(index) (Some (W.Request_context.request_id context));
+               let wait () =
+                 while not (Atomic.get release) do
+                   Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+                 done
+               in
+               if cancel
+               then (
+                 (* Return an old value even after cancel was requested. The real
+                   Worker must emit Cancelled and suppress this late completion. *)
+                 Eio.Cancel.protect wait;
+                 Atomic.incr late_returns;
+                 completed
+                   request
+                   (V2_block_outcome
+                      (V2_present_block
+                         { value =
+                             record
+                               { block with
+                                 uuid = target
+                               ; title = "Late cancelled target"
+                               }
+                         ; revision = "old"
+                         })))
+               else (
+                 wait ();
+                 Error "Injected outer Worker failure"))
+             else
+               completed
+                 request
+                 (V2_block_outcome
+                    (V2_present_block
+                       { value =
+                           record
+                             { block with
+                               uuid = target
+                             ; title = Printf.sprintf "Fresh target %d" index
+                             }
+                       ; revision = "fresh"
+                       }))
+           | V2_graph_info ->
+             completed
+               request
+               (V2_graph_info_outcome
+                  { graph_uuid = uuid 900
+                  ; graph_name = "Fixture"
+                  ; schema = { major = 65; minor = 33 }
+                  ; admission_facts = []
+                  ; journal_title_format = None
+                  ; limits =
+                      { response_budget_bytes = P.maximum_response_bytes
+                      ; outbox_max_records = 4096
+                      ; outbox_max_bytes = 8388608
+                      ; change_max_items = 4096
+                      ; change_max_bytes = 1048576
+                      ; dispatcher_capacity = 256
+                      ; wire_batch_max_bytes = 262144
+                      }
+                  ; generation = "g"
+                  ; projection_revision = "p"
+                  })
+           | V2_list_journals _ ->
+             completed
+               request
+               (V2_journals_outcome
+                  { items = [ { page; journal_day = 20260901; revision = "p" } ]
+                  ; next_cursor = None
+                  })
+           | V2_get_page_tree _ ->
+             completed
+               request
+               (V2_page_tree_outcome
+                  { page = page.uuid
+                  ; maximum_depth = 1
+                  ; items =
+                      [ { value = record block
+                        ; revision = "root"
+                        ; depth = 0
+                        ; parent = page.uuid
+                        }
+                      ]
+                  ; next_cursor = None
+                  })
+           | V2_pull_changes _ ->
+             completed
+               request
+               (V2_changes
+                  { generation = "g"
+                  ; from_exclusive = Some "r1"
+                  ; through = "r2"
+                  ; next = None
+                  ; windows =
+                      [ { id = "c1"
+                        ; predecessor = "r1"
+                        ; successor = "r2"
+                        ; block_uuids = Array.to_list (Array.sub targets 0 4)
+                        ; page_uuids = []
+                        ; structure_interests = []
+                        }
+                      ]
+                  })
+           | V2_ack_changes { generation; through } ->
+             completed request (V2_changes_acknowledged { generation; through })
+           | V2_list_assets _ ->
+             completed
+               request
+               (V2_assets_outcome
+                  { generation = "g"
+                  ; projection_revision = "p"
+                  ; items = []
+                  ; next_cursor = None
+                  })
+           | _ ->
+             completed
+               request
+               (V2_failed { code = "InvalidRequest"; message = "unused fixture query" })))
+      ~shutdown:(fun () -> ())
+      ()
+  in
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  let hooks =
+    Application.For_testing.app_with_service
+      ~calendar_sampler:sampler
+      ~on_client:(fun value ->
+        client := Some value;
+        W.on_event value (function
+          | W.Response { outcome = Failed _ | Cancelled; _ } -> incr terminal_count
+          | _ -> ()))
+      service
+  in
+  let texts = Hashtbl.create 128 in
+  let saw_late = ref false in
+  let consume encoded =
+    if encoded <> ""
+    then
+      let open Yojson.Safe.Util in
+      Yojson.Safe.from_string encoded
+      |> member "ops"
+      |> to_list
+      |> List.iter (fun op ->
+        match op |> member "op" |> to_string with
+        | "set-prop" when member "property" op = `String "text" ->
+          let text = member "value" op |> to_string in
+          if
+            List.exists
+              (fun value -> String.trim value = "Late cancelled target")
+              (String.split_on_char '|' text)
+          then saw_late := true;
+          Hashtbl.replace texts (member "id" op |> to_int) text
+        | "drop-node" -> Hashtbl.remove texts (member "id" op |> to_int)
+        | _ -> ())
+  in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 5. in
+    while (not (predicate ())) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ());
+      Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ())
+  in
+  let startup =
+    Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-reference-terminal-fixture"
+      ~target:(Managed_sync { base_url = "https://example.invalid" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:P.maximum_response_bytes
+      ~default_page_size:P.default_page_size
+    |> Result.get_ok
+    |> Journal_startup.encode
+    |> Result.get_ok
+    |> Bytes.to_string
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Atomic.set release true;
+      ignore (hooks.dispose ());
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+       consume (hooks.init 2 2 startup);
+       wait "four accepted reference reads occupy hydration window" (fun () ->
+         Array.for_all (fun id -> Option.is_some (Atomic.get id)) worker_ids);
+       Alcotest.(check int)
+         "remaining references wait for slots"
+         0
+         (Atomic.get attempts.(4));
+       if cancel
+       then
+         Array.iter
+           (fun id ->
+              W.cancel (Option.get !client) ~request_id:(Option.get (Atomic.get id)))
+           worker_ids;
+       Atomic.set release true;
+       wait "four real Worker outer terminals delivered" (fun () -> !terminal_count >= 4);
+       wait "queued references resume after four terminal outcomes" (fun () ->
+         Array.for_all (fun attempt -> Atomic.get attempt = 1) attempts);
+       if cancel
+       then
+         Alcotest.(check int)
+           "cancelled handlers attempted late return"
+           4
+           (Atomic.get late_returns);
+       Atomic.set refresh true;
+       ignore (W.send (Option.get !client) Service.Get_graph_state);
+       wait "terminated targets can be read again" (fun () ->
+         Array.for_all (fun attempt -> Atomic.get attempt = 2) (Array.sub attempts 0 4));
+       let expected =
+         String.concat " | " (List.init 8 (Printf.sprintf "Fresh target %d"))
+       in
+       wait "resolved label recovers after termination and refresh" (fun () ->
+         Hashtbl.fold (fun _ text found -> found || text = expected) texts false);
+       Alcotest.(check bool) "late cancelled completion never rendered" false !saw_late)
+;;
+
 let () =
   Alcotest.run
     "application view"
-    [ ( "root navigation"
+    [ ( "reference Worker terminals"
+      , [ Alcotest.test_case "outer Failed releases hydration" `Quick (fun () ->
+            test_reference_outer_terminals false)
+        ; Alcotest.test_case
+            "outer Cancelled fences late return and drains"
+            `Quick
+            (fun () -> test_reference_outer_terminals true)
+        ] )
+    ; ( "root navigation"
       , [ Alcotest.test_case
             "native Favorites media visibility"
             `Quick

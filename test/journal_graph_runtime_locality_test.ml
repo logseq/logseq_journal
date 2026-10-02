@@ -1861,10 +1861,28 @@ let test_reference_to_loaded_block_shares_change_read () =
 ;;
 
 let test_abandoned_reference_can_refresh () =
-  let runtime = Runtime.create () in
-  let request = reference_feed runtime reference |> check_target_request in
-  Runtime.abandon runtime request;
-  ignore (changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request)
+  List.iter
+    (fun fail ->
+       let runtime = Runtime.create () in
+       let request = reference_feed runtime reference |> check_target_request in
+       if fail
+       then ignore (Runtime.fail_request runtime request ~message:"Worker interrupted")
+       else Runtime.abandon runtime request;
+       let late = Runtime.receive runtime (target_response request "Late completion") in
+       Alcotest.(check int)
+         "interrupted completion is unowned"
+         0
+         (List.length late.responses + List.length late.requests);
+       let fresh =
+         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+       in
+       ignore (Runtime.receive runtime (target_response fresh "Recovered"));
+       let duplicate = Runtime.fail_request runtime request ~message:"Late terminal" in
+       Alcotest.(check int)
+         "duplicate old terminal is unowned"
+         0
+         (List.length duplicate.responses + List.length duplicate.requests))
+    [ false; true ]
 ;;
 
 let test_shorter_reference_path_discovers_nested_targets () =
@@ -1929,11 +1947,137 @@ let test_reference_burst_is_bounded () =
     (List.length output.requests)
 ;;
 
+let begin_reference_tree runtime generation =
+  let request =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 3
+         ; blocks_per_day = 4
+         ; slot_limit = 16
+         ; request_generation = generation
+         })
+    |> fun output -> only "reference journal request" output.requests
+  in
+  Runtime.receive
+    runtime
+    (response
+       request
+       (Protocol.V2_journals_outcome
+          { items = [ { page; journal_day = 20260901; revision = "page" } ]
+          ; next_cursor = None
+          }))
+  |> fun output -> only "reference tree request" output.requests
+;;
+
+let reference_tree_response request title =
+  let root = { record with block = { block with title = reference } } in
+  let target =
+    { record with block = { block with uuid = target_uuid; title; order = "b" } }
+  in
+  response
+    request
+    (Protocol.V2_page_tree_outcome
+       { page = page_uuid
+       ; maximum_depth = 1
+       ; next_cursor = None
+       ; items =
+           List.map
+             (fun value ->
+                Protocol.{ value; revision = title; depth = 0; parent = page_uuid })
+             [ root; target ]
+       })
+;;
+
+let test_stale_feed_cannot_replace_reference_source () =
+  List.iter
+    (fun fresh_title ->
+       let runtime = Runtime.create () in
+       set_calendar runtime;
+       let initial = begin_reference_tree runtime 7L in
+       ignore (Runtime.receive runtime (reference_tree_response initial "Initial"));
+       let old = begin_reference_tree runtime 8L in
+       let current = begin_reference_tree runtime 9L in
+       ignore (Runtime.receive runtime (reference_tree_response current fresh_title));
+       let changed_read =
+         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+       in
+       let stale = Runtime.receive runtime (reference_tree_response old "Stale") in
+       Alcotest.(check bool)
+         "invalidated old snapshot cannot publish source"
+         false
+         (List.mem (target_id, Some "Stale") (reference_updates stale));
+       let fresh = Runtime.receive runtime (target_response changed_read fresh_title) in
+       ignore fresh;
+       let old = begin_reference_tree runtime 10L in
+       let newer =
+         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+       in
+       ignore (Runtime.receive runtime (target_response newer fresh_title));
+       let stale = Runtime.receive runtime (reference_tree_response old "Rollback") in
+       Alcotest.(check bool)
+         "newer completion fences older feed, even equal title"
+         false
+         (List.mem (target_id, Some "Rollback") (reference_updates stale)))
+    [ "Fresh"; "Initial" ]
+;;
+
+let test_shared_change_failure_invalidates_reference () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let initial = begin_reference_tree runtime 7L in
+  ignore (Runtime.receive runtime (reference_tree_response initial "Old"));
+  let changed_read =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+  in
+  let failed =
+    Runtime.receive
+      runtime
+      (response
+         changed_read
+         (Protocol.V2_failed
+            { code = "InvalidRequest"; message = "temporary shared read failure" }))
+  in
+  Alcotest.(check bool)
+    "shared failure removes old source"
+    true
+    (List.mem (target_id, None) (reference_updates failed));
+  let old = changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request in
+  let newer =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+  in
+  ignore (Runtime.receive runtime (target_response newer "Fresh"));
+  let failed =
+    Runtime.receive
+      runtime
+      (response
+         old
+         (Protocol.V2_failed { code = "InvalidRequest"; message = "late failure" }))
+  in
+  Alcotest.(check bool)
+    "late failure cannot remove newer source"
+    false
+    (List.mem (target_id, None) (reference_updates failed));
+  let retry =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+  in
+  ignore (Runtime.receive runtime (target_response retry "Recovered"))
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
     [ ( "block references"
       , [ Alcotest.test_case
+            "stale feed source fence"
+            `Quick
+            test_stale_feed_cannot_replace_reference_source
+        ; Alcotest.test_case
+            "shared change failure invalidates source"
+            `Quick
+            test_shared_change_failure_invalidates_reference
+        ; Alcotest.test_case
             "hydration, edits, deletion and reset"
             `Quick
             test_reference_hydration_and_changes
