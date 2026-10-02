@@ -143,7 +143,7 @@ enum JournalExtensionFingerprint {
 
   static func assetImportExtension() -> LUIAppleExtension {
     journalExtension(identifier: "journal-asset-import", profiles: allHostProfiles,
-      standardChildren: false, events: true) { context in
+      standardChildren: true, events: true) { context in
       AnyView(JournalAssetImport.View(context: context))
     }
   }

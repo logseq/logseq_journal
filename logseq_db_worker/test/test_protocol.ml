@@ -26,6 +26,45 @@ let page_tree_result_without_collection_revision () =
       "page-tree result gained a revision"
 ;;
 
+let rec add_tag_titles = function
+  | `Assoc fields ->
+    let fields = List.map (fun (k, v) -> k, add_tag_titles v) fields in
+    if List.mem_assoc "renderedPageTitle" fields && List.mem_assoc "block" fields
+    then `Assoc (("tagTitles", `List [ `String "户外"; `String "周末计划" ]) :: fields)
+    else `Assoc fields
+  | `List xs -> `List (List.map add_tag_titles xs)
+  | x -> x
+;;
+
+let tag_titles_survive_block_read_json () =
+  let catalog = T.read_json (T.fixture "protocol/v2-outcome-catalog.json") in
+  let responses =
+    match catalog with
+    | `Assoc f -> List.assoc "responses" f
+    | _ -> assert false
+  in
+  let responses =
+    match responses with
+    | `List xs -> xs
+    | _ -> assert false
+  in
+  List.iter
+    (fun original ->
+       let expected = add_tag_titles original in
+       if expected <> original
+       then (
+         match P.response_of_yojson expected with
+         | Error message ->
+           T.fail "named tags rejected at block read boundary: %s" message
+         | Ok decoded ->
+           T.require
+             (Yojson.Safe.equal
+                (Yojson.Safe.sort expected)
+                (Yojson.Safe.sort (P.response_to_yojson decoded)))
+             "named tags were lost by block read serialization"))
+    responses
+;;
+
 let fixture_has_version expected_version path =
   match T.read_json (T.fixture path) with
   | `Assoc fields ->
@@ -390,6 +429,7 @@ let () =
         fixture_has_version 2 "protocol/v2-operation-contracts.json")
     ; T.case "request JSON round trip" request_round_trip
     ; T.case "response JSON round trip" response_round_trip
+    ; T.case "named tags in block reads" tag_titles_survive_block_read_json
     ; T.case
         "admission inspection request JSON round trip"
         admission_inspection_request_round_trip

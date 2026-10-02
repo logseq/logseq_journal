@@ -184,6 +184,7 @@ and v2_block_record =
   { block : block
   ; task_status : v2_task_status option
   ; rendered_page_title : string
+  ; tag_titles : string list
   }
 
 and v2_block_lookup =

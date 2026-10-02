@@ -160,7 +160,7 @@ let test_sync_error_card_is_temporary_and_error_only root =
     text_between
       (read_file (path root "app/journal_header.ml"))
       ~start_marker:"let sync_feedback ="
-      ~end_marker:"let controls name placement values"
+      ~end_marker:"let body ="
   with
   | None -> fail "unable to locate the native safe-area sync error"
   | Some overlay ->
@@ -1170,12 +1170,12 @@ let () =
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#6dfddf7ace8a73a16b61fce6a8d8e46c00922262"
+    "git+https://github.com/logseq/lui.git#main"
     1;
   require_occurrences
     root
     "logseq_journal.opam"
-    "git+https://github.com/logseq/ocaml-signal.git#976b40f1770a65b3464df1ef38d1550f1d8a43dd"
+    "git+https://github.com/logseq/ocaml-signal.git#main"
     1;
   List.iter
     (fun relative ->
@@ -1197,7 +1197,7 @@ let () =
     ; "logseq_db_worker.opam.locked"
     ]
   in
-  let current_datascript_revision = "40345cc2f59214daa88b33b8aec711337d20afa7" in
+  let current_datascript_revision = "datascript-ocaml.git#main" in
   List.iter
     (fun relative ->
        require_occurrences root relative current_datascript_revision 2;
@@ -1208,7 +1208,7 @@ let () =
          ; "5895af25101de15f56d7c5df383c150ca07cef90"
          ])
     dependency_manifests;
-  let current_melange_transit_revision = "35f8afe7d6506863c7253e67a20befb3dde5c18f" in
+  let current_melange_transit_revision = "melange-transit.git#main" in
   List.iter
     (fun (relative, occurrences) ->
        require_occurrences root relative current_melange_transit_revision occurrences;
@@ -1315,7 +1315,7 @@ let () =
     ; "arrow.clockwise"
     ; "V.Navigation_stack.create"
     ; "V.Sheet.create"
-    ; "V.text_editor"
+    ; "V.composer"
     ; "if favorites_selected"
     ; "Detail_list.view"
     ; "V.progress"
@@ -1324,9 +1324,9 @@ let () =
     root
     "app/journal_header.ml"
     [ "Journal_symbols.Account"
-    ; "V.button"
+    ; "V.buttons"
     ; "V.semantics"
-    ; "V.Menu.create"
+    ; "V.buttons_menu_action"
     ; "journal-root-navigation"
     ; "switch-graph"
     ; "sign-out"
@@ -1434,7 +1434,7 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Ui.Theme.create"; "~mode:System"; "V.text_editor" ];
+    [ "Ui.Theme.create"; "~mode:System"; "V.composer" ];
   forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root

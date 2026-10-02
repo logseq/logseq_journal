@@ -67,7 +67,7 @@ let authoritative_db ~block_count =
     kv
       "schema-version"
       "logseq.kv/schema-version"
-      (Map [ Keyword "major", Int 65; Keyword "minor", Int 33 ])
+      (Map [ Keyword "major", Int64 65L; Keyword "minor", Int64 33L ])
     @ kv "db-type" "logseq.kv/db-type" (String "db")
     @ kv
         "local-graph-uuid"
@@ -184,7 +184,7 @@ let seed_mirror ~application_support_directory ~block_count =
       [ Datascript.Add (entity, "block/uuid", Uuid uuid)
       ; Add (entity, "block/name", String (String.lowercase_ascii title))
       ; Add (entity, "block/title", String title)
-      ; Add (entity, "block/journal-day", Int (2_026_01_01 + index))
+      ; Add (entity, "block/journal-day", Int64 (Int64.of_int (2_026_01_01 + index)))
       ])
     |> List.concat
   in

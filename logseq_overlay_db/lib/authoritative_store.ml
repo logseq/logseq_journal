@@ -40,7 +40,7 @@ let string_of_value = function
 ;;
 
 let int_of_value = function
-  | Datascript.Int value -> Some value
+  | Datascript.Int64 value -> Datascript.Util.int64_to_int value
   | _ -> None
 ;;
 

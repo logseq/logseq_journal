@@ -867,7 +867,7 @@ let rec all_options = function
 let rec internal_property_value ?uuid_of_ref database = function
   | Datascript.Nil -> Some Graph.Internal_null
   | Bool value -> Some (Internal_bool value)
-  | Int value -> Some (Internal_number (string_of_int value))
+  | Int64 value -> Some (Internal_number (Int64.to_string value))
   | Float value -> Some (Internal_number (string_of_float value))
   | String value | Symbol value -> Some (Internal_string value)
   | Keyword value -> Some (Internal_keyword value)
@@ -892,7 +892,7 @@ let rec internal_property_value ?uuid_of_ref database = function
           (internal_property_value ?uuid_of_ref database value)))
     |> all_options
     |> Option.map (fun entries -> Graph.Internal_map entries)
-  | Instant value -> Some (Graph.Internal_number (string_of_int value))
+  | Instant value -> Some (Graph.Internal_number (Int64.to_string value))
   | Regex value -> Some (Graph.Internal_string value)
   | Tuple values ->
     values
@@ -922,12 +922,15 @@ let property_value ?uuid_of_ref database property_type value =
   | Json, String value -> Some (Json_value value)
   | Number, String value -> Some (Number_value value)
   | Raw_number, String value -> Some (Raw_number_value value)
-  | Number, Int value -> Some (Number_value (string_of_int value))
+  | Number, Int64 value -> Some (Number_value (Int64.to_string value))
   | Number, Float value -> Some (Number_value (string_of_float value))
-  | Raw_number, Int value -> Some (Raw_number_value (string_of_int value))
+  | Raw_number, Int64 value -> Some (Raw_number_value (Int64.to_string value))
   | Raw_number, Float value -> Some (Raw_number_value (string_of_float value))
-  | Date, Int journal_day -> Some (Date_value { journal_day })
-  | Datetime, Int unix_ms -> Some (Datetime_value { unix_ms = Int64.of_int unix_ms })
+  | Date, Int64 journal_day ->
+    Option.map
+      (fun journal_day -> Graph.Date_value { journal_day })
+      (Datascript.Util.int64_to_int journal_day)
+  | Datetime, Int64 unix_ms -> Some (Datetime_value { unix_ms })
   | Checkbox, Bool value -> Some (Checkbox_value value)
   | Keyword, Keyword value -> Some (Keyword_value value)
   | Node, Ref entity ->
@@ -1291,7 +1294,7 @@ let set_block_field_properties
        ?cache
        database
        "block/updated-at"
-       [ Datascript.Int (Int64.to_int updated_at_ms) ]
+       [ Datascript.Int64 updated_at_ms ]
   |> set_uuid_property_values ?cache database "block/refs" refs
 ;;
 
@@ -1890,12 +1893,10 @@ let graph_info snapshot =
   with_snapshot_read snapshot (fun snapshot ->
     let journal_title_format =
       Option.bind snapshot.authoritative_database (fun database ->
-        Option.bind
-          (entity_of_ident database "logseq.class/Journal")
-          (fun entity ->
-            Option.bind
-              (one database entity "logseq.property.journal/title-format")
-              string_of_value))
+        Option.bind (entity_of_ident database "logseq.class/Journal") (fun entity ->
+          Option.bind
+            (one database entity "logseq.property.journal/title-format")
+            string_of_value))
     in
     Ok
       { Types.graph_uuid = snapshot.owner.graph_uuid
@@ -2013,16 +2014,8 @@ let rec inserted_block
       |> set_uuid_property_values ?cache database "block/parent" [ parent ]
       |> set_uuid_property_values ?cache database "block/page" [ page ]
       |> set_property_values ?cache database "block/order" [ Datascript.String order ]
-      |> set_property_values
-           ?cache
-           database
-           "block/created-at"
-           [ Datascript.Int (Int64.to_int now) ]
-      |> set_property_values
-           ?cache
-           database
-           "block/updated-at"
-           [ Datascript.Int (Int64.to_int now) ]
+      |> set_property_values ?cache database "block/created-at" [ Datascript.Int64 now ]
+      |> set_property_values ?cache database "block/updated-at" [ Datascript.Int64 now ]
     in
     Some
       Types.
@@ -2128,17 +2121,17 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
                   ?cache
                   authoritative
                   "block/created-at"
-                  [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                  [ Datascript.Int64 record.intent_time_ms ]
              |> set_property_values
                   ?cache
                   authoritative
                   "block/updated-at"
-                  [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                  [ Datascript.Int64 record.intent_time_ms ]
              |> set_property_values
                   ?cache
                   authoritative
                   "block/journal-day"
-                  [ Datascript.Int journal_day ]
+                  [ Datascript.Int64 (Int64.of_int journal_day) ]
            in
            Some
              Types.
@@ -2194,7 +2187,7 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
                          ?cache
                          authoritative
                          "block/updated-at"
-                         [ Datascript.Int (Int64.to_int patch.updated_at_ms) ]
+                         [ Datascript.Int64 patch.updated_at_ms ]
                          properties
                      in
                      Types.
@@ -2265,7 +2258,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                          ?cache
                          authoritative
                          "block/updated-at"
-                         [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                         [ Datascript.Int64 record.intent_time_ms ]
                   in
                   { value with
                     block =
@@ -2293,7 +2286,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                          ?cache
                          authoritative
                          "block/updated-at"
-                         [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                         [ Datascript.Int64 record.intent_time_ms ]
                   in
                   Types.
                     { value with
@@ -2365,7 +2358,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                           ?cache
                           authoritative
                           "logseq.property.asset/size"
-                          [ Datascript.Int (Int64.to_int asset.size) ]
+                          [ Datascript.Int64 asset.size ]
                    in
                    let tags =
                      Option.bind
@@ -2394,7 +2387,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                                ?cache
                                authoritative
                                "block/updated-at"
-                               [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                               [ Datascript.Int64 record.intent_time_ms ]
                         in
                         { value with
                           block =
@@ -2431,7 +2424,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                                ?cache
                                authoritative
                                "block/updated-at"
-                               [ Datascript.Int (Int64.to_int patch.updated_at_ms) ]
+                               [ Datascript.Int64 patch.updated_at_ms ]
                         in
                         Types.
                           { value with
@@ -2483,7 +2476,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                         ?cache
                         authoritative
                         "block/updated-at"
-                        [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                        [ Datascript.Int64 record.intent_time_ms ]
                         value.block.properties
                     in
                     match entity_of_ident authoritative (status_ident status) with
@@ -2521,7 +2514,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                          ?cache
                          authoritative
                          "block/updated-at"
-                         [ Datascript.Int (Int64.to_int record.intent_time_ms) ]
+                         [ Datascript.Int64 record.intent_time_ms ]
                   in
                   Types.
                     { value with
@@ -2962,7 +2955,7 @@ let indexed_journal_candidates (snapshot : snapshot) ~from_day ~upper_day ~local
     database
     Datascript.Avet
     ~a:attribute
-    ~v:(Datascript.Int upper_day)
+    ~v:(Datascript.Int64 (Int64.of_int upper_day))
     ~e:Int.max_int
     ~tx:Int.max_int
     ()
@@ -3962,8 +3955,8 @@ let local_operations
     | Types.Set_asset_reference { block; asset; _ } ->
       [ Datascript.RetractAttr (uuid_lookup block, "logseq.property/asset")
       ; Add (uuid_lookup block, "logseq.property/asset", Ref_to (uuid_lookup asset))
-      ; Add (uuid_lookup block, "block/updated-at", Int now)
-      ; Add (uuid_lookup block, "block/tx-id", Int next_tx)
+      ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
+      ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
     | Types.Publish_asset { block; version; _ } ->
       [ Datascript.Add
@@ -3973,14 +3966,14 @@ let local_operations
               [ Keyword "checksum", String version.checksum
               ; Keyword "type", String version.file_type
               ] )
-      ; Add (uuid_lookup block, "block/updated-at", Int now)
-      ; Add (uuid_lookup block, "block/tx-id", Int next_tx)
+      ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
+      ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
     | Types.Save_block { block; title; _ } ->
       let entity = uuid_lookup block in
       [ Datascript.Add (entity, "block/title", String title)
-      ; Add (entity, "block/updated-at", Int now)
-      ; Add (entity, "block/tx-id", Int next_tx)
+      ; Add (entity, "block/updated-at", Int64 (Int64.of_int now))
+      ; Add (entity, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
     | Insert_blocks { tree; parent; asset; _ } ->
       let page =
@@ -3997,9 +3990,9 @@ let local_operations
         ; Add (entity, "block/parent", Ref_to parent_ref)
         ; Add (entity, "block/page", Ref_to page_ref)
         ; Add (entity, "block/order", String order)
-        ; Add (entity, "block/created-at", Int now)
-        ; Add (entity, "block/updated-at", Int now)
-        ; Add (entity, "block/tx-id", Int next_tx)
+        ; Add (entity, "block/created-at", Int64 (Int64.of_int now))
+        ; Add (entity, "block/updated-at", Int64 (Int64.of_int now))
+        ; Add (entity, "block/tx-id", Int64 (Int64.of_int next_tx))
         ]
         @ (tree.children
            |> List.map (fun child -> add_tree ~parent_ref:entity child)
@@ -4014,7 +4007,7 @@ let local_operations
           [ Datascript.Add (entity, "block/tags", Ref_to (Ident "logseq.class/Asset"))
           ; Add (entity, "logseq.property.asset/type", String asset.version.file_type)
           ; Add (entity, "logseq.property.asset/checksum", String asset.version.checksum)
-          ; Add (entity, "logseq.property.asset/size", Int (Int64.to_int asset.size))
+          ; Add (entity, "logseq.property.asset/size", Int64 asset.size)
           ]
           @
             (match asset.replace_reference with
@@ -4022,8 +4015,8 @@ let local_operations
             | Some _ ->
               [ Datascript.RetractAttr (uuid_lookup parent, "logseq.property/asset")
               ; Add (uuid_lookup parent, "logseq.property/asset", Ref_to entity)
-              ; Add (uuid_lookup parent, "block/updated-at", Int now)
-              ; Add (uuid_lookup parent, "block/tx-id", Int next_tx)
+              ; Add (uuid_lookup parent, "block/updated-at", Int64 (Int64.of_int now))
+              ; Add (uuid_lookup parent, "block/tx-id", Int64 (Int64.of_int next_tx))
               ]))
     | Delete_blocks _ ->
       let artifacts = Option.get delete_artifacts in
@@ -4031,8 +4024,8 @@ let local_operations
         let entity = uuid_lookup patch.block_uuid in
         [ Datascript.RetractAttr (entity, "block/refs")
         ; Add (entity, "block/title", String patch.title)
-        ; Add (entity, "block/updated-at", Int (Int64.to_int patch.updated_at_ms))
-        ; Add (entity, "block/tx-id", Int next_tx)
+        ; Add (entity, "block/updated-at", Int64 patch.updated_at_ms)
+        ; Add (entity, "block/tx-id", Int64 (Int64.of_int next_tx))
         ]
         @ List.map
             (fun target ->
@@ -4048,8 +4041,8 @@ let local_operations
                  ( holder
                  , patch.property_ident
                  , Ref_to (uuid_lookup patch.replacement_uuid) )
-             ; Add (holder, "block/updated-at", Int (Int64.to_int patch.updated_at_ms))
-             ; Add (holder, "block/tx-id", Int next_tx)
+             ; Add (holder, "block/updated-at", Int64 patch.updated_at_ms)
+             ; Add (holder, "block/tx-id", Int64 (Int64.of_int next_tx))
              ])
           artifacts.property_patches
       @ List.map
@@ -4058,37 +4051,36 @@ let local_operations
       @ List.map
           (fun patch ->
              Datascript.Add
-               ( uuid_lookup patch.page_uuid
-               , "block/updated-at"
-               , Int (Int64.to_int patch.updated_at_ms) ))
+               (uuid_lookup patch.page_uuid, "block/updated-at", Int64 patch.updated_at_ms))
           artifacts.page_patches
       @ List.map
           (fun patch ->
-             Datascript.Add (uuid_lookup patch.page_uuid, "block/tx-id", Int next_tx))
+             Datascript.Add
+               (uuid_lookup patch.page_uuid, "block/tx-id", Int64 (Int64.of_int next_tx)))
           artifacts.page_patches
     | Create_journal_page { page; title; journal_day; _ } ->
       let entity = uuid_temp "overlay-page" page in
       [ Datascript.Add (entity, "block/uuid", Uuid (Graph.Uuid.to_string page))
       ; Add (entity, "block/title", String title)
       ; Add (entity, "block/name", String (String.lowercase_ascii title))
-      ; Add (entity, "block/created-at", Int now)
-      ; Add (entity, "block/updated-at", Int now)
-      ; Add (entity, "block/journal-day", Int journal_day)
+      ; Add (entity, "block/created-at", Int64 (Int64.of_int now))
+      ; Add (entity, "block/updated-at", Int64 (Int64.of_int now))
+      ; Add (entity, "block/journal-day", Int64 (Int64.of_int journal_day))
       ; Add (entity, "block/tags", Ref_to (Ident "logseq.class/Journal"))
-      ; Add (entity, "block/tx-id", Int next_tx)
+      ; Add (entity, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
     | Set_task_status { block; status; _ } ->
       [ Datascript.Add
           ( uuid_lookup block
           , "logseq.property/status"
           , Ref_to (Ident (status_ident status)) )
-      ; Add (uuid_lookup block, "block/updated-at", Int now)
-      ; Add (uuid_lookup block, "block/tx-id", Int next_tx)
+      ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
+      ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
     | Clear_task_status { block; _ } ->
       [ Datascript.RetractAttr (uuid_lookup block, "logseq.property/status")
-      ; Add (uuid_lookup block, "block/updated-at", Int now)
-      ; Add (uuid_lookup block, "block/tx-id", Int next_tx)
+      ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
+      ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
   in
   operations
@@ -5763,7 +5755,7 @@ let authoritative_import_matches
       | Some entity, Some asset_class ->
         entity_has_ref database entity "block/tags" asset_class
         && one database entity "logseq.property.asset/size"
-           = Some (Datascript.Int (Int64.to_int asset.size))
+           = Some (Datascript.Int64 asset.size)
       | _ -> false)
 ;;
 
@@ -8128,8 +8120,8 @@ let replay_authoritative database prepared =
                 ~tx_meta:
                   [ "skip-store?", Datascript.Bool true
                   ; "logseq-overlay/commit-id", String commit_id
-                  ; "logseq-overlay/batch-ordinal", Int ordinal
-                  ; "logseq-overlay/batch-count", Int count
+                  ; "logseq-overlay/batch-ordinal", Int64 (Int64.of_int ordinal)
+                  ; "logseq-overlay/batch-count", Int64 (Int64.of_int count)
                   ]
                 database.authoritative_connection
                 operations
@@ -8141,9 +8133,9 @@ let replay_authoritative database prepared =
         && List.assoc_opt "logseq-overlay/commit-id" report.tx_meta
            = Some (Datascript.String commit_id)
         && List.assoc_opt "logseq-overlay/batch-ordinal" report.tx_meta
-           = Some (Datascript.Int ordinal)
+           = Some (Datascript.Int64 (Int64.of_int ordinal))
         && List.assoc_opt "logseq-overlay/batch-count" report.tx_meta
-           = Some (Datascript.Int count)
+           = Some (Datascript.Int64 (Int64.of_int count))
       in
       if
         List.length reports = count

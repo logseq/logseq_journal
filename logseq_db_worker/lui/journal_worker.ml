@@ -109,6 +109,7 @@ module Service = struct
   type ('config, 'request, 'response, 'push, 'state) direct_callbacks =
     { push_topic_count : int
     ; concurrency : concurrency
+    ; merge_push : topic:ID.Worker.push_topic -> 'push -> 'push -> 'push
     ; data_directory : ('config -> (string, string) result) option
     ; init : 'push Session_context.t -> 'config -> ('state, string) result
     ; handle : 'push Request_context.t -> 'state -> 'request -> ('response, string) result
@@ -131,10 +132,27 @@ module Service = struct
     | Concurrent _ -> invalid_arg "Worker concurrency must be positive"
   ;;
 
-  let create ~push_topic_count ~concurrency ?data_directory ~init ~handle ~shutdown () =
+  let create
+        ~push_topic_count
+        ~concurrency
+        ?(merge_push = fun ~topic:_ _ next -> next)
+        ?data_directory
+        ~init
+        ~handle
+        ~shutdown
+        ()
+    =
     validate_push_topic_count push_topic_count;
     validate_concurrency concurrency;
-    Direct { push_topic_count; concurrency; data_directory; init; handle; shutdown }
+    Direct
+      { push_topic_count
+      ; concurrency
+      ; merge_push
+      ; data_directory
+      ; init
+      ; handle
+      ; shutdown
+      }
   ;;
 end
 
@@ -625,7 +643,18 @@ let run_direct_session
     in
     with_output_lock client (fun () ->
       match
-        Journal_bounded_mailbox.Coalesced.push client.pushes ~topic:topic_index event
+        Journal_bounded_mailbox.Coalesced.push
+          ~merge:(fun previous next ->
+            match previous, next with
+            | Push old, Push fresh ->
+              Push
+                { fresh with
+                  payload = callbacks.merge_push ~topic old.payload fresh.payload
+                }
+            | _ -> next)
+          client.pushes
+          ~topic:topic_index
+          event
       with
       | `Added -> increment_pending_output_locked client
       | `Replaced -> Condition.broadcast client.output_condition

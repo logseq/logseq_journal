@@ -552,10 +552,13 @@ let task_status_of_protocol = function
   | V2_later -> Later
 ;;
 
-let block_record (value : Overlay.block_record) : Protocol.v2_block_record =
+let block_record ?(tag_titles = []) (value : Overlay.block_record)
+  : Protocol.v2_block_record
+  =
   { block = value.block
   ; task_status = Option.map task_status_to_protocol value.task_status
   ; rendered_page_title = value.rendered_page_title
+  ; tag_titles
   }
 ;;
 
@@ -798,6 +801,36 @@ let read_snapshot database request command =
     Fun.protect
       ~finally:(fun () -> Database.release_snapshot snapshot)
       (fun () ->
+         let titles = Hashtbl.create 16 in
+         let block_record (value : Overlay.block_record) =
+           let missing =
+             List.filter
+               (fun uuid -> not (Hashtbl.mem titles (Graph.Uuid.to_string uuid)))
+               value.block.tags
+           in
+           if missing <> []
+           then (
+             match Database.get_pages snapshot missing with
+             | Ok pages ->
+               List.iter
+                 (function
+                   | Overlay.Present_page { value; _ } ->
+                     Hashtbl.replace
+                       titles
+                       (Graph.Uuid.to_string value.page.uuid)
+                       (Some value.page.title)
+                   | Overlay.Missing_page { uuid; _ } ->
+                     Hashtbl.replace titles (Graph.Uuid.to_string uuid) None)
+                 pages
+             | Error _ -> ());
+           let tag_titles =
+             List.filter_map
+               (fun uuid ->
+                  Option.join (Hashtbl.find_opt titles (Graph.Uuid.to_string uuid)))
+               value.block.tags
+           in
+           block_record ~tag_titles value
+         in
          match command with
          | Protocol.V2_graph_info ->
            (match Database.graph_info snapshot with
@@ -1101,7 +1134,7 @@ let acknowledge_changes session request generation through =
       response request (Protocol.V2_changes_acknowledged { generation; through }))
 ;;
 
-let execute_database session request =
+let execute_database session ~response_budget_bytes request =
   match request.Protocol.command with
   | Protocol.V2_pull_changes { generation; after; limit } ->
     pull_changes session request generation after limit
@@ -1116,7 +1149,16 @@ let execute_database session request =
     | V2_set_task_status _
     | V2_clear_task_status _ ) as command ->
     execute_mutation session.database request command
-  | command -> read_snapshot session.database request command
+  | command ->
+    let result = read_snapshot session.database request command in
+    let budget = min response_budget_bytes Protocol.maximum_response_bytes in
+    if Protocol.encoded_response_bytes result <= budget
+    then result
+    else
+      failure
+        request
+        Response_too_large
+        "The encoded read response exceeded its byte limit."
 ;;
 
 let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
@@ -1483,7 +1525,12 @@ let run_request t (type a) (request : a Core.runner_request)
   | Core.Execute_request { database; request } ->
     (match Hashtbl.find_opt t.databases (Core.database_handle_id database) with
      | None -> Error (effect_error "The overlay database is unavailable.")
-     | Some session -> Ok (execute_database session request))
+     | Some session ->
+       Ok
+         (execute_database
+            session
+            ~response_budget_bytes:t.dependencies.config.response_budget_bytes
+            request))
   | Close_database database -> close_database_by_id t (Core.database_handle_id database)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect
 ;;

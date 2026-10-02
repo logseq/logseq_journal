@@ -26,6 +26,7 @@ parser.add_argument('--rows', type=int, default=500, help='Number of fixture jou
 parser.add_argument('--children', type=int, default=35, help='Children under the first root (0–5000)')
 parser.add_argument('--graphs', type=int, default=1, help='Independent encrypted fixture graphs (1–4)')
 parser.add_argument('--history-days', type=int, default=0, help='Additional journal days with 12 rows each (0–30)')
+parser.add_argument('--references', action='store_true', help='Seed isolated UUID reference and literal fallback cases')
 parser.add_argument('--platform', choices=['macos', 'ios-simulator'], default='macos')
 parser.add_argument('--native-object', type=Path, help='Use the current verified production object')
 arguments = parser.parse_args()
@@ -69,7 +70,7 @@ if not artifact.is_file():
 record['nativeObject'] = {'path': str(artifact), 'sha256': hashlib.sha256(artifact.read_bytes()).hexdigest()}
 
 bootstrap = "\n".join(subprocess.run(['dune', 'ocaml', 'top', target], cwd=root,
-    capture_output=True, text=True, check=True).stdout for target in ['app', 'logseq_overlay_db/test'])
+    capture_output=True, text=True, check=True).stdout for target in ['logseq_overlay_db/test', 'logseq_sync'])
 bootstrap = "\n".join(line for line in dict.fromkeys(bootstrap.splitlines())
                       if not (line.startswith('#load ') and '/native_backend/' in line))
 generator = host/'generate.ml'
@@ -85,11 +86,13 @@ for tracked in sources + [source]:
 lui_probe_host.stage(host, app_swift=source.read_text(),
                      bundle_id='org.logseq.journal.warm-start-probe',
                      display_name='Logseq Journal')
+# Preserve the repository's resolved dependency versions in the isolated host.
+shutil.copy2(root/'swift/Package.resolved', host/'swift/Package.resolved')
 
 for case in ['valid', 'missing']:
     support = host/('support-'+case)
     support.mkdir()
-    fixture = run(['ocaml', '-noinit', '-noprompt', generator, support, str(arguments.rows), str(arguments.children), str(arguments.graphs), str(arguments.history_days)], cwd=root)
+    fixture = run(['ocaml', '-noinit', '-noprompt', generator, support, str(arguments.rows), str(arguments.children), str(arguments.graphs), str(arguments.history_days)] + (["references"] if arguments.references else []), cwd=root)
     (host/(case+'.json')).write_text(json.dumps(json.loads(fixture), indent=2)+'\n')
 
 # XCODE_XCCONFIG_FILE enables DEBUG inside the probe build (the test host's

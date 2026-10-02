@@ -20,6 +20,8 @@
   <string>26.0</string>
   <key>MinimumOSVersion</key>
   <string>26.0</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Take a photo to attach to a journal entry.</string>
   <key>UILaunchScreen</key>
   <dict/>
   <key>UISupportedInterfaceOrientations</key>

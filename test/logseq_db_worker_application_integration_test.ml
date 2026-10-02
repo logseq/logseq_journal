@@ -45,7 +45,7 @@ let block : Graph.block =
 ;;
 
 let record : Protocol.v2_block_record =
-  { block; task_status = None; rendered_page_title = page.title }
+  { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
 ;;
 
 let capture : Journal_graph_projection.capture =
@@ -83,7 +83,7 @@ let set_calendar runtime =
   Runtime.set_calendar runtime calendar
 ;;
 
-let seed_visible_block runtime =
+let seed_visible_block ?(record = record) runtime =
   set_calendar runtime;
   let journals =
     Runtime.submit
@@ -730,11 +730,211 @@ let test_uninterested_change_is_acknowledged_without_hydration () =
   | _ -> Alcotest.fail "uninterested change must only produce an acknowledgement"
 ;;
 
+let test_named_tags_reach_timeline_row () =
+  let module Ui = Journal_view in
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let journals =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 1
+         ; blocks_per_day = 2
+         ; slot_limit = 4
+         ; request_generation = 7L
+         })
+    |> fun out -> only "journals" out.requests
+  in
+  let tree =
+    Runtime.receive
+      runtime
+      (respond
+         journals
+         (Protocol.V2_journals_outcome
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            ; next_cursor = None
+            }))
+    |> fun out -> only "tree" out.requests
+  in
+  let raw =
+    Protocol.response_to_yojson
+      (respond
+         tree
+         (Protocol.V2_page_tree_outcome
+            { page = page_uuid
+            ; maximum_depth = 1
+            ; items =
+                [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid }
+                ]
+            ; next_cursor = None
+            }))
+  in
+  let rec enrich = function
+    | `Assoc fields ->
+      let fields = List.map (fun (k, v) -> k, enrich v) fields in
+      if List.mem_assoc "renderedPageTitle" fields
+      then `Assoc (("tagTitles", `List [ `String "户外"; `String "周末计划" ]) :: fields)
+      else `Assoc fields
+    | `List values -> `List (List.map enrich values)
+    | value -> value
+  in
+  let response =
+    match Protocol.response_of_yojson (enrich raw) with
+    | Ok value -> value
+    | Error message -> Alcotest.failf "tag read rejected: %s" message
+  in
+  let output = Runtime.receive runtime response in
+  let entry =
+    List.find_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Feed_loaded { feed; _ } ->
+           List.find_map
+             (fun (d : Journal_graph_projection.day_feed) ->
+                match d.entries with
+                | head :: _ -> Some head
+                | [] -> None)
+             feed.days
+         | _ -> None)
+      output.responses
+    |> Option.get
+  in
+  let batches = ref [] in
+  let backend : Lui_protocol.backend =
+    { backend_profile = Lui_protocol.profile IOS SwiftUIHost
+    ; apply_batch =
+        (fun b ->
+          batches := b :: !batches;
+          true)
+    }
+  in
+  let view =
+    Journal_row.view
+      ~show_timestamp:false
+      ~render_media:(fun ~root:_ child -> child)
+      entry
+  in
+  let app =
+    Lui_app.create_with_extensions
+      backend
+      Journal_lui_native.registry
+      ()
+      (fun () () -> ())
+      (fun _ _ _ -> Ui.mount view)
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Lui_app.dispose app))
+    (fun () ->
+       ignore (Lui_app.start app);
+       ignore (Lui_app.flush app);
+       let ops = List.concat_map (fun (b : Lui_protocol.patch_batch) -> b.ops) !batches in
+       Alcotest.(check bool)
+         "tag labels reach actual timeline UI"
+         true
+         (List.exists
+            (function
+              | Lui_protocol.SetProp (_, TextValue, StringValue "#户外  #周末计划") -> true
+              | _ -> false)
+            ops))
+;;
+
+let test_point_read_tag_metadata () =
+  List.iter
+    (fun titles ->
+       let runtime = Runtime.create ~localtime:Unix.gmtime () in
+       let tagged =
+         { record with
+           block = { block with tags = [ page_uuid ] }
+         ; tag_titles = [ "before" ]
+         }
+       in
+       ignore (seed_visible_block ~record:tagged runtime);
+       let pull =
+         Runtime.reconcile_push
+           runtime
+           ~request_generation:11L
+           (Protocol.V2_changes_available
+              { api_version = 2; generation = "generation-1"; through = "revision-2" })
+         |> fun output -> only "change request" output.requests
+       in
+       let hydrated =
+         Runtime.receive
+           runtime
+           (respond
+              pull
+              (V2_changes
+                 { generation = "generation-1"
+                 ; from_exclusive = None
+                 ; through = "revision-2"
+                 ; windows =
+                     [ { id = "change-1"
+                       ; predecessor = "revision-1"
+                       ; successor = "revision-2"
+                       ; block_uuids = [ block_uuid ]
+                       ; page_uuids = []
+                       ; structure_interests = []
+                       }
+                     ]
+                 ; next = None
+                 }))
+       in
+       let point =
+         List.find
+           (fun (request : Protocol.request) ->
+              match request.command with
+              | V2_get_block _ -> true
+              | _ -> false)
+           hydrated.requests
+       in
+       let updated =
+         { tagged with
+           block =
+             { block with
+               title = "Remote edit"
+             ; tags = (if titles = [] then [] else [ page_uuid ])
+             }
+         ; tag_titles = titles
+         }
+       in
+       let output =
+         Runtime.receive
+           runtime
+           (respond
+              point
+              (V2_block_outcome
+                 (V2_present_block { value = updated; revision = "block-2" })))
+       in
+       let projected =
+         List.find_map
+           (fun (response : Runtime.response) ->
+              match response.payload with
+              | Block_updated { block; _ } -> Some block
+              | _ -> None)
+           output.responses
+         |> Option.get
+       in
+       Alcotest.(check (list string))
+         "point read replaces tag metadata"
+         titles
+         (Journal_model.tag_titles projected);
+       Alcotest.(check string)
+         "updated body"
+         "Remote edit"
+         (Journal_model.source projected))
+    [ [ "before" ]; [ "after"; "中文" ]; [] ]
+;;
+
 let () =
   Alcotest.run
     "Worker application integration"
     [ ( "v2 boundary"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "point read tag metadata" `Quick test_point_read_tag_metadata
+        ; Alcotest.test_case
+            "named tags reach timeline row"
+            `Quick
+            test_named_tags_reach_timeline_row
+        ; Alcotest.test_case
             "read response becomes normalized feed"
             `Quick
             test_worker_read_becomes_normalized_application_feed

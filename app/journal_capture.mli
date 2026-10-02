@@ -40,6 +40,23 @@ val update_source : t -> source:string -> t
 val toggle_task_intent : t -> t
 val apply_text_edit : t -> Ui.Event.Payload.text_edit -> t
 
+(** Upper bound on attachments a draft capture may hold. *)
+val attachment_limit : int
+
+(** Assets picked for this draft, awaiting attach-on-save. *)
+val pending_attachments : t -> Journal_asset_import.staged list
+
+(** Whether another attachment may be added (not saving, under the limit). *)
+val can_attach : t -> bool
+
+val add_attachment : t -> Journal_asset_import.staged -> t
+val remove_attachment : t -> token:string -> t
+val clear_attachments : t -> t
+
+(** For an admitted save, the captured block id and the attachments to import
+    into it; [None] without a pending capture or attachments. *)
+val attachment_imports : t -> (string * Journal_asset_import.staged list) option
+
 val admit_save
   :  t
   -> mutation_id:string

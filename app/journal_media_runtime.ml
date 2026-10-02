@@ -353,6 +353,15 @@ let root_visible t ~root visible =
   | _ -> ()
 ;;
 
+let retain_visible_roots t roots =
+  let visible = Hashtbl.create (List.length roots) in
+  List.iter (fun root -> Hashtbl.replace visible root ()) roots;
+  Hashtbl.iter
+    (fun root group ->
+       if group.visible && not (Hashtbl.mem visible root) then root_visible t ~root false)
+    t.groups
+;;
+
 let asset_visible t ~root ~asset visible =
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some graph_generation ->

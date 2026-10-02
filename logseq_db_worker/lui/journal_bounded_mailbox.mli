@@ -39,8 +39,14 @@ module Coalesced : sig
   val create : capacity:int -> 'a t
 
   (** Stores the latest value for [topic]. A new topic is rejected when all
-      topic slots are occupied, while an existing topic is always replaced. *)
-  val push : 'a t -> topic:int -> 'a -> [ `Added | `Replaced | `Full ]
+      topic slots are occupied, while an existing topic is replaced using [merge] (latest value by default).
+      The merge executes under the mailbox lock and must not reenter the mailbox. *)
+  val push
+    :  ?merge:('a -> 'a -> 'a)
+    -> 'a t
+    -> topic:int
+    -> 'a
+    -> [ `Added | `Replaced | `Full ]
 
   val drain : 'a t -> max_items:int -> (int * 'a) list
 end

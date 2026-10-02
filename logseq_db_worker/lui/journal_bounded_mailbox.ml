@@ -154,10 +154,11 @@ module Coalesced = struct
     Fun.protect ~finally:(fun () -> Mutex.unlock t.mutex) f
   ;;
 
-  let push t ~topic value =
+  let push ?(merge = fun _ next -> next) t ~topic value =
     with_lock t (fun () ->
       if Hashtbl.mem t.slots topic
       then (
+        let value = merge (Hashtbl.find t.slots topic) value in
         Hashtbl.replace t.slots topic value;
         `Replaced)
       else if Hashtbl.length t.slots >= t.capacity

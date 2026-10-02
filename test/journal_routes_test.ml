@@ -210,6 +210,196 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
     "direct Capture retry did not return to Saving"
 ;;
 
+let staged_pick ~operation ~path ~title ~file_type =
+  match
+    Journal_asset_import.decode_event
+      (Printf.sprintf
+         {|{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s","replaceReference":null}|}
+         operation
+         "70000000-0000-4000-a000-00000000a001"
+         "70000000-0000-4000-a000-00000000a002"
+         "70000000-0000-4000-a000-00000000a003"
+         path
+         title
+         file_type)
+  with
+  | Ok (Journal_asset_import.Picked (staged, _)) -> staged
+  | _ -> fail "staged pick did not decode"
+;;
+
+let test_direct_capture_pending_attachments () =
+  let capture = Journal_capture.create ~session_number:13L ~source:"" in
+  require (not (Journal_capture.can_save capture)) "blank Capture admitted Save";
+  let pick =
+    staged_pick
+      ~operation:"70000000-0000-4000-a000-00000000a010"
+      ~path:"/tmp/a.png"
+      ~title:"a.png"
+      ~file_type:"png"
+  in
+  let attached = Journal_capture.add_attachment capture pick in
+  require
+    (Journal_capture.can_save attached)
+    "blank Capture with a pending attachment kept Save disabled";
+  let token = Journal_asset_import.staged_token pick in
+  let removed = Journal_capture.remove_attachment attached ~token in
+  require
+    (Journal_capture.pending_attachments removed = [])
+    "remove_attachment kept the picked asset";
+  require
+    (not (Journal_capture.can_save removed))
+    "removing the only attachment left a blank Capture saveable";
+  let attached = Journal_capture.add_attachment removed pick in
+  let over_limit =
+    List.init Journal_capture.attachment_limit (fun ordinal ->
+      staged_pick
+        ~operation:(Printf.sprintf "70000000-0000-4000-a000-%012x" (ordinal + 1))
+        ~path:"/tmp/x.png"
+        ~title:"x.png"
+        ~file_type:"png")
+    |> List.fold_left Journal_capture.add_attachment attached
+  in
+  require
+    (List.length (Journal_capture.pending_attachments over_limit)
+     = Journal_capture.attachment_limit)
+    "pending attachments exceeded the limit";
+  require
+    (not (Journal_capture.can_attach over_limit))
+    "Capture at the attachment limit still accepted picks";
+  let saving, request =
+    Journal_capture.admit_save
+      attached
+      ~mutation_id:"70000000-0000-4000-9000-000000000013"
+      ~block_id:"70000000-0000-4000-a000-000000000013"
+      ~sibling_order:"000000000013"
+      ~calendar_generation:7L
+      ~creation_time:(creation_time 543)
+  in
+  require (Option.is_some request) "attachment-only Capture did not admit Save";
+  (match request with
+   | Some (Journal_graph_request.Capture { command; _ }) ->
+     require_string
+       "a.png"
+       command.source
+       "attachment-only Capture did not name the block after its pick"
+   | _ -> fail "attachment-only Capture admitted a non-Capture request");
+  (match Journal_capture.attachment_imports saving with
+   | Some (block_id, [ staged ]) ->
+     require_string
+       "70000000-0000-4000-a000-000000000013"
+       block_id
+       "attachment imports lost the captured block";
+     require_string
+       "/tmp/a.png"
+       (Journal_asset_import.staged_path staged)
+       "attachment imports lost the staged path"
+   | _ -> fail "attachment imports did not expose the pending pick");
+  require
+    (Journal_capture.clear_attachments attached
+     |> Journal_capture.pending_attachments
+     |> List.is_empty)
+    "clear_attachments kept pending picks"
+;;
+
+let test_collapse_retains_complete_capture () =
+  let module R = Application.Root_navigation in
+  let state = R.create ~graph_generation:3 |> fun s -> R.step s Capture_opened in
+  let original = Option.get (R.capture state) in
+  let edited =
+    Journal_capture.apply_text_edit
+      original
+      (edit
+         ~session_id:(Journal_capture.session_id original)
+         ~local_revision:1L
+         ~base_document_revision:0L
+         ~text:"Draft 中文"
+         ~selection_start:7
+         ~selection_end:8
+         ~composing:(6, 8)
+         ())
+  in
+  let picks =
+    List.init 2 (fun index ->
+      staged_pick
+        ~operation:(Printf.sprintf "70000000-0000-4000-a000-%012d" (100 + index))
+        ~path:(if index = 0 then "/tmp/synthetic.png" else "/tmp/synthetic.pdf")
+        ~title:(if index = 0 then "synthetic.png" else "synthetic.pdf")
+        ~file_type:(if index = 0 then "png" else "pdf"))
+  in
+  let editing =
+    List.fold_left
+      Journal_capture.add_attachment
+      (Journal_capture.toggle_task_intent edited)
+      picks
+  in
+  let saving, request =
+    Journal_capture.admit_save
+      editing
+      ~mutation_id:"70000000-0000-4000-9000-000000000099"
+      ~block_id:"70000000-0000-4000-a000-000000000099"
+      ~sibling_order:"z"
+      ~calendar_generation:1L
+      ~creation_time:(creation_time 550)
+  in
+  require (Option.is_some request) "fixture save admission failed";
+  List.iter
+    (fun expected ->
+       let start = R.step state (Capture_admitted expected) in
+       let final =
+         List.fold_left
+           (fun s _ ->
+              let hidden = R.step s Capture_closed in
+              require (not (R.capture_presented hidden)) "collapse remained visible";
+              require
+                (R.capture hidden = Some expected)
+                "collapse changed owned draft state";
+              R.step hidden Capture_opened)
+           start
+           [ 1; 2; 3 ]
+       in
+       let actual = Option.get (R.capture final) in
+       require
+         (actual = expected)
+         "repeated expansion changed draft, phase, selection or staging";
+       require
+         (Journal_capture.pending_attachments actual = picks)
+         "collapse lost ordered staged attachments")
+    [ editing
+    ; saving
+    ; Journal_capture.fail saving ~message:"synthetic admission failure"
+    ];
+  let discarded = R.step (R.step state (Capture_admitted editing)) Capture_discarded in
+  require
+    (R.capture discarded = None && not (R.capture_presented discarded))
+    "explicit discard retained draft state";
+  let fresh = R.step discarded Capture_opened |> R.capture |> Option.get in
+  require
+    (Journal_capture.source fresh = ""
+     && Journal_capture.task_state fresh = No_status
+     && Journal_capture.pending_attachments fresh = [])
+    "discard did not reset complete draft";
+  let admitted = R.step state (Capture_admitted saving) in
+  require
+    (R.capture (R.step admitted Capture_discarded) = Some saving)
+    "discard cancelled an admitted save";
+  let picking = R.step state (Capture_picker_requested Journal_asset_import.Files) in
+  let staged = List.hd picks in
+  let hidden_completion =
+    R.step (R.step picking Capture_closed) (Capture_asset_picked (staged, Some 1))
+  in
+  require
+    (Journal_capture.pending_attachments (Option.get (R.capture hidden_completion))
+     = [ staged ])
+    "collapse rejected its existing picker completion";
+  let replacement =
+    R.step (R.step picking Capture_discarded) Capture_opened
+    |> fun next -> R.step next (Capture_asset_picked (staged, Some 1))
+  in
+  require
+    (Journal_capture.pending_attachments (Option.get (R.capture replacement)) = [])
+    "discard allowed a late picker completion into the next draft"
+;;
+
 let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   let source = "  Todo 中文 👩🏽‍💻 exact  " in
   let capture = Journal_capture.create ~session_number:12L ~source in
@@ -1630,6 +1820,7 @@ let tests =
     , test_favorites_state_isolates_requests_and_refreshes )
   ; ( "direct Capture source and mutation identity"
     , test_direct_capture_preserves_source_and_mutation_identity )
+  ; "direct Capture pending attachments", test_direct_capture_pending_attachments
   ; ( "direct Capture task intent lifecycle"
     , test_direct_capture_task_intent_survives_edit_failure_and_retry )
   ; "outline branches, append and subtree Undo", test_outline_branches_append_and_delete
@@ -1639,6 +1830,7 @@ let tests =
 ;;
 
 let () = test_native_composer_dismissal_and_edit_fences ()
+let () = test_collapse_retains_complete_capture ()
 
 let () =
   List.iter

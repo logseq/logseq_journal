@@ -9,6 +9,7 @@ let journalIconNames: [String] = [
     "arrow.up",
     "book",
     "calendar",
+    "camera",
     "checkmark.circle",
     "checkmark.square",
     "chevron.down",
@@ -26,7 +27,9 @@ let journalIconNames: [String] = [
     "lock.doc",
     "lock.shield",
     "minus.circle",
+    "paperclip",
     "person.crop.circle",
+    "photo",
     "plus",
     "questionmark.folder",
     "rectangle.portrait.and.arrow.right",
@@ -35,6 +38,7 @@ let journalIconNames: [String] = [
     "star",
     "stethoscope",
     "trash",
+    "xmark",
 ]
 
 let journalAppIcons: [String: LUIAppleIconSource] = Dictionary(

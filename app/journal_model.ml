@@ -51,6 +51,7 @@ type t =
   ; sibling_order : string
   ; source : string
   ; task_state : task_state
+  ; tag_titles : string list
   ; child_count : int
   ; creation_time : Journal_time.t
   ; revision : string
@@ -114,6 +115,7 @@ let create_on_page
         ; sibling_order
         ; source
         ; task_state
+        ; tag_titles = []
         ; child_count
         ; creation_time
         ; revision
@@ -171,4 +173,94 @@ let with_child_count value ~child_count =
   if child_count < 0
   then Error "Journal child count must not be negative"
   else Ok { value with child_count }
+;;
+
+let tag_titles value = value.tag_titles
+
+let with_tag_titles value ~tag_titles =
+  { value with
+    tag_titles = List.filter (fun title -> String.trim title <> "") tag_titles
+  }
+;;
+
+(* The literal-text renderer recognizes only exact UUID links. Scanning is linear
+   in source bytes, with the same validator used for block identity. *)
+let fold_references source ~init ~f =
+  let length = String.length source in
+  let rec scan offset acc =
+    if offset >= length
+    then acc
+    else if source.[offset] = '\\'
+    then scan (min length (offset + 2)) acc
+    else if
+      offset + 40 <= length
+      && source.[offset] = '['
+      && source.[offset + 1] = '['
+      && source.[offset + 38] = ']'
+      && source.[offset + 39] = ']'
+    then (
+      let id = String.sub source (offset + 2) 36 in
+      if Journal_validation.is_uuid id
+      then scan (offset + 40) (f acc offset (String.lowercase_ascii id))
+      else scan (offset + 1) acc)
+    else scan (offset + 1) acc
+  in
+  scan 0 init
+;;
+
+let reference_ids source =
+  let seen = Hashtbl.create 8 in
+  fold_references source ~init:[] ~f:(fun ids _ id ->
+    if Hashtbl.mem seen id
+    then ids
+    else (
+      Hashtbl.add seen id ();
+      id :: ids))
+  |> List.rev
+;;
+
+let maximum_reference_depth = 16
+
+let render_references ~lookup source =
+  let remaining = ref 256 in
+  let rec expand path depth source =
+    let output = Buffer.create (min 65536 (String.length source)) in
+    let copied = ref 0
+    and cyclic = ref false in
+    fold_references source ~init:() ~f:(fun () offset id ->
+      Buffer.add_substring output source !copied (offset - !copied);
+      let replacement =
+        if List.mem id path
+        then (
+          cyclic := true;
+          None)
+        else if depth >= maximum_reference_depth || !remaining = 0
+        then None
+        else (
+          match lookup id with
+          | None -> None
+          | Some target ->
+            decr remaining;
+            let result = expand (id :: path) (depth + 1) target in
+            if Option.is_none result then cyclic := true;
+            result)
+      in
+      (* Reserve space for the literal suffix, so a large expansion falls back
+         to its original token without truncating the surrounding source. *)
+      let replacement =
+        Option.bind replacement (fun text ->
+          if
+            Buffer.length output + String.length text + String.length source - offset - 40
+            <= 65536
+          then Some text
+          else None)
+      in
+      (match replacement with
+       | Some text -> Buffer.add_string output text
+       | None -> Buffer.add_substring output source offset 40);
+      copied := offset + 40);
+    Buffer.add_substring output source !copied (String.length source - !copied);
+    if !cyclic && depth > 0 then None else Some (Buffer.contents output)
+  in
+  Option.value (expand [] 0 source) ~default:source
 ;;

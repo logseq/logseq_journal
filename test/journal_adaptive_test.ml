@@ -70,6 +70,186 @@ let test_header_context_copy_is_pure_product_state () =
     "Favorites context changed"
 ;;
 
+let test_ios_capsules_mount_outside_toolbars () =
+  let module V = Ui.View in
+  List.iter
+    (fun context ->
+       List.iter
+         (fun (capture_enabled, capture_expanded, account_available, error_available) ->
+            let batches = ref [] in
+            let presses = ref [] in
+            let handler name =
+              Ui.Event.Handler.create (fun _ -> presses := name :: !presses)
+            in
+            let backend : Lui_protocol.backend =
+              { backend_profile = Lui_protocol.profile IOS SwiftUIHost
+              ; apply_batch =
+                  (fun batch ->
+                    batches := batch :: !batches;
+                    true)
+              }
+            in
+            let view =
+              Journal_header.view
+                ~key:(Ui.Key.string "bottom-capsules")
+                ~platform:"ios"
+                ~context
+                ~sync_phase:None
+                ~sync_error:None
+                ~on_error_info:
+                  (if error_available then Some (handler "Error info") else None)
+                ~on_account_action:
+                  (if account_available then Some (handler "Account menu") else None)
+                ~local_deletion_available:false
+                ~on_journals:(handler "Journals")
+                ~on_favorites:(handler "Favorites")
+                ~on_capture:(handler "Capture")
+                ~capture_enabled
+                ~capture_expanded
+                ~body:(V.Body.static (V.text "Page content"))
+            in
+            let app =
+              Lui_app.create_with_extensions
+                backend
+                Journal_lui_native.registry
+                ()
+                (fun () () -> ())
+                (fun _context _model _send -> Ui.mount (V.Body.Private.to_widget view))
+            in
+            Fun.protect
+              ~finally:(fun () -> ignore (Lui_app.dispose app))
+              (fun () ->
+                 require (Lui_app.start app) "Header did not start";
+                 ignore (Lui_app.flush app);
+                 let ops =
+                   List.concat_map
+                     (fun (batch : Lui_protocol.patch_batch) -> batch.ops)
+                     (List.rev !batches)
+                 in
+                 let parents = Hashtbl.create 16 in
+                 let toolbars = Hashtbl.create 4 in
+                 List.iter
+                   (function
+                     | Lui_protocol.InsertChild (parent, child, _) ->
+                       Hashtbl.replace parents child parent
+                     | CreateNode (node, Toolbar) -> Hashtbl.replace toolbars node ()
+                     | _ -> ())
+                   ops;
+                 require
+                   (Hashtbl.length toolbars = 0)
+                   "iOS page controls and title must not create toolbars";
+                 let surfaces =
+                   List.filter_map
+                     (function
+                       | Lui_protocol.SetProp (node, BackgroundValue, StringValue "glass")
+                         -> Some node
+                       | _ -> None)
+                     ops
+                   |> List.sort_uniq Int.compare
+                 in
+                 require
+                   (List.length surfaces
+                    = (if Option.is_none capture_expanded then 2 else 0)
+                      + if account_available || error_available then 1 else 0)
+                   "Each buttons composite must supply exactly one glass surface";
+                 let rec in_toolbar node =
+                   Hashtbl.mem toolbars node
+                   || Option.fold
+                        ~none:false
+                        ~some:in_toolbar
+                        (Hashtbl.find_opt parents node)
+                 in
+                 List.iter
+                   (fun label ->
+                      let nodes =
+                        List.filter_map
+                          (function
+                            | Lui_protocol.SetProp
+                                (node, AccessibilityLabel, StringValue value)
+                              when value = label -> Some node
+                            | _ -> None)
+                          ops
+                        |> List.sort_uniq Int.compare
+                      in
+                      match capture_expanded, nodes with
+                      | Some _, [] -> ()
+                      | None, [ node ] ->
+                        require
+                          (not (in_toolbar node))
+                          "%s must render outside toolbar glass"
+                          label;
+                        List.iter
+                          (fun property ->
+                             require
+                               (List.exists
+                                  (function
+                                    | Lui_protocol.SetProp (id, key, IntValue 44) ->
+                                      id = node && key = property
+                                    | _ -> false)
+                                  ops)
+                               "%s must retain a 44pt hit cell"
+                               label)
+                          [ Lui_protocol.WidthValue; HeightValue ];
+                        require
+                          (Lui_app.dispatch_event app (Lui_protocol.Press node))
+                          "%s press was not delivered"
+                          label;
+                        ignore (Lui_app.flush app);
+                        require
+                          (List.mem label !presses
+                           = (label <> "Capture" || capture_enabled))
+                          "%s press guard changed"
+                          label
+                      | _ ->
+                        failwith
+                          (label ^ " must occur exactly once while Capture is closed"))
+                   [ "Journals"; "Favorites"; "Capture" ];
+                 if error_available
+                 then (
+                   let error =
+                     List.find_map
+                       (function
+                         | Lui_protocol.SetProp
+                             (node, AccessibilityLabel, StringValue "Error info") ->
+                           Some node
+                         | _ -> None)
+                       ops
+                     |> Option.get
+                   in
+                   require
+                     (not (in_toolbar error))
+                     "Error must render outside toolbar glass";
+                   require
+                     (Lui_app.dispatch_event app (Lui_protocol.Press error))
+                     "Error press was not delivered";
+                   ignore (Lui_app.flush app);
+                   require (List.mem "Error info" !presses) "Error handler was lost");
+                 let menus =
+                   List.filter_map
+                     (function
+                       | Lui_protocol.CreateNode (node, MenuTrigger) -> Some node
+                       | _ -> None)
+                     ops
+                 in
+                 require
+                   (List.length menus = if account_available then 1 else 0)
+                   "Account must retain exactly one native menu trigger";
+                 List.iter
+                   (fun menu ->
+                      require
+                        (not (in_toolbar menu))
+                        "Account must render outside toolbar glass")
+                   menus))
+         (List.concat_map
+            (fun (capture_enabled, capture_expanded) ->
+               List.map
+                 (fun (account_available, error_available) ->
+                    capture_enabled, capture_expanded, account_available, error_available)
+                 [ false, false; true, false; false, true; true, true ])
+            [ true, None; false, None; true, Some (V.text "Expanded Capture") ]))
+    [ Journal_header.Context.journals; Journal_header.Context.favorites ]
+;;
+
 (* Relative luminance and contrast are independent of palette implementation.
    [Ui.Style.Color.t] exposes no channel accessors on the lui shim; the
    "#rrggbb" channels are recovered with ordered probes through the public
@@ -166,12 +346,145 @@ let test_status_palette_contrast () =
     !minimum_increased
 ;;
 
+let test_detail_capsules_mount_outside_toolbars () =
+  let module V = Ui.View in
+  let root =
+    Journal_model.create
+      ~id:"70000000-0000-4000-a000-000000000001"
+      ~page_id:"70000000-0000-4000-b000-000020260809"
+      ~journal_day:20260809
+      ~parent_id:None
+      ~sibling_order:"a"
+      ~source:"Detail fixture"
+      ~task_state:Journal_model.No_status
+      ~child_count:0
+      ~creation_time:
+        (Journal_time.create
+           ~instant_unix_ms:1_786_204_800_000L
+           ~local_day:20260809
+           ~local_minute_of_day:0
+         |> Result.get_ok)
+      ~revision:"block-1"
+      ~last_mutation_id:"70000000-0000-4000-9000-000000000001"
+    |> Result.get_ok
+  in
+  let loading =
+    Journal_routes.open_detail
+      (Journal_routes.create ())
+      ~block_id:(Journal_model.id root)
+      ~request_generation:1L
+  in
+  let loaded =
+    Journal_routes.apply_detail_response
+      loading
+      ~request_generation:1L
+      { root; children = { blocks = []; continuation = None } }
+  in
+  List.iter
+    (fun (routes, write_enabled, actions_enabled) ->
+       let batches = ref []
+       and actions = ref [] in
+       let dispatch =
+         Ui.Event.Handler.create (function
+           | Ui.Event.Payload.Text action -> actions := action :: !actions
+           | _ -> ())
+       in
+       let view = Application.For_testing.detail_page ~routes ~write_enabled dispatch in
+       let backend : Lui_protocol.backend =
+         { backend_profile = Lui_protocol.profile IOS SwiftUIHost
+         ; apply_batch =
+             (fun batch ->
+               batches := batch :: !batches;
+               true)
+         }
+       in
+       let app =
+         Lui_app.create_with_extensions
+           backend
+           Journal_lui_native.registry
+           ()
+           (fun () () -> ())
+           (fun _context _model _send -> Ui.mount (V.Body.Private.to_widget view))
+       in
+       Fun.protect
+         ~finally:(fun () -> ignore (Lui_app.dispose app))
+         (fun () ->
+            require (Lui_app.start app) "Detail did not start";
+            ignore (Lui_app.flush app);
+            let ops =
+              List.concat_map
+                (fun (batch : Lui_protocol.patch_batch) -> batch.ops)
+                (List.rev !batches)
+            in
+            require
+              (not
+                 (List.exists
+                    (function
+                      | Lui_protocol.CreateNode (_, Toolbar) -> true
+                      | _ -> false)
+                    ops))
+              "Detail controls must render outside toolbar glass";
+            let surfaces =
+              List.filter_map
+                (function
+                  | Lui_protocol.SetProp (node, BackgroundValue, StringValue "glass") ->
+                    Some node
+                  | _ -> None)
+                ops
+              |> List.sort_uniq Int.compare
+            in
+            require
+              (List.length surfaces = 2)
+              "Detail must have one Back and one action capsule";
+            List.iter
+              (fun (label, command, allowed) ->
+                 let nodes =
+                   List.filter_map
+                     (function
+                       | Lui_protocol.SetProp (node, AccessibilityLabel, StringValue value)
+                         when value = label -> Some node
+                       | _ -> None)
+                     ops
+                   |> List.sort_uniq Int.compare
+                 in
+                 require (List.length nodes = 1) "%s must appear exactly once" label;
+                 let node = List.hd nodes in
+                 List.iter
+                   (fun property ->
+                      require
+                        (List.exists
+                           (function
+                             | Lui_protocol.SetProp (id, key, IntValue 44) ->
+                               id = node && key = property
+                             | _ -> false)
+                           ops)
+                        "%s must retain a 44pt hit cell"
+                        label)
+                   [ Lui_protocol.WidthValue; HeightValue ];
+                 require
+                   (Lui_app.dispatch_event app (Lui_protocol.Press node))
+                   "%s press was not delivered"
+                   label;
+                 ignore (Lui_app.flush app);
+                 require
+                   (List.mem command !actions = allowed)
+                   "%s action guard changed"
+                   label)
+              [ "Back", "back", true
+              ; "Append", "detail-session:1:open-append", actions_enabled
+              ; "Attach file", "detail-session:1:open-asset-import", actions_enabled
+              ]))
+    [ loading, true, false; loaded, false, false; loaded, true, true ]
+;;
+
 let tests =
   [ ( "SF Symbols preserve identity and appearance"
     , test_sf_symbols_preserve_identity_and_appearance )
   ; ( "exact status rail categories"
     , test_every_exact_status_maps_to_the_decided_rail_category )
   ; "header context", test_header_context_copy_is_pure_product_state
+  ; "iOS capsules outside toolbars", test_ios_capsules_mount_outside_toolbars
+  ; "detail capsules outside toolbars", test_detail_capsules_mount_outside_toolbars
   ; "status palette contrast", test_status_palette_contrast
   ]
 ;;

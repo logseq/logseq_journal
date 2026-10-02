@@ -23,6 +23,7 @@ type failure_source =
   | Projection_failure of string
 
 type payload =
+  | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
       * Logseq_db_worker.Protocol.v2_favorites_result
@@ -136,6 +137,10 @@ type children_interest =
   }
 
 type operation =
+  | Reference_read of
+      { block_id : string
+      ; depth : int
+      }
   | List_favorites of Journal_graph_request.favorites_request
   | Graph_info
   | Admission_info of Journal_graph_request.admission_request
@@ -244,6 +249,11 @@ type t =
   ; graph_pages : (string, Graph.page) Hashtbl.t
   ; mutable pages : (string * Projection.page) list
   ; mutable block_pages : (string * Projection.page) list
+  ; tag_titles : (string, string list) Hashtbl.t
+  ; reference_sources : (string, string option) Hashtbl.t
+  ; reference_depths : (string, int) Hashtbl.t
+  ; reference_pending : (string, unit) Hashtbl.t
+  ; reference_dirty : (string, unit) Hashtbl.t
   ; projected_blocks : (string, Projection.block) Hashtbl.t
   ; page_tree_interests : (string, page_tree_interest) Hashtbl.t
   ; children_interests : (string, children_interest) Hashtbl.t
@@ -293,6 +303,11 @@ let create ?(localtime = Unix.localtime) () =
   ; graph_pages = Hashtbl.create 32
   ; pages = []
   ; block_pages = []
+  ; tag_titles = Hashtbl.create 64
+  ; reference_sources = Hashtbl.create 64
+  ; reference_depths = Hashtbl.create 64
+  ; reference_pending = Hashtbl.create 64
+  ; reference_dirty = Hashtbl.create 16
   ; projected_blocks = Hashtbl.create 64
   ; page_tree_interests = Hashtbl.create 32
   ; children_interests = Hashtbl.create 32
@@ -312,7 +327,12 @@ let reset t =
   Hashtbl.clear t.graph_pages;
   t.pages <- [];
   t.block_pages <- [];
+  Hashtbl.clear t.reference_sources;
+  Hashtbl.clear t.reference_depths;
+  Hashtbl.clear t.reference_pending;
+  Hashtbl.clear t.reference_dirty;
   Hashtbl.clear t.projected_blocks;
+  Hashtbl.clear t.tag_titles;
   Hashtbl.clear t.page_tree_interests;
   Hashtbl.clear t.children_interests;
   t.initial_feed <- None
@@ -466,7 +486,7 @@ module Journal_title = struct
 
   let tokenize pattern =
     let length = String.length pattern in
-    let is_alpha c = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' in
+    let is_alpha c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') in
     let rec loop index tokens =
       if index >= length
       then List.rev tokens
@@ -489,9 +509,7 @@ module Journal_title = struct
             if stop < length && pattern.[stop] = c then scan (stop + 1) else stop
           in
           let stop = scan index in
-          loop
-            stop
-            (Pattern_token (String.sub pattern index (stop - index)) :: tokens)
+          loop stop (Pattern_token (String.sub pattern index (stop - index)) :: tokens)
         | _ ->
           let rec scan stop =
             if stop < length && not (is_alpha pattern.[stop] || pattern.[stop] = '\'')
@@ -499,9 +517,7 @@ module Journal_title = struct
             else stop
           in
           let stop = scan index in
-          loop
-            stop
-            (Pattern_quoted (String.sub pattern index (stop - index)) :: tokens))
+          loop stop (Pattern_quoted (String.sub pattern index (stop - index)) :: tokens))
     in
     loop 0 []
   ;;
@@ -575,7 +591,7 @@ module Journal_title = struct
     let year = if month <= 2 then year - 1 else year in
     let era = if year >= 0 then year / 400 else (year - 399) / 400 in
     let yoe = year - (era * 400) in
-    let doy = (((153 * (if month > 2 then month - 3 else month + 9)) + 2) / 5) + day - 1 in
+    let doy = (((153 * if month > 2 then month - 3 else month + 9) + 2) / 5) + day - 1 in
     let doe = (yoe * 365) + (yoe / 4) - (yoe / 100) + doy in
     (era * 146097) + doe - 719468
   ;;
@@ -604,7 +620,7 @@ module Journal_title = struct
 
   let context ~year ~month ~day =
     let epoch_days = days_from_civil ~year ~month ~day in
-    let day_of_week = (((epoch_days + 3) mod 7) + 7) mod 7 + 1 in
+    let day_of_week = ((((epoch_days + 3) mod 7) + 7) mod 7) + 1 in
     let thursday = epoch_days + (4 - day_of_week) in
     let weekyear, _, _ = civil_from_days thursday in
     { day
@@ -612,7 +628,8 @@ module Journal_title = struct
     ; year
     ; day_of_week
     ; weekyear
-    ; weekyear_week = (thursday - days_from_civil ~year:weekyear ~month:1 ~day:1) / 7 + 1
+    ; weekyear_week =
+        ((thursday - days_from_civil ~year:weekyear ~month:1 ~day:1) / 7) + 1
     }
   ;;
 
@@ -1222,7 +1239,16 @@ let refresh_response t page refresh result =
   match projection_time_context t with
   | Error message -> reject message
   | Ok time_context ->
-    (match Projection.timeline_entry_page ~page ~time_context result with
+    (match
+       Projection.timeline_entry_page
+         ~tag_titles:(fun uuid ->
+           Option.value
+             (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+             ~default:[])
+         ~page
+         ~time_context
+         result
+     with
      | Error message -> reject message
      | Ok projected ->
        remember_entries t page projected.entries;
@@ -1231,6 +1257,37 @@ let refresh_response t page refresh result =
            (fun (entry : Projection.timeline_entry) ->
               String.equal (Journal_model.id entry.block) id)
            projected.entries
+       in
+       (* Empty-source roots are filtered out of the timeline projection, so a
+          committed block with no title is not among the entries — project it
+          from the raw members to still confirm the completion. *)
+       let project_invisible ~block_id ~missing ~complete =
+         match
+           List.find_opt
+             (fun (item : Projection.tree_member) ->
+                String.equal (Graph.Uuid.to_string item.block.uuid) block_id)
+             result.items
+         with
+         | None -> reject missing
+         | Some item ->
+           let child_count =
+             List.length
+               (List.filter
+                  (fun (child : Projection.tree_member) ->
+                     child.depth = 1
+                     && String.equal (Graph.Uuid.to_string child.block.parent) block_id)
+                  result.items)
+           in
+           (match
+              Projection.block
+                ~page
+                ~revision:item.revision
+                ~child_count
+                ~time_context
+                item.block
+            with
+            | Error message -> reject message
+            | Ok block -> responses [ response (complete block) ])
        in
        (match refresh with
         | Captured { block_id } ->
@@ -1241,7 +1298,12 @@ let refresh_response t page refresh result =
                    (Block_captured
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
-           | None -> reject "The captured block was not visible after commit.")
+           | None ->
+             project_invisible
+               ~block_id
+               ~missing:"The captured block was not visible after commit."
+               ~complete:(fun block ->
+                 Block_captured { block; timeline_entry_update = None }))
         | Updated { block_id } ->
           (match find block_id with
            | Some entry ->
@@ -1250,7 +1312,12 @@ let refresh_response t page refresh result =
                    (Block_updated
                       { block = entry.block; timeline_entry_update = Some entry })
                ]
-           | None -> reject "The updated block was not visible after commit.")
+           | None ->
+             project_invisible
+               ~block_id
+               ~missing:"The updated block was not visible after commit."
+               ~complete:(fun block ->
+                 Block_updated { block; timeline_entry_update = None }))
         | Delete_conflict_refresh { block_id } ->
           let completion =
             match find block_id with
@@ -1332,6 +1399,84 @@ let schedule_hydration t output =
   { output with requests = drain_hydration t }
 ;;
 
+(* Session bounds keep adversarial reference chains/bursts finite. Unresolved
+   tokens remain literal. Point reads use the Worker's indexed UUID lookup. *)
+let maximum_reference_targets = 4096
+let maximum_reference_sources = 8192
+
+let reference_read t block_id depth =
+  if Hashtbl.mem t.reference_pending block_id
+  then None
+  else (
+    Hashtbl.replace t.reference_pending block_id ();
+    Some
+      (read
+         t
+         (Reference_read { block_id; depth })
+         (Protocol.V2_get_block
+            { block = Graph.Uuid.of_string block_id |> Result.get_ok; revision = None })))
+;;
+
+let invalidate_reference t block_id =
+  match Hashtbl.find_opt t.reference_depths block_id with
+  | None -> None
+  | Some depth ->
+    if Hashtbl.mem t.reference_pending block_id
+    then (
+      Hashtbl.replace t.reference_dirty block_id ();
+      None)
+    else reference_read t block_id depth
+;;
+
+let observe_reference_sources t depth values =
+  let updates = ref []
+  and reads = ref [] in
+  (* Install the whole fragment before discovery, so references between members
+     of the same page do not cause duplicate point reads. *)
+  List.iter
+    (fun (id, source) ->
+       if
+         Hashtbl.mem t.reference_sources id
+         || Hashtbl.mem t.reference_depths id
+         || Hashtbl.length t.reference_sources < maximum_reference_sources
+       then
+         if Hashtbl.find_opt t.reference_sources id <> Some source
+         then (
+           Hashtbl.replace t.reference_sources id source;
+           if Hashtbl.mem t.reference_depths id then updates := (id, source) :: !updates))
+    values;
+  let rec discover depth source =
+    if depth < Journal_model.maximum_reference_depth
+    then
+      List.iter
+        (fun id ->
+           let next_depth = depth + 1 in
+           let previous = Hashtbl.find_opt t.reference_depths id in
+           if
+             match previous with
+             | Some old -> next_depth < old
+             | None -> Hashtbl.length t.reference_depths < maximum_reference_targets
+           then (
+             Hashtbl.replace t.reference_depths id next_depth;
+             match Hashtbl.find_opt t.reference_sources id with
+             | Some source ->
+               updates := (id, source) :: !updates;
+               Option.iter (discover next_depth) source
+             | None ->
+               Option.iter
+                 (fun request -> reads := request :: !reads)
+                 (reference_read t id next_depth)))
+        (Journal_model.reference_ids source)
+  in
+  List.iter (fun (_, source) -> Option.iter (discover depth) source) values;
+  { requests = List.rev !reads
+  ; responses =
+      (if !updates = []
+       then []
+       else [ response (Reference_sources_changed (List.rev !updates)) ])
+  }
+;;
+
 let hydration_for_changes t ~request_generation windows =
   let blocks, pages, structures = changed_interests windows in
   let point_reads =
@@ -1345,6 +1490,18 @@ let hydration_for_changes t ~request_generation windows =
                 (Changed_block { block_id; page })
                 (Protocol.V2_get_block { block; revision = None }))
            (page_by_block t block_id))
+      blocks
+  in
+  let reference_reads =
+    List.filter_map
+      (fun block ->
+         let id = Graph.Uuid.to_string block in
+         if Option.is_none (page_by_block t id)
+         then invalidate_reference t id
+         else (
+           if Hashtbl.mem t.reference_pending id
+           then Hashtbl.replace t.reference_dirty id ();
+           None))
       blocks
   in
   let tree_reads =
@@ -1402,7 +1559,8 @@ let hydration_for_changes t ~request_generation windows =
   in
   schedule_hydration
     t
-    { requests = point_reads @ tree_reads @ children_reads @ journal.requests
+    { requests =
+        point_reads @ reference_reads @ tree_reads @ children_reads @ journal.requests
     ; responses = journal.responses
     }
 ;;
@@ -1464,9 +1622,18 @@ let rehydrate_current_interests t ~request_generation ~generation =
              (Protocol.V2_get_children
                 { parent; limit = interest.limit; cursor = None; revision = None })))
   in
+  let reference_requests =
+    Hashtbl.to_seq_keys t.reference_depths
+    |> Seq.filter_map (invalidate_reference t)
+    |> List.of_seq
+  in
   schedule_hydration
     t
-    { requests = (graph_info :: journal.requests) @ tree_requests @ children_requests
+    { requests =
+        (graph_info :: journal.requests)
+        @ tree_requests
+        @ children_requests
+        @ reference_requests
     ; responses = journal.responses
     }
 ;;
@@ -1528,6 +1695,7 @@ let read_child_parent t command page child =
 ;;
 
 let operation_name = function
+  | Reference_read _ -> "readBlockReference"
   | List_favorites _ -> "listFavorites"
   | Graph_info -> "graphInfo"
   | Admission_info _ -> "inspectAdmission"
@@ -1642,6 +1810,15 @@ let failure_output ?(code = Error.Unsupported_semantics) t operation request_id 
           (Child_failed
              { block_id = command.block_id; failure = Worker_failure worker_failure })
       ]
+  | Reference_read { block_id; depth } ->
+    Hashtbl.remove t.reference_pending block_id;
+    if Hashtbl.mem t.reference_dirty block_id
+    then (
+      Hashtbl.remove t.reference_dirty block_id;
+      requests (Option.to_list (reference_read t block_id depth)))
+    else (
+      Hashtbl.replace t.reference_sources block_id None;
+      responses [ response (Reference_sources_changed [ block_id, None ]) ])
   | Changed_block _
   | Find_block_result
   | Changed_children _
@@ -1835,8 +2012,7 @@ let receive_response t (protocol_response : Protocol.response) =
                    ; page = page_uuid
                    ; journal_day
                    ; title = journal_title ~format:journal_title_format journal_day
-                   ; preconditions =
-                       preconditions ~pages:[ page_uuid, page_revision ] ()
+                   ; preconditions = preconditions ~pages:[ page_uuid, page_revision ] ()
                    })
             ]
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
@@ -1904,12 +2080,18 @@ let receive_response t (protocol_response : Protocol.response) =
           requests
             [ read
                 t
-                (Capture_format
-                   { command; page_uuid = uuid; page_revision = revision })
+                (Capture_format { command; page_uuid = uuid; page_revision = revision })
                 Protocol.V2_graph_info
             ]
         | _ -> failure_output t operation request_id "Unexpected page response.")
      | V2_block_outcome lookup ->
+       (match lookup with
+        | V2_present_block { value; _ } ->
+          Hashtbl.replace
+            t.tag_titles
+            (Graph.Uuid.to_string value.block.uuid)
+            value.tag_titles
+        | V2_missing_block _ -> ());
        (match lookup, operation with
         | ( V2_present_block { value; revision }
           , Detail_block { generation; limit; after; _ } ) ->
@@ -2002,6 +2184,22 @@ let receive_response t (protocol_response : Protocol.response) =
                 in
                 { refresh with responses = completion :: refresh.responses }
               | Error message, _ | _, Error message -> reject message))
+        | (V2_present_block _ | V2_missing_block _), Reference_read { block_id; depth } ->
+          let depth =
+            Hashtbl.find_opt t.reference_depths block_id |> Option.value ~default:depth
+          in
+          Hashtbl.remove t.reference_pending block_id;
+          if Hashtbl.mem t.reference_dirty block_id
+          then (
+            Hashtbl.remove t.reference_dirty block_id;
+            requests (Option.to_list (reference_read t block_id depth)))
+          else (
+            let source =
+              match lookup with
+              | V2_present_block { value; _ } -> Some value.block.title
+              | V2_missing_block _ -> None
+            in
+            observe_reference_sources t depth [ block_id, source ])
         | V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
@@ -2009,7 +2207,11 @@ let receive_response t (protocol_response : Protocol.response) =
              (match
                 Projection.block ~page ~revision ~child_count:0 ~time_context value.block
               with
-              | Ok block -> responses [ response (Block_found (Some block)) ]
+              | Ok block ->
+                let block =
+                  Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
+                in
+                responses [ response (Block_found (Some block)) ]
               | Error message -> reject message)
            | None, _ -> responses [ response (Block_found None) ]
            | _, Error message -> reject message)
@@ -2030,6 +2232,9 @@ let receive_response t (protocol_response : Protocol.response) =
               with
               | Error message -> reject message
               | Ok block ->
+                let block =
+                  Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
+                in
                 remember_block_page t page block_id;
                 Hashtbl.replace t.projected_blocks block_id block;
                 responses
@@ -2052,7 +2257,11 @@ let receive_response t (protocol_response : Protocol.response) =
        remember_scope_revision t revision_scope scope_revision;
        List.iter
          (fun (item : Protocol.v2_child_member) ->
-            remember_block_revision t item.value.block.uuid item.revision)
+            remember_block_revision t item.value.block.uuid item.revision;
+            Hashtbl.replace
+              t.tag_titles
+              (Graph.Uuid.to_string item.value.block.uuid)
+              item.value.tag_titles)
          items;
        (match operation with
         | Detail_children { generation; page; root } ->
@@ -2095,7 +2304,11 @@ let receive_response t (protocol_response : Protocol.response) =
      | V2_page_tree_outcome { items; next_cursor; _ } ->
        List.iter
          (fun (item : Protocol.v2_tree_member) ->
-            remember_block_revision t item.value.block.uuid item.revision)
+            remember_block_revision t item.value.block.uuid item.revision;
+            Hashtbl.replace
+              t.tag_titles
+              (Graph.Uuid.to_string item.value.block.uuid)
+              item.value.tag_titles)
          items;
        let result = tree_result items next_cursor in
        (match operation with
@@ -2122,7 +2335,16 @@ let receive_response t (protocol_response : Protocol.response) =
             match projection_time_context t with
             | Error message -> fail_page message
             | Ok time_context ->
-              (match Projection.timeline_entry_page ~page ~time_context result with
+              (match
+                 Projection.timeline_entry_page
+                   ~tag_titles:(fun uuid ->
+                     Option.value
+                       (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+                       ~default:[])
+                   ~page
+                   ~time_context
+                   result
+               with
                | Error message -> fail_page message
                | Ok projected ->
                  (match projected.entries, result.continuation with
@@ -2146,7 +2368,16 @@ let receive_response t (protocol_response : Protocol.response) =
           (match projection_time_context t with
            | Error message -> day_failure ~day:page.Projection.day generation message
            | Ok time_context ->
-             (match Projection.timeline_entry_page ~page ~time_context result with
+             (match
+                Projection.timeline_entry_page
+                  ~tag_titles:(fun uuid ->
+                    Option.value
+                      (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+                      ~default:[])
+                  ~page
+                  ~time_context
+                  result
+              with
               | Ok projected ->
                 (match projected.entries, result.continuation with
                  | [], Some cursor ->
@@ -2201,7 +2432,16 @@ let receive_response t (protocol_response : Protocol.response) =
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match Projection.timeline_entry_page ~page ~time_context result with
+             (match
+                Projection.timeline_entry_page
+                  ~tag_titles:(fun uuid ->
+                    Option.value
+                      (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
+                      ~default:[])
+                  ~page
+                  ~time_context
+                  result
+              with
               | Error message -> reject message
               | Ok value ->
                 remember_entries t page value.entries;
@@ -2256,19 +2496,68 @@ let receive_response t (protocol_response : Protocol.response) =
 let receive t (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
-  let owned = Hashtbl.mem t.pending key in
+  let operation = Hashtbl.find_opt t.pending key in
+  let owned = Option.is_some operation in
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let output = receive_response t protocol_response in
+  let references =
+    match operation, protocol_response with
+    | None, _ | Some (Reference_read _), _ -> empty
+    | Some _, Protocol.V2_response { outcome; _ } ->
+      let block (value : Protocol.v2_block_record) =
+        Graph.Uuid.to_string value.block.uuid, Some value.block.title
+      in
+      let values =
+        match outcome with
+        | V2_block_outcome (V2_present_block { value; _ }) -> [ block value ]
+        | V2_block_outcome (V2_missing_block { uuid; _ }) ->
+          [ Graph.Uuid.to_string uuid, None ]
+        | V2_children_outcome { items; _ } ->
+          List.map (fun (item : Protocol.v2_child_member) -> block item.value) items
+        | V2_page_tree_outcome { items; _ } ->
+          List.map (fun (item : Protocol.v2_tree_member) -> block item.value) items
+        | _ -> []
+      in
+      let values =
+        List.fold_left
+          (fun values response ->
+             match response.payload with
+             | Block_removed { block_id } | Subtree_deleted { block_id; _ } ->
+               (block_id, None) :: values
+             | Favorites_loaded (_, result) ->
+               List.fold_left
+                 (fun values item ->
+                    let favorite = Projection.favorite item in
+                    match favorite.target with
+                    | Page _ -> values
+                    | Block id -> (id, Some favorite.title) :: values)
+                 values
+                 result.items
+             | _ -> values)
+          values
+          output.responses
+      in
+      observe_reference_sources t 0 values
+  in
+  let output = { output with responses = output.responses @ references.responses } in
   if background
-  then schedule_hydration t output
+  then
+    schedule_hydration t { output with requests = output.requests @ references.requests }
   else if owned
-  then { output with requests = output.requests @ drain_hydration t }
+  then (
+    List.iter (fun request -> Queue.push request t.hydration_queue) references.requests;
+    { output with requests = output.requests @ drain_hydration t })
   else output
 ;;
 
 let abandon t (request : Protocol.request) =
   let key = Graph.Uuid.to_string request.request_id in
+  (match Hashtbl.find_opt t.pending key with
+   | Some (Reference_read { block_id; _ }) ->
+     Hashtbl.remove t.reference_pending block_id;
+     Hashtbl.remove t.reference_dirty block_id
+   | _ -> ());
   Hashtbl.remove t.pending key;
   Hashtbl.remove t.hydration_active key
 ;;

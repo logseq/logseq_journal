@@ -53,6 +53,24 @@ let date_header ~title =
     ()
 ;;
 
+let detail ~on_back ~actions body =
+  let back =
+    V.buttons
+      ~actions:
+        [ V.buttons_action ~label:"Back" ~icon:"chevron.left" ~on_press:on_back () ]
+      ()
+    |> test_id "BackButton"
+  in
+  Ui.Native_widget.widget
+    chrome
+    ~key:(Ui.Key.string "journal-detail-header")
+    ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
+    ~on_event:(fun _ -> ())
+    ~children:[ V.Body.Private.to_widget body; back; V.buttons ~actions () ]
+    ()
+  |> V.Body.static
+;;
+
 let view
       ~key
       ~platform
@@ -66,107 +84,132 @@ let view
       ~on_favorites
       ~on_capture
       ~capture_enabled
+      ~capture_expanded
       ~body
   =
-  let selected =
-    match context with
-    | Context.Favorites -> true
-    | Journals -> false
-  in
-  let heading value =
-    V.text ~style:(Ui.Style.Text_style.create ~font_weight:Semi_bold ()) value
-  in
-  let navigation label symbol selected on_press =
-    V.button
-      ~on_press
-      ~child:(V.label ~title:(V.text label) ~icon:(Journal_symbols.create symbol) ())
-      ()
-    |> V.semantics ~properties:(Ui.Semantics.create ~label ~selected ())
-  in
-  let account =
-    match on_account_action with
-    | None -> V.empty ()
-    | Some dispatch ->
-      let actions =
-        [ ( 5L
-          , "Attachment settings"
-          , "slider.horizontal.3"
-          , "open-asset-settings"
-          , V.Button_role.Normal )
-        ; 1L, "Diagnostics", "stethoscope", "open-diagnostics", V.Button_role.Normal
-        ; ( 2L
-          , "Switch graph"
-          , "arrow.triangle.2.circlepath"
-          , "switch-graph"
-          , V.Button_role.Normal )
-        ]
-        @ (if local_deletion_available
-           then
-             [ ( 3L
-               , "Delete local graph copy"
-               , "trash"
-               , "request-local-cache-reset"
-               , V.Button_role.Destructive )
+  let account_action =
+    Option.map
+      (fun dispatch ->
+         let actions =
+           [ ( 5L
+             , "Attachment settings"
+             , "slider.horizontal.3"
+             , "open-asset-settings"
+             , V.Button_role.Normal )
+           ; 1L, "Diagnostics", "stethoscope", "open-diagnostics", V.Button_role.Normal
+           ; ( 2L
+             , "Switch graph"
+             , "arrow.triangle.2.circlepath"
+             , "switch-graph"
+             , V.Button_role.Normal )
+           ]
+           @ (if local_deletion_available
+              then
+                [ ( 3L
+                  , "Delete local graph copy"
+                  , "trash"
+                  , "request-local-cache-reset"
+                  , V.Button_role.Destructive )
+                ]
+              else [])
+           @ [ ( 4L
+               , "Sign out"
+               , "rectangle.portrait.and.arrow.right"
+               , "sign-out"
+               , V.Button_role.Normal )
              ]
-           else [])
-        @ [ ( 4L
-            , "Sign out"
-            , "rectangle.portrait.and.arrow.right"
-            , "sign-out"
-            , V.Button_role.Normal )
-          ]
-      in
-      V.Menu.create
-        ~on_select:
-          (Ui.Event.Handler.create (function
-             | Ui.Event.Payload.Int64 id ->
-               List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
-               |> Option.iter (fun (_, _, _, action, _) ->
-                 Ui.Event.Handler.Private.invoke dispatch (Ui.Event.Payload.Text action))
-             | _ -> ()))
-        ~title:""
-        ~icon:(Journal_symbols.name Journal_symbols.Account)
-        ~label:"Account menu"
-        (List.map
-           (fun (id, title, symbol, _, role) ->
-              V.Menu.action ~id ~role ~title ~icon:symbol ())
-           actions)
-      |> V.semantics
-           ~properties:
-             (Ui.Semantics.create
-                ~label:"Account menu"
-                ~hint:"Switch graphs, delete the local copy, or sign out"
-                ~role:Button
-                ())
-      |> test_id "journal-account-menu-button"
+         in
+         V.buttons_menu_action
+           ~label:"Account menu"
+           ~icon:(Journal_symbols.name Journal_symbols.Account)
+           ~on_select:
+             (Ui.Event.Handler.create (function
+                | Ui.Event.Payload.Int64 id ->
+                  List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
+                  |> Option.iter (fun (_, _, _, action, _) ->
+                    Ui.Event.Handler.Private.invoke
+                      dispatch
+                      (Ui.Event.Payload.Text action))
+                | _ -> ()))
+           (List.map
+              (fun (id, title, symbol, _, role) ->
+                 V.Menu.action ~id ~role ~title ~icon:symbol ())
+              actions))
+      on_account_action
   in
-  let error =
-    match on_error_info with
-    | None -> V.empty ()
-    | Some on_press ->
-      V.button
-        ~on_press
-        ~child:
-          (V.label
-             ~title:(V.text "Error info")
-             ~icon:(Journal_symbols.create Journal_symbols.Error)
-             ())
-        ()
-      |> V.help ~message:"Inspect application errors"
-      |> test_id "journal-error-info-button"
+  let error_action =
+    Option.map
+      (fun on_press ->
+         V.buttons_action
+           ~label:"Error info"
+           ~icon:(Journal_symbols.name Journal_symbols.Error)
+           ~on_press
+           ())
+      on_error_info
+  in
+  (* The error and account chrome controls fuse into one capsule: error leads
+     so the account menu stays the trailing glyph. *)
+  let cluster =
+    match Option.to_list error_action @ Option.to_list account_action with
+    | [] -> None
+    | actions ->
+      let view = V.buttons ~actions () in
+      let view =
+        if Option.is_some error_action
+        then
+          view
+          |> V.help ~message:"Inspect application errors"
+          |> test_id "journal-error-info-button"
+        else view
+      in
+      let view =
+        if Option.is_some account_action
+        then
+          view
+          |> V.semantics
+               ~properties:
+                 (Ui.Semantics.create
+                    ~label:"Account menu"
+                    ~hint:"Switch graphs, delete the local copy, or sign out"
+                    ~role:Button
+                    ())
+          |> test_id "journal-account-menu-button"
+        else view
+      in
+      Some view
   in
   let capture =
-    V.button
-      ~enabled:capture_enabled
-      ~on_press:on_capture
-      ~child:
-        (V.label
-           ~title:(V.text "Capture")
-           ~icon:(V.symbol ~name:"square.and.pencil" ())
-           ())
+    (* buttons has no disabled state — guard the handler instead. *)
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:"Capture"
+            ~icon:"square.and.pencil"
+            ~on_press:
+              (Ui.Event.Handler.create (fun payload ->
+                 if capture_enabled
+                 then Ui.Event.Handler.Private.invoke on_capture payload))
+            ()
+        ]
       ()
     |> V.semantics ~properties:(Ui.Semantics.create ~label:"Capture" ())
     |> test_id "journal-capture-open"
+  in
+  let destinations =
+    V.buttons
+      ~actions:
+        [ V.buttons_action
+            ~label:"Journals"
+            ~icon:(Journal_symbols.name Journal_symbols.Journals)
+            ~on_press:on_journals
+            ()
+        ; V.buttons_action
+            ~label:"Favorites"
+            ~icon:(Journal_symbols.name Journal_symbols.Favorites)
+            ~on_press:on_favorites
+            ()
+        ]
+      ()
   in
   let sync_feedback =
     V.column
@@ -181,65 +224,6 @@ let view
       ]
     |> V.padding ~insets:(Ui.Layout.Edge_insets.all 8.)
   in
-  let controls name placement values =
-    if platform = "ios"
-    then
-      [ V.Toolbar.group
-          ~key:(Ui.Key.string name)
-          ~placement
-          (List.map
-             (fun (key, value) -> V.Toolbar.child ~key:(Ui.Key.string key) value)
-             values)
-      ]
-    else
-      List.map
-        (fun (key, value) ->
-           V.Toolbar.item ~key:(Ui.Key.string (name ^ ":" ^ key)) ~placement value)
-        values
-  in
-  let navigation_placement =
-    if platform = "ios" then V.Toolbar.Bottom_bar else Navigation
-  in
-  let capture_placement =
-    if platform = "ios" then V.Toolbar.Bottom_bar else Primary_action
-  in
-  let items =
-    (match context with
-     | Context.Journals -> []
-     | Favorites ->
-       [ V.Toolbar.item
-           ~key:(Ui.Key.string "title")
-           ~placement:Principal
-           (heading "Favorites" |> test_id "favorites-header-title")
-       ])
-    @ (match context with
-       | Context.Journals when platform = "ios" -> []
-       | Journals | Favorites ->
-         controls
-           "account"
-           V.Toolbar.Primary_action
-           (Option.to_list (Option.map (fun _ -> "error", error) on_error_info)
-            @ Option.to_list (Option.map (fun _ -> "account", account) on_account_action)
-           ))
-    @ controls
-        "destinations"
-        navigation_placement
-        [ ( "journals"
-          , navigation "Journals" Journal_symbols.Journals (not selected) on_journals )
-        ; ( "favorites"
-          , navigation "Favorites" Journal_symbols.Favorites selected on_favorites )
-        ]
-    @ (if platform = "ios"
-       then
-         [ V.Toolbar.spacer
-             ~key:(Ui.Key.string "capture-space")
-             ~placement:Bottom_bar
-             Flexible
-         ]
-       else [])
-    @ [ V.Toolbar.item ~key:(Ui.Key.string "capture") ~placement:capture_placement capture
-      ]
-  in
   let body =
     match context with
     | Context.Journals -> body
@@ -252,44 +236,54 @@ let view
         ~expanded:sync_feedback
         body
   in
+  let body = body |> V.Body.with_test_id (Ui.Test_id.string "journal-root-navigation") in
   let body =
-    body
-    |> V.Body.toolbar ~items
-    |> V.Body.with_test_id (Ui.Test_id.string "journal-root-navigation")
+    Ui.Native_widget.widget
+      chrome
+      ~key
+      ~props:
+        (`Assoc
+            [ "mode", `String "page"
+            ; ( "title"
+              , match context with
+                | Journals -> `Null
+                | Favorites -> `String "Favorites" )
+            ; "connecting", `Bool (sync_phase = Some Graph_service.Connecting)
+            ; "controls", `Bool (Option.is_some cluster)
+            ])
+      ~on_event:(fun _ -> ())
+        (* Keep absent slots mounted so the native child indexes stay stable. *)
+      ~children:
+        [ V.Body.Private.to_widget body
+        ; V.column (Option.to_list cluster)
+        ; V.column
+            [ (if sync_phase = Some Graph_service.Connecting
+               then
+                 V.progress ~style:Circular ()
+                 |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
+                 |> test_id "journal-header-sync-progress"
+               else V.empty ())
+            ]
+        ]
+      ()
+    |> test_id "journal-floating-chrome"
+    |> V.Body.static
   in
-  let body =
-    match context with
-    | Context.Favorites -> body
-    | Journals ->
-      Ui.Native_widget.widget
-        chrome
-        ~key
-        ~props:
-          (`Assoc
-              [ "mode", `String "journal"
-              ; "connecting", `Bool (sync_phase = Some Graph_service.Connecting)
-              ; "account", `Bool (Option.is_some on_account_action)
-              ; "error", `Bool (Option.is_some on_error_info)
-              ])
-        ~on_event:(fun _ -> ())
-          (* Chrome slots are positional on the native side — absent slots must
-           still mount a (zero-size) node or the host's index lookup shifts. *)
-        ~children:
-          [ V.Body.Private.to_widget body
-          ; (if platform = "ios" then V.column [ account ] else V.column [])
-          ; (if platform = "ios" then V.column [ error ] else V.column [])
-          ; V.column
-              [ (if sync_phase = Some Graph_service.Connecting
-                 then
-                   V.progress ~style:Circular ()
-                   |> V.semantics ~properties:(Ui.Semantics.create ~label:"Connecting" ())
-                   |> test_id "journal-header-sync-progress"
-                 else V.empty ())
-              ]
-          ]
-        ()
-      |> test_id "journal-floating-chrome"
-      |> V.Body.static
-  in
-  body
+  if platform <> "ios" || Option.is_none capture_expanded
+  then
+    (* The native inset reserves scrolling space; each buttons composite
+       supplies its own glass without system toolbar chrome. *)
+    Ui.Native_widget.widget
+      chrome
+      ~key:(Ui.Key.string "journal-bottom-controls")
+      ~props:(`Assoc [ "mode", `String "bottom-controls" ])
+      ~on_event:(fun _ -> ())
+      ~children:
+        [ V.Body.Private.to_widget body
+        ; V.row ~spacing:16. [ destinations; V.spacer (); capture ]
+          |> test_id "journal-bottom-controls"
+        ]
+      ()
+    |> V.Body.static
+  else body
 ;;

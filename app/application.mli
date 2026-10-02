@@ -50,6 +50,12 @@ val admission_rows : Admission_refresh.observation -> (string * string) list
 module For_testing : sig
   val diagnostics_page : Journal_view.Event.Handler.t -> Journal_view.View.Body.t
 
+  val detail_page
+    :  routes:Journal_routes.t
+    -> write_enabled:bool
+    -> Journal_view.Event.Handler.t
+    -> Journal_view.View.Body.t
+
   val favorites_page
     :  Logseq_db_worker.Protocol.v2_favorite_item list
     -> Journal_view.View.t
@@ -82,6 +88,9 @@ module Root_navigation : sig
     | Select of Journal_routes.destination
     | Capture_opened
     | Capture_closed
+    | Capture_discarded
+    | Capture_picker_requested of Journal_asset_import.source
+    | Capture_asset_picked of Journal_asset_import.staged * int option
     | Capture_native_edit of Journal_view.Event.Payload.text_edit
     | Capture_task_intent of bool
     | Capture_edited of string

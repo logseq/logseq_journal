@@ -314,11 +314,286 @@ let test_root_navigation_capture_lifecycle () =
      && Journal_routes.Favorites.items (R.favorites replaced) = [])
 ;;
 
+let test_favorites_native_visibility_retires_media () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module P = Logseq_db_worker.Protocol in
+  let module G = Logseq_db_types.Graph_types in
+  let uuid n =
+    G.Uuid.of_string (Printf.sprintf "82000000-0000-4000-8000-%012d" n) |> Result.get_ok
+  in
+  let roots = List.init 65 (fun n -> uuid (n + 1)) in
+  let queried = Atomic.make [] in
+  let feed_queried = Atomic.make false in
+  let items =
+    List.mapi
+      (fun n root ->
+         { P.membership_uuid = uuid (1000 + n)
+         ; membership_order = Printf.sprintf "%03d" n
+         ; membership_revision = "membership-1"
+         ; target =
+             (if n mod 2 = 0
+              then
+                P.V2_favorite_page
+                  { uuid = root
+                  ; title = Printf.sprintf "Fixture %d" n
+                  ; revision = "page-1"
+                  }
+              else
+                P.V2_favorite_block
+                  { uuid = root
+                  ; title = Printf.sprintf "Fixture %d" n
+                  ; task_status = None
+                  ; revision = "block-1"
+                  })
+         })
+      roots
+  in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Current
+        ; catalog = []
+        ; selected_graph = Some (uuid 900)
+        ; applied_server_t = Some 0
+        ; timeline_presentation_pending = false
+        ; startup =
+            { authenticated = true
+            ; catalog_loading = false
+            ; awaiting_selection = false
+            ; restoring_local = false
+            ; bootstrapping = false
+            ; awaiting_e2ee_password = false
+            ; failure = None
+            ; account_generation = 1
+            ; graph_generation = 1
+            ; presentation_generation = 1
+            }
+        ; last_error = None
+        ; local_deletion = None
+        }
+    ; diagnostics = { groups = [] }
+    }
+  in
+  let service =
+    W.Service.create
+      ~push_topic_count:6
+      ~concurrency:Serial
+      ~init:(fun context _ ->
+        W.Session_context.emit
+          context
+          ~topic:Service.manager_topic
+          (Service.Client_state_changed manager);
+        Ok ())
+      ~handle:(fun _ () request ->
+        match request with
+        | Service.Get_graph_state ->
+          Ok
+            (Service.Graph_state
+               { generation = 1
+               ; graph_id = Some (uuid 900)
+               ; phase = Graph_open
+               ; error = None
+               })
+        | Client_command _ | Asset_command _ | Release_asset_file _ ->
+          Ok Service.Client_command_completed
+        | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Import_asset _ -> Error "unexpected import"
+        | Graph_request request ->
+          let outcome =
+            match request.command with
+            | P.V2_graph_info ->
+              P.V2_graph_info_outcome
+                { graph_uuid = uuid 900
+                ; graph_name = "Fixture"
+                ; schema = { major = 65; minor = 33 }
+                ; admission_facts = []
+                ; journal_title_format = None
+                ; limits =
+                    { response_budget_bytes = P.maximum_response_bytes
+                    ; outbox_max_records = 4096
+                    ; outbox_max_bytes = 8388608
+                    ; change_max_items = 4096
+                    ; change_max_bytes = 1048576
+                    ; dispatcher_capacity = 256
+                    ; wire_batch_max_bytes = 262144
+                    }
+                ; generation = "g"
+                ; projection_revision = "p"
+                }
+            | V2_list_journals _ ->
+              Atomic.set feed_queried true;
+              V2_journals_outcome { items = []; next_cursor = None }
+            | V2_list_favorites _ ->
+              V2_favorites_outcome
+                { favorites_page = None
+                ; generation = "g"
+                ; projection_revision = "p"
+                ; items
+                ; next_cursor = None
+                }
+            | V2_list_assets { roots; _ } ->
+              Atomic.set queried (List.rev_append roots (Atomic.get queried));
+              V2_assets_outcome
+                { generation = "g"
+                ; projection_revision = "p"
+                ; items = []
+                ; next_cursor = None
+                }
+            | _ -> V2_failed { code = "unsupported"; message = "Unused fixture command" }
+          in
+          Ok
+            (Service.Graph_response
+               (P.V2_response
+                  { api_version = 2; request_id = request.request_id; outcome })))
+      ~shutdown:(fun () -> ())
+      ()
+  in
+  let hooks = Application.For_testing.app_with_service service in
+  let props = Hashtbl.create 512
+  and parents = Hashtbl.create 512 in
+  let consume encoded =
+    if encoded <> ""
+    then
+      let open Yojson.Safe.Util in
+      Yojson.Safe.from_string encoded
+      |> member "ops"
+      |> to_list
+      |> List.iter (fun op ->
+        match op |> member "op" |> to_string with
+        | "create-extension" ->
+          Hashtbl.replace
+            props
+            (op |> member "id" |> to_int)
+            [ "_extension", member "identifier" op ]
+        | "set-prop" ->
+          let id = op |> member "id" |> to_int in
+          let previous = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          let key = op |> member "property" |> to_string in
+          Hashtbl.replace
+            props
+            id
+            ((key, member "value" op) :: List.remove_assoc key previous)
+        | "drop-node" ->
+          let id = op |> member "id" |> to_int in
+          Hashtbl.remove props id;
+          Hashtbl.remove parents id
+        | "insert-child" | "move-child" ->
+          Hashtbl.replace
+            parents
+            (op |> member "child" |> to_int)
+            (op |> member "parent" |> to_int)
+        | _ -> ())
+  in
+  let find key value =
+    Hashtbl.fold
+      (fun id values found ->
+         if List.assoc_opt key values = Some (`String value) then Some id else found)
+      props
+      None
+  in
+  let rec ancestor_property id key =
+    if
+      List.assoc_opt key (Option.value (Hashtbl.find_opt props id) ~default:[])
+      = Some (`Bool true)
+    then id
+    else (
+      match Hashtbl.find_opt parents id with
+      | Some parent -> ancestor_property parent key
+      | None -> failwith ("fixture node has no " ^ key ^ " ancestor"))
+  in
+  let dispatch event = hooks.dispatch event |> consume in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 5. in
+    while (not (predicate ())) && Unix.gettimeofday () < deadline do
+      hooks.pump () |> consume;
+      Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ())
+  in
+  let startup =
+    Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-favorites-synthetic"
+      ~target:(Managed_sync { base_url = "https://example.invalid" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:P.maximum_response_bytes
+      ~default_page_size:P.default_page_size
+    |> Result.get_ok
+    |> Journal_startup.encode
+    |> Result.get_ok
+    |> Bytes.to_string
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (hooks.dispose ()))
+    (fun () ->
+       hooks.init 2 2 startup |> consume;
+       wait "initial feed read" (fun () -> Atomic.get feed_queried);
+       for _ = 1 to 3 do
+         hooks.pump () |> consume;
+         Unix.sleepf 0.001
+       done;
+       wait "Journals mounted" (fun () ->
+         Option.is_some (find "accessibility-label" "Favorites"));
+       let favorites = Option.get (find "accessibility-label" "Favorites") in
+       dispatch (Lui_protocol.Press favorites);
+       wait "Favorites loaded" (fun () -> Option.is_some (find "text" "Fixture 64"));
+       let show n =
+         let text = Option.get (find "text" (Printf.sprintf "Fixture %d" n)) in
+         dispatch (Lui_protocol.Appear (ancestor_property text "appear-enabled"))
+       in
+       for n = 0 to 63 do
+         show n;
+         wait (Printf.sprintf "root %d query completed" n) (fun () ->
+           List.mem (List.nth roots n) (Atomic.get queried));
+         (* Drain the response as well, so the next root is not query-concurrency limited. *)
+         for _ = 1 to 3 do
+           hooks.pump () |> consume;
+           Unix.sleepf 0.001
+         done
+       done;
+       let list_node = Option.get (find "_extension" "journal-list") in
+       (* The native list extension callback converts Visible_range to Int64_pair. *)
+       hooks.extension_event
+         list_node
+         "event"
+         (Yojson.Safe.to_string
+            (`Assoc
+                [ "id", `Int 1
+                ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
+                ]))
+       |> consume;
+       show 64;
+       wait "65th root admitted after real Favorites Int64_pair event" (fun () ->
+         List.mem (List.nth roots 64) (Atomic.get queried));
+       let list_node = Option.get (find "_extension" "journal-list") in
+       hooks.extension_event
+         list_node
+         "event"
+         (Yojson.Safe.to_string
+            (`Assoc
+                [ "id", `Int 1
+                ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
+                ]))
+       |> consume;
+       show 64;
+       for _ = 1 to 3 do
+         hooks.pump () |> consume;
+         Unix.sleepf 0.001
+       done;
+       Alcotest.(check int)
+         "same visible page root does not refetch"
+         1
+         (List.length
+            (List.filter (G.Uuid.equal (List.nth roots 64)) (Atomic.get queried))))
+;;
+
 let () =
   Alcotest.run
     "application view"
     [ ( "root navigation"
       , [ Alcotest.test_case
+            "native Favorites media visibility"
+            `Quick
+            test_favorites_native_visibility_retires_media
+        ; Alcotest.test_case
             "draft, save, and graph lifetime"
             `Quick
             test_root_navigation_capture_lifecycle

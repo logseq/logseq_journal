@@ -61,7 +61,7 @@ let block : Graph.block =
 ;;
 
 let record : Protocol.v2_block_record =
-  { block; task_status = None; rendered_page_title = page.title }
+  { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
 ;;
 
 let load_feed runtime =
@@ -1550,8 +1550,7 @@ let capture_format_read ~journal_day =
       runtime
       (response
          lookup
-         (Protocol.V2_page_outcome
-            (V2_missing_page { uuid = page; revision = "page-1" })))
+         (Protocol.V2_page_outcome (V2_missing_page { uuid = page; revision = "page-1" })))
     |> fun output -> only "journal title format read" output.requests
   in
   (match format_read.command with
@@ -1570,10 +1569,7 @@ let create_journal_title ~journal_day ~journal_title_format =
   in
   match creation.command with
   | V2_create_journal_page { page = created; journal_day = day; title; _ } ->
-    Alcotest.(check bool)
-      "journal page identity"
-      true
-      (Graph.Uuid.equal created page);
+    Alcotest.(check bool) "journal page identity" true (Graph.Uuid.equal created page);
     Alcotest.(check int) "journal day" journal_day day;
     title
   | _ -> Alcotest.fail "format read did not continue to journal page creation"
@@ -1603,9 +1599,7 @@ let test_journal_title_falls_back_on_invalid_format () =
   Alcotest.(check string)
     "unsupported token falls back to the upstream default"
     "Sep 19th, 2026"
-    (create_journal_title
-       ~journal_day:20260919
-       ~journal_title_format:(Some "yyyy-QQ-dd"))
+    (create_journal_title ~journal_day:20260919 ~journal_title_format:(Some "yyyy-QQ-dd"))
 ;;
 
 let test_journal_title_failed_format_read_rejects () =
@@ -1620,7 +1614,10 @@ let test_journal_title_failed_format_read_rejects () =
             ; message = "Snapshot unavailable"
             }))
   in
-  Alcotest.(check int) "no creation after a failed read" 0 (List.length completed.requests);
+  Alcotest.(check int)
+    "no creation after a failed read"
+    0
+    (List.length completed.requests);
   match (only "capture rejected" completed.responses).payload with
   | Rejected (Worker_failure _) -> ()
   | _ -> Alcotest.fail "a failed format read was not rejected"
@@ -1650,10 +1647,319 @@ let test_journal_title_ordinals_and_boundaries () =
     ]
 ;;
 
+let target_uuid = uuid "a1000000-0000-4000-9000-000000000050"
+let target_id = Graph.Uuid.to_string target_uuid
+let reference = "[[" ^ target_id ^ "]]"
+
+let reference_feed runtime source =
+  set_calendar runtime;
+  let journals = load_feed runtime in
+  let tree =
+    Runtime.receive
+      runtime
+      (response
+         journals
+         (Protocol.V2_journals_outcome
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            ; next_cursor = None
+            }))
+    |> fun output -> only "reference page tree" output.requests
+  in
+  Runtime.receive
+    runtime
+    (response
+       tree
+       (Protocol.V2_page_tree_outcome
+          { page = page_uuid
+          ; maximum_depth = 1
+          ; items =
+              [ { value = { record with block = { block with title = source } }
+                ; revision = "block-1"
+                ; depth = 0
+                ; parent = page_uuid
+                }
+              ]
+          ; next_cursor = None
+          }))
+;;
+
+let target_response request title =
+  response
+    request
+    (Protocol.V2_block_outcome
+       (V2_present_block
+          { value = { record with block = { block with uuid = target_uuid; title } }
+          ; revision = title
+          }))
+;;
+
+let reference_updates output =
+  List.concat_map
+    (fun response ->
+       match response.Runtime.payload with
+       | Runtime.Reference_sources_changed values -> values
+       | _ -> [])
+    output.Runtime.responses
+;;
+
+let check_target_request output =
+  let request = only "shared reference point read" (hydration_requests output) in
+  Alcotest.(check bool)
+    "reads only target UUID"
+    true
+    (request.Protocol.command = V2_get_block { block = target_uuid; revision = None });
+  request
+;;
+
+let test_reference_hydration_and_changes () =
+  let runtime = Runtime.create () in
+  let request =
+    reference_feed runtime (reference ^ " " ^ reference ^ " [[page]]")
+    |> check_target_request
+  in
+  let resolved = Runtime.receive runtime (target_response request "Referenced content") in
+  Alcotest.(check (option string))
+    "target is shared with UI"
+    (Some "Referenced content")
+    (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
+  Alcotest.(check int)
+    "duplicate and literal links cause no extra requests"
+    0
+    (List.length resolved.requests);
+  let changed_request =
+    changed runtime (window ~blocks:[ target_uuid; unrelated_uuid ] ())
+    |> check_target_request
+  in
+  let updated =
+    Runtime.receive runtime (target_response changed_request "Edited content")
+  in
+  Alcotest.(check (option string))
+    "target edit reaches UI"
+    (Some "Edited content")
+    (List.assoc_opt target_id (reference_updates updated) |> Option.join);
+  let deleted_request =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+  in
+  let deleted =
+    Runtime.receive
+      runtime
+      (response
+         deleted_request
+         (Protocol.V2_block_outcome
+            (V2_missing_block { uuid = target_uuid; revision = "deleted" })))
+  in
+  Alcotest.(check bool)
+    "missing target clears cached source"
+    true
+    (List.assoc_opt target_id (reference_updates deleted) = Some None);
+  let recreated_request =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+  in
+  ignore (Runtime.receive runtime (target_response recreated_request "Recreated"));
+  let resync =
+    Runtime.reconcile_push
+      runtime
+      ~request_generation:12L
+      (Protocol.V2_resync_required_push
+         { api_version = Protocol.api_version
+         ; generation = "generation-2"
+         ; reason = "consumer lagged"
+         })
+  in
+  Alcotest.(check bool)
+    "resync retains target interest"
+    true
+    (List.exists
+       (fun (request : Protocol.request) ->
+          request.command = V2_get_block { block = target_uuid; revision = None })
+       resync.requests);
+  Runtime.reset runtime;
+  Alcotest.(check int)
+    "reset discards old completion"
+    0
+    (List.length
+       (Runtime.receive runtime (target_response request "Old graph")).responses)
+;;
+
+let test_reference_cycle_and_failure () =
+  let runtime = Runtime.create () in
+  let request = reference_feed runtime reference |> check_target_request in
+  let output =
+    Runtime.receive
+      runtime
+      (target_response request ("[[" ^ Graph.Uuid.to_string block_uuid ^ "]]"))
+  in
+  Alcotest.(check int)
+    "known cyclic root does not trigger another read"
+    0
+    (List.length output.requests);
+  let changed_request =
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+  in
+  let failed =
+    Runtime.receive
+      runtime
+      (response
+         changed_request
+         (Protocol.V2_failed
+            { code = "InvalidRequest"; message = "temporary read failure" }))
+  in
+  Alcotest.(check bool)
+    "failed target clears stale content"
+    true
+    (List.assoc_opt target_id (reference_updates failed) = Some None);
+  ignore (changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request)
+;;
+
+let test_reference_invalidation_during_read () =
+  List.iter
+    (fun fail ->
+       let runtime = Runtime.create () in
+       let request = reference_feed runtime reference |> check_target_request in
+       let changed = changed runtime (window ~blocks:[ target_uuid ] ()) in
+       Alcotest.(check int)
+         "pending target invalidation coalesces"
+         0
+         (List.length (hydration_requests changed));
+       let stale =
+         Runtime.receive
+           runtime
+           (if fail
+            then
+              response
+                request
+                (Protocol.V2_failed
+                   { code = "InvalidRequest"; message = "old snapshot failed" })
+            else target_response request "Stale")
+       in
+       Alcotest.(check bool)
+         "stale completion is not published"
+         true
+         (not (List.mem (target_id, Some "Stale") (reference_updates stale)));
+       let fresh = check_target_request stale in
+       let result = Runtime.receive runtime (target_response fresh "Fresh") in
+       Alcotest.(check (option string))
+         "newest content wins"
+         (Some "Fresh")
+         (List.assoc_opt target_id (reference_updates result) |> Option.join))
+    [ false; true ]
+;;
+
+let test_reference_to_loaded_block_shares_change_read () =
+  let runtime = Runtime.create () in
+  let id = Graph.Uuid.to_string block_uuid in
+  let initial = reference_feed runtime ("Self [[" ^ id ^ "]]") in
+  Alcotest.(check int)
+    "loaded target needs no extra read"
+    0
+    (List.length initial.requests);
+  let output = changed runtime (window ~blocks:[ block_uuid ] ()) in
+  Alcotest.(check int)
+    "loaded target shares its existing changed-block read"
+    1
+    (List.length (hydration_requests output))
+;;
+
+let test_abandoned_reference_can_refresh () =
+  let runtime = Runtime.create () in
+  let request = reference_feed runtime reference |> check_target_request in
+  Runtime.abandon runtime request;
+  ignore (changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request)
+;;
+
+let test_shorter_reference_path_discovers_nested_targets () =
+  let runtime = Runtime.create () in
+  let id n = Printf.sprintf "a3000000-0000-4000-9000-%012d" n in
+  let link n = "[[" ^ id n ^ "]]" in
+  let output = ref (reference_feed runtime (link 1)) in
+  for n = 1 to Journal_model.maximum_reference_depth do
+    let request = only "chain point read" !output.requests in
+    output
+    := Runtime.receive
+         runtime
+         (response
+            request
+            (Protocol.V2_block_outcome
+               (V2_present_block
+                  { value =
+                      { record with
+                        block = { block with uuid = uuid (id n); title = link (n + 1) }
+                      }
+                  ; revision = "chain"
+                  })))
+  done;
+  Alcotest.(check int) "deep chain stops at depth bound" 0 (List.length !output.requests);
+  let output = reference_feed runtime (link Journal_model.maximum_reference_depth) in
+  let request = only "shorter path discovers previously bounded target" output.requests in
+  Alcotest.(check bool)
+    "reads next nested target"
+    true
+    (request.Protocol.command
+     = V2_get_block
+         { block = uuid (id (Journal_model.maximum_reference_depth + 1))
+         ; revision = None
+         })
+;;
+
+let test_reference_burst_is_bounded () =
+  let runtime = Runtime.create () in
+  let source =
+    String.concat
+      " "
+      (List.init 30 (fun index ->
+         Printf.sprintf "[[a2000000-0000-4000-9000-%012x]]" index))
+  in
+  let output = reference_feed runtime source in
+  Alcotest.(check int)
+    "reference discovery shares four-read hydration budget"
+    4
+    (List.length output.requests);
+  let request = List.hd output.requests in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (Protocol.V2_block_outcome
+            (V2_missing_block { uuid = target_uuid; revision = "missing" })))
+  in
+  Alcotest.(check int)
+    "completion drains one queued lookup"
+    1
+    (List.length output.requests)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "sparse tree pages"
+    [ ( "block references"
+      , [ Alcotest.test_case
+            "hydration, edits, deletion and reset"
+            `Quick
+            test_reference_hydration_and_changes
+        ; Alcotest.test_case
+            "cycles and failure recovery"
+            `Quick
+            test_reference_cycle_and_failure
+        ; Alcotest.test_case
+            "invalidation during a pending read"
+            `Quick
+            test_reference_invalidation_during_read
+        ; Alcotest.test_case
+            "loaded target shares changed read"
+            `Quick
+            test_reference_to_loaded_block_shares_change_read
+        ; Alcotest.test_case
+            "abandoned reference can refresh"
+            `Quick
+            test_abandoned_reference_can_refresh
+        ; Alcotest.test_case
+            "shorter path discovers bounded target"
+            `Quick
+            test_shorter_reference_path_discovers_nested_targets
+        ; Alcotest.test_case "bounded burst" `Quick test_reference_burst_is_bounded
+        ] )
+    ; ( "sparse tree pages"
       , [ Alcotest.test_case "children before a later root" `Quick (fun () ->
             test_child_only_day_pages `Found)
         ; Alcotest.test_case "children before true exhaustion" `Quick (fun () ->

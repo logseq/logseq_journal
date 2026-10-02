@@ -3,7 +3,7 @@ import ImageIO
 import QuickLook
 import SwiftUI
 
-private actor JournalMediaDecoder {
+actor JournalMediaDecoder {
   static let shared = JournalMediaDecoder()
   private let cache = NSCache<NSString, CGImage>()
   init() { cache.totalCostLimit = 32 * 1024 * 1024; cache.countLimit = 32 }
@@ -25,6 +25,10 @@ private actor JournalMediaDecoder {
 }
 
 @MainActor enum JournalMedia {
+  nonisolated static let imageTypes: Set<String> = [
+    "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp",
+    "avif",
+  ]
   struct Item: Decodable, Identifiable {
     let id: String
     let kind: String
@@ -32,7 +36,7 @@ private actor JournalMediaDecoder {
     let type: String
     let width: Int
     let height: Int
-    var isImage: Bool { ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "tif", "tiff", "bmp", "avif"].contains(type) }
+    var isImage: Bool { JournalMedia.imageTypes.contains(type) }
   }
   struct Picker: Decodable {
     let items: [Item]
