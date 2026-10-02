@@ -2,9 +2,11 @@
 
 This Journal branch uses LUI commit
 `f73927380d7138003d2ad2f434a48f20d9d8c323` for its shared composer.
-The commit is local and unpublished. The GitHub pin in `logseq_journal.opam`
-will resolve only after that LUI commit is published. Until then, use the
-paired local LUI checkout in a dedicated development opam switch:
+The commit is published on the LUI Composer branch in
+[LUI PR #93](https://github.com/logseq/lui/pull/93), and the exact GitHub pin in
+`logseq_journal.opam` resolves independently of the PR's merge state.
+Merge LUI PR #93 before the Journal integration PR.
+For paired local development, use a dedicated development opam switch:
 
 ```sh
 opam pin add --no-action lui.0.1.0 ../lui
