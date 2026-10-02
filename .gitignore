@@ -37,3 +37,6 @@
 /journal.sqlite3-wal
 /.dir-locals.el
 app/journal_complete_iossim.o
+
+# Local validation reports and evidence
+/docs/test-reports/
