@@ -4,7 +4,8 @@ val loading_view : unit -> Ui.View.t
 
 val view
   :  render_source:(string -> string)
-  -> render_media:(root:string -> Ui.View.t -> Ui.View.t)
+  -> render_media:
+       (root:string -> image_children:(string * string) list -> Ui.View.t -> Ui.View.t)
   -> state:Journal_timeline_state.t
   -> day_presentation:(int -> Journal_calendar.date_presentation option)
   -> on_visible_range:Ui.Event.Handler.t

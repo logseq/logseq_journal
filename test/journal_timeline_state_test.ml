@@ -343,7 +343,7 @@ let test_stale_generations_and_page_append () =
 let test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id () =
   let parent = block ~source:"Summary parent" ~child_count:1 22 in
   let first_summary : Journal_graph_projection.child_summary =
-    { block_id = id "block" 23; source = "Original summary" }
+    { block_id = id "block" 23; source = "Original summary"; asset_file_type = None }
   in
   let initial_entry = entry ~child_summaries:[ first_summary ] parent in
   let state =
@@ -354,7 +354,7 @@ let test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id () =
          (feed [ day_feed_entries 20260809 "Today" [ initial_entry ] ])
   in
   let refreshed_summary : Journal_graph_projection.child_summary =
-    { block_id = id "block" 24; source = "Promoted summary" }
+    { block_id = id "block" 24; source = "Promoted summary"; asset_file_type = None }
   in
   let refreshed =
     Timeline.replace_timeline_entry

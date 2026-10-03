@@ -460,7 +460,7 @@ let checksum_snapshot_fixture root ~e2ee ~empty ~duplicates ~title =
   in
   let callbacks = Storage.connection_callbacks connection in
   callbacks.begin_staging () |> T.require_ok ~behavior:"begin vector";
-  Datascript.store ~storage:callbacks.storage database;
+  ignore (Datascript.store ~storage:callbacks.storage database);
   let batch =
     callbacks.finish_staging
       None
@@ -1778,8 +1778,238 @@ let applied_receipt_survives_reopen () =
   T.require survived "reopen lost the terminal Applied receipt"
 ;;
 
+module Codec = Logseq_db_storage.Logseq_sqlite_codec
+
+let legacy_storage_payloads_roundtrip () =
+  let root_content =
+    {|{"~:schema":{"~:block/title":{"~:db/valueType":"~:db.type/string"}},"~:max-eid":42,"~:max-tx":536870913,"~:eavt":"10","~:aevt":"11","~:avet":"12","~:duplicate-datoms":[],"~:max-addr":21,"~:branching-factor":32,"~:ref-type":"~:weak","~:index-order-version":1}|}
+  in
+  let decode content = Codec.decode_storage_payload content |> Result.get_ok in
+  let root = decode root_content in
+  (match root with
+   | Datascript.Storage_root root ->
+     T.require (root.storage_schema_idents = []) "legacy root invented schema identities";
+     T.require (root.storage_eavt_metadata = None) "legacy root invented counts"
+   | _ -> Alcotest.failf "legacy root changed payload kind");
+  let payloads =
+    [ root
+    ; decode {|{"~:keys":[[42,"~:block/title","sample",536870913]]}|}
+    ; decode {|{"~:keys":[[42,"~:block/title","sample",536870913]],"~:children":[20,21]}|}
+    ]
+  in
+  List.iter
+    (fun payload ->
+       let encoded = Codec.encode_storage_payload payload |> Result.get_ok in
+       T.require (decode encoded = payload) "legacy payload lost data on roundtrip")
+    payloads;
+  let branch = List.nth payloads 2 in
+  let content, addresses = Codec.encode_physical_payload branch |> Result.get_ok in
+  T.require (addresses = [ "20"; "21" ]) "legacy branch address column changed";
+  T.require
+    (Codec.decode_physical_payload ~content ~addresses |> Result.get_ok = branch)
+    "legacy physical branch lost keys/addresses"
+;;
+
+let root_schema_identities_and_counts_roundtrip () =
+  let sample_schema_attr =
+    Datascript.
+      { cardinality = Many
+      ; unique = Some Identity
+      ; indexed = true
+      ; is_component = false
+      ; no_history = false
+      ; doc = Some "sample"
+      ; value_type = Some StringType
+      ; tuple_attrs = None
+      ; tuple_types = None
+      }
+  in
+  let root =
+    Datascript.
+      { storage_schema = [ "block/title", sample_schema_attr ]
+      ; storage_schema_idents = [ 42, "block/title" ]
+      ; storage_max_eid = 42
+      ; storage_max_tx = 536870913
+      ; storage_eavt = "10"
+      ; storage_aevt = "11"
+      ; storage_avet = "12"
+      ; storage_eavt_metadata = Some { storage_index_count = 5; storage_index_shift = 1 }
+      ; storage_aevt_metadata = Some { storage_index_count = 5; storage_index_shift = 1 }
+      ; storage_avet_metadata = Some { storage_index_count = 3; storage_index_shift = 0 }
+      ; storage_duplicate_datoms = []
+      ; storage_max_addr = 12
+      ; storage_branching_factor = 32
+      ; storage_ref_type = Persistent_sorted_set.Weak
+      }
+  in
+  let encoded = Codec.encode_storage_payload (Storage_root root) |> Result.get_ok in
+  let decoded = Codec.decode_storage_payload encoded |> Result.get_ok in
+  T.require (decoded = Datascript.Storage_root root) "root identities/counts lost";
+  let metadata = Codec.decode_root_index_metadata encoded |> Result.get_ok in
+  T.require (metadata.eavt = { count = 5; shift = 1 }) "root EAVT count changed";
+  T.require (metadata.avet = { count = 3; shift = 0 }) "root AVET count changed";
+  match Codec.decode_transit encoded |> Result.get_ok with
+  | Transit_core.Json.Map entries ->
+    T.require
+      (List.mem
+         (Transit_core.Json.Keyword "index-order-version", Transit_core.Json.Int 1)
+         entries)
+      "legacy Journal order marker disappeared"
+  | _ -> Alcotest.failf "root changed Transit representation"
+;;
+
+let storage_address_reuse_survives_commit_or_rollback ~fail_commit () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let behavior = "public storage address reuse and legacy reopen" in
+  T.with_temp_directory "storage-api-compat-" (fun directory ->
+    let path = Filename.concat directory "mirror.sqlite" in
+    T.copy_storage_fixture path;
+    let physical_rows () =
+      let sqlite = Sqlite3.db_open ~mode:`READONLY path in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+        (fun () ->
+           let rows = ref [] in
+           Sqlite3.Rc.check
+             (Sqlite3.exec
+                sqlite
+                "SELECT addr, content, addresses FROM kvs ORDER BY addr"
+                ~cb:(fun row _ -> rows := Array.to_list row :: !rows));
+           List.rev !rows)
+    in
+    let rows_before = physical_rows () in
+    let connection = Storage.open_database path |> T.require_ok ~behavior in
+    let base_callbacks = Storage.connection_callbacks connection in
+    let before = Storage.restore_database connection |> T.require_ok ~behavior in
+    let before_datoms = Datascript.datoms before Datascript.Eavt () |> List.of_seq in
+    let root =
+      match base_callbacks.storage.storage_restore Datascript.Storage.root_address with
+      | Some (Datascript.Storage_root root) -> root
+      | _ -> Alcotest.fail "legacy fixture has no root"
+    in
+    let old_addresses = Hashtbl.create 128 in
+    List.iter
+      (fun address -> Hashtbl.replace old_addresses address ())
+      (base_callbacks.storage.storage_list_addresses ());
+    let staged_writes = ref [] in
+    let applied_writes = ref 0 in
+    let reused_node_written = ref false in
+    let callbacks =
+      { base_callbacks with
+        finish_staging =
+          (fun metadata extras ->
+            Result.map
+              (fun (batch : Storage.batch) ->
+                 staged_writes := batch.writes;
+                 batch)
+              (base_callbacks.finish_staging metadata extras))
+      ; upsert =
+          (fun write ->
+            incr applied_writes;
+            if fail_commit && !reused_node_written
+            then Error "injected compatibility rollback"
+            else (
+              let result = base_callbacks.upsert write in
+              (match result with
+               | Ok ()
+                 when write.address <> Datascript.Storage.root_address
+                      && write.address <> Datascript.Storage.tail_address
+                      && Hashtbl.mem old_addresses write.address ->
+                 reused_node_written := true
+               | Ok () | Error _ -> ());
+              result))
+      }
+    in
+    let session =
+      Session.create
+        ~tail:(Datascript.Storage.restore_tail_groups callbacks.storage)
+        ~callbacks
+    in
+    let identity_entity = root.storage_max_eid + 1 in
+    let identity = "journal.compat/value" in
+    let ops =
+      Datascript.Add (Entity_id identity_entity, "db/ident", Keyword identity)
+      :: List.init (root.storage_branching_factor + 1) (fun index ->
+        Datascript.Add
+          ( Entity_id (identity_entity + index + 1)
+          , "block/title"
+          , String ("Compatibility " ^ string_of_int index) ))
+    in
+    let staged =
+      Session.stage_transact session ~authoritative_before:before ops
+      |> T.require_ok ~behavior
+    in
+    T.require (physical_rows () = rows_before) "staging changed legacy disk rows";
+    T.require
+      (List.exists
+         (fun (write : Storage.write) ->
+            write.address <> Datascript.Storage.root_address
+            && write.address <> Datascript.Storage.tail_address
+            && Hashtbl.mem old_addresses write.address)
+         !staged_writes)
+      "compaction did not exercise existing node address reuse";
+    let expected_after =
+      Session.staged_db_after staged
+      |> fun database -> Datascript.datoms database Datascript.Eavt () |> List.of_seq
+    in
+    (match Session.commit_staged session staged with
+     | Error (Session.Persistence_failed _) when fail_commit ->
+       T.require
+         (!applied_writes >= 4 && !reused_node_written)
+         "failure did not follow a successful SQL rewrite of an existing node";
+       T.require (Session.is_fatal session) "failed commit was not terminal";
+       T.require (physical_rows () = rows_before) "rollback changed legacy rows"
+     | Ok () when not fail_commit -> ()
+     | _ -> Alcotest.fail "unexpected compatibility commit result");
+    Session.close session |> T.require_ok ~behavior;
+    let reopened = Storage.open_database path |> T.require_ok ~behavior in
+    Fun.protect
+      ~finally:(fun () ->
+        Storage.close (Storage.connection_callbacks reopened) |> T.require_ok ~behavior)
+      (fun () ->
+         let restored = Storage.restore_database reopened |> T.require_ok ~behavior in
+         let expected = if fail_commit then before_datoms else expected_after in
+         let actual = Datascript.datoms restored Datascript.Eavt () |> List.of_seq in
+         T.require (actual = expected) "legacy reopen lost or changed datoms";
+         T.require
+           (Datascript.schema restored = Datascript.schema before)
+           "reopen changed schema";
+         if not fail_commit
+         then (
+           let callbacks = Storage.connection_callbacks reopened in
+           (match callbacks.storage.storage_restore Datascript.Storage.root_address with
+            | Some (Datascript.Storage_root root) ->
+              T.require
+                (List.mem (identity_entity, identity) root.storage_schema_idents)
+                "compaction lost schema identity metadata";
+              T.require
+                (Persistent_sorted_set.count restored.Datascript.eavt_index
+                 + List.length restored.duplicate_datoms
+                 = List.length actual)
+                "restore snapshot count disagrees with datoms"
+            | _ -> Alcotest.fail "committed root missing");
+           Storage.garbage_stats callbacks |> T.require_ok ~behavior |> ignore)))
+;;
+
 let cases =
   [ Alcotest.test_case
+      "legacy storage payloads roundtrip"
+      `Quick
+      legacy_storage_payloads_roundtrip
+  ; Alcotest.test_case
+      "root schema identities and counts roundtrip"
+      `Quick
+      root_schema_identities_and_counts_roundtrip
+  ; Alcotest.test_case
+      "storage reused addresses commit and reopen"
+      `Quick
+      (storage_address_reuse_survives_commit_or_rollback ~fail_commit:false)
+  ; Alcotest.test_case
+      "storage reused addresses rollback and reopen"
+      `Quick
+      (storage_address_reuse_survives_commit_or_rollback ~fail_commit:true)
+  ; Alcotest.test_case
       "dependency construction validates every limit"
       `Quick
       dependency_construction_validates_every_limit

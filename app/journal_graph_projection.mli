@@ -78,6 +78,7 @@ type block_cursor =
 type child_summary =
   { block_id : string
   ; source : string
+  ; asset_file_type : string option
   }
 
 type timeline_entry =

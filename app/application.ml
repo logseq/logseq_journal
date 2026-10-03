@@ -1659,6 +1659,20 @@ let media_label state dispatch ~root child =
     child
 ;;
 
+let row_media_label state dispatch ~root ~image_children child =
+  let scope = media_scope state in
+  Journal_media_view.row
+    ~scope
+    ~root
+    ~image_children
+    ~media_for_root:(fun id -> Media_views.find_opt id state.media_views)
+    ~on_event:(fun payload ->
+      Ui.Event.Handler.Private.invoke
+        dispatch
+        (Ui.Event.Payload.Text ("media-session:" ^ scope ^ ":media:" ^ payload)))
+    child
+;;
+
 module Favorites_list = struct
   module Keys = Set.Make (String)
 
@@ -2011,6 +2025,7 @@ let composer_page
 let timeline_page
       ~render_source
       ~render_media
+      ~render_row_media
       ~platform
       ~graph_generation
       ~on_scroll_completed
@@ -2059,7 +2074,7 @@ let timeline_page
     | None ->
       Journal_timeline.view
         ~render_source
-        ~render_media
+        ~render_media:render_row_media
         ~state:timeline_state
         ~day_presentation
         ~delete_enabled
@@ -5453,6 +5468,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
         timeline_page
           ~render_source:(render_source state)
           ~render_media:(media_label state dispatch)
+          ~render_row_media:(row_media_label state dispatch)
           ~platform:state.environment.platform
           ~graph_generation:state.graph_state.generation
           ~on_scroll_completed:timeline_scroll_completed
@@ -5970,6 +5986,7 @@ module For_testing = struct
     timeline_page
       ~render_source:(render_source initial_state)
       ~render_media:(media_label initial_state handler)
+      ~render_row_media:(row_media_label initial_state handler)
       ~platform:"ios"
       ~graph_generation:1
       ~on_scroll_completed:handler

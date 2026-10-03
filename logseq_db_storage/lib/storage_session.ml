@@ -44,10 +44,6 @@ let compare_attr left right =
   compare (Datascript.Util.split_keyword left) (Datascript.Util.split_keyword right)
 ;;
 
-(* [compare_datom] orders attributes by (namespace, name), which matches Datascript
-   storage index order version 1. *)
-let physical_index_order_version = 1
-
 let storage_index_metadata (metadata : Logseq_sqlite_codec.index_metadata) =
   { Datascript.storage_index_count = metadata.count
   ; storage_index_shift = metadata.shift
@@ -113,9 +109,14 @@ let physical_indexes ~attached callbacks db =
   in
   let node_storage : Datascript.datom Persistent_sorted_set.storage =
     { store_node =
-        (fun node ->
-          incr next_address;
-          let address = string_of_int !next_address in
+        (fun ?address node ->
+          let address =
+            match address with
+            | Some address -> address
+            | None ->
+              incr next_address;
+              string_of_int !next_address
+          in
           callbacks.storage.storage_store [ address, Datascript.Storage_node node ];
           address)
     ; restore_node =
@@ -294,9 +295,10 @@ let compact_physical callbacks physical db tail =
     let rec descend shift address =
       match callbacks.Logseq_sqlite_storage.storage.storage_restore address with
       | Some (Datascript.Storage_node (Persistent_sorted_set.Leaf _)) -> shift
-      | Some (Storage_node (Branch (_, child :: _))) -> descend (shift + 1) child
-      | Some (Storage_node (Branch (_, []))) ->
-        invalid_arg ("physical index has an empty branch at " ^ address)
+      | Some (Storage_node (Branch (_, children))) ->
+        if Array.length children = 0
+        then invalid_arg ("physical index has an empty branch at " ^ address)
+        else descend (shift + 1) children.(0)
       | Some (Storage_root _ | Storage_tail _) ->
         invalid_arg ("physical index points at non-node address " ^ address)
       | None -> invalid_arg ("physical index points at missing address " ^ address)
@@ -312,6 +314,13 @@ let compact_physical callbacks physical db tail =
   in
   let root =
     { Datascript.storage_schema = schema
+    ; storage_schema_idents =
+        Datascript.datoms db Datascript.Aevt ~a:"db/ident" ()
+        |> Seq.filter_map (fun datom ->
+          match datom.Datascript.v with
+          | Keyword ident -> Some (datom.e, ident)
+          | _ -> None)
+        |> List.of_seq
     ; storage_max_eid = max_eid
     ; storage_max_tx = max_tx
     ; storage_eavt = eavt_address
@@ -324,7 +333,6 @@ let compact_physical callbacks physical db tail =
     ; storage_eavt_metadata = Some (storage_index_metadata metadata.eavt)
     ; storage_aevt_metadata = Some (storage_index_metadata metadata.aevt)
     ; storage_avet_metadata = Some (storage_index_metadata metadata.avet)
-    ; storage_index_order_version = physical_index_order_version
     }
   in
   ( { physical with eavt; aevt; avet; metadata }

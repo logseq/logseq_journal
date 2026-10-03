@@ -9,7 +9,9 @@ let body ~render_source block =
   let long =
     String.length source > 240 || List.length (String.split_on_char '\n' source) > 3
   in
-  if not long
+  if String.trim source = ""
+  then V.column []
+  else if not long
   then V.of_lui (L.text ~value:source [])
   else
     V.of_lui (fun context parent ->
@@ -72,6 +74,7 @@ let metadata block =
     else
       [ L.text
           ~value:(String.concat "  " (List.map (fun title -> "#" ^ title) titles))
+          ~grow:1.
           ~style_class:"caption"
           ~foreground:"secondary"
           []
@@ -90,15 +93,44 @@ let view
   =
   let block = entry.block in
   let id = Journal_model.id block in
-  let labels = [ render_media ~root:id (body ~render_source block) ] in
+  let is_image_asset file_type =
+    Option.fold ~none:false ~some:Journal_media_view.is_image_type file_type
+  in
+  let image_children, text_children =
+    List.partition
+      (fun (summary : Journal_graph_projection.child_summary) ->
+         is_image_asset summary.asset_file_type)
+      entry.child_summaries
+  in
+  let image_children =
+    List.map
+      (fun (summary : Journal_graph_projection.child_summary) ->
+         summary.block_id, Option.get summary.asset_file_type)
+      image_children
+  in
+  let image_children =
+    match Journal_model.asset_file_type block with
+    | Some file_type when is_image_asset (Some file_type) ->
+      (id, file_type) :: image_children
+    | _ -> image_children
+  in
+  let body =
+    if is_image_asset (Journal_model.asset_file_type block)
+    then V.column []
+    else body ~render_source block
+  in
+  let content = V.column ~spacing:8. ~alignment:Leading (body :: metadata block) in
+  let labels = [ render_media ~root:id ~image_children content ] in
   let labels =
     labels
     @ List.map
         (fun (summary : Journal_graph_projection.child_summary) ->
-           render_media ~root:summary.block_id (V.text (render_source summary.source)))
-        entry.child_summaries
+           render_media
+             ~root:summary.block_id
+             ~image_children:[]
+             (V.text (render_source summary.source)))
+        text_children
   in
-  let labels = labels @ metadata block in
   let labels =
     if show_timestamp
     then
