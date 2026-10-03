@@ -108,6 +108,12 @@ let view
          summary.block_id, Option.get summary.asset_file_type)
       image_children
   in
+  let image_children =
+    match Journal_model.asset_file_type block with
+    | Some file_type when is_image_asset (Some file_type) ->
+      (id, file_type) :: image_children
+    | _ -> image_children
+  in
   let body =
     if is_image_asset (Journal_model.asset_file_type block)
     then V.column []

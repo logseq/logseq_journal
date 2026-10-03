@@ -14,7 +14,17 @@ let size_text size =
   else Printf.sprintf "%.1f GB" (Int64.to_float size /. 1_000_000_000.)
 ;;
 
-let view ?(observed_roots = []) ?asset_root ~scope ~root ~media ~editable ~on_event child =
+let view
+      ?(observed_roots = [])
+      ?asset_root
+      ?(known_images = [])
+      ~scope
+      ~root
+      ~media
+      ~editable
+      ~on_event
+      child
+  =
   let asset_root = Option.value asset_root ~default:(fun _ -> root) in
   let observed_roots = if observed_roots = [] then [ root ] else observed_roots in
   let emit ?(target_root = root) ?(asset = "") ?(visible = true) action =
@@ -133,24 +143,100 @@ let view ?(observed_roots = []) ?asset_root ~scope ~root ~media ~editable ~on_ev
         (fun (i : Journal_media_runtime.item) -> is_image_type i.file_type)
         items
     in
+    (* Graph identity/type arrives independently of file availability. Keep its
+       slot and composition even while the runtime descriptor is absent. *)
+    let uuid (item : Journal_media_runtime.item) =
+      Logseq_db_types.Graph_types.Uuid.to_string item.asset.uuid
+    in
+    let by_id = Hashtbl.create (List.length images) in
+    List.iter (fun item -> Hashtbl.replace by_id (uuid item) item) images;
+    let known_ids = Hashtbl.create (List.length known_images) in
+    let known_slots =
+      List.filter_map
+        (fun (id, file_type) ->
+           if (not (is_image_type file_type)) || Hashtbl.mem known_ids id
+           then None
+           else (
+             Hashtbl.add known_ids id ();
+             Some (id, Hashtbl.find_opt by_id id)))
+        known_images
+    in
+    let image_slots =
+      List.filter_map
+        (fun item ->
+           let id = uuid item in
+           if Hashtbl.mem known_ids id then None else Some (id, Some item))
+        images
+      @ known_slots
+    in
+    let render_slot ~gallery (id, (item : Journal_media_runtime.item option)) =
+      let content =
+        match item with
+        | Some ({ presentation = File _ | External _; _ } as item) ->
+          render_item ~gallery item
+        | Some item ->
+          let message =
+            match item.presentation with
+            | Placeholder message -> message
+            | Hidden -> "Waiting for file"
+            | External _ | File _ -> "Waiting for file"
+          in
+          L.column
+            ~gap:6
+            ~padding:10
+            ~cross:`start
+            ~on_appear:(fun _ ->
+              emit ~target_root:(asset_root item.token) ~asset:item.token "asset")
+            [ L.text
+                ~value:message
+                ~style_class:"caption line-clamp-3"
+                ~foreground:"secondary"
+                []
+            ; L.text
+                ~value:"Retry"
+                ~style_class:"caption"
+                ~on_press:(fun _ ->
+                  emit ~target_root:(asset_root item.token) ~asset:item.token "retry")
+                []
+            ]
+        | None ->
+          L.column
+            ~padding:10
+            ~cross:`start
+            [ L.text
+                ~value:"Waiting for file"
+                ~style_class:"caption line-clamp-3"
+                ~foreground:"secondary"
+                []
+            ]
+      in
+      L.column
+        ~key:("image-slot:" ^ id)
+        ~width:(if gallery then 190 else 102)
+        ~height:(if gallery then 90 else 102)
+        ~cross:`start
+        ~background:"#839B7F0B"
+        ~corner_radius:10
+        ~accessibility_identifier:("journal-image-slot:" ^ id)
+        [ content ]
+    in
     let gallery =
-      match images with
-      | [] -> []
-      | [ _ ] -> []
-      | items ->
+      match image_slots with
+      | [] | [ _ ] -> []
+      | slots ->
         [ L.scroll
             ~orientation:`horizontal
-            [ L.row ~gap:8 (List.map (render_item ~gallery:true) items) ]
+            [ L.row ~gap:8 (List.map (render_slot ~gallery:true) slots) ]
         ]
     in
     let body =
-      match images with
-      | [ item ] ->
+      match image_slots with
+      | [ slot ] ->
         L.row
           ~gap:15
           ~cross:`start
           [ L.column ~grow:1. ~cross:`start [ Ui.mount child ]
-          ; L.column ~width:102 ~cross:`start [ render_item ~gallery:false item ]
+          ; render_slot ~gallery:false slot
           ]
       | [] | _ :: _ :: _ -> Ui.mount child
     in
@@ -219,25 +305,20 @@ let view ?(observed_roots = []) ?asset_root ~scope ~root ~media ~editable ~on_ev
         ~gap:12
         ~cross:`start
         ~on_appear:(fun _ -> emit "root")
-        ([ body ]
-         @ gallery
-         @ file_rows
-         @ actions
-         @ picker_rows
-         @ errors
-         @ more_rows
-         @
-         if items = []
-         then []
-         else
-           [ L.dyn
-               ~equal:( = )
-               (function
-                 | None -> L.column []
-                 | Some path ->
-                   L.file_preview ~path ~on_dismiss:(fun _ -> Signal.set preview None) [])
-               (Signal.value preview)
-           ])
+        ([ body ] @ gallery @ file_rows @ actions @ picker_rows @ errors @ more_rows)
+    in
+    (* A modal preview is an overlay, not a spacing child of the row body. *)
+    let content =
+      L.stack
+        [ content
+        ; L.dyn
+            ~equal:( = )
+            (function
+              | None -> L.column ~width:0 ~height:0 []
+              | Some path ->
+                L.file_preview ~path ~on_dismiss:(fun _ -> Signal.set preview None) [])
+            (Signal.value preview)
+        ]
     in
     let observers =
       List.filter_map
@@ -265,7 +346,7 @@ let view ?(observed_roots = []) ?asset_root ~scope ~root ~media ~editable ~on_ev
     content context parent)
 ;;
 
-(* Aggregate only the known direct image asset children. Their own descriptors
+(* Aggregate the known root image and direct image asset children. Their own descriptors
    keep their lease/event owner, even when the parent references the same asset. *)
 let row ~scope ~root ~image_children ~media_for_root ~on_event child =
   let module Runtime = Journal_media_runtime in
@@ -310,7 +391,7 @@ let row ~scope ~root ~image_children ~media_for_root ~on_event child =
   let items, errors =
     List.fold_left
       (fun (items, errors) (id, file_type) ->
-         let media = media_for_root id in
+         let media = if id = root then parent else media_for_root id in
          let own =
            Option.bind media (fun (v : Runtime.view) ->
              List.find_opt (fun item -> uuid item = id) v.items)
@@ -326,7 +407,11 @@ let row ~scope ~root ~image_children ~media_for_root ~on_event child =
            | Some item -> add items owner { item with file_type }
          in
          let errors =
-           match Option.bind media (fun (v : Runtime.view) -> v.error) with
+           match
+             if id = root
+             then None
+             else Option.bind media (fun (v : Runtime.view) -> v.error)
+           with
            | None -> errors
            | Some message -> message :: errors
          in
@@ -348,6 +433,7 @@ let row ~scope ~root ~image_children ~media_for_root ~on_event child =
       }
   in
   view
+    ~known_images:image_children
     ~observed_roots:(root :: List.map fst image_children)
     ~asset_root:(fun token -> Hashtbl.find_opt owners token |> Option.value ~default:root)
     ~scope

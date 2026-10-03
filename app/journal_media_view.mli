@@ -1,6 +1,7 @@
 val view
   :  ?observed_roots:string list
   -> ?asset_root:(string -> string)
+  -> ?known_images:(string * string) list
   -> scope:string
   -> root:string
   -> media:Journal_media_runtime.view option
@@ -11,6 +12,8 @@ val view
 
 val is_image_type : string -> bool
 
+(** [image_children] carries known graph image identities and types, including
+    the root itself when it is an image asset. No runtime descriptor is required. *)
 val row
   :  scope:string
   -> root:string

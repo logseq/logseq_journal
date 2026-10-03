@@ -904,8 +904,122 @@ let test_top_image_asset_has_no_filename_body () =
          "top image asset was hidden with its title")
 ;;
 
+(* Availability is runtime state, but the frame contract is owned by the public
+   row renderer and graph image metadata, not the download reducer. *)
+let check_stable_image_slots ~entry ~images ~width ~height =
+  let current = ref None in
+  let slot = Signal.state_slot "stable-image-slot-fixture" in
+  let views presentation count =
+    images
+    |> List.mapi (fun index item ->
+      ( asset_id item
+      , media_state (if index < count then [ { item with presentation } ] else []) ))
+  in
+  let view =
+    V.of_lui (fun context parent ->
+      let state = Signal.state_at context.ui_scheduler context.ui_state_scope slot [] in
+      current := Some state;
+      Lui_elements.dyn
+        ~equal:( = )
+        (fun views -> Ui.mount (projected_row ~views ~on_event:ignore entry))
+        (Signal.value state)
+        context
+        parent)
+  in
+  with_mounted view (fun app ops ->
+    let slot_nodes operations =
+      List.filter_map
+        (function
+          | Lui_protocol.SetProp (node, AccessibilityIdentifier, StringValue name)
+            when String.starts_with ~prefix:"journal-image-slot:" name -> Some (name, node)
+          | _ -> None)
+        operations
+    in
+    let initial = slot_nodes (ops ()) in
+    require
+      (List.length initial = List.length images)
+      "known image graph metadata must reserve final slots before descriptors arrive";
+    List.iter
+      (fun item ->
+         require
+           (List.mem_assoc ("journal-image-slot:" ^ asset_id item) initial)
+           "reserved slot lost graph asset identity")
+      images;
+    let check () =
+      let operations = ops () in
+      List.iter
+        (fun (_, node) ->
+           let prop property =
+             List.fold_left
+               (fun value -> function
+                  | Lui_protocol.SetProp (id, p, v) when id = node && p = property ->
+                    Some v
+                  | Lui_protocol.RemoveProp (id, p) when id = node && p = property -> None
+                  | _ -> value)
+               None
+               operations
+           in
+           require
+             (prop WidthValue = Some (IntValue width)
+              && prop HeightValue = Some (IntValue height))
+             "image availability changed the final slot dimensions";
+           require
+             (not
+                (List.exists
+                   (function
+                     | Lui_protocol.DropNode id -> id = node
+                     | _ -> false)
+                   operations))
+             "image availability replaced a reserved slot")
+        initial
+    in
+    check ();
+    List.iter
+      (fun next ->
+         Signal.set (Option.get !current) next;
+         ignore (Lui_app.flush app);
+         check ())
+      [ views (Placeholder "Waiting for file") 1
+      ; views (Placeholder "Opening file") (List.length images)
+      ; views (File "/tmp/synthetic-first.png") 1
+      ; views (File "/tmp/synthetic-first.png") (List.length images)
+      ; views Hidden (List.length images)
+      ; []
+      ; views (Placeholder "Retrying file") (List.length images)
+      ; views (File "/tmp/synthetic-first.png") (List.length images)
+      ])
+;;
+
+let test_known_single_slot_survives_availability () =
+  let first = media_item 91 "png" Hidden None in
+  let entry =
+    projected_entry
+      [ 0, graph_node ~id:block_id ~parent:page_id "Short body"
+      ; 1, graph_node ~file_type:"png" ~id:(asset_id first) ~parent:block_id "camera.png"
+      ]
+  in
+  check_stable_image_slots ~entry ~images:[ first ] ~width:102 ~height:102
+;;
+
+let test_known_root_slot_survives_availability () =
+  let first = media_item 92 "png" Hidden None in
+  let entry =
+    projected_entry
+      [ 0, graph_node ~file_type:"png" ~id:(asset_id first) ~parent:page_id "camera.png" ]
+  in
+  check_stable_image_slots ~entry ~images:[ first ] ~width:102 ~height:102
+;;
+
+let test_known_gallery_slots_survive_separate_arrivals () =
+  let entry, _, first, second = child_gallery_fixture () in
+  check_stable_image_slots ~entry ~images:[ first; second ] ~width:190 ~height:90
+;;
+
 let tests =
-  [ "direct image child composition", test_direct_image_children_share_parent_gallery
+  [ "known single image stable slot", test_known_single_slot_survives_availability
+  ; "known root image stable slot", test_known_root_slot_survives_availability
+  ; "known gallery stable slots", test_known_gallery_slots_survive_separate_arrivals
+  ; "direct image child composition", test_direct_image_children_share_parent_gallery
   ; "late image child discovery", test_image_children_load_without_title_flash
   ; "empty parent image gallery", test_empty_parent_keeps_direct_images
   ; "top image asset body", test_top_image_asset_has_no_filename_body
