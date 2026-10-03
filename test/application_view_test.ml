@@ -323,6 +323,8 @@ let run_favorites_native_visibility
       ?(check_chrome = false)
       ?(check_error_control = false)
       ?(check_ios_capture = false)
+      ?media_rows
+      ?(shared_media = false)
       ()
   =
   let module W = Logseq_db_worker_lui.Journal_worker in
@@ -338,6 +340,25 @@ let run_favorites_native_visibility
   let publish_error = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
+  let media_notices = Atomic.make [] in
+  let media_delivered = Atomic.make 0 in
+  let demands = Atomic.make [] in
+  let retries = Atomic.make 0 in
+  let acquire_entered = Atomic.make 0 in
+  let acquire_release = Atomic.make false in
+  let released_files = Atomic.make 0 in
+  let scope : Service.asset_scope =
+    { account =
+        { managed_sync_origin = Uri.of_string "https://example.invalid"
+        ; user_id = "fixture"
+        ; account_generation = 1
+        ; presentation_generation = 1
+        ; lifecycle_generation = 1L
+        }
+    ; graph_id = uuid 900
+    ; graph_generation = 1
+    }
+  in
   let items =
     List.mapi
       (fun n root ->
@@ -420,6 +441,7 @@ let run_favorites_native_visibility
   let service =
     W.Service.create
       ~push_topic_count:6
+      ~merge_push:Service.coalesce_push
       ~concurrency:Serial
       ~init:(fun context _ ->
         W.Session_context.emit
@@ -430,6 +452,14 @@ let run_favorites_native_visibility
       ~handle:(fun context () request ->
         match request with
         | Service.Get_graph_state ->
+          List.iter
+            (fun notice ->
+               Atomic.incr media_delivered;
+               W.Request_context.emit
+                 context
+                 ~topic:Service.asset_topic
+                 (Service.Asset_notice (scope, notice)))
+            (Atomic.exchange media_notices []);
           let sync_phase = Atomic.exchange publish_phase None in
           let error = Atomic.exchange publish_error None in
           if sync_phase <> None || error <> None
@@ -452,8 +482,31 @@ let run_favorites_native_visibility
                ; phase = Graph_open
                ; error = None
                })
-        | Client_command _ | Asset_command _ | Release_asset_file _ ->
+        | Asset_command { command = Replace_asset_demand { consumer; assets; _ }; _ }
+          when Option.is_some media_rows ->
+          List.iter
+            (fun asset ->
+               Atomic.set
+                 demands
+                 ((consumer, asset.Logseq_db_types.Asset_descriptor.uuid)
+                  :: Atomic.get demands))
+            assets;
           Ok Service.Client_command_completed
+        | Asset_command { command = Retry_asset _; _ } when Option.is_some media_rows ->
+          Atomic.incr retries;
+          Ok Service.Client_command_completed
+        | Acquire_asset_file _ when Option.is_some media_rows ->
+          let lease = Atomic.fetch_and_add acquire_entered 1 + 1 in
+          while not (Atomic.get acquire_release) do
+            Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+          done;
+          Ok
+            (Service.Asset_file
+               (Some (Printf.sprintf "fixture-lease-%d" lease, "/tmp/targeted-media.png")))
+        | Release_asset_file _ ->
+          Atomic.incr released_files;
+          Ok Service.Client_command_completed
+        | Client_command _ | Asset_command _ -> Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
         | Import_asset _ -> Error "unexpected import"
         | Graph_request request ->
@@ -489,7 +542,7 @@ let run_favorites_native_visibility
                 { page = page.uuid
                 ; maximum_depth = 1
                 ; items =
-                    List.init 3 (fun n ->
+                    List.init (Option.value media_rows ~default:3) (fun n ->
                       { P.value = timeline_block n
                       ; revision = "root"
                       ; depth = 0
@@ -524,11 +577,21 @@ let run_favorites_native_visibility
                 { generation = "g"
                 ; projection_revision = "p"
                 ; items =
-                    (if check_ios_capture
+                    (if check_ios_capture || Option.is_some media_rows
                      then
                        let module A = Logseq_db_types.Asset_descriptor in
                        [ A.create
-                           ~uuid:(uuid 20000)
+                           ~uuid:
+                             (uuid
+                                (if shared_media
+                                 then 20000
+                                 else
+                                   20000
+                                   + Option.value
+                                       (List.find_index
+                                          (G.Uuid.equal (List.hd roots))
+                                          (List.init 65 (fun n -> uuid (n + 1))))
+                                       ~default:0))
                            ~source:
                              (Managed
                                 (Some
@@ -638,7 +701,11 @@ let run_favorites_native_visibility
     |> Bytes.to_string
   in
   Fun.protect
-    ~finally:(fun () -> ignore (hooks.dispose ()))
+    ~finally:(fun () ->
+      Atomic.set acquire_release true;
+      ignore (hooks.dispose ());
+      if Option.is_some media_rows
+      then Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
        hooks.init 2 2 startup |> consume;
        if check_ios_capture
@@ -670,289 +737,506 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
-       if check_ios_capture
+       (* Media reducers own transfer state, but cannot reproduce the defect:
+          only the public mounted Application owns LUI subscription invalidation.
+          Drive actual Worker notices/completions and native appearance events. *)
+       if Option.is_some media_rows
        then (
-         dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
-         let label = Option.get (find "text" "Timeline fixture 1") in
-         dispatch (Lui_protocol.Appear (ancestor_property label "appear-enabled"));
-         for _ = 1 to 10 do
-           hooks.pump () |> consume;
-           Unix.sleepf 0.001
-         done;
-         Alcotest.(check bool)
-           "iOS composer persists after opening and settling"
-           true
-           (Option.is_some (find "style-class" "composer-input"));
-         let editor = Option.get (find "style-class" "composer-input") in
-         Hashtbl.clear regions;
-         dispatch (Lui_protocol.TextChanged (editor, "iOS persistent draft"));
-         for _ = 1 to 10 do
-           hooks.pump () |> consume;
-           Unix.sleepf 0.001
-         done;
-         Alcotest.(check bool)
-           "iOS edit is delivered and persists"
-           true
-           (Option.is_some (find "text" "iOS persistent draft"));
-         Alcotest.(check int)
-           "iOS draft does not rebuild Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
-         let dismiss =
+         let count = Option.get media_rows in
+         let all key value =
            Hashtbl.fold
-             (fun id values found ->
-                if
-                  List.assoc_opt "press-enabled" values = Some (`Bool true)
-                  &&
-                  match List.assoc_opt "grow" values with
-                  | Some (`Int 1) | Some (`Float 1.) -> true
-                  | _ -> false
-                then Some id
-                else found)
+             (fun id values ids ->
+                if List.assoc_opt key values = Some (`String value)
+                then id :: ids
+                else ids)
              props
-             None
+             []
          in
-         dispatch (Lui_protocol.Press (Option.get dismiss));
-         wait "iOS collapse removes editor" (fun () ->
-           Option.is_none (find "style-class" "composer-input"));
-         dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
-         for _ = 1 to 10 do
-           hooks.pump () |> consume;
-           Unix.sleepf 0.001
-         done;
-         Alcotest.(check bool)
-           "iOS reopen retains latest draft"
-           true
-           (Option.is_some (find "text" "iOS persistent draft"));
-         dispatch
-           (Lui_protocol.Press (Option.get (find "accessibility-label" "Discard draft"))));
-       let connecting () =
-         Hashtbl.fold
-           (fun _ values found ->
-              match
-                List.assoc_opt "_extension" values, List.assoc_opt "payload" values
-              with
-              | Some (`String "journal-chrome"), Some (`String payload) ->
-                let open Yojson.Safe.Util in
-                let json = Yojson.Safe.from_string payload in
-                found
-                || (member "mode" json = `String "page"
-                    && member "connecting" json = `Bool true)
-              | _ -> found)
-           props
-           false
-       in
-       let publish sync_phase =
-         Atomic.set publish_phase (Some sync_phase);
-         ignore (W.send (Option.get !client) Service.Get_graph_state)
-       in
-       if check_chrome
-       then (
-         Hashtbl.clear regions;
-         publish Service.Connecting;
-         wait "page chrome observes Connecting" connecting;
-         Alcotest.(check int)
-           "Connecting does not construct Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
-         Alcotest.(check int)
-           "Connecting does not construct Timeline rows"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline-row") ~default:0));
-       if check_error_control
-       then (
-         Alcotest.(check bool)
-           "error control initially absent"
-           true
-           (Option.is_none (find "accessibility-label" "Error info"));
-         let list_node = Option.get (find "_extension" "journal-list") in
-         Hashtbl.clear regions;
-         Atomic.set publish_error (Some (Some "Fixture sync error"));
-         ignore (W.send (Option.get !client) Service.Get_graph_state);
-         wait "new manager error exposes current Error info action" (fun () ->
-           Option.is_some (find "accessibility-label" "Error info"));
-         Alcotest.(check int)
-           "error control does not construct Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
-         Alcotest.(check int)
-           "chrome error preserves list identity"
-           list_node
-           (Option.get (find "_extension" "journal-list"));
-         dispatch
-           (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
-         wait "current Error info action opens latest error" (fun () ->
-           Option.is_some (find "text" "Fixture sync error"));
-         dispatch
-           (Lui_protocol.Press
-              (Option.get (find "accessibility-identifier" "journal-error-info-close")));
-         Hashtbl.clear regions;
-         Atomic.set publish_error (Some None);
-         ignore (W.send (Option.get !client) Service.Get_graph_state);
-         wait "cleared error removes control" (fun () ->
-           Option.is_none (find "accessibility-label" "Error info"));
-         Alcotest.(check int)
-           "clearing error does not construct Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
-       if check_generation
-       then (
-         let previous = Option.get (find "_extension" "journal-list") in
-         Atomic.set graph_generation 2;
-         ignore (W.send (Option.get !client) Service.Get_graph_state);
-         wait "graph generation replaces native list identity" (fun () ->
-           match find "_extension" "journal-list" with
-           | Some current ->
-             current <> previous && Option.is_some (find "text" "Timeline fixture 2")
-           | None -> false));
-       let favorites = Option.get (find "accessibility-label" "Favorites") in
-       if check_visible
-       then (
-         Hashtbl.clear regions;
-         let list_node = Option.get (find "_extension" "journal-list") in
-         hooks.extension_event
-           list_node
-           "event"
-           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":1,\"last\":2}"}|}
-         |> consume;
-         Alcotest.(check int)
-           "visible demand does not construct Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
-       Hashtbl.clear regions;
-       dispatch (Lui_protocol.Press favorites);
-       wait "Favorites loaded" (fun () -> Option.is_some (find "text" "Fixture 64"));
-       if check_chrome
-       then (
-         Hashtbl.clear regions;
-         publish Service.Current;
-         wait "Favorites chrome clears Connecting" (fun () -> not (connecting ()));
-         Alcotest.(check int)
-           "Current does not construct Favorites"
-           0
-           (Option.value (Hashtbl.find_opt regions "favorites") ~default:0));
-       if check_hidden
-       then
-         Alcotest.(check int)
-           "hidden Timeline is not constructed"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
-       if check_draft
-       then (
-         let capture = Option.get (find "accessibility-label" "Capture") in
-         dispatch (Lui_protocol.Press capture);
-         let editor = Option.get (find "style-class" "composer-input") in
-         Hashtbl.clear regions;
-         dispatch (Lui_protocol.TextChanged (editor, "first"));
-         Alcotest.(check bool)
-           "input is delivered to composer"
-           true
-           (Option.is_some (find "text" "first"));
-         Alcotest.(check int)
-           "draft input does not construct Favorites"
-           0
-           (Option.value (Hashtbl.find_opt regions "favorites") ~default:0);
-         let journals = Option.get (find "accessibility-label" "Journals") in
-         dispatch (Lui_protocol.Press journals);
-         let editor = Option.get (find "style-class" "composer-input") in
-         Hashtbl.clear regions;
-         dispatch (Lui_protocol.TextChanged (editor, "second"));
-         Alcotest.(check bool)
-           "second edit uses current draft"
-           true
-           (Option.is_some (find "text" "second"));
-         Alcotest.(check int)
-           "draft input does not construct Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
-         (* Return to Favorites so this fixture's native visibility checks still apply. *)
-         let favorites = Option.get (find "accessibility-label" "Favorites") in
-         dispatch (Lui_protocol.Press favorites));
-       if check_detail
-       then (
-         let journals = Option.get (find "accessibility-label" "Journals") in
-         dispatch (Lui_protocol.Press journals);
-         let text = Option.get (find "text" "Timeline fixture 1") in
-         dispatch (Lui_protocol.Press (ancestor_property text "press-enabled"));
-         wait "Detail loaded" (fun () ->
-           Option.is_some
-             (find
-                "accessibility-identifier"
-                ("detail-block:" ^ G.Uuid.to_string (List.nth roots 1))));
-         dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Append")));
-         let editor = Option.get (find "style-class" "composer-input") in
-         Alcotest.(check bool)
-           "append sheet title is present"
-           true
-           (Option.is_some (find "text" "Append"));
-         Hashtbl.clear regions;
-         dispatch (Lui_protocol.TextChanged (editor, "child draft"));
-         Alcotest.(check bool)
-           "append sheet title survives subscribed edit"
-           true
-           (Option.is_some (find "text" "Append"));
-         Alcotest.(check bool)
-           "append input uses current draft"
-           true
-           (Option.is_some (find "text" "child draft"));
-         Alcotest.(check int)
-           "append input does not construct retained Timeline"
-           0
-           (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
-         Alcotest.(check int)
-           "append input does not construct outline"
-           0
-           (Option.value (Hashtbl.find_opt regions "detail") ~default:0));
-       if (not check_detail) && not check_generation
-       then (
-         let show n =
-           let text = Option.get (find "text" (Printf.sprintf "Fixture %d" n)) in
-           dispatch (Lui_protocol.Appear (ancestor_property text "appear-enabled"))
-         in
-         for n = 0 to 63 do
-           show n;
-           wait (Printf.sprintf "root %d query completed" n) (fun () ->
-             List.mem (List.nth roots n) (Atomic.get queried));
-           (* Drain the response as well, so the next root is not query-concurrency limited. *)
-           for _ = 1 to 3 do
+         let settle () =
+           for _ = 1 to 12 do
              hooks.pump () |> consume;
              Unix.sleepf 0.001
            done
-         done;
+         in
          let list_node = Option.get (find "_extension" "journal-list") in
-         (* The native list extension callback converts Visible_range to Int64_pair. *)
-         hooks.extension_event
-           list_node
-           "event"
-           (Yojson.Safe.to_string
-              (`Assoc
-                  [ "id", `Int 1
-                  ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
-                  ]))
-         |> consume;
-         show 64;
-         wait "65th root admitted after real Favorites Int64_pair event" (fun () ->
-           List.mem (List.nth roots 64) (Atomic.get queried));
-         let list_node = Option.get (find "_extension" "journal-list") in
-         hooks.extension_event
-           list_node
-           "event"
-           (Yojson.Safe.to_string
-              (`Assoc
-                  [ "id", `Int 1
-                  ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
-                  ]))
-         |> consume;
-         show 64;
-         for _ = 1 to 3 do
-           hooks.pump () |> consume;
-           Unix.sleepf 0.001
+         for n = 0 to count - 1 do
+           let label =
+             Option.get (find "text" (Printf.sprintf "Timeline fixture %d" n))
+           in
+           dispatch (Lui_protocol.Appear (ancestor_property label "appear-enabled"));
+           wait "metadata delivered to mounted root" (fun () ->
+             List.mem (List.nth roots n) (Atomic.get queried));
+           settle ()
          done;
+         let waiting = all "text" "Waiting for file" in
          Alcotest.(check int)
-           "same visible page root does not refetch"
-           1
-           (List.length
-              (List.filter (G.Uuid.equal (List.nth roots 64)) (Atomic.get queried)))))
+           "one mounted asset slot per root"
+           count
+           (List.length waiting);
+         (* Show one descriptor (two independent consumers for a shared asset). *)
+         let shown_count = if shared_media then 2 else 1 in
+         let rec within node ancestor =
+           node = ancestor
+           ||
+           match Hashtbl.find_opt parents node with
+           | None -> false
+           | Some parent -> within parent ancestor
+         in
+         let rec waiting_for_row node =
+           match
+             List.find_opt (fun id -> within id node) (all "text" "Waiting for file")
+           with
+           | Some id -> id
+           | None -> waiting_for_row (Hashtbl.find parents node)
+         in
+         for n = 0 to shown_count - 1 do
+           let title =
+             Option.get (find "text" (Printf.sprintf "Timeline fixture %d" n))
+           in
+           let id = waiting_for_row title in
+           dispatch (Lui_protocol.Appear (ancestor_property id "appear-enabled"));
+           wait "foreground demand delivered" (fun () ->
+             List.length (Atomic.get demands) = n + 1);
+           settle ()
+         done;
+         settle ();
+         let title_ids =
+           List.init count (fun n ->
+             let title = Printf.sprintf "Timeline fixture %d" n in
+             title, Option.get (find "text" title))
+         in
+         let publish availability =
+           let delivered = Atomic.get media_delivered in
+           Atomic.set
+             media_notices
+             (List.map
+                (fun (consumer, asset) ->
+                   Service.Asset_availability { consumer; asset; availability })
+                (Atomic.get demands));
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           wait "public media notices delivered" (fun () ->
+             Atomic.get media_delivered = delivered + shown_count)
+         in
+         let check_isolated label =
+           List.iter
+             (fun name ->
+                Alcotest.(check int)
+                  (label ^ " " ^ name)
+                  0
+                  (Option.value (Hashtbl.find_opt regions name) ~default:0))
+             [ "root"; "timeline"; "timeline-row" ];
+           Alcotest.(check int)
+             (label ^ " retained native list")
+             list_node
+             (Option.get (find "_extension" "journal-list"));
+           List.iter
+             (fun (title, id) ->
+                Alcotest.(check int)
+                  (label ^ " retains row text " ^ title)
+                  id
+                  (Option.get (find "text" title)))
+             title_ids
+         in
+         let check_media_counts label changed =
+           List.iter
+             (fun (name, expected) ->
+                Alcotest.(check int)
+                  (label ^ " " ^ name)
+                  expected
+                  (Option.value (Hashtbl.find_opt regions name) ~default:0))
+             [ "media-structure-compare", changed
+             ; "media-structure-notify", 0
+             ; "media-structure-build", 0
+             ; "media-item-compare", changed
+             ; "media-item-notify", changed
+             ; "media-item-build", changed
+             ];
+           check_isolated label
+         in
+         let record label =
+           Printf.printf "MEDIA_PHASE N=%d shared=%b %s" count shared_media label;
+           Hashtbl.to_seq regions
+           |> List.of_seq
+           |> List.sort compare
+           |> List.iter (fun (name, n) -> Printf.printf " %s=%d" name n);
+           Printf.printf "\n%!"
+         in
+         Hashtbl.clear regions;
+         publish
+           (Service.Asset.Failed
+              { failure = Network; attempts = 1; retry_scheduled = false });
+         settle ();
+         wait "Failed updates only the demanded slots" (fun () ->
+           List.length (all "text" "Unable to download file") = shown_count);
+         settle ();
+         record "failed";
+         check_media_counts "Failed" shown_count;
+         (* Retry uses the current UI action and the public Worker command.
+            Ready is a separate notice; hold Acquire to observe both phases. *)
+         Hashtbl.clear regions;
+         let failed = Option.get (find "text" "Unable to download file") in
+         let failed_parent = Hashtbl.find parents failed in
+         let retry =
+           List.find
+             (fun id -> Hashtbl.find_opt parents id = Some failed_parent)
+             (all "text" "Retry")
+         in
+         dispatch (Lui_protocol.Press retry);
+         wait "Retry sends a real asset retry command" (fun () -> Atomic.get retries = 1);
+         wait "Retry restores waiting presentation" (fun () ->
+           List.length (all "text" "Unable to download file") = shown_count - 1);
+         settle ();
+         record "retry";
+         check_media_counts "Retry" 1;
+         Hashtbl.clear regions;
+         publish (Ready "fixture-ready");
+         wait "Ready enters real Acquire before completion" (fun () ->
+           Atomic.get acquire_entered >= 1
+           && List.length (all "text" "Opening file") = shown_count);
+         settle ();
+         record "ready";
+         check_media_counts "Ready" shown_count;
+         Alcotest.(check int)
+           "Acquire held: file is not installed yet"
+           0
+           (List.length (all "path" "/tmp/targeted-media.png"));
+         Hashtbl.clear regions;
+         Atomic.set acquire_release true;
+         wait "Acquire completion installs file" (fun () ->
+           List.length (all "path" "/tmp/targeted-media.png") = shown_count);
+         settle ();
+         record "acquired";
+         check_media_counts "Acquire" shown_count;
+         let acquired = Atomic.get acquire_entered in
+         Hashtbl.clear regions;
+         publish (Ready "fixture-ready");
+         settle ();
+         record "duplicate";
+         check_media_counts "duplicate Ready" 0;
+         Alcotest.(check int)
+           "duplicate Ready does not reacquire"
+           acquired
+           (Atomic.get acquire_entered);
+         List.iter
+           (fun name ->
+              Alcotest.(check int)
+                ("duplicate " ^ name)
+                0
+                (Option.value (Hashtbl.find_opt regions name) ~default:0))
+           [ "media-structure-notify"
+           ; "media-structure-build"
+           ; "media-item-notify"
+           ; "media-item-build"
+           ];
+         dispatch
+           (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites")));
+         wait "unmount removes acquired images" (fun () ->
+           all "path" "/tmp/targeted-media.png" = []);
+         Hashtbl.clear regions;
+         publish (Ready "fixture-ready");
+         settle ();
+         Alcotest.(check int)
+           "unmounted late Ready cannot recreate images"
+           0
+           (List.length (all "path" "/tmp/targeted-media.png"));
+         Atomic.set graph_generation 2;
+         ignore (W.send (Option.get !client) Service.Get_graph_state);
+         settle ();
+         wait "graph reset releases acquired leases" (fun () ->
+           Atomic.get released_files >= shown_count);
+         publish (Ready "fixture-ready");
+         settle ();
+         Alcotest.(check int)
+           "old generation notice cannot reacquire"
+           acquired
+           (Atomic.get acquire_entered))
+       else (
+         if check_ios_capture
+         then (
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           let label = Option.get (find "text" "Timeline fixture 1") in
+           dispatch (Lui_protocol.Appear (ancestor_property label "appear-enabled"));
+           for _ = 1 to 10 do
+             hooks.pump () |> consume;
+             Unix.sleepf 0.001
+           done;
+           Alcotest.(check bool)
+             "iOS composer persists after opening and settling"
+             true
+             (Option.is_some (find "style-class" "composer-input"));
+           let editor = Option.get (find "style-class" "composer-input") in
+           Hashtbl.clear regions;
+           dispatch (Lui_protocol.TextChanged (editor, "iOS persistent draft"));
+           for _ = 1 to 10 do
+             hooks.pump () |> consume;
+             Unix.sleepf 0.001
+           done;
+           Alcotest.(check bool)
+             "iOS edit is delivered and persists"
+             true
+             (Option.is_some (find "text" "iOS persistent draft"));
+           Alcotest.(check int)
+             "iOS draft does not rebuild Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+           let dismiss =
+             Hashtbl.fold
+               (fun id values found ->
+                  if
+                    List.assoc_opt "press-enabled" values = Some (`Bool true)
+                    &&
+                    match List.assoc_opt "grow" values with
+                    | Some (`Int 1) | Some (`Float 1.) -> true
+                    | _ -> false
+                  then Some id
+                  else found)
+               props
+               None
+           in
+           dispatch (Lui_protocol.Press (Option.get dismiss));
+           wait "iOS collapse removes editor" (fun () ->
+             Option.is_none (find "style-class" "composer-input"));
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           for _ = 1 to 10 do
+             hooks.pump () |> consume;
+             Unix.sleepf 0.001
+           done;
+           Alcotest.(check bool)
+             "iOS reopen retains latest draft"
+             true
+             (Option.is_some (find "text" "iOS persistent draft"));
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Discard draft"))));
+         let connecting () =
+           Hashtbl.fold
+             (fun _ values found ->
+                match
+                  List.assoc_opt "_extension" values, List.assoc_opt "payload" values
+                with
+                | Some (`String "journal-chrome"), Some (`String payload) ->
+                  let open Yojson.Safe.Util in
+                  let json = Yojson.Safe.from_string payload in
+                  found
+                  || (member "mode" json = `String "page"
+                      && member "connecting" json = `Bool true)
+                | _ -> found)
+             props
+             false
+         in
+         let publish sync_phase =
+           Atomic.set publish_phase (Some sync_phase);
+           ignore (W.send (Option.get !client) Service.Get_graph_state)
+         in
+         if check_chrome
+         then (
+           Hashtbl.clear regions;
+           publish Service.Connecting;
+           wait "page chrome observes Connecting" connecting;
+           Alcotest.(check int)
+             "Connecting does not construct Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+           Alcotest.(check int)
+             "Connecting does not construct Timeline rows"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline-row") ~default:0));
+         if check_error_control
+         then (
+           Alcotest.(check bool)
+             "error control initially absent"
+             true
+             (Option.is_none (find "accessibility-label" "Error info"));
+           let list_node = Option.get (find "_extension" "journal-list") in
+           Hashtbl.clear regions;
+           Atomic.set publish_error (Some (Some "Fixture sync error"));
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           wait "new manager error exposes current Error info action" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info"));
+           Alcotest.(check int)
+             "error control does not construct Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+           Alcotest.(check int)
+             "chrome error preserves list identity"
+             list_node
+             (Option.get (find "_extension" "journal-list"));
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
+           wait "current Error info action opens latest error" (fun () ->
+             Option.is_some (find "text" "Fixture sync error"));
+           dispatch
+             (Lui_protocol.Press
+                (Option.get (find "accessibility-identifier" "journal-error-info-close")));
+           Hashtbl.clear regions;
+           Atomic.set publish_error (Some None);
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           wait "cleared error removes control" (fun () ->
+             Option.is_none (find "accessibility-label" "Error info"));
+           Alcotest.(check int)
+             "clearing error does not construct Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
+         if check_generation
+         then (
+           let previous = Option.get (find "_extension" "journal-list") in
+           Atomic.set graph_generation 2;
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           wait "graph generation replaces native list identity" (fun () ->
+             match find "_extension" "journal-list" with
+             | Some current ->
+               current <> previous && Option.is_some (find "text" "Timeline fixture 2")
+             | None -> false));
+         let favorites = Option.get (find "accessibility-label" "Favorites") in
+         if check_visible
+         then (
+           Hashtbl.clear regions;
+           let list_node = Option.get (find "_extension" "journal-list") in
+           hooks.extension_event
+             list_node
+             "event"
+             {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":1,\"last\":2}"}|}
+           |> consume;
+           Alcotest.(check int)
+             "visible demand does not construct Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
+         Hashtbl.clear regions;
+         dispatch (Lui_protocol.Press favorites);
+         wait "Favorites loaded" (fun () -> Option.is_some (find "text" "Fixture 64"));
+         if check_chrome
+         then (
+           Hashtbl.clear regions;
+           publish Service.Current;
+           wait "Favorites chrome clears Connecting" (fun () -> not (connecting ()));
+           Alcotest.(check int)
+             "Current does not construct Favorites"
+             0
+             (Option.value (Hashtbl.find_opt regions "favorites") ~default:0));
+         if check_hidden
+         then
+           Alcotest.(check int)
+             "hidden Timeline is not constructed"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+         if check_draft
+         then (
+           let capture = Option.get (find "accessibility-label" "Capture") in
+           dispatch (Lui_protocol.Press capture);
+           let editor = Option.get (find "style-class" "composer-input") in
+           Hashtbl.clear regions;
+           dispatch (Lui_protocol.TextChanged (editor, "first"));
+           Alcotest.(check bool)
+             "input is delivered to composer"
+             true
+             (Option.is_some (find "text" "first"));
+           Alcotest.(check int)
+             "draft input does not construct Favorites"
+             0
+             (Option.value (Hashtbl.find_opt regions "favorites") ~default:0);
+           let journals = Option.get (find "accessibility-label" "Journals") in
+           dispatch (Lui_protocol.Press journals);
+           let editor = Option.get (find "style-class" "composer-input") in
+           Hashtbl.clear regions;
+           dispatch (Lui_protocol.TextChanged (editor, "second"));
+           Alcotest.(check bool)
+             "second edit uses current draft"
+             true
+             (Option.is_some (find "text" "second"));
+           Alcotest.(check int)
+             "draft input does not construct Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+           (* Return to Favorites so this fixture's native visibility checks still apply. *)
+           let favorites = Option.get (find "accessibility-label" "Favorites") in
+           dispatch (Lui_protocol.Press favorites));
+         if check_detail
+         then (
+           let journals = Option.get (find "accessibility-label" "Journals") in
+           dispatch (Lui_protocol.Press journals);
+           let text = Option.get (find "text" "Timeline fixture 1") in
+           dispatch (Lui_protocol.Press (ancestor_property text "press-enabled"));
+           wait "Detail loaded" (fun () ->
+             Option.is_some
+               (find
+                  "accessibility-identifier"
+                  ("detail-block:" ^ G.Uuid.to_string (List.nth roots 1))));
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Append")));
+           let editor = Option.get (find "style-class" "composer-input") in
+           Alcotest.(check bool)
+             "append sheet title is present"
+             true
+             (Option.is_some (find "text" "Append"));
+           Hashtbl.clear regions;
+           dispatch (Lui_protocol.TextChanged (editor, "child draft"));
+           Alcotest.(check bool)
+             "append sheet title survives subscribed edit"
+             true
+             (Option.is_some (find "text" "Append"));
+           Alcotest.(check bool)
+             "append input uses current draft"
+             true
+             (Option.is_some (find "text" "child draft"));
+           Alcotest.(check int)
+             "append input does not construct retained Timeline"
+             0
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+           Alcotest.(check int)
+             "append input does not construct outline"
+             0
+             (Option.value (Hashtbl.find_opt regions "detail") ~default:0));
+         if (not check_detail) && not check_generation
+         then (
+           let show n =
+             let text = Option.get (find "text" (Printf.sprintf "Fixture %d" n)) in
+             dispatch (Lui_protocol.Appear (ancestor_property text "appear-enabled"))
+           in
+           for n = 0 to 63 do
+             show n;
+             wait (Printf.sprintf "root %d query completed" n) (fun () ->
+               List.mem (List.nth roots n) (Atomic.get queried));
+             (* Drain the response as well, so the next root is not query-concurrency limited. *)
+             for _ = 1 to 3 do
+               hooks.pump () |> consume;
+               Unix.sleepf 0.001
+             done
+           done;
+           let list_node = Option.get (find "_extension" "journal-list") in
+           (* The native list extension callback converts Visible_range to Int64_pair. *)
+           hooks.extension_event
+             list_node
+             "event"
+             (Yojson.Safe.to_string
+                (`Assoc
+                    [ "id", `Int 1
+                    ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
+                    ]))
+           |> consume;
+           show 64;
+           wait "65th root admitted after real Favorites Int64_pair event" (fun () ->
+             List.mem (List.nth roots 64) (Atomic.get queried));
+           let list_node = Option.get (find "_extension" "journal-list") in
+           hooks.extension_event
+             list_node
+             "event"
+             (Yojson.Safe.to_string
+                (`Assoc
+                    [ "id", `Int 1
+                    ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
+                    ]))
+           |> consume;
+           show 64;
+           for _ = 1 to 3 do
+             hooks.pump () |> consume;
+             Unix.sleepf 0.001
+           done;
+           Alcotest.(check int)
+             "same visible page root does not refetch"
+             1
+             (List.length
+                (List.filter (G.Uuid.equal (List.nth roots 64)) (Atomic.get queried))))))
 ;;
 
 (* The root reducer has no Worker accepted-ID/terminal-event boundary. This
@@ -1672,6 +1956,14 @@ let () =
             `Quick
             test_application_region_generation
         ; Alcotest.test_case "iOS Capture persists" `Quick test_application_ios_capture
+        ] )
+    ; ( "targeted media subscriptions"
+      , [ Alcotest.test_case "single Ready and Acquire N=3" `Quick (fun () ->
+            run_favorites_native_visibility ~media_rows:3 ())
+        ; Alcotest.test_case "single Ready and Acquire N=50" `Quick (fun () ->
+            run_favorites_native_visibility ~media_rows:50 ())
+        ; Alcotest.test_case "shared asset independent consumers" `Quick (fun () ->
+            run_favorites_native_visibility ~media_rows:3 ~shared_media:true ())
         ] )
     ; ( "stable media identity"
       , [ Alcotest.test_case

@@ -1671,9 +1671,19 @@ let media_presentation_scope state ~detail =
        | Favorites -> "favorites")
 ;;
 
-let media_label ?(detail = false) state dispatch ~root child =
+let media_label
+      ?store
+      ?(on_region = fun _ -> ())
+      ?(detail = false)
+      state
+      dispatch
+      ~root
+      child
+  =
   let scope = media_presentation_scope state ~detail in
   Journal_media_view.view
+    ?store
+    ~on_region
     ~scope
     ~root
     ~media:(Media_views.find_opt root state.media_views)
@@ -1684,9 +1694,19 @@ let media_label ?(detail = false) state dispatch ~root child =
     child
 ;;
 
-let row_media_label state dispatch ~root ~image_children child =
+let row_media_label
+      ?store
+      ?(on_region = fun _ -> ())
+      state
+      dispatch
+      ~root
+      ~image_children
+      child
+  =
   let scope = media_presentation_scope state ~detail:false in
   Journal_media_view.row
+    ?store
+    ~on_region
     ~scope
     ~root
     ~image_children
@@ -2564,7 +2584,13 @@ module Detail_list = struct
   ;;
 end
 
-let detail_page ~state ~on_scroll_completed dispatch =
+let detail_page
+      ?media_store
+      ?(on_region = fun _ -> ())
+      ~state
+      ~on_scroll_completed
+      dispatch
+  =
   let detail = Journal_routes.detail state.routes in
   let enabled =
     state.write_enabled && state.pending_delete = None && state.pending_status = None
@@ -2619,7 +2645,13 @@ let detail_page ~state ~on_scroll_completed dispatch =
           in
           V.text ~key:(Ui.Key.string ("detail-label:" ^ Journal_model.id block)) source
           |> V.with_test_id (Ui.Test_id.string ("detail-block:" ^ Journal_model.id block))
-          |> media_label ~detail:true state dispatch ~root:(Journal_model.id block))
+          |> media_label
+               ?store:media_store
+               ~on_region
+               ~detail:true
+               state
+               dispatch
+               ~root:(Journal_model.id block))
       (Journal_detail.rows detail)
   in
   let content =
@@ -3231,6 +3263,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
   in
   let media_worker_requests = Hashtbl.create 16 in
   let media_changes = Hashtbl.create 16 in
+  let media_store = Journal_media_view.Store.create ~observe:on_view_region () in
   let media_context = ref None in
   let media_runtime =
     Journal_media_runtime.create
@@ -3249,6 +3282,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
     if key <> !media_context
     then (
       media_context := key;
+      Journal_media_view.Store.reset media_store;
       Journal_media_runtime.reset media_runtime ~graph_generation:(Option.map fst key))
   in
   let flush_media set_state =
@@ -3265,7 +3299,12 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           let media_views =
             List.fold_left
               (fun views (root, (view : Journal_media_runtime.view)) ->
-                 if view.items = [] && view.error = None && not view.more
+                 let empty = view.items = [] && view.error = None && not view.more in
+                 Journal_media_view.Store.update
+                   media_store
+                   ~root
+                   (if empty then None else Some view);
+                 if empty
                  then Media_views.remove root views
                  else if Media_views.find_opt root views = Some view
                  then views
@@ -5424,7 +5463,6 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
       && same_actions left right
       && left.modal = No_modal = (right.modal = No_modal)
       && left.reference_sources == right.reference_sources
-      && left.media_views == right.media_views
       && left.feed_loaded = right.feed_loaded
       && left.graph_error == right.graph_error
       && (Option.is_none left.graph_error
@@ -5452,7 +5490,6 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
          (Journal_routes.detail right.routes)
     && same_actions left right
     && left.reference_sources == right.reference_sources
-    && left.media_views == right.media_views
     && left.import_completion = right.import_completion
     && left.asset_import_request = right.asset_import_request
     && left.graph_ready = right.graph_ready
@@ -5602,10 +5639,18 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
             ~header_signal:(Some header_signal)
             ~on_region:on_view_region
             ~render_source:(render_source state)
-            ~render_media:(media_label state dispatch)
+            ~render_media:
+              (media_label ~store:media_store ~on_region:on_view_region state dispatch)
             ~render_row_media:(fun ~root ~image_children child ->
               on_view_region "timeline-row";
-              row_media_label state dispatch ~root ~image_children child)
+              row_media_label
+                ~store:media_store
+                ~on_region:on_view_region
+                state
+                dispatch
+                ~root
+                ~image_children
+                child)
             ~platform:state.environment.platform
             ~graph_generation:state.graph_state.generation
             ~on_scroll_completed:timeline_scroll_completed
@@ -5707,7 +5752,12 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
             ~title:"Block"
             ~can_pop:true
             (region "detail" ~equal:equal_detail_presentation (fun state ->
-               detail_page ~state ~on_scroll_completed:detail_scroll_completed dispatch
+               detail_page
+                 ~media_store
+                 ~on_region:on_view_region
+                 ~state
+                 ~on_scroll_completed:detail_scroll_completed
+                 dispatch
                |> operation_feedback ~scope:"detail" ~state dispatch))
         ]
     in
