@@ -199,7 +199,21 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
   require
     (Journal_capture.phase still_saving = Journal_capture.Saving)
     "rapid repeated Save changed phase";
-  let failed = Journal_capture.fail saving ~message:"storage unavailable" in
+  let wrong =
+    Journal_capture.fail_attempt
+      saving
+      ~mutation_id:"70000000-0000-4000-9000-000000000012"
+      ~block_id:(generated_block_id 541)
+      ~message:"another attempt failed"
+  in
+  require (wrong == saving) "another admitted attempt failed the current Capture";
+  let failed =
+    Journal_capture.fail_attempt
+      saving
+      ~mutation_id:"70000000-0000-4000-9000-000000000011"
+      ~block_id:(generated_block_id 541)
+      ~message:"storage unavailable"
+  in
   require_string source (Journal_capture.source failed) "failed direct Capture draft";
   let retrying, retry = Journal_capture.retry failed in
   require
@@ -1194,7 +1208,7 @@ let test_append_drafts_follow_parent_navigation () =
     "Append 中文"
     (Journal_capture.source (Option.get (Journal_detail.child_capture ignored)))
     "detached edit";
-  let routes = load_parent routes second 40L in
+  let routes = R.back routes in
   require_string
     "Second"
     (Journal_capture.source
@@ -1920,8 +1934,403 @@ let test_detail_noop_completion_retains_route_owner () =
     "changed Append source"
 ;;
 
+let test_public_nested_detail_owners () =
+  let module R = Journal_routes in
+  let parent = block () in
+  let other = block ~id:"70000000-0000-4000-a000-000000000002" () in
+  let errors = ref [] in
+  let check label run =
+    try run () with
+    | error ->
+      Printf.eprintf "PUBLIC_OWNER_RED %s: %s\n%!" label (Printexc.to_string error);
+      errors := label :: !errors
+  in
+  check "A -> B -> Back preserves A" (fun () ->
+    let first = load_parent (R.create ()) parent 100L in
+    let original = Option.get (R.detail first) in
+    let covered = load_parent first other 200L in
+    let returned = R.back covered in
+    require
+      (R.detail_block_id returned = Some (Journal_model.id parent))
+      "Back discarded the covered parent";
+    require (R.detail returned = Some original) "Back recreated the covered detail state");
+  check "same block presentations own independent composers" (fun () ->
+    let first = load_parent (R.create ()) parent 300L in
+    let first =
+      R.update_detail
+        first
+        (Journal_detail.update_child_source
+           (Option.get (R.detail first))
+           "First entry draft")
+    in
+    let second = load_parent first parent 400L in
+    require
+      (Journal_detail.child_capture (Option.get (R.detail second)) = None)
+      "new same-block entry cloned a live entry's composer";
+    let returned = R.back second in
+    require_string
+      "First entry draft"
+      (Journal_capture.source
+         (Option.get (Journal_detail.child_capture (Option.get (R.detail returned)))))
+      "covered same-block composer");
+  require
+    (!errors = [])
+    "public nested detail owners failed: %s"
+    (String.concat ", " (List.rev !errors))
+;;
+
+let entry_id routes = Option.get (Journal_routes.active_entry_id routes)
+let entry routes id = Option.get (Journal_routes.at_entry routes ~entry_id:id)
+let entry_detail routes id = Option.get (Journal_routes.detail (entry routes id))
+
+let path_ids routes =
+  Lui_navigation.Path.entries (Journal_routes.path routes)
+  |> List.map (fun (entry : string Lui_navigation.entry) -> entry.id)
+;;
+
+let test_typed_path_prefix_and_loading_owners () =
+  let module R = Journal_routes in
+  let a = block ()
+  and b = block ~id:"70000000-0000-4000-a000-000000000002" () in
+  let loading_a =
+    R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:500L
+  in
+  let a_id = entry_id loading_a in
+  let loading_b =
+    R.open_detail loading_a ~block_id:(Journal_model.id b) ~request_generation:600L
+  in
+  let b_id = entry_id loading_b in
+  let loaded_a =
+    R.apply_detail_response loading_b ~request_generation:500L (detail ~root:a ())
+  in
+  require (R.route loaded_a = Detail_loading) "covered success replaced top loading owner";
+  require (R.route (entry loaded_a a_id) = Detail) "covered initial success was discarded";
+  let failed_b =
+    R.apply_detail_failure
+      ~block_id:(Journal_model.id b)
+      loaded_a
+      ~request_generation:600L
+      ~missing:false
+      ~message:"Blocked"
+  in
+  require
+    (R.route failed_b = Failed_detail "Blocked")
+    "matching top failure was discarded";
+  let retry, request = R.retry_detail failed_b ~request_generation:700L in
+  require
+    (path_ids retry = [ a_id; b_id ] && entry_id retry = b_id)
+    "Retry changed presentation identity or path depth";
+  require (Option.is_some request) "Retry did not request the same entry";
+  let stale =
+    R.apply_detail_response retry ~request_generation:600L (detail ~root:b ())
+  in
+  require (stale == retry) "Retry accepted its obsolete initial response";
+  let retry =
+    R.apply_detail_response retry ~request_generation:700L (detail ~root:b ())
+  in
+  let foreign =
+    R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:800L
+  in
+  require
+    (R.accept_path retry (R.path foreign) == retry)
+    "native path accepted foreign entries";
+  require
+    (R.accept_path retry (R.path retry) == retry)
+    "identical native path republished owner";
+  let shortened = R.accept_path retry (R.path loading_a) in
+  require
+    (path_ids shortened = [ a_id ]
+     && R.detail_block_id shortened = Some (Journal_model.id a))
+    "prefix pop lost covered presentation";
+  require (R.at_entry shortened ~entry_id:b_id = None) "popped entry remained live";
+  let late =
+    R.apply_detail_response shortened ~request_generation:700L (detail ~root:b ())
+  in
+  require (late == shortened) "popped initial response recreated an entry";
+  let root = R.pop_to_root shortened in
+  require
+    (path_ids root = [] && R.route root = Timeline && R.active_entry_id root = None)
+    "pop_to_root retained a presentation";
+  require (R.back root == root) "empty back republished owner"
+;;
+
+let test_typed_covered_failure_missing_and_branch () =
+  let module R = Journal_routes in
+  let a = block ()
+  and b = block ~id:"70000000-0000-4000-a000-000000000002" () in
+  let child =
+    block
+      ~id:"70000000-0000-4000-a000-000000000003"
+      ~parent_id:(Some (Journal_model.id a))
+      ~child_count:2
+      ()
+  in
+  let initial =
+    R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:810L
+  in
+  let a_id = entry_id initial in
+  let covered = load_parent initial b 820L in
+  let b_id = entry_id covered in
+  let b_owner = entry_detail covered b_id in
+  let wrong =
+    R.apply_detail_failure
+      ~block_id:(Journal_model.id b)
+      covered
+      ~request_generation:810L
+      ~missing:true
+      ~message:"wrong target"
+  in
+  require (wrong == covered) "failure for another block changed the loading owner";
+  let failed =
+    R.apply_detail_failure
+      ~block_id:(Journal_model.id a)
+      covered
+      ~request_generation:810L
+      ~missing:false
+      ~message:"covered failure"
+  in
+  require
+    (R.route (entry failed a_id) = Failed_detail "covered failure"
+     && entry_detail failed b_id == b_owner)
+    "covered failure changed the top owner";
+  let retry, _ = R.retry_detail_at failed ~entry_id:a_id ~request_generation:830L in
+  require (entry_id retry = b_id) "covered Retry changed the top owner";
+  let ready =
+    R.apply_detail_response
+      retry
+      ~request_generation:830L
+      { Journal_graph_projection.root = a
+      ; children = { blocks = [ child ]; continuation = None }
+      }
+  in
+  let owner = entry_detail ready a_id in
+  let owner, requests =
+    Journal_detail.step owner (Set_branch_expanded (Journal_model.id child, true))
+  in
+  let generation =
+    match requests with
+    | [ Journal_graph_request.Load_detail { request_generation; _ } ] ->
+      request_generation
+    | _ -> fail "branch event did not produce one owned request"
+  in
+  let loading = R.update_detail_at ready ~entry_id:a_id owner in
+  let failed =
+    R.apply_detail_failure
+      ~block_id:(Journal_model.id child)
+      ~stale_cursor:true
+      loading
+      ~request_generation:generation
+      ~missing:false
+      ~message:"stale branch"
+  in
+  require
+    (entry_detail failed b_id == b_owner)
+    "covered branch failure changed sibling owner";
+  let owner, requests =
+    Journal_detail.step (entry_detail failed a_id) (Load_more (Journal_model.id child))
+  in
+  let fresh =
+    match requests with
+    | [ Journal_graph_request.Load_detail { after = None; request_generation; _ } ] ->
+      request_generation
+    | _ -> fail "stale branch retry reused its old cursor"
+  in
+  let loading = R.update_detail_at failed ~entry_id:a_id owner in
+  let grandchild =
+    block
+      ~id:"70000000-0000-4000-a000-000000000004"
+      ~parent_id:(Some (Journal_model.id child))
+      ()
+  in
+  let projection =
+    { Journal_graph_projection.root = child
+    ; children = { blocks = [ grandchild ]; continuation = None }
+    }
+  in
+  require
+    (R.apply_detail_response loading ~request_generation:generation projection == loading)
+    "covered branch accepted obsolete generation";
+  let completed = R.apply_detail_response loading ~request_generation:fresh projection in
+  require
+    (Journal_detail.find_block
+       (entry_detail completed a_id)
+       ~block_id:(Journal_model.id grandchild)
+     <> None)
+    "covered branch success was discarded";
+  require
+    (entry_detail completed b_id == b_owner)
+    "covered branch success rebuilt the sibling owner";
+  let cleared = R.graph_unavailable completed in
+  require
+    (path_ids cleared = [] && R.at_entry cleared ~entry_id:a_id = None)
+    "graph replacement retained the path or live map";
+  require
+    (R.apply_detail_response cleared ~request_generation:fresh projection == cleared)
+    "old graph branch completion revived an owner";
+  let missing =
+    R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:840L
+  in
+  let a_id = entry_id missing in
+  let missing =
+    load_parent missing b 850L
+    |> fun t -> R.apply_missing_detail t ~request_generation:840L
+  in
+  require
+    (R.route (entry missing a_id) = Missing_detail && R.route missing = Detail)
+    "covered missing result changed the top entry"
+;;
+
+let test_typed_shared_data_delete_undo_and_drafts () =
+  let module R = Journal_routes in
+  let parent = block () in
+  let first = load_parent (R.create ()) parent 900L in
+  let first_id = entry_id first in
+  let first =
+    R.update_detail
+      first
+      (Journal_detail.update_child_source (Option.get (R.detail first)) "First retained")
+  in
+  let second = load_parent first parent 910L in
+  let second_id = entry_id second in
+  let second =
+    R.update_detail
+      second
+      (Journal_detail.update_child_source
+         (Option.get (R.detail second))
+         "Second retained")
+  in
+  require
+    (not
+       (ID.Text_input.Session_id.equal
+          (Journal_detail.session_id (entry_detail second first_id))
+          (Journal_detail.session_id (entry_detail second second_id))))
+    "duplicate entry reused editor session";
+  let latest = block ~task_state:Done () in
+  let shared = R.map_details second ~f:(fun d -> Journal_detail.apply_block d latest) in
+  List.iter
+    (fun id ->
+       require
+         (Journal_model.task_state (Journal_detail.root (entry_detail shared id)) = Done)
+         "shared graph data was not propagated to every matching live owner")
+    [ first_id; second_id ];
+  require_string
+    "First retained"
+    (Journal_capture.source
+       (Option.get (Journal_detail.child_capture (entry_detail shared first_id))))
+    "first independent draft after graph update";
+  let staged, undo = R.stage_delete shared ~block_id:(Journal_model.id parent) in
+  List.iter
+    (fun id ->
+       require
+         (R.route (entry staged id) = Missing_detail)
+         "delete left a matching live root visible")
+    [ first_id; second_id ];
+  let deleted_reopened = R.pop_to_root staged |> fun t -> load_parent t parent 925L in
+  require_string
+    "Second retained"
+    (Journal_capture.source
+       (Option.get
+          (Journal_detail.child_capture (Option.get (R.detail deleted_reopened)))))
+    "deleted root kept its independent retained composer";
+  let restored = R.undo_delete staged (Option.get undo) in
+  List.iter
+    (fun id ->
+       require
+         (R.route (entry restored id) = Detail)
+         "aggregate Undo did not restore a live owner")
+    [ first_id; second_id ];
+  require_string
+    "Second retained"
+    (Journal_capture.source
+       (Option.get (Journal_detail.child_capture (entry_detail restored second_id))))
+    "second independent draft after Undo";
+  let popped = R.back staged |> fun t -> R.undo_delete t (Option.get undo) in
+  require
+    (R.at_entry popped ~entry_id:second_id = None && path_ids popped = [ first_id ])
+    "Undo revived a popped owner";
+  let detached = R.pop_to_root restored in
+  let reopened = load_parent detached parent 920L in
+  require_string
+    "Second retained"
+    (Journal_capture.source
+       (Option.get (Journal_detail.child_capture (Option.get (R.detail reopened)))))
+    "most recently detached same-parent draft";
+  let next = R.back reopened |> fun t -> load_parent t parent 930L in
+  require_string
+    "Second retained"
+    (Journal_capture.source
+       (Option.get (Journal_detail.child_capture (Option.get (R.detail next)))))
+    "repeated reopen draft contract"
+;;
+
+let test_typed_detached_duplicate_pending_mutations () =
+  let module R = Journal_routes in
+  let parent = block () in
+  let save routes child_id text =
+    let detail, request =
+      Journal_detail.update_child_source (Option.get (R.detail routes)) text
+      |> fun owner ->
+      Journal_detail.admit_child
+        owner
+        ~mutation_id:child_id
+        ~calendar_generation:1L
+        ~block_id:child_id
+        ~sibling_order:"z"
+        ~creation_time:(creation_time 550)
+    in
+    require
+      (Option.is_some request)
+      "duplicate owner did not admit an independent mutation";
+    R.update_detail routes detail
+  in
+  let child1 = "70000000-0000-4000-a000-000000000031" in
+  let child2 = "70000000-0000-4000-a000-000000000032" in
+  let first =
+    load_parent (R.create ()) parent 950L |> fun t -> save t child1 "First pending"
+  in
+  let second = load_parent first parent 960L |> fun t -> save t child2 "Second pending" in
+  let detached = R.pop_to_root second in
+  let child id source =
+    block ~id ~parent_id:(Some (Journal_model.id parent)) ~source ()
+  in
+  let completed =
+    R.apply_child_created detached ~child:(child child1 "First pending") ~parent
+  in
+  let reopened = load_parent completed parent 970L in
+  require
+    (Journal_detail.mode (Option.get (R.detail reopened)) = Saving_child)
+    "completion for first owner erased second pending mutation";
+  require_string
+    "Second pending"
+    (Journal_capture.source
+       (Option.get (Journal_detail.child_capture (Option.get (R.detail reopened)))))
+    "independent detached pending mutation";
+  let failed = R.apply_child_failure reopened ~block_id:child2 ~message:"offline" in
+  require
+    (Journal_detail.mode (Option.get (R.detail failed)) = Failed "offline")
+    "matching owner lost its pending failure";
+  let old_epoch = R.runtime_replaced failed in
+  require
+    (path_ids old_epoch = path_ids failed && R.route old_epoch = Detail_loading)
+    "runtime reload changed entry identity";
+  let reloaded =
+    R.apply_detail_response
+      old_epoch
+      ~request_generation:(R.detail_request_generation old_epoch)
+      (detail ~root:parent ())
+  in
+  require
+    (Journal_detail.child_capture (Option.get (R.detail reloaded)) <> None)
+    "runtime reload lost the retained independent attempt"
+;;
+
 let tests =
-  [ ( "normal attachment pick without replacement metadata"
+  [ "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
+  ; "typed covered failure and branch", test_typed_covered_failure_missing_and_branch
+  ; "typed shared data and aggregate Undo", test_typed_shared_data_delete_undo_and_drafts
+  ; "typed duplicate detached mutations", test_typed_detached_duplicate_pending_mutations
+  ; "public nested detail owners", test_public_nested_detail_owners
+  ; ( "normal attachment pick without replacement metadata"
     , test_normal_attachment_pick_needs_no_replacement_metadata )
   ; "detail no-op route owner", test_detail_noop_completion_retains_route_owner
   ; "root no-op observable owner", test_root_noops_preserve_observable_owner

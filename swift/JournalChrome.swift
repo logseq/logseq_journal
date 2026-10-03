@@ -134,24 +134,18 @@ import SwiftUI
           SectionDate(title: title)
         }
       case .detail:
-        if let title = properties?.title, context.childIDs.count == 3 {
+        if let title = properties?.title, context.childIDs.count == 2 {
           GeometryReader { bounds in
             child(0).frame(width: bounds.size.width, height: bounds.size.height)
           }
           #if os(iOS)
-          .toolbar(.hidden, for: .navigationBar)
+          .toolbar(.visible, for: .navigationBar)
           #endif
-          .safeAreaInset(edge: .top, spacing: 0) {
-            ZStack {
-              Text(title).font(.headline).accessibilityAddTraits(.isHeader)
-              HStack {
-                child(1).fixedSize()
-                Spacer()
-                child(2).fixedSize()
-              }
+          .navigationTitle(title)
+          .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+              child(1).fixedSize()
             }
-            .frame(minHeight: 44)
-            .padding(.horizontal, 16)
           }
         }
       case .bottomControls:

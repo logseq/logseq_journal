@@ -23,9 +23,170 @@ let should_show_timestamp ~today ~previous_slot = function
   | Top_level _ | Day_heading _ | Day_continuation _ | Feed_continuation _ -> false
 ;;
 
+module Store = struct
+  type row =
+    { entry : Journal_graph_projection.timeline_entry
+    ; show_timestamp : bool
+    }
+
+  type listener =
+    { epoch : int
+    ; mutable active : bool
+    ; callback : unit -> unit
+    }
+
+  type shape =
+    | Block of string * int
+    | Other of Timeline.slot * string option * bool
+
+  type t =
+    { rows : (string, row) Hashtbl.t
+    ; listeners : (string, (int, listener) Hashtbl.t) Hashtbl.t
+    ; observe : string -> unit
+    ; mutable last : Timeline.t option
+    ; mutable shape : (int * int * (int64 * int * string) option * shape list) option
+    ; mutable revision : int
+    ; mutable epoch : int
+    ; mutable serial : int
+    }
+
+  let create ?(observe = fun _ -> ()) () =
+    { rows = Hashtbl.create 64
+    ; listeners = Hashtbl.create 64
+    ; observe
+    ; last = None
+    ; shape = None
+    ; revision = 0
+    ; epoch = 0
+    ; serial = 0
+    }
+  ;;
+
+  let find t block_id = Hashtbl.find_opt t.rows block_id
+
+  let subscribe t block_id callback =
+    let bucket =
+      match Hashtbl.find_opt t.listeners block_id with
+      | Some bucket -> bucket
+      | None ->
+        let bucket = Hashtbl.create 2 in
+        Hashtbl.add t.listeners block_id bucket;
+        bucket
+    in
+    t.serial <- t.serial + 1;
+    let id = t.serial in
+    let listener = { epoch = t.epoch; active = true; callback } in
+    Hashtbl.add bucket id listener;
+    fun () ->
+      if listener.active
+      then (
+        listener.active <- false;
+        Hashtbl.remove bucket id;
+        if Hashtbl.length bucket = 0 then Hashtbl.remove t.listeners block_id)
+  ;;
+
+  let notify t block_id =
+    Option.iter
+      (fun bucket ->
+         let listeners = Hashtbl.fold (fun _ value rest -> value :: rest) bucket [] in
+         List.iter
+           (fun listener ->
+              if listener.active && listener.epoch = t.epoch
+              then (
+                t.observe "timeline-item-notify";
+                listener.callback ()))
+           listeners)
+      (Hashtbl.find_opt t.listeners block_id)
+  ;;
+
+  (* Only a changed timeline presentation reaches this traversal. Media,
+     navigation, draft and visible-demand writes do not scan retained rows. *)
+  let synchronize t state =
+    let same =
+      Option.fold
+        ~none:false
+        ~some:(fun old -> Timeline.equal_presentation old state)
+        t.last
+    in
+    t.last <- Some state;
+    if not same
+    then (
+      let seen = Hashtbl.create (Timeline.retained_slot_count state) in
+      let changes = ref [] in
+      let previous = ref None in
+      let shape =
+        Timeline.fold_slots
+          (fun reversed slot ->
+             let shape =
+               match slot with
+               | Timeline.Top_level entry ->
+                 let block_id = Journal_model.id entry.block in
+                 let row =
+                   { entry
+                   ; show_timestamp =
+                       should_show_timestamp
+                         ~today:(Timeline.today state)
+                         ~previous_slot:!previous
+                         slot
+                   }
+                 in
+                 Hashtbl.replace seen block_id ();
+                 t.observe "timeline-item-compare";
+                 if find t block_id <> Some row
+                 then (
+                   Hashtbl.replace t.rows block_id row;
+                   changes := block_id :: !changes);
+                 Block (block_id, Journal_model.journal_day entry.block)
+               | Day_continuation { day; _ } ->
+                 Other
+                   ( slot
+                   , Timeline.day_error state ~day
+                   , Option.is_some (Timeline.pending_request state) )
+               | Day_heading _ | Feed_continuation _ -> Other (slot, None, false)
+             in
+             previous := Some slot;
+             shape :: reversed)
+          []
+          state
+        |> List.rev
+      in
+      let removed =
+        Hashtbl.fold
+          (fun block_id _ rest ->
+             if Hashtbl.mem seen block_id then rest else block_id :: rest)
+          t.rows
+          []
+      in
+      List.iter (Hashtbl.remove t.rows) removed;
+      let shape =
+        Some
+          ( Timeline.today state
+          , Timeline.first_retained_index state
+          , Timeline.scroll_target state
+          , shape )
+      in
+      if t.shape <> shape
+      then (
+        t.shape <- shape;
+        t.revision <- t.revision + 1;
+        t.observe "timeline-structure-change");
+      List.iter (notify t) (List.rev_append !changes removed));
+    t.revision
+  ;;
+
+  let reset t =
+    t.epoch <- t.epoch + 1;
+    t.last <- None;
+    t.shape <- None;
+    Hashtbl.clear t.rows
+  ;;
+end
+
 let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
+      ?store
+      ?(on_region = fun _ -> ())
       ~render_source
       ~render_media
       ~state
@@ -38,6 +199,7 @@ let view
       ~actions_enabled
       ~on_status
       ~on_delete
+      ()
   =
   let slots = Timeline.fold_slots (fun acc slot -> slot :: acc) [] state |> List.rev in
   let today = Timeline.today state in
@@ -68,11 +230,34 @@ let view
       match slot with
       | Timeline.Day_heading page -> heading page.day page.title
       | Top_level entry ->
-        Journal_row.view
-          ~render_source
-          ~render_media
-          ~show_timestamp:(should_show_timestamp ~today ~previous_slot slot)
-          entry
+        let render entry show_timestamp =
+          on_region "timeline-item-build";
+          Journal_row.view ~render_source ~render_media ~show_timestamp entry
+        in
+        (match store with
+         | None -> render entry (should_show_timestamp ~today ~previous_slot slot)
+         | Some store ->
+           V.of_lui (fun context parent ->
+             let block_id = Journal_model.id entry.block in
+             let current =
+               Signal.state context.Lui_ui.ui_scheduler (Store.find store block_id)
+             in
+             let unsubscribe =
+               Store.subscribe store block_id (fun () ->
+                 Signal.set current (Store.find store block_id))
+             in
+             Signal.on_dispose context.ui_scope (fun () ->
+               unsubscribe ();
+               Signal.dispose_signal (Signal.value current));
+             Lui_elements.dyn
+               ~equal:( = )
+               (function
+                 | None -> Journal_view.mount (V.column [])
+                 | Some (row : Store.row) ->
+                   Journal_view.mount (render row.entry row.show_timestamp))
+               (Signal.value current)
+               context
+               parent))
       | Day_continuation { day; _ } ->
         (match Timeline.day_error state ~day with
          | None -> V.loading ~message:"Loading more journal entries" ()

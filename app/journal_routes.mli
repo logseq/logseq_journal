@@ -26,6 +26,34 @@ val open_detail : t -> block_id:string -> request_generation:int64 -> t
 val detail_block_id : t -> string option
 val detail_request_generation : t -> int64
 
+(** Typed presentation path. Each push allocates a distinct UI entry even for
+    the same block; mutable phase/detail state is owned separately. *)
+type detail_route = string
+
+val path : t -> detail_route Lui_navigation.Path.t
+val active_entry_id : t -> string option
+
+(* Read-only rendering projection. Persist mutations on the canonical owner
+    using [update_detail_at] / [retry_detail_at], rather than storing this view. *)
+val at_entry : t -> entry_id:string -> t option
+val update_detail_at : t -> entry_id:string -> Journal_detail.t -> t
+val accept_path : t -> detail_route Lui_navigation.Path.t -> t
+val pop_to_root : t -> t
+val retry_detail : t -> request_generation:int64 -> t * Journal_graph_request.t option
+
+val retry_detail_at
+  :  t
+  -> entry_id:string
+  -> request_generation:int64
+  -> t * Journal_graph_request.t option
+
+val map_details : t -> f:(Journal_detail.t -> Journal_detail.t) -> t
+
+type staged_delete
+
+val stage_delete : t -> block_id:string -> t * staged_delete option
+val undo_delete : t -> staged_delete -> t
+
 val apply_detail_response
   :  t
   -> request_generation:int64
@@ -35,7 +63,9 @@ val apply_detail_response
 val apply_missing_detail : t -> request_generation:int64 -> t
 
 val apply_detail_failure
-  :  t
+  :  ?block_id:string
+  -> ?stale_cursor:bool
+  -> t
   -> request_generation:int64
   -> missing:bool
   -> message:string

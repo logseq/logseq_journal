@@ -53,20 +53,13 @@ let date_header ~title =
     ()
 ;;
 
-let detail ~on_back ~actions body =
-  let back =
-    V.buttons
-      ~actions:
-        [ V.buttons_action ~label:"Back" ~icon:"chevron.left" ~on_press:on_back () ]
-      ()
-    |> test_id "BackButton"
-  in
+let detail ~actions body =
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string "journal-detail-header")
     ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
     ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body; back; V.buttons ~actions () ]
+    ~children:[ V.Body.Private.to_widget body; V.buttons ~actions () ]
     ()
   |> V.Body.static
 ;;

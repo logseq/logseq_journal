@@ -319,6 +319,10 @@ let run_favorites_native_visibility
       ?(check_hidden = false)
       ?(check_draft = false)
       ?(check_detail = false)
+      ?(check_navigation = false)
+      ?(check_detail_row_action = false)
+      ?(check_covered_update = false)
+      ?(timeline_rows = 3)
       ?(check_generation = false)
       ?(check_chrome = false)
       ?(check_error_control = false)
@@ -340,6 +344,8 @@ let run_favorites_native_visibility
   let publish_error = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
+  let publish_block = Atomic.make false in
+  let updated_block = Atomic.make false in
   let media_notices = Atomic.make [] in
   let media_delivered = Atomic.make 0 in
   let demands = Atomic.make [] in
@@ -398,7 +404,10 @@ let run_favorites_native_visibility
   let timeline_block n : P.v2_block_record =
     { block =
         { uuid = List.nth roots n
-        ; title = Printf.sprintf "Timeline fixture %d" n
+        ; title =
+            (if n = 1 && Atomic.get updated_block
+             then "Updated covered row"
+             else Printf.sprintf "Timeline fixture %d" n)
         ; parent = page.uuid
         ; page = page.uuid
         ; order = Printf.sprintf "%03d" n
@@ -452,6 +461,15 @@ let run_favorites_native_visibility
       ~handle:(fun context () request ->
         match request with
         | Service.Get_graph_state ->
+          if Atomic.exchange publish_block false
+          then (
+            Atomic.set updated_block true;
+            W.Request_context.emit
+              context
+              ~topic:Service.invalidation_topic
+              (Service.Graph_push
+                 (P.V2_changes_available
+                    { api_version = 2; generation = "g"; through = "p2" })));
           List.iter
             (fun notice ->
                Atomic.incr media_delivered;
@@ -542,7 +560,7 @@ let run_favorites_native_visibility
                 { page = page.uuid
                 ; maximum_depth = 1
                 ; items =
-                    List.init (Option.value media_rows ~default:3) (fun n ->
+                    List.init (Option.value media_rows ~default:timeline_rows) (fun n ->
                       { P.value = timeline_block n
                       ; revision = "root"
                       ; depth = 0
@@ -550,6 +568,24 @@ let run_favorites_native_visibility
                       })
                 ; next_cursor = None
                 }
+            | V2_pull_changes _ ->
+              V2_changes
+                { generation = "g"
+                ; from_exclusive = Some "p"
+                ; through = "p2"
+                ; next = None
+                ; windows =
+                    [ { id = "covered-update"
+                      ; predecessor = "p"
+                      ; successor = "p2"
+                      ; block_uuids = [ uuid 2 ]
+                      ; page_uuids = []
+                      ; structure_interests = []
+                      }
+                    ]
+                }
+            | V2_ack_changes _ ->
+              V2_changes_acknowledged { generation = "g"; through = "p2" }
             | V2_get_block { block; _ } ->
               let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
               V2_block_outcome
@@ -651,7 +687,7 @@ let run_favorites_native_visibility
             props
             id
             ((key, member "value" op) :: List.remove_assoc key previous)
-        | "drop-node" ->
+        | "drop-node" | "drop-extension" ->
           let id = op |> member "id" |> to_int in
           Hashtbl.remove props id;
           Hashtbl.remove parents id
@@ -737,6 +773,134 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       (* Routes reducers cannot own LUI mount/subscription retention. The
+          public mounted Application boundary reproduces top-only teardown. *)
+       if check_navigation
+       then (
+         let root_list = Option.get (find "_extension" "journal-list") in
+         let root_label = Option.get (find "text" "Timeline fixture 1") in
+         Hashtbl.clear regions;
+         dispatch (Lui_protocol.Press (ancestor_property root_label "press-enabled"));
+         wait "Detail reaches its actual block" (fun () ->
+           Option.is_some
+             (find
+                "accessibility-identifier"
+                ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+         Alcotest.(check bool)
+           "covered Timeline retains its original native List node"
+           true
+           (Hashtbl.mem props root_list);
+         Alcotest.(check bool)
+           "covered Timeline retains its original row text node"
+           true
+           (Hashtbl.mem props root_label);
+         let navigator = Option.get (find "_extension" "navigation-stack") in
+         let native_event name length =
+           let revision =
+             List.assoc "revision" (Hashtbl.find props navigator)
+             |> Yojson.Safe.Util.to_int
+           in
+           hooks.extension_event
+             navigator
+             name
+             (Yojson.Safe.to_string
+                (`Assoc [ "revision", `Int revision; "length", `Int length ]))
+           |> consume
+         in
+         if check_detail_row_action
+         then (
+           let list =
+             Hashtbl.fold
+               (fun id values result ->
+                  if
+                    id <> root_list
+                    && List.assoc_opt "_extension" values = Some (`String "journal-list")
+                  then Some id
+                  else result)
+               props
+               None
+             |> Option.get
+           in
+           let payload =
+             Yojson.Safe.to_string
+               (`Assoc
+                   [ "key", `String "open"
+                   ; "row", `String ("block:" ^ G.Uuid.to_string (uuid 2))
+                   ])
+           in
+           hooks.extension_event
+             list
+             "event"
+             (Yojson.Safe.to_string
+                (`Assoc
+                    [ "id", `Int 1
+                    ; ( "payload"
+                      , `String
+                          (Yojson.Safe.to_string
+                             (`Assoc
+                                 [ "type", `String "row_event"
+                                 ; "payload", `String payload
+                                 ])) )
+                    ]))
+           |> consume;
+           wait "native context menu pushes another Detail entry" (fun () ->
+             List.assoc "path" (Hashtbl.find props navigator)
+             |> Yojson.Safe.Util.to_string
+             |> String.split_on_char ','
+             |> List.length
+             |> ( = ) 2));
+         if check_covered_update
+         then (
+           let unchanged = Option.get (find "text" "Timeline fixture 2") in
+           Hashtbl.clear regions;
+           Atomic.set publish_block true;
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           wait "covered target receives real Worker change" (fun () ->
+             Hashtbl.fold
+               (fun _ values count ->
+                  if List.assoc_opt "text" values = Some (`String "Updated covered row")
+                  then count + 1
+                  else count)
+               props
+               0
+             = 2);
+           List.iter
+             (fun name ->
+                Alcotest.(check int)
+                  ("covered update keeps " ^ name ^ " builder idle")
+                  0
+                  (Option.value (Hashtbl.find_opt regions name) ~default:0))
+             [ "root"; "timeline" ];
+           Alcotest.(check int)
+             "covered data rebuilds one Timeline row"
+             1
+             (Option.value (Hashtbl.find_opt regions "timeline-row") ~default:0);
+           Alcotest.(check int)
+             "covered data notifies one indexed row"
+             1
+             (Option.value (Hashtbl.find_opt regions "timeline-item-notify") ~default:0);
+           Alcotest.(check bool)
+             "unrelated row node survives covered update"
+             true
+             (Hashtbl.mem props unchanged);
+           Alcotest.(check bool)
+             "native List survives covered update"
+             true
+             (Hashtbl.mem props root_list);
+           Hashtbl.clear regions);
+         native_event "path-changed" 0;
+         native_event "settled" 0;
+         Alcotest.(check bool)
+           "native Back retains Timeline List identity"
+           true
+           (Hashtbl.mem props root_list);
+         List.iter
+           (fun name ->
+              Alcotest.(check int)
+                ("push/pop does not rebuild " ^ name)
+                0
+                (Option.value (Hashtbl.find_opt regions name) ~default:0))
+           [ "root"; "timeline"; "timeline-row" ]);
        (* Media reducers own transfer state, but cannot reproduce the defect:
           only the public mounted Application owns LUI subscription invalidation.
           Drive actual Worker notices/completions and native appearance events. *)
@@ -1925,7 +2089,24 @@ let test_application_ios_capture () =
 let () =
   Alcotest.run
     "application view"
-    [ ( "application regions"
+    [ ( "native navigation"
+      , [ Alcotest.test_case
+            "retained root across actual push and native Back"
+            `Quick
+            (fun () -> run_favorites_native_visibility ~check_navigation:true ())
+        ; Alcotest.test_case "covered target row at N=50" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~check_navigation:true
+              ~check_covered_update:true
+              ~timeline_rows:50
+              ())
+        ; Alcotest.test_case "Detail native context menu dispatch" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~check_navigation:true
+              ~check_detail_row_action:true
+              ())
+        ] )
+    ; ( "application regions"
       , [ Alcotest.test_case
             "visible demand isolation"
             `Quick

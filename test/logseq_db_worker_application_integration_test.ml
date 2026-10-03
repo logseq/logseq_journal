@@ -655,7 +655,21 @@ let test_capture_task_fails_closed_when_inserted_block_is_missing () =
   in
   Alcotest.(check int) "no status mutation" 0 (List.length output.requests);
   match output.responses with
-  | [ { Runtime.payload = Rejected (Projection_failure message); _ } ] ->
+  | [ { Runtime.payload =
+          Mutation_failed
+            { kind = Capture_mutation
+            ; mutation_id
+            ; block_id
+            ; failure = Projection_failure message
+            }
+      ; _
+      }
+    ] ->
+    Alcotest.(check string)
+      "failure keeps admitted mutation"
+      capture.mutation_id
+      mutation_id;
+    Alcotest.(check string) "failure keeps admitted block" capture.block_id block_id;
     Alcotest.(check string)
       "missing captured block"
       "The captured block is unavailable."
@@ -681,7 +695,21 @@ let test_stale_calendar_generation_rejects_capture_before_worker_io () =
   in
   Alcotest.(check int) "no stale worker request" 0 (List.length output.requests);
   match output.responses with
-  | [ { Runtime.payload = Rejected (Projection_failure message); _ } ] ->
+  | [ { Runtime.payload =
+          Mutation_failed
+            { kind = Capture_mutation
+            ; mutation_id
+            ; block_id
+            ; failure = Projection_failure message
+            }
+      ; _
+      }
+    ] ->
+    Alcotest.(check string)
+      "failure keeps admitted mutation"
+      capture.mutation_id
+      mutation_id;
+    Alcotest.(check string) "failure keeps admitted block" capture.block_id block_id;
     Alcotest.(check string)
       "stale calendar rejection"
       "The local calendar changed before capture admission."

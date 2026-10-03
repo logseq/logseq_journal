@@ -31,6 +31,7 @@ let event_schema =
 
 let registry =
   let registry = Lui_extension.registry () in
+  Lui_navigation.register_into registry;
   (* Journal native views nest: chrome slots hold page content (including
      other chrome sections, lists, and media), and list rows hold media and
      chrome section headers. Every component accepts all journal extensions

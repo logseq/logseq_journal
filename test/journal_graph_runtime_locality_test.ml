@@ -998,7 +998,8 @@ let test_status_failure_conversion () =
            0
            (List.length output.requests);
          match (only "status failure" output.responses).payload with
-         | Runtime.Rejected (Worker_failure failure) ->
+         | Runtime.Mutation_failed
+             { kind = Status_mutation; failure = Worker_failure failure; _ } ->
            Alcotest.(check string)
              "original code"
              (Logseq_db_worker.Error.code_string code)
@@ -1262,13 +1263,15 @@ let test_paged_mutation_refresh kind result =
   Alcotest.(check int) "terminal page stops reading" 0 (List.length completed.requests);
   let first_response = List.hd completed.responses in
   match result, kind, first_response.payload with
-  | Cursor_failed, _, Rejected (Worker_failure failure) ->
+  | Cursor_failed, _, Mutation_failed { failure = Worker_failure failure; _ } ->
     Alcotest.(check bool)
       "cursor failure category is preserved"
       true
       (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
   | Missing, Delete_conflict, Subtree_deleted { deleted_count = 0; _ } -> ()
-  | Missing, (Capture | Update | Update_conflict), Rejected (Projection_failure _) -> ()
+  | ( Missing
+    , (Capture | Update | Update_conflict)
+    , Mutation_failed { failure = Projection_failure _; _ } ) -> ()
   | Found, Capture, Block_captured { block = actual; _ }
   | Found, Update, Block_updated { block = actual; _ }
   | Found, Update_conflict, Update_conflict actual
@@ -1619,8 +1622,8 @@ let test_journal_title_failed_format_read_rejects () =
     0
     (List.length completed.requests);
   match (only "capture rejected" completed.responses).payload with
-  | Rejected (Worker_failure _) -> ()
-  | _ -> Alcotest.fail "a failed format read was not rejected"
+  | Mutation_failed { kind = Capture_mutation; failure = Worker_failure _; _ } -> ()
+  | _ -> Alcotest.fail "a failed format read lost its admitted capture"
 ;;
 
 let test_journal_title_ordinals_and_boundaries () =
@@ -2065,6 +2068,170 @@ let test_shared_change_failure_invalidates_reference () =
   ignore (Runtime.receive runtime (target_response retry "Recovered"))
 ;;
 
+let expect_admitted_failure description ~kind ~mutation_id ~block_id output =
+  match (only description output.Runtime.responses).payload with
+  | Runtime.Mutation_failed owner ->
+    Alcotest.(check bool) "original mutation category" true (owner.kind = kind);
+    Alcotest.(check string) "admitted mutation identity" mutation_id owner.mutation_id;
+    Alcotest.(check string) "admitted block identity" block_id owner.block_id;
+    (match owner.failure with
+     | Worker_failure failure ->
+       Alcotest.(check bool)
+         "transport failure category"
+         true
+         (Logseq_db_worker.Error.code failure.error = Closed_session)
+     | Projection_failure _ -> ())
+  | _ -> Alcotest.fail (description ^ ": admitted owner was lost")
+;;
+
+let test_background_failure_keeps_sync_owner () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let request = pull runtime in
+  let output = Runtime.fail_request runtime request ~message:"Background unavailable" in
+  match (only "background failure" output.responses).payload with
+  | Runtime.Rejected (Worker_failure _) -> ()
+  | _ -> Alcotest.fail "background failure was attributed to a mutation"
+;;
+
+let test_capture_failure_keeps_admitted_owner () =
+  let runtime, _, request = capture_format_read ~journal_day:20260901 in
+  Runtime.fail_request runtime request ~message:"Admitted capture unavailable"
+  |> expect_admitted_failure
+       "capture failure"
+       ~kind:Capture_mutation
+       ~mutation_id:"a1000000-0000-4000-a000-0000000000c1"
+       ~block_id:(Graph.Uuid.to_string block_uuid)
+;;
+
+let test_status_failure_keeps_admitted_owner () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let request =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Set_task_state
+         { mutation_id = "a1000000-0000-4000-a000-000000000071"
+         ; block_id = Graph.Uuid.to_string block_uuid
+         ; expected_revision = "block-1"
+         ; task_state = Journal_model.Done
+         })
+    |> fun output -> only "admitted status" output.requests
+  in
+  let followup =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (Protocol.V2_failed
+            { code = Logseq_db_worker.Error.code_string Conflict; message = "Conflict" }))
+    |> fun output -> only "admitted conflict refresh" output.requests
+  in
+  Runtime.fail_request runtime followup ~message:"Status refresh unavailable"
+  |> expect_admitted_failure
+       "status conflict refresh failure"
+       ~kind:Status_mutation
+       ~mutation_id:"a1000000-0000-4000-a000-000000000071"
+       ~block_id:(Graph.Uuid.to_string block_uuid)
+;;
+
+let test_submit_rejections_keep_admitted_identity () =
+  let runtime = Runtime.create () in
+  let mutation_id = "invalid-admitted-mutation"
+  and block_id = "invalid-admitted-block" in
+  let check kind request =
+    Runtime.submit runtime request
+    |> expect_admitted_failure "submit rejection" ~kind ~mutation_id ~block_id
+  in
+  check
+    Source_mutation
+    (Journal_graph_request.Update_source
+       { mutation_id; block_id; expected_revision = "old"; source = "Draft" });
+  check
+    Status_mutation
+    (Journal_graph_request.Set_task_state
+       { mutation_id; block_id; expected_revision = "old"; task_state = Done });
+  check
+    Delete_subtree_mutation
+    (Journal_graph_request.Delete_subtree
+       { mutation_id; block_id; expected_revision = "old" });
+  let creation_time =
+    Journal_time.create
+      ~instant_unix_ms:1_788_192_000_000L
+      ~local_day:20260901
+      ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  check
+    Capture_mutation
+    (Journal_graph_request.Capture
+       { calendar_generation = 99L
+       ; command =
+           { mutation_id
+           ; block_id
+           ; sibling_order = "a"
+           ; source = "Draft"
+           ; task_state = No_status
+           ; creation_time
+           ; children = []
+           }
+       })
+;;
+
+let test_child_failure_retains_admitted_child () =
+  let runtime = Runtime.create () in
+  seed_children_interest runtime;
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  ignore (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+  let calendar = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  Runtime.set_calendar runtime calendar;
+  let mutation_id = "a1000000-0000-4000-a000-000000000081"
+  and block_id = "a1000000-0000-4000-9000-000000000081" in
+  let command : Journal_graph_projection.create_child =
+    { mutation_id
+    ; block_id
+    ; parent_block_id = Graph.Uuid.to_string block_uuid
+    ; calendar_generation = Journal_calendar.generation calendar
+    ; expected_parent_revision = "block-detail-1"
+    ; sibling_order = "a"
+    ; source = "Child draft"
+    ; task_state = No_status
+    ; creation_time =
+        Journal_time.create
+          ~instant_unix_ms:1_788_192_000_000L
+          ~local_day:20260901
+          ~local_minute_of_day:0
+        |> Result.get_ok
+    }
+  in
+  let check output =
+    match (only "child failure" output.Runtime.responses).payload with
+    | Child_failed owner ->
+      Alcotest.(check string) "admitted child" block_id owner.block_id;
+      Alcotest.(check string) "admitted child mutation" mutation_id owner.mutation_id
+    | _ -> Alcotest.fail "child failure lost admitted child owner"
+  in
+  check
+    (Runtime.submit
+       runtime
+       (Journal_graph_request.Create_child { command with calendar_generation = 99L }));
+  let request =
+    Runtime.submit runtime (Journal_graph_request.Create_child command)
+    |> fun output -> only "admitted child mutation" output.requests
+  in
+  check (Runtime.fail_request runtime request ~message:"Child unavailable");
+  let duplicate = Runtime.fail_request runtime request ~message:"Late duplicate" in
+  Alcotest.(check int)
+    "duplicate error has no admitted owner"
+    0
+    (List.length duplicate.responses)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
@@ -2173,6 +2340,28 @@ let () =
             "ordinal and calendar boundaries"
             `Quick
             test_journal_title_ordinals_and_boundaries
+        ] )
+    ; ( "admitted failure ownership"
+      , [ Alcotest.test_case
+            "background failure keeps sync owner"
+            `Quick
+            test_background_failure_keeps_sync_owner
+        ; Alcotest.test_case
+            "capture failure keeps admitted owner"
+            `Quick
+            test_capture_failure_keeps_admitted_owner
+        ; Alcotest.test_case
+            "status refresh failure keeps admitted owner"
+            `Quick
+            test_status_failure_keeps_admitted_owner
+        ; Alcotest.test_case
+            "submit rejections keep admitted identity"
+            `Quick
+            test_submit_rejections_keep_admitted_identity
+        ; Alcotest.test_case
+            "child failure retains admitted child"
+            `Quick
+            test_child_failure_retains_admitted_child
         ] )
     ; ( "mutation conversion"
       , [ Alcotest.test_case
