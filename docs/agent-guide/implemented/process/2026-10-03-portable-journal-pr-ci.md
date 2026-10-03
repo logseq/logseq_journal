@@ -10,7 +10,7 @@ Publish the companion LUI draft first and reference its exact published commit i
 
 ## Decision
 
-Publish LUI draft PR https://github.com/logseq/lui/pull/95 and declare its exact head 7fec999410f015d88d2279632fa805ebac89cf7d in Journal's opam and locked overlay. Add the hosted CI workflow and resolve all declared Git dependency sources once per run, then pin those exact checkouts after cache restoration. Keep main references for already-merged APIs, including ocaml-signal in LUI. The published PR dependency is temporary until LUI merges; replace it with main and rerun Journal CI before merging Journal.
+LUI PR https://github.com/logseq/lui/pull/95 was merged at f00846f0aa0607638249a17e0522d2ed88e09159 after all four CI jobs passed at exact head 7fec999410f015d88d2279632fa805ebac89cf7d. The fetched main tree is identical to that tested head. Return both Journal LUI pins to main as explicitly requested by the user. Add the hosted CI workflow and resolve all declared Git dependency sources once per run, then pin those exact checkouts after cache restoration. Keep main references for already-merged APIs, including ocaml-signal in LUI. Run Journal CI against the now-merged main dependency. Journal PR #43 remains unmerged; its merge is not authorized.
 
 ## Alternatives considered
 
@@ -25,14 +25,14 @@ The fit/fill API is not present in main yet; a declared cross-PR dependency is r
 ## Acceptance criteria
 
 - Both draft PRs contain only intended source, regression and decision/config files.
-- The Journal opam pin references a published LUI commit and CI records resolved dependency SHAs.
+- Both Journal LUI pins reference main after confirmed LUI merge; CI records the actual resolved dependency SHAs.
 - Remote checks are followed to terminal status; failures are identified and fixed within scope where possible.
-- No merge, device rebuild/install, private screenshot upload or generated report commits.
+- Only the expressly authorized LUI merge is performed. No Journal merge, device install, private screenshot upload or generated report commits.
 
 ## Risks
 
 - A fresh locked dependency installation is slower than an existing Mac switch; run it in hosted CI to preserve the benchmark window.
-- Current main dependencies may change between runs. Each run resolves once and reports actual SHAs; the immutable companion LUI commit makes the unmerged dependency explicit.
+- Current main dependencies may change between runs. Each run resolves once and reports actual SHAs; the confirmed LUI merge makes the fit/fill API available on main.
 - The existing global bottom-lui-capsules decision document lacks required sections; it is reported independently rather than represented as green.
 
 ## Consequences
@@ -41,4 +41,4 @@ Reviewers can build from ordinary Git/opam manifests or use hosted CI without a 
 
 ## Questions
 
-None. The user explicitly authorized both PRs and necessary portable CI dependency work; no local compilation is needed for publication.
+None. The user explicitly authorized both PRs, the LUI #95 merge and returning Journal pins to main. Journal #43 merge is not authorized. No local compilation is needed during the benchmark window.
