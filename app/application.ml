@@ -4807,8 +4807,9 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                let text name = Yojson.Basic.Util.to_string (field name) in
                let root = text "root" in
                let visible = Yojson.Basic.Util.to_bool (field "visible") in
+               (* A retained page can appear before native path-changed. Its
+                  validated scope may reclaim media ownership while covered. *)
                match text "action" with
-               | _ when visible && not !media_source_active -> ()
                | "root" ->
                  Journal_media_runtime.root_visible
                    ~owner:!media_owner
@@ -4822,6 +4823,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                    ~root
                    ~asset:(text "asset")
                    visible
+               | _ when visible && not !media_source_active -> ()
                | "retry" ->
                  Journal_media_runtime.retry
                    ~owner:!media_owner

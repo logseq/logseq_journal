@@ -1056,16 +1056,18 @@ let run_favorites_native_visibility
            in
            let native_path length =
              let navigator = Option.get (find "_extension" "navigation-stack") in
-             let revision =
-               List.assoc "revision" (Hashtbl.find props navigator)
-               |> Yojson.Safe.Util.to_int
-             in
-             let payload =
+             let payload () =
+               let revision =
+                 List.assoc "revision" (Hashtbl.find props navigator)
+                 |> Yojson.Safe.Util.to_int
+               in
                Yojson.Safe.to_string
                  (`Assoc [ "revision", `Int revision; "length", `Int length ])
              in
-             hooks.extension_event navigator "path-changed" payload |> consume;
-             hooks.extension_event navigator "settled" payload |> consume;
+             hooks.extension_event navigator "path-changed" (payload ()) |> consume;
+             (* Swift completes with the latest owner reply revision, since
+                path-changed synchronously publishes a new authoritative path. *)
+             hooks.extension_event navigator "settled" (payload ()) |> consume;
              settle ()
            in
            let files () = all "path" "/tmp/targeted-media.png" in
@@ -1177,6 +1179,53 @@ let run_favorites_native_visibility
                  native_path 0;
                  assert_ready "natural Back without appearance replay"
                done
+             | `Restore_early ->
+               push ();
+               wait "Detail mounts" (fun () ->
+                 List.length (all "_extension" "journal-list") = 2);
+               appear_detail ();
+               native_range 2 (count + 1);
+               Alcotest.(check int)
+                 "Detail retains root after Timeline offscreen"
+                 0
+                 (Atomic.get released_files);
+               (* On return, root range/appearance arrive before path-changed.
+                  Root and leaf are real retained Timeline nodes, not forged events. *)
+               native_range 0 (count + 1);
+               List.iter
+                 (fun id ->
+                    if within id list_node then appear_with_ancestors id list_node)
+                 (files ());
+               settle ();
+               native_path 0;
+               Printf.printf
+                 "REVIEW_EARLY_RETURN releases=%d demands_released=%d files=%d\n%!"
+                 (Atomic.get released_files)
+                 (Atomic.get released_demands)
+                 (List.length (files ()));
+               Alcotest.(check int)
+                 "visible returning Timeline retains acquired lease"
+                 0
+                 (Atomic.get released_files);
+               Alcotest.(check int)
+                 "visible returning Timeline stays Ready"
+                 shown_count
+                 (List.length (files ()));
+               Alcotest.(check int)
+                 "returning Timeline preserves its demand"
+                 0
+                 (Atomic.get released_demands);
+               Alcotest.(check int)
+                 "returning Timeline does not reacquire"
+                 acquired
+                 (Atomic.get acquire_entered);
+               List.iter
+                 (fun id ->
+                    Alcotest.(check bool)
+                      "returning Timeline keeps original ready leaf"
+                      true
+                      (Hashtbl.mem props id))
+                 ready_ids
              | `Owners | `Leaf_first ->
                push ();
                wait "Detail mounts" (fun () ->
@@ -2449,6 +2498,14 @@ let () =
                  ())
         ; Alcotest.test_case "Detail asset appears before its root" `Quick (fun () ->
             run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Leaf_first ())
+        ; Alcotest.test_case
+            "returning root appearance precedes Back path"
+            `Quick
+            (fun () ->
+               run_favorites_native_visibility
+                 ~media_rows:3
+                 ~media_navigation:`Restore_early
+                 ())
         ] )
     ; ( "stable media identity"
       , [ Alcotest.test_case
