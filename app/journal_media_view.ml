@@ -21,7 +21,6 @@ let view
       ~scope
       ~root
       ~media
-      ~editable
       ~on_event
       child
   =
@@ -37,10 +36,10 @@ let view
              ; "visible", `Bool visible
              ]))
   in
-  let items, more, error, picker =
+  let items, more, error =
     match media with
-    | None -> [], false, None, None
-    | Some view -> view.Journal_media_runtime.items, view.more, view.error, view.picker
+    | None -> [], false, None
+    | Some view -> view.Journal_media_runtime.items, view.more, view.error
   in
   Ui.View.of_lui (fun context parent ->
     let context = Lui_ui.child_context context ("media:" ^ scope ^ ":" ^ root) in
@@ -241,47 +240,6 @@ let view
       | [] | _ :: _ :: _ -> Ui.mount child
     in
     let file_rows = List.map (render_item ~gallery:false) files in
-    let actions =
-      if editable
-      then
-        [ L.row
-            ~gap:10
-            [ L.text
-                ~value:"Replace file…"
-                ~style_class:"caption"
-                ~on_press:(fun _ -> emit "replace")
-                []
-            ; L.text
-                ~value:"Reuse existing…"
-                ~style_class:"caption"
-                ~on_press:(fun _ -> emit "reuse")
-                []
-            ]
-        ]
-      else []
-    in
-    let picker_rows =
-      match picker with
-      | None -> []
-      | Some picker ->
-        (if picker.busy && picker.candidates = []
-         then [ L.text ~value:"Loading attachments" [] ]
-         else [])
-        @ List.map
-            (fun (i : Journal_media_runtime.item) ->
-               L.text
-                 ~value:(String.uppercase_ascii i.file_type ^ " attachment")
-                 ~on_press:(fun _ ->
-                   if not picker.busy then emit ~asset:i.token "reuse-select")
-                 [])
-            picker.candidates
-        @ (if picker.candidates_more
-           then
-             [ L.text ~value:"More attachments" ~on_press:(fun _ -> emit "reuse-next") []
-             ]
-           else [])
-        @ [ L.text ~value:"Cancel" ~on_press:(fun _ -> emit "reuse-cancel") [] ]
-    in
     let errors =
       match error with
       | None -> []
@@ -305,7 +263,7 @@ let view
         ~gap:12
         ~cross:`start
         ~on_appear:(fun _ -> emit "root")
-        ([ body ] @ gallery @ file_rows @ actions @ picker_rows @ errors @ more_rows)
+        ([ body ] @ gallery @ file_rows @ errors @ more_rows)
     in
     (* A modal preview is an overlay, not a spacing child of the row body. *)
     let content =
@@ -420,9 +378,7 @@ let row ~scope ~root ~image_children ~media_for_root ~on_event child =
       image_children
   in
   let base =
-    Option.value
-      parent
-      ~default:{ Runtime.items = []; more = false; error = None; picker = None }
+    Option.value parent ~default:{ Runtime.items = []; more = false; error = None }
   in
   let errors = Option.to_list base.error @ List.rev errors in
   let media =
@@ -439,7 +395,6 @@ let row ~scope ~root ~image_children ~media_for_root ~on_event child =
     ~scope
     ~root
     ~media
-    ~editable:false
     ~on_event
     child
 ;;

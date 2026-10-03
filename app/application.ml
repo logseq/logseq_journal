@@ -252,8 +252,7 @@ type state =
   ; reference_sources : string Reference_sources.t
   ; media_views : Journal_media_runtime.view Media_views.t
   ; import_completion : (string * string option) option
-  ; pending_replace : string option
-  ; replace_request : int
+  ; asset_import_request : int
   ; capture_pick_request : int
   ; capture_pick_source : Journal_asset_import.source
   ; capture_imports : capture_import_batch option
@@ -337,8 +336,7 @@ let initial_state =
   ; reference_sources = Reference_sources.empty
   ; media_views = Media_views.empty
   ; import_completion = None
-  ; pending_replace = None
-  ; replace_request = 0
+  ; asset_import_request = 0
   ; capture_pick_request = 0
   ; capture_pick_source = Journal_asset_import.Files
   ; capture_imports = None
@@ -1675,19 +1673,10 @@ let media_presentation_scope state ~detail =
 
 let media_label ?(detail = false) state dispatch ~root child =
   let scope = media_presentation_scope state ~detail in
-  let editable =
-    detail
-    && state.write_enabled
-    &&
-    match Journal_routes.detail state.routes with
-    | Some detail -> String.equal root (Journal_model.id (Journal_detail.root detail))
-    | None -> false
-  in
   Journal_media_view.view
     ~scope
     ~root
     ~media:(Media_views.find_opt root state.media_views)
-    ~editable
     ~on_event:(fun payload ->
       Ui.Event.Handler.Private.invoke
         dispatch
@@ -2688,8 +2677,7 @@ let detail_page ~state ~on_scroll_completed dispatch =
        ~key:(Ui.Key.string (scope ^ "import"))
        ~enabled:actions_enabled
        ~completion:state.import_completion
-       ~replacement:state.pending_replace
-       ~request:(Journal_asset_import.file_request ~id:state.replace_request)
+       ~request:(Journal_asset_import.file_request ~id:state.asset_import_request)
        ~pending:[]
        ~on_select:(fun payload ->
          Ui.Event.Handler.Private.invoke
@@ -3244,7 +3232,6 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
   let media_worker_requests = Hashtbl.create 16 in
   let media_changes = Hashtbl.create 16 in
   let media_context = ref None in
-  let media_armed = ref None in
   let media_runtime =
     Journal_media_runtime.create
       ~send:(fun ticket request ->
@@ -3256,9 +3243,6 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           true
         | Full | Not_ready | Stopping -> false)
       ~changed:(fun root view -> Hashtbl.replace media_changes root view)
-      ~armed:(fun _root previous ->
-        media_armed
-        := Some (Option.map Logseq_db_types.Graph_types.Uuid.to_string previous))
   in
   let sync_media state =
     let key = media_key state in
@@ -3270,10 +3254,8 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
   let flush_media set_state =
     let changes = Hashtbl.to_seq media_changes |> List.of_seq in
     Hashtbl.clear media_changes;
-    let armed = !media_armed in
-    media_armed := None;
     let context = !media_context in
-    if changes = [] && armed = None
+    if changes = []
     then Effect.ignore
     else
       set_state (fun state ->
@@ -3283,11 +3265,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           let media_views =
             List.fold_left
               (fun views (root, (view : Journal_media_runtime.view)) ->
-                 if
-                   view.items = []
-                   && view.error = None
-                   && (not view.more)
-                   && view.picker = None
+                 if view.items = [] && view.error = None && not view.more
                  then Media_views.remove root views
                  else if Media_views.find_opt root views = Some view
                  then views
@@ -3295,20 +3273,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
               state.media_views
               changes
           in
-          if media_views == state.media_views && armed = None
-          then state
-          else
-            { state with
-              media_views
-            ; pending_replace =
-                (match armed with
-                 | None -> state.pending_replace
-                 | Some previous -> Some (Option.value ~default:"" previous))
-            ; replace_request =
-                (match armed with
-                 | None -> state.replace_request
-                 | Some _ -> state.replace_request + 1)
-            }))
+          if media_views == state.media_views then state else { state with media_views }))
   in
   let import_worker_requests = Hashtbl.create 2 in
   (* operation token -> staged pick whose temp copy is removed on completion *)
@@ -4748,15 +4713,6 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                | "retry" ->
                  Journal_media_runtime.retry media_runtime ~root ~asset:(text "asset")
                | "next" -> Journal_media_runtime.next media_runtime ~root
-               | "replace" -> Journal_media_runtime.begin_replace media_runtime ~root
-               | "reuse" -> Journal_media_runtime.begin_reuse media_runtime ~root
-               | "reuse-select" ->
-                 Journal_media_runtime.reuse_select
-                   media_runtime
-                   ~root
-                   ~asset:(text "asset")
-               | "reuse-next" -> Journal_media_runtime.reuse_next media_runtime ~root
-               | "reuse-cancel" -> Journal_media_runtime.end_reuse media_runtime ~root
                | _ -> ()
              with
              | _ -> ()))
@@ -4772,17 +4728,13 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                  ~none:false
                  ~some:(fun detail -> Journal_detail.mode detail <> Saving_child)
                  (Journal_routes.detail state.routes)
-          then
-            { state with
-              pending_replace = None
-            ; replace_request = state.replace_request + 1
-            }
+          then { state with asset_import_request = state.asset_import_request + 1 }
           else state)
       else if String.starts_with ~prefix:"import-asset:" action
       then (
         let import_payload = String.sub action 13 (String.length action - 13) in
         if Journal_asset_import.is_dismissal import_payload
-        then update (fun state -> { state with pending_replace = None })
+        then Effect.ignore
         else (
           match Journal_routes.detail snapshot.routes with
           | None -> Effect.ignore
@@ -4796,41 +4748,35 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                 Journal_asset_import.decode ~target import_payload)
             in
             (match source with
-             | Error _ -> update (fun state -> { state with pending_replace = None })
+             | Error _ -> Effect.ignore
              | Ok source ->
                let operation =
                  Logseq_db_types.Graph_types.Uuid.to_string source.operation
                in
                let graph_generation = snapshot.graph_state.generation in
-               Effect.many
-                 [ update (fun state -> { state with pending_replace = None })
-                 ; Effect.bind
-                     (Effect.of_thunk (fun () ->
-                        if not snapshot.write_enabled
-                        then Some "The destination is not ready for imports"
-                        else (
-                          match
-                            Worker.send
-                              client
-                              (Graph_service.Import_asset { graph_generation; source })
-                          with
-                          | Accepted id ->
-                            Hashtbl.replace
-                              import_worker_requests
-                              id
-                              (graph_generation, operation);
-                            None
-                          | Full | Not_ready | Stopping ->
-                            Some
-                              "Import is temporarily unavailable. Select the file again.")))
-                     ~f:(function
-                       | None -> Effect.ignore
-                       | Some message ->
-                         update (fun state ->
-                           { state with
-                             import_completion = Some (operation, Some message)
-                           }))
-                 ])))
+               Effect.bind
+                 (Effect.of_thunk (fun () ->
+                    if not snapshot.write_enabled
+                    then Some "The destination is not ready for imports"
+                    else (
+                      match
+                        Worker.send
+                          client
+                          (Graph_service.Import_asset { graph_generation; source })
+                      with
+                      | Accepted id ->
+                        Hashtbl.replace
+                          import_worker_requests
+                          id
+                          (graph_generation, operation);
+                        None
+                      | Full | Not_ready | Stopping ->
+                        Some "Import is temporarily unavailable. Select the file again.")))
+                 ~f:(function
+                   | None -> Effect.ignore
+                   | Some message ->
+                     update (fun state ->
+                       { state with import_completion = Some (operation, Some message) })))))
       else if String.length action > 13 && String.sub action 0 13 = "select-graph:"
       then (
         let graph_id = String.sub action 13 (String.length action - 13) in
@@ -5508,8 +5454,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
     && left.reference_sources == right.reference_sources
     && left.media_views == right.media_views
     && left.import_completion = right.import_completion
-    && left.pending_replace = right.pending_replace
-    && left.replace_request = right.replace_request
+    && left.asset_import_request = right.asset_import_request
     && left.graph_ready = right.graph_ready
     && operation_failure left.timeline_notice = operation_failure right.timeline_notice
   in
@@ -5748,7 +5693,6 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           ~key:(Ui.Key.string "journal-capture-asset-import")
           ~enabled:(state.write_enabled && Journal_capture.can_attach capture)
           ~completion:assets.completion
-          ~replacement:None
           ~request:assets.request
           ~pending:[]
           ~on_select:assets.on_event

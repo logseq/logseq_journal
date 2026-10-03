@@ -58,7 +58,6 @@ val view
   :  key:Journal_view.Key.t
   -> enabled:bool
   -> completion:(string * string option) option
-  -> replacement:string option
   -> request:request
   -> pending:staged list
   -> on_select:(string -> unit)

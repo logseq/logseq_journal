@@ -874,7 +874,11 @@ let run_favorites_native_visibility
          dispatch (Lui_protocol.Press journals);
          let text = Option.get (find "text" "Timeline fixture 1") in
          dispatch (Lui_protocol.Press (ancestor_property text "press-enabled"));
-         wait "Detail loaded" (fun () -> Option.is_some (find "text" "Replace file…"));
+         wait "Detail loaded" (fun () ->
+           Option.is_some
+             (find
+                "accessibility-identifier"
+                ("detail-block:" ^ G.Uuid.to_string (List.nth roots 1))));
          dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Append")));
          let editor = Option.get (find "style-class" "composer-input") in
          Alcotest.(check bool)

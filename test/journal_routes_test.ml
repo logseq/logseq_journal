@@ -214,7 +214,7 @@ let staged_pick ~operation ~path ~title ~file_type =
   match
     Journal_asset_import.decode_event
       (Printf.sprintf
-         {|{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s","replaceReference":null}|}
+         {|{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s"}|}
          operation
          "70000000-0000-4000-a000-00000000a001"
          "70000000-0000-4000-a000-00000000a002"
@@ -225,6 +225,37 @@ let staged_pick ~operation ~path ~title ~file_type =
   with
   | Ok (Journal_asset_import.Picked (staged, _)) -> staged
   | _ -> fail "staged pick did not decode"
+;;
+
+let test_normal_attachment_pick_needs_no_replacement_metadata () =
+  let target =
+    Logseq_db_types.Graph_types.Uuid.of_string "70000000-0000-4000-a000-00000000a011"
+    |> Result.get_ok
+  in
+  let payload =
+    {|{"operation":"70000000-0000-4000-a000-00000000a010","asset":"70000000-0000-4000-a000-00000000a001","localMutation":"70000000-0000-4000-a000-00000000a002","metadataMutation":"70000000-0000-4000-a000-00000000a003","path":"/tmp/synthetic-attachment.png","title":"Existing picker selection","type":"png","request":{"id":4,"source":"files","staged":false}}|}
+  in
+  let imported =
+    match Journal_asset_import.decode ~target payload with
+    | Ok imported -> imported
+    | Error message -> fail "normal picker selection rejected: %s" message
+  in
+  require
+    (imported.target = target && imported.replace_reference = None)
+    "normal picker selection changed attachment destination or replaced an existing \
+     reference";
+  require_string "Existing picker selection" imported.title "normal picker title";
+  match Journal_asset_import.decode_event payload with
+  | Ok (Picked (staged, Some 4)) ->
+    let imported = Journal_asset_import.to_import staged ~target in
+    require
+      (imported.replace_reference = None)
+      "Capture pick replaced an existing reference";
+    require_string
+      "/tmp/synthetic-attachment.png"
+      (Journal_asset_import.staged_path staged)
+      "staged path"
+  | _ -> fail "normal picker selection did not preserve staged event and request identity"
 ;;
 
 let test_direct_capture_pending_attachments () =
@@ -1890,7 +1921,9 @@ let test_detail_noop_completion_retains_route_owner () =
 ;;
 
 let tests =
-  [ "detail no-op route owner", test_detail_noop_completion_retains_route_owner
+  [ ( "normal attachment pick without replacement metadata"
+    , test_normal_attachment_pick_needs_no_replacement_metadata )
+  ; "detail no-op route owner", test_detail_noop_completion_retains_route_owner
   ; "root no-op observable owner", test_root_noops_preserve_observable_owner
   ; ( "Append restarts partial children"
     , test_append_restarts_partial_children_without_reusing_cursor )

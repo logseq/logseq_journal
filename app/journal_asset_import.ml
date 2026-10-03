@@ -66,15 +66,6 @@ let parse payload =
     let* asset = uuid "asset" in
     let* local_mutation = uuid "localMutation" in
     let* metadata_mutation = uuid "metadataMutation" in
-    let* replace_reference =
-      match json with
-      | `Assoc fields ->
-        (match List.assoc_opt "replaceReference" fields with
-         | Some `Null | Some (`String "") -> Ok None
-         | Some (`String id) -> Result.map Option.some (Uuid.of_string id)
-         | _ -> Error "Invalid replacement reference")
-      | _ -> Error "Invalid attachment selection"
-    in
     let* source_file = field "path" in
     let* title = field "title" in
     let* file_type = field "type" in
@@ -96,7 +87,6 @@ let parse payload =
         ; title
         ; file_type
         }
-      , replace_reference
       , request_id )
   with
   | _ -> Error "Invalid attachment selection"
@@ -104,12 +94,12 @@ let parse payload =
 
 let decode ~target payload =
   Result.map
-    (fun ((pick : staged), replace_reference, _) ->
+    (fun ((pick : staged), _) ->
        Logseq_db_types.Asset_import.
          { operation = pick.operation
          ; asset = pick.asset
          ; target
-         ; replace_reference
+         ; replace_reference = None
          ; local_mutation = pick.local_mutation
          ; metadata_mutation = pick.metadata_mutation
          ; source_file = pick.source_file
@@ -158,7 +148,7 @@ let decode_event payload =
         | _ -> Error "Invalid attachment selection")
      | _ ->
        Result.map
-         (fun (staged, _, request_id) -> Picked (staged, request_id))
+         (fun (staged, request_id) -> Picked (staged, request_id))
          (parse payload))
   | _ -> Error "Invalid attachment selection"
 ;;
@@ -188,7 +178,7 @@ let is_dismissal payload =
   | _ -> false
 ;;
 
-let view ~key ~enabled ~completion ~replacement ~request ~pending ~on_select body =
+let view ~key ~enabled ~completion ~request ~pending ~on_select body =
   let operation, error =
     match completion with
     | None -> `Null, `Null
@@ -206,10 +196,6 @@ let view ~key ~enabled ~completion ~replacement ~request ~pending ~on_select bod
           [ "enabled", `Bool enabled
           ; "completion", operation
           ; "error", error
-          ; ( "replace"
-            , match replacement with
-              | None -> `Null
-              | Some root -> `String root )
           ; ( "request"
             , `Assoc
                 [ "id", `Int request.id

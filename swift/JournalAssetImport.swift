@@ -28,7 +28,6 @@ import UIKit
     let enabled: Bool
     let completion: String?
     let error: String?
-    let replace: String?
     let request: Request?
     let pending: [PendingItem]?
   }
@@ -203,7 +202,6 @@ import UIKit
         "metadataMutation": UUID().uuidString.lowercased(),
         "path": path,
         "title": title,
-        "replaceReference": properties?.replace ?? NSNull(),
         "type": type.isEmpty ? "bin" : type,
         "request": [
           "id": request?.id ?? 0,
@@ -298,14 +296,14 @@ import UIKit
         guard context.isUserInteractionEnabled else { return }
         do {
           guard let source = try result.get().first else {
-            if properties?.replace != nil { emitDismissed() }
+            emitDismissed()
             return
           }
           handleFilePick(source)
         } catch {
           selection.release()
           if (error as NSError).code == NSUserCancelledError {
-            if properties?.replace != nil { emitDismissed() }
+            emitDismissed()
           } else {
             self.error = "Unable to access the selected file. Please try again."
           }
@@ -324,9 +322,7 @@ import UIKit
               self.error = "Unable to save the image. Please try again."
             }
           },
-          onCancel: {
-            if properties?.replace != nil { emitDismissed() }
-          })
+          onCancel: emitDismissed)
         #else
         EmptyView()
         #endif
@@ -334,10 +330,6 @@ import UIKit
       .onChange(of: filePresented) { _, isPresented in
         if isPresented {
           handled = false
-        } else if properties?.replace != nil {
-          // iOS never invokes the fileImporter completion on Cancel, so treat
-          // closing an armed picker without a pick as a dismissal.
-          emitDismissed()
         }
       }
       .onChange(of: photosPresented) { _, isPresented in

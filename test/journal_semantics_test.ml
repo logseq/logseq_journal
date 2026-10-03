@@ -361,11 +361,45 @@ let media_view items =
   Journal_media_view.view
     ~scope:"fixture"
     ~root:block_id
-    ~media:
-      (Some { Journal_media_runtime.items; more = false; error = None; picker = None })
-    ~editable:false
+    ~media:(Some { Journal_media_runtime.items; more = false; error = None })
     ~on_event:(fun _ -> ())
     (V.text "Example body")
+;;
+
+let test_detail_media_preserves_rendering_without_asset_actions () =
+  let view =
+    Journal_media_view.view
+      ~scope:"detail-action-removal"
+      ~root:block_id
+      ~media:
+        (Some
+           { Journal_media_runtime.items =
+               [ media_item 41 "png" (File "/tmp/existing-image.png") None ]
+           ; more = false
+           ; error = None
+           })
+      ~on_event:(fun _ -> ())
+      (V.text "Existing detail body")
+  in
+  with_mounted view (fun _ ops ->
+    let ops = ops () in
+    require
+      (has_text ops "Existing detail body")
+      "removing media actions lost the detail body";
+    List.iter
+      (fun label ->
+         require
+           (not (has_text ops label))
+           "removed media action is still mounted: %s"
+           label)
+      [ "Replace file…"; "Reuse existing…" ];
+    require
+      (List.exists
+         (function
+           | Lui_protocol.CreateNode (_, FileImage) -> true
+           | _ -> false)
+         ops)
+      "removing media actions lost existing attachment rendering")
 ;;
 
 let test_single_image_beside_body () =
@@ -618,10 +652,7 @@ let projected_entry nodes =
 ;;
 
 let asset_id (item : Journal_media_runtime.item) = Graph.Uuid.to_string item.asset.uuid
-
-let media_state items =
-  { Journal_media_runtime.items; more = false; error = None; picker = None }
-;;
+let media_state items = { Journal_media_runtime.items; more = false; error = None }
 
 let projected_row ~views ~on_event entry =
   Journal_row.view
@@ -1121,7 +1152,9 @@ let test_native_list_payload_binds_nested_contents () =
 ;;
 
 let tests =
-  [ "native list nested content bindings", test_native_list_payload_binds_nested_contents
+  [ ( "detail media without asset actions"
+    , test_detail_media_preserves_rendering_without_asset_actions )
+  ; "native list nested content bindings", test_native_list_payload_binds_nested_contents
   ; "known single image stable slot", test_known_single_slot_survives_availability
   ; "known root image stable slot", test_known_root_slot_survives_availability
   ; "known gallery stable slots", test_known_gallery_slots_survive_separate_arrivals
