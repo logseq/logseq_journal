@@ -231,11 +231,7 @@ module Theme : sig
 
   type t
 
-  val create :
-       mode:mode
-    -> ?tokens:(string * Lui_ui.theme_token_value) list
-    -> unit
-    -> t
+  val create : mode:mode -> ?tokens:(string * Lui_ui.theme_token_value) list -> unit -> t
 end
 
 module Text_editing : sig
@@ -991,6 +987,7 @@ module Native_widget : sig
     :  ('props, 'event) Extension.t
     -> ?key:Key.t
     -> props:'props
+    -> ?props_signal:'props Signal.signal
     -> on_event:('event -> unit)
     -> ?children:View.t list
     -> unit

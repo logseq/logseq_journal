@@ -67,6 +67,17 @@ type retained_composer =
   ; draft_pending : Journal_graph_request.t option
   }
 
+let equal_presentation (left : t) (right : t) =
+  left == right
+  || (left.root_id = right.root_id
+      && left.blocks == right.blocks
+      && left.branches == right.branches
+      && left.session_number = right.session_number
+      && left.mode = right.mode
+      && left.composer_revision = right.composer_revision
+      && left.reveal_id = right.reveal_id)
+;;
+
 let pending_child pending block_id =
   match pending with
   | Some (Journal_graph_request.Create_child command) -> command.block_id = block_id

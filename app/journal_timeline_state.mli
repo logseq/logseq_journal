@@ -47,6 +47,11 @@ val replace_timeline_entry_page
 val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
 val stage_delete : t -> block_id:string -> (t * staged_delete) option
 val undo_delete : t -> staged_delete -> t
+
+(** Equality of the rendered slots, date/error presentation and scroll command.
+    Demand windows and recovery bookkeeping do not affect this comparison. *)
+val equal_presentation : t -> t -> bool
+
 val observe_visible_range : t -> first_index:int -> last_exclusive:int -> t
 
 (** Read an index relative to the first retained slot. Out-of-range indices return [None]. *)

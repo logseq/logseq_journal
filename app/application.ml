@@ -295,11 +295,14 @@ let favorites_event state event =
           Logseq_db_types.Graph_types.Uuid.to_string uuid)
       |> Rrbvec.of_list
   in
-  { state with
-    favorites
-  ; favorites_media_roots
-  ; favorites_requests = state.favorites_requests @ requests
-  }
+  if favorites == state.favorites && requests = []
+  then state
+  else
+    { state with
+      favorites
+    ; favorites_media_roots
+    ; favorites_requests = state.favorites_requests @ requests
+    }
 ;;
 
 let select_destination state destination =
@@ -404,7 +407,9 @@ let track_capture_session state =
     let next =
       ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture) |> Int64.succ
     in
-    { state with next_local_sequence = Int64.max state.next_local_sequence next }
+    if Int64.compare next state.next_local_sequence <= 0
+    then state
+    else { state with next_local_sequence = next }
 ;;
 
 let clear_graph_surface state =
@@ -847,12 +852,15 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
       List.fold_left
         (fun sources (id, source) ->
            match source with
+           | _ when Reference_sources.find_opt id sources = source -> sources
            | None -> Reference_sources.remove id sources
            | Some source -> Reference_sources.add id source sources)
         state.reference_sources
         updates
     in
-    { state with reference_sources }
+    if reference_sources == state.reference_sources
+    then state
+    else { state with reference_sources }
   | Favorites_loaded (request, result) -> favorites_event state (Loaded (request, result))
   | Favorites_failed (request, stale, message) ->
     favorites_event state (Failed (request, stale, message))
@@ -1293,8 +1301,11 @@ module Root_navigation = struct
             ; next_local_sequence = Int64.succ state.next_local_sequence
             }
         in
-        { state with modal = Capture_sheet }
-      | Capture_closed -> { state with modal = No_modal }
+        if state.modal = Capture_sheet
+        then state
+        else { state with modal = Capture_sheet }
+      | Capture_closed ->
+        if state.modal = No_modal then state else { state with modal = No_modal }
       | Capture_discarded ->
         (match state.direct_capture with
          | Some capture when Journal_capture.phase capture = Journal_capture.Editing ->
@@ -1324,22 +1335,21 @@ module Root_navigation = struct
            Journal_asset_import.discard_staged_file staged;
            state)
       | Capture_native_edit edit ->
-        { state with
-          direct_capture =
-            Option.map
-              (fun capture -> Journal_capture.apply_text_edit capture edit)
-              state.direct_capture
-        }
+        (match state.direct_capture with
+         | None -> state
+         | Some capture ->
+           let next = Journal_capture.apply_text_edit capture edit in
+           if next == capture then state else { state with direct_capture = Some next })
       | Capture_task_intent selected ->
-        { state with
-          direct_capture =
-            Option.map
-              (fun capture ->
-                 if Journal_capture.task_state capture = Journal_model.Todo = selected
-                 then capture
-                 else Journal_capture.toggle_task_intent capture)
-              state.direct_capture
-        }
+        (match state.direct_capture with
+         | None -> state
+         | Some capture ->
+           let next =
+             if Journal_capture.task_state capture = Journal_model.Todo = selected
+             then capture
+             else Journal_capture.toggle_task_intent capture
+           in
+           if next == capture then state else { state with direct_capture = Some next })
       | Capture_edited source ->
         let capture, next_local_sequence =
           match state.direct_capture with
@@ -1349,13 +1359,22 @@ module Root_navigation = struct
           | Some capture ->
             Journal_capture.update_source capture ~source, state.next_local_sequence
         in
-        { state with
-          direct_capture = Some capture
-        ; next_local_sequence
-        ; capture_error = None
-        }
+        if
+          (match state.direct_capture with
+           | Some previous -> previous == capture
+           | None -> false)
+          && state.capture_error = None
+        then state
+        else
+          { state with
+            direct_capture = Some capture
+          ; next_local_sequence
+          ; capture_error = None
+          }
       | Capture_admitted capture ->
-        { state with direct_capture = Some capture; capture_error = None }
+        (match state.direct_capture with
+         | Some previous when previous == capture && state.capture_error = None -> state
+         | _ -> { state with direct_capture = Some capture; capture_error = None })
       | Completed response -> apply_worker_response state response
       | Graph_replaced { generation; graph_id } ->
         let state = replace_graph state generation graph_id in
@@ -1638,10 +1657,27 @@ let media_scope state =
     (Int64.to_string (Journal_routes.detail_request_generation state.routes))
 ;;
 
-let media_label state dispatch ~root child =
-  let scope = media_scope state in
+let media_presentation_scope state ~detail =
+  if detail
+  then
+    Printf.sprintf
+      "%d:detail:%Ld"
+      state.graph_state.generation
+      (Journal_routes.detail_request_generation state.routes)
+  else
+    Printf.sprintf
+      "%d:%s"
+      state.graph_state.generation
+      (match Journal_routes.destination state.routes with
+       | Journals -> "journals"
+       | Favorites -> "favorites")
+;;
+
+let media_label ?(detail = false) state dispatch ~root child =
+  let scope = media_presentation_scope state ~detail in
   let editable =
-    state.write_enabled
+    detail
+    && state.write_enabled
     &&
     match Journal_routes.detail state.routes with
     | Some detail -> String.equal root (Journal_model.id (Journal_detail.root detail))
@@ -1660,7 +1696,7 @@ let media_label state dispatch ~root child =
 ;;
 
 let row_media_label state dispatch ~root ~image_children child =
-  let scope = media_scope state in
+  let scope = media_presentation_scope state ~detail:false in
   Journal_media_view.row
     ~scope
     ~root
@@ -2023,6 +2059,8 @@ let composer_page
 ;;
 
 let timeline_page
+      ~header_signal
+      ~on_region
       ~render_source
       ~render_media
       ~render_row_media
@@ -2058,7 +2096,8 @@ let timeline_page
       ~cache_reset_available
       ~on_account_action
   =
-  let timeline =
+  let timeline () =
+    on_region "timeline";
     match graph_error with
     | Some message ->
       graph_unavailable_view
@@ -2089,7 +2128,8 @@ let timeline_page
   let favorites_selected = destination = Journal_routes.Favorites in
   let content =
     if favorites_selected
-    then
+    then (
+      on_region "favorites";
       favorites_view
         ~render_source
         ~render_media
@@ -2097,37 +2137,19 @@ let timeline_page
         ~actions_enabled:interaction_enabled
         ~on_visible_range:on_favorites_visible_range
         ~on_retry:on_favorites_retry
-        ~on_open_favorite
-    else timeline
-  in
-  let content =
-    match capture_expanded, platform with
-    | Some expanded, "ios" ->
-      (* The composer floats at the bottom of a full-body overlay, not in the
-         page column: a grow child there becomes a flexible VStack sibling that
-         splits the leftover height with the body, so the capsule overflows
-         and gets clipped. The overlay press layer collapses the composer when
-         tapping outside it. *)
-      V.Body.overlay
-        ~overlay:
-          (V.stack
-             [ (* The tap layer sits below the composer in the stack: a spacer
-                  child expands each layer's column to the overlay bounds, taps
-                  on empty space fall through to the tap layer (collapse), and
-                  taps on the capsule hit it directly. The overlay already ends
-                  at the bottom safe-area boundary, so no extra inset is
-                  needed. *)
-               V.tap_area ~on_press:(bind_action on_capture_event "close-composer") ()
-             ; V.column ~spacing:0. [ V.spacer (); expanded ]
-             ])
-        content
-    | _ -> content
+        ~on_open_favorite)
+    else timeline ()
   in
   let destination_action index =
     Ui.Event.Handler.create (fun _ ->
       Ui.Event.Handler.Private.invoke on_select_destination (Ui.Event.Payload.Int64 index))
   in
-  Journal_header.view
+  let header =
+    match header_signal with
+    | None -> Journal_header.view
+    | Some presentation_signal -> Journal_header.reactive_view ~presentation_signal
+  in
+  header
     ~platform
     ~key:(Ui.Key.string ("journal-root:" ^ string_of_int graph_generation))
     ~context:
@@ -2136,7 +2158,10 @@ let timeline_page
        | Favorites -> Journal_header.Context.favorites)
     ~sync_phase
     ~sync_error
-    ~on_error_info:(if error_info_available then Some on_error_info else None)
+    ~on_error_info:
+      (if error_info_available || Option.is_some header_signal
+       then Some on_error_info
+       else None)
     ~on_account_action:(if account_menu_available then Some on_account_action else None)
     ~local_deletion_available:cache_reset_available
     ~on_journals:(destination_action 0L)
@@ -2605,7 +2630,7 @@ let detail_page ~state ~on_scroll_completed dispatch =
           in
           V.text ~key:(Ui.Key.string ("detail-label:" ^ Journal_model.id block)) source
           |> V.with_test_id (Ui.Test_id.string ("detail-block:" ^ Journal_model.id block))
-          |> media_label state dispatch ~root:(Journal_model.id block))
+          |> media_label ~detail:true state dispatch ~root:(Journal_model.id block))
       (Journal_detail.rows detail)
   in
   let content =
@@ -3153,7 +3178,9 @@ let response_tag = function
   | tag -> tag
 ;;
 
-let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
+let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
+  : app_context
+  =
   let pump = Journal_pump.create () in
   Journal_pump.set_wakeup pump Journal_bridge.wakeup;
   let running = ref true in
@@ -3252,29 +3279,36 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       set_state (fun state ->
         if media_key state <> context
         then state
-        else
-          { state with
-            media_views =
-              List.fold_left
-                (fun views (root, (view : Journal_media_runtime.view)) ->
-                   if
-                     view.items = []
-                     && view.error = None
-                     && (not view.more)
-                     && view.picker = None
-                   then Media_views.remove root views
-                   else Media_views.add root view views)
-                state.media_views
-                changes
-          ; pending_replace =
-              (match armed with
-               | None -> state.pending_replace
-               | Some previous -> Some (Option.value ~default:"" previous))
-          ; replace_request =
-              (match armed with
-               | None -> state.replace_request
-               | Some _ -> state.replace_request + 1)
-          })
+        else (
+          let media_views =
+            List.fold_left
+              (fun views (root, (view : Journal_media_runtime.view)) ->
+                 if
+                   view.items = []
+                   && view.error = None
+                   && (not view.more)
+                   && view.picker = None
+                 then Media_views.remove root views
+                 else if Media_views.find_opt root views = Some view
+                 then views
+                 else Media_views.add root view views)
+              state.media_views
+              changes
+          in
+          if media_views == state.media_views && armed = None
+          then state
+          else
+            { state with
+              media_views
+            ; pending_replace =
+                (match armed with
+                 | None -> state.pending_replace
+                 | Some previous -> Some (Option.value ~default:"" previous))
+            ; replace_request =
+                (match armed with
+                 | None -> state.replace_request
+                 | Some _ -> state.replace_request + 1)
+            }))
   in
   let import_worker_requests = Hashtbl.create 2 in
   (* operation token -> staged pick whose temp copy is removed on completion *)
@@ -4495,15 +4529,24 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       match payload with
       | Ui.Event.Payload.Text action
         when String.starts_with ~prefix:"media-session:" action ->
-        let prefix = "media-session:" ^ media_scope snapshot ^ ":" in
-        if String.starts_with ~prefix action
-        then
-          Ui.Event.Payload.Text
-            (String.sub
-               action
-               (String.length prefix)
-               (String.length action - String.length prefix))
-        else Ui.Event.Payload.Unit
+        let scope =
+          match Journal_routes.route snapshot.routes with
+          | Timeline -> Some (media_presentation_scope snapshot ~detail:false)
+          | Detail -> Some (media_presentation_scope snapshot ~detail:true)
+          | Detail_loading | Missing_detail | Failed_detail _ -> None
+        in
+        (match scope with
+         | Some scope ->
+           let prefix = "media-session:" ^ scope ^ ":" in
+           if String.starts_with ~prefix action
+           then
+             Ui.Event.Payload.Text
+               (String.sub
+                  action
+                  (String.length prefix)
+                  (String.length action - String.length prefix))
+           else Ui.Event.Payload.Unit
+         | None -> Ui.Event.Payload.Unit)
       | Ui.Event.Payload.Text action
         when String.starts_with ~prefix:"detail-session:" action ->
         let prefix = Detail_outline.scope snapshot.routes in
@@ -4582,12 +4625,10 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
           (match Journal_routes.detail state.routes with
            | None -> state
            | Some detail ->
-             { state with
-               routes =
-                 Journal_routes.update_detail
-                   state.routes
-                   (Journal_detail.apply_child_edit detail edit)
-             })
+             let next = Journal_detail.apply_child_edit detail edit in
+             if next == detail
+             then state
+             else { state with routes = Journal_routes.update_detail state.routes next })
         | _, Some { startup = { awaiting_e2ee_password = true; _ }; _ }
         | _, Some { startup = { failure = Some During_e2ee; _ }; _ } ->
           let e2ee_password = Journal_capture.apply_text_edit state.e2ee_password edit in
@@ -5212,14 +5253,14 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
            set_state (fun state ->
              if state.graph_state.generation <> generation
              then state
-             else
-               { state with
-                 timeline =
-                   Journal_timeline_state.complete_scroll
-                     state.timeline
-                     ~token:completion.token
-                     ~outcome:completion.outcome
-               })))
+             else (
+               let timeline =
+                 Journal_timeline_state.complete_scroll
+                   state.timeline
+                   ~token:completion.token
+                   ~outcome:completion.outcome
+               in
+               if timeline == state.timeline then state else { state with timeline }))))
   in
   let detail_scroll_completed =
     Ui.Event.Handler.create ~name:"detail-scroll-completed" (fun payload ->
@@ -5238,15 +5279,16 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                match Journal_routes.detail state.routes with
                | None -> state
                | Some detail ->
-                 { state with
-                   routes =
-                     Journal_routes.update_detail
-                       state.routes
-                       (Journal_detail.complete_reveal
-                          detail
-                          ~token:completion.token
-                          ~outcome:completion.outcome)
-                 }))))
+                 let next =
+                   Journal_detail.complete_reveal
+                     detail
+                     ~token:completion.token
+                     ~outcome:completion.outcome
+                 in
+                 if next == detail
+                 then state
+                 else
+                   { state with routes = Journal_routes.update_detail state.routes next }))))
   in
   let notice_token_sequence = ref 0L in
   let notice_cancellation : int64 option ref = ref None in
@@ -5385,26 +5427,163 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       model
     | Environment_changed snapshot -> { model with environment = snapshot }
   in
-  let body_view state dispatch timeline_scroll_completed detail_scroll_completed =
-    let tokens =
-      Journal_visual_tokens.resolve
-        ~brightness:state.environment.brightness
-        ~high_contrast:state.environment.high_contrast
+  (* These subscriptions use complete presentation dependencies. They compare
+     persistent owners rather than walking retained rows on every input event. *)
+  let same_actions left right =
+    left.write_enabled = right.write_enabled
+    && Option.is_some left.pending_delete = Option.is_some right.pending_delete
+    && Option.is_some left.pending_status = Option.is_some right.pending_status
+  in
+  let capture_saving state =
+    Option.fold
+      ~none:false
+      ~some:(fun capture -> Journal_capture.phase capture = Saving)
+      state.direct_capture
+  in
+  let capture_attachable state =
+    Option.fold ~none:false ~some:Journal_capture.can_attach state.direct_capture
+  in
+  let equal_capture_presentation left right =
+    left.direct_capture == right.direct_capture
+    && left.modal = right.modal
+    && left.graph_state.generation = right.graph_state.generation
+    && left.write_enabled = right.write_enabled
+    && left.capture_error == right.capture_error
+    && left.capture_pick_request = right.capture_pick_request
+    && left.capture_pick_source = right.capture_pick_source
+    && left.import_completion = right.import_completion
+    && left.environment.platform = right.environment.platform
+  in
+  let equal_calendar_projection left right =
+    Option.equal
+      (fun left right ->
+         Journal_calendar.equal_projection_fingerprint
+           (Journal_calendar.projection_fingerprint left)
+           (Journal_calendar.projection_fingerprint right))
+      left.calendar
+      right.calendar
+  in
+  let error_info_available state =
+    state.worker_errors <> []
+    || Option.is_some (Option.bind state.manager (fun manager -> manager.last_error))
+    || Option.is_some (operation_failure state.timeline_notice)
+  in
+  let equal_root_presentation left right =
+    if (not left.graph_ready) || not right.graph_ready
+    then left == right
+    else
+      left.graph_state.generation = right.graph_state.generation
+      && left.environment.platform = right.environment.platform
+      && Journal_routes.destination left.routes = Journal_routes.destination right.routes
+      && same_actions left right
+      && left.modal = No_modal = (right.modal = No_modal)
+      && left.reference_sources == right.reference_sources
+      && left.media_views == right.media_views
+      && left.feed_loaded = right.feed_loaded
+      && left.graph_error == right.graph_error
+      && (Option.is_none left.graph_error
+          || error_info_available left = error_info_available right)
+      && equal_calendar_projection left right
+      &&
+      match Journal_routes.destination left.routes with
+      | Journals -> Journal_timeline_state.equal_presentation left.timeline right.timeline
+      | Favorites ->
+        let module F = Journal_routes.Favorites in
+        F.revision left.favorites = F.revision right.favorites
+        && F.loading left.favorites = F.loading right.favorites
+        && F.error left.favorites = F.error right.favorites
+        && F.initialized left.favorites = F.initialized right.favorites
+        && F.has_more left.favorites = F.has_more right.favorites
+  in
+  let equal_detail_presentation left right =
+    left.graph_state.generation = right.graph_state.generation
+    && Journal_routes.route left.routes = Journal_routes.route right.routes
+    && Journal_routes.detail_request_generation left.routes
+       = Journal_routes.detail_request_generation right.routes
+    && Option.equal
+         Journal_detail.equal_presentation
+         (Journal_routes.detail left.routes)
+         (Journal_routes.detail right.routes)
+    && same_actions left right
+    && left.reference_sources == right.reference_sources
+    && left.media_views == right.media_views
+    && left.import_completion = right.import_completion
+    && left.pending_replace = right.pending_replace
+    && left.replace_request = right.replace_request
+    && left.graph_ready = right.graph_ready
+    && operation_failure left.timeline_notice = operation_failure right.timeline_notice
+  in
+  let equal_modal_presentation left right =
+    match left.modal, right.modal with
+    | Capture_sheet, Capture_sheet -> equal_capture_presentation left right
+    | Append_sheet, Append_sheet ->
+      Option.equal
+        (fun left right ->
+           Journal_detail.child_capture left == Journal_detail.child_capture right
+           && Journal_detail.mode left = Journal_detail.mode right)
+        (Journal_routes.detail left.routes)
+        (Journal_routes.detail right.routes)
+      && Journal_routes.detail_request_generation left.routes
+         = Journal_routes.detail_request_generation right.routes
+      && left.write_enabled = right.write_enabled
+      && left.capture_error == right.capture_error
+    | _ -> left == right
+  in
+  let equal_shell_presentation left right =
+    left == right
+    || (left.graph_state.generation = right.graph_state.generation
+        && left.graph_state.graph_id = right.graph_state.graph_id
+        && left.graph_state.phase = right.graph_state.phase
+        && left.graph_ready = right.graph_ready
+        && left.modal = right.modal
+        && Journal_routes.route left.routes
+           = Timeline
+           = (Journal_routes.route right.routes = Timeline)
+        && left.environment.platform = right.environment.platform
+        && Option.is_some left.direct_capture = Option.is_some right.direct_capture
+        && left.write_enabled = right.write_enabled
+        && capture_attachable left = capture_attachable right
+        && left.capture_pick_request = right.capture_pick_request
+        && left.capture_pick_source = right.capture_pick_source
+        && left.import_completion = right.import_completion
+        && left.confirmation_sequence = right.confirmation_sequence
+        && operation_failure left.timeline_notice
+           = operation_failure right.timeline_notice
+        && left.uploads == right.uploads
+        && left.asset_offline = right.asset_offline
+        && left.asset_settings_open = right.asset_settings_open)
+  in
+  let body_view
+        model_signal
+        header_signal
+        state
+        dispatch
+        timeline_scroll_completed
+        detail_scroll_completed
+    =
+    let region name ~equal build =
+      V.of_lui
+        (Lui_elements.stack
+           ~key:("region:" ^ name ^ ":" ^ string_of_int state.graph_state.generation)
+           [ Lui_elements.dyn
+               ~equal
+               (fun current ->
+                  on_view_region name;
+                  Journal_view.mount (build current))
+               model_signal
+           ])
     in
-    let capture_saving =
+    let capture_saving state =
       match state.direct_capture with
       | Some capture -> Journal_capture.phase capture = Journal_capture.Saving
       | None -> false
     in
-    let row_actions_enabled =
+    let row_actions_enabled state =
       state.write_enabled
       && Option.is_none state.pending_delete
       && Option.is_none state.pending_status
     in
-    let sync_error =
-      Option.map (fun notice -> sync_failure_message notice.failure) state.sync_error
-    in
-    let capture_assets ~camera =
+    let capture_assets state ~camera =
       { request =
           Journal_asset_import.staged_request
             ~id:state.capture_pick_request
@@ -5421,7 +5600,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
             Ui.Event.Handler.Private.invoke dispatch (Text ("capture-asset:" ^ payload)))
       }
     in
-    let floating_capture =
+    let floating_capture state =
       (* On iOS the capture composer expands directly into the bottom bar
            instead of presenting a sheet. It is mounted through the body
            overlay (see the toolbar view above) whose column already ends at
@@ -5456,74 +5635,105 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                         (match Journal_capture.phase capture with
                          | Failed message -> Some message
                          | Editing | Saving -> None))
-                   ~assets:(Some (capture_assets ~camera:true))
+                   ~assets:(Some (capture_assets state ~camera:true))
                ])
           state.direct_capture
       | _ -> None
     in
+    let floating_capture =
+      match state.modal, state.environment.platform, state.direct_capture with
+      | Capture_sheet, "ios", Some _ ->
+        Some
+          (region "capture" ~equal:equal_capture_presentation (fun current ->
+             Option.value (floating_capture current) ~default:(V.empty ())))
+      | _ -> None
+    in
     let root =
-      match state.graph_ready, state.manager with
-      | false, Some _ -> manager_page state dispatch
-      | false, None | true, _ ->
-        timeline_page
-          ~render_source:(render_source state)
-          ~render_media:(media_label state dispatch)
-          ~render_row_media:(row_media_label state dispatch)
-          ~platform:state.environment.platform
-          ~graph_generation:state.graph_state.generation
-          ~on_scroll_completed:timeline_scroll_completed
-          ~destination:(Journal_routes.destination state.routes)
-          ~favorites:state.favorites
-          ~on_select_destination:
-            (Ui.Event.Handler.create ~name:"select-root-destination" (function
-               | Ui.Event.Payload.Int64 0L ->
-                 Ui.Event.Handler.Private.invoke dispatch (Text "select-journals")
-               | Int64 1L ->
-                 Ui.Event.Handler.Private.invoke dispatch (Text "select-favorites")
-               | _ -> ()))
-          ~on_favorites_visible_range:
-            (Ui.Event.Handler.create ~name:"favorites-visible-range" (function
-               | Ui.Event.Payload.Visible_range range ->
-                 Ui.Event.Handler.Private.invoke
-                   dispatch
-                   (Int64_pair
-                      { first = range.first_index; second = range.last_exclusive })
-               | _ -> ()))
-          ~on_favorites_retry:(bind_action dispatch "favorites-retry")
-          ~timeline_state:state.timeline
-          ~loading:(not state.feed_loaded)
-          ~graph_error:(Option.map graph_error_message state.graph_error)
-          ~sync_error
-          ~sync_phase:
-            (Option.map
-               (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
-               state.manager)
-          ~day_presentation:(presentation_for_day state)
-          ~capture_enabled:
-            (state.write_enabled
-             && Option.is_none state.pending_delete
-             && Option.is_none state.pending_status
-             && not capture_saving)
-          ~on_capture_event:dispatch
-          ~capture_expanded:floating_capture
-          ~on_visible_range:dispatch
-          ~on_retry_day:(prefix_action dispatch "timeline-retry:")
-          ~on_open_block:(prefix_action dispatch "timeline-open-block:")
-          ~on_open_favorite:(prefix_action dispatch "favorite-open-block:")
-          ~delete_enabled:state.write_enabled
-          ~actions_enabled:row_actions_enabled
-          ~interaction_enabled:(state.modal = No_modal)
-          ~on_status:(prefix_action dispatch "timeline-status:")
-          ~on_delete:(prefix_action dispatch "timeline-delete:")
-          ~error_info_available:
-            (state.worker_errors <> []
-             || Option.is_some
-                  (Option.bind state.manager (fun manager -> manager.last_error))
-             || Option.is_some (operation_failure state.timeline_notice))
-          ~on_error_info:(bind_action dispatch "open-error-info")
-          ~account_menu_available:true
-          ~on_account_action:dispatch
-          ~cache_reset_available:(local_deletion_available state)
+      region "root" ~equal:equal_root_presentation (fun state ->
+        match state.graph_ready, state.manager with
+        | false, Some _ -> manager_page state dispatch
+        | false, None | true, _ ->
+          timeline_page
+            ~header_signal:(Some header_signal)
+            ~on_region:on_view_region
+            ~render_source:(render_source state)
+            ~render_media:(media_label state dispatch)
+            ~render_row_media:(fun ~root ~image_children child ->
+              on_view_region "timeline-row";
+              row_media_label state dispatch ~root ~image_children child)
+            ~platform:state.environment.platform
+            ~graph_generation:state.graph_state.generation
+            ~on_scroll_completed:timeline_scroll_completed
+            ~destination:(Journal_routes.destination state.routes)
+            ~favorites:state.favorites
+            ~on_select_destination:
+              (Ui.Event.Handler.create ~name:"select-root-destination" (function
+                 | Ui.Event.Payload.Int64 0L ->
+                   Ui.Event.Handler.Private.invoke dispatch (Text "select-journals")
+                 | Int64 1L ->
+                   Ui.Event.Handler.Private.invoke dispatch (Text "select-favorites")
+                 | _ -> ()))
+            ~on_favorites_visible_range:
+              (Ui.Event.Handler.create ~name:"favorites-visible-range" (function
+                 | Ui.Event.Payload.Visible_range range ->
+                   Ui.Event.Handler.Private.invoke
+                     dispatch
+                     (Int64_pair
+                        { first = range.first_index; second = range.last_exclusive })
+                 | _ -> ()))
+            ~on_favorites_retry:(bind_action dispatch "favorites-retry")
+            ~timeline_state:state.timeline
+            ~loading:(not state.feed_loaded)
+            ~graph_error:(Option.map graph_error_message state.graph_error)
+            ~sync_error:
+              (Option.map
+                 (fun notice -> sync_failure_message notice.failure)
+                 state.sync_error)
+            ~sync_phase:
+              (Option.map
+                 (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
+                 state.manager)
+            ~day_presentation:(presentation_for_day state)
+            ~capture_enabled:
+              (state.write_enabled
+               && Option.is_none state.pending_delete
+               && Option.is_none state.pending_status
+               && not (capture_saving state))
+            ~on_capture_event:dispatch
+            ~capture_expanded:floating_capture
+            ~on_visible_range:dispatch
+            ~on_retry_day:(prefix_action dispatch "timeline-retry:")
+            ~on_open_block:(prefix_action dispatch "timeline-open-block:")
+            ~on_open_favorite:(prefix_action dispatch "favorite-open-block:")
+            ~delete_enabled:state.write_enabled
+            ~actions_enabled:(row_actions_enabled state)
+            ~interaction_enabled:(state.modal = No_modal)
+            ~on_status:(prefix_action dispatch "timeline-status:")
+            ~on_delete:(prefix_action dispatch "timeline-delete:")
+            ~error_info_available:
+              (state.worker_errors <> []
+               || Option.is_some
+                    (Option.bind state.manager (fun manager -> manager.last_error))
+               || Option.is_some (operation_failure state.timeline_notice))
+            ~on_error_info:(bind_action dispatch "open-error-info")
+            ~account_menu_available:true
+            ~on_account_action:dispatch
+            ~cache_reset_available:(local_deletion_available state))
+    in
+    (* The floating composer is a sibling of the root subscription. Rebuilding
+       rows after asynchronous media delivery must not reconcile a nested
+       composer subscription and retire its current branch. *)
+    let root =
+      match floating_capture with
+      | None -> root
+      | Some expanded ->
+        V.Body.overlay
+          ~overlay:
+            (V.stack
+               [ V.tap_area ~on_press:(bind_action dispatch "close-composer") ()
+               ; V.column ~spacing:0. [ V.spacer (); expanded ]
+               ])
+          root
     in
     let root = operation_feedback ~scope:"root" ~state dispatch root in
     (* Keep the picker/resource adapter mounted while the draft is hidden.
@@ -5533,7 +5743,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
       match state.direct_capture with
       | None -> root
       | Some capture ->
-        let assets = capture_assets ~camera:(state.environment.platform = "ios") in
+        let assets = capture_assets state ~camera:(state.environment.platform = "ios") in
         Journal_asset_import.view
           ~key:(Ui.Key.string "journal-capture-asset-import")
           ~enabled:(state.write_enabled && Journal_capture.can_attach capture)
@@ -5552,11 +5762,17 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
             ~page_key:"journal-detail-route"
             ~title:"Block"
             ~can_pop:true
-            (detail_page ~state ~on_scroll_completed:detail_scroll_completed dispatch
-             |> operation_feedback ~scope:"detail" ~state dispatch)
+            (region "detail" ~equal:equal_detail_presentation (fun state ->
+               detail_page ~state ~on_scroll_completed:detail_scroll_completed dispatch
+               |> operation_feedback ~scope:"detail" ~state dispatch))
         ]
     in
-    let modal =
+    let modal state =
+      let tokens =
+        Journal_visual_tokens.resolve
+          ~brightness:state.environment.brightness
+          ~high_contrast:state.environment.high_contrast
+      in
       match state.modal with
       | No_modal -> None
       | Capture_sheet ->
@@ -5590,7 +5806,8 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
                         | Failed message -> Some message
                         | Editing | Saving -> None))
                   ~assets:
-                    (Some (capture_assets ~camera:(state.environment.platform = "ios"))))
+                    (Some
+                       (capture_assets state ~camera:(state.environment.platform = "ios"))))
              state.direct_capture)
       | Append_sheet ->
         Option.bind (Journal_routes.detail state.routes) (fun detail ->
@@ -5652,6 +5869,27 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
              (newest_first_worker_errors state)
              dispatch)
     in
+    let modal_title = function
+      | No_modal -> ""
+      | Capture_sheet -> "Capture"
+      | Append_sheet -> "Append"
+      | Status_sheet _ -> "Set status"
+      | Cache_reset_confirmation _ -> "Delete local graph copy?"
+      | Diagnostics -> "Diagnostics"
+      | Error_info -> "Error info"
+    in
+    let modal =
+      match state.modal, floating_capture with
+      | No_modal, _ | Cache_reset_confirmation _, _ | Capture_sheet, Some _ -> None
+      | _ ->
+        Some
+          (region "modal" ~equal:equal_modal_presentation (fun state ->
+             V.Navigation_stack.create
+               ~title:(modal_title state.modal)
+               ~on_path_change:(Ui.Event.Handler.create (fun _ -> ()))
+               ~path:[]
+               (Option.value (modal state) ~default:(V.empty ()))))
+    in
     let body =
       let base =
         V.Navigation_stack.create
@@ -5672,16 +5910,6 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
         | Status_sheet _ -> true
         | _ -> false
       in
-      let title =
-        match state.modal with
-        | No_modal -> ""
-        | Capture_sheet -> "Capture"
-        | Append_sheet -> "Append"
-        | Status_sheet _ -> "Set status"
-        | Cache_reset_confirmation _ -> "Delete local graph copy?"
-        | Diagnostics -> "Diagnostics"
-        | Error_info -> "Error info"
-      in
       V.Sheet.create
         ~key:(Ui.Key.string "journal-sheet")
         ~presented:(Option.is_some modal)
@@ -5692,12 +5920,7 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
         ~content:
           (match modal with
            | None -> V.empty ()
-           | Some content ->
-             V.Navigation_stack.create
-               ~title
-               ~on_path_change:(Ui.Event.Handler.create (fun _ -> ()))
-               ~path:[]
-               content)
+           | Some content -> content)
         base
     in
     let body =
@@ -5715,15 +5938,44 @@ let start ~calendar_sampler ~client ~platform_code ~host_code : app_context =
     in
     V.Body.theme ~data:(application_theme ()) (V.Body.static body)
   in
-  let view _context model_signal _send =
+  let view context model_signal _send =
+    let header_signal =
+      Signal.map
+        (fun state ->
+           { Journal_header.sync_phase =
+               Option.map
+                 (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
+                 state.manager
+           ; sync_error =
+               Option.map
+                 (fun notice -> sync_failure_message notice.failure)
+                 state.sync_error
+           ; error_available =
+               state.worker_errors <> []
+               || Option.is_some
+                    (Option.bind state.manager (fun manager -> manager.last_error))
+               || Option.is_some (operation_failure state.timeline_notice)
+           ; local_deletion_available = local_deletion_available state
+           ; capture_enabled =
+               state.write_enabled
+               && Option.is_none state.pending_delete
+               && Option.is_none state.pending_status
+               && not (capture_saving state)
+           })
+        model_signal
+    in
+    Signal.on_dispose context.Lui_ui.ui_scope (fun () ->
+      Signal.dispose_signal header_signal);
     (* Dynamic elements mount under a parent, so the root must be a static
        container. *)
     Lui_elements.column
       [ Lui_elements.dyn
-          ~equal:( == )
+          ~equal:equal_shell_presentation
           (fun model ->
              Journal_view.mount
                (body_view
+                  model_signal
+                  header_signal
                   model
                   dispatch
                   timeline_scroll_completed
@@ -5805,6 +6057,7 @@ let decode_config payload =
 ;;
 
 let create
+      ?(on_view_region = fun _ -> ())
       ?on_client
       ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ())
       ~service
@@ -5829,6 +6082,7 @@ let create
           (try
              ignore
                (start
+                  ~on_view_region
                   ~calendar_sampler:(calendar_sampler ())
                   ~client
                   ~platform_code
@@ -5945,6 +6199,19 @@ let create
 ;;
 
 module For_testing = struct
+  let timeline_media_row ~routes ~graph_generation entry dispatch =
+    let state =
+      { initial_state with
+        routes
+      ; graph_state = { initial_state.graph_state with generation = graph_generation }
+      }
+    in
+    Journal_row.view
+      ~render_media:(row_media_label state dispatch)
+      ~show_timestamp:false
+      entry
+  ;;
+
   let detail_page ~routes ~write_enabled dispatch =
     detail_page
       ~state:{ initial_state with routes; write_enabled }
@@ -5984,6 +6251,8 @@ module For_testing = struct
     in
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page
+      ~header_signal:None
+      ~on_region:(fun _ -> ())
       ~render_source:(render_source initial_state)
       ~render_media:(media_label initial_state handler)
       ~render_row_media:(row_media_label initial_state handler)
@@ -6022,9 +6291,9 @@ module For_testing = struct
     V.Navigation_stack.create ~title:"" ~on_path_change:handler ~path:[] page
   ;;
 
-  let app_with_service ?on_client ?calendar_sampler service =
+  let app_with_service ?on_client ?on_view_region ?calendar_sampler service =
     let calendar_sampler = Option.map (fun sampler () -> sampler) calendar_sampler in
-    create ?on_client ?calendar_sampler ~service ()
+    create ?on_client ?on_view_region ?calendar_sampler ~service ()
   ;;
 end
 

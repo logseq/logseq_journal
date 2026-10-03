@@ -1770,8 +1770,129 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
     "a fully hidden page stopped the continuation chain"
 ;;
 
+let test_root_noops_preserve_observable_owner () =
+  let module R = Application.Root_navigation in
+  let unchanged state event label =
+    require (R.step state event == state) "%s published an unchanged root model" label
+  in
+  let initial = R.create ~graph_generation:3 in
+  unchanged initial Capture_closed "already closed capture";
+  unchanged initial (Capture_task_intent false) "task intent without a draft";
+  let opened = R.step initial Capture_opened in
+  unchanged opened Capture_opened "already open capture";
+  unchanged opened (Select Journals) "selected destination with retained draft";
+  unchanged opened (Capture_task_intent false) "unchanged task intent";
+  unchanged opened (Capture_edited "") "unchanged source";
+  let capture = Option.get (R.capture opened) in
+  let valid =
+    edit
+      ~session_id:(Journal_capture.session_id capture)
+      ~local_revision:1L
+      ~base_document_revision:0L
+      ~text:"Retained draft"
+      ~selection_start:14
+      ~selection_end:14
+      ()
+  in
+  let edited = R.step opened (Capture_native_edit valid) in
+  require (edited != opened) "valid edit did not publish its changed state";
+  unchanged edited (Capture_native_edit valid) "duplicate native edit";
+  let wrong_session =
+    edit
+      ~session_id:
+        (Journal_capture.session_id
+           (Journal_capture.create ~session_number:99L ~source:""))
+      ~local_revision:2L
+      ~base_document_revision:0L
+      ~text:"Wrong draft"
+      ~selection_start:0
+      ~selection_end:0
+      ()
+  in
+  unchanged edited (Capture_native_edit wrong_session) "foreign-session native edit";
+  unchanged
+    edited
+    (Completed
+       { payload = Admission_unavailable { graph_generation = 3; request_generation = 1L }
+       })
+    "unobserved admission completion";
+  unchanged
+    edited
+    (Completed { payload = Reference_sources_changed [] })
+    "empty reference update";
+  let stale_request : Journal_graph_request.favorites_request =
+    { graph_generation = 2; request_generation = 1L; limit = 50; cursor = None }
+  in
+  unchanged
+    edited
+    (Completed { payload = Favorites_failed (stale_request, true, "stale") })
+    "foreign-graph Favorites completion";
+  let selected = R.step edited (Capture_task_intent true) in
+  require (selected != edited) "changed task intent was suppressed";
+  require
+    (Journal_capture.task_state (Option.get (R.capture selected)) = Todo)
+    "changed task intent was not retained";
+  let closed = R.step selected Capture_closed in
+  require (not (R.capture_presented closed)) "closing was suppressed";
+  unchanged closed Capture_closed "duplicate close with retained draft";
+  require_string
+    "Retained draft"
+    (Journal_capture.source (Option.get (R.capture closed)))
+    "no-op draft retention"
+;;
+
+let test_detail_noop_completion_retains_route_owner () =
+  let routes =
+    Journal_routes.create ()
+    |> fun routes ->
+    Journal_routes.open_detail
+      routes
+      ~block_id:(Journal_model.id (block ()))
+      ~request_generation:30L
+    |> fun routes ->
+    Journal_routes.apply_detail_response routes ~request_generation:30L (detail ())
+  in
+  let retained = Option.get (Journal_routes.detail routes) in
+  require
+    (Journal_routes.update_detail routes retained == routes)
+    "unchanged Detail republishes its route owner";
+  let stale = Journal_detail.complete_reveal retained ~token:0L ~outcome:Succeeded in
+  require (stale == retained) "stale reveal completion changed its detail owner";
+  require
+    (Journal_routes.update_detail routes stale == routes)
+    "stale reveal completion republishes its route owner";
+  let foreign =
+    edit
+      ~session_id:
+        (Journal_capture.session_id
+           (Journal_capture.create ~session_number:999L ~source:""))
+      ~local_revision:1L
+      ~base_document_revision:0L
+      ~text:"Foreign Append"
+      ~selection_start:0
+      ~selection_end:0
+      ()
+  in
+  let ignored = Journal_detail.apply_child_edit retained foreign in
+  require (ignored == retained) "foreign Append editor event changed its detail owner";
+  require
+    (Journal_routes.update_detail routes ignored == routes)
+    "foreign Append editor event republishes its route owner";
+  let changed = Journal_detail.update_child_source retained "Changed Append" in
+  let updated = Journal_routes.update_detail routes changed in
+  require (updated != routes) "changed Append did not publish its route owner";
+  require_string
+    "Changed Append"
+    (Journal_capture.source
+       (Option.get
+          (Journal_detail.child_capture (Option.get (Journal_routes.detail updated)))))
+    "changed Append source"
+;;
+
 let tests =
-  [ ( "Append restarts partial children"
+  [ "detail no-op route owner", test_detail_noop_completion_retains_route_owner
+  ; "root no-op observable owner", test_root_noops_preserve_observable_owner
+  ; ( "Append restarts partial children"
     , test_append_restarts_partial_children_without_reusing_cursor )
   ; ( "child refresh replaces opaque cursor"
     , test_child_refresh_replaces_cursor_and_fences_pending_read )

@@ -754,6 +754,7 @@ module View = struct
   let opacity ?key:_ value t = modify (fun _ _ -> ignore value) t
   let ignores_safe_area ?regions:_ ?edges:_ t = t
   let safe_area_padding ?key:_ ~insets:_ t = t
+
   let theme ?key:_ ~data t =
     modify
       (fun context node ->
@@ -1916,10 +1917,13 @@ module View = struct
      extension children in a deterministic order; the payload lists their
      index so the host binds each child node to its list position. *)
     let build sections ~style ~scroll_request ~track_visible ~track_scroll =
-      let contents = ref [] in
+      let contents = ref Rrbvec.empty in
+      let next_content_index = ref 0 in
       let push element =
-        contents := !contents @ [ element ];
-        List.length !contents - 1
+        let index = !next_content_index in
+        incr next_content_index;
+        contents := Rrbvec.push_back !contents element;
+        index
       in
       let rec row_json (row : row) =
         let content_index = push row.content in
@@ -2001,7 +2005,7 @@ module View = struct
           ; "track_scroll_completion", `Bool track_scroll
           ]
       in
-      Yojson.Basic.to_string payload, List.rev !contents |> List.rev
+      Yojson.Basic.to_string payload, Rrbvec.to_list !contents
     ;;
 
     let decode_outcome = function
@@ -2590,8 +2594,23 @@ module Native_widget = struct
       parent
   ;;
 
-  let widget extension ?key ~props ~on_event ?(children = []) () =
-    element ?key (mount extension ~props ~on_event ~children)
+  let widget extension ?key ~props ?props_signal ~on_event ?(children = []) () =
+    element ?key (fun context parent ->
+      let node = mount extension ?key ~props ~on_event ~children context parent in
+      Option.iter
+        (fun source ->
+           let payload =
+             Signal.map
+               (fun props ->
+                  Lui_protocol.StringValue
+                    (Bytes.to_string (extension.Extension.encode_props props)))
+               source
+           in
+           Signal.on_dispose context.Lui_ui.ui_scope (fun () ->
+             Signal.dispose_signal payload);
+           Lui_ui.extension_property_signal context node "payload" payload)
+        props_signal;
+      node)
   ;;
 
   let widget_with_handler extension ?key ~props ~on_event ?(children = []) () =

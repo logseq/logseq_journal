@@ -89,6 +89,7 @@ type group =
   ; mutable reference : reference option
   ; mutable reuse : reuse option
   ; mutable replace : bool
+  ; mutable last_view : view option
   }
 
 type outgoing =
@@ -123,8 +124,7 @@ let create ~send ~changed ~armed =
 let empty_view = { items = []; more = false; error = None; picker = None }
 
 let notify t g =
-  t.changed
-    g.root
+  let view =
     { items =
         List.filter_map
           (fun (receipt : Logseq_db_worker.import_receipt) ->
@@ -166,6 +166,11 @@ let notify t g =
              })
           g.reuse
     }
+  in
+  if g.last_view <> Some view
+  then (
+    g.last_view <- Some view;
+    t.changed g.root view)
 ;;
 
 let rec pump t =
@@ -304,6 +309,7 @@ let root_visible t ~root visible =
       Hashtbl.remove t.groups old.root;
       t.changed old.root empty_view);
   match Hashtbl.find_opt t.groups root, visible, t.generation with
+  | Some g, true, Some _ when g.visible -> pump t
   | Some g, false, _ ->
     g.visible <- false;
     g.replace <- false;
@@ -345,6 +351,7 @@ let root_visible t ~root visible =
          ; reference = None
          ; reuse = None
          ; replace = false
+         ; last_view = None
          }
        in
        Hashtbl.add t.groups root g;
@@ -770,6 +777,7 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           ; reference = None
           ; reuse = None
           ; replace = false
+          ; last_view = None
           }
         in
         Hashtbl.add t.groups root g;

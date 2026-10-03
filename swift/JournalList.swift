@@ -1,5 +1,6 @@
 import LUIAppleBackend
 import SwiftUI
+import Observation
 
 /// SwiftUI host for the `journal-list` extension — the lui replacement for
 /// bonsai's `Native_list` family (grouped sections, disclosure rows, scroll
@@ -69,17 +70,202 @@ import SwiftUI
     let track_scroll_completion: Bool?
   }
 
+  /// One payload observation belongs to one mounted native list. Child-model
+  /// changes do not decode it, and cell lifecycle reads only prepared indices.
+  @MainActor final class Snapshot {
+    let properties: Properties
+    let positions: [String: Int]
+
+    init?(_ json: String) {
+      guard let properties = try? JSONDecoder().decode(Properties.self, from: Data(json.utf8))
+      else { return nil }
+      var positions: [String: Int] = [:]
+      var keys: Set<String> = []
+      var valid = true
+      func walk(_ row: Row, displayed: Bool) {
+        guard keys.insert(row.key).inserted else { valid = false; return }
+        if displayed { positions[row.key] = positions.count }
+        for child in row.children ?? [] {
+          walk(child, displayed: displayed && row.isDisclosure && row.expanded == true)
+        }
+      }
+      for section in properties.sections {
+        for row in section.rows { walk(row, displayed: true) }
+      }
+      guard valid else { return nil }
+      self.properties = properties
+      self.positions = positions
+    }
+  }
+
+  struct RowLease {
+    let instance: UUID
+    let key: String
+    let incarnation: UUID
+  }
+
+  @MainActor final class PreparedState: ObservableObject {
+    @Published private(set) var snapshot: Snapshot?
+    private var context: LUIAppleExtensionViewContext?
+    private var instance = UUID()
+    private var rowIncarnations: [String: UUID] = [:]
+    private var visible: Set<String> = []
+    private var delivered: Range<Int>?
+    private var payload: String?
+    private var refreshTask: Task<Void, Never>?
+    private var emitTask: Task<Void, Never>?
+    private var dirty = false
+    private var active = false
+    private var queued: [(RowLease, Bool)] = []
+
+    var range: Range<Int>? {
+      guard let snapshot else { return nil }
+      var first = Int.max
+      var last = -1
+      for key in visible {
+        guard let index = snapshot.positions[key] else { continue }
+        first = min(first, index)
+        last = max(last, index)
+      }
+      return last >= 0 ? first..<(last + 1) : nil
+    }
+
+    init(context: LUIAppleExtensionViewContext? = nil) {
+      if let context { bind(context) }
+    }
+
+    func bind(_ context: LUIAppleExtensionViewContext) {
+      if let previous = self.context, previous.nodeID != context.nodeID { dispose() }
+      active = true
+      guard self.context == nil else { scheduleRange(); return }
+      self.context = context
+      refresh()
+    }
+
+    // A navigation destination can be retained while temporarily offscreen.
+    // Keep its native List content, visible keys and row identities for Back.
+    func suspend() {
+      active = false
+      emitTask?.cancel()
+      emitTask = nil
+      delivered = nil
+      queued.removeAll()
+    }
+
+    func dispose() {
+      suspend()
+      instance = UUID()
+      context = nil
+      refreshTask?.cancel()
+      refreshTask = nil
+      emitTask?.cancel()
+      emitTask = nil
+      // Keep List content while a retained navigation destination is offscreen.
+      // Binding again refreshes it before delivering any lifecycle work.
+      payload = nil
+      rowIncarnations.removeAll()
+      visible.removeAll()
+      queued.removeAll()
+      delivered = nil
+      dirty = false
+    }
+
+    private func refresh() {
+      guard let context else { return }
+      let observedInstance = instance
+      let value = withObservationTracking {
+        context.property("payload")
+      } onChange: { [weak self] in
+        // Extension models are committed on MainActor. Observation fires before
+        // the setter completes, so parse on its next turn and fence deliveries.
+        MainActor.assumeIsolated {
+          guard let self, self.instance == observedInstance, self.context != nil else { return }
+          self.dirty = true
+          self.emitTask?.cancel()
+          self.refreshTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, self.instance == observedInstance else { return }
+            self.refresh()
+          }
+        }
+      }
+      let nextPayload: String?
+      if case let .string(json) = value { nextPayload = json } else { nextPayload = nil }
+      if nextPayload != payload {
+        payload = nextPayload
+        snapshot = nextPayload.flatMap(Snapshot.init)
+        let positions = snapshot?.positions ?? [:]
+        rowIncarnations = positions.reduce(into: [:]) { result, entry in
+          result[entry.key] = rowIncarnations[entry.key] ?? UUID()
+        }
+        visible = visible.intersection(positions.keys)
+      }
+      dirty = false
+      let pending = queued
+      queued.removeAll()
+      for (lease, appeared) in pending { _ = receive(lease, appeared: appeared) }
+      scheduleRange()
+    }
+
+    func lease(for key: String) -> RowLease? {
+      guard let incarnation = rowIncarnations[key] else { return nil }
+      return RowLease(instance: instance, key: key, incarnation: incarnation)
+    }
+
+    @discardableResult func receive(_ lease: RowLease, appeared: Bool) -> Bool {
+      guard active, context != nil, lease.instance == instance,
+        rowIncarnations[lease.key] == lease.incarnation else { return false }
+      if dirty {
+        queued.append((lease, appeared))
+        return false
+      }
+      let changed = appeared
+        ? visible.insert(lease.key).inserted
+        : visible.remove(lease.key) != nil
+      if changed { scheduleRange() }
+      return changed
+    }
+
+    private func scheduleRange() {
+      guard active, !dirty, snapshot?.properties.track_visible_range == true,
+        let next = range else {
+        emitTask?.cancel()
+        emitTask = nil
+        delivered = nil
+        return
+      }
+      guard delivered != next else { return }
+      emitTask?.cancel()
+      let emittingInstance = instance
+      emitTask = Task { @MainActor [weak self] in
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        guard let self, !Task.isCancelled, self.instance == emittingInstance,
+          self.active, !self.dirty, let context = self.context,
+          self.snapshot?.properties.track_visible_range == true,
+          self.range == next else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject:
+          ["type": "visible_range", "first": next.lowerBound, "last": next.upperBound],
+          options: [.sortedKeys]) else { return }
+        if JournalExtensions.emit(context: context, payload: data) {
+          self.delivered = next
+        }
+      }
+    }
+  }
+
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
-    @State private var visible: Set<Int> = []
-    @State private var delivered: (first: Int, last: Int)?
+    @StateObject private var prepared: PreparedState
     @State private var handledScrollToken: Int64 = 0
     @State private var scrollProxy: ScrollViewProxy?
     @State private var pendingScroll: (id: String, anchor: UnitPoint)?
-    @State private var visibleEmitTask: Task<Void, Never>?
+
+    init(context: LUIAppleExtensionViewContext) {
+      self.context = context
+      _prepared = StateObject(wrappedValue: PreparedState(context: context))
+    }
 
     private var properties: Properties? {
-      JournalExtensions.decode(Properties.self, context: context)
+      prepared.snapshot?.properties
     }
 
     private func emit(_ fields: [String: Any]) {
@@ -104,45 +290,7 @@ import SwiftUI
       return context.content(for: context.childIDs[index])
     }
 
-    /// Rows displayed in payload order; disclosure children appear only while
-    /// their parent row is expanded. The OCaml side maps these positions to
-    /// its own row indices.
-    private var positions: [String: Int] {
-      guard let properties else { return [:] }
-      var map: [String: Int] = [:]
-      var index = 0
-      func walk(_ row: Row) {
-        map[row.key] = index
-        index += 1
-        if row.isDisclosure, row.expanded == true {
-          (row.children ?? []).forEach(walk)
-        }
-      }
-      for section in properties.sections {
-        section.rows.forEach(walk)
-      }
-      return map
-    }
-
-    private func updateVisibleRange() {
-      guard let properties, properties.track_visible_range == true else { return }
-      let ordered = visible.sorted()
-      guard let first = ordered.first, let last = ordered.last else {
-        delivered = nil
-        return
-      }
-      let range = (first, last + 1)
-      guard delivered?.first != range.0 || delivered?.last != range.1 else { return }
-      delivered = range
-      // Cells flicker in/out while the collection re-layouts; emit only the
-      // settled range so an oscillating boundary row cannot flood the bridge.
-      visibleEmitTask?.cancel()
-      visibleEmitTask = Task { @MainActor in
-        try? await Task.sleep(nanoseconds: 80_000_000)
-        guard !Task.isCancelled else { return }
-        emit(["type": "visible_range", "first": range.0, "last": range.1])
-      }
-    }
+    private var positions: [String: Int] { prepared.snapshot?.positions ?? [:] }
 
     private func completeScroll(_ token: String, _ outcome: String) {
       emit(["type": "scroll_completed", "token": token, "outcome": outcome])
@@ -272,21 +420,16 @@ import SwiftUI
 
     // Opaque `some View` can't express the recursive disclosure shape.
     private func rowBody(_ row: Row) -> AnyView {
+      let lease = prepared.lease(for: row.key)
       let content = rowActions(row)
         .onAppear {
-          if let position = positions[row.key] {
-            DispatchQueue.main.async {
-              visible.insert(position)
-              updateVisibleRange()
-            }
+          if let lease {
+            DispatchQueue.main.async { prepared.receive(lease, appeared: true) }
           }
         }
         .onDisappear {
-          if let position = positions[row.key] {
-            DispatchQueue.main.async {
-              visible.remove(position)
-              updateVisibleRange()
-            }
+          if let lease {
+            DispatchQueue.main.async { prepared.receive(lease, appeared: false) }
           }
         }
       if row.isDisclosure {
@@ -337,11 +480,24 @@ import SwiftUI
         }
         .modifier(ListStyleModifier(style: style))
         .onAppear {
+          prepared.bind(context)
           scrollProxy = proxy
           performPendingScroll()
           if let request = properties?.scroll_request { applyScrollRequest(request) }
         }
         .onChange(of: pendingScroll?.id) { _, _ in performPendingScroll() }
+      }
+      .onDisappear {
+        prepared.suspend()
+        pendingScroll = nil
+        scrollProxy = nil
+      }
+      .onChange(of: context.nodeID) { _, _ in
+        prepared.dispose()
+        handledScrollToken = 0
+        pendingScroll = nil
+        prepared.bind(context)
+        if let request = properties?.scroll_request { applyScrollRequest(request) }
       }
       .onChange(of: properties?.scroll_request?.token) { _, _ in
         if let request = properties?.scroll_request { applyScrollRequest(request) }

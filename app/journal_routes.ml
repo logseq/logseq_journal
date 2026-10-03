@@ -213,6 +213,7 @@ let detail t =
 
 let update_detail t detail =
   match t.view with
+  | Detail_view view when view.detail == detail -> t
   | Detail_view view ->
     let t = track_detail_session t detail in
     { t with view = Detail_view { view with detail } }

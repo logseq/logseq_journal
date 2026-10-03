@@ -1015,8 +1015,114 @@ let test_known_gallery_slots_survive_separate_arrivals () =
   check_stable_image_slots ~entry ~images:[ first; second ] ~width:190 ~height:90
 ;;
 
+let test_native_list_payload_binds_nested_contents () =
+  let module N = V.Native_list in
+  let row key = N.row ~key:(Ui.Key.string key) (V.text key) in
+  let nested =
+    N.disclosure_row
+      ~key:(Ui.Key.string "parent")
+      ~expanded:true
+      ~on_expanded_changed:(Ui.Event.Handler.create (fun _ -> ()))
+      ~label:(V.text "parent")
+      [ row "child-a"; row "child-b" ]
+  in
+  let view =
+    N.vertical
+      ~style:Plain
+      [ N.section
+          ~key:(Ui.Key.string "first")
+          ~header:(V.text "first-header")
+          ~footer:(V.text "first-footer")
+          [ row "first-row"; nested ]
+      ; N.section
+          ~key:(Ui.Key.string "second")
+          ~header:(V.text "second-header")
+          [ row "second-row" ]
+      ]
+  in
+  with_mounted view (fun _ ops ->
+    let ops = ops () in
+    let list_node =
+      List.find_map
+        (function
+          | Lui_protocol.CreateExtension (node, identifier, _)
+            when identifier = Journal_lui_native.list_identifier -> Some node
+          | _ -> None)
+        ops
+      |> Option.get
+    in
+    let payload =
+      List.find_map
+        (function
+          | Lui_protocol.SetExtensionProp (node, "payload", StringValue value)
+            when node = list_node -> Some (Yojson.Basic.from_string value)
+          | _ -> None)
+        ops
+      |> Option.get
+    in
+    let member key = function
+      | `Assoc fields -> List.assoc key fields
+      | _ -> fail "expected list payload object"
+    in
+    let children =
+      List.filter_map
+        (function
+          | Lui_protocol.InsertChild (parent, child, index) when parent = list_node ->
+            Some (index, child)
+          | _ -> None)
+        ops
+    in
+    let text_at = function
+      | `Int index ->
+        let child = List.assoc index children in
+        List.find_map
+          (function
+            | Lui_protocol.SetProp (node, TextValue, StringValue value) when node = child
+              -> Some value
+            | _ -> None)
+          ops
+        |> Option.get
+      | _ -> fail "expected mounted content index"
+    in
+    let rec check_row row =
+      let key = member "key" row in
+      require
+        (key = `String (text_at (member "content_index" row)))
+        "row index bound another row's content";
+      match member "type" row with
+      | `String "disclosure" ->
+        (match member "children" row with
+         | `List rows -> List.iter check_row rows
+         | _ -> fail "expected disclosure children")
+      | _ -> ()
+    in
+    match member "sections" payload with
+    | `List sections ->
+      List.iter
+        (fun section ->
+           let key = member "key" section in
+           (match key with
+            | `String key ->
+              require
+                (text_at (member "header_index" section) = key ^ "-header")
+                "section header bound another child"
+            | _ -> fail "expected section key");
+           (match member "footer_index" section with
+            | `Null -> ()
+            | index ->
+              require
+                (text_at index = "first-footer")
+                "section footer bound another child");
+           match member "rows" section with
+           | `List rows -> List.iter check_row rows
+           | _ -> fail "expected section rows")
+        sections
+    | _ -> fail "expected list sections")
+;;
+
 let tests =
-  [ "known single image stable slot", test_known_single_slot_survives_availability
+  [ "native list nested content bindings", test_native_list_payload_binds_nested_contents
+  ; "known single image stable slot", test_known_single_slot_survives_availability
   ; "known root image stable slot", test_known_root_slot_survives_availability
   ; "known gallery stable slots", test_known_gallery_slots_survive_separate_arrivals
   ; "direct image child composition", test_direct_image_children_share_parent_gallery

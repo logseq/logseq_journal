@@ -10,16 +10,72 @@ let uuid n =
   G.Uuid.of_string (Printf.sprintf "89000000-0000-4000-8000-%012d" n) |> Result.get_ok
 ;;
 
+let test_equal_media_notices_keep_effects () =
+  let sent = Queue.create () in
+  let changes = ref [] in
+  let runtime =
+    R.create
+      ~send:(fun ticket request ->
+        Queue.add (ticket, request) sent;
+        true)
+      ~changed:(fun root view -> changes := (root, view) :: !changes)
+      ~armed:(fun _ _ -> ())
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let root = G.Uuid.to_string (uuid 1) in
+  R.root_visible runtime ~root true;
+  let ticket, request = Queue.take sent in
+  let request_id =
+    match request with
+    | S.Graph_request query -> query.request_id
+    | _ -> failwith "visible root must send its initial metadata query"
+  in
+  R.receive
+    runtime
+    (Option.get ticket)
+    (Graph_response
+       (P.V2_response
+          { api_version = 2
+          ; request_id
+          ; outcome =
+              V2_assets_outcome
+                { generation = "g"
+                ; projection_revision = "p"
+                ; items = []
+                ; next_cursor = None
+                }
+          }));
+  changes := [];
+  for _ = 1 to 10 do
+    R.root_visible runtime ~root true
+  done;
+  check (!changes = []) "duplicate visible roots must not republish an equal view";
+  check (Queue.is_empty sent) "duplicate visibility must not query metadata";
+  R.root_visible runtime ~root false;
+  changes := [];
+  R.root_visible runtime ~root false;
+  check (!changes = []) "duplicate hidden roots must not republish an equal view";
+  R.reset runtime ~graph_generation:(Some 2);
+  check
+    (List.exists (fun (actual, _) -> actual = root) !changes)
+    "graph reset must clear the old root presentation even when it was empty"
+;;
+
+let () = test_equal_media_notices_keep_effects ()
+
 let () =
   let sent = Queue.create () in
   let views = Hashtbl.create 2 in
+  let changes = ref 0 in
   let armed = ref [] in
   let runtime =
     R.create
       ~send:(fun ticket request ->
         Queue.add (ticket, request) sent;
         true)
-      ~changed:(Hashtbl.replace views)
+      ~changed:(fun root view ->
+        incr changes;
+        Hashtbl.replace views root view)
       ~armed:(fun root previous -> armed := (root, previous) :: !armed)
   in
   R.reset runtime ~graph_generation:(Some 1);
@@ -96,6 +152,14 @@ let () =
     ; graph_generation = 1
     }
   in
+  let before_waiting = !changes in
+  R.notice
+    runtime
+    scope
+    (Asset_availability { consumer; asset = asset.uuid; availability = Queued });
+  check
+    (!changes = before_waiting)
+    "equal waiting availability must not republish the pending presentation";
   R.notice
     runtime
     scope
@@ -114,6 +178,15 @@ let () =
     ((List.hd (Hashtbl.find views root).items).presentation
      = Journal_media.File "/cache/image.png")
     "native view receives retained path";
+  let before_ready_duplicate = !changes in
+  R.notice
+    runtime
+    scope
+    (Asset_availability { consumer; asset = asset.uuid; availability = Ready "cached" });
+  check
+    (!changes = before_ready_duplicate)
+    "duplicate readiness must not republish a retained file";
+  check (Queue.is_empty sent) "duplicate readiness must not reacquire the retained file";
   R.reset runtime ~graph_generation:None;
   let requests = Queue.to_seq sent |> List.of_seq |> List.map snd in
   check
@@ -143,8 +216,20 @@ let () =
           item.presentation = Journal_media.File "/staged/import.bin")
        (Hashtbl.find views root).items)
     "imported file appears immediately";
+  let before_duplicate = !changes in
   R.imported runtime ~current:true receipt;
+  check
+    (!changes = before_duplicate)
+    "duplicate import must not republish the same file presentation";
   check (Queue.is_empty sent) "duplicate receipt must not release its live lease";
+  R.begin_replace runtime ~root;
+  let replacement, _ = Queue.take sent in
+  R.root_visible runtime ~root false;
+  let before_cancelled_replace = !changes in
+  R.reject runtime (Option.get replacement);
+  check
+    (!changes = before_cancelled_replace)
+    "hide must cancel a replacement even when the imported group was already hidden";
   R.reset runtime ~graph_generation:None;
   check
     (List.exists

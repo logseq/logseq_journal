@@ -48,6 +48,13 @@ val format_bytes : int -> string
 val admission_rows : Admission_refresh.observation -> (string * string) list
 
 module For_testing : sig
+  val timeline_media_row
+    :  routes:Journal_routes.t
+    -> graph_generation:int
+    -> Journal_graph_projection.timeline_entry
+    -> Journal_view.Event.Handler.t
+    -> Journal_view.View.t
+
   val diagnostics_page : Journal_view.Event.Handler.t -> Journal_view.View.Body.t
 
   val detail_page
@@ -76,6 +83,7 @@ module For_testing : sig
             , Logseq_db_worker_lui.Logseq_db_worker_lui_service.push )
             Logseq_db_worker_lui.Journal_worker.client
           -> unit)
+    -> ?on_view_region:(string -> unit)
     -> ?calendar_sampler:Journal_calendar.Sampler.t
     -> ( Logseq_db_worker.Config.t
          , Logseq_db_worker_lui.Logseq_db_worker_lui_service.request
