@@ -40,6 +40,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: journal-ci-evidence
+          include-hidden-files: true
+          if-no-files-found: error
           path: |
             .ci-reports/
             _build/default/**/_build/_tests/
