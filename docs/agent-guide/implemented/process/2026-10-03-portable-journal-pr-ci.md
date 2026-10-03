@@ -6,7 +6,7 @@ The selected Journal changes require the unmerged companion LUI FileImage fit/fi
 
 ## Proposal
 
-Publish the companion LUI draft first and reference its exact published commit in both Journal opam manifests. Keep merged dependencies on their main branches. Add one Ubuntu OCaml workflow that resolves each declared locked Git pin once into isolated checkouts, records actual SHAs, pins these local CI sources without recursive metadata overrides, installs declared locked dependencies, and runs the full build/native object and test suite. Publish logs and the dependency manifest as CI artifacts, never source files. Refresh the LUI pin to main when the companion PR is merged before Journal merge.
+Publish the companion LUI draft first and reference its exact published commit in both Journal opam manifests. Keep merged dependencies on their main branches. Add one Apple-hosted OCaml workflow that resolves each declared locked Git pin once into isolated checkouts, records actual SHAs, pins these local CI sources without recursive metadata overrides, installs declared locked dependencies, and runs the full build/native object and test suite. Publish logs and the dependency manifest as CI artifacts, never source files. Refresh the LUI pin to main when the companion PR is merged before Journal merge.
 
 ## Decision
 
@@ -30,6 +30,8 @@ The fit/fill API is not present in main yet; a declared cross-PR dependency is r
 - Only the expressly authorized LUI merge is performed. No Journal merge, device install, private screenshot upload or generated report commits.
 
 ## Risks
+
+- The first Ubuntu run built all targets and the native embed, but full transport tests cannot pass there: the unchanged non-Apple DNS stub explicitly raises `Apple DNS-SD is required`. Run the complete suite on macOS without skipping tests or changing the transport. An unchanged cache test also exposed a dangling-symlink cleanup failure on Linux.
 
 - A fresh locked dependency installation is slower than an existing Mac switch; run it in hosted CI to preserve the benchmark window.
 - Current main dependencies may change between runs. Each run resolves once and reports actual SHAs; the confirmed LUI merge makes the fit/fill API available on main.

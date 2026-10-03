@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # The production transport explicitly requires Apple DNS-SD.
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -35,14 +36,17 @@ jobs:
         run: |
           # OCaml's partial linker does not use the C compiler's multiarch paths.
           # Expose archives only so the complete object cannot select a shared library.
-          static_directory="$PWD/.ci-deps/system-static-libs"
-          mkdir -p "$static_directory"
-          for library in rt sqlite3; do
-            archive="$(cc -print-file-name="lib${library}.a")"
-            test -f "$archive"
-            ln -s "$archive" "$static_directory/lib${library}.a"
-          done
-          OCAMLPARAM="_,cclib=-L$static_directory" opam exec -- dune build @all app/native_embed.exe.o
+          if [ "$(uname -s)" = Linux ]; then
+            static_directory="$PWD/.ci-deps/system-static-libs"
+            mkdir -p "$static_directory"
+            for library in rt sqlite3; do
+              archive="$(cc -print-file-name="lib${library}.a")"
+              test -f "$archive"
+              ln -s "$archive" "$static_directory/lib${library}.a"
+            done
+            export OCAMLPARAM="_,cclib=-L$static_directory"
+          fi
+          opam exec -- dune build @all app/native_embed.exe.o
       - name: Run full regression suite
         run: opam exec -- dune runtest --force
       - name: Upload resolved dependencies and test logs
