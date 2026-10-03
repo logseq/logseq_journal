@@ -5034,7 +5034,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      Datascript.Conn.from_db
                        { empty_db = Datascript.empty_db
                        ; init_db = Datascript.init_db
-                       ; store = (fun ?storage:_ _ -> ())
+                       ; store = (fun ?storage:_ database -> database)
                        }
                        authoritative_database
                    in

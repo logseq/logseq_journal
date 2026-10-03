@@ -308,7 +308,7 @@ let persist_database staged database metadata =
     | Error message -> Error message
     | Ok () ->
       (try
-         Datascript.store ~storage:callbacks.storage database;
+         ignore (Datascript.store ~storage:callbacks.storage database);
          match callbacks.finish_staging None [] with
          | Error message ->
            callbacks.abort_staging ();

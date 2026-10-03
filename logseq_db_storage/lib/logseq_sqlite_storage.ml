@@ -188,7 +188,7 @@ let unreachable_addresses (callbacks : callbacks) =
       | Some (Datascript.Storage_root root) ->
         visit_all [ root.storage_eavt; root.storage_aevt; root.storage_avet ]
       | Some (Storage_node (Persistent_sorted_set.Branch (_, children))) ->
-        visit_all children
+        visit_all (Array.to_list children)
       | Some (Storage_node (Leaf _) | Storage_tail _) -> Ok ())
   and visit_all = function
     | [] -> Ok ()

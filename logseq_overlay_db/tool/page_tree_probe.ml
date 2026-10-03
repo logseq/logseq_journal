@@ -50,7 +50,7 @@ let rewrite_root path transform =
   let database = transform original in
   let callbacks = Storage.connection_callbacks connection in
   callbacks.begin_staging () |> ok "edge begin staging";
-  Datascript.store ~storage:callbacks.storage database;
+  ignore (Datascript.store ~storage:callbacks.storage database);
   let batch =
     callbacks.finish_staging
       None

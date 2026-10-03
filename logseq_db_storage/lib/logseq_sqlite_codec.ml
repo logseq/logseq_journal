@@ -171,12 +171,24 @@ let schema_attr_to_transit attr =
   Transit.Map (List.rev !entries)
 ;;
 
-let schema_to_transit schema =
+let schema_to_transit ?(idents = []) schema =
   Transit.Map
     (List.map
        (fun (attr, schema_attr) ->
           Transit.Keyword attr, schema_attr_to_transit schema_attr)
-       schema)
+       schema
+     @ List.map (fun (entity, attr) -> Transit.Int entity, Transit.Keyword attr) idents)
+;;
+
+let schema_idents_of_transit = function
+  | Transit.Map entries ->
+    List.filter_map
+      (fun (entity, attr) ->
+         match int_of_transit_value entity, keyword_of_transit attr with
+         | Some entity, Some attr -> Some (entity, attr)
+         | _ -> None)
+      entries
+  | _ -> []
 ;;
 
 let tuple_attrs_of_transit = function
@@ -347,7 +359,8 @@ let index_metadata_to_transit metadata =
 
 let storage_root_to_transit ?metadata root =
   let entries =
-    [ Transit.Keyword "schema", schema_to_transit root.storage_schema
+    [ ( Transit.Keyword "schema"
+      , schema_to_transit ~idents:root.storage_schema_idents root.storage_schema )
     ; Transit.Keyword "max-eid", Transit.Int root.storage_max_eid
     ; Transit.Keyword "max-tx", Transit.Int root.storage_max_tx
     ; Transit.Keyword "eavt", address_to_transit root.storage_eavt
@@ -357,12 +370,31 @@ let storage_root_to_transit ?metadata root =
     ; Transit.Keyword "max-addr", Transit.Int root.storage_max_addr
     ; Transit.Keyword "branching-factor", Transit.Int root.storage_branching_factor
     ; Transit.Keyword "ref-type", transit_of_ref_type root.storage_ref_type
-    ; Transit.Keyword "index-order-version", Transit.Int root.storage_index_order_version
+    ; (* Journal still writes namespace/name ordered indexes. Preserve its legacy
+       marker even though the current DataScript record no longer carries it. *)
+      Transit.Keyword "index-order-version", Transit.Int 1
     ]
   in
   let entries =
     match metadata with
-    | None -> entries
+    | None ->
+      let metadata_entry key = function
+        | None -> None
+        | Some metadata ->
+          Some
+            ( Transit.Keyword key
+            , index_metadata_to_transit
+                { count = metadata.Ds.storage_index_count
+                ; shift = metadata.storage_index_shift
+                } )
+      in
+      entries
+      @ List.filter_map
+          Fun.id
+          [ metadata_entry "eavt-metadata" root.storage_eavt_metadata
+          ; metadata_entry "aevt-metadata" root.storage_aevt_metadata
+          ; metadata_entry "avet-metadata" root.storage_avet_metadata
+          ]
     | Some metadata ->
       entries
       @ [ Transit.Keyword "eavt-metadata", index_metadata_to_transit metadata.eavt
@@ -374,12 +406,13 @@ let storage_root_to_transit ?metadata root =
 ;;
 
 let storage_node_to_transit = function
-  | PSet.Leaf datoms -> Transit.Map [ Transit.Keyword "keys", datoms_to_transit datoms ]
+  | PSet.Leaf datoms ->
+    Transit.Map [ Transit.Keyword "keys", datoms_to_transit (Array.to_list datoms) ]
   | PSet.Branch (keys, child_addresses) ->
     Transit.Map
-      [ Transit.Keyword "keys", datoms_to_transit keys
+      [ Transit.Keyword "keys", datoms_to_transit (Array.to_list keys)
       ; ( Transit.Keyword "children"
-        , Transit.Array (List.map address_to_transit child_addresses) )
+        , Transit.Array (List.map address_to_transit (Array.to_list child_addresses)) )
       ]
 ;;
 
@@ -420,6 +453,7 @@ let storage_index_metadata_of_transit key entries =
 
 let storage_root_of_transit entries =
   { Ds.storage_schema = schema_of_transit (require_key "schema" entries)
+  ; storage_schema_idents = schema_idents_of_transit (require_key "schema" entries)
   ; storage_max_eid =
       int_of_transit "storage root :max-eid" (require_key "max-eid" entries)
   ; storage_max_tx = int_of_transit "storage root :max-tx" (require_key "max-tx" entries)
@@ -437,10 +471,6 @@ let storage_root_of_transit entries =
   ; storage_eavt_metadata = storage_index_metadata_of_transit "eavt-metadata" entries
   ; storage_aevt_metadata = storage_index_metadata_of_transit "aevt-metadata" entries
   ; storage_avet_metadata = storage_index_metadata_of_transit "avet-metadata" entries
-  ; storage_index_order_version =
-      (match lookup_transit_key "index-order-version" entries with
-       | Some value -> int_of_transit "storage root :index-order-version" value
-       | None -> 0)
   }
 ;;
 
@@ -451,10 +481,11 @@ let child_addresses_of_transit = function
 ;;
 
 let storage_node_of_transit entries =
-  let keys = datoms_of_transit (require_key "keys" entries) in
+  let keys = Array.of_list (datoms_of_transit (require_key "keys" entries)) in
   match lookup_transit_key "children" entries with
   | None -> PSet.Leaf keys
-  | Some children -> PSet.Branch (keys, child_addresses_of_transit children)
+  | Some children ->
+    PSet.Branch (keys, Array.of_list (child_addresses_of_transit children))
 ;;
 
 let storage_tail_of_transit = function
@@ -796,8 +827,8 @@ let decode_physical_payload ~content ~addresses =
          match transit, addresses with
          | Transit.Map entries, _ :: _
            when Option.is_some (lookup_transit_key "keys" entries) ->
-           let keys = datoms_of_transit (require_key "keys" entries) in
-           Storage_node (PSet.Branch (keys, addresses))
+           let keys = Array.of_list (datoms_of_transit (require_key "keys" entries)) in
+           Storage_node (PSet.Branch (keys, Array.of_list addresses))
          | _ -> payload_of_transit transit))
 ;;
 
@@ -807,12 +838,12 @@ let encode_physical_payload payload =
     | Datascript.Storage_node (PSet.Branch (keys, addresses)) ->
       ( Transit.to_string
           ~mode:Transit.Verbose
-          (Transit.Map [ Transit.Keyword "keys", datoms_to_transit keys ])
-      , addresses )
+          (Transit.Map [ Transit.Keyword "keys", datoms_to_transit (Array.to_list keys) ])
+      , Array.to_list addresses )
     | Storage_node (PSet.Leaf keys) ->
       ( Transit.to_string
           ~mode:Transit.Verbose
-          (Transit.Map [ Transit.Keyword "keys", datoms_to_transit keys ])
+          (Transit.Map [ Transit.Keyword "keys", datoms_to_transit (Array.to_list keys) ])
       , [] )
     | payload -> Transit.to_string ~mode:Transit.Verbose (payload_to_transit payload), [])
 ;;
@@ -852,17 +883,17 @@ let encode_physical_batch ?(restore = fun _ -> None) ?metadata entries =
             walk address
           | None, Some _ | None, None ->
             invalid_arg ("stored index points at missing address " ^ address)
-          | Some (PSet.Leaf keys), _ -> { count = List.length keys; shift = 0 }
+          | Some (PSet.Leaf keys), _ -> { count = Array.length keys; shift = 0 }
           | Some (PSet.Branch (keys, children)), _ ->
-            if children = []
+            if Array.length children = 0
             then invalid_arg ("stored branch has no children at " ^ address);
-            let child_metadata = List.map walk children in
-            let child_shift = (List.hd child_metadata).shift in
-            if List.exists (fun metadata -> metadata.shift <> child_shift) child_metadata
+            let child_metadata = Array.map walk children in
+            let child_shift = child_metadata.(0).shift in
+            if Array.exists (fun metadata -> metadata.shift <> child_shift) child_metadata
             then invalid_arg ("stored index has inconsistent depth at " ^ address);
             ignore keys;
             { count =
-                List.fold_left
+                Array.fold_left
                   (fun count metadata -> count + metadata.count)
                   0
                   child_metadata
