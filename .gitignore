@@ -40,3 +40,5 @@ app/journal_complete_iossim.o
 
 # Local validation reports and evidence
 /docs/test-reports/
+/.ci-deps/
+/.ci-reports/

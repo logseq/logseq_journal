@@ -1,0 +1,46 @@
+name: Journal CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.5.0"
+      - name: Resolve declared dependency sources
+        run: python3 tool/prepare_ci_dependencies.py
+      - name: Cache installed dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: journal-opam-v1-${{ runner.os }}-${{ hashFiles('*.opam*', '.ci-reports/dependencies.json') }}
+      - name: Pin resolved checkouts after cache restoration
+        run: python3 tool/prepare_ci_dependencies.py --pin
+      - name: Install locked dependencies
+        run: opam install . --deps-only --with-test --locked --ignore-pin-depends --yes
+      - name: Record installed package versions
+        if: always()
+        run: opam list --installed --json > .ci-reports/packages.json
+      - name: Build all targets and native embed
+        run: opam exec -- dune build @all app/native_embed.exe.o
+      - name: Run full regression suite
+        run: opam exec -- dune runtest --force
+      - name: Upload resolved dependencies and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: journal-ci-evidence
+          path: |
+            .ci-reports/
+            _build/default/**/_build/_tests/
+            _build/_tests/
