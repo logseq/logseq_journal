@@ -196,10 +196,10 @@ blocking the timeline. A cached asset remains usable offline under account polic
 
 ### Upload architecture (included in this phase)
 
-Uploads are triggered by explicit local import/replacement, independently of the
+Uploads are triggered by explicit local import, independently of the
 selective download union. An attachment added to an old journal still uploads.
 Never derive upload intent from a missing local cache file or from remote graph
-transactions. Reuse existing attachment bytes when the user adds another reference.
+transactions. Shared reference mutations do not upload existing attachment bytes.
 
 The app invokes an import command with a native source handle and target location.
 `logseq_db_worker` owns the durable upload workflow and graph mutation coordination;
@@ -453,55 +453,24 @@ Implemented foundations:
   observes the three download slots admit only two concurrent 16 MiB
   reservations under the budget and admits the rest after release.
 
-- Binary replacement and reuse-existing-reference flows are now wired to native
-  UI. The detail media group exposes a native `Menu` with "Replace file…" and
-  "Reuse existing…" when the group is the editable detail root. Replace first
-  reads the holder block through the worker (`V2_get_block`) and arms the
-  import picker with the holder's current asset reference — the durable import
-  intent's `replace_reference` must equal the reference the holder currently
-  carries, because the commit rejects the whole mutation on a stale expected
-  value — and picker dismissal clears the armed state. A holder with no current
-  asset reference arms the picker with no expected reference, degrading to a
-  plain import. Reuse reads the holder block through the worker for its page
-  and expected reference, enumerates managed assets under that page through
-  `V2_list_assets {recursive}`, and commits `V2_set_asset_reference` with the
-  holder's block-revision precondition; a successful commit re-queries the group
-  through the ordinary completion path. Media-runtime boundary tests cover
-  holder lookup, page-scoped candidate enumeration, atomic repointing with the
-  exact previous reference, and picker teardown.
+- On 2026-10-03 the user requested removing the Journal detail replacement and
+  existing-attachment selection controls and their dedicated runtime, events,
+  candidate picker and native props. Ordinary detail Attach file and Capture
+  attachments remain. Normal Journal picks pass no expected replacement reference
+  to the shared import API. Existing graph data and attachment relationships are
+  untouched. The scoped decision is recorded in
+  `docs/agent-guide/implemented/simplification/2026-10-03-remove-detail-asset-actions.md`.
 
-- Representative native UI verification is now complete on the adhoc-signed
-  iOS Simulator against graph `ocaml-sync-test` (lldb-traced): the
-  `journal-media-actions` menu exposes Replace file… and Reuse existing… on the
-  editable detail-root group, Attach shows the staged local preview
-  immediately, Reuse enumerates/selects/cancels candidates and commits
-  `V2_set_asset_reference`, and cached filenames carry the real extension.
-  The run exposed and fixed three iOS defects: `URL.path` binding the
-  `path(percentEncoded:)` method reference crashed every pick; the replace
-  auto-present guard dropped the armed request; iOS `fileImporter` never
-  invokes its completion on cancel, so closing an armed picker is now
-  detected and reported as dismissal. Follow-up verification exposed
-  three more: the armed replace picker sent the attachment holder's uuid
-  as `replaceReference`, so the local commit rejected the mutation as a
-  stale expected reference and the upload failed non-retryably — the
-  runtime now resolves the holder's current asset reference
-  (`Entity_value` under `logseq.property/asset`, the variant
-  `asset_reference_matches` requires) through `V2_get_block` before
-  arming; the reference reader previously matched `Asset_value`, which the
-  store never writes, so reuse-select's `previous` fence was always
-  `None` and `set_asset_reference` rejected on referenced holders; and
-  media groups only registered through the import-completion path, so
-  replace/reuse actions were inert on cold-open detail views — menu
-  actions now lazily register the group through the ordinary
-  root-visibility path. Media-runtime tests cover arming with the
-  expected previous reference and cold-open lazy registration. macOS
-  interactive sign-in remains environment-blocked (-34018 keychain
-  entitlement; no development
-  certificate on the verification machine) — iOS is the representative path
-  since the widget and runtime code are shared. Deployed server import
-  limits remain unverified (no live-server access); code-level caps are
-  verified — the application admits 8 MiB files, the runner rejects PUTs
-  above 100 MiB, and encrypted envelope overhead is fixture-verified.
+- Earlier representative native UI verification ran on the adhoc-signed iOS
+  Simulator against a disposable fixture graph. Ordinary Attach retained a staged
+  local preview immediately, and cached filenames carried the real extension.
+  The earlier replacement/selection controls and their owner tests have since been
+  removed; their historical native acceptance does not describe the current UI.
+  macOS interactive sign-in remained environment-blocked (-34018 keychain
+  entitlement; no development certificate on the verification machine). Deployed
+  server import limits were unverified; the application's 8 MiB file cap, runner's
+  100 MiB PUT rejection and encrypted-envelope overhead were verified in code.
+
 
 Remaining delivery work:
 
@@ -758,8 +727,8 @@ invalid destinations, local-only asset targets, restart, and remote reference
 conflicts before and after restart. The initial public reference operation failed
 before implementation; enumeration then exposed and fixed omission of new local
 properties. These tests execute the graph mutation owner, not an upload simulator.
-Native selection/replacement UI and binary replacement workflow integration remain
-open; this graph primitive alone does not complete those flows.
+This graph primitive is a shared backend operation; Journal's native selection and
+replacement controls were removed by the later explicit user decision.
 
 The worker protocol now exposes `setAssetReference` with mutation ID, holder,
 expected previous reference, asset UUID and ordinary write preconditions. It uses
@@ -770,14 +739,15 @@ fixture restores a locally introduced asset, submits the public command, observe
 the change push and queries the new reference. Its byte IO capabilities reject
 unexpected calls, proving this route does not stage, download or upload bytes.
 The existing macOS mutation-runtime suite also passes with current runner
-capabilities and reducer-owned currency checks. Native UI wiring remains open.
+capabilities and reducer-owned currency checks. The shared operation remains even
+after Journal's corresponding controls were removed.
 
 Binary replacement now travels in the durable import intent as an expected old
 asset UUID. Preparing an intent rejects reusing that UUID for the new bytes, and
 idempotent import recovery compares the replacement parameter too. The upload
 checkpoint stores the field explicitly; its SQLite restart tests include a
-replacement target. The native append picker explicitly sends no replacement
-until the replacement action is wired.
+replacement target. Current Journal attachment picks explicitly send no replacement
+reference; the durable field remains part of the shared worker API.
 
 The graph insertion's asset metadata carries this parameter. One normalized
 transaction creates the new asset and redirects the holder's asset property;
@@ -789,8 +759,8 @@ preservation, idempotent retry, local query visibility, restart, and a remote
 reference edit blocking both insertion and redirection. Outbox format v16 replaces
 v15 and the obsolete serializer module is removed; no migration path is added.
 The existing upload phase machine remains unchanged and uses this atomic local
-mutation before PUT. Native replacement/reuse UI and its end-to-end acceptance
-remain outstanding.
+mutation before PUT. The shared workflow is retained independently of the removed
+Journal replacement/selection UI.
 
 ## Decision
 
@@ -807,13 +777,13 @@ transfer's worst-case wire-plus-plaintext footprint. The staging and download
 caches keep real file extensions, preview leases survive upload completion, and
 orphan reconciliation runs before each import or recovery page.
 
-Attachments are `logseq.class/Asset` children of their holder block, referenced
-by the holder's single-valued `logseq.property/asset`. Upload stages locally,
-imports atomically create the asset entity and redirect the reference inside one
-transaction, and the durable import intent carries the expected previous
-reference for replacement. `set_asset_reference` repoints a holder to an
-existing asset under the ordinary revision preconditions; native UI exposes
-Attach, Replace, and Reuse flows on the editable detail-root media group.
+Attachments are `logseq.class/Asset` children and may be referenced by a holder's
+single-valued `logseq.property/asset`. Upload stages locally. The shared import API
+can atomically create an asset and redirect a holder's reference when given an
+expected previous reference; `set_asset_reference` can repoint a holder under the
+ordinary revision preconditions. Current Journal UI exposes ordinary Attach file
+and Capture attachments, which pass no replacement reference. The shared backend
+contracts and existing stored relationships remain unchanged.
 
 Native automatic visible-attachment demand is deferred by explicit user
 decision: no scroll-visibility workaround or custom AppKit/UIKit coordination
@@ -884,13 +854,12 @@ adjustment above. All other clauses remain required for this delivery.
 - Downloaded and staged cache payloads carry real file extensions, so native
   viewers classify deferred and previewed files correctly; legacy `.bin`
   payloads are evicted on cache open rather than migrated.
-- Attachment references can be repointed atomically from native UI. Replace
-  flows reuse the durable import intent so a crash mid-replacement cannot
-  strand a half-updated holder, and Reuse commits through the ordinary
-  mutation machinery with previous-reference and block-revision fences.
-- The editable detail-root media group now exposes replace/reuse actions; the
-  menu appears only where the import target is current, keeping foreign or
-  read-only surfaces inert.
+- Shared backend attachment-reference mutations remain atomic, with durable import
+  recovery and previous-reference/revision fences. These contracts remain available
+  independently of the removed Journal controls.
+- Journal's detail replacement and existing-attachment selection controls, dedicated
+  state and events have been removed. Ordinary Attach and Capture attachment import,
+  upload, previews and saved references remain.
 - Native automatic visible-attachment demand remains undelivered by explicit
   decision. Rows still initiate media discovery through the explicit query
   path; scroll-driven foreground demand requires revisiting that decision with

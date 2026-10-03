@@ -237,6 +237,14 @@ let fail t ~message =
   | None -> t
 ;;
 
+let fail_attempt t ~mutation_id ~block_id ~message =
+  match t.pending with
+  | Some (Journal_graph_request.Capture { command; _ })
+    when command.mutation_id = mutation_id && command.block_id = block_id ->
+    fail t ~message
+  | _ -> t
+;;
+
 let completed_by t block =
   match t.pending with
   | Some (Journal_graph_request.Capture { command; _ }) ->

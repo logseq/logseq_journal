@@ -22,6 +22,12 @@ type failure_source =
   | Worker_failure of worker_failure
   | Projection_failure of string
 
+type mutation_kind =
+  | Capture_mutation
+  | Source_mutation
+  | Status_mutation
+  | Delete_subtree_mutation
+
 type payload =
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
@@ -40,7 +46,8 @@ type payload =
       ; timeline_entry_update : Projection.timeline_entry option
       }
   | Child_failed of
-      { block_id : string
+      { mutation_id : string
+      ; block_id : string
       ; failure : failure_source
       }
   | Child_created of
@@ -99,6 +106,12 @@ type payload =
       ; failure : failure_source
       }
   | Open_failed of worker_failure
+  | Mutation_failed of
+      { kind : mutation_kind
+      ; mutation_id : string
+      ; block_id : string
+      ; failure : failure_source
+      }
   | Rejected of failure_source
 
 type response = { payload : payload }
@@ -234,9 +247,21 @@ type operation =
       }
   | Delete_mutation of Projection.delete_subtree
 
+type failure_owner =
+  | Mutation_owner of
+      { kind : mutation_kind
+      ; mutation_id : string
+      ; block_id : string
+      }
+  | Child_owner of
+      { mutation_id : string
+      ; block_id : string
+      }
+
 type pending_operation =
   { operation : operation
   ; source_epoch : int64
+  ; failure_owner : failure_owner option
   }
 
 type t =
@@ -372,7 +397,10 @@ let uuid value = Graph.Uuid.of_string value
 let make_request t operation command =
   let source_epoch = t.next_request in
   let request_id = request_uuid t in
-  Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) { operation; source_epoch };
+  Hashtbl.replace
+    t.pending
+    (Graph.Uuid.to_string request_id)
+    { operation; source_epoch; failure_owner = None };
   Protocol.{ api_version; request_id; command }
 ;;
 
@@ -881,7 +909,35 @@ let feed_progress pending =
     ])
 ;;
 
-let submit t (request : Journal_graph_request.t) =
+(* Admission identity follows only direct continuations of this operation.
+   Reference reconciliation and queued background hydration are merged later. *)
+let scope_output t owner output =
+  match owner with
+  | None -> output
+  | Some owner ->
+    List.iter
+      (fun (request : Protocol.request) ->
+         let key = Graph.Uuid.to_string request.request_id in
+         match Hashtbl.find_opt t.pending key with
+         | None -> ()
+         | Some pending ->
+           Hashtbl.replace t.pending key { pending with failure_owner = Some owner })
+      output.requests;
+    let responses =
+      List.map
+        (fun response ->
+           match response.payload, owner with
+           | Rejected failure, Mutation_owner { kind; mutation_id; block_id } ->
+             { payload = Mutation_failed { kind; mutation_id; block_id; failure } }
+           | Rejected failure, Child_owner { mutation_id; block_id } ->
+             { payload = Child_failed { mutation_id; block_id; failure } }
+           | _ -> response)
+        output.responses
+    in
+    { output with responses }
+;;
+
+let submit_unowned t (request : Journal_graph_request.t) =
   match request with
   | Load_favorites request ->
     requests
@@ -937,7 +993,17 @@ let submit t (request : Journal_graph_request.t) =
         | Error message -> day_failure ~day request_generation message))
   | Load_detail { block_id; request_generation; limit; after } ->
     (match parse_uuid "block UUID" block_id with
-     | Error message -> reject message
+     | Error message ->
+       responses
+         [ response
+             (Detail_failed
+                { request_generation
+                ; block_id
+                ; missing = false
+                ; stale_cursor = false
+                ; failure = Projection_failure message
+                })
+         ]
      | Ok block ->
        requests
          [ read
@@ -1044,7 +1110,10 @@ let submit t (request : Journal_graph_request.t) =
       responses
         [ response
             (Child_failed
-               { block_id = command.block_id; failure = Projection_failure message })
+               { mutation_id = command.mutation_id
+               ; block_id = command.block_id
+               ; failure = Projection_failure message
+               })
         ]
     in
     if not (calendar_generation_is_current t command.calendar_generation)
@@ -1101,6 +1170,45 @@ let submit t (request : Journal_graph_request.t) =
              (Protocol.V2_delete_blocks { mutation_id; root = block; preconditions })
          ]
      | Error message, _ | _, Error message -> reject message)
+;;
+
+let submit t (request : Journal_graph_request.t) =
+  let owner =
+    match request with
+    | Capture { command; _ } ->
+      Some
+        (Mutation_owner
+           { kind = Capture_mutation
+           ; mutation_id = command.mutation_id
+           ; block_id = command.block_id
+           })
+    | Update_source command ->
+      Some
+        (Mutation_owner
+           { kind = Source_mutation
+           ; mutation_id = command.mutation_id
+           ; block_id = command.block_id
+           })
+    | Set_task_state command ->
+      Some
+        (Mutation_owner
+           { kind = Status_mutation
+           ; mutation_id = command.mutation_id
+           ; block_id = command.block_id
+           })
+    | Delete_subtree command ->
+      Some
+        (Mutation_owner
+           { kind = Delete_subtree_mutation
+           ; mutation_id = command.mutation_id
+           ; block_id = command.block_id
+           })
+    | Create_child command ->
+      Some
+        (Child_owner { mutation_id = command.mutation_id; block_id = command.block_id })
+    | _ -> None
+  in
+  scope_output t owner (submit_unowned t request)
 ;;
 
 let page_of_graph_page (page : Graph.page) =
@@ -1840,7 +1948,10 @@ let failure_output
     responses
       [ response
           (Child_failed
-             { block_id = command.block_id; failure = Worker_failure worker_failure })
+             { mutation_id = command.mutation_id
+             ; block_id = command.block_id
+             ; failure = Worker_failure worker_failure
+             })
       ]
   | Reference_read { block_id; depth } ->
     Hashtbl.remove t.reference_pending block_id;
@@ -1977,7 +2088,7 @@ let receive_response t (protocol_response : Protocol.response) =
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
-  | Some { operation; source_epoch } ->
+  | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
     (match outcome with
@@ -2312,7 +2423,17 @@ let receive_response t (protocol_response : Protocol.response) =
                remember_blocks t journal_page children.items)
             (page_of_graph_page page);
           (match projection_time_context t with
-           | Error message -> reject message
+           | Error message ->
+             responses
+               [ response
+                   (Detail_failed
+                      { request_generation = generation
+                      ; block_id = Graph.Uuid.to_string root.block.uuid
+                      ; missing = false
+                      ; stale_cursor = false
+                      ; failure = Projection_failure message
+                      })
+               ]
            | Ok time_context ->
              (match Projection.detail_on_page ~page ~time_context ~root children with
               | Ok detail ->
@@ -2322,7 +2443,17 @@ let receive_response t (protocol_response : Protocol.response) =
                   detail.root;
                 responses
                   [ response (Detail_loaded { request_generation = generation; detail }) ]
-              | Error message -> reject message))
+              | Error message ->
+                responses
+                  [ response
+                      (Detail_failed
+                         { request_generation = generation
+                         ; block_id = Graph.Uuid.to_string root.block.uuid
+                         ; missing = false
+                         ; stale_cursor = false
+                         ; failure = Projection_failure message
+                         })
+                  ]))
         | Changed_children { page; root; _ } ->
           let children = children_result items next_cursor in
           Option.iter
@@ -2540,7 +2671,12 @@ let receive t (protocol_response : Protocol.response) =
   let owned = Option.is_some pending in
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
-  let output = receive_response t protocol_response in
+  let output =
+    scope_output
+      t
+      (Option.bind pending (fun pending -> pending.failure_owner))
+      (receive_response t protocol_response)
+  in
   let references =
     match pending, protocol_response with
     | None, _ | Some { operation = Reference_read _; _ }, _ -> empty

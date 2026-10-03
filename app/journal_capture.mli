@@ -67,5 +67,6 @@ val admit_save
   -> t * Journal_graph_request.t option
 
 val fail : t -> message:string -> t
+val fail_attempt : t -> mutation_id:string -> block_id:string -> message:string -> t
 val retry : t -> t * Journal_graph_request.t option
 val completed_by : t -> Journal_model.t -> bool

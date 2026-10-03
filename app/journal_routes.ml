@@ -1,4 +1,6 @@
+module Owners = Map.Make (String)
 module Drafts = Map.Make (String)
+module Path = Lui_navigation.Path
 
 type destination =
   | Journals
@@ -11,12 +13,15 @@ type route =
   | Missing_detail
   | Failed_detail of string
 
+type detail_route = string
+
 type view =
   | Timeline_view
   | Detail_loading_view of
       { block_id : string
       ; request_generation : int64
       ; session_number : int64
+      ; draft_owner : string option
       }
   | Detail_view of
       { block_id : string
@@ -33,31 +38,92 @@ type view =
       ; request_generation : int64
       }
 
+type detached =
+  { block_id : string
+  ; rank : int64
+  ; composer : Journal_detail.retained_composer
+  }
+
 type t =
   { destination : destination
-  ; view : view
+  ; path : detail_route Path.t
+  ; owners : view Owners.t
+  ; focus : string option
   ; next_session : int64
-  ; drafts : Journal_detail.retained_composer Drafts.t
+  ; next_retained : int64
+  ; drafts : detached Drafts.t
   }
 
 let create () =
   { destination = Journals
-  ; view = Timeline_view
+  ; path = Path.empty
+  ; owners = Owners.empty
+  ; focus = None
   ; next_session = 1L
+  ; next_retained = 1L
   ; drafts = Drafts.empty
   }
 ;;
 
 let destination t = t.destination
-let select_destination t destination = { t with destination }
 
-let route t =
-  match t.view with
+let select_destination t destination =
+  if t.destination = destination then t else { t with destination }
+;;
+
+let path t = t.path
+
+let active_entry_id t =
+  match t.focus with
+  | Some id -> Some id
+  | None ->
+    Option.map
+      (fun (entry : detail_route Lui_navigation.entry) -> entry.id)
+      (List.nth_opt (List.rev (Path.entries t.path)) 0)
+;;
+
+let at_entry t ~entry_id =
+  if Owners.mem entry_id t.owners then Some { t with focus = Some entry_id } else None
+;;
+
+let current_view t =
+  Option.bind (active_entry_id t) (fun id -> Owners.find_opt id t.owners)
+  |> Option.value ~default:Timeline_view
+;;
+
+let view_route = function
   | Timeline_view -> Timeline
   | Detail_loading_view _ -> Detail_loading
   | Detail_view _ -> Detail
   | Missing_detail_view _ -> Missing_detail
   | Failed_detail_view { message; _ } -> Failed_detail message
+;;
+
+let route t = view_route (current_view t)
+
+let view_block_id = function
+  | Timeline_view -> None
+  | Detail_loading_view { block_id; _ }
+  | Detail_view { block_id; _ }
+  | Failed_detail_view { block_id; _ }
+  | Missing_detail_view { block_id; _ } -> Some block_id
+;;
+
+let view_generation = function
+  | Timeline_view -> 0L
+  | Detail_loading_view { request_generation; _ }
+  | Detail_view { request_generation; _ }
+  | Failed_detail_view { request_generation; _ }
+  | Missing_detail_view { request_generation; _ } -> request_generation
+;;
+
+let detail_block_id t = view_block_id (current_view t)
+let detail_request_generation t = view_generation (current_view t)
+
+let detail t =
+  match current_view t with
+  | Detail_view { detail; _ } -> Some detail
+  | _ -> None
 ;;
 
 let track_detail_session t detail =
@@ -66,40 +132,56 @@ let track_detail_session t detail =
     | None -> Journal_detail.session_id detail
     | Some capture -> Journal_capture.session_id capture
   in
-  { t with
-    next_session =
-      Int64.max
-        t.next_session
-        (Int64.succ (Journal_ids.Text_input.Session_id.to_int64 session))
-  }
+  let next_session =
+    Int64.max
+      t.next_session
+      (Int64.succ (Journal_ids.Text_input.Session_id.to_int64 session))
+  in
+  if next_session = t.next_session then t else { t with next_session }
 ;;
 
-let retain_active_composer t =
-  match t.view with
-  | Detail_view { block_id; detail; _ } ->
+let retain_owner t owner_id =
+  match Owners.find_opt owner_id t.owners with
+  | Some (Detail_view { block_id; detail; _ }) ->
     let t = track_detail_session t detail in
-    { t with
-      drafts =
-        (match Journal_detail.retain_composer detail with
-         | None -> Drafts.remove block_id t.drafts
-         | Some draft -> Drafts.add block_id draft t.drafts)
-    }
-  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
-    -> t
+    (match Journal_detail.retain_composer detail with
+     | None -> { t with drafts = Drafts.remove owner_id t.drafts }
+     | Some composer ->
+       { t with
+         drafts =
+           Drafts.add owner_id { block_id; composer; rank = t.next_retained } t.drafts
+       ; next_retained = Int64.succ t.next_retained
+       })
+  | _ -> t
+;;
+
+let retain_live_composers t =
+  List.fold_left
+    (fun t (entry : detail_route Lui_navigation.entry) -> retain_owner t entry.id)
+    t
+    (Path.entries t.path)
 ;;
 
 type retained_drafts =
-  { composers : Journal_detail.retained_composer Drafts.t
+  { composers : detached Drafts.t
   ; next_editor_session : int64
+  ; next_rank : int64
   }
 
 let retain_drafts ~interrupted t =
-  let t = retain_active_composer t in
+  let t = retain_live_composers t in
   { composers =
       (if interrupted
-       then Drafts.map Journal_detail.interrupt_retained_composer t.drafts
+       then
+         Drafts.map
+           (fun draft ->
+              { draft with
+                composer = Journal_detail.interrupt_retained_composer draft.composer
+              })
+           t.drafts
        else t.drafts)
   ; next_editor_session = t.next_session
+  ; next_rank = t.next_retained
   }
 ;;
 
@@ -107,15 +189,51 @@ let restore_drafts t retained =
   { t with
     drafts = retained.composers
   ; next_session = Int64.max t.next_session retained.next_editor_session
+  ; next_retained = Int64.max t.next_retained retained.next_rank
   }
 ;;
 
+let latest_detached t block_id =
+  Drafts.fold
+    (fun id (draft : detached) found ->
+       if draft.block_id <> block_id
+       then found
+       else (
+         match found with
+         | Some (_, old) when old.rank >= draft.rank -> found
+         | _ -> Some (id, draft)))
+    t.drafts
+    None
+;;
+
 let open_detail t ~block_id ~request_generation =
-  let t = retain_active_composer t in
+  let t =
+    Owners.fold
+      (fun _ view t ->
+         match view with
+         | Detail_view { detail; _ } -> track_detail_session t detail
+         | _ -> t)
+      t.owners
+      t
+  in
+  let has_live =
+    Owners.exists (fun _ view -> view_block_id view = Some block_id) t.owners
+  in
+  let draft_owner =
+    if has_live then None else Option.map fst (latest_detached t block_id)
+  in
+  let path = Path.push block_id t.path in
+  let owner_id = (List.hd (List.rev (Path.entries path))).id in
   let session_number = Int64.max t.next_session (Int64.succ request_generation) in
   { t with
-    next_session = Int64.succ session_number
-  ; view = Detail_loading_view { block_id; request_generation; session_number }
+    path
+  ; focus = None
+  ; next_session = Int64.succ session_number
+  ; owners =
+      Owners.add
+        owner_id
+        (Detail_loading_view { block_id; request_generation; session_number; draft_owner })
+        t.owners
   }
 ;;
 
@@ -128,160 +246,302 @@ let open_favorite
   | V2_favorite_page _ -> t, None
   | V2_favorite_block { uuid; _ } ->
     let block_id = Logseq_db_types.Graph_types.Uuid.to_string uuid in
-    let t = open_detail t ~block_id ~request_generation in
-    ( t
+    ( open_detail t ~block_id ~request_generation
     , Some
         (Journal_graph_request.Load_detail
            { block_id; after = None; limit = 64; request_generation }) )
 ;;
 
-let detail_block_id t =
-  match t.view with
-  | Detail_loading_view { block_id; _ }
-  | Detail_view { block_id; _ }
-  | Failed_detail_view { block_id; _ }
-  | Missing_detail_view { block_id; _ } -> Some block_id
-  | Timeline_view -> None
-;;
-
-let detail_request_generation t =
-  match t.view with
-  | Detail_loading_view { request_generation; _ }
-  | Detail_view { request_generation; _ }
-  | Failed_detail_view { request_generation; _ }
-  | Missing_detail_view { request_generation; _ } -> request_generation
-  | Timeline_view -> 0L
-;;
-
-let apply_detail_response t ~request_generation detail =
-  match t.view with
-  | Detail_loading_view loading
-    when Int64.equal request_generation loading.request_generation
-         && String.equal
-              loading.block_id
-              (Journal_model.id detail.Journal_graph_projection.root) ->
-    let detail = Journal_detail.create ~session_number:loading.session_number detail in
-    let detail =
-      match Drafts.find_opt loading.block_id t.drafts with
-      | None -> detail
-      | Some draft -> Journal_detail.restore_composer detail draft
-    in
-    { t with
-      drafts = Drafts.remove loading.block_id t.drafts
-    ; view = Detail_view { block_id = loading.block_id; request_generation; detail }
-    }
-  | Timeline_view
-  | Detail_loading_view _
-  | Detail_view _
-  | Failed_detail_view _
-  | Missing_detail_view _ -> t
-;;
-
-let apply_missing_detail t ~request_generation =
-  match t.view with
-  | Detail_loading_view loading
-    when Int64.equal request_generation loading.request_generation ->
-    { t with
-      view = Missing_detail_view { block_id = loading.block_id; request_generation }
-    }
-  | Timeline_view
-  | Detail_loading_view _
-  | Detail_view _
-  | Failed_detail_view _
-  | Missing_detail_view _ -> t
-;;
-
-let apply_detail_failure t ~request_generation ~missing ~message =
-  if missing
-  then apply_missing_detail t ~request_generation
-  else (
-    match t.view with
-    | Detail_loading_view loading when loading.request_generation = request_generation ->
-      { t with
-        view =
-          Failed_detail_view { block_id = loading.block_id; request_generation; message }
-      }
-    | _ -> t)
-;;
-
-let detail t =
-  match t.view with
-  | Detail_view { detail; _ } -> Some detail
-  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
-    -> None
+let update_detail_at t ~entry_id detail =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Detail_view owner) when owner.detail == detail -> t
+  | Some (Detail_view owner) ->
+    let t = track_detail_session t detail in
+    { t with owners = Owners.add entry_id (Detail_view { owner with detail }) t.owners }
+  | _ -> t
 ;;
 
 let update_detail t detail =
-  match t.view with
-  | Detail_view view ->
-    let t = track_detail_session t detail in
-    { t with view = Detail_view { view with detail } }
-  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
-    -> t
+  match active_entry_id t with
+  | None -> t
+  | Some entry_id -> update_detail_at t ~entry_id detail
+;;
+
+let map_details t ~f =
+  Owners.fold
+    (fun entry_id view t ->
+       match view with
+       | Detail_view { detail; _ } -> update_detail_at t ~entry_id (f detail)
+       | _ -> t)
+    t.owners
+    t
+;;
+
+let apply_detail_response t ~request_generation projection =
+  Owners.fold
+    (fun entry_id view t ->
+       match view with
+       | Detail_loading_view loading
+         when loading.request_generation = request_generation
+              && loading.block_id
+                 = Journal_model.id projection.Journal_graph_projection.root ->
+         let detail =
+           Journal_detail.create ~session_number:loading.session_number projection
+         in
+         let draft =
+           Option.bind loading.draft_owner (fun id -> Drafts.find_opt id t.drafts)
+         in
+         let detail =
+           match draft with
+           | None -> detail
+           | Some draft -> Journal_detail.restore_composer detail draft.composer
+         in
+         let t = track_detail_session t detail in
+         { t with
+           drafts =
+             (match loading.draft_owner with
+              | None -> t.drafts
+              | Some id -> Drafts.remove id t.drafts)
+         ; owners =
+             Owners.add
+               entry_id
+               (Detail_view { block_id = loading.block_id; request_generation; detail })
+               t.owners
+         }
+       | Detail_view { detail; _ } ->
+         let next, _ =
+           Journal_detail.step detail (Loaded (request_generation, projection))
+         in
+         update_detail_at t ~entry_id next
+       | _ -> t)
+    t.owners
+    t
+;;
+
+let apply_detail_failure
+      ?block_id
+      ?(stale_cursor = false)
+      t
+      ~request_generation
+      ~missing
+      ~message
+  =
+  Owners.fold
+    (fun entry_id view t ->
+       match view with
+       | Detail_loading_view loading
+         when loading.request_generation = request_generation
+              && (block_id = None || block_id = Some loading.block_id) ->
+         let view =
+           if missing
+           then Missing_detail_view { block_id = loading.block_id; request_generation }
+           else
+             Failed_detail_view
+               { block_id = loading.block_id; request_generation; message }
+         in
+         { t with owners = Owners.add entry_id view t.owners }
+       | Detail_view { detail; _ } ->
+         let next, _ =
+           Journal_detail.step
+             detail
+             (Load_failed (request_generation, stale_cursor, message))
+         in
+         if next = detail then t else update_detail_at t ~entry_id next
+       | _ -> t)
+    t.owners
+    t
+;;
+
+let apply_missing_detail t ~request_generation =
+  apply_detail_failure t ~request_generation ~missing:true ~message:"Block unavailable"
 ;;
 
 let apply_child_created t ~child ~parent =
-  let parent_id = Journal_model.id parent in
   let drafts =
-    Drafts.update
-      parent_id
-      (fun draft ->
-         Option.bind draft (fun draft ->
-           Journal_detail.complete_retained_composer draft ~child ~parent))
+    Drafts.filter_map
+      (fun _ draft ->
+         Option.map
+           (fun composer -> { draft with composer })
+           (Journal_detail.complete_retained_composer draft.composer ~child ~parent))
       t.drafts
   in
-  let t = { t with drafts } in
-  match detail t with
-  | None -> t
-  | Some owner ->
-    update_detail t (Journal_detail.apply_child_created owner ~child ~parent)
+  let t = if drafts = t.drafts then t else { t with drafts } in
+  map_details t ~f:(fun detail ->
+    Journal_detail.apply_child_created detail ~child ~parent)
 ;;
 
 let apply_child_failure t ~block_id ~message =
-  let t =
-    { t with
-      drafts =
-        Drafts.map
-          (fun draft -> Journal_detail.fail_retained_composer draft ~block_id ~message)
-          t.drafts
-    }
+  let drafts =
+    Drafts.map
+      (fun draft ->
+         let composer =
+           Journal_detail.fail_retained_composer draft.composer ~block_id ~message
+         in
+         if composer == draft.composer then draft else { draft with composer })
+      t.drafts
   in
-  match detail t with
-  | None -> t
-  | Some owner ->
-    let owner, _ = Journal_detail.step owner (Append_failed (block_id, message)) in
-    update_detail t owner
+  let t = if drafts = t.drafts then t else { t with drafts } in
+  map_details t ~f:(fun detail ->
+    fst (Journal_detail.step detail (Append_failed (block_id, message))))
 ;;
 
-let back t =
-  let t = retain_active_composer t in
-  match t.view with
-  | Timeline_view -> t
-  | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _ ->
-    { t with view = Timeline_view }
-  | Detail_view _ -> { t with view = Timeline_view }
+let accept_path t path =
+  let original = Path.entries t.path
+  and next = Path.entries path in
+  let rec prefix before after =
+    match before, after with
+    | _, [] -> true
+    | ( (a : detail_route Lui_navigation.entry) :: rest
+      , (b : detail_route Lui_navigation.entry) :: tail )
+      when a.id = b.id -> prefix rest tail
+    | _ -> false
+  in
+  if not (prefix original next)
+  then t
+  else if List.length original = List.length next
+  then t
+  else (
+    let kept =
+      List.fold_left
+        (fun kept (entry : detail_route Lui_navigation.entry) ->
+           Owners.add entry.id Timeline_view kept)
+        Owners.empty
+        next
+    in
+    let t =
+      List.fold_left
+        (fun t (entry : detail_route Lui_navigation.entry) ->
+           if Owners.mem entry.id kept
+           then t
+           else (
+             let t = retain_owner t entry.id in
+             { t with owners = Owners.remove entry.id t.owners }))
+        t
+        original
+    in
+    { t with path; focus = None })
+;;
+
+let back t = accept_path t (Path.pop t.path)
+let pop_to_root t = accept_path t (Path.pop_to_root t.path)
+
+let retry_detail_at t ~entry_id ~request_generation =
+  match Owners.find_opt entry_id t.owners with
+  | None | Some Timeline_view -> t, None
+  | Some view ->
+    let block_id = Option.get (view_block_id view) in
+    let t = retain_owner t entry_id in
+    let session_number = Int64.max t.next_session (Int64.succ request_generation) in
+    let draft_owner =
+      if Drafts.mem entry_id t.drafts
+      then Some entry_id
+      else (
+        match view with
+        | Detail_loading_view loading -> loading.draft_owner
+        | _ -> None)
+    in
+    ( { t with
+        owners =
+          Owners.add
+            entry_id
+            (Detail_loading_view
+               { block_id; request_generation; session_number; draft_owner })
+            t.owners
+      ; next_session = Int64.succ session_number
+      ; focus = None
+      }
+    , Some
+        (Journal_graph_request.Load_detail
+           { block_id; after = None; limit = 64; request_generation }) )
+;;
+
+let retry_detail t ~request_generation =
+  match active_entry_id t with
+  | None -> t, None
+  | Some entry_id -> retry_detail_at t ~entry_id ~request_generation
 ;;
 
 let background t = t
 let graph_unavailable t = restore_drafts (create ()) (retain_drafts ~interrupted:true t)
 
 let runtime_replaced t =
-  let t = retain_active_composer t in
-  match t.view with
-  | Detail_view view ->
-    { t with
-      view =
-        Detail_loading_view
-          { block_id = view.block_id
-          ; request_generation = Int64.succ view.request_generation
-          ; session_number =
-              Int64.succ
-                (Journal_ids.Text_input.Session_id.to_int64
-                   (Journal_detail.session_id view.detail))
-          }
-    }
-  | Timeline_view | Detail_loading_view _ | Failed_detail_view _ | Missing_detail_view _
-    -> t
+  let generation =
+    Owners.fold (fun _ view n -> Int64.max n (view_generation view)) t.owners 0L
+  in
+  let t, _ =
+    List.fold_left
+      (fun (t, generation) (entry : detail_route Lui_navigation.entry) ->
+         let generation = Int64.succ generation in
+         let next, _ =
+           retry_detail_at t ~entry_id:entry.id ~request_generation:generation
+         in
+         next, generation)
+      (t, generation)
+      (Path.entries t.path)
+  in
+  t
+;;
+
+type staged_delete = (string * int64 * view * Journal_detail.staged_delete) list
+
+let stage_delete t ~block_id =
+  (* A missing root no longer carries its composer. Preserve it before changing
+     phase, in path order, so pop/Undo cannot lose an independent pending draft. *)
+  let t =
+    List.fold_left
+      (fun t (entry : detail_route Lui_navigation.entry) ->
+         match Owners.find_opt entry.id t.owners with
+         | Some (Detail_view owner)
+           when Journal_model.id (Journal_detail.root owner.detail) = block_id ->
+           retain_owner t entry.id
+         | _ -> t)
+      t
+      (Path.entries t.path)
+  in
+  let t, staged =
+    Owners.fold
+      (fun entry_id view (t, staged) ->
+         match view with
+         | Detail_view owner ->
+           (match Journal_detail.stage_delete owner.detail ~block_id with
+            | None -> t, staged
+            | Some (hidden, undo) ->
+              let next =
+                if Journal_model.id (Journal_detail.root owner.detail) = block_id
+                then
+                  Missing_detail_view
+                    { block_id = owner.block_id
+                    ; request_generation = owner.request_generation
+                    }
+                else Detail_view { owner with detail = hidden }
+              in
+              ( { t with owners = Owners.add entry_id next t.owners }
+              , (entry_id, owner.request_generation, view, undo) :: staged ))
+         | _ -> t, staged)
+      t.owners
+      (t, [])
+  in
+  t, if staged = [] then None else Some staged
+;;
+
+let undo_delete t staged =
+  List.fold_left
+    (fun t (entry_id, generation, before, undo) ->
+       match Owners.find_opt entry_id t.owners with
+       | Some (Detail_view { detail; _ }) as current
+         when Option.fold
+                ~none:false
+                ~some:(fun view -> view_generation view = generation)
+                current ->
+         update_detail_at t ~entry_id (Journal_detail.undo_delete detail undo)
+       | Some (Missing_detail_view owner) when owner.request_generation = generation ->
+         { t with
+           owners = Owners.add entry_id before t.owners
+         ; drafts = Drafts.remove entry_id t.drafts
+         }
+       | _ -> t)
+    t
+    staged
 ;;
 
 module Favorites = struct

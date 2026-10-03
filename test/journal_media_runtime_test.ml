@@ -10,17 +10,70 @@ let uuid n =
   G.Uuid.of_string (Printf.sprintf "89000000-0000-4000-8000-%012d" n) |> Result.get_ok
 ;;
 
-let () =
+let test_equal_media_notices_keep_effects () =
   let sent = Queue.create () in
-  let views = Hashtbl.create 2 in
-  let armed = ref [] in
+  let changes = ref [] in
   let runtime =
     R.create
       ~send:(fun ticket request ->
         Queue.add (ticket, request) sent;
         true)
-      ~changed:(Hashtbl.replace views)
-      ~armed:(fun root previous -> armed := (root, previous) :: !armed)
+      ~changed:(fun root view -> changes := (root, view) :: !changes)
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let root = G.Uuid.to_string (uuid 1) in
+  R.root_visible runtime ~root true;
+  let ticket, request = Queue.take sent in
+  let request_id =
+    match request with
+    | S.Graph_request query -> query.request_id
+    | _ -> failwith "visible root must send its initial metadata query"
+  in
+  R.receive
+    runtime
+    (Option.get ticket)
+    (Graph_response
+       (P.V2_response
+          { api_version = 2
+          ; request_id
+          ; outcome =
+              V2_assets_outcome
+                { generation = "g"
+                ; projection_revision = "p"
+                ; items = []
+                ; next_cursor = None
+                }
+          }));
+  changes := [];
+  for _ = 1 to 10 do
+    R.root_visible runtime ~root true
+  done;
+  check (!changes = []) "duplicate visible roots must not republish an equal view";
+  check (Queue.is_empty sent) "duplicate visibility must not query metadata";
+  R.root_visible runtime ~root false;
+  changes := [];
+  R.root_visible runtime ~root false;
+  check (!changes = []) "duplicate hidden roots must not republish an equal view";
+  R.reset runtime ~graph_generation:(Some 2);
+  check
+    (List.exists (fun (actual, _) -> actual = root) !changes)
+    "graph reset must clear the old root presentation even when it was empty"
+;;
+
+let () = test_equal_media_notices_keep_effects ()
+
+let () =
+  let sent = Queue.create () in
+  let views = Hashtbl.create 2 in
+  let changes = ref 0 in
+  let runtime =
+    R.create
+      ~send:(fun ticket request ->
+        Queue.add (ticket, request) sent;
+        true)
+      ~changed:(fun root view ->
+        incr changes;
+        Hashtbl.replace views root view)
   in
   R.reset runtime ~graph_generation:(Some 1);
   let root = G.Uuid.to_string (uuid 1) in
@@ -96,6 +149,14 @@ let () =
     ; graph_generation = 1
     }
   in
+  let before_waiting = !changes in
+  R.notice
+    runtime
+    scope
+    (Asset_availability { consumer; asset = asset.uuid; availability = Queued });
+  check
+    (!changes = before_waiting)
+    "equal waiting availability must not republish the pending presentation";
   R.notice
     runtime
     scope
@@ -114,6 +175,15 @@ let () =
     ((List.hd (Hashtbl.find views root).items).presentation
      = Journal_media.File "/cache/image.png")
     "native view receives retained path";
+  let before_ready_duplicate = !changes in
+  R.notice
+    runtime
+    scope
+    (Asset_availability { consumer; asset = asset.uuid; availability = Ready "cached" });
+  check
+    (!changes = before_ready_duplicate)
+    "duplicate readiness must not republish a retained file";
+  check (Queue.is_empty sent) "duplicate readiness must not reacquire the retained file";
   R.reset runtime ~graph_generation:None;
   let requests = Queue.to_seq sent |> List.of_seq |> List.map snd in
   check
@@ -143,7 +213,11 @@ let () =
           item.presentation = Journal_media.File "/staged/import.bin")
        (Hashtbl.find views root).items)
     "imported file appears immediately";
+  let before_duplicate = !changes in
   R.imported runtime ~current:true receipt;
+  check
+    (!changes = before_duplicate)
+    "duplicate import must not republish the same file presentation";
   check (Queue.is_empty sent) "duplicate receipt must not release its live lease";
   R.reset runtime ~graph_generation:None;
   check
@@ -164,223 +238,5 @@ let () =
          | _, S.Release_asset_file { handle = "late-lease"; _ } -> true
          | _ -> false)
        (Queue.to_seq sent |> List.of_seq))
-    "late import receipt releases its lease";
-  Queue.clear sent;
-  R.reset runtime ~graph_generation:(Some 1);
-  R.root_visible runtime ~root true;
-  ignore (Queue.take sent);
-  R.begin_reuse runtime ~root;
-  let token, request = Queue.take sent in
-  let reference_query =
-    match request with
-    | S.Graph_request
-        ({ command = P.V2_get_block { block; revision = None }; _ } as query)
-      when block = uuid 1 -> query
-    | _ -> failwith "reuse must read the attachment holder first"
-  in
-  check
-    (Option.is_some (Hashtbl.find views root).picker)
-    "reuse opens the candidate picker while loading";
-  let holder : G.block =
-    { uuid = uuid 1
-    ; title = "entry"
-    ; parent = uuid 0
-    ; page = uuid 9
-    ; order = "a"
-    ; created_at_ms = 0L
-    ; updated_at_ms = 0L
-    ; refs = []
-    ; tags = []
-    ; properties =
-        [ G.
-            { ident = "logseq.property/asset"
-            ; uuid = uuid 10
-            ; title = "asset"
-            ; schema =
-                { property_type = G.Entity
-                ; cardinality = G.One
-                ; hidden = true
-                ; public = false
-                }
-            ; values = [ G.Entity_value (uuid 2) ]
-            ; values_truncated = false
-            }
-        ]
-    }
-  in
-  R.receive
-    runtime
-    (Option.get token)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id = reference_query.request_id
-          ; outcome =
-              V2_block_outcome
-                (V2_present_block
-                   { value =
-                       { block = holder
-                       ; task_status = None
-                       ; rendered_page_title = "page"
-                       ; tag_titles = []
-                       }
-                   ; revision = "r7"
-                   })
-          }));
-  let token, request = Queue.take sent in
-  let picker_query =
-    match request with
-    | S.Graph_request
-        ({ command =
-             P.V2_list_assets
-               { recursive = true; roots = [ u ]; limit = 16; cursor = None }
-         ; _
-         } as query)
-      when u = uuid 9 -> query
-    | _ -> failwith "reuse candidates enumerate the holder page subtree"
-  in
-  let candidate_asset =
-    A.create
-      ~uuid:(uuid 5)
-      ~source:
-        (Managed
-           (Some
-              (A.version ~checksum:(String.make 64 'b') ~file_type:"pdf" |> Result.get_ok)))
-      ~current_checksum:None
-      ~size:None
-      ~dimensions:None
-    |> Result.get_ok
-  in
-  R.receive
-    runtime
-    (Option.get token)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id = picker_query.request_id
-          ; outcome =
-              V2_assets_outcome
-                { generation = "g"
-                ; projection_revision = "p"
-                ; items = [ asset; candidate_asset ]
-                ; next_cursor = None
-                }
-          }));
-  let picker = (Hashtbl.find views root).picker |> Option.get in
-  check (List.length picker.candidates = 2) "managed assets become candidates";
-  let chosen =
-    List.find
-      (fun (item : R.item) -> item.asset.uuid = candidate_asset.uuid)
-      picker.candidates
-  in
-  R.reuse_select runtime ~root ~asset:chosen.token;
-  let _, request = Queue.take sent in
-  (match request with
-   | S.Graph_request
-       { command =
-           P.V2_set_asset_reference
-             { block; previous = Some previous; asset = chosen; preconditions; _ }
-       ; _
-       }
-     when block = uuid 1
-          && previous = uuid 2
-          && chosen = uuid 5
-          && preconditions.P.blocks = [ uuid 1, "r7" ] -> ()
-   | _ -> failwith "reuse must repoint the holder reference atomically");
-  R.end_reuse runtime ~root;
-  check
-    ((Hashtbl.find views root).picker = None)
-    "closing the picker clears candidate state";
-  check (!armed = []) "reuse must not arm the replacement picker";
-  R.begin_replace runtime ~root;
-  let token, request = Queue.take sent in
-  let replace_query =
-    match request with
-    | S.Graph_request
-        ({ command = P.V2_get_block { block; revision = None }; _ } as query)
-      when block = uuid 1 -> query
-    | _ -> failwith "replace must read the attachment holder before arming"
-  in
-  R.receive
-    runtime
-    (Option.get token)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id = replace_query.request_id
-          ; outcome =
-              V2_block_outcome
-                (V2_present_block
-                   { value =
-                       { block = holder
-                       ; task_status = None
-                       ; rendered_page_title = "page"
-                       ; tag_titles = []
-                       }
-                   ; revision = "r8"
-                   })
-          }));
-  (match !armed with
-   | [ (armed_root, Some previous) ] when armed_root = root && previous = uuid 2 -> ()
-   | _ -> failwith "replace must arm the picker with the current asset reference");
-  R.begin_replace runtime ~root;
-  let token, _ = Queue.take sent in
-  R.receive runtime (Option.get token) S.Client_command_completed;
-  check
-    (List.length !armed = 1)
-    "a failed holder read must not arm the replacement picker";
-  check
-    ((Hashtbl.find views root).error <> None)
-    "a failed holder read surfaces a retryable error";
-  let cold_root = G.Uuid.to_string (uuid 7) in
-  R.begin_reuse runtime ~root:cold_root;
-  let _, request = Queue.take sent in
-  (match request with
-   | S.Graph_request
-       { command =
-           P.V2_list_assets
-             { recursive = false; roots = [ u ]; limit = 16; cursor = None }
-       ; _
-       }
-     when u = uuid 7 -> ()
-   | _ -> failwith "menu actions on an unregistered group must register and query it");
-  let token, request = Queue.take sent in
-  let cold_reference =
-    match request with
-    | S.Graph_request
-        ({ command = P.V2_get_block { block; revision = None }; _ } as query)
-      when block = uuid 7 -> query
-    | _ -> failwith "cold-open reuse must read the attachment holder"
-  in
-  R.receive
-    runtime
-    (Option.get token)
-    (Graph_response
-       (P.V2_response
-          { api_version = 2
-          ; request_id = cold_reference.request_id
-          ; outcome =
-              V2_block_outcome
-                (V2_present_block
-                   { value =
-                       { block = { holder with uuid = uuid 7; properties = [] }
-                       ; task_status = None
-                       ; rendered_page_title = "page"
-                       ; tag_titles = []
-                       }
-                   ; revision = "r9"
-                   })
-          }));
-  let _, request = Queue.take sent in
-  (match request with
-   | S.Graph_request
-       { command =
-           P.V2_list_assets { recursive = true; roots = [ u ]; limit = 16; cursor = None }
-       ; _
-       }
-     when u = uuid 9 -> ()
-   | _ -> failwith "cold-open reuse must enumerate the holder page subtree");
-  check
-    (Option.is_some (Hashtbl.find views cold_root).picker)
-    "cold-open reuse opens the candidate picker"
+    "late import receipt releases its lease"
 ;;

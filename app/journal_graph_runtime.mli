@@ -17,6 +17,12 @@ type failure_source =
   | Worker_failure of worker_failure
   | Projection_failure of string
 
+type mutation_kind =
+  | Capture_mutation
+  | Source_mutation
+  | Status_mutation
+  | Delete_subtree_mutation
+
 type payload =
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
@@ -35,7 +41,8 @@ type payload =
       ; timeline_entry_update : Journal_graph_projection.timeline_entry option
       }
   | Child_failed of
-      { block_id : string
+      { mutation_id : string
+      ; block_id : string
       ; failure : failure_source
       }
   | Child_created of
@@ -94,6 +101,12 @@ type payload =
       ; failure : failure_source
       }
   | Open_failed of worker_failure
+  | Mutation_failed of
+      { kind : mutation_kind
+      ; mutation_id : string
+      ; block_id : string
+      ; failure : failure_source
+      }
   | Rejected of failure_source
 
 type response = { payload : payload }

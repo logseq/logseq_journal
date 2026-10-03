@@ -23,7 +23,7 @@ final class JournalListViewportTests: XCTestCase {
     let position = row.frame.midY
     row.tap()
     XCTAssertTrue(app.buttons["Append"].waitForExistence(timeout: 5))
-    app.buttons["BackButton"].tap()
+    app.navigationBars.buttons["Back"].tap()
     let returned = app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
     XCTAssertTrue(returned.waitForExistence(timeout: 5))
     XCTAssertEqual(returned.frame.midY, position, accuracy: 3)

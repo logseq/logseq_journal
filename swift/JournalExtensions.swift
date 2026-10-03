@@ -171,6 +171,7 @@ enum JournalExtensionFingerprint {
 
   static func registry() throws -> LUIAppleExtensionRegistry {
     let registry = LUIAppleExtensionRegistry()
+    try LUINavigation.register(in: registry)
     for journalExtension in [
       chromeExtension(),
       assetImportExtension(),

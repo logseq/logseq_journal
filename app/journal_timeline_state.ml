@@ -1159,6 +1159,19 @@ let observe_visible_range (state : t) ~first_index ~last_exclusive =
   }
 ;;
 
+(* Rendering consumes slots/date/errors and the active scroll command, not the
+   latest demand window or recovery bookkeeping. Slots are persistent. *)
+let equal_presentation (left : t) (right : t) =
+  left == right
+  || (left.slots == right.slots
+      && left.today = right.today
+      && left.first_retained_index = right.first_retained_index
+      && left.day_failures == right.day_failures
+      && left.scroll_target = right.scroll_target
+      && (left.day_failures = []
+          || Option.is_some left.pending = Option.is_some right.pending))
+;;
+
 let retained_slot (state : t) index = Rrbvec.nth_opt state.slots index
 let fold_slots f initial (state : t) = Rrbvec.fold_left f initial state.slots
 

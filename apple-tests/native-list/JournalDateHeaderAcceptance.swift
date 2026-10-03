@@ -124,7 +124,7 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     record("Before historical detail", app)
     row.tap()
     XCTAssertTrue(app.buttons["Append"].waitForExistence(timeout: 5))
-    app.buttons["BackButton"].tap()
+    app.navigationBars.buttons["Back"].tap()
     let returned = app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
     XCTAssertTrue(returned.waitForExistence(timeout: 5))
     XCTAssertTrue(returned.isHittable)

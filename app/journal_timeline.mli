@@ -1,9 +1,23 @@
 module Ui = Journal_view
 
+module Store : sig
+  type t
+
+  val create : ?observe:(string -> unit) -> unit -> t
+  val synchronize : t -> Journal_timeline_state.t -> int
+
+  (* Return the native collection's structural presentation revision. Only
+      actual timeline changes reconcile retained slots; item publications go
+      to indexed mounted subscribers, never per-row global model selectors. *)
+  val reset : t -> unit
+end
+
 val loading_view : unit -> Ui.View.t
 
 val view
-  :  render_source:(string -> string)
+  :  ?store:Store.t
+  -> ?on_region:(string -> unit)
+  -> render_source:(string -> string)
   -> render_media:
        (root:string -> image_children:(string * string) list -> Ui.View.t -> Ui.View.t)
   -> state:Journal_timeline_state.t
@@ -16,4 +30,5 @@ val view
   -> actions_enabled:bool
   -> on_status:Ui.Event.Handler.t
   -> on_delete:Ui.Event.Handler.t
+  -> unit
   -> Ui.View.Body.t

@@ -30,6 +30,11 @@ type event =
   | Append_failed of string * string
 
 val create : session_number:int64 -> Journal_graph_projection.detail -> t
+
+(** Equality of outline content, actions and reveal commands, excluding child
+    draft text and request bookkeeping. *)
+val equal_presentation : t -> t -> bool
+
 val root : t -> Journal_model.t
 val find_block : t -> block_id:string -> Journal_model.t option
 val children : t -> Journal_model.t list

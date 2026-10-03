@@ -37,7 +37,7 @@ final class JournalListNavigationAcceptance: XCTestCase {
     record("Before detail", app)
     row.tap()
     XCTAssertTrue(app.buttons["Append"].waitForExistence(timeout: 5))
-    app.buttons["BackButton"].tap()
+    app.navigationBars.buttons["Back"].tap()
     record("After detail Back", app)
     XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch.waitForExistence(timeout: 5))
     let returned = app.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
@@ -56,7 +56,7 @@ final class JournalListNavigationAcceptance: XCTestCase {
     record("Before trailing-space tap", app)
     row.coordinate(withNormalizedOffset: CGVector(dx: 0.90, dy: 0.5)).tap()
     XCTAssertTrue(app.buttons["Append"].waitForExistence(timeout: 5), "The visible row's trailing space did not open detail")
-    app.buttons["BackButton"].tap()
+    app.navigationBars.buttons["Back"].tap()
     XCTAssertTrue(row.isHittable)
   }
 

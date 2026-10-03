@@ -434,8 +434,8 @@ let test_detail_capsules_mount_outside_toolbars () =
               |> List.sort_uniq Int.compare
             in
             require
-              (List.length surfaces = 2)
-              "Detail must have one Back and one action capsule";
+              (List.length surfaces = 1)
+              "Detail must have one action capsule; native navigation supplies Back";
             List.iter
               (fun (label, command, allowed) ->
                  let nodes =
@@ -470,10 +470,15 @@ let test_detail_capsules_mount_outside_toolbars () =
                    (List.mem command !actions = allowed)
                    "%s action guard changed"
                    label)
-              [ "Back", "back", true
-              ; "Append", "detail-session:1:open-append", actions_enabled
-              ; "Attach file", "detail-session:1:open-asset-import", actions_enabled
-              ]))
+              (let prefix =
+                 Printf.sprintf
+                   "detail-session:%s:%Ld:"
+                   (Journal_routes.active_entry_id routes |> Option.get)
+                   (Journal_routes.detail_request_generation routes)
+               in
+               [ "Append", prefix ^ "open-append", actions_enabled
+               ; "Attach file", prefix ^ "open-asset-import", actions_enabled
+               ])))
     [ loading, true, false; loaded, false, false; loaded, true, true ]
 ;;
 
