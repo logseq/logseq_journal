@@ -1625,6 +1625,16 @@ let media_presentation_scope state ~detail =
        | Favorites -> "favorites")
 ;;
 
+let media_presentation_scopes state =
+  media_presentation_scope state ~detail:false
+  :: List.filter_map
+       (fun (entry : Journal_routes.detail_route Lui_navigation.entry) ->
+          Option.map
+            (fun routes -> media_presentation_scope { state with routes } ~detail:true)
+            (Journal_routes.at_entry state.routes ~entry_id:entry.id))
+       (Lui_navigation.Path.entries (Journal_routes.path state.routes))
+;;
+
 let media_label
       ?store
       ?(on_region = fun _ -> ())
@@ -3277,12 +3287,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
   in
   ignore (Journal_timeline.Store.synchronize timeline_store initial_state.timeline : int);
   let media_context = ref None in
-  let media_page state =
-    ( Journal_routes.destination state.routes
-    , Journal_routes.active_entry_id state.routes
-    , Journal_routes.detail_request_generation state.routes )
-  in
-  let active_media_page = ref (media_page initial_state) in
+  let prev_media_owners = ref (media_presentation_scopes initial_state) in
   let media_runtime =
     Journal_media_runtime.create
       ~send:(fun ticket request ->
@@ -4575,20 +4580,12 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                     request)))
     in
     let media_source_active = ref true in
+    let media_owner = ref (media_presentation_scope snapshot ~detail:false) in
     let payload =
       match payload with
       | Ui.Event.Payload.Text action
         when String.starts_with ~prefix:"media-session:" action ->
-        let scopes =
-          media_presentation_scope snapshot ~detail:false
-          :: List.filter_map
-               (fun (entry : Journal_routes.detail_route Lui_navigation.entry) ->
-                  Option.map
-                    (fun routes ->
-                       media_presentation_scope { snapshot with routes } ~detail:true)
-                    (Journal_routes.at_entry snapshot.routes ~entry_id:entry.id))
-               (Lui_navigation.Path.entries (Journal_routes.path snapshot.routes))
-        in
+        let scopes = media_presentation_scopes snapshot in
         (match
            List.find_opt
              (fun scope ->
@@ -4596,6 +4593,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
              scopes
          with
          | Some scope ->
+           media_owner := scope;
            media_source_active
            := scope
               = media_presentation_scope
@@ -4725,12 +4723,15 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
         |> Option.get
         |> Rrbvec.to_list
       in
-      Journal_media_runtime.retain_visible_roots media_runtime roots;
-      update (fun state ->
-        favorites_event state (Visible { first_index; last_exclusive }))
+      Journal_media_runtime.retain_visible_roots
+        ~owner:(media_presentation_scope snapshot ~detail:false)
+        media_runtime
+        roots;
+      Effect.bind (flush_media set_state) ~f:(fun () ->
+        update (fun state ->
+          favorites_event state (Visible { first_index; last_exclusive })))
     | Ui.Event.Payload.Visible_range _
-      when Journal_routes.route snapshot.routes <> Timeline
-           || Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
+      when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
       Effect.ignore
     | Ui.Event.Payload.Visible_range range ->
       let total = Int64.of_int (Journal_timeline_state.total_count snapshot.timeline) in
@@ -4758,7 +4759,10 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           in
           collect (index + 1) roots)
       in
-      Journal_media_runtime.retain_visible_roots media_runtime (collect first []);
+      Journal_media_runtime.retain_visible_roots
+        ~owner:(media_presentation_scope snapshot ~detail:false)
+        media_runtime
+        (collect first []);
       let observe timeline =
         let total_count = Journal_timeline_state.total_count timeline in
         let bounded value =
@@ -4770,9 +4774,12 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
       in
       (* Redelivery does not change the pure timeline. Avoid scheduling a
              no-op model update, which would recreate native menu bindings. *)
-      if observe snapshot.timeline = snapshot.timeline
-      then Effect.ignore
-      else update (fun state -> { state with timeline = observe state.timeline })
+      Effect.bind (flush_media set_state) ~f:(fun () ->
+        if
+          Journal_routes.route snapshot.routes <> Timeline
+          || observe snapshot.timeline = snapshot.timeline
+        then Effect.ignore
+        else update (fun state -> { state with timeline = observe state.timeline }))
     | Ui.Event.Payload.Navigation_path_changed [] -> update back_state
     | Ui.Event.Payload.Bool false ->
       update (fun state ->
@@ -4802,15 +4809,25 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                let visible = Yojson.Basic.Util.to_bool (field "visible") in
                match text "action" with
                | _ when visible && not !media_source_active -> ()
-               | "root" -> Journal_media_runtime.root_visible media_runtime ~root visible
+               | "root" ->
+                 Journal_media_runtime.root_visible
+                   ~owner:!media_owner
+                   media_runtime
+                   ~root
+                   visible
                | "asset" ->
                  Journal_media_runtime.asset_visible
+                   ~owner:!media_owner
                    media_runtime
                    ~root
                    ~asset:(text "asset")
                    visible
                | "retry" ->
-                 Journal_media_runtime.retry media_runtime ~root ~asset:(text "asset")
+                 Journal_media_runtime.retry
+                   ~owner:!media_owner
+                   media_runtime
+                   ~root
+                   ~asset:(text "asset")
                | "next" -> Journal_media_runtime.next media_runtime ~root
                | _ -> ()
              with
@@ -5410,11 +5427,11 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
      then (
        prev_media_key := key;
        media_callback ()));
-    (let key = media_page model in
-     if !active_media_page <> key
+    (let owners = media_presentation_scopes model in
+     if !prev_media_owners <> owners
      then (
-       active_media_page := key;
-       Journal_media_runtime.retain_visible_roots media_runtime [];
+       prev_media_owners := owners;
+       Journal_media_runtime.retain_owners media_runtime owners;
        Effect.run (flush_media set_state)));
     (let key = notice_key model in
      if

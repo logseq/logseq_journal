@@ -3,6 +3,7 @@ module Asset = Logseq_db_types.Asset_descriptor
 module P = Journal_media
 module G = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
+module Owners = Set.Make (String)
 
 type ticket =
   | Query of
@@ -35,12 +36,14 @@ type controller =
   ; consumer : string
   ; mutable state : P.t
   ; mutable shown : bool
+  ; mutable owners : Owners.t
   }
 
 type group =
   { root : string
   ; epoch : int
   ; mutable visible : bool
+  ; mutable owners : Owners.t
   ; mutable pending : G.Uuid.t option
   ; mutable cursor : G.Cursor.t option
   ; mutable error : string option
@@ -199,9 +202,11 @@ let release_import t (receipt : Logseq_db_worker.import_receipt) =
 let clear t g =
   List.iter (release_import t) g.local;
   g.local <- [];
+  g.owners <- Owners.empty;
   List.iter
     (fun c ->
        c.shown <- false;
+       c.owners <- Owners.empty;
        dispatch t g c P.Hide;
        Hashtbl.remove t.consumers c.consumer)
     g.controllers;
@@ -246,7 +251,7 @@ let reset t ~graph_generation =
   pump t
 ;;
 
-let root_visible t ~root visible =
+let root_visible ?(owner = "default") t ~root visible =
   if visible && (not (Hashtbl.mem t.groups root)) && Hashtbl.length t.groups >= 64
   then (
     match Hashtbl.to_seq_values t.groups |> Seq.find (fun g -> not g.visible) with
@@ -256,29 +261,22 @@ let root_visible t ~root visible =
       Hashtbl.remove t.groups old.root;
       t.changed old.root empty_view);
   match Hashtbl.find_opt t.groups root, visible, t.generation with
-  | Some g, true, Some _ when g.visible -> pump t
   | Some g, false, _ ->
-    g.visible <- false;
+    g.owners <- Owners.remove owner g.owners;
+    g.visible <- not (Owners.is_empty g.owners);
     List.iter
-      (fun c ->
-         c.shown <- false;
-         dispatch t g c Hide)
+      (fun (c : controller) ->
+         c.owners <- Owners.remove owner c.owners;
+         if c.shown && Owners.is_empty c.owners
+         then (
+           c.shown <- false;
+           dispatch t g c Hide))
       g.controllers;
     notify t g;
     pump t
-  | Some g, true, Some graph_generation ->
+  | Some g, true, Some _ ->
+    g.owners <- Owners.add owner g.owners;
     g.visible <- true;
-    List.iter
-      (fun c ->
-         if c.shown
-         then
-           dispatch
-             t
-             g
-             c
-             (Show { graph_generation; consumer = c.consumer; asset = c.asset }))
-      g.controllers;
-    notify t g;
     pump t
   | None, true, Some _ when Hashtbl.length t.groups < 64 && List.length t.queued < 1024 ->
     (match G.Uuid.of_string root with
@@ -289,6 +287,7 @@ let root_visible t ~root visible =
          { root
          ; epoch = t.serial
          ; visible = true
+         ; owners = Owners.singleton owner
          ; pending = None
          ; cursor = None
          ; error = None
@@ -303,29 +302,52 @@ let root_visible t ~root visible =
   | _ -> ()
 ;;
 
-let retain_visible_roots t roots =
+let retain_visible_roots ?(owner = "default") t roots =
   let visible = Hashtbl.create (List.length roots) in
   List.iter (fun root -> Hashtbl.replace visible root ()) roots;
   Hashtbl.iter
     (fun root group ->
-       if group.visible && not (Hashtbl.mem visible root) then root_visible t ~root false)
+       if Owners.mem owner group.owners && not (Hashtbl.mem visible root)
+       then root_visible ~owner t ~root false)
     t.groups
 ;;
 
-let asset_visible t ~root ~asset visible =
+let retain_owners t owners =
+  let retained = Owners.of_list owners in
+  Hashtbl.iter
+    (fun root g ->
+       Owners.iter
+         (fun owner ->
+            if not (Owners.mem owner retained) then root_visible ~owner t ~root false)
+         g.owners)
+    t.groups
+;;
+
+let asset_visible ?(owner = "default") t ~root ~asset visible =
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some graph_generation ->
     (match List.find_opt (fun c -> c.consumer = asset) g.controllers with
-     | Some c when c.shown <> visible && ((not visible) || List.length t.queued < 1024) ->
-       c.shown <- visible;
-       dispatch
-         t
-         g
-         c
-         (if visible && g.visible
-          then Show { graph_generation; consumer = c.consumer; asset = c.asset }
-          else Hide);
-       notify t g;
+     | Some c when (not visible) || List.length t.queued < 1024 ->
+       (* Native child appearance can precede its parent's appearance. The
+          visible asset itself establishes this presentation's root ownership. *)
+       if visible
+       then (
+         g.owners <- Owners.add owner g.owners;
+         g.visible <- true);
+       c.owners
+       <- (if visible then Owners.add owner c.owners else Owners.remove owner c.owners);
+       let shown = not (Owners.is_empty c.owners) in
+       if c.shown <> shown
+       then (
+         c.shown <- shown;
+         dispatch
+           t
+           g
+           c
+           (if shown
+            then Show { graph_generation; consumer = c.consumer; asset = c.asset }
+            else Hide);
+         notify t g);
        pump t
      | _ -> ())
   | _ -> ()
@@ -340,13 +362,13 @@ let next t ~root =
   | _ -> ()
 ;;
 
-let retry t ~root ~asset =
+let retry ?(owner = "default") t ~root ~asset =
   match Hashtbl.find_opt t.groups root with
   | None -> ()
   | Some g ->
     (match List.find_opt (fun c -> c.consumer = asset) g.controllers with
      | Some c when c.shown -> dispatch t g c Retry_requested
-     | Some _ -> asset_visible t ~root ~asset true
+     | Some _ -> asset_visible ~owner t ~root ~asset true
      | None when asset = "" -> read t g None
      | None -> ());
     notify t g;
@@ -391,6 +413,7 @@ let receive t ticket response =
                     ; consumer = Printf.sprintf "media:%d:%d" epoch t.serial
                     ; state = P.empty
                     ; shown = false
+                    ; owners = Owners.empty
                     })
                items
            in
@@ -399,6 +422,7 @@ let receive t ticket response =
                 if not (List.exists (fun kept -> kept.consumer = c.consumer) controllers)
                 then (
                   c.shown <- false;
+                  c.owners <- Owners.empty;
                   dispatch t g c Hide;
                   Hashtbl.remove t.consumers c.consumer))
              old;
@@ -464,6 +488,7 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           { root
           ; epoch = t.serial
           ; visible = false
+          ; owners = Owners.empty
           ; pending = None
           ; cursor = None
           ; error = None
