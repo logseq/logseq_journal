@@ -3,6 +3,10 @@
 No pure reducer can detect a missing ABI symbol or mismatched callback arguments.
 This headless test uses Journal_bridge's public hook boundary and opens no app,
 account, simulator or graph. It leaves the shared opam switch untouched.
+
+The pure Application reducer cannot execute the runtime lock or Swift callback.
+The regression therefore uses the public Journal_bridge hooks with the real C
+trampoline: a synchronous patch callback reenters it, as deferred LUI events do.
 """
 import os
 from pathlib import Path
@@ -20,7 +24,7 @@ def run(command, cwd=ROOT):
 
 
 run(["swift", "build", "--package-path", str(LUI), "--scratch-path", str(SCRATCH),
-     "--product", "LUIAppleBackendStatic", "-j", "8"])
+     "--product", "LUIAppleBackendStatic", "-j", "2"])
 binary_directory = Path(subprocess.check_output(
     ["swift", "build", "--package-path", str(LUI), "--scratch-path", str(SCRATCH),
      "--show-bin-path"], text=True).strip())
@@ -31,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix="journal-lui-events-") as directory:
     for name in ["journal_bridge.mli", "journal_bridge.ml"]:
         shutil.copy2(ROOT / "app" / name, temporary / name)
     shutil.copy2(ROOT / "apple-tests/native-events/bridge_fixture.ml", temporary)
-    compiler = ["ocamlfind", "ocamlopt", "-package", "lui"]
+    compiler = ["ocamlfind", "ocamlopt", "-thread", "-package", "threads,lui"]
     for name in ["journal_bridge.mli", "journal_bridge.ml", "bridge_fixture.ml"]:
         run([*compiler, "-c", name], temporary)
     run([*compiler, "-linkpkg", "-output-complete-obj", "-o", "fixture.o",
@@ -44,4 +48,5 @@ with tempfile.TemporaryDirectory(prefix="journal-lui-events-") as directory:
          str(ROOT / "apple-tests/native-events/JournalLUIEventsTests.swift"),
          str(binary_directory / "libLUIAppleBackendStatic.a"),
          str(temporary / "fixture.o"), str(temporary / "bridge.o"), "-o", str(executable)])
-    run([str(executable)], temporary)
+    # A bridge lock regression must fail instead of parking the test runner.
+    subprocess.run([str(executable)], cwd=temporary, check=True, timeout=20)

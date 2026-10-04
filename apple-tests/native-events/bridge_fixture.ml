@@ -2,6 +2,25 @@
    These public hooks observe exactly what crossed the production C boundary. *)
 open Lui_protocol
 
+let pending_platform = ref None
+let allocating = Atomic.make false
+let worker = ref None
+
+let start_worker () =
+  Atomic.set allocating true;
+  worker := Some (Domain.spawn (fun () ->
+    while Atomic.get allocating do
+      ignore (Sys.opaque_identity (Array.make 1024 "worker allocation"));
+      Gc.minor ()
+    done))
+;;
+
+let stop_worker () =
+  Atomic.set allocating false;
+  Option.iter Domain.join !worker;
+  worker := None
+;;
+
 let patch node text =
   Gc.full_major ();
   Lui_wire.encode_batch
@@ -30,15 +49,21 @@ let dispatch = function
 
 let () =
   Journal_bridge.register
-    { init = (fun _ _ _ -> "")
+    { init = (fun _ _ _ -> start_worker (); patch 42 "init")
     ; dispatch
     ; extension_event =
         (fun node name payload -> patch node ("extension:" ^ name ^ ":" ^ payload))
-    ; pump = (fun () -> "")
-    ; platform_event = (fun _ -> ())
-    ; platform_response = (fun _ -> ())
-    ; platform_failure = (fun _ -> ())
-    ; dispose = (fun () -> "")
-    ; root_node = (fun () -> 0)
+    ; pump = (fun () ->
+        let text = Option.fold ~none:"pump" ~some:(fun bytes ->
+          let buffer = Buffer.create (String.length bytes * 2) in
+          String.iter (fun byte -> Buffer.add_string buffer (Printf.sprintf "%02x" (Char.code byte))) bytes;
+          "platform:" ^ Buffer.contents buffer) !pending_platform in
+        pending_platform := None;
+        patch 42 text)
+    ; platform_event = (fun bytes -> pending_platform := Some bytes)
+    ; platform_response = (fun bytes -> pending_platform := Some bytes)
+    ; platform_failure = (fun bytes -> pending_platform := Some bytes)
+    ; dispose = (fun () -> stop_worker (); patch 42 "dispose")
+    ; root_node = (fun () -> 42)
     }
 ;;

@@ -1,8 +1,9 @@
 (** OCaml-side entries exposed to the native host through
     [journal_lui_bridge.c]. [register] installs every [Callback] named value
     the C stub resolves. Each entry that produces UI patches returns the
-    latest JSON patch batch, exactly like [lui_ocaml_bridge.c]'s emit_patch
-    protocol. *)
+    latest JSON patch batch. The C bridge copies the response before releasing
+    the runtime, then delivers it synchronously to the host. Host application
+    may reenter the bridge; it must never run while this entry holds the runtime. *)
 
 type hooks =
   { init : int -> int -> string -> string
