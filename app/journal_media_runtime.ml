@@ -341,7 +341,7 @@ let asset_visible ?(owner = "default") t ~root ~asset visible =
   match Hashtbl.find_opt t.groups root, t.generation with
   | Some g, Some graph_generation ->
     (match List.find_opt (fun c -> c.consumer = asset) g.controllers with
-     | Some c when (not visible) || List.length t.queued < 1024 ->
+     | Some c when (not visible) || c.shown || List.length t.queued < 1024 ->
        (* Native child appearance can precede its parent's appearance. The
           visible asset itself establishes this presentation's root ownership. *)
        if visible
