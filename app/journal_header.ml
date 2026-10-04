@@ -64,6 +64,13 @@ let detail ~actions body =
   |> V.Body.static
 ;;
 
+type account_action =
+  | Open_asset_settings
+  | Open_diagnostics
+  | Switch_graph
+  | Request_local_cache_reset
+  | Sign_out
+
 type presentation =
   { sync_phase : Graph_service.sync_phase option
   ; sync_error : string option
@@ -149,13 +156,13 @@ let view_impl
              [ ( 5L
                , "Attachment settings"
                , "slider.horizontal.3"
-               , "open-asset-settings"
+               , Open_asset_settings
                , V.Button_role.Normal )
-             ; 1L, "Diagnostics", "stethoscope", "open-diagnostics", V.Button_role.Normal
+             ; 1L, "Diagnostics", "stethoscope", Open_diagnostics, V.Button_role.Normal
              ; ( 2L
                , "Switch graph"
                , "arrow.triangle.2.circlepath"
-               , "switch-graph"
+               , Switch_graph
                , V.Button_role.Normal )
              ]
              @ (if local_deletion_available
@@ -163,14 +170,14 @@ let view_impl
                   [ ( 3L
                     , "Delete local graph copy"
                     , "trash"
-                    , "request-local-cache-reset"
+                    , Request_local_cache_reset
                     , V.Button_role.Destructive )
                   ]
                 else [])
              @ [ ( 4L
                  , "Sign out"
                  , "rectangle.portrait.and.arrow.right"
-                 , "sign-out"
+                 , Sign_out
                  , V.Button_role.Normal )
                ]
            in
@@ -181,10 +188,7 @@ let view_impl
                (Ui.Event.Handler.create (function
                   | Ui.Event.Payload.Int64 id ->
                     List.find_opt (fun (candidate, _, _, _, _) -> candidate = id) actions
-                    |> Option.iter (fun (_, _, _, action, _) ->
-                      Ui.Event.Handler.Private.invoke
-                        dispatch
-                        (Ui.Event.Payload.Text action))
+                    |> Option.iter (fun (_, _, _, action, _) -> dispatch action)
                   | _ -> ()))
              (List.map
                 (fun (id, title, symbol, _, role) ->

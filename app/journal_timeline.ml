@@ -44,7 +44,7 @@ module Store = struct
     ; listeners : (string, (int, listener) Hashtbl.t) Hashtbl.t
     ; observe : string -> unit
     ; mutable last : Timeline.t option
-    ; mutable shape : (int * int * (int64 * int * string) option * shape list) option
+    ; mutable shape : (int * (int64 * int * string) option * shape list) option
     ; mutable revision : int
     ; mutable epoch : int
     ; mutable serial : int
@@ -158,13 +158,7 @@ module Store = struct
           []
       in
       List.iter (Hashtbl.remove t.rows) removed;
-      let shape =
-        Some
-          ( Timeline.today state
-          , Timeline.first_retained_index state
-          , Timeline.scroll_target state
-          , shape )
-      in
+      let shape = Some (Timeline.today state, Timeline.scroll_target state, shape) in
       if t.shape <> shape
       then (
         t.shape <- shape;
@@ -308,12 +302,10 @@ let view
   let presented = present None None (List.mapi (fun index slot -> index, slot) slots) in
   let presented =
     if
-      Timeline.first_retained_index state = 0
-      && not
-           (List.exists
-              (fun (row, _) ->
-                 row.Journal_native_collection.section = string_of_int today)
-              presented)
+      not
+        (List.exists
+           (fun (row, _) -> row.Journal_native_collection.section = string_of_int today)
+           presented)
     then synthetic_heading today :: presented
     else presented
   in

@@ -85,17 +85,15 @@ let render_media ~root child =
     then [ item 3 "pdf" "reading.pdf" (Some 1800000L); item 4 "txt" "notes.txt" None ]
     else []
   in
+  let store = Journal_media_view.Store.create () in
+  Journal_media_view.Store.update
+    store
+    ~root
+    (Some { Journal_media_runtime.items = images; more = false; error = None });
   Journal_media_view.view
+    ~store
     ~scope:"synthetic-preview"
     ~root
-    ~media:
-      (Some
-         { Journal_media_runtime.items = images
-         ; more = false
-         ; error = None
-         ; picker = None
-         })
-    ~editable:false
     ~on_event:(fun _ -> ())
     child
 ;;

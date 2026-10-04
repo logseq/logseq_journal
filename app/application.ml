@@ -216,7 +216,6 @@ type sync_error_notice =
   }
 
 module Graph_drafts = Map.Make (String)
-module Media_views = Map.Make (String)
 module Reference_sources = Map.Make (String)
 
 type graph_drafts =
@@ -251,7 +250,6 @@ type state =
   ; uploads : Journal_uploads.t
   ; asset_settings_open : bool
   ; reference_sources : string Reference_sources.t
-  ; media_views : Journal_media_runtime.view Media_views.t
   ; import_completion : (string * string option) option
   ; asset_import_request : int
   ; asset_import_owner : (string * int64) option
@@ -337,7 +335,6 @@ let initial_state =
   ; uploads = Journal_uploads.empty
   ; asset_settings_open = false
   ; reference_sources = Reference_sources.empty
-  ; media_views = Media_views.empty
   ; import_completion = None
   ; asset_import_request = 0
   ; asset_import_owner = None
@@ -1368,9 +1365,63 @@ let secondary_text value =
   V.text ~style:(Ui.Style.Text_style.create ~foreground:Secondary ()) value
 ;;
 
-let bind_action handler action =
-  Ui.Event.Handler.create ~name:("journal-action:" ^ action) (fun _payload ->
-    Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text action))
+type command =
+  | Open_asset_settings
+  | Capture_submit
+  | Select_journals
+  | Select_favorites
+  | Favorites_retry
+  | Open_asset_import
+  | Refresh_catalog
+  | Begin_online_recovery
+  | Open_capture
+  | Close_composer
+  | Discard_capture
+  | Capture_task_on
+  | Capture_task_off
+  | Open_append
+  | Close_status
+  | Open_diagnostics
+  | Close_diagnostics
+  | Open_error_info
+  | Dismiss_operation_error
+  | Close_error_info
+  | Switch_graph
+  | Sign_out
+  | Submit_e2ee_password
+  | Request_local_cache_reset
+  | Delete_undo
+  | Detail_retry
+  | Asset_settings of string
+  | Import_asset of string
+  | Select_graph of string
+  | Capture_attach of Journal_asset_import.source
+  | Capture_asset of Journal_asset_import.event
+  | Timeline_retry of string
+  | Detail_open of string
+  | Detail_expand of string
+  | Detail_collapse of string
+  | Detail_more of string
+  | Detail_task_intent of string
+  | Detail_submit of string
+  | Timeline_status of string
+  | Status_sheet_select of string
+  | Timeline_delete of string
+  | Detail_delete of string
+  | Timeline_open_block of string
+  | Favorite_open_block of string
+  | Media of string * Journal_media_view.event
+  | Media_range of string * int64 * int64
+  | Detail_action of string * command
+  | Native_payload of Ui.Event.Payload.t
+
+type dispatch =
+  { send : command -> unit
+  ; native : Ui.Event.Handler.t
+  }
+
+let bind_action dispatch action =
+  Ui.Event.Handler.create ~name:"journal-action" (fun _payload -> dispatch.send action)
 ;;
 
 module Presentation = struct
@@ -1487,10 +1538,7 @@ let status_sheet_page ~tokens ~block dispatch =
         (Ui.Event.Handler.create (function
            | Ui.Event.Payload.Int64 id ->
              List.find_opt (fun (candidate, _, _) -> candidate = id) options
-             |> Option.iter (fun (_, tag, _) ->
-               Ui.Event.Handler.Private.invoke
-                 dispatch
-                 (Ui.Event.Payload.Text ("status-sheet-select:" ^ tag)))
+             |> Option.iter (fun (_, tag, _) -> dispatch.send (Status_sheet_select tag))
            | _ -> ()))
       (List.map
          (fun (id, tag, state) ->
@@ -1520,7 +1568,7 @@ let status_sheet_page ~tokens ~block dispatch =
       ()
   in
   Presentation.form [ picker ]
-  |> dismiss_toolbar ~test_id:"journal-status-close" ~command:"close-status" dispatch
+  |> dismiss_toolbar ~test_id:"journal-status-close" ~command:Close_status dispatch
   |> V.Body.with_test_id
        (Ui.Test_id.string ("journal-status-sheet-page:" ^ Journal_model.id block))
 ;;
@@ -1549,8 +1597,8 @@ let operation_feedback ~scope ~state dispatch body =
       ( summary
       , V.buttons
           ~actions:
-            [ action "Details" "exclamationmark.circle" "open-error-info"
-            ; action "Dismiss" "xmark" "dismiss-operation-error"
+            [ action "Details" "exclamationmark.circle" Open_error_info
+            ; action "Dismiss" "xmark" Dismiss_operation_error
             ]
           ()
         |> V.with_test_id (Ui.Test_id.string (scope ^ "-operation-actions")) )
@@ -1602,10 +1650,9 @@ let graph_unavailable_view ~message ~on_details ~on_diagnostics ~on_choose_graph
   |> V.with_test_id (Ui.Test_id.string "logseq-graph-open-failed")
 ;;
 
-let prefix_action handler prefix =
-  Ui.Event.Handler.create ~name:("journal-action-prefix:" ^ prefix) (function
-    | Ui.Event.Payload.Text value ->
-      Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text (prefix ^ value))
+let prefix_action dispatch action =
+  Ui.Event.Handler.create ~name:"journal-row-action" (function
+    | Ui.Event.Payload.Text value -> dispatch.send (action value)
     | _ -> ())
 ;;
 
@@ -1655,7 +1702,7 @@ let media_detail_roots state =
 ;;
 
 let media_label
-      ?store
+      ~store
       ?(on_region = fun _ -> ())
       ?(detail = false)
       state
@@ -1665,20 +1712,16 @@ let media_label
   =
   let scope = media_presentation_scope state ~detail in
   Journal_media_view.view
-    ?store
+    ~store
     ~on_region
     ~scope
     ~root
-    ~media:(Media_views.find_opt root state.media_views)
-    ~on_event:(fun payload ->
-      Ui.Event.Handler.Private.invoke
-        dispatch
-        (Ui.Event.Payload.Text ("media-session:" ^ scope ^ ":media:" ^ payload)))
+    ~on_event:(fun event -> dispatch.send (Media (scope, event)))
     child
 ;;
 
 let row_media_label
-      ?store
+      ~store
       ?(on_region = fun _ -> ())
       state
       dispatch
@@ -1688,16 +1731,12 @@ let row_media_label
   =
   let scope = media_presentation_scope state ~detail:false in
   Journal_media_view.row
-    ?store
+    ~store
     ~on_region
     ~scope
     ~root
     ~image_children
-    ~media_for_root:(fun id -> Media_views.find_opt id state.media_views)
-    ~on_event:(fun payload ->
-      Ui.Event.Handler.Private.invoke
-        dispatch
-        (Ui.Event.Payload.Text ("media-session:" ^ scope ^ ":media:" ^ payload)))
+    ~on_event:(fun event -> dispatch.send (Media (scope, event)))
     child
 ;;
 
@@ -1721,7 +1760,9 @@ module Favorites_list = struct
                  ~key:(Ui.Key.string ("favorite-open:" ^ key))
                  ~activation_id:key
                  ~enabled:actions_enabled
-                 ~on_activate:(bind_action on_open key)
+                 ~on_activate:
+                   (Ui.Event.Handler.create (fun _ ->
+                      Ui.Event.Handler.Private.invoke on_open (Ui.Event.Payload.Text key)))
                  ~label
                  ()
              else label
@@ -1862,6 +1903,7 @@ type composer_assets =
   ; completion : (string * string option) option
   ; on_attach : Journal_asset_import.source -> unit
   ; on_event : string -> unit
+  ; on_remove : string -> unit
   }
 
 let composer_content
@@ -1955,14 +1997,7 @@ let composer_content
                         match assets with
                         | None -> ()
                         | Some assets when enabled && not saving ->
-                          assets.on_event
-                            (Yojson.Basic.to_string
-                               (`Assoc
-                                   [ "action", `String "remove"
-                                   ; ( "token"
-                                     , `String (Journal_asset_import.staged_token staged)
-                                     )
-                                   ]))
+                          assets.on_remove (Journal_asset_import.staged_token staged)
                         | Some _ -> ())
                       ())
                  pending)))
@@ -1976,7 +2011,7 @@ let composer_content
             [ V.buttons_action
                 ~label:"Discard draft"
                 ~icon:"trash"
-                ~on_press:(bind_action on_edit "discard-capture")
+                ~on_press:(bind_action on_edit Discard_capture)
                 ()
             ]
           ()
@@ -1998,7 +2033,7 @@ let composer_content
       ?attachments
       ?feedback:(Option.map live_region_text error)
       ~actions:(attach @ [ task ] @ discard)
-      ~on_edit
+      ~on_edit:on_edit.native
       ~on_submit:ignored
       ~on_send:on_save
       ()
@@ -2096,7 +2131,7 @@ let timeline_page
       graph_unavailable_view
         ~message
         ~on_details:(if error_info_available then Some on_error_info else None)
-        ~on_diagnostics:(bind_action on_account_action "open-diagnostics")
+        ~on_diagnostics:(bind_action on_account_action Open_diagnostics)
         ~on_choose_graph:None
       |> V.Body.static
     | None when loading ->
@@ -2158,29 +2193,31 @@ let timeline_page
       (if error_info_available || Option.is_some header_signal
        then Some on_error_info
        else None)
-    ~on_account_action:(if account_menu_available then Some on_account_action else None)
+    ~on_account_action:
+      (if account_menu_available
+       then
+         Some
+           (fun (action : Journal_header.account_action) ->
+             on_account_action.send
+               (match action with
+                | Open_asset_settings -> Open_asset_settings
+                | Open_diagnostics -> Open_diagnostics
+                | Switch_graph -> Switch_graph
+                | Request_local_cache_reset -> Request_local_cache_reset
+                | Sign_out -> Sign_out))
+       else None)
     ~local_deletion_available:cache_reset_available
     ~on_journals:(destination_action 0L)
     ~on_favorites:(destination_action 1L)
-    ~on_capture:(bind_action on_capture_event "open-capture")
+    ~on_capture:(bind_action on_capture_event Open_capture)
     ~capture_enabled
     ~capture_expanded
     ~body:content
 ;;
 
-let obsolete_diagnostic_row = function
-  | "Phase" | "Startup presentation" -> true
-  | _ -> false
-;;
-
-let current_diagnostic_rows rows =
-  List.filter (fun (label, _) -> not (obsolete_diagnostic_row label)) rows
-;;
-
 let diagnostic_rows (diagnostics : Graph_service.diagnostics) =
   List.concat_map
-    (fun (group : Graph_service.diagnostic_group) ->
-       current_diagnostic_rows group.entries)
+    (fun (group : Graph_service.diagnostic_group) -> group.entries)
     diagnostics.groups
 ;;
 
@@ -2287,7 +2324,7 @@ let diagnostic_groups diagnostics =
   | Some (diagnostics : Graph_service.diagnostics) ->
     diagnostics.groups
     |> List.filter_map (fun (group : Graph_service.diagnostic_group) ->
-      let entries = current_diagnostic_rows group.entries in
+      let entries = group.entries in
       if entries = [] then None else Some (group.title, entries))
 ;;
 
@@ -2395,7 +2432,7 @@ let error_info_page ~sync_error ~operation_failure occurrences dispatch =
   Presentation.form (sync @ operation @ rows)
   |> dismiss_toolbar
        ~test_id:"journal-error-info-close"
-       ~command:"close-error-info"
+       ~command:Close_error_info
        dispatch
   |> V.Body.with_test_id (Ui.Test_id.string "journal-error-info-page")
 ;;
@@ -2418,7 +2455,7 @@ let diagnostics_page ~snapshot ~graph ~admission diagnostics dispatch =
        groups)
   |> dismiss_toolbar
        ~test_id:"journal-diagnostics-close"
-       ~command:"close-diagnostics"
+       ~command:Close_diagnostics
        dispatch
   |> V.Body.with_test_id (Ui.Test_id.string "journal-diagnostics-dialog-page")
 ;;
@@ -2447,7 +2484,7 @@ module Cache_confirmation = struct
     V.Confirmation.alert
       ~key:(Ui.Key.string "local-cache-confirmation")
       ~request
-      ~on_response:dispatch
+      ~on_response:dispatch.native
       body
     |> V.with_test_id (Ui.Test_id.string "local-cache-reset-confirmation")
   ;;
@@ -2472,7 +2509,6 @@ module Detail_list = struct
         ~on_visible_range
         ~children
     =
-    let row_actions = Hashtbl.create 16 in
     let depth = function
       | Journal_detail.Block row -> row.depth
       | More row -> row.depth
@@ -2488,16 +2524,8 @@ module Detail_list = struct
             V.Native_list.row ~key:row_key ~separator:Hidden label
           | Block { block; expanded; leaf; _ } ->
             let id = Journal_model.id block in
-            let delete = bind_action on_action ("detail-delete:" ^ id) in
-            let open_block = bind_action on_action ("detail-open:" ^ id) in
-            let register action handler =
-              Hashtbl.replace row_actions (Journal_detail.row_key row, action) handler
-            in
-            register "open" open_block;
-            if enabled
-            then (
-              register "delete" delete;
-              register ("delete:" ^ id) delete);
+            let delete = bind_action on_action (Detail_delete id) in
+            let open_block = bind_action on_action (Detail_open id) in
             let swipe_actions =
               V.Swipe_actions.create
                 ~allows_full_swipe:false
@@ -2554,11 +2582,8 @@ module Detail_list = struct
                 ~on_expanded_changed:
                   (Ui.Event.Handler.create (function
                      | Ui.Event.Payload.Bool expanded ->
-                       Ui.Event.Handler.Private.invoke
-                         on_action
-                         (Text
-                            ((if expanded then "detail-expand:" else "detail-collapse:")
-                             ^ id))
+                       on_action.send
+                         (if expanded then Detail_expand id else Detail_collapse id)
                      | _ -> ()))
                 ~label
                 nested
@@ -2592,23 +2617,6 @@ module Detail_list = struct
       ?scroll_request
       ~on_scroll_completed
       ~on_visible_range
-      ~on_row_event:
-        (Ui.Event.Handler.create (function
-           | Ui.Event.Payload.Native_event { payload; _ } ->
-             (match
-                try Yojson.Basic.from_string (Bytes.to_string payload) with
-                | _ -> `Null
-              with
-              | `Assoc fields ->
-                (match List.assoc_opt "row" fields, List.assoc_opt "key" fields with
-                 | Some (`String row), Some (`String action) ->
-                   Option.iter
-                     (fun handler ->
-                        Ui.Event.Handler.Private.invoke handler Ui.Event.Payload.Unit)
-                     (Hashtbl.find_opt row_actions (row, action))
-                 | _ -> ())
-              | _ -> ())
-           | _ -> ()))
       [ V.Native_list.section ~key:(Ui.Key.string "outline") ~separator:Hidden rows ]
     |> V.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-detail-outline")
     |> V.Body.Vertical.fill
@@ -2617,7 +2625,7 @@ module Detail_list = struct
 end
 
 let detail_page
-      ?media_store
+      ~media_store
       ?(on_region = fun _ -> ())
       ~state
       ~on_scroll_completed
@@ -2634,7 +2642,10 @@ let detail_page
       detail
   in
   let scope = Detail_outline.scope state.routes in
-  let on_action action = bind_action dispatch (scope ^ action) in
+  let local =
+    { dispatch with send = (fun action -> dispatch.send (Detail_action (scope, action))) }
+  in
+  let on_action action = bind_action local action in
   let button ~id ~command ~symbol title =
     V.buttons
       ~actions:
@@ -2659,7 +2670,7 @@ let detail_page
               (Option.to_list (Option.map live_region_text error)
                @ [ button
                      ~id:("detail-more:" ^ parent_id)
-                     ~command:("detail-more:" ^ parent_id)
+                     ~command:(Detail_more parent_id)
                      ~symbol:
                        (if Option.is_some error then "arrow.clockwise" else "ellipsis")
                      (if Option.is_some error
@@ -2678,7 +2689,7 @@ let detail_page
           V.text ~key:(Ui.Key.string ("detail-label:" ^ Journal_model.id block)) source
           |> V.with_test_id (Ui.Test_id.string ("detail-block:" ^ Journal_model.id block))
           |> media_label
-               ?store:media_store
+               ~store:media_store
                ~on_region
                ~detail:true
                state
@@ -2693,28 +2704,16 @@ let detail_page
         ~key:(Ui.Key.string scope)
         ~detail
         ~enabled:(enabled && not saving)
-        ~on_action:(prefix_action dispatch scope)
+        ~on_action:local
         ~on_scroll_completed
         ~on_visible_range:
           (Ui.Event.Handler.create (function
              | Ui.Event.Payload.Visible_range range ->
-               let payload =
-                 Yojson.Basic.to_string
-                   (`Assoc
-                       [ "action", `String "range"
-                       ; "root", `String ""
-                       ; "visible", `Bool true
-                       ; "first", `String (Int64.to_string range.first_index)
-                       ; "last", `String (Int64.to_string range.last_exclusive)
-                       ])
-               in
-               Ui.Event.Handler.Private.invoke
-                 dispatch
-                 (Ui.Event.Payload.Text
-                    ("media-session:"
-                     ^ media_presentation_scope state ~detail:true
-                     ^ ":media:"
-                     ^ payload))
+               dispatch.send
+                 (Media_range
+                    ( media_presentation_scope state ~detail:true
+                    , range.first_index
+                    , range.last_exclusive ))
              | _ -> ()))
         ~children:(rows detail)
     | None ->
@@ -2734,7 +2733,7 @@ let detail_page
            ~actions:
              (button
                 ~id:"detail-retry"
-                ~command:"detail-retry"
+                ~command:Detail_retry
                 ~symbol:"arrow.clockwise"
                 "Retry")
        | Detail | Timeline -> V.empty ())
@@ -2754,8 +2753,8 @@ let detail_page
   content
   |> Journal_header.detail
        ~actions:
-         [ action ~label:"Append" ~icon:"plus" "open-append"
-         ; action ~label:"Attach file" ~icon:"paperclip" "open-asset-import"
+         [ action ~label:"Append" ~icon:"plus" Open_append
+         ; action ~label:"Attach file" ~icon:"paperclip" Open_asset_import
          ]
   |> Journal_asset_import.view
        ~key:(Ui.Key.string (scope ^ "import"))
@@ -2772,10 +2771,7 @@ let detail_page
                then state.asset_import_request
                else 0))
        ~pending:[]
-       ~on_select:(fun payload ->
-         Ui.Event.Handler.Private.invoke
-           dispatch
-           (Ui.Event.Payload.Text (scope ^ "import-asset:" ^ payload)))
+       ~on_select:(fun payload -> local.send (Import_asset payload))
   |> V.Body.static
   |> V.Body.with_test_id (Ui.Test_id.string "journal-detail-route")
 ;;
@@ -2807,7 +2803,7 @@ let manager_page state dispatch =
   let diagnostics =
     button
       ~id:"journal-startup-diagnostics"
-      ~command:"open-diagnostics"
+      ~command:Open_diagnostics
       "Diagnostics"
       "stethoscope"
   in
@@ -2833,7 +2829,7 @@ let manager_page state dispatch =
   let choose_graph =
     capsule
       ~id:"graph-picker-choose"
-      ~command:"switch-graph"
+      ~command:Switch_graph
       "Choose another graph"
       "folder"
   in
@@ -2862,7 +2858,7 @@ let manager_page state dispatch =
     let refresh =
       button
         ~id:"graph-picker-refresh"
-        ~command:"refresh-catalog"
+        ~command:Refresh_catalog
         "Refresh graphs"
         "arrow.clockwise"
       |> V.help ~message:"Refresh the authorized graph catalog"
@@ -2884,7 +2880,7 @@ let manager_page state dispatch =
                 in
                 button
                   ~id:("graph-picker:" ^ graph_id)
-                  ~command:("select-graph:" ^ graph_id)
+                  ~command:(Select_graph graph_id)
                   graph.name
                   (if graph.encrypted then "lock.doc" else "folder"))
              graphs)
@@ -2902,7 +2898,7 @@ let manager_page state dispatch =
   let unlock error =
     let password = state.e2ee_password in
     let ignored = Ui.Event.Handler.create (fun _ -> ()) in
-    let submit = bind_action dispatch "submit-e2ee-password" in
+    let submit = bind_action dispatch Submit_e2ee_password in
     let editor =
       V.secure_field
         ~label:"Encryption password"
@@ -2919,7 +2915,7 @@ let manager_page state dispatch =
         ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
         ~update_mode:(Journal_capture.update_mode password)
         ~value:(Journal_capture.value password)
-        ~on_edit:dispatch
+        ~on_edit:dispatch.native
         ~on_submit:submit
         ~on_focus_changed:ignored
         ~on_limit_reached:ignored
@@ -2952,7 +2948,7 @@ let manager_page state dispatch =
         ~key:(Ui.Key.string "unlock-cancel")
         ~role:Cancel
         ~style:Plain
-        ~on_press:(bind_action dispatch "switch-graph")
+        ~on_press:(bind_action dispatch Switch_graph)
         ~child:(V.text "Choose another graph")
         ()
       |> V.with_test_id (Ui.Test_id.string "e2ee-password-cancel")
@@ -3025,9 +3021,9 @@ let manager_page state dispatch =
            ~on_details:
              (if state.worker_errors = []
               then None
-              else Some (bind_action dispatch "open-error-info"))
-           ~on_diagnostics:(bind_action dispatch "open-diagnostics")
-           ~on_choose_graph:(Some (bind_action dispatch "switch-graph"))
+              else Some (bind_action dispatch Open_error_info))
+           ~on_diagnostics:(bind_action dispatch Open_diagnostics)
+           ~on_choose_graph:(Some (bind_action dispatch Switch_graph))
          |> V.frame ~max_width:Fill ~max_height:Fill
          |> V.Body.static
          |> toolbar "Journals" []
@@ -3076,13 +3072,13 @@ let manager_page state dispatch =
            | Some Refresh_catalog ->
              capsule
                ~id:"graph-picker-retry"
-               ~command:"refresh-catalog"
+               ~command:Refresh_catalog
                "Retry"
                "arrow.clockwise"
            | Some Begin_online_recovery | Some Retry_graph_open ->
              capsule
                ~id:"graph-picker-retry"
-               ~command:"begin-online-recovery"
+               ~command:Begin_online_recovery
                "Retry"
                "arrow.clockwise"
            | Some Submit_e2ee_password | Some Sign_in | None -> V.empty ()
@@ -3105,7 +3101,6 @@ let manager_page state dispatch =
 ;;
 
 let identity_sequence = ref 0L
-let managed_sync_startup = ref true
 let managed_sync_origin = ref "https://api.logseq.io"
 
 let fresh_identity () =
@@ -3370,23 +3365,15 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
         if media_key state <> context
         then state
         else (
-          let media_views =
-            List.fold_left
-              (fun views (root, (view : Journal_media_runtime.view)) ->
-                 let empty = view.items = [] && view.error = None && not view.more in
-                 Journal_media_view.Store.update
-                   media_store
-                   ~root
-                   (if empty then None else Some view);
-                 if empty
-                 then Media_views.remove root views
-                 else if Media_views.find_opt root views = Some view
-                 then views
-                 else Media_views.add root view views)
-              state.media_views
-              changes
-          in
-          if media_views == state.media_views then state else { state with media_views }))
+          List.iter
+            (fun (root, (view : Journal_media_runtime.view)) ->
+               let empty = view.items = [] && view.error = None && not view.more in
+               Journal_media_view.Store.update
+                 media_store
+                 ~root
+                 (if empty then None else Some view))
+            changes;
+          state))
   in
   let import_worker_requests = Hashtbl.create 2 in
   (* operation token -> staged pick whose temp copy is removed on completion *)
@@ -4127,14 +4114,11 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
       | Error _ -> apply_authenticated_user payload)
   in
   let managed_startup =
-    if not !managed_sync_startup
-    then Effect.ignore
-    else
-      platform_request Journal_platform.local_account_binding_request ~f:(fun binding ->
-        Effect.bind (apply_local_account_binding binding) ~f:(fun () ->
-          platform_request Journal_platform.authenticated_user_request ~f:(function
-            | Error _ -> Effect.ignore
-            | Ok payload -> apply_authenticated_user payload)))
+    platform_request Journal_platform.local_account_binding_request ~f:(fun binding ->
+      Effect.bind (apply_local_account_binding binding) ~f:(fun () ->
+        platform_request Journal_platform.authenticated_user_request ~f:(function
+          | Error _ -> Effect.ignore
+          | Ok payload -> apply_authenticated_user payload)))
   in
   let calendar_startup =
     Effect.bind (sample_calendar ()) ~f:(function
@@ -4630,62 +4614,27 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                        (Capture_admitted capture))
                     request)))
     in
-    let media_source_active = ref true in
-    let media_owner = ref (media_presentation_scope snapshot ~detail:false) in
     let payload =
       match payload with
-      | Ui.Event.Payload.Text action
-        when String.starts_with ~prefix:"media-session:" action ->
-        let scopes = media_presentation_scopes snapshot in
-        (match
-           List.find_opt
-             (fun scope ->
-                String.starts_with ~prefix:("media-session:" ^ scope ^ ":") action)
-             scopes
-         with
-         | Some scope ->
-           media_owner := scope;
-           media_source_active
-           := scope
-              = media_presentation_scope
-                  snapshot
-                  ~detail:(Journal_routes.route snapshot.routes <> Timeline);
-           let prefix = "media-session:" ^ scope ^ ":" in
-           Ui.Event.Payload.Text
-             (String.sub
-                action
-                (String.length prefix)
-                (String.length action - String.length prefix))
-         | None -> Ui.Event.Payload.Unit)
-      | Ui.Event.Payload.Text action
-        when String.starts_with ~prefix:"detail-session:" action ->
-        let prefix = Detail_outline.scope snapshot.routes in
-        if String.starts_with ~prefix action
-        then
-          Ui.Event.Payload.Text
-            (String.sub
-               action
-               (String.length prefix)
-               (String.length action - String.length prefix))
-        else Ui.Event.Payload.Unit
-      | payload -> payload
+      | Detail_action (owner, action) ->
+        if owner = Detail_outline.scope snapshot.routes
+        then action
+        else Native_payload Unit
+      | action -> action
     in
     match payload with
     | payload
       when local_deletion_active snapshot
            &&
            match payload with
-           | Ui.Event.Payload.Text ("open-diagnostics" | "close-diagnostics")
-           | Ui.Event.Payload.Navigation_path_changed _ -> false
-           | Ui.Event.Payload.Text text
-             when String.starts_with ~prefix:"asset-settings:" text -> false
+           | Open_diagnostics | Close_diagnostics
+           | Native_payload (Ui.Event.Payload.Navigation_path_changed _) -> false
+           | Asset_settings _ -> false
            | _ -> true -> Effect.ignore
-    | Ui.Event.Payload.Text "open-asset-settings" ->
+    | Open_asset_settings ->
       update (fun state -> { state with asset_settings_open = true })
-    | Ui.Event.Payload.Text text when String.starts_with ~prefix:"asset-settings:" text ->
-      (match
-         Journal_asset_settings.decode (String.sub text 15 (String.length text - 15))
-       with
+    | Asset_settings text ->
+      (match Journal_asset_settings.decode text with
        | None -> Effect.ignore
        | Some Dismissed ->
          update (fun state -> { state with asset_settings_open = false })
@@ -4715,7 +4664,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                refresh_assets
                  ~graph_generation:current.graph_state.generation
                  current.calendar)))
-    | Ui.Event.Payload.Confirmation_response response ->
+    | Native_payload (Ui.Event.Payload.Confirmation_response response) ->
       set_state_and_effect (fun state ->
         match state.modal with
         | Cache_reset_confirmation graph_id
@@ -4727,7 +4676,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
            | Action "cancel" | Dismissed -> { state with modal = No_modal }, Effect.ignore
            | Action _ -> state, Effect.ignore)
         | _ -> state, Effect.ignore)
-    | Ui.Event.Payload.Text_edit edit ->
+    | Native_payload (Ui.Event.Payload.Text_edit edit) ->
       update (fun state ->
         match state.modal, state.manager with
         | Capture_sheet, _ -> Root_navigation.step state (Capture_native_edit edit)
@@ -4749,18 +4698,18 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           then state
           else { state with e2ee_password }
         | _ -> state)
-    | Ui.Event.Payload.Text "capture-submit" ->
+    | Capture_submit ->
       (match snapshot.modal, snapshot.direct_capture with
        | Capture_sheet, Some capture ->
          admit_direct_capture (Journal_capture.source capture)
        | _ -> Effect.ignore)
-    | Ui.Event.Payload.Text "select-journals" ->
+    | Select_journals ->
       update (fun state -> Root_navigation.step state (Select Journal_routes.Journals))
-    | Ui.Event.Payload.Text "select-favorites" ->
+    | Select_favorites ->
       update (fun state -> Root_navigation.step state (Select Journal_routes.Favorites))
-    | Ui.Event.Payload.Text "favorites-retry" ->
-      update (fun state -> favorites_event state Retry)
-    | Ui.Event.Payload.Int64_pair { first = first_index; second = last_exclusive }
+    | Favorites_retry -> update (fun state -> favorites_event state Retry)
+    | Native_payload
+        (Ui.Event.Payload.Int64_pair { first = first_index; second = last_exclusive })
       when Journal_routes.route snapshot.routes = Timeline
            && Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
       let total = Rrbvec.length snapshot.favorites_media_roots in
@@ -4781,23 +4730,20 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
       Effect.bind (flush_media set_state) ~f:(fun () ->
         update (fun state ->
           favorites_event state (Visible { first_index; last_exclusive })))
-    | Ui.Event.Payload.Visible_range _
+    | Native_payload (Ui.Event.Payload.Visible_range _)
       when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
       Effect.ignore
-    | Ui.Event.Payload.Visible_range range ->
+    | Native_payload (Ui.Event.Payload.Visible_range range) ->
       let total = Int64.of_int (Journal_timeline_state.total_count snapshot.timeline) in
       let bounded value = Int64.to_int (Int64.min total (Int64.max 0L value)) in
       let first = bounded range.first_index in
       let last = bounded range.last_exclusive in
-      let offset = Journal_timeline_state.first_retained_index snapshot.timeline in
       let rec collect index roots =
         if index >= last
         then roots
         else (
           let roots =
-            match
-              Journal_timeline_state.retained_slot snapshot.timeline (index - offset)
-            with
+            match Journal_timeline_state.retained_slot snapshot.timeline index with
             | Some (Top_level entry) ->
               Journal_model.id entry.block
               :: List.rev_append
@@ -4831,8 +4777,8 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           || observe snapshot.timeline = snapshot.timeline
         then Effect.ignore
         else update (fun state -> { state with timeline = observe state.timeline }))
-    | Ui.Event.Payload.Navigation_path_changed [] -> update back_state
-    | Ui.Event.Payload.Bool false ->
+    | Native_payload (Ui.Event.Payload.Navigation_path_changed []) -> update back_state
+    | Native_payload (Ui.Event.Payload.Bool false) ->
       update (fun state ->
         match state.modal with
         | Diagnostics ->
@@ -4844,584 +4790,501 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
         | Capture_sheet -> Root_navigation.step state Capture_closed
         | Append_sheet | Status_sheet _ | Error_info | Cache_reset_confirmation _ ->
           { state with modal = No_modal })
-    | Ui.Event.Payload.Text action ->
-      if String.starts_with ~prefix:"media:" action
-      then
-        Effect.bind
-          (Effect.of_thunk (fun () ->
-             sync_media snapshot;
-             try
-               let json =
-                 Yojson.Basic.from_string (String.sub action 6 (String.length action - 6))
-               in
-               let field name = Yojson.Basic.Util.member name json in
-               let text name = Yojson.Basic.Util.to_string (field name) in
-               let root = text "root" in
-               let visible = Yojson.Basic.Util.to_bool (field "visible") in
-               let detail_roots =
-                 List.assoc_opt !media_owner (media_detail_roots snapshot)
-               in
-               (* A retained page can appear before native path-changed. Its
-                  validated scope may reclaim media ownership while covered. *)
-               match text "action" with
-               | "range" ->
-                 Option.iter
-                   (fun rows ->
-                      let total = List.length rows in
-                      let bounded name =
-                        Int64.to_int
-                          (Int64.min
-                             (Int64.of_int total)
-                             (Int64.max 0L (Int64.of_string (text name))))
-                      in
-                      let first = bounded "first" in
-                      let last = max first (bounded "last") in
-                      let roots =
-                        List.filter_map
-                          Fun.id
-                          (List.mapi
-                             (fun index root ->
-                                if index >= first && index < last then root else None)
-                             rows)
-                      in
-                      Journal_media_runtime.retain_visible_roots
-                        ~owner:!media_owner
-                        media_runtime
-                        roots)
-                   detail_roots
-               | _
-                 when visible
-                      && Option.fold
-                           ~none:false
-                           ~some:(fun rows -> not (List.mem (Some root) rows))
-                           detail_roots -> ()
-               | "root" ->
-                 Journal_media_runtime.root_visible
-                   ~owner:!media_owner
-                   media_runtime
-                   ~root
-                   visible
-               | "asset" ->
-                 Journal_media_runtime.asset_visible
-                   ~owner:!media_owner
-                   media_runtime
-                   ~root
-                   ~asset:(text "asset")
-                   visible
-               | "preview" ->
-                 Journal_media_runtime.preview_visible
-                   media_runtime
-                   ~owner:!media_owner
-                   ~slot:(text "slot")
-                   ~root
-                   ~asset:(text "asset")
-                   visible
-               | _ when visible && not !media_source_active -> ()
-               | "retry" ->
-                 Journal_media_runtime.retry
-                   ~owner:!media_owner
-                   media_runtime
-                   ~root
-                   ~asset:(text "asset")
-               | "next" -> Journal_media_runtime.next media_runtime ~root
-               | _ -> ()
-             with
-             | _ -> ()))
-          ~f:(fun () -> flush_media set_state)
-      else if String.equal action "open-asset-import"
-      then
-        update (fun state ->
-          if
-            state.write_enabled
-            && Option.is_none state.pending_delete
-            && Option.is_none state.pending_status
-            && Option.fold
-                 ~none:false
-                 ~some:(fun detail -> Journal_detail.mode detail <> Saving_child)
-                 (Journal_routes.detail state.routes)
-          then
-            { state with
-              asset_import_request = state.asset_import_request + 1
-            ; asset_import_owner =
-                Option.map
-                  (fun id -> id, Journal_routes.detail_request_generation state.routes)
-                  (Journal_routes.active_entry_id state.routes)
-            }
-          else state)
-      else if String.starts_with ~prefix:"import-asset:" action
-      then (
-        let import_payload = String.sub action 13 (String.length action - 13) in
-        if Journal_asset_import.is_dismissal import_payload
-        then Effect.ignore
-        else (
-          match Journal_routes.detail snapshot.routes with
-          | None -> Effect.ignore
-          | Some detail ->
-            let target =
-              Logseq_db_types.Graph_types.Uuid.of_string
-                (Journal_model.id (Journal_detail.root detail))
-            in
-            let source =
-              Result.bind target (fun target ->
-                Journal_asset_import.decode ~target import_payload)
-            in
-            (match source with
-             | Error _ -> Effect.ignore
-             | Ok source ->
-               let operation =
-                 Logseq_db_types.Graph_types.Uuid.to_string source.operation
-               in
-               let graph_generation = snapshot.graph_state.generation in
-               Effect.bind
-                 (Effect.of_thunk (fun () ->
-                    if not snapshot.write_enabled
-                    then Some "The destination is not ready for imports"
-                    else (
-                      match
-                        Worker.send
-                          client
-                          (Graph_service.Import_asset { graph_generation; source })
-                      with
-                      | Accepted id ->
-                        Hashtbl.replace
-                          import_worker_requests
-                          id
-                          ( graph_generation
-                          , operation
-                          , Option.map
-                              (fun id ->
-                                 ( id
-                                 , Journal_routes.detail_request_generation
-                                     snapshot.routes ))
-                              (Journal_routes.active_entry_id snapshot.routes) );
-                        None
-                      | Full | Not_ready | Stopping ->
-                        Some "Import is temporarily unavailable. Select the file again.")))
-                 ~f:(function
-                   | None -> Effect.ignore
-                   | Some message ->
-                     update (fun state ->
-                       { state with import_completion = Some (operation, Some message) })))))
-      else if String.length action > 13 && String.sub action 0 13 = "select-graph:"
-      then (
-        let graph_id = String.sub action 13 (String.length action - 13) in
-        match Logseq_db_types.Graph_types.Uuid.of_string graph_id with
-        | Error _ -> Effect.ignore
-        | Ok graph_id -> send_manager (Graph_service.Select_graph graph_id))
-      else if String.equal action "refresh-catalog"
-      then send_manager Graph_service.Refresh_catalog
-      else if String.equal action "begin-online-recovery"
-      then send_manager Graph_service.Begin_online_recovery
-      else if
-        String.equal action "open-capture"
-        && snapshot.write_enabled
-        && snapshot.pending_delete = None
-        && snapshot.pending_status = None
-      then update (fun state -> Root_navigation.step state Capture_opened)
-      else if String.equal action "close-composer"
-      then update (fun state -> Root_navigation.step state Capture_closed)
-      else if String.equal action "discard-capture"
-      then update (fun state -> Root_navigation.step state Capture_discarded)
-      else if String.starts_with ~prefix:"capture-attach:" action
-      then
-        update (fun state ->
-          match
-            ( Journal_asset_import.source_of_string
-                (String.sub action 15 (String.length action - 15))
-            , state.direct_capture )
-          with
-          | Some source, Some capture
-            when state.write_enabled
-                 && Option.is_none state.pending_delete
-                 && Option.is_none state.pending_status
-                 && Journal_capture.can_attach capture ->
-            Root_navigation.step state (Capture_picker_requested source)
-          | _ -> state)
-      else if String.starts_with ~prefix:"capture-asset:" action
-      then (
-        match
-          Journal_asset_import.decode_event
-            (String.sub action 14 (String.length action - 14))
-        with
-        | Error _ | Ok Journal_asset_import.Dismissed -> Effect.ignore
-        | Ok (Journal_asset_import.Unavailable message) ->
-          update (fun state ->
-            { state with capture_error = Some (Local_capture_failure message) })
-        | Ok (Journal_asset_import.Removed token) ->
-          (match snapshot.direct_capture with
-           | Some capture ->
-             List.iter
-               (fun (staged : Journal_asset_import.staged) ->
-                  if String.equal (Journal_asset_import.staged_token staged) token
-                  then Journal_asset_import.discard_staged_file staged)
-               (Journal_capture.pending_attachments capture)
-           | None -> ());
-          update (fun state ->
-            { state with
-              direct_capture =
-                Option.map
-                  (fun capture -> Journal_capture.remove_attachment capture ~token)
-                  state.direct_capture
-            })
-        | Ok (Journal_asset_import.Picked (staged, request_id)) ->
-          update (fun state ->
-            Root_navigation.step state (Capture_asset_picked (staged, request_id))))
-      else if
-        String.equal action "capture-task-on" || String.equal action "capture-task-off"
-      then
-        update (fun state ->
-          Root_navigation.step state (Capture_task_intent (action = "capture-task-on")))
-      else if
-        String.equal action "open-append"
-        && snapshot.write_enabled
-        && snapshot.pending_delete = None
-        && snapshot.pending_status = None
-      then
-        update (fun state ->
-          match Journal_routes.detail state.routes with
-          | None -> state
-          | Some detail ->
-            let detail =
-              if Journal_detail.child_capture detail = None
-              then Journal_detail.update_child_source detail ""
-              else detail
-            in
-            { state with
-              modal = Append_sheet
-            ; routes = Journal_routes.update_detail state.routes detail
-            })
-      else if String.equal action "close-status"
-      then
-        update (fun state ->
-          match state.modal with
-          | Status_sheet _ -> { state with modal = No_modal }
-          | _ -> state)
-      else if String.equal action "open-diagnostics"
-      then
-        set_state_and_effect (fun state ->
-          let admission_refresh, directive =
-            Admission_refresh.open_
-              state.admission_refresh
-              ~graph_generation:state.graph_state.generation
-              ~graph_open:(state.graph_state.phase = Graph_open)
-          in
-          ( { state with modal = Diagnostics; admission_refresh }
-          , run_admission_directive set_state_and_effect directive ))
-      else if String.equal action "close-diagnostics"
-      then
-        update (fun state ->
+    | Media_range (owner, first, last)
+      when List.mem owner (media_presentation_scopes snapshot) ->
+      Effect.bind
+        (Effect.of_thunk (fun () ->
+           sync_media snapshot;
+           Option.iter
+             (fun rows ->
+                let total = List.length rows in
+                let bounded value =
+                  Int64.to_int (Int64.min (Int64.of_int total) (Int64.max 0L value))
+                in
+                let first = bounded first in
+                let last = max first (bounded last) in
+                let roots =
+                  List.filter_map
+                    Fun.id
+                    (List.mapi
+                       (fun index root ->
+                          if index >= first && index < last then root else None)
+                       rows)
+                in
+                Journal_media_runtime.retain_visible_roots ~owner media_runtime roots)
+             (List.assoc_opt owner (media_detail_roots snapshot))))
+        ~f:(fun () -> flush_media set_state)
+    | Media (owner, event) when List.mem owner (media_presentation_scopes snapshot) ->
+      Effect.bind
+        (Effect.of_thunk (fun () ->
+           sync_media snapshot;
+           let source_active =
+             owner
+             = media_presentation_scope
+                 snapshot
+                 ~detail:(Journal_routes.route snapshot.routes <> Timeline)
+           in
+           let allowed_root =
+             Option.fold
+               ~none:true
+               ~some:(fun rows -> List.mem (Some event.Journal_media_view.root) rows)
+               (List.assoc_opt owner (media_detail_roots snapshot))
+           in
+           if event.visible && not allowed_root
+           then ()
+           else (
+             match event.action with
+             | Root ->
+               Journal_media_runtime.root_visible
+                 ~owner
+                 media_runtime
+                 ~root:event.root
+                 event.visible
+             | Asset ->
+               Journal_media_runtime.asset_visible
+                 ~owner
+                 media_runtime
+                 ~root:event.root
+                 ~asset:event.asset
+                 event.visible
+             | Preview ->
+               Journal_media_runtime.preview_visible
+                 media_runtime
+                 ~owner
+                 ~slot:event.slot
+                 ~root:event.root
+                 ~asset:event.asset
+                 event.visible
+             | _ when event.visible && not source_active -> ()
+             | Retry ->
+               Journal_media_runtime.retry
+                 ~owner
+                 media_runtime
+                 ~root:event.root
+                 ~asset:event.asset
+             | Next -> Journal_media_runtime.next media_runtime ~root:event.root)))
+        ~f:(fun () -> flush_media set_state)
+    | Open_asset_import ->
+      update (fun state ->
+        if
+          state.write_enabled
+          && Option.is_none state.pending_delete
+          && Option.is_none state.pending_status
+          && Option.fold
+               ~none:false
+               ~some:(fun detail -> Journal_detail.mode detail <> Saving_child)
+               (Journal_routes.detail state.routes)
+        then
           { state with
-            modal = No_modal
-          ; admission_refresh = Admission_refresh.close state.admission_refresh
-          })
-      else if String.equal action "open-error-info"
-      then
-        update (fun state ->
-          if
-            state.worker_errors = []
-            && Option.is_none
-                 (Option.bind state.manager (fun manager -> manager.last_error))
-            && Option.is_none (operation_failure state.timeline_notice)
-          then state
-          else { state with modal = Error_info })
-      else if String.equal action "dismiss-operation-error"
-      then
-        update (fun state ->
-          match state.timeline_notice with
-          | Some (Delete_failed _ | Status_failed _) ->
-            { state with timeline_notice = None }
-          | None | Some Delete_undo -> state)
-      else if String.equal action "close-error-info"
-      then update (fun state -> { state with modal = No_modal })
-      else if String.equal action "switch-graph"
-      then
-        Effect.many
-          [ update (fun state -> { state with modal = No_modal })
-          ; send_manager Graph_service.Return_to_graph_picker
-          ]
-      else if String.equal action "sign-out"
-      then (
-        sign_out_in_flight := true;
-        Effect.many
-          [ update (fun state -> Root_navigation.step state Account_cleared)
-          ; send_manager (Graph_service.Reconcile_authenticated_user { user_id = None })
-          ])
-      else if String.equal action "submit-e2ee-password"
-      then (
-        let password = Journal_capture.source snapshot.e2ee_password in
-        if String.equal (String.trim password) ""
-        then Effect.ignore
-        else
-          Effect.many
-            [ send_manager (Graph_service.Submit_e2ee_password password)
-            ; update (fun state ->
-                { state with
-                  e2ee_password =
-                    Journal_capture.create
-                      ~session_number:state.next_local_sequence
-                      ~source:""
-                ; next_local_sequence = Int64.succ state.next_local_sequence
-                })
-            ])
-      else if String.equal action "request-local-cache-reset"
-      then
-        update (fun state ->
-          match state.manager with
-          | Some { selected_graph = Some graph_id; _ } when local_deletion_available state
-            ->
-            { state with
-              modal = Cache_reset_confirmation graph_id
-            ; confirmation_sequence = Int64.succ state.confirmation_sequence
-            }
-          | None | Some _ -> state)
-      else if String.equal action "delete-undo"
-      then
-        update (fun state ->
-          match state.pending_delete with
-          | Some ({ phase = Undoable; _ } as pending) ->
-            { (restore_deleted state pending) with
-              pending_delete = None
-            ; timeline_notice = None
-            }
-          | None | Some { phase = Committing; _ } -> state)
-      else if String.equal action "back"
-      then update back_state
-      else if String.starts_with ~prefix:"timeline-retry:" action
-      then (
-        match int_of_string_opt (String.sub action 15 (String.length action - 15)) with
-        | None -> Effect.ignore
-        | Some day ->
-          update (fun state ->
-            { state with timeline = Journal_timeline_state.retry_day state.timeline ~day }))
-      else if String.starts_with ~prefix:"detail-open:" action
-      then open_block (String.sub action 12 (String.length action - 12))
-      else if String.starts_with ~prefix:"detail-expand:" action
-      then
-        detail_event
-          (Set_branch_expanded (String.sub action 14 (String.length action - 14), true))
-      else if String.starts_with ~prefix:"detail-collapse:" action
-      then
-        detail_event
-          (Set_branch_expanded (String.sub action 16 (String.length action - 16), false))
-      else if String.starts_with ~prefix:"detail-more:" action
-      then detail_event (Load_more (String.sub action 12 (String.length action - 12)))
-      else if String.starts_with ~prefix:"detail-draft:" action
-      then update_draft ~toggle:false (String.sub action 13 (String.length action - 13))
-      else if String.starts_with ~prefix:"detail-task-intent:" action
-      then update_draft ~toggle:true (String.sub action 19 (String.length action - 19))
-      else if String.equal action "detail-retry"
-      then (
+            asset_import_request = state.asset_import_request + 1
+          ; asset_import_owner =
+              Option.map
+                (fun id -> id, Journal_routes.detail_request_generation state.routes)
+                (Journal_routes.active_entry_id state.routes)
+          }
+        else state)
+    | Import_asset value ->
+      let import_payload = value in
+      if Journal_asset_import.is_dismissal import_payload
+      then Effect.ignore
+      else (
         match Journal_routes.detail snapshot.routes with
-        | None ->
-          let generation = snapshot.next_request_generation in
-          let routes, request =
-            Journal_routes.retry_detail snapshot.routes ~request_generation:generation
-          in
-          (match request with
-           | None -> Effect.ignore
-           | Some request ->
-             with_direct_request
-               { snapshot with routes; next_request_generation = Int64.succ generation }
-               request)
+        | None -> Effect.ignore
         | Some detail ->
-          let number = snapshot.next_local_sequence in
-          let detail, request = Journal_detail.retry detail in
-          (match request with
-           | None -> Effect.ignore
-           | Some request ->
-             with_direct_request
-               { snapshot with
-                 routes = Journal_routes.update_detail snapshot.routes detail
-               ; next_local_sequence = Int64.succ number
-               }
-               request))
-      else if
-        String.starts_with ~prefix:"detail-submit:" action
-        && snapshot.write_enabled
-        && snapshot.pending_delete = None
-        && snapshot.pending_status = None
-      then (
-        match Journal_routes.detail snapshot.routes, snapshot.calendar with
-        | Some detail, Some _ ->
-          let detail =
-            Journal_detail.update_child_source
-              detail
-              (String.sub action 14 (String.length action - 14))
+          let target =
+            Logseq_db_types.Graph_types.Uuid.of_string
+              (Journal_model.id (Journal_detail.root detail))
           in
-          (match Journal_calendar.Sampler.sample calendar_sampler with
-           | Error error ->
-             update (fun state ->
-               { state with
-                 capture_error =
-                   Some (Local_capture_failure (Journal_calendar.error_message error))
-               })
-           | Ok calendar ->
-             Journal_graph_runtime.set_calendar graph_runtime calendar;
-             let creation_time = Journal_time.of_calendar calendar |> Result.get_ok in
-             let number = snapshot.next_local_sequence in
-             let admission =
-               with_block_identity
-                 ~creation_time
-                 ~f:(fun block_id ->
-                   if
-                     match Journal_detail.mode detail with
-                     | Failed _ -> true
-                     | _ -> false
-                   then Journal_detail.retry detail
-                   else
-                     Journal_detail.admit_child
-                       detail
-                       ~mutation_id:(fresh_identity ())
-                       ~calendar_generation:(Journal_calendar.generation calendar)
-                       ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
-                       ~sibling_order:(sibling_order number)
-                       ~creation_time)
-                 ()
+          let source =
+            Result.bind target (fun target ->
+              Journal_asset_import.decode ~target import_payload)
+          in
+          (match source with
+           | Error _ -> Effect.ignore
+           | Ok source ->
+             let operation =
+               Logseq_db_types.Graph_types.Uuid.to_string source.operation
              in
-             (match admission with
-              | Error message ->
-                update (fun state ->
-                  { state with capture_error = Some (Local_capture_failure message) })
-              | Ok (_, None) -> Effect.ignore
-              | Ok (detail, Some request) ->
-                with_direct_request
-                  { snapshot with
-                    calendar = Some calendar
-                  ; routes = Journal_routes.update_detail snapshot.routes detail
-                  ; capture_error = None
-                  ; next_local_sequence = Int64.succ number
-                  }
-                  request))
-        | None, _ | _, None -> Effect.ignore)
-      else if String.length action > 16 && String.sub action 0 16 = "timeline-status:"
-      then (
-        let block_id = String.sub action 16 (String.length action - 16) in
-        match
-          ( snapshot.write_enabled
-          , snapshot.pending_delete
-          , snapshot.pending_status
-          , block_in_timeline snapshot.timeline block_id )
-        with
-        | true, None, None, Some _ ->
-          update (fun state -> { state with modal = Status_sheet block_id })
-        | false, _, _, _
-        | true, Some _, _, _
-        | true, None, Some _, _
-        | true, None, None, None -> Effect.ignore)
-      else if String.length action > 20 && String.sub action 0 20 = "status-sheet-select:"
-      then (
-        let tag = String.sub action 20 (String.length action - 20) in
-        let task_state = List.assoc_opt tag status_sheet_options in
-        match
-          ( snapshot.modal
-          , snapshot.write_enabled
-          , snapshot.pending_delete
-          , snapshot.pending_status
-          , task_state )
-        with
-        | Status_sheet block_id, true, None, None, Some task_state ->
-          (match block_in_timeline snapshot.timeline block_id with
-           | None -> update (fun state -> { state with modal = No_modal })
-           | Some block when Journal_model.task_state block = task_state -> Effect.ignore
-           | Some block ->
-             let pending_status =
+             let graph_generation = snapshot.graph_state.generation in
+             Effect.bind
+               (Effect.of_thunk (fun () ->
+                  if not snapshot.write_enabled
+                  then Some "The destination is not ready for imports"
+                  else (
+                    match
+                      Worker.send
+                        client
+                        (Graph_service.Import_asset { graph_generation; source })
+                    with
+                    | Accepted id ->
+                      Hashtbl.replace
+                        import_worker_requests
+                        id
+                        ( graph_generation
+                        , operation
+                        , Option.map
+                            (fun id ->
+                               ( id
+                               , Journal_routes.detail_request_generation snapshot.routes
+                               ))
+                            (Journal_routes.active_entry_id snapshot.routes) );
+                      None
+                    | Full | Not_ready | Stopping ->
+                      Some "Import is temporarily unavailable. Select the file again.")))
+               ~f:(function
+                 | None -> Effect.ignore
+                 | Some message ->
+                   update (fun state ->
+                     { state with import_completion = Some (operation, Some message) }))))
+    | Select_graph value ->
+      let graph_id = value in
+      (match Logseq_db_types.Graph_types.Uuid.of_string graph_id with
+       | Error _ -> Effect.ignore
+       | Ok graph_id -> send_manager (Graph_service.Select_graph graph_id))
+    | Refresh_catalog -> send_manager Graph_service.Refresh_catalog
+    | Begin_online_recovery -> send_manager Graph_service.Begin_online_recovery
+    | Open_capture
+      when snapshot.write_enabled
+           && snapshot.pending_delete = None
+           && snapshot.pending_status = None ->
+      update (fun state -> Root_navigation.step state Capture_opened)
+    | Close_composer -> update (fun state -> Root_navigation.step state Capture_closed)
+    | Discard_capture ->
+      update (fun state -> Root_navigation.step state Capture_discarded)
+    | Capture_attach value ->
+      update (fun state ->
+        match state.direct_capture with
+        | Some capture
+          when state.write_enabled
+               && Option.is_none state.pending_delete
+               && Option.is_none state.pending_status
+               && Journal_capture.can_attach capture ->
+          Root_navigation.step state (Capture_picker_requested value)
+        | _ -> state)
+    | Capture_asset value ->
+      (match value with
+       | Journal_asset_import.Dismissed -> Effect.ignore
+       | Journal_asset_import.Unavailable message ->
+         update (fun state ->
+           { state with capture_error = Some (Local_capture_failure message) })
+       | Journal_asset_import.Removed token ->
+         (match snapshot.direct_capture with
+          | Some capture ->
+            List.iter
+              (fun (staged : Journal_asset_import.staged) ->
+                 if String.equal (Journal_asset_import.staged_token staged) token
+                 then Journal_asset_import.discard_staged_file staged)
+              (Journal_capture.pending_attachments capture)
+          | None -> ());
+         update (fun state ->
+           { state with
+             direct_capture =
+               Option.map
+                 (fun capture -> Journal_capture.remove_attachment capture ~token)
+                 state.direct_capture
+           })
+       | Journal_asset_import.Picked (staged, request_id) ->
+         update (fun state ->
+           Root_navigation.step state (Capture_asset_picked (staged, request_id))))
+    | (Capture_task_on | Capture_task_off) as action ->
+      update (fun state ->
+        Root_navigation.step state (Capture_task_intent (action = Capture_task_on)))
+    | Open_append
+      when snapshot.write_enabled
+           && snapshot.pending_delete = None
+           && snapshot.pending_status = None ->
+      update (fun state ->
+        match Journal_routes.detail state.routes with
+        | None -> state
+        | Some detail ->
+          let detail =
+            if Journal_detail.child_capture detail = None
+            then Journal_detail.update_child_source detail ""
+            else detail
+          in
+          { state with
+            modal = Append_sheet
+          ; routes = Journal_routes.update_detail state.routes detail
+          })
+    | Close_status ->
+      update (fun state ->
+        match state.modal with
+        | Status_sheet _ -> { state with modal = No_modal }
+        | _ -> state)
+    | Open_diagnostics ->
+      set_state_and_effect (fun state ->
+        let admission_refresh, directive =
+          Admission_refresh.open_
+            state.admission_refresh
+            ~graph_generation:state.graph_state.generation
+            ~graph_open:(state.graph_state.phase = Graph_open)
+        in
+        ( { state with modal = Diagnostics; admission_refresh }
+        , run_admission_directive set_state_and_effect directive ))
+    | Close_diagnostics ->
+      update (fun state ->
+        { state with
+          modal = No_modal
+        ; admission_refresh = Admission_refresh.close state.admission_refresh
+        })
+    | Open_error_info ->
+      update (fun state ->
+        if
+          state.worker_errors = []
+          && Option.is_none
+               (Option.bind state.manager (fun manager -> manager.last_error))
+          && Option.is_none (operation_failure state.timeline_notice)
+        then state
+        else { state with modal = Error_info })
+    | Dismiss_operation_error ->
+      update (fun state ->
+        match state.timeline_notice with
+        | Some (Delete_failed _ | Status_failed _) ->
+          { state with timeline_notice = None }
+        | None | Some Delete_undo -> state)
+    | Close_error_info -> update (fun state -> { state with modal = No_modal })
+    | Switch_graph ->
+      Effect.many
+        [ update (fun state -> { state with modal = No_modal })
+        ; send_manager Graph_service.Return_to_graph_picker
+        ]
+    | Sign_out ->
+      sign_out_in_flight := true;
+      Effect.many
+        [ update (fun state -> Root_navigation.step state Account_cleared)
+        ; send_manager (Graph_service.Reconcile_authenticated_user { user_id = None })
+        ]
+    | Submit_e2ee_password ->
+      let password = Journal_capture.source snapshot.e2ee_password in
+      if String.equal (String.trim password) ""
+      then Effect.ignore
+      else
+        Effect.many
+          [ send_manager (Graph_service.Submit_e2ee_password password)
+          ; update (fun state ->
+              { state with
+                e2ee_password =
+                  Journal_capture.create
+                    ~session_number:state.next_local_sequence
+                    ~source:""
+              ; next_local_sequence = Int64.succ state.next_local_sequence
+              })
+          ]
+    | Request_local_cache_reset ->
+      update (fun state ->
+        match state.manager with
+        | Some { selected_graph = Some graph_id; _ } when local_deletion_available state
+          ->
+          { state with
+            modal = Cache_reset_confirmation graph_id
+          ; confirmation_sequence = Int64.succ state.confirmation_sequence
+          }
+        | None | Some _ -> state)
+    | Delete_undo ->
+      update (fun state ->
+        match state.pending_delete with
+        | Some ({ phase = Undoable; _ } as pending) ->
+          { (restore_deleted state pending) with
+            pending_delete = None
+          ; timeline_notice = None
+          }
+        | None | Some { phase = Committing; _ } -> state)
+    | Timeline_retry value ->
+      (match int_of_string_opt value with
+       | None -> Effect.ignore
+       | Some day ->
+         update (fun state ->
+           { state with timeline = Journal_timeline_state.retry_day state.timeline ~day }))
+    | Detail_open value -> open_block value
+    | Detail_expand value -> detail_event (Set_branch_expanded (value, true))
+    | Detail_collapse value -> detail_event (Set_branch_expanded (value, false))
+    | Detail_more value -> detail_event (Load_more value)
+    | Detail_task_intent value -> update_draft ~toggle:true value
+    | Detail_retry ->
+      (match Journal_routes.detail snapshot.routes with
+       | None ->
+         let generation = snapshot.next_request_generation in
+         let routes, request =
+           Journal_routes.retry_detail snapshot.routes ~request_generation:generation
+         in
+         (match request with
+          | None -> Effect.ignore
+          | Some request ->
+            with_direct_request
+              { snapshot with routes; next_request_generation = Int64.succ generation }
+              request)
+       | Some detail ->
+         let number = snapshot.next_local_sequence in
+         let detail, request = Journal_detail.retry detail in
+         (match request with
+          | None -> Effect.ignore
+          | Some request ->
+            with_direct_request
+              { snapshot with
+                routes = Journal_routes.update_detail snapshot.routes detail
+              ; next_local_sequence = Int64.succ number
+              }
+              request))
+    | Detail_submit value
+      when snapshot.write_enabled
+           && snapshot.pending_delete = None
+           && snapshot.pending_status = None ->
+      (match Journal_routes.detail snapshot.routes, snapshot.calendar with
+       | Some detail, Some _ ->
+         let detail = Journal_detail.update_child_source detail value in
+         (match Journal_calendar.Sampler.sample calendar_sampler with
+          | Error error ->
+            update (fun state ->
+              { state with
+                capture_error =
+                  Some (Local_capture_failure (Journal_calendar.error_message error))
+              })
+          | Ok calendar ->
+            Journal_graph_runtime.set_calendar graph_runtime calendar;
+            let creation_time = Journal_time.of_calendar calendar |> Result.get_ok in
+            let number = snapshot.next_local_sequence in
+            let admission =
+              with_block_identity
+                ~creation_time
+                ~f:(fun block_id ->
+                  if
+                    match Journal_detail.mode detail with
+                    | Failed _ -> true
+                    | _ -> false
+                  then Journal_detail.retry detail
+                  else
+                    Journal_detail.admit_child
+                      detail
+                      ~mutation_id:(fresh_identity ())
+                      ~calendar_generation:(Journal_calendar.generation calendar)
+                      ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
+                      ~sibling_order:(sibling_order number)
+                      ~creation_time)
+                ()
+            in
+            (match admission with
+             | Error message ->
+               update (fun state ->
+                 { state with capture_error = Some (Local_capture_failure message) })
+             | Ok (_, None) -> Effect.ignore
+             | Ok (detail, Some request) ->
+               with_direct_request
+                 { snapshot with
+                   calendar = Some calendar
+                 ; routes = Journal_routes.update_detail snapshot.routes detail
+                 ; capture_error = None
+                 ; next_local_sequence = Int64.succ number
+                 }
+                 request))
+       | None, _ | _, None -> Effect.ignore)
+    | Timeline_status value ->
+      let block_id = value in
+      (match
+         ( snapshot.write_enabled
+         , snapshot.pending_delete
+         , snapshot.pending_status
+         , block_in_timeline snapshot.timeline block_id )
+       with
+       | true, None, None, Some _ ->
+         update (fun state -> { state with modal = Status_sheet block_id })
+       | false, _, _, _
+       | true, Some _, _, _
+       | true, None, Some _, _
+       | true, None, None, None -> Effect.ignore)
+    | Status_sheet_select value ->
+      let tag = value in
+      let task_state = List.assoc_opt tag status_sheet_options in
+      (match
+         ( snapshot.modal
+         , snapshot.write_enabled
+         , snapshot.pending_delete
+         , snapshot.pending_status
+         , task_state )
+       with
+       | Status_sheet block_id, true, None, None, Some task_state ->
+         (match block_in_timeline snapshot.timeline block_id with
+          | None -> update (fun state -> { state with modal = No_modal })
+          | Some block when Journal_model.task_state block = task_state -> Effect.ignore
+          | Some block ->
+            let pending_status =
+              { mutation_id = fresh_identity ()
+              ; block_id
+              ; expected_revision = Journal_model.revision block
+              ; task_state
+              }
+            in
+            let request =
+              Journal_graph_request.Set_task_state
+                { mutation_id = pending_status.mutation_id
+                ; block_id
+                ; expected_revision = pending_status.expected_revision
+                ; task_state
+                }
+            in
+            with_request
+              { snapshot with
+                modal = No_modal
+              ; pending_status = Some pending_status
+              ; timeline_notice = None
+              }
+              request)
+       | No_modal, _, _, _, _
+       | Capture_sheet, _, _, _, _
+       | Append_sheet, _, _, _, _
+       | Diagnostics, _, _, _, _
+       | Error_info, _, _, _, _
+       | Cache_reset_confirmation _, _, _, _, _
+       | Status_sheet _, false, _, _, _
+       | Status_sheet _, true, Some _, _, _
+       | Status_sheet _, true, None, Some _, _
+       | Status_sheet _, true, None, None, None -> Effect.ignore)
+    | Timeline_delete block_id | Detail_delete block_id ->
+      let block =
+        match Journal_routes.detail snapshot.routes with
+        | Some detail -> Journal_detail.find_block detail ~block_id
+        | None -> block_in_timeline snapshot.timeline block_id
+      in
+      (match
+         snapshot.write_enabled, snapshot.pending_delete, snapshot.pending_status, block
+       with
+       | true, None, None, Some block ->
+         let saving =
+           Option.fold
+             ~none:false
+             ~some:(fun detail -> Journal_detail.mode detail = Saving_child)
+             (Journal_routes.detail snapshot.routes)
+         in
+         if saving
+         then Effect.ignore
+         else (
+           let duration =
+             if snapshot.environment.accessible_navigation then 10. else 5.
+           in
+           Effect.bind current_time ~f:(fun now ->
+             let pending =
                { mutation_id = fresh_identity ()
                ; block_id
                ; expected_revision = Journal_model.revision block
-               ; task_state
+               ; staged = None
+               ; detail_staged = None
+               ; deadline = Core.Time_ns.add now (Core.Time_ns.Span.of_sec duration)
+               ; phase = Undoable
                }
              in
-             let request =
-               Journal_graph_request.Set_task_state
-                 { mutation_id = pending_status.mutation_id
-                 ; block_id
-                 ; expected_revision = pending_status.expected_revision
-                 ; task_state
-                 }
-             in
-             with_request
-               { snapshot with
-                 modal = No_modal
-               ; pending_status = Some pending_status
-               ; timeline_notice = None
-               }
-               request)
-        | No_modal, _, _, _, _
-        | Capture_sheet, _, _, _, _
-        | Append_sheet, _, _, _, _
-        | Diagnostics, _, _, _, _
-        | Error_info, _, _, _, _
-        | Cache_reset_confirmation _, _, _, _, _
-        | Status_sheet _, false, _, _, _
-        | Status_sheet _, true, Some _, _, _
-        | Status_sheet _, true, None, Some _, _
-        | Status_sheet _, true, None, None, None -> Effect.ignore)
-      else if
-        String.starts_with ~prefix:"timeline-delete:" action
-        || String.starts_with ~prefix:"detail-delete:" action
-      then (
-        let prefix_length =
-          if String.starts_with ~prefix:"detail-delete:" action then 14 else 16
-        in
-        let block_id =
-          String.sub action prefix_length (String.length action - prefix_length)
-        in
-        let block =
-          match Journal_routes.detail snapshot.routes with
-          | Some detail -> Journal_detail.find_block detail ~block_id
-          | None -> block_in_timeline snapshot.timeline block_id
-        in
-        match
-          snapshot.write_enabled, snapshot.pending_delete, snapshot.pending_status, block
-        with
-        | true, None, None, Some block ->
-          let saving =
-            Option.fold
-              ~none:false
-              ~some:(fun detail -> Journal_detail.mode detail = Saving_child)
-              (Journal_routes.detail snapshot.routes)
-          in
-          if saving
-          then Effect.ignore
-          else (
-            let duration =
-              if snapshot.environment.accessible_navigation then 10. else 5.
-            in
-            Effect.bind current_time ~f:(fun now ->
-              let pending =
-                { mutation_id = fresh_identity ()
-                ; block_id
-                ; expected_revision = Journal_model.revision block
-                ; staged = None
-                ; detail_staged = None
-                ; deadline = Core.Time_ns.add now (Core.Time_ns.Span.of_sec duration)
-                ; phase = Undoable
-                }
-              in
-              update (fun state ->
-                hide_deleted { state with timeline_notice = Some Delete_undo } pending)))
-        | _ -> Effect.ignore)
-      else if String.starts_with ~prefix:"timeline-open-block:" action
-      then open_block (String.sub action 20 (String.length action - 20))
-      else if String.starts_with ~prefix:"favorite-open-block:" action
-      then open_favorite (String.sub action 20 (String.length action - 20))
-      else Effect.ignore
-    | Ui.Event.Payload.Native_event _
-    | Unit
-    | Bool _
-    | Int _
-    | Int64 _
-    | Int64_bool _
-    | Navigation_path_changed _
-    | Int64_pair _
-    | Float _
-    | Scroll _
-    | Native_list_completion _
-    | Event _ -> Effect.ignore
+             update (fun state ->
+               hide_deleted { state with timeline_notice = Some Delete_undo } pending)))
+       | _ -> Effect.ignore)
+    | Timeline_open_block value -> open_block value
+    | Favorite_open_block value -> open_favorite value
+    | _ -> Effect.ignore
   in
+  let send command = Effect.run (handle_dispatch command) in
   let dispatch =
-    Ui.Event.Handler.create ~name:"journal-dispatch" (fun payload ->
-      Effect.run (handle_dispatch payload))
+    { send
+    ; native =
+        Ui.Event.Handler.create ~name:"journal-dispatch" (fun payload ->
+          send (Native_payload payload))
+    }
   in
   let timeline_scroll_completed =
     Ui.Event.Handler.create ~name:"timeline-scroll-completed" (fun payload ->
@@ -5470,10 +5333,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           | Error _ -> ()
           | Ok payload ->
             (match Journal_platform.decode_notice_response ~token payload with
-             | Ok Notice_action ->
-               Ui.Event.Handler.Private.invoke
-                 dispatch
-                 (Ui.Event.Payload.Text "delete-undo")
+             | Ok Notice_action -> dispatch.send Delete_undo
              | Ok (Notice_dismiss | Notice_swipe | Notice_timeout) | Error _ -> ()))
   in
   let notice_key state =
@@ -5735,14 +5595,15 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
             ~source:state.capture_pick_source
       ; camera
       ; completion = state.import_completion
-      ; on_attach =
-          (fun source ->
-            Ui.Event.Handler.Private.invoke
-              dispatch
-              (Text ("capture-attach:" ^ Journal_asset_import.source_to_string source)))
+      ; on_attach = (fun source -> dispatch.send (Capture_attach source))
       ; on_event =
           (fun payload ->
-            Ui.Event.Handler.Private.invoke dispatch (Text ("capture-asset:" ^ payload)))
+            match Journal_asset_import.decode_event payload with
+            | Ok event -> dispatch.send (Capture_asset event)
+            | Error _ -> ())
+      ; on_remove =
+          (fun token ->
+            dispatch.send (Capture_asset (Journal_asset_import.Removed token)))
       }
     in
     let floating_capture state =
@@ -5767,12 +5628,10 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                    ~on_toggle:
                      (Ui.Event.Handler.create (function
                         | Ui.Event.Payload.Bool selected ->
-                          Ui.Event.Handler.Private.invoke
-                            dispatch
-                            (Text
-                               (if selected then "capture-task-on" else "capture-task-off"))
+                          dispatch.send
+                            (if selected then Capture_task_on else Capture_task_off)
                         | _ -> ()))
-                   ~on_save:(bind_action dispatch "capture-submit")
+                   ~on_save:(bind_action dispatch Capture_submit)
                    ~error:
                      (match state.capture_error with
                       | Some failure -> Some (capture_failure_message failure)
@@ -5790,7 +5649,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
         if current.environment.platform = "ios" && current.modal = Capture_sheet
         then
           V.stack
-            [ V.tap_area ~on_press:(bind_action dispatch "close-composer") ()
+            [ V.tap_area ~on_press:(bind_action dispatch Close_composer) ()
             ; V.column
                 ~spacing:0.
                 [ V.spacer ()
@@ -5828,20 +5687,18 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
             ~favorites:state.favorites
             ~on_select_destination:
               (Ui.Event.Handler.create ~name:"select-root-destination" (function
-                 | Ui.Event.Payload.Int64 0L ->
-                   Ui.Event.Handler.Private.invoke dispatch (Text "select-journals")
-                 | Int64 1L ->
-                   Ui.Event.Handler.Private.invoke dispatch (Text "select-favorites")
+                 | Ui.Event.Payload.Int64 0L -> dispatch.send Select_journals
+                 | Int64 1L -> dispatch.send Select_favorites
                  | _ -> ()))
             ~on_favorites_visible_range:
               (Ui.Event.Handler.create ~name:"favorites-visible-range" (function
                  | Ui.Event.Payload.Visible_range range ->
                    Ui.Event.Handler.Private.invoke
-                     dispatch
+                     dispatch.native
                      (Int64_pair
                         { first = range.first_index; second = range.last_exclusive })
                  | _ -> ()))
-            ~on_favorites_retry:(bind_action dispatch "favorites-retry")
+            ~on_favorites_retry:(bind_action dispatch Favorites_retry)
             ~timeline_state:state.timeline
             ~loading:(not state.feed_loaded)
             ~graph_error:(Option.map graph_error_message state.graph_error)
@@ -5861,21 +5718,23 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                && not (capture_saving state))
             ~on_capture_event:dispatch
             ~capture_expanded:None
-            ~on_visible_range:dispatch
-            ~on_retry_day:(prefix_action dispatch "timeline-retry:")
-            ~on_open_block:(prefix_action dispatch "timeline-open-block:")
-            ~on_open_favorite:(prefix_action dispatch "favorite-open-block:")
+            ~on_visible_range:dispatch.native
+            ~on_retry_day:(prefix_action dispatch (fun value -> Timeline_retry value))
+            ~on_open_block:
+              (prefix_action dispatch (fun value -> Timeline_open_block value))
+            ~on_open_favorite:
+              (prefix_action dispatch (fun value -> Favorite_open_block value))
             ~delete_enabled:state.write_enabled
             ~actions_enabled:(row_actions_enabled state)
             ~interaction_enabled:true
-            ~on_status:(prefix_action dispatch "timeline-status:")
-            ~on_delete:(prefix_action dispatch "timeline-delete:")
+            ~on_status:(prefix_action dispatch (fun value -> Timeline_status value))
+            ~on_delete:(prefix_action dispatch (fun value -> Timeline_delete value))
             ~error_info_available:
               (state.worker_errors <> []
                || Option.is_some
                     (Option.bind state.manager (fun manager -> manager.last_error))
                || Option.is_some (operation_failure state.timeline_notice))
-            ~on_error_info:(bind_action dispatch "open-error-info")
+            ~on_error_info:(bind_action dispatch Open_error_info)
             ~account_menu_available:true
             ~on_account_action:dispatch
             ~cache_reset_available:(local_deletion_available state))
@@ -6025,13 +5884,11 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                  ~on_toggle:
                    (Ui.Event.Handler.create (function
                       | Ui.Event.Payload.Bool selected ->
-                        Ui.Event.Handler.Private.invoke
-                          dispatch
-                          (Text
-                             (if selected then "capture-task-on" else "capture-task-off"))
+                        dispatch.send
+                          (if selected then Capture_task_on else Capture_task_off)
                       | _ -> ()))
-                 ~on_save:(bind_action dispatch "capture-submit")
-                 ~on_close:(bind_action dispatch "close-composer")
+                 ~on_save:(bind_action dispatch Capture_submit)
+                 ~on_close:(bind_action dispatch Close_composer)
                  ~error:
                    (match state.capture_error with
                     | Some failure -> Some (capture_failure_message failure)
@@ -6060,22 +5917,20 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                         when selected
                              <> (Journal_capture.task_state capture = Journal_model.Todo)
                         ->
-                        Ui.Event.Handler.Private.invoke
-                          dispatch
-                          (Text
-                             (Detail_outline.scope state.routes
-                              ^ "detail-task-intent:"
-                              ^ Journal_capture.source capture))
+                        dispatch.send
+                          (Detail_action
+                             ( Detail_outline.scope state.routes
+                             , Detail_task_intent (Journal_capture.source capture) ))
                       | _ -> ()))
                  ~on_save:
                    (bind_action
                       dispatch
-                      (Detail_outline.scope state.routes
-                       ^
-                       match Journal_detail.mode detail with
-                       | Failed _ -> "detail-retry"
-                       | _ -> "detail-submit:" ^ Journal_capture.source capture))
-                 ~on_close:(bind_action dispatch "close-composer")
+                      (Detail_action
+                         ( Detail_outline.scope state.routes
+                         , match Journal_detail.mode detail with
+                           | Failed _ -> Detail_retry
+                           | _ -> Detail_submit (Journal_capture.source capture) )))
+                 ~on_close:(bind_action dispatch Close_composer)
                  ~assets:None
                  ~error:
                    (match Journal_detail.mode detail with
@@ -6123,7 +5978,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
           ~key:(Ui.Key.string "journal-sheet")
           ~title:(modal_title current.modal)
           ~presented:(Option.is_some content)
-          ~on_presented_changed:dispatch
+          ~on_presented_changed:dispatch.native
           ~interactive_dismiss:true
           ~sizing:Form
           ~detents:[ Large ]
@@ -6173,8 +6028,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                   (Journal_uploads.sync current.uploads (upload_context current)))
              ~offline:current.asset_offline
              ~presented:current.asset_settings_open
-             ~on_event:(fun value ->
-               Ui.Event.Handler.Private.invoke dispatch (Text ("asset-settings:" ^ value)))
+             ~on_event:(fun value -> dispatch.send (Asset_settings value))
              (V.empty ()))
     in
     let body =
@@ -6301,7 +6155,6 @@ let decode_config payload =
   match Journal_startup.decode payload with
   | Ok startup ->
     let (Managed_sync { base_url }) = startup.Logseq_db_worker.Config.target in
-    managed_sync_startup := true;
     managed_sync_origin := base_url;
     Ok startup
   | Error error -> Error (Journal_startup.Error.to_string error)
@@ -6450,6 +6303,19 @@ let create
 ;;
 
 module For_testing = struct
+  type detail_action =
+    | Append
+    | Attach_file
+    | Open_block of string
+    | Delete_block of string
+    | Set_expanded of string * bool
+    | Load_more of string
+    | Retry
+    | Submit of string
+    | Task_intent of string
+
+  let ignore_dispatch native = { native; send = (fun _ -> ()) }
+
   let timeline_media_row ~routes ~graph_generation entry dispatch =
     let state =
       { initial_state with
@@ -6458,16 +6324,34 @@ module For_testing = struct
       }
     in
     Journal_row.view
-      ~render_media:(row_media_label state dispatch)
+      ~render_media:
+        (row_media_label
+           ~store:(Journal_media_view.Store.create ())
+           state
+           (ignore_dispatch dispatch))
       ~show_timestamp:false
       entry
   ;;
 
-  let detail_page ~routes ~write_enabled dispatch =
+  let detail_page ~routes ~write_enabled on_action =
+    let send = function
+      | Detail_action (_, Open_append) -> on_action Append
+      | Detail_action (_, Open_asset_import) -> on_action Attach_file
+      | Detail_action (_, Detail_open id) -> on_action (Open_block id)
+      | Detail_action (_, Detail_delete id) -> on_action (Delete_block id)
+      | Detail_action (_, Detail_expand id) -> on_action (Set_expanded (id, true))
+      | Detail_action (_, Detail_collapse id) -> on_action (Set_expanded (id, false))
+      | Detail_action (_, Detail_more id) -> on_action (Load_more id)
+      | Detail_action (_, Detail_retry) -> on_action Retry
+      | Detail_action (_, Detail_submit source) -> on_action (Submit source)
+      | Detail_action (_, Detail_task_intent source) -> on_action (Task_intent source)
+      | _ -> ()
+    in
     detail_page
+      ~media_store:(Journal_media_view.Store.create ())
       ~state:{ initial_state with routes; write_enabled }
       ~on_scroll_completed:(Ui.Event.Handler.create (fun _ -> ()))
-      dispatch
+      { send; native = Ui.Event.Handler.create (fun _ -> ()) }
   ;;
 
   let diagnostics_page dispatch =
@@ -6476,7 +6360,7 @@ module For_testing = struct
       ~graph:{ generation = 0; graph_id = None; phase = Graph_closed; error = None }
       ~admission:Admission_refresh.Unavailable
       (Some { groups = [] })
-      dispatch
+      (ignore_dispatch dispatch)
   ;;
 
   let read_block_entropy = read_block_entropy
@@ -6506,8 +6390,16 @@ module For_testing = struct
       ~timeline_store:None
       ~on_region:(fun _ -> ())
       ~render_source:(render_source initial_state)
-      ~render_media:(media_label initial_state handler)
-      ~render_row_media:(row_media_label initial_state handler)
+      ~render_media:
+        (media_label
+           ~store:(Journal_media_view.Store.create ())
+           initial_state
+           (ignore_dispatch handler))
+      ~render_row_media:
+        (row_media_label
+           ~store:(Journal_media_view.Store.create ())
+           initial_state
+           (ignore_dispatch handler))
       ~platform:"ios"
       ~graph_generation:1
       ~on_scroll_completed:handler
@@ -6523,7 +6415,7 @@ module For_testing = struct
       ~sync_phase:(Some Graph_service.Connecting)
       ~day_presentation:(fun _ -> None)
       ~capture_enabled:false
-      ~on_capture_event:handler
+      ~on_capture_event:(ignore_dispatch handler)
       ~capture_expanded:None
       ~on_visible_range:handler
       ~on_retry_day:handler
@@ -6537,7 +6429,7 @@ module For_testing = struct
       ~error_info_available:true
       ~on_error_info:handler
       ~account_menu_available:true
-      ~on_account_action:handler
+      ~on_account_action:(ignore_dispatch handler)
       ~cache_reset_available:false
     |> fun page ->
     V.Navigation_stack.create ~title:"" ~on_path_change:handler ~path:[] page

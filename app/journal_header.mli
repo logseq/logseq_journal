@@ -6,6 +6,13 @@ module Context : sig
   val semantics_label : t -> string
 end
 
+type account_action =
+  | Open_asset_settings
+  | Open_diagnostics
+  | Switch_graph
+  | Request_local_cache_reset
+  | Sign_out
+
 type presentation =
   { sync_phase : Logseq_db_worker_lui.Logseq_db_worker_lui_service.sync_phase option
   ; sync_error : string option
@@ -21,7 +28,7 @@ val view
   -> sync_phase:Logseq_db_worker_lui.Logseq_db_worker_lui_service.sync_phase option
   -> sync_error:string option
   -> on_error_info:Journal_view.Event.Handler.t option
-  -> on_account_action:Journal_view.Event.Handler.t option
+  -> on_account_action:(account_action -> unit) option
   -> local_deletion_available:bool
   -> on_journals:Journal_view.Event.Handler.t
   -> on_favorites:Journal_view.Event.Handler.t
@@ -39,7 +46,7 @@ val reactive_view
   -> sync_phase:Logseq_db_worker_lui.Logseq_db_worker_lui_service.sync_phase option
   -> sync_error:string option
   -> on_error_info:Journal_view.Event.Handler.t option
-  -> on_account_action:Journal_view.Event.Handler.t option
+  -> on_account_action:(account_action -> unit) option
   -> local_deletion_available:bool
   -> on_journals:Journal_view.Event.Handler.t
   -> on_favorites:Journal_view.Event.Handler.t

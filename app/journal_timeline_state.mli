@@ -15,11 +15,7 @@ type slot =
   | Feed_continuation of { before_day : int }
 
 type t
-
-type staged_delete =
-  { block : Journal_model.t
-  ; before : t
-  }
+type staged_delete
 
 val empty : today:int -> t
 val reset : t -> today:int -> t
@@ -64,8 +60,10 @@ val fold_slots : ('a -> slot -> 'a) -> 'a -> t -> 'a
 val find_block : t -> block_id:string -> Journal_model.t option
 
 val retained_slot_count : t -> int
-val first_retained_index : t -> int
+
+(** Number of rendered slots, including headings and continuations. *)
 val total_count : t -> int
+
 val today : t -> int
 val set_today : t -> today:int -> t
 val slot_key : slot -> string

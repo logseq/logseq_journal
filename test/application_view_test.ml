@@ -33,16 +33,10 @@ let test_phase_names () =
     graph_phases
 ;;
 
-let test_diagnostics_hide_retired_phase_rows () =
+let test_current_diagnostic_rows () =
   let diagnostics : Service.diagnostics =
     { groups =
-        [ { title = "Manager"
-          ; entries =
-              [ "Phase", "retired"
-              ; "Startup presentation", "retired"
-              ; "Last error", "None"
-              ]
-          }
+        [ { title = "Manager"; entries = [ "Last error", "None" ] }
         ; { title = "Graph"; entries = [ "Selected graph", "Fixture" ] }
         ]
     }
@@ -776,14 +770,7 @@ let run_favorites_native_visibility
        hooks.init 2 2 startup |> consume;
        if check_ios_capture
        then (
-         let snapshot =
-           { Journal_environment.fallback with
-             platform = "ios"
-           ; viewport_width = 390.
-           ; viewport_height = 844.
-           ; device_pixel_ratio = 3.
-           }
-         in
+         let snapshot = { Journal_environment.fallback with platform = "ios" } in
          let payload =
            Journal_environment.encode_json snapshot |> Yojson.Basic.to_string
          in
@@ -2655,7 +2642,7 @@ let test_reactive_header_current_controls () =
               ~sync_phase:None
               ~sync_error:None
               ~on_error_info:(Some (handler (fun () -> incr error_count)))
-              ~on_account_action:(Some noop)
+              ~on_account_action:(Some (fun _ -> ()))
               ~local_deletion_available:false
               ~on_journals:noop
               ~on_favorites:noop
@@ -2996,9 +2983,9 @@ let () =
     ; ( "worker presentation"
       , [ Alcotest.test_case "phase labels" `Quick test_phase_names
         ; Alcotest.test_case
-            "retired diagnostics are hidden"
+            "current diagnostic rows are preserved"
             `Quick
-            test_diagnostics_hide_retired_phase_rows
+            test_current_diagnostic_rows
         ; Alcotest.test_case
             "graph lifecycle survives missing snapshot"
             `Quick

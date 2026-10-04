@@ -52,8 +52,6 @@ enum JournalExtensionFingerprint {
 
 @MainActor enum JournalExtensions {
   private static let appleProfiles = ["macos/swiftui", "ios/swiftui"]
-  private static let allHostProfiles =
-    appleProfiles + ["macos/flutter", "ios/flutter", "android/flutter"]
   private static let payloadProperty =
     JournalExtensionFingerprint.Property(
       name: "payload", kind: "string", required: true, defaultValue: nil)
@@ -74,13 +72,12 @@ enum JournalExtensionFingerprint {
   }
 
   /// Journal native views nest (chrome slots hold page content including
-  /// other chrome sections, lists, and media; list rows hold media and
+  /// other chrome sections and lists; list rows hold native LUI media and
   /// chrome section headers), so every component accepts all journal
   /// extensions as children. Must stay in sync with `journal_lui_native.ml`.
   private static let journalChildIdentifiers = [
     "journal-chrome",
     "journal-asset-import",
-    "journal-media",
     "journal-asset-settings",
     "journal-list",
   ]
@@ -142,28 +139,21 @@ enum JournalExtensionFingerprint {
   }
 
   static func assetImportExtension() -> LUIAppleExtension {
-    journalExtension(identifier: "journal-asset-import", profiles: allHostProfiles,
+    journalExtension(identifier: "journal-asset-import", profiles: appleProfiles,
       standardChildren: true, events: true) { context in
       AnyView(JournalAssetImport.View(context: context))
     }
   }
 
-  static func mediaExtension() -> LUIAppleExtension {
-    journalExtension(identifier: "journal-media", profiles: allHostProfiles,
-      standardChildren: true, events: true) { context in
-      AnyView(JournalMedia.View(context: context))
-    }
-  }
-
   static func assetSettingsExtension() -> LUIAppleExtension {
-    journalExtension(identifier: "journal-asset-settings", profiles: allHostProfiles,
+    journalExtension(identifier: "journal-asset-settings", profiles: appleProfiles,
       standardChildren: true, events: true) { context in
       AnyView(JournalAssetSettings.View(context: context))
     }
   }
 
   static func listExtension() -> LUIAppleExtension {
-    journalExtension(identifier: "journal-list", profiles: allHostProfiles,
+    journalExtension(identifier: "journal-list", profiles: appleProfiles,
       standardChildren: true, events: true) { context in
       AnyView(JournalList.View(context: context))
     }
@@ -175,7 +165,6 @@ enum JournalExtensionFingerprint {
     for journalExtension in [
       chromeExtension(),
       assetImportExtension(),
-      mediaExtension(),
       assetSettingsExtension(),
       listExtension(),
     ] {

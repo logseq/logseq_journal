@@ -1,7 +1,8 @@
 (** Journal-specific lui extension components.
 
    Replaces the [Ui.Native_widget.Extension] registrations that previously
-   carried kinds 2103-2106 over the bonsai_swiftui native-widget channel.
+   carried kinds 2103, 2104 and 2106 over the bonsai_swiftui
+   native-widget channel, plus the native collection.
    Each component ships its properties as one [payload] string field holding
    the same JSON object the Swift [Properties] structs already decode, and
    reports events through one ["event"] extension event with [id] (int) and
@@ -12,11 +13,10 @@
 val chrome_identifier : string
 
 val asset_import_identifier : string
-val media_identifier : string
 val asset_settings_identifier : string
 val list_identifier : string
 
-(** Extension schemas shared with the Apple/Flutter hosts. *)
+(** Extension schemas shared with the Apple iOS/macOS hosts. *)
 val registry : Lui_extension.extension_registry
 
 (** A journal extension event decoded from the lui event stream. *)
@@ -51,13 +51,6 @@ val chrome
   -> Lui_elements.t
 
 val asset_import
-  :  ?key:string
-  -> payload:string
-  -> ?on_event:(event -> unit)
-  -> Lui_elements.t list
-  -> Lui_elements.t
-
-val media
   :  ?key:string
   -> payload:string
   -> ?on_event:(event -> unit)
