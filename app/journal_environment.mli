@@ -1,40 +1,16 @@
-(** Host environment snapshot, replacing [Journal_environment]. The
-    native host pushes snapshots through the application platform channel;
-    the model stores the latest one. *)
-
-type edge_insets =
-  { left : float
-  ; top : float
-  ; right : float
-  ; bottom : float
-  }
+(** Product preferences pushed by the native host through the application
+    platform channel. Native layout and accessibility retain their host owners;
+    this wire does not report geometry, keyboard occlusion, or device metrics. *)
 
 type brightness =
   | Light
   | Dark
 
-type orientation =
-  | Portrait
-  | Landscape
-
 type snapshot =
-  { viewport_width : float
-  ; viewport_height : float
-  ; device_pixel_ratio : float
-  ; text_scale : float
-  ; brightness : brightness
+  { brightness : brightness
   ; platform : string
-  ; locale : string
-  ; safe_area : edge_insets
-  ; keyboard_insets : edge_insets
   ; accessible_navigation : bool
-  ; bold_text : bool
-  ; invert_colors : bool
-  ; disable_animations : bool
-  ; reduced_motion : bool
   ; high_contrast : bool
-  ; orientation : orientation
-  ; pointer_kinds : int
   }
 
 val equal : snapshot -> snapshot -> bool

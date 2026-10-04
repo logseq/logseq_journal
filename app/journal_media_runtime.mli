@@ -24,11 +24,28 @@ val create
   -> t
 
 val reset : t -> graph_generation:int option -> unit
-val root_visible : t -> root:string -> bool -> unit
-val retain_visible_roots : t -> string list -> unit
-val asset_visible : t -> root:string -> asset:string -> bool -> unit
+
+(** Visibility belongs to a retained presentation. Shared roots and assets are
+    released after their last owner leaves; omitting [owner] uses one legacy owner. *)
+val root_visible : ?owner:string -> t -> root:string -> bool -> unit
+
+val retain_visible_roots : ?owner:string -> t -> string list -> unit
+val retain_owners : t -> string list -> unit
+val asset_visible : ?owner:string -> t -> root:string -> asset:string -> bool -> unit
+
+(** A preview is an independent consumer of the current file. Its slot is
+    replaced/dismissed separately from row visibility and retired with [owner]. *)
+val preview_visible
+  :  t
+  -> owner:string
+  -> slot:string
+  -> root:string
+  -> asset:string
+  -> bool
+  -> unit
+
 val next : t -> root:string -> unit
-val retry : t -> root:string -> asset:string -> unit
+val retry : ?owner:string -> t -> root:string -> asset:string -> unit
 val refresh : t -> unit
 val receive : t -> ticket -> Service.response -> unit
 val reject : t -> ticket -> unit

@@ -240,3 +240,114 @@ let () =
        (Queue.to_seq sent |> List.of_seq))
     "late import receipt releases its lease"
 ;;
+
+(* The pure media reducer has no queue admission input; it correctly keeps an
+   existing selection. Runtime owns whether a new reference can join that file. *)
+let test_preview_reference_when_requests_are_full () =
+  let sent = Queue.create () in
+  let full = ref false in
+  let views = Hashtbl.create 2 in
+  let runtime =
+    R.create
+      ~send:(fun ticket request ->
+        if !full
+        then false
+        else (
+          Queue.add (ticket, request) sent;
+          true))
+      ~changed:(fun root view -> Hashtbl.replace views root view)
+  in
+  let asset =
+    A.create
+      ~uuid:(uuid 2)
+      ~source:
+        (Managed
+           (Some
+              (A.version ~checksum:(String.make 64 'a') ~file_type:"png" |> Result.get_ok)))
+      ~current_checksum:None
+      ~size:None
+      ~dimensions:None
+    |> Result.get_ok
+  in
+  let scope : S.asset_scope =
+    { account =
+        { managed_sync_origin = Uri.of_string "https://sync.example"
+        ; user_id = "u"
+        ; account_generation = 1
+        ; presentation_generation = 1
+        ; lifecycle_generation = 1L
+        }
+    ; graph_id = uuid 3
+    ; graph_generation = 1
+    }
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let metadata root =
+    R.root_visible ~owner:"row" runtime ~root true;
+    let ticket, request = Queue.take sent in
+    let request_id =
+      match request with
+      | S.Graph_request query -> query.request_id
+      | _ -> assert false
+    in
+    R.receive
+      runtime
+      (Option.get ticket)
+      (Graph_response
+         (P.V2_response
+            { api_version = 2
+            ; request_id
+            ; outcome =
+                V2_assets_outcome
+                  { generation = "g"
+                  ; projection_revision = "p"
+                  ; items = [ asset ]
+                  ; next_cursor = None
+                  }
+            }));
+    (List.hd (Hashtbl.find views root).items).token
+  in
+  let root = G.Uuid.to_string (uuid 1) in
+  let token = metadata root in
+  R.asset_visible ~owner:"row" runtime ~root ~asset:token true;
+  Queue.clear sent;
+  R.notice
+    runtime
+    scope
+    (Asset_availability
+       { consumer = token; asset = asset.uuid; availability = Ready "cached" });
+  let ticket, _ = Queue.take sent in
+  R.receive
+    runtime
+    (Option.get ticket)
+    (Asset_file (Some ("preview-file", "/cache/image.png")));
+  let pressure_root = G.Uuid.to_string (uuid 4) in
+  let pressure_token = metadata pressure_root in
+  full := true;
+  for _ = 1 to 1100 do
+    R.asset_visible runtime ~root:pressure_root ~asset:pressure_token true;
+    R.asset_visible runtime ~root:pressure_root ~asset:pressure_token false
+  done;
+  R.preview_visible runtime ~owner:"row" ~slot:root ~root ~asset:token true;
+  R.root_visible ~owner:"row" runtime ~root false;
+  check
+    ((List.hd (Hashtbl.find views root).items).presentation
+     = Journal_media.File "/cache/image.png")
+    "a full request queue cannot reject a preview reference to an already acquired file";
+  full := false;
+  R.pump runtime;
+  let release_count () =
+    Queue.to_seq sent
+    |> Seq.filter (function
+      | _, S.Release_asset_file { handle = "preview-file"; _ } -> true
+      | _ -> false)
+    |> Seq.length
+  in
+  check (release_count () = 0) "draining pressure must keep the preview file";
+  R.preview_visible runtime ~owner:"row" ~slot:root ~root ~asset:token false;
+  check (release_count () = 1) "closing the preview releases its file once after pressure";
+  R.preview_visible runtime ~owner:"row" ~slot:root ~root ~asset:token false;
+  check (release_count () = 1) "duplicate pressure cleanup cannot release again"
+;;
+
+let () = test_preview_reference_when_requests_are_full ()

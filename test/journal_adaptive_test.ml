@@ -5,6 +5,96 @@ let require condition format =
   Printf.ksprintf (fun message -> if not condition then failwith message) format
 ;;
 
+(* Environment wire contract tests: the Apple host sends only product inputs,
+   independent of native geometry and keyboard layout. *)
+let environment_fields ~platform ~brightness ~high_contrast ~accessible_navigation =
+  [ "platform", `String platform
+  ; "brightness", `String brightness
+  ; "highContrast", `Bool high_contrast
+  ; "accessibleNavigation", `Bool accessible_navigation
+  ]
+;;
+
+let test_four_field_environment_roundtrip () =
+  List.iter
+    (fun platform ->
+       List.iter
+         (fun (brightness, expected_brightness) ->
+            List.iter
+              (fun high_contrast ->
+                 List.iter
+                   (fun accessible_navigation ->
+                      let fields =
+                        environment_fields
+                          ~platform
+                          ~brightness
+                          ~high_contrast
+                          ~accessible_navigation
+                      in
+                      let snapshot =
+                        match Journal_environment.decode_json (`Assoc fields) with
+                        | Ok snapshot -> snapshot
+                        | Error error ->
+                          failwith ("four-field host sample rejected: " ^ error)
+                      in
+                      require
+                        (snapshot.platform = platform
+                         && snapshot.brightness = expected_brightness
+                         && snapshot.high_contrast = high_contrast
+                         && snapshot.accessible_navigation = accessible_navigation)
+                        "host preference changed across environment decode";
+                      match Journal_environment.encode_json snapshot with
+                      | `Assoc encoded ->
+                        require
+                          (List.sort Stdlib.compare encoded
+                           = List.sort Stdlib.compare fields)
+                          "canonical host sample must round-trip without retired fields"
+                      | _ -> failwith "environment encoder did not produce an object")
+                   [ false; true ])
+              [ false; true ])
+         [ "light", Journal_environment.Light; "dark", Dark ])
+    [ "ios"; "macos" ]
+;;
+
+let test_environment_requires_valid_product_inputs () =
+  let fields =
+    environment_fields
+      ~platform:"ios"
+      ~brightness:"light"
+      ~high_contrast:false
+      ~accessible_navigation:false
+  in
+  let rejected json =
+    require
+      (Result.is_error (Journal_environment.decode_json json))
+      "incomplete or invalid environment sample was accepted"
+  in
+  List.iter
+    (fun (key, _) ->
+       rejected (`Assoc (List.remove_assoc key fields));
+       rejected (`Assoc ((key, `Null) :: List.remove_assoc key fields)))
+    fields;
+  rejected
+    (`Assoc (("brightness", `String "automatic") :: List.remove_assoc "brightness" fields));
+  rejected `Null;
+  rejected (`List [])
+;;
+
+let test_environment_preference_changes_are_observable () =
+  let initial = Journal_environment.fallback in
+  require (Journal_environment.equal initial initial) "identical sample must deduplicate";
+  List.iter
+    (fun changed ->
+       require
+         (not (Journal_environment.equal initial changed))
+         "changed product preference must reach the application")
+    [ { initial with platform = "ios" }
+    ; { initial with brightness = Journal_environment.Dark }
+    ; { initial with high_contrast = true }
+    ; { initial with accessible_navigation = true }
+    ]
+;;
+
 let test_sf_symbols_preserve_identity_and_appearance () =
   let cases =
     Journal_symbols.
@@ -99,7 +189,9 @@ let test_ios_capsules_mount_outside_toolbars () =
                 ~on_error_info:
                   (if error_available then Some (handler "Error info") else None)
                 ~on_account_action:
-                  (if account_available then Some (handler "Account menu") else None)
+                  (if account_available
+                   then Some (fun _ -> presses := "Account menu" :: !presses)
+                   else None)
                 ~local_deletion_available:false
                 ~on_journals:(handler "Journals")
                 ~on_favorites:(handler "Favorites")
@@ -384,11 +476,7 @@ let test_detail_capsules_mount_outside_toolbars () =
     (fun (routes, write_enabled, actions_enabled) ->
        let batches = ref []
        and actions = ref [] in
-       let dispatch =
-         Ui.Event.Handler.create (function
-           | Ui.Event.Payload.Text action -> actions := action :: !actions
-           | _ -> ())
-       in
+       let dispatch action = actions := action :: !actions in
        let view = Application.For_testing.detail_page ~routes ~write_enabled dispatch in
        let backend : Lui_protocol.backend =
          { backend_profile = Lui_protocol.profile IOS SwiftUIHost
@@ -470,20 +558,19 @@ let test_detail_capsules_mount_outside_toolbars () =
                    (List.mem command !actions = allowed)
                    "%s action guard changed"
                    label)
-              (let prefix =
-                 Printf.sprintf
-                   "detail-session:%s:%Ld:"
-                   (Journal_routes.active_entry_id routes |> Option.get)
-                   (Journal_routes.detail_request_generation routes)
-               in
-               [ "Append", prefix ^ "open-append", actions_enabled
-               ; "Attach file", prefix ^ "open-asset-import", actions_enabled
-               ])))
+              [ "Append", Application.For_testing.Append, actions_enabled
+              ; "Attach file", Application.For_testing.Attach_file, actions_enabled
+              ]))
     [ loading, true, false; loaded, false, false; loaded, true, true ]
 ;;
 
 let tests =
-  [ ( "SF Symbols preserve identity and appearance"
+  [ "four-field environment roundtrip", test_four_field_environment_roundtrip
+  ; ( "environment requires valid product inputs"
+    , test_environment_requires_valid_product_inputs )
+  ; ( "environment preference changes are observable"
+    , test_environment_preference_changes_are_observable )
+  ; ( "SF Symbols preserve identity and appearance"
     , test_sf_symbols_preserve_identity_and_appearance )
   ; ( "exact status rail categories"
     , test_every_exact_status_maps_to_the_decided_rail_category )

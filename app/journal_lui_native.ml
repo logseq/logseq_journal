@@ -3,7 +3,6 @@ open Lui_extension
 
 let chrome_identifier = "journal-chrome"
 let asset_import_identifier = "journal-asset-import"
-let media_identifier = "journal-media"
 let asset_settings_identifier = "journal-asset-settings"
 let list_identifier = "journal-list"
 
@@ -11,14 +10,6 @@ let apple_profiles =
   [ { profile_os = MacOS; profile_host = SwiftUIHost }
   ; { profile_os = IOS; profile_host = SwiftUIHost }
   ]
-;;
-
-let all_host_profiles =
-  apple_profiles
-  @ [ { profile_os = MacOS; profile_host = FlutterHost }
-    ; { profile_os = IOS; profile_host = FlutterHost }
-    ; { profile_os = AndroidOS; profile_host = FlutterHost }
-    ]
 ;;
 
 let payload_property = property "payload" StringScalar true None
@@ -33,14 +24,13 @@ let registry =
   let registry = Lui_extension.registry () in
   Lui_navigation.register_into registry;
   (* Journal native views nest: chrome slots hold page content (including
-     other chrome sections, lists, and media), and list rows hold media and
+     other chrome sections and lists), and list rows hold native LUI media and
      chrome section headers. Every component accepts all journal extensions
      as children; the schema must stay in sync with the fingerprint the
      Apple host computes in JournalExtensions.swift. *)
   let children =
     [ chrome_identifier
     ; asset_import_identifier
-    ; media_identifier
     ; asset_settings_identifier
     ; list_identifier
     ]
@@ -52,16 +42,7 @@ let registry =
     registry
     (component
        asset_import_identifier
-       all_host_profiles
-       true
-       children
-       [ payload_property ]
-       [ event_schema ]);
-  register_component
-    registry
-    (component
-       media_identifier
-       all_host_profiles
+       apple_profiles
        true
        children
        [ payload_property ]
@@ -70,7 +51,7 @@ let registry =
     registry
     (component
        asset_settings_identifier
-       all_host_profiles
+       apple_profiles
        true
        children
        [ payload_property ]
@@ -79,7 +60,7 @@ let registry =
     registry
     (component
        list_identifier
-       all_host_profiles
+       apple_profiles
        true
        children
        [ payload_property ]
@@ -100,7 +81,6 @@ let decode_event = function
     when String.equal name "event"
          && (String.equal identifier chrome_identifier
              || String.equal identifier asset_import_identifier
-             || String.equal identifier media_identifier
              || String.equal identifier asset_settings_identifier
              || String.equal identifier list_identifier) ->
     (match String_map.find_opt "id" values, String_map.find_opt "payload" values with
@@ -134,11 +114,6 @@ let chrome ?key ~payload ?on_event children : Lui_elements.t =
 let asset_import ?key ~payload ?on_event children : Lui_elements.t =
   fun context parent ->
   mount ?key ~payload ~children ?on_event asset_import_identifier context parent
-;;
-
-let media ?key ~payload ?on_event children : Lui_elements.t =
-  fun context parent ->
-  mount ?key ~payload ~children ?on_event media_identifier context parent
 ;;
 
 let asset_settings ?key ~payload ?on_event children : Lui_elements.t =

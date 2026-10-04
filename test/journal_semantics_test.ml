@@ -181,6 +181,89 @@ let test_scoped_theme_wire_properties () =
     cases
 ;;
 
+(* Picker label ownership is in the mounted value-control adapter. Reducer
+   selection events cannot reveal a missing accessibility label that makes the
+   Apple backend reject the batch before presenting the sheet. *)
+let test_status_picker_keeps_accessible_group_and_selection () =
+  let selections = ref [] in
+  let view =
+    V.Picker.create
+      ~label:"Task status"
+      ~style:Inline
+      ~selected_id:(Some 1L)
+      ~on_select:
+        (Ui.Event.Handler.create (function
+           | Ui.Event.Payload.Int64 id -> selections := id :: !selections
+           | _ -> fail "status choice lost its typed selection"))
+      [ V.Picker.option ~id:1L ~label:(V.text "Todo") ()
+      ; V.Picker.option ~id:2L ~label:(V.text "Done") ()
+      ; V.Picker.option ~id:3L ~enabled:false ~label:(V.text "Clear") ()
+      ]
+      ()
+  in
+  with_mounted view (fun app ops ->
+    let ops = ops () in
+    let group =
+      List.find_map
+        (function
+          | Lui_protocol.CreateNode (node, RadioGroup) -> Some node
+          | _ -> None)
+        ops
+      |> Option.get
+    in
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, AccessibilityLabel, StringValue "Task status") ->
+             node = group
+           | _ -> false)
+         ops)
+      "Task status group lost its accessible name; Apple rejects this value control";
+    let radio title =
+      List.find_map
+        (function
+          | Lui_protocol.SetProp (node, TextValue, StringValue value) when value = title
+            -> Some node
+          | _ -> None)
+        ops
+      |> Option.get
+    in
+    let todo = radio "Todo"
+    and done_ = radio "Done"
+    and clear = radio "Clear" in
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, Checked, BoolValue true) -> node = todo
+           | _ -> false)
+         ops)
+      "status Picker lost its current selection";
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, Enabled, BoolValue false) -> node = clear
+           | _ -> false)
+         ops)
+      "status Picker lost its disabled option";
+    (* Native Radio uses Change for selecting an unchecked option. A false
+       ToggleChanged is deselection, not a new status choice. *)
+    ignore (Lui_app.dispatch_event app (Lui_protocol.ToggleChanged (todo, false)));
+    ignore (Lui_app.flush app);
+    require (!selections = []) "radio deselection executed a status choice";
+    ignore (Lui_app.dispatch_event app (Lui_protocol.Change done_));
+    ignore (Lui_app.flush app);
+    require
+      (!selections = [ 2L ])
+      "native Radio Change did not execute its typed status selection callback";
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, ChangeEnabled, BoolValue true) -> node = done_
+           | _ -> false)
+         ops)
+      "native Radio did not advertise its Change binding")
+;;
+
 let has_text ops expected =
   List.exists
     (function
@@ -287,6 +370,280 @@ let test_timeline_has_no_chevron () =
       "timeline still draws a trailing chevron")
 ;;
 
+(* Row-action callback binding is owned by the mounted Native_list wrapper.
+   Pure Application events already execute these commands; they cannot recreate
+   the missing extension-event -> captured row callback binding. *)
+let native_list_node ops =
+  List.find_map
+    (function
+      | Lui_protocol.CreateExtension (node, identifier, _)
+        when identifier = Journal_lui_native.list_identifier -> Some node
+      | _ -> None)
+    (List.rev ops)
+  |> Option.get
+;;
+
+let dispatch_list_payload app node payload =
+  let values =
+    Lui_protocol.String_map.empty
+    |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 0)
+    |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue payload)
+  in
+  ignore
+    (Lui_app.dispatch_event
+       app
+       (Lui_protocol.ExtensionEvent
+          (node, Journal_lui_native.list_identifier, "event", values)));
+  ignore (Lui_app.flush app)
+;;
+
+let dispatch_row_action app node row key =
+  let payload =
+    Yojson.Basic.to_string (`Assoc [ "row", `String row; "key", `String key ])
+  in
+  dispatch_list_payload
+    app
+    node
+    (Yojson.Basic.to_string
+       (`Assoc [ "type", `String "row_event"; "payload", `String payload ]))
+;;
+
+let timeline_action_view ~enabled received =
+  let handler tag =
+    Ui.Event.Handler.create (function
+      | Ui.Event.Payload.Text id -> received := (tag, id) :: !received
+      | _ -> fail "row action lost its block identity")
+  in
+  let ignore_event = Ui.Event.Handler.create (fun _ -> ()) in
+  Journal_native_collection.view
+    ~key:(Ui.Key.string "action-list")
+    ~test_id:(Ui.Test_id.string "action-list")
+    ~rows:
+      [ { Journal_native_collection.id = "block:" ^ block_id
+        ; section = "20260809"
+        ; header = false
+        ; slot_index = Some 0
+        ; block_id = Some block_id
+        }
+      ]
+    ~scroll_target:None
+    ~on_scroll_completed:ignore_event
+    ~actions_enabled:enabled
+    ~on_visible_range:ignore_event
+    ~on_open:(handler "open")
+    ~on_status:(handler "status")
+    ~on_delete:(handler "delete")
+    ~children:[ V.text "Action target" ]
+  |> V.Body.Private.to_widget
+;;
+
+let test_timeline_native_status_delete_callbacks () =
+  let received = ref [] in
+  with_mounted (timeline_action_view ~enabled:true received) (fun app ops ->
+    let node = native_list_node (ops ()) in
+    let row = "block:" ^ block_id in
+    List.iter
+      (dispatch_row_action app node row)
+      [ "status:" ^ block_id; "delete:" ^ block_id; "status"; "delete" ];
+    require
+      (List.rev !received
+       = [ "status", block_id
+         ; "delete", block_id
+         ; "status", block_id
+         ; "delete", block_id
+         ])
+      "Timeline native Status/Delete did not execute their bound block callbacks")
+;;
+
+let test_native_row_actions_ignore_disabled_missing_and_malformed () =
+  let received = ref [] in
+  List.iter
+    (fun enabled ->
+       with_mounted (timeline_action_view ~enabled received) (fun app ops ->
+         let node = native_list_node (ops ()) in
+         let row = "block:" ^ block_id in
+         if not enabled
+         then
+           List.iter
+             (dispatch_row_action app node row)
+             [ "status"; "delete"; "status:" ^ block_id; "delete:" ^ block_id ];
+         dispatch_row_action app node "missing-row" "delete";
+         dispatch_row_action app node row "retired-action";
+         dispatch_list_payload app node {|{"type":"row_event","payload":"invalid json"}|};
+         dispatch_list_payload
+           app
+           node
+           {|{"type":"row_event","payload":"{\"row\":4,\"key\":\"delete\"}"}|};
+         require (!received = []) "disabled, missing, or malformed row action executed"))
+    [ false; true ]
+;;
+
+let test_native_nested_row_actions_bind_current_owner () =
+  let module N = V.Native_list in
+  let received = ref [] in
+  let action tag =
+    V.Context_menu.action
+      ~key:(Ui.Key.string "delete")
+      ~title:"Delete"
+      ~on_press:(Ui.Event.Handler.create (fun _ -> received := tag :: !received))
+      ()
+  in
+  let row key tag =
+    N.row
+      ~key:(Ui.Key.string key)
+      ~context_menu:(V.Context_menu.create ~actions:[ action tag ] ())
+      (V.text tag)
+  in
+  let parent =
+    N.disclosure_row
+      ~key:(Ui.Key.string "parent")
+      ~expanded:true
+      ~on_expanded_changed:
+        (Ui.Event.Handler.create (function
+           | Ui.Event.Payload.Bool value ->
+             received := (if value then "expand" else "collapse") :: !received
+           | _ -> fail "disclosure payload lost Bool"))
+      ~context_menu:(V.Context_menu.create ~actions:[ action "parent-delete" ] ())
+      ~label:(V.text "Parent")
+      [ row "child" "child-delete" ]
+  in
+  let closed =
+    N.disclosure_row
+      ~key:(Ui.Key.string "closed")
+      ~expanded:false
+      ~on_expanded_changed:(Ui.Event.Handler.create (fun _ -> ()))
+      ~label:(V.text "Closed")
+      [ row "hidden-child" "hidden-delete" ]
+  in
+  let view =
+    N.vertical ~style:Plain [ N.section ~key:(Ui.Key.string "nested") [ parent; closed ] ]
+  in
+  with_mounted view (fun app ops ->
+    let node = native_list_node (ops ()) in
+    dispatch_row_action app node "hidden-child" "delete";
+    dispatch_row_action app node "child" "delete";
+    dispatch_row_action app node "parent" "delete";
+    dispatch_list_payload app node {|{"type":"expanded","key":"parent","expanded":false}|};
+    require
+      (List.rev !received = [ "child-delete"; "parent-delete"; "collapse" ])
+      "nested row action executed another owner or lost disclosure behavior")
+;;
+
+let test_native_retired_row_actions_do_not_execute () =
+  let received = ref [] in
+  let mounted = ref None in
+  let view =
+    V.of_lui (fun context parent ->
+      let state = Signal.state context.ui_scheduler true in
+      mounted := Some state;
+      Lui_elements.dyn
+        ~equal:Bool.equal
+        (fun show ->
+           if show
+           then Ui.mount (timeline_action_view ~enabled:true received)
+           else Lui_elements.column [])
+        (Signal.value state)
+        context
+        parent)
+  in
+  with_mounted view (fun app ops ->
+    let node = native_list_node (ops ()) in
+    Signal.set (Option.get !mounted) false;
+    ignore (Lui_app.flush app);
+    dispatch_row_action app node ("block:" ^ block_id) "delete";
+    require (!received = []) "retired List node executed an obsolete callback";
+    Signal.set (Option.get !mounted) true;
+    ignore (Lui_app.flush app);
+    let current = native_list_node (ops ()) in
+    require (current <> node) "remount reused retired extension identity";
+    dispatch_row_action app current ("block:" ^ block_id) "status";
+    require
+      (!received = [ "status", block_id ])
+      "remounted List lost its current callback")
+;;
+
+let test_mounted_input_revisions_remain_independent () =
+  let module T = Journal_ids.Text_input in
+  let edits = ref [] in
+  let handler =
+    Ui.Event.Handler.create (function
+      | Ui.Event.Payload.Text_edit edit -> edits := edit :: !edits
+      | _ -> fail "input callback did not translate text edit")
+  in
+  let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+  let session_id n = T.Session_id.of_int64 n in
+  let revision n = T.Local_revision.of_int64 n in
+  let document_revision = T.Document_revision.of_int64 9L in
+  let value =
+    Ui.Text_editing.Value.create
+      ~text:""
+      ~selection:(Ui.Text_editing.Range.create ~text:"" ~start_utf16:0 ~end_utf16:0)
+      ()
+  in
+  let composer =
+    V.composer
+      ~placeholder:"Compose"
+      ~session_id:(session_id 11L)
+      ~document_revision
+      ~accepted_local_revision:(revision 4L)
+      ~value
+      ~send_disabled:false
+      ~actions:[]
+      ~on_edit:handler
+      ~on_submit:ignored
+      ~on_send:ignored
+      ()
+  in
+  let password =
+    V.secure_field
+      ~label:"Password"
+      ~session_id:(session_id 12L)
+      ~document_revision
+      ~accepted_local_revision:(revision 20L)
+      ~update_mode:Initiate
+      ~value
+      ~on_edit:handler
+      ~on_submit:ignored
+      ~on_focus_changed:ignored
+      ()
+  in
+  with_mounted
+    (V.column [ composer; password ])
+    (fun app ops ->
+       let node kind =
+         List.find_map
+           (function
+             | Lui_protocol.CreateNode (node, actual) when actual = kind -> Some node
+             | _ -> None)
+           (ops ())
+         |> Option.get
+       in
+       let input node text =
+         ignore (Lui_app.dispatch_event app (Lui_protocol.TextChanged (node, text)));
+         ignore (Lui_app.flush app)
+       in
+       input (node Textarea) "中文👩🏽‍💻";
+       input (node SecureField) "密碼";
+       input (node Textarea) "中文👩🏽‍💻!";
+       let observed =
+         List.rev_map
+           (fun (edit : Ui.Event.Payload.text_edit) ->
+              require
+                (edit.base_document_revision = document_revision
+                 && edit.selection.start_utf16 = 0
+                 && edit.selection.end_utf16 = 0
+                 && edit.composing = None)
+                "input translation changed revision/selection metadata";
+              ( T.Session_id.to_int64 edit.session_id
+              , T.Local_revision.to_int64 edit.local_revision
+              , edit.text ))
+           !edits
+       in
+       require
+         (observed = [ 11L, 5L, "中文👩🏽‍💻"; 12L, 21L, "密碼"; 11L, 6L, "中文👩🏽‍💻!" ])
+         "simultaneous composer/password mounts shared revisions or changed Unicode text")
+;;
+
 let test_long_body_can_expand () =
   let source =
     String.concat
@@ -357,11 +714,21 @@ let media_item n file_type presentation size =
   { Journal_media_runtime.token = string_of_int n; asset; file_type; presentation }
 ;;
 
+let seeded_media_store views =
+  let store = Journal_media_view.Store.create () in
+  List.iter
+    (fun (root, view) -> Journal_media_view.Store.update store ~root (Some view))
+    views;
+  store
+;;
+
 let media_view items =
   Journal_media_view.view
     ~scope:"fixture"
     ~root:block_id
-    ~media:(Some { Journal_media_runtime.items; more = false; error = None })
+    ~store:
+      (seeded_media_store
+         [ block_id, { Journal_media_runtime.items; more = false; error = None } ])
     ~on_event:(fun _ -> ())
     (V.text "Example body")
 ;;
@@ -371,13 +738,15 @@ let test_detail_media_preserves_rendering_without_asset_actions () =
     Journal_media_view.view
       ~scope:"detail-action-removal"
       ~root:block_id
-      ~media:
-        (Some
-           { Journal_media_runtime.items =
-               [ media_item 41 "png" (File "/tmp/existing-image.png") None ]
-           ; more = false
-           ; error = None
-           })
+      ~store:
+        (seeded_media_store
+           [ ( block_id
+             , { Journal_media_runtime.items =
+                   [ media_item 41 "png" (File "/tmp/existing-image.png") None ]
+               ; more = false
+               ; error = None
+               } )
+           ])
       ~on_event:(fun _ -> ())
       (V.text "Existing detail body")
   in
@@ -655,15 +1024,19 @@ let asset_id (item : Journal_media_runtime.item) = Graph.Uuid.to_string item.ass
 let media_state items = { Journal_media_runtime.items; more = false; error = None }
 
 let projected_row ?store ~views ~on_event entry =
+  let store =
+    match store with
+    | Some store -> store
+    | None -> seeded_media_store views
+  in
   Journal_row.view
     ~show_timestamp:false
     ~render_media:(fun ~root ~image_children child ->
       Journal_media_view.row
-        ?store
+        ~store
         ~scope:"direct-child-regression"
         ~root
         ~image_children
-        ~media_for_root:(fun id -> List.assoc_opt id views)
         ~on_event
         child)
     entry
@@ -842,11 +1215,7 @@ let test_image_children_load_without_title_flash () =
   in
   let root_requested id =
     List.exists
-      (fun json ->
-         let open Yojson.Basic.Util in
-         let payload = Yojson.Basic.from_string json in
-         payload |> member "action" |> to_string = "root"
-         && payload |> member "root" |> to_string = id)
+      (fun (event : Journal_media_view.event) -> event.action = Root && event.root = id)
       !events
   in
   with_mounted view (fun app ops ->
@@ -898,11 +1267,8 @@ let test_image_children_load_without_title_flash () =
     ignore (Lui_app.flush app);
     require
       (List.exists
-         (fun json ->
-            let open Yojson.Basic.Util in
-            let payload = Yojson.Basic.from_string json in
-            payload |> member "action" |> to_string = "asset"
-            && payload |> member "root" |> to_string = asset_id first)
+         (fun (event : Journal_media_view.event) ->
+            event.action = Asset && event.root = asset_id first)
          !events)
       "aggregated image download event was routed to its parent instead of owner")
 ;;
@@ -1225,12 +1591,8 @@ let test_reactive_child_gallery_routes_and_preserves_siblings () =
          ignore (Lui_app.flush app);
          require
            (List.exists
-              (fun encoded ->
-                 let open Yojson.Basic.Util in
-                 let event = Yojson.Basic.from_string encoded in
-                 member "action" event = `String "asset"
-                 && member "root" event = `String owner
-                 && member "asset" event = `String token)
+              (fun (event : Journal_media_view.event) ->
+                 event.action = Asset && event.root = owner && event.asset = token)
               !events)
            "gallery appearance used an obsolete parent/child descriptor owner"
        in
@@ -1322,7 +1684,6 @@ let test_reactive_nonimage_structure_and_presentation () =
       ~store
       ~scope:"reactive-files"
       ~root:block_id
-      ~media:None
       ~on_event:ignore
       (V.text "Persistent file body")
   in
@@ -1425,7 +1786,6 @@ let test_reactive_media_subscription_disposal_and_epoch () =
                   ~on_region:observe
                   ~scope:"lifetime"
                   ~root:block_id
-                  ~media:None
                   ~on_event:ignore
                   (V.text "Lifetime body"))
            else Lui_elements.column [])
@@ -1479,7 +1839,16 @@ let test_reactive_media_subscription_disposal_and_epoch () =
 ;;
 
 let tests =
-  [ ( "reactive gallery owner routing and sibling identity"
+  [ ( "native status Picker contracts"
+    , test_status_picker_keeps_accessible_group_and_selection )
+  ; "independent mounted input revisions", test_mounted_input_revisions_remain_independent
+  ; ( "Timeline native Status/Delete callbacks"
+    , test_timeline_native_status_delete_callbacks )
+  ; ( "native action rejection"
+    , test_native_row_actions_ignore_disabled_missing_and_malformed )
+  ; "nested native action owners", test_native_nested_row_actions_bind_current_owner
+  ; "retired native action owners", test_native_retired_row_actions_do_not_execute
+  ; ( "reactive gallery owner routing and sibling identity"
     , test_reactive_child_gallery_routes_and_preserves_siblings )
   ; ( "reactive nonimage structure and presentation"
     , test_reactive_nonimage_structure_and_presentation )

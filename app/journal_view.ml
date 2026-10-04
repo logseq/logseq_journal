@@ -19,7 +19,6 @@ type t =
   ; test_id : string option
   ; mount : Lui_elements.t
   ; label_content : label_content option
-  ; menu_item_mount : Lui_elements.t option
   }
 
 module Key = struct
@@ -37,10 +36,7 @@ module Test_id = struct
   let to_string s = s
 end
 
-let element ?key ?test_id ?menu_item_mount mount =
-  { key; test_id; mount; label_content = None; menu_item_mount }
-;;
-
+let element ?key ?test_id mount = { key; test_id; mount; label_content = None }
 let mount t = t.mount
 let int_of_float_nan v = int_of_float (Float.round v)
 
@@ -58,14 +54,12 @@ let journal_icon name : Lui_elements.icon =
   `app (String.map (fun c -> if c = '.' then '-' else c) name)
 ;;
 
-(* While a navigation bar or bottom bar mounts its items, labels collapse to
-   their icon — matching the icon-only affordances the system chrome showed. *)
+(* Navigation-bar controls keep their icon-only system-chrome presentation. *)
 let icon_only = ref false
 
 (* [set_leaf_label] records each bar-mounted control that actually collapsed
    its label to an icon; only those get the uniform 40pt control cell — a
-   text button like "Close" keeps its natural width, and a grouped row of
-   controls sizes its leaves rather than the row itself. *)
+   text button like "Close" keeps its natural width. *)
 let icon_only_collapsed_nodes : int list ref = ref []
 
 (* Leaf controls carry their label/icon as properties; each kind only accepts
@@ -805,133 +799,40 @@ module View = struct
       | Some _ as variant -> variant
       | None -> Option.map Button_style.lui_variant style
     in
-    { (element
-         ?key
-         (Lui_elements.button
-            ~disabled:(not enabled)
-            ?variant
-            ~autofocus
-            ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
-            (* lui controls are leaf nodes: their label/icon travel as
-               properties, not child elements. *)
-            [ leaf_label child.label_content ]))
-      with
-      menu_item_mount =
-        Some
-          (Lui_elements.menu_item
-             ~disabled:(not enabled)
-             ?text:
-               (Option.map
-                  (fun (label : label_content) ->
-                     if String.length label.title = 0 then " " else label.title)
-                  child.label_content)
-             ?icon:
-               (match child.label_content with
-                | Some { icon = Some name; _ } -> Some (journal_icon name)
-                | _ -> None)
-             ?variant:(Button_role.lui_variant role)
-             ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
-             [])
-    }
-  ;;
-
-  let toggle
-        ?key
-        ?(style = Button_style.Automatic)
-        ?(enabled = true)
-        ~value
-        ~on_changed
-        ~label
-        ()
-    =
-    let on_toggle event =
-      match event with
-      | Lui_protocol.ToggleChanged (_, selected) ->
-        invoke on_changed (Event.Payload.Bool selected)
-      | _ -> ()
-    in
     element
       ?key
-      (match style, label.label_content with
-       (* A button-style toggle mounts the toggle-button control, whose
-          [checked] state carries the selected affordance — and unlike
-          [toggle] it can carry the label's icon. *)
-       | Button_style.Button, Some { title; icon } ->
-         Lui_elements.toggle_button
-           ~checked:value
-           ~disabled:(not enabled)
-           ~label:title
-           ~text:title
-           ?icon:(Option.map journal_icon icon)
-           ~on_toggle
-           []
-       (* A text-only label mounts the shared toggle-row composite. *)
-       | _, Some { title; icon = None } ->
-         Lui_element_combine.toggle_row
-           ~label:title
-           ~checked:value
-           ~disabled:(not enabled)
-           ~on_toggle
-           ()
-       | _ ->
-         Lui_elements.toggle
-           ~checked:value
-           ~disabled:(not enabled)
-           ~on_toggle
-           [ leaf_label label.label_content ])
+      (Lui_elements.button
+         ~disabled:(not enabled)
+         ?variant
+         ~autofocus
+         ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
+         (* Leaf controls carry label/icon as properties, not child nodes. *)
+         [ leaf_label child.label_content ])
   ;;
 
-  let text_editor
-        ?key
-        ?(autofocus = false)
-        ?(enabled = true)
-        ?(read_only = false)
-        ?(submit_on_return = true)
-        ?max_utf8_bytes:_
-        ~session_id
-        ~document_revision
-        ~accepted_local_revision
-        ~update_mode:_
-        ~value
-        ~on_edit
-        ~on_submit
-        ~on_focus_changed:_
-        ?on_limit_reached:_
-        ()
-    =
-    element ?key (fun context parent ->
-      let local_revision = ref accepted_local_revision in
-      Lui_elements.textarea
-        ~text:(Text_editing.Value.text value)
-        ~disabled:(not (enabled && not read_only))
-        ~autofocus
-        ~submit_on_enter:submit_on_return
-        ~on_input:(fun event ->
-          match event with
-          | Lui_protocol.TextChanged (_, text) ->
-            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
-            invoke
-              on_edit
-              (Event.Payload.Text_edit
-                 { session_id
-                 ; local_revision = !local_revision
-                 ; base_document_revision = document_revision
-                 ; text
-                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
-                 ; composing = None
-                 })
-          | _ -> ())
-        ~on_submit:(fun _ -> invoke on_submit Event.Payload.Unit)
-        []
-        context
-        parent)
+  let text_edit_handler ~session_id ~document_revision ~accepted_local_revision ~on_edit =
+    let local_revision = ref accepted_local_revision in
+    function
+    | Lui_protocol.TextChanged (_, text) ->
+      local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
+      invoke
+        on_edit
+        (Event.Payload.Text_edit
+           { session_id
+           ; local_revision = !local_revision
+           ; base_document_revision = document_revision
+           ; text
+           ; selection = { start_utf16 = 0; end_utf16 = 0 }
+           ; composing = None
+           })
+    | _ -> ()
   ;;
 
   (* The shared composer composite owns the content-sized capsule, bounded
      [composer-input] textarea, attachments, feedback and action row. Journal
      keeps its revision-aware edit payloads by
      translating the composer's raw [on_input] events through the same
-     per-mount local-revision bookkeeping [text_editor] uses. The composite's
+     per-mount local-revision bookkeeping. The composite's
      textarea cannot be disabled, so [~enabled] state is carried only by the
      actions and the send button (the model drops edits while saving). *)
   let composer
@@ -954,7 +855,6 @@ module View = struct
         ()
     =
     element ?key (fun context parent ->
-      let local_revision = ref accepted_local_revision in
       Lui_element_combine.composer
         ?accessibility_identifier
         ?label
@@ -967,21 +867,12 @@ module View = struct
         ~submit_on_enter:true
         ~send_disabled_signal:(Signal.constant context.Lui_ui.ui_scheduler send_disabled)
         ~actions:(List.map (fun action -> action.mount) actions)
-        ~on_input:(fun event ->
-          match event with
-          | Lui_protocol.TextChanged (_, text) ->
-            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
-            invoke
-              on_edit
-              (Event.Payload.Text_edit
-                 { session_id
-                 ; local_revision = !local_revision
-                 ; base_document_revision = document_revision
-                 ; text
-                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
-                 ; composing = None
-                 })
-          | _ -> ())
+        ~on_input:
+          (text_edit_handler
+             ~session_id
+             ~document_revision
+             ~accepted_local_revision
+             ~on_edit)
         ~on_submit:(fun _ -> invoke on_submit Event.Payload.Unit)
         ~on_send:(fun _ -> invoke on_send Event.Payload.Unit)
         ()
@@ -1079,27 +970,17 @@ module View = struct
         ()
     =
     element ?key (fun context parent ->
-      let local_revision = ref accepted_local_revision in
       Lui_elements.secure_field
         ~text:(Text_editing.Value.text value)
         ~placeholder:prompt
         ~disabled:(not enabled)
         ~autofocus
-        ~on_input:(fun event ->
-          match event with
-          | Lui_protocol.TextChanged (_, text) ->
-            local_revision := Journal_ids.Text_input.Local_revision.succ !local_revision;
-            invoke
-              on_edit
-              (Event.Payload.Text_edit
-                 { session_id
-                 ; local_revision = !local_revision
-                 ; base_document_revision = document_revision
-                 ; text
-                 ; selection = { start_utf16 = 0; end_utf16 = 0 }
-                 ; composing = None
-                 })
-          | _ -> ())
+        ~on_input:
+          (text_edit_handler
+             ~session_id
+             ~document_revision
+             ~accepted_local_revision
+             ~on_edit)
         ~on_submit:(fun _ -> invoke on_submit Event.Payload.Unit)
         []
         context
@@ -1234,86 +1115,21 @@ module View = struct
 
   module Toolbar = struct
     type placement =
-      | Automatic
       | Principal
-      | Navigation
       | Primary_action
       | Secondary_action
-      | Status
-      | Confirmation_action
       | Cancellation_action
-      | Destructive_action
-      | Bottom_bar
-
-    type spacing =
-      | Fixed
-      | Flexible
-
-    type child = t
 
     type item =
       { item_key : string
       ; placement : placement option
-      ; content : child
-      ; spacing : spacing option
-      ; is_group : bool
-      ; raw : bool
+      ; content : t
       }
 
-    let child ~key:_ view = view
-
-    let item ~key ?placement content =
-      { item_key = key
-      ; placement
-      ; content
-      ; spacing = None
-      ; is_group = false
-      ; raw = false
-      }
-    ;;
-
-    (* Bar content that mounts unmodified — no icon collapsing and no
-       per-item capsule fusion. For chrome-surface elements that already
-       carry their own chrome, like the expanded composer. *)
-    let raw_item ~key ?placement content =
-      { item_key = key; placement; content; spacing = None; is_group = false; raw = true }
-    ;;
-
-    let group ~key ?placement children =
-      { item_key = key
-      ; placement
-      ; content =
-          element ~key (fun context parent ->
-            (* Groups mount their children flat into the enclosing bar: the
-               toolbar capsule already is the group, and a wrapper
-               button-group/row is either not a legal toolbar child or would
-               stretch the capsule to full width. *)
-            match parent with
-            | Some parent ->
-              Lui_elements.mount_children
-                context
-                parent
-                (List.map (fun child -> child.mount) children);
-              0
-            | None -> 0)
-      ; spacing = None
-      ; is_group = true
-      ; raw = false
-      }
-    ;;
-
-    let spacer ~key ?placement spacing =
-      { item_key = key
-      ; placement
-      ; content = element (Lui_elements.spacer [])
-      ; spacing = Some spacing
-      ; is_group = false
-      ; raw = false
-      }
-    ;;
+    let item ~key ?placement content = { item_key = key; placement; content }
 
     (* System-chrome emulation: on iOS the previous renderer put toolbar items
-       into real navigation/bottom bars — leading back affordance, centered
+       into real navigation bars — leading back affordance, centered
        principal title, and trailing icon-only actions grouped in a capsule.
        lui has no chrome node, so the shim reproduces that layout inline. *)
     let mount_icon_only (item : item) : Lui_elements.t =
@@ -1360,7 +1176,7 @@ module View = struct
         (* Items hoist into the platform chrome by placement: each
            `placement` toolbar emits its children as system ToolbarItems
            (the navigation bar's leading/principal/trailing areas on iOS,
-           the window toolbar on macOS) — groups fuse into one capsule.
+           the window toolbar on macOS).
            Hosts without chrome hoisting render the toolbar's inline row
            content instead, so this row keeps the emulated arrangement. *)
         let emit_bar placement children : Lui_elements.t =
@@ -1369,8 +1185,7 @@ module View = struct
         let of_placement p =
           List.filter (fun (item : item) -> item.placement = Some p) items
         in
-        let navigation = of_placement Navigation
-        and cancellation = of_placement Cancellation_action
+        let cancellation = of_placement Cancellation_action
         and principal = of_placement Principal in
         let nav_can_pop =
           match !nav_bar with
@@ -1382,19 +1197,18 @@ module View = struct
           ~cross:`center
           ~padding_horizontal:10
           ~padding_vertical:4
-          ((if nav_can_pop || navigation <> []
+          ((if nav_can_pop
             then
               [ emit_bar
                   "navigation"
-                  ((match !nav_bar with
-                    | Some { nav_can_pop = true; nav_on_change; nav_remaining; _ } ->
-                      [ nav_button ~icon:"chevron.left" ~label:"Back" ~on_press:(fun () ->
-                          invoke
-                            nav_on_change
-                            (Event.Payload.Navigation_path_changed nav_remaining))
-                      ]
-                    | _ -> [])
-                   @ List.map mount_icon_only navigation)
+                  (match !nav_bar with
+                   | Some { nav_can_pop = true; nav_on_change; nav_remaining; _ } ->
+                     [ nav_button ~icon:"chevron.left" ~label:"Back" ~on_press:(fun () ->
+                         invoke
+                           nav_on_change
+                           (Event.Payload.Navigation_path_changed nav_remaining))
+                     ]
+                   | _ -> [])
               ]
             else [])
            @ (if cancellation <> []
@@ -1431,68 +1245,26 @@ module View = struct
                   else [])
                [ "primary-action", of_placement Primary_action
                ; "automatic", List.filter (fun (i : item) -> i.placement = None) items
-               ; "status", of_placement Status
-               ; "confirmation-action", of_placement Confirmation_action
-               ; "destructive-action", of_placement Destructive_action
                ; "secondary-action", of_placement Secondary_action
                ])
           context
           parent)
     ;;
 
-    (* A toolbar child is limited to the schema's interactive kinds, so raw
-       content (e.g. the expanded composer column) mounts as a direct child of
-       the page column — pinned at the bottom without bar chrome. *)
-    let mount_raw (item : item) context parent =
-      let mounted = item.content.mount context parent in
-      if mounted <> 0 then Lui_ui.key context mounted item.item_key;
-      mounted
-    ;;
-
-    let mount_bottom_bar items =
-      element (fun context parent ->
-        (* A `placement "bottom"` toolbar maps to the platform bottom bar on
-           iOS — the system renders each group as a floating glass capsule,
-           spacers flex between them, and scroll content insets around the
-           bar. Groups need a button-group child so the bar renders one
-           capsule per group instead of one capsule per button. *)
-        Lui_elements.toolbar
-          ~label:"actions"
-          ~toolbar_gap:16
-          ~placement:"bottom"
-          (List.map
-             (fun (item : item) ->
-                match item.spacing with
-                | Some _ -> Lui_elements.spacer []
-                | None ->
-                  if item.is_group
-                  then Lui_elements.button_group [ mount_icon_only item ]
-                  else mount_icon_only item)
-             items)
-          context
-          parent)
-    ;;
-
     let create ?key ~items t =
       element ?key (fun context parent ->
-        let top, bottom =
-          List.partition (fun (item : item) -> item.placement <> Some Bottom_bar) items
-        in
-        let bare, bar = List.partition (fun (item : item) -> item.raw) bottom in
         Lui_elements.column
           ~grow:1.0
           ((if
-              top <> []
+              items <> []
               || Option.fold ~none:false ~some:(fun bar -> bar.nav_can_pop) !nav_bar
-            then [ (mount_items top).mount ]
+            then [ (mount_items items).mount ]
             else [])
            @ [ (fun context parent ->
                  let body = t.mount context parent in
                  if node_is_standard context body then Lui_ui.grow context body 1.0;
                  body)
-             ]
-           @ (if bar <> [] then [ (mount_bottom_bar bar).mount ] else [])
-           @ List.map mount_raw bare)
+             ])
           context
           parent)
     ;;
@@ -1528,18 +1300,6 @@ module View = struct
       let create ?key children = column ?key children
     end
 
-    module Horizontal = struct
-      type child = t
-
-      let fixed t = t
-
-      let fill ?(weight = 1.) t =
-        modify (fun context node -> Lui_ui.grow context node weight) t
-      ;;
-
-      let create ?key children = row ?key children
-    end
-
     module Private = struct
       let to_widget t = t
     end
@@ -1559,30 +1319,6 @@ module View = struct
       let overlay ?key ?alignment ~overlay t = parent_overlay ?key ?alignment ~overlay t
       let with_height ~height t = frame ~height t
     end
-
-    module Horizontal = struct
-      type nonrec t = t
-
-      let with_test_id id t = with_test_id id t
-      let with_width ~width t = frame ~width t
-    end
-  end
-
-  module Scroll = struct
-    type anchor =
-      | Start
-      | End
-
-    let vertical
-          ?key
-          ?on_scroll:_
-          ?shows_indicators:_
-          ?fill_viewport:_
-          ?initial_anchor:_
-          t
-      =
-      element ?key (Lui_elements.scroll [ t.mount ])
-    ;;
   end
 
   module Swipe_actions = struct
@@ -1621,8 +1357,6 @@ module View = struct
   end
 
   module Context_menu = struct
-    type nonrec view = t
-
     type role =
       | Normal
       | Destructive
@@ -1643,29 +1377,6 @@ module View = struct
     ;;
 
     let create ?enabled:_ ~actions () = actions
-
-    let attach ?key:_ actions (view : element_) =
-      element ?key:view.key (fun context parent ->
-        let node = view.mount context parent in
-        ignore
-          (Lui_elements.context_menu
-             (List.map
-                (fun (action : action) ->
-                   Lui_elements.menu_item
-                     ~text:action.title
-                     ?icon:(Option.map journal_icon action.symbol)
-                     ?variant:
-                       (match action.role with
-                        | Normal -> None
-                        | Destructive -> Some `destructive)
-                     ~disabled:(not action.enabled)
-                     ~on_press:(fun _ -> invoke action.on_press Event.Payload.Unit)
-                     [])
-                actions)
-             context
-             (Some node));
-        node)
-    ;;
   end
 
   module Confirmation = struct
@@ -2023,7 +1734,6 @@ module View = struct
           ?scroll_request
           ?on_scroll_completed
           ?on_visible_range
-          ?(on_row_event : Event.handler option)
           sections
       =
       let payload, contents =
@@ -2047,6 +1757,40 @@ module View = struct
           (fun acc section -> List.fold_left collect acc section.rows)
           []
           sections
+      in
+      (* Actions belong to the current mounted snapshot, including only the
+         visible children of expanded rows. Disabled/removed actions have no
+         callback entry, so a late host event cannot resurrect them. *)
+      let row_actions = Hashtbl.create 16 in
+      let rec register (row : row) =
+        Option.iter
+          (List.iter (fun (action : Swipe_actions.action) ->
+             if action.enabled
+             then Hashtbl.replace row_actions (row.key, action.key) action.on_press))
+          row.swipe_actions;
+        Option.iter
+          (List.iter (fun (action : Context_menu.action) ->
+             if action.enabled
+             then Hashtbl.replace row_actions (row.key, action.key) action.on_press))
+          row.context_menu;
+        match row.kind with
+        | Disclosure { expanded = true; children } -> List.iter register children
+        | Row | Disclosure { expanded = false; _ } -> ()
+      in
+      List.iter (fun section -> List.iter register section.rows) sections;
+      let dispatch_row payload =
+        match
+          try Yojson.Basic.from_string payload with
+          | _ -> `Null
+        with
+        | `Assoc fields ->
+          (match List.assoc_opt "row" fields, List.assoc_opt "key" fields with
+           | Some (`String row), Some (`String key) ->
+             Option.iter
+               (fun handler -> invoke handler Event.Payload.Unit)
+               (Hashtbl.find_opt row_actions (row, key))
+           | _ -> ())
+        | _ -> ()
       in
       let on_event (event : Journal_lui_native.event) =
         match
@@ -2100,20 +1844,9 @@ module View = struct
                   expanded_handlers
               | _ -> ())
            | Some (`String "row_event") ->
-             Option.iter
-               (fun handler ->
-                  match List.assoc_opt "payload" fields with
-                  | Some (`String payload) ->
-                    invoke
-                      handler
-                      (Event.Payload.Native_event
-                         { kind_id = Journal_ids.Native_widget.Kind_id.of_int 0
-                         ; version = 0
-                         ; event_id = event.event_id
-                         ; payload = Bytes.of_string payload
-                         })
-                  | _ -> ())
-               on_row_event
+             (match List.assoc_opt "payload" fields with
+              | Some (`String payload) -> dispatch_row payload
+              | _ -> ())
            | _ -> ())
         | _ -> ()
       in
@@ -2271,11 +2004,7 @@ module View = struct
   end
 
   module Picker = struct
-    type style =
-      | Automatic
-      | Menu
-      | Segmented
-      | Inline
+    type style = Inline
 
     type choice =
       { id : int64
@@ -2287,8 +2016,8 @@ module View = struct
 
     let create
           ?key
-          ?label:_
-          ?(style = Automatic)
+          ?label
+          ?style:(_ = Inline)
           ?(enabled = true)
           ~selected_id
           ~on_select
@@ -2304,6 +2033,7 @@ module View = struct
               (match selected_id with
                | Some selected when selected = choice.id -> Some true
                | _ -> None)
+            ~on_change:(fun _ -> invoke on_select (Event.Payload.Int64 choice.id))
             ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 choice.id))
             ~on_toggle:(fun event ->
               match event with
@@ -2314,39 +2044,7 @@ module View = struct
             [ leaf_label choice.label.label_content ]
         in
         let node =
-          (match style with
-           | Segmented ->
-             (* [toggle_group] accepts only plain elements, so its [radio]
-                items mount through an in-place hook on the raw path. *)
-             Lui_elements.toggle_group
-               [ Lui_elements.dynamic (fun context group ->
-                   List.iter
-                     (fun (choice : choice) ->
-                        let item = Lui_ui.radio context in
-                        Lui_ui.key context item (Int64.to_string choice.id);
-                        if not choice.enabled then Lui_ui.disabled context item true;
-                        (match selected_id with
-                         | Some selected when selected = choice.id ->
-                           Lui_ui.bool_property context item Lui_protocol.Checked true
-                         | _ -> ());
-                        Lui_ui.on_event context item (fun event ->
-                          match event with
-                          | Lui_protocol.Press _ | ToggleChanged (_, true) ->
-                            invoke on_select (Event.Payload.Int64 choice.id)
-                          | _ -> ());
-                        Option.iter
-                          (set_leaf_label context item)
-                          choice.label.label_content;
-                        Option.iter
-                          (Lui_ui.accessibility_identifier context item)
-                          choice.label.test_id;
-                        Lui_ui.append context group item)
-                     choices)
-               ]
-           | Automatic | Menu | Inline ->
-             Lui_elements.radio_group (List.map choice_radio choices))
-            context
-            parent
+          Lui_elements.radio_group ?label (List.map choice_radio choices) context parent
         in
         if not enabled then Lui_ui.disabled context node true;
         node)
@@ -2354,142 +2052,34 @@ module View = struct
   end
 
   module Menu = struct
-    type label =
-      { title : string
+    type entry =
+      { id : int64
+      ; title : string
       ; icon : string option
+      ; enabled : bool
+      ; role : Button_role.t
       }
 
-    type entry =
-      | Action of
-          { id : int64
-          ; label : label
-          ; enabled : bool
-          ; role : Button_role.t
-          }
-      | Choice of
-          { id : int64
-          ; label : label
-          ; selected : bool
-          ; enabled : bool
-          }
-      | Divider of int64
-      | Section of
-          { id : int64
-          ; label : label option
-          ; entries : entry list
-          }
-      | Submenu of
-          { id : int64
-          ; label : label
-          ; enabled : bool
-          ; entries : entry list
-          }
-
     let action ~id ~title ?icon ?(enabled = true) ?(role = Button_role.Normal) () =
-      Action { id; label = { title; icon }; enabled; role }
+      { id; title; icon; enabled; role }
     ;;
 
-    let choice ~id ~title ?icon ~selected ?(enabled = true) () =
-      Choice { id; label = { title; icon }; selected; enabled }
-    ;;
-
-    let divider ~id = Divider id
-
-    let section ~id ?title ?icon entries =
-      Section { id; label = Option.map (fun title -> { title; icon }) title; entries }
-    ;;
-
-    let submenu ~id ~title ?icon ?(enabled = true) entries =
-      Submenu { id; label = { title; icon }; enabled; entries }
-    ;;
-
-    (* lui menus are declarative: a [menu_trigger] holding one [dropdown_menu]
-       child renders as a native popup menu, and menu rows carry their label
-       and icon as properties (menu items accept only menu children). *)
-    let menu_item ?key ~title ~icon ~enabled ~role ~selected ?on_press () : Lui_elements.t
-      =
-      (* menu-item requires non-empty text; a blank space keeps icon-only
-         triggers visually identical without violating the schema. *)
-      Lui_elements.menu_item
-        ?key
-        ~text:(if String.length title = 0 then " " else title)
-        ?icon:(Option.map journal_icon icon)
-        ~disabled:(not enabled)
-        ?variant:(Button_role.lui_variant role)
-        ?selected
-        ?on_press:(Option.map (fun press _ -> press ()) on_press)
-        []
-    ;;
-
-    let rec entry_elements ~on_select (entry : entry) : Lui_elements.t list =
-      match entry with
-      | Divider id ->
-        [ Lui_elements.separator ~key:(Int64.to_string id) ~orientation:`horizontal [] ]
-      | Action { id; label; enabled; role } ->
-        [ menu_item
-            ~key:(Int64.to_string id)
-            ~title:label.title
-            ~icon:label.icon
-            ~enabled
-            ~role
-            ~selected:None
-            ~on_press:(fun () -> invoke on_select (Event.Payload.Int64 id))
-            ()
-        ]
-      | Choice { id; label; selected; enabled } ->
-        [ Lui_element_combine.check_menu_item
-            ~key:(Int64.to_string id)
-            ~label:(if String.length label.title = 0 then " " else label.title)
-            ?icon:(Option.map journal_icon label.icon)
-            ~checked:selected
-            ~disabled:(not enabled)
-            ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 id))
-            ()
-        ]
-      | Section { label; entries; _ } ->
-        (match label with
-         | Some label ->
-           [ menu_item
-               ~title:label.title
-               ~icon:label.icon
-               ~enabled:false
-               ~role:Button_role.Normal
-               ~selected:None
-               ()
-           ]
-         | None -> [])
-        @ List.concat_map (entry_elements ~on_select) entries
-      | Submenu { id; label; enabled; entries } ->
-        [ Lui_elements.submenu
-            ~key:(Int64.to_string id)
-            ~text:(if String.length label.title = 0 then " " else label.title)
-            ?icon:(Option.map journal_icon label.icon)
-            ~disabled:(not enabled)
-            (List.concat_map (entry_elements ~on_select) entries)
-        ]
-    ;;
-
-    (* Menu entries rendered as [dropdown_menu] children — for [buttons]
-       menu actions, where the capsule composite mounts the trigger. *)
     let to_elements ~on_select entries =
-      List.concat_map (entry_elements ~on_select) entries
-    ;;
-
-    let create ?key ?(enabled = true) ~on_select ~title ?icon ?label entries =
-      element
-        ?key
-        (Lui_elements.menu
-           ?text:(if String.length title = 0 then None else Some title)
-           ?icon:(Option.map journal_icon icon)
-           ?label
-           ~disabled:(not enabled)
-           (to_elements ~on_select entries))
+      List.map
+        (fun entry ->
+           Lui_elements.menu_item
+             ~key:(Int64.to_string entry.id)
+             ~text:(if String.length entry.title = 0 then " " else entry.title)
+             ?icon:(Option.map journal_icon entry.icon)
+             ~disabled:(not entry.enabled)
+             ?variant:(Button_role.lui_variant entry.role)
+             ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 entry.id))
+             [])
+        entries
     ;;
   end
 
-  (* A [buttons] action that opens a native dropdown menu — the [Menu.entry]
-     vocabulary (actions, choices, sections, submenus) carries over, with the
-     same [Int64] id dispatch as [Menu.create]. *)
+  (* Account's flat menu entries use the shared buttons capsule trigger. *)
   let buttons_menu_action ~label ~icon ?text ~on_select ?on_dismiss entries =
     Menu
       { buttons_action_label = label
@@ -2543,7 +2133,6 @@ module Native_widget = struct
       match Journal_ids.Native_widget.Kind_id.to_int kind_id with
       | 2103 -> Journal_lui_native.chrome_identifier
       | 2104 -> Journal_lui_native.asset_import_identifier
-      | 2105 -> Journal_lui_native.media_identifier
       | 2106 -> Journal_lui_native.asset_settings_identifier
       | other -> invalid_arg ("unregistered journal extension kind " ^ string_of_int other)
     ;;

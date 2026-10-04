@@ -21,7 +21,7 @@ import UIKit
     let type: String?
     var id: String { token }
     var fileType: String { type ?? "bin" }
-    var isImage: Bool { JournalMedia.imageTypes.contains(fileType) }
+    var isImage: Bool { JournalImportThumbnail.imageTypes.contains(fileType) }
   }
 
   struct Properties: Decodable {
@@ -95,7 +95,7 @@ import UIKit
         guard item.isImage else { return }
         image = nil
         decodeFailed = false
-        let decoded = await JournalMediaDecoder.shared.load(item.path)
+        let decoded = await JournalImportThumbnailDecoder.shared.load(item.path)
         guard !Task.isCancelled else { return }
         image = decoded
         decodeFailed = decoded == nil

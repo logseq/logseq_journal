@@ -127,6 +127,21 @@ module Store = struct
   ;;
 end
 
+type action =
+  | Root
+  | Asset
+  | Preview
+  | Retry
+  | Next
+
+type event =
+  { action : action
+  ; root : string
+  ; asset : string
+  ; visible : bool
+  ; slot : string
+  }
+
 let preview_slot = Signal.state_slot "journal-media-preview"
 let is_image_type = Journal_model.is_image_file_type
 
@@ -140,8 +155,8 @@ let size_text size =
   else Printf.sprintf "%.1f GB" (Int64.to_float size /. 1_000_000_000.)
 ;;
 
-let view_static
-      ?store
+let view_content
+      ~store
       ?(on_region = fun _ -> ())
       ?(observed_roots = [])
       ?asset_root
@@ -155,14 +170,7 @@ let view_static
   let asset_root = Option.value asset_root ~default:(fun _ -> root) in
   let observed_roots = if observed_roots = [] then [ root ] else observed_roots in
   let emit ?(target_root = root) ?(asset = "") ?(visible = true) action =
-    on_event
-      (Yojson.Basic.to_string
-         (`Assoc
-             [ "action", `String action
-             ; "root", `String target_root
-             ; "asset", `String asset
-             ; "visible", `Bool visible
-             ]))
+    on_event { action; root = target_root; asset; visible; slot = root }
   in
   let items, more, error =
     match media with
@@ -174,41 +182,74 @@ let view_static
     let preview =
       Signal.state_at context.ui_scheduler context.ui_state_scope preview_slot None
     in
-    let preview_file path = Signal.set preview (Some path) in
+    let selected_preview = ref None in
+    let unsubscribe_preview = ref (fun () -> ()) in
+    let close_preview () =
+      let selected = !selected_preview in
+      selected_preview := None;
+      !unsubscribe_preview ();
+      (unsubscribe_preview := fun () -> ());
+      Signal.set preview None;
+      Option.iter
+        (fun (owner, token) ->
+           emit ~target_root:owner ~asset:token ~visible:false Preview)
+        selected
+    in
+    let preview_file (item : Journal_media_runtime.item) path =
+      let owner = asset_root item.token in
+      let current () = Store.item store owner item.token in
+      if
+        Option.map
+          (fun (item : Journal_media_runtime.item) -> item.presentation)
+          (current ())
+        = Some (Journal_media.File path)
+      then (
+        (* Replace the slot atomically: closing first could release the only
+           file reference when the same offscreen preview is selected again. *)
+        !unsubscribe_preview ();
+        (unsubscribe_preview := fun () -> ());
+        selected_preview := Some (owner, item.token);
+        emit ~target_root:owner ~asset:item.token Preview;
+        Signal.set preview (Some path);
+        unsubscribe_preview
+        := Store.subscribe_item store owner item.token (fun () ->
+             if
+               Option.map
+                 (fun (item : Journal_media_runtime.item) -> item.presentation)
+                 (current ())
+               <> Some (Journal_media.File path)
+             then close_preview ()))
+    in
+    Signal.on_dispose context.ui_scope close_preview;
     let reactive_item (item : Journal_media_runtime.item) render =
-      match store with
-      | None -> render item
-      | Some store ->
-        fun context parent ->
-          let owner = asset_root item.token in
-          let current =
-            Signal.state context.Lui_ui.ui_scheduler (Store.item store owner item.token)
-          in
-          let unsubscribe =
-            Store.subscribe_item store owner item.token (fun () ->
-              Signal.set current (Store.item store owner item.token))
-          in
-          Signal.on_dispose context.ui_scope (fun () ->
-            unsubscribe ();
-            Signal.dispose_signal (Signal.value current));
-          L.dyn
-            ~equal:( = )
-            (fun selected ->
-               on_region "media-item-build";
-               let selected =
-                 Option.value
-                   selected
-                   ~default:{ item with presentation = Journal_media.Hidden }
-               in
-               render { selected with file_type = item.file_type })
-            (Signal.value current)
-            context
-            parent
+      fun context parent ->
+      let owner = asset_root item.token in
+      let current =
+        Signal.state context.Lui_ui.ui_scheduler (Store.item store owner item.token)
+      in
+      let unsubscribe =
+        Store.subscribe_item store owner item.token (fun () ->
+          Signal.set current (Store.item store owner item.token))
+      in
+      Signal.on_dispose context.ui_scope (fun () ->
+        unsubscribe ();
+        Signal.dispose_signal (Signal.value current));
+      L.dyn
+        ~equal:( = )
+        (fun selected ->
+           on_region "media-item-build";
+           let selected =
+             Option.value
+               selected
+               ~default:{ item with presentation = Journal_media.Hidden }
+           in
+           render { selected with file_type = item.file_type })
+        (Signal.value current)
+        context
+        parent
     in
     let render_item ~gallery (item : Journal_media_runtime.item) =
-      let visible _ =
-        emit ~target_root:(asset_root item.token) ~asset:item.token "asset"
-      in
+      let visible _ = emit ~target_root:(asset_root item.token) ~asset:item.token Asset in
       let id = "journal-media:" ^ item.token in
       match item.presentation with
       | Journal_media.File path when is_image_type item.file_type ->
@@ -222,7 +263,7 @@ let view_static
           ~corner_radius:10
           ~accessibility_identifier:id
           ~on_appear:visible
-          ~on_press:(fun _ -> preview_file path)
+          ~on_press:(fun _ -> preview_file item path)
           []
       | File path ->
         let typ =
@@ -255,7 +296,7 @@ let view_static
                       ~value:(typ ^ " attachment")
                       ~style_class:"footnote"
                       ~accessibility_identifier:id
-                      ~on_press:(fun _ -> preview_file path)
+                      ~on_press:(fun _ -> preview_file item path)
                       []
                   ; L.text ~value:detail ~style_class:"caption" ~foreground:"secondary" []
                   ]
@@ -283,7 +324,7 @@ let view_static
               ~value:"Retry"
               ~style_class:"caption"
               ~on_press:(fun _ ->
-                emit ~target_root:(asset_root item.token) ~asset:item.token "retry")
+                emit ~target_root:(asset_root item.token) ~asset:item.token Retry)
               []
           ]
       | Hidden ->
@@ -343,7 +384,7 @@ let view_static
             ~padding:10
             ~cross:`start
             ~on_appear:(fun _ ->
-              emit ~target_root:(asset_root item.token) ~asset:item.token "asset")
+              emit ~target_root:(asset_root item.token) ~asset:item.token Asset)
             [ L.text
                 ~value:message
                 ~style_class:"caption line-clamp-3"
@@ -353,7 +394,7 @@ let view_static
                 ~value:"Retry"
                 ~style_class:"caption"
                 ~on_press:(fun _ ->
-                  emit ~target_root:(asset_root item.token) ~asset:item.token "retry")
+                  emit ~target_root:(asset_root item.token) ~asset:item.token Retry)
                 []
             ]
         | None ->
@@ -413,13 +454,13 @@ let view_static
         ; L.text
             ~value:"Retry attachments"
             ~on_press:(fun _ ->
-              List.iter (fun target_root -> emit ~target_root "retry") observed_roots)
+              List.iter (fun target_root -> emit ~target_root Retry) observed_roots)
             []
         ]
     in
     let more_rows =
       if more
-      then [ L.text ~value:"Next attachments" ~on_press:(fun _ -> emit "next") [] ]
+      then [ L.text ~value:"Next attachments" ~on_press:(fun _ -> emit Next) [] ]
       else []
     in
     let content =
@@ -427,7 +468,7 @@ let view_static
         ~key:("media:" ^ scope ^ ":" ^ root)
         ~gap:12
         ~cross:`start
-        ~on_appear:(fun _ -> emit "root")
+        ~on_appear:(fun _ -> emit Root)
         ([ body ] @ gallery @ file_rows @ errors @ more_rows)
     in
     (* A modal preview is an overlay, not a spacing child of the row body. *)
@@ -439,7 +480,7 @@ let view_static
             (function
               | None -> L.column ~width:0 ~height:0 []
               | Some path ->
-                L.file_preview ~path ~on_dismiss:(fun _ -> Signal.set preview None) [])
+                L.file_preview ~path ~on_dismiss:(fun _ -> close_preview ()) [])
             (Signal.value preview)
         ]
     in
@@ -453,7 +494,7 @@ let view_static
                (L.column
                   ~key:("observe-media:" ^ target_root)
                   ~height:0
-                  ~on_appear:(fun _ -> emit ~target_root "root")
+                  ~on_appear:(fun _ -> emit ~target_root Root)
                   []))
         observed_roots
     in
@@ -497,53 +538,39 @@ let reactive_structure store ~roots ~on_region build =
 ;;
 
 let view
-      ?store
+      ~store
       ?(on_region = fun _ -> ())
       ?(observed_roots = [])
       ?asset_root
       ?(known_images = [])
       ~scope
       ~root
-      ~media
       ~on_event
       child
   =
-  match store with
-  | None ->
-    view_static
+  let roots = if observed_roots = [] then [ root ] else observed_roots in
+  reactive_structure store ~roots ~on_region (fun () ->
+    view_content
+      ~store
+      ~on_region
       ~observed_roots
       ?asset_root
       ~known_images
       ~scope
       ~root
-      ~media
+      ~media:(Store.find store root)
       ~on_event
-      child
-  | Some store ->
-    let roots = if observed_roots = [] then [ root ] else observed_roots in
-    reactive_structure store ~roots ~on_region (fun () ->
-      view_static
-        ~store
-        ~on_region
-        ~observed_roots
-        ?asset_root
-        ~known_images
-        ~scope
-        ~root
-        ~media:(Store.find store root)
-        ~on_event
-        child)
+      child)
 ;;
 
 (* Aggregate the known root image and direct image asset children. Their own descriptors
    keep their lease/event owner, even when the parent references the same asset. *)
-let row_static
-      ?store
+let row_content
+      ~store
       ?(on_region = fun _ -> ())
       ~scope
       ~root
       ~image_children
-      ~media_for_root
       ~on_event
       child
   =
@@ -562,7 +589,7 @@ let row_static
            true))
       image_children
   in
-  let parent = media_for_root root in
+  let parent = Store.find store root in
   let parent_items =
     Option.fold ~none:[] ~some:(fun (v : Runtime.view) -> v.items) parent
   in
@@ -589,7 +616,7 @@ let row_static
   let items, errors =
     List.fold_left
       (fun (items, errors) (id, file_type) ->
-         let media = if id = root then parent else media_for_root id in
+         let media = if id = root then parent else Store.find store id in
          let own =
            Option.bind media (fun (v : Runtime.view) ->
              List.find_opt (fun item -> uuid item = id) v.items)
@@ -628,8 +655,8 @@ let row_static
       ; error = (if errors = [] then None else Some (String.concat "\n" errors))
       }
   in
-  view_static
-    ?store
+  view_content
+    ~store
     ~on_region
     ~known_images:image_children
     ~observed_roots:(root :: List.map fst image_children)
@@ -641,31 +668,10 @@ let row_static
     child
 ;;
 
-let row
-      ?store
-      ?(on_region = fun _ -> ())
-      ~scope
-      ~root
-      ~image_children
-      ~media_for_root
-      ~on_event
-      child
-  =
-  match store with
-  | None -> row_static ~scope ~root ~image_children ~media_for_root ~on_event child
-  | Some store ->
-    reactive_structure
-      store
-      ~roots:(root :: List.map fst image_children)
-      ~on_region
-      (fun () ->
-         row_static
-           ~store
-           ~on_region
-           ~scope
-           ~root
-           ~image_children
-           ~media_for_root:(Store.find store)
-           ~on_event
-           child)
+let row ~store ?(on_region = fun _ -> ()) ~scope ~root ~image_children ~on_event child =
+  reactive_structure
+    store
+    ~roots:(root :: List.map fst image_children)
+    ~on_region
+    (fun () -> row_content ~store ~on_region ~scope ~root ~image_children ~on_event child)
 ;;

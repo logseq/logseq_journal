@@ -195,12 +195,14 @@ import Observation
     deliverEvents()
   }
 
-  /// Pushes the latest host environment sample (LJP2 tag 24) once it changes.
+  /// Retains the latest sample even before startup or between connections;
+  /// connected runtimes receive changed samples as LJP2 tag-24 events.
   func pushEnvironment(_ sample: JournalEnvironmentSample) {
-    guard connected, sample != lastEnvironment else { return }
+    guard sample != lastEnvironment else { return }
     guard let data = try? JournalPlatformWire.environment(sample.jsonObject())
     else { return }
     lastEnvironment = sample
+    guard connected else { return }
     runtime?.sendPlatformEvent(data)
   }
 

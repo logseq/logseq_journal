@@ -48,6 +48,17 @@ val format_bytes : int -> string
 val admission_rows : Admission_refresh.observation -> (string * string) list
 
 module For_testing : sig
+  type detail_action =
+    | Append
+    | Attach_file
+    | Open_block of string
+    | Delete_block of string
+    | Set_expanded of string * bool
+    | Load_more of string
+    | Retry
+    | Submit of string
+    | Task_intent of string
+
   val timeline_media_row
     :  routes:Journal_routes.t
     -> graph_generation:int
@@ -60,7 +71,7 @@ module For_testing : sig
   val detail_page
     :  routes:Journal_routes.t
     -> write_enabled:bool
-    -> Journal_view.Event.Handler.t
+    -> (detail_action -> unit)
     -> Journal_view.View.Body.t
 
   val favorites_page

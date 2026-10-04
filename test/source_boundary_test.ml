@@ -66,29 +66,6 @@ let require_occurrences root relative needle expected =
       fail "expected %d occurrences of %S in %s, found %d" expected needle relative actual)
 ;;
 
-let rec dart_files root relative =
-  let candidate = path root relative in
-  if not (Sys.file_exists candidate)
-  then []
-  else if Sys.is_directory candidate
-  then
-    Sys.readdir candidate
-    |> Array.to_list
-    |> List.sort String.compare
-    |> List.filter (fun name -> String.length name = 0 || name.[0] <> '.')
-    |> List.concat_map (fun name -> dart_files root (Filename.concat relative name))
-  else if Filename.check_suffix relative ".dart"
-  then [ relative ]
-  else []
-;;
-
-let require_allowed_dart_files root directory allowed =
-  dart_files root directory
-  |> List.iter (fun relative ->
-    if not (List.mem relative allowed)
-    then fail "Dart product or unsupported test file exists: %s" relative)
-;;
-
 let rec files_with_suffixes root relative suffixes =
   let candidate = path root relative in
   if not (Sys.file_exists candidate)
@@ -170,7 +147,7 @@ let test_sync_error_card_is_temporary_and_error_only root =
          then fail "sync-error card retains obsolete action text %S" obsolete)
       [ "Reset local copy"
       ; "Reset local graph copy"
-      ; "request-local-cache-reset"
+      ; "Request_local_cache_reset"
       ; "cache_reset_available"
       ; "on_cache_reset_requested"
       ];
@@ -744,9 +721,7 @@ let test_logseq_sync_install_manifest filename =
   let contents = read_file filename in
   if
     not
-      (contains
-         contents
-         {|"_build/install/default/lib/logseq_sync/pure_reducer/logseq_sync_pure_reducer.cmi"|})
+      (contains contents {|/lib/logseq_sync/pure_reducer/logseq_sync_pure_reducer.cmi"|})
   then fail "installed logseq_sync package is missing its pure-reducer interface";
   List.iter
     (fun module_name ->
@@ -755,7 +730,7 @@ let test_logseq_sync_install_manifest filename =
            (contains
               contents
               (Printf.sprintf
-                 {|"_build/install/default/lib/logseq_sync/pure_reducer/logseq_sync_pure_reducer__%s.cmi"|}
+                 {|/lib/logseq_sync/pure_reducer/logseq_sync_pure_reducer__%s.cmi"|}
                  module_name))
        then fail "installed pure-reducer library is missing public %s" module_name)
     [ "Core"; "Sync_protocol" ];
@@ -763,19 +738,19 @@ let test_logseq_sync_install_manifest filename =
     not
       (contains
          contents
-         {|"_build/install/default/lib/logseq_sync/effect_runner/logseq_sync_effect_runner.cmi"|})
+         {|/lib/logseq_sync/effect_runner/logseq_sync_effect_runner.cmi"|})
   then fail "installed logseq_sync package is missing its effect-runner interface";
   if
     not
       (contains
          contents
-         {|"_build/install/default/lib/logseq_sync/effect_runner/logseq_sync_effect_runner__Effect_runner.cmi"|})
+         {|/lib/logseq_sync/effect_runner/logseq_sync_effect_runner__Effect_runner.cmi"|})
   then fail "installed effect-runner library is missing public Effect_runner";
   List.iter
     (fun obsolete ->
        if contains contents obsolete
        then fail "obsolete combined Logseq_sync interface remains installed: %s" obsolete)
-    [ {|"_build/install/default/lib/logseq_sync/logseq_sync.cmi"|}
+    [ {|/lib/logseq_sync/logseq_sync.cmi"|}
     ; "/logseq_sync__Core.cmi"
     ; "/logseq_sync__Effect_runner.cmi"
     ; "/logseq_sync__Sync_protocol.cmi"
@@ -963,10 +938,7 @@ let test_sync_transport_is_websocket_only root =
   in
   List.iter
     (fun relative -> forbid_text root relative obsolete_symbols)
-    [ "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"
-    ; "app/journal_platform.ml"
-    ; "flutter/lib/application_host_adapter.dart"
-    ];
+    [ "logseq_db_worker/lui/logseq_db_worker_lui_service.ml"; "app/journal_platform.ml" ];
   forbid_text
     root
     "logseq_sync/lib/effect_runner/eio/http.ml"
@@ -1278,10 +1250,6 @@ let () =
     ; "logseq_sync/lib/effect_runner/protocol/catalog.mli"
     ; "logseq_sync/lib/effect_runner/eio/http.ml"
     ; "logseq_sync/lib/effect_runner/eio/http.mli"
-    ; "flutter/lib/application_host_adapter.dart"
-    ; "flutter/lib/main.dart"
-    ; "flutter/test/application_host_adapter_test.dart"
-    ; "flutter/test/widget_test.dart"
     ; "swift/App.swift"
     ; "swift/JournalApplicationPlatform.swift"
     ; "swift/JournalNativeServices.swift"
@@ -1328,10 +1296,10 @@ let () =
     ; "V.semantics"
     ; "V.buttons_menu_action"
     ; "journal-root-navigation"
-    ; "switch-graph"
-    ; "sign-out"
-    ; "open-diagnostics"
-    ; "request-local-cache-reset"
+    ; "Switch_graph"
+    ; "Sign_out"
+    ; "Open_diagnostics"
+    ; "Request_local_cache_reset"
     ];
   require_text
     root
@@ -1343,15 +1311,7 @@ let () =
     [ "~full_swipe:true"; "quick_status_actions" ];
   List.iter
     (forbid_path root)
-    [ "flutter/lib/app"
-    ; "flutter/lib/core"
-    ; "flutter/lib/features"
-    ; "flutter/test/app"
-    ; "flutter/test/features"
-    ; "flutter/test/support"
-    ; "flutter/integration_test/app_runtime_flow_test.dart"
-    ; "flutter/integration_test/attachment_flow_test.dart"
-    ; "flutter/integration_test/capture_flow_test.dart"
+    [ "flutter"
     ; "app/journal_feed_state.ml"
     ; "app/journal_feed_state.mli"
     ; "test/feed_app_test.ml"
@@ -1369,33 +1329,7 @@ let () =
     ; "app/journal_worker.mli"
     ; "app/journal_process_recovery.ml"
     ; "app/journal_process_recovery.mli"
-    ; "flutter/lib/journal_account_shell.dart"
-    ; "flutter/lib/journal_e2ee.dart"
-    ; "flutter/lib/journal_snapshot_progress.dart"
-    ; "flutter/lib/journal_sync_transport.dart"
     ];
-  require_allowed_dart_files
-    root
-    "flutter/lib"
-    [ "flutter/lib/application_host_adapter.dart"
-    ; "flutter/lib/journal_asset_import.dart"
-    ; "flutter/lib/journal_asset_settings.dart"
-    ; "flutter/lib/journal_chrome.dart"
-    ; "flutter/lib/journal_ext_utils.dart"
-    ; "flutter/lib/journal_extension_registry.dart"
-    ; "flutter/lib/journal_list.dart"
-    ; "flutter/lib/journal_media.dart"
-    ; "flutter/lib/journal_platform_menu.dart"
-    ; "flutter/lib/main.dart"
-    ];
-  require_allowed_dart_files
-    root
-    "flutter/test"
-    [ "flutter/test/application_host_adapter_test.dart"
-    ; "flutter/test/logseq_db_worker_host_adapter_test.dart"
-    ; "flutter/test/widget_test.dart"
-    ];
-  require_allowed_dart_files root "flutter/integration_test" [];
   forbid_text root "app/application.ml" [ "Ui.Style.Color.rgb"; "Ui.Style.Color.argb" ];
   require_occurrences root "app/journal_visual_tokens.ml" "Ui.Style.Color.rgb" 1;
   forbid_text root "app/application.ml" [ "let color"; "(color " ];
@@ -1469,59 +1403,6 @@ let () =
     ; "Ui.Native_widget.Message_composer.create_with_handler"
     ; "journal-capture-composer-safe-area"
     ];
-  forbid_text root "flutter/ios/Runner/Info.plist" [ "UIUserInterfaceStyle" ];
-  let forbidden_dart_text =
-    [ "package:logseq_journal/app/"
-    ; "package:logseq_journal/core/"
-    ; "package:logseq_journal/features/"
-    ; "import 'app/"
-    ; "package:file_selector/"
-    ; "package:path_provider/"
-    ; "package:sqlite3/"
-    ; "JournalTimelineController"
-    ; "JournalTimelinePage"
-    ; "MaterialIconRetention"
-    ; "JournalApp("
-    ; "runApp(const JournalApp"
-    ; "JournalDatabase"
-    ; "JournalRepository"
-    ; "JournalEntry"
-    ; "SliverList"
-    ; "TextSpan"
-    ; "WidgetSpan"
-    ; "package:sqflite/"
-    ; "package:drift/"
-    ; "JournalCapture"
-    ; "CaptureController"
-    ; "TextEditingController"
-    ]
-  in
-  dart_files root "flutter/lib"
-  @ dart_files root "flutter/test"
-  @ dart_files root "flutter/integration_test"
-  |> List.iter (fun relative -> forbid_text root relative forbidden_dart_text);
-  dart_files root "flutter/lib"
-  |> List.iter (fun relative -> forbid_text root relative [ "CustomScrollView" ]);
-  forbid_text
-    root
-    "flutter/pubspec.yaml"
-    [ "name: logseq_journal\n"
-    ; "\n  crypto:"
-    ; "\n  file_selector:"
-    ; "\n  flutter_localizations:"
-    ; "\n  image:"
-    ; "\n  path:"
-    ; "\n  path_provider:"
-    ; "\n  sqlite3:"
-    ];
-  require_text
-    root
-    "flutter/pubspec.yaml"
-    [ "dev_dependencies:\n"; "  integration_test:\n    sdk: flutter\n" ];
-  forbid_text
-    root
-    "flutter/macos/Flutter/GeneratedPluginRegistrant.swift"
-    [ "file_selector"; "FileSelectorPlugin"; "PathProviderPlugin" ];
   List.iter
     (fun relative ->
        forbid_text root relative [ "com.apple.security.files.user-selected" ])
@@ -1647,14 +1528,14 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "timeline-open-block:"
-    ; "favorite-open-block:"
-    ; "detail-expand:"
-    ; "detail-collapse:"
-    ; "detail-submit:"
+    [ "Timeline_open_block"
+    ; "Favorite_open_block"
+    ; "Detail_expand"
+    ; "Detail_collapse"
+    ; "Detail_submit"
     ; "V.secure_field"
     ; "Graph_service.Submit_e2ee_password"
-    ; "request-local-cache-reset"
+    ; "Request_local_cache_reset"
     ; "Action \"cancel\""
     ; "V.Confirmation.alert"
     ; "Graph_service.Delete_local_cache"
@@ -1960,8 +1841,8 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "open-diagnostics"
-    ; "close-diagnostics"
+    [ "Open_diagnostics"
+    ; "Close_diagnostics"
     ; "journal-startup-diagnostics"
     ; "journal-diagnostics-dialog-page"
     ; "Overlay DB"

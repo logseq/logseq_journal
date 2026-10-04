@@ -406,39 +406,10 @@ module View : sig
     -> unit
     -> t
 
-  val toggle
-    :  ?key:Key.t
-    -> ?style:Button_style.t
-    -> ?enabled:bool
-    -> value:bool
-    -> on_changed:Event.handler
-    -> label:t
-    -> unit
-    -> t
-
-  val text_editor
-    :  ?key:Key.t
-    -> ?autofocus:bool
-    -> ?enabled:bool
-    -> ?read_only:bool
-    -> ?submit_on_return:bool
-    -> ?max_utf8_bytes:int
-    -> session_id:Journal_ids.Text_input.Session_id.t
-    -> document_revision:Journal_ids.Text_input.Document_revision.t
-    -> accepted_local_revision:Journal_ids.Text_input.Local_revision.t
-    -> update_mode:Text_editing.update_mode
-    -> value:Text_editing.Value.t
-    -> on_edit:Event.handler
-    -> on_submit:Event.handler
-    -> on_focus_changed:Event.handler
-    -> ?on_limit_reached:Event.handler
-    -> unit
-    -> t
-
   (** The shared [Lui_element_combine.composer] capsule: growing textarea,
       caller [actions] row, and a send button wired to [on_send] (disabled
       while [send_disabled] holds). Edits arrive as [Text_edit] payloads with
-      the session/document/local-revision bookkeeping [text_editor] uses. *)
+      per-mount session/document/local-revision bookkeeping. *)
   val composer
     :  ?key:Key.t
     -> ?accessibility_identifier:string
@@ -553,36 +524,14 @@ module View : sig
 
   module Toolbar : sig
     type placement =
-      | Automatic
       | Principal
-      | Navigation
       | Primary_action
       | Secondary_action
-      | Status
-      | Confirmation_action
       | Cancellation_action
-      | Destructive_action
-      | Bottom_bar
 
-    type spacing =
-      | Fixed
-      | Flexible
-
-    type child
     type item
 
-    val child : key:Key.t -> t -> child
     val item : key:Key.t -> ?placement:placement -> t -> item
-
-    (** Bar content that mounts unmodified: no icon collapsing and no
-        capsule-group fusion. Unlike regular items it is not mounted inside a
-        toolbar — the schema whitelists toolbar children to interactive kinds —
-        so a raw item mounts as a direct bottom child of the page column.
-        Only [Bottom_bar] placement is supported. *)
-    val raw_item : key:Key.t -> ?placement:placement -> t -> item
-
-    val group : key:Key.t -> ?placement:placement -> child list -> item
-    val spacer : key:Key.t -> ?placement:placement -> spacing -> item
     val create : ?key:Key.t -> items:item list -> t -> t
   end
 
@@ -602,14 +551,6 @@ module View : sig
     val toolbar : ?key:Key.t -> items:Toolbar.item list -> t -> t
 
     module Vertical : sig
-      type child
-
-      val fixed : widget -> child
-      val fill : ?weight:float -> widget -> child
-      val create : ?key:Key.t -> child list -> t
-    end
-
-    module Horizontal : sig
       type child
 
       val fixed : widget -> child
@@ -638,28 +579,6 @@ module View : sig
       val overlay : ?key:Key.t -> ?alignment:Layout.Alignment.t -> overlay:t -> t -> t
       val with_height : height:float -> t -> t
     end
-
-    module Horizontal : sig
-      type nonrec t = t
-
-      val with_test_id : Test_id.t -> t -> t
-      val with_width : width:float -> t -> t
-    end
-  end
-
-  module Scroll : sig
-    type anchor =
-      | Start
-      | End
-
-    val vertical
-      :  ?key:Key.t
-      -> ?on_scroll:Event.handler
-      -> ?shows_indicators:bool
-      -> ?fill_viewport:bool
-      -> ?initial_anchor:anchor
-      -> t
-      -> t
   end
 
   module Swipe_actions : sig
@@ -691,8 +610,6 @@ module View : sig
   end
 
   module Context_menu : sig
-    type nonrec view = t
-
     type role =
       | Normal
       | Destructive
@@ -711,7 +628,6 @@ module View : sig
       -> action
 
     val create : ?enabled:bool -> actions:action list -> unit -> t
-    val attach : ?key:Key.t -> t -> view -> view
   end
 
   module Confirmation : sig
@@ -814,7 +730,6 @@ module View : sig
       -> ?scroll_request:scroll_request
       -> ?on_scroll_completed:Event.handler
       -> ?on_visible_range:Event.handler
-      -> ?on_row_event:Event.handler
       -> section list
       -> t
   end
@@ -870,12 +785,7 @@ module View : sig
 
   module Picker : sig
     type choice
-
-    type style =
-      | Automatic
-      | Menu
-      | Segmented
-      | Inline
+    type style = Inline
 
     val option : id:int64 -> ?enabled:bool -> ?label:t -> unit -> choice
 
@@ -902,42 +812,11 @@ module View : sig
       -> ?role:Button_role.t
       -> unit
       -> entry
-
-    val choice
-      :  id:int64
-      -> title:string
-      -> ?icon:string
-      -> selected:bool
-      -> ?enabled:bool
-      -> unit
-      -> entry
-
-    val divider : id:int64 -> entry
-    val section : id:int64 -> ?title:string -> ?icon:string -> entry list -> entry
-
-    val submenu
-      :  id:int64
-      -> title:string
-      -> ?icon:string
-      -> ?enabled:bool
-      -> entry list
-      -> entry
-
-    val create
-      :  ?key:Key.t
-      -> ?enabled:bool
-      -> on_select:Event.handler
-      -> title:string
-      -> ?icon:string
-      -> ?label:string
-      -> entry list
-      -> t
   end
 
   (** A menu capsule action for {!buttons} built from {!Menu.entry} values:
       pressing it opens the native dropdown and selecting an entry invokes
-      [on_select] with the entry's [Int64] id, same dispatch as
-      {!Menu.create}. *)
+      [on_select] with the entry's [Int64] id. *)
   val buttons_menu_action
     :  label:string
     -> icon:string

@@ -39,9 +39,7 @@ type day_knowledge =
 type t =
   { today : int
   ; slots : slot Rrbvec.t
-  ; first_retained_index : int
   ; days : day_knowledge Days.t
-  ; total_count : int
   ; visible_first : int
   ; visible_last_exclusive : int
   ; scroll_generation : int64
@@ -53,9 +51,11 @@ type t =
   ; day_failures : (int * string) list
   }
 
+(* The entry's stable (day, sibling_order, id) position is its restore anchor.
+   Only the day context hidden by this deletion is retained, not the old timeline. *)
 type staged_delete =
-  { block : Journal_model.t
-  ; before : t
+  { entry : Journal_graph_projection.timeline_entry
+  ; day_after_delete : day_knowledge option
   }
 
 let maximum_hidden_days = 512
@@ -66,9 +66,7 @@ let prefetch_margin = 4
 let empty ~today =
   { today
   ; slots = Rrbvec.empty
-  ; first_retained_index = 0
   ; days = Days.empty
-  ; total_count = 0
   ; visible_first = 0
   ; visible_last_exclusive = 0
   ; scroll_generation = 0L
@@ -218,19 +216,19 @@ let insert_entry slots (entry : Journal_graph_projection.timeline_entry) =
 ;;
 
 let preserve_anchor (before : t) (state : t) =
-  let offset = before.visible_first - before.first_retained_index in
-  let anchor = Rrbvec.nth_opt before.slots offset |> Option.map slot_key in
+  let anchor = Rrbvec.nth_opt before.slots before.visible_first |> Option.map slot_key in
   let visible_first =
     Option.bind anchor (fun key ->
       find_slot_index (fun slot -> String.equal (slot_key slot) key) state.slots)
-    |> Option.fold ~none:(min before.visible_first state.total_count) ~some:(fun index ->
-      state.first_retained_index + index)
+    |> Option.fold
+         ~none:(min before.visible_first (Rrbvec.length state.slots))
+         ~some:(fun index -> index)
   in
   { state with
     visible_first
   ; visible_last_exclusive =
       min
-        state.total_count
+        (Rrbvec.length state.slots)
         (visible_first + max 0 (before.visible_last_exclusive - before.visible_first))
   }
 ;;
@@ -277,8 +275,7 @@ let normalize_days (state : t) =
            else knowledge))
       state.days
   in
-  let delta = Rrbvec.length !slots - Rrbvec.length state.slots in
-  { state with slots = !slots; days; total_count = max 0 (state.total_count + delta) }
+  { state with slots = !slots; days }
 ;;
 
 let prune_days (state : t) =
@@ -362,7 +359,7 @@ let start_recovery (state : t) ~day =
       state.slots
   in
   let anchor_ids =
-    let anchor_index = max 0 (state.visible_first - state.first_retained_index) in
+    let anchor_index = max 0 state.visible_first in
     let indexed = ref [] in
     Rrbvec.iteri
       (fun index slot ->
@@ -468,11 +465,11 @@ let request_is_retained (state : t) request =
 ;;
 
 let visible_requests (state : t) ~first_index ~last_exclusive =
-  let lower = max state.first_retained_index (first_index - prefetch_margin) in
-  let upper = min state.total_count (last_exclusive + prefetch_margin) in
+  let lower = max 0 (first_index - prefetch_margin) in
+  let upper = min (Rrbvec.length state.slots) (last_exclusive + prefetch_margin) in
   let length = Rrbvec.length state.slots in
-  let start = min length (max 0 (lower - state.first_retained_index)) in
-  let stop = min length (max start (upper - state.first_retained_index)) in
+  let start = min length (max 0 lower) in
+  let stop = min length (max start upper) in
   slice state.slots start stop
   |> filter_map_slots (fun slot ->
     match request_of_slot slot with
@@ -526,8 +523,7 @@ let replace_slot (state : t) ~predicate replacement =
   | None -> state
   | Some index ->
     let slots = splice state.slots index (index + 1) (Rrbvec.of_list replacement) in
-    let delta = List.length replacement - 1 in
-    { state with slots; total_count = state.total_count + delta; pending = None }
+    { state with slots; pending = None }
 ;;
 
 let apply_feed (state : t) ~generation feed =
@@ -550,8 +546,6 @@ let apply_feed (state : t) ~generation feed =
      | None when Rrbvec.is_empty state.slots ->
        { state with
          slots = Rrbvec.of_list projected
-       ; first_retained_index = 0
-       ; total_count = List.length projected
        ; visible_first = 0
        ; visible_last_exclusive = min initial_visible_count (List.length projected)
        ; visible_demand = None
@@ -561,14 +555,7 @@ let apply_feed (state : t) ~generation feed =
        |> prune_days
      | None ->
        let slots = Rrbvec.of_list projected in
-       { state with
-         slots
-       ; first_retained_index = 0
-       ; total_count = Rrbvec.length slots
-       ; visible_demand = None
-       ; pending = None
-       }
-       |> finish_change before
+       { state with slots; visible_demand = None; pending = None } |> finish_change before
      | Some expected_before_day ->
        let request = Feed { before_day = Some expected_before_day } in
        let state =
@@ -674,15 +661,7 @@ let append_timeline_entry_page
        let slots =
          splice state.slots start (continuation_index + 1) (Rrbvec.of_list replacement)
        in
-       let state =
-         { state with
-           slots
-         ; total_count =
-             state.total_count + Rrbvec.length slots - Rrbvec.length state.slots
-         ; pending = None
-         }
-         |> finish_change before
-       in
+       let state = { state with slots; pending = None } |> finish_change before in
        let request = Day { day; after } in
        let successor =
          Option.map (fun after -> Day { day; after = Some after }) page.continuation
@@ -761,10 +740,7 @@ let replace_timeline_entry_page
            @ Option.to_list
                (Option.map (fun entry -> Top_level entry) knowledge.hidden_entry))
       in
-      { state with
-        slots
-      ; total_count = state.total_count + Rrbvec.length slots - Rrbvec.length state.slots
-      }
+      { state with slots }
     | _ -> state
   in
   let state =
@@ -846,9 +822,7 @@ let replace_timeline_entry_page
     in
     let stop = span_end belongs_to_page state.slots start in
     let slots = splice state.slots start stop (Rrbvec.of_list replacement_slots) in
-    let delta = Rrbvec.length slots - Rrbvec.length state.slots in
-    { state with slots; pending; total_count = max 0 (state.total_count + delta) }
-    |> finish_change before
+    { state with slots; pending } |> finish_change before
 ;;
 
 let apply_timeline_entry_page
@@ -949,14 +923,13 @@ let apply_timeline_entry_page
         in
         let visible_first =
           find_slot_index (fun slot -> slot_key slot = anchor_key) updated.slots
-          |> Option.fold ~none:state.visible_first ~some:(fun offset ->
-            updated.first_retained_index + offset)
+          |> Option.fold ~none:state.visible_first ~some:(fun offset -> offset)
         in
         { updated with
           visible_first
         ; visible_last_exclusive =
             min
-              updated.total_count
+              (Rrbvec.length updated.slots)
               (visible_first + max 1 (state.visible_last_exclusive - state.visible_first))
         ; visible_demand = Option.map (fun _ -> []) state.visible_demand
         })
@@ -1029,12 +1002,14 @@ let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timelin
         }
       in
       let slots = insert_entry state.slots entry in
-      { state with slots; total_count = state.total_count + 1 } |> finish_change before)
+      { state with slots } |> finish_change before)
   in
   { next with
     visible_first = 0
   ; visible_last_exclusive =
-      min next.total_count (max 0 (before.visible_last_exclusive - before.visible_first))
+      min
+        (Rrbvec.length next.slots)
+        (max 0 (before.visible_last_exclusive - before.visible_first))
   ; scroll_target =
       Rrbvec.find_map
         (function
@@ -1061,26 +1036,28 @@ let stage_delete (state : t) ~block_id =
     let state = invalidate_recovery_for_day state (Journal_model.journal_day block) in
     let stop = index + 1 in
     let slots = splice state.slots index stop Rrbvec.empty in
-    let removed = Rrbvec.length state.slots - Rrbvec.length slots in
-    let total_count = max 0 (state.total_count - removed) in
-    let before = { state with pending = None } in
+    let total_count = Rrbvec.length slots in
+    let deleted =
+      normalize_days
+        { state with
+          days =
+            Days.update
+              (Journal_model.journal_day block)
+              (Option.map (fun knowledge ->
+                 { knowledge with block_count = max 0 (knowledge.block_count - 1) }))
+              state.days
+        ; slots
+        ; visible_first = min state.visible_first total_count
+        ; visible_last_exclusive = min state.visible_last_exclusive total_count
+        ; pending = None
+        }
+      |> preserve_anchor state
+    in
     Some
-      ( finish_change
-          state
-          { state with
-            days =
-              Days.update
-                (Journal_model.journal_day block)
-                (Option.map (fun knowledge ->
-                   { knowledge with block_count = max 0 (knowledge.block_count - 1) }))
-                state.days
-          ; slots
-          ; total_count
-          ; visible_first = min state.visible_first total_count
-          ; visible_last_exclusive = min state.visible_last_exclusive total_count
-          ; pending = None
-          }
-      , { block; before } )
+      ( prune_days deleted
+      , { entry
+        ; day_after_delete = Days.find_opt (Journal_model.journal_day block) deleted.days
+        } )
   | None | Some (_, (Day_heading _ | Day_continuation _ | Feed_continuation _)) -> None
 ;;
 
@@ -1106,52 +1083,66 @@ let remove_block (state : t) ~block_id =
 ;;
 
 let undo_delete (state : t) staged =
-  let before = state in
-  let target_key = "block:" ^ Journal_model.id staged.block in
-  if Rrbvec.exists (fun slot -> String.equal (slot_key slot) target_key) state.slots
+  let block = staged.entry.Journal_graph_projection.block in
+  let block_id = Journal_model.id block in
+  let day = Journal_model.journal_day block in
+  let current_day = Days.find_opt day state.days in
+  let target_present =
+    Option.fold
+      ~none:false
+      ~some:(fun knowledge ->
+        Option.fold
+          ~none:false
+          ~some:(fun (entry : Journal_graph_projection.timeline_entry) ->
+            String.equal (Journal_model.id entry.block) block_id)
+          knowledge.hidden_entry)
+      current_day
+    || Rrbvec.exists
+         (function
+           | Top_level entry -> String.equal (Journal_model.id entry.block) block_id
+           | _ -> false)
+         state.slots
+  in
+  if target_present
   then state
   else (
-    match stage_delete staged.before ~block_id:(Journal_model.id staged.block) with
-    | None -> state
-    | Some (without_target, _) ->
-      let day = Journal_model.journal_day staged.block in
-      let state =
-        match Days.find_opt day state.days, Days.find_opt day staged.before.days with
-        | Some knowledge, _ ->
-          update_day state day (fun _ ->
-            { knowledge with block_count = knowledge.block_count + 1 })
-          |> normalize_days
-        | None, Some knowledge -> { state with days = Days.add day knowledge state.days }
-        | None, None -> state
-      in
-      let retained_keys = Rrbvec.map slot_key without_target.slots in
-      let removed slot = not (Rrbvec.mem (slot_key slot) retained_keys) in
-      let insert_before anchor slot slots =
-        let index =
-          find_slot_index (fun head -> Some (slot_key head) = anchor) slots
-          |> Option.value ~default:(Rrbvec.length slots)
+    let knowledge =
+      match current_day with
+      | Some knowledge -> { knowledge with block_count = knowledge.block_count + 1 }
+      | None ->
+        let previous =
+          Option.value
+            ~default:
+              { page =
+                  { id = Journal_model.page_id block; day; title = string_of_int day }
+              ; block_count = 0
+              ; complete = false
+              ; hidden = true
+              ; hidden_entry = None
+              }
+            staged.day_after_delete
         in
-        splice slots index index (Rrbvec.singleton slot)
-      in
-      let slots, _, inserted =
-        Rrbvec.fold_right
-          (fun slot (slots, anchor, inserted) ->
-             let key = slot_key slot in
-             if Rrbvec.exists (fun current -> String.equal (slot_key current) key) slots
-             then slots, Some key, inserted
-             else if removed slot
-             then insert_before anchor slot slots, Some key, inserted + 1
-             else slots, anchor, inserted)
-          staged.before.slots
-          (state.slots, None, 0)
-      in
-      { state with slots; total_count = state.total_count + inserted; pending = None }
-      |> finish_change before)
+        (* Absent current days regain only this deletion's footprint. Historical
+           siblings/continuations removed by a later refresh are not resurrected. *)
+        let hidden_entry = if previous.hidden then previous.hidden_entry else None in
+        { previous with
+          block_count = (1 + if Option.is_some hidden_entry then 1 else 0)
+        ; hidden = true
+        ; hidden_entry
+        }
+    in
+    let restored =
+      { state with days = Days.add day knowledge state.days } |> normalize_days
+    in
+    (* Reuse the current ordering, including intervening Capture/page entries.
+       normalize_days reveals a surviving hidden sibling using its latest value. *)
+    let slots = insert_entry restored.slots staged.entry in
+    { restored with slots; pending = None } |> finish_change state)
 ;;
 
 let observe_visible_range (state : t) ~first_index ~last_exclusive =
-  let first_index = max 0 (min state.total_count first_index) in
-  let last_exclusive = max first_index (min state.total_count last_exclusive) in
+  let first_index = max 0 (min (Rrbvec.length state.slots) first_index) in
+  let last_exclusive = max first_index (min (Rrbvec.length state.slots) last_exclusive) in
   { state with
     visible_first = first_index
   ; visible_last_exclusive = last_exclusive
@@ -1165,7 +1156,6 @@ let equal_presentation (left : t) (right : t) =
   left == right
   || (left.slots == right.slots
       && left.today = right.today
-      && left.first_retained_index = right.first_retained_index
       && left.day_failures == right.day_failures
       && left.scroll_target = right.scroll_target
       && (left.day_failures = []
@@ -1198,8 +1188,7 @@ let find_block (state : t) ~block_id =
 ;;
 
 let retained_slot_count (state : t) = Rrbvec.length state.slots
-let first_retained_index (state : t) = state.first_retained_index
-let total_count (state : t) = state.total_count
+let total_count (state : t) = Rrbvec.length state.slots
 let today (state : t) = state.today
 let set_today (state : t) ~today = { state with today }
 let first_visible_index (state : t) = state.visible_first

@@ -14,9 +14,6 @@
  (deps
   (source_tree .)
   (source_tree ../app)
-  (source_tree ../flutter/integration_test)
-  (source_tree ../flutter/lib)
-  (source_tree ../flutter/test)
   (source_tree ../logseq_db_storage)
   (source_tree ../logseq_db_types)
   (source_tree ../logseq_db_worker)
@@ -25,16 +22,8 @@
   (source_tree ../tool)
   (source_tree ../swift)
   ../dune-project
-  ../flutter/ios/Flutter/Debug.xcconfig
-  ../flutter/ios/Flutter/Release.xcconfig
-  ../flutter/ios/Runner/Info.plist
-  ../flutter/macos/Flutter/Flutter-Debug.xcconfig
-  ../flutter/macos/Flutter/Flutter-Release.xcconfig
-  ../flutter/macos/Flutter/GeneratedPluginRegistrant.swift
-  ../flutter/macos/Runner/AppDelegate.swift
   ../config/entitlements/macos-debug-profile.entitlements
   ../config/entitlements/macos-release.entitlements
-  ../flutter/pubspec.yaml
   ../swift/JournalE2EECrypto.swift
   ../logseq_db_storage.opam
   ../logseq_db_storage.opam.locked
