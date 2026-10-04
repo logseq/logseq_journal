@@ -291,7 +291,17 @@ Undo 轻量单次 CPU 对照（排除 setup/feed/stage）：5k 旧 1.037320s、�
 
 原生验收使用独立合成 graph、实际 Journal/LUI/Swift 组件与本地 Worker fixture，不操作用户 graph。它不覆盖 native admission saturation、platform reconnect、延迟 Delete commit/Undo notice、full Graph file import、远端 Worker、OS VoiceOver/IME 或正式 benchmark。reconnect 由实际 platform owner 的公开生命周期测试补证，admission/late completions/Undo 由已有或新增公共 owner 测试补证，不能据此声称全端到端流程通过。accessibilityNavigation=true 的环境样本是显式 LJP2 输入，不是 OS VoiceOver 手势。Simulator 采用仓库既有 host-arm64 OCaml complete object 的 vtool restamp；这是 Simulator 验收，不是 device cross-target package 或手机安装。
 
-相对 clean media base `c0e14e11` 的实际分组统计：app/Swift 21 文件新增 1,172、删除 2,362，净删除 **1,190** 行；Flutter 116 路径删除 **9,479** 文本行及 46 binary files；test 6 文件净新增 **506** 行（含精确授权 Dune 依赖删除）；fixture/.gitignore 2 文件净删除 5 行。正式文档单独统计，binary 不换算行数。这是完成后的 diff，原各项估计仍为历史估计、不作交付配额；C5 media renderer 与 Flutter 总退休不重复累计。独立 final-source review 无新增 P1/P2。首轮 sandbox 阻止本地 loopback peer 与临时 RSA fixture，造成 transport/crypto 的环境失败；已在相同源码、仅这些 OS 能力可用的执行环境重跑完整 Release runtest 通过，未改生产 crypto/transport 或删测试。源码 boundary 对 manifest 的公开 CMI 检查改为同样精确路径后缀，支持隔离绝对 build-dir；接口、private module、shared owner 检查均保留。历史 bottom-lui-capsules 文档缺三个必需 section 的 check --all 失败依旧独立报告。
+首轮产品冻结 e580 相对 clean media base `c0e14e11` 的实际分组统计：app/Swift 21 文件新增 1,172、删除 2,362，净删除 **1,190** 行；Flutter 116 路径删除 **9,479** 文本行及 46 binary files；test 6 文件净新增 **506** 行（含精确授权 Dune 依赖删除）；fixture/.gitignore 2 文件净删除 5 行。正式文档单独统计，binary 不换算行数。这是完成后的 diff，原各项估计仍为历史估计、不作交付配额；C5 media renderer 与 Flutter 总退休不重复累计。独立 final-source review 无新增 P1/P2。首轮 sandbox 阻止本地 loopback peer 与临时 RSA fixture，造成 transport/crypto 的环境失败；已在相同源码、仅这些 OS 能力可用的执行环境重跑完整 Release runtest 通过，未改生产 crypto/transport 或删测试。源码 boundary 对 manifest 的公开 CMI 检查改为同样精确路径后缀，支持隔离绝对 build-dir；接口、private module、shared owner 检查均保留。历史 bottom-lui-capsules 文档缺三个必需 section 的 check --all 失败依旧独立报告。
+
+### PR45 的既有 fixture teardown 修复（另行授权）
+
+首轮 PR45 head `1df1707` 的 [CI run37171150824](https://github.com/logseq/logseq_journal/actions/runs/37171150824) 构建/native embed 通过，Application 54/55 通过，唯一 regions/7 在 initial feed 前因 `Worker Domain session is already attached` 失败。旧 main953 的 [run37131983436](https://github.com/logseq/logseq_journal/actions/runs/37131983436) 已记录同一签名；共享 fixture 的 conditional finally 与 Worker runtime 当时均未改。`Application.dispose` 请求异步停止并清空 current app，fixture 却只在 media_rows=Some 时等公开 Runtime.stop，下一 fixture 可在全局 Attached 尚未退出时启动。
+
+用户随后明确回复 **“处理”**，授权此既有测试清理问题纳入 PR45。先补全部 fixture 清理后的公开 Idle/active_sessions=0 断言，及实际初始化后 body Failure/Exit 两个场景：旧逻辑的 11 项局部检查一次通过（保留竞态限制），完整 57 项在两项退出的 Idle 断言 RED，后继媒体 fixture 也 Busy→initial feed false，共三项失败。再按最小范围去掉 media_rows 条件，在 release Acquire gate→dispose 后无条件调用公开 Runtime.stop，等待 client stopped 与全局 Attached 退出；不 join/shutdown 全局 Domain。Fun.protect 保留 body 异常/提前退出的 finally 与原异常身份，不新增 sleep、retry、UUID/tempdir workaround、生产 API、Dune 或 protected spec 修改。
+
+测试源码冻结 `f07deacbb0c70967d30e8abd86f7d89644fd90b0`；修复后 11 项局部 GREEN，最终 Release `dune build @all` 与 **`dune runtest --force` 完整重跑均退出 0**，Application 全 57 项通过（非首轮增量聚合）。实际 build-source/Git 字节一致，app/Swift 与 e580 原生验收产品源码不变，因此不把已有九项原生结果描述为此轮重新安装/运行。[fixture RED/GREEN、源码与检查证据](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/fixture-teardown/report.md)、[最终强制回归日志](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/fixture-teardown/final-runtest.log)。独立复核未发现实质问题。
+
+此授权增量只改 test/application_view_test.ml，新增 36、删除 2 行；相对 c0 的最终 tests 净增 **540** 行，Apple/Swift 净删 1,190 与 Flutter 9,479 文本行/46 binary 的产品统计不变。首轮失败 CI 保留，后续更新到 PR45 的精确 head 并跟踪新 CI，不能把旧 head 的结果当新 head 通过；最终远端结论以 GitHub 对应 head/run 与 Git 外交付记录为准。无新增待答产品取舍。
 
 ## Questions
 
