@@ -2016,7 +2016,7 @@ module View = struct
 
     let create
           ?key
-          ?label:_
+          ?label
           ?style:(_ = Inline)
           ?(enabled = true)
           ~selected_id
@@ -2043,7 +2043,7 @@ module View = struct
             [ leaf_label choice.label.label_content ]
         in
         let node =
-          Lui_elements.radio_group (List.map choice_radio choices) context parent
+          Lui_elements.radio_group ?label (List.map choice_radio choices) context parent
         in
         if not enabled then Lui_ui.disabled context node true;
         node)

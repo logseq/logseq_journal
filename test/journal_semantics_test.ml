@@ -181,6 +181,77 @@ let test_scoped_theme_wire_properties () =
     cases
 ;;
 
+(* Picker label ownership is in the mounted value-control adapter. Reducer
+   selection events cannot reveal a missing accessibility label that makes the
+   Apple backend reject the batch before presenting the sheet. *)
+let test_status_picker_keeps_accessible_group_and_selection () =
+  let selections = ref [] in
+  let view =
+    V.Picker.create
+      ~label:"Task status"
+      ~style:Inline
+      ~selected_id:(Some 1L)
+      ~on_select:
+        (Ui.Event.Handler.create (function
+           | Ui.Event.Payload.Int64 id -> selections := id :: !selections
+           | _ -> fail "status choice lost its typed selection"))
+      [ V.Picker.option ~id:1L ~label:(V.text "Todo") ()
+      ; V.Picker.option ~id:2L ~label:(V.text "Done") ()
+      ; V.Picker.option ~id:3L ~enabled:false ~label:(V.text "Clear") ()
+      ]
+      ()
+  in
+  with_mounted view (fun app ops ->
+    let ops = ops () in
+    let group =
+      List.find_map
+        (function
+          | Lui_protocol.CreateNode (node, RadioGroup) -> Some node
+          | _ -> None)
+        ops
+      |> Option.get
+    in
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, AccessibilityLabel, StringValue "Task status") ->
+             node = group
+           | _ -> false)
+         ops)
+      "Task status group lost its accessible name; Apple rejects this value control";
+    let radio title =
+      List.find_map
+        (function
+          | Lui_protocol.SetProp (node, TextValue, StringValue value) when value = title
+            -> Some node
+          | _ -> None)
+        ops
+      |> Option.get
+    in
+    let todo = radio "Todo"
+    and done_ = radio "Done"
+    and clear = radio "Clear" in
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, Checked, BoolValue true) -> node = todo
+           | _ -> false)
+         ops)
+      "status Picker lost its current selection";
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, Enabled, BoolValue false) -> node = clear
+           | _ -> false)
+         ops)
+      "status Picker lost its disabled option";
+    ignore (Lui_app.dispatch_event app (Lui_protocol.Press done_));
+    ignore (Lui_app.flush app);
+    require
+      (!selections = [ 2L ])
+      "status choice did not execute its current selection callback")
+;;
+
 let has_text ops expected =
   List.exists
     (function
@@ -1756,7 +1827,8 @@ let test_reactive_media_subscription_disposal_and_epoch () =
 ;;
 
 let tests =
-  [ "independent mounted input revisions", test_mounted_input_revisions_remain_independent
+  [ "accessible status Picker", test_status_picker_keeps_accessible_group_and_selection
+  ; "independent mounted input revisions", test_mounted_input_revisions_remain_independent
   ; ( "Timeline native Status/Delete callbacks"
     , test_timeline_native_status_delete_callbacks )
   ; ( "native action rejection"
