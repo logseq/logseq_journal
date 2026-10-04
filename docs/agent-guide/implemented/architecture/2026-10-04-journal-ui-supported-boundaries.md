@@ -1,4 +1,4 @@
-# Journal UI Supported Boundaries（UI 简化与删除范围探索）
+# Journal UI Supported Boundaries（支持范围决策与实施）
 
 ## Problem
 
@@ -6,19 +6,19 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 
 本文件的一个主决策是：**以实际产品消费者为 UI 支持边界，分阶段收窄适配与状态来源；合同取舍、正确性修复和机械删除分别验收。** C1–C11 对应原 review S1–S11，C12 补足子报告中的输入翻译重复；A0 单列 Timeline action 正确性先决项。使用 architecture 类，因为环境 wire/static 接口含支持范围取舍，不能把所有项都当行为保持的 simplification。小清理纳入用户要求的完整 inventory，不为每个小项另造 decision。
 
-用户已于 2026-10-04（Asia/Shanghai）回答 Questions：**“1B, 2A, 3A”**，随后明确要求“等上面附件相关问题fix完之后，开始执行这个doc”。附件 final clean c0e14e11 与独立复审通过后，现推进 proposed 与分阶段本地实施/验证/本地提交；不授权 push/PR/merge 或手机安装。原探索和答案记录保留为基线证据，后续实施记录与 Git 外验证报告分离。
+用户已于 2026-10-04（Asia/Shanghai）回答 Questions：**“1B, 2A, 3A”**，随后明确要求“等上面附件相关问题fix完之后，开始执行这个doc”。附件 final clean c0e14e11 与独立复审通过后，已按 proposed 开始分阶段本地实施/验证/本地提交；原初不授权 push/PR/merge 或手机安装；2026-10-04 用户随后要求“journal的所有事情完成后提个pr”，已授权完成此批验证后统一推送并向 main 提一个 draft PR、跟踪 CI，不授权 merge 或手机安装。原探索和答案记录保留为基线证据，后续实施记录与 Git 外验证报告分离。
 
 ### 固定版本、消费者与来源
 
 日期为 Asia/Shanghai **2026-10-04**。在独立 `clone --no-hardlinks` 副本安全 fetch `origin main`，固定基线 [Journal main / PR44 merge](https://github.com/logseq/logseq_journal/commit/953f71b5852b5ffd094bf75a040e46656ab8a1c9)：`953f71b5852b5ffd094bf75a040e46656ab8a1c9`，tree `ac3d58e48ee8a555284150f6082a287b435b296f`。原 review head `6d63f869dd5b8dffb4f310e66664304d334dae9b` 与此同树。所有下列源码链接固定 merge SHA，不使用会变动的 main。独立 branch 为 `docs/ui-boundary-exploration-2026-10-04`，未复制/编辑原 repo 的未跟踪文档。
 
-原始证据：[完整 UI review](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/journal-ui-review.md)、[wrapper](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/view-review.md)、[list](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/list-review.md)、[media](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/media-review.md)、[native](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/native-review.md)、[媒体闪烁诊断](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/media-flicker-diagnosis.md)。这些是本机 Git 外报告，不是已提交附件；其它机器需取得原证据。本文件重核源码树、消费者和规范，复用原诊断并标明限制，没有重新运行原实验或声称新 UI PASS。
+原始证据：[完整 UI review](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/journal-ui-review.md)、[wrapper](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/view-review.md)、[list](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/list-review.md)、[media](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/media-review.md)、[native](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/native-review.md)、[媒体闪烁诊断](/Users/rcmerci/Documents/Codex/2026-10-03/task-8/media-flicker-diagnosis.md)。这些是本机 Git 外报告，不是已提交附件；其它机器需取得原证据。本文件重核源码树、消费者和规范，复用原诊断并标明限制，探索阶段没有重新运行原实验或声称新 UI PASS；后续新版本验收独立记录。
 
-原 review/native 的 LUI 基线为 `67ea3e8a9787cd80b1106a11a2504a6735f96d30`；当时看到的 main `1db993d4e2eaa2ec844620e374c736829798a2d0` 不是其 native 输入。本次没有 fetch/升级 LUI。后续实现按 [composer integration](../../../development/composer-integration.md) 解析一致的 OCaml/LUI/Apple package，记录完整 SHA/ABI，不混用新 backend 和旧实验。
+原 review/native 的 LUI 基线为 `67ea3e8a9787cd80b1106a11a2504a6735f96d30`；当时看到的 main `1db993d4e2eaa2ec844620e374c736829798a2d0` 不是其 native 输入。探索阶段没有 fetch/升级 LUI；实施阶段已隔离解析 main（见实施记录）。实施按 [composer integration](../../../development/composer-integration.md) 解析一致的 OCaml/LUI/Apple package，记录完整 SHA/ABI，不混用新 backend 和旧实验。
 
 生产入口 [native_embed](https://github.com/logseq/logseq_journal/blob/953f71b5852b5ffd094bf75a040e46656ab8a1c9/app/native_embed.ml#L1) → `Application.native_hooks` → Application/LUI/C → Apple；固定审查基线的 Flutter 也使用同一 Journal 协议，Q1=B 已决定其后续退役。检索包括 app/test/review、registration/schema/fingerprint、wire 字符串与 kind 映射。测试/static fixture 是实际消费者，不能按“非生产”便删除。[app library](https://github.com/logseq/logseq_journal/blob/953f71b5852b5ffd094bf75a040e46656ab8a1c9/app/dune#L1) 无 `public_name`，Journal_view 不是公开安装 widget 包，但 `.mli`、host wire、测试仍是成套合同。未找到受支持的外部 Journal_view/journal-media mount；这是仓库证据边界，不证明所有外部源码不存在。实施发现真实受支持消费者须补证据、暂停相应删除，不私加 fallback。
 
-排除 worker/storage/sync 内部算法、认证/加密、generated/vendor、任何 Dune、`spec/` OCaml、bonsai_flutter OCaml 编辑。iOS 主产品、macOS 基本测试支持已由 [UX guidelines](../../../ux-guidelines.md) 明确，不重复问；Q1=B 已确定退役 Flutter iOS/Android/macOS hosts，后续支持集合仅 Apple iOS 主产品与 macOS 基础支持。Flutter 源码链接保留为固定基线的退休证据，不代表继续支持。
+排除 worker/storage/sync 内部算法、认证/加密、generated/vendor、`spec/` OCaml、bonsai_flutter OCaml 编辑。Dune 原为保护边界；2026-10-04 用户另行明确“允许”仅删除 `test/dune` 的 11 项退休 Flutter 依赖，其他 Dune 不改。iOS 主产品、macOS 基本测试支持已由 [UX guidelines](../../../ux-guidelines.md) 明确，不重复问；Q1=B 已确定退役 Flutter iOS/Android/macOS hosts，后续支持集合仅 Apple iOS 主产品与 macOS 基础支持。Flutter 源码链接保留为固定基线的退休证据，不代表继续支持。
 
 ### 规范、已有决策与独立媒体修复
 
@@ -30,11 +30,17 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 - composer integration 与 [rapid input 既有修复](../../rejected/bugfix/2026-09-05-accept-rapid-controlled-text-input-edits.md)：collapse 保留 draft/picker，Discard 使 request generation 失效；session/revision/IME 防护保留。
 - [session Undo/Redo deferred](../../rejected/feature/2026-09-17-session-delete-history-contract.md)：C11 只优化现有 timed Delete cancellation，不新增永久 history/Redo/database inverse。
 
-**媒体闪烁正在另一任务独立修复；本文件不覆盖、也不假定其结果。** 旧基线诊断确认 route 变化清空可见 media roots，managed PNG/PDF 公共 Runtime 经 File→Hidden→Waiting→Opening→File。原生 PNG 使用 programmatic UIKit pop，List 身份/offset 保留但自然 Back 无新 demand/acquire、持续 Waiting；显式 appearance 因果控制才恢复，不是自然 Back PASS。PDF 无同版完整 native Back，截图采样不是 FPS。旧 journal-media 无 mount，C5 不是当前 flicker 根因或修复。
+**探索阶段媒体闪烁在另一任务独立修复；本文件未覆盖或假定其结果。实施阶段现已消费该任务的 clean c0e14e11 与独立复审（见实施记录）。** 旧基线诊断确认 route 变化清空可见 media roots，managed PNG/PDF 公共 Runtime 经 File→Hidden→Waiting→Opening→File。原生 PNG 使用 programmatic UIKit pop，List 身份/offset 保留但自然 Back 无新 demand/acquire、持续 Waiting；显式 appearance 因果控制才恢复，不是自然 Back PASS。PDF 无同版完整 native Back，截图采样不是 FPS。旧 journal-media 无 mount，C5 不是当前 flicker 根因或修复。
 
 媒体相关 C7/C8 实施前须读取独立修复 final SHA/diff/owner 说明，重核 covered/active/disposed 行为，不能从旧基线覆盖修复；未完成时可推进 C1–C6 独立清理，不借旧实验宣布新版本通过。
 
-## Proposal
+## Decision
+
+按已答 Q1=B、Q2=A、Q3=A 落地 C1–C12，并先完成 A0 共享 mounted action 正确性边界；保留 Apple iOS 主产品与 macOS 基础支持，退役全部 Flutter hosts，static fixtures 原子改为独立 seeded Store，Apple/OCaml 环境最终收窄为四个消费字段。消费独立媒体修复 clean c0e14e11，保留其 retained/preview/pressure/late completion owner 机制。产品最终冻结 e5803bd，Release 聚合与九项独立 Simulator 验收通过，具体输入及限制见实施记录。
+
+实施不增加旧协议 fallback，不改变 protected spec，Dune 仅使用明确获准的 11 项退休依赖删除。后续单 Draft PR 按用户新增授权发布并跟踪 CI；不合并、不安装手机。历史 Proposal 与估计作为决策追溯保留，实际净 diff、验收证据及已知限制以下方实施记录为准。
+
+## Proposal（历史范围与分阶段计划）
 
 ### 已确认的支持决定（2026-10-04）
 
@@ -46,11 +52,11 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 
 保留 Apple hosts 与 OCaml 的合同原子切换；Flutter 完成退役后不再更新其新四字段编码器或新 fingerprint，不新增旧 17-field、旧媒体 2105、旧 static API 的 fallback/alias/migration。临时四项 projection 可以是过渡步骤，但不能当作 C9 最终完成；若 probe 还承担原生布局职责，保留该职责，暂停受影响删除并报告证据，不能自动改回未选的完整 snapshot 支持方案。
 
-这些是已答且已授权分阶段本地实施的产品范围。未来盘点若发现 Flutter 退役涉及 Dune/protected spec，仍须按现有 AGENTS 的保护边界停止相关编辑并报告所需明确授权，本次不改这些文件。
+这些是已答且已授权分阶段本地实施的产品范围。未来盘点若发现 Flutter 退役涉及 Dune/protected spec，仍须按现有 AGENTS 的保护边界停止相关编辑并报告所需明确授权，实施仅使用用户另行授权的 `test/dune` 11 项依赖删除；其它 Dune 与 protected spec 未改。
 
 ### 分类、估计与依赖
 
-数字均为**净删除估计，非已实现 diff、交付承诺或验收指标**；移入 helper/迁出 Decoder 不算净删。C1–C4 合计约 360–450 ml + 130–185 mli（约 490–635 行），C5 430–480，C6 25–45。其它项以减少状态来源/协调义务为价值，不累计成总配额。C5 的 430–480 是原三端旧扩展审查估计；Flutter 全 host 退役尚无实施 diff，额外范围未估算，其中旧 media renderer 的 311 行只能计一次，不与 C5 重复累加。
+数字均为**净删除估计，非已实现 diff、交付承诺或验收指标**；移入 helper/迁出 Decoder 不算净删。C1–C4 合计约 360–450 ml + 130–185 mli（约 490–635 行），C5 430–480，C6 25–45。其它项以减少状态来源/协调义务为价值，不累计成总配额。C5 的 430–480 是原三端旧扩展审查估计；探索时 Flutter 全 host 退役尚无实施 diff，额外范围未估算，其中旧 media renderer 的 311 行只能计一次，不与 C5 重复累加。
 
 | 项目 | 处置 / 阶段 | 估计 | 前置条件 |
 | --- | --- | --- | --- |
@@ -88,7 +94,7 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 
 - **现状/消费者：** [Picker/Menu](https://github.com/logseq/logseq_journal/blob/953f71b5852b5ffd094bf75a040e46656ab8a1c9/app/journal_view.ml#L2273-L2488)、[接口](https://github.com/logseq/logseq_journal/blob/953f71b5852b5ffd094bf75a040e46656ab8a1c9/app/journal_view.mli#L871-L935) 维持 Choice/Divider/Section/Submenu、standalone trigger、Segmented raw radios。真实 [status sheet](https://github.com/logseq/logseq_journal/blob/953f71b5852b5ffd094bf75a040e46656ab8a1c9/app/application.ml#L1482-L1520) 固定 Inline；Account 只有 flat Action/shared buttons trigger，无退休 constructors 调用。
 - **成本/范围：** 删递归词汇/trigger/generic forwarding、Segmented 分支，保留 keyed flat actions 与 radio_group；先不改现用 Picker 名称，避免额外 churn。约 110–140 ml + 35–50 mli。
-- **护栏/替代：** 十个 status choices、selection/disabled/destructive/accessibility/stable keys、条件显示 Delete local graph copy 保留。完整通用 Menu/Picker 利于未来需求，但当前无层级/segmented 要求；不能把真实 menu 换成不合适的普通按钮。
+- **护栏/替代：** 七个 status choices、selection/disabled/destructive/accessibility/stable keys、条件显示 Delete local graph copy 保留。完整通用 Menu/Picker 利于未来需求，但当前无层级/segmented 要求；不能把真实 menu 换成不合适的普通按钮。
 - **影响/风险/依赖：** P1 在 C1/C2 后，低至中风险的 private exports/types 改动。
 - **验收/退出：** 每 Account command、每 status option 选择/显示/禁用保持，现有 mount/semantics 通过；新真实层级需求或旧 constructor consumer 出现则重新定范围。
 
@@ -170,7 +176,7 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 
 建议另立 bugfix：wrapper 从自身 row/action records dispatch 实际 callbacks，让 Timeline/Detail 同 owner；保留 enabled/row path/disclosure/missing/retired action/entry fence。shared routing 完整覆盖后才去 Detail custom adapter。约 35 行 custom 可能换成 15–25 行 shared routing，不计本次行为保持收益。
 
-原 review 是完整静态链，新 public mount/event harness 被 frozen Signal ABI 不匹配挡住，无真实 Swift tap PASS。本次不重构建。后续先尝试 public pure reducer；若 reducer 已正确、缺陷只在 mounted callback binding，则记录缺口，只测最窄 public extension-event 边界，不复制 router。验收 Timeline Status 打开对应 sheet、Delete 发 undoable notice、disabled/missing/retired 无效、Detail 无回归，再做 native swipe/context smoke。C8 等此 owner 明确；C11 不能因断链而删 cancellation 语义。
+探索时原 review 是完整静态链，新 public mount/event harness 被 frozen Signal ABI 不匹配挡住，当时无真实 Swift tap PASS。实施后已建立匹配依赖并运行实际 Release 验收，见实施记录。原验收计划为先尝试 public pure reducer；若 reducer 已正确、缺陷只在 mounted callback binding，则记录缺口，只测最窄 public extension-event 边界，不复制 router。验收 Timeline Status 打开对应 sheet、Delete 发 undoable notice、disabled/missing/retired 无效、Detail 无回归，再做 native swipe/context smoke。C8 等此 owner 明确；C11 不能因断链而删 cancellation 语义。
 
 ### 其余审查点与明确保留
 
@@ -187,7 +193,7 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 5. **P4 typed actions：** C8 等 A0，媒体 family 等 final owner/必要 C7，逐 family 迁移、最后消费者消失再删旧 router。
 6. **P5 环境：** C9 按 Q3=A 实施 Apple/OCaml 四字段 cutover；先核对诊断/probe/native 布局职责，原子更新保留 hosts/codecs/fixtures。键盘/safe area 不通过则暂停受影响删除并保留原生职责，不把暂时存在旧 wire 当作最终验收，也不自行切换为 Q3=B。
 
-每批按可观察行为/合同、实际净 diff 和 owner 数退出，不按估计行数退出。新真实 consumer、旧 guard 丢失、owner 无法复现、mixed ABI、独立修复冲突均停止受影响批次，无关范围可继续。本次按用户已明确授权推进分阶段本地 implementation/验证/提交，不推送、开 PR 或合并。
+每批按可观察行为/合同、实际净 diff 和 owner 数退出，不按估计行数退出。新真实 consumer、旧 guard 丢失、owner 无法复现、mixed ABI、独立修复冲突均停止受影响批次，无关范围可继续。本次按用户已明确授权推进分阶段本地 implementation/验证/提交，在后续统一 draft PR 授权前不推送；现完成当前批次后统一提交 draft PR 并跟踪 CI，不合并。
 
 ## Alternatives considered
 
@@ -212,11 +218,11 @@ whole-model media、Undo state=before、typed callback 无 fence 更短，却分
 ### 本次文档完成条件
 
 - C1–C12/A0、媒体独立边界、保留机制均记录，每项有固定 SHA source/consumer、范围、护栏、替代、风险/依赖、验收/退出。
-- 原探索仅修改文档。现在 Questions 已全部回答，推进 proposed，允许本地 source/test 变更与提交；继续保护 Dune/spec，不 push/PR/merge/upload。
+- 原探索仅修改文档。Questions 已全部回答，实施已完成并转为 implemented，允许本地 source/test 变更与提交；继续保护其他 Dune/spec；后续用户已授权统一 draft PR、跟踪 CI，不 merge/手机安装，不上传 Git 外截图或报告。
 - 新文档 schema、固定 SHA paths/line ranges、相对决策链接、whitespace 核对完成；全仓既有 fail 与新增 fail 分开报告。
 - 交付路径、branch/status、三项已答记录与一致的决定/范围/验收；无新增待用户问题，不重复索取已答选择。
 
-### 后续实施验收（本次未运行）
+### 实施验收计划（原探索时未运行，结果见实施记录）
 
 既有测试优先；新增回归按 AGENTS 找生产 state owner，先尝试 public pure events/completions/state/effects，能 reducer 复现只加 reducer test，不能跨 runner/persistence/UI 重复覆盖。不能复制 implementation、绕 `.mli`、删现有测试来满足新形状；必要回归先 RED 后修复 PASS。
 
@@ -237,20 +243,59 @@ whole-model media、Undo state=before、typed callback 无 fence 更短，却分
 
 - 无 production call 仍可能有外部 private consumer；保留 Apple 产品的真实消费者须查清，`.mli`/Apple/OCaml 成套切换。Q1=B 明确使 Flutter 入口不再受支持，迁出/退休漏项会造成错误发布或 CI 支持宣告；不提供 Flutter 兼容层，也不误删共享逻辑/测试。
 - Q2=A 已允许原子改 static source API，Q3=A 已选择四字段环境；仍须保留 fixture 功能/隔离性及 native keyboard/accessibility，迁移漏项或未核对诊断会造成回归。实现授权已另行记录；C1–C6 的证据不授权删其它形似代码。
-- A0 是正确性先决项，Detail adapter 留到 shared owner 覆盖；媒体 fix 无本文件验收结果，不能覆盖其 owner policy。
+- A0 是正确性先决项，Detail adapter 留到 shared owner 覆盖；媒体修复的旧探索时无本文件验收结果，实施已消费 clean c0e14e11 并重新验收，仍不能覆盖其 owner policy。
 - Undo before 结构共享本身低成本，错误 footprint/anchor 会损坏期间工作；以 exact public state/effects/工作量验证，不以行数/机器时间验证。
 - generation/session/lease/分页/IME guard 具有真实生命周期；helper 迁移要保留每 mount ref scope。
 - 零 OCaml geometry read 不证明 native 键盘/accessibility 可删；Q3=A 的诊断核对/probe 职责分离是硬验收。projection 过渡不能代替最终四字段 cutover，不声称未测性能收益。
 
-### 文档验证与剩余限制
+## Consequences
+
+保留产品只有一个 Apple/OCaml wire 和一个媒体 presentation 来源；无人消费的扩展支持义务及 Flutter hosts 已移除。静态 source API 与环境完整快照的兼容承诺按已答决定终止，未来新增能力需重新建立明确消费者和合同。Undo 不再遍历删除时的全部历史，期间编辑和当前顺序仍受 public reducer 验证。
+
+代价是退休 Flutter 的运行入口不再受支持、旧 static 调用方必须 seed Store、外部环境快照消费者须随合同更新。独立媒体修复与正确性 guard 保留；原生验收和性能证据的边界在实施记录中逐项说明。全仓历史文档规范缺口独立记录，不修改无关文件。
+
+### 探索阶段文档验证（历史）
 
 `TZ=Asia/Shanghai` 工具创建 canonical 日期路径；HEAD 固定 PR44 merge。2026-10-04 答案更新后 `spec-dev-tool check <doc>` 通过；91 个 Markdown 链接完成存在性复核，其中 73 个源码链接通过固定 SHA 的 Git blob 路径/行范围检查。相对 decision 链接与本机报告路径存在，Questions 为最后 level-two section。已核对 Q1=B/Q2=A/Q3=A 原选项并记录原话/日期，全文无旧的待答依赖或 retained Flutter 验收要求。`git diff --check` 与本次修改前副本的 no-index whitespace 检查无输出；后者退出 1 仅表示文档内容不同。工作树仍仅本文件 untracked，未改其它 tracked/untracked 仓库文件。
 
 全仓历史 `docs/agent-guide/implemented/feature/2026-09-28-bottom-lui-capsules.md` 缺 Problem、Alternatives considered、Consequences，初版完成前 check --all 已失败；答案更新后重跑仍仅该历史文档失败。本次不修其它文件；这是既有文档规范缺口，不是新增 source/test 失败。原媒体与 A0 native 证据限制见上文，不隐去未执行 PDF/真实点击验收。
 
+## Implementation record（2026-10-04）
+
+### 探索到实施的固定基线
+
+Implementation checkout: `journal-impl`, branch `simplify/ui-supported-boundaries-2026-10-04`. Safe fetch resolves Journal origin/main to 953f71b5852b5ffd094bf75a040e46656ab8a1c9; local base is clean reviewed c0e14e11d8cf17ab75a267b53ca1845589ff12d3, preserving separate b3ab77d/aaea1c4/0798a5c/c0e14e1 commits. R1 retained-return owner, R2 collapsed/retired owner, R3 independent preview lease, shared owners, pressure join for already-shown controllers, rejection of new requests and late completion guards are mandatory regressions. Dependency main resolution and actual native validation inputs are recorded in the implementation evidence below.
+
+### 已落地范围与实际证据
+
+- C1–C4/C12：删除未消费 UI 构造/导出/挂载表示，输入翻译每 mount 仍持独立 revision；真实 Toolbar、flat Account、Inline status、composer/secure field、Native_list 与 typed navigation 保留。
+- A0：wrapper 绑定当前 mounted rows 的 enabled actions；折叠子行、缺失/退休 node 与未知 key 不进入回调。Timeline/Detail 同一转发路径通过后才删 Detail raw JSON/Hashtbl 补丁。原生 Status 暴露基线已有的 Picker label 缺失，修复真实 batch rejection。另补显式 Radio Change 合同与公开事件 RED→GREEN；旧 LUI 有 Toggle/Press fallback，直接注入 Change 的旧失败不证明实际 native 点击失败。最终验收验证标准 Change 路径，不以 synthetic Press 冒充。
+- C5/Q1=B：116 个 Flutter 路径（含 46 个 binary files）全部退休，删除 9,479 行文本；外部未发现仅 Flutter 的 tool/CI/config。旧 media schema/kind/profile/Swift renderer 移除，仍实际使用的导入 Decoder/cache/cancel/security-scoped owner 保留为 `JournalImportThumbnail`。共享 OCaml/C/worker/Apple/crypto 边界与测试保留。`test/dune` 仅删获授权的 3 个 source_tree、8 个明确依赖，不改 stanza/action。
+- C6/C11：offset 删除、count 从 slots 长度导出；Undo 仅保存被删 target 和必要 day knowledge，在当前 `(day,sibling_order,id)` 顺序恢复。公共 reducer 捕获 intervening insert/pagination、隐藏 sibling、同 key 新内容、过期 anchor 与 hidden-budget prune 的业务 RED；31 原有加 6 新回归共 37 个通过，不恢复整份 before。
+- C7/Q2=A：所有 production/static/review/testing 视图必须接收独立 Store，fixtures seed 功能保留；根 media_views 镜像、optional fallback 删除。Store flush 保留 graph/session context 校验与局部结构/item 订阅，不发布重复根 model。
+- C8：按钮、Account、Detail、媒体、Capture attach/remove 走 typed callbacks；保留原生 external wire 的一次解码，scope/entry/request generation 不由去字符串而撤销。
+- C9/Q3=A：Apple/OCaml wire 最终仅 platform/brightness/highContrast/accessibleNavigation 四项。旧几何探针无 layout/诊断消费者后移除；实际 platform owner 先缓存连接前/断连样本，再由 connect/reconnect 发送最新样本，四个公开生命周期 RED→GREEN。native layout/keyboard/安全区/Dynamic Type owner 保留。
+- C10：managed_sync_startup 恒 true 分支、旧 diagnostic label 过滤移除；保留 origin 与当前 diagnostics/lifecycle。
+
+实施源基线为 c0e14e11d8cf17ab75a267b53ca1845589ff12d3；本地提交记录保留媒体修复原提交，不覆盖原任务工作区。解析 Journal main 为 953f71b5852b5ffd094bf75a040e46656ab8a1c9、LUI main 为 27e8d149cd725c722cb0b17604a491e407f5153a、Signal main 为 868c1459f865b4ba3b227eb440dba40f1c812899。匹配 OCaml 5.5.0/Dune 3.23.1、最新 main 的 OCaml/Apple Release 闭包都在隔离 overlay，未改共享 opam/冻结前缀；Signal 20、LUI 56 测试通过，冻结库 4,990 文件 hash 无漂移。[依赖证据](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/dependencies/README.md)。
+
+[wrapper/A0 证据](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/wrapper/ownership-and-proof.md)、[Picker label 证据](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/wrapper/status-label/report.md)、[Undo 证据](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/timeline/implementation-evidence.txt)、[环境合同/owner 证据](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/environment/summary.md)、[退役清单](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/retirement/flutter-retirement-freeze.json)、[独立 review](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/independent-simplification/report.md) 均 Git 外保存，便于复核且不混入产品路径。
+
+Undo 轻量单次 CPU 对照（排除 setup/feed/stage）：5k 旧 1.037320s、新 0.000750s；10k 旧 4.537246s、新 0.001433s。只说明此次全历史二次扫描已移除，不设时间阈值，不声称正式 benchmark、全 Timeline 算法线性或零分配；其它 normalize/recovery 扫描保留。
+
+### 验证记录与局限
+
+产品源码冻结为 `e5803bd902b1eae7cc2ec29aa6f013d0250c9d8d`，后续仅本正式文档与 lifecycle 路径变更。该版本 `dune build @all --profile release` 与完整 `dune runtest --profile release` 均退出 0；Application 55、semantics 31、Timeline 37 与现有共享/媒体/分页/transport/crypto 覆盖保留。使用隔离绝对 build-dir、匹配 main 依赖，最终日志：[Release build](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/root/final-change-build.log)、[Release runtest](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/root/final-change-runtest.log)。此前所有套件成功结果与最终增量聚合检查相同源码闭包，不把只重新执行的 Application 55 项描述成所有套件重新执行。
+
+最终 iOS 26.1 / iPhone 13 专用 Simulator 的真实 Release `-O`/WMO 二进制完成九项新验收：collapse、PNG/PDF/TXT Quick Look、两次 retained Back、Status/Delete、四字段环境/Capture keyboard、Append、import thumbnail。31 张截图及 lease/layout/source/hash assertions 均通过。Status 是 CUA 激活真实 SwiftUI Todo 按钮，sheet 关闭、production command 到 synthetic Worker fixture 一次；Delete optimistic rows 从 50 变 49。QL 实际呈现并执行真实 dismiss callback；背景 UIKit `scrollToItem` 产生自然 visible range 18..29，未注入 range/dismiss。Back 使用程序化实际 UIKit pop，保留同一 collection/layout/media IDs，并非手势测试。Append 等 Detail loaded/native settled 后验证真实编辑器中文与 keyboard；初次过早触发被 loading guard 正确拒绝。Capture 验证实际 first responder、文本和键盘通知，Dynamic Type 验证同一 collection 内容高度变化。[最终原生报告](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/native-simplification/report.md)、[二进制与源码 provenance](/Users/rcmerci/Documents/Codex/2026-10-04/task/evidence/native-simplification/build-provenance-e580.json) Git 外保存。
+
+原生验收使用独立合成 graph、实际 Journal/LUI/Swift 组件与本地 Worker fixture，不操作用户 graph。它不覆盖 native admission saturation、platform reconnect、延迟 Delete commit/Undo notice、full Graph file import、远端 Worker、OS VoiceOver/IME 或正式 benchmark。reconnect 由实际 platform owner 的公开生命周期测试补证，admission/late completions/Undo 由已有或新增公共 owner 测试补证，不能据此声称全端到端流程通过。accessibilityNavigation=true 的环境样本是显式 LJP2 输入，不是 OS VoiceOver 手势。Simulator 采用仓库既有 host-arm64 OCaml complete object 的 vtool restamp；这是 Simulator 验收，不是 device cross-target package 或手机安装。
+
+相对 clean media base `c0e14e11` 的实际分组统计：app/Swift 21 文件新增 1,172、删除 2,362，净删除 **1,190** 行；Flutter 116 路径删除 **9,479** 文本行及 46 binary files；test 6 文件净新增 **506** 行（含精确授权 Dune 依赖删除）；fixture/.gitignore 2 文件净删除 5 行。正式文档单独统计，binary 不换算行数。这是完成后的 diff，原各项估计仍为历史估计、不作交付配额；C5 media renderer 与 Flutter 总退休不重复累计。独立 final-source review 无新增 P1/P2。首轮 sandbox 阻止本地 loopback peer 与临时 RSA fixture，造成 transport/crypto 的环境失败；已在相同源码、仅这些 OS 能力可用的执行环境重跑完整 Release runtest 通过，未改生产 crypto/transport 或删测试。源码 boundary 对 manifest 的公开 CMI 检查改为同样精确路径后缀，支持隔离绝对 build-dir；接口、private module、shared owner 检查均保留。历史 bottom-lui-capsules 文档缺三个必需 section 的 check --all 失败依旧独立报告。
+
 ## Questions
 
-**三项均已答，无新增待用户回答问题。** 用户于 **2026-10-04（Asia/Shanghai）** 原话回复：**“1B, 2A, 3A”**。以下保留原问题/选项用于决策追溯，A 的“推荐”是当时提供的原选项标签，不代表覆盖用户选择；正文以上述已答范围为准。后续实现授权已另行记录；当前推进 proposed 与本地实施/提交，不 push/PR/merge。诊断消费者、原生布局、Flutter 退休清单与独立媒体修复结果等剩余工作是后续技术核对/验收，不再要求用户重复回答。
+**三项均已答，无新增待用户回答问题。** 用户于 **2026-10-04（Asia/Shanghai）** 原话回复：**“1B, 2A, 3A”**。以下保留原问题/选项用于决策追溯，A 的“推荐”是当时提供的原选项标签，不代表覆盖用户选择；正文以上述已答范围为准。后续实现授权已另行记录；实施与验收完成后转为 implemented，按后续明确授权统一提交 draft PR 并跟踪 CI，不 merge/手机安装。诊断消费者、原生布局、Flutter 退休清单与独立媒体修复结果属于技术核对/验收，结果见实施记录，不再要求用户重复回答。
 
 1. **Q1 — 已答 B（2026-10-04）：退役全部 Flutter hosts，保留 Apple iOS 与 macOS 基础支持。** 原问题： UI 合同收窄后，仓库已注册的 Flutter iOS/Android/macOS hosts 是否仍须保持可运行，并随 Apple/OCaml 原子更新？
    - **A（推荐）：全部保留。** 同步修改 Flutter registry/schema/环境编码并做相应 host tests；代价是跨三端验证与发布协调，不会悄悄退役现有注册能力。
@@ -264,7 +309,3 @@ whole-model media、Undo state=before、typed callback 无 fence 更短，却分
 3. **Q3 — 已答 A（2026-10-04）：四字段最终环境合同，保留原生行为，删探针前核对诊断消费者。** 原问题： 是否将 Journal OCaml 环境 wire 限定为现用 platform、brightness、high_contrast、accessible_navigation 四项，停止支持其余几何/键盘/设备/辅助设置快照字段？native 键盘布局、safe area、Dynamic Type、accessibility 行为继续保留。
    - **A（推荐）：收窄四项，保留 hosts 原子切换。** 证明 probe 无布局/诊断消费者并通过 native 验收后删仅用于旧 wire 的探针/编码；代价是依赖完整快照的外部诊断/host 必须同步改合同，未来业务需要字段再正式引入。
    - **B：保留完整 17-field snapshot 合同。** 只缩窄 Application 比较/通知 projection；代价是继续维护完整 probe/codecs，不能宣称 140–220 行整退役收益。
-
-### Integration baseline
-
-Implementation checkout: `journal-impl`, branch `simplify/ui-supported-boundaries-2026-10-04`. Safe fetch resolves Journal origin/main to 953f71b5852b5ffd094bf75a040e46656ab8a1c9; local base is clean reviewed c0e14e11d8cf17ab75a267b53ca1845589ff12d3, preserving separate b3ab77d/aaea1c4/0798a5c/c0e14e1 commits. R1 retained-return owner, R2 collapsed/retired owner, R3 independent preview lease, shared owners, pressure join for already-shown controllers, rejection of new requests and late completion guards are mandatory regressions. Dependency main resolution and actual native validation inputs will be recorded before execution.
