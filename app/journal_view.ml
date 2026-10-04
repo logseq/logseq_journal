@@ -2033,6 +2033,7 @@ module View = struct
               (match selected_id with
                | Some selected when selected = choice.id -> Some true
                | _ -> None)
+            ~on_change:(fun _ -> invoke on_select (Event.Payload.Int64 choice.id))
             ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 choice.id))
             ~on_toggle:(fun event ->
               match event with

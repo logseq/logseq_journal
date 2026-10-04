@@ -245,11 +245,23 @@ let test_status_picker_keeps_accessible_group_and_selection () =
            | _ -> false)
          ops)
       "status Picker lost its disabled option";
-    ignore (Lui_app.dispatch_event app (Lui_protocol.Press done_));
+    (* Native Radio uses Change for selecting an unchecked option. A false
+       ToggleChanged is deselection, not a new status choice. *)
+    ignore (Lui_app.dispatch_event app (Lui_protocol.ToggleChanged (todo, false)));
+    ignore (Lui_app.flush app);
+    require (!selections = []) "radio deselection executed a status choice";
+    ignore (Lui_app.dispatch_event app (Lui_protocol.Change done_));
     ignore (Lui_app.flush app);
     require
       (!selections = [ 2L ])
-      "status choice did not execute its current selection callback")
+      "native Radio Change did not execute its typed status selection callback";
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, ChangeEnabled, BoolValue true) -> node = done_
+           | _ -> false)
+         ops)
+      "native Radio did not advertise its Change binding")
 ;;
 
 let has_text ops expected =
@@ -1827,7 +1839,8 @@ let test_reactive_media_subscription_disposal_and_epoch () =
 ;;
 
 let tests =
-  [ "accessible status Picker", test_status_picker_keeps_accessible_group_and_selection
+  [ ( "native status Picker contracts"
+    , test_status_picker_keeps_accessible_group_and_selection )
   ; "independent mounted input revisions", test_mounted_input_revisions_remain_independent
   ; ( "Timeline native Status/Delete callbacks"
     , test_timeline_native_status_delete_callbacks )
