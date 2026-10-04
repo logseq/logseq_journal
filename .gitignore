@@ -15,9 +15,6 @@
 *.coverage
 /_bisect_ppx_coverage/
 
-# bonsai_flutter dependency and artifact staging
-/.bonsai-flutter/
-
 # Generated SwiftUI hosts and native artifact staging
 /apple/
 /.bonsai-swiftui/
