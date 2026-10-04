@@ -308,6 +308,22 @@ let test_root_navigation_capture_lifecycle () =
      && Journal_routes.Favorites.items (R.favorites replaced) = [])
 ;;
 
+(* Fixture teardown is outside pure reducer ownership: dispose requests an
+   asynchronous stop on the process-wide Worker Domain. Check its public
+   lifecycle before another fixture can attach. *)
+let check_fixture_worker_idle () =
+  let module Runtime = Logseq_db_worker_lui.Journal_worker_runtime in
+  let diagnostics = Runtime.For_testing.diagnostics () in
+  Alcotest.(check bool)
+    "fixture releases Worker Domain to Idle"
+    true
+    (diagnostics.state = Runtime.Idle);
+  Alcotest.(check int)
+    "fixture leaves no active Worker session"
+    0
+    diagnostics.active_sessions
+;;
+
 let run_favorites_native_visibility
       ?(check_visible = false)
       ?(check_hidden = false)
@@ -321,6 +337,7 @@ let run_favorites_native_visibility
       ?(check_chrome = false)
       ?(check_error_control = false)
       ?(check_ios_capture = false)
+      ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
       ?media_navigation
@@ -764,10 +781,11 @@ let run_favorites_native_visibility
     ~finally:(fun () ->
       Atomic.set acquire_release true;
       ignore (hooks.dispose ());
-      if Option.is_some media_rows
-      then Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client;
+      check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
+       on_initialized ();
        if check_ios_capture
        then (
          let snapshot = { Journal_environment.fallback with platform = "ios" } in
@@ -2739,6 +2757,18 @@ let test_application_ios_capture () =
   run_favorites_native_visibility ~check_ios_capture:true ()
 ;;
 
+let test_fixture_exception_cleanup exception_ =
+  let observed =
+    try
+      run_favorites_native_visibility ~on_initialized:(fun () -> raise exception_) ();
+      false
+    with
+    | actual when actual == exception_ -> true
+  in
+  Alcotest.(check bool) "fixture preserves its original exit" true observed;
+  check_fixture_worker_idle ()
+;;
+
 let () =
   Alcotest.run
     "application view"
@@ -2790,6 +2820,10 @@ let () =
             `Quick
             test_application_region_generation
         ; Alcotest.test_case "iOS Capture persists" `Quick test_application_ios_capture
+        ; Alcotest.test_case "fixture failure releases Worker" `Quick (fun () ->
+            test_fixture_exception_cleanup (Failure "fixture body failure"))
+        ; Alcotest.test_case "fixture early exit releases Worker" `Quick (fun () ->
+            test_fixture_exception_cleanup Exit)
         ] )
     ; ( "targeted media subscriptions"
       , [ Alcotest.test_case "single Ready and Acquire N=3" `Quick (fun () ->
