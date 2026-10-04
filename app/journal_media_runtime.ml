@@ -63,6 +63,7 @@ type t =
   ; changed : string -> view -> unit
   ; groups : (string, group) Hashtbl.t
   ; consumers : (string, group * controller) Hashtbl.t
+  ; previews : (string, string * string * string) Hashtbl.t
   ; mutable generation : int option
   ; mutable serial : int
   ; mutable queued : outgoing list
@@ -73,6 +74,7 @@ let create ~send ~changed =
   ; changed
   ; groups = Hashtbl.create 16
   ; consumers = Hashtbl.create 32
+  ; previews = Hashtbl.create 4
   ; generation = None
   ; serial = 0
   ; queued = []
@@ -247,6 +249,7 @@ let reset t ~graph_generation =
     t.groups;
   Hashtbl.clear t.groups;
   Hashtbl.clear t.consumers;
+  Hashtbl.clear t.previews;
   t.generation <- graph_generation;
   pump t
 ;;
@@ -314,6 +317,17 @@ let retain_visible_roots ?(owner = "default") t roots =
 
 let retain_owners t owners =
   let retained = Owners.of_list owners in
+  Hashtbl.filter_map_inplace
+    (fun preview (owner, root, asset) ->
+       if Owners.mem owner retained
+       then Some (owner, root, asset)
+       else (
+         root_visible ~owner:preview t ~root false;
+         None))
+    t.previews;
+  let retained =
+    Hashtbl.fold (fun preview _ owners -> Owners.add preview owners) t.previews retained
+  in
   Hashtbl.iter
     (fun root g ->
        Owners.iter
@@ -351,6 +365,37 @@ let asset_visible ?(owner = "default") t ~root ~asset visible =
        pump t
      | _ -> ())
   | _ -> ()
+;;
+
+let preview_visible t ~owner ~slot ~root ~asset visible =
+  let preview = "preview:" ^ owner ^ ":" ^ slot in
+  let selected = owner, root, asset in
+  let current = Hashtbl.find_opt t.previews preview in
+  if (not visible) || current <> Some selected
+  then (
+    Hashtbl.remove t.previews preview;
+    Option.iter (fun (_, root, _) -> root_visible ~owner:preview t ~root false) current);
+  if visible
+  then (
+    match Hashtbl.find_opt t.groups root with
+    | Some g
+      when List.exists
+             (fun c ->
+                c.consumer = asset
+                &&
+                match P.presentation c.state with
+                | File _ -> true
+                | _ -> false)
+             g.controllers
+           || List.exists
+                (fun (receipt : Logseq_db_worker.import_receipt) ->
+                   asset = "import:" ^ G.Uuid.to_string receipt.operation
+                   && Option.is_some receipt.preview)
+                g.local ->
+      Hashtbl.replace t.previews preview selected;
+      root_visible ~owner:preview t ~root true;
+      asset_visible ~owner:preview t ~root ~asset true
+    | _ -> ())
 ;;
 
 let next t ~root =

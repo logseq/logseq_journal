@@ -356,6 +356,8 @@ let run_favorites_native_visibility
   let acquire_entered = Atomic.make 0 in
   let acquire_release = Atomic.make false in
   let released_files = Atomic.make 0 in
+  let media_checksum = Atomic.make 'a' in
+  let detail_fixture = Atomic.make false in
   let released_demands = Atomic.make 0 in
   let scope : Service.asset_scope =
     { account =
@@ -599,6 +601,20 @@ let run_favorites_native_visibility
               V2_block_outcome
                 (V2_present_block { value = timeline_block n; revision = "root" })
             | V2_get_page _ -> V2_page_outcome (V2_present_page { page; revision = "p" })
+            | V2_get_children { parent; _ }
+              when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
+              let value = timeline_block 1 in
+              V2_children_outcome
+                { parent
+                ; revision_scope = V2_children_revision parent
+                ; scope_revision = "children"
+                ; items =
+                    [ { value = { value with block = { value.block with parent } }
+                      ; revision = "child"
+                      }
+                    ]
+                ; next_cursor = None
+                }
             | V2_get_children { parent; _ } ->
               V2_children_outcome
                 { parent
@@ -640,7 +656,8 @@ let run_favorites_native_visibility
                              (Managed
                                 (Some
                                    (A.version
-                                      ~checksum:(String.make 64 'a')
+                                      ~checksum:
+                                        (String.make 64 (Atomic.get media_checksum))
                                       ~file_type:"png"
                                     |> Result.get_ok)))
                            ~current_checksum:None
@@ -682,6 +699,11 @@ let run_favorites_native_visibility
       |> to_list
       |> List.iter (fun op ->
         match op |> member "op" |> to_string with
+        | "create-node" ->
+          Hashtbl.replace
+            props
+            (op |> member "id" |> to_int)
+            [ "_kind", member "kind" op ]
         | "create-extension" ->
           Hashtbl.replace
             props
@@ -1072,6 +1094,18 @@ let run_favorites_native_visibility
            in
            let files () = all "path" "/tmp/targeted-media.png" in
            let push () =
+             if
+               List.mem
+                 scenario
+                 [ `Detail_collapse
+                 ; `Detail_reopen
+                 ; `Detail_shared
+                 ; `Detail_pending
+                 ; `Detail_offscreen
+                 ; `Detail_graph
+                 ; `Detail_preview
+                 ]
+             then Atomic.set detail_fixture true;
              let title = List.assoc "Timeline fixture 0" title_ids in
              dispatch (Lui_protocol.Press (ancestor_property title "press-enabled"));
              settle ()
@@ -1179,6 +1213,330 @@ let run_favorites_native_visibility
                  native_path 0;
                  assert_ready "natural Back without appearance replay"
                done
+             | `Detail_collapse
+             | `Detail_reopen
+             | `Detail_shared
+             | `Detail_pending
+             | `Detail_offscreen
+             | `Detail_graph
+             | `Detail_preview ->
+               push ();
+               wait "Detail with child mounts" (fun () ->
+                 List.length (all "_extension" "journal-list") = 2);
+               appear_detail ();
+               let detail_list =
+                 List.find (fun id -> id <> list_node) (all "_extension" "journal-list")
+               in
+               let child_label () =
+                 List.find
+                   (fun id -> within id detail_list)
+                   (all "text" "Timeline fixture 1")
+               in
+               if scenario = `Detail_shared
+               then (
+                 let timeline_child =
+                   List.find
+                     (fun id -> within id list_node)
+                     (all "text" "Timeline fixture 1")
+                 in
+                 appear_with_ancestors (waiting_for_row timeline_child) list_node);
+               let hidden = waiting_for_row (child_label ()) in
+               appear_with_ancestors hidden detail_list;
+               wait "child has real demand" (fun () ->
+                 List.length (Atomic.get demands) = 2);
+               let consumer, asset =
+                 List.find
+                   (fun (_, asset) -> not (G.Uuid.equal asset (uuid 20000)))
+                   (Atomic.get demands)
+               in
+               let child_ready () =
+                 W.Session_context.emit
+                   (Option.get !worker_context)
+                   ~topic:Service.asset_topic
+                   (Service.Asset_notice
+                      ( scope
+                      , Service.Asset_availability
+                          { consumer; asset; availability = Ready "child-ready" } ))
+               in
+               let child_files () =
+                 List.filter
+                   (fun id -> within id detail_list)
+                   (all "accessibility-identifier" ("journal-media:" ^ consumer))
+               in
+               if scenario = `Detail_pending then Atomic.set acquire_release false;
+               child_ready ();
+               wait "child Acquire entered" (fun () -> Atomic.get acquire_entered = 2);
+               if scenario <> `Detail_pending
+               then
+                 wait "child Ready acquired" (fun () -> List.length (child_files ()) = 1);
+               let old_leaf =
+                 if scenario = `Detail_pending then hidden else List.hd (child_files ())
+               in
+               if scenario = `Detail_preview
+               then (
+                 dispatch (Lui_protocol.Press old_leaf);
+                 settle ();
+                 Alcotest.(check int)
+                   "child preview opens"
+                   1
+                   (List.length (all "_kind" "file-preview")));
+               native_range 2 (count + 1);
+               let before_released = Atomic.get released_files in
+               let before_demands = Atomic.get released_demands in
+               let detail_event payload =
+                 hooks.extension_event
+                   detail_list
+                   "event"
+                   (Yojson.Safe.to_string
+                      (`Assoc
+                          [ "id", `Int 1
+                          ; "payload", `String (Yojson.Safe.to_string payload)
+                          ]))
+                 |> consume;
+                 settle ()
+               in
+               let expand expanded =
+                 detail_event
+                   (`Assoc
+                       [ "type", `String "expanded"
+                       ; "key", `String ("block:" ^ G.Uuid.to_string (uuid 1))
+                       ; "expanded", `Bool expanded
+                       ])
+               in
+               if scenario = `Detail_offscreen
+               then
+                 detail_event
+                   (`Assoc
+                       [ "type", `String "visible_range"
+                       ; "first", `Int 0
+                       ; "last", `Int 1
+                       ])
+               else (
+                 expand false;
+                 Alcotest.(check int)
+                   "collapsed child native media node removed"
+                   0
+                   (List.length (child_files ())));
+               if scenario = `Detail_pending
+               then (
+                 Alcotest.(check int)
+                   "pending retired child cannot publish a file"
+                   2
+                   (List.length (files ()));
+                 Atomic.set acquire_release true);
+               if scenario = `Detail_shared
+               then (
+                 Alcotest.(check int)
+                   "Timeline owner retains shared child lease"
+                   0
+                   (Atomic.get released_files - before_released);
+                 Alcotest.(check bool)
+                   "shared asset stays Ready in Timeline"
+                   true
+                   (List.exists
+                      (fun id -> within id list_node)
+                      (all "accessibility-identifier" ("journal-media:" ^ consumer)));
+                 native_range 3 (count + 1));
+               wait "retired child releases last file" (fun () ->
+                 Atomic.get released_files - before_released = 1);
+               Alcotest.(check int)
+                 "retired child releases last demand once"
+                 1
+                 (Atomic.get released_demands - before_demands);
+               Printf.printf
+                 "REVIEW_COLLAPSE acquired=%d released=%d collapse_release_delta=%d \
+                  files=%d\n\
+                  %!"
+                 (Atomic.get acquire_entered)
+                 (Atomic.get released_files)
+                 (Atomic.get released_files - before_released)
+                 (List.length (files ()));
+               dispatch (Lui_protocol.Appear old_leaf);
+               child_ready ();
+               settle ();
+               Alcotest.(check int)
+                 "removed leaf and late Ready cannot reacquire"
+                 2
+                 (Atomic.get acquire_entered);
+               if scenario = `Detail_preview
+               then
+                 Alcotest.(check int)
+                   "unmounted child removes preview path"
+                   0
+                   (List.length (all "_kind" "file-preview"));
+               if scenario = `Detail_reopen
+               then (
+                 expand true;
+                 wait "reopened child remounts" (fun () ->
+                   all "text" "Timeline fixture 1"
+                   |> List.exists (fun id -> within id detail_list));
+                 appear_with_ancestors (waiting_for_row (child_label ())) detail_list;
+                 wait "reopened child sends one new demand" (fun () ->
+                   List.length (Atomic.get demands) = 3);
+                 child_ready ();
+                 wait "reopened child acquires fresh lease" (fun () ->
+                   Atomic.get acquire_entered = 3 && List.length (child_files ()) = 1);
+                 Alcotest.(check bool)
+                   "reopened child gets a fresh native leaf"
+                   true
+                   (List.hd (child_files ()) <> old_leaf);
+                 expand false;
+                 wait "second collapse releases fresh child lease" (fun () ->
+                   Atomic.get released_files = before_released + 2));
+               if scenario = `Detail_graph
+               then (
+                 Atomic.set graph_generation 2;
+                 ignore (W.send (Option.get !client) Service.Get_graph_state);
+                 wait "graph invalidation removes all old paths" (fun () -> files () = []);
+                 wait "graph invalidation releases remaining root" (fun () ->
+                   Atomic.get released_files = 2);
+                 child_ready ();
+                 settle ();
+                 Alcotest.(check int)
+                   "old child notice cannot cross graph"
+                   2
+                   (Atomic.get acquire_entered))
+               else (
+                 native_path 0;
+                 wait "entry retirement releases remaining root" (fun () ->
+                   Atomic.get released_files = if scenario = `Detail_reopen then 3 else 2))
+             | `Preview_offscreen
+             | `Preview_navigation
+             | `Preview_detail_pop
+             | `Preview_graph
+             | `Preview_invalidated
+             | `Preview_repeat
+             | `Preview_replaced
+             | `Preview_duplicate ->
+               let image =
+                 if scenario = `Preview_detail_pop
+                 then (
+                   push ();
+                   appear_detail ();
+                   let detail_list =
+                     List.find
+                       (fun id -> id <> list_node)
+                       (all "_extension" "journal-list")
+                   in
+                   List.find (fun id -> within id detail_list) (files ()))
+                 else List.hd (files ())
+               in
+               let open_preview () =
+                 dispatch (Lui_protocol.Press image);
+                 settle ();
+                 List.hd (all "_kind" "file-preview")
+               in
+               let preview = open_preview () in
+               Alcotest.(check bool)
+                 "preview publishes acquired path"
+                 true
+                 (List.mem preview (files ()));
+               if scenario = `Preview_repeat
+               then
+                 for _ = 1 to 3 do
+                   dispatch (Lui_protocol.Dismiss (List.hd (all "_kind" "file-preview")));
+                   settle ();
+                   Alcotest.(check int)
+                     "closing preview keeps visible row file"
+                     0
+                     (Atomic.get released_files);
+                   ignore (open_preview ())
+                 done;
+               if scenario = `Preview_navigation
+               then (
+                 push ();
+                 appear_detail ());
+               if scenario = `Preview_invalidated
+               then (
+                 publish
+                   (Service.Asset.Failed
+                      { failure = Network; attempts = 1; retry_scheduled = false });
+                 wait "invalidated file closes preview" (fun () ->
+                   all "_kind" "file-preview" = []);
+                 Alcotest.(check int)
+                   "invalidated preview leaves no URL"
+                   0
+                   (List.length (files ())))
+               else (
+                 native_range 2 (count + 1);
+                 settle ();
+                 Alcotest.(check int)
+                   "open preview retains valid file reference"
+                   0
+                   (Atomic.get released_files);
+                 Alcotest.(check int)
+                   "open preview retains its demand"
+                   0
+                   (Atomic.get released_demands);
+                 Alcotest.(check int)
+                   "preview reuses current acquired file"
+                   acquired
+                   (Atomic.get acquire_entered));
+               if scenario = `Preview_duplicate
+               then (
+                 ignore (open_preview ());
+                 Alcotest.(check int)
+                   "repeated offscreen selection retains its lease"
+                   0
+                   (Atomic.get released_files);
+                 Alcotest.(check bool)
+                   "repeated selection publishes valid preview"
+                   true
+                   (List.for_all
+                      (fun id -> List.mem id (files ()))
+                      (all "_kind" "file-preview")));
+               if scenario = `Preview_replaced
+               then (
+                 Atomic.set media_checksum 'b';
+                 W.Session_context.emit
+                   (Option.get !worker_context)
+                   ~topic:Service.invalidation_topic
+                   (Service.Graph_push
+                      (P.V2_changes_available
+                         { api_version = 2; generation = "g"; through = "p2" }));
+                 wait "descriptor replacement clears old preview" (fun () ->
+                   files () = []));
+               if scenario = `Preview_graph
+               then (
+                 Atomic.set graph_generation 2;
+                 ignore (W.send (Option.get !client) Service.Get_graph_state);
+                 wait "graph retirement clears preview and row paths" (fun () ->
+                   files () = []))
+               else if scenario = `Preview_detail_pop
+               then native_path 0
+               else (
+                 let current = all "_kind" "file-preview" in
+                 List.iter (fun node -> dispatch (Lui_protocol.Dismiss node)) current;
+                 settle ();
+                 if scenario = `Preview_navigation
+                 then (
+                   Alcotest.(check int)
+                     "closing preview retains Detail owner"
+                     0
+                     (Atomic.get released_files);
+                   native_path 0);
+                 if scenario = `Preview_invalidated then native_range 2 (count + 1));
+               wait "closing last preview releases file" (fun () ->
+                 Atomic.get released_files = 1);
+               Alcotest.(check int)
+                 "closed preview leaves no path"
+                 0
+                 (List.length (files ()));
+               Alcotest.(check int)
+                 "closed preview releases demand once"
+                 1
+                 (Atomic.get released_demands);
+               dispatch (Lui_protocol.Dismiss preview);
+               publish (Ready "fixture-ready");
+               settle ();
+               Alcotest.(check int)
+                 "duplicate dismissal and stale Ready cannot reacquire"
+                 acquired
+                 (Atomic.get acquire_entered);
+               Alcotest.(check int)
+                 "duplicate dismissal releases exactly once"
+                 1
+                 (Atomic.get released_files)
              | `Restore_early ->
                push ();
                wait "Detail mounts" (fun () ->
@@ -2505,6 +2863,96 @@ let () =
                run_favorites_native_visibility
                  ~media_rows:3
                  ~media_navigation:`Restore_early
+                 ())
+        ; Alcotest.test_case "collapsed Detail retires media ownership" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Detail_collapse
+              ())
+        ; Alcotest.test_case "review preview offscreen reference" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Preview_offscreen
+              ())
+        ; Alcotest.test_case "Detail reopens after media retirement" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Detail_reopen
+              ())
+        ; Alcotest.test_case
+            "Detail collapse preserves Timeline shared owner"
+            `Quick
+            (fun () ->
+               run_favorites_native_visibility
+                 ~media_rows:3
+                 ~media_navigation:`Detail_shared
+                 ())
+        ; Alcotest.test_case "Detail collapse fences pending Acquire" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Detail_pending
+              ())
+        ; Alcotest.test_case
+            "Detail actual offscreen releases child media"
+            `Quick
+            (fun () ->
+               run_favorites_native_visibility
+                 ~media_rows:3
+                 ~media_navigation:`Detail_offscreen
+                 ())
+        ; Alcotest.test_case "Detail retirement followed by graph reset" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Detail_graph
+              ())
+        ; Alcotest.test_case "Detail child removal retires its preview" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Detail_preview
+              ())
+        ; Alcotest.test_case
+            "preview closes while Detail still owns file"
+            `Quick
+            (fun () ->
+               run_favorites_native_visibility
+                 ~media_rows:3
+                 ~media_navigation:`Preview_navigation
+                 ())
+        ; Alcotest.test_case "Detail pop retires its open preview" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Preview_detail_pop
+              ())
+        ; Alcotest.test_case "graph reset retires open preview" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Preview_graph
+              ())
+        ; Alcotest.test_case "invalid availability closes preview URL" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Preview_invalidated
+              ())
+        ; Alcotest.test_case
+            "repeated preview open and close does not leak"
+            `Quick
+            (fun () ->
+               run_favorites_native_visibility
+                 ~media_rows:3
+                 ~media_navigation:`Preview_repeat
+                 ())
+        ; Alcotest.test_case "descriptor replacement retires preview" `Quick (fun () ->
+            run_favorites_native_visibility
+              ~media_rows:3
+              ~media_navigation:`Preview_replaced
+              ())
+        ; Alcotest.test_case
+            "repeated offscreen preview selection remains valid"
+            `Quick
+            (fun () ->
+               run_favorites_native_visibility
+                 ~media_rows:3
+                 ~media_navigation:`Preview_duplicate
                  ())
         ] )
     ; ( "stable media identity"

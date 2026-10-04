@@ -162,6 +162,7 @@ let view_static
              ; "root", `String target_root
              ; "asset", `String asset
              ; "visible", `Bool visible
+             ; "slot", `String root
              ]))
   in
   let items, more, error =
@@ -174,7 +175,52 @@ let view_static
     let preview =
       Signal.state_at context.ui_scheduler context.ui_state_scope preview_slot None
     in
-    let preview_file path = Signal.set preview (Some path) in
+    let selected_preview = ref None in
+    let unsubscribe_preview = ref (fun () -> ()) in
+    let close_preview () =
+      let selected = !selected_preview in
+      selected_preview := None;
+      !unsubscribe_preview ();
+      (unsubscribe_preview := fun () -> ());
+      Signal.set preview None;
+      Option.iter
+        (fun (owner, token) ->
+           emit ~target_root:owner ~asset:token ~visible:false "preview")
+        selected
+    in
+    let preview_file (item : Journal_media_runtime.item) path =
+      let owner = asset_root item.token in
+      let current () =
+        match store with
+        | None -> Some item
+        | Some store -> Store.item store owner item.token
+      in
+      if
+        Option.map
+          (fun (item : Journal_media_runtime.item) -> item.presentation)
+          (current ())
+        = Some (Journal_media.File path)
+      then (
+        (* Replace the slot atomically: closing first could release the only
+           file reference when the same offscreen preview is selected again. *)
+        !unsubscribe_preview ();
+        (unsubscribe_preview := fun () -> ());
+        selected_preview := Some (owner, item.token);
+        emit ~target_root:owner ~asset:item.token "preview";
+        Signal.set preview (Some path);
+        Option.iter
+          (fun store ->
+             unsubscribe_preview
+             := Store.subscribe_item store owner item.token (fun () ->
+                  if
+                    Option.map
+                      (fun (item : Journal_media_runtime.item) -> item.presentation)
+                      (current ())
+                    <> Some (Journal_media.File path)
+                  then close_preview ()))
+          store)
+    in
+    Signal.on_dispose context.ui_scope close_preview;
     let reactive_item (item : Journal_media_runtime.item) render =
       match store with
       | None -> render item
@@ -222,7 +268,7 @@ let view_static
           ~corner_radius:10
           ~accessibility_identifier:id
           ~on_appear:visible
-          ~on_press:(fun _ -> preview_file path)
+          ~on_press:(fun _ -> preview_file item path)
           []
       | File path ->
         let typ =
@@ -255,7 +301,7 @@ let view_static
                       ~value:(typ ^ " attachment")
                       ~style_class:"footnote"
                       ~accessibility_identifier:id
-                      ~on_press:(fun _ -> preview_file path)
+                      ~on_press:(fun _ -> preview_file item path)
                       []
                   ; L.text ~value:detail ~style_class:"caption" ~foreground:"secondary" []
                   ]
@@ -439,7 +485,7 @@ let view_static
             (function
               | None -> L.column ~width:0 ~height:0 []
               | Some path ->
-                L.file_preview ~path ~on_dismiss:(fun _ -> Signal.set preview None) [])
+                L.file_preview ~path ~on_dismiss:(fun _ -> close_preview ()) [])
             (Signal.value preview)
         ]
     in

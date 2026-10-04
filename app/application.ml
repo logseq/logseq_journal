@@ -1635,6 +1635,25 @@ let media_presentation_scopes state =
        (Lui_navigation.Path.entries (Journal_routes.path state.routes))
 ;;
 
+let media_detail_roots state =
+  List.filter_map
+    (fun (entry : Journal_routes.detail_route Lui_navigation.entry) ->
+       Option.map
+         (fun routes ->
+            ( media_presentation_scope { state with routes } ~detail:true
+            , Option.fold
+                ~none:[]
+                ~some:(fun detail ->
+                  List.map
+                    (function
+                      | Journal_detail.Block { block; _ } -> Some (Journal_model.id block)
+                      | More _ -> None)
+                    (Journal_detail.rows detail))
+                (Journal_routes.detail routes) ))
+         (Journal_routes.at_entry state.routes ~entry_id:entry.id))
+    (Lui_navigation.Path.entries (Journal_routes.path state.routes))
+;;
+
 let media_label
       ?store
       ?(on_region = fun _ -> ())
@@ -2444,7 +2463,15 @@ module Detail_outline = struct
 end
 
 module Detail_list = struct
-  let view ~key ~detail ~enabled ~on_action ~on_scroll_completed ~children =
+  let view
+        ~key
+        ~detail
+        ~enabled
+        ~on_action
+        ~on_scroll_completed
+        ~on_visible_range
+        ~children
+    =
     let row_actions = Hashtbl.create 16 in
     let depth = function
       | Journal_detail.Block row -> row.depth
@@ -2564,6 +2591,7 @@ module Detail_list = struct
       ~style:Plain
       ?scroll_request
       ~on_scroll_completed
+      ~on_visible_range
       ~on_row_event:
         (Ui.Event.Handler.create (function
            | Ui.Event.Payload.Native_event { payload; _ } ->
@@ -2667,6 +2695,27 @@ let detail_page
         ~enabled:(enabled && not saving)
         ~on_action:(prefix_action dispatch scope)
         ~on_scroll_completed
+        ~on_visible_range:
+          (Ui.Event.Handler.create (function
+             | Ui.Event.Payload.Visible_range range ->
+               let payload =
+                 Yojson.Basic.to_string
+                   (`Assoc
+                       [ "action", `String "range"
+                       ; "root", `String ""
+                       ; "visible", `Bool true
+                       ; "first", `String (Int64.to_string range.first_index)
+                       ; "last", `String (Int64.to_string range.last_exclusive)
+                       ])
+               in
+               Ui.Event.Handler.Private.invoke
+                 dispatch
+                 (Ui.Event.Payload.Text
+                    ("media-session:"
+                     ^ media_presentation_scope state ~detail:true
+                     ^ ":media:"
+                     ^ payload))
+             | _ -> ()))
         ~children:(rows detail)
     | None ->
       (match Journal_routes.route state.routes with
@@ -3288,6 +3337,8 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
   ignore (Journal_timeline.Store.synchronize timeline_store initial_state.timeline : int);
   let media_context = ref None in
   let prev_media_owners = ref (media_presentation_scopes initial_state) in
+  let prev_detail_media_roots = ref (media_detail_roots initial_state) in
+  let prev_detail_media_routes = ref initial_state.routes in
   let media_runtime =
     Journal_media_runtime.create
       ~send:(fun ticket request ->
@@ -4807,9 +4858,43 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                let text name = Yojson.Basic.Util.to_string (field name) in
                let root = text "root" in
                let visible = Yojson.Basic.Util.to_bool (field "visible") in
+               let detail_roots =
+                 List.assoc_opt !media_owner (media_detail_roots snapshot)
+               in
                (* A retained page can appear before native path-changed. Its
                   validated scope may reclaim media ownership while covered. *)
                match text "action" with
+               | "range" ->
+                 Option.iter
+                   (fun rows ->
+                      let total = List.length rows in
+                      let bounded name =
+                        Int64.to_int
+                          (Int64.min
+                             (Int64.of_int total)
+                             (Int64.max 0L (Int64.of_string (text name))))
+                      in
+                      let first = bounded "first" in
+                      let last = max first (bounded "last") in
+                      let roots =
+                        List.filter_map
+                          Fun.id
+                          (List.mapi
+                             (fun index root ->
+                                if index >= first && index < last then root else None)
+                             rows)
+                      in
+                      Journal_media_runtime.retain_visible_roots
+                        ~owner:!media_owner
+                        media_runtime
+                        roots)
+                   detail_roots
+               | _
+                 when visible
+                      && Option.fold
+                           ~none:false
+                           ~some:(fun rows -> not (List.mem (Some root) rows))
+                           detail_roots -> ()
                | "root" ->
                  Journal_media_runtime.root_visible
                    ~owner:!media_owner
@@ -4820,6 +4905,14 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
                  Journal_media_runtime.asset_visible
                    ~owner:!media_owner
                    media_runtime
+                   ~root
+                   ~asset:(text "asset")
+                   visible
+               | "preview" ->
+                 Journal_media_runtime.preview_visible
+                   media_runtime
+                   ~owner:!media_owner
+                   ~slot:(text "slot")
                    ~root
                    ~asset:(text "asset")
                    visible
@@ -5435,6 +5528,21 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
        prev_media_owners := owners;
        Journal_media_runtime.retain_owners media_runtime owners;
        Effect.run (flush_media set_state)));
+    if !prev_detail_media_routes != model.routes
+    then (
+      prev_detail_media_routes := model.routes;
+      let roots = media_detail_roots model in
+      if !prev_detail_media_roots <> roots
+      then (
+        prev_detail_media_roots := roots;
+        List.iter
+          (fun (owner, rows) ->
+             Journal_media_runtime.retain_visible_roots
+               ~owner
+               media_runtime
+               (List.filter_map Fun.id rows))
+          roots;
+        Effect.run (flush_media set_state)));
     (let key = notice_key model in
      if
        not
