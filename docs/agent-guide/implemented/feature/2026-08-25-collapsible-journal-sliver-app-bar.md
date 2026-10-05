@@ -174,7 +174,7 @@ accepted centering or accessibility requirements.
 - The existing one-physical-pixel divider remains visible and no rendered
   screen exceeds the project limit of three dividers.
 - Timeline item keys, sparse extents, visible ranges, pagination requests,
-  scroll anchoring, swipe actions, body overlays, and Capture bottom-navigation
+  scroll anchoring, body overlays, and Capture bottom-navigation
   layout retain their current observable behavior.
 - Focused OCaml view and semantics tests fail before implementation and pass
   afterward; the complete OCaml suite, Flutter analysis and tests, runtime

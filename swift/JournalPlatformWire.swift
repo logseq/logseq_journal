@@ -8,6 +8,7 @@ enum JournalPlatformWire {
     case idToken(challengeID: String)
     case showNotice(token: String, message: String, actionLabel: String?, durationMs: Int)
     case cancelNotice(token: String)
+    case copyText(String)
   }
   enum Response: Equatable {
     case authenticatedUser(String?)
@@ -16,6 +17,7 @@ enum JournalPlatformWire {
     case localAccount(userID: String, origin: String)
     case noLocalAccount
     case notice(token: String, result: String)
+    case textCopied
   }
   enum NoticeResult: String {
     case action, dismiss, swipe, timeout
@@ -67,6 +69,12 @@ enum JournalPlatformWire {
       return .showNotice(
         token: token, message: message, actionLabel: actionLabel,
         durationMs: durationMs)
+    case 28:
+      let fields = try object(payload)
+      guard fields.count == 1, let text = fields["text"] as? String else {
+        throw Failure.invalidPacket
+      }
+      return .copyText(text)
     case 27:
       let fields = try object(payload)
       guard let token = fields["token"] as? String else {
@@ -100,6 +108,8 @@ enum JournalPlatformWire {
       return try json(tag: 21, ["userId": NSNull(), "managedSyncOrigin": NSNull()])
     case .timelinePresented:
       return try json(tag: 23, ["presented": true])
+    case .textCopied:
+      return try json(tag: 29, ["copied": true])
     case .notice(let token, let result):
       return try json(tag: 26, ["token": token, "result": result])
     }

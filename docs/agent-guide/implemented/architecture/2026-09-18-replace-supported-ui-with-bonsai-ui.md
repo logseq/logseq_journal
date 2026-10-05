@@ -61,7 +61,7 @@ and must not justify retaining a custom bridge or adding framework features.
 | `swift/JournalFavorites.swift`, `Native_favorites` in `app/application.ml` | `Native_list.vertical` and `on_visible_range` | Preserve favorite identities, loading/error/retry states, and pagination. |
 | Journal/Favorites full-row open buttons and pending-open machinery | `View.Navigation_link.create` | Keep route acceptance in OCaml; provide stable keys, semantic activation identities, and handler bindings. |
 | `swift/JournalOutline.swift`, `Native_outline` in `app/application.ml` | `Native_list.disclosure_row` and ordinary rows | Preserve expansion, independent parent/child actions, child loading, editing, and append behavior. |
-| Journal status/delete and outline delete swipes | Row-owned `View.Swipe_actions` descriptors | Preserve labels, roles, enabled state, direction, and disabled full-swipe behavior. |
+| Journal status/delete and outline delete menus | Row-owned `View.Context_menu` descriptors | Preserve labels, roles and enabled state. |
 | Journal and outline context menus | `View.Context_menu` row slots or `attach` | Preserve commands and reject actions belonging to removed/replaced owners. |
 | Journal positioning and outline reveal after append | `Native_list.target`, `scroll_request`, `completion_of_payload` | Use monotonic tokens, scoped row paths, explicit anchors, and terminal outcomes. |
 | `swift/JournalListViewport.swift` and custom visibility timers | `Native_list.vertical ~on_visible_range` plus application projection | Preserve correct paging observations without native polling or estimated row heights. |
@@ -124,7 +124,7 @@ indeterminate Circular combinations do not need gratuitous changes.
 - Preserve the same List owner when returning from detail. Do not issue a new
   scroll command on every render or reconstruct the list to restore position.
 - Preserve loaded descendant data and application expansion authority. Parent
-  label activation, expansion, swipe, and context actions must stay independent.
+  label activation, expansion and context actions must stay independent.
 - Replace confirmation Boolean transport with token-scoped action/dismissal
   events. Preserve the stable base child and existing cache-reset reducer effects.
 - Follow `docs/ux-guidelines.md`: at most three dividers, immediate reopening of
@@ -308,7 +308,7 @@ the evidence report. These limitations do not retain obsolete UI paths.
 - Form, Section, LabeledContent, ContentUnavailable, descendant text selection,
   Graph selection, Journal, Favorites and outline rows use public views. Native
   Form metadata is grouped into one column per section to avoid excess dividers.
-- Journal/Favorites activation uses Navigation_link. Disclosure, row-owned swipe
+- Journal/Favorites activation uses Navigation_link. Disclosure, row-owned context
   actions and context actions are public components with stable semantic keys.
   Row visibility is projected past date headings, including explicit empty-day
   rows and continuation rows. An empty Journal overlays ContentUnavailable while

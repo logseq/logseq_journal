@@ -19,5 +19,6 @@ val view
   -> on_open:Ui.Event.Handler.t
   -> on_status:Ui.Event.Handler.t
   -> on_delete:Ui.Event.Handler.t
+  -> on_copy:Ui.Event.Handler.t
   -> children:Ui.View.t list
   -> Ui.View.Viewport.Vertical.t

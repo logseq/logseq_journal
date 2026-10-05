@@ -13,7 +13,7 @@ callbacks; those checks must remain intact.
 
 ## Decision
 
-Resolve Journal row menu/swipe actions through the list's existing resource,
+Resolve Journal row menu actions through the list's existing resource,
 which receives the current typed action closures when the native view renders.
 The retained platform menu keeps the stable row identity and list resource;
 at activation the resource checks current action permission and row existence

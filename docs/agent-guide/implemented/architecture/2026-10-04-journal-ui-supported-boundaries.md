@@ -176,7 +176,7 @@ Journal 已完成 LUI、局部媒体订阅与 typed native NavigationStack 迁�
 
 建议另立 bugfix：wrapper 从自身 row/action records dispatch 实际 callbacks，让 Timeline/Detail 同 owner；保留 enabled/row path/disclosure/missing/retired action/entry fence。shared routing 完整覆盖后才去 Detail custom adapter。约 35 行 custom 可能换成 15–25 行 shared routing，不计本次行为保持收益。
 
-探索时原 review 是完整静态链，新 public mount/event harness 被 frozen Signal ABI 不匹配挡住，当时无真实 Swift tap PASS。实施后已建立匹配依赖并运行实际 Release 验收，见实施记录。原验收计划为先尝试 public pure reducer；若 reducer 已正确、缺陷只在 mounted callback binding，则记录缺口，只测最窄 public extension-event 边界，不复制 router。验收 Timeline Status 打开对应 sheet、Delete 发 undoable notice、disabled/missing/retired 无效、Detail 无回归，再做 native swipe/context smoke。C8 等此 owner 明确；C11 不能因断链而删 cancellation 语义。
+探索时原 review 是完整静态链，新 public mount/event harness 被 frozen Signal ABI 不匹配挡住，当时无真实 Swift tap PASS。实施后已建立匹配依赖并运行实际 Release 验收，见实施记录。原验收计划为先尝试 public pure reducer；若 reducer 已正确、缺陷只在 mounted callback binding，则记录缺口，只测最窄 public extension-event 边界，不复制 router。验收 Timeline Status 打开对应 sheet、Delete 发 undoable notice、disabled/missing/retired 无效、Detail 无回归，再做 native context smoke。C8 等此 owner 明确；C11 不能因断链而删 cancellation 语义。
 
 ### 其余审查点与明确保留
 
@@ -231,7 +231,7 @@ whole-model media、Undo state=before、typed callback 无 fence 更短，却分
 | P1 wrapper/input | 当前 buttons/menus/status/capsules/password/composer 事件/mount 保持，退休 API 无消费者 | `dune exec test/application_view_test.exe`、`dune exec test/journal_semantics_test.exe`、`dune exec test/journal_routes_test.exe` |
 | C6/C11 Timeline | exact slots/count/anchor/pending/stale/hidden-day、Undo 保留 intervening changes；10k 工作量非二次 | `dune exec test/journal_timeline_state_test.exe` + 必要 public RED regression |
 | P2 media | fingerprint 同一 registry，import Decoder、LUI image/file/gallery/preview 保持 | `dune exec test/journal_media_test.exe`、`dune exec test/journal_media_runtime_test.exe` + Apple registry/import；静态核对 Flutter-only 入口/profile/依赖/测试与 CI 退休闭环、共享覆盖保留 |
-| A0/C8 action | actual public extension-event→callback→reducer、enabled/retired/entry fences、Detail 保持 | public Application + 必要最窄 mount event；native swipe/context smoke |
+| A0/C8 action | actual public extension-event→callback→reducer、enabled/retired/entry fences、Detail 保持 | public Application + 必要最窄 mount event；native context smoke |
 | C7 Store | static/review/testing API 原子迁移、各自 Store seed、无 root live mirror/optional fallback；one-item 只实际 channels、zero unrelated builders | targeted decision 的 mounted Application/Store/review fixtures、隔离性与 shared/topology/epoch/dispose，matched final-source probes |
 | C9 environment | canonical 四字段 wire、initial/reconnect、诊断同步；native keyboard/safe area/rotation/accessibility 保持 | OCaml codec/Application、Apple environment/composer、必要 native smoke；Flutter 旧 encoder 已归退休清单 |
 

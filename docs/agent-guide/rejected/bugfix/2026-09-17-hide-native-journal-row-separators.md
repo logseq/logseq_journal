@@ -11,7 +11,7 @@ is the failing visual acceptance.
 ## Proposal
 
 Apply native row/section separator visibility at the actual List row composition
-boundary. Keep native List, navigation, swipe actions and context menus. Remove
+boundary. Keep native List, navigation and context menus. Remove
 ineffective duplicate placement rather than adding a compatibility path.
 
 The production owner is JournalList's SwiftUI row projection. Public pure
@@ -29,7 +29,7 @@ tests, or a separate screenshot-analysis implementation.
 ## Acceptance criteria
 
 - The same production iPhone Journal screen has no row separators after the fix.
-- Row opening/back, destination selection and native swipe/context actions remain
+- Row opening/back, destination selection and native context actions remain
   available in the current device acceptance.
 - Signed iPhone Release build succeeds; no OCaml, protected spec, Dune or SDK
   source changes are needed.

@@ -1309,6 +1309,10 @@ let () =
     root
     "app/journal_timeline.ml"
     [ "~full_swipe:true"; "quick_status_actions" ];
+  forbid_text
+    root
+    "swift/JournalList.swift"
+    [ ".swipeActions"; "let swipe:"; "let side:"; "let background:"; "actionTint" ];
   List.iter
     (forbid_path root)
     [ "flutter"
@@ -1344,7 +1348,7 @@ let () =
   require_text
     root
     "app/journal_visual_tokens.ml"
-    [ "module Color_exceptions = struct"; "type presentation"; "let status_swipe_action" ];
+    [ "module Color_exceptions = struct"; "type presentation"; "let status_colors" ];
   List.iter
     (fun relative ->
        forbid_text

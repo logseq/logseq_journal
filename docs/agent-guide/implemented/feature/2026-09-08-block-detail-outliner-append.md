@@ -21,7 +21,7 @@ direct child of the currently opened block using the Capture input UI.
 The first version supports entry from Timeline and Favorites block rows,
 reading, branch disclosure inside detail, append, and deletion. Timeline no
 longer expands block trees inline. Inside detail, child content taps do
-nothing, and a rightward swipe reveals only `Delete`. Editing existing blocks
+nothing; the long-press context menu provides `Delete`. Editing existing blocks
 is outside the first version, as clarified by the user on 2026-09-08.
 
 ### Entry from Timeline and Favorites
@@ -40,9 +40,8 @@ is outside the first version, as clarified by the user on 2026-09-08.
   Do not invent a corresponding block, open the membership record, or pick
   the first child of a favorite page. Page detail is outside this proposal.
 - Give navigable rows normal tap feedback and an accessible `Open block`
-  action. Timeline swipe actions still operate on their row and must not also
-  navigate. Favorites list rows retain their existing no-swipe behavior; the
-  right-swipe Delete action belongs to the detail outline.
+  action. Timeline context actions still operate on their row and must not also
+  navigate. Favorites list rows retain their existing navigation behavior.
 - Record the originating destination, stable row identity, and scroll/focus
   anchor before loading detail. Back returns to Timeline or Favorites as
   appropriate, including from loading/error states. For Favorites, restore by
@@ -163,23 +162,10 @@ v Opened block, with its full content
   obsolete inline child editor and its actions when implementing this design.
   Do not retain a second input UI or a compatibility path.
 
-### Row swipe actions
-
-- Every block row in the outline, including the root and visible descendants,
-  supports a physical rightward swipe to reveal only `Delete`.
-  Reuse the timeline row's Slidable component, reveal motion, action sizing,
-  icon/label treatment, destructive Delete palette, and single-open-row
-  behavior. Place Delete in the detail row's right-swipe pane regardless of
-  its side in the timeline. Preserve that physical gesture under RTL and
-  expose an accessible Delete action.
-- Swiping only reveals Delete; it must not delete automatically, even on a
-  full swipe. Close the action pane when Delete is selected.
-- Do not expose an Edit action, disabled Edit placeholder, root editor, or
-  prefilled editing sheet in this version. Existing block content is read-only.
 
 ### Delete behavior
 
-- `Delete` targets the swiped block and its descendants, using the existing
+- `Delete` targets the selected block and its descendants, using the existing
   `Delete_subtree` semantics. Apply the timeline's staged deletion, Undo window
   (including its accessibility duration), and failure restoration behavior.
   Do not add an extra confirmation dialog for the same action.
@@ -196,7 +182,7 @@ v Opened block, with its full content
 ### Scope
 
 This iteration covers Timeline/Favorites block-row navigation, removal of
-Timeline inline trees, detail tree reading/disclosure, append, and per-row swipe
+Timeline inline trees, detail tree reading/disclosure, append, and per-row context
 delete inside detail. Editing existing blocks, detail-to-child navigation,
 favorite page detail, inline row editors,
 dragging, reparenting, sibling insertion, bulk operations, and a complete
@@ -210,7 +196,7 @@ compatibility paths.
   detail load and after child creation. It owns page composition, native event
   routing, and mutation dispatch. Replace those automatic editing transitions,
   rebuild the page layout, and share composer configuration and row action
-  dispatch here. Route deletion by the swiped block ID, not the detail root.
+  dispatch here. Route deletion by the selected block ID, not the detail root.
   Wire Timeline and Favorites activation to detail loading, remove
   `timeline-toggle-children:` handling and its callbacks, and resolve Favorites
   navigation targets before reducing them to display-only row items.
@@ -233,7 +219,7 @@ compatibility paths.
 - `app/journal_row.ml` and `app/journal_timeline_state.ml` provide existing
   hierarchy/status patterns, but their bounded preview text and row extents
   are not a full-content detail rendering contract. Do not copy those clipping
-  assumptions into detail. `app/journal_timeline.ml` owns the Slidable action
+  assumptions into detail. `app/journal_timeline.ml` owns the context-menu action
   composition to reuse, while application pending-delete state owns the
   timeline's Undo deadline and mutation dispatch.
   Replace list-row `Toggle_children` interaction with block activation, retaining
@@ -268,7 +254,7 @@ change, and rationale before proceeding.
 
 Advance this design to proposed at the user's request on 2026-09-08. The
 first-version scope is a dedicated outliner page with a far-left Back button,
-Capture-style append to the opened root, and right-swipe Delete on block rows.
+Capture-style append to the opened root, and context-menu Delete on block rows.
 Timeline and Favorites block-row taps open the corresponding detail root;
 Timeline inline tree expansion is removed. Child content taps inside detail
 do nothing, and editing existing blocks is deferred.
@@ -325,8 +311,8 @@ sessions, or composer API extensions for editing as part of this version.
   and row/scroll anchor, including a Favorites membership anchor after refresh.
   Deleted targets show an unavailable state; stale completions cannot navigate
   to another block or graph.
-- Timeline swipe actions do not trigger navigation. Favorites list rows gain
-  block activation without swipe actions. Timeline journal/day pagination and
+- Timeline context actions do not trigger navigation. Favorites list rows gain
+  block activation with context-menu actions. Timeline journal/day pagination and
   static child summaries remain functional without inline tree loading.
 - Opening a block shows its dedicated reading page with a far-left header Back
   control and no automatically focused source editor.
@@ -336,7 +322,7 @@ sessions, or composer API extensions for editing as part of this version.
 - Tapping child content inside detail has no effect on route, editor, or expansion. Only
   the disclosure control toggles a branch; no child detail history is created.
 - Right-swiping any visible block row reveals only `Delete` in the timeline
-  action style. A full swipe does not execute deletion. No Edit entry point
+  action style. No Edit entry point
   or editing sheet is available for the root or descendants.
 - Delete removes the selected subtree with the timeline Undo behavior.
   Descendant deletion keeps detail open; root deletion returns to the origin.
@@ -368,14 +354,14 @@ cache through the narrow public production boundary that executes that read;
 do not inject a resolved detail result to claim coverage of page resolution.
 Update tests for the retired Timeline expansion and Favorites block-row no-op
 contracts to exercise the new navigation behavior at their existing ownership
-boundaries, while retaining unrelated pagination, swipe, and graph-read coverage.
+boundaries, while retaining unrelated pagination and graph-read coverage.
 
 Verify detail branch events, pagination completions, append parent identity, ordering,
 duplicate admission, subtree delete/Undo events and deadlines, and return
 state through their production public pure
 state/reducer interfaces. Exercise real public order-allocation behavior for a
 partially loaded sibling list rather than injecting an already correct order.
-Use the native widget boundary only for layout, swipe actions, focus, sheet
+Use the native widget boundary only for layout, context actions, focus, sheet
 lifecycle, and Capture parity that pure state cannot observe. For any regression
 discovered during implementation, first reproduce it through its production owner's public
 pure events/state/effects and follow the repository's narrowest-layer rule.
@@ -400,7 +386,7 @@ Do not add redundant coverage across reducer, transport, and UI layers.
 - Concurrent changes may delete/move the parent or invalidate sibling cursors
   during append. Use existing revision/admission outcomes and reconcile the
   branch; never silently redirect the write to a different parent.
-- Swipe-only Delete needs an accessible action equivalent and must
+- Delete must remain accessible through the context menu and must
   remain distinguishable from disclosure and vertical scrolling.
 - Descendant deletion adds mutation targets beyond the page root. Completion
   correlation and localized Undo restoration are required to
@@ -435,7 +421,7 @@ The application supplies all product rows and actions from OCaml. The small
 `journal_detail_outline.dart` native adapter owns measured variable-height list
 geometry, visible-range reporting, anchor restoration, reveal scrolling and
 accessible custom actions. It uses Flutter's `ListView.builder`, `AppBar` and
-existing Slidable host. Capture and append call the same composer constructor
+existing native host. Capture and append call the same composer constructor
 with separate state and keys. Append admission is published before dispatching
 its effect, so immediate responses cannot be overwritten by Saving state.
 
@@ -466,7 +452,7 @@ Native viewport geometry is tested only in the adapter. The macOS continuous
 append reproduction exercises application effect scheduling, which the detail
 reducer does not own; its final check was repeated in the actual application.
 Retired Timeline-expansion assertions were replaced by static-row/navigation
-checks while retaining day/feed pagination, swipe and graph-read coverage.
+checks while retaining day/feed pagination and graph-read coverage.
 
 ### Actual macOS acceptance
 
@@ -480,7 +466,7 @@ recent graph. Used a uniquely named test root created through Capture to check:
 - Expanding a child and submitting additional appends produces ordered direct
   children of the root. Continuous submissions return to the readable outline
   and reveal the new child. Child content taps do not navigate or expand.
-- A full rightward swipe reveals only Delete without executing it. Deleting
+- Selecting Delete in the context menu targets the chosen block. Deleting
   a child retains detail; immediate Undo restores it. Deleting the root
   returns to Timeline; Undo restores the test root and its subtree.
 - Existing Favorites block targets open their own outline, deeper disclosure

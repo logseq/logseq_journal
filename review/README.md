@@ -4,7 +4,7 @@ This change targets current main directly. It contains the text-first Journal ro
 
 ## Result
 
-Rows keep the existing date headers and native navigation and swipe actions, remove the disclosure arrow, and place body text above media and quiet task/tag metadata. Long text clamps to three lines with stable expand/collapse. Single images use a large native preview; galleries use horizontal scrolling with the next image visible. File cards show type icons and actual descriptor sizes when available. Missing metadata produces no extra footer. Native visible-range events release offscreen media demand without new geometry tracking.
+Rows keep the existing date headers and native navigation and context menus, remove the disclosure arrow, and place body text above media and quiet task/tag metadata. Long text clamps to three lines with stable expand/collapse. Single images use a large native preview; galleries use horizontal scrolling with the next image visible. File cards show type icons and actual descriptor sizes when available. Missing metadata produces no extra footer. Native visible-range events release offscreen media demand without new geometry tracking.
 
 Named tags are resolved from the same immutable Worker read snapshot as their block. Optional tagTitles preserves decoding of older responses. Missing tag pages are omitted. Asset descriptors do not guarantee an original filename; inline cards use descriptive type labels instead of presenting cache paths as original filenames. Native Quick Look may show its source cache basename; unsupported types use the system fallback.
 
@@ -32,7 +32,7 @@ The Worker now supports a pure optional merge callback under the existing mailbo
 - The combined-base simulator previously verified real graph file metadata and image rendering, full-image Quick Look, file fallback preview, and return to the timeline. Those private screenshots remain local and are excluded from Git and the PR.
 - Full runtest has an existing source_boundary_test failure: unchanged journal_timeline.ml uses V.loading while that check requires literal V.progress. No check is disabled or suppressed.
 - spec-dev-tool check --all has one existing invalid decision document, 2026-09-28-bottom-lui-capsules.md. This feature and fix decision validate.
-- Horizontal gallery versus row-swipe gesture conflict still needs manual confirmation. Structural/native component checks and visible 1.5-image layout are verified; a computer drag did not establish a reliable movement result.
+- Horizontal gallery movement still needs manual confirmation. Structural/native component checks and visible 1.5-image layout are verified; a computer drag did not establish a reliable movement result.
 
 ## Local verification
 

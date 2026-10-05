@@ -145,6 +145,7 @@ type timeline_notice =
   | Delete_undo
   | Delete_failed of string
   | Status_failed of string
+  | Copy_failed of string
 
 let operation_failure = function
   | Some (Delete_failed message) ->
@@ -157,6 +158,8 @@ let operation_failure = function
       ( "Status not changed"
       , message
       , "The block keeps its current status. Open its Status menu to try again." )
+  | Some (Copy_failed message) ->
+    Some ("Copy failed", message, "Select Copy to try again.")
   | None | Some Delete_undo -> None
 ;;
 
@@ -1408,6 +1411,8 @@ type command =
   | Status_sheet_select of string
   | Timeline_delete of string
   | Detail_delete of string
+  | Copy_block of string
+  | Favorite_copy of string
   | Timeline_open_block of string
   | Favorite_open_block of string
   | Media of string * Journal_media_view.event
@@ -1542,7 +1547,7 @@ let status_sheet_page ~tokens ~block dispatch =
            | _ -> ()))
       (List.map
          (fun (id, tag, state) ->
-            let palette = Journal_visual_tokens.status_swipe_action tokens state in
+            let palette = Journal_visual_tokens.status_colors tokens state in
             let icon_tint =
               if state = Journal_model.No_status
               then palette.foreground
@@ -1743,7 +1748,15 @@ let row_media_label
 module Favorites_list = struct
   module Keys = Set.Make (String)
 
-  let view ~keys ~block_keys ~actions_enabled ~on_visible_range ~on_open ~children =
+  let view
+        ~keys
+        ~block_keys
+        ~actions_enabled
+        ~on_visible_range
+        ~on_open
+        ~on_copy
+        ~children
+    =
     let block_keys = Keys.of_list block_keys in
     let footer, children =
       match List.rev children with
@@ -1767,7 +1780,32 @@ module Favorites_list = struct
                  ()
              else label
            in
-           V.Native_list.row ~key:(Ui.Key.string key) ~separator:Hidden label)
+           let context_menu =
+             if Keys.mem key block_keys
+             then
+               Some
+                 (V.Context_menu.create
+                    ~actions:
+                      [ V.Context_menu.action
+                          ~key:(Ui.Key.string "copy")
+                          ~enabled:actions_enabled
+                          ~title:"Copy"
+                          ~symbol:"doc.on.doc"
+                          ~on_press:
+                            (Ui.Event.Handler.create (fun _ ->
+                               Ui.Event.Handler.Private.invoke
+                                 on_copy
+                                 (Ui.Event.Payload.Text key)))
+                          ()
+                      ]
+                    ())
+             else None
+           in
+           V.Native_list.row
+             ~key:(Ui.Key.string key)
+             ~separator:Hidden
+             ?context_menu
+             label)
         keys
         children
     in
@@ -1800,6 +1838,7 @@ let favorites_view
       ~on_visible_range
       ~on_retry
       ~on_open_favorite
+      ~on_copy
   =
   let module F = Journal_routes.Favorites in
   let rows = F.items state in
@@ -1887,6 +1926,7 @@ let favorites_view
                 | Page _ -> None
                 | Block _ -> Some favorite.membership_id)
              rows)
+        ~on_copy
         ~on_open:on_open_favorite
         ~on_visible_range
         ~children:(children @ [ footer ]))
@@ -2118,6 +2158,8 @@ let timeline_page
       ~interaction_enabled
       ~on_status
       ~on_delete
+      ~on_copy
+      ~on_copy_favorite
       ~error_info_available
       ~on_error_info
       ~account_menu_available
@@ -2150,6 +2192,7 @@ let timeline_page
         ~actions_enabled:(actions_enabled && interaction_enabled)
         ~on_status
         ~on_delete
+        ~on_copy
         ~on_visible_range
         ~on_retry_day
         ~on_scroll_completed
@@ -2168,7 +2211,8 @@ let timeline_page
         ~actions_enabled:interaction_enabled
         ~on_visible_range:on_favorites_visible_range
         ~on_retry:on_favorites_retry
-        ~on_open_favorite)
+        ~on_open_favorite
+        ~on_copy:on_copy_favorite)
     else timeline ()
   in
   let destination_action index =
@@ -2526,23 +2570,6 @@ module Detail_list = struct
             let id = Journal_model.id block in
             let delete = bind_action on_action (Detail_delete id) in
             let open_block = bind_action on_action (Detail_open id) in
-            let swipe_actions =
-              V.Swipe_actions.create
-                ~allows_full_swipe:false
-                ~actions:
-                  [ V.Swipe_actions.action
-                      ~key:(Ui.Key.string ("delete:" ^ id))
-                      ~enabled
-                      ~side:End
-                      ~title:"Delete"
-                      ~symbol:"trash"
-                      ~role:Destructive
-                      ~background:Journal_visual_tokens.delete_action_background
-                      ~on_press:delete
-                      ()
-                  ]
-                ()
-            in
             let context_menu =
               V.Context_menu.create
                 ~actions:
@@ -2560,22 +2587,22 @@ module Detail_list = struct
                       ~symbol:"trash"
                       ~on_press:delete
                       ()
+                  ; V.Context_menu.action
+                      ~key:(Ui.Key.string "copy")
+                      ~enabled
+                      ~title:"Copy"
+                      ~symbol:"doc.on.doc"
+                      ~on_press:(bind_action on_action (Copy_block id))
+                      ()
                   ]
                 ()
             in
             if leaf
-            then
-              V.Native_list.row
-                ~key:row_key
-                ~separator:Hidden
-                ~swipe_actions
-                ~context_menu
-                label
+            then V.Native_list.row ~key:row_key ~separator:Hidden ~context_menu label
             else
               V.Native_list.disclosure_row
                 ~key:row_key
                 ~separator:Hidden
-                ~swipe_actions
                 ~context_menu
                 ~test_id:(Ui.Test_id.string ("detail-disclosure:" ^ id))
                 ~expanded
@@ -3246,10 +3273,17 @@ let response_tag = function
   | 20 -> 21
   | 22 -> 23
   | 25 -> 26
+  | 28 -> 29
   | tag -> tag
 ;;
 
-let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
+let start
+      ~on_view_region
+      ~on_platform_request
+      ~calendar_sampler
+      ~client
+      ~platform_code
+      ~host_code
   : app_context
   =
   let pump = Journal_pump.create () in
@@ -3302,10 +3336,101 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
        let tag = Bytes.get_uint16_le request 6 in
        Hashtbl.replace pending_platform (response_tag tag) k
      | Some _, false | None, _ -> ());
+    on_platform_request request;
     Journal_bridge.platform_request (Bytes.to_string request)
   in
   let platform_request request ~f : unit Effect.t =
     fun () -> emit_platform_request ~k:(fun result -> Effect.run (f result)) request
+  in
+  let copy_state = ref Journal_graph_runtime.Copy.initial in
+  let copy_owner = ref None in
+  let copy_sequence = ref 0L in
+  let copy_worker_requests = Hashtbl.create 2 in
+  let cancel_copy () =
+    let state, _ = Journal_graph_runtime.Copy.step !copy_state Cancel in
+    copy_state := state;
+    copy_owner := None;
+    Hashtbl.iter
+      (fun request_id _ -> Worker.cancel client ~request_id)
+      copy_worker_requests
+  in
+  let copy_current owner =
+    !copy_owner = Some owner
+    && !state_ref.graph_state.generation = fst owner
+    && !state_ref.graph_state.phase = Graph_open
+    && !state_ref.graph_ready
+    && not (local_deletion_active !state_ref)
+  in
+  let copy_error owner message =
+    set_state (fun state ->
+      if copy_current owner
+      then { state with timeline_notice = Some (Copy_failed message) }
+      else state)
+  in
+  let rec copy_transition owner event =
+    if !copy_owner <> Some owner
+    then Effect.ignore
+    else if not (copy_current owner)
+    then (
+      cancel_copy ();
+      Effect.ignore)
+    else (
+      let state, actions = Journal_graph_runtime.Copy.step !copy_state event in
+      copy_state := state;
+      Effect.many (List.map (copy_action owner) actions))
+  and copy_action owner = function
+    | Journal_graph_runtime.Copy.Failed message -> copy_error owner message
+    | Copied text ->
+      (match Journal_platform.copy_text_request ~text with
+       | Error message -> copy_error owner message
+       | Ok request ->
+         if not (copy_current owner)
+         then Effect.ignore
+         else
+           platform_request request ~f:(fun result ->
+             if not (copy_current owner)
+             then Effect.ignore
+             else (
+               match Result.bind result Journal_platform.decode_copy_text_response with
+               | Ok () -> Effect.ignore
+               | Error message -> copy_error owner message)))
+    | Read (ticket, command) ->
+      Effect.bind
+        (Effect.of_thunk (fun () ->
+           if not (copy_current owner)
+           then None
+           else (
+             let request =
+               Logseq_db_worker.Protocol.
+                 { api_version
+                 ; request_id =
+                     Logseq_db_types.Graph_types.Uuid.of_string (fresh_identity ())
+                     |> Result.get_ok
+                 ; command
+                 }
+             in
+             match Worker.send client (Graph_service.Graph_request request) with
+             | Accepted request_id ->
+               Hashtbl.replace
+                 copy_worker_requests
+                 request_id
+                 (owner, ticket, request.request_id);
+               None
+             | Full | Not_ready | Stopping ->
+               Some "The graph reader is temporarily unavailable.")))
+        ~f:(function
+          | None -> Effect.ignore
+          | Some message -> copy_transition owner (Read_failed (ticket, message)))
+  in
+  let begin_copy block_id =
+    match Logseq_db_types.Graph_types.Uuid.of_string block_id with
+    | Error _ -> Effect.ignore
+    | Ok root ->
+      cancel_copy ();
+      copy_sequence := Int64.succ !copy_sequence;
+      let owner = !state_ref.graph_state.generation, !copy_sequence in
+      copy_owner := Some owner;
+      copy_transition owner (Start root)
   in
   let graph_runtime =
     Journal_graph_runtime.create
@@ -3556,6 +3681,13 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
         ; graph_error
         })
     in
+    if
+      graph_state.phase <> Graph_open
+      || Option.fold
+           ~none:false
+           ~some:(fun (generation, _) -> generation <> graph_state.generation)
+           !copy_owner
+    then cancel_copy ();
     let start_graph =
       match graph_state.phase with
       | Graph_open ->
@@ -3647,6 +3779,8 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
   let termination_in_flight = ref false in
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
+    if Option.is_some manager.local_deletion || not manager.startup.authenticated
+    then cancel_copy ();
     if Option.is_some manager.local_deletion
     then (
       Journal_graph_runtime.reset graph_runtime;
@@ -3698,6 +3832,19 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
     sync_media !state_ref;
     Journal_media_runtime.pump media_runtime;
     match event with
+    | Worker.Response { request_id; outcome; _ }
+      when Hashtbl.mem copy_worker_requests request_id ->
+      let owner, ticket, protocol_id = Hashtbl.find copy_worker_requests request_id in
+      Hashtbl.remove copy_worker_requests request_id;
+      let event =
+        match outcome with
+        | Completed
+            (Graph_service.Graph_response (Logseq_db_worker.Protocol.V2_response response))
+          when Logseq_db_types.Graph_types.Uuid.equal response.request_id protocol_id ->
+          Journal_graph_runtime.Copy.Completed (ticket, response.outcome)
+        | _ -> Read_failed (ticket, "The copy request was cancelled or failed.")
+      in
+      copy_transition owner event
     | Worker.Response { request_id; outcome = Completed response; _ }
       when Hashtbl.mem media_worker_requests request_id ->
       let ticket = Hashtbl.find media_worker_requests request_id in
@@ -5039,16 +5186,18 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
     | Dismiss_operation_error ->
       update (fun state ->
         match state.timeline_notice with
-        | Some (Delete_failed _ | Status_failed _) ->
+        | Some (Delete_failed _ | Status_failed _ | Copy_failed _) ->
           { state with timeline_notice = None }
         | None | Some Delete_undo -> state)
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
     | Switch_graph ->
+      cancel_copy ();
       Effect.many
         [ update (fun state -> { state with modal = No_modal })
         ; send_manager Graph_service.Return_to_graph_picker
         ]
     | Sign_out ->
+      cancel_copy ();
       sign_out_in_flight := true;
       Effect.many
         [ update (fun state -> Root_navigation.step state Account_cleared)
@@ -5239,6 +5388,7 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
        | Status_sheet _, true, None, Some _, _
        | Status_sheet _, true, None, None, None -> Effect.ignore)
     | Timeline_delete block_id | Detail_delete block_id ->
+      cancel_copy ();
       let block =
         match Journal_routes.detail snapshot.routes with
         | Some detail -> Journal_detail.find_block detail ~block_id
@@ -5274,6 +5424,26 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
              update (fun state ->
                hide_deleted { state with timeline_notice = Some Delete_undo } pending)))
        | _ -> Effect.ignore)
+    | Copy_block block_id ->
+      let exists =
+        match Journal_routes.detail snapshot.routes with
+        | Some detail -> Option.is_some (Journal_detail.find_block detail ~block_id)
+        | None -> Option.is_some (block_in_timeline snapshot.timeline block_id)
+      in
+      if exists && snapshot.graph_ready then begin_copy block_id else Effect.ignore
+    | Favorite_copy membership_id ->
+      (match
+         List.find_opt
+           (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+              Logseq_db_types.Graph_types.Uuid.to_string item.membership_uuid
+              = membership_id)
+           (Journal_routes.Favorites.items snapshot.favorites)
+       with
+       | Some item ->
+         (match (Journal_graph_projection.favorite item).target with
+          | Block id -> begin_copy id
+          | Page _ -> Effect.ignore)
+       | None -> Effect.ignore)
     | Timeline_open_block value -> open_block value
     | Favorite_open_block value -> open_favorite value
     | _ -> Effect.ignore
@@ -5729,6 +5899,8 @@ let start ~on_view_region ~calendar_sampler ~client ~platform_code ~host_code
             ~interaction_enabled:true
             ~on_status:(prefix_action dispatch (fun value -> Timeline_status value))
             ~on_delete:(prefix_action dispatch (fun value -> Timeline_delete value))
+            ~on_copy:(prefix_action dispatch (fun value -> Copy_block value))
+            ~on_copy_favorite:(prefix_action dispatch (fun value -> Favorite_copy value))
             ~error_info_available:
               (state.worker_errors <> []
                || Option.is_some
@@ -6162,6 +6334,7 @@ let decode_config payload =
 
 let create
       ?(on_view_region = fun _ -> ())
+      ?(on_platform_request = fun _ -> ())
       ?on_client
       ?(calendar_sampler = fun () -> Journal_calendar.Sampler.create ())
       ~service
@@ -6187,6 +6360,7 @@ let create
              ignore
                (start
                   ~on_view_region
+                  ~on_platform_request
                   ~calendar_sampler:(calendar_sampler ())
                   ~client
                   ~platform_code
@@ -6426,6 +6600,8 @@ module For_testing = struct
       ~interaction_enabled:true
       ~on_status:handler
       ~on_delete:handler
+      ~on_copy:handler
+      ~on_copy_favorite:handler
       ~error_info_available:true
       ~on_error_info:handler
       ~account_menu_available:true
@@ -6435,9 +6611,15 @@ module For_testing = struct
     V.Navigation_stack.create ~title:"" ~on_path_change:handler ~path:[] page
   ;;
 
-  let app_with_service ?on_client ?on_view_region ?calendar_sampler service =
+  let app_with_service
+        ?on_client
+        ?on_view_region
+        ?on_platform_request
+        ?calendar_sampler
+        service
+    =
     let calendar_sampler = Option.map (fun sampler () -> sampler) calendar_sampler in
-    create ?on_client ?on_view_region ?calendar_sampler ~service ()
+    create ?on_client ?on_view_region ?on_platform_request ?calendar_sampler ~service ()
   ;;
 end
 

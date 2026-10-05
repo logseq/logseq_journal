@@ -22,7 +22,7 @@ The production styling corpus is split across several ownership boundaries:
 - `app/journal_header.ml`, `app/journal_row.ml`, and
   `app/journal_timeline.ml` consume the custom palette for text, icons,
   backgrounds, dividers, press overlays, task-status rails, child connectors,
-  and swipe-delete feedback.
+  and delete feedback.
 - `flutter/lib/main.dart` owns the pre-runtime configuration failure and
   runtime-preparation states. `flutter/lib/application_host_adapter.dart` owns
   the Amplify authentication shell and currently supplies `ThemeData.light()`
@@ -76,8 +76,7 @@ palette rather than proving that semantic Material roles own styling.
 
 This is not entirely a local cleanup. The installed framework exposes
 `Theme.Color_scheme.t` as an opaque seed description. `Style.Color.t`,
-`Style.Text_style`, `Style.Decoration`, generic icons, generic press overlays,
-and `Native_widget.Swipe_action.action` accept concrete colors only. OCaml code
+`Style.Text_style`, `Style.Decoration`, generic icons, and generic press overlays accept concrete colors only. OCaml code
 cannot name `surface`, `onSurfaceVariant`, `outlineVariant`, `error`, or another
 derived role. The renderer computes those roles only after it receives the
 logical frame. Therefore the application cannot strictly remove every
@@ -94,7 +93,7 @@ must not erase:
 - the current persistent MessageComposer retains its behavior unless the
   active Capture FAB exploration is separately resolved and proposed;
 - top-level and child rows retain deterministic one-to-four-line extents,
-  stable varied-sliver geometry, swipe ownership, exact semantics, and a
+  stable varied-sliver geometry, exact semantics, and a
   leading status rail;
 - Todo, Doing, Done, and Later rails are currently four distinguishable
   semantic families in normal and high-contrast presentation; and
@@ -111,7 +110,7 @@ primitive with a Material component.
 
 Adopt a seed-owned styling architecture with one production seed declaration
 for the authenticated Bonsai application plus a bounded set of fixed colors
-for the status rails and native destructive swipe action. Material semantic
+for the status rails. Material semantic
 roles should own all other general-purpose surfaces, content, outlines, state
 layers, errors, and destructive presentation. `Journal_visual_tokens` should
 cease to be a color theme and retain only application-specific non-color policy
@@ -168,7 +167,7 @@ Replace the graph picker's text-button rows with `Ui.Material.list_tile`. Keep
 stable keys, click events, accessibility labels and hints, scrolling, width
 constraints, and graph-selection behavior. This is the clearest current
 `list_tile` consumer because each row is an immediate list action and does not
-have the Journal row's variable-height, status, timestamp, expansion, or swipe
+have the Journal row's variable-height, status, timestamp or expansion
 contracts.
 
 Replace hand-drawn logical separators with `Ui.Material.divider` when its
@@ -204,14 +203,12 @@ icon, divider, and state colors become theme-owned.
 Do not convert Journal rows to `Material.list_tile` merely because the API is
 available. The current row coordinates deterministic one-to-four-line height,
 timestamp suppression, collapsed child summaries, disclosure, a status rail,
-RTL geometry, stable focus, varied-sliver extent, group boundaries, and native
-swipe dismissal. The installed ListTile API does not expose the control needed
+RTL geometry, stable focus, varied-sliver extent, group boundaries. The installed ListTile API does not expose the control needed
 to preserve those contracts. Keep the custom row layout, remove its redundant
 fixed background, and theme its remaining visual roles through the prerequisite
 described below.
 
-Retain `Native_widget.Swipe_action` because it owns maintained interaction
-behavior that no current OCaml Material node replaces. Do not use this styling
+Do not use this styling
 decision to choose between the current persistent MessageComposer and the
 active FAB/input exploration. If that feature later selects a Material FAB and
 MessageComposer composition, both states must consume the same seed-owned
@@ -231,7 +228,6 @@ roles for:
   timestamp, supporting text, icons, connectors, and empty/loading views;
 - outline/outline-variant separators;
 - press state layers;
-- error and on-error destructive swipe feedback; and
 - the four agreed status-rail roles.
 
 The application must not reproduce Flutter's Material Color Utilities
@@ -250,7 +246,7 @@ never be patched as a workaround.
 The exception contract is deliberately narrow:
 
 - four task-status rail roles: Todo, Doing, Done, and Later; and
-- the background and foreground roles of the native destructive swipe action.
+- accessible destructive feedback.
 
 These roles must live together in one dedicated exception module rather than
 preserving `Journal_visual_tokens.palette`. The module may select different
@@ -356,7 +352,7 @@ scheme.
 Remove the general-purpose palette and interaction records from
 `Journal_visual_tokens`. Keep one nested `Color_exceptions` module whose only
 fixed roles are Todo, Doing, Done, and Later status rails plus the background
-and foreground of the native destructive swipe action. The same six accepted
+of the status picker. The same six accepted
 colors meet the runtime contrast and distinguishability thresholds in all four
 presentations, so the implementation does not duplicate them per variant.
 
@@ -366,7 +362,7 @@ Remove the repeated row and group separators instead of reproducing them across
 the virtual timeline; the rendered Journal screen consequently contains one
 divider and remains below the three-divider limit. Keep the child connector and
 bullet as theme-inheriting structural primitives, and keep the custom Journal
-header, variable-height rows, status rails, and native swipe interaction.
+header, variable-height rows, status rails, and native row interactions.
 
 Remove fixed colors from buttons, dialogs, modal barriers, Capture surfaces,
 rows, headers, text, icons, errors, and press overlays. Remove the iOS forced
@@ -408,8 +404,7 @@ contrast dependent on composition. It is not the target architecture.
 
 ### Convert every custom layout to a Material component
 
-Replacing the two-line header, variable-height journal rows, status rails, or
-swipe action only to gain theme access would discard maintained product
+Replacing the two-line header, variable-height journal rows, status rails only to gain theme access would discard maintained product
 behavior. The separate Capture FAB exploration owns any MessageComposer
 replacement. Material components should replace equivalent roles, not force
 unrelated interaction or geometry changes.
@@ -442,7 +437,7 @@ the iOS `UIUserInterfaceStyle=Light` override.
 - The accepted scope defines exactly one production seed declaration and no
   second application palette. Concrete RGB/ARGB values outside that declaration
   exist only in the dedicated exception module for four status rails and the
-  destructive swipe background/foreground.
+  destructive feedback.
 - `Journal_visual_tokens` owns only non-color application policy. Unused
   `neutral_badge`, `fab`, `focused`, `disabled`, and `error` tokens and every
   obsolete palette accessor disappear rather than remaining as compatibility
@@ -456,7 +451,7 @@ the iOS `UIUserInterfaceStyle=Light` override.
   virtual row extents or child geometry. Repeated row and group separators are
   removed, every screen remains below three dividers, and the non-equivalent
   connector and bullet decorations are explicitly classified.
-- The Journal header, row, status rail, and SwipeAction retain their implemented
+- The Journal header, row and status rail retain their implemented
   product and interaction contracts. The active Capture FAB exploration owns
   any change to MessageComposer/FAB structure. No NavigationBar, RadioGroup,
   Slider, RangeSlider, or Chip behavior is introduced without a matching
@@ -479,7 +474,7 @@ the iOS `UIUserInterfaceStyle=Light` override.
 - Exact former palette assertions are replaced by theme ownership, semantic
   role, accessibility contrast, component-kind, and runtime rendering tests.
   Existing semantics, stable sliver geometry, pagination, scroll anchoring,
-  swipe/delete, Capture, Detail, graph selection, RTL, text scale, reduced
+  Delete, Capture, Detail, graph selection, RTL, text scale, reduced
   motion, high contrast, and platform startup behavior remain covered.
 - `spec-dev-tool check --all`, `dune runtest`, `bonsai-flutter sync-host
   --check`, Flutter analysis and tests through `bonsai-flutter exec`, the macOS
@@ -495,7 +490,7 @@ the iOS `UIUserInterfaceStyle=Light` override.
   adopting them could change graph-row density or inject default divider extent
   into the varied sliver.
 - Removing explicit row and header backgrounds exposes the Scaffold surface.
-  Overlay, clipping, swipe translation, and modal transitions must not reveal
+  Overlay, clipping and modal transitions must not reveal
   an unintended intermediate color.
 - A seed-generated tonal scheme does not guarantee that four arbitrary roles
   remain perceptually distinct under every dynamic variant or contrast level.
@@ -525,7 +520,7 @@ the iOS `UIUserInterfaceStyle=Light` override.
   Adding another fixed role requires a new decision; a future framework semantic
   color API can remove the exception module entirely.
 - Repeated timeline separators are gone. Stable row extents, scroll anchoring,
-  swipe ownership, child geometry, and semantics remain unchanged, while the
+  child geometry, and semantics remain unchanged, while the
   Journal screen renders only one divider in its resting state.
 - Graph rows use Material ListTile and the sync error uses Material Card, so their
   disabled, pressed, surface, and content presentation track Material theme

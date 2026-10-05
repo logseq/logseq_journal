@@ -1,6 +1,6 @@
 module Ui = Journal_view
 
-type swipe_action_colors =
+type status_colors =
   { background : Ui.Style.Color.t
   ; foreground : Ui.Style.Color.t
   }
@@ -11,16 +11,14 @@ module Color_exceptions = struct
     | Dark
 
   type status_palette =
-    { no_status : swipe_action_colors
-    ; todo : swipe_action_colors
-    ; doing : swipe_action_colors
-    ; done_ : swipe_action_colors
-    ; backlog : swipe_action_colors
+    { no_status : status_colors
+    ; todo : status_colors
+    ; doing : status_colors
+    ; done_ : status_colors
+    ; backlog : status_colors
     }
 
   let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue
-  let status_action_background = rgb 0 100 210
-  let delete_action_background = rgb 190 35 35
   let transparent = Ui.Style.Color.argb ~alpha:0 ~red:0 ~green:0 ~blue:0
 
   let light_status =
@@ -67,7 +65,7 @@ module Color_exceptions = struct
     | Dark, true -> dark_increased_status
   ;;
 
-  let status_swipe_action ~presentation ~high_contrast =
+  let status_colors ~presentation ~high_contrast =
     let palette = status_palette ~presentation ~high_contrast in
     function
     | Journal_model.No_status -> palette.no_status
@@ -92,12 +90,9 @@ let resolve ~brightness ~high_contrast =
   { presentation; high_contrast }
 ;;
 
-let status_swipe_action t status =
-  Color_exceptions.status_swipe_action
+let status_colors t status =
+  Color_exceptions.status_colors
     ~presentation:t.presentation
     ~high_contrast:t.high_contrast
     status
 ;;
-
-let status_action_background = Color_exceptions.status_action_background
-let delete_action_background = Color_exceptions.delete_action_background

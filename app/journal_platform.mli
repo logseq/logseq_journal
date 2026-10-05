@@ -56,3 +56,6 @@ val decode_notice_response : token:int64 -> bytes -> (notice_result, string) res
 
 (** OCaml -> host request cancelling a pending notice (tag 27). *)
 val notice_cancel_request : token:int64 -> bytes
+
+val copy_text_request : text:string -> (bytes, string) result
+val decode_copy_text_response : bytes -> (unit, string) result

@@ -2232,10 +2232,324 @@ let test_child_failure_retains_admitted_child () =
     (List.length duplicate.responses)
 ;;
 
+module Copy = Runtime.Copy
+
+let copy_read = function
+  | [ Copy.Read (ticket, command) ] -> ticket, command
+  | _ -> Alcotest.fail "Copy must issue one bounded subtree read"
+;;
+
+let copy_reply state effects outcome =
+  let ticket, _ = copy_read effects in
+  Copy.step state (Copy.Completed (ticket, outcome))
+;;
+
+let copy_start root =
+  let state, effects = Copy.step Copy.initial (Copy.Start root) in
+  Alcotest.(check bool)
+    "Copy begins with graph version"
+    true
+    (snd (copy_read effects) = Protocol.V2_graph_info);
+  let state, effects =
+    copy_reply state effects (graph_info_outcome ~journal_title_format:None)
+  in
+  Alcotest.(check bool)
+    "Copy reads selected root only"
+    true
+    (match snd (copy_read effects) with
+     | Protocol.V2_get_block { block; _ } -> Graph.Uuid.equal block root
+     | _ -> false);
+  state, effects
+;;
+
+let copy_children ?cursor ?(revision = "children-1") parent items =
+  Protocol.V2_children_outcome
+    { parent
+    ; revision_scope = V2_children_revision parent
+    ; scope_revision = revision
+    ; items
+    ; next_cursor = cursor
+    }
+;;
+
+let copy_root state effects title =
+  copy_reply
+    state
+    effects
+    (Protocol.V2_block_outcome
+       (V2_present_block
+          { value = { record with block = { block with title } }; revision = "root-1" }))
+;;
+
+let copy_child id parent title : Protocol.v2_child_member =
+  { value = { record with block = { block with uuid = id; parent; title } }
+  ; revision = "child-1"
+  }
+;;
+
+let copy_parent effects expected =
+  match snd (copy_read effects) with
+  | Protocol.V2_get_children { parent; limit; _ } ->
+    Alcotest.(check bool)
+      "selected subtree parent"
+      true
+      (Graph.Uuid.equal parent expected);
+    Alcotest.(check bool) "bounded child page" true (limit <= Protocol.maximum_page_size)
+  | _ -> Alcotest.fail "Copy attempted a read outside the selected subtree"
+;;
+
+let test_copy_nested_paginated_text () =
+  let first = unrelated_uuid in
+  let second = uuid "a1000000-0000-4000-9000-000000000002" in
+  let nested = uuid "a1000000-0000-4000-9000-000000000003" in
+  let cursor = Graph.Cursor.of_string "copy-page-2" |> Result.get_ok in
+  let state, effects = copy_start block_uuid in
+  let state, effects = copy_root state effects "Root\noriginal line" in
+  copy_parent effects block_uuid;
+  let state, effects =
+    copy_reply
+      state
+      effects
+      (copy_children ~cursor block_uuid [ copy_child first block_uuid "Child\n续行" ])
+  in
+  copy_parent effects block_uuid;
+  Alcotest.(check bool)
+    "all child pages requested"
+    true
+    (match snd (copy_read effects) with
+     | Protocol.V2_get_children { cursor = Some value; _ } -> value = cursor
+     | _ -> false);
+  let state, effects =
+    copy_reply
+      state
+      effects
+      (copy_children block_uuid [ copy_child second block_uuid "" ])
+  in
+  copy_parent effects first;
+  let state, effects =
+    copy_reply state effects (copy_children first [ copy_child nested first "孙子😀" ])
+  in
+  copy_parent effects nested;
+  let state, effects = copy_reply state effects (copy_children nested []) in
+  copy_parent effects second;
+  let state, effects = copy_reply state effects (copy_children second []) in
+  Alcotest.(check bool)
+    "verify graph version after complete subtree"
+    true
+    (snd (copy_read effects) = Protocol.V2_graph_info);
+  let _, effects =
+    copy_reply state effects (graph_info_outcome ~journal_title_format:None)
+  in
+  Alcotest.(check bool)
+    "original root and all ordered descendants"
+    true
+    (effects = [ Copy.Copied "Root\noriginal line\n  - Child\n    续行\n    - 孙子😀\n  - " ])
+;;
+
+let test_copy_empty_and_root_whitespace () =
+  List.iter
+    (fun source ->
+       let state, effects = copy_start block_uuid in
+       let state, effects = copy_root state effects source in
+       let state, effects = copy_reply state effects (copy_children block_uuid []) in
+       let _, effects =
+         copy_reply state effects (graph_info_outcome ~journal_title_format:None)
+       in
+       Alcotest.(check bool)
+         "empty/whitespace root is copied exactly"
+         true
+         (effects = [ Copy.Copied source ]))
+    [ ""; "  Root\n\n" ]
+;;
+
+let test_copy_cancel_and_replacement () =
+  let state, effects = Copy.step Copy.initial (Copy.Start block_uuid) in
+  let ticket, _ = copy_read effects in
+  let canceled, effects = Copy.step state Copy.Cancel in
+  Alcotest.(check bool) "cancel emits no clipboard result" true (effects = []);
+  let _, effects =
+    Copy.step
+      canceled
+      (Copy.Completed (ticket, graph_info_outcome ~journal_title_format:None))
+  in
+  Alcotest.(check bool) "late cancelled completion ignored" true (effects = []);
+  let replacement, effects = Copy.step state (Copy.Start unrelated_uuid) in
+  Alcotest.(check bool)
+    "replacement uses a fresh ticket"
+    true
+    (fst (copy_read effects) <> ticket);
+  let _, effects =
+    Copy.step
+      replacement
+      (Copy.Completed (ticket, graph_info_outcome ~journal_title_format:None))
+  in
+  Alcotest.(check bool) "late replaced completion ignored" true (effects = [])
+;;
+
+let copy_expect_failure state effects outcome =
+  let _, effects = copy_reply state effects outcome in
+  Alcotest.(check bool)
+    "failure never copies a partial subtree"
+    true
+    (match effects with
+     | [ Copy.Failed message ] -> message <> ""
+     | _ -> false)
+;;
+
+let test_copy_rejects_missing_failed_or_changed_graph () =
+  let state, effects = copy_start block_uuid in
+  copy_expect_failure
+    state
+    effects
+    (Protocol.V2_block_outcome
+       (V2_missing_block { uuid = block_uuid; revision = "missing" }));
+  let state, effects = copy_root state effects "Root" in
+  copy_expect_failure
+    state
+    effects
+    (Protocol.V2_failed { code = "staleReadCursor"; message = "Changed" });
+  let ticket, _ = copy_read effects in
+  let _, failed = Copy.step state (Copy.Read_failed (ticket, "Cancelled by Worker")) in
+  Alcotest.(check bool)
+    "worker failure never copies"
+    true
+    (match failed with
+     | [ Copy.Failed _ ] -> true
+     | _ -> false);
+  let state, effects = copy_reply state effects (copy_children block_uuid []) in
+  let changed =
+    match graph_info_outcome ~journal_title_format:None with
+    | Protocol.V2_graph_info_outcome info ->
+      Protocol.V2_graph_info_outcome { info with projection_revision = "projection-2" }
+    | _ -> assert false
+  in
+  copy_expect_failure state effects changed
+;;
+
+let test_copy_rejects_wrong_owner_cycle_and_cursor () =
+  let state, effects = copy_start block_uuid in
+  let state, effects = copy_root state effects "Root" in
+  copy_expect_failure state effects (copy_children unrelated_uuid []);
+  copy_expect_failure
+    state
+    effects
+    (copy_children block_uuid [ copy_child block_uuid block_uuid "Cycle" ]);
+  copy_expect_failure
+    state
+    effects
+    (copy_children block_uuid [ copy_child unrelated_uuid page_uuid "Wrong parent" ]);
+  let cursor = Graph.Cursor.of_string "repeated" |> Result.get_ok in
+  let state, effects =
+    copy_reply
+      state
+      effects
+      (copy_children ~cursor block_uuid [ copy_child unrelated_uuid block_uuid "Child" ])
+  in
+  copy_expect_failure state effects (copy_children ~cursor block_uuid []);
+  copy_expect_failure state effects (copy_children ~revision:"children-2" block_uuid [])
+;;
+
+let test_copy_rejects_oversized_text () =
+  let state, effects = copy_start block_uuid in
+  copy_expect_failure
+    state
+    effects
+    (Protocol.V2_block_outcome
+       (V2_present_block
+          { value =
+              { record with
+                block = { block with title = String.make ((256 * 1024) + 1) 'x' }
+              }
+          ; revision = "root-1"
+          }))
+;;
+
+let test_copy_result_fits_serialized_clipboard () =
+  let maximum = 256 * 1024 in
+  let complete source =
+    let state, effects = copy_start block_uuid in
+    let state, effects = copy_root state effects source in
+    let state, effects = copy_reply state effects (copy_children block_uuid []) in
+    snd (copy_reply state effects (graph_info_outcome ~journal_title_format:None))
+  in
+  let check source effects =
+    match Journal_platform.copy_text_request ~text:source with
+    | Ok _ ->
+      Alcotest.(check bool)
+        "encodable text is copied exactly"
+        true
+        (effects = [ Copy.Copied source ])
+    | Error _ ->
+      Alcotest.(check bool)
+        "unencodable JSON never produces Copied"
+        true
+        (match effects with
+         | [ Copy.Failed message ] -> message <> ""
+         | _ -> false)
+  in
+  List.iter
+    (fun source -> check source (complete source))
+    [ String.make maximum 'x'
+    ; String.make (maximum - 11) 'x'
+    ; String.make (maximum - 10) 'x'
+    ; String.make (maximum / 2) '"'
+    ; String.make (maximum / 2) '\\'
+    ; String.make (maximum / 2) '\n'
+    ; String.make (maximum / 6) '\001'
+    ; String.make ((maximum - 11) / 2) '\n' ^ "a"
+    ; String.make ((maximum - 11) / 2) '\n' ^ "ab"
+    ];
+  List.iter
+    (fun root_length ->
+       let root = String.make root_length 'x' in
+       let child = copy_child unrelated_uuid block_uuid "\"" in
+       let state, effects = copy_start block_uuid in
+       let state, effects = copy_root state effects root in
+       let state, effects =
+         copy_reply state effects (copy_children block_uuid [ child ])
+       in
+       let state, effects = copy_reply state effects (copy_children unrelated_uuid []) in
+       let _, effects =
+         copy_reply state effects (graph_info_outcome ~journal_title_format:None)
+       in
+       check (root ^ "\n  - \"") effects)
+    [ maximum - 19; maximum - 18 ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "block references"
+    [ ( "copy subtree"
+      , [ Alcotest.test_case
+            "serialized clipboard payload bound"
+            `Quick
+            test_copy_result_fits_serialized_clipboard
+        ; Alcotest.test_case
+            "nested complete pagination and multiline"
+            `Quick
+            test_copy_nested_paginated_text
+        ; Alcotest.test_case
+            "empty and whitespace text"
+            `Quick
+            test_copy_empty_and_root_whitespace
+        ; Alcotest.test_case
+            "cancel and replaced ownership"
+            `Quick
+            test_copy_cancel_and_replacement
+        ; Alcotest.test_case
+            "missing failed and changed graph"
+            `Quick
+            test_copy_rejects_missing_failed_or_changed_graph
+        ; Alcotest.test_case
+            "owner cycle and cursor fences"
+            `Quick
+            test_copy_rejects_wrong_owner_cycle_and_cursor
+        ; Alcotest.test_case
+            "oversized text fails without truncation"
+            `Quick
+            test_copy_rejects_oversized_text
+        ] )
+    ; ( "block references"
       , [ Alcotest.test_case
             "stale feed source fence"
             `Quick

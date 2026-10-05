@@ -85,7 +85,7 @@ status area cannot establish production toolbar or safe-area visual acceptance.
 Add it to a signed UI testing target on the available device. Use a fresh fixture
 with 500 roots, 135 children and two graphs. It exercises Capture save/status after
 scrolling to the saved record, Append across partial child pagination, native
-child swipe deletion with timed cancellation, restart persistence and outline
+child context-menu deletion with timed cancellation, restart persistence and outline
 navigation. Each test launches independently; a failed sheet must not obstruct
 later cases. A root with many child previews can exceed the viewport, so open its
 visible title instead of tapping the off-screen center of the entire row.

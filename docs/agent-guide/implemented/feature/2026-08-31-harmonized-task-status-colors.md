@@ -2,7 +2,7 @@
 
 ## Problem
 
-The timeline's logical-start swipe pane exposes four quick task-status actions:
+The timeline's status presentation exposes four quick task-status actions:
 
 ```text
 No status | Todo | Doing | Done
@@ -35,9 +35,9 @@ white foreground. That is below the WCAG AA `4.5:1` threshold for ordinary text.
 the same mid-tone background in Dark theme also gives up Material's light-background and
 dark-foreground pairing.
 
-The row rail and swipe action currently share the Todo, Doing, and Done category colors.
+The row rail and status icon currently share the Todo, Doing, and Done category colors.
 `No status` intentionally has no row rail and receives a neutral color only when it must be
-rendered as a full-bleed swipe action.
+rendered in the status picker.
 
 This proposal is deliberately limited to the four quick statuses above. It does not
 design colors for `In review`, `Now`, `Canceled`, `Backlog`, `Waiting`, or `Later`, and it
@@ -53,7 +53,7 @@ status background + on-status foreground
 ```
 
 Generate the palette in HCT color space and harmonize each semantic hue toward the theme
-seed `#00262F`. Keep chroma restrained so the transient full-bleed swipe pane belongs to the
+seed `#00262F`. Keep chroma restrained so the status presentation belongs to the
 same visual system as the cyan theme instead of competing with it. Use darker tones in Light
 theme and lighter tones with dark foregrounds in Dark theme.
 
@@ -97,7 +97,7 @@ therefore make brightness explicit without modifying `bonsai_flutter`.
 The intended token result for each quick status is a foreground/background pair, selected
 by brightness and contrast presentation. The implementation should not infer a foreground
 from an arbitrary background and should not retain white as a universal status foreground.
-The status rail consumes only the background role. The full-bleed swipe action consumes both
+The status rail consumes only the background role. The shared palette retains both
 roles.
 
 High Contrast appearances reuse the corresponding normal Light or Dark status pair. They do
@@ -107,14 +107,14 @@ rest of the application's High Contrast presentation.
 
 ### Resolved product decisions
 
-- Todo, Doing, and Done continue to share their semantic backgrounds between swipe actions
+- Todo, Doing, and Done continue to share their semantic backgrounds between status icons
   and row rails.
 - Dark theme uses the proposed lighter status backgrounds with their explicit dark
   foregrounds.
 - High Contrast reuses the corresponding normal Light or Dark status pairs instead of
   generating separate HCT tones.
 - `No status` remains absent from row rails and uses its neutral pair only in the full-bleed
-  swipe action.
+  status icon.
 
 ## Decision
 
@@ -130,7 +130,7 @@ framework brightness into `Journal_visual_tokens.resolve` at the application com
 point.
 Todo, Doing, and Done share their resolved backgrounds with the corresponding row rails.
 No status remains rail-free, and Later retains its existing rail color.
-The full-bleed swipe action consumes both roles from the resolved pair without inferring a
+The shared palette retains both roles from the resolved pair without inferring a
 foreground or sharing the Delete foreground.
 
 ### Scope boundaries
@@ -211,7 +211,7 @@ text contrast shortfall, or the missing Light/Dark foreground pairing.
 ## Risks
 
 - Applying Todo, Doing, and Done colors to their shared row-rail tokens changes persistent
-  timeline color as well as the transient swipe pane; limiting the change to swipe actions
+  timeline color as well as the status presentation; limiting the change to status icons
   would instead break the current shared semantic-token rule.
 - Separate Light and Dark pairs expand the token surface and require brightness to become an
   explicit `Journal_visual_tokens.resolve` input.

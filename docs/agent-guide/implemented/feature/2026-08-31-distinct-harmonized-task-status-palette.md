@@ -4,7 +4,7 @@
 
 The implemented quick task-status palette documented in
 `docs/agent-guide/implemented/feature/2026-08-31-harmonized-task-status-colors.md`
-made the four swipe actions theme-aware and gave Light and Dark appearances explicit
+made the status palette theme-aware and gave Light and Dark appearances explicit
 foreground/background pairs.
 That decision fixed the original contrast and theme-integration problems, but its `No status`
 and `Todo` colors remain two closely related blue-grays:
@@ -172,7 +172,7 @@ The candidate instead relies on controlled hue differences and strong tone contr
 - The muted indigo Todo role is intentionally less semantically conventional than a neutral
   pending state, so labels and icons must continue to carry the literal meaning.
 - Applying Todo, Doing, and Done colors to shared rail tokens changes persistent timeline
-  color as well as the transient swipe pane.
+  color as well as the status presentation.
 - The new Todo hue will produce broad golden-image color differences even when geometry is
   unchanged; implementation review must distinguish expected color pixels from layout drift.
 - Reusing normal pairs in High Contrast gives up status-specific contrast escalation, though

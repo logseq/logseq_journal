@@ -233,7 +233,7 @@ application-specific verification. See its [public API](../../../../../bonsai-ui
 | Material root, header, tabs and routes | `View.Body`, `Toolbar`, `Tabs`, `Navigation_stack` and OCaml route state | Back navigation, graph replacement, modal coverage and scroll-driven root-control visibility dispatch the existing transitions. Native navigation must not become a second route owner. |
 | Sliver timeline and bounded row window | `View.Collection` with declared extents and visible-range events | Preserve stable keys, sparse geometry, continuation requests, scroll anchors and the 512 retained-slot / 40 supplied-row / overscan 4 limits. |
 | Capture and detail text input | Revisioned `View.text_field` / `View.text_editor` in a launcher/sheet presentation | Preserve session/document/local revision fencing, UTF-16 selection, composition, correction, failed-save draft and retry intent. |
-| Swipe/status/delete UI | `View.Swipe_actions`, buttons, menus and sheets | Preserve status choices, delete confirmation where present, staged deletion/undo and scroll-versus-swipe arbitration. |
+| Status/delete UI | buttons, menus and sheets | Preserve status choices, delete confirmation where present, staged deletion/undo. |
 | Snackbar undo | `Host_effect.show_notice` | Map Action to the existing undo event and other results to their existing non-action consequences. Verify cancellation and timer ownership; do not copy removed `show_snack_bar` result variants. |
 | Custom date row, tail fade, root navigation and detail outline | Compose public views first; use a typed `Native_widget.Extension` only for an observed missing native behavior | Match baseline visible-range, reveal/focus, overflow, scrolling and semantic events. A native outliner must not take over expansion, child-loading or mutation state. |
 | Material colors/icons and typography presets | `Theme`, `Style`, semantic symbols and application visual tokens | Preserve task-state distinctions, readable hierarchy, preference meaning, accessibility and useful labels without requiring Material glyph assets. |
@@ -314,7 +314,7 @@ local data usable before authentication and preserve E2EE secrets in place.
 | 0. Freeze evidence | The platform, visual direction, UX rule replacement and listed build-file scope are approved. Select matching installed framework/CLI releases and iOS SDK, record their source/archive identities, and record the current dirty-tree behavior and test baseline. Apply the approved UX wording before UI implementation. | Reproducible installed dependencies, CLI doctor result and recorded baseline; no unreviewed business change. |
 | 1. Prove critical integration | Use disposable external spike applications for worker/Eio, actual Journal native dependency closure, collection eviction, revisioned text, authentication and termination. Read target public APIs; do not bypass `.mli` files. | Each gate above has concrete evidence, or a named blocker. Do not start wholesale view conversion with an unresolved owner mismatch. |
 | 2. Replace application host | Add `swift/` sources and schema-4 config; wire `app/native_embed.ml`, the worker adapter and application platform bridge. Relocate shared Swift services. Make only explicitly authorized build-file edits, then use `bonsai-swiftui init --adopt`, `sync-host`, `build` and `run`. | CLI-generated host passes `sync-host --check`; actual Journal worker starts and reopens local data through the CLI-built SwiftUI app; auth/lifecycle/crypto boundaries preserve their contracts. |
-| 3. Migrate visible surfaces | Port root/graph states and settings, then rows/timeline/Favorites, then detail/capture/swipe/undo. Adapt mixed UI types without changing domain transitions. Port all current custom Dart widgets' required behavior. | Every baseline flow is reachable and state/effect behavior matches; UI acceptance passes on the agreed platforms. |
+| 3. Migrate visible surfaces | Port root/graph states and settings, then rows/timeline/Favorites, then detail/capture/undo. Adapt mixed UI types without changing domain transitions. Port all current custom Dart widgets' required behavior. | Every baseline flow is reachable and state/effect behavior matches; UI acceptance passes on the agreed platforms. |
 | 4. Cut over and remove obsolete paths | Replace test harness imports, native test tooling, package declarations and documentation; remove Flutter sources/config/packages and obsolete icon tooling after relocating required services. | A clean checkout builds and runs with no active Flutter dependency, old CLI path or compatibility adapter. |
 
 Phases are development ordering, not separate shipped backends. Only the final
@@ -707,7 +707,7 @@ following architectural risks remain relevant.
 - **Collection mismatch:** a full key catalog can reintroduce history-sized work
   even while only a small number of views are mounted.
 - **Text and native gestures:** ephemeral composer semantics, IME composition,
-  swipe arbitration and native sheet dismissal need application-level evidence.
+  native sheet dismissal need application-level evidence.
 - **Authentication and storage identity:** a different SDK, bundle identity or
   entitlement can make existing sessions or data inaccessible. Incompatibility
   must be surfaced rather than hidden by fallback, forced reset or migration.

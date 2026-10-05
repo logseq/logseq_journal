@@ -109,7 +109,7 @@ The obsolete rendering path will be removed.
   typography preset, and the day-heading sparse extent grows accordingly.
 - Semantics retain the complete source and the currently visible collapsed
   child summaries; fading does not alter accessible text.
-- Focus, disclosure, swipe, sparse-window, RTL, and the no-more-than-three-
+- Focus, disclosure, sparse-window, RTL, and the no-more-than-three-
   dividers rule remain intact.
 - Focused OCaml tests and the relevant Flutter tests pass.
 - A debug-profile build runs on a connected physical iPhone and visual review

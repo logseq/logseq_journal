@@ -24,6 +24,7 @@ import Foundation
       "termination-ready": .terminationReady,
       "local-account": .localAccount,
       "timeline-presented": .timelinePresented,
+      "copy-text": .copyText("Root\n  - 中文😀"),
     ]
     var baseRequest = Data()
     for (name, expectedRequest) in expected {
@@ -63,6 +64,7 @@ import Foundation
       "sign-out": .signedOut, "termination-ready": .terminationReady,
       "local-account": .localAccount(userID: "fixture-user", origin: "https://api.logseq.io"),
       "no-local-account": .noLocalAccount, "timeline-presented": .timelinePresented,
+      "copy-text": .textCopied,
     ]
     var encoded: [String: String] = [:]
     for (name, response) in responses {

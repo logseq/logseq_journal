@@ -193,6 +193,7 @@ let view
       ~actions_enabled
       ~on_status
       ~on_delete
+      ~on_copy
       ()
   =
   let slots = Timeline.fold_slots (fun acc slot -> slot :: acc) [] state |> List.rev in
@@ -324,6 +325,7 @@ let view
     ~on_open:on_open_block
     ~on_status
     ~on_delete
+    ~on_copy
     ~children
   |> V.Body.Vertical.fill
   |> fun content -> V.Body.Vertical.create [ content ]

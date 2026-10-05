@@ -581,34 +581,6 @@ module View : sig
     end
   end
 
-  module Swipe_actions : sig
-    type side =
-      | Start
-      | End
-
-    type action
-    type nonrec t
-
-    val action
-      :  key:Key.t
-      -> ?enabled:bool
-      -> ?role:Button_role.t
-      -> ?symbol:string
-      -> side:side
-      -> title:string
-      -> background:Style.Color.t
-      -> on_press:Event.handler
-      -> unit
-      -> action
-
-    val create
-      :  ?enabled:bool
-      -> ?allows_full_swipe:bool
-      -> actions:action list
-      -> unit
-      -> t
-  end
-
   module Context_menu : sig
     type role =
       | Normal
@@ -699,7 +671,6 @@ module View : sig
       :  key:Key.t
       -> ?test_id:Test_id.t
       -> ?separator:separator
-      -> ?swipe_actions:Swipe_actions.t
       -> ?context_menu:Context_menu.t
       -> t
       -> row
@@ -708,7 +679,6 @@ module View : sig
       :  key:Key.t
       -> ?test_id:Test_id.t
       -> ?separator:separator
-      -> ?swipe_actions:Swipe_actions.t
       -> ?context_menu:Context_menu.t
       -> expanded:bool
       -> on_expanded_changed:Event.handler

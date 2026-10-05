@@ -513,12 +513,6 @@ module View = struct
       | Destructive
       | Cancel
 
-    let variant = function
-      | Destructive -> "destructive"
-      | Cancel -> "secondary"
-      | Normal -> "default"
-    ;;
-
     (* Element variants are typed; [Normal] writes nothing, matching the
        mount sites that only override the variant for a non-Normal role. *)
     let lui_variant : t -> Lui_elements.variant option = function
@@ -1321,41 +1315,6 @@ module View = struct
     end
   end
 
-  module Swipe_actions = struct
-    type side =
-      | Start
-      | End
-
-    type action =
-      { key : string
-      ; enabled : bool
-      ; role : Button_role.t
-      ; symbol : string option
-      ; side : side
-      ; title : string
-      ; background : Style.Color.t
-      ; on_press : Event.handler
-      }
-
-    type nonrec t = action list
-
-    let action
-          ~key
-          ?(enabled = true)
-          ?(role = Button_role.Normal)
-          ?symbol
-          ~side
-          ~title
-          ~background
-          ~on_press
-          ()
-      =
-      { key; enabled; role; symbol; side; title; background; on_press }
-    ;;
-
-    let create ?enabled:_ ?allows_full_swipe:_ ~actions () = actions
-  end
-
   module Context_menu = struct
     type role =
       | Normal
@@ -1521,7 +1480,6 @@ module View = struct
       { key : string
       ; test_id : string option
       ; separator : separator
-      ; swipe_actions : Swipe_actions.t option
       ; context_menu : Context_menu.t option
       ; kind : row_kind
       ; content : t
@@ -1536,11 +1494,10 @@ module View = struct
       ; rows : row list
       }
 
-    let row ~key ?test_id ?(separator = Automatic) ?swipe_actions ?context_menu content =
+    let row ~key ?test_id ?(separator = Automatic) ?context_menu content =
       { key
       ; test_id
       ; separator
-      ; swipe_actions
       ; context_menu
       ; kind = Row
       ; content
@@ -1552,7 +1509,6 @@ module View = struct
           ~key
           ?test_id
           ?(separator = Automatic)
-          ?swipe_actions
           ?context_menu
           ~expanded
           ~on_expanded_changed
@@ -1562,7 +1518,6 @@ module View = struct
       { key
       ; test_id
       ; separator
-      ; swipe_actions
       ; context_menu
       ; kind = Disclosure { expanded; children }
       ; content = label
@@ -1572,32 +1527,6 @@ module View = struct
 
     let section ~key ?header ?footer ?(separator = Automatic) rows =
       { section_key = key; header; footer; separator; rows }
-    ;;
-
-    let swipe_json (actions : Swipe_actions.t) =
-      `Assoc
-        [ ( "actions"
-          , `List
-              (List.map
-                 (fun (a : Swipe_actions.action) ->
-                    `Assoc
-                      [ "key", `String a.key
-                      ; "enabled", `Bool a.enabled
-                      ; "role", `String (Button_role.variant a.role)
-                      ; ( "symbol"
-                        , match a.symbol with
-                          | Some s -> `String s
-                          | None -> `Null )
-                      ; ( "side"
-                        , `String
-                            (match a.side with
-                             | Start -> "start"
-                             | End -> "end") )
-                      ; "title", `String a.title
-                      ; "background", `String a.background
-                      ])
-                 actions) )
-        ]
     ;;
 
     let context_menu_json (actions : Context_menu.t) =
@@ -1647,11 +1576,6 @@ module View = struct
         let base =
           match row.test_id with
           | Some id -> ("test_id", `String id) :: base
-          | None -> base
-        in
-        let base =
-          match row.swipe_actions with
-          | Some actions -> ("swipe", swipe_json actions) :: base
           | None -> base
         in
         let base =
@@ -1763,11 +1687,6 @@ module View = struct
          callback entry, so a late host event cannot resurrect them. *)
       let row_actions = Hashtbl.create 16 in
       let rec register (row : row) =
-        Option.iter
-          (List.iter (fun (action : Swipe_actions.action) ->
-             if action.enabled
-             then Hashtbl.replace row_actions (row.key, action.key) action.on_press))
-          row.swipe_actions;
         Option.iter
           (List.iter (fun (action : Context_menu.action) ->
              if action.enabled

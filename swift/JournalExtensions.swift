@@ -80,6 +80,7 @@ enum JournalExtensionFingerprint {
     "journal-asset-import",
     "journal-asset-settings",
     "journal-list",
+    "journal-image-preview",
   ]
 
   private static let eventSchema = LUIExtensionEvent(
@@ -159,6 +160,13 @@ enum JournalExtensionFingerprint {
     }
   }
 
+  static func imagePreviewExtension() -> LUIAppleExtension {
+    journalExtension(identifier: "journal-image-preview", profiles: appleProfiles,
+      standardChildren: true, events: true) { context in
+      AnyView(JournalImagePreview.View(context: context))
+    }
+  }
+
   static func registry() throws -> LUIAppleExtensionRegistry {
     let registry = LUIAppleExtensionRegistry()
     try LUINavigation.register(in: registry)
@@ -167,6 +175,7 @@ enum JournalExtensionFingerprint {
       assetImportExtension(),
       assetSettingsExtension(),
       listExtension(),
+      imagePreviewExtension(),
     ] {
       try registry.register(journalExtension)
     }

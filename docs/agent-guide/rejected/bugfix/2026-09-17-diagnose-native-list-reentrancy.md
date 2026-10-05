@@ -67,7 +67,7 @@ Scratch SDK instrumentation confirms warnings after binding-only commits: list
 properties and child identities remain unchanged while generation-bound callbacks
 and presentation admission refresh. Separating display inputs from interaction
 context still warns on pagination and is not adopted. Independent SwiftUI controls
-with swipeActions, NavigationStack and Chrome-style geometry remain negative.
+with NavigationStack and Chrome-style geometry remain negative.
 Investigate native presentation acknowledgment/layout timing next without bypassing
 stale-event admission. Production and installed SDK source remain unchanged.
 

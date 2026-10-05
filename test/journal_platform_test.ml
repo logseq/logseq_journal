@@ -158,8 +158,36 @@ let test_network_lifecycle_epochs_are_bounded_and_typed () =
       "invalid network lifecycle packet was accepted")
 ;;
 
+let test_clipboard_is_bounded_and_acknowledged () =
+  List.iter
+    (fun text ->
+       let request = Journal_platform.copy_text_request ~text |> require_ok in
+       require (Bytes.get_uint16_le request 6 = 28) "clipboard request tag differs";
+       let payload =
+         Bytes.sub_string request 32 (Bytes.length request - 32)
+         |> Yojson.Safe.from_string
+         |> Yojson.Safe.Util.member "text"
+         |> Yojson.Safe.Util.to_string
+       in
+       require (payload = text) "clipboard text was altered")
+    [ ""; "Root\n  - 中文😀" ];
+  require
+    (Result.is_error
+       (Journal_platform.copy_text_request ~text:(String.make (256 * 1024) '\n')))
+    "oversized clipboard envelope was accepted";
+  envelope 29 (Bytes.of_string {|{"copied":true}|})
+  |> Journal_platform.decode_copy_text_response
+  |> require_ok;
+  require
+    (Result.is_error
+       (Journal_platform.decode_copy_text_response
+          (envelope 29 (Bytes.of_string {|{"copied":false}|}))))
+    "failed clipboard write was accepted"
+;;
+
 let tests =
-  [ ( "bounded auth capability"
+  [ "clipboard text", test_clipboard_is_bounded_and_acknowledged
+  ; ( "bounded auth capability"
     , test_auth_capability_envelopes_are_bounded_and_protocol_free )
   ; "sign-out capability", test_sign_out_capability_is_bounded_and_acknowledged
   ; "local account binding", test_local_account_binding_is_bounded_and_origin_scoped

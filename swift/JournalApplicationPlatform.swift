@@ -1,6 +1,11 @@
 import Amplify
 import Foundation
 import Observation
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 
 /// Terminal prepare-to-terminate exchange, mirroring `BonsaiApplicationShutdown`:
 /// the host pushes the event, then completes once OCaml's termination-ready
@@ -131,6 +136,17 @@ import Observation
     if pending.terminating, request != .terminationReady { return nil }
     // Notice requests resolve through the presenter, not platform services.
     switch request {
+    case .copyText(let text):
+      guard connected else { return nil }
+      #if os(iOS)
+      UIPasteboard.general.string = text
+      #elseif os(macOS)
+      NSPasteboard.general.clearContents()
+      guard NSPasteboard.general.setString(text, forType: .string) else { return nil }
+      #else
+      return nil
+      #endif
+      return try? JournalPlatformWire.encodeResponse(.textCopied)
     case .cancelNotice(let token):
       notices.cancel(token: token)
       return nil

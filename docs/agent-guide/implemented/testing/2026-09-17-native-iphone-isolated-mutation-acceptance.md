@@ -79,7 +79,7 @@ cursor defect, tracked by refresh-child-continuations-after-append.
 
 Batch 35 resumes physical execution on the paired iPhone 13. The production app
 and isolated fixture install and launch. Capture/Todo/Done, partial-page Append,
-child-specific swipe deletion/timed cancellation and deletion persistence pass
+child-specific deletion/timed cancellation and deletion persistence pass
 through staged XCTest runs and exact outbox checks. A sparse-tree Journal paging
 defect discovered during acceptance is repaired in its own implemented decision.
 The initial failures, later test-target corrections and repaired run are retained.
