@@ -48,3 +48,5 @@ Full regression tests pass when existing loopback transport fixtures are allowed
 ## Questions
 
 None for Copy and image grouping: the user explicitly authorized them. The separate Save destination decision remains outside this proposal.
+
+The subsequent [Save current image to Photos decision](2026-10-05-save-current-image-to-photos.md) records the user's Photos choice, image-only single-preview routing and add-only permission implementation. The scope and validation above describe the preceding Copy/group-preview change.

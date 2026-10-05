@@ -22,6 +22,8 @@
   <string>26.0</string>
   <key>NSCameraUsageDescription</key>
   <string>Take a photo to attach to a journal entry.</string>
+  <key>NSPhotoLibraryAddUsageDescription</key>
+  <string>将你选择的图片保存到相册。Save the image you select to your photo library.</string>
   <key>UILaunchScreen</key>
   <dict/>
   <key>UISupportedInterfaceOrientations</key>

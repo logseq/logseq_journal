@@ -278,7 +278,7 @@ let view_content
           | (_, token, _, _) :: _ when token = item.token -> position
           | _ :: rest -> index (position + 1) rest
         in
-        Signal.set preview (Some (paths, index 0 group));
+        Signal.set preview (Some (paths, index 0 group, is_image_type item.file_type));
         let subscriptions =
           List.map
             (fun ((owner, token, _, _) as member) ->
@@ -517,9 +517,9 @@ let view_content
             ~equal:( = )
             (function
               | None -> L.column ~width:0 ~height:0 []
-              | Some ([ path ], _) ->
+              | Some ([ path ], _, false) ->
                 L.file_preview ~path ~on_dismiss:(fun _ -> close_preview ()) []
-              | Some (paths, selected_index) ->
+              | Some (paths, selected_index, _) ->
                 let payload =
                   Yojson.Safe.to_string
                     (`Assoc

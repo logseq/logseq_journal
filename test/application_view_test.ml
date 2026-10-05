@@ -1200,7 +1200,29 @@ let run_favorites_native_visibility
              hooks.extension_event navigator "settled" (payload ()) |> consume;
              settle ()
            in
-           let files () = all "path" "/tmp/targeted-media.png" in
+           let previews () = all "_extension" "journal-image-preview" in
+           let preview_has_path id =
+             let open Yojson.Safe.Util in
+             match List.assoc_opt "payload" (Hashtbl.find props id) with
+             | Some (`String json) ->
+               Yojson.Safe.from_string json
+               |> member "paths"
+               |> to_list
+               |> List.mem (`String "/tmp/targeted-media.png")
+             | _ -> false
+           in
+           let files () =
+             all "path" "/tmp/targeted-media.png"
+             @ List.filter preview_has_path (previews ())
+           in
+           let dismiss_preview node =
+             hooks.extension_event
+               node
+               "event"
+               (Yojson.Safe.to_string
+                  (`Assoc [ "id", `Int 1; "payload", `String {|{"type":"dismiss"}|} ]))
+             |> consume
+           in
            let push () =
              if
                List.mem
@@ -1384,10 +1406,7 @@ let run_favorites_native_visibility
                then (
                  dispatch (Lui_protocol.Press old_leaf);
                  settle ();
-                 Alcotest.(check int)
-                   "child preview opens"
-                   1
-                   (List.length (all "_kind" "file-preview")));
+                 Alcotest.(check int) "child preview opens" 1 (List.length (previews ())));
                native_range 2 (count + 1);
                let before_released = Atomic.get released_files in
                let before_demands = Atomic.get released_demands in
@@ -1471,7 +1490,7 @@ let run_favorites_native_visibility
                  Alcotest.(check int)
                    "unmounted child removes preview path"
                    0
-                   (List.length (all "_kind" "file-preview"));
+                   (List.length (previews ()));
                if scenario = `Detail_reopen
                then (
                  expand true;
@@ -1532,17 +1551,17 @@ let run_favorites_native_visibility
                let open_preview () =
                  dispatch (Lui_protocol.Press image);
                  settle ();
-                 List.hd (all "_kind" "file-preview")
+                 List.hd (previews ())
                in
                let preview = open_preview () in
                Alcotest.(check bool)
                  "preview publishes acquired path"
                  true
-                 (List.mem preview (files ()));
+                 (preview_has_path preview);
                if scenario = `Preview_repeat
                then
                  for _ = 1 to 3 do
-                   dispatch (Lui_protocol.Dismiss (List.hd (all "_kind" "file-preview")));
+                   dismiss_preview (List.hd (previews ()));
                    settle ();
                    Alcotest.(check int)
                      "closing preview keeps visible row file"
@@ -1559,8 +1578,7 @@ let run_favorites_native_visibility
                  publish
                    (Service.Asset.Failed
                       { failure = Network; attempts = 1; retry_scheduled = false });
-                 wait "invalidated file closes preview" (fun () ->
-                   all "_kind" "file-preview" = []);
+                 wait "invalidated file closes preview" (fun () -> previews () = []);
                  Alcotest.(check int)
                    "invalidated preview leaves no URL"
                    0
@@ -1590,9 +1608,7 @@ let run_favorites_native_visibility
                  Alcotest.(check bool)
                    "repeated selection publishes valid preview"
                    true
-                   (List.for_all
-                      (fun id -> List.mem id (files ()))
-                      (all "_kind" "file-preview")));
+                   (List.for_all preview_has_path (previews ())));
                if scenario = `Preview_replaced
                then (
                  Atomic.set media_checksum 'b';
@@ -1613,8 +1629,8 @@ let run_favorites_native_visibility
                else if scenario = `Preview_detail_pop
                then native_path 0
                else (
-                 let current = all "_kind" "file-preview" in
-                 List.iter (fun node -> dispatch (Lui_protocol.Dismiss node)) current;
+                 let current = previews () in
+                 List.iter (fun node -> dismiss_preview node) current;
                  settle ();
                  if scenario = `Preview_navigation
                  then (
@@ -1634,7 +1650,7 @@ let run_favorites_native_visibility
                  "closed preview releases demand once"
                  1
                  (Atomic.get released_demands);
-               dispatch (Lui_protocol.Dismiss preview);
+               dismiss_preview preview;
                publish (Ready "fixture-ready");
                settle ();
                Alcotest.(check int)

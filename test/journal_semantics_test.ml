@@ -2008,7 +2008,7 @@ let test_gallery_preview_filters_unavailable_and_closes_on_retirement () =
          "retiring a preview member must release the whole gallery")
 ;;
 
-let test_single_image_and_document_keep_file_preview () =
+let test_single_image_save_preview_and_document_compatibility () =
   List.iter
     (fun (file_type, path) ->
        let item = media_item 91 file_type (File path) None in
@@ -2020,16 +2020,28 @@ let test_single_image_and_document_keep_file_preview () =
          in
          ignore (Lui_app.dispatch_event app (Press node));
          ignore (Lui_app.flush app);
-         require
-           (List.exists
-              (function
-                | Lui_protocol.CreateNode (_, FilePreview) -> true
-                | _ -> false)
-              (ops ()))
-           "single image/document did not keep native file preview";
-         require
-           (gallery_preview (ops ()) = None)
-           "single image/document unexpectedly mounted image group preview"))
+         if Journal_media_view.is_image_type file_type
+         then (
+           let _, payload =
+             match gallery_preview (ops ()) with
+             | Some preview -> preview
+             | None -> fail "single image did not mount the Save-enabled native preview"
+           in
+           require
+             (Yojson.Safe.Util.member "paths" payload = `List [ `String path ]
+              && Yojson.Safe.Util.member "selected_index" payload = `Int 0)
+             "single image preview payload changed")
+         else (
+           require
+             (List.exists
+                (function
+                  | Lui_protocol.CreateNode (_, FilePreview) -> true
+                  | _ -> false)
+                (ops ()))
+             "document did not keep native file preview";
+           require
+             (gallery_preview (ops ()) = None)
+             "document unexpectedly exposed image Save")))
     [ "png", "/tmp/single-image.png"; "pdf", "/tmp/single-document.pdf" ]
 ;;
 
@@ -2067,8 +2079,8 @@ let test_gallery_disposal_releases_preview_references_once () =
 ;;
 
 let tests =
-  [ ( "single image and document preview compatibility"
-    , test_single_image_and_document_keep_file_preview )
+  [ ( "single image save preview and document compatibility"
+    , test_single_image_save_preview_and_document_compatibility )
   ; ( "gallery disposal releases once"
     , test_gallery_disposal_releases_preview_references_once )
   ; ( "gallery preview order selection and leases"
