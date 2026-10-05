@@ -124,7 +124,7 @@ Use the one-line block extent as the varied sliver's default. Publish sparse
 overrides for every retained top-level or direct-child slot whose computed
 extent differs from that default, and keep the existing explicit overrides for
 day headings, continuations, and bottom clearance. `Journal_row`, direct-child
-rendering, swipe wrappers, focus scopes, group separators, connectors, and
+rendering, focus scopes, group separators, connectors, and
 `Journal_timeline_state.extent_geometry` must all consume the same computed
 extent. The status rail and child connector use that extent rather than a
 profile-wide fixed height.
@@ -178,7 +178,7 @@ empty space than the current three-line row.
 
 ### Apply variable height only inside `Journal_row`
 
-Rejected. The sliver, focus wrapper, swipe wrapper, group separator, and row
+Rejected. The sliver, focus wrapper, group separator, and row
 surface would disagree about the same slot's extent. The resulting clipping or
 scroll-offset drift would be a geometry defect, not merely a visual mismatch.
 
@@ -219,7 +219,7 @@ The implemented behavior has the following verified properties:
   remain trailing.
 - One-, two-, three-, and four-line top-level rows publish four corresponding
   exact extents. Materialized direct-child rows follow the same rule.
-- Row surface, swipe content, focus scope, group separator, status rail, child
+- Row surface, content, focus scope, group separator, status rail, child
   connector, and sparse extent override agree on each block's exact height.
 - Changing a retained block's status does not move its text horizontally;
   changing its visible line count updates its sparse extent while preserving
@@ -227,7 +227,7 @@ The implemented behavior has the following verified properties:
 - Focused OCaml view/state tests cover the status mapping, semantics, line
   budget, colors, alignment, and extent matrix. The compiled runtime golden is
   regenerated with at least one example of each rail category and each line
-  count, and swipe/delete coverage remains green.
+  count, and delete coverage remains green.
 - Existing bounded-window, pagination, expansion, deletion, accessibility,
   RTL, high-contrast, and text-scale tests remain green without modifying
   `bonsai_flutter`, `spec/`, or dune files.

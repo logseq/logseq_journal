@@ -20,6 +20,7 @@ let emit path =
     ; "termination-ready", P.termination_ready_request
     ; "local-account", P.local_account_binding_request
     ; "timeline-presented", P.timeline_presented_request
+    ; "copy-text", P.copy_text_request ~text:"Root\n  - 中文😀" |> Result.get_ok
     ]
   in
   Yojson.Safe.to_file
@@ -47,6 +48,7 @@ let verify path =
     (Ok "fixture-token-中文");
   if Result.is_ok (P.decode_id_token_response ~challenge_id:"stale" (packet "id-token"))
   then failwith "Swift token accepted for a different challenge";
+  require "copy-text" (P.decode_copy_text_response (packet "copy-text")) (Ok ());
   require "sign-out" (P.decode_sign_out_response (packet "sign-out")) (Ok ());
   require
     "termination-ready"

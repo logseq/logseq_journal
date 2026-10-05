@@ -297,7 +297,7 @@ the repository's current iOS/macOS host.
 - The real runtime fixture contains Chinese, English, digits, a historical day,
   and multiline entries. Dense, Balanced, and Comfortable goldens at
   `390 x 844` show the corrected hierarchy; all affected capture, reference,
-  swipe, dark, high-contrast, and RTL goldens were regenerated through
+  dark, high-contrast, and RTL goldens were regenerated through
   `bonsai-flutter exec` and visually inspected.
 - Runtime assertions prove that a 47-point top inset remains owned once, the
   title and Account action remain below it, the expanded subtitle is

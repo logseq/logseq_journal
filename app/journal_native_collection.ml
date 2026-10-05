@@ -25,6 +25,7 @@ let view
       ~on_open
       ~on_status
       ~on_delete
+      ~on_copy
       ~children
   =
   let indexed =
@@ -50,32 +51,6 @@ let view
     | Some id ->
       let status = action on_status id
       and delete = action on_delete id in
-      let swipe_actions =
-        V.Swipe_actions.create
-          ~allows_full_swipe:false
-          ~actions:
-            [ V.Swipe_actions.action
-                ~key:(Ui.Key.string ("status:" ^ id))
-                ~enabled:actions_enabled
-                ~side:Start
-                ~title:"Status"
-                ~symbol:"checkmark.circle"
-                ~background:Journal_visual_tokens.status_action_background
-                ~on_press:status
-                ()
-            ; V.Swipe_actions.action
-                ~key:(Ui.Key.string ("delete:" ^ id))
-                ~enabled:actions_enabled
-                ~side:End
-                ~title:"Delete"
-                ~symbol:"trash"
-                ~role:Destructive
-                ~background:Journal_visual_tokens.delete_action_background
-                ~on_press:delete
-                ()
-            ]
-          ()
-      in
       let context_menu =
         V.Context_menu.create
           ~actions:
@@ -94,13 +69,19 @@ let view
                 ~role:Destructive
                 ~on_press:delete
                 ()
+            ; V.Context_menu.action
+                ~key:(Ui.Key.string "copy")
+                ~enabled:actions_enabled
+                ~title:"Copy"
+                ~symbol:"doc.on.doc"
+                ~on_press:(action on_copy id)
+                ()
             ]
           ()
       in
       V.Native_list.row
         ~key:row_key
         ~separator:Hidden
-        ~swipe_actions
         ~context_menu
         (V.Navigation_link.create
            ~key:(Ui.Key.string ("open:" ^ id))

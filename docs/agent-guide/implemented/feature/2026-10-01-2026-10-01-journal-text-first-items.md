@@ -6,7 +6,7 @@ Journal entries currently render body text, child summaries, and task state with
 
 ## Proposal
 
-Implement the user-selected proposal 01 with LUI elements written in OCaml. Keep the existing native backend, graph, date headers, and floating controls. Use LUI file_image, file_preview, horizontal scroll and line-clamp-3; do not add SwiftUI UI code. Root body opens the block; media opens its own preview. Preserve row context and swipe actions and prevent full-swipe deletion. Add optional named tags to the existing Worker block read payload by resolving class page titles from the same read snapshot, preserving backward compatibility for payloads without that field. Carry names through graph projection to Journal_model. File cards use actual type and optional descriptor size; when no stable original filename is available use a descriptive type label instead of a cache-path basename.
+Implement the user-selected proposal 01 with LUI elements written in OCaml. Keep the existing native backend, graph, date headers, and floating controls. Use LUI file_image, file_preview, horizontal scroll and line-clamp-3; do not add SwiftUI UI code. Root body opens the block; media opens its own preview. Preserve row context menus. Add optional named tags to the existing Worker block read payload by resolving class page titles from the same read snapshot, preserving backward compatibility for payloads without that field. Carry names through graph projection to Journal_model. File cards use actual type and optional descriptor size; when no stable original filename is available use a descriptive type label instead of a cache-path basename.
 
 The PR targets freshly fetched official main a33d7823b55a0cc4c3d78a9b0731ad47c3378b11. The original combined-base local commits remain preserved on a backup branch. PR 35 loading changes and PR 32 importer changes are excluded from the independent feature diff.
 
@@ -41,7 +41,7 @@ The existing native host remains required. Named tag metadata becomes an optiona
 
 ## Risks
 
-- Horizontal gallery scrolling and row swipe actions need actual simulator interaction verification.
+- Horizontal gallery scrolling need actual simulator interaction verification.
 - The current descriptor contains no guaranteed filename; type-label fallback is an intentional limitation.
 - Private real-graph screenshots remain local; public screenshots must use invented notes and explicit synthetic labels.
 - Existing known failing checks must be reported independently from new failures.
@@ -54,7 +54,7 @@ The existing native host remains required. Named tag metadata becomes an optiona
 
 ## Implementation evidence
 
-Implemented in OCaml/LUI and validated by nine mounted-UI checks, fourteen Worker application integration cases, protocol round trips, and successful workspace build. Actual iOS simulator screenshots and native PDF preview, expansion and collapse were reviewed. See review/README.md for local artifacts, base/PR dependencies, and reproducible host linking. Full runtest has the unchanged baseline V.progress source assertion failure. Horizontal drag/swipe conflict remains an explicit manual verification item because the mouse-control tool reports noWindowsAvailable. File names are unavailable from the descriptor; type and optional actual size are used honestly. Draft PR publication is authorized; no physical-device installation or merge occurs.
+Implemented in OCaml/LUI and validated by nine mounted-UI checks, fourteen Worker application integration cases, protocol round trips, and successful workspace build. Actual iOS simulator screenshots and native PDF preview, expansion and collapse were reviewed. See review/README.md for local artifacts, base/PR dependencies, and reproducible host linking. Full runtest has the unchanged baseline V.progress source assertion failure. Horizontal gallery drag remains an explicit manual verification item because the mouse-control tool reports noWindowsAvailable. File names are unavailable from the descriptor; type and optional actual size are used honestly. Draft PR publication is authorized; no physical-device installation or merge occurs.
 
 
 ## Follow-up validation

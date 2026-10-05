@@ -329,6 +329,7 @@ let run_favorites_native_visibility
       ?(check_hidden = false)
       ?(check_draft = false)
       ?(check_detail = false)
+      ?(check_copy = false)
       ?(check_navigation = false)
       ?(check_detail_row_action = false)
       ?(check_covered_update = false)
@@ -688,10 +689,14 @@ let run_favorites_native_visibility
       ~shutdown:(fun () -> Atomic.set shutdown_called true)
       ()
   in
+  let clipboard_requests = ref [] in
   let regions = Hashtbl.create 8 in
   let hooks =
     Application.For_testing.app_with_service
       ~on_client:(fun value -> client := Some value)
+      ~on_platform_request:(fun request ->
+        if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 28
+        then clipboard_requests := request :: !clipboard_requests)
       ~on_view_region:(fun name ->
         Hashtbl.replace
           regions
@@ -724,6 +729,26 @@ let run_favorites_native_visibility
           let id = op |> member "id" |> to_int in
           let previous = Option.value (Hashtbl.find_opt props id) ~default:[] in
           let key = op |> member "property" |> to_string in
+          if
+            key = "payload"
+            && List.assoc_opt "_extension" previous = Some (`String "journal-list")
+          then (
+            let rec check_row row =
+              Alcotest.(check bool)
+                "production row has no swipe entry"
+                true
+                (member "swipe" row = `Null);
+              match member "children" row with
+              | `List children -> List.iter check_row children
+              | _ -> ()
+            in
+            member "value" op
+            |> to_string
+            |> Yojson.Safe.from_string
+            |> member "sections"
+            |> to_list
+            |> List.iter (fun section ->
+              section |> member "rows" |> to_list |> List.iter check_row));
           Hashtbl.replace
             props
             id
@@ -939,7 +964,85 @@ let run_favorites_native_visibility
        (* Media reducers own transfer state, but cannot reproduce the defect:
           only the public mounted Application owns LUI subscription invalidation.
           Drive actual Worker notices/completions and native appearance events. *)
-       if Option.is_some media_rows
+       if check_copy
+       then (
+         (* The pure Copy owner verifies traversal. This boundary verifies the
+            mounted menus and Worker cancellation ownership before clipboard I/O. *)
+         let send_copy list row =
+           let payload =
+             Yojson.Safe.to_string (`Assoc [ "key", `String "copy"; "row", `String row ])
+           in
+           let action =
+             Yojson.Safe.to_string
+               (`Assoc [ "type", `String "row_event"; "payload", `String payload ])
+           in
+           hooks.extension_event
+             list
+             "event"
+             (Yojson.Safe.to_string (`Assoc [ "id", `Int 1; "payload", `String action ]))
+           |> consume
+         in
+         let check_copy_text list row text =
+           clipboard_requests := [];
+           send_copy list row;
+           wait "menu reaches clipboard" (fun () -> !clipboard_requests <> []);
+           let request = List.hd !clipboard_requests in
+           let json =
+             Bytes.sub_string request 32 (Bytes.length request - 32)
+             |> Yojson.Safe.from_string
+           in
+           Alcotest.(check string)
+             "copied menu target"
+             text
+             Yojson.Safe.Util.(json |> member "text" |> to_string)
+         in
+         let list = Option.get (find "_extension" "journal-list") in
+         let row = "block:" ^ G.Uuid.to_string (uuid 2) in
+         check_copy_text list row "Timeline fixture 1";
+         clipboard_requests := [];
+         send_copy list row;
+         send_copy list row;
+         wait "replacement ignores cancelled request response" (fun () ->
+           !clipboard_requests <> []);
+         dispatch
+           (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites")));
+         wait "copy Favorites loaded" (fun () ->
+           Option.is_some (find "text" "Fixture 64"));
+         let list = Option.get (find "_extension" "journal-list") in
+         check_copy_text list (G.Uuid.to_string (uuid 1001)) "Timeline fixture 1";
+         clipboard_requests := [];
+         send_copy list (G.Uuid.to_string (uuid 1000));
+         for _ = 1 to 5 do
+           hooks.pump () |> consume
+         done;
+         Alcotest.(check int)
+           "page favorite has no Copy"
+           0
+           (List.length !clipboard_requests);
+         dispatch
+           (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
+         let root_list = Option.get (find "_extension" "journal-list") in
+         let label = Option.get (find "text" "Timeline fixture 1") in
+         dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
+         wait "copy Detail loaded" (fun () ->
+           Option.is_some
+             (find
+                "accessibility-identifier"
+                ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+         let detail_list =
+           Hashtbl.fold
+             (fun id values found ->
+                if
+                  id <> root_list
+                  && List.assoc_opt "_extension" values = Some (`String "journal-list")
+                then Some id
+                else found)
+             props
+             None
+           |> Option.get
+         in
+         check_copy_text detail_list row "Timeline fixture 1")
+       else if Option.is_some media_rows
        then (
          let count = Option.get media_rows in
          let all key value =
@@ -2783,6 +2886,8 @@ let () =
               ~check_covered_update:true
               ~timeline_rows:50
               ())
+        ; Alcotest.test_case "Copy menus and replacement ownership" `Quick (fun () ->
+            run_favorites_native_visibility ~check_copy:true ())
         ; Alcotest.test_case "Detail native context menu dispatch" `Quick (fun () ->
             run_favorites_native_visibility
               ~check_navigation:true

@@ -390,9 +390,9 @@ let test_status_palette_contrast () =
        let increased = Tokens.resolve ~brightness ~high_contrast:true in
        List.iter
          (fun status ->
-            let regular = Tokens.status_swipe_action regular status in
-            let increased = Tokens.status_swipe_action increased status in
-            let symbol (palette : Tokens.swipe_action_colors) =
+            let regular = Tokens.status_colors regular status in
+            let increased = Tokens.status_colors increased status in
+            let symbol (palette : Tokens.status_colors) =
               if status = Journal_model.No_status
               then palette.foreground
               else palette.background

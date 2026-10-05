@@ -4,7 +4,7 @@ import Observation
 
 /// SwiftUI host for the `journal-list` extension — the lui replacement for
 /// bonsai's `Native_list` family (grouped sections, disclosure rows, scroll
-/// position requests, visible-range paging, swipe + context actions).
+/// position requests, visible-range paging, context actions).
 ///
 /// Rows carry arbitrary content: each row's `content_index` (and each
 /// section's `header_index`/`footer_index`) indexes `context.childIDs` and is
@@ -25,9 +25,7 @@ import Observation
     let enabled: Bool?
     let role: String?
     let symbol: String?
-    let side: String?
     let title: String
-    let background: String?
     var id: String { key }
   }
   struct ActionGroup: Decodable { let actions: [Action] }
@@ -37,7 +35,6 @@ import Observation
     let content_index: Int
     let separator: String?
     let test_id: String?
-    let swipe: ActionGroup?
     let context_menu: ActionGroup?
     let expanded: Bool?
     let children: [Row]?
@@ -356,17 +353,6 @@ import Observation
       }
     }
 
-    private static func actionTint(_ background: String?) -> Color? {
-      guard let background, background != "transparent" else { return nil }
-      var hex = background
-      if hex.hasPrefix("#") { hex.removeFirst() }
-      guard hex.count == 6, let value = UInt32(hex, radix: 16) else { return nil }
-      return Color(
-        red: Double((value >> 16) & 0xff) / 255,
-        green: Double((value >> 8) & 0xff) / 255,
-        blue: Double(value & 0xff) / 255)
-    }
-
     private func actionInteractive(_ action: Action) -> Bool {
       action.enabled != false && context.isUserInteractionEnabled
     }
@@ -386,26 +372,6 @@ import Observation
         .id(row.key)
         .listRowSeparator(separatorVisibility(row.separator))
         .accessibilityIdentifier(row.test_id ?? row.key)
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
-          ForEach(row.swipe?.actions.filter { $0.side == "start" } ?? []) { action in
-            Button { rowEvent(action: action.key, row: row.key) } label: {
-              actionLabel(action)
-            }
-            .disabled(!actionInteractive(action))
-            .tint(Self.actionTint(action.background))
-          }
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-          ForEach(row.swipe?.actions.filter { $0.side != "start" } ?? []) { action in
-            Button(role: action.role == "destructive" ? .destructive : nil) {
-              rowEvent(action: action.key, row: row.key)
-            } label: {
-              actionLabel(action)
-            }
-            .disabled(!actionInteractive(action))
-            .tint(Self.actionTint(action.background))
-          }
-        }
         .contextMenu {
           ForEach(row.context_menu?.actions ?? []) { action in
             Button(role: action.role == "destructive" ? .destructive : nil) {

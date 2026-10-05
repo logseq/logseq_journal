@@ -53,11 +53,11 @@ Release builds pass. See batch 24 in the native standardization implementation
 ledger and `apple-tests/native-outline/README.md` for the repeatable native probe.
 
 The separate bulk-change request fan-out failure remains open. Physical UIKit
-swipe/VoiceOver acceptance is not implied by the macOS check.
+VoiceOver acceptance is not implied by the macOS check.
 
 ## Risks
 
-- Moving actions to a label must retain native swipe/context accessibility.
+- Moving actions to a label must retain native context accessibility.
   Inspect actual native actions instead of assuming modifier semantics.
 - macOS evidence does not prove UIKit's gesture behavior.
 

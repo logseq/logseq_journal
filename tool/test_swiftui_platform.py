@@ -6,19 +6,10 @@ or Dune file is modified and no application, credentials or graph is opened.
 """
 from pathlib import Path
 import subprocess
+import json
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = ','.join([
-    'lui', 'logseq_db_worker.lui',
-    'digestif.c', 'mirage-ptime.unix', 'logseq_overlay_db.impl',
-    'logseq_sync.pure_reducer.impl', 'logseq_sync.effect_runner.impl',
-    'logseq_db_worker.pure_reducer.impl', 'logseq_db_worker.effect_runner.impl',
-    'logseq_db_worker', 'logseq_db_worker.contract', 'logseq_db_types',
-    'logseq_sync.effect_runner', 'melange-transit-native',
-    'eio', 'eio.core', 'eio.unix', 'eio_posix',
-    'mtime.clock.os', 'threads.posix', 'unix', 'uri', 'yojson',
-])
 
 
 def run(directory, command):
@@ -35,17 +26,36 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-wire-') as directory:
     # logseq_db_worker.lui package (Logseq_db_worker_lui.*) — only the public
     # codec files themselves are copied and compiled fresh.
     sources = [ROOT / 'app' / ('journal_validation' + suffix) for suffix in ['.mli', '.ml']]
+    sources += [ROOT / 'app' / ('journal_environment' + suffix) for suffix in ['.mli', '.ml']]
     sources += [ROOT / 'app' / ('journal_platform' + suffix) for suffix in ['.mli', '.ml']]
     sources += [ROOT / 'app' / ('journal_startup' + suffix) for suffix in ['.mli', '.ml']]
     sources += [ROOT / 'apple-tests/platform-wire/journal_platform_wire_test.ml']
-    compiler = ['ocamlfind', 'ocamlopt', '-thread', '-package', PACKAGES]
+    # Dune's public toplevel metadata selects the concrete implementations of
+    # virtual libraries; ocamlfind alone cannot perform that substitution.
+    includes, libraries = [], []
+    lines = subprocess.check_output(['dune', 'ocaml', 'top', 'app'], cwd=ROOT, text=True)
+    for line in dict.fromkeys(lines.splitlines()):
+        if line.startswith('#directory '):
+            path = Path(json.loads(line[len('#directory '):-2]))
+            if not path.is_absolute():
+                path = ROOT / path
+            includes.extend(['-I', str(path)])
+            if path.name == 'byte':
+                includes.extend(['-I', str(path.with_name('native'))])
+        elif line.startswith('#load '):
+            path = Path(json.loads(line[len('#load '):-2]))
+            if not path.is_absolute():
+                path = ROOT / path
+            if path != ROOT / '_build/default/app/app.cma':
+                libraries.append(str(path.with_suffix('.cmxa')))
+    compiler = ['ocamlopt', '-thread', '-w', '-58', *includes]
     for source in sources:
         (destination / source.name).write_text(source.read_text())
         run(destination, [*compiler, '-c', source.name])
-    run(destination, [*compiler, '-linkpkg', '-o', 'wire_ocaml',
+    run(destination, [*compiler, *libraries, '-o', 'wire_ocaml',
                       *[source.stem + '.cmx' for source in sources if source.suffix == '.ml']])
     run(destination, [str(destination / 'wire_ocaml'), 'emit', 'requests.json'])
-    run(destination, ['swiftc', '-swift-version', '6', '-o', 'wire_swift',
+    run(destination, ['swiftc', '-swift-version', '6', '-module-cache-path', str(destination / 'module-cache'), '-o', 'wire_swift',
                       str(ROOT / 'swift/JournalPlatformWire.swift'),
                       str(ROOT / 'swift/JournalStartupConfiguration.swift'),
                       str(ROOT / 'apple-tests/platform-wire/JournalPlatformWireTests.swift')])

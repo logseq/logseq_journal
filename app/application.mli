@@ -95,6 +95,7 @@ module For_testing : sig
             Logseq_db_worker_lui.Journal_worker.client
           -> unit)
     -> ?on_view_region:(string -> unit)
+    -> ?on_platform_request:(bytes -> unit)
     -> ?calendar_sampler:Journal_calendar.Sampler.t
     -> ( Logseq_db_worker.Config.t
          , Logseq_db_worker_lui.Logseq_db_worker_lui_service.request

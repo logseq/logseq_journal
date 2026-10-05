@@ -169,56 +169,125 @@ let view_content
   =
   let asset_root = Option.value asset_root ~default:(fun _ -> root) in
   let observed_roots = if observed_roots = [] then [ root ] else observed_roots in
-  let emit ?(target_root = root) ?(asset = "") ?(visible = true) action =
-    on_event { action; root = target_root; asset; visible; slot = root }
+  let emit ?(target_root = root) ?(asset = "") ?(visible = true) ?(slot = root) action =
+    on_event { action; root = target_root; asset; visible; slot }
   in
   let items, more, error =
     match media with
     | None -> [], false, None
     | Some view -> view.Journal_media_runtime.items, view.more, view.error
   in
+  let images, files =
+    List.partition
+      (fun (i : Journal_media_runtime.item) -> is_image_type i.file_type)
+      items
+  in
+  (* Graph identity/type arrives independently of file availability. Keep its
+     slot and composition even while the runtime descriptor is absent. *)
+  let uuid (item : Journal_media_runtime.item) =
+    Logseq_db_types.Graph_types.Uuid.to_string item.asset.uuid
+  in
+  let by_id = Hashtbl.create (List.length images) in
+  List.iter (fun item -> Hashtbl.replace by_id (uuid item) item) images;
+  let known_ids = Hashtbl.create (List.length known_images) in
+  let known_slots =
+    List.filter_map
+      (fun (id, file_type) ->
+         if (not (is_image_type file_type)) || Hashtbl.mem known_ids id
+         then None
+         else (
+           Hashtbl.add known_ids id ();
+           Some (id, Hashtbl.find_opt by_id id)))
+      known_images
+  in
+  let image_slots =
+    List.filter_map
+      (fun item ->
+         let id = uuid item in
+         if Hashtbl.mem known_ids id then None else Some (id, Some item))
+      images
+    @ known_slots
+  in
   Ui.View.of_lui (fun context parent ->
     let context = Lui_ui.child_context context ("media:" ^ scope ^ ":" ^ root) in
     let preview =
       Signal.state_at context.ui_scheduler context.ui_state_scope preview_slot None
     in
-    let selected_preview = ref None in
+    let selected_preview = ref [] in
     let unsubscribe_preview = ref (fun () -> ()) in
     let close_preview () =
       let selected = !selected_preview in
-      selected_preview := None;
+      selected_preview := [];
       !unsubscribe_preview ();
       (unsubscribe_preview := fun () -> ());
       Signal.set preview None;
-      Option.iter
-        (fun (owner, token) ->
-           emit ~target_root:owner ~asset:token ~visible:false Preview)
+      List.iter
+        (fun (owner, token, _, slot) ->
+           emit ~target_root:owner ~asset:token ~slot ~visible:false Preview)
         selected
     in
     let preview_file (item : Journal_media_runtime.item) path =
       let owner = asset_root item.token in
-      let current () = Store.item store owner item.token in
-      if
+      let current owner token = Store.item store owner token in
+      let unchanged (owner, token, path, _) =
         Option.map
           (fun (item : Journal_media_runtime.item) -> item.presentation)
-          (current ())
+          (current owner token)
         = Some (Journal_media.File path)
+      in
+      let selected_slot = root ^ ":" ^ item.token in
+      let selected = owner, item.token, path, selected_slot in
+      if unchanged selected
       then (
-        (* Replace the slot atomically: closing first could release the only
-           file reference when the same offscreen preview is selected again. *)
+        let group =
+          if is_image_type item.file_type
+          then
+            List.filter_map
+              (fun (_, candidate) ->
+                 Option.bind candidate (fun (candidate : Journal_media_runtime.item) ->
+                   let owner = asset_root candidate.token in
+                   Option.bind (current owner candidate.token) (fun current ->
+                     match current.presentation with
+                     | Journal_media.File path ->
+                       Some (owner, candidate.token, path, root ^ ":" ^ candidate.token)
+                     | Hidden | Placeholder _ | External _ -> None)))
+              image_slots
+          else [ selected ]
+        in
+        (* Acquire every new preview reference before releasing previous ones.
+           Each member has a separate runtime slot, so swiping never relinquishes
+           a sibling's only file lease when the source row leaves the viewport. *)
+        let previous = !selected_preview in
         !unsubscribe_preview ();
         (unsubscribe_preview := fun () -> ());
-        selected_preview := Some (owner, item.token);
-        emit ~target_root:owner ~asset:item.token Preview;
-        Signal.set preview (Some path);
+        selected_preview := group;
+        List.iter
+          (fun (owner, token, _, slot) ->
+             emit ~target_root:owner ~asset:token ~slot Preview)
+          group;
+        let retained = Hashtbl.create (List.length group) in
+        List.iter (fun (_, _, _, slot) -> Hashtbl.replace retained slot ()) group;
+        List.iter
+          (fun (owner, token, _, slot) ->
+             if not (Hashtbl.mem retained slot)
+             then emit ~target_root:owner ~asset:token ~slot ~visible:false Preview)
+          previous;
+        let paths = List.map (fun (_, _, path, _) -> path) group in
+        let rec index position = function
+          | [] -> 0
+          | (_, token, _, _) :: _ when token = item.token -> position
+          | _ :: rest -> index (position + 1) rest
+        in
+        Signal.set preview (Some (paths, index 0 group));
+        let subscriptions =
+          List.map
+            (fun ((owner, token, _, _) as member) ->
+               Store.subscribe_item store owner token (fun () ->
+                 if not (unchanged member) then close_preview ()))
+            group
+        in
         unsubscribe_preview
-        := Store.subscribe_item store owner item.token (fun () ->
-             if
-               Option.map
-                 (fun (item : Journal_media_runtime.item) -> item.presentation)
-                 (current ())
-               <> Some (Journal_media.File path)
-             then close_preview ()))
+        := fun () -> List.iter (fun unsubscribe -> unsubscribe ()) subscriptions)
     in
     Signal.on_dispose context.ui_scope close_preview;
     let reactive_item (item : Journal_media_runtime.item) render =
@@ -336,37 +405,6 @@ let view_content
           ~on_appear:visible
           []
     in
-    let images, files =
-      List.partition
-        (fun (i : Journal_media_runtime.item) -> is_image_type i.file_type)
-        items
-    in
-    (* Graph identity/type arrives independently of file availability. Keep its
-       slot and composition even while the runtime descriptor is absent. *)
-    let uuid (item : Journal_media_runtime.item) =
-      Logseq_db_types.Graph_types.Uuid.to_string item.asset.uuid
-    in
-    let by_id = Hashtbl.create (List.length images) in
-    List.iter (fun item -> Hashtbl.replace by_id (uuid item) item) images;
-    let known_ids = Hashtbl.create (List.length known_images) in
-    let known_slots =
-      List.filter_map
-        (fun (id, file_type) ->
-           if (not (is_image_type file_type)) || Hashtbl.mem known_ids id
-           then None
-           else (
-             Hashtbl.add known_ids id ();
-             Some (id, Hashtbl.find_opt by_id id)))
-        known_images
-    in
-    let image_slots =
-      List.filter_map
-        (fun item ->
-           let id = uuid item in
-           if Hashtbl.mem known_ids id then None else Some (id, Some item))
-        images
-      @ known_slots
-    in
     let render_slot ~gallery (id, (item : Journal_media_runtime.item option)) =
       let render_content (item : Journal_media_runtime.item option) =
         match item with
@@ -479,8 +517,21 @@ let view_content
             ~equal:( = )
             (function
               | None -> L.column ~width:0 ~height:0 []
-              | Some path ->
-                L.file_preview ~path ~on_dismiss:(fun _ -> close_preview ()) [])
+              | Some ([ path ], _) ->
+                L.file_preview ~path ~on_dismiss:(fun _ -> close_preview ()) []
+              | Some (paths, selected_index) ->
+                let payload =
+                  Yojson.Safe.to_string
+                    (`Assoc
+                        [ "paths", `List (List.map (fun path -> `String path) paths)
+                        ; "selected_index", `Int selected_index
+                        ])
+                in
+                Journal_lui_native.image_preview
+                  ~payload
+                  ~on_event:(fun event ->
+                    if event.payload = "{\"type\":\"dismiss\"}" then close_preview ())
+                  [])
             (Signal.value preview)
         ]
     in

@@ -30,5 +30,6 @@ val view
   -> actions_enabled:bool
   -> on_status:Ui.Event.Handler.t
   -> on_delete:Ui.Event.Handler.t
+  -> on_copy:Ui.Event.Handler.t
   -> unit
   -> Ui.View.Body.t

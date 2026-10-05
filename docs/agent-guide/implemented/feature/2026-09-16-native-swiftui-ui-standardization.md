@@ -28,7 +28,7 @@ not a compatibility plan for the current renderer or application architecture.
 - Framework behavior was traced through the installed BonsaiSwiftUI sources,
   including `NativeSheet.swift`, `NativeNavigationStack.swift`,
   `NativeExpandableComposer.swift`, `NativeMessageComposer.swift`,
-  `SwipeActions.swift`, `NativeTextView.swift` and `NativeNotices.swift`.
+  `NativeTextView.swift` and `NativeNotices.swift`.
 - Code locations below identify the audited working-tree snapshot, including
   uncommitted migration work. Recheck line numbers before implementation.
 - This was a source review, not a visual or interaction test. Clipping, contrast,
@@ -208,7 +208,6 @@ the target iPhone layout; no expanded sidebar variant is required.
 | UI-14 — Settings | `application.ml:1881` uses three button chips and displays font-size/line-height/weight strings. | Use Form/Section and a labeled density Picker, segmented when appropriate. Show a live reading preview instead of implementation metrics. Present settings through the iPhone navigation or sheet flow with native dismissal. |
 | UI-15 — Graph selection | `application.ml:2640` uses a ScrollView/column of generic buttons with a custom refresh header. | Use List with native row/open or selection behavior and a native toolbar refresh action; use refreshable where appropriate. Launch still restores the last graph directly; this screen appears only when graph choice is needed. |
 | UI-16 — Journal and Favorites feeds | `journal_timeline.ml` uses a custom sparse collection; `journal_row.ml` imposes estimated heights and clipping. | Use List, date Sections and intrinsic native row sizing. Use plain native row Buttons with programmatic NavigationStack pushes, retaining the existing List UI through detail navigation. Keep pagination correct, but redesign presentation around the native container rather than retaining custom geometry for compatibility. |
-| UI-17 — Row actions | `journal_timeline.ml:77` and line 190 use framework swipe actions; installed SwipeActions translates rows and draws gesture-driven action panes. | Use List swipeActions and contextMenu with concise Label-based actions, SF Symbols and destructive roles. Native gesture arbitration, keyboard/context alternatives and accessibility actions are available. |
 | UI-18 — Block hierarchy | `application.ml:2480` manually renders dots, chevrons, indentation and expanded-state text in a flattened window. | Use OutlineGroup or DisclosureGroup in List. Native disclosure exposes expansion state and keyboard interaction; adapt child-loading presentation to the native hierarchy. |
 | UI-19 — Diagnostics | `application.ml:2254` creates heading/value columns and a custom close header. | Use Form/Section/LabeledContent for diagnostic values, selectable text and native dismissal/navigation. Values remain readable at large text sizes and on narrow iPhone displays. |
 | UI-20 — Error details | `application.ml:2103` creates a custom Back header and metadata columns in GroupBox cards. | Use native structured sections, selectable error/cause text and contextual recovery actions. Distinguish a modal Close from hierarchical Back; diagnostic content does not become decorative glass controls. |
@@ -306,7 +305,7 @@ data operations, authentication, encryption, graph restoration and synchronizati
 remain product responsibilities. Any
 change in undo lifetime, draft retention or operation semantics must be explicit.
 
-Do not preserve current sparse collections, hand-built swipe gestures, custom
+Do not preserve current sparse collections, custom
 button chips, row-height estimation or generic modal wrappers solely because
 they already exist. Conversely, native SecureField, SF Symbols and valid content
 layouts need no cosmetic replacement merely to claim more Liquid Glass usage.
@@ -363,7 +362,7 @@ remain subject to the separate contrast/non-color acceptance gate.
 ### Restyle the existing UI without replacing its structure
 
 Changing colors, icons or button backgrounds would leave custom navigation,
-selection, sheet sizing, swipe behavior and text geometry in place. It does not
+selection, sheet sizing and text geometry in place. It does not
 meet the user's request for the most idiomatic native design.
 
 ### Replace the bottom controls with a conventional TabView

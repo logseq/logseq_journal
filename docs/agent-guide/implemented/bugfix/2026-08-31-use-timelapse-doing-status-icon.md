@@ -48,7 +48,7 @@ The RED test rendered Doing as U+F051E (`incomplete_circle`) and failed against
 the required U+E660. After replacing the catalog role and timeline mapping, the
 focused rendered-icon test, full OCaml test suite, Material icon artifact
 verification, generated-host check, Flutter test suite, and real-runtime
-centered swipe-action test pass.
+status tests pass.
 
 ## Questions
 

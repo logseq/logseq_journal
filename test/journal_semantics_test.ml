@@ -355,6 +355,7 @@ let test_timeline_has_no_chevron () =
       ~on_open:handler
       ~on_status:handler
       ~on_delete:handler
+      ~on_copy:handler
       ~children:[ V.text "Body" ]
     |> V.Body.Private.to_widget
   in
@@ -433,6 +434,7 @@ let timeline_action_view ~enabled received =
     ~on_open:(handler "open")
     ~on_status:(handler "status")
     ~on_delete:(handler "delete")
+    ~on_copy:(handler "copy")
     ~children:[ V.text "Action target" ]
   |> V.Body.Private.to_widget
 ;;
@@ -442,17 +444,43 @@ let test_timeline_native_status_delete_callbacks () =
   with_mounted (timeline_action_view ~enabled:true received) (fun app ops ->
     let node = native_list_node (ops ()) in
     let row = "block:" ^ block_id in
+    List.iter (dispatch_row_action app node row) [ "status"; "delete"; "copy" ];
+    require
+      (List.rev !received = [ "status", block_id; "delete", block_id; "copy", block_id ])
+      "Timeline context Status/Delete lost their bound block callbacks";
+    received := [];
     List.iter
       (dispatch_row_action app node row)
-      [ "status:" ^ block_id; "delete:" ^ block_id; "status"; "delete" ];
-    require
-      (List.rev !received
-       = [ "status", block_id
-         ; "delete", block_id
-         ; "status", block_id
-         ; "delete", block_id
-         ])
-      "Timeline native Status/Delete did not execute their bound block callbacks")
+      [ "status:" ^ block_id; "delete:" ^ block_id ];
+    require (!received = []) "retired swipe action still executed";
+    let payload =
+      List.find_map
+        (function
+          | Lui_protocol.SetExtensionProp (id, "payload", StringValue value)
+            when id = node -> Some (Yojson.Basic.from_string value)
+          | _ -> None)
+        (ops ())
+      |> Option.get
+    in
+    let open Yojson.Basic.Util in
+    let row =
+      payload
+      |> member "sections"
+      |> to_list
+      |> List.hd
+      |> member "rows"
+      |> to_list
+      |> List.hd
+    in
+    require (member "swipe" row = `Null) "Timeline still exposes swipe controls";
+    let keys =
+      row
+      |> member "context_menu"
+      |> member "actions"
+      |> to_list
+      |> List.map (fun action -> action |> member "key" |> to_string)
+    in
+    require (keys = [ "status"; "delete"; "copy" ]) "Timeline context menu changed")
 ;;
 
 let test_native_row_actions_ignore_disabled_missing_and_malformed () =
@@ -466,7 +494,7 @@ let test_native_row_actions_ignore_disabled_missing_and_malformed () =
          then
            List.iter
              (dispatch_row_action app node row)
-             [ "status"; "delete"; "status:" ^ block_id; "delete:" ^ block_id ];
+             [ "status"; "delete"; "copy"; "status:" ^ block_id; "delete:" ^ block_id ];
          dispatch_row_action app node "missing-row" "delete";
          dispatch_row_action app node row "retired-action";
          dispatch_list_payload app node {|{"type":"row_event","payload":"invalid json"}|};
@@ -872,10 +900,10 @@ let test_images_use_lui_gallery_and_preview () =
     require
       (List.exists
          (function
-           | Lui_protocol.CreateNode (_, FilePreview) -> true
+           | Lui_protocol.CreateExtension (_, "journal-image-preview", _) -> true
            | _ -> false)
          (ops ()))
-      "image press did not open LUI file_preview")
+      "image press did not open native image group preview")
 ;;
 
 let test_file_cards_use_actual_metadata () =
@@ -1157,7 +1185,7 @@ let test_direct_image_children_share_parent_gallery () =
     let preview =
       List.find_map
         (function
-          | Lui_protocol.CreateNode (node, FilePreview) -> Some node
+          | Lui_protocol.CreateExtension (node, "journal-image-preview", _) -> Some node
           | _ -> None)
         (ops ())
     in
@@ -1165,9 +1193,10 @@ let test_direct_image_children_share_parent_gallery () =
     require
       (List.exists
          (function
-           | Lui_protocol.SetProp
-               (node, PathValue, StringValue "/tmp/synthetic-second.jpg") ->
+           | Lui_protocol.SetExtensionProp (node, "payload", StringValue json) ->
              Some node = preview
+             && Yojson.Safe.Util.member "selected_index" (Yojson.Safe.from_string json)
+                = `Int 1
            | _ -> false)
          (ops ()))
       "gallery preview selected a different child")
@@ -1838,8 +1867,215 @@ let test_reactive_media_subscription_disposal_and_epoch () =
       "new epoch item did not reach the mounted file image")
 ;;
 
+(* Preview composition is owned by the mounted media view, rather than a pure
+   reducer. Drive public Press/extension events and Store updates at that boundary. *)
+let gallery_preview ops =
+  let node =
+    List.find_map
+      (function
+        | Lui_protocol.CreateExtension (node, "journal-image-preview", _) -> Some node
+        | _ -> None)
+      ops
+  in
+  Option.bind node (fun node ->
+    List.find_map
+      (function
+        | Lui_protocol.SetExtensionProp (id, "payload", StringValue json) when id = node
+          -> Some (node, Yojson.Safe.from_string json)
+        | _ -> None)
+      (List.rev ops))
+;;
+
+let test_gallery_preview_order_selection_and_leases () =
+  let entry, views, first, second = child_gallery_fixture ~duplicates:true () in
+  let events = ref [] in
+  let store = seeded_media_store views in
+  with_mounted
+    (projected_row
+       ~store
+       ~views
+       ~on_event:(fun event -> events := event :: !events)
+       entry)
+    (fun app ops ->
+       let image =
+         mounted_node (ops ()) PathValue (StringValue "/tmp/synthetic-second.jpg")
+       in
+       ignore (Lui_app.dispatch_event app (Press image));
+       ignore (Lui_app.flush app);
+       let node, payload =
+         match gallery_preview (ops ()) with
+         | Some preview -> preview
+         | None -> fail "multi-image press did not mount the native image preview"
+       in
+       let open Yojson.Safe.Util in
+       require
+         (member "paths" payload
+          = `List
+              [ `String "/tmp/synthetic-first.png"; `String "/tmp/synthetic-second.jpg" ]
+         )
+         "preview did not preserve displayed order or included PDF/grandchildren";
+       require
+         (member "selected_index" payload = `Int 1)
+         "preview must start at the clicked image";
+       let held =
+         List.filter
+           (fun (event : Journal_media_view.event) ->
+              event.action = Preview && event.visible)
+           !events
+       in
+       require (List.length held = 2) "preview must retain both image leases";
+       require
+         (List.map (fun (e : Journal_media_view.event) -> e.root) (List.rev held)
+          = [ asset_id first; asset_id second ])
+         "preview lease owner must be the asset's source row";
+       require
+         (List.length
+            (List.sort_uniq
+               String.compare
+               (List.map (fun (e : Journal_media_view.event) -> e.slot) held))
+          = 2)
+         "gallery lease slots must not replace each other";
+       events := [];
+       let values =
+         Lui_protocol.String_map.empty
+         |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
+         |> Lui_protocol.String_map.add
+              "payload"
+              (Lui_protocol.StringValue {|{"type":"dismiss"}|})
+       in
+       ignore
+         (Lui_app.dispatch_event
+            app
+            (ExtensionEvent (node, "journal-image-preview", "event", values)));
+       ignore (Lui_app.flush app);
+       require
+         (List.length
+            (List.filter
+               (fun (event : Journal_media_view.event) ->
+                  event.action = Preview && not event.visible)
+               !events)
+          = 2)
+         "closing preview must release all gallery references")
+;;
+
+let test_gallery_preview_filters_unavailable_and_closes_on_retirement () =
+  let ready = media_item 81 "png" (File "/tmp/ready.png") None in
+  let other = media_item 82 "jpg" (File "/tmp/other.jpg") None in
+  let items =
+    [ ready
+    ; media_item 83 "pdf" (File "/tmp/document.pdf") None
+    ; media_item 84 "png" (Placeholder "Unavailable") None
+    ; media_item 85 "png" (External "https://example.com/photo.png") None
+    ; other
+    ]
+  in
+  let store = seeded_media_store [ block_id, media_state items ] in
+  let events = ref [] in
+  with_mounted
+    (Journal_media_view.view
+       ~store
+       ~scope:"preview-retirement"
+       ~root:block_id
+       ~on_event:(fun event -> events := event :: !events)
+       (V.text "Fixture"))
+    (fun app ops ->
+       let image = mounted_node (ops ()) PathValue (StringValue "/tmp/other.jpg") in
+       ignore (Lui_app.dispatch_event app (Press image));
+       ignore (Lui_app.flush app);
+       let _, payload =
+         match gallery_preview (ops ()) with
+         | Some preview -> preview
+         | None -> fail "ready image group did not open native preview"
+       in
+       require
+         (Yojson.Safe.Util.member "paths" payload
+          = `List [ `String "/tmp/ready.png"; `String "/tmp/other.jpg" ])
+         "unavailable, external or nonimage file entered image preview";
+       events := [];
+       Journal_media_view.Store.update
+         store
+         ~root:block_id
+         (Some
+            (media_state [ { ready with presentation = Placeholder "Removed" }; other ]));
+       ignore (Lui_app.flush app);
+       require
+         (List.length
+            (List.filter
+               (fun (event : Journal_media_view.event) ->
+                  event.action = Preview && not event.visible)
+               !events)
+          = 2)
+         "retiring a preview member must release the whole gallery")
+;;
+
+let test_single_image_and_document_keep_file_preview () =
+  List.iter
+    (fun (file_type, path) ->
+       let item = media_item 91 file_type (File path) None in
+       with_mounted (media_view [ item ]) (fun app ops ->
+         let node =
+           if Journal_media_view.is_image_type file_type
+           then mounted_node (ops ()) PathValue (StringValue path)
+           else mounted_node (ops ()) TextValue (StringValue "PDF attachment")
+         in
+         ignore (Lui_app.dispatch_event app (Press node));
+         ignore (Lui_app.flush app);
+         require
+           (List.exists
+              (function
+                | Lui_protocol.CreateNode (_, FilePreview) -> true
+                | _ -> false)
+              (ops ()))
+           "single image/document did not keep native file preview";
+         require
+           (gallery_preview (ops ()) = None)
+           "single image/document unexpectedly mounted image group preview"))
+    [ "png", "/tmp/single-image.png"; "pdf", "/tmp/single-document.pdf" ]
+;;
+
+let test_gallery_disposal_releases_preview_references_once () =
+  let items =
+    [ media_item 92 "png" (File "/tmp/dispose-a.png") None
+    ; media_item 93 "jpg" (File "/tmp/dispose-b.jpg") None
+    ]
+  in
+  let store = seeded_media_store [ block_id, media_state items ] in
+  let events = ref [] in
+  with_mounted
+    (Journal_media_view.view
+       ~store
+       ~scope:"gallery-disposal"
+       ~root:block_id
+       ~on_event:(fun event -> events := event :: !events)
+       (V.text "Fixture"))
+    (fun app ops ->
+       let node = mounted_node (ops ()) PathValue (StringValue "/tmp/dispose-b.jpg") in
+       ignore (Lui_app.dispatch_event app (Press node));
+       ignore (Lui_app.flush app);
+       events := [];
+       ignore (Lui_app.dispose app);
+       let releases () =
+         List.length
+           (List.filter
+              (fun (event : Journal_media_view.event) ->
+                 event.action = Preview && not event.visible)
+              !events)
+       in
+       require (releases () = 2) "disposing row must release both preview references";
+       Journal_media_view.Store.update store ~root:block_id None;
+       require (releases () = 2) "disposed preview subscriptions released twice")
+;;
+
 let tests =
-  [ ( "native status Picker contracts"
+  [ ( "single image and document preview compatibility"
+    , test_single_image_and_document_keep_file_preview )
+  ; ( "gallery disposal releases once"
+    , test_gallery_disposal_releases_preview_references_once )
+  ; ( "gallery preview order selection and leases"
+    , test_gallery_preview_order_selection_and_leases )
+  ; ( "gallery preview filtering and retirement"
+    , test_gallery_preview_filters_unavailable_and_closes_on_retirement )
+  ; ( "native status Picker contracts"
     , test_status_picker_keeps_accessible_group_and_selection )
   ; "independent mounted input revisions", test_mounted_input_revisions_remain_independent
   ; ( "Timeline native Status/Delete callbacks"

@@ -318,7 +318,7 @@ review before decoupling synchronous receipt.
 An incremental section/row payload wire could reduce full-payload parsing for
 small updates, but changes both OCaml and Swift protocol owners. It is not the
 minimal first fix. Likewise a shared list interaction gate can avoid per-row
-payload updates, but must preserve all swipe/context/navigation blocking and
+payload updates, but must preserve all context/navigation blocking and
 model-side write checks. Neither is assumed implemented by this exploration.
 
 ## Stages and dependencies
@@ -439,7 +439,7 @@ not substitute for the complete Application/C/Swift integration chain.
 | One root tag/media/reference changes, N=25/100/500/1000 | All dependent rows update, unrelated rows retain state | Row builds proportional to K; for the one-root fixture K=1, not N; no new graph reads |
 | Favorites change or Detail draft update | Correct current destination; back restores scroll/expansion | 0 hidden Journal row builds; root identity remains valid |
 | Detail open/back/request generation change | Native navigation and preview lifecycle correct | 0 create/drop of retained Timeline media wrappers; real graph replacement still resets them |
-| Modal/pending write gate | All prohibited swipe/context/navigation remain blocked | O(N) gate patches are allowed until a separately accepted shared gate; never bypass correctness for a count target |
+| Modal/pending write gate | All prohibited context/navigation remain blocked | O(N) gate patches are allowed until a separately accepted shared gate; never bypass correctness for a count target |
 | Sync unrelated root / media duplicate visibility | Necessary dependency/Favorites updates continue | No equal-view media publication; refresh requests depend on affected roots, not unconditionally all64 groups, once dependency rules are proven |
 | Image repeated key, cache pressure, cancellation | Correct image/token/quality, bounded memory | One shared in-flight decode per identical key; no stale token state; existing cache budget preserved initially |
 | Patch invalid property/parent/extension or failed decode | Atomic rejection, no partially committed future batch | Same validation coverage; ordered generation-safe commit, if asynchronous parsing is adopted |
@@ -449,7 +449,7 @@ The current UI has no search/tag/status filter, date picker or existing-block
 body editor. Do not invent acceptance flows for them. Cover actual direct
 capture save and Detail append-child save, plus remote metadata updates.
 The independent status event fix must land or be tested at the picker/public
-reducer boundary before claiming real swipe-to-save coverage. Root Retry has
+reducer boundary before claiming real gesture-to-save coverage. Root Retry has
 its own validation; do not hide a nonresponsive action behind a performance gate.
 
 ### Scaling and timing targets

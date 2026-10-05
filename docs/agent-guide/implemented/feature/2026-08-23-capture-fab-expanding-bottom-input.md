@@ -162,7 +162,7 @@ revision.
 - The timeline contains no synthetic Capture clearance and its final real row
   is not obscured by the bottom-navigation affordance.
 - Light, dark, high-contrast light, and high-contrast dark runtime tests pass;
-  the two light reference goldens show the collapsed FAB and valid swipe
+  the two light reference goldens show the collapsed FAB and valid row
   threshold state.
 - OCaml view, worker integration, timeline state, adaptive, semantics, source
   boundary, and full build tests pass.

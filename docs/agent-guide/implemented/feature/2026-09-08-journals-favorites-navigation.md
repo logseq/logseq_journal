@@ -16,7 +16,7 @@ cannot browse the favorites already stored in their Logseq graph.
 
 The requested change adds a bottom NavigationBar with exactly two destinations,
 `Journals` and `Favorites`, with Journals selected on launch. Favorites must use
-the existing timeline visual language and have no horizontal row swipe actions.
+the existing timeline visual language and retain native vertical scrolling.
 On 2026-09-08, the user confirmed that Favorites should show **one row per
 favorite target, in favorite order**, rather than a feed of blocks grouped by
 favorite page. The user subsequently confirmed that first-version Favorites rows
@@ -51,10 +51,6 @@ Inspected this checkout at HEAD `4d19f87`:
 - `app/application.ml` constructs the timeline Scaffold and Capture composer.
   Graph startup, requests, completion reconciliation, and visible-range events
   are currently wired around one timeline.
-- `app/journal_timeline.ml` composes `Journal_row.view` with status/delete
-  Slidable panes. `delete_enabled = false` already avoids the Slidable wrapper,
-  while `actions_enabled = false` only disables actions. Favorites should render
-  the shared row directly, without constructing either pane.
 - `app/journal_row.ml` owns row typography, status rails, text truncation, sizing,
   and disclosure. A row with children toggles direct-child previews on press;
   a childless row is not currently a detail-navigation button.
@@ -121,9 +117,7 @@ mode rather than wiring a no-op callback into a still-pressable row. Static
 collapsed summaries may reuse the existing row presentation, but do not render
 expanded child rows or create child-loading interactions.
 
-Favorites rows have no Slidable widgets, horizontal gesture handlers,
-status/delete action panes, or corresponding accessibility actions. Journals
-retains its existing row interactions. Vertical scrolling remains available.
+Favorites retains independent vertical scrolling.
 
 Capture is shown only on Journals. Favorites renders neither the Capture FAB nor
 the composer. Switching to Favorites dismisses the composer and its keyboard
@@ -222,7 +216,7 @@ After the interface prerequisite is resolved:
 | --- | --- |
 | 1. Graph contract and read | The two overlay spec interfaces above, their implementations, graph types if necessary, and `logseq_db_worker/contract/protocol.ml/.mli` plus codecs/validation expose a bounded resolved read. Update the existing protocol catalogs. |
 | 2. Runtime and state | `app/journal_graph_request.ml/.mli`, `app/journal_graph_runtime.ml/.mli`, and Application expose Favorites requests/completions and destination-isolated state. Update push reconciliation. |
-| 3. Shared presentation | `app/journal_row.ml/.mli`, `app/journal_graph_projection.ml/.mli`, and `app/journal_header.ml/.mli` support favorite content and header context without requiring a journal day. Add explicit display-only row rendering with no press/disclosure/swipe affordances; share static summary styling. |
+| 3. Shared presentation | `app/journal_row.ml/.mli`, `app/journal_graph_projection.ml/.mli`, and `app/journal_header.ml/.mli` support favorite content and header context without requiring a journal day. Add explicit display-only row rendering with no press/disclosure affordances; share static summary styling. |
 | 4. Root shell | `app/application.ml` and `app/journal_routes.ml/.mli` wire navigation, anchors, lifecycle resets, and loading/error states. Show Capture only on Journals, preserving its draft and in-flight save across tab switches. |
 | 5. Verification | Extend existing state, graph read, protocol, application view, and layout coverage at their actual ownership boundaries. Perform native visual and gesture checks. |
 
@@ -280,7 +274,7 @@ supporting a requested behavior.
   retains its expansion state. Favorites has no expansion state; delayed
   completions cannot contaminate another tab or graph.
 - Favorites reuses timeline row typography/geometry and contains no left/right
-  swipe affordances or accessibility actions. Journals swipes continue to work.
+  horizontal action panes.
 - Native visual checks cover light/dark themes, high contrast, RTL, narrow width,
   enlarged text, reduced motion, bottom insets, and keyboard/composer layout.
   Rows and navigation labels remain readable, tappable, and unobscured.

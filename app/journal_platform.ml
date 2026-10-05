@@ -262,3 +262,19 @@ let notice_cancel_request ~token =
   |> encode_envelope 27
   |> Result.get_ok
 ;;
+
+let copy_text_request ~text =
+  if not (Journal_validation.is_valid_utf_8 text)
+  then Error "Clipboard text is invalid."
+  else
+    encode_envelope
+      28
+      (Yojson.Safe.to_string (`Assoc [ "text", `String text ]) |> Bytes.of_string)
+;;
+
+let decode_copy_text_response bytes =
+  Result.bind (decode_envelope [ 29 ] bytes) (fun payload ->
+    decode_json_object "clipboard response" payload (function
+      | [ ("copied", `Bool true) ] -> Ok ()
+      | _ -> Error "Clipboard write was not acknowledged."))
+;;

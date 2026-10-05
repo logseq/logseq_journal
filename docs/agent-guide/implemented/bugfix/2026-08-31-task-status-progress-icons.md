@@ -67,8 +67,7 @@ against the required U+E518. The catalog and timeline mapping now render:
 
 The focused semantics test, full OCaml test suite, source-boundary checks,
 Material icon font artifact verification, generated-host check, Flutter test
-suite, Flutter analysis, and the real-runtime centered full-bleed swipe-action
-test pass.
+suite and Flutter analysis pass.
 
 ## Questions
 

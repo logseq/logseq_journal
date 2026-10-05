@@ -17,5 +17,5 @@ receive an already selected block ID and cannot reproduce native inherited
 parent actions without injecting the wrong external result. Do not add duplicate
 reducer, storage or transport tests for this targeting defect.
 
-macOS observations do not establish UIKit swipe targeting or spoken VoiceOver
+macOS observations do not establish UIKit row targeting or spoken VoiceOver
 behavior. Run the real iPhone flow when a device becomes available.

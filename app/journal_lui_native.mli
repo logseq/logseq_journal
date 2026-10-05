@@ -15,6 +15,7 @@ val chrome_identifier : string
 val asset_import_identifier : string
 val asset_settings_identifier : string
 val list_identifier : string
+val image_preview_identifier : string
 
 (** Extension schemas shared with the Apple iOS/macOS hosts. *)
 val registry : Lui_extension.extension_registry
@@ -65,10 +66,18 @@ val asset_settings
   -> Lui_elements.t
 
 (** Native virtualized collection (grouped sections, scroll positioning,
-    visible-range paging, swipe actions). Section and row structure rides in
+    visible-range paging, context actions). Section and row structure rides in
     [payload]; each row's content element mounts as an extension child in the
     order described by the payload's content indexes. *)
 val list
+  :  ?key:string
+  -> payload:string
+  -> ?on_event:(event -> unit)
+  -> Lui_elements.t list
+  -> Lui_elements.t
+
+(** Native QuickLook image group, using display order and a selected index. *)
+val image_preview
   :  ?key:string
   -> payload:string
   -> ?on_event:(event -> unit)

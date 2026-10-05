@@ -76,7 +76,7 @@ native navigation suite, without duplicate reducer or SDK tests.
 Expand each plain Button label to the available width with leading alignment and
 apply a rectangular interaction content shape inside the label. Retain native
 Button semantics, the existing programmatic NavigationStack, retained List UI,
-action fences, swipe actions and menus. Do not add gesture recognizers or scroll
+action fences and menus. Do not add gesture recognizers or scroll
 restoration. Rebuild the isolated host without temporary diagnostics and run the
 same two failing tests, followed by existing Journal/Favorites return checks.
 The old center-tap intermittent failure remains unproven as the same defect.
