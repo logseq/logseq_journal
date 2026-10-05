@@ -2967,8 +2967,10 @@ module Copy = struct
     | After, V2_graph_info_outcome info
       when job.version = Some (info.graph_uuid, info.generation, info.projection_revision)
       ->
-      ( { t with awaiting = None; job = None }
-      , [ Copied (String.concat "" (List.rev job.fragments_rev)) ] )
+      let text = String.concat "" (List.rev job.fragments_rev) in
+      (match Journal_platform.copy_text_request ~text with
+       | Ok _ -> { t with awaiting = None; job = None }, [ Copied text ]
+       | Error _ -> fail t "The selected block is too large to copy.")
     | _, V2_failed { message; _ } -> fail t ("Unable to copy block: " ^ message)
     | Root, V2_block_outcome (V2_missing_block _) ->
       fail t "The selected block no longer exists."

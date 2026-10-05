@@ -2464,11 +2464,67 @@ let test_copy_rejects_oversized_text () =
           }))
 ;;
 
+let test_copy_result_fits_serialized_clipboard () =
+  let maximum = 256 * 1024 in
+  let complete source =
+    let state, effects = copy_start block_uuid in
+    let state, effects = copy_root state effects source in
+    let state, effects = copy_reply state effects (copy_children block_uuid []) in
+    snd (copy_reply state effects (graph_info_outcome ~journal_title_format:None))
+  in
+  let check source effects =
+    match Journal_platform.copy_text_request ~text:source with
+    | Ok _ ->
+      Alcotest.(check bool)
+        "encodable text is copied exactly"
+        true
+        (effects = [ Copy.Copied source ])
+    | Error _ ->
+      Alcotest.(check bool)
+        "unencodable JSON never produces Copied"
+        true
+        (match effects with
+         | [ Copy.Failed message ] -> message <> ""
+         | _ -> false)
+  in
+  List.iter
+    (fun source -> check source (complete source))
+    [ String.make maximum 'x'
+    ; String.make (maximum - 11) 'x'
+    ; String.make (maximum - 10) 'x'
+    ; String.make (maximum / 2) '"'
+    ; String.make (maximum / 2) '\\'
+    ; String.make (maximum / 2) '\n'
+    ; String.make (maximum / 6) '\001'
+    ; String.make ((maximum - 11) / 2) '\n' ^ "a"
+    ; String.make ((maximum - 11) / 2) '\n' ^ "ab"
+    ];
+  List.iter
+    (fun root_length ->
+       let root = String.make root_length 'x' in
+       let child = copy_child unrelated_uuid block_uuid "\"" in
+       let state, effects = copy_start block_uuid in
+       let state, effects = copy_root state effects root in
+       let state, effects =
+         copy_reply state effects (copy_children block_uuid [ child ])
+       in
+       let state, effects = copy_reply state effects (copy_children unrelated_uuid []) in
+       let _, effects =
+         copy_reply state effects (graph_info_outcome ~journal_title_format:None)
+       in
+       check (root ^ "\n  - \"") effects)
+    [ maximum - 19; maximum - 18 ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
     [ ( "copy subtree"
       , [ Alcotest.test_case
+            "serialized clipboard payload bound"
+            `Quick
+            test_copy_result_fits_serialized_clipboard
+        ; Alcotest.test_case
             "nested complete pagination and multiline"
             `Quick
             test_copy_nested_paginated_text
