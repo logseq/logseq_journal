@@ -4,9 +4,9 @@ import Observation
 
 /// C bridge entries exported by app/journal_lui_bridge.c (see also
 /// platform/native/lui_ocaml_bridge.c in the lui repository). Every entry that
-/// produces a patch emits it synchronously through the patch callback installed
-/// at start; all entries are invoked on the main actor, which owns the OCaml
-/// runtime started by `lui_ocaml_start` on this thread.
+/// produces a patch copies it into owned bytes and releases the OCaml runtime
+/// before invoking the synchronous patch callback. All entries run on the main
+/// actor; applying a patch may synchronously reenter an event entry.
 private typealias PatchCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
 private typealias WakeupCallback = @convention(c) () -> Void
 private typealias PlatformRequestCallback =
@@ -37,8 +37,8 @@ private func journalOCamlSetPlatformRequestCallback(_ callback: PlatformRequestC
 
 nonisolated(unsafe) private var activeRuntime: JournalRuntime?
 
-/// OCaml only invokes the patch callback from entries the host runs on the main
-/// actor, so `assumeIsolated` holds by construction.
+/// The C bridge invokes this on the main actor after releasing the runtime.
+/// The copied bytes remain valid until the callback returns, including reentry.
 private let receivePatch: PatchCallback = { source in
   guard let source else { return }
   let json = String(cString: source)

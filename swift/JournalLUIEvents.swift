@@ -2,7 +2,8 @@ import Foundation
 import LUIAppleBackend
 
 // Match LUI's typed native ABI. Journal's C adapter also acquires/releases the
-// OCaml runtime lock and delivers each resulting patch before returning.
+// OCaml runtime lock and delivers an owned patch after releasing it, before
+// returning. A backend patch can therefore synchronously dispatch another event.
 @_silgen_name("lui_ocaml_appear")
 private func luiOCamlAppear(_ node: Int64) -> Int32
 @_silgen_name("lui_ocaml_press")
