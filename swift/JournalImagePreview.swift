@@ -1,12 +1,13 @@
 import LUIAppleBackend
 import QuickLook
 import SwiftUI
+
 #if os(iOS)
 import UIKit
 #endif
 
-/// The OCaml owner retains every URL until this presentation closes. iOS gives
-/// QuickLook one immutable data source so its native pager owns item selection.
+/// The OCaml owner retains every URL until this presentation closes. The native
+/// iOS page controller owns selection within one immutable image snapshot.
 @MainActor enum JournalImagePreview {
   struct Properties: Decodable {
     let paths: [String]
@@ -64,7 +65,7 @@ import UIKit
 
     func updateUIViewController(_ presenter: Presenter, context: Context) {
       // The presentation is a snapshot. SwiftUI updates must not reset the
-      // controller's currentPreviewItemIndex while the user is paging.
+      // native controller's current page while the user is paging.
     }
 
     static func dismantleUIViewController(_ presenter: Presenter, coordinator: ()) {
@@ -72,7 +73,7 @@ import UIKit
     }
   }
 
-  final class Items: NSObject, QLPreviewControllerDataSource, @MainActor QLPreviewControllerDelegate {
+  final class Items {
     let urls: [URL]
     private let onDismiss: () -> Void
     private var finished = false
@@ -83,14 +84,6 @@ import UIKit
       self.onDismiss = onDismiss
     }
 
-    func numberOfPreviewItems(in controller: QLPreviewController) -> Int { urls.count }
-
-    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> any QLPreviewItem {
-      urls[index] as NSURL
-    }
-
-    func previewControllerDidDismiss(_ controller: QLPreviewController) { finish() }
-
     func finish() {
       guard !finished else { return }
       finished = true
@@ -99,44 +92,146 @@ import UIKit
     }
   }
 
-  /// Standard navigation containment keeps Save visible while QuickLook owns
-  /// image paging, zooming and sharing. The selected URL is read on each tap.
-  final class Screen: UIViewController {
-    let preview: QLPreviewController
-    let urls: [URL]
-    var onClose: (() -> Void)?
-    private static var chinese: Bool { Locale.current.language.languageCode?.identifier == "zh" }
-    private static func text(_ english: String, _ chinese: String) -> String { self.chinese ? chinese : english }
-    lazy var save = JournalPhotoSave(dependencies: JournalPhotos.dependencies { [weak self] in self?.feedback($0) })
-    lazy var saveButton = UIBarButtonItem(title: Self.text("Save to Photos", "保存到相册"), style: .plain, target: self, action: #selector(saveCurrent))
+  final class ImagePage: UIViewController, UIScrollViewDelegate {
+    let index: Int
+    let url: URL
+    private let scroll = UIScrollView()
+    private let image = UIImageView()
 
-    private lazy var shareButton = UIBarButtonItem(systemItem: .action, primaryAction: UIAction { [weak self] _ in self?.shareCurrent() })
-
-    init(preview: QLPreviewController, urls: [URL]) {
-      self.preview = preview
-      self.urls = urls
+    init(index: Int, url: URL) {
+      self.index = index
+      self.url = url
       super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
-    var currentURL: URL? {
-      let index = preview.currentPreviewItemIndex
-      return urls.indices.contains(index) ? urls[index] : nil
+    override func viewDidLoad() {
+      super.viewDidLoad()
+      view.backgroundColor = .systemBackground
+      scroll.delegate = self
+      scroll.minimumZoomScale = 1
+      scroll.maximumZoomScale = 8
+      scroll.showsHorizontalScrollIndicator = false
+      scroll.showsVerticalScrollIndicator = false
+      scroll.contentInsetAdjustmentBehavior = .never
+      scroll.panGestureRecognizer.isEnabled = false
+      scroll.accessibilityIdentifier = "journal-image-zoom"
+      image.image = UIImage(contentsOfFile: url.path)
+      image.contentMode = .scaleAspectFit
+      image.isAccessibilityElement = true
+      image.accessibilityLabel = url.deletingPathExtension().lastPathComponent
+      scroll.translatesAutoresizingMaskIntoConstraints = false
+      image.translatesAutoresizingMaskIntoConstraints = false
+      view.addSubview(scroll)
+      scroll.addSubview(image)
+      NSLayoutConstraint.activate([
+        scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+        scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        scroll.topAnchor.constraint(equalTo: view.topAnchor),
+        scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        image.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+        image.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+        image.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+        image.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+        image.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+        image.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+      ])
     }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? { image }
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+      // At fit size the outer page controller owns horizontal input. Once
+      // zoomed, UIKit's image scroll view owns panning within the current page.
+      scrollView.panGestureRecognizer.isEnabled =
+        scrollView.zoomScale > scrollView.minimumZoomScale
+    }
+  }
+
+  final class Gallery: UIPageViewController, UIPageViewControllerDataSource {
+    let urls: [URL]
+
+    init(urls: [URL], selectedIndex: Int) {
+      self.urls = urls
+      super.init(transitionStyle: .scroll, navigationOrientation: .horizontal)
+      dataSource = urls.count > 1 ? self : nil
+      if !urls.isEmpty {
+        let index = urls.indices.contains(selectedIndex) ? selectedIndex : 0
+        setViewControllers(
+          [ImagePage(index: index, url: urls[index])], direction: .forward, animated: false)
+      }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    var currentPage: ImagePage? { viewControllers?.first as? ImagePage }
+
+    override func viewDidLoad() {
+      super.viewDidLoad()
+      view.accessibilityIdentifier = "journal-image-gallery"
+    }
+
+    private func adjacent(to controller: UIViewController, offset: Int) -> UIViewController? {
+      guard let page = controller as? ImagePage else { return nil }
+      let index = page.index + offset
+      return urls.indices.contains(index) ? ImagePage(index: index, url: urls[index]) : nil
+    }
+
+    func pageViewController(
+      _ pageViewController: UIPageViewController,
+      viewControllerBefore viewController: UIViewController
+    ) -> UIViewController? {
+      adjacent(to: viewController, offset: -1)
+    }
+
+    func pageViewController(
+      _ pageViewController: UIPageViewController,
+      viewControllerAfter viewController: UIViewController
+    ) -> UIViewController? {
+      adjacent(to: viewController, offset: 1)
+    }
+  }
+
+  /// Standard navigation keeps Save visible above native paging and zooming.
+  /// Save and Share read the native current controller's URL on each tap.
+  final class Screen: UIViewController {
+    let preview: Gallery
+    var onClose: (() -> Void)?
+    private static var chinese: Bool { Locale.current.language.languageCode?.identifier == "zh" }
+    private static func text(_ english: String, _ chinese: String) -> String {
+      self.chinese ? chinese : english
+    }
+    lazy var save = JournalPhotoSave(
+      dependencies: JournalPhotos.dependencies { [weak self] in self?.feedback($0) })
+    lazy var saveButton = UIBarButtonItem(
+      title: Self.text("Save to Photos", "保存到相册"), style: .plain, target: self,
+      action: #selector(saveCurrent))
+
+    private lazy var shareButton = UIBarButtonItem(
+      systemItem: .action, primaryAction: UIAction { [weak self] _ in self?.shareCurrent() })
+
+    init(preview: Gallery) {
+      self.preview = preview
+      super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    var currentURL: URL? { preview.currentPage?.url }
 
     override func viewDidLoad() {
       super.viewDidLoad()
       view.backgroundColor = .systemBackground
-      navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak self] _ in self?.onClose?() })
+      navigationItem.leftBarButtonItem = UIBarButtonItem(
+        systemItem: .done, primaryAction: UIAction { [weak self] _ in self?.onClose?() })
       saveButton.accessibilityIdentifier = "journal-save-current-image"
-      // A child QuickLook controller does not own this navigation item's
-      // sharing controls; keep the system share sheet explicitly available.
       navigationItem.rightBarButtonItems = [saveButton, shareButton]
       save.onBusyChanged = { [weak self] busy in
         self?.saveButton.isEnabled = !busy
         self?.shareButton.isEnabled = !busy
-        self?.saveButton.title = busy ? Self.text("Saving…", "正在保存…") : Self.text("Save to Photos", "保存到相册")
+        self?.saveButton.title =
+          busy ? Self.text("Saving…", "正在保存…") : Self.text("Save to Photos", "保存到相册")
       }
       addChild(preview)
       preview.view.translatesAutoresizingMaskIntoConstraints = false
@@ -158,7 +253,8 @@ import UIKit
     private func shareCurrent() {
       guard let url = currentURL else { return }
       let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-      activity.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItems?.last
+      activity.popoverPresentationController?.barButtonItem =
+        navigationItem.rightBarButtonItems?.last
       present(activity, animated: true)
     }
 
@@ -172,10 +268,13 @@ import UIKit
         message = Self.text("The current image was saved.", "当前图片已保存。")
       case .denied:
         title = Self.text("Photo Access Denied", "未允许添加照片")
-        message = Self.text("Allow Journal to add photos in Settings, then try again.", "请在系统设置中允许 Journal 添加照片，然后重试。")
+        message = Self.text(
+          "Allow Journal to add photos in Settings, then try again.",
+          "请在系统设置中允许 Journal 添加照片，然后重试。")
       case .restricted:
         title = Self.text("Photo Access Restricted", "添加照片受到限制")
-        message = Self.text("This device restricts adding photos to the library.", "此设备限制了向相册添加照片。")
+        message = Self.text(
+          "This device restricts adding photos to the library.", "此设备限制了向相册添加照片。")
       case .notImage:
         title = Self.text("Cannot Save Image", "无法保存图片")
         message = Self.text("This file is not a supported image.", "此文件不是支持的图片格式。")
@@ -190,7 +289,7 @@ import UIKit
   }
 
   final class Presenter: UIViewController {
-    let preview = QLPreviewController()
+    let preview: Gallery
     let items: Items
     let screen: Screen
     let navigation: UINavigationController
@@ -198,19 +297,13 @@ import UIKit
 
     init(urls: [URL], selectedIndex: Int, onDismiss: @escaping () -> Void) {
       items = Items(urls: urls, onDismiss: onDismiss)
-      screen = Screen(preview: preview, urls: urls)
+      preview = Gallery(urls: urls, selectedIndex: selectedIndex)
+      screen = Screen(preview: preview)
       navigation = UINavigationController(rootViewController: screen)
       super.init(nibName: nil, bundle: nil)
-      preview.dataSource = items
-      preview.delegate = items
       navigation.modalPresentationStyle = .fullScreen
       screen.onClose = { [weak self] in self?.close(animated: true) }
       items.onWillFinish = { [weak screen] in screen?.save.close() }
-      // QuickLook has no active item until it loads the datasource. Selecting
-      // before this boundary can leave currentPreviewItemIndex at NSNotFound.
-      preview.loadViewIfNeeded()
-      preview.reloadData()
-      preview.currentPreviewItemIndex = urls.indices.contains(selectedIndex) ? selectedIndex : 0
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
@@ -229,7 +322,10 @@ import UIKit
 
     func close(animated: Bool = false) {
       screen.save.close()
-      guard navigation.presentingViewController != nil else { items.finish(); return }
+      guard navigation.presentingViewController != nil else {
+        items.finish()
+        return
+      }
       navigation.dismiss(animated: animated) { [items] in items.finish() }
     }
   }
