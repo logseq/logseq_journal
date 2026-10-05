@@ -4123,14 +4123,21 @@ let start
     | Worker.Push { payload = Client_state_changed manager_state; _ } ->
       apply_manager_transition set_state set_state_and_effect manager_state
     | Worker.Push { payload = Need_id_token challenge; _ } ->
-      platform_request (Journal_platform.id_token_request challenge) ~f:(function
-        | Error _ -> send_manager (Graph_service.Reject_token challenge)
-        | Ok payload ->
-          let challenge_id = Graph_service.token_request_id challenge in
-          (match Journal_platform.decode_id_token_response ~challenge_id payload with
-           | Error _ -> send_manager (Graph_service.Reject_token challenge)
-           | Ok token ->
-             send_manager (Graph_service.Provide_token { request = challenge; token })))
+      platform_request (Journal_platform.id_token_request challenge) ~f:(fun response ->
+        let answer =
+          Result.bind response (fun payload ->
+            Journal_platform.decode_id_token_response
+              ~challenge_id:(Graph_service.token_request_id challenge)
+              payload)
+        in
+        Effect.of_thunk (fun () ->
+          match Graph_service.answer_token client challenge answer with
+          | Worker.Control_accepted
+          | Control_duplicate
+          | Control_stale
+          | Control_not_ready
+          | Control_stopping -> ()
+          | Control_unsupported -> failwith "Graph Service has no token control handler"))
     | Worker.Push { payload = Bootstrap_progress progress; _ } ->
       set_state (fun state ->
         match state.manager with

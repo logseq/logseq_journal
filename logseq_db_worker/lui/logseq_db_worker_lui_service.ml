@@ -71,9 +71,12 @@ type state =
   ; diagnostics : diagnostics
   }
 
-type token_request = Worker_runner.id_token_request
+type token_request =
+  { request : Worker_runner.id_token_request
+  ; control : Journal_worker.control_ticket
+  }
 
-let token_request_id = Worker_runner.id_token_request_id
+let token_request_id token = Worker_runner.id_token_request_id token.request
 
 type bootstrap_progress =
   { graph_id : graph_id
@@ -491,6 +494,7 @@ let create ~(dependencies : dependencies) =
     type t =
       { worker : Db.t
       ; token_cache : Worker_runner.id_token_cache
+      ; authenticated_user : string option ref
       }
   end
   in
@@ -499,22 +503,59 @@ let create ~(dependencies : dependencies) =
     ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
+    ~control_topic_count:2
+    ~classify_control:(function
+      | Client_command (Provide_token { request; _ } | Reject_token request) ->
+        Some (Journal_worker.Reply request.control)
+      | Client_command (Reconcile_authenticated_user { user_id }) ->
+        let key =
+          match user_id with
+          | None -> "none"
+          | Some user -> "user:" ^ user
+        in
+        Some (Journal_worker.Latest { topic = 1; key; invalidates = Some 0 })
+      | _ -> None)
+    ~handle_control:(fun session -> function
+       | Client_command (Provide_token { request; token }) ->
+         Worker_runner.provide_id_token session.Session.token_cache request.request token
+       | Client_command (Reject_token request) ->
+         Worker_runner.reject_id_token
+           session.Session.token_cache
+           request.request
+           "host rejected request"
+       | Client_command (Reconcile_authenticated_user { user_id }) ->
+         session.Session.authenticated_user := user_id;
+         (* Every admitted changed key revoked the old reply ticket, including
+           A -> B -> A coalescing. Preserve that invalidation even when only
+           final A reaches the cache. Identical keys never reach this handler. *)
+         Worker_runner.reconcile_authenticated_user
+           session.Session.token_cache
+           ~user_id:None;
+         Worker_runner.reconcile_authenticated_user session.Session.token_cache ~user_id
+       | _ -> invalid_arg "Only token replies and authentication state are short controls")
     ~init:(fun context config ->
       let sw = Journal_worker.Session_context.switch context in
       let event_sink = ref (fun (_ : Pure.event) -> ()) in
+      let authenticated_user = ref None in
       let token_cache =
         Worker_runner.id_token_cache
           ~wall_clock_s:Unix.gettimeofday
           ~monotonic_ns:Mtime_clock.elapsed_ns
           ~request:(fun request ->
-            Journal_worker.Session_context.emit
-              context
-              ~topic:auth_topic
-              (Need_id_token request))
+            match Journal_worker.Session_context.issue_control context ~topic:0 with
+            | None -> failwith "Token control session is stopped or changing account"
+            | Some control ->
+              Journal_worker.Session_context.emit
+                context
+                ~topic:auth_topic
+                (Need_id_token { request; control }))
       in
       let id_token_provider =
         Sync_runner.id_token_provider
-          ~acquire:(fun account -> Worker_runner.acquire_id_token token_cache ~account)
+          ~acquire:(fun (account : Sync.account_scope) ->
+            if !authenticated_user <> Some account.user_id
+            then Error "ID token request is no longer current."
+            else Worker_runner.acquire_id_token token_cache ~account)
           ~invalidate:(fun account ~token ->
             Worker_runner.invalidate_id_token token_cache ~account ~token)
       in
@@ -611,7 +652,7 @@ let create ~(dependencies : dependencies) =
                | Error (Db.Invalid_create message) -> Error message
                | Ok worker ->
                  event_sink := Db.post worker;
-                 Ok Session.{ worker; token_cache }))))
+                 Ok Session.{ worker; token_cache; authenticated_user }))))
     ~handle:(fun _context session request ->
       match request with
       | Import_asset { graph_generation; source } ->
@@ -648,13 +689,17 @@ let create ~(dependencies : dependencies) =
         Db.release_asset_file session.worker ~scope ~handle;
         Ok Client_command_completed
       | Client_command (Provide_token { request; token }) ->
-        Worker_runner.provide_id_token session.token_cache request token;
+        Worker_runner.provide_id_token session.token_cache request.request token;
         Ok Client_command_completed
       | Client_command (Reject_token request) ->
-        Worker_runner.reject_id_token session.token_cache request "host rejected request";
+        Worker_runner.reject_id_token
+          session.token_cache
+          request.request
+          "host rejected request";
         Ok Client_command_completed
       | Client_command (Reconcile_authenticated_user { user_id }) ->
-        Worker_runner.reconcile_authenticated_user session.token_cache ~user_id;
+        (* The short token-cache transition already ran on the control lane.
+           Only the ordered database/Core event remains on the data lane. *)
         Db.post session.worker (client_event (Reconcile_authenticated_user { user_id }));
         Ok Client_command_completed
       | Client_command command ->
@@ -668,3 +713,12 @@ let create ~(dependencies : dependencies) =
 ;;
 
 let service = create ~dependencies:(production_dependencies ())
+
+let answer_token client request answer =
+  let command =
+    match answer with
+    | Ok token when String.length token <= 1_048_576 -> Provide_token { request; token }
+    | Ok _ | Error _ -> Reject_token request
+  in
+  Journal_worker.send_control client (Client_command command)
+;;
