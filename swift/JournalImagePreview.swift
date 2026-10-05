@@ -16,9 +16,11 @@ import UIKit
 
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
-    #if !os(iOS)
-    @State private var selectedURL: URL?
     @State private var opened = false
+    #if os(iOS)
+    @State private var presented = false
+    #else
+    @State private var selectedURL: URL?
     #endif
 
     private var properties: Properties? {
@@ -33,8 +35,19 @@ import UIKit
       if let properties {
         let urls = properties.paths.map { URL(fileURLWithPath: $0) }
         #if os(iOS)
-        Pager(urls: urls, selectedIndex: properties.selected_index, onDismiss: dismissed)
+        Color.clear
           .frame(width: 0, height: 0)
+          .fullScreenCover(isPresented: $presented, onDismiss: dismissed) {
+            Pager(urls: urls, selectedIndex: properties.selected_index) {
+              presented = false
+            }
+            .ignoresSafeArea()
+          }
+          .onAppear {
+            guard !opened, urls.indices.contains(properties.selected_index) else { return }
+            opened = true
+            presented = true
+          }
         #else
         Color.clear
           .frame(width: 0, height: 0)
@@ -57,38 +70,29 @@ import UIKit
   struct Pager: UIViewControllerRepresentable {
     let urls: [URL]
     let selectedIndex: Int
-    let onDismiss: () -> Void
+    let onClose: () -> Void
 
-    func makeUIViewController(context: Context) -> Presenter {
-      Presenter(urls: urls, selectedIndex: selectedIndex, onDismiss: onDismiss)
+    func makeUIViewController(context: Context) -> UINavigationController {
+      let screen = Screen(preview: Gallery(urls: urls, selectedIndex: selectedIndex))
+      screen.onClose = { [weak screen] in
+        screen?.save.close()
+        onClose()
+      }
+      return UINavigationController(rootViewController: screen)
     }
 
-    func updateUIViewController(_ presenter: Presenter, context: Context) {
+    func updateUIViewController(_ navigation: UINavigationController, context: Context) {
       // The presentation is a snapshot. SwiftUI updates must not reset the
       // native controller's current page while the user is paging.
     }
 
-    static func dismantleUIViewController(_ presenter: Presenter, coordinator: ()) {
-      presenter.close()
-    }
-  }
-
-  final class Items {
-    let urls: [URL]
-    private let onDismiss: () -> Void
-    private var finished = false
-    var onWillFinish: (() -> Void)?
-
-    init(urls: [URL], onDismiss: @escaping () -> Void) {
-      self.urls = urls
-      self.onDismiss = onDismiss
-    }
-
-    func finish() {
-      guard !finished else { return }
-      finished = true
-      onWillFinish?()
-      onDismiss()
+    static func dismantleUIViewController(_ navigation: UINavigationController, coordinator: ()) {
+      // A native List may discard temporary hosting instances. Teardown only
+      // cancels their local work; SwiftUI owns the actual presentation dismissal.
+      if let screen = navigation.viewControllers.first as? Screen {
+        screen.save.close()
+        screen.onClose = nil
+      }
     }
   }
 
@@ -288,46 +292,5 @@ import UIKit
     }
   }
 
-  final class Presenter: UIViewController {
-    let preview: Gallery
-    let items: Items
-    let screen: Screen
-    let navigation: UINavigationController
-    private var presented = false
-
-    init(urls: [URL], selectedIndex: Int, onDismiss: @escaping () -> Void) {
-      items = Items(urls: urls, onDismiss: onDismiss)
-      preview = Gallery(urls: urls, selectedIndex: selectedIndex)
-      screen = Screen(preview: preview)
-      navigation = UINavigationController(rootViewController: screen)
-      super.init(nibName: nil, bundle: nil)
-      navigation.modalPresentationStyle = .fullScreen
-      screen.onClose = { [weak self] in self?.close(animated: true) }
-      items.onWillFinish = { [weak screen] in screen?.save.close() }
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
-
-    override func viewDidLoad() {
-      super.viewDidLoad()
-      view.backgroundColor = .clear
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-      super.viewDidAppear(animated)
-      guard !presented, !items.urls.isEmpty else { return }
-      presented = true
-      present(navigation, animated: true)
-    }
-
-    func close(animated: Bool = false) {
-      screen.save.close()
-      guard navigation.presentingViewController != nil else {
-        items.finish()
-        return
-      }
-      navigation.dismiss(animated: animated) { [items] in items.finish() }
-    }
-  }
   #endif
 }
