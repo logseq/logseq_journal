@@ -22,14 +22,18 @@ import Photos
       },
       stage: JournalPhotoSaveFile.stage,
       write: { url, completion in
-        PHPhotoLibrary.shared().performChanges {
+        // Photos executes this transaction on its own queue. Explicit
+        // Sendable closures prevent inheriting the adapter's MainActor.
+        let changes: @Sendable () -> Void = { [url] in
           let request = PHAssetCreationRequest.forAsset()
           let options = PHAssetResourceCreationOptions()
           options.shouldMoveFile = false
           request.addResource(with: .photo, fileURL: url, options: options)
-        } completionHandler: { success, _ in
+        }
+        let finished: @Sendable (Bool, (any Error)?) -> Void = { success, _ in
           Task { @MainActor in completion(success) }
         }
+        PHPhotoLibrary.shared().performChanges(changes, completionHandler: finished)
       },
       feedback: feedback)
   }
