@@ -19,7 +19,7 @@ Avoid modifying LUI or protected Dune/spec files. Use existing native Journal la
 - Actual same-device baseline and after screenshots without personal data or password contents.
 - Empty and whitespace submissions rejected; password bytes preserved; repeated pending submission rejected.
 - Error/retry and cancel/reopen are user reachable; keyboard and large text remain readable.
-- Local commit only, and final comparison saved to Library when supported.
+- Scoped implementation and actual comparison saved to Library; publication follows explicit user authorization.
 
 ## Risks
 
@@ -49,3 +49,7 @@ No live account, remote encrypted graph, production Keychain, physical iPhone or
 After viewing the delivered comparison, the user requested adjusting Unlock graph button size. The prior regular native button was visually shallow with a leading label. Use the existing LUI primary button's large native control size, centered label and 44-point minimum touch target; keep its field-aligned width and intrinsic Dynamic Type height. No password or submission behavior changes.
 
 The public Application E2EE case passed again (0.135s). The same iPhone 13 Simulator verified default text/software keyboard, touch submission, disabled loading, accessibility3, and native scrolling with the keyboard visible. The adjusted default control is about 50 points high; its large-text label remains complete without a fixed height. Actual screenshots updated the After panel while retaining the original baseline. The same Library file was replaced successfully as version 1, preserving libfile_d9bf40e90568819185d8e6ca96b897cf.
+
+## Final pre-PR verification
+
+The user accepted Library version 1 After and explicitly requested a PR after testing on 2026-10-06. Current origin/main remains b2261b1. All 29 Swift hashes in the accepted Simulator build match current sources; Application matches its built source. The existing cached native build (`dune build @all app/native_embed.exe.o`) and full `dune runtest --force` both completed successfully on the final button-adjusted source, including 59 Application cases. The native linker retained its preexisting sqlite3 text-stub warning. No additional UI rebuild, graph/account access or credential operation was needed. Push only the task branch, open one Draft PR and follow CI for its exact head; do not merge.
