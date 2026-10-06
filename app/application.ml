@@ -2973,13 +2973,18 @@ let manager_page state dispatch =
       |> Option.value ~default:"Encrypted graph"
     in
     let unlock_button =
-      V.button
-        ~key:(Ui.Key.string "unlock-submit")
-        ~style:Prominent
-        ~enabled:((not pending) && Journal_capture.can_save password)
-        ~on_press:submit
-        ~child:(V.text (if pending then "Unlocking…" else "Unlock graph"))
-        ()
+      V.of_lui
+        (Lui_elements.button
+           ~key:"unlock-submit"
+           ~variant:`primary
+           ~size:`lg
+           ~text_alignment:`center
+           ~grow:1.
+           ~min_height:44
+           ~disabled:(pending || not (Journal_capture.can_save password))
+           ~on_press:(fun _ -> dispatch.send Submit_e2ee_password)
+           ~text:(if pending then "Unlocking…" else "Unlock graph")
+           [])
       |> V.frame ~max_width:Fill
       |> V.with_test_id (Ui.Test_id.string "e2ee-password-submit")
     in

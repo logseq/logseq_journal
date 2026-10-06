@@ -43,3 +43,9 @@ Actual iPhone 13 / iOS 26.1 Simulator screenshots use the production Application
 ## Consequences
 
 No live account, remote encrypted graph, production Keychain, physical iPhone or VoiceOver speech was tested. Diagnostics opens, but Simulator CUA drag returned noWindowsAvailable, so swipe dismissal remains unverified. The synthetic 30-second pending delay is screenshot control, not performance evidence. Repository-wide formatting and decision checks report preexisting failures outside this task; the new decision and task diff validate.
+
+## Button sizing follow-up
+
+After viewing the delivered comparison, the user requested adjusting Unlock graph button size. The prior regular native button was visually shallow with a leading label. Use the existing LUI primary button's large native control size, centered label and 44-point minimum touch target; keep its field-aligned width and intrinsic Dynamic Type height. No password or submission behavior changes.
+
+The public Application E2EE case passed again (0.135s). The same iPhone 13 Simulator verified default text/software keyboard, touch submission, disabled loading, accessibility3, and native scrolling with the keyboard visible. The adjusted default control is about 50 points high; its large-text label remains complete without a fixed height. Actual screenshots updated the After panel while retaining the original baseline. The same Library file was replaced successfully as version 1, preserving libfile_d9bf40e90568819185d8e6ca96b897cf.
