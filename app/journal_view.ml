@@ -942,7 +942,7 @@ module View = struct
 
   let secure_field
         ?key
-        ~label:_
+        ~label
         ?(prompt = "")
         ?keyboard:_
         ?submit_label:_
@@ -967,6 +967,7 @@ module View = struct
       Lui_elements.secure_field
         ~text:(Text_editing.Value.text value)
         ~placeholder:prompt
+        ~label
         ~disabled:(not enabled)
         ~autofocus
         ~on_input:
