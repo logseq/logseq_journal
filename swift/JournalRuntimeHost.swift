@@ -12,13 +12,28 @@ struct JournalRuntimeHost: View {
   let extensions: LUIAppleExtensionRegistry
   @State private var runtime: JournalRuntime?
 
-  var body: some SwiftUI.View {
+  private var content: some SwiftUI.View {
     Group {
       if let runtime, let rootID = runtime.rootID {
         LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
       } else {
         ProgressView("Opening journal")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
+    }
+  }
+
+  var body: some SwiftUI.View {
+    Group {
+      #if os(iOS)
+      // Capture the container inset before the descendant NavigationStack
+      // adds its navigation bar; floating pages retain their original layout.
+      GeometryReader { container in
+        content.environment(\.journalContainerTopInset, container.safeAreaInsets.top)
+      }
+      #else
+      content
+      #endif
     }
     .modifier(JournalNoticePresenter(controller: platform.notices))
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
