@@ -4,7 +4,7 @@ import SwiftUI
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
-    case feedback, page, header, detail
+    case feedback, page, header, detail, unlock
     case bottomControls = "bottom-controls"
   }
 
@@ -15,6 +15,8 @@ import SwiftUI
     let title: String?
     let connecting: Bool?
     let controls: Bool?
+    let pending: Bool?
+    let error: String?
   }
 
   fileprivate struct ControlsSizeKey: EnvironmentKey {
@@ -159,6 +161,68 @@ import SwiftUI
               .padding(.horizontal, 16)
               .padding(.vertical, 8)
           }
+        }
+      case .unlock:
+        if let properties, let title = properties.title, context.childIDs.count == 4 {
+          Form {
+            Section {
+              VStack(alignment: .leading, spacing: 8) {
+                Label("Unlock your graph", systemImage: "lock.shield")
+                  .font(.title2.weight(.semibold))
+                  .accessibilityAddTraits(.isHeader)
+                Text(title).font(.headline).textSelection(.enabled)
+                Text("Enter the encryption password you set up in Logseq to access your notes.")
+                  .font(.subheadline).foregroundStyle(.secondary)
+                  .fixedSize(horizontal: false, vertical: true)
+              }
+              .padding(.vertical, 4)
+              .listRowBackground(Color.clear)
+              .listRowSeparator(.hidden)
+            }
+            Section {
+              child(0)
+                .accessibilityLabel("Encryption password")
+                .accessibilityHint("Use the encryption password for this graph.")
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.go)
+                #endif
+            } header: {
+              Text("Encryption password").textCase(nil)
+            }
+            Section {
+              if properties.pending == true {
+                HStack {
+                  ProgressView()
+                  Text("Unlocking your graph…")
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("e2ee-password-loading")
+              } else if let error = properties.error {
+                VStack(alignment: .leading, spacing: 4) {
+                  Label("Couldn't unlock graph", systemImage: "exclamationmark.circle")
+                    .font(.headline)
+                  Text(error).font(.subheadline)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(.red)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("e2ee-password-error")
+              }
+              child(1).frame(maxWidth: .infinity)
+                .listRowBackground(Color.clear).listRowSeparator(.hidden)
+              child(2).frame(maxWidth: .infinity)
+                .listRowBackground(Color.clear).listRowSeparator(.hidden)
+            } footer: {
+              child(3).font(.footnote).frame(maxWidth: .infinity)
+            }
+          }
+          .listSectionSpacing(16)
+          .scrollDismissesKeyboard(.interactively)
+          #if os(iOS)
+          .toolbar(.hidden, for: .navigationBar)
+          #endif
         }
       case .none:
         EmptyView()

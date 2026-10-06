@@ -277,6 +277,7 @@ type state =
   ; worker_errors : worker_error_occurrence list
   ; next_sync_error_sequence : int64
   ; e2ee_password : Journal_capture.t
+  ; e2ee_submission_pending : bool
   ; modal : modal
   ; confirmation_sequence : int64
   ; environment : Journal_environment.snapshot
@@ -362,6 +363,7 @@ let initial_state =
   ; worker_errors = []
   ; next_sync_error_sequence = 1L
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
+  ; e2ee_submission_pending = false
   ; modal = No_modal
   ; confirmation_sequence = 0L
   ; environment = Journal_environment.fallback
@@ -562,7 +564,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
   in
   let is_awaiting_password = snapshot.startup.awaiting_e2ee_password in
   let e2ee_password, next_local_sequence =
-    if is_awaiting_password = was_awaiting_password
+    if is_awaiting_password = was_awaiting_password && not graph_context_changed
     then state.e2ee_password, state.next_local_sequence
     else
       ( Journal_capture.create ~session_number:state.next_local_sequence ~source:""
@@ -588,6 +590,16 @@ let apply_manager_state state (manager_state : Graph_service.state) =
       manager = Some snapshot
     ; diagnostics = Some manager_state.diagnostics
     ; e2ee_password
+    ; e2ee_submission_pending =
+        state.e2ee_submission_pending
+        && not
+             (graph_context_changed
+              || is_awaiting_password
+              || Option.is_some snapshot.startup.failure
+              || snapshot.startup.bootstrapping
+              || (not snapshot.startup.authenticated)
+              || (Journal_startup.derive ~snapshot ~graph:state.graph_state).phase = Ready
+             )
     ; next_local_sequence
     ; modal
     ; graph_ready = state.graph_ready && not graph_context_changed
@@ -2923,6 +2935,7 @@ let manager_page state dispatch =
       content
   in
   let unlock error =
+    let pending = state.e2ee_submission_pending in
     let password = state.e2ee_password in
     let ignored = Ui.Event.Handler.create (fun _ -> ()) in
     let submit = bind_action dispatch Submit_e2ee_password in
@@ -2932,10 +2945,10 @@ let manager_page state dispatch =
         ~prompt:"Enter password"
         ~appearance:Ui.Text_editing.Field_appearance.Plain
         ~key:(Ui.Key.string "e2ee-password-editor")
-        ~enabled:true
+        ~enabled:(not pending)
         ~keyboard:Ui.Text_editing.Keyboard.Text
         ~submit_label:Ui.Text_editing.Submit_label.Go
-        ~autofocus:true
+        ~autofocus:(not pending)
         ~max_utf8_bytes:4096
         ~session_id:(Journal_capture.session_id password)
         ~document_revision:(Journal_capture.document_revision password)
@@ -2963,9 +2976,9 @@ let manager_page state dispatch =
       V.button
         ~key:(Ui.Key.string "unlock-submit")
         ~style:Prominent
-        ~enabled:(Journal_capture.can_save password)
+        ~enabled:((not pending) && Journal_capture.can_save password)
         ~on_press:submit
-        ~child:(V.text "Unlock graph")
+        ~child:(V.text (if pending then "Unlocking…" else "Unlock graph"))
         ()
       |> V.frame ~max_width:Fill
       |> V.with_test_id (Ui.Test_id.string "e2ee-password-submit")
@@ -2973,32 +2986,39 @@ let manager_page state dispatch =
     let choose_graph =
       V.button
         ~key:(Ui.Key.string "unlock-cancel")
-        ~role:Cancel
         ~style:Plain
         ~on_press:(bind_action dispatch Switch_graph)
-        ~child:(V.text "Choose another graph")
+        ~child:(V.text "Change graph")
         ()
+      |> V.frame ~min_height:44.
       |> V.with_test_id (Ui.Test_id.string "e2ee-password-cancel")
     in
-    Presentation.form
-      [ Presentation.section
-          "Unlock your graph"
-          [ V.symbol ~name:"lock.shield" ()
-          ; V.text ~key:(Ui.Key.string "graph-name") graph_name
-            |> V.text_selection ~enabled:true
-          ; V.text "Enter your encryption password to access your notes."
-          ]
-      ; Presentation.section
-          "Encryption password"
-          [ editor
-          ; (match error with
-             | None -> V.empty ()
-             | Some message -> live_region_text message)
-          ; unlock_button
-          ; V.text "Use the encryption password you set up in Logseq."
-          ; choose_graph
-          ]
-      ]
+    let chrome =
+      Ui.Native_widget.Extension.create
+        ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
+        ~version:2
+        ~capabilities:[ Stateful; Semantics ]
+        ~encode_props:(fun props -> Yojson.Basic.to_string props |> Bytes.of_string)
+        ~decode_event:(fun ~event_id:_ _ -> Error "Unlock uses child control events")
+        ()
+    in
+    Ui.Native_widget.widget
+      chrome
+      ~key:(Ui.Key.string "graph-unlock")
+      ~props:
+        (`Assoc
+            [ "mode", `String "unlock"
+            ; "title", `String graph_name
+            ; "pending", `Bool pending
+            ; ( "error"
+              , match error with
+                | None -> `Null
+                | Some message -> `String message )
+            ])
+      ~on_event:(fun _ -> ())
+      ~children:[ editor; unlock_button; choose_graph; diagnostics ]
+      ()
+    |> V.Body.static
     |> V.Body.toolbar
          ~items:
            [ V.Toolbar.item
@@ -3013,6 +3033,7 @@ let manager_page state dispatch =
     | Some snapshot ->
       let startup = Journal_startup.derive ~snapshot ~graph:state.graph_state in
       (match startup.phase with
+       | _ when state.e2ee_submission_pending -> unlock None
        | Awaiting_selection -> graph_picker snapshot
        | Awaiting_e2ee_password -> unlock None
        | Failed
@@ -4836,7 +4857,8 @@ let start
              then state
              else { state with routes = Journal_routes.update_detail state.routes next })
         | _, Some { startup = { awaiting_e2ee_password = true; _ }; _ }
-        | _, Some { startup = { failure = Some During_e2ee; _ }; _ } ->
+        | _, Some { startup = { failure = Some During_e2ee; _ }; _ }
+          when not state.e2ee_submission_pending ->
           let e2ee_password = Journal_capture.apply_text_edit state.e2ee_password edit in
           (* A mount-time echo produces an identical capture; rebuilding the
              record would republish the model and remount the field, which
@@ -5193,7 +5215,16 @@ let start
     | Switch_graph ->
       cancel_copy ();
       Effect.many
-        [ update (fun state -> { state with modal = No_modal })
+        [ update (fun state ->
+            { state with
+              modal = No_modal
+            ; e2ee_submission_pending = false
+            ; e2ee_password =
+                Journal_capture.create
+                  ~session_number:state.next_local_sequence
+                  ~source:""
+            ; next_local_sequence = Int64.succ state.next_local_sequence
+            })
         ; send_manager Graph_service.Return_to_graph_picker
         ]
     | Sign_out ->
@@ -5205,20 +5236,29 @@ let start
         ]
     | Submit_e2ee_password ->
       let password = Journal_capture.source snapshot.e2ee_password in
-      if String.equal (String.trim password) ""
+      let awaiting =
+        match snapshot.manager with
+        | Some { startup = { awaiting_e2ee_password = true; _ }; _ }
+        | Some { startup = { failure = Some During_e2ee; _ }; _ } -> true
+        | None | Some _ -> false
+      in
+      if
+        snapshot.e2ee_submission_pending
+        || (not awaiting)
+        || String.equal (String.trim password) ""
       then Effect.ignore
       else
-        Effect.many
-          [ send_manager (Graph_service.Submit_e2ee_password password)
-          ; update (fun state ->
-              { state with
-                e2ee_password =
-                  Journal_capture.create
-                    ~session_number:state.next_local_sequence
-                    ~source:""
-              ; next_local_sequence = Int64.succ state.next_local_sequence
-              })
-          ]
+        Effect.bind
+          (update (fun state ->
+             { state with
+               e2ee_submission_pending = true
+             ; e2ee_password =
+                 Journal_capture.create
+                   ~session_number:state.next_local_sequence
+                   ~source:""
+             ; next_local_sequence = Int64.succ state.next_local_sequence
+             }))
+          ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password password))
     | Request_local_cache_reset ->
       update (fun state ->
         match state.manager with

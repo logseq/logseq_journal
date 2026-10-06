@@ -2888,10 +2888,268 @@ let test_fixture_exception_cleanup exception_ =
   check_fixture_worker_idle ()
 ;;
 
+(* Application owns password admission and UI. No public pure root event exists
+   for E2EE; this fixture exercises mounted Application through its public hooks. *)
+let unlock_fixture () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let graph_id =
+    Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
+    |> Result.get_ok
+  in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Offline
+        ; catalog =
+            [ { graph_id
+              ; name = "Private Journal"
+              ; schema = { major = 65; minor = 33; exact = true }
+              ; encrypted = true
+              }
+            ]
+        ; selected_graph = Some graph_id
+        ; applied_server_t = None
+        ; timeline_presentation_pending = false
+        ; startup =
+            { authenticated = true
+            ; catalog_loading = false
+            ; awaiting_selection = false
+            ; restoring_local = false
+            ; bootstrapping = false
+            ; awaiting_e2ee_password = true
+            ; failure = None
+            ; account_generation = 1
+            ; graph_generation = 1
+            ; presentation_generation = 1
+            }
+        ; last_error = None
+        ; local_deletion = None
+        }
+    ; diagnostics = { groups = [] }
+    }
+  in
+  let current = Atomic.make manager in
+  let submissions = Atomic.make [] in
+  let release = Atomic.make false in
+  let client = ref None in
+  let worker =
+    W.Service.create
+      ~push_topic_count:6
+      ~merge_push:Service.coalesce_push
+      ~concurrency:Serial
+      ~init:(fun context _ ->
+        W.Session_context.emit
+          context
+          ~topic:Service.manager_topic
+          (Service.Client_state_changed manager);
+        Ok ())
+      ~handle:(fun context () request ->
+        let publish value =
+          Atomic.set current value;
+          W.Request_context.emit
+            context
+            ~topic:Service.manager_topic
+            (Service.Client_state_changed value)
+        in
+        match request with
+        | Service.Get_graph_state ->
+          Ok
+            (Service.Graph_state
+               { generation = 1
+               ; graph_id = (Atomic.get current).snapshot.selected_graph
+               ; phase = Graph_closed
+               ; error = None
+               })
+        | Client_command (Submit_e2ee_password password) ->
+          Atomic.set submissions (password :: Atomic.get submissions);
+          let old = Atomic.get current in
+          publish
+            { old with
+              snapshot =
+                { old.snapshot with
+                  startup =
+                    { old.snapshot.startup with
+                      awaiting_e2ee_password = false
+                    ; failure = None
+                    }
+                ; last_error = None
+                }
+            };
+          let delay =
+            if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1" then 30. else 8.
+          in
+          let deadline = Unix.gettimeofday () +. delay in
+          while (not (Atomic.get release)) && Unix.gettimeofday () < deadline do
+            Eio.Time.Mono.sleep (W.Request_context.clock context) 0.01
+          done;
+          publish
+            { manager with
+              snapshot =
+                { manager.snapshot with
+                  startup = { manager.snapshot.startup with failure = Some During_e2ee }
+                ; last_error =
+                    Some
+                      "Could not unlock the graph. Check your encryption password and \
+                       try again."
+                }
+            };
+          Ok Service.Client_command_completed
+        | Client_command Return_to_graph_picker ->
+          publish
+            { manager with
+              snapshot =
+                { manager.snapshot with
+                  selected_graph = None
+                ; startup =
+                    { manager.snapshot.startup with
+                      awaiting_selection = true
+                    ; awaiting_e2ee_password = false
+                    }
+                }
+            };
+          Ok Service.Client_command_completed
+        | Client_command (Select_graph _) ->
+          publish manager;
+          Ok Service.Client_command_completed
+        | Client_command _ | Asset_command _ | Release_asset_file _ ->
+          Ok Service.Client_command_completed
+        | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Import_asset _ | Graph_request _ ->
+          Error "Unused isolated password fixture command")
+      ~shutdown:(fun () -> ())
+      ()
+  in
+  let hooks =
+    Application.For_testing.app_with_service
+      ~on_client:(fun value -> client := Some value)
+      worker
+  in
+  hooks, submissions, release, client
+;;
+
+let test_unlock_application () =
+  let hooks, submissions, release, client = unlock_fixture () in
+  let props = Hashtbl.create 64 in
+  let consume encoded =
+    if encoded <> ""
+    then
+      let open Yojson.Safe.Util in
+      Yojson.Safe.from_string encoded
+      |> member "ops"
+      |> to_list
+      |> List.iter (fun op ->
+        let id = op |> member "id" in
+        match op |> member "op" |> to_string with
+        | "create-node" | "create-extension" -> Hashtbl.replace props (to_int id) []
+        | "set-prop" | "set-extension-prop" ->
+          let id = to_int id in
+          let previous = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          let key = op |> member "property" |> to_string in
+          Hashtbl.replace
+            props
+            id
+            ((key, member "value" op) :: List.remove_assoc key previous)
+        | "drop-node" | "drop-extension" -> Hashtbl.remove props (to_int id)
+        | _ -> ())
+  in
+  let find key value =
+    Hashtbl.fold
+      (fun id values found ->
+         if List.assoc_opt key values = Some (`String value) then Some id else found)
+      props
+      None
+  in
+  let node name =
+    match find "accessibility-identifier" name with
+    | Some id -> id
+    | None -> failwith ("Missing " ^ name)
+  in
+  let property id key = List.assoc_opt key (Hashtbl.find props id) in
+  let dispatch event = consume (hooks.dispatch event) in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 5. in
+    while (not (predicate ())) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ());
+      Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ())
+  in
+  let startup =
+    Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-unlock-synthetic"
+      ~target:(Managed_sync { base_url = "https://example.invalid" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+    |> Result.get_ok
+    |> Journal_startup.encode
+    |> Result.get_ok
+    |> Bytes.to_string
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Atomic.set release true;
+      ignore (hooks.dispose ());
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+       consume (hooks.init 2 2 startup);
+       wait "password page mounts" (fun () ->
+         Option.is_some (find "accessibility-identifier" "e2ee-password-editor"));
+       dispatch (Lui_protocol.Submit (node "e2ee-password-editor"));
+       Alcotest.(check int)
+         "empty Return sends nothing"
+         0
+         (List.length (Atomic.get submissions));
+       dispatch (Lui_protocol.TextChanged (node "e2ee-password-editor", "   "));
+       dispatch (Lui_protocol.Submit (node "e2ee-password-editor"));
+       Alcotest.(check int)
+         "blank Return sends nothing"
+         0
+         (List.length (Atomic.get submissions));
+       dispatch
+         (Lui_protocol.TextChanged (node "e2ee-password-editor", " synthetic-only "));
+       dispatch (Lui_protocol.Submit (node "e2ee-password-editor"));
+       wait "Return reaches worker" (fun () -> List.length (Atomic.get submissions) = 1);
+       Alcotest.(check string)
+         "password bytes preserved"
+         " synthetic-only "
+         (List.hd (Atomic.get submissions));
+       wait "pending stays on password page" (fun () ->
+         Option.is_some (find "accessibility-identifier" "e2ee-password-editor")
+         && property (node "e2ee-password-editor") "enabled" = Some (`Bool false));
+       Alcotest.(check (option bool))
+         "pending editor disabled"
+         (Some false)
+         (Option.map
+            Yojson.Safe.Util.to_bool
+            (property (node "e2ee-password-editor") "enabled"));
+       dispatch (Lui_protocol.Submit (node "e2ee-password-editor"));
+       Alcotest.(check int)
+         "pending duplicate sends nothing"
+         1
+         (List.length (Atomic.get submissions));
+       Atomic.set release true;
+       wait "retry field reenabled" (fun () ->
+         property (node "e2ee-password-editor") "enabled" = Some (`Bool true));
+       dispatch (Lui_protocol.Press (node "e2ee-password-cancel"));
+       wait "cancel returns to picker" (fun () ->
+         Option.is_none (find "accessibility-identifier" "e2ee-password-editor"));
+       let graph = find "text" "Private Journal" |> Option.get in
+       dispatch (Lui_protocol.Press graph);
+       (* Native list activation is exercised on Simulator. Headless assertions
+         above cover the shared Return/button admission and cancel boundary. *)
+       ())
+;;
+
 let () =
-  Alcotest.run
+  if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
+  then (
+    let hooks, _, _, _ = unlock_fixture () in
+    Journal_bridge.register hooks)
+  else Alcotest.run
     "application view"
-    [ ( "native navigation"
+    [ ( "E2EE input"
+      , [ Alcotest.test_case "Application admission and recovery" `Quick test_unlock_application ] )
+    ; ( "native navigation"
       , [ Alcotest.test_case
             "retained root across actual push and native Back"
             `Quick
