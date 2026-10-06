@@ -662,6 +662,177 @@ let warm_encrypted_graph_online_recovery_attaches_existing_mirror () =
        recovered.effects)
 ;;
 
+let e2ee_password_retry_recovers_after_failed_unlock () =
+  let selected, scope = selected_graph encrypted_graph in
+  let missing = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) in
+  let failed_cache =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+          Some
+            (Core.step
+               missing.next
+               (Core.Runner_completed
+                  (Core.Completion (ticket, Error (Core.Effect_failed "missing key")))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      missing.effects
+    |> Option.get
+  in
+  let recovery = Core.step failed_cache.next Core.Online_recovery_requested in
+  let user_key_fetch =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+          Some
+            (Core.step
+               recovery.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok "encrypted-graph-key"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      recovery.effects
+    |> Option.get
+  in
+  let prompt =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+          Some
+            (Core.step
+               user_key_fetch.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok "private-key-package"))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      user_key_fetch.effects
+    |> Option.get
+  in
+  let first = Core.step prompt.next (Core.E2ee_password_submitted "wrong-synthetic") in
+  let rejected, repeat_rejected =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
+          let event =
+            Core.Runner_completed
+              (Core.Completion
+                 ( ticket
+                 , Error (Core.Crypto_failed (Invalid_key_material, "wrong password")) ))
+          in
+          Some (Core.step first.next event, event)
+        | Run _ | Delegate _ | Publish _ -> None)
+      first.effects
+    |> Option.get
+  in
+  Alcotest.(check bool)
+    "failure stays visible"
+    true
+    ((Core.state rejected.next).snapshot.startup.failure = Some During_e2ee);
+  let corrected =
+    Core.step rejected.next (Core.E2ee_password_submitted " corrected-synthetic ")
+  in
+  let requests =
+    List.filter_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Unlock_private_key request)) ->
+          Some
+            ( request
+            , fun (result : (unit, Core.effect_error) result) ->
+                Core.Runner_completed (Core.Completion (ticket, result)) )
+        | Run _ | Delegate _ | Publish _ -> None)
+      corrected.effects
+  in
+  Alcotest.(check int)
+    "corrected password emits one unlock request"
+    1
+    (List.length requests);
+  let request, complete = List.hd requests in
+  Alcotest.(check string)
+    "retry preserves password bytes"
+    " corrected-synthetic "
+    request.password;
+  Alcotest.(check string)
+    "retry preserves encrypted package"
+    "private-key-package"
+    request.private_key_package;
+  Alcotest.(check bool)
+    "retry remains in account scope"
+    true
+    (request.scope = scope.account);
+  Alcotest.(check bool)
+    "failure awaits another password"
+    true
+    (Core.state rejected.next).snapshot.startup.awaiting_e2ee_password;
+  Alcotest.(check bool)
+    "retry clears previous failure"
+    true
+    ((Core.state corrected.next).snapshot.startup.failure = None);
+  let duplicate =
+    Core.step corrected.next (Core.E2ee_password_submitted "duplicate-synthetic")
+  in
+  Alcotest.(check int) "pending duplicate is inert" 0 (List.length duplicate.effects);
+  let stale = Core.step duplicate.next repeat_rejected in
+  Alcotest.(check int) "old rejection completion is inert" 0 (List.length stale.effects);
+  let again =
+    Core.step stale.next (complete (Error (Core.Effect_failed "still wrong")))
+  in
+  Alcotest.(check bool)
+    "repeated failure remains retryable"
+    true
+    (Core.state again.next).snapshot.startup.awaiting_e2ee_password;
+  let final = Core.step again.next (Core.E2ee_password_submitted "final-synthetic") in
+  let unlocked =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
+          Some
+            (Core.step
+               final.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok ()))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      final.effects
+    |> Option.get
+  in
+  let resumed =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key request)) ->
+          Alcotest.(check string)
+            "retry retains encrypted graph key"
+            "encrypted-graph-key"
+            request.encrypted_graph_key;
+          let handle = Core.graph_key_handle ~id:"retry-graph-key" ~scope:request.scope in
+          Some
+            (Core.step
+               unlocked.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok handle))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      unlocked.effects
+    |> Option.get
+  in
+  Alcotest.(check bool)
+    "successful retry resumes snapshot bootstrap"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> true
+         | Run _ | Delegate _ | Publish _ -> false)
+       resumed.effects);
+  let picker = Core.step rejected.next Core.Graph_picker_requested in
+  let abandoned =
+    Core.step picker.next (Core.E2ee_password_submitted "abandoned-synthetic")
+  in
+  Alcotest.(check int)
+    "picker discards password challenge"
+    0
+    (List.length abandoned.effects);
+  let account =
+    Core.step rejected.next (Core.Account_authenticated { user_id = Some "other-user" })
+  in
+  let abandoned =
+    Core.step account.next (Core.E2ee_password_submitted "other-account-synthetic")
+  in
+  Alcotest.(check int)
+    "account switch discards password challenge"
+    0
+    (List.length abandoned.effects)
+;;
+
 let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
   let authenticated =
     Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
@@ -3412,6 +3583,10 @@ let scenarios =
       "invalid snapshot baseline fails bootstrap"
       `Quick
       invalid_snapshot_baseline_fails_bootstrap
+  ; Alcotest.test_case
+      "E2EE password retry after failed unlock"
+      `Quick
+      e2ee_password_retry_recovers_after_failed_unlock
   ; Alcotest.test_case
       "encrypted recovery unlocks graph key before bootstrap"
       `Quick

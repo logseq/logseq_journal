@@ -2190,10 +2190,28 @@ let consume_completion core (Completion (ticket, result)) =
             During_catalog
             message
         | Load_and_unlock_graph_key_kind -> fail core During_local_restore message
+        | Unlock_private_key_kind ->
+          (* A rejected password leaves the encrypted challenge available for
+             another attempt. No password or unlocked key is retained. *)
+          let failed = fail core During_e2ee message in
+          let startup =
+            { failed.next.public_state.snapshot.startup with
+              awaiting_e2ee_password = true
+            }
+          in
+          let next =
+            set_snapshot
+              { failed.next with
+                snapshot_scope = core.snapshot_scope
+              ; pending_encrypted_graph_key = core.pending_encrypted_graph_key
+              ; pending_private_key_package = core.pending_private_key_package
+              }
+              { failed.next.public_state.snapshot with startup }
+          in
+          { next; effects = [ publish next ] }
         | Fetch_e2ee_graph_key_kind
         | Fetch_e2ee_user_keys_kind
-        | Fetch_and_unlock_graph_key_kind
-        | Unlock_private_key_kind -> fail core During_e2ee message
+        | Fetch_and_unlock_graph_key_kind -> fail core During_e2ee message
         | Delete_account_secrets_kind ->
           cleanup_failed core "account secret cleanup failed"
         | Fetch_snapshot_baseline_kind
@@ -2542,9 +2560,20 @@ let step core event =
        with
        | Some graph, Some private_key_package, true ->
          let startup =
-           { core.public_state.snapshot.startup with awaiting_e2ee_password = false }
+           { core.public_state.snapshot.startup with
+             awaiting_e2ee_password = false
+           ; failure = None
+           }
          in
-         let core = set_snapshot core { core.public_state.snapshot with startup } in
+         let core =
+           set_snapshot
+             core
+             { core.public_state.snapshot with
+               startup
+             ; sync_phase = Offline
+             ; last_error = None
+             }
+         in
          let scope = graph.account in
          let next, request =
            issue_request
