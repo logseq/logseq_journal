@@ -102,7 +102,8 @@ try:
           if masked: payload=bytes(c^mask[i%4] for i,c in enumerate(payload))
           opcode=pending[0]&15
           frames.append({'opcode':opcode,'mask':mask.hex(),'payload':payload.hex()})
-          with open(root+'/frame-count','w') as f: f.write(str(len(frames)))
+          with open(root+'/frame-count.tmp','w') as f: f.write(str(len(frames)))
+          os.replace(root+'/frame-count.tmp', root+'/frame-count')
           pending=pending[offset+4*masked+length:]
           if opcode==8 and case.get('reply_close',True):
             time.sleep(case.get('close_delay',0))
