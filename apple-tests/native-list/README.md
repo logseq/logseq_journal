@@ -64,3 +64,36 @@ Semantic dates, empty Today, midnight presentation, hidden-day restoration,
 Capture projection and slot mapping are covered once at the public OCaml view
 boundary. Native layout is not owned by the pure timeline reducer. Only control
 cluster size is measured in the application chrome; no row/date frame tracking remains.
+
+
+## Timeline top scroll-edge regression
+
+`JournalTopEdgeEffectAcceptance.swift` drives the isolated full Application
+(`org.logseq.journal.pr47-application-fixture`, `timeline-images.json`, memory
+keys) with public XCTest taps and drags. Use an iPhone 13 / iOS 26.1 fixture for
+the fixed coordinates. It covers repeated native Back at the top, scrolled text,
+images under the date/account glass, edge-back cancellation/completion, shared Favorites/Timeline chrome navigation, actual account-menu taps, and
+rotation back to portrait, and the current inline Capture composer above the actual software keyboard (TextField, trash and button.send identifiers).
+Native render/compositing is outside the public pure OCaml route reducer; the
+retained Timeline state and List identity remain correct in the reproduced case.
+This regression therefore belongs at the narrow native Application UI boundary.
+
+The XCTest navigation assertions alone cannot detect the short blur interruption:
+record the Simulator during `testTextBack`, then run
+`python3 apple-tests/native-list/check_top_edge_video.py --video <recording.mov> --trace <passive-frame-log.jsonl>`. The diagnostic host's Git-external frame log
+reads public collection identity, contentOffset and adjustedContentInset without
+injecting events or adding a view. The oracle checks the 646-point scrolled
+fixture, stable normal-area glyphs and the top glyphs that should stay blurred.
+It fails for the original automatic/explicit-soft controls; a hard-edge control
+passed, but changes the visual style. The validated soft candidate retains an
+empty transparent native navigation bar and uses the outer container safe area;
+its repeated native Back recording has zero sharp top frames. Inspect retained image and interactive-transition frames too;
+after-return screenshots alone do not establish absence of the transient.
+Keep hard only as a diagnostic control: it changes the cutoff/divider and is not
+an accepted replacement for the requested soft design.
+
+The final main-aligned acceptance uses main `efb97631d9f1814803abe814bd3305fc6d17b8ae`, its complete current OCaml object, freshly rebuilt LUI Swift `adbdf63`, and the real locked Amplify/AWS dependencies. The real App.swift host compiles/links separately; UI operations use the synthetic offline scene with the same production host/chrome. Production contains no fixture controls or frame probe.
+
+The Git-external runner also toggles an outer sign-in notice with exactly the production App.swift safeAreaInset shape. This verifies insertion/removal and native Back geometry; it does not claim to execute a real account authentication failure. That fixture-only method is not part of this repository test file.
+
+The current-main unmodified control reproduces 17 sharp top frames in 348 matching normal-content frames across two native Back operations; the coherent soft candidate has zero in 301. Final image/top/menu/rotation/preview and software-keyboard acceptance also pass. With the outer notice and no diagnostic overlay, the collection container reports isHittable=false before and after navigation while actual menu taps and a second Detail navigation from root text succeed. This container flag alone is not an acceptance criterion for those fixture controls.

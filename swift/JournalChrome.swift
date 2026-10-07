@@ -28,6 +28,7 @@ import SwiftUI
     let cluster: AnyView
     let progress: AnyView
     let properties: Properties
+    @Environment(\.journalContainerTopInset) private var containerTopInset
     @State private var controlsSize = CGSize.zero
 
     var body: some SwiftUI.View {
@@ -36,10 +37,14 @@ import SwiftUI
           .scrollContentBackground(.hidden)
           #if os(iOS)
           .scrollEdgeEffectHidden(true, for: .bottom)
+          .scrollEdgeEffectStyle(.soft, for: .top)
           #endif
           .environment(\.journalControlsSize, controlsSize)
           #if os(iOS)
-          .toolbar(.hidden, for: .navigationBar)
+          // Retaining the native bar host across Detail returns avoids the
+          // reproduced soft scroll-edge flash during the pop transition.
+          .toolbar(.visible, for: .navigationBar)
+          .toolbarBackground(.hidden, for: .navigationBar)
           #endif
           .overlay(alignment: .topTrailing) {
             if properties.title == nil {
@@ -63,6 +68,12 @@ import SwiftUI
             }
           }
       }
+      #if os(iOS)
+      // Use the outer container safe area, so the empty retained bar does not
+      // move the native List section headers or account controls down.
+      .safeAreaPadding(.top, containerTopInset)
+      .ignoresSafeArea(.container, edges: .top)
+      #endif
     }
 
     private var controls: some SwiftUI.View {
@@ -235,5 +246,16 @@ private extension EnvironmentValues {
   var journalControlsSize: CGSize {
     get { self[JournalChrome.ControlsSizeKey.self] }
     set { self[JournalChrome.ControlsSizeKey.self] = newValue }
+  }
+}
+
+private struct JournalContainerTopInsetKey: EnvironmentKey {
+  static let defaultValue: CGFloat = 0
+}
+
+extension EnvironmentValues {
+  var journalContainerTopInset: CGFloat {
+    get { self[JournalContainerTopInsetKey.self] }
+    set { self[JournalContainerTopInsetKey.self] = newValue }
   }
 }
