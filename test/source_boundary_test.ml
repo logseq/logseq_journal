@@ -1139,11 +1139,14 @@ let () =
     "logseq_journal.opam"
     ~package:"ocaml-signal"
     ~version:"0.1.0";
-  require_occurrences
-    root
-    "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#main"
-    1;
+  List.iter
+    (fun relative ->
+       require_occurrences
+         root
+         relative
+         "git+https://github.com/logseq/lui.git#adbdf63fe940157824f29262095bb194ebd21404"
+         1)
+    [ "logseq_journal.opam"; "logseq_journal.opam.locked" ];
   require_occurrences
     root
     "logseq_journal.opam"
