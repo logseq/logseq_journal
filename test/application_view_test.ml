@@ -3140,6 +3140,177 @@ let test_unlock_application () =
        ())
 ;;
 
+(* Root_navigation public reducer events do not own platform continuations,
+   Worker.send admission, or token-cache effects. A pure reducer cannot produce
+   Full here. Exercise the narrow production Application adapter with the real
+   graph Service, a real opaque challenge and a valid host envelope. The token
+   is invalid by design so token resolution occurs before any HTTP request. *)
+let test_application_token_control ~saturated ~failure () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module R = Logseq_db_worker_lui.Journal_worker_runtime in
+  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
+  let module SyncR = Logseq_sync_effect_runner.Effect_runner in
+  let support = Filename.temp_file "journal-token-control-" "" in
+  Sys.remove support;
+  Unix.mkdir support 0o700;
+  let rec remove path =
+    if Sys.is_directory path
+    then (
+      Array.iter (fun name -> remove (Filename.concat path name)) (Sys.readdir path);
+      Unix.rmdir path)
+    else Sys.remove path
+  in
+  let wait label f =
+    let deadline = Unix.gettimeofday () +. 2. in
+    while (not (f ())) && Unix.gettimeofday () < deadline do
+      Unix.sleepf 0.002
+    done;
+    Alcotest.(check bool) label true (f ())
+  in
+  let crypto =
+    SyncR.crypto
+      ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_ -> Error "disabled")
+      ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_ -> Error "disabled")
+    |> Result.get_ok
+  in
+  let secrets =
+    SyncR.secrets
+      ~unlock_private_key:
+        (fun
+          ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_ ->
+        Error "disabled")
+      ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_ ->
+        Error "disabled")
+      ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ->
+        Error (SyncR.Wrapped_graph_key_unavailable "disabled"))
+      ~verify_and_save_wrapped_graph_key:
+        (fun
+          ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_ ->
+        Error "disabled")
+      ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_ -> Ok ())
+    |> Result.get_ok
+  in
+  let overlay =
+    Logseq_overlay_db.Database.dependencies
+      ~epoch_ms:(fun () -> 1700000000000L)
+      ~monotonic_ns:Mtime_clock.elapsed_ns
+      ~limits:
+        Logseq_overlay_db.Types.
+          { response_budget_bytes = Logseq_db_worker.Protocol.maximum_response_bytes
+          ; outbox_max_records = 4096
+          ; outbox_max_bytes = 8388608
+          ; change_max_items = Logseq_db_worker.Protocol.maximum_changed_uuids
+          ; change_max_bytes = Logseq_db_worker.Protocol.maximum_push_bytes
+          ; dispatcher_capacity = 256
+          ; wire_batch_max_bytes = Logseq_db_worker.Protocol.maximum_response_bytes
+          }
+    |> Result.get_ok
+  in
+  let deps =
+    S.dependencies
+      ~overlay
+      ~secrets
+      ~crypto
+      ~tls_authenticator:(SyncR.system_tls_authenticator () |> Result.get_ok)
+  in
+  let config =
+    Logseq_db_worker.Config.create
+      ~application_support_directory:support
+      ~target:(Managed_sync { base_url = "https://invalid.example" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+    |> Result.get_ok
+  in
+  let client_ref = ref None in
+  let hooks =
+    Application.For_testing.app_with_service
+      ~on_client:(fun c -> client_ref := Some c)
+      (S.create ~dependencies:deps)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      ignore (hooks.dispose ());
+      Option.iter R.stop !client_ref;
+      remove support)
+    (fun () ->
+       let patch =
+         hooks.init 1 2 (Journal_startup.encode config |> Result.get_ok |> Bytes.to_string)
+       in
+       Alcotest.(check bool)
+         "real app has a root"
+         true
+         (patch <> "" && hooks.root_node () <> 0);
+       let client = Option.get !client_ref in
+       let challenge = ref None
+       and token_error = ref None in
+       W.on_event client (function
+         | W.Push { payload = S.Need_id_token value; _ } -> challenge := Some value
+         | W.Push { payload = S.Client_state_changed state; _ } ->
+           token_error := state.snapshot.last_error
+         | _ -> ());
+       let send request =
+         match W.send client request with
+         | W.Accepted _ -> ()
+         | _ -> Alcotest.fail "request not accepted"
+       in
+       send
+         (S.Client_command (Restore_local_account { user_id = "synthetic-probe-user" }));
+       send
+         (S.Client_command
+            (Reconcile_authenticated_user { user_id = Some "synthetic-probe-user" }));
+       wait "real token challenge" (fun () ->
+         ignore (hooks.pump ());
+         Option.is_some !challenge);
+       let request = Option.get !challenge in
+       let packet = Journal_platform.id_token_request request |> Bytes.to_string in
+       if saturated
+       then (
+         for _ = 1 to 32 do
+           send S.Get_graph_state
+         done;
+         wait "32 undrained data responses" (fun () ->
+           W.For_testing.pending_output_count client = 32);
+         Alcotest.(check bool)
+           "ordinary lane is Full"
+           true
+           (W.send client S.Get_graph_state = W.Full));
+       if failure
+       then hooks.platform_failure packet
+       else (
+         let json =
+           Yojson.Safe.to_string
+             (`Assoc
+                 [ "challengeId", `String (S.token_request_id request)
+                 ; "token", `String "synthetic-invalid-token"
+                 ])
+         in
+         let response = Bytes.make (32 + String.length json) '\000' in
+         Bytes.blit_string "LJP2" 0 response 0 4;
+         Bytes.set_uint16_le response 4 2;
+         Bytes.set_uint16_le response 6 9;
+         Bytes.set_int32_le response 24 (Int32.of_int (String.length json));
+         Bytes.blit_string json 0 response 32 (String.length json);
+         Alcotest.(check bool)
+           "valid host envelope"
+           true
+           (Journal_platform.decode_id_token_response
+              ~challenge_id:(S.token_request_id request)
+              response
+            = Ok "synthetic-invalid-token");
+         hooks.platform_response (Bytes.to_string response));
+       wait "token answer reaches cache without an explicit resend" (fun () ->
+         ignore (hooks.pump ());
+         Option.is_some !token_error);
+       Alcotest.(check (option string))
+         "real token wait resolved"
+         (Some
+            (if failure
+             then "ID token is unavailable."
+             else "ID token response is invalid."))
+         !token_error)
+;;
+
 let () =
   if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
   then (
@@ -3147,7 +3318,25 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "E2EE input"
+    [ ( "token control transport"
+      , [ Alcotest.test_case
+            "full data lane host response"
+            `Quick
+            (test_application_token_control ~saturated:true ~failure:false)
+        ; Alcotest.test_case
+            "full data lane host failure"
+            `Quick
+            (test_application_token_control ~saturated:true ~failure:true)
+        ; Alcotest.test_case
+            "normal host response"
+            `Quick
+            (test_application_token_control ~saturated:false ~failure:false)
+        ; Alcotest.test_case
+            "normal host failure"
+            `Quick
+            (test_application_token_control ~saturated:false ~failure:true)
+        ] )
+    ; ( "E2EE input"
       , [ Alcotest.test_case "Application admission and recovery" `Quick test_unlock_application ] )
     ; ( "native navigation"
       , [ Alcotest.test_case

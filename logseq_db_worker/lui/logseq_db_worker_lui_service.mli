@@ -221,3 +221,12 @@ val create
 
 val service
   : (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t
+
+(** Complete the current token challenge through bounded control storage.
+    Stale/duplicate replies cannot replace the current flight. Authentication
+    changes revoke old tickets before their ordered DB work is admitted. *)
+val answer_token
+  :  (request, response, push) Journal_worker.client
+  -> token_request
+  -> (string, string) result
+  -> Journal_worker.control_send_result

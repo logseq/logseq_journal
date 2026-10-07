@@ -5,6 +5,26 @@ type net = [ `Generic ] Eio.Net.ty Eio.Resource.t
 type data_dir = Eio.Fs.dir_ty Eio.Path.t
 type environment = Journal_worker_eio_backend.environment
 
+(** A client-bound capability for one reply. New tickets retire older replies
+    on the same topic. Tickets cannot be forged or transferred to another client. *)
+type control_ticket
+
+type control_admission =
+  | Reply of control_ticket
+  | Latest of
+      { topic : int
+      ; key : string
+      ; invalidates : int option
+      }
+
+type control_send_result =
+  | Control_accepted
+  | Control_duplicate
+  | Control_stale
+  | Control_not_ready
+  | Control_stopping
+  | Control_unsupported
+
 module Session_context : sig
   type 'push t
 
@@ -15,6 +35,12 @@ module Session_context : sig
   val data_dir : 'push t -> data_dir option
   val emit : 'push t -> topic:Journal_worker_ids.Worker.push_topic -> 'push -> unit
   val fork_daemon : 'push t -> name:string -> (unit -> unit) -> unit
+
+  (** Register one current reply capability in a configured fixed topic.
+      Supersedes its previous ticket and pending reply: the service must cancel
+      the previous obligation before issuing a replacement. Returns [None]
+      during stop or while an invalidating latest update is pending. *)
+  val issue_control : 'push t -> topic:int -> control_ticket option
 end
 
 module Request_context : sig
@@ -75,6 +101,9 @@ module Service : sig
     -> concurrency:concurrency
     -> ?merge_push:(topic:Journal_worker_ids.Worker.push_topic -> 'push -> 'push -> 'push)
     -> ?data_directory:('config -> (string, string) result)
+    -> ?control_topic_count:int
+    -> ?classify_control:('request -> control_admission option)
+    -> ?handle_control:('state -> 'request -> unit)
     -> init:('push Session_context.t -> 'config -> ('state, string) result)
     -> handle:
          ('push Request_context.t -> 'state -> 'request -> ('response, string) result)
@@ -83,8 +112,27 @@ module Service : sig
     -> ('config, 'request, 'response, 'push) t
 end
 
-(** Non-blocking domain-0 request enqueue. *)
+(** Non-blocking domain-0 data enqueue. For a classified [Latest] update, its
+    short control state is mirrored before data admission, including on [Full].
+    Its data handler waits for that control version (or a newer coalesced version)
+    after taking its ordinary handler permit and before invoking the data handler.
+    Other data work keeps existing
+    FIFO/backpressure and response semantics. *)
 val send : ('request, 'response, 'push) client -> 'request -> send_result
+
+(** Non-blocking domain-0 control submission. Fixed topics (at most 64) retain
+    one pending payload each. A topic has one role; a latest topic keeps a fixed
+    invalidation target throughout the session. Replies accept only the current client ticket and
+    first answer; latest updates coalesce identical complete state keys and
+    revoke unclaimed replies immediately when the key changes. Every invalidating
+    topic must finish its current version before a new reply ticket can be issued.
+    Execution claims are atomic under the short control lock; already claimed
+    callbacks may finish and always run outside that lock.
+    Accepted means stored, not executed. No data response is produced.
+    The service handler runs on the Worker coordinator without the data handler
+    semaphore. It must be short and perform no network/DB waits. Control work
+    yields and gives data admission a turn after a bounded batch. *)
+val send_control : ('request, 'response, 'push) client -> 'request -> control_send_result
 
 (** Requests cooperative cancellation without entering the bounded request
     lane. *)
@@ -143,8 +191,11 @@ module Private : sig
     -> 'config
     -> ('request, 'response, 'push) client * packed_startup
 
+  (** Optional scheduler observation after extracting control work and before
+      its execution claim. Runs without the control mutex; production omits it. *)
   val run_session
-    :  packed_startup
+    :  ?on_control_taken:(unit -> unit)
+    -> packed_startup
     -> environment:Journal_worker_eio_backend.environment
     -> session_switch:Eio.Switch.t
     -> on_startup:((unit, string) result -> unit)
@@ -184,6 +235,7 @@ module For_testing : sig
   val await_output : ('request, 'response, 'push) client -> unit
   val pending_output_count : ('request, 'response, 'push) client -> int
   val is_stopping : ('request, 'response, 'push) client -> bool
+  val pending_control_count : ('request, 'response, 'push) client -> int
 
   val inject_push
     :  ('request, 'response, 'push) client

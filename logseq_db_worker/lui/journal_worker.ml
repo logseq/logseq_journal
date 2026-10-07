@@ -61,6 +61,27 @@ let status_of_code = function
   | _ -> failwith "Worker client status invariant failed"
 ;;
 
+type control_ticket =
+  { topic : int
+  ; identity : unit ref
+  }
+
+type control_admission =
+  | Reply of control_ticket
+  | Latest of
+      { topic : int
+      ; key : string
+      ; invalidates : int option
+      }
+
+type control_send_result =
+  | Control_accepted
+  | Control_duplicate
+  | Control_stale
+  | Control_not_ready
+  | Control_stopping
+  | Control_unsupported
+
 module Session_context = struct
   type 'push t =
     { switch : Eio.Switch.t
@@ -70,6 +91,7 @@ module Session_context = struct
     ; data_dir : data_dir option
     ; emit : topic:ID.Worker.push_topic -> 'push -> unit
     ; fork_daemon : name:string -> (unit -> unit) -> unit
+    ; issue_control : topic:int -> control_ticket option
     }
 
   let switch t = t.switch
@@ -79,6 +101,7 @@ module Session_context = struct
   let data_dir t = t.data_dir
   let emit t = t.emit
   let fork_daemon t = t.fork_daemon
+  let issue_control t = t.issue_control
 end
 
 module Request_context = struct
@@ -109,6 +132,9 @@ module Service = struct
   type ('config, 'request, 'response, 'push, 'state) direct_callbacks =
     { push_topic_count : int
     ; concurrency : concurrency
+    ; control_topic_count : int
+    ; classify_control : ('request -> control_admission option) option
+    ; handle_control : ('state -> 'request -> unit) option
     ; merge_push : topic:ID.Worker.push_topic -> 'push -> 'push -> 'push
     ; data_directory : ('config -> (string, string) result) option
     ; init : 'push Session_context.t -> 'config -> ('state, string) result
@@ -137,6 +163,9 @@ module Service = struct
         ~concurrency
         ?(merge_push = fun ~topic:_ _ next -> next)
         ?data_directory
+        ?(control_topic_count = 0)
+        ?classify_control
+        ?handle_control
         ~init
         ~handle
         ~shutdown
@@ -144,9 +173,20 @@ module Service = struct
     =
     validate_push_topic_count push_topic_count;
     validate_concurrency concurrency;
+    if control_topic_count < 0 || control_topic_count > 64
+    then invalid_arg "Worker control topic count must be between zero and 64";
+    if
+      control_topic_count
+      > 0
+      <> (Option.is_some classify_control && Option.is_some handle_control)
+      || Option.is_some classify_control <> Option.is_some handle_control
+    then invalid_arg "Worker control topics require classifier and short handler";
     Direct
       { push_topic_count
       ; concurrency
+      ; control_topic_count
+      ; classify_control
+      ; handle_control
       ; merge_push
       ; data_directory
       ; init
@@ -160,9 +200,30 @@ type 'request request_envelope =
   { request_id : ID.Worker.request_id
   ; payload : 'request
   ; enqueued_at_ns : int64
+  ; control_barrier : (int * int) option
   }
 
 type control_message = Cancel of ID.Worker.request_id
+
+type 'request control_payload =
+  | Ticket_reply of control_ticket * 'request
+  | Latest_update of
+      { payload : 'request
+      ; invalidates : int option
+      }
+
+type 'request control_slot =
+  { mutable ticket : control_ticket option
+  ; mutable answered : bool
+  ; mutable claimed : bool
+  ; mutable reply_topic : bool
+  ; mutable latest_key : string option
+  ; mutable version : int
+  ; mutable applied_version : int
+  ; mutable invalidation_target : int option option
+  ; mutable blocked_by : int64
+  ; mutable pending : 'request control_payload option
+  }
 
 exception Request_cancelled
 exception Request_shutdown
@@ -172,6 +233,11 @@ type ('request, 'response, 'push) client =
   ; worker_generation : ID.Worker.generation
   ; requests : 'request request_envelope Journal_bounded_mailbox.Fifo.t
   ; wake : Eio.Condition.t
+  ; control_mutex : Mutex.t
+  ; control_slots : 'request control_slot array
+  ; control_pending : bool Atomic.t
+  ; classify_control : ('request -> control_admission option) option
+  ; mutable next_control_topic : int
   ; responses : ('response, 'push) event Journal_bounded_mailbox.Reserved.t
   ; pushes : ('response, 'push) event Journal_bounded_mailbox.Coalesced.t
   ; injected : ('response, 'push) event Journal_bounded_mailbox.Fifo.t
@@ -269,16 +335,41 @@ let record_duration count maximum started =
 let duration_option value = if Int64.equal value no_duration then None else Some value
 
 let prepare ~runtime_epoch ~worker_generation service config =
-  let push_topic_count, configured_concurrency_limit =
+  let ( push_topic_count
+      , configured_concurrency_limit
+      , control_topic_count
+      , classify_control )
+    =
     match service with
-    | Service.Direct { push_topic_count; concurrency; _ } ->
-      push_topic_count, concurrency_limit concurrency
+    | Service.Direct
+        { push_topic_count; concurrency; control_topic_count; classify_control; _ } ->
+      ( push_topic_count
+      , concurrency_limit concurrency
+      , control_topic_count
+      , classify_control )
   in
   let client =
     { runtime_epoch
     ; worker_generation
     ; requests = Journal_bounded_mailbox.Fifo.create ~capacity:request_capacity
     ; wake = Eio.Condition.create ()
+    ; control_mutex = Mutex.create ()
+    ; control_slots =
+        Array.init control_topic_count (fun _ ->
+          { ticket = None
+          ; answered = false
+          ; claimed = false
+          ; reply_topic = false
+          ; latest_key = None
+          ; version = 0
+          ; applied_version = 0
+          ; invalidation_target = None
+          ; blocked_by = 0L
+          ; pending = None
+          })
+    ; control_pending = Atomic.make false
+    ; classify_control
+    ; next_control_topic = 0
     ; responses = Journal_bounded_mailbox.Reserved.create ~capacity:response_capacity
     ; pushes = Journal_bounded_mailbox.Coalesced.create ~capacity:push_topic_count
     ; injected = Journal_bounded_mailbox.Fifo.create ~capacity:injected_capacity
@@ -349,16 +440,227 @@ let next_request_id client =
   request_id
 ;;
 
+let with_control_lock client f =
+  Mutex.lock client.control_mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock client.control_mutex) f
+;;
+
+let control_slot client topic =
+  if topic < 0 || topic >= Array.length client.control_slots
+  then invalid_arg "Worker control topic is outside the configured bound";
+  client.control_slots.(topic)
+;;
+
+let clear_service_controls client =
+  with_control_lock client (fun () ->
+    Array.iter
+      (fun slot ->
+         slot.ticket <- None;
+         slot.pending <- None;
+         slot.latest_key <- None;
+         slot.blocked_by <- 0L;
+         slot.claimed <- false;
+         slot.answered <- false)
+      client.control_slots;
+    Atomic.set client.control_pending false)
+;;
+
+let issue_control_ticket client ~topic =
+  with_control_lock client (fun () ->
+    let slot = control_slot client topic in
+    if Option.is_some slot.invalidation_target
+    then invalid_arg "Latest state topics cannot issue reply tickets";
+    if
+      Atomic.get client.stop_requested
+      || slot.blocked_by <> 0L
+      ||
+      match status_of_code (Atomic.get client.status) with
+      | Starting_status | Ready_status -> false
+      | _ -> true
+    then None
+    else (
+      let ticket = { topic; identity = ref () } in
+      slot.reply_topic <- true;
+      slot.ticket <- Some ticket;
+      slot.pending <- None;
+      slot.answered <- false;
+      slot.claimed <- false;
+      slot.version <- slot.version + 1;
+      Some ticket))
+;;
+
+let stage_control client admission payload =
+  let result =
+    with_control_lock client (fun () ->
+      match status_of_code (Atomic.get client.status) with
+      | Starting_status -> Control_not_ready
+      | Stopping_status | Stopped_status | Terminal_status -> Control_stopping
+      | Ready_status when Atomic.get client.stop_requested -> Control_stopping
+      | Ready_status ->
+        (match admission with
+         | Reply ticket ->
+           if ticket.topic < 0 || ticket.topic >= Array.length client.control_slots
+           then Control_stale
+           else (
+             let slot = control_slot client ticket.topic in
+             match slot.ticket with
+             | Some current
+               when current.identity == ticket.identity && slot.blocked_by = 0L ->
+               if slot.answered
+               then Control_duplicate
+               else (
+                 slot.answered <- true;
+                 slot.pending <- Some (Ticket_reply (ticket, payload));
+                 Atomic.set client.control_pending true;
+                 Control_accepted)
+             | _ -> Control_stale)
+         | Latest { topic; key; invalidates } ->
+           let slot = control_slot client topic in
+           if slot.reply_topic
+           then invalid_arg "Reply topics cannot receive latest state updates";
+           (match slot.invalidation_target with
+            | Some target when target <> invalidates ->
+              invalid_arg "A latest control topic must keep its invalidation target"
+            | None -> slot.invalidation_target <- Some invalidates
+            | Some _ -> ());
+           if slot.latest_key = Some key
+           then Control_duplicate
+           else (
+             Option.iter
+               (fun target ->
+                  if target = topic
+                  then invalid_arg "A control topic cannot invalidate itself";
+                  let other = control_slot client target in
+                  other.ticket <- None;
+                  other.pending <- None;
+                  other.answered <- false;
+                  other.claimed <- false;
+                  other.blocked_by
+                  <- Int64.logor other.blocked_by (Int64.shift_left 1L topic);
+                  other.version <- other.version + 1)
+               invalidates;
+             slot.latest_key <- Some key;
+             slot.version <- slot.version + 1;
+             slot.pending <- Some (Latest_update { payload; invalidates });
+             Atomic.set client.control_pending true;
+             Control_accepted)))
+  in
+  if result = Control_accepted then Eio.Condition.broadcast client.wake;
+  result
+;;
+
+let send_control client payload =
+  match client.classify_control with
+  | None -> Control_unsupported
+  | Some classify ->
+    (match classify payload with
+     | None -> Control_unsupported
+     | Some admission -> stage_control client admission payload)
+;;
+
+let take_service_control client =
+  (* The hint may be conservatively true after ticket revocation, but never
+     false while a pending payload exists. Slot mutations and hint resets share
+     the mutex; staging sets the hint before broadcasting the coordinator wake. *)
+  if not (Atomic.get client.control_pending)
+  then None
+  else
+    with_control_lock client (fun () ->
+      let count = Array.length client.control_slots in
+      let rec scan offset =
+        if offset = count
+        then None
+        else (
+          let topic = (client.next_control_topic + offset) mod count in
+          let slot = client.control_slots.(topic) in
+          match slot.pending with
+          | None -> scan (offset + 1)
+          | Some payload ->
+            slot.pending <- None;
+            client.next_control_topic <- (topic + 1) mod count;
+            Some (topic, slot.version, payload))
+      in
+      let result = scan 0 in
+      Atomic.set
+        client.control_pending
+        (Array.exists (fun slot -> Option.is_some slot.pending) client.control_slots);
+      result)
+;;
+
+(* Claim is the linearization point for control execution. Invalidation can
+   revoke extracted but unclaimed work; callbacks that already claimed execute
+   outside this mutex and may safely yield or reenter control admission. *)
+let claim_service_control client (topic, version, control) =
+  with_control_lock client (fun () ->
+    let slot = control_slot client topic in
+    if
+      Atomic.get client.stop_requested
+      || status_of_code (Atomic.get client.status) <> Ready_status
+      || slot.version <> version
+    then false
+    else (
+      match control with
+      | Latest_update _ -> true
+      | Ticket_reply (ticket, _) ->
+        (match slot.ticket with
+         | Some current
+           when current.identity == ticket.identity
+                && slot.blocked_by = 0L
+                && not slot.claimed ->
+           slot.claimed <- true;
+           true
+         | _ -> false)))
+;;
+
+let finish_service_control client topic version = function
+  | Ticket_reply _ -> ()
+  | Latest_update { invalidates; _ } ->
+    with_control_lock client (fun () ->
+      let slot = control_slot client topic in
+      slot.applied_version <- max slot.applied_version version;
+      if slot.version = version
+      then
+        Option.iter
+          (fun target ->
+             let other = control_slot client target in
+             other.blocked_by
+             <- Int64.logand other.blocked_by (Int64.lognot (Int64.shift_left 1L topic)))
+          invalidates)
+;;
+
+let pending_control_count client =
+  with_control_lock client (fun () ->
+    Array.fold_left
+      (fun count slot -> if Option.is_some slot.pending then count + 1 else count)
+      0
+      client.control_slots)
+;;
+
 let send client payload =
   match status_of_code (Atomic.get client.status) with
   | Starting_status -> Not_ready
   | Stopping_status | Stopped_status | Terminal_status -> Stopping
   | Ready_status ->
+    (* Latest control state is mirrored independently of admission of its data
+       work. Replies use [send_control] and never reserve a data response. *)
+    let control_barrier =
+      match client.classify_control with
+      | Some classify ->
+        (match classify payload with
+         | Some (Latest { topic; _ } as admission) ->
+           ignore (stage_control client admission payload);
+           with_control_lock client (fun () ->
+             Some (topic, (control_slot client topic).version))
+         | Some (Reply _) | None -> None)
+      | None -> None
+    in
     if not (Journal_bounded_mailbox.Reserved.reserve client.responses)
     then Full
     else (
       let request_id = next_request_id client in
-      let request = { request_id; payload; enqueued_at_ns = now_ns () } in
+      let request =
+        { request_id; payload; enqueued_at_ns = now_ns (); control_barrier }
+      in
       match Journal_bounded_mailbox.Fifo.try_push client.requests request with
       | `Ok ->
         Hashtbl.add client.pending_requests request_id ();
@@ -523,6 +825,7 @@ let set_terminal_event client error =
 
 let mark_stopped client status =
   Atomic.set client.status (status_code status);
+  clear_service_controls client;
   Mutex.lock client.stopped_mutex;
   client.stopped <- true;
   Condition.broadcast client.stopped_condition;
@@ -539,6 +842,7 @@ let request_stop client =
      Atomic.set client.status (status_code Stopping_status)
    | Stopping_status | Stopped_status | Terminal_status -> ());
   Atomic.set client.stop_requested true;
+  clear_service_controls client;
   Journal_bounded_mailbox.Fifo.close client.requests;
   Eio.Condition.broadcast client.wake
 ;;
@@ -622,6 +926,7 @@ let run_direct_session
       ~on_startup
       ~on_idle_wait
       ~on_yield
+      ~on_control_taken
   =
   let next_push_sequence = ref ID.Worker.Push_sequence.one in
   let emit_push ~topic payload =
@@ -757,6 +1062,7 @@ let run_direct_session
         ; data_dir = directory_capability
         ; emit = emit_push
         ; fork_daemon = start_daemon
+        ; issue_control = issue_control_ticket client
         }
     in
     let init_result, resolve_init = Eio.Promise.create () in
@@ -847,6 +1153,14 @@ let run_direct_session
                handler_started := Some (now_ns ());
                let active_handlers = Atomic.fetch_and_add client.active_handlers 1 + 1 in
                update_peak client.peak_active_handlers active_handlers;
+               Option.iter
+                 (fun (topic, version) ->
+                    Eio.Condition.loop_no_mutex client.wake (fun () ->
+                      with_control_lock client (fun () ->
+                        if (control_slot client topic).applied_version >= version
+                        then Some ()
+                        else None)))
+                 request.control_barrier;
                Eio.Fiber.check ();
                let context =
                  Request_context.
@@ -963,55 +1277,81 @@ let run_direct_session
            mark_stopped client Terminal_status;
            Session_callback_failed error
        in
-       let rec coordinate consecutive_requests =
+       let run_service_control ((topic, version, control) as work) =
+         if claim_service_control client work
+         then (
+           let payload =
+             match control with
+             | Ticket_reply (_, payload) | Latest_update { payload; _ } -> payload
+           in
+           try
+             (Option.get callbacks.handle_control) state payload;
+             finish_service_control client topic version control;
+             Eio.Condition.broadcast client.wake
+           with
+           | exception_ ->
+             if Option.is_none !fatal_error
+             then fatal_error := Some (exception_message exception_))
+       in
+       let take_action () =
+         match take_cancel_control client with
+         | Some (Cancel request_id) -> Some (`Cancel request_id)
+         | None ->
+           (match take_service_control client with
+            | Some control -> Some (`Control control)
+            | None ->
+              Option.map
+                (fun request -> `Request request)
+                (Journal_bounded_mailbox.Fifo.pop client.requests))
+       in
+       let rec coordinate consecutive_controls consecutive_actions =
          match !fatal_error with
          | Some error -> stop_session (Some error)
          | None when Atomic.get client.stop_requested -> stop_session None
-         | None ->
-           (match take_cancel_control client with
-            | Some (Cancel request_id) ->
-              fail_request_switch client request_id;
-              coordinate consecutive_requests
-            | None when consecutive_requests >= 8 ->
+         | None when consecutive_actions >= 8 ->
+           on_yield ();
+           Eio.Fiber.yield ();
+           coordinate consecutive_controls 0
+         | None when consecutive_controls >= 4 ->
+           (match Journal_bounded_mailbox.Fifo.pop client.requests with
+            | Some request ->
+              dispatch request;
               on_yield ();
               Eio.Fiber.yield ();
-              coordinate 0
+              coordinate 0 0
             | None ->
-              (match Journal_bounded_mailbox.Fifo.pop client.requests with
-               | Some request ->
-                 dispatch request;
-                 coordinate (consecutive_requests + 1)
-               | None ->
-                 on_idle_wait ();
-                 let next =
-                   Eio.Condition.loop_no_mutex client.wake (fun () ->
-                     match !fatal_error with
-                     | Some _ -> Some `Fatal
-                     | None ->
-                       if Atomic.get client.stop_requested
-                       then Some (`Action `Stop)
-                       else (
-                         match take_cancel_control client with
-                         | Some control -> Some (`Action (`Control control))
-                         | None ->
-                           (match Journal_bounded_mailbox.Fifo.pop client.requests with
-                            | Some request -> Some (`Action (`Request request))
-                            | None -> None)))
-                 in
-                 (match next with
-                  | `Fatal -> coordinate 0
-                  | `Action `Stop -> coordinate 0
-                  | `Action (`Control (Cancel request_id)) ->
-                    fail_request_switch client request_id;
-                    coordinate 0
-                  | `Action (`Request request) ->
-                    dispatch request;
-                    coordinate 1)))
+              on_yield ();
+              Eio.Fiber.yield ();
+              coordinate 0 0)
+         | None ->
+           let action =
+             match take_action () with
+             | Some action -> Some action
+             | None ->
+               on_idle_wait ();
+               Eio.Condition.loop_no_mutex client.wake (fun () ->
+                 if Option.is_some !fatal_error || Atomic.get client.stop_requested
+                 then Some None
+                 else Option.map Option.some (take_action ()))
+           in
+           (match action with
+            | None -> coordinate 0 0
+            | Some (`Cancel request_id) ->
+              fail_request_switch client request_id;
+              coordinate (consecutive_controls + 1) (consecutive_actions + 1)
+            | Some (`Control control) ->
+              on_control_taken ();
+              run_service_control control;
+              coordinate (consecutive_controls + 1) (consecutive_actions + 1)
+            | Some (`Request request) ->
+              dispatch request;
+              coordinate 0 (consecutive_actions + 1))
        in
-       coordinate 0)
+       coordinate 0 0)
 ;;
 
 let run_session
+      ?(on_control_taken = fun () -> ())
       (Packed_startup { service; config; client })
       ~(environment : Journal_worker_eio_backend.environment)
       ~session_switch
@@ -1030,6 +1370,7 @@ let run_session
       ~on_startup
       ~on_idle_wait
       ~on_yield
+      ~on_control_taken
 ;;
 
 let take_terminal_locked client =
@@ -1189,5 +1530,6 @@ module For_testing = struct
   let await_output = await_output
   let pending_output_count = pending_output_count
   let is_stopping = is_stopping
+  let pending_control_count = pending_control_count
   let inject_push = inject_push
 end
