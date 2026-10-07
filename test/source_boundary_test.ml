@@ -1139,11 +1139,14 @@ let () =
     "logseq_journal.opam"
     ~package:"ocaml-signal"
     ~version:"0.1.0";
-  require_occurrences
-    root
-    "logseq_journal.opam"
-    "git+https://github.com/logseq/lui.git#main"
-    1;
+  (* Journal's host-code mapping uses the validated FlutterHost protocol;
+     keep both developer and CI manifests on that compatible revision. *)
+  let compatible_lui_revision =
+    "git+https://github.com/logseq/lui.git#adbdf63fe940157824f29262095bb194ebd21404"
+  in
+  List.iter
+    (fun relative -> require_occurrences root relative compatible_lui_revision 1)
+    [ "logseq_journal.opam"; "logseq_journal.opam.locked" ];
   require_occurrences
     root
     "logseq_journal.opam"
