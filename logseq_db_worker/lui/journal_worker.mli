@@ -124,7 +124,10 @@ val send : ('request, 'response, 'push) client -> 'request -> send_result
     one pending payload each. A topic has one role; a latest topic keeps a fixed
     invalidation target throughout the session. Replies accept only the current client ticket and
     first answer; latest updates coalesce identical complete state keys and
-    revoke the configured reply topic immediately when the key changes.
+    revoke unclaimed replies immediately when the key changes. Every invalidating
+    topic must finish its current version before a new reply ticket can be issued.
+    Execution claims are atomic under the short control lock; already claimed
+    callbacks may finish and always run outside that lock.
     Accepted means stored, not executed. No data response is produced.
     The service handler runs on the Worker coordinator without the data handler
     semaphore. It must be short and perform no network/DB waits. Control work
@@ -188,8 +191,11 @@ module Private : sig
     -> 'config
     -> ('request, 'response, 'push) client * packed_startup
 
+  (** Optional scheduler observation after extracting control work and before
+      its execution claim. Runs without the control mutex; production omits it. *)
   val run_session
-    :  packed_startup
+    :  ?on_control_taken:(unit -> unit)
+    -> packed_startup
     -> environment:Journal_worker_eio_backend.environment
     -> session_switch:Eio.Switch.t
     -> on_startup:((unit, string) result -> unit)

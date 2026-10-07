@@ -215,12 +215,13 @@ type 'request control_payload =
 type 'request control_slot =
   { mutable ticket : control_ticket option
   ; mutable answered : bool
+  ; mutable claimed : bool
   ; mutable reply_topic : bool
   ; mutable latest_key : string option
   ; mutable version : int
   ; mutable applied_version : int
   ; mutable invalidation_target : int option option
-  ; mutable blocked_by : int option
+  ; mutable blocked_by : int64
   ; mutable pending : 'request control_payload option
   }
 
@@ -357,12 +358,13 @@ let prepare ~runtime_epoch ~worker_generation service config =
         Array.init control_topic_count (fun _ ->
           { ticket = None
           ; answered = false
+          ; claimed = false
           ; reply_topic = false
           ; latest_key = None
           ; version = 0
           ; applied_version = 0
           ; invalidation_target = None
-          ; blocked_by = None
+          ; blocked_by = 0L
           ; pending = None
           })
     ; control_pending = Atomic.make false
@@ -456,7 +458,8 @@ let clear_service_controls client =
          slot.ticket <- None;
          slot.pending <- None;
          slot.latest_key <- None;
-         slot.blocked_by <- None;
+         slot.blocked_by <- 0L;
+         slot.claimed <- false;
          slot.answered <- false)
       client.control_slots;
     Atomic.set client.control_pending false)
@@ -469,7 +472,7 @@ let issue_control_ticket client ~topic =
     then invalid_arg "Latest state topics cannot issue reply tickets";
     if
       Atomic.get client.stop_requested
-      || Option.is_some slot.blocked_by
+      || slot.blocked_by <> 0L
       ||
       match status_of_code (Atomic.get client.status) with
       | Starting_status | Ready_status -> false
@@ -481,6 +484,7 @@ let issue_control_ticket client ~topic =
       slot.ticket <- Some ticket;
       slot.pending <- None;
       slot.answered <- false;
+      slot.claimed <- false;
       slot.version <- slot.version + 1;
       Some ticket))
 ;;
@@ -501,8 +505,7 @@ let stage_control client admission payload =
              let slot = control_slot client ticket.topic in
              match slot.ticket with
              | Some current
-               when current.identity == ticket.identity && Option.is_none slot.blocked_by
-               ->
+               when current.identity == ticket.identity && slot.blocked_by = 0L ->
                if slot.answered
                then Control_duplicate
                else (
@@ -531,7 +534,9 @@ let stage_control client admission payload =
                   other.ticket <- None;
                   other.pending <- None;
                   other.answered <- false;
-                  other.blocked_by <- Some topic;
+                  other.claimed <- false;
+                  other.blocked_by
+                  <- Int64.logor other.blocked_by (Int64.shift_left 1L topic);
                   other.version <- other.version + 1)
                invalidates;
              slot.latest_key <- Some key;
@@ -582,6 +587,31 @@ let take_service_control client =
       result)
 ;;
 
+(* Claim is the linearization point for control execution. Invalidation can
+   revoke extracted but unclaimed work; callbacks that already claimed execute
+   outside this mutex and may safely yield or reenter control admission. *)
+let claim_service_control client (topic, version, control) =
+  with_control_lock client (fun () ->
+    let slot = control_slot client topic in
+    if
+      Atomic.get client.stop_requested
+      || status_of_code (Atomic.get client.status) <> Ready_status
+      || slot.version <> version
+    then false
+    else (
+      match control with
+      | Latest_update _ -> true
+      | Ticket_reply (ticket, _) ->
+        (match slot.ticket with
+         | Some current
+           when current.identity == ticket.identity
+                && slot.blocked_by = 0L
+                && not slot.claimed ->
+           slot.claimed <- true;
+           true
+         | _ -> false)))
+;;
+
 let finish_service_control client topic version = function
   | Ticket_reply _ -> ()
   | Latest_update { invalidates; _ } ->
@@ -593,7 +623,8 @@ let finish_service_control client topic version = function
         Option.iter
           (fun target ->
              let other = control_slot client target in
-             if other.blocked_by = Some topic then other.blocked_by <- None)
+             other.blocked_by
+             <- Int64.logand other.blocked_by (Int64.lognot (Int64.shift_left 1L topic)))
           invalidates)
 ;;
 
@@ -895,6 +926,7 @@ let run_direct_session
       ~on_startup
       ~on_idle_wait
       ~on_yield
+      ~on_control_taken
   =
   let next_push_sequence = ref ID.Worker.Push_sequence.one in
   let emit_push ~topic payload =
@@ -1245,19 +1277,21 @@ let run_direct_session
            mark_stopped client Terminal_status;
            Session_callback_failed error
        in
-       let run_service_control (topic, version, control) =
-         let payload =
-           match control with
-           | Ticket_reply (_, payload) | Latest_update { payload; _ } -> payload
-         in
-         try
-           (Option.get callbacks.handle_control) state payload;
-           finish_service_control client topic version control;
-           Eio.Condition.broadcast client.wake
-         with
-         | exception_ ->
-           if Option.is_none !fatal_error
-           then fatal_error := Some (exception_message exception_)
+       let run_service_control ((topic, version, control) as work) =
+         if claim_service_control client work
+         then (
+           let payload =
+             match control with
+             | Ticket_reply (_, payload) | Latest_update { payload; _ } -> payload
+           in
+           try
+             (Option.get callbacks.handle_control) state payload;
+             finish_service_control client topic version control;
+             Eio.Condition.broadcast client.wake
+           with
+           | exception_ ->
+             if Option.is_none !fatal_error
+             then fatal_error := Some (exception_message exception_))
        in
        let take_action () =
          match take_cancel_control client with
@@ -1306,6 +1340,7 @@ let run_direct_session
               fail_request_switch client request_id;
               coordinate (consecutive_controls + 1) (consecutive_actions + 1)
             | Some (`Control control) ->
+              on_control_taken ();
               run_service_control control;
               coordinate (consecutive_controls + 1) (consecutive_actions + 1)
             | Some (`Request request) ->
@@ -1316,6 +1351,7 @@ let run_direct_session
 ;;
 
 let run_session
+      ?(on_control_taken = fun () -> ())
       (Packed_startup { service; config; client })
       ~(environment : Journal_worker_eio_backend.environment)
       ~session_switch
@@ -1334,6 +1370,7 @@ let run_session
       ~on_startup
       ~on_idle_wait
       ~on_yield
+      ~on_control_taken
 ;;
 
 let take_terminal_locked client =

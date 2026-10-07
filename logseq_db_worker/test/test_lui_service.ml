@@ -663,6 +663,194 @@ let test_control_barrier ~ending () =
            "barrier shutdown clears control state")
 ;;
 
+(* Worker owns dequeue/claim and invalidation scheduling; no pure reducer owns
+   these transitions. Use its declared Private host hook and Service interface. *)
+let with_review_host service ~on_control_taken run =
+  let client, startup =
+    Worker.Private.prepare
+      ~runtime_epoch:(ID.Runtime.Epoch.of_int64 2400L)
+      ~worker_generation:(ID.Worker.Generation.of_int64 1L)
+      service
+      ()
+  in
+  let ready = Atomic.make false
+  and start = Atomic.make false in
+  let worker =
+    Domain.spawn (fun () ->
+      Logseq_db_worker_lui.Journal_worker_eio_backend.run (fun environment ->
+        Eio.Switch.run (fun session_switch ->
+          Worker.Private.run_session
+            ~on_control_taken:(fun () -> on_control_taken client)
+            startup
+            ~environment
+            ~session_switch
+            ~on_startup:(fun result ->
+              T.require (Result.is_ok result) "review host ready";
+              Atomic.set ready true;
+              control_wait "release review startup" (fun () -> Atomic.get start))
+            ~on_idle_wait:(fun () -> ())
+            ~on_yield:(fun () -> ()))))
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Atomic.set start true;
+      Worker.Private.request_stop client;
+      ignore (Domain.join worker))
+    (fun () ->
+       control_wait "review startup observed" (fun () -> Atomic.get ready);
+       run client (fun () -> Atomic.set start true))
+;;
+
+let test_extracted_reply_revalidation ~change () =
+  let context = Atomic.make None
+  and ticket = Atomic.make None in
+  let paused = Atomic.make false
+  and resume = Atomic.make false
+  and replies = Atomic.make 0
+  and auths = Atomic.make 0 in
+  let service =
+    Worker.Service.create
+      ~push_topic_count:1
+      ~control_topic_count:2
+      ~concurrency:Worker.Service.Serial
+      ~classify_control:(function
+        | Reply (ticket, _) -> Some (Worker.Reply ticket)
+        | Latest value ->
+          Some
+            (Worker.Latest { topic = 1; key = string_of_int value; invalidates = Some 0 })
+        | _ -> None)
+      ~init:(fun ctx () ->
+        Atomic.set context (Some ctx);
+        Atomic.set ticket (Worker.Session_context.issue_control ctx ~topic:0);
+        Ok ())
+      ~handle:(fun _ () -> function
+         | Data value -> Ok value
+         | _ -> Error "unexpected data")
+      ~handle_control:(fun () -> function
+         | Reply _ -> Atomic.incr replies
+         | Latest _ -> Atomic.incr auths
+         | _ -> failwith "unexpected control")
+      ~shutdown:(fun () -> ())
+      ()
+  in
+  Fun.protect
+    ~finally:(fun () -> Atomic.set resume true)
+    (fun () ->
+       with_review_host
+         service
+         ~on_control_taken:(fun _ ->
+           if not (Atomic.get paused)
+           then (
+             Atomic.set paused true;
+             control_wait "release extracted reply" (fun () -> Atomic.get resume)))
+         (fun client start ->
+            T.require
+              (Worker.send_control client (Reply (Option.get (Atomic.get ticket), 1))
+               = Worker.Control_accepted)
+              "first reply accepted";
+            start ();
+            control_wait "reply extracted before claim" (fun () -> Atomic.get paused);
+            (match change with
+             | `Auth ->
+               T.require
+                 (Worker.send_control client (Latest 1) = Worker.Control_accepted)
+                 "authentication revokes extracted reply"
+             | `Stop -> Worker.Private.request_stop client
+             | `Replacement ->
+               T.require
+                 (Option.is_some
+                    (Worker.Session_context.issue_control
+                       (Option.get (Atomic.get context))
+                       ~topic:0))
+                 "new ticket replaces extracted reply");
+            Atomic.set resume true;
+            if change = `Auth
+            then control_wait "auth applied" (fun () -> Atomic.get auths = 1)
+            else if change = `Replacement
+            then ignore (Worker.send client (Data 1) |> accepted |> await_response client);
+            Worker.Private.request_stop client;
+            Worker.Private.await_stopped client;
+            T.require
+              (Atomic.get replies = 0)
+              "revoked extracted reply never invokes callback"))
+;;
+
+let test_all_invalidators_block_reply ?(second_topic = 2) ~newer () =
+  let context = Atomic.make None
+  and callbacks = Atomic.make 0
+  and premature = Atomic.make false
+  and fresh = Atomic.make false in
+  let client_ref = Atomic.make None in
+  let service =
+    Worker.Service.create
+      ~push_topic_count:1
+      ~control_topic_count:(second_topic + 1)
+      ~concurrency:Worker.Service.Serial
+      ~classify_control:(function
+        | Latest value ->
+          Some
+            (Worker.Latest
+               { topic = (if value = 2 then second_topic else 1)
+               ; key = string_of_int value
+               ; invalidates = Some 0
+               })
+        | _ -> None)
+      ~init:(fun ctx () ->
+        Atomic.set context (Some ctx);
+        ignore (Worker.Session_context.issue_control ctx ~topic:0);
+        Ok ())
+      ~handle:(fun _ () _ ->
+        Atomic.set
+          fresh
+          (Option.is_some
+             (Worker.Session_context.issue_control
+                (Option.get (Atomic.get context))
+                ~topic:0));
+        Ok 1)
+      ~handle_control:(fun () -> function
+         | Latest value ->
+           if value = 1 && newer
+           then
+             T.require
+               (Worker.send_control (Option.get (Atomic.get client_ref)) (Latest 11)
+                = Worker.Control_accepted)
+               "newer version stages during old callback";
+           if value = 2 || value = 11
+           then
+             if
+               Option.is_some
+                 (Worker.Session_context.issue_control
+                    (Option.get (Atomic.get context))
+                    ~topic:0)
+             then Atomic.set premature true;
+           Atomic.incr callbacks
+         | _ -> failwith "unexpected control")
+      ~shutdown:(fun () -> ())
+      ()
+  in
+  with_review_host
+    service
+    ~on_control_taken:(fun _ -> ())
+    (fun client start ->
+       Atomic.set client_ref (Some client);
+       T.require
+         (Worker.send_control client (Latest 2) = Worker.Control_accepted)
+         "second topic stages first";
+       T.require
+         (Worker.send_control client (Latest 1) = Worker.Control_accepted)
+         "first topic stages last";
+       start ();
+       control_wait "all invalidators applied" (fun () ->
+         Atomic.get callbacks = if newer then 3 else 2);
+       T.require
+         (not (Atomic.get premature))
+         "every pending invalidator blocks issuing a reply";
+       ignore (Worker.send client (Data 0) |> accepted |> await_response client);
+       T.require
+         (Atomic.get fresh)
+         "all invalidators finish and fresh ticket is available")
+;;
+
 (* Pause the actual Worker coordinator through its existing public private-host
    scheduler hook. No production callback is blocked or implementation copied. *)
 let test_real_auth_control ~transition () =
@@ -718,7 +906,9 @@ let test_real_auth_control ~transition () =
             |> accepted);
          let challenge = ref None
          and errors = ref []
-         and authenticated = ref true in
+         and authenticated = ref true
+         and account_generation = ref 0
+         and cancelled = ref [] in
          let drain () =
            List.iter
              (function
@@ -726,9 +916,12 @@ let test_real_auth_control ~transition () =
                  challenge := Some request
                | Worker.Push { payload = Service.Client_state_changed state; _ } ->
                  authenticated := state.snapshot.startup.authenticated;
+                 account_generation := state.snapshot.startup.account_generation;
                  Option.iter
                    (fun message -> errors := message :: !errors)
                    state.snapshot.last_error
+               | Worker.Response { request_id; outcome = Cancelled; _ } ->
+                 cancelled := request_id :: !cancelled
                | _ -> ())
              (Worker.For_testing.drain_events client ~max_events:64)
          in
@@ -736,10 +929,27 @@ let test_real_auth_control ~transition () =
            drain ();
            Option.is_some !challenge);
          let request = Option.get !challenge in
+         let initial_account_generation = !account_generation in
          Atomic.set pause true;
          ignore (Worker.send client Service.Get_graph_state |> accepted);
          control_wait "coordinator is paused before changes" (fun () -> Atomic.get paused);
+         let cancelled_auth = ref None in
          (match transition with
+          | `Late_restore ->
+            ignore
+              (Worker.send
+                 client
+                 (Service.Client_command (Restore_local_account { user_id = "auth-A" }))
+               |> accepted)
+          | `Cancelled_auth ->
+            let id =
+              Worker.send
+                client
+                (Service.Client_command (Reconcile_authenticated_user { user_id = None }))
+              |> accepted
+            in
+            cancelled_auth := Some id;
+            Worker.cancel client ~request_id:id
           | `Same ->
             ignore
               (Worker.send
@@ -781,6 +991,31 @@ let test_real_auth_control ~transition () =
             T.require
               (Service.answer_token client request (Error "late") = Worker.Control_stale)
               "signout revokes even a queued reply"
+          | `Full_signout | `Full_auth_after_signout ->
+            if transition = `Full_auth_after_signout
+            then
+              ignore
+                (Worker.send
+                   client
+                   (Service.Client_command
+                      (Reconcile_authenticated_user { user_id = None }))
+                 |> accepted);
+            let full = ref false
+            and admissions = ref 0 in
+            while (not !full) && !admissions < 32 do
+              match Worker.send client Service.Get_graph_state with
+              | Worker.Accepted _ -> incr admissions
+              | Worker.Full -> full := true
+              | _ -> T.fail "fixture stopped while filling ordinary reservations"
+            done;
+            T.require !full "ordinary response reservations are full";
+            let user_id = if transition = `Full_signout then None else Some "auth-A" in
+            T.require
+              (Worker.send
+                 client
+                 (Service.Client_command (Reconcile_authenticated_user { user_id }))
+               = Worker.Full)
+              "latest auth has no ordinary data admission"
           | `Worker_owned ->
             (* No Application continuation is needed: invalidation identifies the
             Worker-owned current capability without Application continuation state. *)
@@ -797,11 +1032,15 @@ let test_real_auth_control ~transition () =
            "real service has two bounded topics";
          Atomic.set pause false;
          (match transition with
+          | `Late_restore ->
+            control_wait "SDK auth is reasserted after late local restoration" (fun () ->
+              drain ();
+              !account_generation > initial_account_generation && !authenticated)
           | `Same ->
             control_wait "same-user answer reaches the real cache" (fun () ->
               drain ();
               List.mem "ID token response is invalid." !errors)
-          | `Aba ->
+          | `Aba | `Full_auth_after_signout ->
             control_wait
               "A-B-A creates a new flight instead of joining the revoked one"
               (fun () ->
@@ -810,10 +1049,16 @@ let test_real_auth_control ~transition () =
                  | Some fresh ->
                    Service.token_request_id fresh <> Service.token_request_id request
                  | None -> false)
-          | `Queued_reply | `Worker_owned ->
+          | `Queued_reply | `Worker_owned | `Full_signout | `Cancelled_auth ->
             control_wait "real account invalidation reaches Core" (fun () ->
               drain ();
               not !authenticated));
+         Option.iter
+           (fun id ->
+              control_wait "cancelled auth waiter retires" (fun () ->
+                drain ();
+                List.mem id !cancelled))
+           !cancelled_auth;
          if transition <> `Same
          then
            T.require
@@ -844,6 +1089,36 @@ let () =
     ; T.case
         "control barrier exception shuts down"
         (test_control_barrier ~ending:`Failure)
+    ; T.case
+        "late local restoration retains observed SDK auth"
+        (test_real_auth_control ~transition:`Late_restore)
+    ; T.case
+        "cancelled auth waiter preserves latest Core intent"
+        (test_real_auth_control ~transition:`Cancelled_auth)
+    ; T.case
+        "Full auth signout still reaches Core"
+        (test_real_auth_control ~transition:`Full_signout)
+    ; T.case
+        "Full latest auth supersedes queued signout"
+        (test_real_auth_control ~transition:`Full_auth_after_signout)
+    ; T.case
+        "auth revokes an extracted reply"
+        (test_extracted_reply_revalidation ~change:`Auth)
+    ; T.case
+        "stop revokes an extracted reply"
+        (test_extracted_reply_revalidation ~change:`Stop)
+    ; T.case
+        "replacement revokes an extracted reply"
+        (test_extracted_reply_revalidation ~change:`Replacement)
+    ; T.case
+        "all invalidators block reply"
+        (test_all_invalidators_block_reply ~newer:false)
+    ; T.case
+        "topic 63 invalidator blocks reply"
+        (test_all_invalidators_block_reply ~second_topic:63 ~newer:false)
+    ; T.case
+        "old invalidator completion retains new block"
+        (test_all_invalidators_block_reply ~newer:true)
     ; T.case "real auth A-B-A retires flight" (test_real_auth_control ~transition:`Aba)
     ; T.case "same auth retains flight" (test_real_auth_control ~transition:`Same)
     ; T.case

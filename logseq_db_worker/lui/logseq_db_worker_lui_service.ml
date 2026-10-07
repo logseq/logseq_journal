@@ -495,6 +495,11 @@ let create ~(dependencies : dependencies) =
       { worker : Db.t
       ; token_cache : Worker_runner.id_token_cache
       ; authenticated_user : string option ref
+      ; auth_seen : bool ref
+      ; queue_auth : string option -> unit
+      ; auth_sequence : int ref
+      ; auth_enqueued_sequence : int ref
+      ; auth_wake : Eio.Condition.t
       }
   end
   in
@@ -531,7 +536,9 @@ let create ~(dependencies : dependencies) =
          Worker_runner.reconcile_authenticated_user
            session.Session.token_cache
            ~user_id:None;
-         Worker_runner.reconcile_authenticated_user session.Session.token_cache ~user_id
+         Worker_runner.reconcile_authenticated_user session.Session.token_cache ~user_id;
+         session.Session.auth_seen := true;
+         session.Session.queue_auth user_id
        | _ -> invalid_arg "Only token replies and authentication state are short controls")
     ~init:(fun context config ->
       let sw = Journal_worker.Session_context.switch context in
@@ -652,7 +659,47 @@ let create ~(dependencies : dependencies) =
                | Error (Db.Invalid_create message) -> Error message
                | Ok worker ->
                  event_sink := Db.post worker;
-                 Ok Session.{ worker; token_cache; authenticated_user }))))
+                 let auth_seen = ref false in
+                 let auth_sequence = ref 0
+                 and auth_enqueued_sequence = ref 0 in
+                 let auth_pending = ref None
+                 and auth_wake = Eio.Condition.create () in
+                 let queue_auth user_id =
+                   incr auth_sequence;
+                   auth_pending := Some (!auth_sequence, user_id);
+                   Eio.Condition.broadcast auth_wake
+                 in
+                 (* One in-flight Core event and one coalesced pending state.
+                    Db.post may wait for Core capacity, so it belongs to this
+                    registered daemon, never the short token coordinator. *)
+                 Journal_worker.Session_context.fork_daemon
+                   context
+                   ~name:"authentication-state"
+                   (fun () ->
+                      let rec deliver () =
+                        let sequence, user_id =
+                          Eio.Condition.loop_no_mutex auth_wake (fun () -> !auth_pending)
+                        in
+                        auth_pending := None;
+                        Db.post
+                          worker
+                          (client_event (Reconcile_authenticated_user { user_id }));
+                        auth_enqueued_sequence := max !auth_enqueued_sequence sequence;
+                        Eio.Condition.broadcast auth_wake;
+                        deliver ()
+                      in
+                      deliver ());
+                 Ok
+                   Session.
+                     { worker
+                     ; token_cache
+                     ; authenticated_user
+                     ; auth_seen
+                     ; queue_auth
+                     ; auth_sequence
+                     ; auth_enqueued_sequence
+                     ; auth_wake
+                     }))))
     ~handle:(fun _context session request ->
       match request with
       | Import_asset { graph_generation; source } ->
@@ -697,10 +744,21 @@ let create ~(dependencies : dependencies) =
           request.request
           "host rejected request";
         Ok Client_command_completed
-      | Client_command (Reconcile_authenticated_user { user_id }) ->
-        (* The short token-cache transition already ran on the control lane.
-           Only the ordered database/Core event remains on the data lane. *)
-        Db.post session.worker (client_event (Reconcile_authenticated_user { user_id }));
+      | Client_command (Reconcile_authenticated_user _) ->
+        (* The reliable latest-state daemon owns Core delivery, including Full.
+           An old admitted request must not repost its superseded user value.
+           Completion means the current state has entered Core's event queue,
+           not that Core has applied or persisted it. *)
+        Eio.Condition.loop_no_mutex session.auth_wake (fun () ->
+          if !(session.auth_enqueued_sequence) >= !(session.auth_sequence)
+          then Some ()
+          else None);
+        Ok Client_command_completed
+      | Client_command (Restore_local_account { user_id }) ->
+        Db.post session.worker (client_event (Restore_local_account { user_id }));
+        (* Local restoration may arrive after the SDK authentication event.
+           Reassert the observed SDK state after restoration's ordered post. *)
+        if !(session.auth_seen) then session.queue_auth !(session.authenticated_user);
         Ok Client_command_completed
       | Client_command command ->
         Db.post session.worker (client_event command);
