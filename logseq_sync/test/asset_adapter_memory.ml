@@ -99,7 +99,7 @@ let () =
                      ~network:(Eio.Stdenv.net env)
                      ~clock:(Eio.Stdenv.clock env)
                      ~websocket_liveness:R.Disabled))
-             ~local_store:(get (R.local_store ~application_support_directory:support))
+             ~local_store:(get (R.local_store ~application_support_directory:support ()))
              ~artifact_store:
                (get
                   (R.artifact_store
@@ -126,6 +126,33 @@ let () =
       in
       let context = C.asset_context unlocked |> Option.get in
       let handle = context.key |> Option.get in
+      let owner = ref unlocked in
+      let protected operation action =
+        posted := [];
+        let requested =
+          C.step
+            !owner
+            (C.Protected_requested
+               { protected_operation = operation
+               ; protected_scope = context.scope
+               ; protected_action = action
+               })
+        in
+        List.iter
+          (function
+            | C.Run runnable -> R.submit runner runnable
+            | _ -> ())
+          requested.effects;
+        let completed = C.step requested.next (List.hd !posted) in
+        owner := completed.next;
+        List.find_map
+          (function
+            | C.Publish (C.Protected_finished output) -> Some output.protected_result
+            | _ -> None)
+          completed.effects
+        |> Option.get
+        |> get
+      in
       List.iter
         (fun size ->
            let value = String.init size (fun i -> Char.chr (i mod 128)) in
@@ -133,15 +160,21 @@ let () =
              Transit_native.Transit.Json.to_string (Transit_core.Json.String value)
            in
            let iv, ciphertext =
-             match get (R.encrypt_protected_values runner handle [ plaintext ]) with
-             | [ pair ] -> pair
+             match
+               protected
+                 ("encrypt-" ^ string_of_int size)
+                 (C.Encrypt_values (handle, [ plaintext ]))
+             with
+             | C.Encrypted_values [ pair ] -> pair
              | _ -> failwith "missing encrypted value"
            in
            let wire =
              Transit_native.Transit.Json.to_string
                (Transit_core.Json.Array [ Binary iv; Binary ciphertext ])
            in
-           if get (R.decrypt_protected_value runner handle wire) <> value
+           if
+             protected ("decrypt-" ^ string_of_int size) (C.Decrypt_value (handle, wire))
+             <> C.Decrypted_value value
            then failwith "production adapter roundtrip changed bytes")
         [ 0; 1; 256; 4097; 131057 ];
       let size = 8 * 1024 * 1024 in
@@ -152,19 +185,62 @@ let () =
         get (A.version ~checksum:(Codec.checksum plaintext) ~file_type:"bin")
       in
       Gc.full_major ();
+      let staged =
+        C.step
+          !owner
+          (C.Asset_requested
+             { scope = context.scope
+             ; operation = "stage"
+             ; action =
+                 C.Stage_asset_file
+                   { operation = graph_id; file_type = "bin"; source_file }
+             })
+      in
+      posted := [];
+      List.iter
+        (function
+          | C.Run runnable -> R.submit runner runnable
+          | _ -> ())
+        staged.effects;
+      let staged_done = C.step staged.next (List.hd !posted) in
+      let file =
+        List.find_map
+          (function
+            | C.Publish (C.Asset_finished { result = Ok (C.Asset_staged { file; _ }); _ })
+              -> Some file
+            | _ -> None)
+          staged_done.effects
+        |> Option.get
+      in
       let before = Gc.allocated_bytes () in
+      let upload =
+        C.step
+          staged_done.next
+          (C.Asset_requested
+             { scope = context.scope
+             ; operation = "upload"
+             ; action =
+                 C.Put_asset_file
+                   { asset = graph_id; version; file; maximum_plaintext_bytes = size }
+             })
+      in
+      posted := [];
+      List.iter
+        (function
+          | C.Run runnable -> R.submit runner runnable
+          | _ -> ())
+        upload.effects;
+      let finished = C.step upload.next (List.hd !posted) in
       let outcome =
-        R.upload_asset
-          runner
-          ~context
-          ~asset:graph_id
-          ~version
-          ~source_file
-          ~maximum_plaintext_bytes:size
-          ~current:(fun () -> true)
+        List.find_map
+          (function
+            | C.Publish (C.Asset_finished output) -> Some output.result
+            | _ -> None)
+          finished.effects
+        |> Option.get
       in
       let allocated = Gc.allocated_bytes () -. before in
-      if outcome <> Error R.Upload_authentication || !auth_calls <> 1
+      if outcome <> Error C.Asset_authentication || !auth_calls <> 1
       then failwith "production adapter did not encode the maximum-size asset";
       Printf.printf "Production upload OCaml allocation bytes: %.0f\n%!" allocated;
       if allocated > 128. *. 1024. *. 1024.

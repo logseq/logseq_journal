@@ -174,16 +174,14 @@ let with_peer cases f =
 
 let graph = { Core_contract.graph with name = "Transport fixture" }
 
-let bootstrap origin =
+let bootstrap ?(mirror_absent = true) ?(user_id = "fixture") origin =
   let initial =
     Core.config ~managed_sync_origin:origin ~limits:(Core_contract.limits ())
     |> Result.get_ok
     |> Core.initial
     |> Result.get_ok
   in
-  let auth =
-    Core.step initial (Core.Account_authenticated { user_id = Some "fixture" })
-  in
+  let auth = Core.step initial (Core.Account_authenticated { user_id = Some user_id }) in
   let catalog =
     List.find_map
       (function
@@ -205,11 +203,14 @@ let bootstrap origin =
       selected.effects
     |> Option.get
   in
-  Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)), scope
+  ( (if mirror_absent
+     then Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
+     else selected)
+  , scope )
 ;;
 
-let operation ~download origin =
-  let transition, scope = bootstrap origin in
+let operation ?artifact_uri ~download origin =
+  let transition, _scope = bootstrap origin in
   if not download
   then
     List.find_map
@@ -232,7 +233,11 @@ let operation ~download origin =
         transition.effects
       |> Option.get
     in
-    let artifact_uri = Uri.with_path origin "/artifact" |> Uri.to_string in
+    let artifact_uri =
+      Option.value
+        artifact_uri
+        ~default:(Uri.with_path origin "/artifact" |> Uri.to_string)
+    in
     let response =
       Yojson.Basic.to_string (`Assoc [ "ok", `Bool true; "url", `String artifact_uri ])
     in
@@ -250,11 +255,204 @@ let operation ~download origin =
     in
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
-          Some (Core.Request (ticket, Core.Download_snapshot { request with scope }))
+        | Core.Run (Core.Request (_, Core.Download_snapshot _) as runnable) ->
+          Some runnable
         | _ -> None)
       downloading.effects
     |> Option.get)
+;;
+
+let websocket_cores = ref []
+
+let websocket_start ?(checkpoint = 0) origin =
+  let selected, scope = bootstrap ~mirror_absent:false origin in
+  let inspected =
+    Core.step
+      selected.next
+      (Core.Mirror_inspected (Core.Mirror_available { graph; scope }))
+  in
+  let sync =
+    Logseq_overlay_db.Types.sync_view
+      ~token:
+        (Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:transport"
+         |> Result.get_ok)
+      ~checkpoint:
+        (Logseq_overlay_db.Types.Server_cursor.of_string
+           ("server-cursor:v1:" ^ string_of_int checkpoint)
+         |> Result.get_ok)
+      ~submissions:[]
+  in
+  let attached = Core.step inspected.next (Core.Graph_attached { scope; sync }) in
+  let runnable, connection =
+    List.find_map
+      (function
+        | Core.Run (Core.Start_websocket request as runnable) ->
+          Some (runnable, request.scope)
+        | _ -> None)
+      attached.effects
+    |> Option.get
+  in
+  websocket_cores := (connection, attached.next) :: !websocket_cores;
+  runnable
+;;
+
+let websocket_core (scope : Core.connection_scope) = List.assoc scope !websocket_cores
+
+let websocket_close (scope : Core.connection_scope) =
+  let opened = Core.step (websocket_core scope) (Core.Websocket_opened scope) in
+  Core.step
+    opened.next
+    (Core.Foreground_changed
+       { foreground = false
+       ; lifecycle_generation = scope.graph.account.lifecycle_generation
+       })
+  |> fun transition ->
+  List.find_map
+    (function
+      | Core.Run (Core.Close_websocket _ as runnable) -> Some runnable
+      | _ -> None)
+    transition.effects
+  |> Option.get
+;;
+
+let websocket_send (scope : Core.connection_scope) checkpoint =
+  let _ = websocket_start ~checkpoint scope.Core.graph.account.managed_sync_origin in
+  Core.step (websocket_core scope) (Core.Websocket_opened scope)
+  |> fun transition ->
+  List.find_map
+    (function
+      | Core.Run (Core.Send_websocket _ as runnable) -> Some runnable
+      | _ -> None)
+    transition.effects
+  |> Option.get
+;;
+
+let cancellation_effect scope =
+  let core =
+    Core.config
+      ~managed_sync_origin:(Uri.of_string "https://localhost")
+      ~limits:(Core_contract.limits ())
+    |> Result.get_ok
+    |> Core.initial
+    |> Result.get_ok
+  in
+  let core =
+    (Core.step core (Core.Account_authenticated { user_id = Some "fixture" })).next
+  in
+  let transition = Core.step core Core.Shutdown in
+  ignore scope;
+  List.find_map
+    (function
+      | Core.Run (Core.Cancel_effects _ as runnable) -> Some runnable
+      | _ -> None)
+    transition.effects
+  |> Option.get
+;;
+
+(* Keep the fixture's real reducer owner across sequential commands. Each accepted
+   completion consumes a ticket; starting from its old snapshot would replay it. *)
+let asset_fixture_owners = ref []
+
+let asset_owner t =
+  match List.find_opt (fun (runner, _) -> runner == t) !asset_fixture_owners with
+  | Some (_, scopes) -> scopes
+  | None ->
+    let scopes = Hashtbl.create 8 in
+    asset_fixture_owners := (t, scopes) :: !asset_fixture_owners;
+    scopes
+;;
+
+let asset_current_core t core scope =
+  if Core.admitted_graph_scope core <> Some scope
+  then core
+  else Option.value (Hashtbl.find_opt (asset_owner t) scope) ~default:core
+;;
+
+let asset_remember_core t scope core = Hashtbl.replace (asset_owner t) scope core
+
+let asset_submit t core scope operation action =
+  let core = asset_current_core t core scope in
+  let transition = Core.step core (Core.Asset_requested { scope; operation; action }) in
+  List.iter
+    (function
+      | Core.Run runnable -> Runner.submit t runnable
+      | _ -> ())
+    transition.effects;
+  asset_remember_core t scope transition.next;
+  transition.next
+;;
+
+let asset_collect t core posted =
+  let rec collect core outputs = function
+    | [] ->
+      Option.iter
+        (fun scope -> asset_remember_core t scope core)
+        (Core.admitted_graph_scope core);
+      core, List.rev outputs
+    | event :: events ->
+      let transition = Core.step core event in
+      let outputs =
+        List.fold_left
+          (fun outputs -> function
+             | Core.Publish (Core.Asset_finished result) -> result :: outputs
+             | Core.Run runnable ->
+               Runner.submit t runnable;
+               outputs
+             | _ -> outputs)
+          outputs
+          transition.effects
+      in
+      collect transition.next outputs events
+  in
+  collect core [] posted
+;;
+
+let asset_run t ~clock ~posted core scope operation action =
+  let core = asset_current_core t core scope in
+  posted := [];
+  let transition = Core.step core (Core.Asset_requested { scope; operation; action }) in
+  let immediate =
+    List.filter_map
+      (function
+        | Core.Publish (Core.Asset_finished output) -> Some output
+        | _ -> None)
+      transition.effects
+  in
+  List.iter
+    (function
+      | Core.Run runnable -> Runner.submit t runnable
+      | _ -> ())
+    transition.effects;
+  let outputs =
+    if immediate <> []
+    then (
+      asset_remember_core t scope transition.next;
+      immediate)
+    else (
+      wait clock (fun () -> !posted <> []);
+      let completed, outputs = asset_collect t transition.next !posted in
+      asset_remember_core t scope completed;
+      outputs)
+  in
+  match outputs with
+  | [ output ] -> output.Core.result
+  | _ -> Alcotest.fail "asset request did not publish exactly one typed outcome"
+;;
+
+let asset_stage t ~clock ~posted core scope source_file =
+  match
+    asset_run
+      t
+      ~clock
+      ~posted
+      core
+      scope
+      "stage"
+      (Core.Stage_asset_file
+         { operation = graph.graph_id; file_type = "bin"; source_file })
+  with
+  | Ok (Core.Asset_staged { file; _ }) -> file
+  | _ -> Alcotest.fail "source staging failed"
 ;;
 
 let runner
@@ -263,6 +461,10 @@ let runner
       ?secrets_dependency
       ?crypto_dependency
       ?(acquire = fun _ -> Ok "fixture-token")
+      ?(on_invalidate = fun _ -> ())
+      ?asset_cache_budget_bytes
+      ?asset_maximum_file_bytes
+      ?asset_pending_budget_bytes
       ~environment
       ~sw
       ~support
@@ -287,15 +489,22 @@ let runner
          |> Result.get_ok)
       ~transport
       ~local_store:
-        (Runner.local_store ~application_support_directory:support |> Result.get_ok)
+        (Runner.local_store
+           ?asset_cache_budget_bytes
+           ?asset_maximum_file_bytes
+           ?asset_pending_budget_bytes
+           ~application_support_directory:support
+           ()
+         |> Result.get_ok)
       ~artifact_store:
         (Runner.artifact_store ~staging_directory:(Filename.concat support "staging")
          |> Result.get_ok)
       ~secrets:(Option.value secrets_dependency ~default:(secrets ()))
       ~crypto:(Option.value crypto_dependency ~default:(crypto ()))
       ~id_token_provider:
-        (Runner.id_token_provider ~acquire ~invalidate:(fun _ ~token:_ ->
-           incr invalidations))
+        (Runner.id_token_provider ~acquire ~invalidate:(fun _ ~token ->
+           incr invalidations;
+           on_invalidate token))
     |> Result.get_ok
   in
   Runner.create ~sw dependencies ~post:(fun event -> posted := !posted @ [ event ])
@@ -427,10 +636,7 @@ let ws_test ?(extra = "") ?(segment = 16384) ~messages ~terminal wire () =
          let t = runner ~environment ~sw ~support ~posted ~invalidations () in
          let _, graph = bootstrap origin in
          let scope = Core.{ graph; connection_generation = 1 } in
-         Runner.submit
-           t
-           (Core.Start_websocket
-              { scope; uri = Uri.with_scheme (Uri.with_path origin "/ws") (Some "wss") });
+         Runner.submit t (websocket_start origin);
          let clock = Eio.Stdenv.clock environment in
          let message_count () =
            List.length
@@ -464,7 +670,7 @@ let ws_test ?(extra = "") ?(segment = 16384) ~messages ~terminal wire () =
          ordered false !posted;
          if not terminal
          then (
-           Runner.submit t (Core.Close_websocket scope);
+           Runner.submit t (websocket_close scope);
            wait clock closed);
          Alcotest.(check int)
            "one terminal notification"
@@ -610,7 +816,7 @@ let test_cancelled_attempt ~download () =
          Runner.submit t op;
          let clock = Eio.Stdenv.clock environment in
          wait clock (fun () -> Sys.file_exists (Filename.concat support "sent"));
-         Runner.submit t (Core.Cancel_effects (Core.runner_effect_scope op));
+         Runner.submit t (cancellation_effect (Core.runner_effect_scope op));
          Eio.Time.sleep clock 0.05;
          let event_count = List.length !posted in
          Eio.Time.sleep clock 0.05;
@@ -711,9 +917,7 @@ let test_ws_cancellation ~during_close () =
          let t = runner ~environment ~sw ~support ~posted ~invalidations () in
          let _, graph = bootstrap origin in
          let scope = Core.{ graph; connection_generation = 1 } in
-         Runner.submit
-           t
-           (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+         Runner.submit t (websocket_start origin);
          let clock = Eio.Stdenv.clock environment in
          wait clock (fun () ->
            List.exists
@@ -721,9 +925,9 @@ let test_ws_cancellation ~during_close () =
                | Core.Websocket_opened _ -> true
                | _ -> false)
              !posted);
-         if during_close then Runner.submit t (Core.Close_websocket scope);
+         if during_close then Runner.submit t (websocket_close scope);
          let start = Eio.Time.now clock in
-         Runner.submit t (Core.Cancel_effects (Core.effect_scope_of_graph graph));
+         Runner.submit t (cancellation_effect (Core.effect_scope_of_graph graph));
          Runner.shutdown t;
          Alcotest.(check bool)
            "abort dispatch does not await grace"
@@ -795,15 +999,11 @@ let test_artifact_credentials ~status () =
          and invalidations = ref 0 in
          let t = runner ~environment ~sw ~support ~posted ~invalidations () in
          let op =
-           match operation ~download:true (Uri.with_port origin (Some 1)) with
-           | Core.Request (ticket, Core.Download_snapshot request) ->
-             Core.Request
-               ( ticket
-               , Core.Download_snapshot
-                   { request with
-                     uri = Uri.with_path origin "/signed-artifact?signature=fixture"
-                   } )
-           | _ -> assert false
+           operation
+             ~download:true
+             ~artifact_uri:
+               (Uri.with_path origin "/signed-artifact?signature=fixture" |> Uri.to_string)
+             (Uri.with_port origin (Some 1))
          in
          Runner.submit t op;
          wait (Eio.Stdenv.clock environment) (fun () ->
@@ -868,9 +1068,7 @@ let test_liveness ~reply () =
       in
       let _, graph = bootstrap origin in
       let scope = Core.{ graph; connection_generation = 1 } in
-      Runner.submit
-        t
-        (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+      Runner.submit t (websocket_start origin);
       let clock = Eio.Stdenv.clock environment in
       wait clock (fun () ->
         List.exists
@@ -889,7 +1087,7 @@ let test_liveness ~reply () =
       Alcotest.(check bool) "correlated Pong determines liveness" (not reply) (closed ());
       if reply
       then (
-        Runner.submit t (Core.Close_websocket scope);
+        Runner.submit t (websocket_close scope);
         wait clock closed);
       Runner.shutdown t)
   in
@@ -928,9 +1126,7 @@ let test_control_output () =
       in
       let _, graph = bootstrap origin in
       let scope = Core.{ graph; connection_generation = 1 } in
-      Runner.submit
-        t
-        (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+      Runner.submit t (websocket_start origin);
       let clock = Eio.Stdenv.clock environment in
       wait clock (fun () ->
         List.exists
@@ -938,16 +1134,9 @@ let test_control_output () =
             | Core.Websocket_opened _ -> true
             | _ -> false)
           !posted);
-      Runner.submit
-        t
-        (Core.Send_websocket
-           { scope
-           ; message =
-               Logseq_sync_pure_reducer.Sync_protocol.Client.Hello
-                 { client = "mask-fixture" }
-           });
+      Runner.submit t (websocket_send scope 0);
       Eio.Time.sleep clock 0.15;
-      Runner.submit t (Core.Close_websocket scope);
+      Runner.submit t (websocket_close scope);
       wait clock (fun () ->
         List.exists
           (function
@@ -1029,9 +1218,7 @@ let test_output_admission () =
          let t = runner ~environment ~sw ~support ~posted ~invalidations () in
          let _, graph = bootstrap origin in
          let scope = Core.{ graph; connection_generation = 1 } in
-         Runner.submit
-           t
-           (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+         Runner.submit t (websocket_start origin);
          let clock = Eio.Stdenv.clock environment in
          wait clock (fun () ->
            List.exists
@@ -1040,28 +1227,14 @@ let test_output_admission () =
                | _ -> false)
              !posted);
          for index = 0 to 1999 do
-           Runner.submit
-             t
-             (Core.Send_websocket
-                { scope
-                ; message =
-                    Logseq_sync_pure_reducer.Sync_protocol.Client.Hello
-                      { client = string_of_int index }
-                })
+           Runner.submit t (websocket_send scope index)
          done;
          let count_path = Filename.concat support "frame-count" in
          wait clock (fun () ->
            Sys.file_exists count_path
            && Option.value (int_of_string_opt (read_file count_path)) ~default:0 >= 128);
-         Runner.submit
-           t
-           (Core.Send_websocket
-              { scope
-              ; message =
-                  Logseq_sync_pure_reducer.Sync_protocol.Client.Hello
-                    { client = "after-drain" }
-              });
-         Runner.submit t (Core.Close_websocket scope);
+         Runner.submit t (websocket_send scope 2000);
+         Runner.submit t (websocket_close scope);
          wait clock (fun () ->
            List.exists
              (function
@@ -1084,9 +1257,10 @@ let test_output_admission () =
     (List.length data);
   List.iteri
     (fun index frame ->
-       let client = if index = 128 then "after-drain" else string_of_int index in
+       let since = if index = 128 then 2000 else index in
        let expected =
-         Logseq_sync_pure_reducer.Sync_protocol.encode_client_message (Hello { client })
+         Logseq_sync_pure_reducer.Sync_protocol.encode_client_message
+           (Pull { since = Some since })
          |> Result.get_ok
          |> hex
        in
@@ -1113,18 +1287,11 @@ let test_setup_cancel ~websocket ~dns () =
     and invalidations = ref 0 in
     let t = runner ~environment ~sw ~support ~posted ~invalidations () in
     let op =
-      if websocket
-      then (
-        let _, graph = bootstrap origin in
-        Core.Start_websocket
-          { scope = { graph; connection_generation = 1 }
-          ; uri = Uri.with_scheme origin (Some "wss")
-          })
-      else operation ~download:false origin
+      if websocket then websocket_start origin else operation ~download:false origin
     in
     Runner.submit t op;
     Eio.Time.sleep (Eio.Stdenv.clock environment) 0.03;
-    Runner.submit t (Core.Cancel_effects (Core.runner_effect_scope op));
+    Runner.submit t (cancellation_effect (Core.runner_effect_scope op));
     Runner.shutdown t
   in
   let started = Unix.gettimeofday () in
@@ -1173,9 +1340,7 @@ let test_alternate_address ~websocket () =
          then (
            let _, graph = bootstrap origin in
            let scope = Core.{ graph; connection_generation = 1 } in
-           Runner.submit
-             t
-             (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+           Runner.submit t (websocket_start origin);
            wait (Eio.Stdenv.clock environment) (fun () ->
              List.exists
                (function
@@ -1190,7 +1355,7 @@ let test_alternate_address ~websocket () =
                   | Core.Websocket_opened _ -> true
                   | _ -> false)
                 !posted);
-           Runner.submit t (Core.Close_websocket scope);
+           Runner.submit t (websocket_close scope);
            wait (Eio.Stdenv.clock environment) (fun () ->
              List.exists
                (function
@@ -1242,9 +1407,7 @@ let test_upgrade_authentication ~status () =
       let t = runner ~environment ~sw ~support ~posted ~invalidations () in
       let _, graph = bootstrap origin in
       let scope = Core.{ graph; connection_generation = 1 } in
-      Runner.submit
-        t
-        (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+      Runner.submit t (websocket_start origin);
       let clock = Eio.Stdenv.clock environment in
       let closed () =
         List.exists
@@ -1271,7 +1434,7 @@ let test_upgrade_authentication ~status () =
         !invalidations;
       if opened ()
       then (
-        Runner.submit t (Core.Close_websocket scope);
+        Runner.submit t (websocket_close scope);
         wait clock closed);
       Runner.shutdown t)
   in
@@ -1344,7 +1507,7 @@ let test_stalled_tcp ~cancel () =
          let started = Eio.Time.now clock in
          if cancel
          then (
-           Runner.submit t (Core.Cancel_effects (Core.runner_effect_scope op));
+           Runner.submit t (cancellation_effect (Core.runner_effect_scope op));
            wait clock (fun () -> !released);
            Alcotest.(check bool)
              "TCP cancellation is prompt"
@@ -1472,14 +1635,12 @@ let test_close_with_pending_pong ~reply () =
       let _, graph = bootstrap origin in
       let scope = Core.{ graph; connection_generation = 1 } in
       let clock = Eio.Stdenv.clock environment in
-      Runner.submit
-        t
-        (Core.Start_websocket { scope; uri = Uri.with_scheme origin (Some "wss") });
+      Runner.submit t (websocket_start origin);
       (* The peer records a Ping only after receiving the complete frame, and
          deliberately never answers it. Close starts with a Pong outstanding. *)
       wait clock (fun () -> Sys.file_exists (Filename.concat support "frame-count"));
       let started = Eio.Time.now clock in
-      Runner.submit t (Core.Close_websocket scope);
+      Runner.submit t (websocket_close scope);
       let closures () =
         List.filter_map
           (function
@@ -1539,9 +1700,7 @@ let scenarios =
 ;;
 
 let asset_download ~mismatch ~refresh () =
-  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let module Asset = Logseq_db_types.Asset_descriptor in
-  let module Cache = Logseq_sync_effect_runner.Asset_cache in
   let module Codec = Logseq_sync_effect_runner.Asset_codec in
   let bytes = "\000\255file\128" in
   let checksum = Codec.checksum (if mismatch then "different" else bytes) in
@@ -1559,82 +1718,76 @@ let asset_download ~mismatch ~refresh () =
       let posted = ref []
       and invalidations = ref 0 in
       let t = runner ~environment ~sw ~support ~posted ~invalidations () in
-      let _, scope = bootstrap origin in
-      let cache =
-        Cache.create
-          ~root:(Filename.concat support "assets")
-          ~scope
-          ~budget_bytes:1024L
-          ~maximum_file_bytes:32
-        |> Result.get_ok
+      let selected, scope = bootstrap ~mirror_absent:false origin in
+      let clock = Eio.Stdenv.clock environment in
+      let result =
+        asset_run
+          t
+          ~clock
+          ~posted
+          selected.next
+          scope
+          "download"
+          (Core.Fetch_asset
+             { asset = scope.graph_id; version; maximum_plaintext_bytes = 32 })
       in
-      let descriptor =
-        Asset.create
-          ~uuid:scope.graph_id
-          ~source:(Managed (Some version))
-          ~current_checksum:None
-          ~size:None
-          ~dimensions:None
-        |> Result.get_ok
-      in
-      let state =
-        Transfer.create
-          (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:4 ~retries:1
-           |> Result.get_ok)
-          ~scope
-          ~online:true
-          ~unlocked:true
-      in
-      let state, instructions =
-        Transfer.step
-          state
-          (Replace
-             { consumer = "visible"; priority = Foreground; assets = [ descriptor ] })
-      in
-      let lookup =
-        List.find_map
-          (function
-            | Transfer.Check_cache ticket -> Some ticket
-            | _ -> None)
-          instructions
-        |> Option.get
-      in
-      let _, instructions = Transfer.step state (Cache_checked (lookup, Ok None)) in
-      let instruction =
-        List.find
-          (function
-            | Transfer.Fetch _ -> true
-            | _ -> false)
-          instructions
-      in
-      let events = ref [] in
-      Runner.submit_asset
-        t
-        ~scope
-        ~cache
-        ~encryption:Plaintext
-        ~maximum_plaintext_bytes:32
-        ~current:(fun _ -> true)
-        ~post:(fun event -> events := event :: !events)
-        instruction;
-      wait (Eio.Stdenv.clock environment) (fun () -> !events <> []);
-      (match !events with
-       | [ Transfer.Downloaded (_, Ok handle) ] when not mismatch ->
-         Alcotest.(check string)
-           "verified binary bytes"
-           bytes
-           (read_file (Cache.path cache handle |> Option.get))
-       | [ Transfer.Downloaded (_, Error Transfer.Checksum_mismatch) ] when mismatch ->
+      (match result with
+       | Ok (Core.Asset_downloaded file) when not mismatch ->
+         let retained =
+           asset_run
+             t
+             ~clock
+             ~posted
+             selected.next
+             scope
+             "retain"
+             (Core.Retain_asset_file file)
+         in
+         (match retained with
+          | Ok (Core.Asset_retained (Some (lease, path))) ->
+            Alcotest.(check string) "verified binary bytes" bytes (read_file path);
+            ignore
+              (asset_run
+                 t
+                 ~clock
+                 ~posted
+                 selected.next
+                 scope
+                 "release"
+                 (Core.Release_asset_file lease));
+            Alcotest.(check bool)
+              "download handle releases through completion"
+              true
+              (asset_run
+                 t
+                 ~clock
+                 ~posted
+                 selected.next
+                 scope
+                 "release-download"
+                 (Core.Release_asset_file file)
+               = Ok Core.Asset_unit)
+          | _ -> Alcotest.fail "downloaded resource could not be retained")
+       | Error Core.Asset_checksum_mismatch when mismatch ->
+         let checked =
+           asset_run
+             t
+             ~clock
+             ~posted
+             selected.next
+             scope
+             "check"
+             (Core.Check_asset_cache (scope.graph_id, version))
+         in
          Alcotest.(check bool)
            "bad object not published"
            true
-           (Cache.lookup cache ~asset:scope.graph_id ~version = Ok None)
+           (checked = Ok (Core.Asset_cached None))
        | _ -> Alcotest.fail "unexpected asset download outcome");
       Alcotest.(check int)
         "same token refresh owner"
         (if refresh then 1 else 0)
         !invalidations;
-      Cache.close cache;
       Runner.shutdown t)
   in
   check_retired report;
@@ -1685,33 +1838,46 @@ let asset_upload ~status ~refresh () =
       let posted = ref []
       and invalidations = ref 0 in
       let runner = runner ~environment ~sw ~support ~posted ~invalidations () in
-      let _, scope = bootstrap origin in
+      let selected, scope = bootstrap ~mirror_absent:false origin in
       let source_file = Filename.concat support "staged.bin" in
-      let out = open_out_bin source_file in
-      output_string out bytes;
-      close_out out;
+      Out_channel.with_open_bin source_file (fun out -> output_string out bytes);
+      let clock = Eio.Stdenv.clock environment in
+      let file = asset_stage runner ~clock ~posted selected.next scope source_file in
       let result =
-        Runner.upload_asset
+        asset_run
           runner
-          ~context:Core.{ scope; encrypted = false; key = None }
-          ~asset:scope.graph_id
-          ~version
-          ~source_file
-          ~maximum_plaintext_bytes:32
-          ~current:(fun () -> true)
+          ~clock
+          ~posted
+          selected.next
+          scope
+          "upload"
+          (Core.Put_asset_file
+             { asset = scope.graph_id; version; file; maximum_plaintext_bytes = 32 })
       in
       let expected =
         match status with
-        | 200 -> Ok ()
-        | 403 -> Error Runner.Upload_revoked_access
-        | 413 -> Error Runner.Upload_size_rejected
-        | _ -> Error Runner.Upload_network
+        | 200 -> Ok Core.Asset_unit
+        | 403 -> Error Core.Asset_revoked_access
+        | 413 -> Error Core.Asset_size_rejected
+        | _ -> Error Core.Asset_network
       in
       Alcotest.(check bool) "explicit upload result" true (result = expected);
       Alcotest.(check int)
         "upload token refresh"
         (if refresh then 1 else 0)
         !invalidations;
+      Alcotest.(check bool)
+        "upload staging cleanup completes"
+        true
+        (asset_run
+           runner
+           ~clock
+           ~posted
+           selected.next
+           scope
+           "release-upload-stage"
+           (Core.Release_staged_file file)
+         = Ok Core.Asset_unit);
       Runner.shutdown runner)
   in
   check_retired report;
@@ -1753,54 +1919,122 @@ let asset_upload_source () =
         let posted = ref []
         and invalidations = ref 0 in
         let runner = runner ~environment ~sw ~support ~posted ~invalidations () in
-        let _, scope = bootstrap (Uri.of_string "https://localhost:1") in
+        let selected, scope =
+          bootstrap ~mirror_absent:false (Uri.of_string "https://localhost:1")
+        in
+        let clock = Eio.Stdenv.clock environment in
         let version =
           Logseq_db_types.Asset_descriptor.version
             ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "file")
-            ~file_type:"png"
+            ~file_type:"bin"
           |> Result.get_ok
         in
         let source_file = Filename.concat support "source.bin" in
-        let upload ~limit ~current ~encrypted =
-          Runner.upload_asset
+        let missing =
+          asset_run
             runner
-            ~context:Core.{ scope; encrypted; key = None }
-            ~asset:scope.graph_id
-            ~version
-            ~source_file
-            ~maximum_plaintext_bytes:limit
-            ~current:(fun () -> current)
+            ~clock
+            ~posted
+            selected.next
+            scope
+            "missing"
+            (Core.Put_asset_file
+               { asset = scope.graph_id
+               ; version
+               ; file = "unavailable-stage"
+               ; maximum_plaintext_bytes = 32
+               })
         in
         Alcotest.(check bool)
           "missing staging file"
           true
-          (upload ~limit:32 ~current:true ~encrypted:false
-           = Error Runner.Upload_missing_source);
-        let out = open_out_bin source_file in
-        output_string out "file";
-        close_out out;
+          (missing = Error Core.Asset_missing_source);
+        Out_channel.with_open_bin source_file (fun out -> output_string out "file");
+        let file = asset_stage runner ~clock ~posted selected.next scope source_file in
+        let put core scope operation maximum_plaintext_bytes version =
+          asset_run
+            runner
+            ~clock
+            ~posted
+            core
+            scope
+            operation
+            (Core.Put_asset_file
+               { asset = scope.Core.graph_id; version; file; maximum_plaintext_bytes })
+        in
         Alcotest.(check bool)
           "size bound before network"
           true
-          (upload ~limit:3 ~current:true ~encrypted:false
-           = Error Runner.Upload_size_rejected);
+          (put selected.next scope "size" 3 version = Error Core.Asset_size_rejected);
+        let locked, locked_scope =
+          Core_contract.selected_graph Core_contract.encrypted_graph
+        in
+        let locked_file =
+          asset_stage runner ~clock ~posted locked.next locked_scope source_file
+        in
         Alcotest.(check bool)
           "locked graph never sends plaintext"
           true
-          (upload ~limit:32 ~current:true ~encrypted:true = Error Runner.Upload_locked);
+          (asset_run
+             runner
+             ~clock
+             ~posted
+             locked.next
+             locked_scope
+             "locked"
+             (Core.Put_asset_file
+                { asset = locked_scope.graph_id
+                ; version
+                ; file = locked_file
+                ; maximum_plaintext_bytes = 32
+                })
+           = Error Core.Asset_locked);
+        let requested =
+          Core.step
+            selected.next
+            (Core.Asset_requested
+               { scope
+               ; operation = "cancelled"
+               ; action =
+                   Core.Put_asset_file
+                     { asset = scope.graph_id
+                     ; version
+                     ; file
+                     ; maximum_plaintext_bytes = 32
+                     }
+               })
+        in
+        let cancelled =
+          Core.step
+            requested.next
+            (Core.Asset_requested
+               { scope
+               ; operation = "cancel"
+               ; action = Core.Cancel_asset_operation "cancelled"
+               })
+        in
         Alcotest.(check bool)
           "cancelled intent never uploads"
           true
-          (upload ~limit:32 ~current:false ~encrypted:false
-           = Error Runner.Upload_cancelled);
-        let out = open_out_bin source_file in
-        output_string out "oops";
-        close_out out;
+          (List.exists
+             (function
+               | Core.Publish (Core.Asset_finished output) ->
+                 output.request.operation = "cancelled"
+                 && output.result = Error Core.Asset_cancelled
+               | _ -> false)
+             cancelled.effects);
+        let incorrect =
+          Logseq_db_types.Asset_descriptor.version
+            ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "oops")
+            ~file_type:"bin"
+          |> Result.get_ok
+        in
         Alcotest.(check bool)
           "changed source rejected"
           true
-          (upload ~limit:32 ~current:true ~encrypted:false
-           = Error Runner.Upload_invalid_content);
+          (match put selected.next scope "changed" 32 incorrect with
+           | Error (Core.Asset_invalid_content _) -> true
+           | _ -> false);
         Runner.shutdown runner)))
 ;;
 
@@ -1843,43 +2077,45 @@ let asset_upload_admission () =
           decr active;
           Error "offline"
         in
+        let posted = ref [] in
         let t =
-          runner
-            ~acquire
-            ~environment
-            ~sw
-            ~support
-            ~posted:(ref [])
-            ~invalidations:(ref 0)
-            ()
+          runner ~acquire ~environment ~sw ~support ~posted ~invalidations:(ref 0) ()
         in
-        let _, scope = bootstrap (Uri.of_string "https://localhost") in
+        let selected, scope =
+          bootstrap ~mirror_absent:false (Uri.of_string "https://localhost")
+        in
+        let clock = Eio.Stdenv.clock environment in
         let source_file = Filename.concat support "pending.bin" in
         Out_channel.with_open_bin source_file (fun out -> output_string out "file");
+        let file = asset_stage t ~clock ~posted selected.next scope source_file in
         let version =
           Logseq_db_types.Asset_descriptor.version
             ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "file")
             ~file_type:"bin"
           |> Result.get_ok
         in
-        let results =
-          Eio.Fiber.List.map
-            (fun _ ->
-               Runner.upload_asset
+        posted := [];
+        let core =
+          List.fold_left
+            (fun core index ->
+               asset_submit
                  t
-                 ~context:Core.{ scope; encrypted = false; key = None }
-                 ~asset:scope.graph_id
-                 ~version
-                 ~source_file
-                 ~maximum_plaintext_bytes:4
-                 ~current:(fun () -> true))
+                 core
+                 scope
+                 ("upload-" ^ string_of_int index)
+                 (Core.Put_asset_file
+                    { asset = scope.graph_id; version; file; maximum_plaintext_bytes = 4 }))
+            selected.next
             [ 1; 2; 3 ]
         in
+        wait clock (fun () -> List.length !posted = 3);
+        let _, outputs = asset_collect t core !posted in
         Alcotest.(check int) "one upload holds source and wire buffers" 1 !maximum;
         Alcotest.(check bool)
           "failed transfer releases admission"
           true
-          (List.length results = 3 && List.for_all Result.is_error results);
+          (List.length outputs = 3
+           && List.for_all (fun output -> Result.is_error output.Core.result) outputs);
         Runner.shutdown t)))
 ;;
 
@@ -1888,100 +2124,63 @@ let scenarios =
   @ [ Alcotest.test_case "asset upload resource admission" `Quick asset_upload_admission ]
 ;;
 
-let asset_download_admission () =
-  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+let asset_download_budget maximum_plaintext_bytes expected_entered () =
   let module Asset = Logseq_db_types.Asset_descriptor in
-  let module Cache = Logseq_sync_effect_runner.Asset_cache in
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
-        let entered = ref 0
-        and completed = ref 0 in
+        let entered = ref 0 in
         let gate, release = Eio.Promise.create () in
         let acquire _ =
           incr entered;
           Eio.Promise.await gate;
           Error "offline"
         in
+        let posted = ref [] in
         let t =
-          runner
-            ~acquire
-            ~environment
-            ~sw
-            ~support
-            ~posted:(ref [])
-            ~invalidations:(ref 0)
-            ()
+          runner ~acquire ~environment ~sw ~support ~posted ~invalidations:(ref 0) ()
         in
-        let _, base = bootstrap (Uri.of_string "https://localhost") in
         let version =
           Asset.version ~checksum:(String.make 64 '0') ~file_type:"bin" |> Result.get_ok
         in
-        let caches =
-          List.init 5 (fun generation ->
-            let scope = Core.{ base with graph_generation = generation } in
-            let cache =
-              Cache.create ~root:support ~scope ~budget_bytes:32L ~maximum_file_bytes:4
-              |> Result.get_ok
+        let cores =
+          List.init 5 (fun index ->
+            let selected, scope =
+              bootstrap
+                ~mirror_absent:false
+                ~user_id:("fixture-" ^ string_of_int index)
+                (Uri.of_string "https://localhost")
             in
-            let asset =
-              Asset.create
-                ~uuid:scope.graph_id
-                ~source:(Managed (Some version))
-                ~current_checksum:None
-                ~size:None
-                ~dimensions:None
-              |> Result.get_ok
-            in
-            let state =
-              Transfer.create
-                (Transfer.config ~active:1 ~foreground_reserved:0 ~pending:1 ~retries:0
-                 |> Result.get_ok)
-                ~scope
-                ~online:true
-                ~unlocked:true
-            in
-            let state, effects =
-              Transfer.step
-                state
-                (Replace { consumer = "test"; priority = Foreground; assets = [ asset ] })
-            in
-            let ticket =
-              List.find_map
-                (function
-                  | Transfer.Check_cache t -> Some t
-                  | _ -> None)
-                effects
-              |> Option.get
-            in
-            let _, effects = Transfer.step state (Cache_checked (ticket, Ok None)) in
-            List.iter
-              (function
-                | Transfer.Fetch _ as instruction ->
-                  Runner.submit_asset
-                    t
-                    ~scope
-                    ~cache
-                    ~encryption:Plaintext
-                    ~maximum_plaintext_bytes:4
-                    ~current:(fun _ -> true)
-                    ~post:(fun _ -> incr completed)
-                    instruction
-                | _ -> ())
-              effects;
-            cache)
+            asset_submit
+              t
+              selected.next
+              scope
+              ("download-" ^ string_of_int index)
+              (Core.Fetch_asset
+                 { asset = scope.graph_id; version; maximum_plaintext_bytes }))
         in
         for _ = 1 to 10 do
           Eio.Fiber.yield ()
         done;
         let initial = !entered in
         Eio.Promise.resolve release ();
-        wait (Eio.Stdenv.clock environment) (fun () -> !completed = 5);
-        Alcotest.(check int) "downloads share three permits across scopes" 3 initial;
-        Alcotest.(check int) "all failed requests release their permit" 5 !entered;
-        Runner.shutdown t;
-        List.iter Cache.close caches)))
+        wait (Eio.Stdenv.clock environment) (fun () -> List.length !posted = 5);
+        let outputs =
+          List.concat_map (fun core -> snd (asset_collect t core !posted)) cores
+        in
+        Alcotest.(check int)
+          "scopes share bounded download and byte permits"
+          expected_entered
+          initial;
+        Alcotest.(check int) "all failed requests release admission" 5 !entered;
+        Alcotest.(check int)
+          "all completions pass through reducer outputs"
+          5
+          (List.length outputs);
+        Runner.shutdown t)))
 ;;
+
+let asset_download_admission = asset_download_budget 4 3
 
 let scenarios =
   scenarios
@@ -1992,120 +2191,15 @@ let scenarios =
     ]
 ;;
 
-let shared_asset_byte_budget () =
-  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
-  let module Asset = Logseq_db_types.Asset_descriptor in
-  let module Cache = Logseq_sync_effect_runner.Asset_cache in
-  with_support (fun support ->
-    Eio_main.run (fun environment ->
-      Eio.Switch.run (fun sw ->
-        let entered = ref 0
-        and completed = ref 0 in
-        let gate, release = Eio.Promise.create () in
-        let acquire _ =
-          incr entered;
-          Eio.Promise.await gate;
-          Error "offline"
-        in
-        let t =
-          runner
-            ~acquire
-            ~environment
-            ~sw
-            ~support
-            ~posted:(ref [])
-            ~invalidations:(ref 0)
-            ()
-        in
-        let _, base = bootstrap (Uri.of_string "https://localhost") in
-        let version =
-          Asset.version ~checksum:(String.make 64 '0') ~file_type:"bin" |> Result.get_ok
-        in
-        let caches =
-          List.init 5 (fun generation ->
-            let scope = Core.{ base with graph_generation = generation } in
-            let cache =
-              Cache.create
-                ~root:support
-                ~scope
-                ~budget_bytes:32L
-                ~maximum_file_bytes:16777216
-              |> Result.get_ok
-            in
-            let asset =
-              Asset.create
-                ~uuid:scope.graph_id
-                ~source:(Managed (Some version))
-                ~current_checksum:None
-                ~size:None
-                ~dimensions:None
-              |> Result.get_ok
-            in
-            let state =
-              Transfer.create
-                (Transfer.config ~active:1 ~foreground_reserved:0 ~pending:1 ~retries:0
-                 |> Result.get_ok)
-                ~scope
-                ~online:true
-                ~unlocked:true
-            in
-            let state, effects =
-              Transfer.step
-                state
-                (Replace { consumer = "test"; priority = Foreground; assets = [ asset ] })
-            in
-            let ticket =
-              List.find_map
-                (function
-                  | Transfer.Check_cache t -> Some t
-                  | _ -> None)
-                effects
-              |> Option.get
-            in
-            let _, effects = Transfer.step state (Cache_checked (ticket, Ok None)) in
-            List.iter
-              (function
-                | Transfer.Fetch _ as instruction ->
-                  Runner.submit_asset
-                    t
-                    ~scope
-                    ~cache
-                    ~encryption:Plaintext
-                    ~maximum_plaintext_bytes:16777216
-                    ~current:(fun _ -> true)
-                    ~post:(fun _ -> incr completed)
-                    instruction
-                | _ -> ())
-              effects;
-            cache)
-        in
-        for _ = 1 to 10 do
-          Eio.Fiber.yield ()
-        done;
-        let initial = !entered in
-        Eio.Promise.resolve release ();
-        wait (Eio.Stdenv.clock environment) (fun () -> !completed = 5);
-        (* Each 16 MiB request reserves 32 MiB of wire plus plaintext footprint,
-           so only two of the three download permits admit work concurrently. *)
-        Alcotest.(check int) "byte budget admits two large downloads" 2 initial;
-        Alcotest.(check int) "all failed requests release their bytes" 5 !entered;
-        Runner.shutdown t;
-        List.iter Cache.close caches)))
-;;
+let shared_asset_byte_budget = asset_download_budget 16777216 2
 
 let scenarios =
   scenarios
-  @ [ Alcotest.test_case
-        "shared asset byte budget"
-        `Quick
-        shared_asset_byte_budget
-    ]
+  @ [ Alcotest.test_case "shared asset byte budget" `Quick shared_asset_byte_budget ]
 ;;
 
 let shared_asset_codec_admission () =
-  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let module Asset = Logseq_db_types.Asset_descriptor in
-  let module Cache = Logseq_sync_effect_runner.Asset_cache in
   let plaintext = "file" in
   let version =
     Asset.version
@@ -2179,96 +2273,51 @@ let shared_asset_codec_admission () =
              ~invalidations:(ref 0)
              ()
          in
-         let _, instruction = Runner_contract.cached_key_effect ~origin () in
-         let scope, key =
-           match instruction with
-           | Core.Request (ticket, Core.Load_and_unlock_graph_key scope) ->
-             ( scope
-             , Core.graph_key_handle
-                 ~scope
-                 ~id:
-                   ("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
-             )
-           | _ -> Alcotest.fail "missing key request"
-         in
+         let before, instruction = Runner_contract.cached_key_effect ~origin () in
          Runner.submit t instruction;
          wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+         let unlocked = (Core.step before.next (List.hd !posted)).next in
+         let context = Core.asset_context unlocked |> Option.get in
+         let scope = context.scope in
          let source_file = Filename.concat support "pending.bin" in
          Out_channel.with_open_bin source_file (fun out -> output_string out plaintext);
-         let upload = ref None in
-         Eio.Fiber.fork ~sw (fun () ->
-           upload
-           := Some
-                (Runner.upload_asset
-                   t
-                   ~context:Core.{ scope; encrypted = true; key = Some key }
-                   ~asset:scope.graph_id
-                   ~version
-                   ~source_file
-                   ~maximum_plaintext_bytes:4
-                   ~current:(fun () -> true)));
-         wait (Eio.Stdenv.clock environment) (fun () -> !encrypted);
-         let cache =
-           Cache.create ~root:support ~scope ~budget_bytes:32L ~maximum_file_bytes:4
-           |> Result.get_ok
+         let clock = Eio.Stdenv.clock environment in
+         let file = asset_stage t ~clock ~posted unlocked scope source_file in
+         posted := [];
+         let uploading =
+           asset_submit
+             t
+             unlocked
+             scope
+             "codec-upload"
+             (Core.Put_asset_file
+                { asset = scope.graph_id; version; file; maximum_plaintext_bytes = 4 })
          in
-         let asset =
-           Asset.create
-             ~uuid:scope.graph_id
-             ~source:(Managed (Some version))
-             ~current_checksum:None
-             ~size:None
-             ~dimensions:None
-           |> Result.get_ok
+         wait clock (fun () -> !encrypted);
+         let downloading =
+           asset_submit
+             t
+             uploading
+             scope
+             "codec-download"
+             (Core.Fetch_asset
+                { asset = scope.graph_id; version; maximum_plaintext_bytes = 4 })
          in
-         let state =
-           Transfer.create
-             (Transfer.config ~active:1 ~foreground_reserved:0 ~pending:1 ~retries:0
-              |> Result.get_ok)
-             ~scope
-             ~online:true
-             ~unlocked:true
-         in
-         let state, effects =
-           Transfer.step
-             state
-             (Replace { consumer = "codec"; priority = Foreground; assets = [ asset ] })
-         in
-         let ticket =
-           List.find_map
-             (function
-               | Transfer.Check_cache t -> Some t
-               | _ -> None)
-             effects
-           |> Option.get
-         in
-         let _, effects = Transfer.step state (Cache_checked (ticket, Ok None)) in
-         let downloaded = ref false in
-         List.iter
-           (function
-             | Transfer.Fetch _ as instruction ->
-               Runner.submit_asset
-                 t
-                 ~scope
-                 ~cache
-                 ~encryption:(Encrypted (Some key))
-                 ~maximum_plaintext_bytes:4
-                 ~current:(fun _ -> true)
-                 ~post:(fun _ -> downloaded := true)
-                 instruction
-             | _ -> ())
-           effects;
          wait (Eio.Stdenv.clock environment) (fun () ->
            Sys.file_exists (Filename.concat support "report"));
          Eio.Promise.resolve release ();
-         wait (Eio.Stdenv.clock environment) (fun () -> !downloaded && !upload <> None);
+         wait (Eio.Stdenv.clock environment) (fun () -> List.length !posted = 2);
+         let _, outputs = asset_collect t downloading !posted in
+         Alcotest.(check int)
+           "both codec completions reach reducer"
+           2
+           (List.length outputs);
          Alcotest.(check int) "GET and PUT share one codec permit" 1 !maximum;
          Alcotest.(check bool)
            "failed encoding releases the permit for decoding"
            true
            !decrypted;
-         Runner.shutdown t;
-         Cache.close cache)
+         Runner.shutdown t)
   in
   check_retired report
 ;;
@@ -2280,4 +2329,607 @@ let scenarios =
         `Quick
         shared_asset_codec_admission
     ]
+;;
+
+(* Provider refresh contracts execute through reducer-created HTTP operations. *)
+let submitted_authentication_policy
+      statuses
+      expected_result
+      expected_tokens
+      expected_invalidated
+      ()
+  =
+  let acquired = ref []
+  and invalidated = ref [] in
+  let tokens = Queue.create () in
+  Queue.add "token-1" tokens;
+  Queue.add "token-2" tokens;
+  let report =
+    with_peer
+      (List.map (fun status -> case (response ~status "x")) statuses)
+      (fun ~environment ~sw ~support ~origin ->
+         let posted = ref [] in
+         let acquire _ =
+           match Queue.take_opt tokens with
+           | Some token ->
+             acquired := token :: !acquired;
+             Ok token
+           | None -> Error "no token"
+         in
+         let t =
+           runner
+             ~acquire
+             ~on_invalidate:(fun token -> invalidated := token :: !invalidated)
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations:(ref 0)
+             ()
+         in
+         let requested, _ = bootstrap origin in
+         let runnable =
+           List.find_map
+             (function
+               | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _) as runnable)
+                 -> Some runnable
+               | _ -> None)
+             requested.effects
+           |> Option.get
+         in
+         Runner.submit t runnable;
+         wait (Eio.Stdenv.clock environment) (fun () -> completed !posted <> None);
+         Alcotest.(check bool)
+           "typed authentication outcome"
+           true
+           (match completed !posted, expected_result with
+            | Some (Ok ()), None -> true
+            | Some (Error (Core.Effect_failed message)), Some expected ->
+              String.equal message expected
+            | _ -> false);
+         List.iter (fun event -> ignore (Core.step requested.next event)) !posted;
+         Runner.shutdown t)
+  in
+  Alcotest.(check (list string))
+    "bounded acquired token attempts"
+    expected_tokens
+    (List.rev !acquired);
+  Alcotest.(check (list string))
+    "only first unauthorized token invalidated"
+    expected_invalidated
+    (List.rev !invalidated);
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "authenticated operation retries one unauthorized response"
+        `Quick
+        (submitted_authentication_policy
+           [ 401; 200 ]
+           None
+           [ "token-1"; "token-2" ]
+           [ "token-1" ])
+    ; Alcotest.test_case
+        "authenticated operation surfaces second unauthorized response"
+        `Quick
+        (submitted_authentication_policy
+           [ 401; 401 ]
+           (Some "Authentication failed.")
+           [ "token-1"; "token-2" ]
+           [ "token-1" ])
+    ; Alcotest.test_case
+        "authenticated operation does not retry forbidden response"
+        `Quick
+        (submitted_authentication_policy
+           [ 403 ]
+           (Some "Authorization failed.")
+           [ "token-1" ]
+           [])
+    ]
+;;
+
+(* Semaphore ownership belongs to runner I/O: cancellation while a reservation is
+   incomplete must release the units already acquired, before the first request ends. *)
+let cancelled_asset_byte_wait_releases_partial_reservation () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let entered = ref 0 in
+        let gate, release = Eio.Promise.create () in
+        let acquire _ =
+          incr entered;
+          Eio.Promise.await gate;
+          Error "offline"
+        in
+        let posted = ref [] in
+        let t =
+          runner ~acquire ~environment ~sw ~support ~posted ~invalidations:(ref 0) ()
+        in
+        let selected, scope =
+          bootstrap ~mirror_absent:false (Uri.of_string "https://localhost")
+        in
+        let version =
+          Logseq_db_types.Asset_descriptor.version
+            ~checksum:(String.make 64 'a')
+            ~file_type:"bin"
+          |> Result.get_ok
+        in
+        let action maximum_plaintext_bytes =
+          Core.Fetch_asset { asset = scope.graph_id; version; maximum_plaintext_bytes }
+        in
+        let first =
+          asset_submit t selected.next scope "holding-48MiB" (action (24 * 1024 * 1024))
+        in
+        wait (Eio.Stdenv.clock environment) (fun () -> !entered = 1);
+        let waiting =
+          asset_submit t first scope "waiting-for-48MiB" (action (24 * 1024 * 1024))
+        in
+        for _ = 1 to 10 do
+          Eio.Fiber.yield ()
+        done;
+        let cancelled =
+          asset_submit
+            t
+            waiting
+            scope
+            "cancel-waiter"
+            (Core.Cancel_asset_operation "waiting-for-48MiB")
+        in
+        wait (Eio.Stdenv.clock environment) (fun () -> List.length !posted >= 2);
+        let admitted =
+          asset_submit t cancelled scope "using-returned-16MiB" (action (8 * 1024 * 1024))
+        in
+        wait (Eio.Stdenv.clock environment) (fun () -> !entered = 2);
+        Alcotest.(check int)
+          "cancelled partial reservation immediately admits another request"
+          2
+          !entered;
+        Eio.Promise.resolve release ();
+        wait (Eio.Stdenv.clock environment) (fun () -> List.length !posted = 4);
+        ignore (asset_collect t admitted !posted);
+        Runner.shutdown t)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "asset cancellation releases partial byte reservation"
+        `Quick
+        cancelled_asset_byte_wait_releases_partial_reservation
+    ]
+;;
+
+(* Two legal 40 MiB reservations must not divide the 64 MiB pool and deadlock. *)
+let weighted_asset_reservations_make_progress () =
+  let bytes = "file" in
+  let version =
+    Logseq_db_types.Asset_descriptor.version
+      ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum bytes)
+      ~file_type:"bin"
+    |> Result.get_ok
+  in
+  let headers = "Content-Length: 4\r\n" in
+  let report =
+    with_peer
+      [ case (response ~headers bytes); case (response ~headers bytes) ]
+      (fun ~environment ~sw ~support ~origin ->
+         let entered = ref 0 in
+         let gate, release = Eio.Promise.create () in
+         let acquire _ =
+           incr entered;
+           Eio.Promise.await gate;
+           Ok "fixture-token"
+         in
+         let posted = ref [] in
+         let t =
+           runner ~acquire ~environment ~sw ~support ~posted ~invalidations:(ref 0) ()
+         in
+         let selected, scope = bootstrap ~mirror_absent:false origin in
+         let action =
+           Core.Fetch_asset
+             { asset = scope.graph_id
+             ; version
+             ; maximum_plaintext_bytes = 20 * 1024 * 1024
+             }
+         in
+         let first = asset_submit t selected.next scope "weighted-first" action in
+         wait (Eio.Stdenv.clock environment) (fun () -> !entered = 1);
+         let second = asset_submit t first scope "weighted-second" action in
+         for _ = 1 to 10 do
+           Eio.Fiber.yield ()
+         done;
+         Alcotest.(check int)
+           "one entire reservation enters while the second waits"
+           1
+           !entered;
+         Eio.Promise.resolve release ();
+         wait (Eio.Stdenv.clock environment) (fun () -> List.length !posted = 2);
+         let _, outputs = asset_collect t second !posted in
+         Alcotest.(check int)
+           "both weighted TLS downloads complete"
+           2
+           (List.length outputs);
+         Alcotest.(check bool)
+           "weighted reservations release for the next request"
+           true
+           (List.for_all
+              (fun output ->
+                 match output.Core.result with
+                 | Ok (Core.Asset_downloaded _) -> true
+                 | _ -> false)
+              outputs);
+         Alcotest.(check int) "second request proceeds after the first" 2 !entered;
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "weighted asset reservations make TLS progress"
+        `Quick
+        weighted_asset_reservations_make_progress
+    ]
+;;
+
+(* Migrated downloaded cache scenarios. *)
+module Cache_asset = Logseq_db_types.Asset_descriptor
+module Cache_codec = Logseq_sync_effect_runner.Asset_codec
+
+let cache_version bytes =
+  Cache_asset.version ~checksum:(Cache_codec.checksum bytes) ~file_type:"png"
+  |> Result.get_ok
+;;
+
+let cache_response bytes =
+  case
+    (response
+       ~headers:(Printf.sprintf "Content-Length: %d\r\n" (String.length bytes))
+       bytes)
+;;
+
+let cache_selection ?(user = "fixture") ?(selected_graph : Core.graph = graph) origin =
+  let initial =
+    Core.config ~managed_sync_origin:origin ~limits:(Core_contract.limits ())
+    |> Result.get_ok
+    |> Core.initial
+    |> Result.get_ok
+  in
+  let authenticated =
+    Core.step initial (Core.Account_authenticated { user_id = Some user })
+  in
+  let catalog =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+          Some
+            (Core.step
+               authenticated.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok [ selected_graph ]))))
+        | _ -> None)
+      authenticated.effects
+    |> Option.get
+  in
+  let selected = Core.step catalog.next (Core.Graph_selected selected_graph.graph_id) in
+  selected.next, Core.admitted_graph_scope selected.next |> Option.get
+;;
+
+let with_downloaded_cache ?(budget = 8L) ?(pending_budget = 8L) cases test =
+  let report =
+    with_peer cases (fun ~environment ~sw ~support ~origin ->
+      let posted = ref []
+      and invalidations = ref 0 in
+      let create () =
+        runner
+          ~asset_cache_budget_bytes:budget
+          ~asset_maximum_file_bytes:8
+          ~asset_pending_budget_bytes:pending_budget
+          ~environment
+          ~sw
+          ~support
+          ~posted
+          ~invalidations
+          ()
+      in
+      let active = ref (create ()) in
+      Fun.protect
+        ~finally:(fun () -> Runner.shutdown !active)
+        (fun () ->
+           let sequence = ref 0 in
+           let request core scope action =
+             incr sequence;
+             asset_run
+               !active
+               ~clock:(Eio.Stdenv.clock environment)
+               ~posted
+               core
+               scope
+               ("cache-" ^ string_of_int !sequence)
+               action
+           in
+           let reopen () =
+             Runner.shutdown !active;
+             active := create ()
+           in
+           test support origin request reopen))
+  in
+  check_retired report
+;;
+
+let cache_download request core (scope : Core.graph_scope) bytes =
+  match
+    request
+      core
+      scope
+      (Core.Fetch_asset
+         { asset = scope.graph_id
+         ; version = cache_version bytes
+         ; maximum_plaintext_bytes = 8
+         })
+  with
+  | Ok (Core.Asset_downloaded handle) -> handle
+  | _ -> Alcotest.fail "cache download did not produce a controlled resource"
+;;
+
+let cache_lookup request core (scope : Core.graph_scope) bytes =
+  match
+    request core scope (Core.Check_asset_cache (scope.graph_id, cache_version bytes))
+  with
+  | Ok (Core.Asset_cached handle) -> handle
+  | _ -> Alcotest.fail "cache lookup did not resolve through reducer output"
+;;
+
+let cache_retain request core scope handle =
+  match request core scope (Core.Retain_asset_file handle) with
+  | Ok (Core.Asset_retained (Some resource)) -> resource
+  | _ -> Alcotest.fail "cache resource retention failed"
+;;
+
+let cache_release request core scope handle =
+  Runner_contract.cache_unit (request core scope (Core.Release_asset_file handle))
+;;
+
+let test_downloaded_cache_restart () =
+  with_downloaded_cache
+    [ cache_response "file" ]
+    (fun _ origin request reopen ->
+       let core, scope = cache_selection origin in
+       let handle = cache_download request core scope "file" in
+       let lease, path = cache_retain request core scope handle in
+       Alcotest.(check string) "published bytes" "file" (read_file path);
+       cache_release request core scope lease;
+       reopen ();
+       Alcotest.(check bool)
+         "restart restores verified file"
+         true
+         (Option.is_some (cache_lookup request core scope "file")))
+;;
+
+let test_downloaded_cache_corruption () =
+  with_downloaded_cache
+    [ cache_response "file" ]
+    (fun _ origin request reopen ->
+       let core, scope = cache_selection origin in
+       let handle = cache_download request core scope "file" in
+       let _, path = cache_retain request core scope handle in
+       Runner_contract.cache_unit (request core scope Core.Close_asset_scope);
+       Out_channel.with_open_bin path (fun output -> output_string output "bad!");
+       reopen ();
+       Alcotest.(check bool)
+         "corrupt file not ready"
+         true
+         (cache_lookup request core scope "file" = None))
+;;
+
+let test_downloaded_cache_eligibility () =
+  with_downloaded_cache
+    [ cache_response "bad!" ]
+    (fun _ origin request _ ->
+       let core, scope = cache_selection origin in
+       Alcotest.(check bool)
+         "checksum verified before publication"
+         true
+         (request
+            core
+            scope
+            (Core.Fetch_asset
+               { asset = scope.graph_id
+               ; version = cache_version "file"
+               ; maximum_plaintext_bytes = 8
+               })
+          = Error Core.Asset_checksum_mismatch);
+       Alcotest.(check bool)
+         "no corrupt record"
+         true
+         (cache_lookup request core scope "file" = None))
+;;
+
+let test_downloaded_cache_leases () =
+  with_downloaded_cache
+    ~budget:4L
+    [ cache_response "file"; cache_response "next"; cache_response "next" ]
+    (fun support origin request _ ->
+       let core, scope = cache_selection origin in
+       let source = Filename.concat support "picker.bin" in
+       Out_channel.with_open_bin source (fun output -> output_string output "source");
+       let staged, _, _ = Runner_contract.cache_stage (request core scope) source in
+       let stage_lease, staged_path =
+         request core scope (Core.Retain_staged_file staged)
+         |> Runner_contract.retained_value
+       in
+       cache_release request core scope stage_lease;
+       let handle = cache_download request core scope "file" in
+       let lease, path = cache_retain request core scope handle in
+       cache_release request core scope handle;
+       Alcotest.(check bool)
+         "live renderer pins file"
+         true
+         (request
+            core
+            scope
+            (Core.Fetch_asset
+               { asset = scope.graph_id
+               ; version = cache_version "next"
+               ; maximum_plaintext_bytes = 8
+               })
+          = Error Core.Asset_storage_full);
+       Alcotest.(check bool) "renderer path remains" true (Sys.file_exists path);
+       cache_release request core scope lease;
+       ignore (cache_download request core scope "next");
+       Alcotest.(check bool)
+         "unpinned LRU evicted"
+         true
+         (cache_lookup request core scope "file" = None);
+       Alcotest.(check bool)
+         "LRU does not evict pending import"
+         true
+         (Sys.file_exists staged_path))
+;;
+
+let test_downloaded_cache_filename () =
+  with_downloaded_cache
+    [ cache_response "file" ]
+    (fun _ origin request reopen ->
+       let core, scope = cache_selection origin in
+       let handle = cache_download request core scope "file" in
+       let lease, path = cache_retain request core scope handle in
+       Alcotest.(check bool)
+         "download carries its type"
+         true
+         (Filename.check_suffix path ".png");
+       cache_release request core scope lease;
+       cache_release request core scope handle;
+       reopen ();
+       let handle = cache_lookup request core scope "file" |> Option.get in
+       let lease, path = cache_retain request core scope handle in
+       Alcotest.(check bool)
+         "restart preserves typed filename"
+         true
+         (Filename.check_suffix path ".png");
+       cache_release request core scope lease;
+       cache_release request core scope handle)
+;;
+
+let test_downloaded_cache_legacy_cleanup () =
+  with_downloaded_cache
+    [ cache_response "file" ]
+    (fun _ origin request reopen ->
+       let core, scope = cache_selection origin in
+       let handle = cache_download request core scope "file" in
+       let _, path = cache_retain request core scope handle in
+       let legacy = Filename.chop_extension path ^ ".bin" in
+       Sys.rename path legacy;
+       Runner_contract.cache_unit (request core scope Core.Close_asset_scope);
+       reopen ();
+       let restored = cache_lookup request core scope "file" in
+       Alcotest.(check bool) "untyped data file evicted" false (Sys.file_exists legacy);
+       Alcotest.(check bool) "manifest without typed data removed" true (restored = None))
+;;
+
+let test_downloaded_cache_isolation () =
+  with_downloaded_cache
+    [ cache_response "file"; cache_response "next" ]
+    (fun _ origin request _ ->
+       let first, first_scope = cache_selection origin in
+       let second, second_scope = cache_selection ~user:"another" origin in
+       ignore (cache_download request first first_scope "file");
+       Alcotest.(check bool)
+         "accounts isolated"
+         true
+         (cache_lookup request second second_scope "file" = None);
+       ignore (cache_download request second second_scope "next");
+       Runner_contract.cache_unit (request first first_scope Core.Delete_graph_assets);
+       Alcotest.(check bool)
+         "deletion leaves other account"
+         true
+         (Option.is_some (cache_lookup request second second_scope "next")))
+;;
+
+let test_downloaded_cache_account_cleanup () =
+  with_downloaded_cache
+    [ cache_response "file"; cache_response "file"; cache_response "file" ]
+    (fun _ origin request _ ->
+       let other_report =
+         with_peer
+           [ cache_response "file" ]
+           (fun ~environment:_ ~sw:_ ~support:_ ~origin:other_origin ->
+              let first = cache_selection origin in
+              let another_graph =
+                cache_selection
+                  ~selected_graph:{ graph with graph_id = Core_contract.other_graph_id }
+                  origin
+              in
+              let other_user = cache_selection ~user:"other" origin in
+              let other_origin = cache_selection other_origin in
+              List.iter
+                (fun (core, scope) ->
+                   let handle = cache_download request core scope "file" in
+                   cache_release request core scope handle;
+                   Runner_contract.cache_unit (request core scope Core.Close_asset_scope))
+                [ first; another_graph; other_user; other_origin ];
+              let first_core, first_scope = first in
+              Runner_contract.cache_unit
+                (request first_core first_scope Core.Delete_account_assets);
+              Runner_contract.cache_unit
+                (request first_core first_scope Core.Delete_account_assets);
+              List.iter
+                (fun (core, scope) ->
+                   Alcotest.(check bool)
+                     "all account graphs removed"
+                     true
+                     (cache_lookup request core scope "file" = None))
+                [ first; another_graph ];
+              List.iter
+                (fun (core, scope) ->
+                   Alcotest.(check bool)
+                     "other namespace preserved"
+                     true
+                     (Option.is_some (cache_lookup request core scope "file")))
+                [ other_user; other_origin ])
+       in
+       check_retired other_report)
+;;
+
+let test_downloaded_cache_graph_cleanup () =
+  with_downloaded_cache
+    [ cache_response "file"; cache_response "file" ]
+    (fun _ origin request _ ->
+       let first, scope = cache_selection origin in
+       let another, another_scope =
+         cache_selection
+           ~selected_graph:{ graph with graph_id = Core_contract.other_graph_id }
+           origin
+       in
+       List.iter
+         (fun (core, scope) -> ignore (cache_download request core scope "file"))
+         [ first, scope; another, another_scope ];
+       Runner_contract.cache_unit (request first scope Core.Delete_graph_assets);
+       Runner_contract.cache_unit (request first scope Core.Delete_graph_assets);
+       Alcotest.(check bool)
+         "selected graph removed"
+         true
+         (cache_lookup request first scope "file" = None);
+       Alcotest.(check bool)
+         "other graph retained"
+         true
+         (Option.is_some (cache_lookup request another another_scope "file")))
+;;
+
+let scenarios =
+  scenarios
+  @ List.map
+      (fun (name, test) -> Alcotest.test_case name `Quick test)
+      [ "cache restart via submit", test_downloaded_cache_restart
+      ; "cache corruption via submit", test_downloaded_cache_corruption
+      ; "cache publication eligibility via submit", test_downloaded_cache_eligibility
+      ; "cache leases and budget via submit", test_downloaded_cache_leases
+      ; "cache downloaded filename via submit", test_downloaded_cache_filename
+      ; "cache legacy bin cleanup via submit", test_downloaded_cache_legacy_cleanup
+      ; "cache account isolation via submit", test_downloaded_cache_isolation
+      ; "cache account cleanup via submit", test_downloaded_cache_account_cleanup
+      ; "cache graph cleanup via submit", test_downloaded_cache_graph_cleanup
+      ]
 ;;

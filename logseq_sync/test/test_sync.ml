@@ -5,6 +5,7 @@ let () =
     ; ( "pure core"
       , Core_contract.scenarios @ [ Local_restore_failure_reconciliation.scenario ] )
     ; "sync recovery reproductions", Core_contract.sync_recovery_reproductions
+    ; "asset execution core", Core_contract.asset_scenarios
     ; "effect runner", Runner_contract.scenarios
     ; "transport", Transport_contract.scenarios
     ]

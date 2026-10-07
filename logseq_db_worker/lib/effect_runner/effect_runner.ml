@@ -306,39 +306,8 @@ type runtime =
   }
 
 type sync_runner =
-  { stage_asset :
-      scope:Sync.graph_scope
-      -> operation:Graph.Uuid.t
-      -> file_type:string
-      -> source_file:string
-      -> (string * string * int64, string) result
-  ; put_upload :
-      context:Sync.asset_context
-      -> Logseq_db_types.Asset_upload_intent.t
-      -> current:(unit -> bool)
-      -> (unit, Upload.failure) result
-  ; prune_staging :
-      scope:Sync.graph_scope
-      -> keep:(Graph.Uuid.t -> (bool, string) result)
-      -> (int, string) result
-  ; release_staging : scope:Sync.graph_scope -> file:string -> (unit, string) result
-  ; submit_asset :
-      context:Sync.asset_context
-      -> current:(Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool)
-      -> post:(Logseq_sync_pure_reducer.Asset_transfer.event -> unit)
-      -> Logseq_sync_pure_reducer.Asset_transfer.instruction
-      -> unit
-  ; delete_assets : Sync.mirror_deletion -> (unit, string) result
-  ; close_assets : Sync.graph_scope -> unit
-  ; retain_staged_file : scope:Sync.graph_scope -> file:string -> (string * string) option
-  ; retain_asset_file :
-      scope:Sync.graph_scope -> handle:string -> (string * string) option
-  ; release_asset_file : scope:Sync.graph_scope -> handle:string -> unit
-  ; submit : Sync.runner_effect -> unit
+  { submit : Sync.runner_effect -> unit
   ; shutdown : unit -> unit
-  ; decrypt_protected_value : Sync.graph_key_handle -> string -> (string, string) result
-  ; encrypt_protected_values :
-      Sync.graph_key_handle -> string list -> ((string * string) list, string) result
   }
 
 type dependencies =
@@ -355,6 +324,19 @@ type create_error = Invalid_create of string
 type waiter =
   { request : Protocol.request
   ; resolve : Protocol.response Eio.Promise.u
+  }
+
+type asset_waiter =
+  { request : Sync.asset_request
+  ; resolve : Sync.asset_output Eio.Promise.u
+  ; mutable delivered : Sync.asset_output option
+  ; mutable accepted : bool
+  ; mutable reclaimed : bool
+  }
+
+type protected_waiter =
+  { protected_request : Sync.protected_request
+  ; protected_resolve : Sync.protected_output Eio.Promise.u
   }
 
 type change_window =
@@ -380,6 +362,10 @@ type t =
   ; dependencies : dependencies
   ; post : Core.event -> unit
   ; upload_operations : (Upload.ticket, unit Eio.Promise.u) Hashtbl.t
+  ; protected_waiters : (string, protected_waiter) Hashtbl.t
+  ; asset_waiters : (string, asset_waiter) Hashtbl.t
+  ; asset_operations : (Logseq_sync_pure_reducer.Asset_transfer.ticket, string) Hashtbl.t
+  ; mutable next_asset_operation : int64
   ; upload_staging_lock : Eio.Mutex.t
   ; mutable staging_reconciled : Sync.graph_scope option
   ; recovery_current : Core.upload_recovery_ticket -> bool
@@ -395,47 +381,13 @@ type t =
   }
 
 let runtime ~fork ~sleep = Ok { fork; sleep }
-
-let sync_runner
-      ?(decrypt_protected_value = fun _ _ -> Error "sync decryption is unavailable")
-      ?(encrypt_protected_values = fun _ _ -> Error "sync encryption is unavailable")
-      ~stage_asset
-      ~put_upload
-      ~prune_staging
-      ~release_staging
-      ~submit_asset
-      ~delete_assets
-      ~close_assets
-      ~retain_staged_file
-      ~retain_asset_file
-      ~release_asset_file
-      ~submit
-      ~shutdown
-      ()
-  =
-  { stage_asset
-  ; put_upload
-  ; release_staging
-  ; prune_staging
-  ; submit
-  ; shutdown
-  ; decrypt_protected_value
-  ; encrypt_protected_values
-  ; submit_asset
-  ; delete_assets
-  ; close_assets
-  ; retain_staged_file
-  ; retain_asset_file
-  ; release_asset_file
-  }
-;;
+let sync_runner ~submit ~shutdown () = { submit; shutdown }
 
 let dependencies ~runtime ~config ~overlay ~sync_runner ~publish =
   Ok { runtime; config; overlay; sync_runner; publish }
 ;;
 
 let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_current =
-  ignore dependencies.sync_runner.encrypt_protected_values;
   Ok
     { sw
     ; dependencies
@@ -444,6 +396,10 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; upload_current
     ; recovery_current
     ; upload_operations = Hashtbl.create 32
+    ; protected_waiters = Hashtbl.create 32
+    ; asset_waiters = Hashtbl.create 32
+    ; asset_operations = Hashtbl.create 8
+    ; next_asset_operation = 0L
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = None
     ; databases = Hashtbl.create 4
@@ -478,28 +434,184 @@ let with_upload_store t action =
   | exn -> Error (Printexc.to_string exn)
 ;;
 
+let asset_request t ~scope action =
+  let operation = "worker-asset:" ^ Int64.to_string t.next_asset_operation in
+  t.next_asset_operation <- Int64.succ t.next_asset_operation;
+  { Sync.scope; operation; action }
+;;
+
+let post_asset_request t request = t.post (Core.Sync_event (Sync.Asset_requested request))
+
+let send_asset t ~scope action =
+  Eio.Cancel.protect (fun () -> post_asset_request t (asset_request t ~scope action))
+;;
+
+let reclaim_asset_output t (output : Sync.asset_output) =
+  let action =
+    match output.result with
+    | Ok (Sync.Asset_staged { file; _ }) -> Some (Sync.Release_staged_file file)
+    | Ok
+        ( Asset_retained (Some (handle, _))
+        | Asset_cached (Some handle)
+        | Asset_downloaded handle ) -> Some (Sync.Release_asset_file handle)
+    | Ok _ | Error _ -> None
+  in
+  Option.iter (send_asset t ~scope:output.request.scope) action
+;;
+
+let reclaim_waiter t waiter =
+  if (not waiter.accepted) && not waiter.reclaimed
+  then (
+    waiter.reclaimed <- true;
+    Option.iter (reclaim_asset_output t) waiter.delivered)
+;;
+
+let asset_call ?(started = fun _ -> ()) t ~scope action =
+  let request = asset_request t ~scope action in
+  let promise, resolve = Eio.Promise.create () in
+  let waiter =
+    { request; resolve; delivered = None; accepted = false; reclaimed = false }
+  in
+  Hashtbl.add t.asset_waiters request.operation waiter;
+  Fun.protect
+    ~finally:(fun () ->
+      Hashtbl.remove t.asset_waiters request.operation;
+      if not waiter.accepted
+      then (
+        reclaim_waiter t waiter;
+        send_asset t ~scope (Sync.Cancel_asset_operation request.operation)))
+    (fun () ->
+       started request.operation;
+       post_asset_request t request;
+       let output = Eio.Promise.await promise in
+       waiter.accepted <- true;
+       output.Sync.result)
+;;
+
+let protected_call t action =
+  let key =
+    match action with
+    | Sync.Encrypt_values (key, _) | Decrypt_value (key, _) -> key
+  in
+  let operation = "worker-protected:" ^ Int64.to_string t.next_asset_operation in
+  t.next_asset_operation <- Int64.succ t.next_asset_operation;
+  let request =
+    { Sync.protected_operation = operation
+    ; protected_scope = Sync.graph_key_handle_scope key
+    ; protected_action = action
+    }
+  in
+  let promise, resolve = Eio.Promise.create () in
+  Hashtbl.add
+    t.protected_waiters
+    operation
+    { protected_request = request; protected_resolve = resolve };
+  Fun.protect
+    ~finally:(fun () -> Hashtbl.remove t.protected_waiters operation)
+    (fun () ->
+       t.post (Core.Sync_event (Sync.Protected_requested request));
+       (Eio.Promise.await promise).Sync.protected_result)
+;;
+
+let encrypt_protected_values t key plaintexts =
+  match protected_call t (Sync.Encrypt_values (key, plaintexts)) with
+  | Ok (Sync.Encrypted_values values) -> Ok values
+  | Ok _ -> Error "Unexpected protected encryption completion"
+  | Error (Sync.Effect_failed message | Crypto_failed (_, message)) -> Error message
+;;
+
+let decrypt_protected_value t key source =
+  match protected_call t (Sync.Decrypt_value (key, source)) with
+  | Ok (Sync.Decrypted_value value) -> Ok value
+  | Ok _ -> Error "Unexpected protected decryption completion"
+  | Error (Sync.Effect_failed message | Crypto_failed (_, message)) -> Error message
+;;
+
+let asset_failure_message = function
+  | Sync.Asset_invalid_content message -> message
+  | Asset_network -> "Asset network request failed"
+  | Asset_not_found | Asset_missing_source -> "Asset source is unavailable"
+  | Asset_checksum_mismatch -> "Asset checksum mismatch"
+  | Asset_authentication -> "Asset authentication failed"
+  | Asset_locked -> "Asset encryption key is unavailable"
+  | Asset_storage_full -> "Asset storage is full"
+  | Asset_size_rejected -> "Asset size exceeds the limit"
+  | Asset_revoked_access -> "Asset access was revoked"
+  | Asset_cancelled -> "Asset operation was cancelled"
+;;
+
+let asset_unit t ~scope action =
+  match asset_call t ~scope action with
+  | Ok Sync.Asset_unit -> Ok ()
+  | Error failure -> Error (asset_failure_message failure)
+  | Ok _ -> Error "Unexpected asset completion"
+;;
+
+let with_staging_lock t action =
+  Eio.Mutex.lock t.upload_staging_lock;
+  Fun.protect
+    ~finally:(fun () -> Eio.Mutex.unlock t.upload_staging_lock)
+    (fun () ->
+       match action () with
+       | result ->
+         if Result.is_error result then t.staging_reconciled <- None;
+         result
+       | exception error ->
+         t.staging_reconciled <- None;
+         raise error)
+;;
+
 let reconcile_staging t (scope : Sync.graph_scope) ~current =
   if (not (current ())) || t.stopped
   then Error "Stale staging recovery"
   else if t.staging_reconciled = Some scope
   then Ok ()
-  else
-    with_upload_store t (fun db ->
-      t.dependencies.sync_runner.prune_staging ~scope ~keep:(fun operation ->
-        if (not (current ())) || t.stopped
-        then Error "Stale staging recovery"
-        else
-          Result.bind (Logseq_db_storage.Asset_upload_store.read db ~operation) (function
-            | None -> Ok false
-            | Some intent
-              when intent.origin = Uri.to_string scope.account.managed_sync_origin
-                   && intent.account = scope.account.user_id
-                   && intent.graph = scope.graph_id
-                   && intent.staged_file
-                      = Graph.Uuid.to_string operation ^ "." ^ intent.version.file_type ->
-              Ok true
-            | Some _ -> Error "Staging checkpoint scope mismatch")))
-    |> Result.map (fun _ -> t.staging_reconciled <- Some scope)
+  else (
+    let keep =
+      with_upload_store t (fun db ->
+        let rec read after reversed =
+          if (not (current ())) || t.stopped
+          then Error "Stale staging recovery"
+          else
+            Result.bind
+              (Logseq_db_storage.Asset_upload_store.list
+                 db
+                 ~origin:(Uri.to_string scope.account.managed_sync_origin)
+                 ~account:scope.account.user_id
+                 ~graph:scope.graph_id
+                 ~after
+                 ~limit:128)
+              (fun intents ->
+                 let reversed =
+                   List.fold_left
+                     (fun files intent ->
+                        intent.Logseq_db_types.Asset_upload_intent.staged_file :: files)
+                     reversed
+                     intents
+                 in
+                 match List.rev intents with
+                 | [] -> Ok (List.rev reversed)
+                 | last :: _ when List.length intents = 128 ->
+                   read
+                     (Some last.Logseq_db_types.Asset_upload_intent.operation_id)
+                     reversed
+                 | _ -> Ok (List.rev reversed))
+        in
+        read None [])
+    in
+    Result.bind keep (fun keep ->
+      if (not (current ())) || t.stopped
+      then Error "Stale staging recovery"
+      else (
+        match asset_call t ~scope (Sync.Prune_asset_staging keep) with
+        | Ok (Sync.Asset_pruned _) ->
+          if current ()
+          then (
+            t.staging_reconciled <- Some scope;
+            Ok ())
+          else Error "Stale staging recovery"
+        | Error failure -> Error (asset_failure_message failure)
+        | Ok _ -> Error "Unexpected staging recovery completion")))
 ;;
 
 let save_upload t intent expected =
@@ -1182,7 +1294,7 @@ let protect_request t key request =
   | Some key ->
     let plaintexts = Database.protection_plaintexts request in
     let raw = List.map snd plaintexts in
-    (match t.dependencies.sync_runner.encrypt_protected_values key raw with
+    (match encrypt_protected_values t key raw with
      | Error message -> Error (effect_error message)
      | Ok encrypted ->
        let encrypted =
@@ -1201,7 +1313,7 @@ let unprotect_request t key request =
     let rec decrypt reversed = function
       | [] -> Ok (List.rev reversed)
       | (id, ciphertext) :: rest ->
-        (match t.dependencies.sync_runner.decrypt_protected_value key ciphertext with
+        (match decrypt_protected_value t key ciphertext with
          | Error message -> Error (effect_error message)
          | Ok plaintext -> decrypt ((id, plaintext) :: reversed) rest)
     in
@@ -1291,11 +1403,7 @@ let handle_sync_worker_effect t = function
                        let rec decrypt reversed = function
                          | [] -> Ok (List.rev reversed)
                          | (id, ciphertext) :: rest ->
-                           (match
-                              t.dependencies.sync_runner.decrypt_protected_value
-                                graph_key
-                                ciphertext
-                            with
+                           (match decrypt_protected_value t graph_key ciphertext with
                             | Error message -> Error message
                             | Ok plaintext -> decrypt ((id, plaintext) :: reversed) rest)
                        in
@@ -1338,7 +1446,15 @@ let handle_sync_worker_effect t = function
                     ~origin:(Uri.to_string request.account.managed_sync_origin)
                     ~account:request.account.user_id
                     ~graph:request.graph_id))
-               (fun () -> t.dependencies.sync_runner.delete_assets request)
+               (fun () ->
+                  asset_unit
+                    t
+                    ~scope:
+                      { Sync.account = request.account
+                      ; graph_id = request.graph_id
+                      ; graph_generation = 0
+                      }
+                    Sync.Delete_graph_assets)
              |> Result.map_error (fun _ -> ()))
             (fun () ->
                Database.delete_mirror inspection |> Result.map_error (fun _ -> ()))
@@ -1573,9 +1689,7 @@ let run_upload t (context : Sync.asset_context) instruction =
   | Upload.Cancel_operation _ -> ()
   | Release_staging intent ->
     (match
-       t.dependencies.sync_runner.release_staging
-         ~scope:context.scope
-         ~file:intent.staged_file
+       asset_unit t ~scope:context.scope (Sync.Release_staged_file intent.staged_file)
      with
      | Ok () -> ()
      | Error message -> t.dependencies.publish (Core.Diagnostic message))
@@ -1614,8 +1728,31 @@ let run_upload t (context : Sync.asset_context) instruction =
     then
       finish
         ticket
-        (t.dependencies.sync_runner.put_upload ~context intent ~current:(fun () ->
-           current ticket))
+        (match
+           asset_call
+             t
+             ~scope:context.scope
+             (Sync.Put_asset_file
+                { asset = intent.asset
+                ; version = intent.version
+                ; file = intent.staged_file
+                ; maximum_plaintext_bytes = 8 * 1024 * 1024
+                })
+         with
+         | Ok Sync.Asset_unit -> Ok ()
+         | Ok _ -> Error Upload.Invalid_content
+         | Error failure ->
+           Error
+             (match failure with
+              | Sync.Asset_network -> Upload.Network
+              | Asset_authentication | Asset_locked -> Authentication
+              | Asset_missing_source | Asset_not_found -> Missing_source
+              | Asset_size_rejected -> Size_rejected
+              | Asset_revoked_access -> Revoked_access
+              | Asset_checksum_mismatch
+              | Asset_storage_full
+              | Asset_cancelled
+              | Asset_invalid_content _ -> Invalid_content))
         Upload.Put_succeeded
   | Await_publication (ticket, intent) ->
     let rec await () =
@@ -1640,7 +1777,8 @@ let submit_upload t context instruction =
     Option.iter
       (fun resolver -> ignore (Eio.Promise.try_resolve resolver () : bool))
       (Hashtbl.find_opt t.upload_operations ticket)
-  | Release_staging _ -> run_upload t context instruction
+  | Release_staging _ ->
+    t.dependencies.runtime.fork ~sw:t.sw (fun () -> run_upload t context instruction)
   | Persist (ticket, _, _)
   | Inspect (ticket, _)
   | Apply_local (ticket, _)
@@ -1660,7 +1798,117 @@ let submit_upload t context instruction =
                (fun () -> Eio.Promise.await cancelled))))
 ;;
 
+let transfer_failure = function
+  | Sync.Asset_network -> Logseq_sync_pure_reducer.Asset_transfer.Network
+  | Asset_not_found | Asset_missing_source -> Not_found
+  | Asset_checksum_mismatch -> Checksum_mismatch
+  | Asset_authentication | Asset_revoked_access -> Authentication
+  | Asset_locked -> Locked
+  | Asset_storage_full -> Storage_full
+  | Asset_size_rejected -> Invalid_content "Asset size exceeds the limit"
+  | Asset_cancelled -> Invalid_content "Asset operation was cancelled"
+  | Asset_invalid_content message -> Invalid_content message
+;;
+
+let run_asset t (context : Sync.asset_context) instruction =
+  let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+  let perform ticket action success =
+    if
+      (not t.stopped)
+      && t.asset_current ticket
+      && not (Hashtbl.mem t.asset_operations ticket)
+    then (
+      Hashtbl.add t.asset_operations ticket "";
+      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+        Fun.protect
+          ~finally:(fun () -> Hashtbl.remove t.asset_operations ticket)
+          (fun () ->
+             let result =
+               if t.stopped || not (t.asset_current ticket)
+               then Error Sync.Asset_cancelled
+               else
+                 asset_call
+                   ~started:(fun operation ->
+                     Hashtbl.replace t.asset_operations ticket operation)
+                   t
+                   ~scope:context.scope
+                   action
+             in
+             if (not t.stopped) && t.asset_current ticket
+             then
+               t.post
+                 (Core.Asset_completed
+                    ( context.scope
+                    , success
+                        (match result with
+                         | Ok value -> Ok value
+                         | Error failure -> Error (transfer_failure failure)) ))
+             else (
+               match result with
+               | Ok (Sync.Asset_cached (Some handle) | Asset_downloaded handle) ->
+                 send_asset t ~scope:context.scope (Sync.Release_asset_file handle)
+               | Ok _ | Error _ -> ()))))
+  in
+  match instruction with
+  | Transfer.Check_cache ticket ->
+    perform
+      ticket
+      (Sync.Check_asset_cache (ticket.asset, ticket.version))
+      (fun result ->
+         Transfer.Cache_checked
+           ( ticket
+           , Result.bind result (function
+               | Sync.Asset_cached handle -> Ok handle
+               | _ -> Error (Transfer.Invalid_content "Unexpected cache completion")) ))
+  | Fetch ticket ->
+    perform
+      ticket
+      (Sync.Fetch_asset
+         { asset = ticket.asset
+         ; version = ticket.version
+         ; maximum_plaintext_bytes = 8 * 1024 * 1024
+         })
+      (fun result ->
+         Transfer.Downloaded
+           ( ticket
+           , Result.bind result (function
+               | Sync.Asset_downloaded handle -> Ok handle
+               | _ -> Error (Transfer.Invalid_content "Unexpected download completion"))
+           ))
+  | Cancel ticket ->
+    Option.iter
+      (fun operation ->
+         if operation <> ""
+         then send_asset t ~scope:context.scope (Sync.Cancel_asset_operation operation))
+      (Hashtbl.find_opt t.asset_operations ticket)
+  | Release_handle handle ->
+    send_asset t ~scope:context.scope (Sync.Release_asset_file handle)
+  | Retry_after { id; seconds } ->
+    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      match asset_call t ~scope:context.scope (Sync.Asset_retry_after seconds) with
+      | Ok Sync.Asset_retry_elapsed when not t.stopped ->
+        t.post (Core.Asset_completed (context.scope, Transfer.Retry_elapsed id))
+      | Ok _ | Error _ -> ())
+  | Notify _ | Backpressure _ | Capacity_available -> ()
+;;
+
 let submit t = function
+  | Core.Deliver_protected_result output ->
+    (match
+       Hashtbl.find_opt
+         t.protected_waiters
+         output.Sync.protected_request.protected_operation
+     with
+     | Some waiter when waiter.protected_request = output.protected_request ->
+       ignore (Eio.Promise.try_resolve waiter.protected_resolve output : bool)
+     | Some _ | None -> ())
+  | Core.Deliver_asset_result output ->
+    (match Hashtbl.find_opt t.asset_waiters output.Sync.request.operation with
+     | Some waiter when waiter.request = output.request && waiter.delivered = None ->
+       waiter.delivered <- Some output;
+       if not (Eio.Promise.try_resolve waiter.resolve output) then reclaim_waiter t waiter
+     | Some waiter when waiter.request = output.request -> ()
+     | Some _ | None -> reclaim_asset_output t output)
   | Core.Read_uploads ticket ->
     if (not t.stopped) && t.recovery_current ticket
     then
@@ -1668,7 +1916,7 @@ let submit t = function
         if (not t.stopped) && t.recovery_current ticket
         then (
           let result =
-            Eio.Mutex.use_rw ~protect:true t.upload_staging_lock (fun () ->
+            with_staging_lock t (fun () ->
               Result.bind
                 (reconcile_staging t ticket.scope ~current:(fun () ->
                    t.recovery_current ticket))
@@ -1687,15 +1935,8 @@ let submit t = function
   | Core.Run_upload (context, instruction) ->
     if not t.stopped then submit_upload t context instruction
   | Core.Run_asset (context, instruction) ->
-    if not t.stopped
-    then
-      t.dependencies.sync_runner.submit_asset
-        ~context
-        ~current:(fun ticket -> (not t.stopped) && t.asset_current ticket)
-        ~post:(fun event ->
-          if not t.stopped then t.post (Core.Asset_completed (context.scope, event)))
-        instruction
-  | Close_asset_scope scope -> t.dependencies.sync_runner.close_assets scope
+    if not t.stopped then run_asset t context instruction
+  | Close_asset_scope scope -> send_asset t ~scope Sync.Close_asset_scope
   | Core.Run_worker request ->
     if not t.stopped
     then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
@@ -1716,6 +1957,8 @@ let submit t = function
           (Core.Sync_event
              (Sync.Runner_completed
                 (Sync.Completion (ticket, Error (Sync.Effect_failed message))))))
+  | Run_sync (Sync.Asset_io _ as sync_effect) ->
+    t.dependencies.sync_runner.submit sync_effect
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect
   | Publish output -> if not t.stopped then t.dependencies.publish output
@@ -1746,6 +1989,7 @@ let submit t instruction =
 let shutdown t =
   if not t.stopped
   then (
+    t.post (Core.Sync_event Sync.Shutdown);
     t.stopped <- true;
     Hashtbl.iter
       (fun _ resolve -> ignore (Eio.Promise.try_resolve resolve () : bool))
@@ -1755,7 +1999,7 @@ let shutdown t =
     t.dependencies.sync_runner.shutdown ();
     Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () ->
       Hashtbl.iter
-        (fun _ waiter ->
+        (fun _ (waiter : waiter) ->
            let response = failure waiter.request Closed_session "The Worker stopped." in
            Eio.Promise.resolve waiter.resolve response)
         t.waiters;
@@ -1763,11 +2007,13 @@ let shutdown t =
 ;;
 
 let retain_asset_file t ~scope ~handle =
-  if t.stopped then None else t.dependencies.sync_runner.retain_asset_file ~scope ~handle
+  match asset_call t ~scope (Sync.Retain_asset_file handle) with
+  | Ok (Sync.Asset_retained file) -> file
+  | Ok _ | Error _ -> None
 ;;
 
 let release_asset_file t ~scope ~handle =
-  t.dependencies.sync_runner.release_asset_file ~scope ~handle
+  ignore (asset_unit t ~scope (Sync.Release_asset_file handle))
 ;;
 
 let prepare_import_unlocked
@@ -1820,11 +2066,19 @@ let prepare_import_unlocked
     | Some _ -> Error "This import identity is already in use"
     | None ->
       let* file, checksum, size =
-        t.dependencies.sync_runner.stage_asset
-          ~scope:context.scope
-          ~operation:request.operation
-          ~file_type:request.file_type
-          ~source_file:request.source_file
+        match
+          asset_call
+            t
+            ~scope:context.scope
+            (Sync.Stage_asset_file
+               { operation = request.operation
+               ; file_type = request.file_type
+               ; source_file = request.source_file
+               })
+        with
+        | Ok (Sync.Asset_staged { file; checksum; size }) -> Ok (file, checksum, size)
+        | Error failure -> Error (asset_failure_message failure)
+        | Ok _ -> Error "Unexpected staging completion"
       in
       let persistence_attempted = ref false in
       let result =
@@ -1835,24 +2089,23 @@ let prepare_import_unlocked
         else (
           persistence_attempted := true;
           let* () =
-            with_upload_store t (fun db ->
-              Logseq_db_storage.Asset_upload_store.save db ~expected:None intent)
+            Eio.Cancel.protect (fun () ->
+              with_upload_store t (fun db ->
+                Logseq_db_storage.Asset_upload_store.save db ~expected:None intent))
           in
           Ok intent)
       in
       (match result with
        | Ok _ -> ()
        | Error _ when not !persistence_attempted ->
-         ignore (t.dependencies.sync_runner.release_staging ~scope:context.scope ~file)
+         Eio.Cancel.protect (fun () ->
+           ignore (asset_unit t ~scope:context.scope (Sync.Release_staged_file file)))
        | Error _ -> ());
       result
 ;;
 
 let prepare_import t ~context request ~current =
-  Eio.Mutex.use_rw ~protect:true t.upload_staging_lock (fun () ->
-    let result = prepare_import_unlocked t ~context request ~current in
-    if Result.is_error result then t.staging_reconciled <- None;
-    result)
+  with_staging_lock t (fun () -> prepare_import_unlocked t ~context request ~current)
 ;;
 
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
@@ -1868,6 +2121,8 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
            && intent.account = scope.account.user_id
            && intent.graph = scope.graph_id
            && intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled ->
-      t.dependencies.sync_runner.retain_staged_file ~scope ~file:intent.staged_file
+      (match asset_call t ~scope (Sync.Retain_staged_file intent.staged_file) with
+       | Ok (Sync.Asset_retained file) -> file
+       | Ok _ | Error _ -> None)
     | Ok _ | Error _ -> None)
 ;;

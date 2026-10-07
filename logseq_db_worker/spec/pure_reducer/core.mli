@@ -101,6 +101,8 @@ type upload_recovery_ticket = private
   }
 
 type instruction =
+  | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
+  | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
   | Read_uploads of upload_recovery_ticket
   | Run_upload of Logseq_sync_pure_reducer.Core.asset_context * Asset_upload.instruction
   | Run_asset of

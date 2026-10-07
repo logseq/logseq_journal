@@ -1452,12 +1452,14 @@ let canonical_overlay_happy_path () =
   in
   let hp01_event = Core.Account_authenticated { user_id = Some "user" } in
   let hp01_preview = preview_step "HP01" origin hp01_event in
-  let catalog_ticket : Core.graph list Core.effect_ticket =
+  let (catalog_ticket, catalog_scope)
+    : Core.graph list Core.effect_ticket * Core.account_scope
+    =
     match hp01_preview.effects with
     | [ Core.Publish (Core.State_changed state)
       ; Core.Run (Core.Request (ticket, Core.Fetch_catalog scope))
       ]
-      when state = authenticated_state && scope.user_id = "user" -> ticket
+      when state = authenticated_state && scope.user_id = "user" -> ticket, scope
     | _ -> Alcotest.fail "HP01 unexpected instruction shape"
   in
   let account_scope : Core.account_scope =
@@ -1468,15 +1470,9 @@ let canonical_overlay_happy_path () =
     ; lifecycle_generation = 0L
     }
   in
+  Alcotest.(check bool) "HP01 full account scope" true (catalog_scope = account_scope);
   let hp01 =
-    check_step
-      "HP01"
-      origin
-      hp01_event
-      authenticated_observed
-      [ Core.Publish (Core.State_changed authenticated_state)
-      ; Core.Run (Core.Request (catalog_ticket, Core.Fetch_catalog account_scope))
-      ]
+    check_step "HP01" origin hp01_event authenticated_observed hp01_preview.effects
   in
   let hp02 = hp01 in
   let catalogued_startup =
@@ -1499,15 +1495,13 @@ let canonical_overlay_happy_path () =
   let save_catalog_effect =
     match hp03_preview.effects with
     | [ Core.Publish (Core.State_changed state)
-      ; Core.Run (Core.Request (ticket, Core.Save_catalog { account; cache }))
+      ; (Core.Run (Core.Request (_, Core.Save_catalog { account; cache })) as save_effect)
       ]
       when state = catalogued_state
            && account = account_scope
            && Core.catalog_cache_user_id cache = "user"
            && Core.catalog_cache_graphs cache = [ graph ]
-           && Core.catalog_cache_selected_graph cache = None ->
-      Core.Run
-        (Core.Request (ticket, Core.Save_catalog { account = account_scope; cache }))
+           && Core.catalog_cache_selected_graph cache = None -> save_effect
     | _ -> Alcotest.fail "HP03 unexpected instruction shape"
   in
   let hp03 =
@@ -1546,7 +1540,7 @@ let canonical_overlay_happy_path () =
     match hp04_preview.effects with
     | [ Core.Delegate (Core.Inspect_mirror request)
       ; Core.Publish (Core.State_changed state)
-      ; Core.Run (Core.Request (ticket, Core.Save_catalog { account; cache }))
+      ; (Core.Run (Core.Request (_, Core.Save_catalog { account; cache })) as save_effect)
       ]
       when (request = Core.{ graph; scope = graph_scope })
            && state = selected_state
@@ -1554,9 +1548,7 @@ let canonical_overlay_happy_path () =
            && Core.catalog_cache_user_id cache = "user"
            && Core.catalog_cache_graphs cache = [ graph ]
            && Core.catalog_cache_selected_graph cache = Some graph_id ->
-      ( request
-      , Core.Run
-          (Core.Request (ticket, Core.Save_catalog { account = account_scope; cache })) )
+      request, save_effect
     | _ -> Alcotest.fail "HP04 unexpected instruction shape"
   in
   let hp04 =
@@ -1617,15 +1609,13 @@ let canonical_overlay_happy_path () =
     ; uri = Uri.of_string "wss://api.logseq.io/sync/11111111-1111-4111-8111-111111111111"
     }
   in
+  let hp06_preview = preview_step "HP06" hp05.next hp06_event in
+  (match hp06_preview.effects with
+   | [ Core.Publish (Core.State_changed state); Core.Run (Core.Start_websocket request) ]
+     when state = connecting_state && request = websocket_request -> ()
+   | _ -> Alcotest.fail "HP06 unexpected instruction shape");
   let hp06 =
-    check_step
-      "HP06"
-      hp05.next
-      hp06_event
-      connecting_observed
-      [ Core.Publish (Core.State_changed connecting_state)
-      ; Core.Run (Core.Start_websocket websocket_request)
-      ]
+    check_step "HP06" hp05.next hp06_event connecting_observed hp06_preview.effects
   in
   let hp07 = hp06 in
   let pulling0_state =
@@ -1636,19 +1626,18 @@ let canonical_overlay_happy_path () =
   let pulling0_observed =
     { state = pulling0_state; admitted_graph_scope = Some graph_scope }
   in
-  let pull0 =
-    Core.Run
-      (Core.Send_websocket
-         { scope = connection; message = Protocol.Client.Pull { since = Some 0 } })
-  in
   let hp08_event = Core.Websocket_opened connection in
+  let hp08_preview = preview_step "HP08" hp07.next hp08_event in
+  (match hp08_preview.effects with
+   | [ Core.Publish (Core.State_changed state)
+     ; Core.Run (Core.Send_websocket { scope; message })
+     ]
+     when state = pulling0_state
+          && scope = connection
+          && message = Protocol.Client.Pull { since = Some 0 } -> ()
+   | _ -> Alcotest.fail "HP08 unexpected instruction shape");
   let hp08 =
-    check_step
-      "HP08"
-      hp07.next
-      hp08_event
-      pulling0_observed
-      [ Core.Publish (Core.State_changed pulling0_state); pull0 ]
+    check_step "HP08" hp07.next hp08_event pulling0_observed hp08_preview.effects
   in
   let remote_tx : Protocol.Server.pull_transaction =
     { t = 1; tx = "[]"; outliner_op = Some "save-block" }
@@ -1833,23 +1822,19 @@ let canonical_overlay_happy_path () =
     Core.Outbox_transition_applied
       { scope = submit_request.scope; commit = submit_commit; sync = submitted_sync }
   in
+  let hp13_preview = preview_step "HP13" hp12.next hp13_event in
   let hp13 =
-    let timer =
-      match (Core.step hp12.next hp13_event).effects with
-      | [ Core.Run (Core.Send_websocket _); Core.Run (Core.Schedule_timer timer) ]
-        when timer.delay_seconds = 30.
-             && timer.scope.connection_generation = Some connection.connection_generation
-        -> timer
-      | _ -> Alcotest.fail "HP13 submission omitted its scoped response timeout"
-    in
-    check_step
-      "HP13"
-      hp12.next
-      hp13_event
-      submitting_observed
-      [ Core.Run (Core.Send_websocket { scope = connection; message = tx_message })
-      ; Core.Run (Core.Schedule_timer timer)
-      ]
+    (match hp13_preview.effects with
+     | [ Core.Run (Core.Send_websocket { scope; message })
+       ; Core.Run (Core.Schedule_timer timer)
+       ]
+       when scope = connection
+            && message = tx_message
+            && timer.delay_seconds = 30.
+            && timer.scope.connection_generation = Some connection.connection_generation
+       -> ()
+     | _ -> Alcotest.fail "HP13 submission omitted its scoped response timeout");
+    check_step "HP13" hp12.next hp13_event submitting_observed hp13_preview.effects
   in
   let hp14_event =
     Core.Websocket_message
@@ -1916,17 +1901,17 @@ let canonical_overlay_happy_path () =
     Core.Outbox_transition_applied
       { scope = accept_request.scope; commit = accept_commit; sync = accepted_sync }
   in
+  let hp15_preview = preview_step "HP15" hp14.next hp15_event in
+  (match hp15_preview.effects with
+   | [ Core.Publish (Core.State_changed state)
+     ; Core.Run (Core.Send_websocket { scope; message })
+     ]
+     when state = pulling1_state
+          && scope = connection
+          && message = Protocol.Client.Pull { since = Some 1 } -> ()
+   | _ -> Alcotest.fail "HP15 unexpected instruction shape");
   let hp15 =
-    check_step
-      "HP15"
-      hp14.next
-      hp15_event
-      pulling1_observed
-      [ Core.Publish (Core.State_changed pulling1_state)
-      ; Core.Run
-          (Core.Send_websocket
-             { scope = connection; message = Protocol.Client.Pull { since = Some 1 } })
-      ]
+    check_step "HP15" hp14.next hp15_event pulling1_observed hp15_preview.effects
   in
   let incorporated_tx : Protocol.Server.pull_transaction =
     { t = 2; tx = "[]"; outliner_op = Some "save-block" }
@@ -3623,5 +3608,476 @@ let scenarios =
       "whole-batch invalid tx partitions every member"
       `Quick
       whole_batch_invalid_tx_partitions_every_member
+  ]
+;;
+
+(* Core owns admission and acceptance; filesystem execution is tested by the runner. *)
+let asset_version =
+  Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"bin"
+  |> Result.get_ok
+;;
+
+let asset_fixture () =
+  let selected, scope = selected_graph graph in
+  selected.next, scope
+;;
+
+let asset_issue core scope operation action =
+  let request : Core.asset_request = { scope; operation; action } in
+  let transition = Core.step core (Core.Asset_requested request) in
+  let ticket =
+    List.find_map
+      (function
+        | Core.Run (Core.Asset_io (ticket, io)) when io.operation = operation ->
+          Some ticket
+        | _ -> None)
+      transition.effects
+    |> Option.get
+  in
+  transition, ticket, request
+;;
+
+let asset_outputs effects =
+  List.filter_map
+    (function
+      | Core.Publish (Core.Asset_finished output) -> Some output
+      | _ -> None)
+    effects
+;;
+
+let asset_complete core ticket result =
+  Core.step core (Core.Runner_completed (Core.Asset_completion (ticket, result)))
+;;
+
+let asset_accepts_exact_identity_once () =
+  let core, scope = asset_fixture () in
+  let first, ticket, request =
+    asset_issue core scope "cache-1" (Core.Check_asset_cache (graph_id, asset_version))
+  in
+  Alcotest.(check int)
+    "request emits no premature result"
+    0
+    (List.length (asset_outputs first.effects));
+  let second, other, other_request =
+    asset_issue
+      first.next
+      scope
+      "cache-2"
+      (Core.Check_asset_cache (graph_id, asset_version))
+  in
+  let completed = asset_complete second.next other (Ok (Core.Asset_cached None)) in
+  Alcotest.(check bool)
+    "second ticket resolves only second operation"
+    true
+    (asset_outputs completed.effects
+     = [ { Core.request = other_request; result = Ok (Core.Asset_cached None) } ]);
+  let first_done = asset_complete completed.next ticket (Ok (Core.Asset_cached None)) in
+  Alcotest.(check bool)
+    "first ticket remains pending"
+    true
+    (asset_outputs first_done.effects
+     = [ { Core.request; result = Ok (Core.Asset_cached None) } ]);
+  let repeated = asset_complete first_done.next ticket (Ok (Core.Asset_cached None)) in
+  check_instructions "asset completion replay" [] repeated.effects
+;;
+
+let asset_rejects_foreign_scope_and_duplicate_request () =
+  let core, scope = asset_fixture () in
+  let pending, _, _ =
+    asset_issue
+      core
+      scope
+      "same"
+      (Core.Fetch_asset
+         { asset = graph_id; version = asset_version; maximum_plaintext_bytes = 32 })
+  in
+  let duplicate =
+    Core.step
+      pending.next
+      (Core.Asset_requested
+         { scope
+         ; operation = "same"
+         ; action =
+             Core.Fetch_asset
+               { asset = graph_id; version = asset_version; maximum_plaintext_bytes = 32 }
+         })
+  in
+  Alcotest.(check bool)
+    "duplicate request does not execute twice"
+    false
+    (List.exists
+       (function
+         | Core.Run (Core.Asset_io _) -> true
+         | _ -> false)
+       duplicate.effects);
+  let foreign_scopes =
+    [ { scope with graph_generation = scope.graph_generation + 1 }
+    ; { scope with graph_id = other_graph_id }
+    ; { scope with
+        account =
+          { scope.account with account_generation = scope.account.account_generation + 1 }
+      }
+    ; { scope with
+        account =
+          { scope.account with
+            presentation_generation = scope.account.presentation_generation + 1
+          }
+      }
+    ; { scope with
+        account =
+          { scope.account with
+            lifecycle_generation = Int64.succ scope.account.lifecycle_generation
+          }
+      }
+    ; { scope with account = { scope.account with user_id = "other-account" } }
+    ; { scope with
+        account =
+          { scope.account with
+            managed_sync_origin = Uri.of_string "https://other-origin.invalid"
+          }
+      }
+    ]
+  in
+  List.iter
+    (fun foreign_scope ->
+       let rejected =
+         Core.step
+           duplicate.next
+           (Core.Asset_requested
+              { scope = foreign_scope
+              ; operation = "foreign"
+              ; action =
+                  Core.Fetch_asset
+                    { asset = graph_id
+                    ; version = asset_version
+                    ; maximum_plaintext_bytes = 32
+                    }
+              })
+       in
+       Alcotest.(check bool)
+         "foreign scope identity cannot execute IO"
+         false
+         (List.exists
+            (function
+              | Core.Run (Core.Asset_io _) -> true
+              | _ -> false)
+            rejected.effects))
+    foreign_scopes
+;;
+
+let asset_failure_is_published_once () =
+  let core, scope = asset_fixture () in
+  let pending, ticket, request =
+    asset_issue
+      core
+      scope
+      "failed"
+      (Core.Put_asset_file
+         { asset = graph_id
+         ; version = asset_version
+         ; file = "resource"
+         ; maximum_plaintext_bytes = 32
+         })
+  in
+  let failed = asset_complete pending.next ticket (Error Core.Asset_network) in
+  Alcotest.(check bool)
+    "typed failure preserves request identity"
+    true
+    (asset_outputs failed.effects
+     = [ { Core.request; result = Error Core.Asset_network } ]);
+  let repeated = asset_complete failed.next ticket (Error Core.Asset_network) in
+  check_instructions "asset failure replay" [] repeated.effects
+;;
+
+let asset_cancelled_completion_cleans_resources () =
+  List.iter
+    (fun (action, value, cleanup) ->
+       let core, scope = asset_fixture () in
+       let pending, ticket, _ = asset_issue core scope "cancelled" action in
+       let cancelled, _, _ =
+         asset_issue pending.next scope "cancel" (Core.Cancel_asset_operation "cancelled")
+       in
+       let late = asset_complete cancelled.next ticket (Ok value) in
+       Alcotest.(check int)
+         "cancelled work never publishes success"
+         0
+         (List.length (asset_outputs late.effects));
+       Alcotest.(check bool)
+         "cancelled completion releases its resource"
+         true
+         (List.exists
+            (function
+              | Core.Run (Core.Asset_io (_, io)) -> io.action = cleanup
+              | _ -> false)
+            late.effects))
+    [ ( Core.Fetch_asset
+          { asset = graph_id; version = asset_version; maximum_plaintext_bytes = 32 }
+      , Core.Asset_downloaded "file"
+      , Core.Release_asset_file "file" )
+    ; ( Core.Stage_asset_file
+          { operation = graph_id; file_type = "bin"; source_file = "source" }
+      , Core.Asset_staged { file = "stage"; checksum = String.make 64 'a'; size = 4L }
+      , Core.Release_staged_file "stage" )
+    ; ( Core.Retain_asset_file "file"
+      , Core.Asset_retained (Some ("lease", "path"))
+      , Core.Release_asset_file "lease" )
+    ]
+;;
+
+let asset_scope_switch_cleans_late_resources () =
+  List.iter
+    (fun (action, result, cleanup) ->
+       let core, scope = asset_fixture () in
+       let pending, ticket, _ = asset_issue core scope "old-resource" action in
+       let picker = Core.step pending.next Core.Graph_picker_requested in
+       let late = asset_complete picker.next ticket (Ok result) in
+       Alcotest.(check int)
+         "old graph publishes no resource"
+         0
+         (List.length (asset_outputs late.effects));
+       Alcotest.(check bool)
+         "old graph resource is released via runner effect"
+         true
+         (List.exists
+            (function
+              | Core.Run (Core.Asset_io (_, io)) -> io.action = cleanup
+              | _ -> false)
+            late.effects))
+    [ ( Core.Fetch_asset
+          { asset = graph_id; version = asset_version; maximum_plaintext_bytes = 32 }
+      , Core.Asset_downloaded "late-file"
+      , Core.Release_asset_file "late-file" )
+    ; ( Core.Stage_asset_file
+          { operation = graph_id; file_type = "bin"; source_file = "source" }
+      , Core.Asset_staged
+          { file = "late-stage"; checksum = String.make 64 'a'; size = 4L }
+      , Core.Release_staged_file "late-stage" )
+    ; ( Core.Retain_asset_file "file"
+      , Core.Asset_retained (Some ("late-lease", "path"))
+      , Core.Release_asset_file "late-lease" )
+    ]
+;;
+
+let asset_mismatched_completion_cleans_resource () =
+  let core, scope = asset_fixture () in
+  let pending, ticket, _ =
+    asset_issue core scope "cache" (Core.Check_asset_cache (graph_id, asset_version))
+  in
+  let wrong =
+    asset_complete
+      pending.next
+      ticket
+      (Ok
+         (Core.Asset_staged
+            { file = "unexpected-stage"; checksum = String.make 64 'a'; size = 4L }))
+  in
+  Alcotest.(check bool)
+    "wrong resource kind is not accepted"
+    true
+    (match asset_outputs wrong.effects with
+     | [ { result = Error (Core.Asset_invalid_content _); _ } ] -> true
+     | _ -> false);
+  Alcotest.(check bool)
+    "wrong resource is cleaned through runner"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Asset_io (_, io)) ->
+           io.action = Core.Release_staged_file "unexpected-stage"
+         | _ -> false)
+       wrong.effects)
+;;
+
+let asset_retry_completion_is_consumed_once () =
+  let core, scope = asset_fixture () in
+  let pending, ticket, request =
+    asset_issue core scope "retry" (Core.Asset_retry_after 0.1)
+  in
+  let elapsed = asset_complete pending.next ticket (Ok Core.Asset_retry_elapsed) in
+  Alcotest.(check bool)
+    "timer returns to requesting owner"
+    true
+    (asset_outputs elapsed.effects
+     = [ { Core.request; result = Ok Core.Asset_retry_elapsed } ]);
+  let duplicate = asset_complete elapsed.next ticket (Ok Core.Asset_retry_elapsed) in
+  check_instructions "asset timer replay" [] duplicate.effects
+;;
+
+let asset_cleanup_requires_admitted_scope () =
+  let core, scope = asset_fixture () in
+  let foreign =
+    { scope with account = { scope.account with user_id = "forged-account" } }
+  in
+  List.iter
+    (fun action ->
+       let rejected =
+         Core.step
+           core
+           (Core.Asset_requested { scope = foreign; operation = "forged-cleanup"; action })
+       in
+       Alcotest.(check bool)
+         "foreign account cannot execute destructive or resource cleanup"
+         false
+         (List.exists
+            (function
+              | Core.Run (Core.Asset_io _) -> true
+              | _ -> false)
+            rejected.effects);
+       Alcotest.(check bool)
+         "rejected cleanup reports its own cancelled identity"
+         true
+         (match asset_outputs rejected.effects with
+          | [ output ] ->
+            output.request.scope = foreign && output.result = Error Core.Asset_cancelled
+          | _ -> false))
+    [ Core.Release_asset_file "resource"
+    ; Core.Release_staged_file "stage"
+    ; Core.Close_asset_scope
+    ; Core.Delete_graph_assets
+    ; Core.Delete_account_assets
+    ; Core.Cancel_asset_operation "pending"
+    ];
+  let picker = Core.step core Core.Graph_picker_requested in
+  List.iter
+    (fun action ->
+       let accepted =
+         Core.step
+           picker.next
+           (Core.Asset_requested { scope; operation = "known-cleanup"; action })
+       in
+       Alcotest.(check bool)
+         "previously admitted scope still permits required cleanup"
+         true
+         (List.exists
+            (function
+              | Core.Run (Core.Asset_io (_, io)) ->
+                io.context.scope = scope && io.action = action
+              | _ -> false)
+            accepted.effects))
+    [ Core.Release_asset_file "resource"
+    ; Core.Release_staged_file "stage"
+    ; Core.Close_asset_scope
+    ]
+;;
+
+let asset_deletion_cancels_stage core scope deletion_scope action =
+  let pending, ticket, request =
+    asset_issue
+      core
+      scope
+      "stage-before-deletion"
+      (Core.Stage_asset_file
+         { operation = graph_id; file_type = "bin"; source_file = "source" })
+  in
+  let deleting, _, _ = asset_issue pending.next deletion_scope "delete-assets" action in
+  let late =
+    asset_complete
+      deleting.next
+      ticket
+      (Ok
+         (Core.Asset_staged
+            { file = "late-deleted-stage"; checksum = String.make 64 'a'; size = 4L }))
+  in
+  Alcotest.(check int)
+    "deleted asset operation cannot publish late staging success"
+    0
+    (List.length (asset_outputs late.effects));
+  Alcotest.(check bool)
+    "deletion cancels the exact pending staging request"
+    true
+    (asset_outputs deleting.effects
+     = [ { Core.request; result = Error Core.Asset_cancelled } ]);
+  Alcotest.(check bool)
+    "late staging completion cleans through the original resource scope"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Asset_io (_, io)) ->
+           io.context.scope = scope
+           && io.action = Core.Release_staged_file "late-deleted-stage"
+         | _ -> false)
+       late.effects);
+  let repeated =
+    asset_complete
+      late.next
+      ticket
+      (Ok
+         (Core.Asset_staged
+            { file = "late-deleted-stage"; checksum = String.make 64 'a'; size = 4L }))
+  in
+  check_instructions "deleted staging completion replay" [] repeated.effects
+;;
+
+let asset_graph_deletion_cancels_other_generation () =
+  let core, scope = asset_fixture () in
+  asset_deletion_cancels_stage
+    core
+    scope
+    { scope with graph_generation = 0 }
+    Core.Delete_graph_assets
+;;
+
+let asset_account_deletion_cancels_other_known_graph () =
+  let core, old_scope = asset_fixture () in
+  let catalogued = refresh_catalog core [ graph; other_graph ] in
+  let picker = Core.step catalogued.next Core.Graph_picker_requested in
+  let selected = Core.step picker.next (Core.Graph_selected other_graph_id) in
+  let current_scope = Core.admitted_graph_scope selected.next |> Option.get in
+  Alcotest.(check bool)
+    "account deletion fixture keeps the same account across graph selection"
+    true
+    (Uri.equal
+       current_scope.account.managed_sync_origin
+       old_scope.account.managed_sync_origin
+     && String.equal current_scope.account.user_id old_scope.account.user_id
+     && current_scope.graph_id <> old_scope.graph_id);
+  asset_deletion_cancels_stage
+    selected.next
+    current_scope
+    old_scope
+    Core.Delete_account_assets
+;;
+
+let asset_scenarios =
+  [ Alcotest.test_case
+      "graph asset deletion cancels pending work across generations"
+      `Quick
+      asset_graph_deletion_cancels_other_generation
+  ; Alcotest.test_case
+      "account asset deletion cancels pending work on another known graph"
+      `Quick
+      asset_account_deletion_cancels_other_known_graph
+  ; Alcotest.test_case
+      "asset cleanup rejects foreign account and accepts retired known scope"
+      `Quick
+      asset_cleanup_requires_admitted_scope
+  ; Alcotest.test_case
+      "asset exact completion identity and replay"
+      `Quick
+      asset_accepts_exact_identity_once
+  ; Alcotest.test_case
+      "asset foreign scope and duplicate admission"
+      `Quick
+      asset_rejects_foreign_scope_and_duplicate_request
+  ; Alcotest.test_case
+      "asset failure resolves once"
+      `Quick
+      asset_failure_is_published_once
+  ; Alcotest.test_case
+      "asset cancellation cleans file staging and lease"
+      `Quick
+      asset_cancelled_completion_cleans_resources
+  ; Alcotest.test_case
+      "asset scope switch cleans stale resources"
+      `Quick
+      asset_scope_switch_cleans_late_resources
+  ; Alcotest.test_case
+      "asset mismatched completion cleans resource"
+      `Quick
+      asset_mismatched_completion_cleans_resource
+  ; Alcotest.test_case
+      "asset retry completion resolves once"
+      `Quick
+      asset_retry_completion_is_consumed_once
   ]
 ;;

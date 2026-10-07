@@ -34,12 +34,27 @@ let dispatch t event =
   List.iter (Effect_runner.submit t.runner) transition.effects
 ;;
 
+let accepts_after_shutdown = function
+  | Pure_reducer.Sync_event
+      ( Logseq_sync_pure_reducer.Core.Asset_requested _ | Protected_requested _
+      | Runner_completed (Asset_completion _ | Protected_completion _)
+      | Shutdown ) -> true
+  | _ -> false
+;;
+
+let route_event t event =
+  if t.stopped
+  then (if accepts_after_shutdown event then dispatch t event)
+  else Eio.Stream.add t.events event
+;;
+
 let create ~sw ~config ~runner_dependencies =
   match Pure_reducer.initial config with
   | Error (Pure_reducer.Invalid_create message) -> Error (Invalid_create message)
   | Ok state ->
     let events = Eio.Stream.create 256 in
     let state_ref = ref state in
+    let event_sink = ref (fun event -> Eio.Stream.add events event) in
     (match
        Effect_runner.create
          ~sw
@@ -50,13 +65,14 @@ let create ~sw ~config ~runner_dependencies =
            Pure_reducer.upload_ticket_current !state_ref ticket)
          ~asset_current:(fun ticket ->
            Pure_reducer.asset_ticket_current !state_ref ticket)
-         ~post:(fun event -> Eio.Stream.add events event)
+         ~post:(fun event -> !event_sink event)
      with
      | Error (Effect_runner.Invalid_create message) -> Error (Invalid_create message)
      | Ok runner ->
        let t =
          { state = state_ref; runner; events; next_request_id = 0L; stopped = false }
        in
+       event_sink := route_event t;
        dispatch t Pure_reducer.Start;
        Eio.Fiber.fork ~sw (fun () ->
          while not t.stopped do
@@ -65,7 +81,7 @@ let create ~sw ~config ~runner_dependencies =
        Ok t)
 ;;
 
-let post t event = if not t.stopped then Eio.Stream.add t.events event
+let post t event = route_event t event
 let view t = Pure_reducer.view !(t.state)
 let graph_state t = (view t).graph
 
@@ -79,8 +95,16 @@ let request t request =
 let shutdown t =
   if not t.stopped
   then (
-    dispatch t Pure_reducer.Shutdown;
     t.stopped <- true;
+    dispatch t Pure_reducer.Shutdown;
+    let rec drain () =
+      match Eio.Stream.take_nonblocking t.events with
+      | None -> ()
+      | Some event ->
+        if accepts_after_shutdown event then dispatch t event;
+        drain ()
+    in
+    drain ();
     Eio.Stream.add t.events Pure_reducer.Shutdown;
     Effect_runner.shutdown t.runner)
 ;;

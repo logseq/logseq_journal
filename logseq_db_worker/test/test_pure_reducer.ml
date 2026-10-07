@@ -66,6 +66,8 @@ let test_closed_graph_request_replies_once () =
         | Run_upload _
         | Read_uploads _
         | Close_asset_scope _
+        | Deliver_asset_result _
+        | Deliver_protected_result _
         | Publish _ -> false)
       transition.effects
   in
@@ -442,6 +444,121 @@ let test_asset_failure_is_independent () =
   Alcotest.(check int) "foreign demand rejected" 0 (List.length stale.effects)
 ;;
 
+let test_asset_execution_completion_is_delivered () =
+  let state, scope = worker_open_graph () in
+  let request : Sync.asset_request =
+    { scope
+    ; operation = "worker-bridge:stage"
+    ; action =
+        Sync.Stage_asset_file
+          { operation = uuid "77000000-0000-4000-8000-000000000001"
+          ; file_type = "png"
+          ; source_file = "picker-reference"
+          }
+    }
+  in
+  let requested = Core.step state (Core.Sync_event (Sync.Asset_requested request)) in
+  let ticket =
+    List.find_map
+      (function
+        | Core.Run_sync (Sync.Asset_io (ticket, io)) ->
+          Alcotest.(check bool)
+            "worker preserves asset request"
+            true
+            (io.context.scope = request.scope && io.action = request.action);
+          Some ticket
+        | _ -> None)
+      requested.effects
+    |> Option.get
+  in
+  Alcotest.(check bool)
+    "request does not resolve its own waiter"
+    false
+    (List.exists
+       (function
+         | Core.Deliver_asset_result _ -> true
+         | _ -> false)
+       requested.effects);
+  let result =
+    Ok
+      (Sync.Asset_staged { file = "staging-reference"; checksum = "checksum"; size = 4L })
+  in
+  let completed =
+    Core.step
+      requested.next
+      (Core.Sync_event (Sync.Runner_completed (Sync.Asset_completion (ticket, result))))
+  in
+  Alcotest.(check bool)
+    "accepted completion resolves worker waiter"
+    true
+    (match completed.effects with
+     | [ Core.Deliver_asset_result output ] ->
+       output.request = request && output.result = result
+     | _ -> false)
+;;
+
+let test_worker_shutdown_forwards_late_resource_cleanup () =
+  let state, scope = worker_open_graph () in
+  let request : Sync.asset_request =
+    { scope
+    ; operation = "worker-shutdown:stage"
+    ; action =
+        Sync.Stage_asset_file
+          { operation = uuid "77000000-0000-4000-8000-000000000007"
+          ; file_type = "bin"
+          ; source_file = "picker-reference"
+          }
+    }
+  in
+  let requested = Core.step state (Core.Sync_event (Sync.Asset_requested request)) in
+  let ticket =
+    List.find_map
+      (function
+        | Core.Run_sync (Sync.Asset_io (ticket, _)) -> Some ticket
+        | _ -> None)
+      requested.effects
+    |> Option.get
+  in
+  let stopped = Core.step requested.next Core.Shutdown in
+  Alcotest.(check bool)
+    "worker shutdown cancels pending requester"
+    true
+    (List.exists
+       (function
+         | Core.Deliver_asset_result output ->
+           output.request = request && output.result = Error Sync.Asset_cancelled
+         | _ -> false)
+       stopped.effects);
+  let late =
+    Core.step
+      stopped.next
+      (Core.Sync_event
+         (Sync.Runner_completed
+            (Sync.Asset_completion
+               ( ticket
+               , Ok
+                   (Sync.Asset_staged
+                      { file = "late-staging-reference"
+                      ; checksum = "checksum"
+                      ; size = 4L
+                      }) ))))
+  in
+  Alcotest.(check bool)
+    "stopped worker keeps accepting cleanup completions"
+    true
+    (Core.view late.next).shutdown;
+  Alcotest.(check bool)
+    "late resource cleanup is forwarded to sync runner"
+    true
+    (List.exists
+       (function
+         | Core.Run_sync (Sync.Asset_io (_, io)) ->
+           io.context.scope = scope
+           && io.action = Sync.Release_staged_file "late-staging-reference"
+         | _ -> false)
+       late.effects)
+;;
+
 let test_upload_session () =
   let module U = Logseq_db_worker_pure_reducer.Asset_upload in
   let state, scope = worker_open_graph () in
@@ -744,6 +861,14 @@ let () =
             test_upload_recovery_invalid_page
         ; Alcotest.test_case "upload recovery failure" `Quick test_upload_recovery_failure
         ; Alcotest.test_case "durable upload session" `Quick test_upload_session
+        ; Alcotest.test_case
+            "asset execution completion delivery"
+            `Quick
+            test_asset_execution_completion_is_delivered
+        ; Alcotest.test_case
+            "worker shutdown late resource forwarding"
+            `Quick
+            test_worker_shutdown_forwards_late_resource_cleanup
         ; Alcotest.test_case "demand lifecycle" `Quick test_asset_demand_lifecycle
         ; Alcotest.test_case
             "independent failure"
