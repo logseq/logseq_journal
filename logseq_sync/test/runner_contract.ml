@@ -1174,6 +1174,7 @@ let test_asset_submit_replay_does_not_mint_a_second_lease () =
           |> Option.get
         in
         posted := [];
+        Gc.full_major ();
         Runner.submit runner runnable;
         run_tasks ();
         Alcotest.(check int)
@@ -1919,5 +1920,76 @@ let scenarios =
         "asset graph deletion cancels queued fetch before cache opens"
         `Quick
         test_graph_asset_deletion_cancels_queued_fetch_before_cache_open
+    ]
+;;
+
+(* Replay bookkeeping belongs to the runner, and Core cannot reproduce retained
+   runner allocations. Drive issued effects and their real completions through
+   the public boundary, retaining only the current reducer state. *)
+let test_asset_submission_history_does_not_retain_completed_effects () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let selected, scope = Core_contract.selected_graph Core_contract.graph in
+        let state = ref selected.next in
+        let completions = ref 0 in
+        let deps =
+          dependencies
+            ~environment
+            ~support
+            ~fork:(fun ~sw:_ _ -> fail "closed runner must not fork")
+            ()
+        in
+        let runner =
+          Runner.create ~sw deps ~post:(fun event ->
+            incr completions;
+            state := (Core.step !state event).next)
+          |> Result.get_ok
+        in
+        Runner.shutdown runner;
+        let version =
+          Logseq_db_types.Asset_descriptor.version
+            ~checksum:(String.make 64 'a')
+            ~file_type:"bin"
+          |> Result.get_ok
+        in
+        let run count =
+          for index = 1 to count do
+            let requested =
+              Core.step
+                !state
+                (Core.Asset_requested
+                   { scope
+                   ; operation = "submission-memory-history"
+                   ; action = Core.Check_asset_cache (graph_id (), version)
+                   })
+            in
+            state := requested.next;
+            List.iter
+              (function
+                | Core.Run runnable -> Runner.submit runner runnable
+                | _ -> ())
+              requested.effects;
+            if index mod 256 = 0 then Gc.full_major ()
+          done
+        in
+        run 512;
+        Gc.full_major ();
+        let before = (Gc.stat ()).live_words in
+        run 8192;
+        Gc.full_major ();
+        let growth = (Gc.stat ()).live_words - before in
+        Runner.shutdown runner;
+        Alcotest.(check int) "every issued request completed" 8704 !completions;
+        if growth > 32768
+        then fail "completed submission history retained %d live words" growth)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "completed asset submission history stays compact"
+        `Quick
+        test_asset_submission_history_does_not_retain_completed_effects
     ]
 ;;

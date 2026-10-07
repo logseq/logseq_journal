@@ -312,12 +312,22 @@ type key_entry =
 let asset_byte_unit = 65536
 let asset_byte_budget_units = 1024
 
+(* The private effect cannot be reconstructed by callers. Its identity must
+   stay replay-protected for as long as a caller can retain and resubmit it,
+   without retaining historical effects (or their scope strings) ourselves. *)
+module Submitted_effects = Weak.Make (struct
+    type t = Core.runner_effect
+
+    let equal = ( == )
+    let hash instruction = Hashtbl.hash (Core.runner_effect_diagnostic instruction)
+  end)
+
 type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
   ; post : Core.event -> unit
   ; operations : (string, operation) Hashtbl.t
-  ; submitted_operations : (string, unit) Hashtbl.t
+  ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (string, Core.connection_scope * Websocket_eio.t) Hashtbl.t
   ; asset_download_slots : Eio.Semaphore.t
@@ -336,7 +346,7 @@ let create ~sw dependencies ~post =
     ; dependencies
     ; post
     ; operations = Hashtbl.create 32
-    ; submitted_operations = Hashtbl.create 32
+    ; submitted_operations = Submitted_effects.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
     ; asset_download_slots = Eio.Semaphore.make 3
@@ -1456,7 +1466,9 @@ let prune_staged_assets t ~scope ~keep =
     match scoped_asset_cache t scope with
     | Error error -> Error (asset_cache_failure error)
     | Ok cache ->
-      Asset_cache.prune_staged cache ~keep:(fun operation -> Ok (List.mem operation keep))
+      let retained = Hashtbl.create (List.length keep) in
+      List.iter (fun file -> Hashtbl.replace retained file ()) keep;
+      Asset_cache.prune_staged cache ~keep:(fun file -> Ok (Hashtbl.mem retained file))
       |> Result.map_error asset_cache_failure)
 ;;
 
@@ -1590,19 +1602,19 @@ let scoped_operation_id kind (scope : Core.graph_scope) ticket =
     ticket
 ;;
 
-let claim_operation t id =
-  if Hashtbl.mem t.submitted_operations id
+let claim_operation t instruction =
+  if Submitted_effects.mem t.submitted_operations instruction
   then false
   else (
-    Hashtbl.add t.submitted_operations id ();
+    Submitted_effects.add t.submitted_operations instruction;
     true)
 ;;
 
-let submit_asset_io t ticket (request : Core.asset_io_request) =
+let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
   let id =
     scoped_operation_id "asset" request.context.scope (Core.asset_ticket_id ticket)
   in
-  if claim_operation t id
+  if claim_operation t instruction
   then (
     let cancelled, resolve_cancelled = Eio.Promise.create () in
     let operation =
@@ -1652,14 +1664,14 @@ let execute_protected t (request : Core.protected_request) =
     |> Result.map (fun value -> Core.Decrypted_value value)
 ;;
 
-let submit_protected t ticket (request : Core.protected_request) =
+let submit_protected t instruction ticket (request : Core.protected_request) =
   let id =
     scoped_operation_id
       "protected"
       request.protected_scope
       (Core.protected_ticket_id ticket)
   in
-  if claim_operation t id
+  if claim_operation t instruction
   then (
     let cancelled, resolve_cancelled = Eio.Promise.create () in
     let operation =
@@ -1713,10 +1725,7 @@ let submit t instruction =
   | Core.Asset_io (ticket, request) ->
     if cleanup_asset_action request.action
     then (
-      let id =
-        scoped_operation_id "asset" request.context.scope (Core.asset_ticket_id ticket)
-      in
-      if claim_operation t id
+      if claim_operation t instruction
       then (
         let result =
           try
@@ -1730,30 +1739,21 @@ let submit t instruction =
         t.post (Core.Runner_completed (Core.Asset_completion (ticket, result)))))
     else if t.closed
     then (
-      let id =
-        scoped_operation_id "asset" request.context.scope (Core.asset_ticket_id ticket)
-      in
-      if claim_operation t id
+      if claim_operation t instruction
       then
         t.post
           (Core.Runner_completed
              (Core.Asset_completion (ticket, Error Core.Asset_cancelled))))
-    else submit_asset_io t ticket request
+    else submit_asset_io t instruction ticket request
   | Protected_io (ticket, request) ->
     if t.closed
     then (
-      let id =
-        scoped_operation_id
-          "protected"
-          request.protected_scope
-          (Core.protected_ticket_id ticket)
-      in
-      if claim_operation t id
+      if claim_operation t instruction
       then
         t.post
           (Core.Runner_completed
              (Core.Protected_completion
                 (ticket, Error (Core.Effect_failed "Protected request cancelled")))))
-    else submit_protected t ticket request
+    else submit_protected t instruction ticket request
   | _ -> submit_nonasset t instruction
 ;;
