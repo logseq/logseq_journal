@@ -27,3 +27,9 @@ Independent review found no material production-source blocker. Its opening-plac
 ## Workflow and limits
 
 spec-dev-tool is unavailable in this execution environment; this decision follows the repository document shape without claiming that tool ran successfully. No push, PR, merge, Library upload, phone installation, real graph/account operation, LUI upgrade, Dune edit or OCaml spec change is part of this local fix. Physical-device and other-OS acceptance remain unperformed.
+
+## Publication dependency correction (2026-10-07)
+
+After authorization to publish ready PR50, its first CI resolved the floating LUI main reference to 33b6908946f80954bf6a9175e14174ec6105abb0. That revision is 71 commits beyond the validated adbdf63 and removes FlutterHost (upstream removal b3a0ff314baf07ac856844919522afea95ad740a); the unchanged application.ml host-code mapping therefore fails to compile before tests run. The actual uploaded dependencies.json and protocol source establish dependency/API drift rather than a Swift soft-edge regression.
+
+Pin only LUI in logseq_journal.opam and logseq_journal.opam.locked to the already validated adbdf63fe940157824f29262095bb194ebd21404. Keep the existing host protocol, Swift source, Dune files and other dependencies unchanged. This also affects other branches based on the same main; use this one correction rather than independently adapting them to Kotlin/GPUI. The historical opam provenance67ea3e8 and adbdf63 differ only in seven Apple/Flutter files, so the previously validated OCaml sources match this compatible pin. Fresh CI on the corrected PR head remains necessary; old test results are not represented as testing the failed upstream33b6908.
