@@ -200,6 +200,116 @@ type private_key_unlock =
   ; private_key_package : string
   }
 
+type asset_context =
+  { scope : graph_scope
+  ; encrypted : bool
+  ; key : graph_key_handle option
+  }
+
+(** Business inputs carry identities and resource references, never asset bytes. *)
+type asset_action =
+  | Check_asset_cache of graph_id * Logseq_db_types.Asset_descriptor.version
+  | Fetch_asset of
+      { asset : graph_id
+      ; version : Logseq_db_types.Asset_descriptor.version
+      ; maximum_plaintext_bytes : int
+      }
+  | Stage_asset_file of
+      { operation : graph_id
+      ; file_type : string
+      ; source_file : string
+      }
+  | Put_asset_file of
+      { asset : graph_id
+      ; version : Logseq_db_types.Asset_descriptor.version
+      ; file : string
+      ; maximum_plaintext_bytes : int
+      }
+  | Retain_asset_file of string
+  | Retain_staged_file of string
+  | Release_asset_file of string
+  | Release_staged_file of string
+  | Prune_asset_staging of string list
+  | Close_asset_scope
+  | Delete_graph_assets
+  | Delete_account_assets
+  | Asset_retry_after of float
+  | Cancel_asset_operation of string
+
+type asset_failure =
+  | Asset_network
+  | Asset_not_found
+  | Asset_checksum_mismatch
+  | Asset_authentication
+  | Asset_locked
+  | Asset_storage_full
+  | Asset_missing_source
+  | Asset_size_rejected
+  | Asset_revoked_access
+  | Asset_cancelled
+  | Asset_invalid_content of string
+
+type asset_value =
+  | Asset_unit
+  | Asset_cached of string option
+  | Asset_downloaded of string
+  | Asset_staged of
+      { file : string
+      ; checksum : string
+      ; size : int64
+      }
+  | Asset_retained of (string * string) option
+  | Asset_pruned of int
+  | Asset_retry_elapsed
+
+type asset_result = (asset_value, asset_failure) result
+
+type asset_request =
+  { scope : graph_scope
+  ; operation : string
+  ; action : asset_action
+  }
+
+type asset_io_request =
+  { context : asset_context
+  ; operation : string
+  ; action : asset_action
+  }
+
+type asset_ticket
+
+val asset_ticket_id : asset_ticket -> string
+
+type asset_output =
+  { request : asset_request
+  ; result : asset_result
+  }
+
+type protected_action =
+  | Encrypt_values of graph_key_handle * string list
+  | Decrypt_value of graph_key_handle * string
+
+type protected_request =
+  { protected_operation : string
+  ; protected_scope : graph_scope
+  ; protected_action : protected_action
+  }
+
+type protected_value =
+  | Encrypted_values of (string * string) list
+  | Decrypted_value of string
+
+type protected_result = (protected_value, effect_error) result
+
+type protected_output =
+  { protected_request : protected_request
+  ; protected_result : protected_result
+  }
+
+type protected_ticket
+
+val protected_ticket_id : protected_ticket -> string
+
 type _ runner_request =
   | Load_catalog : account_scope -> catalog_cache option runner_request
   | Save_catalog :
@@ -244,7 +354,9 @@ type timer_request =
   ; delay_seconds : float
   }
 
-type runner_effect =
+type runner_effect = private
+  | Asset_io of asset_ticket * asset_io_request
+  | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
   | Start_websocket of websocket_request
   | Send_websocket of websocket_send
@@ -253,6 +365,8 @@ type runner_effect =
   | Cancel_effects of effect_scope
 
 type runner_completion =
+  | Asset_completion of asset_ticket * asset_result
+  | Protected_completion of protected_ticket * protected_result
   | Completion : 'a effect_ticket * ('a, effect_error) result -> runner_completion
 
 val runner_effect_scope : runner_effect -> effect_scope
@@ -315,6 +429,8 @@ type worker_effect =
   | Apply_authoritative_batch of authoritative_batch
 
 type output =
+  | Asset_finished of asset_output
+  | Protected_finished of protected_output
   | State_changed of state
   | Bootstrap_progressed of bootstrap_progress
 
@@ -361,6 +477,8 @@ type outbox_transition_result =
 type snapshot_activation = { scope : graph_scope }
 
 type event =
+  | Asset_requested of asset_request
+  | Protected_requested of protected_request
   | Restore_local_account of { user_id : string }
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
@@ -407,13 +525,6 @@ type create_error = Invalid_create of string
 val initial : config -> (t, create_error) result
 val state : t -> state
 val admitted_graph_scope : t -> graph_scope option
-
-type asset_context =
-  { scope : graph_scope
-  ; encrypted : bool
-  ; key : graph_key_handle option
-  }
-
 val asset_context : t -> asset_context option
 
 type transition =

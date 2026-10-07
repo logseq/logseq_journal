@@ -318,6 +318,121 @@ type private_key_unlock =
   ; private_key_package : string
   }
 
+type asset_context =
+  { scope : graph_scope
+  ; encrypted : bool
+  ; key : graph_key_handle option
+  }
+
+type asset_action =
+  | Check_asset_cache of graph_id * Logseq_db_types.Asset_descriptor.version
+  | Fetch_asset of
+      { asset : graph_id
+      ; version : Logseq_db_types.Asset_descriptor.version
+      ; maximum_plaintext_bytes : int
+      }
+  | Stage_asset_file of
+      { operation : graph_id
+      ; file_type : string
+      ; source_file : string
+      }
+  | Put_asset_file of
+      { asset : graph_id
+      ; version : Logseq_db_types.Asset_descriptor.version
+      ; file : string
+      ; maximum_plaintext_bytes : int
+      }
+  | Retain_asset_file of string
+  | Retain_staged_file of string
+  | Release_asset_file of string
+  | Release_staged_file of string
+  | Prune_asset_staging of string list
+  | Close_asset_scope
+  | Delete_graph_assets
+  | Delete_account_assets
+  | Asset_retry_after of float
+  | Cancel_asset_operation of string
+
+type asset_failure =
+  | Asset_network
+  | Asset_not_found
+  | Asset_checksum_mismatch
+  | Asset_authentication
+  | Asset_locked
+  | Asset_storage_full
+  | Asset_missing_source
+  | Asset_size_rejected
+  | Asset_revoked_access
+  | Asset_cancelled
+  | Asset_invalid_content of string
+
+type asset_value =
+  | Asset_unit
+  | Asset_cached of string option
+  | Asset_downloaded of string
+  | Asset_staged of
+      { file : string
+      ; checksum : string
+      ; size : int64
+      }
+  | Asset_retained of (string * string) option
+  | Asset_pruned of int
+  | Asset_retry_elapsed
+
+type asset_result = (asset_value, asset_failure) result
+
+type asset_request =
+  { scope : graph_scope
+  ; operation : string
+  ; action : asset_action
+  }
+
+type asset_io_request =
+  { context : asset_context
+  ; operation : string
+  ; action : asset_action
+  }
+
+type asset_ticket =
+  { asset_serial : int
+  ; asset_request : asset_io_request
+  }
+
+let asset_ticket_id ticket = "asset:" ^ string_of_int ticket.asset_serial
+
+type asset_output =
+  { request : asset_request
+  ; result : asset_result
+  }
+
+type protected_action =
+  | Encrypt_values of graph_key_handle * string list
+  | Decrypt_value of graph_key_handle * string
+
+type protected_request =
+  { protected_operation : string
+  ; protected_scope : graph_scope
+  ; protected_action : protected_action
+  }
+
+type protected_value =
+  | Encrypted_values of (string * string) list
+  | Decrypted_value of string
+
+type protected_result = (protected_value, effect_error) result
+
+type protected_output =
+  { protected_request : protected_request
+  ; protected_result : protected_result
+  }
+
+type protected_ticket =
+  { protected_serial : int
+  ; protected_input : protected_request
+  }
+
+let protected_ticket_id ticket = "protected:" ^ string_of_int ticket.protected_serial
+
 type _ runner_request =
   | Load_catalog : account_scope -> catalog_cache option runner_request
   | Save_catalog :
@@ -383,6 +498,8 @@ type timer_request =
   }
 
 type runner_effect =
+  | Asset_io of asset_ticket * asset_io_request
+  | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
   | Start_websocket of websocket_request
   | Send_websocket of websocket_send
@@ -391,6 +508,8 @@ type runner_effect =
   | Cancel_effects of effect_scope
 
 type runner_completion =
+  | Asset_completion of asset_ticket * asset_result
+  | Protected_completion of protected_ticket * protected_result
   | Completion : 'a effect_ticket * ('a, effect_error) result -> runner_completion
 
 let scope_of_request : type a. a runner_request -> effect_scope = function
@@ -410,6 +529,8 @@ let scope_of_request : type a. a runner_request -> effect_scope = function
 ;;
 
 let runner_effect_scope = function
+  | Protected_io (_, request) -> effect_scope_of_graph request.protected_scope
+  | Asset_io (_, request) -> effect_scope_of_graph request.context.scope
   | Request (ticket, _) -> ticket.scope
   | Start_websocket value -> effect_scope_of_connection value.scope
   | Send_websocket value -> effect_scope_of_connection value.scope
@@ -419,6 +540,8 @@ let runner_effect_scope = function
 ;;
 
 let runner_effect_diagnostic = function
+  | Protected_io (ticket, _) -> protected_ticket_id ticket
+  | Asset_io (ticket, _) -> asset_ticket_id ticket
   | Request (ticket, _) -> Printf.sprintf "request:%d" ticket.id
   | Start_websocket _ -> "start-websocket"
   | Send_websocket _ -> "send-websocket"
@@ -483,6 +606,8 @@ type worker_effect =
   | Apply_authoritative_batch of authoritative_batch
 
 type output =
+  | Asset_finished of asset_output
+  | Protected_finished of protected_output
   | State_changed of state
   | Bootstrap_progressed of bootstrap_progress
 
@@ -529,6 +654,8 @@ type outbox_transition_result =
 type snapshot_activation = { scope : graph_scope }
 
 type event =
+  | Asset_requested of asset_request
+  | Protected_requested of protected_request
   | Restore_local_account of { user_id : string }
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
@@ -576,8 +703,17 @@ type submission_owner =
   ; response_timer : timer_id option
   }
 
+type pending_asset =
+  { asset_ticket : asset_ticket
+  ; asset_cancelled : bool
+  ; asset_notify : bool
+  }
+
 type t =
-  { config : config
+  { asset_known_scopes : graph_scope list
+  ; protected_pending : protected_ticket list
+  ; assets_pending : pending_asset list
+  ; config : config
   ; public_state : state
   ; user_id : string option
   ; lifecycle_generation : lifecycle_generation
@@ -639,7 +775,10 @@ let initial config =
     }
   in
   Ok
-    { config
+    { asset_known_scopes = []
+    ; protected_pending = []
+    ; assets_pending = []
+    ; config
     ; public_state = { snapshot; diagnostics = { groups = [] } }
     ; user_id = None
     ; lifecycle_generation = 0L
@@ -675,12 +814,6 @@ let initial config =
 
 let state core = core.public_state
 let admitted_graph_scope core = core.current_graph_scope
-
-type asset_context =
-  { scope : graph_scope
-  ; encrypted : bool
-  ; key : graph_key_handle option
-  }
 
 let asset_context core =
   match core.current_graph_scope, core.selected_graph_value with
@@ -2163,61 +2296,63 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
   | Decrypt_protected_values_kind -> unchanged core
 ;;
 
-let consume_completion core (Completion (ticket, result)) =
-  match consume_ticket core ticket with
-  | None -> unchanged core
-  | Some core ->
-    (match result with
-     | Ok value -> complete_runner core ticket value
-     | Error (Effect_failed message | Crypto_failed (_, message)) ->
-       let core =
-         match ticket.kind with
-         | Download_snapshot_kind -> { core with active_snapshot_download = None }
-         | _ -> core
-       in
-       (match ticket.kind with
-        | Save_catalog_kind ->
-          (match core.public_state.snapshot.local_deletion with
-           | Some (Deletion_in_progress Clearing_selection) ->
-             deletion_failed core Clearing_selection
-           | None | Some _ -> unchanged core)
-        | Load_catalog_kind ->
-          fail
-            { core with
-              catalog_cache_loading = false
-            ; deferred_catalog_reconciliation = false
-            }
-            During_catalog
-            message
-        | Load_and_unlock_graph_key_kind -> fail core During_local_restore message
-        | Unlock_private_key_kind ->
-          (* A rejected password leaves the encrypted challenge available for
+let consume_completion core = function
+  | Asset_completion _ | Protected_completion _ -> unchanged core
+  | Completion (ticket, result) ->
+    (match consume_ticket core ticket with
+     | None -> unchanged core
+     | Some core ->
+       (match result with
+        | Ok value -> complete_runner core ticket value
+        | Error (Effect_failed message | Crypto_failed (_, message)) ->
+          let core =
+            match ticket.kind with
+            | Download_snapshot_kind -> { core with active_snapshot_download = None }
+            | _ -> core
+          in
+          (match ticket.kind with
+           | Save_catalog_kind ->
+             (match core.public_state.snapshot.local_deletion with
+              | Some (Deletion_in_progress Clearing_selection) ->
+                deletion_failed core Clearing_selection
+              | None | Some _ -> unchanged core)
+           | Load_catalog_kind ->
+             fail
+               { core with
+                 catalog_cache_loading = false
+               ; deferred_catalog_reconciliation = false
+               }
+               During_catalog
+               message
+           | Load_and_unlock_graph_key_kind -> fail core During_local_restore message
+           | Unlock_private_key_kind ->
+             (* A rejected password leaves the encrypted challenge available for
              another attempt. No password or unlocked key is retained. *)
-          let failed = fail core During_e2ee message in
-          let startup =
-            { failed.next.public_state.snapshot.startup with
-              awaiting_e2ee_password = true
-            }
-          in
-          let next =
-            set_snapshot
-              { failed.next with
-                snapshot_scope = core.snapshot_scope
-              ; pending_encrypted_graph_key = core.pending_encrypted_graph_key
-              ; pending_private_key_package = core.pending_private_key_package
-              }
-              { failed.next.public_state.snapshot with startup }
-          in
-          { next; effects = [ publish next ] }
-        | Fetch_e2ee_graph_key_kind
-        | Fetch_e2ee_user_keys_kind
-        | Fetch_and_unlock_graph_key_kind -> fail core During_e2ee message
-        | Delete_account_secrets_kind ->
-          cleanup_failed core "account secret cleanup failed"
-        | Fetch_snapshot_baseline_kind
-        | Fetch_snapshot_metadata_kind
-        | Download_snapshot_kind -> fail core During_bootstrap message
-        | _ -> fail core During_catalog message))
+             let failed = fail core During_e2ee message in
+             let startup =
+               { failed.next.public_state.snapshot.startup with
+                 awaiting_e2ee_password = true
+               }
+             in
+             let next =
+               set_snapshot
+                 { failed.next with
+                   snapshot_scope = core.snapshot_scope
+                 ; pending_encrypted_graph_key = core.pending_encrypted_graph_key
+                 ; pending_private_key_package = core.pending_private_key_package
+                 }
+                 { failed.next.public_state.snapshot with startup }
+             in
+             { next; effects = [ publish next ] }
+           | Fetch_e2ee_graph_key_kind
+           | Fetch_e2ee_user_keys_kind
+           | Fetch_and_unlock_graph_key_kind -> fail core During_e2ee message
+           | Delete_account_secrets_kind ->
+             cleanup_failed core "account secret cleanup failed"
+           | Fetch_snapshot_baseline_kind
+           | Fetch_snapshot_metadata_kind
+           | Download_snapshot_kind -> fail core During_bootstrap message
+           | _ -> fail core During_catalog message)))
 ;;
 
 let websocket_closed core connection message =
@@ -2621,6 +2756,7 @@ let step core event =
            effects = Run (Close_websocket owner.connection) :: restarted.effects
          }
        | _ -> unchanged core)
+    | Asset_requested _ | Protected_requested _ -> unchanged core
     | Local_feed_acknowledged -> unchanged core
     | Shutdown ->
       let scope =
@@ -2648,4 +2784,374 @@ let step core event =
           }
       ; effects = [ Run (Cancel_effects scope) ]
       })
+;;
+
+(* Asset execution is a separate identity/acceptance owner. Download demand and
+   durable import publication remain in their respective policy reducers. *)
+let asset_public_request (request : asset_io_request) : asset_request =
+  { scope = request.context.scope
+  ; operation = request.operation
+  ; action = request.action
+  }
+;;
+
+let asset_output request result = Publish (Asset_finished { request; result })
+
+let issue_asset ?(notify = true) core (request : asset_io_request) =
+  let ticket = { asset_serial = core.next_effect_id; asset_request = request } in
+  { next =
+      { core with
+        next_effect_id = core.next_effect_id + 1
+      ; assets_pending =
+          { asset_ticket = ticket; asset_cancelled = false; asset_notify = notify }
+          :: core.assets_pending
+      }
+  ; effects = [ Run (Asset_io (ticket, request)) ]
+  }
+;;
+
+let asset_cleanup_action = function
+  | Release_asset_file _
+  | Release_staged_file _
+  | Close_asset_scope
+  | Delete_graph_assets
+  | Delete_account_assets
+  | Cancel_asset_operation _ -> true
+  | Check_asset_cache _
+  | Fetch_asset _
+  | Stage_asset_file _
+  | Put_asset_file _
+  | Retain_asset_file _
+  | Retain_staged_file _
+  | Prune_asset_staging _
+  | Asset_retry_after _ -> false
+;;
+
+let asset_cleanup core (request : asset_io_request) result =
+  let action =
+    match result with
+    | Ok (Asset_cached (Some handle) | Asset_downloaded handle) ->
+      Some (Release_asset_file handle)
+    | Ok (Asset_retained (Some (lease, _))) -> Some (Release_asset_file lease)
+    | Ok (Asset_staged { file; _ }) -> Some (Release_staged_file file)
+    | Ok
+        ( Asset_cached None
+        | Asset_retained None
+        | Asset_unit | Asset_pruned _ | Asset_retry_elapsed )
+    | Error _ -> None
+  in
+  match action with
+  | None -> unchanged core
+  | Some action ->
+    issue_asset
+      ~notify:false
+      core
+      { request with operation = "cleanup:" ^ string_of_int core.next_effect_id; action }
+;;
+
+let asset_result_matches action = function
+  | Error _ -> true
+  | Ok value ->
+    (match action, value with
+     | Check_asset_cache _, Asset_cached _
+     | Fetch_asset _, Asset_downloaded _
+     | Stage_asset_file _, Asset_staged _
+     | Put_asset_file _, Asset_unit
+     | Retain_asset_file _, Asset_retained _
+     | Retain_staged_file _, Asset_retained _
+     | Release_asset_file _, Asset_unit
+     | Release_staged_file _, Asset_unit
+     | Prune_asset_staging _, Asset_pruned _
+     | Close_asset_scope, Asset_unit
+     | Delete_graph_assets, Asset_unit
+     | Delete_account_assets, Asset_unit
+     | Asset_retry_after _, Asset_retry_elapsed
+     | Cancel_asset_operation _, Asset_unit -> true
+     | _ -> false)
+;;
+
+let complete_asset core ticket result =
+  match
+    List.find_opt (fun pending -> pending.asset_ticket = ticket) core.assets_pending
+  with
+  | None -> unchanged core
+  | Some pending ->
+    let core =
+      { core with
+        assets_pending =
+          List.filter (fun item -> item.asset_ticket <> ticket) core.assets_pending
+      }
+    in
+    let request = ticket.asset_request in
+    if pending.asset_cancelled
+    then asset_cleanup core request result
+    else if not (asset_result_matches request.action result)
+    then (
+      let cleaned = asset_cleanup core request result in
+      { cleaned with
+        effects =
+          (if pending.asset_notify
+           then
+             [ asset_output
+                 (asset_public_request request)
+                 (Error (Asset_invalid_content "Asset completion kind mismatch"))
+             ]
+           else [])
+          @ cleaned.effects
+      })
+    else
+      { next = core
+      ; effects =
+          (if pending.asset_notify
+           then [ asset_output (asset_public_request request) result ]
+           else [])
+      }
+;;
+
+let cancel_asset_pending core matches =
+  let assets_pending, outputs =
+    List.fold_right
+      (fun pending (retained, outputs) ->
+         if pending.asset_cancelled || not (matches pending.asset_ticket.asset_request)
+         then pending :: retained, outputs
+         else
+           ( { pending with asset_cancelled = true } :: retained
+           , if pending.asset_notify
+             then
+               asset_output
+                 (asset_public_request pending.asset_ticket.asset_request)
+                 (Error Asset_cancelled)
+               :: outputs
+             else outputs ))
+      core.assets_pending
+      ([], [])
+  in
+  { core with assets_pending }, outputs
+;;
+
+let same_asset_account (left : account_scope) (right : account_scope) =
+  Uri.equal left.managed_sync_origin right.managed_sync_origin
+  && String.equal left.user_id right.user_id
+;;
+
+let request_asset core (request : asset_request) =
+  let cleanup = asset_cleanup_action request.action in
+  let context =
+    match asset_context core with
+    | Some context when context.scope = request.scope -> Some context
+    | _ when cleanup ->
+      let known =
+        match request.action with
+        | Delete_account_assets ->
+          List.exists
+            (fun (scope : graph_scope) -> scope.account = request.scope.account)
+            core.asset_known_scopes
+        | Delete_graph_assets ->
+          List.exists
+            (fun (scope : graph_scope) ->
+               scope.account = request.scope.account
+               && scope.graph_id = request.scope.graph_id)
+            core.asset_known_scopes
+        | _ -> List.mem request.scope core.asset_known_scopes
+      in
+      if known
+      then Some { scope = request.scope; encrypted = false; key = None }
+      else None
+    | _ -> None
+  in
+  let duplicate =
+    List.exists
+      (fun pending ->
+         let previous = pending.asset_ticket.asset_request in
+         (not pending.asset_cancelled)
+         && previous.context.scope = request.scope
+         && previous.operation = request.operation)
+      core.assets_pending
+  in
+  let valid =
+    request.operation <> ""
+    &&
+    match request.action with
+    | Fetch_asset { maximum_plaintext_bytes; _ }
+    | Put_asset_file { maximum_plaintext_bytes; _ } ->
+      maximum_plaintext_bytes >= 0 && maximum_plaintext_bytes <= 100 * 1024 * 1024
+    | Asset_retry_after seconds -> Float.is_finite seconds && seconds >= 0.
+    | _ -> true
+  in
+  if duplicate
+  then unchanged core
+  else if (core.closed && not cleanup) || context = None || not valid
+  then { next = core; effects = [ asset_output request (Error Asset_cancelled) ] }
+  else (
+    let core, cancelled =
+      match request.action with
+      | Cancel_asset_operation operation ->
+        cancel_asset_pending core (fun previous ->
+          previous.context.scope = request.scope && previous.operation = operation)
+      | Close_asset_scope ->
+        cancel_asset_pending core (fun previous -> previous.context.scope = request.scope)
+      | Delete_graph_assets ->
+        cancel_asset_pending core (fun previous ->
+          same_asset_account previous.context.scope.account request.scope.account
+          && previous.context.scope.graph_id = request.scope.graph_id)
+      | Delete_account_assets ->
+        cancel_asset_pending core (fun previous ->
+          same_asset_account previous.context.scope.account request.scope.account)
+      | _ -> core, []
+    in
+    let issued =
+      issue_asset
+        core
+        { context = Option.get context
+        ; operation = request.operation
+        ; action = request.action
+        }
+    in
+    { issued with effects = cancelled @ issued.effects })
+;;
+
+let graph_step = step
+
+let step core event =
+  let transition =
+    match event with
+    | Asset_requested request -> request_asset core request
+    | Runner_completed (Asset_completion (ticket, result)) ->
+      complete_asset core ticket result
+    | _ -> graph_step core event
+  in
+  let current = if transition.next.closed then None else asset_context transition.next in
+  let transition =
+    match current with
+    | Some context when not (List.mem context.scope transition.next.asset_known_scopes) ->
+      { transition with
+        next =
+          { transition.next with
+            asset_known_scopes = context.scope :: transition.next.asset_known_scopes
+          }
+      }
+    | Some _ | None -> transition
+  in
+  let retired =
+    transition.next.assets_pending
+    |> List.filter_map (fun pending ->
+      let context = pending.asset_ticket.asset_request.context in
+      if
+        pending.asset_cancelled
+        || asset_cleanup_action pending.asset_ticket.asset_request.action
+        ||
+        match current with
+        | Some active -> active.scope = context.scope
+        | None -> false
+      then None
+      else Some context)
+    |> List.sort_uniq compare
+  in
+  List.fold_left
+    (fun transition (context : asset_context) ->
+       let next, cancelled =
+         cancel_asset_pending transition.next (fun request ->
+           request.context.scope = context.scope
+           && not (asset_cleanup_action request.action))
+       in
+       let closed =
+         issue_asset
+           ~notify:false
+           next
+           { context
+           ; operation = "close:" ^ string_of_int next.next_effect_id
+           ; action = Close_asset_scope
+           }
+       in
+       { closed with effects = transition.effects @ cancelled @ closed.effects })
+    transition
+    retired
+;;
+
+let asset_step = step
+
+let protected_output request result =
+  Publish (Protected_finished { protected_request = request; protected_result = result })
+;;
+
+let protected_current core request =
+  (not core.closed)
+  && core.current_graph_scope = Some request.protected_scope
+  &&
+  match request.protected_action with
+  | Encrypt_values (key, _) | Decrypt_value (key, _) ->
+    graph_key_handle_scope key = request.protected_scope
+;;
+
+let step core event =
+  let transition =
+    match event with
+    | Protected_requested request ->
+      if
+        List.exists
+          (fun ticket ->
+             ticket.protected_input.protected_operation = request.protected_operation
+             && ticket.protected_input.protected_scope = request.protected_scope)
+          core.protected_pending
+      then unchanged core
+      else if not (protected_current core request)
+      then
+        { next = core
+        ; effects =
+            [ protected_output
+                request
+                (Error (Effect_failed "Protected-value request expired"))
+            ]
+        }
+      else (
+        let ticket =
+          { protected_serial = core.next_effect_id; protected_input = request }
+        in
+        { next =
+            { core with
+              next_effect_id = core.next_effect_id + 1
+            ; protected_pending = ticket :: core.protected_pending
+            }
+        ; effects = [ Run (Protected_io (ticket, request)) ]
+        })
+    | Runner_completed (Protected_completion (ticket, result)) ->
+      if not (List.mem ticket core.protected_pending)
+      then unchanged core
+      else (
+        let next =
+          { core with
+            protected_pending =
+              List.filter (fun pending -> pending <> ticket) core.protected_pending
+          }
+        in
+        let valid =
+          match ticket.protected_input.protected_action, result with
+          | _, Error _
+          | Encrypt_values _, Ok (Encrypted_values _)
+          | Decrypt_value _, Ok (Decrypted_value _) -> true
+          | _ -> false
+        in
+        let result =
+          if not valid
+          then Error (Effect_failed "Protected completion kind mismatch")
+          else result
+        in
+        { next; effects = [ protected_output ticket.protected_input result ] })
+    | _ -> asset_step core event
+  in
+  let active, retired =
+    List.partition
+      (fun ticket -> protected_current transition.next ticket.protected_input)
+      transition.next.protected_pending
+  in
+  { next = { transition.next with protected_pending = active }
+  ; effects =
+      transition.effects
+      @ List.map
+          (fun ticket ->
+             protected_output
+               ticket.protected_input
+               (Error (Effect_failed "Protected-value request expired")))
+          retired
+  }
 ;;

@@ -209,7 +209,15 @@ let test_public_api_only_test_boundaries root =
   in
   List.iter
     (fun relative ->
-       if contains_dune_internal_module_path (read_file (path root relative))
+       (* The external negative compiler test intentionally names inaccessible
+          paths in rejected source strings, using only public spec CMIs. *)
+       if relative = "logseq_sync/test/test_asset_cache.ml"
+       then
+         forbid_text
+           root
+           relative
+           [ "logseq_sync/lib/effect_runner/."; "logseq_sync/lib/pure_reducer/." ]
+       else if contains_dune_internal_module_path (read_file (path root relative))
        then fail "test source names an unexposed Dune module: %s" relative)
     ocaml_files;
   List.concat_map
@@ -1971,6 +1979,26 @@ let () =
     root
     "app/application.ml"
     [ "Journal_calendar.Sampler.sample"; "Journal_calendar.present_journal_day" ];
+  require_text
+    root
+    "logseq_sync/spec/pure_reducer/core.mli"
+    [ "type runner_effect = private"; "Asset_requested"; "Asset_finished" ];
+  forbid_text
+    root
+    "logseq_sync/spec/effect_runner/effect_runner.mli"
+    [ "val submit_asset"
+    ; "val run_scoped_asset"
+    ; "val upload_asset"
+    ; "val stage_asset"
+    ; "val retain_asset_file"
+    ; "val release_asset_file"
+    ; "val close_asset_scope"
+    ; "val delete_graph_assets"
+    ; "val staged_asset_path"
+    ; "val release_staged_asset"
+    ; "val prune_staged_assets"
+    ; "val retain_staged_file"
+    ];
   match List.rev !failures with
   | [] -> print_endline "source boundary is clean"
   | failures ->

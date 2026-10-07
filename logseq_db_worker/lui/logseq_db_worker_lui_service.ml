@@ -399,7 +399,8 @@ let publish context = function
        Journal_worker.Session_context.emit
          context
          ~topic:bootstrap_topic
-         (Bootstrap_progress (bootstrap_progress progress)))
+         (Bootstrap_progress (bootstrap_progress progress))
+     | Asset_finished _ | Protected_finished _ -> ())
   | Graph_state_changed state ->
     Journal_worker.Session_context.emit
       context
@@ -434,7 +435,8 @@ let sync_dependencies dependencies context config id_token_provider =
             Result.bind
               (Sync_runner.local_store
                  ~application_support_directory:
-                   config.Db.Config.application_support_directory)
+                   config.Db.Config.application_support_directory
+                 ())
               (fun local_store ->
                  Result.bind
                    (Sync_runner.artifact_store
@@ -586,50 +588,8 @@ let create ~(dependencies : dependencies) =
                    Ok
                      ( sync_config
                      , Worker_runner.sync_runner
-                         ~stage_asset:(Sync_runner.stage_asset runner)
-                         ~release_staging:(Sync_runner.release_staged_asset runner)
-                         ~prune_staging:(Sync_runner.prune_staged_assets runner)
-                         ~put_upload:(fun ~context intent ~current ->
-                           match
-                             Sync_runner.staged_asset_path
-                               runner
-                               ~scope:context.scope
-                               ~file:
-                                 intent.Logseq_db_types.Asset_upload_intent.staged_file
-                           with
-                           | None ->
-                             Error
-                               Logseq_db_worker_pure_reducer.Asset_upload.Missing_source
-                           | Some source_file ->
-                             Sync_runner.upload_asset
-                               runner
-                               ~context
-                               ~asset:intent.asset
-                               ~version:intent.version
-                               ~source_file
-                               ~maximum_plaintext_bytes:(8 * 1024 * 1024)
-                               ~current
-                             |> Result.map_error (function
-                               | Sync_runner.Upload_network ->
-                                 Logseq_db_worker_pure_reducer.Asset_upload.Network
-                               | Upload_authentication | Upload_locked -> Authentication
-                               | Upload_missing_source -> Missing_source
-                               | Upload_size_rejected -> Size_rejected
-                               | Upload_revoked_access -> Revoked_access
-                               | Upload_invalid_content | Upload_cancelled ->
-                                 Invalid_content))
-                         ~submit_asset:(Sync_runner.run_scoped_asset runner)
-                         ~delete_assets:(Sync_runner.delete_graph_assets runner)
-                         ~close_assets:(Sync_runner.close_asset_scope runner)
-                         ~retain_staged_file:(Sync_runner.retain_staged_file runner)
-                         ~retain_asset_file:(Sync_runner.retain_asset_file runner)
-                         ~release_asset_file:(Sync_runner.release_asset_file runner)
                          ~submit:(Sync_runner.submit runner)
                          ~shutdown:(fun () -> Sync_runner.shutdown runner)
-                         ~decrypt_protected_value:
-                           (Sync_runner.decrypt_protected_value runner)
-                         ~encrypt_protected_values:
-                           (Sync_runner.encrypt_protected_values runner)
                          () ))))
       in
       match selected with

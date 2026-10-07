@@ -103,6 +103,8 @@ type upload_recovery_ticket =
   }
 
 type instruction =
+  | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
+  | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
   | Read_uploads of upload_recovery_ticket
   | Run_upload of Logseq_sync_pure_reducer.Core.asset_context * Asset_upload.instruction
   | Run_asset of
@@ -116,6 +118,8 @@ type instruction =
 module Sync = Logseq_sync_pure_reducer.Core
 
 let instruction_diagnostic = function
+  | Deliver_protected_result _ -> "deliver-protected-result"
+  | Deliver_asset_result _ -> "deliver-asset-result"
   | Read_uploads _ -> "read-uploads"
   | Run_upload _ -> "run-upload"
   | Run_asset _ -> "run-asset"
@@ -135,6 +139,8 @@ let instruction_diagnostic = function
 
 let equal_instruction left right =
   match left, right with
+  | Deliver_protected_result l, Deliver_protected_result r -> l = r
+  | Deliver_asset_result l, Deliver_asset_result r -> l = r
   | Read_uploads l, Read_uploads r -> l = r
   | Run_upload (lc, li), Run_upload (rc, ri) -> lc = rc && li = ri
   | Run_asset (lc, li), Run_asset (rc, ri) -> lc = rc && li = ri
@@ -147,6 +153,8 @@ let equal_instruction left right =
       | Run_asset _
       | Run_upload _
       | Read_uploads _
+      | Deliver_protected_result _
+      | Deliver_asset_result _
       | Close_asset_scope _
       | Publish _ )
     , _ ) -> false
@@ -297,6 +305,10 @@ let translate_sync transition state =
   let rec loop state reversed = function
     | [] -> { next = state; effects = List.rev reversed }
     | Sync.Run sync_effect :: rest -> loop state (Run_sync sync_effect :: reversed) rest
+    | Sync.Publish (Sync.Protected_finished output) :: rest ->
+      loop state (Deliver_protected_result output :: reversed) rest
+    | Sync.Publish (Sync.Asset_finished output) :: rest ->
+      loop state (Deliver_asset_result output :: reversed) rest
     | Sync.Publish output :: rest ->
       loop state (Publish (Sync_output output) :: reversed) rest
     | Sync.Delegate (Sync.Detach_graph scope) :: rest ->
@@ -372,7 +384,13 @@ let execute_completion state ticket result =
 
 let step state event =
   if state.shutdown
-  then no_effects state
+  then (
+    match event with
+    | Sync_event
+        (( Sync.Asset_requested _ | Sync.Protected_requested _ | Sync.Shutdown
+         | Sync.Runner_completed (Sync.Asset_completion _ | Sync.Protected_completion _)
+           ) as event) -> translate_sync (Sync.step state.sync_core event) state
+    | _ -> no_effects state)
   else (
     match event with
     | Uploads_loaded _
@@ -491,6 +509,8 @@ let step state event =
           in
           { next = transitioned.next; effects = lifecycle_effects @ transitioned.effects })
     | Shutdown ->
+      let stopped_sync = translate_sync (Sync.step state.sync_core Sync.Shutdown) state in
+      let state = stopped_sync.next in
       let close_effects, state =
         match state.database with
         | None -> [], state
@@ -505,7 +525,7 @@ let step state event =
           ; pending = []
           ; graph = { state.graph with phase = Graph_closed; graph_id = None }
           }
-      ; effects = close_effects
+      ; effects = stopped_sync.effects @ close_effects
       })
 ;;
 
@@ -602,7 +622,7 @@ let asset_scope_current state scope =
   | _ -> false
 ;;
 
-let apply_asset state context transfer event =
+let apply_asset state (context : Sync.asset_context) transfer event =
   let transfer, instructions = Transfer.step transfer event in
   let accepted =
     match event with
@@ -690,7 +710,7 @@ let step state event =
   let current = asset_scope transition.next in
   let retained, retired =
     List.partition
-      (fun (context, _, _) ->
+      (fun ((context : Sync.asset_context), _, _) ->
          match current with
          | Some active -> context.Sync.scope = active.scope
          | None -> false)
@@ -698,14 +718,14 @@ let step state event =
   in
   let cancellations =
     List.concat_map
-      (fun (context, _, upload) ->
+      (fun ((context : Sync.asset_context), _, upload) ->
          let _, instructions = Asset_upload.step upload Shutdown in
          List.map (fun instruction -> Run_upload (context, instruction)) instructions)
       retired
   in
   let cache_closes =
     retired
-    |> List.map (fun (context, _, _) -> context.Sync.scope)
+    |> List.map (fun ((context : Sync.asset_context), _, _) -> context.Sync.scope)
     |> List.sort_uniq compare
     |> List.map (fun scope -> Close_asset_scope scope)
   in
@@ -733,7 +753,7 @@ let step state event =
       List.rev uploads, instructions
   in
   let state = { transition.next with uploads = retained } in
-  let apply context operation upload upload_event =
+  let apply (context : Sync.asset_context) operation upload upload_event =
     let previous = upload in
     let upload, instructions = Asset_upload.step upload upload_event in
     let remaining = List.filter (fun (_, id, _) -> id <> operation) state.uploads in

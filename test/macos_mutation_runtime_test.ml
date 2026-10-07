@@ -69,21 +69,6 @@ let with_worker
         in
         let sync_runner =
           Runner.sync_runner
-            ~stage_asset:(fun ~scope:_ ~operation:_ ~file_type:_ ~source_file:_ ->
-              Error "unexpected staging")
-            ~put_upload:(fun ~context:_ _ ~current:_ -> failwith "unexpected upload")
-            ~prune_staging:(fun ~scope:_ ~keep:_ -> Ok 0)
-            ~release_staging:(fun ~scope:_ ~file:_ -> Ok ())
-            ~submit_asset:(fun ~context:_ ~current:_ ~post:_ _ ->
-              failwith "unexpected asset IO")
-            ~delete_assets:(fun _ -> Ok ())
-            ~close_assets:(fun _ -> ())
-            ~retain_staged_file:(fun ~scope:_ ~file:_ ->
-              failwith "unexpected staged preview")
-            ~retain_asset_file:(fun ~scope:_ ~handle:_ ->
-              failwith "unexpected asset preview")
-            ~release_asset_file:(fun ~scope:_ ~handle:_ ->
-              failwith "unexpected preview release")
             ~submit:(function
               | Sync.Request (ticket, Sync.Load_catalog _) ->
                 let cache =
@@ -99,6 +84,19 @@ let with_worker
                 post
                   (Core.Sync_event
                      (Sync.Runner_completed (Sync.Completion (ticket, Ok ()))))
+              | Sync.Asset_io (ticket, request) ->
+                let result =
+                  match request.Sync.action with
+                  | Sync.Prune_asset_staging _ -> Ok (Sync.Asset_pruned 0)
+                  | Close_asset_scope
+                  | Release_asset_file _
+                  | Release_staged_file _
+                  | Cancel_asset_operation _ -> Ok Sync.Asset_unit
+                  | _ -> failwith "unexpected fixture asset operation"
+                in
+                post
+                  (Core.Sync_event
+                     (Sync.Runner_completed (Sync.Asset_completion (ticket, result))))
               | Cancel_effects _ | Start_websocket _ | Close_websocket _ -> ()
               | effect_ ->
                 failwith
@@ -111,7 +109,7 @@ let with_worker
             ~runtime:
               (Runner.runtime
                  ~sleep:(fun _ -> failwith "unexpected wait")
-                 ~fork:(fun ~sw:_ task -> task ())
+                 ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
                |> Result.get_ok)
             ~config
             ~overlay:

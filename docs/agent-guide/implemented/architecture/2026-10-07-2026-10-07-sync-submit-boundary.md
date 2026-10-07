@@ -1,0 +1,45 @@
+# Sync Submit Boundary
+
+## Problem
+
+Asset execution bypassed the synchronization reducer through public runner methods. Callers received staging paths, cache handles and leases directly, splitting completion identity and stale-resource cleanup between adapters and business state owners.
+
+## Decision
+
+`Core.step` is the only public producer of `runner_effect`. The effect variant is private and its execution tickets are abstract. Callers can inspect, retain and submit an issued effect, but cannot reconstruct it, including with a ticket from another effect or through the visible compiled module alias.
+
+The public execution entry point is `Effect_runner.submit`. Dependency construction, `create` and `shutdown` remain lifecycle interfaces. Public asset execution, scoped callback execution, authentication execution and crypto execution helpers were removed. The cache implementation lives in the existing private Bootstrap module; the former public Asset_cache module exposes no execution values. No Dune change was needed.
+
+Asset execution follows `Asset_requested -> step -> Asset_io -> submit -> Asset_completion -> step -> Asset_finished` or reducer-issued cleanup. The request binds an operation, exact graph scope and action metadata; the opaque ticket also binds the captured execution context. Asset bytes never enter reducer state, events or business outputs. Downloads, PUT, staging, cache inspection, retain/release, path delivery, pruning, scope closure, deletion, retry waits and cancellation use this route. Protected graph-value crypto uses the same public event/completion/output boundary with a distinct ticket and request type.
+
+The state owners remain separate:
+
+- Worker Asset_upload owns durable intent, local attachment insertion, metadata mutation, publication acknowledgement, recovery and cancellation. Staging and intent persistence still precede graph mutation and PUT. A successful PUT does not complete import publication.
+- Sync Core owns asset execution admission, pending identity, cancellation, completion acceptance and resource cleanup effects. Graph sync policy and Asset_transfer demand policy retain their existing independent reducers.
+- Runner owns network, crypto, file and cache I/O plus execution resource budgets. It returns typed completions and does not mutate reducer state or run business retry loops.
+
+Cancelled pending tickets remain eligible for late resource cleanup. Duplicate and mismatched completions cannot publish another operation's success. Deletion cancellation matches the actual persistent origin/user/graph target across presentation and graph generations. Cleanup submitted before or after shutdown executes through submit; shutdown cannot retire queued cleanup without deleting its resource. Worker waiter reclamation covers cancelled callers and outputs already delivered but not yet accepted.
+
+Staging returns an independent physical `UUID.nonce.type` identity. A late completion cannot delete a replacement import using the same business UUID. Recovery pruning preserves exact durable intent file identities. Legacy `UUID.type` staging remains recoverable. Only durable save and required cleanup are protected from cancellation; staging completion waits are cancellable and their lock is released in finally.
+
+The existing download/upload/codec limits (3/1/1) and shared 64 MiB byte reservation remain. Partial reservation cancellation releases acquired capacity without poisoning the acquisition gate. Reservations exceeding the shared budget fail before asset bytes are read. Local store construction permits smaller budgets without increasing production defaults.
+
+## Verification
+
+- `dune runtest logseq_sync logseq_db_worker` passed: sync main suite 182, worker runner 16, worker Core 14, Asset_upload 11, Asset_transfer 12, asset protocol 4, codec 4, descriptor 3, and public negative compilation 1. Existing protocol, overlay and LUI package checks completed under their aliases.
+- The public compile harness uses only exported spec interfaces through the existing test entry point. It rejects private constructor reconstruction, ticket forgery, visible Core alias construction, removed runner APIs and public/private Bootstrap access; holding and submitting effects compiles.
+- Ownership regressions were reproduced before fixes: cross-generation deletion completion acceptance, replacement staging identity and queued graph I/O entering authentication after deletion. Pure acceptance defects are tested only through Core.step; filesystem and scheduler defects use the narrow runner boundary. Worker tests include cancellation of queued/resolved resource outputs and actual Db shutdown with physical staging deletion.
+- Compiled native mutation fixtures passed all 9 cases through the migrated direct caller.
+- Upstream Logseq/Apple crypto interoperability passed in both directions for 0, 1, 256, 4097, 131057 and 8388608 bytes. The production 8 MiB adapter allocated 86698576 OCaml bytes and peaked at 114049024 RSS bytes; native interoperability peaked at 130252800 RSS bytes, within existing limits.
+- Failures and final evidence are retained only in ignored test-report directories. Tests used synthetic accounts, temporary files and localhost peers; no user graph, account or phone was tested.
+- The full decision-document check has one existing baseline failure: `implemented/feature/2026-09-28-bottom-lui-capsules.md` lacks Problem, Alternatives considered and Consequences. This decision is validated separately.
+
+## Alternatives considered
+
+### Compatibility wrappers and merged ownership
+
+Compatibility wrappers were explicitly rejected because they preserve bypass paths. Moving durable import policy into sync or hiding business retry waits in the runner was rejected because those states have different owners. Stable per-operation staging filenames were rejected after the late-completion regression reproduced resource aliasing.
+
+## Consequences
+
+This is a breaking interface cutover: direct consumers must request operations through events and accept reducer outputs. Effect opacity is enforced without adding modules or changing Dune. Existing cache files and durable legacy staging remain usable. The isolated worktree reuses the installed toolchain and avoids a duplicate Journal/LUI application build. A separately reviewed shared compatibility commit fixes the repository LUI manifests to the validated revision; global opam state is unchanged and this does not claim compatibility with latest LUI.
