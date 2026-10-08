@@ -29,10 +29,6 @@ let of_instant_unix_ms_with ~localtime ~instant_unix_ms =
   | exn -> Error ("local time conversion failed: " ^ Printexc.to_string exn)
 ;;
 
-let of_instant_unix_ms ~instant_unix_ms =
-  of_instant_unix_ms_with ~localtime:Unix.localtime ~instant_unix_ms
-;;
-
 let of_calendar calendar =
   create
     ~instant_unix_ms:(Journal_calendar.instant_unix_ms calendar)

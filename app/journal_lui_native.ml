@@ -118,21 +118,6 @@ let mount ?key ~payload ~children ?on_event identifier context parent =
   node
 ;;
 
-let chrome ?key ~payload ?on_event children : Lui_elements.t =
-  fun context parent ->
-  mount ?key ~payload ~children ?on_event chrome_identifier context parent
-;;
-
-let asset_import ?key ~payload ?on_event children : Lui_elements.t =
-  fun context parent ->
-  mount ?key ~payload ~children ?on_event asset_import_identifier context parent
-;;
-
-let asset_settings ?key ~payload ?on_event children : Lui_elements.t =
-  fun context parent ->
-  mount ?key ~payload ~children ?on_event asset_settings_identifier context parent
-;;
-
 let list ?key ~payload ?on_event children : Lui_elements.t =
   fun context parent ->
   mount ?key ~payload ~children ?on_event list_identifier context parent

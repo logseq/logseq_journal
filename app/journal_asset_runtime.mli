@@ -32,8 +32,5 @@ val notice
   -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_notice
   -> unit
 
-val visible : t -> consumer:string -> Logseq_db_types.Asset_descriptor.t list -> unit
-val hidden : t -> consumer:string -> unit
-val progress : t -> Journal_asset_policy.reason -> Journal_asset_policy.progress
 val pump : t -> unit
 val reject : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit

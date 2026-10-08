@@ -43,8 +43,6 @@
   (melange-transit-native (= 0.1.2))
   (ppx_deriving_yojson (>= 3.9.1))
   (sqlite3 (= 5.4.0))
-  (uucp (= 17.0.0))
-  (uunf (= 17.0.0))
   (uutf (= 1.0.4))
   (yojson (= 3.0.0))))
 
@@ -112,8 +110,6 @@
   (logseq_db_types (= 0.1.0))
   (logseq_overlay_db (= 0.1.0))
   (logseq_sync (= 0.1.0))
-  (base (= v0.17.3))
-  (core (= v0.17.2))
   (eio (= 1.2))
   (eio_main (and :with-test (= 1.2)))
   (melange-transit-native (= 0.1.2))

@@ -15,7 +15,6 @@ val chrome_identifier : string
 val asset_import_identifier : string
 val asset_settings_identifier : string
 val list_identifier : string
-val image_preview_identifier : string
 
 (** Extension schemas shared with the Apple iOS/macOS hosts. *)
 val registry : Lui_extension.extension_registry
@@ -28,10 +27,6 @@ type event =
   ; payload : string
   }
 
-(** Decodes a lui [ExtensionEvent] into a journal [event]; returns [None] for
-    events that are not journal extension events or are malformed. *)
-val decode_event : Lui_protocol.event -> event option
-
 (** Low-level mount helper shared by the element constructors and the
     [Journal_view.Native_widget] shim.  [payload] is the JSON-encoded
     properties object (the same JSON the previous [~encode_props] produced);
@@ -42,27 +37,6 @@ val mount
   -> children:Lui_elements.t list
   -> ?on_event:(event -> unit)
   -> string
-  -> Lui_elements.t
-
-val chrome
-  :  ?key:string
-  -> payload:string
-  -> ?on_event:(event -> unit)
-  -> Lui_elements.t list
-  -> Lui_elements.t
-
-val asset_import
-  :  ?key:string
-  -> payload:string
-  -> ?on_event:(event -> unit)
-  -> Lui_elements.t list
-  -> Lui_elements.t
-
-val asset_settings
-  :  ?key:string
-  -> payload:string
-  -> ?on_event:(event -> unit)
-  -> Lui_elements.t list
   -> Lui_elements.t
 
 (** Native virtualized collection (grouped sections, scroll positioning,

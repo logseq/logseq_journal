@@ -23,19 +23,6 @@ let is_valid_utf_8 value =
   loop 0
 ;;
 
-let utf_8_scalar_count value =
-  let rec loop offset count =
-    if offset = String.length value
-    then Some count
-    else (
-      let decoded = String.get_utf_8_uchar value offset in
-      if Uchar.utf_decode_is_valid decoded
-      then loop (offset + Uchar.utf_decode_length decoded) (count + 1)
-      else None)
-  in
-  loop 0 0
-;;
-
 let contains_nul value = String.contains value '\000'
 
 let validate_block_source value =
@@ -46,12 +33,6 @@ let validate_block_source value =
   else if contains_nul value
   then Error "source contains NUL"
   else Ok ()
-;;
-
-let validate_source value =
-  if String.equal (String.trim value) ""
-  then Error "source must not be blank"
-  else validate_block_source value
 ;;
 
 let is_leap_year year = year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0)

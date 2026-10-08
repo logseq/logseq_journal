@@ -34,18 +34,6 @@ jobs:
         run: opam list --installed --columns=name,installed-version --short --color=never > .ci-reports/packages.txt
       - name: Build all targets and native embed
         run: |
-          # OCaml's partial linker does not use the C compiler's multiarch paths.
-          # Expose archives only so the complete object cannot select a shared library.
-          if [ "$(uname -s)" = Linux ]; then
-            static_directory="$PWD/.ci-deps/system-static-libs"
-            mkdir -p "$static_directory"
-            for library in rt sqlite3; do
-              archive="$(cc -print-file-name="lib${library}.a")"
-              test -f "$archive"
-              ln -s "$archive" "$static_directory/lib${library}.a"
-            done
-            export OCAMLPARAM="_,cclib=-L$static_directory"
-          fi
           opam exec -- dune build @all app/native_embed.exe.o
       - name: Run full regression suite
         run: opam exec -- dune runtest --force

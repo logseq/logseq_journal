@@ -54,7 +54,7 @@ The existing native host remains required. Named tag metadata becomes an optiona
 
 ## Implementation evidence
 
-Implemented in OCaml/LUI and validated by nine mounted-UI checks, fourteen Worker application integration cases, protocol round trips, and successful workspace build. Actual iOS simulator screenshots and native PDF preview, expansion and collapse were reviewed. See review/README.md for local artifacts, base/PR dependencies, and reproducible host linking. Full runtest has the unchanged baseline V.progress source assertion failure. Horizontal gallery drag remains an explicit manual verification item because the mouse-control tool reports noWindowsAvailable. File names are unavailable from the descriptor; type and optional actual size are used honestly. Draft PR publication is authorized; no physical-device installation or merge occurs.
+Implemented in OCaml/LUI and validated by nine mounted-UI checks, fourteen Worker application integration cases, protocol round trips, and successful workspace build. Actual iOS simulator screenshots and native PDF preview, expansion and collapse were reviewed. The repository review artifacts were retired by the 2026-10-08 cleanup; historical validation evidence is retained outside the repository. See the development composer integration guide for the maintained host workflow. Full runtest has the unchanged baseline V.progress source assertion failure. Horizontal gallery drag remains an explicit manual verification item because the mouse-control tool reports noWindowsAvailable. File names are unavailable from the descriptor; type and optional actual size are used honestly. Draft PR publication is authorized; no physical-device installation or merge occurs.
 
 
 ## Follow-up validation

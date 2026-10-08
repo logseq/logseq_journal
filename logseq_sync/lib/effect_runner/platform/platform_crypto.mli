@@ -36,12 +36,6 @@ val verify_and_save_wrapped_graph_key
   -> encrypted_graph_key:string
   -> (unit, string) result
 
-val delete_wrapped_graph_key
-  :  managed_sync_origin:Uri.t
-  -> user_id:string
-  -> graph_id:Graph_types.Uuid.t
-  -> (unit, string) result
-
 val delete_account_secrets
   :  managed_sync_origin:Uri.t
   -> user_id:string

@@ -66,5 +66,3 @@ type dependency_shadows =
   }
 
 val empty_dependency_shadows : dependency_shadows
-val equal_footprint : footprint -> footprint -> bool
-val equal_delete_artifacts : delete_artifacts option -> delete_artifacts option -> bool

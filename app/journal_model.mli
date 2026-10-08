@@ -18,7 +18,6 @@ type status_category =
 
 val status_category : task_state -> status_category option
 val status_name : task_state -> string
-val status_default_value : task_state -> string option
 
 type t
 

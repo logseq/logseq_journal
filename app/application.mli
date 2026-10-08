@@ -2,7 +2,6 @@ val sync_phase_name
   :  Logseq_db_worker_lui.Logseq_db_worker_lui_service.sync_phase
   -> string
 
-val startup_phase_name : Journal_startup.startup_phase -> string
 val graph_phase_name : Logseq_db_worker.graph_phase -> string
 
 val diagnostic_phase_rows

@@ -162,14 +162,6 @@ let verify_and_save_wrapped_graph_key
     (fun _ -> Ok ())
 ;;
 
-let delete_wrapped_graph_key ~managed_sync_origin ~user_id ~graph_id =
-  bind
-    (invoke
-       "deleteWrappedGraphKey"
-       (graph_identity_fields ~managed_sync_origin ~user_id ~graph_id))
-    (fun _ -> Ok ())
-;;
-
 let delete_account_secrets ~managed_sync_origin ~user_id =
   bind
     (invoke "deleteAccountSecrets" (identity_fields ~managed_sync_origin ~user_id))

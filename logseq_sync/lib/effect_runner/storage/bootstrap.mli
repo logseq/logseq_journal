@@ -56,7 +56,6 @@ module Asset_cache : sig
   val retain : t -> handle -> handle option
   val release : t -> handle -> unit
   val close : t -> unit
-  val delete : t -> (unit, error) result
 
   (** Remove durable files for one origin/account after its live caches are closed. *)
   val delete_account
