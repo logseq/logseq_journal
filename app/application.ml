@@ -6320,24 +6320,8 @@ let start
           model_signal
       ]
   in
-  let os =
-    match platform_code with
-    | 1 -> Lui_protocol.MacOS
-    | 2 -> Lui_protocol.IOS
-    | 3 -> Lui_protocol.AndroidOS
-    | 4 -> Lui_protocol.LinuxOS
-    | 5 -> Lui_protocol.WindowsOS
-    | _ -> Lui_protocol.GenericOS
-  in
-  let host =
-    match host_code with
-    | 1 -> Lui_protocol.WebHost
-    | 2 -> Lui_protocol.SwiftUIHost
-    | 3 -> Lui_protocol.FlutterHost
-    | _ -> Lui_protocol.GenericHost
-  in
   let backend =
-    { Lui_protocol.backend_profile = Lui_protocol.profile os host
+    { Lui_protocol.backend_profile = Lui_native_bridge.profile platform_code host_code
     ; apply_batch =
         (fun batch ->
           latest_patch := Lui_wire.encode_batch batch;

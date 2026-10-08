@@ -20,22 +20,6 @@ let view _context _model _send =
 let latest_patch = ref ""
 let current_app : (model, action) Lui_app.reducer_app option ref = ref None
 
-let operating_system = function
-  | 1 -> MacOS
-  | 2 -> IOS
-  | 3 -> AndroidOS
-  | 4 -> LinuxOS
-  | 5 -> WindowsOS
-  | _ -> GenericOS
-;;
-
-let host_kind = function
-  | 1 -> WebHost
-  | 2 -> SwiftUIHost
-  | 3 -> FlutterHost
-  | _ -> GenericHost
-;;
-
 let backend profile =
   { backend_profile = profile
   ; apply_batch =
@@ -55,7 +39,7 @@ let init platform_code host_code _payload =
   latest_patch := "";
   let value =
     Lui_app.create
-      (backend (profile (operating_system platform_code) (host_kind host_code)))
+      (backend (Lui_native_bridge.profile platform_code host_code))
       ()
       reducer
       view

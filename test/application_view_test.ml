@@ -1,4 +1,57 @@
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Wire_nodes = Set.Make (Int)
+
+let track_wire_teardown ?(parents = Hashtbl.create 64) on_drop =
+  let children = Hashtbl.create 64 in
+  let children_of node =
+    Option.value (Hashtbl.find_opt children node) ~default:Wire_nodes.empty
+  in
+  let unlink node =
+    match Hashtbl.find_opt parents node with
+    | None -> ()
+    | Some parent ->
+      Hashtbl.replace children parent (Wire_nodes.remove node (children_of parent));
+      Hashtbl.remove parents node
+  in
+  let drop node =
+    unlink node;
+    Wire_nodes.iter (Hashtbl.remove parents) (children_of node);
+    Hashtbl.remove children node;
+    on_drop node
+  in
+  let rec detach node =
+    Wire_nodes.iter detach (children_of node);
+    drop node
+  in
+  function
+  | Lui_protocol.InsertChild (parent, child, _) | MoveChild (parent, child, _) ->
+    unlink child;
+    Hashtbl.replace parents child parent;
+    Hashtbl.replace children parent (Wire_nodes.add child (children_of parent))
+  | RemoveChild (parent, child) ->
+    if Hashtbl.find_opt parents child = Some parent then unlink child
+  | DropNode node -> drop node
+  | DetachSubtree node -> detach node
+  | _ -> ()
+;;
+
+let track_json_wire_teardown ?parents on_drop =
+  let track = track_wire_teardown ?parents on_drop in
+  fun op ->
+    let open Yojson.Safe.Util in
+    let id () = member "id" op |> to_int in
+    let parent () = member "parent" op |> to_int in
+    let child () = member "child" op |> to_int in
+    match member "op" op |> to_string with
+    | "drop-node" | "drop-extension" -> track (Lui_protocol.DropNode (id ()))
+    | "detach-subtree" -> track (Lui_protocol.DetachSubtree (id ()))
+    | "insert-child" ->
+      track (Lui_protocol.InsertChild (parent (), child (), member "index" op |> to_int))
+    | "move-child" ->
+      track (Lui_protocol.MoveChild (parent (), child (), member "index" op |> to_int))
+    | "remove-child" -> track (Lui_protocol.RemoveChild (parent (), child ()))
+    | _ -> ()
+;;
 
 let check_pairs label expected actual =
   Alcotest.(check (list (pair string string))) label expected actual
@@ -706,6 +759,7 @@ let run_favorites_native_visibility
   in
   let props = Hashtbl.create 512
   and parents = Hashtbl.create 512 in
+  let track_teardown = track_json_wire_teardown ~parents (Hashtbl.remove props) in
   let consume encoded =
     if encoded <> ""
     then
@@ -714,6 +768,7 @@ let run_favorites_native_visibility
       |> member "ops"
       |> to_list
       |> List.iter (fun op ->
+        track_teardown op;
         match op |> member "op" |> to_string with
         | "create-node" ->
           Hashtbl.replace
@@ -753,15 +808,6 @@ let run_favorites_native_visibility
             props
             id
             ((key, member "value" op) :: List.remove_assoc key previous)
-        | "drop-node" | "drop-extension" ->
-          let id = op |> member "id" |> to_int in
-          Hashtbl.remove props id;
-          Hashtbl.remove parents id
-        | "insert-child" | "move-child" ->
-          Hashtbl.replace
-            parents
-            (op |> member "child" |> to_int)
-            (op |> member "parent" |> to_int)
         | _ -> ())
   in
   let find key value =
@@ -2455,6 +2501,7 @@ let test_reference_outer_terminals cancel =
       service
   in
   let texts = Hashtbl.create 128 in
+  let track_teardown = track_json_wire_teardown (Hashtbl.remove texts) in
   let saw_late = ref false in
   let consume encoded =
     if encoded <> ""
@@ -2464,6 +2511,7 @@ let test_reference_outer_terminals cancel =
       |> member "ops"
       |> to_list
       |> List.iter (fun op ->
+        track_teardown op;
         match op |> member "op" |> to_string with
         | "set-prop" when member "property" op = `String "text" ->
           let text = member "value" op |> to_string in
@@ -2473,7 +2521,6 @@ let test_reference_outer_terminals cancel =
               (String.split_on_char '|' text)
           then saw_late := true;
           Hashtbl.replace texts (member "id" op |> to_int) text
-        | "drop-node" -> Hashtbl.remove texts (member "id" op |> to_int)
         | _ -> ())
   in
   let wait label predicate =
@@ -2564,17 +2611,19 @@ let with_timeline_media_row run =
   let entry = { Journal_graph_projection.block; child_summaries = [] } in
   let batches = ref [] in
   let texts = Hashtbl.create 32 in
+  let track_teardown = track_wire_teardown (Hashtbl.remove texts) in
   let backend : Lui_protocol.backend =
     { backend_profile = Lui_protocol.profile IOS SwiftUIHost
     ; apply_batch =
         (fun batch ->
           batches := batch :: !batches;
           List.iter
-            (function
-              | Lui_protocol.SetProp (id, TextValue, StringValue text) ->
-                Hashtbl.replace texts id text
-              | DropNode id -> Hashtbl.remove texts id
-              | _ -> ())
+            (fun op ->
+               track_teardown op;
+               match op with
+               | Lui_protocol.SetProp (id, TextValue, StringValue text) ->
+                 Hashtbl.replace texts id text
+               | _ -> ())
             batch.ops;
           true)
     }
@@ -2671,7 +2720,7 @@ let test_timeline_media_identity_across_detail_routes () =
               let drops =
                 List.filter
                   (function
-                    | Lui_protocol.DropNode _ -> true
+                    | Lui_protocol.DropNode _ | DetachSubtree _ -> true
                     | _ -> false)
                   (ops ())
               in
@@ -2724,20 +2773,24 @@ let test_timeline_media_disclosure_and_owner_replacement () =
 
 let test_reactive_header_current_controls () =
   let props = Hashtbl.create 128 in
+  let track_teardown =
+    track_wire_teardown (fun id ->
+      Hashtbl.filter_map_inplace
+        (fun (node, _) value -> if node = id then None else Some value)
+        props)
+  in
   let backend : Lui_protocol.backend =
     { backend_profile = Lui_protocol.profile IOS SwiftUIHost
     ; apply_batch =
         (fun batch ->
           List.iter
-            (function
-              | Lui_protocol.SetProp (id, key, value) ->
-                Hashtbl.replace props (id, key) value
-              | RemoveProp (id, key) -> Hashtbl.remove props (id, key)
-              | DropNode id ->
-                Hashtbl.filter_map_inplace
-                  (fun (node, _) value -> if node = id then None else Some value)
-                  props
-              | _ -> ())
+            (fun op ->
+               track_teardown op;
+               match op with
+               | Lui_protocol.SetProp (id, key, value) ->
+                 Hashtbl.replace props (id, key) value
+               | RemoveProp (id, key) -> Hashtbl.remove props (id, key)
+               | _ -> ())
             batch.Lui_protocol.ops;
           true)
     }
@@ -3029,6 +3082,7 @@ let unlock_fixture () =
 let test_unlock_application () =
   let hooks, submissions, release, client = unlock_fixture () in
   let props = Hashtbl.create 64 in
+  let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
   let consume encoded =
     if encoded <> ""
     then
@@ -3037,6 +3091,7 @@ let test_unlock_application () =
       |> member "ops"
       |> to_list
       |> List.iter (fun op ->
+        track_teardown op;
         let id = op |> member "id" in
         match op |> member "op" |> to_string with
         | "create-node" | "create-extension" -> Hashtbl.replace props (to_int id) []
@@ -3048,7 +3103,6 @@ let test_unlock_application () =
             props
             id
             ((key, member "value" op) :: List.remove_assoc key previous)
-        | "drop-node" | "drop-extension" -> Hashtbl.remove props (to_int id)
         | _ -> ())
   in
   let find key value =

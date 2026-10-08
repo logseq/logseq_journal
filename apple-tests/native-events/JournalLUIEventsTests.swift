@@ -65,6 +65,16 @@ private let receivePatch: PatchCallback = { source in
       (.appear(node: node), "appear"),
       (.press(node: node), "press"),
       (.longPress(node: node), "longPress"),
+      (.pressDetail(node: node, x: -0.25, y: 12.5, modifiers: 15, button: 2,
+        targetClass: "日记📓"), "pressDetail:-0.25:12.5:15:2:日记📓"),
+      (.pointerDown(node: node, x: 1.25, y: -2.5, modifiers: 4, button: 0,
+        targetClass: ""), "pointerDown:1.25:-2.5:4:0:"),
+      (.pointerUp(node: node, x: 0, y: 0, modifiers: 0, button: 1,
+        targetClass: "row"), "pointerUp:0:0:0:1:row"),
+      (.pointerEnter(node: node), "pointerEnter"),
+      (.pointerLeave(node: node), "pointerLeave"),
+      (.contextMenuPress(node: node, x: 3.5, y: 4.25, modifiers: 8, button: 2,
+        targetClass: "菜单"), "contextMenuPress:3.5:4.25:8:2:菜单"),
       (.textChanged(node: node, text: "日记\n\"draft\""), "textChanged:日记\n\"draft\""),
       (.submit(node: node), "submit"),
       (.dismiss(node: node), "dismiss"),
@@ -133,6 +143,11 @@ private let receivePatch: PatchCallback = { source in
       try check(value == "platform:410042", "binary platform envelope changed")
     }
     for _ in 0..<100 {
+      for (event, _) in cases.prefix(9) {
+        patches.removeAll()
+        try check(JournalLUIEvents.dispatch(event) == 1 && patches.count == 1,
+          "repeated pointer dispatch failed")
+      }
       patches.removeAll()
       reenter = true
       try check(JournalLUIEvents.dispatch(.press(node: node)) == 1, "repeated dispatch failed")

@@ -27,6 +27,11 @@ let patch node text =
     { generation = 1; ops = [ SetProp (node, TextValue, StringValue text) ] }
 ;;
 
+let pointer_patch kind node (detail : pointer_detail) =
+  patch node (Printf.sprintf "%s:%g:%g:%d:%d:%s" kind detail.x detail.y
+    detail.modifiers detail.button detail.target_class)
+;;
+
 let dispatch = function
   | Appear node -> patch node "appear"
   | Press node -> patch node "press"
@@ -44,6 +49,14 @@ let dispatch = function
   | VisibleRange (node, first, last) ->
     patch node (Printf.sprintf "visibleRange:%d:%d" first last)
   | Picked (node, payload) -> patch node ("picked:" ^ payload)
+  | PressModifiers (node, modifiers) -> patch node ("pressModifiers:" ^ string_of_int modifiers)
+  | PressDetail (node, detail) -> pointer_patch "pressDetail" node detail
+  | PointerDown (node, detail) -> pointer_patch "pointerDown" node detail
+  | PointerUp (node, detail) -> pointer_patch "pointerUp" node detail
+  | PointerEnter node -> patch node "pointerEnter"
+  | PointerLeave node -> patch node "pointerLeave"
+  | ContextMenuPress (node, detail) -> pointer_patch "contextMenuPress" node detail
+  | Load node -> patch node "load"
   | ExtensionEvent _ -> failwith "extension bypassed its host hook"
 ;;
 

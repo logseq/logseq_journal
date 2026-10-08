@@ -140,11 +140,11 @@ pin-depends: [
 ]
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"
+    "git+https://github.com/logseq/datascript-ocaml.git#0561660e4894faee250d551ab2a32a6b5c25a5fb"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"
+    "git+https://github.com/logseq/datascript-ocaml.git#0561660e4894faee250d551ab2a32a6b5c25a5fb"
   ]
   [
     "melange-edn-core.0.5.0"
