@@ -46,7 +46,13 @@ val preview_visible
 
 val next : t -> root:string -> unit
 val retry : ?owner:string -> t -> root:string -> asset:string -> unit
+
+(** Mark retained metadata dirty after a projection change or resync. Only
+    active root/asset/preview owners read immediately; hidden groups restart
+    lazily. Each root keeps one request and at most one dirty follow-up, always
+    from the first page because cursors belong to the global projection. *)
 val refresh : t -> unit
+
 val receive : t -> ticket -> Service.response -> unit
 val reject : t -> ticket -> unit
 val notice : t -> Service.asset_scope -> Service.asset_notice -> unit

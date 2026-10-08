@@ -8,6 +8,7 @@ type t =
   ; changed : int option -> Policy.offline -> Policy.offline -> unit
   ; mutable published : (int option * Policy.offline * Policy.offline) option
   ; mutable policy : Policy.t
+  ; mutable configuration : (int * int * Policy.settings) option
   ; mutable generation : int option
   ; mutable queued : Policy.instruction list
   ; pending : (string, Policy.ticket) Hashtbl.t
@@ -18,6 +19,7 @@ let create ~send ~changed =
   ; changed
   ; published = None
   ; policy = Policy.empty
+  ; configuration = None
   ; generation = None
   ; queued = []
   ; pending = Hashtbl.create 2
@@ -94,16 +96,22 @@ let dispatch t event =
 ;;
 
 let refresh t ~graph_generation ~today ~settings =
-  Hashtbl.clear t.pending;
-  t.queued
-  <- List.filter
-       (function
-         | Policy.Release _ -> true
-         | Read _ | Demand _ -> false)
-       t.queued;
-  t.generation <- Some graph_generation;
+  let configuration = graph_generation, today, settings in
+  if t.configuration <> Some configuration
+  then (
+    Hashtbl.clear t.pending;
+    t.queued
+    <- List.filter
+         (function
+           | Policy.Release _ -> true
+           | Read _ | Demand _ -> false)
+         t.queued;
+    t.configuration <- Some configuration;
+    t.generation <- Some graph_generation);
   dispatch t (Refresh { graph_generation; today; settings })
 ;;
+
+let invalidate t = dispatch t Graph_changed
 
 let shutdown t =
   t.queued
@@ -115,6 +123,7 @@ let shutdown t =
   dispatch t Shutdown;
   Hashtbl.clear t.pending;
   t.queued <- [];
+  t.configuration <- None;
   t.generation <- None;
   publish t
 ;;

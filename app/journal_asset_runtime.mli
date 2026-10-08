@@ -9,12 +9,19 @@ val create
         -> unit)
   -> t
 
+(** Configure graph scope, day and offline settings. Repeating the same
+    configuration preserves pending requests and completed enumerations. *)
 val refresh
   :  t
   -> graph_generation:int
   -> today:int
   -> settings:Journal_asset_policy.settings
   -> unit
+
+(** Invalidate configured scans after a projection change or resync. Unknown
+    dependencies conservatively affect both scans; global projection cursors
+    are discarded. Pending requests coalesce and retain their terminal owner. *)
+val invalidate : t -> unit
 
 val shutdown : t -> unit
 val receive : t -> Logseq_db_worker.Protocol.response -> bool
