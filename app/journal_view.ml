@@ -853,7 +853,6 @@ module View = struct
         ?accessibility_identifier
         ?label
         ?attachments:(Option.map (fun view -> view.mount) attachments)
-        ~attachments_height:112
         ?feedback:(Option.map (fun view -> view.mount) feedback)
         ~placeholder
         ~text:(Text_editing.Value.text value)

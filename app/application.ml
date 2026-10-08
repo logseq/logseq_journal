@@ -146,6 +146,7 @@ type timeline_notice =
   | Delete_failed of string
   | Status_failed of string
   | Copy_failed of string
+  | Import_failed of string
 
 let operation_failure = function
   | Some (Delete_failed message) ->
@@ -160,6 +161,12 @@ let operation_failure = function
       , "The block keeps its current status. Open its Status menu to try again." )
   | Some (Copy_failed message) ->
     Some ("Copy failed", message, "Select Copy to try again.")
+  | Some (Import_failed message) ->
+    Some
+      ( "Attachment not added"
+      , message
+      , "Your journal entry and other attachments are kept. Select the file again to \
+         retry." )
   | None | Some Delete_undo -> None
 ;;
 
@@ -257,6 +264,7 @@ type state =
   ; asset_import_request : int
   ; asset_import_owner : (string * int64) option
   ; capture_pick_request : int
+  ; capture_picker_armed : bool
   ; capture_pick_source : Journal_asset_import.source
   ; capture_imports : capture_import_batch option
   ; capture_error : capture_failure option
@@ -343,6 +351,7 @@ let initial_state =
   ; asset_import_request = 0
   ; asset_import_owner = None
   ; capture_pick_request = 0
+  ; capture_picker_armed = false
   ; capture_pick_source = Journal_asset_import.Files
   ; capture_imports = None
   ; capture_error = None
@@ -416,15 +425,22 @@ let track_capture_session state =
     else { state with next_local_sequence = next }
 ;;
 
-let clear_graph_surface state =
+let clear_graph_surface ?(discard_capture = true) state =
   (match state.direct_capture with
-   | Some capture ->
+   | Some capture when discard_capture ->
      List.iter
        Journal_asset_import.discard_staged_file
        (Journal_capture.pending_attachments capture)
-   | None -> ());
+   | None | Some _ -> ());
   { state with
-    favorites =
+    capture_picker_armed = false
+  ; capture_pick_request =
+      (state.capture_pick_request
+       +
+       if Option.is_some state.direct_capture || Option.is_some state.draft_graph
+       then 1
+       else 0)
+  ; favorites =
       Journal_routes.Favorites.create ~graph_generation:state.graph_state.generation
   ; favorites_media_roots = Rrbvec.empty
   ; favorites_requests = []
@@ -461,6 +477,15 @@ let discard_local_graph_state state =
 ;;
 
 let clear_account_drafts state =
+  Graph_drafts.iter
+    (fun _ draft ->
+       Option.iter
+         (fun capture ->
+            List.iter
+              Journal_asset_import.discard_staged_file
+              (Journal_capture.pending_attachments capture))
+         draft.capture_draft)
+    state.graph_drafts;
   { (clear_graph_surface state) with
     draft_graph = None
   ; graph_drafts = Graph_drafts.empty
@@ -490,7 +515,9 @@ let switch_draft_graph state graph_id =
         }
         state.graph_drafts
   in
-  let state = clear_graph_surface state in
+  let state =
+    clear_graph_surface ~discard_capture:(Option.is_none state.draft_graph) state
+  in
   let retained =
     Option.bind graph_id (fun id ->
       Graph_drafts.find_opt (Logseq_db_types.Graph_types.Uuid.to_string id) graph_drafts)
@@ -1234,6 +1261,8 @@ module Root_navigation = struct
     | Capture_discarded
     | Capture_picker_requested of Journal_asset_import.source
     | Capture_asset_picked of Journal_asset_import.staged * int option
+    | Capture_assets_picked of
+        Journal_asset_import.staged list * int option * string option
     | Capture_native_edit of Ui.Event.Payload.text_edit
     | Capture_task_intent of bool
     | Capture_edited of string
@@ -1299,23 +1328,79 @@ module Root_navigation = struct
              modal = No_modal
            ; direct_capture = None
            ; capture_error = None
+           ; capture_picker_armed = false
            ; capture_pick_request = state.capture_pick_request + 1
            }
          | None | Some _ -> state)
       | Capture_picker_requested source ->
         { state with
-          capture_pick_source = source
+          capture_picker_armed = true
+        ; capture_pick_source = source
         ; capture_pick_request = state.capture_pick_request + 1
         }
-      | Capture_asset_picked (staged, request_id) ->
+      | (Capture_asset_picked (_, _) as event)
+      | (Capture_assets_picked (_, _, _) as event) ->
+        let items, request_id, error =
+          match event with
+          | Capture_asset_picked (staged, request_id) -> [ staged ], request_id, None
+          | Capture_assets_picked (items, request_id, error) -> items, request_id, error
+          | _ -> assert false
+        in
+        let owned =
+          Option.fold
+            ~none:[]
+            ~some:Journal_capture.pending_attachments
+            state.direct_capture
+        in
+        let discard_from owned item =
+          if
+            not
+              (List.exists
+                 (fun pick ->
+                    String.equal
+                      (Journal_asset_import.staged_path pick)
+                      (Journal_asset_import.staged_path item))
+                 owned)
+          then Journal_asset_import.discard_staged_file item
+        in
         (match state.direct_capture with
-         | Some capture when request_id = Some state.capture_pick_request ->
+         | Some capture
+           when request_id = Some state.capture_pick_request
+                && (state.capture_picker_armed
+                    ||
+                    match event with
+                    | Capture_asset_picked _ -> true
+                    | _ -> false) ->
+           let capture, rejected =
+             List.fold_left
+               (fun (capture, rejected) staged ->
+                  let next = Journal_capture.add_attachment capture staged in
+                  if next == capture
+                  then (
+                    discard_from (Journal_capture.pending_attachments capture) staged;
+                    capture, rejected || not (Journal_capture.can_attach capture))
+                  else next, rejected)
+               (capture, false)
+               items
+           in
+           let error =
+             match error with
+             | Some _ -> error
+             | None when rejected ->
+               Some "Some selections could not be added to this draft."
+             | None -> None
+           in
            { state with
-             direct_capture = Some (Journal_capture.add_attachment capture staged)
-           ; capture_error = None
+             direct_capture = Some capture
+           ; capture_picker_armed =
+               (match event with
+                | Capture_assets_picked _ -> false
+                | _ -> state.capture_picker_armed)
+           ; capture_error =
+               Option.map (fun message -> Local_capture_failure message) error
            }
          | None | Some _ ->
-           Journal_asset_import.discard_staged_file staged;
+           List.iter (discard_from owned) items;
            state)
       | Capture_native_edit edit ->
         (match state.direct_capture with
@@ -3264,6 +3349,7 @@ type app_context =
   ; send_action : action -> unit
   ; apply_platform : bytes -> unit Effect.t
   ; running : bool ref
+  ; release_staging : unit -> unit
   }
 
 let latest_patch = ref ""
@@ -3529,6 +3615,8 @@ let start
   let import_worker_requests = Hashtbl.create 2 in
   (* operation token -> staged pick whose temp copy is removed on completion *)
   let capture_staged_items = Hashtbl.create 2 in
+  let capture_import_queue = Queue.create () in
+  let drain_capture_imports = ref (fun () -> Effect.ignore) in
   let asset_worker_requests = Hashtbl.create 2 in
   let asset_runtime =
     Journal_asset_runtime.create
@@ -4041,62 +4129,71 @@ let start
             Journal_asset_import.discard_staged_file staged
           | None -> ())
        | None -> ());
-      let current =
-        match pending with
-        | Some (generation, _, owner) ->
-          let snapshot = !state_ref in
-          generation = snapshot.graph_state.generation
-          &&
-          let routes =
-            Option.bind owner (fun (entry_id, request_generation) ->
-              Option.bind
-                (Journal_routes.at_entry snapshot.routes ~entry_id)
-                (fun routes ->
-                   if Journal_routes.detail_request_generation routes = request_generation
-                   then Some routes
-                   else None))
-          in
-          (match result, Option.bind routes Journal_routes.detail with
-           | Ok receipt, Some detail ->
-             Journal_model.id (Journal_detail.root detail)
-             = Logseq_db_types.Graph_types.Uuid.to_string receipt.target
-           | Error _, _ -> true
-           | _ -> false)
-        | None -> false
+      let completion =
+        let current =
+          match pending with
+          | Some (generation, _, owner) ->
+            let snapshot = !state_ref in
+            generation = snapshot.graph_state.generation
+            &&
+            let routes =
+              Option.bind owner (fun (entry_id, request_generation) ->
+                Option.bind
+                  (Journal_routes.at_entry snapshot.routes ~entry_id)
+                  (fun routes ->
+                     if
+                       Journal_routes.detail_request_generation routes
+                       = request_generation
+                     then Some routes
+                     else None))
+            in
+            (match result, Option.bind routes Journal_routes.detail with
+             | Ok receipt, Some detail ->
+               Journal_model.id (Journal_detail.root detail)
+               = Logseq_db_types.Graph_types.Uuid.to_string receipt.target
+             | Error _, _ -> true
+             | _ -> false)
+          | None -> false
+        in
+        Effect.bind
+          (Effect.of_thunk (fun () ->
+             sync_media !state_ref;
+             Result.iter (Journal_media_runtime.imported media_runtime ~current) result))
+          ~f:(fun () ->
+            Effect.many
+              [ flush_media set_state
+              ; (match pending with
+                 | None -> Effect.ignore
+                 | Some (generation, operation, owner) ->
+                   set_state (fun state ->
+                     if
+                       state.graph_state.generation <> generation
+                       || Option.fold
+                            ~none:false
+                            ~some:(fun (entry_id, request_generation) ->
+                              match Journal_routes.at_entry state.routes ~entry_id with
+                              | Some routes ->
+                                Journal_routes.detail_request_generation routes
+                                <> request_generation
+                              | None -> true)
+                            owner
+                     then state
+                     else
+                       { state with
+                         timeline_notice =
+                           (match owner, result with
+                            | None, Error message -> Some (Import_failed message)
+                            | _ -> state.timeline_notice)
+                       ; import_completion =
+                           Some
+                             ( operation
+                             , match result with
+                               | Ok _ -> None
+                               | Error message -> Some message )
+                       }))
+              ])
       in
-      Effect.bind
-        (Effect.of_thunk (fun () ->
-           sync_media !state_ref;
-           Result.iter (Journal_media_runtime.imported media_runtime ~current) result))
-        ~f:(fun () ->
-          Effect.many
-            [ flush_media set_state
-            ; (match pending with
-               | None -> Effect.ignore
-               | Some (generation, operation, owner) ->
-                 set_state (fun state ->
-                   if
-                     state.graph_state.generation <> generation
-                     || Option.fold
-                          ~none:false
-                          ~some:(fun (entry_id, request_generation) ->
-                            match Journal_routes.at_entry state.routes ~entry_id with
-                            | Some routes ->
-                              Journal_routes.detail_request_generation routes
-                              <> request_generation
-                            | None -> true)
-                          owner
-                   then state
-                   else
-                     { state with
-                       import_completion =
-                         Some
-                           ( operation
-                           , match result with
-                             | Ok _ -> None
-                             | Error message -> Some message )
-                     }))
-            ])
+      Effect.bind completion ~f:(fun () -> !drain_capture_imports ())
     | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
       when Hashtbl.mem import_worker_requests request_id ->
       let generation, operation, owner = Hashtbl.find import_worker_requests request_id in
@@ -4106,23 +4203,31 @@ let start
          Hashtbl.remove capture_staged_items operation;
          Journal_asset_import.discard_staged_file staged
        | None -> ());
-      set_state (fun state ->
-        if
-          state.graph_state.generation <> generation
-          || Option.fold
-               ~none:false
-               ~some:(fun (entry_id, request_generation) ->
-                 match Journal_routes.at_entry state.routes ~entry_id with
-                 | Some routes ->
-                   Journal_routes.detail_request_generation routes <> request_generation
-                 | None -> true)
-               owner
-        then state
-        else
-          { state with
-            import_completion =
-              Some (operation, Some "Import was interrupted. Select the file again.")
-          })
+      let completion =
+        set_state (fun state ->
+          if
+            state.graph_state.generation <> generation
+            || Option.fold
+                 ~none:false
+                 ~some:(fun (entry_id, request_generation) ->
+                   match Journal_routes.at_entry state.routes ~entry_id with
+                   | Some routes ->
+                     Journal_routes.detail_request_generation routes <> request_generation
+                   | None -> true)
+                 owner
+          then state
+          else
+            { state with
+              timeline_notice =
+                (match owner with
+                 | None ->
+                   Some (Import_failed "Import was interrupted. Select the file again.")
+                 | Some _ -> state.timeline_notice)
+            ; import_completion =
+                Some (operation, Some "Import was interrupted. Select the file again.")
+            })
+      in
+      Effect.bind completion ~f:(fun () -> !drain_capture_imports ())
     | Worker.Response { outcome = Completed (Asset_file _); _ } -> Effect.ignore
     | Worker.Response { outcome = Completed Client_command_completed; _ } -> Effect.ignore
     | Worker.Response { outcome = Completed (Graph_state graph_state); _ }
@@ -4528,55 +4633,70 @@ let start
                 | _ -> state)))
   in
   let prev_capture_imports_key = ref initial_state.capture_imports in
+  let rec drain_imports () =
+    if Hashtbl.length capture_staged_items > 0 || Queue.is_empty capture_import_queue
+    then Effect.ignore
+    else (
+      let generation, target, staged = Queue.take capture_import_queue in
+      let operation = Journal_asset_import.staged_token staged in
+      let failure =
+        if
+          (not !running)
+          || (not !state_ref.write_enabled)
+          || !state_ref.graph_state.generation <> generation
+        then Some "The destination is no longer ready for imports."
+        else (
+          match
+            Worker.send
+              client
+              (Graph_service.Import_asset
+                 { graph_generation = generation
+                 ; source = Journal_asset_import.to_import staged ~target
+                 })
+          with
+          | Accepted request_id ->
+            Hashtbl.replace import_worker_requests request_id (generation, operation, None);
+            Hashtbl.replace capture_staged_items operation staged;
+            None
+          | Full | Not_ready | Stopping ->
+            Some "Import is temporarily unavailable. Select the file again.")
+      in
+      match failure with
+      | None -> Effect.ignore
+      | Some message ->
+        Journal_asset_import.discard_staged_file staged;
+        Effect.bind
+          (set_state (fun state ->
+             if state.graph_state.generation <> generation
+             then state
+             else
+               { state with
+                 import_completion = Some (operation, Some message)
+               ; timeline_notice = Some (Import_failed message)
+               }))
+          ~f:drain_imports)
+  in
+  drain_capture_imports := drain_imports;
   let capture_imports_callback batch =
     match batch with
     | None -> Effect.ignore
     | Some batch ->
-      Effect.many
+      Effect.bind
         (set_state (fun state ->
            match state.capture_imports with
            | Some pending when pending == batch -> { state with capture_imports = None }
-           | _ -> state)
-         ::
-         (match Logseq_db_types.Graph_types.Uuid.of_string batch.batch_target with
+           | _ -> state))
+        ~f:(fun () ->
+          match Logseq_db_types.Graph_types.Uuid.of_string batch.batch_target with
           | Error _ ->
-            [ Effect.of_thunk (fun () ->
-                List.iter Journal_asset_import.discard_staged_file batch.batch_items)
-            ]
+            List.iter Journal_asset_import.discard_staged_file batch.batch_items;
+            Effect.ignore
           | Ok target ->
-            List.map
+            List.iter
               (fun staged ->
-                 let operation = Journal_asset_import.staged_token staged in
-                 let source = Journal_asset_import.to_import staged ~target in
-                 Effect.bind
-                   (Effect.of_thunk (fun () ->
-                      if not !state_ref.write_enabled
-                      then (
-                        Journal_asset_import.discard_staged_file staged;
-                        Some "The destination is not ready for imports")
-                      else (
-                        match
-                          Worker.send
-                            client
-                            (Graph_service.Import_asset
-                               { graph_generation = batch.batch_generation; source })
-                        with
-                        | Accepted request_id ->
-                          Hashtbl.replace
-                            import_worker_requests
-                            request_id
-                            (batch.batch_generation, operation, None);
-                          Hashtbl.replace capture_staged_items operation staged;
-                          None
-                        | Full | Not_ready | Stopping ->
-                          Journal_asset_import.discard_staged_file staged;
-                          Some "Import is temporarily unavailable. Select the file again.")))
-                   ~f:(function
-                     | None -> Effect.ignore
-                     | Some message ->
-                       set_state (fun state ->
-                         { state with import_completion = Some (operation, Some message) })))
-              batch.batch_items))
+                 Queue.add (batch.batch_generation, target, staged) capture_import_queue)
+              batch.batch_items;
+            drain_imports ())
   in
   let prev_upload_key = ref (upload_context initial_state) in
   let upload_callback () =
@@ -5153,6 +5273,11 @@ let start
     | Capture_asset value ->
       (match value with
        | Journal_asset_import.Dismissed -> Effect.ignore
+       | Journal_asset_import.Picker_dismissed request_id ->
+         update (fun state ->
+           if request_id = Some state.capture_pick_request
+           then { state with capture_picker_armed = false }
+           else state)
        | Journal_asset_import.Unavailable message ->
          update (fun state ->
            { state with capture_error = Some (Local_capture_failure message) })
@@ -5172,6 +5297,9 @@ let start
                  (fun capture -> Journal_capture.remove_attachment capture ~token)
                  state.direct_capture
            })
+       | Journal_asset_import.Picked_batch (items, request_id, error) ->
+         update (fun state ->
+           Root_navigation.step state (Capture_assets_picked (items, request_id, error)))
        | Journal_asset_import.Picked (staged, request_id) ->
          update (fun state ->
            Root_navigation.step state (Capture_asset_picked (staged, request_id))))
@@ -5228,7 +5356,7 @@ let start
     | Dismiss_operation_error ->
       update (fun state ->
         match state.timeline_notice with
-        | Some (Delete_failed _ | Status_failed _ | Copy_failed _) ->
+        | Some (Delete_failed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
           { state with timeline_notice = None }
         | None | Some Delete_undo -> state)
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
@@ -5710,6 +5838,7 @@ let start
     && left.graph_state.generation = right.graph_state.generation
     && left.write_enabled = right.write_enabled
     && left.capture_error == right.capture_error
+    && left.capture_picker_armed = right.capture_picker_armed
     && left.capture_pick_request = right.capture_pick_request
     && left.capture_pick_source = right.capture_pick_source
     && left.import_completion = right.import_completion
@@ -5821,8 +5950,16 @@ let start
     let capture_assets state ~camera =
       { request =
           Journal_asset_import.staged_request
-            ~id:state.capture_pick_request
+            ~id:(if state.capture_picker_armed then state.capture_pick_request else 0)
             ~source:state.capture_pick_source
+            ~max_selections:
+              (Journal_capture.attachment_limit
+               - Option.fold
+                   ~none:0
+                   ~some:(fun capture ->
+                     List.length (Journal_capture.pending_attachments capture))
+                   state.direct_capture)
+            ()
       ; camera
       ; completion = state.import_completion
       ; on_attach = (fun source -> dispatch.send (Capture_attach source))
@@ -5984,7 +6121,7 @@ let start
             ~enabled:(current.write_enabled && Journal_capture.can_attach capture)
             ~completion:assets.completion
             ~request:assets.request
-            ~pending:[]
+            ~pending:(Journal_capture.pending_attachments capture)
             ~on_select:assets.on_event
             (V.Body.static (V.empty ())))
     in
@@ -6337,7 +6474,20 @@ let start
       view
   in
   app_cell := Some app;
-  let context = { app; pump; client; send_action; apply_platform; running } in
+  let release_staging () =
+    ignore (clear_account_drafts !state_ref);
+    Queue.iter
+      (fun (_, _, staged) -> Journal_asset_import.discard_staged_file staged)
+      capture_import_queue;
+    Queue.clear capture_import_queue;
+    Hashtbl.iter
+      (fun _ staged -> Journal_asset_import.discard_staged_file staged)
+      capture_staged_items;
+    Hashtbl.clear capture_staged_items
+  in
+  let context =
+    { app; pump; client; send_action; apply_platform; running; release_staging }
+  in
   current_app := Some context;
   ignore (Worker.send client Graph_service.Get_graph_state : Worker.send_result);
   Worker.on_event client (fun event ->
@@ -6498,6 +6648,7 @@ let create
      | Some context ->
        context.running := false;
        Worker.Private.request_stop context.client;
+       context.release_staging ();
        ignore (Lui_app.dispose context.app);
        current_app := None
      | None -> ());

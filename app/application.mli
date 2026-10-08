@@ -116,6 +116,8 @@ module Root_navigation : sig
     | Capture_discarded
     | Capture_picker_requested of Journal_asset_import.source
     | Capture_asset_picked of Journal_asset_import.staged * int option
+    | Capture_assets_picked of
+        Journal_asset_import.staged list * int option * string option
     | Capture_native_edit of Journal_view.Event.Payload.text_edit
     | Capture_task_intent of bool
     | Capture_edited of string

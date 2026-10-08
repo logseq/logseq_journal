@@ -19,10 +19,14 @@ type request =
   { id : int
   ; source : source
   ; staged : bool
+  ; max_selections : int option
   }
 
-let file_request ~id = { id; source = Files; staged = false }
-let staged_request ~id ~source = { id; source; staged = true }
+let file_request ~id = { id; source = Files; staged = false; max_selections = Some 1 }
+
+let staged_request ?max_selections ~id ~source () =
+  { id; source; staged = true; max_selections }
+;;
 
 (* A picked asset held for a later import: the wire pick fields plus [token],
    which identifies the pending item for the extension's remove event. *)
@@ -35,12 +39,14 @@ type staged =
   ; source_file : string
   ; title : string
   ; file_type : string
+  ; source_identity : string option
   }
 
 let staged_token (staged : staged) = staged.token
 let staged_path (staged : staged) = staged.source_file
 let staged_title (staged : staged) = staged.title
 let staged_type (staged : staged) = staged.file_type
+let staged_source_identity (staged : staged) = staged.source_identity
 
 let parse payload =
   let ( let* ) = Result.bind in
@@ -79,6 +85,10 @@ let parse payload =
         ; source_file
         ; title
         ; file_type
+        ; source_identity =
+            (match Yojson.Basic.Util.member "sourceIdentity" json with
+             | `String value -> Some value
+             | _ -> None)
         }
       , request_id )
   with
@@ -117,8 +127,10 @@ let to_import (staged : staged) ~target : Logseq_db_types.Asset_import.t =
 
 type event =
   | Picked of staged * int option
+  | Picked_batch of staged list * int option * string option
   | Removed of string
   | Dismissed
+  | Picker_dismissed of int option
   | Unavailable of string
 
 let decode_event payload =
@@ -128,7 +140,35 @@ let decode_event payload =
   with
   | `Assoc fields ->
     (match List.assoc_opt "action" fields with
-     | Some (`String "dismissed") -> Ok Dismissed
+     | Some (`String "picked-batch") ->
+       let request_id =
+         match Yojson.Basic.Util.member "request" (`Assoc fields) with
+         | `Assoc request ->
+           (match List.assoc_opt "id" request with
+            | Some (`Int id) -> Some id
+            | _ -> None)
+         | _ -> None
+       in
+       let error =
+         match List.assoc_opt "error" fields with
+         | Some (`String message) -> Some message
+         | _ -> None
+       in
+       (match List.assoc_opt "items" fields with
+        | Some (`List items) ->
+          let rec decode reversed = function
+            | [] -> Ok (Picked_batch (List.rev reversed, request_id, error))
+            | item :: rest ->
+              (match parse (Yojson.Basic.to_string item) with
+               | Ok (staged, _) -> decode (staged :: reversed) rest
+               | Error message -> Error message)
+          in
+          decode [] items
+        | _ -> Error "Invalid attachment batch")
+     | Some (`String "dismissed") ->
+       (match List.assoc_opt "request" fields with
+        | Some (`Int id) -> Ok (Picker_dismissed (Some id))
+        | _ -> Ok Dismissed)
      | Some (`String "unavailable") ->
        Ok
          (Unavailable
@@ -167,7 +207,7 @@ let discard_staged_file (staged : staged) =
 
 let is_dismissal payload =
   match decode_event payload with
-  | Ok Dismissed -> true
+  | Ok Dismissed | Ok (Picker_dismissed _) -> true
   | _ -> false
 ;;
 
@@ -194,6 +234,10 @@ let view ~key ~enabled ~completion ~request ~pending ~on_select body =
                 [ "id", `Int request.id
                 ; "source", `String (source_to_string request.source)
                 ; "staged", `Bool request.staged
+                ; ( "maxSelections"
+                  , match request.max_selections with
+                    | None -> `Null
+                    | Some count -> `Int count )
                 ] )
           ; ( "pending"
             , `List
@@ -204,6 +248,10 @@ let view ~key ~enabled ~completion ~request ~pending ~on_select body =
                         ; "path", `String item.source_file
                         ; "title", `String item.title
                         ; "type", `String item.file_type
+                        ; ( "sourceIdentity"
+                          , match item.source_identity with
+                            | None -> `Null
+                            | Some identity -> `String identity )
                         ])
                    pending) )
           ])

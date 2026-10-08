@@ -2324,8 +2324,237 @@ let test_typed_detached_duplicate_pending_mutations () =
     "runtime reload lost the retained independent attempt"
 ;;
 
+let multiselect_pick index path source_identity =
+  let identity offset =
+    Printf.sprintf "71000000-0000-4000-a000-%012d" ((index * 4) + offset)
+  in
+  `Assoc
+    [ "operation", `String (identity 0)
+    ; "asset", `String (identity 1)
+    ; "localMutation", `String (identity 2)
+    ; "metadataMutation", `String (identity 3)
+    ; "path", `String path
+    ; "title", `String (Filename.basename path)
+    ; "type", `String "png"
+    ; "sourceIdentity", `String source_identity
+    ]
+;;
+
+let multiselect_staged index path source_identity =
+  match
+    Journal_asset_import.decode_event
+      (Yojson.Basic.to_string (multiselect_pick index path source_identity))
+  with
+  | Ok (Picked (staged, _)) -> staged
+  | _ -> fail "valid legacy selection did not decode"
+;;
+
+let with_multiselect_files count f =
+  let files = List.init count (fun _ -> Filename.temp_file "journal-import-" ".png") in
+  Fun.protect
+    ~finally:(fun () ->
+      List.iter (fun path -> if Sys.file_exists path then Sys.remove path) files)
+    (fun () -> f files)
+;;
+
+let test_multiselect_batch_boundary () =
+  List.iter
+    (fun (items, error) ->
+       let payload =
+         Yojson.Basic.to_string
+           (`Assoc
+               [ "action", `String "picked-batch"
+               ; "items", `List items
+               ; "request", `Assoc [ "id", `Int 1 ]
+               ; ( "error"
+                 , match error with
+                   | None -> `Null
+                   | Some message -> `String message )
+               ])
+       in
+       match Journal_asset_import.decode_event payload with
+       | Ok (Picked_batch (decoded, Some 1, actual_error)) ->
+         require
+           (List.map Journal_asset_import.staged_path decoded
+            = List.map
+                (fun item ->
+                   Yojson.Basic.Util.member "path" item |> Yojson.Basic.Util.to_string)
+                items)
+           "batch reordered valid siblings";
+         require (actual_error = error) "batch lost its partial failure feedback"
+       | _ -> fail "ordered/empty/partial-failure native batch was rejected")
+    [ ( [ multiselect_pick 0 "/tmp/a.png" "files:a"
+        ; multiselect_pick 1 "/tmp/b.png" "files:b"
+        ]
+      , None )
+    ; [], None
+    ; [ multiselect_pick 1 "/tmp/b.png" "photos:b" ], Some "One photo could not be read."
+    ; [], Some "Unable to read the selected photos."
+    ];
+  require
+    (Result.is_error
+       (Journal_asset_import.decode_event
+          {|{"action":"picked-batch","items":[{}],"request":{"id":1}}|}))
+    "malformed batch item acquired ownership"
+;;
+
+let test_multiselect_order_duplicates_and_readd () =
+  let module R = Application.Root_navigation in
+  with_multiselect_files 4 (function
+    | [ a; b; c; duplicate ] ->
+      let picks =
+        List.mapi
+          (fun i path -> multiselect_staged i path ("files:" ^ string_of_int i))
+          [ a; b; c ]
+      in
+      let start =
+        R.create ~graph_generation:1
+        |> fun s ->
+        R.step s Capture_opened |> fun s -> R.step s (Capture_picker_requested Files)
+      in
+      let selected = R.step start (Capture_assets_picked (picks, Some 1, None)) in
+      let current s = Journal_capture.pending_attachments (Option.get (R.capture s)) in
+      require
+        (List.map Journal_asset_import.staged_path (current selected) = [ a; b; c ])
+        "selection order was lost";
+      let duplicate_pick = multiselect_staged 4 duplicate "files:1" in
+      let deduped = R.step selected (Capture_asset_picked (duplicate_pick, Some 1)) in
+      require (current deduped = picks) "same source added a duplicate attachment";
+      require (not (Sys.file_exists duplicate)) "duplicate staging copy was leaked";
+      let repeated = R.step deduped (Capture_asset_picked (List.hd picks, Some 1)) in
+      require
+        (current repeated = picks && Sys.file_exists a)
+        "replayed event removed an owned source or added a duplicate";
+      let removed =
+        Journal_capture.remove_attachment
+          (Option.get (R.capture repeated))
+          ~token:(Journal_asset_import.staged_token (List.nth picks 1))
+      in
+      let readded = Journal_capture.add_attachment removed (List.nth picks 1) in
+      require
+        (List.map
+           Journal_asset_import.staged_path
+           (Journal_capture.pending_attachments readded)
+         = [ a; c; b ])
+        "removed source could not be readded at selection tail"
+    | _ -> assert false)
+;;
+
+let test_multiselect_rejected_resource_ownership () =
+  let module R = Application.Root_navigation in
+  with_multiselect_files (Journal_capture.attachment_limit + 2) (fun files ->
+    let picks =
+      List.mapi
+        (fun i path -> multiselect_staged i path ("files:" ^ string_of_int i))
+        files
+    in
+    let start =
+      R.create ~graph_generation:1
+      |> fun s ->
+      R.step s Capture_opened |> fun s -> R.step s (Capture_picker_requested Files)
+    in
+    let full =
+      List.fold_left
+        (fun s p -> R.step s (Capture_asset_picked (p, Some 1)))
+        start
+        (List.filteri (fun i _ -> i < Journal_capture.attachment_limit) picks)
+    in
+    let overflow = List.nth picks Journal_capture.attachment_limit in
+    let next = R.step full (Capture_asset_picked (overflow, Some 1)) in
+    require
+      (List.length (Journal_capture.pending_attachments (Option.get (R.capture next)))
+       = Journal_capture.attachment_limit)
+      "capacity changed";
+    require
+      (not (Sys.file_exists (Journal_asset_import.staged_path overflow)))
+      "capacity rejection leaked its staging copy";
+    let saving =
+      Journal_capture.update_source (Option.get (R.capture start)) ~source:"Saving owner"
+      |> fun capture ->
+      fst
+        (Journal_capture.admit_save
+           capture
+           ~mutation_id:"71000000-0000-4000-9000-000000000090"
+           ~block_id:"71000000-0000-4000-a000-000000000090"
+           ~sibling_order:"z"
+           ~calendar_generation:1L
+           ~creation_time:(creation_time 1))
+    in
+    let rejected = List.nth picks (Journal_capture.attachment_limit + 1) in
+    let after =
+      R.step
+        (R.step start (Capture_admitted saving))
+        (Capture_asset_picked (rejected, Some 1))
+    in
+    require (R.capture after = Some saving) "saving capture accepted an async attachment";
+    require
+      (not (Sys.file_exists (Journal_asset_import.staged_path rejected)))
+      "saving rejection leaked its staging copy")
+;;
+
+let test_multiselect_graph_owner_and_cancel () =
+  let module R = Application.Root_navigation in
+  let graph index =
+    Logseq_db_types.Graph_types.Uuid.of_string
+      (Printf.sprintf "71000000-0000-4000-b000-%012d" index)
+    |> Result.get_ok
+  in
+  with_multiselect_files 2 (function
+    | [ kept; late ] ->
+      let start =
+        R.create ~graph_generation:1
+        |> fun s ->
+        R.step s (Graph_replaced { graph_id = Some (graph 1); generation = 1 })
+        |> fun s ->
+        R.step s Capture_opened |> fun s -> R.step s (Capture_picker_requested Photos)
+      in
+      let pick = multiselect_staged 1 kept "photos:kept" in
+      let selected = R.step start (Capture_asset_picked (pick, Some 1)) in
+      require
+        (Journal_asset_import.is_dismissal {|{"action":"dismissed","request":1}|})
+        "picker cancellation did not decode";
+      let collapsed = R.step selected Capture_closed in
+      require
+        (R.capture collapsed = R.capture selected && Sys.file_exists kept)
+        "cancellation/collapse erased owned attachments";
+      let other =
+        R.step collapsed (Graph_replaced { graph_id = Some (graph 2); generation = 2 })
+        |> fun s -> R.step s Capture_opened
+      in
+      require
+        (Sys.file_exists kept)
+        "graph retention deleted a retained draft's attachment";
+      let stale =
+        R.step
+          other
+          (Capture_asset_picked (multiselect_staged 2 late "photos:late", Some 1))
+      in
+      require
+        (Journal_capture.pending_attachments (Option.get (R.capture stale)) = [])
+        "old graph completion acquired a new draft";
+      require (not (Sys.file_exists late)) "old graph completion leaked its staging copy";
+      let returned =
+        R.step stale (Graph_replaced { graph_id = Some (graph 1); generation = 3 })
+      in
+      require
+        (Journal_capture.pending_attachments (Option.get (R.capture returned)) = [ pick ]
+         && Sys.file_exists kept)
+        "returning graph lost staged ownership";
+      let other =
+        R.step returned (Graph_replaced { graph_id = Some (graph 2); generation = 4 })
+      in
+      ignore (R.step other Account_cleared);
+      require (not (Sys.file_exists kept)) "sign-out leaked retained graph staging"
+    | _ -> assert false)
+;;
+
 let tests =
   [ "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
+  ; "multiselect batch boundary", test_multiselect_batch_boundary
+  ; "multiselect order duplicates and readd", test_multiselect_order_duplicates_and_readd
+  ; ( "multiselect rejected resource ownership"
+    , test_multiselect_rejected_resource_ownership )
+  ; "multiselect graph owner and cancel", test_multiselect_graph_owner_and_cancel
   ; "typed covered failure and branch", test_typed_covered_failure_missing_and_branch
   ; "typed shared data and aggregate Undo", test_typed_shared_data_delete_undo_and_drafts
   ; "typed duplicate detached mutations", test_typed_detached_duplicate_pending_mutations

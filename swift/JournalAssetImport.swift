@@ -1,3 +1,4 @@
+import CryptoKit
 import LUIAppleBackend
 import Observation
 import PhotosUI
@@ -7,11 +8,32 @@ import UniformTypeIdentifiers
 import UIKit
 #endif
 
+private actor JournalAssetStaging {
+  static let shared = JournalAssetStaging()
+
+  func copy(_ source: URL) -> URL? {
+    let scoped = source.startAccessingSecurityScopedResource()
+    defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+    let ext = source.pathExtension.lowercased()
+    let name = "journal-import-" + UUID().uuidString.lowercased() + (ext.isEmpty ? "" : "." + ext)
+    let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    do { try FileManager.default.copyItem(at: source, to: dest); return dest }
+    catch { try? FileManager.default.removeItem(at: dest); return nil }
+  }
+
+  func write(_ data: Data, ext: String) -> URL? {
+    let dest = FileManager.default.temporaryDirectory.appendingPathComponent("journal-import-" + UUID().uuidString.lowercased() + "." + ext)
+    do { try data.write(to: dest); return dest }
+    catch { try? FileManager.default.removeItem(at: dest); return nil }
+  }
+}
+
 @MainActor enum JournalAssetImport {
-  struct Request: Decodable {
+  struct Request: Decodable, Equatable {
     let id: Int
     let source: String?
     let staged: Bool?
+    let maxSelections: Int?
   }
 
   struct PendingItem: Decodable, Identifiable {
@@ -19,6 +41,7 @@ import UIKit
     let path: String
     let title: String
     let type: String?
+    let sourceIdentity: String?
     var id: String { token }
     var fileType: String { type ?? "bin" }
     var isImage: Bool { JournalImportThumbnail.imageTypes.contains(fileType) }
@@ -49,58 +72,6 @@ import UIKit
       source = nil
       scoped = false
       operation = nil
-    }
-  }
-
-  /// One pending-attachment chip: thumbnail (images only) over a file icon,
-  /// with a remove affordance that emits the extension's `remove` event.
-  private struct PendingCell: SwiftUI.View {
-    let item: PendingItem
-    let onRemove: () -> Void
-    @State private var image: CGImage?
-    @State private var decodeFailed = false
-
-    var body: some SwiftUI.View {
-      VStack(spacing: 2) {
-        Group {
-          if let image {
-            Image(decorative: image, scale: 1).resizable().scaledToFill()
-          } else {
-            Image(systemName: item.isImage && !decodeFailed ? "photo" : "doc")
-              .font(.title3)
-              .foregroundStyle(.secondary)
-          }
-        }
-        .frame(width: 48, height: 48)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        Text(item.title)
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-          .truncationMode(.middle)
-          .frame(width: 56)
-      }
-      .overlay(alignment: .topTrailing) {
-        Button(action: onRemove) {
-          Image(systemName: "xmark.circle.fill")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
-        .padding(2)
-        .accessibilityIdentifier("journal-asset-remove:" + item.token)
-      }
-      .task(id: item.path) {
-        guard item.isImage else { return }
-        image = nil
-        decodeFailed = false
-        let decoded = await JournalImportThumbnailDecoder.shared.load(item.path)
-        guard !Task.isCancelled else { return }
-        image = decoded
-        decodeFailed = decoded == nil
-      }
-      .accessibilityIdentifier("journal-asset-pending:" + item.token)
     }
   }
 
@@ -155,7 +126,10 @@ import UIKit
     @State private var filePresented = false
     @State private var photosPresented = false
     @State private var cameraPresented = false
-    @State private var photoItem: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var importTask: Task<Void, Never>?
+    @State private var armedRequest: Request?
+    @State private var epoch = 0
     @State private var handled = false
     @State private var lastRequest = 0
     @State private var error: String?
@@ -167,201 +141,196 @@ import UIKit
     private var request: Request? { properties?.request }
 
     private func emit(_ object: [String: Any]) -> Bool {
-      guard let data = try? JSONSerialization.data(withJSONObject: object)
-      else { return false }
+      guard let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
       return JournalExtensions.emit(context: context, payload: data)
+    }
+
+    private func isCurrent(_ request: Request, epoch: Int) -> Bool {
+      self.epoch == epoch && self.request?.id == request.id
+        && context.isUserInteractionEnabled && properties?.enabled == true
     }
 
     private func emitDismissed() {
       guard !handled else { return }
       handled = true
-      _ = emit(["action": "dismissed"])
+      _ = emit(["action": "dismissed", "request": armedRequest?.id ?? 0])
     }
 
-    private func emitUnavailable(_ reason: String) {
+    private func emitUnavailable(_ reason: String, request: Request) {
       handled = true
-      _ = emit([
-        "action": "unavailable",
-        "reason": reason,
-        "request": request?.id ?? 0,
-      ])
+      _ = emit(["action": "unavailable", "reason": reason, "request": request.id])
     }
 
-    private func emitRemove(_ token: String) {
-      _ = emit(["action": "remove", "token": token])
+    private func requestPayload(_ request: Request) -> [String: Any] {
+      ["id": request.id, "source": request.source ?? "files", "staged": request.staged ?? false]
     }
 
-    private func emitPick(path: String, title: String, type: String, retained: URL?) {
+    private func pick(path: String, title: String, type: String, identity: String) -> [String: Any] {
+      ["operation": UUID().uuidString.lowercased(), "asset": UUID().uuidString.lowercased(),
+       "localMutation": UUID().uuidString.lowercased(), "metadataMutation": UUID().uuidString.lowercased(),
+       "path": path, "title": title, "type": type.isEmpty ? "bin" : type, "sourceIdentity": identity]
+    }
+
+    private func discard(_ items: [[String: Any]]) {
+      for item in items {
+        guard let path = item["path"] as? String else { continue }
+        try? FileManager.default.removeItem(atPath: path)
+      }
+    }
+
+    private func emitBatch(_ items: [[String: Any]], failures: Int, request: Request, epoch: Int) {
+      guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
       handled = true
-      let operation = UUID().uuidString.lowercased()
-      if let retained { selection.retain(retained, operation: operation) }
-      let ok = emit([
-        "operation": operation,
-        "asset": UUID().uuidString.lowercased(),
-        "localMutation": UUID().uuidString.lowercased(),
-        "metadataMutation": UUID().uuidString.lowercased(),
-        "path": path,
-        "title": title,
-        "type": type.isEmpty ? "bin" : type,
-        "request": [
-          "id": request?.id ?? 0,
-          "source": request?.source ?? "files",
-          "staged": request?.staged ?? false,
-        ],
-      ] as [String: Any])
-      if !ok {
-        selection.release()
-        error = "The destination is no longer available. Select the file again."
+      var payload: [String: Any] = ["action": "picked-batch", "request": requestPayload(request), "items": items]
+      if failures > 0 { payload["error"] = "\(failures) selected item(s) could not be added. Your other attachments are kept." }
+      if !emit(payload) {
+        discard(items)
+        error = "The destination is no longer available. Select the files again."
       }
     }
 
-    /// Staged requests copy the pick into a temp file so the path stays valid
-    /// after the picker's security scope is released (attach-on-save).
-    private func stagedCopy(of url: URL, title: String) -> (path: String, title: String)? {
-      let ext = url.pathExtension.lowercased()
-      let name =
-        "journal-import-" + UUID().uuidString.lowercased()
-        + (ext.isEmpty ? "" : "." + ext)
-      let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-      try? FileManager.default.removeItem(at: dest)
-      do {
-        try FileManager.default.copyItem(at: url, to: dest)
-        return (dest.path(percentEncoded: false), title)
-      } catch {
-        return nil
-      }
-    }
-
-    private func stageData(_ data: Data, ext: String, title: String) {
-      let dest = FileManager.default.temporaryDirectory
-        .appendingPathComponent("journal-import-" + UUID().uuidString.lowercased() + "." + ext)
-      do {
-        try data.write(to: dest)
-        emitPick(path: dest.path(percentEncoded: false), title: title, type: ext, retained: nil)
-      } catch {
-        self.error = "Unable to save the image. Please try again."
-      }
-    }
-
-    private func handleFilePick(_ source: URL) {
-      let title = source.lastPathComponent
-      let type = source.pathExtension.lowercased()
-      if request?.staged == true {
-        selection.retain(source, operation: UUID().uuidString.lowercased())
-        let staged = stagedCopy(of: source, title: title)
-        selection.release()
-        guard let staged else {
-          self.error = "Unable to access the selected file. Please try again."
-          return
-        }
-        emitPick(path: staged.path, title: staged.title, type: type, retained: nil)
-      } else {
-        emitPick(
-          path: source.path(percentEncoded: false), title: title, type: type,
-          retained: source)
-      }
-    }
-
-    private func importPhoto(_ item: PhotosPickerItem) async {
-      photoItem = nil
-      guard let data = try? await item.loadTransferable(type: Data.self)
-      else {
-        self.error = "Unable to read the selected photo. Please try again."
+    private func handleFiles(_ sources: [URL], request: Request, epoch: Int) async {
+      guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { return }
+      handled = true
+      guard request.staged == true else {
+        guard let source = sources.first else { return }
+        var item = pick(path: source.path(percentEncoded: false), title: source.lastPathComponent,
+                        type: source.pathExtension.lowercased(), identity: "files:" + source.standardizedFileURL.absoluteString)
+        let operation = item["operation"] as! String
+        selection.retain(source, operation: operation)
+        item["request"] = requestPayload(request)
+        if !emit(item) { selection.release(); error = "The destination is no longer available. Select the file again." }
         return
       }
-      let ext =
-        item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
-      stageData(data, ext: ext, title: "photo." + ext)
+      var items: [[String: Any]] = []
+      var seen = Set((properties?.pending ?? []).compactMap(\.sourceIdentity))
+      var failures = 0
+      let remaining = max(0, request.maxSelections ?? sources.count)
+      for source in sources {
+        let identity = "files:" + source.standardizedFileURL.absoluteString
+        guard seen.insert(identity).inserted else { continue }
+        guard items.count < remaining else { failures += 1; continue }
+        guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
+        guard let copy = await JournalAssetStaging.shared.copy(source) else { failures += 1; continue }
+        guard !Task.isCancelled, isCurrent(request, epoch: epoch) else {
+          try? FileManager.default.removeItem(at: copy); discard(items); return
+        }
+        items.append(pick(path: copy.path(percentEncoded: false), title: source.lastPathComponent,
+                          type: source.pathExtension.lowercased(), identity: identity))
+      }
+      emitBatch(items, failures: failures, request: request, epoch: epoch)
+    }
+
+    private func stageData(_ data: Data, ext: String, title: String, identity: String) async -> [String: Any]? {
+      guard let dest = await JournalAssetStaging.shared.write(data, ext: ext) else { return nil }
+      return pick(path: dest.path(percentEncoded: false), title: title, type: ext, identity: identity)
+    }
+
+    private func importPhotos(_ selected: [PhotosPickerItem], request: Request, epoch: Int) async {
+      var items: [[String: Any]] = []
+      var seen = Set((properties?.pending ?? []).compactMap(\.sourceIdentity))
+      var failures = 0
+      let remaining = max(0, request.maxSelections ?? selected.count)
+      for item in selected {
+        guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
+        if let identifier = item.itemIdentifier, seen.contains("photos:" + identifier) { continue }
+        guard items.count < remaining else { failures += 1; continue }
+        guard let data = try? await item.loadTransferable(type: Data.self) else { failures += 1; continue }
+        guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
+        let identity = "photos:" + (item.itemIdentifier ?? SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
+        guard seen.insert(identity).inserted else { continue }
+        let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
+        if let staged = await stageData(data, ext: ext, title: "photo." + ext, identity: identity) { items.append(staged) }
+        else { failures += 1 }
+      }
+      emitBatch(items, failures: failures, request: request, epoch: epoch)
     }
 
     var body: some SwiftUI.View {
-      VStack(spacing: 8) {
-        if let pending = properties?.pending, !pending.isEmpty {
-          ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
-              ForEach(pending) { item in
-                PendingCell(item: item) { emitRemove(item.token) }
-              }
-            }
-            .padding(.horizontal, 4)
-          }
-          .frame(height: 72)
-        }
+      let _ = context.revision
+      // Composer owns the attachment cards; this extension only owns picking.
+      VStack(spacing: 0) {
         context.content
+        Color.clear.frame(width: 1, height: 1).allowsHitTesting(false)
       }
-      .fileImporter(
-        isPresented: $filePresented, allowedContentTypes: [.item],
-        allowsMultipleSelection: false
-      ) { result in
-        guard context.isUserInteractionEnabled else { return }
-        do {
-          guard let source = try result.get().first else {
-            emitDismissed()
-            return
+      .fileImporter(isPresented: $filePresented, allowedContentTypes: [.item], allowsMultipleSelection: armedRequest?.staged == true) { result in
+        guard let request = armedRequest else { return }
+        let epoch = self.epoch
+        guard isCurrent(request, epoch: epoch) else { return }
+        switch result {
+        case .success(let sources):
+          if sources.isEmpty { emitDismissed() }
+          else {
+            handled = true
+            importTask?.cancel()
+            importTask = Task { await handleFiles(sources, request: request, epoch: epoch) }
           }
-          handleFilePick(source)
-        } catch {
+        case .failure(let failure):
           selection.release()
-          if (error as NSError).code == NSUserCancelledError {
-            emitDismissed()
-          } else {
-            self.error = "Unable to access the selected file. Please try again."
-          }
+          if (failure as NSError).code == NSUserCancelledError { emitDismissed() }
+          else if isCurrent(request, epoch: epoch) { emitUnavailable("Unable to access the selected files. Please try again.", request: request) }
         }
       }
-      .photosPicker(
-        isPresented: $photosPresented, selection: $photoItem, matching: .images
-      )
+      .photosPicker(isPresented: $photosPresented, selection: $photoItems,
+                    maxSelectionCount: max(1, armedRequest?.maxSelections ?? 1), selectionBehavior: .ordered, matching: .images)
       .sheet(isPresented: $cameraPresented) {
         #if os(iOS)
-        CameraPicker(
-          onImage: { image in
+        CameraPicker(onImage: { image in
+          guard let request = armedRequest, isCurrent(request, epoch: epoch) else { return }
+          handled = true
+          let epoch = self.epoch
+          importTask?.cancel()
+          importTask = Task {
+            let item: [String: Any]?
             if let data = image.jpegData(compressionQuality: 0.9) {
-              stageData(data, ext: "jpg", title: "camera.jpg")
-            } else {
-              self.error = "Unable to save the image. Please try again."
-            }
-          },
-          onCancel: emitDismissed)
+              item = await stageData(data, ext: "jpg", title: "camera.jpg", identity: "camera:" + UUID().uuidString.lowercased())
+            } else { item = nil }
+            emitBatch(item.map { [$0] } ?? [], failures: item == nil ? 1 : 0, request: request, epoch: epoch)
+          }
+        }, onCancel: emitDismissed)
         #else
         EmptyView()
         #endif
       }
-      .onChange(of: filePresented) { _, isPresented in
-        if isPresented {
-          handled = false
+      .onChange(of: filePresented) { _, presented in if !presented { emitDismissed() } }
+      .onChange(of: photosPresented) { _, presented in if !presented && photoItems.isEmpty { emitDismissed() } }
+      .onChange(of: photoItems) { _, items in
+        guard !items.isEmpty, let request = armedRequest else { return }
+        guard isCurrent(request, epoch: epoch) else { return }
+        handled = true
+        photoItems = []
+        importTask?.cancel()
+        let epoch = self.epoch
+        importTask = Task { await importPhotos(items, request: request, epoch: epoch) }
+      }
+      .onChange(of: request?.id, initial: true) { _, id in
+        guard let id, id != lastRequest else { return }
+        epoch += 1
+        importTask?.cancel()
+        let wasPresenting = filePresented || photosPresented || cameraPresented
+        if id <= 0 || wasPresenting {
+          handled = true
+          filePresented = false; photosPresented = false; cameraPresented = false
+          armedRequest = nil
+          lastRequest = id
+          return
         }
-      }
-      .onChange(of: photosPresented) { _, isPresented in
-        if isPresented { handled = false }
-      }
-      .onChange(of: photoItem) { _, item in
-        guard let item else { return }
-        Task { await importPhoto(item) }
-      }
-      .onChange(of: request?.id) { _, id in
-        guard let id, id != lastRequest, context.isUserInteractionEnabled,
-          properties?.enabled == true, selection.operation == nil
-        else { return }
+        guard context.isUserInteractionEnabled, properties?.enabled == true, selection.operation == nil, let request else { return }
         lastRequest = id
+        armedRequest = request
         handled = false
-        switch request?.source ?? "files" {
-        case "files":
-          filePresented = true
-        case "photos":
-          photosPresented = true
+        photoItems = []
+        switch request.source ?? "files" {
+        case "files": filePresented = true
+        case "photos": photosPresented = true
         case "camera":
           #if os(iOS)
-          if UIImagePickerController.isSourceTypeAvailable(.camera) {
-            cameraPresented = true
-          } else {
-            emitUnavailable("The camera is not available on this device.")
-          }
+          if UIImagePickerController.isSourceTypeAvailable(.camera) { cameraPresented = true }
+          else { emitUnavailable("The camera is not available on this device.", request: request) }
           #else
-          emitUnavailable("Camera capture is not available on this platform.")
+          emitUnavailable("Camera capture is not available on this platform.", request: request)
           #endif
-        default:
-          emitUnavailable("Unknown attachment source.")
+        default: emitUnavailable("Unknown attachment source.", request: request)
         }
       }
       .onChange(of: properties?.completion) { _, operation in
@@ -369,11 +338,12 @@ import UIKit
         selection.release()
         error = properties?.error
       }
-      .onDisappear { selection.release() }
-      .alert(
-        "Unable to import file",
-        isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })
-      ) {
+      .onDisappear {
+        epoch += 1
+        importTask?.cancel()
+        selection.release()
+      }
+      .alert("Unable to import file", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
         Button("OK", role: .cancel) { error = nil }
       } message: { Text(error ?? "") }
     }

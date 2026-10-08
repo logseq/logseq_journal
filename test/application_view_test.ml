@@ -391,6 +391,7 @@ let run_favorites_native_visibility
       ?(check_chrome = false)
       ?(check_error_control = false)
       ?(check_ios_capture = false)
+      ?(check_capture_imports = false)
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
@@ -424,6 +425,14 @@ let run_favorites_native_visibility
   let media_checksum = Atomic.make 'a' in
   let detail_fixture = Atomic.make false in
   let released_demands = Atomic.make 0 in
+  let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
+  let capture_page : G.page option Atomic.t = Atomic.make None in
+  let imports_entered = Atomic.make [] in
+  let imports_finished = Atomic.make 0 in
+  let import_release = Atomic.make false in
+  let import_probe = Atomic.make false in
+  let import_probed = Atomic.make false in
+  let staged_paths = ref [] in
   let scope : Service.asset_scope =
     { account =
         { managed_sync_origin = Uri.of_string "https://example.invalid"
@@ -522,7 +531,8 @@ let run_favorites_native_visibility
     W.Service.create
       ~push_topic_count:6
       ~merge_push:Service.coalesce_push
-      ~concurrency:Serial
+      ~concurrency:
+        (if check_capture_imports then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         worker_context := Some context;
         W.Session_context.emit
@@ -533,6 +543,7 @@ let run_favorites_native_visibility
       ~handle:(fun context () request ->
         match request with
         | Service.Get_graph_state ->
+          if Atomic.get import_probe then Atomic.set import_probed true;
           if Atomic.exchange publish_block false
           then (
             Atomic.set updated_block true;
@@ -601,6 +612,44 @@ let run_favorites_native_visibility
           Ok Service.Client_command_completed
         | Client_command _ | Asset_command _ -> Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Import_asset { graph_generation; source } when check_capture_imports ->
+          Atomic.set imports_entered (Atomic.get imports_entered @ [ source.title ]);
+          if source.title = "First attachment"
+          then (
+            while not (Atomic.get import_release) do
+              Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+            done;
+            Atomic.incr imports_finished;
+            Ok (Service.Asset_imported (Error "Fixture first attachment failed")))
+          else
+            let module A = Logseq_db_types.Asset_descriptor in
+            let asset =
+              A.create
+                ~uuid:source.asset
+                ~source:
+                  (Managed
+                     (Some
+                        (A.version
+                           ~checksum:(String.make 64 'a')
+                           ~file_type:source.file_type
+                         |> Result.get_ok)))
+                ~current_checksum:None
+                ~size:None
+                ~dimensions:None
+              |> Result.get_ok
+            in
+            Atomic.incr imports_finished;
+            Ok
+              (Service.Asset_imported
+                 (Ok
+                    { operation = source.operation
+                    ; graph_generation
+                    ; scope
+                    ; target = source.target
+                    ; asset
+                    ; file_type = source.file_type
+                    ; preview = None
+                    }))
         | Import_asset _ -> Error "unexpected import"
         | Graph_request request ->
           let outcome =
@@ -665,6 +714,55 @@ let run_favorites_native_visibility
               let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
               V2_block_outcome
                 (V2_present_block { value = timeline_block n; revision = "root" })
+            | V2_get_block_summary { block; _ } when check_capture_imports ->
+              let root = Atomic.get capture_root |> Option.get in
+              let page = Atomic.get capture_page |> Option.get in
+              Alcotest.(check string)
+                "capture summary queries committed UUID"
+                (G.Uuid.to_string root.uuid)
+                (G.Uuid.to_string block);
+              let value = timeline_block 0 in
+              V2_block_summary_outcome
+                { lookup =
+                    V2_present_block
+                      { value =
+                          { value with
+                            block =
+                              { value.block with
+                                uuid = root.uuid
+                              ; title = root.title
+                              ; parent = page.uuid
+                              ; page = page.uuid
+                              }
+                          ; rendered_page_title = page.title
+                          }
+                      ; revision = "captured"
+                      }
+                ; page = Some (V2_present_page { page; revision = "p" })
+                ; items = []
+                ; next_cursor = None
+                ; scope_revision = "children"
+                ; generation = "g"
+                ; projection_revision = "p2"
+                }
+            | V2_get_page { page = requested; _ } when check_capture_imports ->
+              let journal_day =
+                Scanf.sscanf
+                  (G.Uuid.to_string requested)
+                  "00000001-%4d-%4d-0000-000000000000"
+                  (fun year month_day -> (year * 10000) + month_day)
+              in
+              let name = Printf.sprintf "%08d" journal_day in
+              let page =
+                { page with
+                  uuid = requested
+                ; name
+                ; title = name
+                ; kind = Journal_page { journal_day }
+                }
+              in
+              Atomic.set capture_page (Some page);
+              V2_page_outcome (V2_present_page { page; revision = "p" })
             | V2_get_page _ -> V2_page_outcome (V2_present_page { page; revision = "p" })
             | V2_get_children { parent; _ }
               when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
@@ -732,6 +830,21 @@ let run_favorites_native_visibility
                        ]
                      else [])
                 ; next_cursor = None
+                }
+            | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
+              when check_capture_imports ->
+              let page = Atomic.get capture_page |> Option.get in
+              Alcotest.(check string)
+                "capture mutation targets its requested journal page"
+                (G.Uuid.to_string page.uuid)
+                (G.Uuid.to_string parent);
+              Atomic.set capture_root (Some root);
+              V2_mutation_committed
+                { mutation_id
+                ; status = V2_applied
+                ; generation = "g"
+                ; before_projection_revision = "p"
+                ; after_projection_revision = "p2"
                 }
             | _ -> V2_failed { code = "unsupported"; message = "Unused fixture command" }
           in
@@ -850,14 +963,16 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set import_release true;
       Atomic.set acquire_release true;
       ignore (hooks.dispose ());
       Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client;
+      List.iter (fun path -> if Sys.file_exists path then Sys.remove path) !staged_paths;
       check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
        on_initialized ();
-       if check_ios_capture
+       if check_ios_capture || check_capture_imports
        then (
          let snapshot = { Journal_environment.fallback with platform = "ios" } in
          let payload =
@@ -1951,6 +2066,104 @@ let run_favorites_native_visibility
              acquired
              (Atomic.get acquire_entered))
        else (
+         if check_capture_imports
+         then (
+           (* Application owns the asynchronous import queue; its pure navigation
+              reducer cannot observe Worker handler overlap or file release.
+              Two Worker lanes make accidental parallel submission observable. *)
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "文件")));
+           let adapter =
+             Hashtbl.fold
+               (fun id values found ->
+                  match
+                    List.assoc_opt "_extension" values, List.assoc_opt "payload" values
+                  with
+                  | Some (`String "journal-asset-import"), Some (`String payload) ->
+                    let request =
+                      Yojson.Safe.from_string payload |> Yojson.Safe.Util.member "request"
+                    in
+                    if
+                      Yojson.Safe.Util.(member "id" request |> to_int) > 0
+                      && Yojson.Safe.Util.member "staged" request = `Bool true
+                    then Some id
+                    else found
+                  | _ -> found)
+               props
+               None
+             |> Option.get
+           in
+           let request =
+             List.assoc "payload" (Hashtbl.find props adapter)
+             |> Yojson.Safe.Util.to_string
+             |> Yojson.Safe.from_string
+             |> Yojson.Safe.Util.member "request"
+           in
+           let item index title =
+             let path = Filename.temp_file "journal-import-" ".txt" in
+             staged_paths := !staged_paths @ [ path ];
+             `Assoc
+               [ "operation", `String (G.Uuid.to_string (uuid (30000 + index)))
+               ; "asset", `String (G.Uuid.to_string (uuid (31000 + index)))
+               ; "localMutation", `String (G.Uuid.to_string (uuid (32000 + index)))
+               ; "metadataMutation", `String (G.Uuid.to_string (uuid (33000 + index)))
+               ; "path", `String path
+               ; "title", `String title
+               ; "type", `String "txt"
+               ; "sourceIdentity", `String title
+               ]
+           in
+           let batch =
+             `Assoc
+               [ "action", `String "picked-batch"
+               ; "request", request
+               ; "items", `List [ item 1 "First attachment"; item 2 "Second attachment" ]
+               ]
+           in
+           hooks.extension_event
+             adapter
+             "event"
+             (Yojson.Safe.to_string
+                (`Assoc [ "id", `Int 1; "payload", `String (Yojson.Safe.to_string batch) ]))
+           |> consume;
+           Alcotest.(check bool)
+             "picker batch mounts pending attachment"
+             true
+             (Option.is_some
+                (find
+                   "accessibility-identifier"
+                   ("composer-attachment:" ^ G.Uuid.to_string (uuid 30001))));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Send")));
+           wait "first attachment enters actual Worker handler" (fun () ->
+             Atomic.get imports_entered <> []);
+           Atomic.set import_probe true;
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           wait "second Worker lane reaches ordered request barrier" (fun () ->
+             Atomic.get import_probed);
+           Alcotest.(check (list string))
+             "second import waits for first terminal response"
+             [ "First attachment" ]
+             (Atomic.get imports_entered);
+           Alcotest.(check bool)
+             "in-flight and queued staging files remain owned"
+             true
+             (List.for_all Sys.file_exists !staged_paths);
+           Atomic.set import_release true;
+           wait "second attachment continues after first failure" (fun () ->
+             Atomic.get imports_finished = 2);
+           wait "terminal import responses release both staging files" (fun () ->
+             List.for_all (fun path -> not (Sys.file_exists path)) !staged_paths);
+           Alcotest.(check (list string))
+             "batch preserves picker order"
+             [ "First attachment"; "Second attachment" ]
+             (Atomic.get imports_entered);
+           wait "first failure exposes Error info after later success" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info"));
+           dispatch
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
+           wait "Error info retains the first batch failure" (fun () ->
+             Option.is_some (find "text" "Fixture first attachment failed")));
          if check_ios_capture
          then (
            dispatch
@@ -3446,6 +3659,12 @@ let () =
             test_fixture_exception_cleanup (Failure "fixture body failure"))
         ; Alcotest.test_case "fixture early exit releases Worker" `Quick (fun () ->
             test_fixture_exception_cleanup Exit)
+        ] )
+    ; ( "Capture attachment imports"
+      , [ Alcotest.test_case
+            "ordered partial failure and staging release"
+            `Quick
+            (fun () -> run_favorites_native_visibility ~check_capture_imports:true ())
         ] )
     ; ( "targeted media subscriptions"
       , [ Alcotest.test_case "single Ready and Acquire N=3" `Quick (fun () ->
