@@ -834,6 +834,7 @@ let local_mutation = function
   | V2_list_journals _
   | V2_get_page _
   | V2_get_block _
+  | V2_get_block_summary _
   | V2_get_children _
   | V2_get_page_tree _
   | V2_pull_changes _
@@ -1098,6 +1099,92 @@ let read_snapshot database request command =
                    (V2_missing_block
                       { uuid; revision = Overlay.Block_state_revision.to_string revision }))
             | Ok _ | Error _ -> failure request Corrupt_storage "The block lookup failed.")
+         | V2_get_block_summary { block; limit; cursor } ->
+           let version = Database.snapshot_version snapshot in
+           let summary lookup page scope_revision items next_cursor =
+             response
+               request
+               (Protocol.V2_block_summary_outcome
+                  { lookup
+                  ; page
+                  ; scope_revision
+                  ; items
+                  ; next_cursor
+                  ; generation = Overlay.Generation.to_string version.generation
+                  ; projection_revision =
+                      Overlay.Projection_revision.to_string version.projection_revision
+                  })
+           in
+           if limit < 1 || limit > Protocol.maximum_page_size
+           then failure request Invalid_request "Invalid block summary limit."
+           else (
+             match Database.get_blocks snapshot [ block ] with
+             | Ok [ Overlay.Missing_block { uuid; revision } ] ->
+               summary
+                 (V2_missing_block
+                    { uuid; revision = Overlay.Block_state_revision.to_string revision })
+                 None
+                 ""
+                 []
+                 None
+             | Ok [ Overlay.Present_block { value; revision } ] ->
+               let lookup =
+                 Protocol.V2_present_block
+                   { value = block_record value
+                   ; revision = Overlay.Block_state_revision.to_string revision
+                   }
+               in
+               (match Database.get_pages snapshot [ value.block.page ] with
+                | Ok [ Overlay.Present_page { value = page; revision } ] ->
+                  let page =
+                    Some
+                      (Protocol.V2_present_page
+                         { page = page.page
+                         ; revision = Overlay.Page_state_revision.to_string revision
+                         })
+                  in
+                  (match
+                     Database.get_structure
+                       snapshot
+                       (Overlay.Children { parent = block; limit; cursor })
+                   with
+                   | Ok
+                       (Overlay.Children_result { scope_revision; items; next_cursor; _ })
+                     ->
+                     summary
+                       lookup
+                       page
+                       (Overlay.Scope_revision.to_string scope_revision)
+                       (List.map
+                          (fun (item : Overlay.child_member) ->
+                             Protocol.
+                               { value = block_record item.block
+                               ; revision =
+                                   Overlay.Block_state_revision.to_string item.revision
+                               })
+                          items)
+                       next_cursor
+                   | Error error -> read_failure request error
+                   | Ok (Page_tree_result _) ->
+                     failure
+                       request
+                       Invalid_request
+                       "The target children query returned a page tree.")
+                | Ok [ Missing_page { uuid; revision } ] ->
+                  summary
+                    lookup
+                    (Some
+                       (V2_missing_page
+                          { uuid
+                          ; revision = Overlay.Page_state_revision.to_string revision
+                          }))
+                    ""
+                    []
+                    None
+                | Ok _ | Error _ ->
+                  failure request Corrupt_storage "The target page lookup failed.")
+             | Error error -> read_failure request error
+             | Ok _ -> failure request Corrupt_storage "The target block lookup failed.")
          | V2_get_children { parent; limit; cursor; _ } ->
            (match
               Database.get_structure snapshot (Overlay.Children { parent; limit; cursor })

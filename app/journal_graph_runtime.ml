@@ -149,6 +149,14 @@ type children_interest =
   ; limit : int
   }
 
+type target_summary =
+  { refresh : refresh
+  ; block_id : string
+  ; children : Protocol.v2_child_member Rrbvec.t
+  ; version : (string * string * string) option
+  ; retries : int
+  }
+
 type operation =
   | Reference_read of
       { block_id : string
@@ -235,6 +243,7 @@ type operation =
       { command : Projection.capture
       ; page : Projection.page
       }
+  | Target_summary of target_summary
   | Refresh_page_tree of
       { page : Projection.page
       ; refresh : refresh
@@ -287,6 +296,7 @@ type t =
   ; projected_blocks : (string, Projection.block) Hashtbl.t
   ; page_tree_interests : (string, page_tree_interest) Hashtbl.t
   ; children_interests : (string, children_interest) Hashtbl.t
+  ; target_read_epochs : (string, int64) Hashtbl.t
   ; mutable initial_feed : feed_spec option
   }
 
@@ -341,6 +351,7 @@ let create ?(localtime = Unix.localtime) () =
   ; projected_blocks = Hashtbl.create 64
   ; page_tree_interests = Hashtbl.create 32
   ; children_interests = Hashtbl.create 32
+  ; target_read_epochs = Hashtbl.create 32
   ; initial_feed = None
   }
 ;;
@@ -365,6 +376,7 @@ let reset t =
   Hashtbl.clear t.tag_titles;
   Hashtbl.clear t.page_tree_interests;
   Hashtbl.clear t.children_interests;
+  Hashtbl.clear t.target_read_epochs;
   t.initial_feed <- None
 ;;
 
@@ -1235,6 +1247,40 @@ let request_refresh t page refresh =
   | Error message -> reject message
 ;;
 
+let target_summary_read t summary cursor =
+  match parse_uuid "block UUID" summary.block_id with
+  | Error message -> reject message
+  | Ok block ->
+    Hashtbl.replace t.target_read_epochs summary.block_id t.next_request;
+    requests
+      [ read
+          t
+          (Target_summary summary)
+          (Protocol.V2_get_block_summary
+             { block; limit = Protocol.default_page_size; cursor })
+      ]
+;;
+
+let request_target_summary t page refresh =
+  (* Keep the structural subscription established by the old confirmation read,
+     including changes arriving before this target query completes. *)
+  Hashtbl.replace
+    t.page_tree_interests
+    page.Projection.id
+    { page; limit = Protocol.maximum_page_size };
+  let block_id =
+    match refresh with
+    | Captured { block_id }
+    | Updated { block_id }
+    | Update_conflict_refresh { block_id }
+    | Delete_conflict_refresh { block_id } -> block_id
+  in
+  target_summary_read
+    t
+    { refresh; block_id; children = Rrbvec.empty; version = None; retries = 0 }
+    None
+;;
+
 let capture_tree (command : Projection.capture) =
   let project (child : Projection.capture_child) =
     match parse_uuid "child UUID" child.block_id with
@@ -1302,7 +1348,7 @@ let capture_children t command page conflict_retries =
 let capture_status t (command : Projection.capture) page =
   match command.Projection.task_state with
   | Journal_model.No_status ->
-    request_refresh t page (Captured { block_id = command.block_id })
+    request_target_summary t page (Captured { block_id = command.block_id })
   | Todo | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
     (match
        ( mutation_context t (Graph.Uuid.to_string (request_uuid t))
@@ -1854,6 +1900,7 @@ let operation_name = function
   | Capture_insert _ -> "insertCaptureBlock"
   | Capture_block _ -> "readCapturedBlock"
   | Capture_status _ -> "setCaptureStatus"
+  | Target_summary _ -> "readMutationTargetSummary"
   | Refresh_page_tree _ -> "refreshPageTree"
   | Changed_page_tree _ -> "reconcileChangedPageTree"
   | Mutation_refresh _ -> "refreshMutation"
@@ -1979,6 +2026,7 @@ let failure_output
   | Capture_insert _
   | Capture_block _
   | Capture_status _
+  | Target_summary _
   | Refresh_page_tree _
   | Changed_page_tree _
   | Mutation_refresh _
@@ -2088,6 +2136,15 @@ let receive_response t (protocol_response : Protocol.response) =
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
+  | Some { operation = Target_summary summary; source_epoch; _ }
+    when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
+    Hashtbl.remove t.pending key;
+    failure_output
+      ~source_epoch
+      t
+      (Target_summary summary)
+      request_id
+      "The target confirmation was superseded."
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
@@ -2110,6 +2167,16 @@ let receive_response t (protocol_response : Protocol.response) =
             "The Worker returned an unknown failure code."
         | Some failure_code ->
           (match operation with
+           | Target_summary summary
+             when failure_code = Error.Stale_read_cursor && summary.retries < 2 ->
+             target_summary_read
+               t
+               { summary with
+                 children = Rrbvec.empty
+               ; version = None
+               ; retries = summary.retries + 1
+               }
+               None
            | Capture_insert { command; page; conflict_retries }
              when String.equal code (Error.code_string Error.Conflict)
                   && conflict_retries < 2 ->
@@ -2235,6 +2302,165 @@ let receive_response t (protocol_response : Protocol.response) =
                 Protocol.V2_graph_info
             ]
         | _ -> failure_output t operation request_id "Unexpected page response.")
+     | V2_block_summary_outcome
+         { lookup
+         ; page
+         ; items
+         ; next_cursor
+         ; scope_revision
+         ; generation
+         ; projection_revision
+         } ->
+       (match operation with
+        | Target_summary summary ->
+          let version = generation, projection_revision, scope_revision in
+          if Option.is_some summary.version && summary.version <> Some version
+          then
+            if summary.retries < 2
+            then
+              target_summary_read
+                t
+                { summary with
+                  children = Rrbvec.empty
+                ; version = None
+                ; retries = summary.retries + 1
+                }
+                None
+            else
+              failure_output
+                t
+                operation
+                request_id
+                "The target changed repeatedly during confirmation."
+          else (
+            match lookup, page with
+            | ( V2_present_block { value; revision }
+              , Some (V2_present_page { page; revision = page_revision }) )
+              when String.equal (Graph.Uuid.to_string value.block.uuid) summary.block_id
+                   && Graph.Uuid.equal value.block.page page.uuid
+                   && List.for_all
+                        (fun (item : Protocol.v2_child_member) ->
+                           Graph.Uuid.equal item.value.block.parent value.block.uuid
+                           && Graph.Uuid.equal item.value.block.page page.uuid)
+                        items ->
+              let children = Rrbvec.append_list summary.children items in
+              (match next_cursor with
+               | Some cursor ->
+                 target_summary_read
+                   t
+                   { summary with children; version = Some version }
+                   (Some cursor)
+               | None ->
+                 let children = Rrbvec.to_list children in
+                 (match projection_time_context t with
+                  | Error message -> failure_output t operation request_id message
+                  | Ok time_context ->
+                    (match
+                       Projection.block_on_page
+                         ~page
+                         ~revision
+                         ~child_count:(List.length children)
+                         ~time_context
+                         value.block
+                     with
+                     | Error message -> failure_output t operation request_id message
+                     | Ok block ->
+                       let block =
+                         Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
+                       in
+                       let timeline =
+                         match page_of_graph_page page with
+                         | Some journal when Graph.Uuid.equal value.block.parent page.uuid
+                           ->
+                           let items : Projection.tree_member list =
+                             { block = value.block; revision; depth = 0 }
+                             :: List.map
+                                  (fun (item : Protocol.v2_child_member) ->
+                                     Projection.
+                                       { block = item.value.block
+                                       ; revision = item.revision
+                                       ; depth = 1
+                                       })
+                                  children
+                           in
+                           Result.map
+                             (fun result -> List.nth_opt result.Projection.entries 0)
+                             (Projection.timeline_entry_page
+                                ~tag_titles:(fun _ -> value.tag_titles)
+                                ~page:journal
+                                ~time_context
+                                { items; continuation = None })
+                         | _ -> Ok None
+                       in
+                       (match timeline with
+                        | Error message -> failure_output t operation request_id message
+                        | Ok entry ->
+                          Hashtbl.replace
+                            t.graph_pages
+                            (Graph.Uuid.to_string page.uuid)
+                            page;
+                          Hashtbl.replace
+                            t.page_revisions
+                            (Graph.Uuid.to_string page.uuid)
+                            page_revision;
+                          Hashtbl.replace t.block_revisions summary.block_id revision;
+                          Hashtbl.replace
+                            t.scope_revisions
+                            (scope_key (Protocol.V2_children_scope value.block.uuid))
+                            scope_revision;
+                          Hashtbl.replace t.tag_titles summary.block_id value.tag_titles;
+                          Hashtbl.replace t.projected_blocks summary.block_id block;
+                          Option.iter
+                            (fun journal ->
+                               Hashtbl.replace
+                                 t.page_tree_interests
+                                 journal.Projection.id
+                                 { page = journal; limit = Protocol.maximum_page_size };
+                               remember_block_page t journal summary.block_id;
+                               List.iter
+                                 (fun (item : Protocol.v2_child_member) ->
+                                    remember_block_page
+                                      t
+                                      journal
+                                      (Graph.Uuid.to_string item.value.block.uuid))
+                                 children)
+                            (page_of_graph_page page);
+                          List.iter
+                            (fun (item : Protocol.v2_child_member) ->
+                               Hashtbl.replace
+                                 t.block_revisions
+                                 (Graph.Uuid.to_string item.value.block.uuid)
+                                 item.revision;
+                               Hashtbl.replace
+                                 t.tag_titles
+                                 (Graph.Uuid.to_string item.value.block.uuid)
+                                 item.value.tag_titles)
+                            children;
+                          (match summary.refresh with
+                           | Captured _ ->
+                             responses
+                               [ response
+                                   (Block_captured
+                                      { block; timeline_entry_update = entry })
+                               ]
+                           | Updated _ ->
+                             responses
+                               [ response
+                                   (Block_updated { block; timeline_entry_update = entry })
+                               ]
+                           | _ ->
+                             failure_output
+                               t
+                               operation
+                               request_id
+                               "Unexpected target confirmation owner.")))))
+            | _ ->
+              failure_output
+                t
+                operation
+                request_id
+                "The canonical mutation target is unavailable or mismatched.")
+        | _ -> failure_output t operation request_id "Unexpected target summary response.")
      | V2_block_outcome lookup ->
        (match lookup with
         | V2_present_block { value; _ } ->
@@ -2631,8 +2857,8 @@ let receive_response t (protocol_response : Protocol.response) =
             ]
         | Capture_insert { command; page; _ } -> continue_capture t command page
         | Capture_status { command; page } ->
-          request_refresh t page (Captured { block_id = command.block_id })
-        | Mutation_refresh { page; refresh } -> request_refresh t page refresh
+          request_target_summary t page (Captured { block_id = command.block_id })
+        | Mutation_refresh { page; refresh } -> request_target_summary t page refresh
         | Delete_mutation command ->
           responses
             [ response
@@ -2680,7 +2906,10 @@ let receive t (protocol_response : Protocol.response) =
   let references =
     match pending, protocol_response with
     | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
-    | Some { source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
+    | Some { operation = Target_summary summary; source_epoch; _ }, _
+      when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
+      empty
+    | Some { operation; source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
       let block (value : Protocol.v2_block_record) =
         Graph.Uuid.to_string value.block.uuid, Some value.block.title
       in
@@ -2689,6 +2918,24 @@ let receive t (protocol_response : Protocol.response) =
         | V2_block_outcome (V2_present_block { value; _ }) -> [ block value ]
         | V2_block_outcome (V2_missing_block { uuid; _ }) ->
           [ Graph.Uuid.to_string uuid, None ]
+        | V2_block_summary_outcome
+            { lookup = V2_present_block { value; _ }; items; next_cursor = None; _ }
+          when List.exists
+                 (fun response ->
+                    match response.payload with
+                    | Block_captured _ | Block_updated _ -> true
+                    | _ -> false)
+                 output.responses ->
+          let retained =
+            match operation with
+            | Target_summary summary -> summary.children
+            | _ -> Rrbvec.empty
+          in
+          block value
+          :: Rrbvec.to_list
+               (Rrbvec.map
+                  (fun (item : Protocol.v2_child_member) -> block item.value)
+                  (Rrbvec.append_list retained items))
         | V2_children_outcome { items; _ } ->
           List.map (fun (item : Protocol.v2_child_member) -> block item.value) items
         | V2_page_tree_outcome { items; _ } ->

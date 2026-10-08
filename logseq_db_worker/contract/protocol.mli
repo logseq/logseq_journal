@@ -49,6 +49,14 @@ and command =
       { block : block_uuid
       ; revision : string option
       }
+  (* Canonical target, owning page and a bounded direct-child slice share one
+     Database snapshot. Limit is 1..maximum_page_size; use default_page_size
+     for normal metadata. The opaque child cursor is projection-version-bound. *)
+  | V2_get_block_summary of
+      { block : block_uuid
+      ; limit : int
+      ; cursor : Cursor.t option
+      }
   | V2_get_children of
       { parent : Uuid.t
       ; limit : int
@@ -275,6 +283,17 @@ and v2_outcome =
       }
   | V2_page_outcome of v2_page_lookup
   | V2_block_outcome of v2_block_lookup
+  (* All fields belong to generation/projection_revision. Child count becomes
+     exact only after consuming next_cursor; page=None denotes a missing target. *)
+  | V2_block_summary_outcome of
+      { lookup : v2_block_lookup
+      ; page : v2_page_lookup option
+      ; items : v2_child_member list
+      ; next_cursor : Cursor.t option
+      ; scope_revision : string
+      ; generation : string
+      ; projection_revision : string
+      }
   | V2_children_outcome of
       { parent : Uuid.t
       ; revision_scope : v2_revision_scope

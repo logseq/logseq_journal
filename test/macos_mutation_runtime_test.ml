@@ -841,6 +841,143 @@ let test_encoded_utf8_budget_boundary () =
     require_response_limit "UTF-8 plus escaped JSON" (!size - 1) (worker.request request))
 ;;
 
+(* The new query combines data at the Database snapshot boundary. Runtime
+   regression scenarios remain in journal_graph_runtime_locality_test. *)
+let test_canonical_target_summary_query () =
+  let target = Fixture.mutation_uuid 16000 in
+  let prepare ~sw ~support =
+    prepare_tagged_fixture ~count:1000 ~title:"Unrelated sibling tag" ~sw ~support;
+    let module D = Logseq_overlay_db.Database in
+    let module O = Logseq_overlay_db.Types in
+    let inspection =
+      D.inspect_mirror ~application_support_directory:support ~graph_id:Fixture.graph_uuid
+      |> Result.get_ok
+    in
+    let db =
+      D.open_
+        ~sw
+        (Fixture.dependencies ~behavior:"canonical target summary")
+        inspection
+        ~graph_name:"Target summary"
+      |> Result.get_ok
+    in
+    Fun.protect
+      ~finally:(fun () -> D.close db |> Result.get_ok)
+      (fun () ->
+         let children =
+           List.init 201 (fun n ->
+             O.
+               { uuid = Fixture.mutation_uuid (17000 + n)
+               ; title = Printf.sprintf "Canonical child %d" n
+               ; children = []
+               })
+         in
+         let expected =
+           Fixture.insert_precondition
+             db
+             ~parent:Fixture.page_uuid
+             ~behavior:"canonical target summary"
+         in
+         D.commit_local
+           db
+           ~expected
+           (O.Insert_blocks
+              { mutation_id = Fixture.mutation_uuid 15999
+              ; parent = Fixture.page_uuid
+              ; tree = { uuid = target; title = "Canonical target"; children }
+              ; asset = None
+              })
+         |> Result.get_ok
+         |> ignore)
+  in
+  let query ?(limit = P.default_page_size) ordinal cursor =
+    P.request_of_yojson
+      (`Assoc
+          [ "apiVersion", `Int P.api_version
+          ; "requestId", `String (Graph.Uuid.to_string (Fixture.mutation_uuid ordinal))
+          ; ( "command"
+            , `Assoc
+                [ "type", `String "getBlockSummary"
+                ; "block", `String (Graph.Uuid.to_string target)
+                ; "limit", `Int limit
+                ; "cursor", cursor
+                ] )
+          ])
+    |> Result.fold ~ok:Fun.id ~error:(fun error ->
+      failwith ("target summary request rejected: " ^ Logseq_db_worker.Error.message error))
+  in
+  with_worker ~prepare (fun worker ->
+    let open Yojson.Safe.Util in
+    let inspect ordinal cursor =
+      worker.request (query ordinal cursor) |> P.response_to_yojson |> member "outcome"
+    in
+    let too_large = worker.request (query ~limit:P.maximum_page_size 17999 `Null) in
+    require_response_limit
+      "full target metadata obeys final bytes"
+      P.maximum_response_bytes
+      too_large;
+    let first = inspect 18000 `Null in
+    require
+      (first |> member "type" |> to_string = "blockSummary")
+      ("canonical query response: " ^ Yojson.Safe.to_string first);
+    require
+      (first |> member "items" |> to_list |> List.length = P.default_page_size)
+      "bounded direct children";
+    require
+      (first
+       |> member "lookup"
+       |> member "block"
+       |> member "title"
+       |> to_string
+       = "Canonical target")
+      "canonical target title";
+    require
+      (first
+       |> member "page"
+       |> member "page"
+       |> member "uuid"
+       |> to_string
+       = Graph.Uuid.to_string Fixture.page_uuid)
+      "owning page is canonical";
+    let cursor = first |> member "nextCursor" in
+    require (cursor <> `Null) "target child continuation";
+    let rec collect ordinal pages reversed output =
+      require
+        (member "generation" first = member "generation" output
+         && member "projectionRevision" first = member "projectionRevision" output)
+        "stable snapshot version across target pages";
+      let items = output |> member "items" |> to_list in
+      require (List.length items <= P.default_page_size) "every target page is bounded";
+      let reversed = List.rev_append items reversed in
+      match member "nextCursor" output with
+      | `Null -> pages, List.rev reversed
+      | cursor -> collect (ordinal + 1) (pages + 1) reversed (inspect ordinal cursor)
+    in
+    let pages, items = collect 18100 1 [] first in
+    require (pages = 5) "201 children use five bounded target pages";
+    require
+      (List.length items = 201)
+      "target pages return all direct children, no unrelated siblings";
+    List.iteri
+      (fun index item ->
+         require
+           (item
+            |> member "block"
+            |> member "uuid"
+            |> to_string
+            = Graph.Uuid.to_string (Fixture.mutation_uuid (17000 + index)))
+           "target-only children preserve canonical order")
+      items;
+    save worker 18002 target "Changed canonical title";
+    let stale = inspect 18003 cursor in
+    require
+      (stale |> member "type" |> to_string = "failed")
+      "stale target child cursor rejects mixed projection";
+    require
+      (stale |> member "code" |> to_string = "staleReadCursor")
+      "typed stale target cursor")
+;;
+
 let () =
   let failures = ref [] in
   List.iter
@@ -852,7 +989,8 @@ let () =
        | exn ->
          failures := name :: !failures;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "Enriched structural read final bytes", test_enriched_response_budget
+    [ "Canonical target summary snapshot query", test_canonical_target_summary_query
+    ; "Enriched structural read final bytes", test_enriched_response_budget
     ; "UTF-8 and escaping exact final budget", test_encoded_utf8_budget_boundary
     ; "Asset reference command without upload", test_asset_reference_command
     ; "Resync clears retained windows", test_resync_clears_retained_windows
