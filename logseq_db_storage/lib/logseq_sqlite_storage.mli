@@ -45,6 +45,7 @@ type callbacks =
   ; upsert_sync_metadata : Sync_checkpoint.t -> (unit, string) result
   ; load_sync_outbox : unit -> (string list, string) result
   ; replace_sync_outbox : string list -> (unit, string) result
+  ; apply_sync_outbox_delta : Sync_outbox_store.delta -> (unit, string) result
   ; upsert_mutation_receipts : (string * string) list -> (unit, string) result
   ; upsert_terminal_batch_receipts : (string * string) list -> (unit, string) result
   ; commit : unit -> (unit, string) result
@@ -73,7 +74,11 @@ val verify_connection_pragmas : connection -> (unit, error) result
 val validate_storage_header : connection -> (unit, error) result
 val restore_database : connection -> (Datascript.db, error) result
 val verify_writable_pragmas : Sqlite3.db -> (unit, error) result
-val commit_batch : callbacks -> batch -> (unit, error) result
+val commit_batch
+  :  ?outbox_delta:Sync_outbox_store.delta
+  -> callbacks
+  -> batch
+  -> (unit, error) result
 val commit_sync_metadata : callbacks -> Sync_checkpoint.t -> (unit, error) result
 val garbage_stats : callbacks -> (garbage_stats, error) result
 val collect_garbage : callbacks -> (unit, error) result

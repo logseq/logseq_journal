@@ -54,7 +54,8 @@ val commit_staged_with_sync_metadata_and_outbox
   -> (unit, error) result
 
 val commit_staged_with_sync_metadata_outbox_and_receipts
-  :  t
+  :  ?outbox_delta:Sync_outbox_store.delta
+  -> t
   -> staged
   -> Sync_checkpoint.t
   -> string list

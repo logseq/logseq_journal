@@ -423,6 +423,7 @@ let terminalize t message =
 ;;
 
 let commit_staged_internal
+      ?outbox_delta
       t
       staged
       sync_metadata
@@ -446,7 +447,7 @@ let commit_staged_internal
         ; terminal_batch_receipts
         }
       in
-      match Logseq_sqlite_storage.commit_batch t.callbacks batch with
+      match Logseq_sqlite_storage.commit_batch ?outbox_delta t.callbacks batch with
       | Error error -> terminalize t (storage_error_message error)
       | Ok () ->
         t.tail <- staged.tail_after;
@@ -482,6 +483,7 @@ let commit_staged_with_sync_metadata_and_outbox t staged metadata records =
 ;;
 
 let commit_staged_with_sync_metadata_outbox_and_receipts
+      ?outbox_delta
       t
       staged
       metadata
@@ -490,6 +492,7 @@ let commit_staged_with_sync_metadata_outbox_and_receipts
       terminal_batch_receipts
   =
   commit_staged_internal
+    ?outbox_delta
     t
     staged
     (Some metadata)
