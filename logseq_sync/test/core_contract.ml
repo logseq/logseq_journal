@@ -1337,6 +1337,14 @@ let local_outbox_change_requests_sync_inspection () =
 
 let accepted_submission_pulls_its_authoritative_transaction () =
   let core, connection = submitted_core () in
+  (* Complete the opening pull before verifying a fresh accepted-submission pull. *)
+  let core =
+    (Core.step
+       core
+       (Core.Websocket_message
+          (connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] })))
+      .next
+  in
   let acknowledged =
     Core.step
       core
@@ -1631,8 +1639,11 @@ let canonical_overlay_happy_path () =
   (match hp08_preview.effects with
    | [ Core.Publish (Core.State_changed state)
      ; Core.Run (Core.Send_websocket { scope; message })
+     ; Core.Run (Core.Schedule_timer timer)
      ]
-     when state = pulling0_state
+     when timer.delay_seconds = 30.
+          && timer.scope.connection_generation = Some connection.connection_generation
+          && state = pulling0_state
           && scope = connection
           && message = Protocol.Client.Pull { since = Some 0 } -> ()
    | _ -> Alcotest.fail "HP08 unexpected instruction shape");
@@ -1905,8 +1916,11 @@ let canonical_overlay_happy_path () =
   (match hp15_preview.effects with
    | [ Core.Publish (Core.State_changed state)
      ; Core.Run (Core.Send_websocket { scope; message })
+     ; Core.Run (Core.Schedule_timer timer)
      ]
-     when state = pulling1_state
+     when timer.delay_seconds = 30.
+          && timer.scope.connection_generation = Some connection.connection_generation
+          && state = pulling1_state
           && scope = connection
           && message = Protocol.Client.Pull { since = Some 1 } -> ()
    | _ -> Alcotest.fail "HP15 unexpected instruction shape");
@@ -3318,6 +3332,412 @@ let recovery_retry_failure_is_visible () =
   check_instructions "failed retry completion cannot send" [] late.effects
 ;;
 
+let pull_sends effects =
+  List.filter_map
+    (function
+      | Core.Run (Core.Send_websocket { scope; message = Protocol.Client.Pull { since } })
+        -> Some (scope, since)
+      | _ -> None)
+    effects
+;;
+
+let check_pull_count message expected effects =
+  Alcotest.(check int) message expected (List.length (pull_sends effects))
+;;
+
+let pull_timer effects =
+  let timers =
+    List.filter_map
+      (function
+        | Core.Run (Core.Schedule_timer timer) -> Some timer
+        | _ -> None)
+      effects
+  in
+  Alcotest.(check int) "one bounded pull timer" 1 (List.length timers);
+  List.hd timers
+;;
+
+let pull_fixture () =
+  let selected, _ = selected_graph graph in
+  let mirror = inspect_mirror_request selected.effects in
+  let inspected =
+    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available mirror))
+  in
+  let sync =
+    Overlay.sync_view
+      ~token:(token Overlay.sync_token_of_string "sync-token:v1:pull-0")
+      ~checkpoint:(recovery_cursor 0)
+      ~submissions:[]
+  in
+  let attached =
+    Core.step inspected.next (Core.Graph_attached { scope = mirror.scope; sync })
+  in
+  let connection = recovery_connection attached.effects in
+  Core.step attached.next (Core.Websocket_opened connection), connection, sync
+;;
+
+let pull_message core connection message =
+  Core.step core (Core.Websocket_message (connection, message))
+;;
+
+let pull_response core connection ~after through =
+  let txs =
+    List.init (through - after) (fun offset ->
+      { Protocol.Server.t = after + offset + 1; tx = "[]"; outliner_op = None })
+  in
+  pull_message
+    core
+    connection
+    (Protocol.Server.Pull_ok { t = through; checksum = None; txs })
+;;
+
+let pull_open_and_notifications_are_singleflight () =
+  let opened, connection, _ = pull_fixture () in
+  check_pull_count "opening baseline pull" 1 opened.effects;
+  let hello =
+    pull_message
+      opened.next
+      connection
+      (Protocol.Server.Hello { t = 100; checksum = None })
+  in
+  check_pull_count "hello joins the opening pull" 0 hello.effects;
+  let state = ref hello.next in
+  for t = 1 to 100 do
+    let changed = pull_message !state connection (Protocol.Server.Changed { t }) in
+    check_pull_count "notification burst joins the same pull" 0 changed.effects;
+    state := changed.next
+  done;
+  Alcotest.(check (option int))
+    "notifications cannot advance the durable checkpoint"
+    (Some 0)
+    (Core.state !state).snapshot.applied_server_t
+;;
+
+let pull_demand_survives_authoritative_apply () =
+  let opened, connection, sync = pull_fixture () in
+  let notified =
+    pull_message opened.next connection (Protocol.Server.Changed { t = 1 })
+  in
+  let received = pull_response notified.next connection ~after:0 1 in
+  let state = ref received.next in
+  for index = 1 to 100 do
+    let t = index + 1 in
+    let changed = pull_message !state connection (Protocol.Server.Changed { t }) in
+    check_pull_count "apply owns the pull until durable completion" 0 changed.effects;
+    state := changed.next
+  done;
+  let committed =
+    recovery_apply !state connection (recovery_sync sync ~checkpoint:1 1 [])
+  in
+  Alcotest.(check bool)
+    "latest target schedules one pull from committed cursor"
+    true
+    (pull_sends committed.effects = [ connection, Some 1 ]);
+  Alcotest.(check bool)
+    "catchup owner is represented by Pulling phase"
+    true
+    ((Core.state committed.next).snapshot.sync_phase = Core.Pulling);
+  Alcotest.(check bool)
+    "catchup phase is publicly published"
+    true
+    (List.exists
+       (function
+         | Core.Publish (Core.State_changed state) ->
+           state.snapshot.sync_phase = Core.Pulling
+         | _ -> false)
+       committed.effects);
+  let received = pull_response committed.next connection ~after:1 2 in
+  let committed =
+    recovery_apply received.next connection (recovery_sync sync ~checkpoint:2 2 [])
+  in
+  Alcotest.(check bool)
+    "partial catchup cannot drop the maximum requested target"
+    true
+    (pull_sends committed.effects = [ connection, Some 2 ]);
+  (* A sparse page is permitted by authoritative_batch: ordering plus last = through,
+     with no contiguous-cursor requirement. One transaction also avoids the existing
+     lexical Server_cursor.compare issue across decimal digit boundaries. *)
+  let received =
+    pull_message
+      committed.next
+      connection
+      (Protocol.Server.Pull_ok
+         { t = 101
+         ; checksum = None
+         ; txs = [ { Protocol.Server.t = 101; tx = "[]"; outliner_op = None } ]
+         })
+  in
+  let committed =
+    recovery_apply received.next connection (recovery_sync sync ~checkpoint:101 3 [])
+  in
+  Alcotest.(check (option int))
+    "latest checkpoint is durably acknowledged"
+    (Some 101)
+    (Core.state committed.next).snapshot.applied_server_t;
+  check_pull_count "caught up exactly to latest target" 0 committed.effects;
+  let stale =
+    pull_message committed.next connection (Protocol.Server.Changed { t = 100 })
+  in
+  check_pull_count "old notifications need no pull" 0 stale.effects;
+  let same = pull_message stale.next connection (Protocol.Server.Changed { t = 101 }) in
+  check_pull_count "same cursor notification needs no pull" 0 same.effects
+;;
+
+let pull_no_progress_is_delayed_and_bounded () =
+  let opened, connection, _ = pull_fixture () in
+  (* The opening response alone can report demand, without Hello/Changed. *)
+  let state = ref opened.next in
+  let previous_delay = ref 0. in
+  for round = 1 to 12 do
+    let reported_head = if round mod 2 = 1 then 10 else 0 in
+    let empty =
+      pull_message
+        !state
+        connection
+        (Protocol.Server.Pull_ok { t = reported_head; checksum = None; txs = [] })
+    in
+    Alcotest.(check (option int))
+      "empty response cannot advance durable checkpoint"
+      (Some 0)
+      (Core.state empty.next).snapshot.applied_server_t;
+    check_pull_count "no progress cannot immediately repeat the pull" 0 empty.effects;
+    Alcotest.(check bool)
+      "pending demand during retry is still Pulling"
+      true
+      ((Core.state empty.next).snapshot.sync_phase = Core.Pulling);
+    Alcotest.(check bool)
+      "retry delay cannot publish false Current"
+      true
+      (List.for_all
+         (function
+           | Core.Publish (Core.State_changed state) ->
+             state.snapshot.sync_phase <> Core.Current
+           | _ -> true)
+         empty.effects);
+    let timer = pull_timer empty.effects in
+    Alcotest.(check bool)
+      "retry delay is positive, bounded, and does not decrease"
+      true
+      (timer.delay_seconds >= 1.
+       && timer.delay_seconds <= 30.
+       && timer.delay_seconds >= !previous_delay);
+    previous_delay := timer.delay_seconds;
+    let notified =
+      pull_message empty.next connection (Protocol.Server.Changed { t = 10 })
+    in
+    check_pull_count "notifications cannot bypass retry delay" 0 notified.effects;
+    let retried = Core.step notified.next (Core.Timer_elapsed timer.id) in
+    Alcotest.(check bool)
+      "retry retains demand and original durable cursor"
+      true
+      (pull_sends retried.effects = [ connection, Some 0 ]);
+    let duplicate = Core.step retried.next (Core.Timer_elapsed timer.id) in
+    check_instructions "retry timer is consumed once" [] duplicate.effects;
+    state := duplicate.next
+  done
+;;
+
+let pull_timeout_reconnects_and_fences_old_work () =
+  let opened, connection, _ = pull_fixture () in
+  let timer = pull_timer opened.effects in
+  Alcotest.(check bool)
+    "response timeout is finite and positive"
+    true
+    (Float.is_finite timer.delay_seconds && timer.delay_seconds > 0.);
+  let expired = Core.step opened.next (Core.Timer_elapsed timer.id) in
+  Alcotest.(check bool)
+    "response timeout closes its exact connection"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Close_websocket scope) -> scope = connection
+         | _ -> false)
+       expired.effects);
+  let replacement = recovery_connection expired.effects in
+  let reopened = Core.step expired.next (Core.Websocket_opened replacement) in
+  check_pull_count "reconnect starts one fresh baseline pull" 1 reopened.effects;
+  let old_timeout = Core.step reopened.next (Core.Timer_elapsed timer.id) in
+  check_instructions "old timeout cannot clear replacement owner" [] old_timeout.effects;
+  let old_response = pull_response old_timeout.next connection ~after:0 1 in
+  check_instructions "old connection response is inert" [] old_response.effects;
+  let changed =
+    pull_message old_response.next replacement (Protocol.Server.Changed { t = 2 })
+  in
+  check_pull_count "replacement still owns its single pull" 0 changed.effects
+;;
+
+let pull_response_timer_does_not_interrupt_apply () =
+  let opened, connection, sync = pull_fixture () in
+  let timer = pull_timer opened.effects in
+  let received = pull_response opened.next connection ~after:0 1 in
+  let late_timer = Core.step received.next (Core.Timer_elapsed timer.id) in
+  check_instructions
+    "response arrived before timer while apply remains active"
+    []
+    late_timer.effects;
+  let changed =
+    pull_message late_timer.next connection (Protocol.Server.Changed { t = 2 })
+  in
+  check_pull_count "notification waits for durable apply" 0 changed.effects;
+  let committed =
+    recovery_apply changed.next connection (recovery_sync sync ~checkpoint:1 1 [])
+  in
+  Alcotest.(check bool)
+    "apply completion releases exactly one catchup"
+    true
+    (pull_sends committed.effects = [ connection, Some 1 ])
+;;
+
+let pull_terminal_outcome_joins_existing_round ~reject () =
+  let core, connection = submitted_core () in
+  let response =
+    if reject
+    then
+      Protocol.Server.Tx_reject
+        { reason = Protocol.Stale
+        ; t = Some 1
+        ; checksum = Some "0123456789abcdef"
+        ; success_tx_ids = []
+        ; failed_tx_id = None
+        ; missing_block_uuids = []
+        ; error_detail = None
+        ; data = None
+        }
+    else Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" }
+  in
+  let terminal = pull_message core connection response in
+  let request = recovery_request terminal.effects in
+  let sync =
+    Overlay.sync_view
+      ~token:request.expected
+      ~checkpoint:(recovery_cursor 0)
+      ~submissions:[]
+  in
+  let committed = Core.step terminal.next (recovery_commit request sync None) in
+  check_pull_count
+    "terminal outbox completion joins already outstanding pull"
+    0
+    committed.effects;
+  let empty = pull_response committed.next connection ~after:0 0 in
+  check_pull_count "unresolved acceptance or rejection target cannot spin" 0 empty.effects;
+  let timer = pull_timer empty.effects in
+  let catchup = Core.step empty.next (Core.Timer_elapsed timer.id) in
+  Alcotest.(check bool)
+    "terminal outcome target survives until catchup"
+    true
+    (pull_sends catchup.effects = [ connection, Some 0 ])
+;;
+
+let pull_terminal_barrier_already_applied_is_current ~reject () =
+  List.iter
+    (fun through ->
+       let core, connection = submitted_core () in
+       let received = pull_response core connection ~after:0 1 in
+       let sync =
+         Overlay.sync_view
+           ~token:(Overlay.sync_token_of_string "sync-token:v1:F5-phase" |> Result.get_ok)
+           ~checkpoint:(recovery_cursor 1)
+           ~submissions:[]
+       in
+       (* This is a public durable completion fact, not a SQLite/checksum test. *)
+       let applied = recovery_apply received.next connection sync in
+       let response =
+         if reject
+         then
+           Protocol.Server.Tx_reject
+             { reason = Protocol.Stale
+             ; t = Some through
+             ; checksum = Some "0123456789abcdef"
+             ; success_tx_ids = []
+             ; failed_tx_id = None
+             ; missing_block_uuids = []
+             ; error_detail = None
+             ; data = None
+             }
+         else
+           Protocol.Server.Tx_batch_ok { t = through; checksum = Some "0123456789abcdef" }
+       in
+       let terminal = pull_message applied.next connection response in
+       let request = recovery_request terminal.effects in
+       let completed = Core.step terminal.next (recovery_commit request sync None) in
+       check_pull_count "already applied barrier needs no new pull" 0 completed.effects;
+       Alcotest.(check bool)
+         "completed barrier remains Current without a future response"
+         true
+         ((Core.state completed.next).snapshot.sync_phase = Core.Current);
+       Alcotest.(check bool)
+         "published terminal phase matches the settled owner"
+         true
+         (List.exists
+            (function
+              | Core.Publish (Core.State_changed state) ->
+                state.snapshot.sync_phase = Core.Current
+              | _ -> false)
+            completed.effects))
+    [ 0; 1 ]
+;;
+
+let pull_shutdown_and_graph_retirement_cancel_demand () =
+  let opened, connection, _ = pull_fixture () in
+  let timer = pull_timer opened.effects in
+  List.iter
+    (fun event ->
+       let retired = Core.step opened.next event in
+       let late_timer = Core.step retired.next (Core.Timer_elapsed timer.id) in
+       check_instructions "retired graph timer is inert" [] late_timer.effects;
+       let late_changed =
+         pull_message late_timer.next connection (Protocol.Server.Changed { t = 20 })
+       in
+       check_instructions "retired graph demand is inert" [] late_changed.effects;
+       let late_response = pull_response late_changed.next connection ~after:0 1 in
+       check_instructions "retired graph response is inert" [] late_response.effects)
+    [ Core.Shutdown; Core.Graph_picker_requested ]
+;;
+
+let pull_singleflight_scenarios =
+  [ Alcotest.test_case
+      "F5 opening and notification burst share one pull"
+      `Quick
+      pull_open_and_notifications_are_singleflight
+  ; Alcotest.test_case
+      "F5 newest demand survives authoritative apply"
+      `Quick
+      pull_demand_survives_authoritative_apply
+  ; Alcotest.test_case
+      "F5 no progress has bounded reducer retry delay"
+      `Quick
+      pull_no_progress_is_delayed_and_bounded
+  ; Alcotest.test_case
+      "F5 response timeout reconnects and fences old work"
+      `Quick
+      pull_timeout_reconnects_and_fences_old_work
+  ; Alcotest.test_case
+      "F5 response timer cannot interrupt durable apply"
+      `Quick
+      pull_response_timer_does_not_interrupt_apply
+  ; Alcotest.test_case
+      "F5 acceptance joins an outstanding pull"
+      `Quick
+      (pull_terminal_outcome_joins_existing_round ~reject:false)
+  ; Alcotest.test_case
+      "F5 rejection joins an outstanding pull"
+      `Quick
+      (pull_terminal_outcome_joins_existing_round ~reject:true)
+  ; Alcotest.test_case
+      "F5 completed acceptance barrier is Current"
+      `Quick
+      (pull_terminal_barrier_already_applied_is_current ~reject:false)
+  ; Alcotest.test_case
+      "F5 completed rejection barrier is Current"
+      `Quick
+      (pull_terminal_barrier_already_applied_is_current ~reject:true)
+  ; Alcotest.test_case
+      "F5 shutdown and picker retire pending pull demand"
+      `Quick
+      pull_shutdown_and_graph_retirement_cancel_demand
+  ]
+;;
+
 let sync_recovery_reproductions =
   [ Alcotest.test_case
       "outbox failures are correlated and terminal"
@@ -3364,6 +3784,7 @@ let sync_recovery_reproductions =
       `Quick
       recovery_submission_timeout
   ]
+  @ pull_singleflight_scenarios
 ;;
 
 let rejected_submission_feedback () =
