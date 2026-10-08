@@ -19,8 +19,8 @@ depends: [
   "yojson" {= "3.0.0"}
 ]
 pin-depends: [
-  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#main"]
-  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#main"]
+  ["datascript_ocaml.dev" "git+https://github.com/logseq/datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"]
+  ["datascript-ocaml-native.dev" "git+https://github.com/logseq/datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"]
   ["melange-edn-core.0.5.0" "git+https://github.com/logseq/melange-edn.git#main"]
   ["melange-edn-native.0.5.0" "git+https://github.com/logseq/melange-edn.git#main"]
   ["melange-transit-core.0.1.2" "git+https://github.com/logseq/melange-transit.git#main"]

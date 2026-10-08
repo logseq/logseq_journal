@@ -69,11 +69,11 @@ build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
   [
     "datascript-ocaml-native.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#main"
+    "git+https://github.com/logseq/datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"
   ]
   [
     "datascript_ocaml.dev"
-    "git+https://github.com/logseq/datascript-ocaml.git#main"
+    "git+https://github.com/logseq/datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"
   ]
   [
     "melange-edn-core.0.5.0"

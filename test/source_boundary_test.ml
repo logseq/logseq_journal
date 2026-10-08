@@ -1155,7 +1155,9 @@ let () =
     ; "logseq_db_worker.opam.locked"
     ]
   in
-  let current_datascript_revision = "datascript-ocaml.git#main" in
+  let current_datascript_revision =
+    "datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"
+  in
   List.iter
     (fun relative ->
        require_occurrences root relative current_datascript_revision 2;
@@ -1164,6 +1166,8 @@ let () =
          relative
          [ "b1029d6a7210baae15f56d7c5df383c150ca07cef90"
          ; "5895af25101de15f56d7c5df383c150ca07cef90"
+         ; "40345cc2f59214daa88b33b8aec711337d20afa7"
+         ; "datascript-ocaml.git#main"
          ])
     dependency_manifests;
   let current_melange_transit_revision = "melange-transit.git#main" in
