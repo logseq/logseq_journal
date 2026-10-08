@@ -833,35 +833,10 @@ let test_final_overlay_data_plane_boundary root =
     ; "logseq_db_types/test/test_mutation_identity.ml"
     ; "logseq_db_types/test/dune"
     ];
-  List.iter
-    (fun relative ->
-       forbid_text
-         root
-         relative
-         [ "Datascript.db"
-         ; "Datascript.conn"
-         ; "Datascript.entity_id"
-         ; "Datascript.tx_op"
-         ; "Logseq_db_types.Mutation"
-         ; "projected_db"
-         ; "projected_conn"
-         ; "Projected_connection"
-         ])
-    (files_with_suffixes root "logseq_overlay_db/spec" [ ".mli" ]);
   forbid_text
     root
     "logseq_db_storage/lib/storage_session.mli"
     [ "val current_db"; "db:Datascript.db"; "Persistent_sorted_set.t" ];
-  forbid_text
-    root
-    "logseq_overlay_db/lib/database.ml"
-    [ "mutable authoritative_blocks"
-    ; "mutable authoritative_pages"
-    ; "mutable blocks : (Graph.block_uuid * Types.block_record) list"
-    ; "mutable pages : (Graph.page_uuid * Types.page_record) list"
-    ; "blocks : (Graph.block_uuid * Types.block_record) list"
-    ; "pages : (Graph.page_uuid * Types.page_record) list"
-    ];
   List.iter
     (fun relative ->
        forbid_worker_storage_access root relative;

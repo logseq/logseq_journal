@@ -812,50 +812,6 @@ enum JournalE2EECrypto {
     testMemoryPrivateKeys.removeValue(forKey: identity.accountDigestHex)
   }
 
-  static func probeIsolatedRealWrappedKeychainItem(
-    origin: String,
-    userID: String,
-    graphID: String
-  ) throws -> [CFString: Any] {
-    var item = try wrappedGraphKeyQuery(
-      origin: origin,
-      userID: userID,
-      graphID: graphID
-    )
-    let service = "\(wrappedGraphKeyService).test.\(UUID().uuidString.lowercased())"
-    item[kSecAttrService] = service
-    item[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-    item[kSecValueData] = Data([1, 0, 0, 0, 0])
-    let addStatus = SecItemAdd(item as CFDictionary, nil)
-    guard addStatus == errSecSuccess else {
-      throw JournalE2EECryptoError.operationFailed
-    }
-
-    var lookup = try wrappedGraphKeyQuery(
-      origin: origin,
-      userID: userID,
-      graphID: graphID
-    )
-    lookup[kSecAttrService] = service
-    let deletionQuery = lookup
-    lookup[kSecReturnAttributes] = true
-    lookup[kSecMatchLimit] = kSecMatchLimitOne
-    var result: CFTypeRef?
-    let readStatus = SecItemCopyMatching(lookup as CFDictionary, &result)
-    let deleteStatus = SecItemDelete(deletionQuery as CFDictionary)
-    var deletedResult: CFTypeRef?
-    let deletedReadStatus = SecItemCopyMatching(lookup as CFDictionary, &deletedResult)
-    guard
-      readStatus == errSecSuccess,
-      let attributes = result as? [CFString: Any],
-      deleteStatus == errSecSuccess,
-      deletedReadStatus == errSecItemNotFound
-    else {
-      _ = SecItemDelete(deletionQuery as CFDictionary)
-      throw JournalE2EECryptoError.operationFailed
-    }
-    return attributes
-  }
 #endif
 
   private static func decryptedGraphKey(_ request: [String: Any]) throws -> Data {

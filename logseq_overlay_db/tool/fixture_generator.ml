@@ -10,89 +10,6 @@ let uuid text =
 let block_uuid ordinal = uuid (Printf.sprintf "20000000-0000-4000-8000-%012d" ordinal)
 let mutation_uuid ordinal = uuid (Printf.sprintf "90000000-0000-4000-8000-%012d" ordinal)
 
-let schema_attr ?unique ?(indexed = false) ?value_type () =
-  Datascript.
-    { cardinality = One
-    ; unique
-    ; indexed
-    ; is_component = false
-    ; no_history = false
-    ; doc = None
-    ; value_type
-    ; tuple_attrs = None
-    ; tuple_types = None
-    }
-;;
-
-let schema =
-  [ ( "db/ident"
-    , schema_attr ~unique:Datascript.Identity ~value_type:Datascript.KeywordType () )
-  ; "kv/value", schema_attr ()
-  ; ( "block/uuid"
-    , schema_attr
-        ~unique:Datascript.Identity
-        ~indexed:true
-        ~value_type:Datascript.UuidType
-        () )
-  ; "block/title", schema_attr ~value_type:Datascript.StringType ()
-  ; "block/order", schema_attr ~value_type:Datascript.StringType ()
-  ; "block/parent", schema_attr ~indexed:true ~value_type:Datascript.RefType ()
-  ; "block/page", schema_attr ~indexed:true ~value_type:Datascript.RefType ()
-  ; "block/journal-day", schema_attr ~indexed:true ~value_type:Datascript.NumberType ()
-  ; "block/name", schema_attr ~value_type:Datascript.StringType ()
-  ]
-;;
-
-let authoritative_db ~block_count =
-  if block_count < 0 then invalid_arg "block_count must be non-negative";
-  let page = Datascript.Temp_id "page" in
-  let overflow_page = Datascript.Temp_id "overflow-page" in
-  let page_uuid = uuid "10000000-0000-4000-8000-000000000001" in
-  let page_ops =
-    [ Datascript.Add (page, "block/uuid", Uuid (Graph.Uuid.to_string page_uuid))
-    ; Add (page, "block/name", String "performance fixture")
-    ; Add (page, "block/title", String "Performance fixture")
-    ; Add (overflow_page, "block/uuid", Uuid "10000000-0000-4000-8000-000000000002")
-    ; Add (overflow_page, "block/name", String "performance overflow fixture")
-    ; Add (overflow_page, "block/title", String "Performance overflow fixture")
-    ]
-  in
-  let kv id ident value =
-    let entity = Datascript.Temp_id id in
-    [ Datascript.Add (entity, "db/ident", Keyword ident)
-    ; Add (entity, "kv/value", value)
-    ]
-  in
-  let identity_ops =
-    kv
-      "schema-version"
-      "logseq.kv/schema-version"
-      (Map [ Keyword "major", Int64 65L; Keyword "minor", Int64 33L ])
-    @ kv "db-type" "logseq.kv/db-type" (String "db")
-    @ kv
-        "local-graph-uuid"
-        "logseq.kv/local-graph-uuid"
-        (Uuid "70000000-0000-4000-8000-000000000001")
-    @ kv "graph-remote" "logseq.kv/graph-remote?" (Bool true)
-    @ kv "graph-uuid" "logseq.kv/graph-uuid" (Uuid "60000000-0000-4000-8000-000000000001")
-  in
-  let block_ops =
-    List.init block_count (fun index ->
-      let entity = Datascript.Temp_id (Printf.sprintf "block-%d" index) in
-      let block = block_uuid index in
-      let parent = if index < 256 then page else overflow_page in
-      [ Datascript.Add (entity, "block/uuid", Uuid (Graph.Uuid.to_string block))
-      ; Add (entity, "block/title", String (Printf.sprintf "Block %d" index))
-      ; Add (entity, "block/order", String (Printf.sprintf "a%08d" index))
-      ; Add (entity, "block/parent", Ref_to parent)
-      ; Add (entity, "block/page", Ref_to parent)
-      ])
-    |> List.concat
-  in
-  Datascript.empty_db ~schema ()
-  |> Datascript.db_with (identity_ops @ page_ops @ block_ops)
-;;
-
 let ensure_directory path =
   let rec create path =
     if Sys.file_exists path
@@ -380,18 +297,6 @@ let outbox_bytes ~database_path =
                 (Printf.sprintf
                    "unable to measure outbox bytes: %s"
                    (Sqlite3.Rc.to_string rc))))
-;;
-
-let mutation_history ~count =
-  if count < 0 then invalid_arg "count must be non-negative";
-  let parent = uuid "10000000-0000-4000-8000-000000000001" in
-  List.init count (fun index ->
-    Types.Insert_blocks
-      { mutation_id = mutation_uuid index
-      ; asset = None
-      ; parent
-      ; tree = { uuid = block_uuid (100_000 + index); title = "Pending"; children = [] }
-      })
 ;;
 
 let fixture_checksum ~block_count =

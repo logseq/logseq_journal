@@ -3,8 +3,6 @@ type source =
   | Photos
   | Camera
 
-val source_to_string : source -> string
-val source_of_string : string -> source option
 
 (** Picker arm request: [source] selects the picker, [staged] makes the host
     copy the pick into a temp file so it survives until a later import. *)

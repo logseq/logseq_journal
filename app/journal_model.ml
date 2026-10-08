@@ -37,12 +37,6 @@ let status_name = function
   | Later -> "Later"
 ;;
 
-let status_default_value = function
-  | No_status -> None
-  | In_review -> Some "In Review"
-  | status -> Some (status_name status)
-;;
-
 type t =
   { id : string
   ; page_id : string

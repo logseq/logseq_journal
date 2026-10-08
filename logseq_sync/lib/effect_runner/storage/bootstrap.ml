@@ -578,11 +578,6 @@ module Asset_cache = struct
       Ok ())
   ;;
 
-  let delete t =
-    close t;
-    Result.map (fun () -> Hashtbl.clear t.records) (remove_tree t.directory)
-  ;;
-
   let delete_account ~root ~account = remove_tree (account_directory ~root account)
 
   let delete_graph ~root ~account ~graph_id =

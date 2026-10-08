@@ -182,7 +182,3 @@ let notice
     | Asset_availability { consumer; asset; availability } ->
       dispatch t (Availability { consumer; asset; availability }))
 ;;
-
-let visible t ~consumer assets = dispatch t (Visible { consumer; assets })
-let hidden t ~consumer = dispatch t (Hidden consumer)
-let progress t reason = Policy.progress t.policy reason

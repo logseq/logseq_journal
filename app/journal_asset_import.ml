@@ -12,13 +12,6 @@ let source_to_string = function
   | Camera -> "camera"
 ;;
 
-let source_of_string = function
-  | "files" -> Some Files
-  | "photos" -> Some Photos
-  | "camera" -> Some Camera
-  | _ -> None
-;;
-
 (* [request] mirrors the extension's request prop; [staged] requests copy the
    pick into a temp file on the host so the path outlives the picker's
    security scope — needed when the selection is attached later (composer). *)

@@ -35,6 +35,10 @@
 /.dir-locals.el
 app/journal_complete_iossim.o
 
+# Generated Python bytecode
+__pycache__/
+*.pyc
+
 # Local validation reports and evidence
 /docs/test-reports/
 /.ci-deps/
