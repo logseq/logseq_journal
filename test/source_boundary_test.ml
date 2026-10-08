@@ -1570,8 +1570,8 @@ let () =
     [ "sign_out_request"; "is_prepare_to_terminate_event"; "termination_ready_request" ];
   require_text
     root
-    "swift/JournalAmplifySession.swift"
-    [ "Amplify.Auth.signOut()"; "Amplify.Auth.fetchAuthSession()"; "getCognitoTokens()" ];
+    "swift/JournalCognitoSession.swift"
+    [ "func signOut()"; "func freshIDToken()"; "func currentUserID()" ];
   require_text
     root
     "swift/JournalNativeServices.swift"

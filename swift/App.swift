@@ -78,7 +78,7 @@ private struct JournalHost: View {
     }
     .sheet(isPresented: $signInPresented) {
       NavigationStack {
-        JournalAuthenticationView(api: JournalAmplifyAuthentication()) {
+        JournalAuthenticationView(api: JournalCognitoNative.shared) {
           platform.refreshAuthentication()
           signInPresented = false
         }

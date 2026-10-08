@@ -51,13 +51,15 @@ enum JournalLocalAccountBindingStore {
   }
 }
 
-@MainActor final class JournalAmplifySession: JournalAuthCapability {
+@MainActor final class JournalCognitoSession: JournalAuthCapability {
   static var signOutCalls = 0
   static var userCalls = 0
   func currentUserID() async throws -> String? { Self.userCalls += 1; return "fixture-user" }
   func freshIDToken() async throws -> String { "fixture-token" }
   func signOut() async throws { Self.signOutCalls += 1 }
 }
+
+@MainActor enum JournalCognitoNative { static let shared = JournalCognitoSession() }
 
 @main struct JournalAccountThreadingTests {
   @MainActor static func waitFor(_ condition: () -> Bool) async throws {
@@ -94,19 +96,19 @@ enum JournalLocalAccountBindingStore {
     let authentication = Task { try await platform.response(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations == ["load"] } }
     let signOut = Task { try await platform.response(for: .signOut) }
-    try await waitFor { JournalAmplifySession.signOutCalls == 1 }
+    try await waitFor { JournalCognitoSession.signOutCalls == 1 }
     authGate.signal()
     try await canceled(authentication)
     let signedOut = try await signOut.value
-    precondition(signedOut == .signedOut && JournalAmplifySession.userCalls == 0)
+    precondition(signedOut == .signedOut && JournalCognitoSession.userCalls == 0)
     precondition(JournalLocalAccountBindingStore.state.withLock { $0.value == nil })
 
     let saveGate = JournalLocalAccountBindingStore.hold("save")
     let saving = Task { try await platform.response(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations.contains("save") } }
     let cleanup = Task { try await platform.response(for: .signOut) }
-    try await waitFor { JournalAmplifySession.signOutCalls == 2 }
-    // Cancellation must not undo cleanup after the SDK has confirmed sign-out.
+    try await waitFor { JournalCognitoSession.signOutCalls == 2 }
+    // Cancellation must not undo cleanup after the provider has confirmed sign-out.
     cleanup.cancel()
     let responsive = try await platform.response(for: .terminationReady)
     precondition(responsive == .terminationReady)

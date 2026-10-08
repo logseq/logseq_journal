@@ -25,18 +25,12 @@ let package = Package(
     platforms: [.iOS("26.0"), .macOS("26.0")],
     dependencies: [
         .package(path: luiPackagePath),
-        .package(
-            url: "https://github.com/aws-amplify/amplify-swift.git",
-            exact: "2.61.0"
-        ),
     ],
     targets: [
         .executableTarget(
             name: "JournalApp",
             dependencies: [
                 .product(name: "LUIAppleBackendStatic", package: "apple"),
-                .product(name: "Amplify", package: "amplify-swift"),
-                .product(name: "AWSCognitoAuthPlugin", package: "amplify-swift"),
             ],
             path: ".",
             exclude: ["Package.swift"],
