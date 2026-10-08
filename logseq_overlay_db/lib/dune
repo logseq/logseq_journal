@@ -12,7 +12,6 @@
   crypto_bridge
   delete_conflict
   logical_change
-  logical_snapshot
   mirror
   mutation_receipt
   create_journal_page

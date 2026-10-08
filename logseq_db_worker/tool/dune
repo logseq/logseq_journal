@@ -1,4 +1,0 @@
-(executable
- (name compare_canonical_graphs)
- (modules compare_canonical_graphs)
- (libraries logseq_db_worker unix yojson))

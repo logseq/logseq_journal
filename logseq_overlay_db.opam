@@ -21,8 +21,6 @@ depends: [
   "melange-transit-native" {= "0.1.2"}
   "ppx_deriving_yojson" {>= "3.9.1"}
   "sqlite3" {= "5.4.0"}
-  "uucp" {= "17.0.0"}
-  "uunf" {= "17.0.0"}
   "uutf" {= "1.0.4"}
   "yojson" {= "3.0.0"}
   "alcotest" {with-test & = "1.7.0"}
