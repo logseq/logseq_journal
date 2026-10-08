@@ -49,6 +49,11 @@ and command =
       { block : block_uuid
       ; revision : string option
       }
+  | V2_get_block_summary of
+      { block : block_uuid
+      ; limit : int
+      ; cursor : Cursor.t option
+      }
   | V2_get_children of
       { parent : Uuid.t
       ; limit : int
@@ -275,6 +280,15 @@ and v2_outcome =
       }
   | V2_page_outcome of v2_page_lookup
   | V2_block_outcome of v2_block_lookup
+  | V2_block_summary_outcome of
+      { lookup : v2_block_lookup
+      ; page : v2_page_lookup option
+      ; items : v2_child_member list
+      ; next_cursor : Cursor.t option
+      ; scope_revision : string
+      ; generation : string
+      ; projection_revision : string
+      }
   | V2_children_outcome of
       { parent : Uuid.t
       ; revision_scope : v2_revision_scope
@@ -581,6 +595,13 @@ let v2_command_to_json = function
       ; "block", uuid_json block
       ; "revision", optional_string_json revision
       ]
+  | V2_get_block_summary { block; limit; cursor } ->
+    `Assoc
+      [ "type", `String "getBlockSummary"
+      ; "block", uuid_json block
+      ; "limit", `Int limit
+      ; "cursor", option_json cursor_json cursor
+      ]
   | V2_get_children { parent; limit; cursor; revision } ->
     `Assoc
       [ "type", `String "getChildren"
@@ -721,6 +742,13 @@ let v2_command_of_json kind json =
     let f = fields [ "block"; "revision" ] in
     V2_get_block
       { block = uuid (field "block" f); revision = optional_string (field "revision" f) }
+  | "getBlockSummary" ->
+    let f = fields [ "block"; "limit"; "cursor" ] in
+    let limit = integer (field "limit" f) in
+    if limit < 1 || limit > maximum_page_size
+    then decode_error "invalid block summary limit";
+    V2_get_block_summary
+      { block = uuid (field "block" f); limit; cursor = cursor (field "cursor" f) }
   | "getChildren" ->
     let f = fields [ "parent"; "limit"; "cursor"; "revision" ] in
     V2_get_children
@@ -1780,6 +1808,25 @@ let v2_outcome_to_json = function
     `Assoc [ "type", `String "page"; "lookup", v2_page_lookup_to_json lookup ]
   | V2_block_outcome lookup ->
     `Assoc [ "type", `String "block"; "lookup", v2_block_lookup_to_json lookup ]
+  | V2_block_summary_outcome
+      { lookup
+      ; page
+      ; items
+      ; next_cursor
+      ; scope_revision
+      ; generation
+      ; projection_revision
+      } ->
+    `Assoc
+      [ "type", `String "blockSummary"
+      ; "lookup", v2_block_lookup_to_json lookup
+      ; "page", option_json v2_page_lookup_to_json page
+      ; "items", `List (List.map v2_child_member_to_json items)
+      ; "nextCursor", option_json cursor_json next_cursor
+      ; "scopeRevision", `String scope_revision
+      ; "generation", `String generation
+      ; "projectionRevision", `String projection_revision
+      ]
   | V2_children_outcome { parent; revision_scope; scope_revision; items; next_cursor } ->
     `Assoc
       [ "type", `String "children"
@@ -1982,6 +2029,35 @@ let v2_outcome_of_json json =
   | "block" ->
     let fields = exact_assoc [ "type"; "lookup" ] json in
     V2_block_outcome (v2_block_lookup_of_json (field "lookup" fields))
+  | "blockSummary" ->
+    let fields =
+      exact_assoc
+        [ "type"
+        ; "lookup"
+        ; "page"
+        ; "items"
+        ; "nextCursor"
+        ; "scopeRevision"
+        ; "generation"
+        ; "projectionRevision"
+        ]
+        json
+    in
+    V2_block_summary_outcome
+      { lookup = v2_block_lookup_of_json (field "lookup" fields)
+      ; page =
+          (match field "page" fields with
+           | `Null -> None
+           | value -> Some (v2_page_lookup_of_json value))
+      ; items =
+          (match field "items" fields with
+           | `List values -> List.map v2_child_member_of_json values
+           | _ -> decode_error "summary child items must be a list")
+      ; next_cursor = cursor (field "nextCursor" fields)
+      ; scope_revision = string (field "scopeRevision" fields)
+      ; generation = string (field "generation" fields)
+      ; projection_revision = string (field "projectionRevision" fields)
+      }
   | "children" ->
     let fields =
       exact_assoc

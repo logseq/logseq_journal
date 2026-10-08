@@ -90,7 +90,7 @@ let pages () =
     "continue favorites beyond UI page";
   let s, ins = P.step s (Roots_loaded (r, [], None)) in
   check (ins = [] && P.progress s Favorites = Complete) "complete enumeration";
-  let s, ins = refresh s in
+  let s, ins = P.step s Graph_changed in
   let r = read Favorites ins in
   check
     (not
@@ -113,7 +113,11 @@ let pages () =
 let fencing () =
   let s, ins = refresh P.empty in
   let old = read Recent ins in
-  let s, _ = refresh s in
+  let s, _ =
+    P.step
+      s
+      (Refresh { graph_generation = 1; today = 20260302; settings = P.default_settings })
+  in
   let _, ins = P.step s (Roots_loaded (old, [ uuid 1 ], None)) in
   check (ins = []) "ignore stale revision";
   let s, ins =
@@ -199,7 +203,7 @@ let residency () =
   in
   let status = P.offline s Favorites in
   check (status.ready = 0 && status.failed = 1) "lost availability revokes completeness";
-  let s, ins = refresh s in
+  let s, ins = P.step s Graph_changed in
   check
     ((P.offline s Favorites).enumeration = Enumerating)
     "replacement cannot claim completeness";
@@ -210,16 +214,206 @@ let residency () =
   check ((P.offline s Favorites).enumeration = Inactive) "shutdown clears status"
 ;;
 
+(* Existing Refresh reproduces graph-push replacement in the baseline. GREEN
+   separates this invalidation from unchanged lifecycle configuration. *)
+let changed state = P.step state Graph_changed
+
+let read_count ins =
+  List.length
+    (List.filter
+       (function
+         | P.Read _ -> true
+         | _ -> false)
+       ins)
+;;
+
+let first_root (ticket : P.ticket) =
+  match ticket.query with
+  | Recent_roots { cursor = None; _ } | Favorite_roots None -> true
+  | _ -> false
+;;
+
+let same_configuration () =
+  let s, ins = refresh P.empty in
+  let original = read Favorites ins in
+  let s, ins = refresh s in
+  check (ins = []) "same configuration must retain the in-flight owner without new IO";
+  let _, ins = P.step s (Roots_loaded (original, [ uuid 1 ], None)) in
+  check (read_count ins = 1) "same configuration must accept its original completion"
+;;
+
+let burst_roots () =
+  let s, ins = refresh P.empty in
+  let old = read Favorites ins in
+  let state = ref s in
+  for _ = 1 to 32 do
+    let s, ins = changed !state in
+    state := s;
+    check (read_count ins = 0) "32 graph changes must coalesce behind each root read"
+  done;
+  let s, ins = P.step !state (Roots_loaded (old, [ uuid 9 ], Some cursor)) in
+  let fresh = read Favorites ins in
+  check (first_root fresh) "superseded roots must restart at root cursor None";
+  let _, ins = P.step s (Roots_loaded (old, [ uuid 9 ], None)) in
+  check (ins = []) "duplicate superseded root completion must be fenced"
+;;
+
+let burst_assets terminal () =
+  let s, ins = refresh P.empty in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], Some cursor)) in
+  let old = read Favorites ins in
+  let s, ins = changed s in
+  check (read_count ins = 0) "asset enumeration must keep its current request";
+  let _, ins =
+    P.step
+      s
+      (if terminal then Assets_loaded (old, [ asset 2 ], Some cursor) else Read_failed old)
+  in
+  check
+    (read_count ins = 1 && first_root (read Favorites ins))
+    "superseded asset success/error must discard old cursor and restart once";
+  check
+    (not
+       (List.exists
+          (function
+            | P.Demand _ -> true
+            | _ -> false)
+          ins))
+    "superseded descriptors cannot become staged demand"
+;;
+
+let dirty_demand pressured () =
+  let s, ins = refresh P.empty in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], None)) in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [ asset 2 ], Some cursor)) in
+  let consumer, _ = demand ins in
+  let s, _ = if pressured then P.step s (Backpressure consumer) else s, [] in
+  let s, ins = changed s in
+  check
+    (List.exists
+       (function
+         | P.Release c -> c = consumer
+         | _ -> false)
+       ins)
+    "invalidation releases superseded staged ownership";
+  let _, follow = if pressured then s, ins else P.step s (Demand_accepted consumer) in
+  check
+    (read_count follow = 1 && first_root (read Favorites follow))
+    "old demand ack/backpressure cannot continue a global stale assets cursor"
+;;
+
+let committed_and_finished () =
+  let s, ins = refresh P.empty in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], None)) in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [ asset 2 ], None)) in
+  let consumer, _ = demand ins in
+  let s, _ = P.step s (Demand_accepted consumer) in
+  let s, ins = refresh s in
+  check
+    (read_count ins = 0 && P.progress s Favorites = Complete)
+    "same configuration must not rescan a finished enumeration";
+  let s, ins = changed s in
+  check
+    (read_count ins = 1)
+    "actual graph change must restart finished Favorites only once";
+  check
+    (not
+       (List.exists
+          (function
+            | P.Release c -> c = consumer
+            | _ -> false)
+          ins))
+    "replacement preserves committed demand until complete";
+  let _, ins = P.step s (Roots_loaded (read Favorites ins, [], None)) in
+  check
+    (List.exists
+       (function
+         | P.Release c -> c = consumer
+         | _ -> false)
+       ins)
+    "successful fresh enumeration retires committed demand"
+;;
+
+let config_and_disabled () =
+  let disabled = P.settings ~recent_days:0 |> Result.get_ok in
+  let s, ins =
+    P.step
+      P.empty
+      (Refresh { graph_generation = 1; today = 20260301; settings = disabled })
+  in
+  check
+    (read_count ins = 1 && P.progress s Recent = Complete)
+    "disabled Recent does not read";
+  let old = read Favorites ins in
+  let s, ins =
+    P.step s (Refresh { graph_generation = 2; today = 20260302; settings = disabled })
+  in
+  check (read_count ins = 1) "hard graph change starts bounded configured scans";
+  let _, ins = P.step s (Roots_loaded (old, [ uuid 1 ], None)) in
+  check (ins = []) "old graph owner cannot escape scope replacement"
+;;
+
+(* Runtime, unlike Policy, owns accepted Worker request IDs and queued IO. *)
+let runtime_same_configuration () =
+  let module R = Journal_asset_runtime in
+  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
+  let module Wire = Logseq_db_worker.Protocol in
+  let sent = Queue.create () in
+  let r =
+    R.create
+      ~send:(fun q ->
+        Queue.add q sent;
+        true)
+      ~changed:(fun _ _ _ -> ())
+  in
+  R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
+  let first = Queue.take sent in
+  Queue.clear sent;
+  R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
+  check (Queue.is_empty sent) "adapter must retain tickets on unchanged lifecycle refresh";
+  let request_id =
+    match first with
+    | S.Graph_request q -> q.request_id
+    | _ -> assert false
+  in
+  let accepted =
+    R.receive
+      r
+      (Wire.V2_response
+         { api_version = 2
+         ; request_id
+         ; outcome = V2_journals_outcome { items = []; next_cursor = None }
+         })
+  in
+  check accepted "adapter must not swallow still-owned response on same configuration"
+;;
+
 let () =
+  let failed = ref 0 in
   List.iter
     (fun (name, test) ->
-       test ();
-       Printf.printf "PASS %s\n%!" name)
+       try
+         test ();
+         Printf.printf "PASS %s\n%!" name
+       with
+       | exn ->
+         incr failed;
+         Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
     [ "calendar", interval
     ; "paginated replacement", pages
     ; "fencing", fencing
     ; "visible", visible
     ; "bounds", invalid_page
     ; "offline residency", residency
-    ]
+    ; "F2 same configuration pending", same_configuration
+    ; "F2 32 root invalidations", burst_roots
+    ; "F2 superseded assets", burst_assets true
+    ; "F2 superseded read failure", burst_assets false
+    ; "F2 awaiting dirty demand", dirty_demand false
+    ; "F2 pressured dirty demand", dirty_demand true
+    ; "F2 finished and committed ownership", committed_and_finished
+    ; "F2 config scope and disabled recent", config_and_disabled
+    ; "F2 adapter same-config request ownership", runtime_same_configuration
+    ];
+  check (!failed = 0) (Printf.sprintf "%d asset policy cases failed" !failed)
 ;;

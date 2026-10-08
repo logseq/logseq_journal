@@ -955,11 +955,16 @@ let duplicate_outbox_member_fails_closed () =
          | Local_existing _ -> Alcotest.fail "fresh duplicate fixture already existed");
         Database.close database |> T.require_ok ~behavior;
         let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
+        let records =
+          Logseq_db_storage.Sync_outbox_store.read_database sqlite |> T.require_ok ~behavior
+        in
         Sqlite3.Rc.check
           (Sqlite3.exec
              sqlite
-             "INSERT INTO sync_outbox(position, record) SELECT 1, record FROM \
-              sync_outbox WHERE position = 0");
+             "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; \
+              CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+        Logseq_db_storage.Sync_outbox_store.replace_database sqlite (records @ records)
+        |> T.require_ok ~behavior;
         T.require (Sqlite3.db_close sqlite) "unable to close duplicate fixture";
         let refreshed = inspect_mirror location behavior in
         let opening_inspection = refreshed in
@@ -971,6 +976,13 @@ let duplicate_outbox_member_fails_closed () =
         | Ok duplicate ->
           Database.close duplicate |> T.require_ok ~behavior;
           Alcotest.fail "duplicate outbox member was accepted")))
+;;
+
+let corrupt_single_outbox_record sqlite record =
+  let statement = Sqlite3.prepare sqlite "UPDATE sync_outbox SET record=?" in
+  Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
+    Sqlite3.Rc.check (Sqlite3.bind_text statement 1 record);
+    Sqlite3.Rc.check (Sqlite3.step statement))
 ;;
 
 let noncanonical_outbox_payload_fails_closed () =
@@ -1012,8 +1024,7 @@ let noncanonical_outbox_payload_fails_closed () =
              | _ -> Alcotest.fail "queued fixture record is not JSON")
           | _ -> Alcotest.fail "queued fixture has the wrong outbox cardinality"
         in
-        Logseq_db_storage.Sync_outbox_store.replace_database sqlite [ tampered ]
-        |> T.require_ok ~behavior;
+        corrupt_single_outbox_record sqlite tampered;
         T.require (Sqlite3.db_close sqlite) "unable to close noncanonical fixture";
         let refreshed = inspect_mirror location behavior in
         let opening_inspection = refreshed in
@@ -1066,8 +1077,7 @@ let inconsistent_origin_evidence_fails_closed () =
              | _ -> Alcotest.fail "queued fixture record is not JSON")
           | _ -> Alcotest.fail "queued fixture has the wrong outbox cardinality"
         in
-        Logseq_db_storage.Sync_outbox_store.replace_database sqlite [ tampered ]
-        |> T.require_ok ~behavior;
+        corrupt_single_outbox_record sqlite tampered;
         T.require (Sqlite3.db_close sqlite) "unable to close origin-evidence fixture";
         let refreshed = inspect_mirror location behavior in
         let opening_inspection = refreshed in
@@ -1568,6 +1578,9 @@ let submit_persistence_failure_restores_queued_state () =
           |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext)
         in
         let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
+        let module Store = Logseq_db_storage.Sync_outbox_store in
+        let durable_before = Store.read_database sqlite |> T.require_ok ~behavior in
+        let revision_before = Store.read_revision sqlite |> T.require_ok ~behavior in
         Sqlite3.Rc.check
           (Sqlite3.exec
              sqlite
@@ -1591,6 +1604,52 @@ let submit_persistence_failure_restores_queued_state () =
          | [ descriptor ] when descriptor.state = Queued && descriptor.attempt_count = 0
            -> ()
          | _ -> Alcotest.fail "failed submit did not restore Queued state");
+        let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
+        Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close sqlite)) (fun () ->
+          Alcotest.(check (list string)) "failed submit rolls back durable mutable record"
+            durable_before (Store.read_database sqlite |> T.require_ok ~behavior);
+          T.require (Store.read_revision sqlite |> T.require_ok ~behavior = revision_before)
+            "failed submit rolls back metadata revision";
+          Sqlite3.Rc.check (Sqlite3.exec sqlite "DROP TRIGGER fail_overlay_submit");
+          let prepared, request = Database.begin_outbox_transition database
+              ~expected:(sync_view_token after) (Submit_group [ mutation_id ])
+            |> T.require_ok ~behavior in
+          let request = Option.get request in
+          let encrypted = Database.protection_plaintexts request
+            |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext) in
+          let retried = Database.apply_outbox_transition database prepared
+              ~encrypted:(Some (request, encrypted)) |> T.require_ok ~behavior in
+          T.require (Store.read_database sqlite |> T.require_ok ~behavior <> durable_before)
+            "retry after rollback failed to persist its changed frozen baseline";
+          let current_revision = Store.read_revision sqlite |> T.require_ok ~behavior |> Option.get in
+          T.require (current_revision = Option.get revision_before + 1)
+            "successful retry must advance metadata exactly once";
+          let durable_after_retry = Store.read_database sqlite |> T.require_ok ~behavior in
+          (* A second public storage writer advances only its revision. Database
+             owns executing the CAS and must reject its now stale durable baseline. *)
+          Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
+          Store.apply_delta sqlite
+            { expected_revision = current_revision; revision = current_revision + 1
+            ; upserts = []; deletes = [] } |> T.require_ok ~behavior;
+          Sqlite3.Rc.check (Sqlite3.exec sqlite "COMMIT");
+          let submitted_view = Database.inspect_sync database |> T.require_ok ~behavior in
+          let batch = Option.get retried.submission_batch in
+          let prepared, request = Database.begin_outbox_transition database
+              ~expected:(sync_view_token submitted_view)
+              (Retry_group (submission_batch_id batch)) |> T.require_ok ~behavior in
+          let encrypted = Option.map (fun request -> request,
+              Database.protection_plaintexts request
+              |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext)) request in
+          (match Database.apply_outbox_transition database prepared ~encrypted with
+           | Error (Outbox_commit_persistence_failed _) -> ()
+           | _ -> Alcotest.fail "stale durable metadata CAS exposed a successful retry");
+          Alcotest.(check (list string)) "metadata CAS failure preserves every payload"
+            durable_after_retry (Store.read_database sqlite |> T.require_ok ~behavior);
+          T.require (Store.read_revision sqlite |> T.require_ok ~behavior = Some (current_revision + 1))
+            "metadata CAS failure overwrote the winning writer revision";
+          let after_conflict = Database.inspect_sync database |> T.require_ok ~behavior in
+          T.require (sync_token_equal (sync_view_token submitted_view) (sync_view_token after_conflict))
+            "metadata CAS failure published an in-memory revision");
         ignore (Database.close database))))
 ;;
 
@@ -1992,8 +2051,412 @@ let storage_address_reuse_survives_commit_or_rollback ~fail_commit () =
            Storage.garbage_stats callbacks |> T.require_ok ~behavior |> ignore)))
 ;;
 
+(* The SQL write set is owned by Database persistence, not a pure reducer.
+   Public Database operations below reproduce the defect; SQLite triggers only
+   observe their committed durable row changes. *)
+let with_outbox_write_fixture behavior f =
+  T.with_temp_directory "overlay-incremental-outbox-" (fun support ->
+    let path = T.seed_mirror support in
+    let dependencies, _, inspection = location_and_inspection support behavior in
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let database =
+          Database.open_ ~sw dependencies inspection ~graph_name:"write-set-fixture"
+          |> T.require_ok ~behavior
+        in
+        let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+        Sqlite3.Rc.check
+          (Sqlite3.exec sqlite
+             "CREATE TABLE outbox_write_audit (kind TEXT NOT NULL, payload_bytes INTEGER NOT NULL); \
+              CREATE TRIGGER audit_outbox_insert AFTER INSERT ON sync_outbox BEGIN \
+              INSERT INTO outbox_write_audit VALUES('insert', length(CAST(NEW.record AS BLOB))); END; \
+              CREATE TRIGGER audit_outbox_update AFTER UPDATE ON sync_outbox BEGIN \
+              INSERT INTO outbox_write_audit VALUES('update', length(CAST(NEW.record AS BLOB))); END; \
+              CREATE TRIGGER audit_outbox_delete AFTER DELETE ON sync_outbox BEGIN \
+              INSERT INTO outbox_write_audit VALUES('delete', 0); END");
+        Fun.protect
+          ~finally:(fun () ->
+            ignore (Sqlite3.db_close sqlite);
+            ignore (Database.close database))
+          (fun () -> f ~sw ~dependencies ~support ~path ~sqlite database))))
+;;
+
+let outbox_write_count sqlite =
+  let count = ref 0 in
+  Sqlite3.Rc.check
+    (Sqlite3.exec sqlite "SELECT count(*) FROM outbox_write_audit"
+       ~cb:(fun row _ -> count := int_of_string (Option.get row.(0))));
+  !count
+;;
+
+let outbox_payload_bytes sqlite =
+  let count = ref 0 in
+  Sqlite3.Rc.check
+    (Sqlite3.exec sqlite "SELECT coalesce(sum(payload_bytes),0) FROM outbox_write_audit"
+       ~cb:(fun row _ -> count := int_of_string (Option.get row.(0))));
+  !count
+;;
+
+let reset_outbox_write_count sqlite =
+  Sqlite3.Rc.check (Sqlite3.exec sqlite "DELETE FROM outbox_write_audit")
+;;
+
+let persisted_outbox sqlite behavior =
+  Logseq_db_storage.Sync_outbox_store.read_database sqlite |> T.require_ok ~behavior
+;;
+
+let append_outbox_save database ordinal behavior =
+  let mutation =
+    Save_block
+      { mutation_id = T.mutation_uuid (10_000 + ordinal)
+      ; block = T.authoritative_block_uuid
+      ; title = Printf.sprintf "Incremental edit %d" ordinal
+      }
+  in
+  let commit =
+    match
+      Database.commit_local database
+        ~expected:(block_precondition database T.authoritative_block_uuid behavior)
+        mutation
+      |> T.require_ok ~behavior
+    with
+    | Local_committed commit -> commit
+    | Local_existing _ -> Alcotest.fail "fresh outbox write fixture reused an identity"
+  in
+  mutation, commit
+;;
+
+let apply_outbox_event database transition behavior =
+  let view = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, request =
+    Database.begin_outbox_transition database ~expected:(sync_view_token view) transition
+    |> T.require_ok ~behavior
+  in
+  let encrypted =
+    Option.map
+      (fun request ->
+        request,
+        Database.protection_plaintexts request
+        |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext))
+      request
+  in
+  Database.apply_outbox_transition database prepared ~encrypted |> T.require_ok ~behavior
+;;
+
+let incremental_outbox_appends count () =
+  let behavior = Printf.sprintf "incremental outbox appends %d" count in
+  with_outbox_write_fixture behavior
+    (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
+      for ordinal = 1 to count do
+        ignore (append_outbox_save database ordinal behavior)
+      done;
+      Alcotest.(check int) "one durable row write per appended intent" count
+        (outbox_write_count sqlite);
+      let stored = persisted_outbox sqlite behavior in
+      Alcotest.(check int) "all intents recover in order" count (List.length stored);
+      let final_bytes = List.fold_left (fun total record -> total + String.length record) 0 stored in
+      Alcotest.(check int) "each appended payload is persisted exactly once" final_bytes
+        (outbox_payload_bytes sqlite);
+      Printf.printf "outbox append N=%d committed_row_changes=%d logical_payload_bytes=%d final_payload_bytes=%d\n%!"
+        count (outbox_write_count sqlite) (outbox_payload_bytes sqlite) final_bytes)
+;;
+
+let incremental_outbox_preserves_unchanged_rows () =
+  let behavior = "incremental outbox preserves unchanged rows" in
+  with_outbox_write_fixture behavior
+    (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
+      ignore (append_outbox_save database 1 behavior);
+      let before = List.hd (persisted_outbox sqlite behavior) in
+      ignore (append_outbox_save database 2 behavior);
+      Alcotest.(check string) "unrelated revision does not reencode prior payload" before
+        (List.hd (persisted_outbox sqlite behavior)))
+;;
+
+let incremental_outbox_no_change_and_identity () =
+  let behavior = "incremental outbox No_change and identity" in
+  with_outbox_write_fixture behavior
+    (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
+      let mutation, _ = append_outbox_save database 1 behavior in
+      for ordinal = 2 to 32 do
+        ignore (append_outbox_save database ordinal behavior)
+      done;
+      reset_outbox_write_count sqlite;
+      let no_change =
+        Save_block
+          { mutation_id = T.mutation_uuid 20_001
+          ; block = T.block_uuid
+          ; title = "Missing target"
+          }
+      in
+      (match Database.commit_local database
+               ~expected:(block_precondition database T.block_uuid behavior) no_change
+             |> T.require_ok ~behavior with
+       | Local_committed { status = No_change; _ } -> ()
+       | _ -> Alcotest.fail "missing target must produce a durable No_change receipt");
+      (match Database.commit_local database ~expected:(T.empty_precondition ~behavior) mutation
+             |> T.require_ok ~behavior with
+       | Local_existing _ -> ()
+       | _ -> Alcotest.fail "same-ID replay appended another intent");
+      (match Database.commit_local database ~expected:(T.empty_precondition ~behavior)
+               (Save_block { mutation_id = T.mutation_uuid 10_001
+                           ; block = T.authoritative_block_uuid; title = "Different intent" }) with
+       | Error Mutation_identity_conflict -> ()
+       | _ -> Alcotest.fail "same-ID different intent must remain a conflict");
+      Alcotest.(check int) "receipt and identity checks do not rewrite outbox rows" 0
+        (outbox_write_count sqlite))
+;;
+
+let incremental_outbox_batch_updates () =
+  let behavior = "incremental outbox batch updates" in
+  with_outbox_write_fixture behavior
+    (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
+      let commits = List.init 64 (fun n -> snd (append_outbox_save database (n + 1) behavior)) in
+      let ids = List.take 32 commits |> List.map (fun (commit : local_commit) -> commit.mutation_id) in
+      reset_outbox_write_count sqlite;
+      let submitted = apply_outbox_event database (Submit_group ids) behavior in
+      Alcotest.(check int) "submit persists its members only" 32 (outbox_write_count sqlite);
+      let batch = Option.get submitted.submission_batch in
+      reset_outbox_write_count sqlite;
+      ignore
+        (apply_outbox_event database
+           (Accept_group
+              { batch_id = submission_batch_id batch
+              ; barrier = { through = server_cursor 32; checksum = checksum "0000000000000000" }
+              }) behavior);
+      Alcotest.(check int) "accept persists its members only" 32 (outbox_write_count sqlite);
+      let stored = persisted_outbox sqlite behavior in
+      let view = Database.inspect_sync database |> T.require_ok ~behavior in
+      Alcotest.(check int) "mutable transport updates remain durable" 32
+        (List.fold_left
+           (fun count descriptor -> match descriptor.state with
+             | Accepted_pending_authoritative _ -> count + 1 | _ -> count)
+           0 (sync_view_submissions view));
+      Alcotest.(check int) "other queued rows remain present" 64 (List.length stored))
+;;
+
+let reject_and_discard database (commit : local_commit) behavior =
+  let submitted = apply_outbox_event database (Submit_group [ commit.mutation_id ]) behavior in
+  let batch = Option.get submitted.submission_batch in
+  ignore
+    (apply_outbox_event database
+       (Reject_group
+          { batch_id = submission_batch_id batch
+          ; resolution = Definitive
+              { reason = Invalid_request
+              ; partition = { accepted_prefix = []; failed_member = Some commit.mutation_id
+                            ; unexecuted_suffix = []; acceptance_barrier = None
+                            ; missing_uuids = []; diagnostics = [] }
+              }
+          }) behavior);
+  Database.discard_blocked database ~mutation_id:commit.mutation_id |> T.require_ok ~behavior |> ignore
+;;
+
+let incremental_outbox_middle_delete_and_empty_revision () =
+  let behavior = "incremental outbox middle delete and empty revision" in
+  with_outbox_write_fixture behavior
+    (fun ~sw ~dependencies ~support ~path:_ ~sqlite database ->
+      let commits = List.init 3 (fun n -> snd (append_outbox_save database (n + 1) behavior)) in
+      let middle = List.nth commits 1 in
+      let submitted = apply_outbox_event database (Submit_group [ middle.mutation_id ]) behavior in
+      let batch = Option.get submitted.submission_batch in
+      ignore (apply_outbox_event database
+                (Reject_group { batch_id = submission_batch_id batch
+                              ; resolution = Definitive
+                                  { reason = Invalid_request
+                                  ; partition = { accepted_prefix = []; failed_member = Some middle.mutation_id
+                                                ; unexecuted_suffix = []; acceptance_barrier = None
+                                                ; missing_uuids = []; diagnostics = [] } } }) behavior);
+      let before = persisted_outbox sqlite behavior in
+      reset_outbox_write_count sqlite;
+      Database.discard_blocked database ~mutation_id:middle.mutation_id |> T.require_ok ~behavior |> ignore;
+      Alcotest.(check int) "middle discard deletes one row" 1 (outbox_write_count sqlite);
+      Alcotest.(check (list string)) "remaining sequence holes and payloads are stable"
+        [ List.nth before 0; List.nth before 2 ] (persisted_outbox sqlite behavior);
+      reject_and_discard database (List.nth commits 0) behavior;
+      reject_and_discard database (List.nth commits 2) behavior;
+      let before_reopen = Database.inspect_sync database |> T.require_ok ~behavior in
+      Database.close database |> T.require_ok ~behavior;
+      let inspection = inspect_mirror support behavior in
+      let reopened = Database.open_ ~sw dependencies inspection ~graph_name:"empty-queue"
+                     |> T.require_ok ~behavior in
+      let after_reopen = Database.inspect_sync reopened |> T.require_ok ~behavior in
+      T.require (sync_token_equal (sync_view_token before_reopen) (sync_view_token after_reopen))
+        "empty durable queue lost its independent sync revision";
+      Database.close reopened |> T.require_ok ~behavior)
+;;
+
+let incremental_outbox_empty_revision () =
+  let behavior = "incremental outbox empty revision" in
+  with_outbox_write_fixture behavior
+    (fun ~sw ~dependencies ~support ~path:_ ~sqlite:_ database ->
+      let _, commit = append_outbox_save database 1 behavior in
+      reject_and_discard database commit behavior;
+      let before = Database.inspect_sync database |> T.require_ok ~behavior in
+      Database.close database |> T.require_ok ~behavior;
+      let reopened = Database.open_ ~sw dependencies (inspect_mirror support behavior)
+                       ~graph_name:"empty-revision" |> T.require_ok ~behavior in
+      let after = Database.inspect_sync reopened |> T.require_ok ~behavior in
+      T.require (sync_token_equal (sync_view_token before) (sync_view_token after))
+        "empty queue must retain its durable sync revision";
+      Database.close reopened |> T.require_ok ~behavior)
+;;
+
+let incremental_outbox_unrelated_authoritative () =
+  let behavior = "incremental outbox unrelated authoritative" in
+  with_outbox_write_fixture behavior
+    (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
+      let commits = List.init 32 (fun n -> snd (append_outbox_save database (n + 1) behavior)) in
+      let ids = List.map (fun (commit : local_commit) -> commit.mutation_id) commits in
+      ignore (apply_outbox_event database (Submit_group ids) behavior);
+      let before = persisted_outbox sqlite behavior in
+      reset_outbox_write_count sqlite;
+      let module Transit = Transit_core.Json in
+      let module Codec = Transit_native.Transit.Json in
+      let wire =
+        Transit.Array
+          [ Transit.Array
+              [ Transit.Keyword "db/add"
+              ; Transit.Array [ Transit.Keyword "block/uuid"
+                              ; Transit.Uuid (Logseq_db_types.Graph_types.Uuid.to_string T.page_uuid) ]
+              ; Transit.Keyword "audit/unrelated"
+              ; Transit.Int 1 ] ]
+        |> Codec.to_string ~mode:Codec.Verbose
+        |> encoded_transaction_of_string ~maximum_bytes:4096 |> T.require_ok ~behavior
+      in
+      let batch = authoritative_batch ~maximum_count:16 ~maximum_bytes:4096
+                    ~transactions:[ authoritative_transaction ~cursor:(server_cursor 1) ~transaction:wire ]
+                    ~through:(server_cursor 1) ~checksum:None |> T.require_ok ~behavior in
+      let view = Database.inspect_sync database |> T.require_ok ~behavior in
+      let prepared, request = Database.begin_authoritative database
+                                ~expected:(sync_view_token view) batch |> T.require_ok ~behavior in
+      T.require (Option.is_none request) "unrelated transaction unexpectedly needs crypto";
+      (match Database.apply_authoritative database prepared ~decrypted:None |> T.require_ok ~behavior with
+       | Authoritative_applied _ -> ()
+       | _ -> Alcotest.fail "unrelated authoritative batch was deferred");
+      Alcotest.(check int) "unrelated checkpoint does not rewrite frozen submissions" 0
+        (outbox_write_count sqlite);
+      Alcotest.(check (list string)) "frozen submission payloads survive unchanged" before
+        (persisted_outbox sqlite behavior))
+;;
+
+let incremental_outbox_legacy_migration () =
+  let behavior = "incremental outbox legacy migration" in
+  with_outbox_write_fixture behavior
+    (fun ~sw ~dependencies ~support ~path:_ ~sqlite database ->
+      ignore (append_outbox_save database 1 behavior);
+      ignore (append_outbox_save database 2 behavior);
+      let records = persisted_outbox sqlite behavior in
+      Database.close database |> T.require_ok ~behavior;
+      Sqlite3.Rc.check (Sqlite3.exec sqlite
+        "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; \
+         CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+      let legacy = List.map
+        (fun record -> match Yojson.Safe.from_string record with
+          | `Assoc fields -> `Assoc (("syncRevision", `Int 57) :: List.remove_assoc "syncRevision" fields)
+                            |> Yojson.Safe.to_string
+          | _ -> Alcotest.fail "legacy fixture omitted record JSON") records in
+      Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy |> T.require_ok ~behavior;
+      let inspection = inspect_mirror support behavior in
+      let reopened = Database.open_ ~sw dependencies inspection ~graph_name:"legacy-queue"
+                     |> T.require_ok ~behavior in
+      let view = Database.inspect_sync reopened |> T.require_ok ~behavior in
+      let expected = sync_token_of_string "sync-token:v1:57" |> T.require_ok ~behavior in
+      T.require (sync_token_equal expected (sync_view_token view)) "legacy migration lost global revision";
+      ignore (append_outbox_save reopened 3 behavior);
+      Database.close reopened |> T.require_ok ~behavior;
+      let again = Database.open_ ~sw dependencies (inspect_mirror support behavior)
+                    ~graph_name:"migrated-queue" |> T.require_ok ~behavior in
+      Alcotest.(check int) "migrated and new mutations all recover" 3
+        (List.length (sync_view_submissions (Database.inspect_sync again |> T.require_ok ~behavior)));
+      T.require
+        (sync_token_equal (sync_token_of_string "sync-token:v1:58" |> T.require_ok ~behavior)
+           (sync_view_token (Database.inspect_sync again |> T.require_ok ~behavior)))
+        "migrated metadata did not advance atomically";
+      Database.close again |> T.require_ok ~behavior)
+;;
+
+let incremental_outbox_migration_writer_lock () =
+  let behavior = "incremental outbox migration writer lock" in
+  with_outbox_write_fixture behavior
+    (fun ~sw ~dependencies ~support ~path:_ ~sqlite database ->
+      ignore (append_outbox_save database 1 behavior);
+      let legacy = persisted_outbox sqlite behavior in
+      Database.close database |> T.require_ok ~behavior;
+      Sqlite3.Rc.check (Sqlite3.exec sqlite
+        "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; \
+         CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+      Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy |> T.require_ok ~behavior;
+      Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
+      Fun.protect ~finally:(fun () -> Sqlite3.Rc.check (Sqlite3.exec sqlite "ROLLBACK"))
+        (fun () -> match Database.open_ ~sw dependencies (inspect_mirror support behavior)
+                           ~graph_name:"locked-migration" with
+          | Error _ -> ()
+          | Ok opened -> ignore (Database.close opened);
+                         Alcotest.fail "write-required migration succeeded under another writer lock");
+      Alcotest.(check (list string)) "failed migration retains complete legacy rows" legacy
+        (persisted_outbox sqlite behavior);
+      let reopened = Database.open_ ~sw dependencies (inspect_mirror support behavior)
+                       ~graph_name:"migration-retry" |> T.require_ok ~behavior in
+      Alcotest.(check int) "migration retries without losing a row" 1
+        (List.length (sync_view_submissions (Database.inspect_sync reopened |> T.require_ok ~behavior)));
+      Database.close reopened |> T.require_ok ~behavior)
+;;
+
+(* Database ownership cannot interpose a writer between its read and migration
+   through a pure event. Exercise the public storage migration at that boundary. *)
+let incremental_outbox_migration_rejects_stale_rows () =
+  let behavior = "incremental outbox migration rejects stale rows" in
+  with_outbox_write_fixture behavior
+    (fun ~sw:_ ~dependencies:_ ~support:_ ~path:_ ~sqlite database ->
+      ignore (append_outbox_save database 1 behavior);
+      ignore (append_outbox_save database 2 behavior);
+      let all_records = persisted_outbox sqlite behavior in
+      Database.close database |> T.require_ok ~behavior;
+      Sqlite3.Rc.check (Sqlite3.exec sqlite
+        "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; \
+         CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+      let module Store = Logseq_db_storage.Sync_outbox_store in
+      Store.replace_database sqlite [ List.hd all_records ] |> T.require_ok ~behavior;
+      let validated = Store.read_database sqlite |> T.require_ok ~behavior in
+      let rows_of records = List.map
+          (fun record ->
+             let open Yojson.Safe.Util in
+             let json = Yojson.Safe.from_string record in
+             Store.{ mutation_id = json |> member "mutation" |> member "mutationId" |> to_string
+                   ; sequence = json |> member "sequence" |> to_int
+                   ; record }) records in
+      let rows = rows_of validated in
+      Store.replace_database sqlite all_records |> T.require_ok ~behavior;
+      (match Store.migrate_database sqlite ~revision:0 ~expected_records:validated rows with
+       | Error _ -> ()
+       | Ok () -> Alcotest.fail "migration discarded a row added after its validated snapshot");
+      Alcotest.(check (list string)) "stale migration preserves all later rows" all_records
+        (Store.read_database sqlite |> T.require_ok ~behavior);
+      T.require (Store.read_revision sqlite |> T.require_ok ~behavior = None)
+        "stale migration must roll back its format change";
+      Store.migrate_database sqlite ~revision:0 ~expected_records:all_records (rows_of all_records)
+      |> T.require_ok ~behavior;
+      (match Store.migrate_database sqlite ~revision:0 ~expected_records:validated rows with
+       | Error _ -> ()
+       | Ok () -> Alcotest.fail "matching revision concealed stale incremental rows");
+      Alcotest.(check (list string)) "incremental stale restore preserves all rows" all_records
+        (Store.read_database sqlite |> T.require_ok ~behavior))
+;;
+
 let cases =
-  [ Alcotest.test_case
+  [ Alcotest.test_case "incremental outbox appends 1" `Quick (incremental_outbox_appends 1)
+  ; Alcotest.test_case "incremental outbox appends 32" `Quick (incremental_outbox_appends 32)
+  ; Alcotest.test_case "incremental outbox appends 1000" `Quick (incremental_outbox_appends 1000)
+  ; Alcotest.test_case "incremental outbox unchanged rows" `Quick incremental_outbox_preserves_unchanged_rows
+  ; Alcotest.test_case "incremental outbox No_change and identity" `Quick incremental_outbox_no_change_and_identity
+  ; Alcotest.test_case "incremental outbox batch updates" `Quick incremental_outbox_batch_updates
+  ; Alcotest.test_case "incremental outbox middle delete and empty revision" `Quick incremental_outbox_middle_delete_and_empty_revision
+  ; Alcotest.test_case "incremental outbox legacy migration" `Quick incremental_outbox_legacy_migration
+  ; Alcotest.test_case "incremental outbox empty revision" `Quick incremental_outbox_empty_revision
+  ; Alcotest.test_case "incremental outbox unrelated authoritative" `Quick incremental_outbox_unrelated_authoritative
+  ; Alcotest.test_case "incremental outbox migration writer lock" `Quick incremental_outbox_migration_writer_lock
+  ; Alcotest.test_case "incremental outbox migration rejects stale rows" `Quick incremental_outbox_migration_rejects_stale_rows
+  ; Alcotest.test_case
       "legacy storage payloads roundtrip"
       `Quick
       legacy_storage_payloads_roundtrip

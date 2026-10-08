@@ -78,6 +78,7 @@ type event =
       ; today : int
       ; settings : settings
       }
+  | Graph_changed
   | Roots_loaded of ticket * Graph.Uuid.t list * Graph.Cursor.t option
   | Assets_loaded of ticket * Asset.t list * Graph.Cursor.t option
   | Read_failed of ticket
@@ -120,6 +121,8 @@ type phase =
 
 type scan =
   { reason : reason
+  ; enabled : bool
+  ; dirty : bool
   ; root_query : query
   ; root_next : Graph.Cursor.t option
   ; committed : string list
@@ -148,7 +151,8 @@ type residency =
   }
 
 type t =
-  { graph_generation : int option
+  { configuration : (int * int * settings) option
+  ; graph_generation : int option
   ; revision : int
   ; serial : int
   ; scans : scan list
@@ -157,7 +161,8 @@ type t =
   }
 
 let empty =
-  { graph_generation = None
+  { configuration = None
+  ; graph_generation = None
   ; revision = 0
   ; serial = 0
   ; scans = []
@@ -255,10 +260,21 @@ let scope_releases state =
      @ List.map (fun (visible : visible) -> visible.consumer) state.visible)
 ;;
 
+let restart state scan =
+  let cleanup = releases scan.staged in
+  let scan = { scan with dirty = false; root_next = None; staged = [] } in
+  let state, instructions =
+    continue state scan (if scan.enabled then Some scan.root_query else None)
+  in
+  state, cleanup @ instructions
+;;
+
 let step_policy state = function
   | Shutdown ->
     ( { empty with serial = state.serial; revision = state.revision + 1 }
     , scope_releases state )
+  | Refresh { graph_generation; today; settings }
+    when state.configuration = Some (graph_generation, today, settings) -> state, []
   | Refresh { graph_generation; today; settings } ->
     let same_scope = state.graph_generation = Some graph_generation in
     let prior = if same_scope then state.scans else [] in
@@ -269,7 +285,8 @@ let step_policy state = function
     in
     let state =
       { state with
-        graph_generation = Some graph_generation
+        configuration = Some (graph_generation, today, settings)
+      ; graph_generation = Some graph_generation
       ; revision = state.revision + 1
       ; scans = []
       ; visible = (if same_scope then state.visible else [])
@@ -293,6 +310,8 @@ let step_policy state = function
          in
          let scan =
            { reason
+           ; enabled = Option.is_some query
+           ; dirty = false
            ; root_query = Option.value query ~default:(Favorite_roots None)
            ; root_next = None
            ; committed
@@ -304,9 +323,27 @@ let step_policy state = function
          state, instructions @ next)
       (state, cleanup)
       [ Recent; Favorites ]
+  | Graph_changed ->
+    let state = { state with revision = state.revision + 1 } in
+    List.fold_left
+      (fun (state, instructions) scan ->
+         if not scan.enabled
+         then state, instructions
+         else (
+           match scan.phase with
+           | Reading _ | Awaiting _ ->
+             let cleanup = releases scan.staged in
+             let scan = { scan with dirty = true; root_next = None; staged = [] } in
+             with_scan state scan, instructions @ cleanup
+           | Pressured _ | Finished | Broken ->
+             let state, next = restart state scan in
+             state, instructions @ next))
+      (state, [])
+      state.scans
   | Roots_loaded (ticket, roots, next_cursor) ->
     (match current state ticket with
      | None -> state, []
+     | Some scan when scan.dirty -> restart state scan
      | Some scan ->
        if List.length roots > page_size
        then fail state scan
@@ -321,6 +358,7 @@ let step_policy state = function
   | Assets_loaded (ticket, assets, next_cursor) ->
     (match current state ticket with
      | None -> state, []
+     | Some scan when scan.dirty -> restart state scan
      | Some scan ->
        if List.length assets > page_size
        then fail state scan
@@ -352,7 +390,7 @@ let step_policy state = function
   | Read_failed ticket ->
     (match current state ticket with
      | None -> state, []
-     | Some scan -> fail state scan)
+     | Some scan -> if scan.dirty then restart state scan else fail state scan)
   | Demand_accepted consumer ->
     (match
        List.find_opt
@@ -371,28 +409,33 @@ let step_policy state = function
                state.visible
          }
        , [] )
+     | Some scan when scan.dirty -> restart state scan
      | Some scan ->
        (match scan.phase with
         | Awaiting p | Pressured p -> continue state scan p.continuation
         | _ -> assert false))
   | Backpressure consumer ->
-    let scans =
-      List.map
-        (fun scan ->
-           match scan.phase with
-           | Awaiting p when p.consumer = consumer -> { scan with phase = Pressured p }
-           | _ -> scan)
-        state.scans
-    in
-    ( { state with
-        scans
-      ; visible =
+    let state =
+      { state with
+        visible =
           List.map
             (fun (v : visible) ->
                if v.consumer = consumer then { v with pressured = true } else v)
             state.visible
       }
-    , [] )
+    in
+    List.fold_left
+      (fun (state, instructions) scan ->
+         match scan.phase with
+         | Awaiting p when p.consumer = consumer ->
+           if scan.dirty
+           then (
+             let state, next = restart state scan in
+             state, instructions @ next)
+           else with_scan state { scan with phase = Pressured p }, instructions
+         | _ -> state, instructions)
+      (state, [])
+      state.scans
   | Capacity_available ->
     let visible_instructions =
       List.filter_map

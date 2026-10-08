@@ -129,6 +129,8 @@ type t =
   ; mutable queryable_page_effects : outbox_record Rrbvec.t Uuid_map.t
   ; mutable queryable_children_effects : outbox_record list Uuid_map.t
   ; mutable sync_revision : int
+  ; mutable durable_sync_revision : int
+  ; mutable durable_outbox : Logseq_db_storage.Sync_outbox_store.row Uuid_map.t
   ; mutable checkpoint : int
   ; mutable checkpoint_metadata : Logseq_db_types.Sync_checkpoint.t
   ; mutable subscriptions : subscription list
@@ -1527,27 +1529,102 @@ let authoritative_block_present database cache uuid =
 ;;
 
 let decode_outbox records =
-  let rec loop decoded seen maximum_revision = function
+  let rec loop decoded seen previous_sequence maximum_revision = function
     | [] -> Ok (List.rev decoded, maximum_revision)
     | record :: rest ->
       Result.bind (Persistence_outbox_v16.decode record) (fun (record, revision) ->
         if List.exists (Graph.Uuid.equal record.mutation_id) seen
         then Error "duplicate mutation UUID in overlay outbox"
+        else if record.sequence <= previous_sequence
+        then Error "overlay outbox sequence is not strictly ordered"
         else
           loop
             (record :: decoded)
             (record.mutation_id :: seen)
+            record.sequence
             (Int.max maximum_revision revision)
             rest)
   in
-  loop [] [] 0 records
+  loop [] [] 0 0 records
 ;;
 
 let read_outbox path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
     ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
-    (fun () -> Logseq_db_storage.Sync_outbox_store.read_database sqlite)
+    (fun () ->
+       let exec sql =
+         let rc = Sqlite3.exec sqlite sql in
+         if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg sqlite)
+       in
+       Result.bind (exec "BEGIN") (fun () ->
+         let result =
+           try
+             Result.bind (Logseq_db_storage.Sync_outbox_store.read_database sqlite)
+               (fun records ->
+                  Result.map
+                    (fun revision -> records, revision)
+                    (Logseq_db_storage.Sync_outbox_store.read_revision sqlite))
+           with exn -> Error (Printexc.to_string exn)
+         in
+         match result with
+         | Error _ as error -> ignore (exec "ROLLBACK"); error
+         | Ok _ ->
+           (match exec "COMMIT" with
+            | Ok () -> result
+            | Error _ as error -> ignore (exec "ROLLBACK"); error)))
+;;
+
+(* Global revision belongs to metadata. Frozen encodings are independent of it
+   and of the mutable transport fields on live outbox records. *)
+let durable_outbox_rows records =
+  List.fold_left
+    (fun rows (record : outbox_record) ->
+       let mutation_id = Graph.Uuid.to_string record.mutation_id in
+       Uuid_map.add mutation_id
+         Logseq_db_storage.Sync_outbox_store.
+           { mutation_id
+           ; sequence = record.sequence
+           ; record = Persistence_outbox_v16.encode ~sync_revision:0 record
+           }
+         rows)
+    Uuid_map.empty records
+;;
+
+let ordered_durable_rows rows =
+  Uuid_map.bindings rows |> List.map snd
+  |> List.sort
+       (fun (left : Logseq_db_storage.Sync_outbox_store.row) right ->
+          Int.compare left.sequence right.sequence)
+;;
+
+let outbox_write_set database ~revision records =
+  let rows = durable_outbox_rows records in
+  let upserts =
+    Uuid_map.fold
+      (fun id (row : Logseq_db_storage.Sync_outbox_store.row) changed ->
+         match Uuid_map.find_opt id database.durable_outbox with
+         | Some before when before = row -> changed
+         | _ -> row :: changed)
+      rows []
+    |> List.sort
+         (fun (left : Logseq_db_storage.Sync_outbox_store.row) right ->
+            Int.compare left.sequence right.sequence)
+  in
+  let deletes =
+    Uuid_map.fold
+      (fun id _ deleted -> if Uuid_map.mem id rows then deleted else id :: deleted)
+      database.durable_outbox []
+  in
+  Logseq_db_storage.Sync_outbox_store.
+    { expected_revision = database.durable_sync_revision; revision; upserts; deletes }, rows
+;;
+
+let migrate_outbox path ~revision ~expected_records rows =
+  let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+  Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close sqlite)) (fun () ->
+    Logseq_db_storage.Sync_outbox_store.migrate_database sqlite ~revision ~expected_records
+      (ordered_durable_rows rows))
 ;;
 
 let validate_durable_receipts path =
@@ -5003,13 +5080,18 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
     match read_outbox path, validate_durable_receipts path with
     | Error message, _ -> Error (Types.Corrupt_outbox message)
     | _, Error message -> Error (Types.Corrupt_mutation_receipt message)
-    | Ok encoded, Ok () ->
+    | Ok (encoded, durable_revision), Ok () ->
       (match decode_outbox encoded with
        | Error message -> Error (Types.Corrupt_outbox message)
        | Ok (outbox, _)
          when List.exists (fun record -> not (outbox_record_is_canonical record)) outbox
          -> Error (Types.Corrupt_outbox "non-canonical overlay outbox record")
-       | Ok (outbox, sync_revision) ->
+       | Ok (outbox, legacy_revision) ->
+         let sync_revision = Option.value durable_revision ~default:legacy_revision in
+         let durable_outbox = durable_outbox_rows outbox in
+         (match migrate_outbox path ~revision:sync_revision ~expected_records:encoded durable_outbox with
+          | Error message -> Error (Types.Corrupt_outbox message)
+          | Ok () ->
          (match Storage.open_database path with
           | Error _ -> Error (Types.Restore_failed "unable to open mirror")
           | Ok connection ->
@@ -5111,6 +5193,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      ; queryable_page_effects
                      ; queryable_children_effects
                      ; sync_revision
+                     ; durable_sync_revision = sync_revision
+                     ; durable_outbox
                      ; checkpoint
                      ; checkpoint_metadata
                      ; subscriptions = []
@@ -5170,7 +5254,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                      `Stop_daemon);
                    transferred := true;
                    installed_listener := None;
-                   Ok database))))
+                   Ok database)))))
 ;;
 
 let open_ ~sw dependencies inspection ~graph_name =
@@ -5207,10 +5291,8 @@ let open_ ~sw dependencies inspection ~graph_name =
 ;;
 
 let persist_outbox ?(terminal_batches = []) database =
-  let records =
-    List.map
-      (Persistence_outbox_v16.encode ~sync_revision:database.sync_revision)
-      database.outbox
+  let delta, durable_outbox =
+    outbox_write_set database ~revision:database.sync_revision database.outbox
   in
   let receipts =
     List.filter_map Persistence_receipt_v1.encode_mutation database.receipts
@@ -5232,7 +5314,7 @@ let persist_outbox ?(terminal_batches = []) database =
               ignore (Sqlite3.exec sqlite "ROLLBACK");
               Error message
             in
-            match Logseq_db_storage.Sync_outbox_store.replace_database sqlite records with
+            match Logseq_db_storage.Sync_outbox_store.apply_delta sqlite delta with
             | Error message -> rollback message
             | Ok () ->
               (match
@@ -5248,7 +5330,10 @@ let persist_outbox ?(terminal_batches = []) database =
                   | Error message -> rollback message
                   | Ok () ->
                     (match rc_result (Sqlite3.exec sqlite "COMMIT") with
-                     | Ok () -> Ok ()
+                     | Ok () ->
+                       database.durable_outbox <- durable_outbox;
+                       database.durable_sync_revision <- database.sync_revision;
+                       Ok ()
                      | Error message -> rollback message)))))
 ;;
 
@@ -8585,10 +8670,8 @@ let commit_authoritative_candidate database prepared =
                 ~checksum
               |> Result.get_ok
             in
-            let outbox =
-              List.map
-                (Persistence_outbox_v16.encode
-                   ~sync_revision:(database.sync_revision + 1))
+            let outbox_delta, durable_outbox =
+              outbox_write_set database ~revision:(database.sync_revision + 1)
                 candidate_outbox
             in
             let receipts =
@@ -8597,10 +8680,11 @@ let commit_authoritative_candidate database prepared =
             (match
                Logseq_db_storage.Storage_session
                .commit_staged_with_sync_metadata_outbox_and_receipts
+                 ~outbox_delta
                  database.storage_session
                  staged
                  metadata
-                 outbox
+                 []
                  receipts
                  (List.map Persistence_receipt_v1.encode_terminal_batch terminal_batches)
              with
@@ -8611,6 +8695,8 @@ let commit_authoritative_candidate database prepared =
                    (Types.Authoritative_commit_persistence_failed
                       (storage_session_error error)) )
              | Ok () ->
+               database.durable_outbox <- durable_outbox;
+               database.durable_sync_revision <- database.sync_revision + 1;
                preparation.authoritative_state <- Authoritative_consumed;
                let before_projection = database.projection in
                let before_snapshot = snapshot_of_database database in

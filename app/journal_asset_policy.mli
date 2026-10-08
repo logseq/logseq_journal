@@ -47,6 +47,9 @@ type event =
       ; today : int
       ; settings : settings
       }
+  (** A projection change or resync invalidates both configured scans. In-flight
+      reads finish before one fresh scan starts; their results are discarded. *)
+  | Graph_changed
   | Roots_loaded of ticket * Graph.Uuid.t list * Graph.Cursor.t option
   | Assets_loaded of ticket * Asset.t list * Graph.Cursor.t option
   | Read_failed of ticket

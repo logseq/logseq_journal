@@ -142,8 +142,12 @@ let connected_fixture () =
    | [ Core.Publish (Core.State_changed _)
      ; Core.Run
          (Core.Send_websocket { scope; message = Protocol.Client.Pull { since = Some 0 } })
+     ; Core.Run (Core.Schedule_timer timer)
      ]
-     when scope = connection -> ()
+     when scope = connection
+          && timer.delay_seconds = 30.
+          && timer.scope.connection_generation = Some connection.connection_generation ->
+     ()
    | _ -> Alcotest.fail "connected fixture did not issue opening Pull");
   { mirror_request; attachment; attached; connection; opened }
 ;;

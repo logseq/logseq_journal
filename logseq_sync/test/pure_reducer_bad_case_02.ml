@@ -15,7 +15,13 @@ let run () =
     |> check_replay "BC02 follow-up" rejected.next follow_up
   in
   match accepted.effects with
-  | [ Core.Publish (Core.State_changed _); Core.Run (Core.Send_websocket _) ] -> ()
+  | [ Core.Publish (Core.State_changed _)
+    ; Core.Run (Core.Send_websocket send)
+    ; Core.Run (Core.Schedule_timer timer)
+    ]
+    when timer.delay_seconds = 30.
+         && timer.scope.connection_generation = Some send.scope.connection_generation ->
+    ()
   | _ -> Alcotest.fail "BC02 current WebSocket scope was not retained"
 ;;
 

@@ -703,6 +703,17 @@ type submission_owner =
   ; response_timer : timer_id option
   }
 
+type pull_stage =
+  | Awaiting_pull_response of timer_id
+  | Applying_pull
+  | Awaiting_pull_retry of timer_id
+
+type pull_owner =
+  { pull_connection : connection_scope
+  ; issued_since : int
+  ; pull_stage : pull_stage
+  }
+
 type pending_asset =
   { asset_ticket : asset_ticket
   ; asset_cancelled : bool
@@ -739,6 +750,9 @@ type t =
   ; pending_sync_inspection : graph_scope option
   ; pending_outbox_transition : outbox_transition_request option
   ; submission_owner : submission_owner option
+  ; pull_owner : pull_owner option
+  ; pull_wanted : (graph_scope * int) option
+  ; pull_retry_delay : float
   ; active_authoritative_batch : authoritative_batch option
   ; queued_authoritative_batch : authoritative_batch option
   ; deferred_authoritative_owner : Overlay.submission_batch_id option
@@ -803,6 +817,9 @@ let initial config =
     ; sync_view = None
     ; pending_sync_inspection = None
     ; pending_outbox_transition = None
+    ; pull_owner = None
+    ; pull_wanted = None
+    ; pull_retry_delay = 1.
     ; submission_owner = None
     ; active_authoritative_batch = None
     ; queued_authoritative_batch = None
@@ -846,6 +863,9 @@ let fail core stage message =
   let core =
     { core with
       pending_effects = []
+    ; pull_owner = None
+    ; pull_wanted = None
+    ; pull_retry_delay = 1.
     ; pending_mirror_inspection = None
     ; pending_attachment = None
     ; pending_encrypted_graph_key = None
@@ -944,6 +964,12 @@ let start_websocket core graph =
       connection_generation = core.connection_generation + 1
     ; websocket_live = false
     ; submission_owner = None
+    ; pull_owner = None
+    ; pull_wanted =
+        (match core.pull_wanted with
+         | Some (scope, _) as wanted when scope = graph -> wanted
+         | _ -> None)
+    ; pull_retry_delay = 1.
     ; active_authoritative_batch = None
     ; queued_authoritative_batch = None
     ; deferred_authoritative_owner = None
@@ -1062,6 +1088,9 @@ let authenticate_new_account core user_id =
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
       ; submission_owner = None
+      ; pull_owner = None
+      ; pull_wanted = None
+      ; pull_retry_delay = 1.
       ; active_authoritative_batch = None
       ; queued_authoritative_batch = None
       ; deferred_authoritative_owner = None
@@ -1142,6 +1171,9 @@ let restore_local core user_id =
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
       ; submission_owner = None
+      ; pull_owner = None
+      ; pull_wanted = None
+      ; pull_retry_delay = 1.
       ; active_authoritative_batch = None
       ; queued_authoritative_batch = None
       ; deferred_authoritative_owner = None
@@ -1194,6 +1226,9 @@ let sign_out core =
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
       ; submission_owner = None
+      ; pull_owner = None
+      ; pull_wanted = None
+      ; pull_retry_delay = 1.
       ; active_authoritative_batch = None
       ; queued_authoritative_batch = None
       ; deferred_authoritative_owner = None
@@ -1261,6 +1296,9 @@ let select_graph_transition core ~persist graph_id =
         ; pending_sync_inspection = None
         ; pending_outbox_transition = None
         ; submission_owner = None
+        ; pull_owner = None
+        ; pull_wanted = None
+        ; pull_retry_delay = 1.
         ; active_authoritative_batch = None
         ; queued_authoritative_batch = None
         ; deferred_authoritative_owner = None
@@ -1381,7 +1419,27 @@ let submission_message batch =
     }
 ;;
 
+let pull_target_pending core graph cursor =
+  match core.pull_wanted with
+  | Some (scope, target) -> scope = graph && target > cursor
+  | None -> false
+;;
+
+let pull_in_progress core =
+  match core.current_graph_scope, core.public_state.snapshot.applied_server_t with
+  | Some graph, Some cursor ->
+    Option.is_some core.pull_owner
+    || Option.is_some core.active_authoritative_batch
+    || pull_target_pending core graph cursor
+  | _ -> false
+;;
+
+let settled_sync_phase ?(baseline = false) core =
+  if pull_in_progress core || (baseline && core.websocket_live) then Pulling else Current
+;;
+
 let phase_transition core sync_phase =
+  let sync_phase = if sync_phase = Current then settled_sync_phase core else sync_phase in
   if core.public_state.snapshot.sync_phase = sync_phase
   then unchanged core
   else (
@@ -1517,6 +1575,101 @@ let plan_submission core =
   | _ -> unchanged core
 ;;
 
+let note_pull_target core graph through =
+  let previous =
+    match core.pull_wanted with
+    | Some (scope, target) when scope = graph -> Some target
+    | _ -> None
+  in
+  let target =
+    match previous, through with
+    | Some old, Some target -> Some (max old target)
+    | None, target | target, None -> target
+  in
+  { core with pull_wanted = Option.map (fun target -> graph, target) target }
+;;
+
+(* The owner spans send, response, and authoritative COMMIT completion. Timers
+   are policy facts: the runner never waits or retries a pull on its own. *)
+let request_pull ?through ?(force = false) core =
+  match core.current_graph_scope, core.public_state.snapshot.applied_server_t with
+  | Some graph, Some cursor when core.websocket_live ->
+    let core = note_pull_target core graph through in
+    let occupied =
+      Option.fold
+        ~none:false
+        ~some:(fun owner -> connection_is_current core owner.pull_connection)
+        core.pull_owner
+    in
+    if
+      occupied
+      || Option.is_some core.active_authoritative_batch
+      || not (force || pull_target_pending core graph cursor)
+    then unchanged core
+    else (
+      let connection = { graph; connection_generation = core.connection_generation } in
+      let timer = core.next_effect_id in
+      let next =
+        set_snapshot
+          { core with
+            next_effect_id = timer + 1
+          ; pull_owner =
+              Some
+                { pull_connection = connection
+                ; issued_since = cursor
+                ; pull_stage = Awaiting_pull_response timer
+                }
+          }
+          { core.public_state.snapshot with sync_phase = Pulling }
+      in
+      { next
+      ; effects =
+          (if next.public_state = core.public_state then [] else [ publish next ])
+          @ [ Run
+                (Send_websocket
+                   { scope = connection
+                   ; message = Sync_protocol.Client.Pull { since = Some cursor }
+                   })
+            ; Run
+                (Schedule_timer
+                   { id = timer
+                   ; scope = effect_scope_of_connection connection
+                   ; delay_seconds = 30.
+                   })
+            ]
+      })
+  | _ -> unchanged core
+;;
+
+let pull_no_progress core (connection : connection_scope) =
+  let cursor = Option.value core.public_state.snapshot.applied_server_t ~default:0 in
+  let core = { core with pull_owner = None } in
+  if not (pull_target_pending core connection.graph cursor)
+  then unchanged { core with pull_retry_delay = 1. }
+  else (
+    let timer = core.next_effect_id in
+    { next =
+        { core with
+          next_effect_id = timer + 1
+        ; pull_owner =
+            Some
+              { pull_connection = connection
+              ; issued_since = cursor
+              ; pull_stage = Awaiting_pull_retry timer
+              }
+        ; pull_retry_delay = min 30. (core.pull_retry_delay *. 2.)
+        }
+    ; effects =
+        [ Run
+            (Schedule_timer
+               { id = timer
+               ; scope = effect_scope_of_connection connection
+               ; delay_seconds = core.pull_retry_delay
+               })
+        ]
+    })
+;;
+
 let outbox_transition_applied core (result : outbox_transition_result) =
   if
     (not (graph_scope_is_current core result.scope))
@@ -1607,41 +1760,37 @@ let outbox_transition_applied core (result : outbox_transition_result) =
       else (
         match result.commit.transition with
         | Overlay.Accept_group _ | Reject_group _ ->
+          let through =
+            match result.commit.transition with
+            | Overlay.Accept_group { barrier; _ } ->
+              Some (server_cursor_number barrier.through)
+            | Reject_group { resolution = Stale { through }; _ } ->
+              Some (server_cursor_number through)
+            | Reject_group { resolution = Definitive { partition; _ }; _ } ->
+              Option.map
+                (fun (barrier : Overlay.acceptance_barrier) ->
+                   server_cursor_number barrier.through)
+                partition.acceptance_barrier
+            | Submit_group _ | Retry_group _ -> None
+          in
+          let demanded =
+            match next.current_graph_scope with
+            | Some graph -> note_pull_target next graph through
+            | None -> next
+          in
           let next =
-            set_snapshot next { next.public_state.snapshot with sync_phase = Pulling }
+            set_snapshot
+              demanded
+              { demanded.public_state.snapshot with
+                sync_phase =
+                  settled_sync_phase ~baseline:(Option.is_none through) demanded
+              }
           in
-          let pull =
-            match
-              ( next.current_graph_scope
-              , next.public_state.snapshot.applied_server_t
-              , next.websocket_live )
-            with
-            | Some graph, Some since, true ->
-              [ Run
-                  (Send_websocket
-                     { scope =
-                         { graph; connection_generation = next.connection_generation }
-                     ; message = Sync_protocol.Client.Pull { since = Some since }
-                     })
-              ]
-            | None, _, _ | _, None, _ | _, _, false -> []
-          in
-          { next; effects = publish next :: pull }
+          let pulled = request_pull ?through ~force:(Option.is_none through) next in
+          { pulled with effects = publish pulled.next :: pulled.effects }
         | Submit_group _ | Retry_group _ ->
           let planned = plan_submission next in
           { next = planned.next; effects = publish next :: planned.effects }))
-;;
-
-let pull_effect core =
-  match core.current_graph_scope, core.public_state.snapshot.applied_server_t with
-  | Some graph, Some cursor when core.websocket_live ->
-    Some
-      (Run
-         (Send_websocket
-            { scope = { graph; connection_generation = core.connection_generation }
-            ; message = Sync_protocol.Client.Pull { since = Some cursor }
-            }))
-  | _ -> None
 ;;
 
 let websocket_opened core connection =
@@ -1653,13 +1802,14 @@ let websocket_opened core connection =
         { core with websocket_live = true }
         { core.public_state.snapshot with sync_phase = Pulling }
     in
-    { next; effects = publish next :: Option.to_list (pull_effect next) })
+    let pulled = request_pull ~force:true next in
+    { pulled with effects = publish next :: pulled.effects })
 ;;
 
 let authoritative_input core t checksum_value txs =
   let current = Option.value core.public_state.snapshot.applied_server_t ~default:(-1) in
   let txs = List.filter (fun tx -> tx.Sync_protocol.Server.t > current) txs in
-  if t = current && txs = []
+  if t >= current && txs = []
   then Ok None
   else (
     let rec encode acc = function
@@ -1837,24 +1987,55 @@ let websocket_message core connection message =
   else (
     match message with
     | Sync_protocol.Server.Pull_ok { t; checksum; txs } ->
-      (match authoritative_input core t checksum txs with
-       | Error message -> fail core During_catalog message
-       | Ok None ->
-         let next =
-           set_snapshot core { core.public_state.snapshot with sync_phase = Current }
-         in
-         let planned = plan_submission next in
-         { next = planned.next; effects = publish next :: planned.effects }
-       | Ok (Some input) ->
-         enqueue_authoritative
-           core
-           { input
-           ; key = core.graph_key
-           ; scope = connection
-           ; presentation_generation =
-               core.public_state.snapshot.startup.presentation_generation
-           ; lifecycle_generation = core.lifecycle_generation
-           })
+      let accepting =
+        Option.fold
+          ~none:(Option.is_none core.active_authoritative_batch)
+          ~some:(fun owner ->
+            owner.pull_connection = connection
+            && t >= owner.issued_since
+            &&
+            match owner.pull_stage with
+            | Awaiting_pull_response _ -> true
+            | _ -> false)
+          core.pull_owner
+      in
+      if not accepting
+      then unchanged core
+      else (
+        let core = note_pull_target core connection.graph (Some t) in
+        match authoritative_input core t checksum txs with
+        | Error message -> fail core During_catalog message
+        | Ok None ->
+          let completed = pull_no_progress core connection in
+          let next =
+            set_snapshot
+              completed.next
+              { core.public_state.snapshot with
+                sync_phase = settled_sync_phase completed.next
+              }
+          in
+          let planned = plan_submission next in
+          { next = planned.next
+          ; effects = (publish next :: completed.effects) @ planned.effects
+          }
+        | Ok (Some input) ->
+          let core =
+            { core with
+              pull_owner =
+                Option.map
+                  (fun owner -> { owner with pull_stage = Applying_pull })
+                  core.pull_owner
+            }
+          in
+          enqueue_authoritative
+            core
+            { input
+            ; key = core.graph_key
+            ; scope = connection
+            ; presentation_generation =
+                core.public_state.snapshot.startup.presentation_generation
+            ; lifecycle_generation = core.lifecycle_generation
+            })
     | Tx_batch_ok { t; checksum } ->
       (match core.submission_owner with
        | Some owner when owner.connection = connection ->
@@ -1865,10 +2046,7 @@ let websocket_message core connection message =
        | Some owner when owner.connection = connection ->
          apply_rejection core owner rejection
        | _ -> unchanged core)
-    | Hello _ | Changed _ ->
-      (match pull_effect core with
-       | None -> unchanged core
-       | Some pull -> { next = core; effects = [ pull ] })
+    | Hello { t; _ } | Changed { t } -> request_pull ~through:t core
     | Error { message } -> fail core During_catalog ("sync server error: " ^ message)
     | Online_users _ | Presence _ | Pong -> unchanged core)
 ;;
@@ -1925,6 +2103,8 @@ let authoritative_applied core (result : authoritative_commit_result) =
         { core with
           sync_view = Some result.sync
         ; submission_owner = owner
+        ; pull_owner = None
+        ; pull_retry_delay = 1.
         ; active_authoritative_batch = None
         ; queued_authoritative_batch = None
         ; deferred_authoritative_owner = None
@@ -1938,6 +2118,11 @@ let authoritative_applied core (result : authoritative_commit_result) =
              else None)
         }
     in
+    let core =
+      set_snapshot
+        core
+        { core.public_state.snapshot with sync_phase = settled_sync_phase core }
+    in
     let planned = plan_submission core in
     let next, queued_effects =
       match queued with
@@ -1946,7 +2131,10 @@ let authoritative_applied core (result : authoritative_commit_result) =
         , [ Delegate (Apply_authoritative_batch batch) ] )
       | None -> planned.next, []
     in
-    { next; effects = (publish core :: planned.effects) @ queued_effects })
+    let pulled = request_pull next in
+    { pulled with
+      effects = (publish core :: planned.effects) @ queued_effects @ pulled.effects
+    })
 ;;
 
 let authoritative_deferred core (result : authoritative_deferred_result) =
@@ -2052,6 +2240,9 @@ let clear_selected_graph_for_catalog core catalog =
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
       ; submission_owner = None
+      ; pull_owner = None
+      ; pull_wanted = None
+      ; pull_retry_delay = 1.
       ; active_authoritative_batch = None
       ; queued_authoritative_batch = None
       ; deferred_authoritative_owner = None
@@ -2363,7 +2554,9 @@ let websocket_closed core connection message =
       set_snapshot
         { core with
           websocket_live = false
+        ; pull_owner = None
         ; submission_owner = None
+        ; pull_retry_delay = 1.
         ; active_authoritative_batch = None
         ; queued_authoritative_batch = None
         ; deferred_authoritative_owner = None
@@ -2413,6 +2606,9 @@ let return_to_graph_picker core =
       ; pending_outbox_transition = None
       ; websocket_live = false
       ; submission_owner = None
+      ; pull_owner = None
+      ; pull_wanted = None
+      ; pull_retry_delay = 1.
       ; active_authoritative_batch = None
       ; queued_authoritative_batch = None
       ; deferred_authoritative_owner = None
@@ -2652,7 +2848,9 @@ let step core event =
         { core with
           lifecycle_generation
         ; websocket_live = false
+        ; pull_owner = None
         ; submission_owner = None
+        ; pull_retry_delay = 1.
         ; active_authoritative_batch = None
         ; queued_authoritative_batch = None
         ; deferred_authoritative_owner = None
@@ -2746,16 +2944,27 @@ let step core event =
          { failed with effects = close @ failed.effects }
        | Some _ | None -> unchanged core)
     | Timer_elapsed id ->
-      (match core.submission_owner, core.current_graph_scope with
-       | Some owner, Some graph
-         when owner.response_timer = Some id
-              && connection_is_current core owner.connection
-              && core.websocket_live ->
-         let restarted = start_websocket core graph in
-         { restarted with
-           effects = Run (Close_websocket owner.connection) :: restarted.effects
-         }
-       | _ -> unchanged core)
+      let restart (connection : connection_scope) =
+        let restarted = start_websocket core connection.graph in
+        { restarted with effects = Run (Close_websocket connection) :: restarted.effects }
+      in
+      let submission_timeout () =
+        match core.submission_owner with
+        | Some owner
+          when owner.response_timer = Some id
+               && connection_is_current core owner.connection
+               && core.websocket_live -> restart owner.connection
+        | _ -> unchanged core
+      in
+      (match core.pull_owner with
+       | Some owner
+         when core.websocket_live && connection_is_current core owner.pull_connection ->
+         (match owner.pull_stage with
+          | Awaiting_pull_response timer when timer = id -> restart owner.pull_connection
+          | Awaiting_pull_retry timer when timer = id ->
+            request_pull { core with pull_owner = None }
+          | _ -> submission_timeout ())
+       | _ -> submission_timeout ())
     | Asset_requested _ | Protected_requested _ -> unchanged core
     | Local_feed_acknowledged -> unchanged core
     | Shutdown ->
@@ -2778,6 +2987,9 @@ let step core event =
           ; pending_sync_inspection = None
           ; pending_outbox_transition = None
           ; submission_owner = None
+          ; pull_owner = None
+          ; pull_wanted = None
+          ; pull_retry_delay = 1.
           ; active_authoritative_batch = None
           ; queued_authoritative_batch = None
           ; deferred_authoritative_owner = None

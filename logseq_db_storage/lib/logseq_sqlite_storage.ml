@@ -45,6 +45,7 @@ type callbacks =
   ; upsert_sync_metadata : Sync_checkpoint.t -> (unit, string) result
   ; load_sync_outbox : unit -> (string list, string) result
   ; replace_sync_outbox : string list -> (unit, string) result
+  ; apply_sync_outbox_delta : Sync_outbox_store.delta -> (unit, string) result
   ; upsert_mutation_receipts : (string * string) list -> (unit, string) result
   ; upsert_terminal_batch_receipts : (string * string) list -> (unit, string) result
   ; commit : unit -> (unit, string) result
@@ -108,7 +109,7 @@ let verify_writable_pragmas db =
     "NORMAL"
 ;;
 
-let commit_batch callbacks batch =
+let commit_batch ?outbox_delta callbacks batch =
   match callbacks.begin_immediate () with
   | Error message -> Error (Begin_failed message)
   | Ok () ->
@@ -135,9 +136,10 @@ let commit_batch callbacks batch =
         | Error message -> rollback (Commit_failed message)
         | Ok () ->
           let outbox =
-            match batch.sync_outbox with
-            | None -> Ok ()
-            | Some records -> callbacks.replace_sync_outbox records
+            match outbox_delta, batch.sync_outbox with
+            | Some delta, _ -> callbacks.apply_sync_outbox_delta delta
+            | None, None -> Ok ()
+            | None, Some records -> callbacks.replace_sync_outbox records
           in
           (match outbox with
            | Error message -> rollback (Commit_failed message)
@@ -558,6 +560,7 @@ let open_database path =
           ; upsert_sync_metadata = Sync_checkpoint_store.update_database sqlite
           ; load_sync_outbox = (fun () -> Sync_outbox_store.read_database sqlite)
           ; replace_sync_outbox = Sync_outbox_store.replace_database sqlite
+          ; apply_sync_outbox_delta = Sync_outbox_store.apply_delta sqlite
           ; upsert_mutation_receipts = Mutation_receipt_store.upsert_mutations sqlite
           ; upsert_terminal_batch_receipts =
               Mutation_receipt_store.upsert_terminal_batches sqlite

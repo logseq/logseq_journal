@@ -1191,105 +1191,750 @@ let prepare_paged_refresh kind =
   runtime, page, refresh
 ;;
 
+let summary_response request page lookup children next_cursor revision =
+  response
+    request
+    (Protocol.V2_block_summary_outcome
+       { lookup
+       ; page = Some (V2_present_page { page; revision = "page-1" })
+       ; items = children
+       ; next_cursor
+       ; scope_revision = "target-children-1"
+       ; generation = "graph-1"
+       ; projection_revision = revision
+       })
+;;
+
+let check_target_summary (request : Protocol.request) cursor =
+  match request.command with
+  | V2_get_block_summary { block; limit; cursor = actual_cursor } ->
+    Alcotest.(check bool) "target identity" true (Graph.Uuid.equal block block_uuid);
+    Alcotest.(check int) "bounded target children" Protocol.default_page_size limit;
+    Alcotest.(check bool) "target children cursor" true (actual_cursor = cursor)
+  | _ -> Alcotest.fail "confirmation must issue one canonical target read"
+;;
+
 let test_paged_mutation_refresh kind result =
   let runtime, page, refresh = prepare_paged_refresh kind in
-  let cursor = Graph.Cursor.of_string "next-root-page" |> Result.get_ok in
-  (* A valid full page of earlier roots does not contain the requested target. *)
-  let members = earlier_members page in
-  let prefix = List.filteri (fun index _ -> index < Protocol.maximum_page_size) members in
-  let tail = List.nth members Protocol.maximum_page_size in
+  if kind = Capture || kind = Update
+  then (
+    check_target_summary refresh None;
+    let target =
+      { record with
+        block =
+          { block with page = page.uuid; parent = page.uuid; title = "Committed target" }
+      }
+    in
+    let lookup = Protocol.V2_present_block { value = target; revision = "target-2" } in
+    let completed =
+      match result with
+      | Found ->
+        Runtime.receive
+          runtime
+          (summary_response refresh page lookup [] None "projection-2")
+      | Missing ->
+        Runtime.receive
+          runtime
+          (summary_response
+             refresh
+             page
+             (V2_missing_block { uuid = block_uuid; revision = "missing-2" })
+             []
+             None
+             "projection-2")
+      | Cursor_failed ->
+        let current = ref refresh in
+        for _ = 1 to 2 do
+          current
+          := Runtime.receive
+               runtime
+               (response
+                  !current
+                  (V2_failed
+                     { code = Logseq_db_worker.Error.code_string Stale_read_cursor
+                     ; message = "Concurrent target change"
+                     }))
+             |> fun output -> only "bounded canonical retry" output.requests
+        done;
+        Runtime.receive
+          runtime
+          (response
+             !current
+             (V2_failed
+                { code = Logseq_db_worker.Error.code_string Stale_read_cursor
+                ; message = "Concurrent target change"
+                }))
+    in
+    Alcotest.(check int)
+      "target terminal confirmation stops reading"
+      0
+      (List.length completed.requests);
+    match
+      result, kind, (only "owned canonical target terminal" completed.responses).payload
+    with
+    | Found, Capture, Block_captured { block; _ }
+    | Found, Update, Block_updated { block; _ } ->
+      Alcotest.(check string)
+        "authoritative target after earlier siblings"
+        "Committed target"
+        (Journal_model.source block)
+    | Cursor_failed, _, Mutation_failed { failure = Worker_failure failure; _ } ->
+      Alcotest.(check bool)
+        "cursor failure category is preserved"
+        true
+        (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
+    | Missing, _, Mutation_failed _ -> ()
+    | _ -> Alcotest.fail "unexpected canonical mutation completion")
+  else (
+    let cursor = Graph.Cursor.of_string "next-root-page" |> Result.get_ok in
+    (* A valid full page of earlier roots does not contain the requested target. *)
+    let members = earlier_members page in
+    let prefix =
+      List.filteri (fun index _ -> index < Protocol.maximum_page_size) members
+    in
+    let tail = List.nth members Protocol.maximum_page_size in
+    let first =
+      Runtime.receive
+        runtime
+        (response
+           refresh
+           (V2_page_tree_outcome
+              { page = page.uuid
+              ; maximum_depth = 1
+              ; items = prefix
+              ; next_cursor = Some cursor
+              }))
+    in
+    Alcotest.(check int)
+      "a partial prefix cannot complete or reject the mutation"
+      0
+      (List.length first.responses);
+    let continuation = only "next authoritative page" first.requests in
+    (match continuation.command with
+     | V2_get_page_tree { page = actual; cursor = Some actual_cursor; _ } ->
+       Alcotest.(check bool) "same journal" true (Graph.Uuid.equal actual page.uuid);
+       Alcotest.(check string)
+         "opaque cursor forwarded"
+         (Graph.Cursor.to_string cursor)
+         (Graph.Cursor.to_string actual_cursor)
+     | _ ->
+       Alcotest.fail "refresh did not continue its read without replaying the mutation");
+    let target =
+      { block with
+        page = page.uuid
+      ; parent = page.uuid
+      ; order = "a1"
+      ; title = "Committed target"
+      }
+    in
+    let completed =
+      Runtime.receive
+        runtime
+        (response
+           continuation
+           (match result with
+            | Cursor_failed ->
+              V2_failed
+                { code = Logseq_db_worker.Error.code_string Stale_read_cursor
+                ; message = "The graph changed during refresh"
+                }
+            | Found | Missing ->
+              V2_page_tree_outcome
+                { page = page.uuid
+                ; maximum_depth = 1
+                ; items =
+                    (if result = Missing
+                     then [ tail ]
+                     else
+                       [ tail
+                       ; { value = { record with block = target }
+                         ; revision = "target-2"
+                         ; depth = 0
+                         ; parent = page.uuid
+                         }
+                       ])
+                ; next_cursor = None
+                }))
+    in
+    Alcotest.(check int) "terminal page stops reading" 0 (List.length completed.requests);
+    let first_response = List.hd completed.responses in
+    match result, kind, first_response.payload with
+    | Cursor_failed, _, Mutation_failed { failure = Worker_failure failure; _ } ->
+      Alcotest.(check bool)
+        "cursor failure category is preserved"
+        true
+        (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
+    | Missing, Delete_conflict, Subtree_deleted { deleted_count = 0; _ } -> ()
+    | ( Missing
+      , (Capture | Update | Update_conflict)
+      , Mutation_failed { failure = Projection_failure _; _ } ) -> ()
+    | Found, Capture, Block_captured { block = actual; _ }
+    | Found, Update, Block_updated { block = actual; _ }
+    | Found, Update_conflict, Update_conflict actual
+    | Found, Delete_conflict, Delete_conflict actual ->
+      Alcotest.(check string)
+        "authoritative target"
+        "Committed target"
+        (Journal_model.source actual);
+      if kind = Delete_conflict
+      then (
+        match List.tl completed.responses with
+        | [ { payload = Page_tree_reconciled { value; _ } } ] ->
+          Alcotest.(check int)
+            "reconciliation retains the entire prefix"
+            (Protocol.maximum_page_size + 2)
+            (List.length value.entries)
+        | _ -> Alcotest.fail "delete conflict omitted prefix reconciliation")
+    | _ -> Alcotest.fail "unexpected paged mutation completion")
+;;
+
+(* F3 is owned by the public Runtime request/completion boundary. The original
+   RED phase used wire representations before the new command existed,
+   so baseline tests fail on the emitted read rather than missing OCaml types. *)
+let target_refresh kind =
+  match kind with
+  | `Capture -> prepare_paged_refresh Capture
+  | `Update -> prepare_paged_refresh Update
+  | `Status ->
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    seed_feed runtime;
+    let mutation =
+      Runtime.submit
+        runtime
+        (Journal_graph_request.Set_task_state
+           { mutation_id = "a1000000-0000-4000-a000-000000000072"
+           ; block_id = Graph.Uuid.to_string block_uuid
+           ; expected_revision = "block-1"
+           ; task_state = Done
+           })
+      |> fun output -> only "status mutation" output.requests
+    in
+    let refresh =
+      Runtime.receive
+        runtime
+        (response
+           mutation
+           (Protocol.V2_mutation_committed
+              { mutation_id = uuid "a1000000-0000-4000-a000-000000000072"
+              ; status = V2_applied
+              ; generation = "graph-1"
+              ; before_projection_revision = "projection-1"
+              ; after_projection_revision = "projection-2"
+              }))
+      |> fun output -> only "status confirmation" output.requests
+    in
+    runtime, page, refresh
+;;
+
+let summary_children ?(page = page_uuid) count =
+  List.init count (fun index ->
+    let child =
+      { block with
+        uuid = uuid (Printf.sprintf "a1000000-0000-4000-b000-%012d" index)
+      ; page
+      ; parent = block_uuid
+      ; order = Printf.sprintf "b%04d" index
+      ; title = Printf.sprintf "Canonical child %d" index
+      }
+    in
+    Protocol.{ value = { record with block = child }; revision = "child-2" })
+;;
+
+let test_target_confirmation kind title count =
+  let runtime, page, refresh = target_refresh kind in
+  check_target_summary refresh None;
+  let canonical =
+    { record with
+      block = { block with page = page.uuid; parent = page.uuid; title; order = "z" }
+    }
+  in
+  let children = summary_children ~page:page.uuid count in
+  let complete =
+    Runtime.receive
+      runtime
+      (summary_response
+         refresh
+         page
+         (V2_present_block { value = canonical; revision = "canonical-2" })
+         children
+         None
+         "projection-2")
+  in
+  Alcotest.(check int)
+    "target completion does not read siblings"
+    0
+    (List.length complete.requests);
+  let payload = (only "target completion" complete.responses).payload in
+  let actual, entry =
+    match kind, payload with
+    | `Capture, Runtime.Block_captured { block; timeline_entry_update }
+    | (`Update | `Status), Runtime.Block_updated { block; timeline_entry_update } ->
+      block, timeline_entry_update
+    | _ -> Alcotest.fail "target completion lost mutation ownership"
+  in
+  Alcotest.(check string) "canonical stored source" title (Journal_model.source actual);
+  Alcotest.(check string)
+    "canonical revision"
+    "canonical-2"
+    (Journal_model.revision actual);
+  Alcotest.(check int) "canonical children count" count (Journal_model.child_count actual);
+  (match entry with
+   | Some entry ->
+     Alcotest.(check int)
+       "canonical child summaries"
+       count
+       (List.length entry.child_summaries)
+   | None -> Alcotest.(check string) "blank root is not fabricated as visible" "" title);
+  let duplicate =
+    Runtime.receive
+      runtime
+      (summary_response
+         refresh
+         page
+         (V2_present_block { value = canonical; revision = "canonical-2" })
+         children
+         None
+         "projection-2")
+  in
+  Alcotest.(check int) "completion is consumed once" 0 (List.length duplicate.responses)
+;;
+
+let test_target_children_continue () =
+  let runtime, page, refresh = target_refresh `Capture in
+  let canonical =
+    { record with
+      block =
+        { block with page = page.uuid; parent = page.uuid; title = "Canonical root" }
+    }
+  in
+  let lookup =
+    Protocol.V2_present_block { value = canonical; revision = "canonical-2" }
+  in
+  let children = summary_children ~page:page.uuid 201 in
+  let current = ref refresh in
+  let previous_cursor = ref None in
+  let completion = ref Runtime.{ requests = []; responses = [] } in
+  for batch = 0 to 4 do
+    check_target_summary !current !previous_cursor;
+    let items =
+      List.filteri
+        (fun index _ ->
+           index >= batch * Protocol.default_page_size
+           && index < (batch + 1) * Protocol.default_page_size)
+        children
+    in
+    let cursor =
+      if batch = 4
+      then None
+      else
+        Some
+          (Graph.Cursor.of_string (Printf.sprintf "target-children-%d" batch)
+           |> Result.get_ok)
+    in
+    let output =
+      Runtime.receive
+        runtime
+        (summary_response !current page lookup items cursor "projection-2")
+    in
+    if batch < 4
+    then (
+      Alcotest.(check int)
+        "partial target children do not complete Capture"
+        0
+        (List.length output.responses);
+      current := only "target child continuation" output.requests;
+      previous_cursor := cursor)
+    else completion := output
+  done;
+  match (only "all canonical children" !completion.responses).payload with
+  | Block_captured { block; timeline_entry_update = Some entry } ->
+    Alcotest.(check int)
+      "child count is not truncated"
+      201
+      (Journal_model.child_count block);
+    Alcotest.(check int)
+      "all target child summaries"
+      201
+      (List.length entry.child_summaries)
+  | _ -> Alcotest.fail "Capture lost its canonical children"
+;;
+
+let test_target_terminal kind terminal =
+  let runtime, page, refresh = target_refresh kind in
+  check_target_summary refresh None;
+  let completion =
+    match terminal with
+    | `Missing ->
+      summary_response
+        refresh
+        page
+        (V2_missing_block { uuid = block_uuid; revision = "missing" })
+        []
+        None
+        "projection-2"
+    | `Failure ->
+      response
+        refresh
+        (Protocol.V2_failed { code = "ClosedSession"; message = "read unavailable" })
+    | `Reset ->
+      Runtime.reset runtime;
+      summary_response
+        refresh
+        page
+        (V2_missing_block { uuid = block_uuid; revision = "missing" })
+        []
+        None
+        "projection-2"
+  in
+  let output = Runtime.receive runtime completion in
+  if terminal = `Reset
+  then
+    Alcotest.(check int) "old graph completion ignored" 0 (List.length output.responses)
+  else (
+    match (only "owned target failure" output.responses).payload with
+    | Runtime.Mutation_failed { kind = actual; block_id; _ } ->
+      Alcotest.(check bool)
+        "mutation kind preserved"
+        true
+        (actual
+         =
+         if kind = `Capture
+         then Capture_mutation
+         else if kind = `Status
+         then Status_mutation
+         else Source_mutation);
+      Alcotest.(check string)
+        "mutation block identity"
+        (Graph.Uuid.to_string block_uuid)
+        block_id
+    | _ -> Alcotest.fail "target failure lost admitted mutation identity")
+;;
+
+let test_target_version_fence () =
+  let runtime, page, refresh = target_refresh `Capture in
+  check_target_summary refresh None;
+  let canonical =
+    { record with block = { block with page = page.uuid; parent = page.uuid } }
+  in
+  let lookup =
+    Protocol.V2_present_block { value = canonical; revision = "canonical-2" }
+  in
+  let cursor = Graph.Cursor.of_string "target-children-next" |> Result.get_ok in
   let first =
     Runtime.receive
       runtime
-      (response
+      (summary_response
          refresh
-         (V2_page_tree_outcome
-            { page = page.uuid
-            ; maximum_depth = 1
-            ; items = prefix
-            ; next_cursor = Some cursor
-            }))
+         page
+         lookup
+         (summary_children ~page:page.uuid Protocol.default_page_size)
+         (Some cursor)
+         "projection-2")
   in
-  Alcotest.(check int)
-    "a partial prefix cannot complete or reject the mutation"
-    0
-    (List.length first.responses);
-  let continuation = only "next authoritative page" first.requests in
-  (match continuation.command with
-   | V2_get_page_tree { page = actual; cursor = Some actual_cursor; _ } ->
-     Alcotest.(check bool) "same journal" true (Graph.Uuid.equal actual page.uuid);
-     Alcotest.(check string)
-       "opaque cursor forwarded"
-       (Graph.Cursor.to_string cursor)
-       (Graph.Cursor.to_string actual_cursor)
-   | _ -> Alcotest.fail "refresh did not continue its read without replaying the mutation");
-  let target =
-    { block with
-      page = page.uuid
-    ; parent = page.uuid
-    ; order = "a1"
-    ; title = "Committed target"
-    }
+  let continuation = only "target child continuation" first.requests in
+  let result =
+    Runtime.receive
+      runtime
+      (summary_response continuation page lookup [] None "projection-3")
   in
-  let completed =
+  Alcotest.(check bool)
+    "different snapshots cannot complete mixed Capture"
+    false
+    (List.exists
+       (fun value ->
+          match value.Runtime.payload with
+          | Block_captured _ -> true
+          | _ -> false)
+       result.responses);
+  let retry = only "fresh canonical target retry" result.requests in
+  check_target_summary retry None
+;;
+
+let test_target_rejects_wrong_identity () =
+  let runtime, page, refresh = target_refresh `Update in
+  check_target_summary refresh None;
+  let output =
+    Runtime.receive
+      runtime
+      (summary_response
+         refresh
+         page
+         (V2_present_block
+            { value = { record with block = { block with uuid = unrelated_uuid } }
+            ; revision = "foreign"
+            })
+         []
+         None
+         "projection-2")
+  in
+  match (only "foreign target failure" output.responses).payload with
+  | Runtime.Mutation_failed _ -> ()
+  | _ -> Alcotest.fail "foreign canonical block cannot confirm admitted target"
+;;
+
+let asset_type_property : Graph.property_summary =
+  { ident = "logseq.property.asset/type"
+  ; uuid = uuid "a1000000-0000-4000-b000-000000000999"
+  ; title = "Asset type"
+  ; schema = { property_type = String; cardinality = One; hidden = false; public = false }
+  ; values = [ String_value "png" ]
+  ; values_truncated = false
+  }
+;;
+
+let test_target_blank_image_and_deep_child () =
+  List.iter
+    (fun child_target ->
+       let runtime, page, refresh = target_refresh `Update in
+       check_target_summary refresh None;
+       let canonical =
+         { record with
+           block =
+             { block with
+               title = ""
+             ; page = page.uuid
+             ; parent = (if child_target then unrelated_uuid else page.uuid)
+             }
+         }
+       in
+       let image = List.hd (summary_children 1) in
+       let image =
+         { image with
+           value =
+             { image.value with
+               block = { image.value.block with properties = [ asset_type_property ] }
+             }
+         }
+       in
+       let output =
+         Runtime.receive
+           runtime
+           (summary_response
+              refresh
+              page
+              (V2_present_block { value = canonical; revision = "canonical-2" })
+              [ image ]
+              None
+              "projection-2")
+       in
+       match
+         (only "canonical blank/image or deep child completion" output.responses).payload
+       with
+       | Runtime.Block_updated { block; timeline_entry_update } ->
+         Alcotest.(check int)
+           "canonical target has its child"
+           1
+           (Journal_model.child_count block);
+         Alcotest.(check bool)
+           "only journal roots create timeline entries"
+           (not child_target)
+           (Option.is_some timeline_entry_update)
+       | _ -> Alcotest.fail "deep child or blank image target was not confirmed")
+    [ false; true ]
+;;
+
+let test_target_stale_recovery_is_bounded () =
+  let runtime, _, refresh = target_refresh `Capture in
+  check_target_summary refresh None;
+  let stale request =
+    response
+      request
+      (Protocol.V2_failed { code = "staleReadCursor"; message = "Concurrent projection" })
+  in
+  let current = ref refresh in
+  for _ = 1 to 2 do
+    let output = Runtime.receive runtime (stale !current) in
+    Alcotest.(check int)
+      "retry does not prematurely complete Capture"
+      0
+      (List.length output.responses);
+    current := only "bounded fresh target retry" output.requests;
+    check_target_summary !current None
+  done;
+  let exhausted = Runtime.receive runtime (stale !current) in
+  Alcotest.(check int) "stale retries stop" 0 (List.length exhausted.requests);
+  match (only "owned retry exhaustion" exhausted.responses).payload with
+  | Runtime.Mutation_failed { kind = Capture_mutation; _ } -> ()
+  | _ -> Alcotest.fail "stale retry exhaustion lost Capture owner"
+;;
+
+let test_target_newer_confirmation_fences_old () =
+  let runtime, page, old_read = target_refresh `Update in
+  check_target_summary old_read None;
+  let mutation =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Update_source
+         { mutation_id = "a1000000-0000-4000-a000-000000000073"
+         ; block_id = Graph.Uuid.to_string block_uuid
+         ; expected_revision = "block-1"
+         ; source = "Newer intent"
+         })
+    |> fun output -> only "newer admitted update" output.requests
+  in
+  let newer_read =
     Runtime.receive
       runtime
       (response
-         continuation
-         (match result with
-          | Cursor_failed ->
-            V2_failed
-              { code = Logseq_db_worker.Error.code_string Stale_read_cursor
-              ; message = "The graph changed during refresh"
-              }
-          | Found | Missing ->
-            V2_page_tree_outcome
-              { page = page.uuid
-              ; maximum_depth = 1
-              ; items =
-                  (if result = Missing
-                   then [ tail ]
-                   else
-                     [ tail
-                     ; { value = { record with block = target }
-                       ; revision = "target-2"
-                       ; depth = 0
-                       ; parent = page.uuid
-                       }
-                     ])
-              ; next_cursor = None
-              }))
+         mutation
+         (Protocol.V2_mutation_committed
+            { mutation_id = uuid "a1000000-0000-4000-a000-000000000073"
+            ; status = V2_applied
+            ; generation = "graph-1"
+            ; before_projection_revision = "projection-2"
+            ; after_projection_revision = "projection-3"
+            }))
+    |> fun output -> only "newer confirmation" output.requests
   in
-  Alcotest.(check int) "terminal page stops reading" 0 (List.length completed.requests);
-  let first_response = List.hd completed.responses in
-  match result, kind, first_response.payload with
-  | Cursor_failed, _, Mutation_failed { failure = Worker_failure failure; _ } ->
+  check_target_summary newer_read None;
+  let canonical title revision request =
+    summary_response
+      request
+      page
+      (V2_present_block
+         { value =
+             { record with
+               block = { block with title; page = page.uuid; parent = page.uuid }
+             }
+         ; revision
+         })
+      []
+      None
+      "projection-3"
+  in
+  ignore (Runtime.receive runtime (canonical "Newer stored" "canonical-3" newer_read));
+  let late = Runtime.receive runtime (canonical "Older stored" "canonical-2" old_read) in
+  Alcotest.(check bool)
+    "superseded read cannot overwrite newer canonical state"
+    false
+    (List.exists
+       (fun value ->
+          match value.Runtime.payload with
+          | Block_updated _ -> true
+          | _ -> false)
+       late.responses)
+;;
+
+let test_target_invisible_root_has_timeline_only_removal () =
+  let runtime, page, refresh = target_refresh `Update in
+  check_target_summary refresh None;
+  let canonical =
+    { record with
+      block = { block with title = ""; page = page.uuid; parent = page.uuid }
+    }
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (summary_response
+         refresh
+         page
+         (V2_present_block { value = canonical; revision = "canonical-2" })
+         []
+         None
+         "projection-2")
+  in
+  Alcotest.(check int)
+    "canonical blank title confirms using existing presentation semantics"
+    1
+    (List.length output.responses);
+  Alcotest.(check bool)
+    "visibility is not deletion of the detail or child"
+    false
+    (List.exists
+       (fun value ->
+          match value.Runtime.payload with
+          | Block_removed _ -> true
+          | _ -> false)
+       output.responses)
+;;
+
+let test_target_confirmation_retains_page_interest completed =
+  let runtime, page, refresh = target_refresh `Capture in
+  check_target_summary refresh None;
+  let canonical =
+    { record with block = { block with page = page.uuid; parent = page.uuid } }
+  in
+  if completed
+  then
+    ignore
+      (Runtime.receive
+         runtime
+         (summary_response
+            refresh
+            page
+            (V2_present_block { value = canonical; revision = "canonical-2" })
+            []
+            None
+            "projection-2"));
+  let output =
+    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page.uuid ] ())
+  in
+  require_ack output;
+  match hydration_requests output with
+  | [ { Protocol.command = V2_get_page_tree { page = actual; maximum_depth = 1; _ }; _ } ]
+    ->
     Alcotest.(check bool)
-      "cursor failure category is preserved"
+      "new Capture page remains subscribed to structural changes"
       true
-      (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
-  | Missing, Delete_conflict, Subtree_deleted { deleted_count = 0; _ } -> ()
-  | ( Missing
-    , (Capture | Update | Update_conflict)
-    , Mutation_failed { failure = Projection_failure _; _ } ) -> ()
-  | Found, Capture, Block_captured { block = actual; _ }
-  | Found, Update, Block_updated { block = actual; _ }
-  | Found, Update_conflict, Update_conflict actual
-  | Found, Delete_conflict, Delete_conflict actual ->
-    Alcotest.(check string)
-      "authoritative target"
-      "Committed target"
-      (Journal_model.source actual);
-    if kind = Delete_conflict
-    then (
-      match List.tl completed.responses with
-      | [ { payload = Page_tree_reconciled { value; _ } } ] ->
-        Alcotest.(check int)
-          "reconciliation retains the entire prefix"
-          (Protocol.maximum_page_size + 2)
-          (List.length value.entries)
-      | _ -> Alcotest.fail "delete conflict omitted prefix reconciliation")
-  | _ -> Alcotest.fail "unexpected paged mutation completion"
+      (Graph.Uuid.equal actual page.uuid)
+  | requests ->
+    Alcotest.failf
+      "captured page lost its structural interest: %d hydration requests"
+      (List.length requests)
+;;
+
+let test_target_confirmation_retains_child_mutation_context () =
+  let runtime, page, refresh = target_refresh `Capture in
+  let canonical =
+    { record with block = { block with page = page.uuid; parent = page.uuid } }
+  in
+  let children = summary_children ~page:page.uuid 1 in
+  let child = (List.hd children).Protocol.value.block.uuid in
+  ignore
+    (Runtime.receive
+       runtime
+       (summary_response
+          refresh
+          page
+          (V2_present_block { value = canonical; revision = "canonical-2" })
+          children
+          None
+          "projection-2"));
+  let source =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Update_source
+         { mutation_id = "a1000000-0000-4000-a000-000000000074"
+         ; block_id = Graph.Uuid.to_string child
+         ; expected_revision = "child-2"
+         ; source = "Child edited"
+         })
+  in
+  (match source.requests with
+   | [ { Protocol.command = V2_save_block { block; _ }; _ } ] ->
+     Alcotest.(check bool)
+       "canonical child keeps its page for source edits"
+       true
+       (Graph.Uuid.equal block child)
+   | _ -> Alcotest.fail "target summary lost child's mutation context");
+  let status =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Set_task_state
+         { mutation_id = "a1000000-0000-4000-a000-000000000075"
+         ; block_id = Graph.Uuid.to_string child
+         ; expected_revision = "child-2"
+         ; task_state = Done
+         })
+  in
+  match status.requests with
+  | [ { Protocol.command = V2_set_task_status { block; _ }; _ } ] ->
+    Alcotest.(check bool)
+      "canonical child keeps its page for status edits"
+      true
+      (Graph.Uuid.equal block child)
+  | _ -> Alcotest.fail "target summary lost child's status context"
 ;;
 
 let tree_page request items next_cursor =
@@ -2598,6 +3243,68 @@ let () =
             `Quick
             test_feed_with_blank_root_continues
         ] )
+    ; ( "target mutation confirmation"
+      , [ Alcotest.test_case
+            "Capture targeted canonical block and children"
+            `Quick
+            (fun () -> test_target_confirmation `Capture "Stored capture" 3)
+        ; Alcotest.test_case "Update last root does not read siblings" `Quick (fun () ->
+            test_target_confirmation `Update "Stored update" 2)
+        ; Alcotest.test_case "Status targeted confirmation" `Quick (fun () ->
+            test_target_confirmation `Status "Retained block" 0)
+        ; Alcotest.test_case
+            "Blank canonical target completes without fabricated entry"
+            `Quick
+            (fun () -> test_target_confirmation `Update "" 0)
+        ; Alcotest.test_case
+            "Target children paginate independently of siblings"
+            `Quick
+            test_target_children_continue
+        ; Alcotest.test_case
+            "Target child snapshots cannot be mixed"
+            `Quick
+            test_target_version_fence
+        ; Alcotest.test_case
+            "Foreign target is rejected"
+            `Quick
+            test_target_rejects_wrong_identity
+        ; Alcotest.test_case
+            "Blank image and deep child semantics"
+            `Quick
+            test_target_blank_image_and_deep_child
+        ; Alcotest.test_case
+            "Stale target recovery is bounded"
+            `Quick
+            test_target_stale_recovery_is_bounded
+        ; Alcotest.test_case
+            "Newer target confirmation fences old"
+            `Quick
+            test_target_newer_confirmation_fences_old
+        ; Alcotest.test_case
+            "Canonical child mutation context retained"
+            `Quick
+            test_target_confirmation_retains_child_mutation_context
+        ; Alcotest.test_case "Capture page retains structure interest" `Quick (fun () ->
+            test_target_confirmation_retains_page_interest true)
+        ; Alcotest.test_case
+            "Pending Capture page retains structure interest"
+            `Quick
+            (fun () -> test_target_confirmation_retains_page_interest false)
+        ; Alcotest.test_case
+            "Invisible root retains existing completion semantics"
+            `Quick
+            test_target_invisible_root_has_timeline_only_removal
+        ]
+        @ List.concat_map
+            (fun (name, kind) ->
+               List.map
+                 (fun (suffix, terminal) ->
+                    Alcotest.test_case
+                      (name ^ " " ^ suffix)
+                      `Quick
+                      (fun () -> test_target_terminal kind terminal))
+                 [ "missing", `Missing; "failure", `Failure; "graph reset", `Reset ])
+            [ "Capture", `Capture; "Update", `Update; "Status", `Status ] )
     ; ( "paged mutation refresh"
       , List.concat_map
           (fun (name, kind) ->

@@ -1993,3 +1993,53 @@ let scenarios =
         test_asset_submission_history_does_not_retain_completed_effects
     ]
 ;;
+
+(* Missing transport ownership is a runner fact, which a pure Core event cannot
+   reproduce. Exercise its public submission boundary without opening a socket. *)
+let test_pull_without_registered_socket_reports_closed () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let opened, connection, _ = Core_contract.pull_fixture () in
+        let send =
+          List.find_map
+            (function
+              | Core.Run (Core.Send_websocket _ as runnable) -> Some runnable
+              | _ -> None)
+            opened.effects
+          |> Option.get
+        in
+        let posted = ref [] in
+        let deps =
+          dependencies
+            ~environment
+            ~support
+            ~fork:(fun ~sw:_ _ -> fail "a send must not schedule a hidden retry")
+            ()
+        in
+        let runner =
+          Runner.create ~sw deps ~post:(fun event -> posted := event :: !posted)
+          |> Result.get_ok
+        in
+        Runner.submit runner send;
+        Alcotest.(check int)
+          "missing socket posts one transport failure"
+          1
+          (List.length !posted);
+        Alcotest.(check bool)
+          "transport failure retains its connection identity"
+          true
+          (match !posted with
+           | [ Core.Websocket_closed (scope, Some _) ] -> scope = connection
+           | _ -> false);
+        Runner.shutdown runner)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "F5 missing socket send posts a closed fact"
+        `Quick
+        test_pull_without_registered_socket_reports_closed
+    ]
+;;

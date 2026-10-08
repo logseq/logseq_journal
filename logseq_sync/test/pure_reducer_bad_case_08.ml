@@ -27,7 +27,13 @@ let run () =
     |> check_replay "BC08 follow-up" rejected.next fresh_event
   in
   match accepted.effects with
-  | [ Core.Publish (Core.State_changed _); Core.Run (Core.Send_websocket _) ] -> ()
+  | [ Core.Publish (Core.State_changed _)
+    ; Core.Run (Core.Send_websocket send)
+    ; Core.Run (Core.Schedule_timer timer)
+    ]
+    when timer.delay_seconds = 30.
+         && timer.scope.connection_generation = Some send.scope.connection_generation ->
+    ()
   | _ -> Alcotest.fail "BC08 fresh connection was not accepted"
 ;;
 

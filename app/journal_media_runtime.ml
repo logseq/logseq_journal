@@ -10,6 +10,7 @@ type ticket =
       { root : string
       ; epoch : int
       ; request_id : G.Uuid.t
+      ; continuation : bool
       }
   | Lease of
       { root : string
@@ -44,6 +45,7 @@ type group =
   ; epoch : int
   ; mutable visible : bool
   ; mutable owners : Owners.t
+  ; mutable dirty : bool
   ; mutable pending : G.Uuid.t option
   ; mutable cursor : G.Cursor.t option
   ; mutable error : string option
@@ -222,15 +224,22 @@ let next_request_id t =
 ;;
 
 let read t g cursor =
-  if List.length t.queued < 1024
+  if g.pending = None && List.length t.queued < 1024
   then (
     let request_id = next_request_id t in
     let root = G.Uuid.of_string g.root |> Result.get_ok in
     g.pending <- Some request_id;
+    g.dirty <- false;
     g.error <- None;
     enqueue
       t
-      ~ticket:(Query { root = g.root; epoch = g.epoch; request_id })
+      ~ticket:
+        (Query
+           { root = g.root
+           ; epoch = g.epoch
+           ; request_id
+           ; continuation = Option.is_some cursor
+           })
       ~current:(fun () -> current_group t g && g.pending = Some request_id)
       (Service.Graph_request
          { api_version = 2
@@ -238,8 +247,11 @@ let read t g cursor =
          ; command =
              V2_list_assets { recursive = false; roots = [ root ]; limit = 16; cursor }
          }))
-  else g.error <- Some "Attachment requests are busy. Retry shortly."
+  else if g.pending = None
+  then g.error <- Some "Attachment requests are busy. Retry shortly."
 ;;
+
+let ensure_fresh t g = if g.dirty && g.pending = None then read t g None
 
 let reset t ~graph_generation =
   Hashtbl.iter
@@ -280,6 +292,7 @@ let root_visible ?(owner = "default") t ~root visible =
   | Some g, true, Some _ ->
     g.owners <- Owners.add owner g.owners;
     g.visible <- true;
+    ensure_fresh t g;
     pump t
   | None, true, Some _ when Hashtbl.length t.groups < 64 && List.length t.queued < 1024 ->
     (match G.Uuid.of_string root with
@@ -291,6 +304,7 @@ let root_visible ?(owner = "default") t ~root visible =
          ; epoch = t.serial
          ; visible = true
          ; owners = Owners.singleton owner
+         ; dirty = true
          ; pending = None
          ; cursor = None
          ; error = None
@@ -347,7 +361,8 @@ let asset_visible ?(owner = "default") t ~root ~asset visible =
        if visible
        then (
          g.owners <- Owners.add owner g.owners;
-         g.visible <- true);
+         g.visible <- true;
+         ensure_fresh t g);
        c.owners
        <- (if visible then Owners.add owner c.owners else Owners.remove owner c.owners);
        let shown = not (Owners.is_empty c.owners) in
@@ -400,8 +415,8 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
 
 let next t ~root =
   match Hashtbl.find_opt t.groups root with
-  | Some g when g.pending = None && g.cursor <> None ->
-    read t g g.cursor;
+  | Some g when g.pending = None && (g.dirty || g.cursor <> None) ->
+    read t g (if g.dirty then None else g.cursor);
     notify t g;
     pump t
   | _ -> ()
@@ -421,7 +436,12 @@ let retry ?(owner = "default") t ~root ~asset =
 ;;
 
 let refresh t =
-  Hashtbl.iter (fun _ g -> read t g None) t.groups;
+  Hashtbl.iter
+    (fun _ g ->
+       g.dirty <- true;
+       g.cursor <- None;
+       if g.visible then ensure_fresh t g)
+    t.groups;
   pump t
 ;;
 
@@ -434,48 +454,62 @@ let release_stale t ticket result =
 
 let receive t ticket response =
   (match ticket with
-   | Query { root; epoch; request_id } ->
+   | Query { root; epoch; request_id; continuation } ->
      (match Hashtbl.find_opt t.groups root with
       | Some g when g.epoch = epoch && g.pending = Some request_id ->
         g.pending <- None;
-        (match response with
-         | Service.Graph_response
-             (Protocol.V2_response
-                { request_id = actual
-                ; outcome = V2_assets_outcome { items; next_cursor; _ }
-                ; _
-                })
-           when actual = request_id && List.length items <= 16 ->
-           let old = g.controllers in
-           let controllers =
-             List.map
-               (fun asset ->
-                  match List.find_opt (fun c -> c.asset = asset) old with
-                  | Some c -> c
-                  | None ->
-                    t.serial <- t.serial + 1;
-                    { asset
-                    ; consumer = Printf.sprintf "media:%d:%d" epoch t.serial
-                    ; state = P.empty
-                    ; shown = false
-                    ; owners = Owners.empty
-                    })
-               items
-           in
-           List.iter
-             (fun c ->
-                if not (List.exists (fun kept -> kept.consumer = c.consumer) controllers)
-                then (
-                  c.shown <- false;
-                  c.owners <- Owners.empty;
-                  dispatch t g c Hide;
-                  Hashtbl.remove t.consumers c.consumer))
-             old;
-           g.controllers <- controllers;
-           g.cursor <- next_cursor;
-           g.error <- None;
-           List.iter (fun c -> Hashtbl.replace t.consumers c.consumer (g, c)) controllers
-         | _ -> g.error <- Some "Unable to load attachments. Retry.");
+        if g.dirty
+        then (if g.visible then ensure_fresh t g)
+        else (
+          match response with
+          | Service.Graph_response
+              (Protocol.V2_response
+                 { request_id = actual
+                 ; outcome = V2_assets_outcome { items; next_cursor; _ }
+                 ; _
+                 })
+            when actual = request_id && List.length items <= 16 ->
+            let old = g.controllers in
+            let controllers =
+              List.map
+                (fun asset ->
+                   match List.find_opt (fun c -> c.asset = asset) old with
+                   | Some c -> c
+                   | None ->
+                     t.serial <- t.serial + 1;
+                     { asset
+                     ; consumer = Printf.sprintf "media:%d:%d" epoch t.serial
+                     ; state = P.empty
+                     ; shown = false
+                     ; owners = Owners.empty
+                     })
+                items
+            in
+            List.iter
+              (fun c ->
+                 if not (List.exists (fun kept -> kept.consumer = c.consumer) controllers)
+                 then (
+                   c.shown <- false;
+                   c.owners <- Owners.empty;
+                   dispatch t g c Hide;
+                   Hashtbl.remove t.consumers c.consumer))
+              old;
+            g.controllers <- controllers;
+            g.cursor <- next_cursor;
+            g.error <- None;
+            List.iter (fun c -> Hashtbl.replace t.consumers c.consumer (g, c)) controllers
+          | Service.Graph_response
+              (Protocol.V2_response
+                 { request_id = actual; outcome = V2_failed { code; _ }; _ })
+            when actual = request_id
+                 && code = Logseq_db_worker.Error.code_string Stale_read_cursor ->
+            g.cursor <- None;
+            if continuation
+            then (
+              g.dirty <- true;
+              if g.visible then ensure_fresh t g)
+            else g.error <- Some "Unable to load attachments. Retry."
+          | _ -> g.error <- Some "Unable to load attachments. Retry.");
         notify t g
       | _ -> ())
    | Lease { root; epoch; consumer; ticket } ->
@@ -534,6 +568,7 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           ; epoch = t.serial
           ; visible = false
           ; owners = Owners.empty
+          ; dirty = true
           ; pending = None
           ; cursor = None
           ; error = None

@@ -982,11 +982,20 @@ let submit_nonasset t instruction =
       (match Sync_protocol.encode_client_message request.message with
        | Error error -> t.post (Core.Websocket_protocol_error (request.scope, error))
        | Ok payload ->
+         let sent = ref false in
          Hashtbl.iter
            (fun _ (scope, websocket) ->
               if scope = request.scope
-              then ignore (t.dependencies.transport.send_websocket websocket payload))
-           t.websockets)
+              then (
+                sent := true;
+                match t.dependencies.transport.send_websocket websocket payload with
+                | Ok () -> ()
+                | Error message ->
+                  t.post (Core.Websocket_closed (request.scope, Some message))))
+           t.websockets;
+         if not !sent
+         then
+           t.post (Core.Websocket_closed (request.scope, Some "WebSocket is unavailable")))
     | Close_websocket scope ->
       retire_websockets
         ~remove:false

@@ -3565,6 +3565,11 @@ let start
       (Option.bind calendar (fun calendar ->
          Option.map (fun settings -> calendar, settings) !asset_settings))
   in
+  let invalidate_assets () =
+    Journal_media_runtime.refresh media_runtime;
+    if !state_ref.graph_state.phase = Graph_open
+    then Journal_asset_runtime.invalidate asset_runtime
+  in
   let started_graph_generation = ref None in
   let send_manager command =
     Effect.of_thunk (fun () ->
@@ -3884,11 +3889,8 @@ let start
       Journal_media_runtime.reject media_runtime ticket;
       flush_media set_state
     | Worker.Push { payload = Graph_service.Graph_push push; _ } ->
-      Journal_media_runtime.refresh media_runtime;
+      invalidate_assets ();
       let snapshot = !state_ref in
-      if snapshot.graph_state.phase = Graph_open
-      then
-        refresh_assets ~graph_generation:snapshot.graph_state.generation snapshot.calendar;
       let admission_refresh =
         trigger_admission
           set_state_and_effect
@@ -3946,6 +3948,12 @@ let start
         ; outcome = Worker.Completed (Graph_service.Graph_response response)
         ; _
         } ->
+      (match response, Hashtbl.find_opt graph_worker_requests request_id with
+       | ( Logseq_db_worker.Protocol.V2_response
+             { request_id = actual; outcome = V2_resync_required _; _ }
+         , Some expected )
+         when expected.request_id = actual -> invalidate_assets ()
+       | _ -> ());
       Hashtbl.remove graph_worker_requests request_id;
       Hashtbl.remove admission_worker_requests request_id;
       Hashtbl.remove favorites_worker_requests request_id;

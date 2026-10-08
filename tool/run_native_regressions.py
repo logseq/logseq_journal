@@ -38,6 +38,15 @@ def main():
                 path = ROOT / path
             if "/native_backend/" not in str(path):
                 libraries.append(str(path.with_suffix(".cmxa")))
+    # `dune ocaml top` may refresh byte interfaces after the first native build.
+    # Rebuild the native libraries that will actually be linked against them.
+    native_targets = []
+    build_root = ROOT / "_build" / "default"
+    for library in libraries:
+        path = Path(library)
+        if path.is_relative_to(build_root):
+            native_targets.append(str(path.relative_to(build_root)))
+    subprocess.run(["dune", "build", *native_targets], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="journal-native-regression-") as directory:
         directory = Path(directory)
         source = ROOT / "test/macos_mutation_runtime_test.ml"
