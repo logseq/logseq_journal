@@ -528,9 +528,9 @@ let decode_server_fields context message_type fields =
   | unsupported -> error context [] (Unsupported_message_type unsupported)
 ;;
 
-let decode direction decode_fields wire =
+let decode ?maximum direction decode_fields wire =
   let context = { direction; message_type = None } in
-  let maximum = maximum_wire_bytes direction in
+  let maximum = Option.value maximum ~default:(maximum_wire_bytes direction) in
   if String.length wire > maximum
   then error context [] (Limit_exceeded { maximum })
   else (
@@ -546,10 +546,13 @@ let decode direction decode_fields wire =
 ;;
 
 let decode_snapshot_baseline =
-  decode Server (fun context message_type fields ->
-    if message_type = "pull/ok"
-    then required_cursor context [] "t" fields
-    else error context [] (Unsupported_message_type message_type))
+  decode
+    ~maximum:Logseq_db_types.Limits.maximum_snapshot_baseline_response_bytes
+    Server
+    (fun context message_type fields ->
+       if message_type = "pull/ok"
+       then required_cursor context [] "t" fields
+       else error context [] (Unsupported_message_type message_type))
 ;;
 
 let decode_client_message = decode Client decode_client_fields

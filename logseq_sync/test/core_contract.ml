@@ -1107,6 +1107,66 @@ let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
        pulling.effects)
 ;;
 
+let snapshot_baseline_above_websocket_budget_bootstraps () =
+  let requested, _scope = begin_snapshot_bootstrap () in
+  (* Ordinary cursor values and small valid Transit transactions form a valid
+     HTTP pull response larger than a WebSocket frame, within the endpoint budget. *)
+  let transaction =
+    let module Transit = Transit_core.Json in
+    Transit_native.Transit.Json.to_string
+      (Transit.Array
+         [ Transit.Array
+             [ Transit.Keyword "db/add"
+             ; Transit.Int 1
+             ; Transit.Keyword "block/title"
+             ; Transit.String (String.make 16_384 'x')
+             ]
+         ])
+  in
+  let body =
+    Yojson.Safe.to_string
+      (`Assoc
+          [ "type", `String "pull/ok"
+          ; "t", `Int 32
+          ; ( "txs"
+            , `List
+                (List.init 32 (fun index ->
+                   `Assoc [ "t", `Int (index + 1); "tx", `String transaction ])) )
+          ])
+  in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "ordinary %d-byte HTTP fixture exceeds only the WebSocket budget"
+       (String.length body))
+    true
+    (String.length body > Logseq_db_types.Limits.maximum_response_bytes
+     && String.length body <= 64 * 1024 * 1024);
+  let metadata =
+    List.find_map
+      (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
+          Some
+            (Core.step
+               requested.next
+               (Core.Runner_completed (Core.Completion (ticket, Ok body))))
+        | Run _ | Delegate _ | Publish _ -> None)
+      requested.effects
+    |> Option.get
+  in
+  Alcotest.(check bool)
+    "valid HTTP baseline proceeds to snapshot metadata"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
+         | Run _ | Delegate _ | Publish _ -> false)
+       metadata.effects);
+  Alcotest.(check bool)
+    "valid HTTP baseline does not fail bootstrap"
+    false
+    ((Core.state metadata.next).snapshot.sync_phase = Core.Failed)
+;;
+
 let invalid_snapshot_baseline_fails_bootstrap () =
   let requested, _scope = begin_snapshot_bootstrap () in
   let failed =
@@ -4071,6 +4131,10 @@ let unordered_pull_is_rejected () =
 
 let scenarios =
   [ Alcotest.test_case
+      "snapshot baseline retains HTTP response budget"
+      `Quick
+      snapshot_baseline_above_websocket_budget_bootstraps
+  ; Alcotest.test_case
       "numeric cursor decimal boundaries"
       `Quick
       decimal_boundary_pull_is_admitted

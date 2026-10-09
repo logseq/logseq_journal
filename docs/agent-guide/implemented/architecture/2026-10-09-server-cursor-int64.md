@@ -89,6 +89,12 @@ Checked interval arithmetic rejects an overflowing submission before freezing or
 persisting it, including an independent suffix after a definitive rejection.
 The native UI consumers build without changing their cursor display semantics.
 
+The HTTP snapshot baseline retains its existing 64 MiB response budget, shared
+between its transport request and decoder. WebSocket response decoding retains
+its independent 262,144-byte budget. A public Core.step bootstrap regression uses
+ordinary cursor values and a valid larger HTTP pull response; decimal-boundary
+bug regressions remain exclusively at that public reducer boundary.
+
 The migration does not run live account or Simulator acceptance. Repository-wide
 decision validation still reports three pre-existing unrelated document errors;
 this decision is independently validated.
