@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Core = Logseq_sync_pure_reducer.Core
 module Overlay = Logseq_overlay_db.Types
 module Protocol = Logseq_sync_pure_reducer.Sync_protocol
@@ -126,7 +130,7 @@ let connected_fixture () =
       request
     | _ -> Alcotest.fail "connected fixture did not emit exact Attach_graph"
   in
-  let checkpoint = token Overlay.Server_cursor.of_string "server-cursor:v1:0" in
+  let checkpoint = token Overlay.Server_cursor.of_int64 0L in
   let sync_token = token Overlay.sync_token_of_string "sync-token:v1:fixture-0" in
   let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
   let attachment : Core.graph_attachment = { scope = attach_request.scope; sync } in
@@ -141,10 +145,12 @@ let connected_fixture () =
   (match opened.effects with
    | [ Core.Publish (Core.State_changed _)
      ; Core.Run
-         (Core.Send_websocket { scope; message = Protocol.Client.Pull { since = Some 0 } })
+         (Core.Send_websocket
+            { scope; message = Protocol.Client.Pull { since = Some since } })
      ; Core.Run (Core.Schedule_timer timer)
      ]
      when scope = connection
+          && Logseq_db_types.Server_cursor.equal since Logseq_db_types.Server_cursor.zero
           && timer.delay_seconds = 30.
           && timer.scope.connection_generation = Some connection.connection_generation ->
      ()
@@ -158,7 +164,9 @@ let current_connected_fixture () =
     Core.step
       fixture.opened.next
       (Core.Websocket_message
-         (fixture.connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] }))
+         ( fixture.connection
+         , Protocol.Server.Pull_ok
+             { t = server_cursor_of_int 0; checksum = None; txs = [] } ))
   in
   (match current.effects with
    | [ Core.Publish (Core.State_changed state) ]
@@ -201,7 +209,7 @@ let pending_submission_fixture () =
      ()
    | _ -> Alcotest.fail "pending submission fixture did not inspect sync state");
   let mutation_id = List.hd mutation_ids in
-  let checkpoint = token Overlay.Server_cursor.of_string "server-cursor:v1:0" in
+  let checkpoint = token Overlay.Server_cursor.of_int64 0L in
   let expected = token Overlay.sync_token_of_string "sync-token:v1:bad-case-before" in
   let sync = queued_sync expected checkpoint mutation_id in
   let planned = Core.step changed.next (Core.Sync_inspected { scope; sync }) in

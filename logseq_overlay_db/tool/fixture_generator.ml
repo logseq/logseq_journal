@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Graph = Logseq_db_types.Graph_types
 module Types = Logseq_overlay_db.Types
 
@@ -162,7 +166,7 @@ let seed_mirror ~application_support_directory ~block_count =
     Logseq_db_types.Sync_checkpoint.create
       ~graph_id
       ~schema:Graph.{ major = 65; minor = 33 }
-      ~applied_server_t:0
+      ~applied_server_t:(server_cursor_of_int 0)
       ~checksum:"0000000000000000"
     |> Result.get_ok
   in

@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Database = Logseq_overlay_db.Database
 module T = Test_support
 module Types = Logseq_overlay_db.Types
@@ -47,7 +51,8 @@ let page_precondition database page behavior =
 ;;
 
 let server_cursor value =
-  Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" value)
+  Server_cursor.of_int64 (Int64.of_int value)
+  |> Result.map_error (fun `Negative_cursor -> "negative cursor")
   |> T.require_ok ~behavior:"construct server cursor"
 ;;
 
@@ -1435,7 +1440,8 @@ let authoritative_checkpoint_and_root_survive_reopen () =
           |> T.require_ok ~behavior
         in
         let cursor =
-          Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior
+          Server_cursor.of_int64 1L
+          |> Result.map_error (fun `Negative_cursor -> "negative cursor") |> T.require_ok ~behavior
         in
         let batch =
           authoritative_batch
@@ -2589,4 +2595,109 @@ let cases =
   ]
 ;;
 
-let () = Alcotest.run "logseq_overlay_db storage" [ "mirror and durability", cases ]
+(* The database owns interval freezing; the reducer only requests this transition.
+   Exercise its public mutation and outbox boundaries without injected results. *)
+let submit_interval_overflow_is_rejected () =
+  let behavior = "submit interval overflow is rejected before freezing" in
+  T.with_temp_directory "cursor-overflow-" (fun support ->
+    let path = T.seed_mirror support in
+    let sqlite = Sqlite3.db_open path in
+    let module Store = Logseq_db_storage.Sync_checkpoint_store in
+    let metadata = Store.read_database sqlite |> Result.get_ok in
+    let metadata =
+      { metadata with
+        applied_server_t = Server_cursor.of_int64 Int64.max_int |> Result.get_ok
+      }
+    in
+    Store.update_database sqlite metadata |> Result.get_ok;
+    T.require (Sqlite3.db_close sqlite) "checkpoint handle closes";
+    Eio_posix.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let dependencies = T.dependencies ~behavior in
+        let open_database () =
+          Database.open_
+            ~sw
+            dependencies
+            (inspect_mirror support behavior)
+            ~graph_name:"overflow"
+          |> T.require_ok ~behavior
+        in
+        let database = open_database () in
+        Database.commit_local
+          database
+          ~expected:(T.insert_precondition database ~parent:T.page_uuid ~behavior)
+          (T.insert_blocks ~ordinal:200 ())
+        |> T.require_ok ~behavior
+        |> ignore;
+        let view = Database.inspect_sync database |> T.require_ok ~behavior in
+        (match
+           Database.begin_outbox_transition
+             database
+             ~expected:(sync_view_token view)
+             (Submit_group [ T.mutation_uuid 200 ])
+         with
+         | Error (Outbox_transition_invalid _) -> ()
+         | _ -> Alcotest.fail "overflowing submit interval was accepted");
+        Database.close database |> T.require_ok ~behavior;
+        let reopened = open_database () in
+        let view = Database.inspect_sync reopened |> T.require_ok ~behavior in
+        T.require
+          (List.for_all
+             (fun member -> member.state = Queued)
+             (sync_view_submissions view))
+          "overflow rejection preserves queued outbox after reopen";
+        Database.close reopened |> T.require_ok ~behavior)))
+;;
+
+let sqlite_full_int64_checkpoint () =
+  let module Checkpoint = Logseq_db_types.Sync_checkpoint in
+  let module Store = Logseq_db_storage.Sync_checkpoint_store in
+  let sqlite = Sqlite3.db_open ":memory:" in
+  Fun.protect
+    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    (fun () ->
+       let metadata =
+         Checkpoint.create
+           ~graph_id:T.graph_uuid
+           ~schema:Logseq_db_types.Graph_types.{ major = 1; minor = 0 }
+           ~applied_server_t:(server_cursor_of_int 0)
+           ~checksum:"0000000000000000"
+         |> Result.get_ok
+       in
+       Store.initialize_database sqlite metadata |> Result.get_ok;
+       Sqlite3.exec sqlite "UPDATE sync_meta SET applied_server_t = 9223372036854775807"
+       |> Sqlite3.Rc.check;
+       let restored = Store.read_database sqlite |> Result.get_ok in
+       Alcotest.(check int64)
+         "SQLite reads the complete int64 value"
+         Int64.max_int
+         (Server_cursor.to_int64 restored.applied_server_t);
+       let next =
+         { restored with
+           applied_server_t =
+             Server_cursor.of_int64 (Int64.pred Int64.max_int) |> Result.get_ok
+         }
+       in
+       Store.update_database sqlite next |> Result.get_ok;
+       let roundtrip = Store.read_database sqlite |> Result.get_ok in
+       T.require
+         (Server_cursor.equal next.applied_server_t roundtrip.applied_server_t)
+         "SQLite update preserves the complete cursor")
+;;
+
+let () =
+  Alcotest.run
+    "logseq_overlay_db storage"
+    [ ( "cursor checkpoint"
+      , [ Alcotest.test_case
+            "submit interval overflow is rejected"
+            `Quick
+            submit_interval_overflow_is_rejected
+        ; Alcotest.test_case
+            "SQLite full int64 checkpoint"
+            `Quick
+            sqlite_full_int64_checkpoint
+        ] )
+    ; "mirror and durability", cases
+    ]
+;;

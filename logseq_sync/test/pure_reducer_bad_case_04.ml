@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 open Pure_reducer_bad_case_support
 
 (* Scenario: WebSocket_opened is replayed for an already live connection. The
@@ -9,7 +13,9 @@ let run () =
   let rejected =
     check_step "BC04" fixture.opened.next event (observe fixture.opened.next) []
   in
-  let message = Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] } in
+  let message =
+    Protocol.Server.Pull_ok { t = server_cursor_of_int 0; checksum = None; txs = [] }
+  in
   let follow_up = Core.Websocket_message (fixture.connection, message) in
   let accepted =
     Core.step rejected.next follow_up

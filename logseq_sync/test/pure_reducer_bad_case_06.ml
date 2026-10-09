@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 open Pure_reducer_bad_case_support
 
 (* Scenario: An authoritative apply completion arrives without a pending apply.
@@ -6,7 +10,7 @@ open Pure_reducer_bad_case_support
 let run () =
   let fixture = connected_fixture () in
   let scope = fixture.connection.graph in
-  let cursor1 = token Overlay.Server_cursor.of_string "server-cursor:v1:1" in
+  let cursor1 = token Overlay.Server_cursor.of_int64 1L in
   let sync_token = token Overlay.sync_token_of_string "sync-token:v1:bc06" in
   let generation = token Overlay.Generation.of_string "generation:v1:6" in
   let projection = token Overlay.Projection_revision.of_string "projection:v1:6" in
@@ -28,12 +32,13 @@ let run () =
     check_step "BC06" fixture.opened.next completion (observe fixture.opened.next) []
   in
   let remote_tx : Protocol.Server.pull_transaction =
-    { t = 1; tx = "[]"; outliner_op = None }
+    { t = server_cursor_of_int 1; tx = "[]"; outliner_op = None }
   in
   let request_event =
     Core.Websocket_message
       ( fixture.connection
-      , Protocol.Server.Pull_ok { t = 1; checksum = None; txs = [ remote_tx ] } )
+      , Protocol.Server.Pull_ok
+          { t = server_cursor_of_int 1; checksum = None; txs = [ remote_tx ] } )
   in
   let requested = Core.step rejected.next request_event in
   (match requested.effects with
@@ -42,7 +47,7 @@ let run () =
   let accepted = Core.step requested.next completion in
   match accepted.effects with
   | [ Core.Publish (Core.State_changed state) ]
-    when state.snapshot.applied_server_t = Some 1 -> ()
+    when state.snapshot.applied_server_t = Some (server_cursor_of_int 1) -> ()
   | _ -> Alcotest.fail "BC06 exact authoritative completion was not accepted"
 ;;
 

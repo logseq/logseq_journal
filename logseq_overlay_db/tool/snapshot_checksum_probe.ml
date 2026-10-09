@@ -170,7 +170,9 @@ let sample ~verify ~root ~name ~graph_id ~path ~expected_rows ~expected ~retry i
         inspection
         ~path
         ~applied_server_cursor:
-          (T.Server_cursor.of_string "server-cursor:v1:0" |> ok "cursor")
+          (T.Server_cursor.of_int64 0L
+           |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+           |> ok "cursor")
         ~expected_checksum:expected
         ~expected_rows
       |> ok "prepare")

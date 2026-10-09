@@ -79,7 +79,11 @@ let point_reads_preserve_property_summaries database =
     |> encoded_transaction_of_string ~maximum_bytes:4_096
     |> T.require_ok ~behavior
   in
-  let cursor = Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior in
+  let cursor =
+    Server_cursor.of_int64 1L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> T.require_ok ~behavior
+  in
   let batch =
     authoritative_batch
       ~maximum_count:16
@@ -484,7 +488,9 @@ let verify_continuation_above_maximum_offset_fails_the_page database =
     |> T.require_ok ~behavior
   in
   let server_cursor =
-    Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior
+    Server_cursor.of_int64 1L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> T.require_ok ~behavior
   in
   let batch =
     authoritative_batch
@@ -779,7 +785,11 @@ let indexed_journals_preserve_selection database =
     |> encoded_transaction_of_string ~maximum_bytes:262144
     |> T.require_ok ~behavior
   in
-  let cursor = Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior in
+  let cursor =
+    Server_cursor.of_int64 1L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> T.require_ok ~behavior
+  in
   let batch =
     authoritative_batch
       ~maximum_count:16
@@ -918,7 +928,8 @@ let page_tree_preserves_valid_windows_and_snapshots database =
       |> T.require_ok ~behavior
     in
     let cursor =
-      Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" number)
+      Server_cursor.of_int64 (Int64.of_int number)
+      |> Result.map_error (fun `Negative_cursor -> "negative cursor")
       |> T.require_ok ~behavior
     in
     let batch =
@@ -1095,7 +1106,8 @@ let favorites_resolve_order_filter_and_snapshot database =
       |> T.require_ok ~behavior
     in
     let cursor =
-      Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" number)
+      Server_cursor.of_int64 (Int64.of_int number)
+      |> Result.map_error (fun `Negative_cursor -> "negative cursor")
       |> T.require_ok ~behavior
     in
     let batch =

@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 open Pure_reducer_bad_case_support
 
 (* Scenario: A server message arrives after its WebSocket connection closed.
@@ -9,7 +13,9 @@ let run () =
   let closed = Core.step fixture.opened.next closed_event in
   let late_message =
     Core.Websocket_message
-      (fixture.connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] })
+      ( fixture.connection
+      , Protocol.Server.Pull_ok { t = server_cursor_of_int 0; checksum = None; txs = [] }
+      )
   in
   let rejected = check_step "BC05" closed.next late_message (observe closed.next) [] in
   let recovery_event =

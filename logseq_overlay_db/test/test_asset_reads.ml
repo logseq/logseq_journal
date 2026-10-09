@@ -17,7 +17,9 @@ let apply database number ops =
     |> get
   in
   let cursor =
-    Types.Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" number) |> get
+    Types.Server_cursor.of_int64 (Int64.of_int number)
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> get
   in
   let batch =
     Types.authoritative_batch

@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
 let fail format = Printf.ksprintf failwith format
@@ -91,7 +95,7 @@ let startup_snapshot
     { sync_phase
     ; catalog = []
     ; selected_graph = Some graph_id
-    ; applied_server_t = Some 11
+    ; applied_server_t = Some (server_cursor_of_int 11)
     ; timeline_presentation_pending
     ; startup =
         { authenticated

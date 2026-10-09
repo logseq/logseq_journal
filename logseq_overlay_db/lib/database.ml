@@ -131,7 +131,7 @@ type t =
   ; mutable sync_revision : int
   ; mutable durable_sync_revision : int
   ; mutable durable_outbox : Logseq_db_storage.Sync_outbox_store.row Uuid_map.t
-  ; mutable checkpoint : int
+  ; mutable checkpoint : Types.server_cursor
   ; mutable checkpoint_metadata : Logseq_db_types.Sync_checkpoint.t
   ; mutable subscriptions : subscription list
   ; mutable snapshots : snapshot list
@@ -280,10 +280,6 @@ let absent_mirror_generation path =
     (Digestif.SHA256.digest_string ("absent:" ^ path) |> Digestif.SHA256.to_hex)
 ;;
 
-let server_cursor value =
-  token Types.Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" value)
-;;
-
 let dependencies ~epoch_ms ~monotonic_ns ~limits =
   let values =
     [ "response_budget_bytes", limits.response_budget_bytes
@@ -346,7 +342,7 @@ let inspect_durable_mirror (location : durable_mirror_location) =
               Types.Available
                 { generation = mirror_generation_for_path location.database_path
                 ; graph_uuid = checkpoint.graph_id
-                ; checkpoint = server_cursor checkpoint.applied_server_t
+                ; checkpoint = checkpoint.applied_server_t
                 ; checksum =
                     Types.Checksum.of_string ("checksum:v1:" ^ checkpoint.checksum)
                     |> Result.to_option
@@ -386,11 +382,16 @@ let checksum_value checksum =
   | _ -> value
 ;;
 
-let cursor_value cursor =
-  let value = Types.Server_cursor.to_string cursor in
-  match String.split_on_char ':' value with
-  | [ "server-cursor"; "v1"; ordinal ] -> int_of_string ordinal
-  | _ -> invalid_arg "invalid server cursor"
+(* Submission ordinals are small local offsets, not server cursors. Keep the
+   checked interval arithmetic here; authoritative progress never narrows to int. *)
+let advance_cursor cursor count =
+  let value = Types.Server_cursor.to_int64 cursor in
+  let count = Int64.of_int count in
+  if count < 0L || value > Int64.sub Int64.max_int count
+  then Error "server cursor interval overflows int64"
+  else
+    Types.Server_cursor.of_int64 (Int64.add value count)
+    |> Result.map_error (fun `Negative_cursor -> "negative server cursor interval")
 ;;
 
 let protected_snapshot_datoms database =
@@ -621,7 +622,7 @@ let persist_snapshot_activation preparation =
               Logseq_db_types.Sync_checkpoint.create
                 ~graph_id:preparation.snapshot_inspection.location.graph_id
                 ~schema:(Mirror.schema preparation.snapshot_staging)
-                ~applied_server_t:(cursor_value preparation.snapshot_cursor)
+                ~applied_server_t:preparation.snapshot_cursor
                 ~checksum:digest
               |> Result.map_error (fun _message -> Types.Snapshot_state_error)
             in
@@ -2010,7 +2011,7 @@ let inspect_admission database =
              + Option.fold
                  ~none:0
                  ~some:(fun cursor ->
-                   String.length (Types.Server_cursor.to_string cursor))
+                   String.length (Persistence_json.server_cursor_to_string cursor))
                  record.observed_origin_cursor)
           0
           database.outbox
@@ -4260,14 +4261,15 @@ let outbox_record_is_canonical (record : outbox_record) =
       record.submission_t_before, record.submission_ordinal, record.submission_count
     with
     | None, None, None -> Some None
-    | Some t_before, Some ordinal, Some count when count > 0 && ordinal < count ->
-      Some (Some (cursor_value t_before + ordinal + 1))
+    | Some t_before, Some ordinal, Some count
+      when count > 0 && ordinal >= 0 && ordinal < count ->
+      Result.to_option (advance_cursor t_before (ordinal + 1)) |> Option.map Option.some
     | _ -> None
   in
   let origin_is_canonical =
     match submission_shape, record.observed_origin_cursor with
     | Some None, None -> true
-    | Some (Some expected), Some observed -> cursor_value observed = expected
+    | Some (Some expected), Some observed -> Types.Server_cursor.equal observed expected
     | Some (Some _), None -> true
     | None, _ | Some None, Some _ -> false
   in
@@ -5143,13 +5145,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                    in
                    let checkpoint =
                      match inspection.presence with
-                     | Types.Available { checkpoint; _ } ->
-                       Types.Server_cursor.to_string checkpoint
-                       |> String.split_on_char ':'
-                       |> List.rev
-                       |> List.hd
-                       |> int_of_string
-                     | Absent _ -> 0
+                     | Types.Available { checkpoint; _ } -> checkpoint
+                     | Absent _ -> Types.Server_cursor.zero
                    in
                    let ( queryable_outbox
                        , queryable_block_effects
@@ -5648,7 +5645,7 @@ let inspect_sync database =
       Ok
         (Types.sync_view
            ~token:(sync_token database.sync_revision)
-           ~checkpoint:(server_cursor database.checkpoint)
+           ~checkpoint:database.checkpoint
            ~submissions:(List.map descriptor database.outbox)))
 ;;
 
@@ -5770,20 +5767,12 @@ let rejection_suffix_records records (partition : Types.rejection_member_partiti
   |> fun (dependent, independent) -> List.rev dependent, List.rev independent
 ;;
 
-let server_cursor_number cursor =
-  Types.Server_cursor.to_string cursor
-  |> String.split_on_char ':'
-  |> List.rev
-  |> List.hd
-  |> int_of_string
-;;
-
 let expected_origin_cursor (record : outbox_record) =
   match
     record.submission_t_before, record.submission_ordinal, record.submission_count
   with
   | Some t_before, Some ordinal, Some count when ordinal >= 0 && ordinal < count ->
-    Ok (server_cursor_number t_before + ordinal + 1)
+    advance_cursor t_before (ordinal + 1)
   | _ -> Error "own transaction omitted its frozen submission interval"
 ;;
 
@@ -5797,7 +5786,7 @@ let strip_versioned_prefix prefix value =
 ;;
 
 let acceptance_barrier_is_current database (barrier : Types.acceptance_barrier) =
-  server_cursor_number barrier.through = database.checkpoint
+  Types.Server_cursor.equal barrier.through database.checkpoint
   && String.equal
        (strip_versioned_prefix "checksum" (Types.Checksum.to_string barrier.checksum))
        (strip_versioned_prefix "checksum" database.checkpoint_metadata.checksum)
@@ -5982,6 +5971,11 @@ let begin_outbox_transition database ~expected transition =
                 (fun (record : outbox_record) -> record.transport_state <> Types.Queued)
                 records
             then Error (Types.Outbox_transition_invalid "submit member is not queued")
+            else if
+              Result.is_error (advance_cursor database.checkpoint (List.length records))
+            then
+              Error
+                (Types.Outbox_transition_invalid "server cursor interval overflows int64")
             else if not (submission_records_are_in_sequence_order records)
             then Error (Types.Outbox_transition_invalid "submit members are reordered")
             else if Option.is_some ineligible_dependency
@@ -6059,9 +6053,9 @@ let begin_outbox_transition database ~expected transition =
            ->
            (match executed_through with
             | Some executed
-              when server_cursor_number executed <= server_cursor_number barrier.through
-                   && server_cursor_number barrier.through <= server_cursor_number through
-              -> make Duplicate_plan None
+              when Types.Server_cursor.compare executed barrier.through <= 0
+                   && Types.Server_cursor.compare barrier.through through <= 0 ->
+              make Duplicate_plan None
             | _ ->
               Error
                 (Types.Outbox_transition_invalid
@@ -6079,16 +6073,16 @@ let begin_outbox_transition database ~expected transition =
            Error (Types.Outbox_transition_invalid "accept batch is missing")
          | Ok None ->
            let records = batch_records database id in
-           let through = server_cursor_number barrier.through in
+           let through = barrier.through in
            let validate result (record : outbox_record) =
              Result.bind result (fun () ->
                Result.bind (expected_origin_cursor record) (fun expected ->
-                 if expected > through
+                 if Types.Server_cursor.compare expected through > 0
                  then Error "acceptance barrier precedes its own submission interval"
-                 else if through <= database.checkpoint
+                 else if Types.Server_cursor.compare through database.checkpoint <= 0
                  then (
                    match record.observed_origin_cursor with
-                   | Some cursor when server_cursor_number cursor = expected -> Ok ()
+                   | Some cursor when Types.Server_cursor.equal cursor expected -> Ok ()
                    | None | Some _ ->
                      Error "covered acceptance has no durable origin evidence")
                  else Ok ()))
@@ -6097,7 +6091,7 @@ let begin_outbox_transition database ~expected transition =
             | Error message -> Error (Types.Outbox_transition_invalid message)
             | Ok () ->
               if
-                through = database.checkpoint
+                Types.Server_cursor.equal through database.checkpoint
                 && not (acceptance_barrier_is_current database barrier)
               then Error (Types.Outbox_transition_invalid "acceptance checksum mismatch")
               else make (Accept_plan (id, barrier)) None))
@@ -6125,8 +6119,7 @@ let begin_outbox_transition database ~expected transition =
                  List.exists
                    (fun (record : outbox_record) ->
                       match record.submission_t_before with
-                      | Some baseline ->
-                        server_cursor_number through <= server_cursor_number baseline
+                      | Some baseline -> Types.Server_cursor.compare through baseline <= 0
                       | None -> true)
                    records
                then
@@ -6293,7 +6286,7 @@ let make_batch preparation encrypted =
        | Retry_plan (_, record :: _) -> Option.get record.submission_t_before
        | Retry_plan (_, []) -> invalid_arg "retry batch is empty"
        | Submit_plan _ | Reject_plan _ | Accept_plan _ | Duplicate_plan ->
-         server_cursor preparation.transition_owner.checkpoint)
+         preparation.transition_owner.checkpoint)
     ~wires
   |> Result.get_ok
 ;;
@@ -6346,50 +6339,69 @@ let outbox_fits_submission preparation records batch =
 ;;
 
 let outbox_submission_batch preparation ~encrypted =
-  match preparation.plan, preparation.protection_request, encrypted with
-  | Submit_plan _, Some request, Some (actual_request, encrypted)
-    when actual_request == request ->
-    (match validate_protected_values ~request ~encrypted with
-     | Error error -> Error (Types.Outbox_crypto_error error)
-     | Ok () ->
-       let batch = make_batch preparation (Some encrypted) in
+  let interval =
+    match preparation.plan with
+    | Submit_plan records ->
+      advance_cursor preparation.transition_owner.checkpoint (List.length records)
+      |> Result.map (fun _ -> ())
+    | Retry_plan (_, (record :: _ as records)) ->
+      advance_cursor (Option.get record.submission_t_before) (List.length records)
+      |> Result.map (fun _ -> ())
+    | Reject_plan (id, Definitive { partition; _ }) ->
+      let records = batch_records preparation.transition_owner id in
+      let _, independent = rejection_suffix_records records partition in
+      advance_cursor preparation.transition_owner.checkpoint (List.length independent)
+      |> Result.map (fun _ -> ())
+    | Retry_plan (_, []) | Accept_plan _ | Reject_plan (_, Stale _) | Duplicate_plan ->
+      Ok ()
+  in
+  match interval with
+  | Error message -> Error (Types.Outbox_transition_invalid message)
+  | Ok () ->
+    (match preparation.plan, preparation.protection_request, encrypted with
+     | Submit_plan _, Some request, Some (actual_request, encrypted)
+       when actual_request == request ->
+       (match validate_protected_values ~request ~encrypted with
+        | Error error -> Error (Types.Outbox_crypto_error error)
+        | Ok () ->
+          let batch = make_batch preparation (Some encrypted) in
+          let records =
+            match preparation.plan with
+            | Submit_plan records -> records
+            | _ -> assert false
+          in
+          if not (outbox_fits_submission preparation records batch)
+          then Error Types.Outbox_limit_exceeded
+          else Ok (Some batch))
+     | Submit_plan _, Some _, None -> Error Types.Outbox_crypto_required
+     | Submit_plan _, Some _, Some _ -> Error Types.Outbox_crypto_unexpected
+     | Retry_plan _, None, None ->
+       let batch = make_batch preparation None in
        let records =
          match preparation.plan with
-         | Submit_plan records -> records
+         | Retry_plan (_, records) -> records
          | _ -> assert false
        in
        if not (outbox_fits_submission preparation records batch)
        then Error Types.Outbox_limit_exceeded
-       else Ok (Some batch))
-  | Submit_plan _, Some _, None -> Error Types.Outbox_crypto_required
-  | Submit_plan _, Some _, Some _ -> Error Types.Outbox_crypto_unexpected
-  | Retry_plan _, None, None ->
-    let batch = make_batch preparation None in
-    let records =
-      match preparation.plan with
-      | Retry_plan (_, records) -> records
-      | _ -> assert false
-    in
-    if not (outbox_fits_submission preparation records batch)
-    then Error Types.Outbox_limit_exceeded
-    else Ok (Some batch)
-  | Reject_plan (_, Definitive { partition; _ }), None, None ->
-    let id =
-      match preparation.plan with
-      | Reject_plan (id, _) -> id
-      | _ -> assert false
-    in
-    let records = batch_records preparation.transition_owner id in
-    let _dependent, independent = rejection_suffix_records records partition in
-    Ok
-      (match independent with
-       | [] -> None
-       | _ -> Some (make_batch preparation None))
-  | (Accept_plan _ | Reject_plan _ | Duplicate_plan), None, None -> Ok None
-  | (Retry_plan _ | Accept_plan _ | Reject_plan _ | Duplicate_plan), _, Some _ ->
-    Error Types.Outbox_crypto_unexpected
-  | _ ->
-    Error (Types.Outbox_transition_invalid "preparation crypto state is inconsistent")
+       else Ok (Some batch)
+     | Reject_plan (_, Definitive { partition; _ }), None, None ->
+       let id =
+         match preparation.plan with
+         | Reject_plan (id, _) -> id
+         | _ -> assert false
+       in
+       let records = batch_records preparation.transition_owner id in
+       let _dependent, independent = rejection_suffix_records records partition in
+       Ok
+         (match independent with
+          | [] -> None
+          | _ -> Some (make_batch preparation None))
+     | (Accept_plan _ | Reject_plan _ | Duplicate_plan), None, None -> Ok None
+     | (Retry_plan _ | Accept_plan _ | Reject_plan _ | Duplicate_plan), _, Some _ ->
+       Error Types.Outbox_crypto_unexpected
+     | _ ->
+       Error (Types.Outbox_transition_invalid "preparation crypto state is inconsistent"))
 ;;
 
 let update_submitted database ~capture_dependency_shadows records batch =
@@ -6434,12 +6446,15 @@ let begin_authoritative database ~expected batch =
     else (
       let transactions = Types.authoritative_batch_transactions batch in
       let cursors = List.map Types.authoritative_transaction_cursor transactions in
-      let rec continuous expected = function
+      let rec continuous previous = function
         | [] -> true
         | cursor :: rest ->
-          server_cursor_number cursor = expected && continuous (expected + 1) rest
+          (match advance_cursor previous 1 with
+           | Error _ -> false
+           | Ok expected ->
+             Types.Server_cursor.equal cursor expected && continuous cursor rest)
       in
-      if not (continuous (database.checkpoint + 1) cursors)
+      if not (continuous database.checkpoint cursors)
       then Error Types.Authoritative_cursor_discontinuous
       else (
         let wires =
@@ -6533,7 +6548,7 @@ let transaction_matches_record_at_cursor record cursor root_before transaction_d
   match expected_origin_cursor record with
   | Error _ -> false
   | Ok expected_cursor ->
-    if server_cursor_number cursor <> expected_cursor
+    if not (Types.Server_cursor.equal cursor expected_cursor)
     then false
     else (
       match expected_record_transaction_data root_before record with
@@ -6603,39 +6618,39 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
     Result.bind validated (fun reversed ->
       let validated = List.rev reversed in
       let previous_checkpoint = owner.checkpoint in
-      let through = server_cursor_number (Types.authoritative_batch_through batch) in
+      let through = Types.authoritative_batch_through batch in
       let validate_accepted result (record : outbox_record) =
         Result.bind result (fun () ->
           match record.transport_state with
           | Types.Accepted_pending_authoritative _ ->
             Result.bind (expected_origin_cursor record) (fun expected ->
-              if expected <= previous_checkpoint
+              if Types.Server_cursor.compare expected previous_checkpoint <= 0
               then (
                 match record.observed_origin_cursor with
-                | Some cursor when server_cursor_number cursor = expected -> Ok ()
+                | Some cursor when Types.Server_cursor.equal cursor expected -> Ok ()
                 | None | Some _ ->
                   Error "accepted transaction has no durable origin evidence")
-              else if expected <= through
+              else if Types.Server_cursor.compare expected through <= 0
               then
                 if
                   List.exists
                     (fun (origin, cursor) ->
                        Graph.Uuid.equal origin record.mutation_id
-                       && server_cursor_number cursor = expected)
+                       && Types.Server_cursor.equal cursor expected)
                     validated
                 then Ok ()
                 else (
                   let actual =
                     contexts
                     |> List.find_opt (fun (cursor, _, _) ->
-                      server_cursor_number cursor = expected)
+                      Types.Server_cursor.equal cursor expected)
                     |> Option.map (fun (_, data, _) -> transaction_data_shape data)
                     |> Option.value ~default:"missing-cursor"
                   in
                   let expected_shape =
                     contexts
                     |> List.find_opt (fun (cursor, _, _) ->
-                      server_cursor_number cursor = expected)
+                      Types.Server_cursor.equal cursor expected)
                     |> fun context ->
                     Option.bind context (fun (_, _, root_before) ->
                       expected_record_transaction_data root_before record
@@ -6853,7 +6868,7 @@ let validated_record_origin (record : outbox_record) origins =
     | None -> record.observed_origin_cursor
   in
   match expected_origin_cursor record, observed with
-  | Ok expected, Some cursor when expected = server_cursor_number cursor -> Some cursor
+  | Ok expected, Some cursor when Types.Server_cursor.equal expected cursor -> Some cursor
   | _ -> None
 ;;
 
@@ -6891,7 +6906,7 @@ let classify_stale_deletes owner batch transactions roots_after =
           | Delete_blocks _, None -> Ok (`Blocked (record.mutation_id, batch_id))
           | _ -> Error "stale delete state contains a non-delete mutation"))
     | cursor :: cursor_rest, _operations :: operation_rest, after :: root_rest ->
-      if server_cursor_number cursor > server_cursor_number rejection_through
+      if Types.Server_cursor.compare cursor rejection_through > 0
       then
         classify_record
           record
@@ -7121,7 +7136,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
                   (match
                      List.find_opt
                        (fun (cursor, _, _, _) ->
-                          server_cursor_number cursor > server_cursor_number t_before)
+                          Types.Server_cursor.compare cursor t_before > 0)
                        contexts
                    with
                    | None -> Ok (`Deferred batch_id)
@@ -7552,7 +7567,7 @@ let settle_stale_records ~checkpoint ~origins records =
   let covered (record : outbox_record) =
     match record.transport_state with
     | Stale_rejected_pending_authoritative { through; _ } ->
-      server_cursor_number through <= checkpoint
+      Types.Server_cursor.compare through checkpoint <= 0
     | _ -> false
   in
   let settled =
@@ -7639,7 +7654,7 @@ let settle_stale_records ~checkpoint ~origins records =
                     | None, cursor -> cursor
                     | Some left, Some right ->
                       Some
-                        (if server_cursor_number left > server_cursor_number right
+                        (if Types.Server_cursor.compare left right > 0
                          then left
                          else right)
                     | cursor, None -> cursor)
@@ -7721,11 +7736,11 @@ let apply_outbox_transition database preparation ~encrypted =
               let logical_before =
                 match preparation.plan with
                 | Accept_plan (_, barrier)
-                  when server_cursor_number barrier.through <= database.checkpoint ->
-                  Some (snapshot_of_database database)
+                  when Types.Server_cursor.compare barrier.through database.checkpoint
+                       <= 0 -> Some (snapshot_of_database database)
                 | Reject_plan (_, Definitive _) -> Some (snapshot_of_database database)
                 | Reject_plan (_, Stale { through })
-                  when server_cursor_number through <= database.checkpoint ->
+                  when Types.Server_cursor.compare through database.checkpoint <= 0 ->
                   Some (snapshot_of_database database)
                 | Submit_plan _ | Retry_plan _ | Accept_plan _
                 | Reject_plan (_, Stale _)
@@ -7773,7 +7788,8 @@ let apply_outbox_transition database preparation ~encrypted =
                     records;
                   Types.Logically_active, []
                 | Accept_plan (id, barrier)
-                  when server_cursor_number barrier.through > database.checkpoint ->
+                  when Types.Server_cursor.compare barrier.through database.checkpoint > 0
+                  ->
                   List.iter
                     (fun (record : outbox_record) ->
                        record.transport_state <- Types.Accepted_pending_authoritative id;
@@ -7784,7 +7800,7 @@ let apply_outbox_transition database preparation ~encrypted =
                   let records = batch_records database id in
                   let current_root = authoritative_database database in
                   let barrier_is_behind =
-                    server_cursor_number barrier.through < database.checkpoint
+                    Types.Server_cursor.compare barrier.through database.checkpoint < 0
                   in
                   let incorporated, mismatched =
                     List.partition
@@ -8471,7 +8487,6 @@ let commit_authoritative_candidate database prepared =
           | Ok staged ->
             let through =
               Types.authoritative_batch_through preparation.authoritative_batch
-              |> server_cursor_number
             in
             let authoritative_after = prepared.authoritative_db_after in
             let authoritative_before = authoritative_database database in
@@ -8533,13 +8548,13 @@ let commit_authoritative_candidate database prepared =
                 (fun (record : outbox_record) ->
                    match record.transport_state, record.acceptance_barrier with
                    | Accepted_pending_authoritative _, Some barrier ->
-                     server_cursor_number barrier.through <= through
+                     Types.Server_cursor.compare barrier.through through <= 0
                    | _ -> false)
                 database.outbox
             in
             let authoritative_root_at barrier =
-              let target = server_cursor_number barrier.Types.through in
-              if target <= database.checkpoint
+              let target = barrier.Types.through in
+              if Types.Server_cursor.compare target database.checkpoint <= 0
               then Some authoritative_before
               else
                 List.combine
@@ -8547,9 +8562,9 @@ let commit_authoritative_candidate database prepared =
                   prepared.authoritative_roots_after
                 |> List.find_map (fun (transaction, root) ->
                   if
-                    server_cursor_number
+                    Types.Server_cursor.equal
                       (Types.authoritative_transaction_cursor transaction)
-                    = target
+                      target
                   then Some root
                   else None)
             in
@@ -8557,14 +8572,15 @@ let commit_authoritative_candidate database prepared =
               match record.acceptance_barrier with
               | None -> false
               | Some barrier ->
-                let barrier_number = server_cursor_number barrier.through in
+                let barrier_cursor = barrier.through in
                 (match record.mutation with
                  | Save_block _
                  | Insert_blocks _
                  | Create_journal_page _
                  | Set_task_status _
                  | Clear_task_status _
-                   when barrier_number < database.checkpoint -> true
+                   when Types.Server_cursor.compare barrier_cursor database.checkpoint < 0
+                   -> true
                  | _ ->
                    (match authoritative_root_at barrier, record.transport_state with
                     | Some root, Accepted_pending_authoritative batch_id ->
@@ -8989,7 +9005,7 @@ let commit_authoritative_candidate database prepared =
                       { Types.generation = database.generation
                       ; before_projection_revision = before_revision
                       ; after_projection_revision = after_revision
-                      ; checkpoint = server_cursor through
+                      ; checkpoint = through
                       ; sync_token = sync_token database.sync_revision
                       ; terminal_receipts
                       ; replanned_queued_ids =

@@ -1,3 +1,14 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
+let cursor_testable =
+  Alcotest.testable
+    (fun fmt cursor ->
+       Format.fprintf fmt "%Ld" (Logseq_db_types.Server_cursor.to_int64 cursor))
+    Logseq_db_types.Server_cursor.equal
+;;
+
 module Core = Logseq_sync_pure_reducer.Core
 
 type observed =
@@ -440,7 +451,8 @@ let warm_encrypted_graph_loads_key_before_attach_and_protects_outbox () =
       Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:warm" |> Result.get_ok
     in
     let checkpoint =
-      Logseq_overlay_db.Types.Server_cursor.of_string "server-cursor:v1:0"
+      Logseq_overlay_db.Types.Server_cursor.of_int64 0L
+      |> Result.map_error (fun `Negative_cursor -> "negative cursor")
       |> Result.get_ok
     in
     let sync =
@@ -1035,7 +1047,10 @@ let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
       activated.effects
     |> Option.get
   in
-  Alcotest.(check int) "activation uses baseline cursor" 42 activation.applied_server_t;
+  Alcotest.(check cursor_testable)
+    "activation uses baseline cursor"
+    (server_cursor_of_int 42)
+    activation.applied_server_t;
   Alcotest.(check bool)
     "plain snapshot has no graph key"
     true
@@ -1060,7 +1075,9 @@ let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
     |> Result.get_ok
   in
   let checkpoint =
-    Logseq_overlay_db.Types.Server_cursor.of_string "server-cursor:v1:42" |> Result.get_ok
+    Logseq_overlay_db.Types.Server_cursor.of_int64 42L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> Result.get_ok
   in
   let sync =
     Logseq_overlay_db.Types.sync_view ~token:sync_token ~checkpoint ~submissions:[]
@@ -1166,7 +1183,9 @@ let submitted_core () =
   let scope = attach_request.scope in
   let sync_token = Overlay.sync_token_of_string "sync-token:v1:1" |> Result.get_ok in
   let checkpoint =
-    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
+    Overlay.Server_cursor.of_int64 0L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> Result.get_ok
   in
   let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
   let attached = Core.step inspected.next (Core.Graph_attached { scope; sync }) in
@@ -1289,7 +1308,7 @@ let partial_rejection_is_normalized_exactly () =
   in
   let rejection : Logseq_sync_pure_reducer.Sync_protocol.rejection =
     { reason = Db_transact_failed
-    ; t = Some 1
+    ; t = Some (server_cursor_of_int 1)
     ; checksum = Some "0123456789abcdef"
     ; success_tx_ids = [ first ]
     ; failed_tx_id = Some second
@@ -1342,7 +1361,9 @@ let accepted_submission_pulls_its_authoritative_transaction () =
     (Core.step
        core
        (Core.Websocket_message
-          (connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] })))
+          ( connection
+          , Protocol.Server.Pull_ok
+              { t = server_cursor_of_int 0; checksum = None; txs = [] } )))
       .next
   in
   let acknowledged =
@@ -1351,7 +1372,7 @@ let accepted_submission_pulls_its_authoritative_transaction () =
       (Core.Websocket_message
          ( connection
          , Logseq_sync_pure_reducer.Sync_protocol.Server.Tx_batch_ok
-             { t = 1; checksum = Some "0123456789abcdef" } ))
+             { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } ))
   in
   let request =
     List.find_map
@@ -1365,7 +1386,9 @@ let accepted_submission_pulls_its_authoritative_transaction () =
   in
   let sync_token = Overlay.sync_token_of_string "sync-token:v1:2" |> Result.get_ok in
   let checkpoint =
-    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
+    Overlay.Server_cursor.of_int64 0L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> Result.get_ok
   in
   let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
   let generation = Overlay.Generation.of_string "generation:v1:2" |> Result.get_ok in
@@ -1397,7 +1420,7 @@ let accepted_submission_pulls_its_authoritative_transaction () =
              (Core.Send_websocket
                 { message = Logseq_sync_pure_reducer.Sync_protocol.Client.Pull { since }
                 ; _
-                }) -> since = Some 0
+                }) -> since = Some (server_cursor_of_int 0)
          | Run _ | Delegate _ | Publish _ -> false)
        completed.effects)
 ;;
@@ -1579,7 +1602,7 @@ let canonical_overlay_happy_path () =
       selected_observed
       [ Core.Delegate (Core.Attach_graph mirror_request) ]
   in
-  let cursor0 = token Overlay.Server_cursor.of_string "server-cursor:v1:0" in
+  let cursor0 = token Overlay.Server_cursor.of_int64 0L in
   let sync_token0 = token Overlay.sync_token_of_string "sync-token:v1:hp-0" in
   let empty_sync0 =
     Overlay.sync_view ~token:sync_token0 ~checkpoint:cursor0 ~submissions:[]
@@ -1592,7 +1615,7 @@ let canonical_overlay_happy_path () =
       snapshot =
         { selected_state.snapshot with
           sync_phase = Core.Current
-        ; applied_server_t = Some 0
+        ; applied_server_t = Some (server_cursor_of_int 0)
         ; timeline_presentation_pending = true
         ; startup = attached_startup
         }
@@ -1645,17 +1668,21 @@ let canonical_overlay_happy_path () =
           && timer.scope.connection_generation = Some connection.connection_generation
           && state = pulling0_state
           && scope = connection
-          && message = Protocol.Client.Pull { since = Some 0 } -> ()
+          && message = Protocol.Client.Pull { since = Some (server_cursor_of_int 0) } ->
+     ()
    | _ -> Alcotest.fail "HP08 unexpected instruction shape");
   let hp08 =
     check_step "HP08" hp07.next hp08_event pulling0_observed hp08_preview.effects
   in
   let remote_tx : Protocol.Server.pull_transaction =
-    { t = 1; tx = "[]"; outliner_op = Some "save-block" }
+    { t = server_cursor_of_int 1; tx = "[]"; outliner_op = Some "save-block" }
   in
   let opening_message =
     Protocol.Server.Pull_ok
-      { t = 1; checksum = Some "0123456789abcdef"; txs = [ remote_tx ] }
+      { t = server_cursor_of_int 1
+      ; checksum = Some "0123456789abcdef"
+      ; txs = [ remote_tx ]
+      }
   in
   let hp09_event = Core.Websocket_message (connection, opening_message) in
   let hp09_preview = preview_step "HP09" hp08.next hp09_event in
@@ -1666,9 +1693,9 @@ let canonical_overlay_happy_path () =
            && request.presentation_generation = 1
            && request.lifecycle_generation = 0L
            && request.key = None
-           && Overlay.Server_cursor.to_string
+           && Overlay.Server_cursor.to_int64
                 (Overlay.authoritative_batch_through request.input)
-              = "server-cursor:v1:1"
+              = 1L
            && List.length (Overlay.authoritative_batch_transactions request.input) = 1 ->
       request
     | _ -> Alcotest.fail "HP09 unexpected instruction shape"
@@ -1683,7 +1710,7 @@ let canonical_overlay_happy_path () =
   in
   let generation1 = token Overlay.Generation.of_string "generation:v1:hp-1" in
   let projection1 = token Overlay.Projection_revision.of_string "projection:v1:1" in
-  let cursor1 = token Overlay.Server_cursor.of_string "server-cursor:v1:1" in
+  let cursor1 = token Overlay.Server_cursor.of_int64 1L in
   let sync_token1 = token Overlay.sync_token_of_string "sync-token:v1:hp-1" in
   let sync1 = Overlay.sync_view ~token:sync_token1 ~checkpoint:cursor1 ~submissions:[] in
   let authoritative_commit1 : Overlay.authoritative_commit =
@@ -1703,7 +1730,7 @@ let canonical_overlay_happy_path () =
       snapshot =
         { pulling0_state.snapshot with
           sync_phase = Core.Current
-        ; applied_server_t = Some 1
+        ; applied_server_t = Some (server_cursor_of_int 1)
         }
     }
   in
@@ -1820,7 +1847,7 @@ let canonical_overlay_happy_path () =
   let tx_message =
     Protocol.Client.Tx_batch
       { client_revision = Some (Overlay.Submission_batch_id.to_string batch_id)
-      ; t_before = 1
+      ; t_before = server_cursor_of_int 1
       ; txs =
           [ { Protocol.Client.tx = "protected-hp-transaction"
             ; tx_id = Some mutation_id
@@ -1850,7 +1877,8 @@ let canonical_overlay_happy_path () =
   let hp14_event =
     Core.Websocket_message
       ( connection
-      , Protocol.Server.Tx_batch_ok { t = 2; checksum = Some "fedcba9876543210" } )
+      , Protocol.Server.Tx_batch_ok
+          { t = server_cursor_of_int 2; checksum = Some "fedcba9876543210" } )
   in
   let hp14_preview = preview_step "HP14" hp13.next hp14_event in
   let accept_request =
@@ -1863,8 +1891,7 @@ let canonical_overlay_happy_path () =
               = Overlay.Accept_group
                   { batch_id
                   ; barrier =
-                      { through =
-                          token Overlay.Server_cursor.of_string "server-cursor:v1:2"
+                      { through = token Overlay.Server_cursor.of_int64 2L
                       ; checksum =
                           token Overlay.Checksum.of_string "checksum:v1:fedcba9876543210"
                       }
@@ -1922,17 +1949,21 @@ let canonical_overlay_happy_path () =
           && timer.scope.connection_generation = Some connection.connection_generation
           && state = pulling1_state
           && scope = connection
-          && message = Protocol.Client.Pull { since = Some 1 } -> ()
+          && message = Protocol.Client.Pull { since = Some (server_cursor_of_int 1) } ->
+     ()
    | _ -> Alcotest.fail "HP15 unexpected instruction shape");
   let hp15 =
     check_step "HP15" hp14.next hp15_event pulling1_observed hp15_preview.effects
   in
   let incorporated_tx : Protocol.Server.pull_transaction =
-    { t = 2; tx = "[]"; outliner_op = Some "save-block" }
+    { t = server_cursor_of_int 2; tx = "[]"; outliner_op = Some "save-block" }
   in
   let confirmation_message =
     Protocol.Server.Pull_ok
-      { t = 2; checksum = Some "fedcba9876543210"; txs = [ incorporated_tx ] }
+      { t = server_cursor_of_int 2
+      ; checksum = Some "fedcba9876543210"
+      ; txs = [ incorporated_tx ]
+      }
   in
   let hp16_event = Core.Websocket_message (connection, confirmation_message) in
   let hp16_preview = preview_step "HP16" hp15.next hp16_event in
@@ -1943,9 +1974,9 @@ let canonical_overlay_happy_path () =
            && request.presentation_generation = 1
            && request.lifecycle_generation = 0L
            && request.key = None
-           && Overlay.Server_cursor.to_string
+           && Overlay.Server_cursor.to_int64
                 (Overlay.authoritative_batch_through request.input)
-              = "server-cursor:v1:2"
+              = 2L
            && List.length (Overlay.authoritative_batch_transactions request.input) = 1 ->
       request
     | _ -> Alcotest.fail "HP16 unexpected instruction shape"
@@ -1958,7 +1989,7 @@ let canonical_overlay_happy_path () =
       pulling1_observed
       [ Core.Delegate (Core.Apply_authoritative_batch confirmation_batch) ]
   in
-  let cursor2 = token Overlay.Server_cursor.of_string "server-cursor:v1:2" in
+  let cursor2 = token Overlay.Server_cursor.of_int64 2L in
   let sync_token4 = token Overlay.sync_token_of_string "sync-token:v1:hp-4" in
   let sync2 = Overlay.sync_view ~token:sync_token4 ~checkpoint:cursor2 ~submissions:[] in
   let authoritative_commit2 : Overlay.authoritative_commit =
@@ -1978,7 +2009,7 @@ let canonical_overlay_happy_path () =
       snapshot =
         { pulling1_state.snapshot with
           sync_phase = Core.Current
-        ; applied_server_t = Some 2
+        ; applied_server_t = Some (server_cursor_of_int 2)
         }
     }
   in
@@ -2066,7 +2097,9 @@ let websocket_connect_uses_deployed_graph_path () =
   let scope = attach_request.scope in
   let sync_token = Overlay.sync_token_of_string "sync-token:v1:1" |> Result.get_ok in
   let checkpoint =
-    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
+    Overlay.Server_cursor.of_int64 0L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> Result.get_ok
   in
   let sync = Overlay.sync_view ~token:sync_token ~checkpoint ~submissions:[] in
   let attached = Core.step inspected.next (Core.Graph_attached { scope; sync }) in
@@ -2325,7 +2358,9 @@ let deletion_ready_graph encrypted =
   in
   let token = Overlay.sync_token_of_string "sync-token:v1:delete" |> Result.get_ok in
   let checkpoint =
-    Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok
+    Overlay.Server_cursor.of_int64 0L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> Result.get_ok
   in
   let sync = Overlay.sync_view ~token ~checkpoint ~submissions:[] in
   let attached = Core.step attaching.next (Core.Graph_attached { scope; sync }) in
@@ -2589,7 +2624,8 @@ let local_deletion_discards_unsynchronized_work () =
     deleting.next
     [ Core.Websocket_message
         ( connection
-        , Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" } )
+        , Protocol.Server.Tx_batch_ok
+            { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } )
     ];
   let closed = Core.step deleting.next (Core.Graph_detached (connection.graph, Ok ())) in
   ignore (deletion_mirror closed.effects)
@@ -2684,7 +2720,11 @@ let recovery_delete_transaction =
 
 let submitted_delete_recovery_fixture () =
   let mutation_id = List.hd mutation_ids in
-  let cursor = Overlay.Server_cursor.of_string "server-cursor:v1:0" |> Result.get_ok in
+  let cursor =
+    Overlay.Server_cursor.of_int64 0L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> Result.get_ok
+  in
   let token ordinal =
     Overlay.sync_token_of_string (Printf.sprintf "sync-token:v1:%d" ordinal)
     |> Result.get_ok
@@ -2789,10 +2829,10 @@ let defer_recovered_delete core connection batch_id =
       (Core.Websocket_message
          ( connection
          , Protocol.Server.Pull_ok
-             { t = 1
+             { t = server_cursor_of_int 1
              ; checksum = Some "0123456789abcdef"
              ; txs =
-                 [ { t = 1
+                 [ { t = server_cursor_of_int 1
                    ; tx = recovery_delete_transaction
                    ; outliner_op = Some "delete-blocks"
                    }
@@ -2835,7 +2875,8 @@ let live_submitted_delete_resumes_after_acknowledgement () =
       deferred
       (Core.Websocket_message
          ( connection
-         , Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" } ))
+         , Protocol.Server.Tx_batch_ok
+             { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } ))
   in
   let request =
     List.find_map
@@ -2886,7 +2927,8 @@ let live_submitted_delete_resumes_after_acknowledgement () =
 ;;
 
 let recovery_cursor n =
-  Overlay.Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" n)
+  Overlay.Server_cursor.of_int64 (Int64.of_int n)
+  |> Result.map_error (fun `Negative_cursor -> "negative cursor")
   |> Result.get_ok
 ;;
 
@@ -2997,7 +3039,10 @@ let recover_retry core connection sync wire_batch effects =
        (Some
           (Overlay.Submission_batch_id.to_string (Overlay.submission_batch_id wire_batch)))
        client_revision;
-     Alcotest.(check int) "retry retains conditional baseline" 0 t_before;
+     Alcotest.(check cursor_testable)
+       "retry retains conditional baseline"
+       (server_cursor_of_int 0)
+       t_before;
      Alcotest.(check string)
        "retry retains protected bytes"
        recovery_delete_transaction
@@ -3022,7 +3067,7 @@ let finish_recovery ~reject core connection sync wire_batch effects batch =
     then
       Protocol.Server.Tx_reject
         { reason = Protocol.Stale
-        ; t = Some 1
+        ; t = Some (server_cursor_of_int 1)
         ; checksum = Some "0123456789abcdef"
         ; success_tx_ids = []
         ; failed_tx_id = None
@@ -3030,7 +3075,9 @@ let finish_recovery ~reject core connection sync wire_batch effects batch =
         ; error_detail = None
         ; data = None
         }
-    else Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" }
+    else
+      Protocol.Server.Tx_batch_ok
+        { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" }
   in
   let terminal = Core.step retried.next (Core.Websocket_message (connection, response)) in
   let request = recovery_request terminal.effects in
@@ -3066,9 +3113,9 @@ let finish_recovery ~reject core connection sync wire_batch effects batch =
   let current =
     recovery_apply resumed.next connection (recovery_sync sync ~checkpoint:1 5 [])
   in
-  Alcotest.(check (option int))
+  Alcotest.(check (option cursor_testable))
     "recovery advances the durable checkpoint"
-    (Some 1)
+    (Some (server_cursor_of_int 1))
     (Core.state current.next).snapshot.applied_server_t;
   Alcotest.(check bool)
     "completed recovery becomes Current"
@@ -3118,9 +3165,9 @@ let submitted_delete_survives_disconnect_reconnect () =
 let submitted_delete_survives_fresh_core_restore () =
   let _, _, persisted_sync, wire_batch = submitted_delete_recovery_fixture () in
   let fresh, connection = restore_recovery_core persisted_sync in
-  Alcotest.(check (option int))
+  Alcotest.(check (option cursor_testable))
     "fresh Core restores the durable checkpoint"
-    (Some 0)
+    (Some (server_cursor_of_int 0))
     (Core.state fresh).snapshot.applied_server_t;
   check_submitted_delete_recovery fresh connection persisted_sync wire_batch
 ;;
@@ -3147,7 +3194,9 @@ let recovery_empty_pull_prioritizes_submitted () =
     Core.step
       fresh
       (Core.Websocket_message
-         (connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] }))
+         ( connection
+         , Protocol.Server.Pull_ok
+             { t = server_cursor_of_int 0; checksum = None; txs = [] } ))
   in
   require_no_new_submission pulled.effects;
   ignore (recover_retry pulled.next connection sync wire_batch pulled.effects)
@@ -3178,7 +3227,9 @@ let recovery_barrier_blocks_queued ~rejected () =
     Core.step
       fresh
       (Core.Websocket_message
-         (connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] }))
+         ( connection
+         , Protocol.Server.Pull_ok
+             { t = server_cursor_of_int 0; checksum = None; txs = [] } ))
   in
   require_no_new_submission pulled.effects;
   Alcotest.(check bool)
@@ -3218,7 +3269,8 @@ let recovery_stale_connection_and_interrupted_retry () =
       opened.next
       (Core.Websocket_message
          ( old_connection
-         , Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" } ))
+         , Protocol.Server.Tx_batch_ok
+             { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } ))
   in
   check_instructions "old response cannot accept recovered batch" [] late.effects;
   check_submitted_delete_recovery late.next new_connection sync wire_batch
@@ -3261,7 +3313,8 @@ let recovery_outbox_failure_is_correlated () =
       submitted.next
       (Core.Websocket_message
          ( connection
-         , Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" } ))
+         , Protocol.Server.Tx_batch_ok
+             { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } ))
   in
   let request = recovery_request acknowledged.effects in
   let message = "The overlay outbox transition was rejected." in
@@ -3306,7 +3359,8 @@ let recovery_outbox_failure_is_correlated () =
       duplicate.next
       (Core.Websocket_message
          ( connection
-         , Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" } ))
+         , Protocol.Server.Tx_batch_ok
+             { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } ))
   in
   check_instructions "old response cannot recreate a failed transition" [] old_ack.effects;
   ignore batch
@@ -3383,12 +3437,15 @@ let pull_message core connection message =
 let pull_response core connection ~after through =
   let txs =
     List.init (through - after) (fun offset ->
-      { Protocol.Server.t = after + offset + 1; tx = "[]"; outliner_op = None })
+      { Protocol.Server.t = server_cursor_of_int (after + offset + 1)
+      ; tx = "[]"
+      ; outliner_op = None
+      })
   in
   pull_message
     core
     connection
-    (Protocol.Server.Pull_ok { t = through; checksum = None; txs })
+    (Protocol.Server.Pull_ok { t = server_cursor_of_int through; checksum = None; txs })
 ;;
 
 let pull_open_and_notifications_are_singleflight () =
@@ -3398,31 +3455,44 @@ let pull_open_and_notifications_are_singleflight () =
     pull_message
       opened.next
       connection
-      (Protocol.Server.Hello { t = 100; checksum = None })
+      (Protocol.Server.Hello { t = server_cursor_of_int 100; checksum = None })
   in
   check_pull_count "hello joins the opening pull" 0 hello.effects;
   let state = ref hello.next in
   for t = 1 to 100 do
-    let changed = pull_message !state connection (Protocol.Server.Changed { t }) in
+    let changed =
+      pull_message
+        !state
+        connection
+        (Protocol.Server.Changed { t = server_cursor_of_int t })
+    in
     check_pull_count "notification burst joins the same pull" 0 changed.effects;
     state := changed.next
   done;
-  Alcotest.(check (option int))
+  Alcotest.(check (option cursor_testable))
     "notifications cannot advance the durable checkpoint"
-    (Some 0)
+    (Some (server_cursor_of_int 0))
     (Core.state !state).snapshot.applied_server_t
 ;;
 
 let pull_demand_survives_authoritative_apply () =
   let opened, connection, sync = pull_fixture () in
   let notified =
-    pull_message opened.next connection (Protocol.Server.Changed { t = 1 })
+    pull_message
+      opened.next
+      connection
+      (Protocol.Server.Changed { t = server_cursor_of_int 1 })
   in
   let received = pull_response notified.next connection ~after:0 1 in
   let state = ref received.next in
   for index = 1 to 100 do
     let t = index + 1 in
-    let changed = pull_message !state connection (Protocol.Server.Changed { t }) in
+    let changed =
+      pull_message
+        !state
+        connection
+        (Protocol.Server.Changed { t = server_cursor_of_int t })
+    in
     check_pull_count "apply owns the pull until durable completion" 0 changed.effects;
     state := changed.next
   done;
@@ -3432,7 +3502,7 @@ let pull_demand_survives_authoritative_apply () =
   Alcotest.(check bool)
     "latest target schedules one pull from committed cursor"
     true
-    (pull_sends committed.effects = [ connection, Some 1 ]);
+    (pull_sends committed.effects = [ connection, Some (server_cursor_of_int 1) ]);
   Alcotest.(check bool)
     "catchup owner is represented by Pulling phase"
     true
@@ -3453,33 +3523,45 @@ let pull_demand_survives_authoritative_apply () =
   Alcotest.(check bool)
     "partial catchup cannot drop the maximum requested target"
     true
-    (pull_sends committed.effects = [ connection, Some 2 ]);
-  (* A sparse page is permitted by authoritative_batch: ordering plus last = through,
-     with no contiguous-cursor requirement. One transaction also avoids the existing
-     lexical Server_cursor.compare issue across decimal digit boundaries. *)
+    (pull_sends committed.effects = [ connection, Some (server_cursor_of_int 2) ]);
+  (* This pure policy test uses a sparse page to acknowledge the newest target.
+     The overlay separately enforces contiguous durable application. *)
   let received =
     pull_message
       committed.next
       connection
       (Protocol.Server.Pull_ok
-         { t = 101
+         { t = server_cursor_of_int 101
          ; checksum = None
-         ; txs = [ { Protocol.Server.t = 101; tx = "[]"; outliner_op = None } ]
+         ; txs =
+             [ { Protocol.Server.t = server_cursor_of_int 101
+               ; tx = "[]"
+               ; outliner_op = None
+               }
+             ]
          })
   in
   let committed =
     recovery_apply received.next connection (recovery_sync sync ~checkpoint:101 3 [])
   in
-  Alcotest.(check (option int))
+  Alcotest.(check (option cursor_testable))
     "latest checkpoint is durably acknowledged"
-    (Some 101)
+    (Some (server_cursor_of_int 101))
     (Core.state committed.next).snapshot.applied_server_t;
   check_pull_count "caught up exactly to latest target" 0 committed.effects;
   let stale =
-    pull_message committed.next connection (Protocol.Server.Changed { t = 100 })
+    pull_message
+      committed.next
+      connection
+      (Protocol.Server.Changed { t = server_cursor_of_int 100 })
   in
   check_pull_count "old notifications need no pull" 0 stale.effects;
-  let same = pull_message stale.next connection (Protocol.Server.Changed { t = 101 }) in
+  let same =
+    pull_message
+      stale.next
+      connection
+      (Protocol.Server.Changed { t = server_cursor_of_int 101 })
+  in
   check_pull_count "same cursor notification needs no pull" 0 same.effects
 ;;
 
@@ -3494,11 +3576,12 @@ let pull_no_progress_is_delayed_and_bounded () =
       pull_message
         !state
         connection
-        (Protocol.Server.Pull_ok { t = reported_head; checksum = None; txs = [] })
+        (Protocol.Server.Pull_ok
+           { t = server_cursor_of_int reported_head; checksum = None; txs = [] })
     in
-    Alcotest.(check (option int))
+    Alcotest.(check (option cursor_testable))
       "empty response cannot advance durable checkpoint"
-      (Some 0)
+      (Some (server_cursor_of_int 0))
       (Core.state empty.next).snapshot.applied_server_t;
     check_pull_count "no progress cannot immediately repeat the pull" 0 empty.effects;
     Alcotest.(check bool)
@@ -3523,14 +3606,17 @@ let pull_no_progress_is_delayed_and_bounded () =
        && timer.delay_seconds >= !previous_delay);
     previous_delay := timer.delay_seconds;
     let notified =
-      pull_message empty.next connection (Protocol.Server.Changed { t = 10 })
+      pull_message
+        empty.next
+        connection
+        (Protocol.Server.Changed { t = server_cursor_of_int 10 })
     in
     check_pull_count "notifications cannot bypass retry delay" 0 notified.effects;
     let retried = Core.step notified.next (Core.Timer_elapsed timer.id) in
     Alcotest.(check bool)
       "retry retains demand and original durable cursor"
       true
-      (pull_sends retried.effects = [ connection, Some 0 ]);
+      (pull_sends retried.effects = [ connection, Some (server_cursor_of_int 0) ]);
     let duplicate = Core.step retried.next (Core.Timer_elapsed timer.id) in
     check_instructions "retry timer is consumed once" [] duplicate.effects;
     state := duplicate.next
@@ -3561,7 +3647,10 @@ let pull_timeout_reconnects_and_fences_old_work () =
   let old_response = pull_response old_timeout.next connection ~after:0 1 in
   check_instructions "old connection response is inert" [] old_response.effects;
   let changed =
-    pull_message old_response.next replacement (Protocol.Server.Changed { t = 2 })
+    pull_message
+      old_response.next
+      replacement
+      (Protocol.Server.Changed { t = server_cursor_of_int 2 })
   in
   check_pull_count "replacement still owns its single pull" 0 changed.effects
 ;;
@@ -3576,7 +3665,10 @@ let pull_response_timer_does_not_interrupt_apply () =
     []
     late_timer.effects;
   let changed =
-    pull_message late_timer.next connection (Protocol.Server.Changed { t = 2 })
+    pull_message
+      late_timer.next
+      connection
+      (Protocol.Server.Changed { t = server_cursor_of_int 2 })
   in
   check_pull_count "notification waits for durable apply" 0 changed.effects;
   let committed =
@@ -3585,7 +3677,7 @@ let pull_response_timer_does_not_interrupt_apply () =
   Alcotest.(check bool)
     "apply completion releases exactly one catchup"
     true
-    (pull_sends committed.effects = [ connection, Some 1 ])
+    (pull_sends committed.effects = [ connection, Some (server_cursor_of_int 1) ])
 ;;
 
 let pull_terminal_outcome_joins_existing_round ~reject () =
@@ -3595,7 +3687,7 @@ let pull_terminal_outcome_joins_existing_round ~reject () =
     then
       Protocol.Server.Tx_reject
         { reason = Protocol.Stale
-        ; t = Some 1
+        ; t = Some (server_cursor_of_int 1)
         ; checksum = Some "0123456789abcdef"
         ; success_tx_ids = []
         ; failed_tx_id = None
@@ -3603,7 +3695,9 @@ let pull_terminal_outcome_joins_existing_round ~reject () =
         ; error_detail = None
         ; data = None
         }
-    else Protocol.Server.Tx_batch_ok { t = 1; checksum = Some "0123456789abcdef" }
+    else
+      Protocol.Server.Tx_batch_ok
+        { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" }
   in
   let terminal = pull_message core connection response in
   let request = recovery_request terminal.effects in
@@ -3625,7 +3719,7 @@ let pull_terminal_outcome_joins_existing_round ~reject () =
   Alcotest.(check bool)
     "terminal outcome target survives until catchup"
     true
-    (pull_sends catchup.effects = [ connection, Some 0 ])
+    (pull_sends catchup.effects = [ connection, Some (server_cursor_of_int 0) ])
 ;;
 
 let pull_terminal_barrier_already_applied_is_current ~reject () =
@@ -3674,7 +3768,7 @@ let pull_terminal_barrier_already_applied_is_current ~reject () =
                 state.snapshot.sync_phase = Core.Current
               | _ -> false)
             completed.effects))
-    [ 0; 1 ]
+    [ server_cursor_of_int 0; server_cursor_of_int 1 ]
 ;;
 
 let pull_shutdown_and_graph_retirement_cancel_demand () =
@@ -3686,7 +3780,10 @@ let pull_shutdown_and_graph_retirement_cancel_demand () =
        let late_timer = Core.step retired.next (Core.Timer_elapsed timer.id) in
        check_instructions "retired graph timer is inert" [] late_timer.effects;
        let late_changed =
-         pull_message late_timer.next connection (Protocol.Server.Changed { t = 20 })
+         pull_message
+           late_timer.next
+           connection
+           (Protocol.Server.Changed { t = server_cursor_of_int 20 })
        in
        check_instructions "retired graph demand is inert" [] late_changed.effects;
        let late_response = pull_response late_changed.next connection ~after:0 1 in
@@ -3791,7 +3888,7 @@ let rejected_submission_feedback () =
   let core, connection = submitted_core () in
   let rejection : Protocol.rejection =
     { reason = Db_transact_failed
-    ; t = Some 0
+    ; t = Some (server_cursor_of_int 0)
     ; checksum = None
     ; success_tx_ids = []
     ; failed_tx_id = Some (List.hd mutation_ids)
@@ -3848,7 +3945,9 @@ let rejected_submission_feedback () =
     Core.step
       committed.next
       (Core.Websocket_message
-         (connection, Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] }))
+         ( connection
+         , Protocol.Server.Pull_ok
+             { t = server_cursor_of_int 0; checksum = None; txs = [] } ))
   in
   Alcotest.(check bool)
     "empty catch-up does not hide the rejected write"
@@ -3861,7 +3960,8 @@ let rejected_submission_feedback () =
       restored
       (Core.Websocket_message
          ( restored_connection
-         , Protocol.Server.Pull_ok { t = 0; checksum = None; txs = [] } ))
+         , Protocol.Server.Pull_ok
+             { t = server_cursor_of_int 0; checksum = None; txs = [] } ))
   in
   Alcotest.(check bool)
     "restored blocked writes retain visible feedback"
@@ -3874,7 +3974,7 @@ let stale_rejection_is_not_a_failed_save_notice () =
   let core, connection = submitted_core () in
   let rejection : Protocol.rejection =
     { reason = Stale
-    ; t = Some 1
+    ; t = Some (server_cursor_of_int 1)
     ; checksum = None
     ; success_tx_ids = []
     ; failed_tx_id = None
@@ -3900,8 +4000,85 @@ let stale_rejection_is_not_a_failed_save_notice () =
      | _ -> false)
 ;;
 
+let decimal_boundary_pull_is_admitted () =
+  List.iter
+    (fun (first, last) ->
+       let checkpoint = recovery_cursor (first - 1) in
+       let sync =
+         Overlay.sync_view
+           ~token:(token Overlay.sync_token_of_string "sync-token:v1:numeric-cursor")
+           ~checkpoint
+           ~submissions:[]
+       in
+       let core, connection = restore_recovery_core sync in
+       let txs =
+         List.map
+           (fun t ->
+              Protocol.Server.
+                { t = server_cursor_of_int t; tx = "[]"; outliner_op = None })
+           [ first; last ]
+       in
+       let wire =
+         Protocol.encode_server_message
+           (Protocol.Server.Pull_ok
+              { t = server_cursor_of_int last; checksum = None; txs })
+         |> Result.get_ok
+       in
+       let message = Protocol.decode_server_message wire |> Result.get_ok in
+       let received = Core.step core (Core.Websocket_message (connection, message)) in
+       Alcotest.(check bool)
+         "normal numeric pull reaches authoritative apply"
+         true
+         (List.exists
+            (function
+              | Core.Delegate (Core.Apply_authoritative_batch _) -> true
+              | _ -> false)
+            received.effects);
+       Alcotest.(check bool)
+         "normal numeric pull does not fail"
+         false
+         ((Core.state received.next).snapshot.sync_phase = Core.Failed))
+    [ 9, 10; 99, 100; 999, 1000 ]
+;;
+
+let unordered_pull_is_rejected () =
+  List.iter
+    (fun values ->
+       let opened, connection, _ = pull_fixture () in
+       let txs =
+         List.map
+           (fun t ->
+              Protocol.Server.
+                { t = server_cursor_of_int t; tx = "[]"; outliner_op = None })
+           values
+       in
+       let received =
+         pull_message
+           opened.next
+           connection
+           (Protocol.Server.Pull_ok
+              { t = server_cursor_of_int (List.hd (List.rev values))
+              ; checksum = None
+              ; txs
+              })
+       in
+       Alcotest.(check bool)
+         "duplicate or reversed pull fails"
+         true
+         ((Core.state received.next).snapshot.sync_phase = Core.Failed))
+    [ [ 9; 9 ]; [ 10; 9 ] ]
+;;
+
 let scenarios =
-  [ Alcotest.test_case "rejected submission feedback" `Quick rejected_submission_feedback
+  [ Alcotest.test_case
+      "numeric cursor decimal boundaries"
+      `Quick
+      decimal_boundary_pull_is_admitted
+  ; Alcotest.test_case
+      "numeric cursor duplicate and reverse order"
+      `Quick
+      unordered_pull_is_rejected
+  ; Alcotest.test_case "rejected submission feedback" `Quick rejected_submission_feedback
   ; Alcotest.test_case
       "stale rejection remains recoverable"
       `Quick

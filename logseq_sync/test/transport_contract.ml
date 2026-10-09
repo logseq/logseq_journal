@@ -277,8 +277,7 @@ let websocket_start ?(checkpoint = 0) origin =
         (Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:transport"
          |> Result.get_ok)
       ~checkpoint:
-        (Logseq_overlay_db.Types.Server_cursor.of_string
-           ("server-cursor:v1:" ^ string_of_int checkpoint)
+        (Logseq_overlay_db.Types.Server_cursor.of_int64 (Int64.of_int checkpoint)
          |> Result.get_ok)
       ~submissions:[]
   in
@@ -1260,7 +1259,7 @@ let test_output_admission () =
        let since = if index = 128 then 2000 else index in
        let expected =
          Logseq_sync_pure_reducer.Sync_protocol.encode_client_message
-           (Pull { since = Some since })
+           (Pull { since = Some (Core_contract.server_cursor_of_int since) })
          |> Result.get_ok
          |> hex
        in

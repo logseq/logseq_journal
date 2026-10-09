@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Wire_nodes = Set.Make (Int)
 
@@ -547,7 +551,7 @@ let run_favorites_native_visibility
         { sync_phase = Current
         ; catalog = []
         ; selected_graph = Some (uuid 900)
-        ; applied_server_t = Some 0
+        ; applied_server_t = Some (server_cursor_of_int 0)
         ; timeline_presentation_pending = false
         ; startup =
             { authenticated = true
@@ -2695,7 +2699,7 @@ let test_reference_outer_terminals cancel =
         { sync_phase = Current
         ; catalog = []
         ; selected_graph = Some (uuid 900)
-        ; applied_server_t = Some 0
+        ; applied_server_t = Some (server_cursor_of_int 0)
         ; timeline_presentation_pending = false
         ; startup =
             { authenticated = true

@@ -90,8 +90,8 @@ let test_package_metadata root =
     "logseq_overlay_db/spec/dune"
     [ "(name logseq_overlay_db)"
     ; "(public_name logseq_overlay_db)"
-    ; "(modules types database)"
-    ; "(virtual_modules types database)"
+    ; "(modules server_cursor types database)"
+    ; "(virtual_modules server_cursor types database)"
     ; "(default_implementation logseq_overlay_db_impl)"
     ; "(libraries eio logseq_db_types)"
     ];

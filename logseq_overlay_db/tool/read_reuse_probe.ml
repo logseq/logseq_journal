@@ -116,7 +116,9 @@ let commit db name expected mutation =
 let token db = D.inspect_sync db |> ok "sync" |> T.sync_view_token
 
 let cursor n =
-  T.Server_cursor.of_string ("server-cursor:v1:" ^ string_of_int n) |> ok "cursor"
+  T.Server_cursor.of_int64 (Int64.of_int n)
+  |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+  |> ok "cursor"
 ;;
 
 let authoritative db n ops =

@@ -6,7 +6,7 @@ type t =
   { format_version : int
   ; graph_id : Graph_types.Uuid.t
   ; schema : Graph_types.schema_version
-  ; applied_server_t : int
+  ; applied_server_t : Server_cursor.t
   ; checksum : string
   ; status : status
   ; last_error : string option
@@ -26,8 +26,6 @@ let valid_checksum value =
 let create_full ~graph_id ~schema ~applied_server_t ~checksum ~status ~last_error =
   if schema.Graph_types.major < 0 || schema.minor < 0
   then Error "sync schema version must be non-negative"
-  else if applied_server_t < 0
-  then Error "applied server t must be non-negative"
   else if not (valid_checksum checksum)
   then Error "sync checksum must be 16 lowercase hexadecimal characters"
   else if status = Active && Option.is_some last_error
@@ -61,7 +59,7 @@ let equal left right =
   left.format_version = right.format_version
   && Graph_types.Uuid.equal left.graph_id right.graph_id
   && left.schema = right.schema
-  && left.applied_server_t = right.applied_server_t
+  && Server_cursor.equal left.applied_server_t right.applied_server_t
   && String.equal left.checksum right.checksum
   && left.status = right.status
   && left.last_error = right.last_error

@@ -1458,11 +1458,7 @@ let handle_sync_worker_effect t = function
     (match Hashtbl.find_opt t.inspections key with
      | None -> Error (effect_error "The snapshot mirror inspection is stale.")
      | Some inspection ->
-       let cursor =
-         Overlay.Server_cursor.of_string
-           (Printf.sprintf "server-cursor:v1:%d" request.applied_server_t)
-         |> Result.get_ok
-       in
+       let cursor = request.applied_server_t in
        (match
           Database.prepare_snapshot_activation
             t.dependencies.overlay

@@ -137,19 +137,6 @@ let measure_journals database =
       then fail "measured get_journals cardinality mismatch"))
 ;;
 
-let server_cursor value =
-  Types.Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" value)
-  |> get_ok "server cursor"
-;;
-
-let server_cursor_number cursor =
-  Types.Server_cursor.to_string cursor
-  |> String.split_on_char ':'
-  |> List.rev
-  |> List.hd
-  |> int_of_string
-;;
-
 let authoritative_wire operations =
   let module Transit = Transit_core.Json in
   let module Codec = Transit_native.Transit.Json in
@@ -167,15 +154,13 @@ let block_lookup uuid =
 ;;
 
 let commit_authoritative database ~cursor wire =
-  let transaction =
-    Types.authoritative_transaction ~cursor:(server_cursor cursor) ~transaction:wire
-  in
+  let transaction = Types.authoritative_transaction ~cursor ~transaction:wire in
   let batch =
     Types.authoritative_batch
       ~maximum_count:16
       ~maximum_bytes:(8 * 1_024 * 1_024)
       ~transactions:[ transaction ]
-      ~through:(server_cursor cursor)
+      ~through:cursor
       ~checksum:None
     |> get_ok "authoritative batch"
   in
@@ -186,10 +171,16 @@ let commit_authoritative database ~cursor wire =
     with
     | Ok value -> value
     | Error Types.Authoritative_cursor_discontinuous ->
-      fail "begin authoritative cursor %d is discontinuous" cursor
+      fail
+        "begin authoritative cursor %Ld is discontinuous"
+        (Types.Server_cursor.to_int64 cursor)
     | Error (Types.Authoritative_decode_failed message) ->
-      fail "begin authoritative cursor %d decode failed: %s" cursor message
-    | Error _ -> fail "begin authoritative cursor %d failed" cursor
+      fail
+        "begin authoritative cursor %Ld decode failed: %s"
+        (Types.Server_cursor.to_int64 cursor)
+        message
+    | Error _ ->
+      fail "begin authoritative cursor %Ld failed" (Types.Server_cursor.to_int64 cursor)
   in
   if Option.is_some crypto
   then fail "performance authoritative transaction requested crypto";
@@ -203,14 +194,16 @@ let commit_authoritative database ~cursor wire =
 
 let measure_rebase database cursor =
   let module Transit = Transit_core.Json in
-  incr cursor;
+  cursor
+  := Types.Server_cursor.of_int64 (Int64.succ (Types.Server_cursor.to_int64 !cursor))
+     |> Result.get_ok;
   let wire =
     authoritative_wire
       [ Transit.Array
           [ Transit.Keyword "db/add"
           ; Transit.Keyword "db/current-tx"
           ; Transit.Keyword "logseq-overlay/performance-rebase"
-          ; Transit.Int !cursor
+          ; Transit.Int64 (Types.Server_cursor.to_int64 !cursor)
           ]
       ]
   in
@@ -219,7 +212,9 @@ let measure_rebase database cursor =
 
 let measure_single_block_classification database cursor ordinal =
   let module Transit = Transit_core.Json in
-  incr cursor;
+  cursor
+  := Types.Server_cursor.of_int64 (Int64.succ (Types.Server_cursor.to_int64 !cursor))
+     |> Result.get_ok;
   let block = Fixture_generator.block_uuid ordinal in
   let wire =
     authoritative_wire
@@ -227,7 +222,8 @@ let measure_single_block_classification database cursor ordinal =
           [ Transit.Keyword "db/add"
           ; block_lookup block
           ; Transit.Keyword "block/updated-at"
-          ; Transit.Int (1_704_067_300_000 + !cursor)
+          ; Transit.Int64
+              (Int64.add 1_704_067_300_000L (Types.Server_cursor.to_int64 !cursor))
           ]
       ]
   in
@@ -273,14 +269,17 @@ let measure_delete_conflict database cursor ordinal =
      |> get_ok "commit performance delete"
      : Types.local_commit_outcome);
   let module Transit = Transit_core.Json in
-  incr cursor;
+  cursor
+  := Types.Server_cursor.of_int64 (Int64.succ (Types.Server_cursor.to_int64 !cursor))
+     |> Result.get_ok;
   let wire =
     authoritative_wire
       [ Transit.Array
           [ Transit.Keyword "db/add"
           ; block_lookup block
           ; Transit.Keyword "block/updated-at"
-          ; Transit.Int (1_704_067_400_000 + !cursor)
+          ; Transit.Int64
+              (Int64.add 1_704_067_400_000L (Types.Server_cursor.to_int64 !cursor))
           ]
       ]
   in
@@ -323,7 +322,6 @@ let benchmark ~open_database ~database_path ~block_count required_sizes =
          Database.inspect_sync database
          |> get_ok "benchmark checkpoint"
          |> Types.sync_view_checkpoint
-         |> server_cursor_number
          |> ref
        in
        let single_block_samples =
