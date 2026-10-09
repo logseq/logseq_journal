@@ -24,6 +24,8 @@ type mutation_kind =
   | Delete_subtree_mutation
 
 type payload =
+  | Projection_changes of Logseq_db_worker.Protocol.v2_change_window list
+  | Projection_resync
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request

@@ -324,10 +324,7 @@ behavior that pure tests cannot establish.
 ## Consequences
 
 Favorites reads fail explicitly above the 10,000-membership resource limit and do
-not display child previews. Invalidation on every graph push is conservative:
-large active lists may refresh for unrelated changes, while inactive lists only
-become dirty. This keeps dependency tracking complete and subscription memory
-constant. Graph replacement clears both destinations. Native adapters add a small
+not display child previews. Graph replacement clears both destinations. Native adapters add a small
 host presentation boundary, verified by native widget tests; graph, cache, draft,
 and mutation ownership remains in OCaml.
 
@@ -359,10 +356,7 @@ the public contract, verifies passing behavior, and checks the affected suites.
 The read implementation audit explicitly verifies link-only publication through
 public authoritative completion and snapshot reads. It asserts that the logical
 projection advances, the membership UUID is published, and an old cursor is
-rejected. This passes with the existing graph publication owner. Favorites
-conservatively invalidates on every logical graph push, including resync, so its
-subscription footprint remains constant and covers filtered targets, ancestry,
-restoration, and hidden-page discovery without a growing per-target watch list.
+rejected. This passes with the existing graph publication owner.
 
 Native Capture uses an application-owned adapter around the existing Flutter FAB,
 persistent bottom sheet, and MessageComposer. The existing expandable composer
@@ -385,8 +379,8 @@ keeps a rendered window of at most 128 rows.
 
 Journals and Favorites share the existing root service and row renderer. Favorites
 owns its lazy cache, refresh staging, request generations, and membership anchor.
-Every graph push invalidates the cache; inactive reads remain isolated and graph
-replacement discards both tab lifetimes. Capture draft/save state stays in the
+Inactive reads remain isolated and graph replacement discards both tab lifetimes.
+Capture draft/save state stays in the
 application, while its native adapter owns only editing controls and sheet focus.
 
 The public widget registry renders the OCaml NavigationBar descriptor using the

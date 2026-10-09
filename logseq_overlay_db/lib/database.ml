@@ -8070,6 +8070,193 @@ let journal_membership = function
   | None | Some _ -> None
 ;;
 
+let property_holder_dependents before after transaction_data ~maximum =
+  let definition database entity =
+    Option.bind (entity_of_ident database "logseq.class/Property") (fun property_class ->
+      Option.bind
+        (Option.bind (one database entity "db/ident") ident_of_value)
+        (fun ident -> property_definition_for_entity database property_class ident entity))
+  in
+  let attributes = Hashtbl.create 16 in
+  let entities = Hashtbl.create 16 in
+  List.iter
+    (List.iter (fun (datom : Datascript.datom) -> Hashtbl.replace entities datom.e ()))
+    transaction_data;
+  Hashtbl.iter
+    (fun entity () ->
+       let old = definition before entity in
+       let current = definition after entity in
+       if old <> current
+       then
+         List.iter
+           (fun (value : Graph.property_summary) ->
+              Hashtbl.replace attributes value.ident ())
+           (Option.to_list old @ Option.to_list current))
+    entities;
+  let holders = Hashtbl.create 16 in
+  let remaining = ref maximum in
+  let overflow = ref false in
+  let inspect database attribute =
+    let rec collect sequence =
+      match sequence () with
+      | Seq.Nil -> ()
+      | Seq.Cons (_, _) when !remaining = 0 -> overflow := true
+      | Seq.Cons ((datom : Datascript.datom), rest) ->
+        (* Bound raw work as well as the emitted UUIDs, including malformed holders. *)
+        decr remaining;
+        Option.iter
+          (fun uuid -> Hashtbl.replace holders (Graph.Uuid.to_string uuid) uuid)
+          (uuid_of_entity database datom.e);
+        collect rest
+    in
+    if not !overflow
+    then collect (Datascript.datoms database Datascript.Aevt ~a:attribute ())
+  in
+  Hashtbl.iter
+    (fun attribute () ->
+       inspect before attribute;
+       inspect after attribute)
+    attributes;
+  Hashtbl.to_seq_values holders |> List.of_seq, !overflow
+;;
+
+let favorite_membership_dependents before after transaction_data ~maximum =
+  let targets = Hashtbl.create 16 in
+  List.iter
+    (List.iter (fun (datom : Datascript.datom) -> Hashtbl.replace targets datom.e ()))
+    transaction_data;
+  let memberships = Hashtbl.create 16 in
+  let remaining = ref maximum in
+  let overflow = ref false in
+  let inspect database target =
+    let rec collect sequence =
+      match sequence () with
+      | Seq.Nil -> ()
+      | Seq.Cons (_, _) when !remaining = 0 -> overflow := true
+      | Seq.Cons ((datom : Datascript.datom), rest) ->
+        decr remaining;
+        Option.iter
+          (fun uuid -> Hashtbl.replace memberships (Graph.Uuid.to_string uuid) uuid)
+          (uuid_of_entity database datom.e);
+        collect rest
+    in
+    if not !overflow
+    then
+      collect
+        (Datascript.datoms
+           database
+           Datascript.Avet
+           ~a:"block/link"
+           ~v:(Datascript.Ref target)
+           ())
+  in
+  Hashtbl.iter
+    (fun target () ->
+       inspect before target;
+       inspect after target)
+    targets;
+  Hashtbl.to_seq_values memberships |> List.of_seq, !overflow
+;;
+
+let asset_reference_dependents
+      before
+      after
+      authoritative_before
+      authoritative_after
+      transaction_data
+      ~maximum
+  =
+  let changed = Hashtbl.create 16 in
+  List.iter
+    (List.iter (fun (datom : Datascript.datom) -> Hashtbl.replace changed datom.e ()))
+    transaction_data;
+  let holders = Hashtbl.create 16 in
+  let remaining = ref maximum in
+  let overflow = ref false in
+  let spend () =
+    if !remaining = 0
+    then (
+      overflow := true;
+      false)
+    else (
+      decr remaining;
+      true)
+  in
+  let rec classify reversed sequence =
+    match sequence () with
+    | Seq.Nil -> List.rev reversed
+    | Seq.Cons (_, _) when not (spend () && spend ()) -> List.rev reversed
+    | Seq.Cons (entity, rest) ->
+      (* Charge both eligibility point reads before touching a candidate. The
+         transaction input is finite; dependent database work shares one budget. *)
+      let changed =
+        match
+          ( uuid_of_entity authoritative_after entity
+          , uuid_of_entity authoritative_before entity )
+        with
+        | None, None -> false
+        | current, old ->
+          let uuid =
+            Option.get
+              (match current with
+               | Some _ -> current
+               | None -> old)
+          in
+          (match asset_descriptor_at before uuid, asset_descriptor_at after uuid with
+           | Ok old, Ok current -> Option.is_some old <> Option.is_some current
+           | _ -> true)
+      in
+      classify (if changed then entity :: reversed else reversed) rest
+  in
+  let targets = classify [] (Hashtbl.to_seq_keys changed) in
+  let inspect database =
+    let property_class = entity_of_ident database "logseq.class/Property" in
+    let admitted attribute =
+      attribute = "block/refs"
+      || Option.fold
+           ~none:false
+           ~some:(fun property_class ->
+             Option.is_some
+               (property_definition_with_class database property_class attribute))
+           property_class
+    in
+    let rec collect sequence =
+      match sequence () with
+      | Seq.Nil -> ()
+      | Seq.Cons (_, _) when not (spend ()) -> ()
+      | Seq.Cons ((datom : Datascript.datom), rest) ->
+        Option.iter
+          (fun uuid -> Hashtbl.replace holders (Graph.Uuid.to_string uuid) uuid)
+          (uuid_of_entity database datom.e);
+        collect rest
+    in
+    let rec attributes = function
+      | [] -> ()
+      | _ when !overflow -> ()
+      | (attribute, (schema : Datascript.schema_attr)) :: rest ->
+        if spend () && schema.value_type = Some Datascript.RefType && admitted attribute
+        then
+          List.iter
+            (fun target ->
+               if (not !overflow) && spend ()
+               then
+                 collect
+                   (Datascript.datoms
+                      database
+                      Datascript.Avet
+                      ~a:attribute
+                      ~v:(Datascript.Ref target)
+                      ()))
+            targets;
+        attributes rest
+    in
+    if targets <> [] && not !overflow then attributes (Datascript.schema database)
+  in
+  inspect authoritative_before;
+  inspect authoritative_after;
+  Hashtbl.to_seq_values holders |> List.of_seq, !overflow
+;;
+
 let logical_change_footprint
       ~before
       ~after
@@ -8081,6 +8268,23 @@ let logical_change_footprint
   let direct =
     changed_entity_uuids authoritative_before authoritative_after transaction_data
   in
+  let property_holders, property_overflow =
+    property_holder_dependents
+      authoritative_before
+      authoritative_after
+      transaction_data
+      ~maximum:before.owner.dependencies.limits.change_max_items
+  in
+  let favorite_memberships, favorite_overflow =
+    favorite_membership_dependents authoritative_before authoritative_after transaction_data
+      ~maximum:before.owner.dependencies.limits.change_max_items
+  in
+  let asset_holders, asset_overflow =
+    asset_reference_dependents before after authoritative_before authoritative_after transaction_data
+      ~maximum:before.owner.dependencies.limits.change_max_items
+  in
+  let asset_pages, asset_blocks = List.partition (fun uuid ->
+    Option.is_some (logical_page_at before uuid) || Option.is_some (logical_page_at after uuid)) asset_holders in
   let outbox_blocks, outbox_pages =
     List.fold_left
       (fun (blocks, pages) (footprint : effect_footprint) ->
@@ -8088,7 +8292,9 @@ let logical_change_footprint
       ([], [])
       outbox_effects
   in
-  let page_candidates = List.sort_uniq Graph.Uuid.compare (direct @ outbox_pages) in
+  let page_candidates =
+    List.sort_uniq Graph.Uuid.compare (direct @ outbox_pages @ property_holders)
+  in
   let changed_pages =
     List.filter
       (fun uuid -> logical_page_at before uuid <> logical_page_at after uuid)
@@ -8122,7 +8328,9 @@ let logical_change_footprint
     collect maximum_dependents [] changed_pages
   in
   let block_candidates =
-    List.sort_uniq Graph.Uuid.compare (direct @ outbox_blocks @ page_dependent_blocks)
+    List.sort_uniq
+      Graph.Uuid.compare
+      (direct @ outbox_blocks @ page_dependent_blocks @ property_holders)
   in
   let block_uuids =
     List.filter
@@ -8131,6 +8339,7 @@ let logical_change_footprint
          let after_value = logical_block_at after uuid in
          before_value <> after_value)
       block_candidates
+    |> fun changed -> List.sort_uniq Graph.Uuid.compare (changed @ favorite_memberships @ asset_blocks)
   in
   let parents, membership_pages =
     List.fold_left
@@ -8173,9 +8382,9 @@ let logical_change_footprint
     @ if journal_changed then [ Types.Journal_index_interest ] else []
   in
   ( block_uuids
-  , List.sort_uniq Graph.Uuid.compare (changed_pages @ membership_pages)
+  , List.sort_uniq Graph.Uuid.compare (changed_pages @ membership_pages @ asset_pages)
   , List.sort_uniq compare structure_interests
-  , dependent_overflow )
+  , dependent_overflow || property_overflow || favorite_overflow || asset_overflow )
 ;;
 
 let storage_session_error = function
@@ -8736,7 +8945,7 @@ let commit_authoritative_candidate database prepared =
                            transitioned_records)
                   in
                   let changed =
-                    block_uuids <> [] || page_uuids <> [] || structure_interests <> []
+                    fanout_overflow || block_uuids <> [] || page_uuids <> [] || structure_interests <> []
                   in
                   database.projection
                   <- (if changed then candidate_projection else before_projection);
@@ -8940,7 +9149,10 @@ let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
           else (
             match logical_tree_candidate snapshot tree_cache uuid with
             | Some candidate -> live (uuid :: seen) candidate.tree_parent
-            | None -> Option.is_some entity))
+            | None ->
+              (match logical_page_at ~cache:tree_cache.hydration snapshot uuid with
+               | Some { page; _ } -> not page.recycled
+               | None -> Option.is_some entity)))
       in
       let peek sequence =
         match sequence () with

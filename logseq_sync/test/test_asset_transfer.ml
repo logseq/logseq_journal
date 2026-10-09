@@ -260,6 +260,146 @@ let lock_and_network () =
   check "online resumes demand" 1 (List.length (fetches e))
 ;;
 
+let failed_transfer () =
+  let t, effects = replace (initial ()) "visible" Foreground [ asset 2 ] in
+  let t, effects = T.step t (Cache_checked (only (checks effects), Ok None)) in
+  let download = only (fetches effects) in
+  let t, effects = T.step t (Downloaded (download, Error Network)) in
+  t, download, effects
+;;
+
+let manual_retry_cached_file () =
+  let t, _, _ = failed_transfer () in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "manual retry checks local before downloading" 1 (List.length (checks effects));
+  check
+    "manual retry does not fetch before cache answer"
+    0
+    (List.length (fetches effects));
+  let t, effects =
+    T.step t (Cache_checked (only (checks effects), Ok (Some "recovered")))
+  in
+  Alcotest.(check bool) "recovered local file becomes Ready" true (ready t "visible");
+  check "local recovery needs no download" 0 (List.length (fetches effects))
+;;
+
+let manual_retry_missing_file () =
+  let t, _, _ = failed_transfer () in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "retry starts one local lookup" 1 (List.length (checks effects));
+  let t, effects = T.step t (Cache_checked (only (checks effects), Ok None)) in
+  check "missing local starts one download" 1 (List.length (fetches effects));
+  let t, effects = T.step t (Downloaded (only (fetches effects), Ok "downloaded")) in
+  Alcotest.(check bool) "download completes Ready" true (ready t "visible");
+  check "completion does not start another download" 0 (List.length (fetches effects))
+;;
+
+let duplicate_retry_while_loading () =
+  let t, _, _ = failed_transfer () in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "retry starts local lookup" 1 (List.length (checks effects));
+  let local = only (checks effects) in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "retry while checking has no effects" 0 (List.length effects);
+  Alcotest.(check bool) "local lookup stays current" true (T.ticket_current t local);
+  let t, effects = T.step t (Cache_checked (local, Ok None)) in
+  let download = only (fetches effects) in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "retry while fetching has no effects" 0 (List.length effects);
+  Alcotest.(check bool) "download stays current" true (T.ticket_current t download)
+;;
+
+let ready_does_not_refresh () =
+  let t, effects = replace (initial ()) "visible" Foreground [ asset 2 ] in
+  let t, _ = T.step t (Cache_checked (only (checks effects), Ok (Some "displayed"))) in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "Ready ignores manual retry" 0 (List.length effects);
+  let descriptors =
+    [ asset 2
+    ; asset ~checksum:(String.make 64 'b') 2
+    ; asset ~remote:false 2
+    ; get
+        (A.create
+           ~uuid:(uuid 2)
+           ~source:(External "https://example/new-image")
+           ~current_checksum:None
+           ~size:None
+           ~dimensions:None)
+    ]
+  in
+  let t =
+    List.fold_left
+      (fun t descriptor ->
+         let t, effects = T.step t (Descriptor_changed descriptor) in
+         check
+           "Ready descriptor refresh has no IO or notification"
+           0
+           (List.length effects);
+         Alcotest.(check bool) "displayed file remains Ready" true (ready t "visible");
+         t)
+      t
+      descriptors
+  in
+  let _, effects =
+    replace t "visible" Foreground [ asset ~checksum:(String.make 64 'b') 2 ]
+  in
+  check "replacing demand keeps displayed resource" 0 (List.length effects)
+;;
+
+let manual_retry_fences_old_work () =
+  let t, old, effects = failed_transfer () in
+  let timer =
+    List.find_map
+      (function
+        | T.Retry_after { id; _ } -> Some id
+        | _ -> None)
+      effects
+    |> Option.get
+  in
+  let t, effects = T.step t (Retry (uuid 2)) in
+  check "retry starts fresh local lookup" 1 (List.length (checks effects));
+  let local = only (checks effects) in
+  let t, effects = T.step t (Retry_elapsed timer) in
+  check "old automatic timer cannot duplicate manual retry" 0 (List.length effects);
+  let t, effects = T.step t (Downloaded (old, Ok "stale")) in
+  Alcotest.(check bool)
+    "late old download releases its handle"
+    true
+    (release_present effects);
+  Alcotest.(check bool)
+    "fresh local ticket survives stale completion"
+    true
+    (T.ticket_current t local);
+  let t, effects = T.step t (Release "visible") in
+  Alcotest.(check bool)
+    "release cancels local lookup"
+    true
+    (List.mem (T.Cancel local) effects);
+  let t, effects = T.step t (Cache_checked (local, Ok (Some "stale"))) in
+  Alcotest.(check bool)
+    "released completion cleans resource"
+    true
+    (release_present effects);
+  check
+    "released consumer is not resurrected"
+    0
+    (List.length (T.availability t ~consumer:"visible"));
+  let scope = { scope with graph_generation = scope.graph_generation + 1 } in
+  let fresh =
+    T.create
+      (get (T.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:2))
+      ~scope
+      ~online:true
+      ~unlocked:true
+  in
+  let fresh, effects = T.step fresh (Downloaded (old, Ok "stale")) in
+  Alcotest.(check bool)
+    "old scope completion cleans resource"
+    true
+    (release_present effects);
+  check "old scope cannot create demand" 0 (T.pending_count fresh)
+;;
+
 let () =
   Alcotest.run
     "asset transfer"
@@ -278,6 +418,11 @@ let () =
           ; "duplicate completion", duplicate
           ; "pending foreground capacity", foreground_queue_capacity
           ; "lock and network", lock_and_network
+          ; "manual retry finds local file", manual_retry_cached_file
+          ; "manual retry downloads only after local miss", manual_retry_missing_file
+          ; "manual retry is inert while loading", duplicate_retry_while_loading
+          ; "Ready ignores Retry and descriptor refresh", ready_does_not_refresh
+          ; "manual retry fences old work", manual_retry_fences_old_work
           ] )
     ]
 ;;

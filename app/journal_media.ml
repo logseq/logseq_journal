@@ -10,6 +10,7 @@ type ticket =
 type presentation =
   | Hidden
   | Placeholder of string
+  | Failed of string
   | File of string
   | External of string
 
@@ -105,10 +106,6 @@ let release t =
         { graph_generation = selected.graph_generation; consumer = selected.consumer }
     ]
   | _ -> []
-;;
-
-let same_version (a : Asset.t) (b : Asset.t) =
-  a.uuid = b.uuid && a.source = b.source && a.current_checksum = b.current_checksum
 ;;
 
 let demand selected =
@@ -217,7 +214,7 @@ let status = function
   | Waiting_unlock -> Placeholder "Unlock graph to view file"
   | Ready _ -> Placeholder "Opening file"
   | Failed { failure; _ } ->
-    Placeholder
+    Failed
       (match failure with
        | Network -> "Unable to download file"
        | Not_found -> "File is not available on the server"
@@ -229,12 +226,20 @@ let status = function
 ;;
 
 let step t = function
-  | Demand_backpressured -> { t with pressured = true }, []
+  | Demand_backpressured ->
+    (match t.status with
+     | File _ | Failed _ -> t, []
+     | _ -> { t with pressured = true }, [])
   | Demand_accepted -> { t with pressured = false }, []
   | Capacity_available ->
     (match t.selection with
-     | Some selected when t.pressured && managed selected.asset ->
-       { t with pressured = false }, [ demand selected ]
+     | Some selected
+       when t.pressured
+            && managed selected.asset
+            &&
+            match t.status with
+            | File _ | Failed _ -> false
+            | _ -> true -> { t with pressured = false }, [ demand selected ]
      | _ -> t, [])
   | Show { graph_generation; consumer; asset } ->
     let selected = { graph_generation; consumer; asset } in
@@ -242,7 +247,7 @@ let step t = function
      | Some old
        when old.graph_generation = graph_generation
             && old.consumer = consumer
-            && same_version old.asset asset -> { t with selection = Some selected }, []
+            && old.asset.uuid = asset.uuid -> { t with selection = Some selected }, []
      | _ ->
        let effects =
          release_file t @ release t @ if managed asset then [ demand selected ] else []
@@ -263,8 +268,9 @@ let step t = function
        when selected.graph_generation = scope.graph_generation
             && selected.consumer = consumer
             && managed selected.asset ->
-       (match availability with
-        | Service.Asset.Ready handle ->
+       (match t.status, availability with
+        | File _, _ -> t, []
+        | _, Service.Asset.Ready handle ->
           if
             (match t.lease with
              | Some l -> l.ticket.scope = scope && l.ticket.handle = handle
@@ -284,11 +290,12 @@ let step t = function
               ; status = Placeholder "Opening file"
               }
             , release_file t @ [ Acquire ticket ] ))
-        | _ ->
+        | _, _ ->
           ( { t with
               pending = None
             ; available = None
             ; lease = None
+            ; pressured = false
             ; status = status availability
             }
           , release_file t ))
@@ -299,7 +306,7 @@ let step t = function
       match result with
       | Some (lease, path) ->
         { t with pending = None; lease = Some { ticket; lease }; status = File path }, []
-      | None -> { t with pending = None; status = Placeholder "Unable to open file" }, [])
+      | None -> { t with pending = None; status = Failed "Unable to open file" }, [])
     else
       ( t
       , (match result, t.lease with
@@ -309,7 +316,12 @@ let step t = function
          | None, _ -> []) )
   | Retry_requested ->
     (match t.selection with
-     | Some selected when managed selected.asset ->
+     | Some selected
+       when managed selected.asset
+            &&
+            match t.status with
+            | Failed _ -> true
+            | _ -> false ->
        (match t.available with
         | Some (scope, handle) ->
           let ticket = { id = t.serial + 1; scope; handle } in

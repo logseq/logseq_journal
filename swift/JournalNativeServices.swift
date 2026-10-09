@@ -6,7 +6,7 @@ import Foundation
   static func makePlatformServices() -> JournalPlatformServices {
     let storage = JournalNativeAccountStorage()
     return JournalPlatformServices(
-      auth: JournalAmplifySession(),
+      auth: JournalCognitoNative.shared,
       account: JournalAccountStore(
         load: { try await storage.load() },
         save: { try await storage.save($0) },

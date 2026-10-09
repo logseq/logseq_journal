@@ -1,5 +1,6 @@
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
+module Protocol = Logseq_db_worker.Protocol
 
 type ticket
 
@@ -46,13 +47,15 @@ val preview_visible
 
 val next : t -> root:string -> unit
 val retry : ?owner:string -> t -> root:string -> asset:string -> unit
+val observe_response : t -> Protocol.response -> unit
 
-(** Mark retained metadata dirty after a projection change or resync. Only
-    active root/asset/preview owners read immediately; hidden groups restart
-    lazily. Each root keeps one request and at most one dirty follow-up, always
-    from the first page because cursors belong to the global projection. *)
-val refresh : t -> unit
+(** Register a successfully admitted current-scope query before its response.
+    Observations retire their registration and cannot overwrite newer facts. *)
+val observe_request : t -> Protocol.request -> unit
 
+val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
+val changes : t -> Protocol.v2_change_window list -> unit
+val resync : t -> unit
 val receive : t -> ticket -> Service.response -> unit
 val reject : t -> ticket -> unit
 val notice : t -> Service.asset_scope -> Service.asset_notice -> unit

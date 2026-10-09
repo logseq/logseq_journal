@@ -29,6 +29,30 @@ let dispatch_lui event = (hooks ()).dispatch event
 let appear node = dispatch_lui (Lui_protocol.Appear node)
 let press node = dispatch_lui (Lui_protocol.Press node)
 let long_press node = dispatch_lui (Lui_protocol.LongPress node)
+
+let pointer_detail x y modifiers button target_class : Lui_protocol.pointer_detail =
+  { x; y; modifiers; button; target_class }
+;;
+
+let press_detail node x y modifiers button target_class =
+  dispatch_lui (Lui_protocol.PressDetail (node, pointer_detail x y modifiers button target_class))
+;;
+
+let pointer_down node x y modifiers button target_class =
+  dispatch_lui (Lui_protocol.PointerDown (node, pointer_detail x y modifiers button target_class))
+;;
+
+let pointer_up node x y modifiers button target_class =
+  dispatch_lui (Lui_protocol.PointerUp (node, pointer_detail x y modifiers button target_class))
+;;
+
+let context_menu_press node x y modifiers button target_class =
+  dispatch_lui (Lui_protocol.ContextMenuPress (node, pointer_detail x y modifiers button target_class))
+;;
+
+let pointer_enter node = dispatch_lui (Lui_protocol.PointerEnter node)
+let pointer_leave node = dispatch_lui (Lui_protocol.PointerLeave node)
+
 let text_changed node text = dispatch_lui (Lui_protocol.TextChanged (node, text))
 let submit node = dispatch_lui (Lui_protocol.Submit node)
 let dismiss node = dispatch_lui (Lui_protocol.Dismiss node)
@@ -63,6 +87,12 @@ let register hooks =
   Callback.register "lui_ocaml_appear" appear;
   Callback.register "lui_ocaml_press" press;
   Callback.register "lui_ocaml_long_press" long_press;
+  Callback.register "lui_ocaml_press_detail" press_detail;
+  Callback.register "lui_ocaml_pointer_down" pointer_down;
+  Callback.register "lui_ocaml_pointer_up" pointer_up;
+  Callback.register "lui_ocaml_pointer_enter" pointer_enter;
+  Callback.register "lui_ocaml_pointer_leave" pointer_leave;
+  Callback.register "lui_ocaml_context_menu_press" context_menu_press;
   Callback.register "lui_ocaml_text_changed" text_changed;
   Callback.register "lui_ocaml_submit" submit;
   Callback.register "lui_ocaml_dismiss" dismiss;

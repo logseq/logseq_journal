@@ -653,7 +653,7 @@ let step state event =
         | Some (_, transfer) -> transfer
         | None ->
           Transfer.create
-            (Transfer.config ~active:3 ~foreground_reserved:1 ~pending:128 ~retries:3
+            (Transfer.config ~active:3 ~foreground_reserved:1 ~pending:128 ~retries:0
              |> Result.get_ok)
             ~scope:context.scope
             ~online:(asset_online state)

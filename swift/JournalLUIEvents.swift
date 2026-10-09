@@ -10,6 +10,30 @@ private func luiOCamlAppear(_ node: Int64) -> Int32
 private func luiOCamlPress(_ node: Int64) -> Int32
 @_silgen_name("lui_ocaml_long_press")
 private func luiOCamlLongPress(_ node: Int64) -> Int32
+@_silgen_name("lui_ocaml_press_detail")
+private func luiOCamlPressDetail(
+  _ node: Int64, _ x: Double, _ y: Double, _ modifiers: Int32, _ button: Int32,
+  _ targetClass: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("lui_ocaml_pointer_down")
+private func luiOCamlPointerDown(
+  _ node: Int64, _ x: Double, _ y: Double, _ modifiers: Int32, _ button: Int32,
+  _ targetClass: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("lui_ocaml_pointer_up")
+private func luiOCamlPointerUp(
+  _ node: Int64, _ x: Double, _ y: Double, _ modifiers: Int32, _ button: Int32,
+  _ targetClass: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("lui_ocaml_context_menu_press")
+private func luiOCamlContextMenuPress(
+  _ node: Int64, _ x: Double, _ y: Double, _ modifiers: Int32, _ button: Int32,
+  _ targetClass: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("lui_ocaml_pointer_enter")
+private func luiOCamlPointerEnter(_ node: Int64) -> Int32
+@_silgen_name("lui_ocaml_pointer_leave")
+private func luiOCamlPointerLeave(_ node: Int64) -> Int32
 @_silgen_name("lui_ocaml_text_changed")
 private func luiOCamlTextChanged(_ node: Int64, _ text: UnsafePointer<CChar>?) -> Int32
 @_silgen_name("lui_ocaml_submit")
@@ -43,6 +67,24 @@ private func journalOCamlExtensionEvent(
     case .appear(let node): return luiOCamlAppear(Int64(node))
     case .press(let node): return luiOCamlPress(Int64(node))
     case .longPress(let node): return luiOCamlLongPress(Int64(node))
+    case .pressDetail(let node, let x, let y, let modifiers, let button, let targetClass):
+      return targetClass.withCString {
+        luiOCamlPressDetail(Int64(node), x, y, Int32(modifiers), Int32(button), $0)
+      }
+    case .pointerDown(let node, let x, let y, let modifiers, let button, let targetClass):
+      return targetClass.withCString {
+        luiOCamlPointerDown(Int64(node), x, y, Int32(modifiers), Int32(button), $0)
+      }
+    case .pointerUp(let node, let x, let y, let modifiers, let button, let targetClass):
+      return targetClass.withCString {
+        luiOCamlPointerUp(Int64(node), x, y, Int32(modifiers), Int32(button), $0)
+      }
+    case .contextMenuPress(let node, let x, let y, let modifiers, let button, let targetClass):
+      return targetClass.withCString {
+        luiOCamlContextMenuPress(Int64(node), x, y, Int32(modifiers), Int32(button), $0)
+      }
+    case .pointerEnter(let node): return luiOCamlPointerEnter(Int64(node))
+    case .pointerLeave(let node): return luiOCamlPointerLeave(Int64(node))
     case .textChanged(let node, let text):
       return text.withCString { luiOCamlTextChanged(Int64(node), $0) }
     case .submit(let node): return luiOCamlSubmit(Int64(node))

@@ -45,6 +45,49 @@ let block
 ;;
 
 module V = Ui.View
+module Wire_nodes = Set.Make (Int)
+
+let track_wire_teardown on_drop =
+  let parents = Hashtbl.create 64 in
+  let children = Hashtbl.create 64 in
+  let children_of node =
+    Option.value (Hashtbl.find_opt children node) ~default:Wire_nodes.empty
+  in
+  let unlink node =
+    match Hashtbl.find_opt parents node with
+    | None -> ()
+    | Some parent ->
+      Hashtbl.replace children parent (Wire_nodes.remove node (children_of parent));
+      Hashtbl.remove parents node
+  in
+  let drop node =
+    unlink node;
+    Wire_nodes.iter (Hashtbl.remove parents) (children_of node);
+    Hashtbl.remove children node;
+    on_drop node
+  in
+  let rec detach node =
+    Wire_nodes.iter detach (children_of node);
+    drop node
+  in
+  function
+  | Lui_protocol.InsertChild (parent, child, _) | MoveChild (parent, child, _) ->
+    unlink child;
+    Hashtbl.replace parents child parent;
+    Hashtbl.replace children parent (Wire_nodes.add child (children_of parent))
+  | RemoveChild (parent, child) ->
+    if Hashtbl.find_opt parents child = Some parent then unlink child
+  | DropNode node -> drop node
+  | DetachSubtree node -> detach node
+  | _ -> ()
+;;
+
+let dropped_wire_nodes ops =
+  let dropped = Hashtbl.create 64 in
+  let track = track_wire_teardown (fun node -> Hashtbl.replace dropped node ()) in
+  List.iter track ops;
+  dropped
+;;
 
 let test_timeline_media_targets () =
   let targets = ref [] in
@@ -925,7 +968,7 @@ let test_file_cards_use_actual_metadata () =
 
 let test_attachment_unavailable_keeps_retry () =
   with_mounted
-    (media_view [ media_item 1 "jpg" (Placeholder "Not downloaded") None ])
+    (media_view [ media_item 1 "jpg" (Failed "Not downloaded") None ])
     (fun _ ops ->
        require
          (has_text (ops ()) "Not downloaded" && has_text (ops ()) "Retry")
@@ -1374,6 +1417,7 @@ let check_stable_image_slots ~entry ~images ~width ~height =
       images;
     let check () =
       let operations = ops () in
+      let dropped = dropped_wire_nodes operations in
       List.iter
         (fun (_, node) ->
            let prop property =
@@ -1391,12 +1435,7 @@ let check_stable_image_slots ~entry ~images ~width ~height =
               && prop HeightValue = Some (IntValue height))
              "image availability changed the final slot dimensions";
            require
-             (not
-                (List.exists
-                   (function
-                     | Lui_protocol.DropNode id -> id = node
-                     | _ -> false)
-                   operations))
+             (not (Hashtbl.mem dropped node))
              "image availability replaced a reserved slot")
         initial
     in
@@ -1552,14 +1591,16 @@ let test_native_list_payload_binds_nested_contents () =
    transfer requests and leases remain covered by their state owners. *)
 let mounted_nodes ops property expected =
   let values = Hashtbl.create 64 in
+  let track_teardown = track_wire_teardown (Hashtbl.remove values) in
   List.iter
-    (function
-      | Lui_protocol.SetProp (node, key, value) when key = property ->
-        Hashtbl.replace values node value
-      | Lui_protocol.RemoveProp (node, key) when key = property ->
-        Hashtbl.remove values node
-      | Lui_protocol.DropNode node -> Hashtbl.remove values node
-      | _ -> ())
+    (fun op ->
+       track_teardown op;
+       match op with
+       | Lui_protocol.SetProp (node, key, value) when key = property ->
+         Hashtbl.replace values node value
+       | Lui_protocol.RemoveProp (node, key) when key = property ->
+         Hashtbl.remove values node
+       | _ -> ())
     ops;
   Hashtbl.fold
     (fun node value nodes -> if value = expected then node :: nodes else nodes)
@@ -1577,16 +1618,12 @@ let current_text ops text =
   mounted_nodes ops Lui_protocol.TextValue (Lui_protocol.StringValue text) <> []
 ;;
 
-let require_nodes_retained nodes delta =
+let require_nodes_retained nodes operations =
+  let dropped = dropped_wire_nodes operations in
   List.iter
     (fun node ->
        require
-         (not
-            (List.exists
-               (function
-                 | Lui_protocol.DropNode id -> id = node
-                 | _ -> false)
-               delta))
+         (not (Hashtbl.mem dropped node))
          "item presentation dropped an unaffected body, slot, or sibling node")
     nodes
 ;;
@@ -1628,14 +1665,12 @@ let test_reactive_child_gallery_routes_and_preserves_siblings () =
        assert_event (asset_id first) first.token;
        List.iter
          (fun presentation ->
-            let before = List.length (ops ()) in
             Store.update
               store
               ~root:(asset_id first)
               (Some (media_state [ { first with presentation } ]));
             ignore (Lui_app.flush app);
-            let delta = List.filteri (fun index _ -> index >= before) (ops ()) in
-            require_nodes_retained [ first_slot; second_slot; body; sibling ] delta;
+            require_nodes_retained [ first_slot; second_slot; body; sibling ] (ops ());
             require
               (node AccessibilityIdentifier ("journal-image-slot:" ^ asset_id first)
                = first_slot)
@@ -1727,7 +1762,6 @@ let test_reactive_nonimage_structure_and_presentation () =
          Store.update store ~root:block_id view;
          ignore (Lui_app.flush app)
        in
-       let before = List.length (ops ()) in
        update
          (Some (media_state [ { pdf with presentation = File "/tmp/reactive-plan.pdf" } ]));
        require
@@ -1736,13 +1770,11 @@ let test_reactive_nonimage_structure_and_presentation () =
        require
          (current_text (ops ()) "PDF · 32.5 KB")
          "PDF card lost actual descriptor metadata";
-       require_nodes_retained
-         [ body; sibling ]
-         (List.filteri (fun index _ -> index >= before) (ops ()));
+       require_nodes_retained [ body; sibling ] (ops ());
        update
          (Some
             (media_state
-               [ { pdf with presentation = Placeholder "Unable to open file" } ]));
+               [ { pdf with presentation = Failed "Unable to open file" } ]));
        require
          (current_text (ops ()) "Unable to open file" && current_text (ops ()) "Retry")
          "nonimage failure lost its current message or retry action";

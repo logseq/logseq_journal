@@ -137,6 +137,51 @@ LUI_EXPORT int32_t lui_ocaml_long_press(int64_t node) {
   return dispatch_long("lui_ocaml_long_press", node);
 }
 
+/* Root every allocated pointer argument before subsequent allocations. The
+   patch callback executes only after dropping these roots and the runtime. */
+static int dispatch_pointer(const char *name, int64_t node, double x, double y,
+                            int32_t modifiers, int32_t button,
+                            const char *target_class) {
+  patch_response response = {0, NULL, NULL};
+  caml_leave_blocking_section();
+  const value *dispatch = caml_named_value(name);
+  if (dispatch != NULL && target_class != NULL) {
+    CAMLparam0();
+    CAMLlocalN(arguments, 6);
+    CAMLlocal1(result);
+    arguments[0] = Val_long(node);
+    arguments[1] = caml_copy_double(x);
+    arguments[2] = caml_copy_double(y);
+    arguments[3] = Val_long(modifiers);
+    arguments[4] = Val_long(button);
+    arguments[5] = caml_copy_string(target_class);
+    result = caml_callbackN_exn(*dispatch, 6, arguments);
+    response = copy_patch(name, result);
+    CAMLdrop;
+  }
+  return release_and_deliver(response);
+}
+
+#define JOURNAL_POINTER_ENTRY(entry) \
+  LUI_EXPORT int32_t entry(int64_t node, double x, double y, \
+                           int32_t modifiers, int32_t button, \
+                           const char *target_class) { \
+    return dispatch_pointer(#entry, node, x, y, modifiers, button, target_class); \
+  }
+
+JOURNAL_POINTER_ENTRY(lui_ocaml_press_detail)
+JOURNAL_POINTER_ENTRY(lui_ocaml_pointer_down)
+JOURNAL_POINTER_ENTRY(lui_ocaml_pointer_up)
+JOURNAL_POINTER_ENTRY(lui_ocaml_context_menu_press)
+
+LUI_EXPORT int32_t lui_ocaml_pointer_enter(int64_t node) {
+  return dispatch_long("lui_ocaml_pointer_enter", node);
+}
+
+LUI_EXPORT int32_t lui_ocaml_pointer_leave(int64_t node) {
+  return dispatch_long("lui_ocaml_pointer_leave", node);
+}
+
 static int dispatch_string(const char *name, int64_t node, const char *text) {
   patch_response response = {0, NULL, NULL};
   caml_leave_blocking_section();

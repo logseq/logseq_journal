@@ -16,7 +16,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 LUI = Path(os.environ.get("JOURNAL_LUI_PACKAGE_PATH", ROOT / "../lui/platform/apple")).resolve()
-SCRATCH = ROOT / "_build/apple-tests/native-events/lui"
+SCRATCH = Path(os.environ.get("JOURNAL_LUI_TEST_SCRATCH",
+    Path(tempfile.gettempdir()) / "journal-native-events-lui"))
 
 
 def run(command, cwd=ROOT):

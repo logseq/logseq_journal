@@ -153,7 +153,22 @@ let can_attach t =
 ;;
 
 let add_attachment t staged =
-  if can_attach t
+  let duplicate =
+    List.exists
+      (fun owned ->
+         String.equal
+           (Journal_asset_import.staged_token owned)
+           (Journal_asset_import.staged_token staged)
+         ||
+         match
+           ( Journal_asset_import.staged_source_identity owned
+           , Journal_asset_import.staged_source_identity staged )
+         with
+         | Some left, Some right -> String.equal left right
+         | _ -> false)
+      t.pending_attachments
+  in
+  if can_attach t && not duplicate
   then (
     let t = replace_attempt t in
     { t with pending_attachments = t.pending_attachments @ [ staged ] })

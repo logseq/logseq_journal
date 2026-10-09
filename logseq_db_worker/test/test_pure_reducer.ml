@@ -444,6 +444,129 @@ let test_asset_failure_is_independent () =
   Alcotest.(check int) "foreign demand rejected" 0 (List.length stale.effects)
 ;;
 
+let asset_instructions effects =
+  List.filter_map
+    (function
+      | Core.Run_asset (_, instruction) -> Some instruction
+      | _ -> None)
+    effects
+;;
+
+let test_asset_manual_retry_policy () =
+  let state, scope = worker_open_graph () in
+  let demanded = Core.step state (asset_demand scope) in
+  let local = lookup demanded.effects in
+  let missing =
+    Core.step
+      demanded.next
+      (Core.Asset_completed (scope, Transfer.Cache_checked (local, Ok None)))
+  in
+  let download =
+    List.find_map
+      (function
+        | Transfer.Fetch ticket -> Some ticket
+        | _ -> None)
+      (asset_instructions missing.effects)
+    |> Option.get
+  in
+  let failed =
+    Core.step
+      missing.next
+      (Core.Asset_completed (scope, Transfer.Downloaded (download, Error Network)))
+  in
+  Alcotest.(check bool)
+    "production never schedules automatic retry"
+    false
+    (List.exists
+       (function
+         | Transfer.Retry_after _ | Fetch _ -> true
+         | _ -> false)
+       (asset_instructions failed.effects));
+  let retry =
+    Core.step
+      failed.next
+      (Core.Asset_requested
+         { graph_generation = scope.graph_generation; event = Retry scope.graph_id })
+  in
+  let local = lookup retry.effects in
+  Alcotest.(check bool)
+    "manual retry does not bypass local lookup"
+    false
+    (List.exists
+       (function
+         | Transfer.Fetch _ -> true
+         | _ -> false)
+       (asset_instructions retry.effects));
+  let hit =
+    Core.step
+      retry.next
+      (Core.Asset_completed (scope, Transfer.Cache_checked (local, Ok (Some "recovered"))))
+  in
+  Alcotest.(check bool)
+    "local recovery is Ready with no download"
+    true
+    (List.exists
+       (function
+         | Core.Publish
+             (Asset_notice (_, Asset_availability { availability = Ready "recovered"; _ }))
+           -> true
+         | _ -> false)
+       hit.effects
+     && not
+          (List.exists
+             (function
+               | Transfer.Fetch _ -> true
+               | _ -> false)
+             (asset_instructions hit.effects)))
+;;
+
+let test_asset_manual_retry_is_unlimited () =
+  let state, scope = worker_open_graph () in
+  let demanded = Core.step state (asset_demand scope) in
+  let rec attempt state local remaining =
+    let missing =
+      Core.step
+        state
+        (Core.Asset_completed (scope, Transfer.Cache_checked (local, Ok None)))
+    in
+    let downloads =
+      List.filter_map
+        (function
+          | Transfer.Fetch ticket -> Some ticket
+          | _ -> None)
+        (asset_instructions missing.effects)
+    in
+    Alcotest.(check int)
+      "each explicit local miss starts exactly one download"
+      1
+      (List.length downloads);
+    let failed =
+      Core.step
+        missing.next
+        (Core.Asset_completed
+           (scope, Transfer.Downloaded (List.hd downloads, Error Not_found)))
+    in
+    Alcotest.(check bool)
+      "failed manual attempt has no automatic timer"
+      false
+      (List.exists
+         (function
+           | Transfer.Retry_after _ -> true
+           | _ -> false)
+         (asset_instructions failed.effects));
+    if remaining > 0
+    then (
+      let retry =
+        Core.step
+          failed.next
+          (Core.Asset_requested
+             { graph_generation = scope.graph_generation; event = Retry scope.graph_id })
+      in
+      attempt retry.next (lookup retry.effects) (remaining - 1))
+  in
+  attempt demanded.next (lookup demanded.effects) 4
+;;
+
 let test_asset_execution_completion_is_delivered () =
   let state, scope = worker_open_graph () in
   let request : Sync.asset_request =
@@ -874,6 +997,14 @@ let () =
             "independent failure"
             `Quick
             test_asset_failure_is_independent
+        ; Alcotest.test_case
+            "manual local-first without automatic retry"
+            `Quick
+            test_asset_manual_retry_policy
+        ; Alcotest.test_case
+            "manual retries have no attempt quota"
+            `Quick
+            test_asset_manual_retry_is_unlimited
         ] )
     ; ( "managed lifecycle"
       , [ Alcotest.test_case

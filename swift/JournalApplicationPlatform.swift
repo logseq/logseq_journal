@@ -1,4 +1,3 @@
-import Amplify
 import Foundation
 import Observation
 #if os(iOS)
@@ -58,7 +57,7 @@ import AppKit
   @ObservationIgnored private var connection = UUID()
   @ObservationIgnored private var refresh: Task<Void, Never>?
   @ObservationIgnored private var pending = JournalPlatformEvents()
-  @ObservationIgnored private var authListener: UnsubscribeToken?
+  @ObservationIgnored private var authListener: NSObjectProtocol?
   @ObservationIgnored private var shutdown: JournalApplicationShutdown?
   @ObservationIgnored private var lastEnvironment: JournalEnvironmentSample?
   @ObservationIgnored private(set) var connected = false
@@ -89,7 +88,7 @@ import AppKit
 
   func disconnect() {
     guard connected || runtime != nil else { return }
-    if let authListener { Amplify.Hub.removeListener(authListener) }
+    if let authListener { NotificationCenter.default.removeObserver(authListener) }
     authListener = nil
     connection = UUID()
     refresh?.cancel()
@@ -233,14 +232,12 @@ import AppKit
   }
 
   private func observeAuthentication() {
-    if let authListener { Amplify.Hub.removeListener(authListener) }
+    if let authListener { NotificationCenter.default.removeObserver(authListener) }
     let identity = connection
-    authListener = Amplify.Hub.listen(to: .auth) { @Sendable [weak self] payload in
-      guard [HubPayload.EventName.Auth.signedIn, HubPayload.EventName.Auth.signedOut,
-             HubPayload.EventName.Auth.sessionExpired, HubPayload.EventName.Auth.userDeleted]
-        .contains(payload.eventName) else { return }
+    authListener = NotificationCenter.default.addObserver(
+      forName: JournalCognitoSession.changed, object: nil, queue: .main) { @Sendable [weak self] _ in
       Task { @MainActor [weak self] in
-        guard let self, connection == identity else { return }
+        guard let self, connection == identity, connected else { return }
         refreshAuthentication()
       }
     }

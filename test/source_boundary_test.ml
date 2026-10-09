@@ -1122,10 +1122,10 @@ let () =
     "logseq_journal.opam"
     ~package:"ocaml-signal"
     ~version:"0.1.0";
-  (* Journal's host-code mapping uses the validated FlutterHost protocol;
-     keep both developer and CI manifests on that compatible revision. *)
+  (* Journal uses the upstream native host ABI decoder; keep the OCaml
+     installation and Apple package on the same validated revision. *)
   let compatible_lui_revision =
-    "git+https://github.com/logseq/lui.git#adbdf63fe940157824f29262095bb194ebd21404"
+    "git+https://github.com/logseq/lui.git#91aecb52a1cba2faaf23aac1d64a0bd1cb6549e7"
   in
   List.iter
     (fun relative -> require_occurrences root relative compatible_lui_revision 1)
@@ -1156,7 +1156,7 @@ let () =
     ]
   in
   let current_datascript_revision =
-    "datascript-ocaml.git#b346cdd36e9d01af381da022723d3307fd26760d"
+    "datascript-ocaml.git#0561660e4894faee250d551ab2a32a6b5c25a5fb"
   in
   List.iter
     (fun relative ->
@@ -1570,8 +1570,8 @@ let () =
     [ "sign_out_request"; "is_prepare_to_terminate_event"; "termination_ready_request" ];
   require_text
     root
-    "swift/JournalAmplifySession.swift"
-    [ "Amplify.Auth.signOut()"; "Amplify.Auth.fetchAuthSession()"; "getCognitoTokens()" ];
+    "swift/JournalCognitoSession.swift"
+    [ "func signOut()"; "func freshIDToken()"; "func currentUserID()" ];
   require_text
     root
     "swift/JournalNativeServices.swift"

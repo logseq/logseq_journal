@@ -143,7 +143,7 @@ if [[ $platform == ios-simulator ]]; then
   # is killed (error 163) no matter what identity signed them. The sim reads
   # its entitlements from the __TEXT,__entitlements section instead — embed
   # them at link time like Xcode does, then sign adhoc. This is what makes
-  # keychain (Amplify sign-in, localAccount) work on the sim.
+  # keychain (OAuth sign-in, localAccount) work on the sim.
   ios_entitlements="$build_dir/ios-sim-entitlements.plist"
   cp "$entitlements_dir/ios-debug-profile.entitlements" "$ios_entitlements"
   bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
@@ -165,14 +165,27 @@ product_dir="$swift_dir/.build/$triple/debug"
 [[ -f $product_dir/JournalApp ]] || product_dir="$swift_dir/.build/debug"
 app_dir=${app_dir_arg:-$build_dir/LogseqJournal.app}
 rm -rf "$app_dir"
+register_callback() {
+  python3 - "$1" <<'PYPLIST'
+import plistlib, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+info = plistlib.loads(path.read_bytes())
+entries = info.setdefault('CFBundleURLTypes', [])
+if not any('logseqjournal' in entry.get('CFBundleURLSchemes', []) for entry in entries):
+    entries.append({'CFBundleURLName': 'com.logseq.journal.auth', 'CFBundleURLSchemes': ['logseqjournal']})
+path.write_bytes(plistlib.dumps(info))
+PYPLIST
+}
 if [[ $platform == macos ]]; then
   mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
   cp "$info_plist" "$app_dir/Contents/Info.plist"
+  register_callback "$app_dir/Contents/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/Contents/MacOS/JournalApp"
   # keychain-access-groups needs a real team id; without one the group is
   # invalid and AMFI kills the binary, so drop the key for local builds. With a
   # team id, sign with the Apple Development identity so the entitlement is
-  # honored (Amplify/keychain then work on macOS too).
+  # honored (OAuth/keychain then work on macOS too).
   macos_entitlements="$build_dir/macos-entitlements.plist"
   cp "$entitlements_dir/macos-debug-profile.entitlements" "$macos_entitlements"
   bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist")
@@ -194,6 +207,7 @@ else
   # iOS bundles are flat; an empty Contents/ dir breaks install + codesign.
   mkdir -p "$app_dir"
   cp "$info_plist" "$app_dir/Info.plist"
+  register_callback "$app_dir/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/JournalApp"
   # Plain adhoc signature — the sim's entitlements already live in the
   # __TEXT,__entitlements section embedded at link time above. Do NOT pass
