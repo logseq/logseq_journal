@@ -329,6 +329,188 @@ let local_asset_import database =
     | _ -> Alcotest.fail "uploaded metadata missing")
 ;;
 
+let local_page_asset_import database =
+  let page = id 95
+  and text = id 96
+  and asset = id 97 in
+  let expected =
+    with_snapshot database (fun snapshot ->
+      match D.get_pages snapshot [ page ] |> get with
+      | [ Types.Missing_page { revision; _ } ] ->
+        D.write_precondition ~blocks:[] ~pages:[ page, revision ] ~scopes:[] |> get
+      | _ -> Alcotest.fail "local journal page unexpectedly exists")
+  in
+  ignore
+    (D.commit_local
+       database
+       ~expected
+       (Types.Create_journal_page
+          { mutation_id = T.mutation_uuid 1200
+          ; page
+          ; title = "2026-10-09"
+          ; journal_day = 20261009
+          })
+     |> get);
+  let expected =
+    T.insert_precondition database ~parent:page ~behavior:"local capture text"
+  in
+  ignore
+    (D.commit_local
+       database
+       ~expected
+       (Types.Insert_blocks
+          { mutation_id = T.mutation_uuid 1201
+          ; parent = page
+          ; tree = { uuid = text; title = "Local capture"; children = [] }
+          ; asset = None
+          })
+     |> get);
+  let expected =
+    with_snapshot database (fun snapshot ->
+      let revision =
+        match D.get_blocks snapshot [ text ] |> get with
+        | [ Types.Present_block block ] -> block.revision
+        | _ -> Alcotest.fail "local capture text missing"
+      in
+      match
+        D.get_structure
+          snapshot
+          (Types.Children { parent = text; limit = 1; cursor = None })
+        |> get
+      with
+      | Types.Children_result { revision_scope; scope_revision; _ } ->
+        D.write_precondition
+          ~blocks:[ text, revision ]
+          ~pages:[]
+          ~scopes:[ revision_scope, scope_revision ]
+        |> get
+      | _ -> Alcotest.fail "local capture children missing")
+  in
+  let version = A.version ~checksum:(String.make 64 'e') ~file_type:"png" |> get in
+  let mutation =
+    Types.Insert_blocks
+      { mutation_id = T.mutation_uuid 1202
+      ; parent = text
+      ; tree = { uuid = asset; title = "Pending local PNG"; children = [] }
+      ; asset = Some { replace_reference = None; version; size = 11L }
+      }
+  in
+  ignore (D.commit_local database ~expected mutation |> get);
+  T.require
+    (Option.is_some (D.inspect_local_mutation database mutation |> get))
+    "local capture asset has no durable receipt";
+  with_snapshot database (fun snapshot ->
+    let descriptors = D.get_asset_descriptors snapshot [ asset ] |> get in
+    (match descriptors with
+     | [ { A.uuid
+         ; source = Managed None
+         ; current_checksum = Some checksum
+         ; size = Some 11L
+         ; _
+         }
+       ] ->
+       T.require
+         (G.Uuid.equal uuid asset && checksum = version.checksum)
+         "local pending descriptor differs from durable import"
+     | _ -> Alcotest.fail "local pending Managed None descriptor missing");
+    let direct =
+      D.get_assets_under_roots
+        snapshot
+        ~recursive:false
+        ~roots:[ asset ]
+        ~limit:1
+        ~cursor:None
+      |> get
+    in
+    T.require
+      (direct.assets = descriptors)
+      "local asset root lost its logical page ancestry";
+    T.require
+      (collect snapshot [ page ] = [ asset ])
+      "local page subtree omitted pending asset";
+    T.require
+      (collect snapshot [ text ] = [ asset ])
+      "local text subtree omitted pending asset";
+    T.require
+      (collect ~recursive:false snapshot [ page; text ] = [])
+      "direct page/text query included child assets";
+    T.require (collect snapshot [ id 99999 ] = []) "missing logical root became live";
+    let expected =
+      T.delete_precondition database ~block:text ~behavior:"delete local capture"
+    in
+    ignore
+      (D.commit_local
+         database
+         ~expected
+         (Types.Delete_blocks { mutation_id = T.mutation_uuid 1203; root = text })
+       |> get);
+    with_snapshot database (fun current ->
+      T.require
+        (collect current [ page; text; asset ] = [])
+        "tombstoned local ancestor retained a pending asset");
+    T.require
+      (collect snapshot [ page ] = [ asset ])
+      "local asset deletion changed pinned snapshot")
+;;
+
+let recycled_asset_ancestry database =
+  seed database;
+  apply database 2 [ add 0 "logseq.property/deleted-at" (Int64 1_788_192_000_001L) ];
+  with_snapshot database (fun snapshot ->
+    (match D.get_pages snapshot [ id 0 ] |> get with
+     | [ Types.Present_page { value; _ } ] ->
+       T.require value.page.recycled "fixture page is not recycled"
+     | _ -> Alcotest.fail "recycled page missing");
+    T.require (collect snapshot [ id 0; id 1 ] = []) "recycled ancestry became live";
+    T.require
+      (collect ~recursive:false snapshot [ id 3 ] = [ id 3 ])
+      "standalone authoritative asset was lost")
+;;
+
+let cyclic_asset_ancestry database =
+  seed database;
+  apply database 2 [ add 1 "block/parent" (Int 40002) ];
+  with_snapshot database (fun snapshot ->
+    match
+      D.get_assets_under_roots
+        snapshot
+        ~recursive:false
+        ~roots:[ id 1 ]
+        ~limit:1
+        ~cursor:None
+    with
+    | Error (Types.Fatal_read_state _) -> ()
+    | _ -> Alcotest.fail "cyclic ancestry did not fail explicitly")
+;;
+
+let bounded_asset_ancestry database =
+  seed database;
+  apply
+    database
+    2
+    (List.init 257 (fun offset ->
+       let n = 1000 + offset
+       and parent = if offset = 0 then 0 else 999 + offset in
+       [ add n "block/uuid" (Uuid (G.Uuid.to_string (id n)))
+       ; add n "block/title" (String "Deep asset ancestor")
+       ; add n "block/parent" (Int (40000 + parent))
+       ; add n "block/page" (Int 40000)
+       ; add n "block/order" (String "a")
+       ])
+     |> List.concat);
+  with_snapshot database (fun snapshot ->
+    match
+      D.get_assets_under_roots
+        snapshot
+        ~recursive:false
+        ~roots:[ id 1256 ]
+        ~limit:1
+        ~cursor:None
+    with
+    | Error Types.Read_limit_exceeded -> ()
+    | _ -> Alcotest.fail "asset ancestry exceeded its explicit depth bound")
+;;
+
 let reuse_asset_reference database =
   seed database;
   let expected block =
@@ -1003,6 +1185,10 @@ let () =
           ; "reuse asset reference", reuse_asset_reference
           ; "direct visible assets", direct_assets
           ; "local asset import", local_asset_import
+          ; "local journal capture asset ancestry", local_page_asset_import
+          ; "recycled asset ancestry", recycled_asset_ancestry
+          ; "cyclic asset ancestry", cyclic_asset_ancestry
+          ; "bounded asset ancestry", bounded_asset_ancestry
           ; "direct and subtree discovery", discovery
           ; "cursor fences", stale
           ; "effective overlay", deletion

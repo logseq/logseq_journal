@@ -9149,7 +9149,10 @@ let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
           else (
             match logical_tree_candidate snapshot tree_cache uuid with
             | Some candidate -> live (uuid :: seen) candidate.tree_parent
-            | None -> Option.is_some entity))
+            | None ->
+              (match logical_page_at ~cache:tree_cache.hydration snapshot uuid with
+               | Some { page; _ } -> not page.recycled
+               | None -> Option.is_some entity)))
       in
       let peek sequence =
         match sequence () with
