@@ -411,7 +411,7 @@ import Observation
           }
         } label: {
           content
-        })
+        }.listRowSeparator(separatorVisibility(row.separator)))
       }
       return AnyView(content)
     }

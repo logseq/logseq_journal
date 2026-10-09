@@ -94,7 +94,7 @@ let test_timeline_media_targets () =
   ignore
     (Journal_row.view
        ~show_timestamp:false
-       ~render_media:(fun ~root ~image_children:_ child ->
+       ~render_media:(fun ~title:_ ~root ~image_children:_ child ->
          targets := root :: !targets;
          child)
        { Journal_graph_projection.block = block ()
@@ -724,7 +724,7 @@ let test_long_body_can_expand () =
   let view =
     Journal_row.view
       ~show_timestamp:false
-      ~render_media:(fun ~root:_ ~image_children:_ child -> child)
+      ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
       { Journal_graph_projection.block =
           block ~source ~task_state:No_status ~child_count:0 ()
       ; child_summaries = []
@@ -994,7 +994,7 @@ let test_status_and_tags_mount () =
   let view =
     Journal_row.view
       ~show_timestamp:false
-      ~render_media:(fun ~root:_ ~image_children:_ child -> child)
+      ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
       { Journal_graph_projection.block; child_summaries = [] }
   in
   with_mounted view (fun _ ops ->
@@ -1024,7 +1024,7 @@ let test_reference_body_and_summary () =
     Journal_row.view
       ~render_source
       ~show_timestamp:false
-      ~render_media:(fun ~root:_ ~image_children:_ child -> child)
+      ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
       entry
   in
   with_mounted view (fun _ ops ->
@@ -1102,9 +1102,10 @@ let projected_row ?store ~views ~on_event entry =
   in
   Journal_row.view
     ~show_timestamp:false
-    ~render_media:(fun ~root ~image_children child ->
+    ~render_media:(fun ~title ~root ~image_children child ->
       Journal_media_view.row
         ~store
+        ~title
         ~scope:"direct-child-regression"
         ~root
         ~image_children
@@ -1772,9 +1773,7 @@ let test_reactive_nonimage_structure_and_presentation () =
          "PDF card lost actual descriptor metadata";
        require_nodes_retained [ body; sibling ] (ops ());
        update
-         (Some
-            (media_state
-               [ { pdf with presentation = Failed "Unable to open file" } ]));
+         (Some (media_state [ { pdf with presentation = Failed "Unable to open file" } ]));
        require
          (current_text (ops ()) "Unable to open file" && current_text (ops ()) "Retry")
          "nonimage failure lost its current message or retry action";
@@ -2064,15 +2063,13 @@ let test_single_image_save_preview_and_document_compatibility () =
               && Yojson.Safe.Util.member "selected_index" payload = `Int 0)
              "single image preview payload changed")
          else (
+           let _, payload =
+             match gallery_preview (ops ()) with
+             | Some preview -> preview
+             | None -> fail "document did not keep native file preview"
+           in
            require
-             (List.exists
-                (function
-                  | Lui_protocol.CreateNode (_, FilePreview) -> true
-                  | _ -> false)
-                (ops ()))
-             "document did not keep native file preview";
-           require
-             (gallery_preview (ops ()) = None)
+             (Yojson.Safe.Util.member "document" payload = `Bool true)
              "document unexpectedly exposed image Save")))
     [ "png", "/tmp/single-image.png"; "pdf", "/tmp/single-document.pdf" ]
 ;;
@@ -2110,8 +2107,156 @@ let test_gallery_disposal_releases_preview_references_once () =
        require (releases () = 2) "disposed preview subscriptions released twice")
 ;;
 
+(* Presentation defects cannot be reproduced by reducer transitions: the reducer
+   already requests the sheet/preview correctly. Exercise the public renderer
+   and native event contract without duplicating Worker or storage coverage. *)
+let test_sheet_has_native_navigation_and_keeps_cancel_delivery () =
+  let closed = ref 0 in
+  let close =
+    V.button
+      ~role:Cancel
+      ~on_press:(Ui.Event.Handler.create (fun _ -> incr closed))
+      ~child:(V.text "Close")
+      ()
+  in
+  let content =
+    V.text "Sheet content"
+    |> V.Body.static
+    |> V.Body.toolbar
+         ~items:
+           [ V.Toolbar.item
+               ~key:(Ui.Key.string "close")
+               ~placement:Cancellation_action
+               close
+           ]
+  in
+  let dismissed = ref false in
+  let view =
+    V.Sheet.create
+      ~title:"Diagnostics"
+      ~presented:true
+      ~on_presented_changed:
+        (Ui.Event.Handler.create (function
+           | Ui.Event.Payload.Bool false -> dismissed := true
+           | _ -> ()))
+      ~sizing:Form
+      ~detents:[ Large ]
+      ~content
+      (V.empty ())
+  in
+  with_mounted view (fun app ops ->
+    let sheet =
+      List.find_map
+        (function
+          | Lui_protocol.CreateNode (node, Sheet) -> Some node
+          | _ -> None)
+        (ops ())
+      |> Option.get
+    in
+    require
+      (List.exists
+         (function
+           | Lui_protocol.SetProp (node, StyleClass, StringValue style) when node = sheet
+             -> List.mem "navigation-content" (String.split_on_char ' ' style)
+           | _ -> false)
+         (ops ()))
+      "sheet has no native navigation host for its Close toolbar";
+    let close = mounted_node (ops ()) TextValue (StringValue "Close") in
+    ignore (Lui_app.dispatch_event app (Press close));
+    ignore (Lui_app.flush app);
+    require (!closed = 1) "Close action no longer reaches its owner";
+    ignore (Lui_app.dispatch_event app (Dismiss sheet));
+    ignore (Lui_app.flush app);
+    require !dismissed "interactive dismissal no longer reaches its owner")
+;;
+
+let test_timeline_document_title_follows_its_asset_child () =
+  let entry, views, _, _ = child_gallery_fixture () in
+  with_mounted (projected_row ~views ~on_event:ignore entry) (fun app ops ->
+    let card = mounted_node (ops ()) TextValue (StringValue "PDF attachment") in
+    ignore (Lui_app.dispatch_event app (Press card));
+    ignore (Lui_app.flush app);
+    let _, payload =
+      match gallery_preview (ops ()) with
+      | Some preview -> preview
+      | None -> fail "document child preview missing"
+    in
+    require
+      (Yojson.Safe.Util.member "title" payload = `String "plan.pdf")
+      "document child used its parent's prose as the friendly title")
+;;
+
+let test_document_preview_preserves_friendly_title_path_and_lease () =
+  List.iter
+    (fun file_type ->
+       let path = "/tmp/immutable-checksum." ^ file_type in
+       let title = "旅行计划与会议记录." ^ file_type in
+       let item = media_item 99 file_type (File path) None in
+       let events = ref [] in
+       let store = seeded_media_store [ block_id, media_state [ item ] ] in
+       with_mounted
+         (Journal_media_view.view
+            ~store
+            ~title
+            ~scope:"friendly-document-title"
+            ~root:block_id
+            ~on_event:(fun event -> events := event :: !events)
+            (V.text title))
+         (fun app ops ->
+            let node =
+              mounted_node
+                (ops ())
+                TextValue
+                (StringValue (String.uppercase_ascii file_type ^ " attachment"))
+            in
+            ignore (Lui_app.dispatch_event app (Press node));
+            ignore (Lui_app.flush app);
+            let preview, payload =
+              match gallery_preview (ops ()) with
+              | Some preview -> preview
+              | None -> fail "document preview dropped its friendly graph title"
+            in
+            let member = Yojson.Safe.Util.member in
+            require
+              (member "document" payload = `Bool true
+               && member "title" payload = `String title)
+              "document preview lost its title or exposed image actions";
+            require
+              (member "paths" payload = `List [ `String path ])
+              "friendly title must not rename the immutable cached file";
+            let values =
+              Lui_protocol.String_map.empty
+              |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
+              |> Lui_protocol.String_map.add
+                   "payload"
+                   (Lui_protocol.StringValue {|{"type":"dismiss"}|})
+            in
+            ignore
+              (Lui_app.dispatch_event
+                 app
+                 (ExtensionEvent (preview, "journal-image-preview", "event", values)));
+            ignore (Lui_app.flush app);
+            let count visible =
+              List.length
+                (List.filter
+                   (fun (event : Journal_media_view.event) ->
+                      event.action = Preview && event.visible = visible)
+                   !events)
+            in
+            require
+              (count true = 1 && count false = 1)
+              "document dismissal must release exactly its own retained file lease"))
+    [ "pdf"; "txt" ]
+;;
+
 let tests =
-  [ ( "single image save preview and document compatibility"
+  [ ( "timeline asset child preview title"
+    , test_timeline_document_title_follows_its_asset_child )
+  ; ( "native sheet navigation and cancellation"
+    , test_sheet_has_native_navigation_and_keeps_cancel_delivery )
+  ; ( "document friendly title and lease"
+    , test_document_preview_preserves_friendly_title_path_and_lease )
+  ; ( "single image save preview and document compatibility"
     , test_single_image_save_preview_and_document_compatibility )
   ; ( "gallery disposal releases once"
     , test_gallery_disposal_releases_preview_references_once )

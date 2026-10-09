@@ -31,6 +31,7 @@ type event =
 
 val view
   :  store:Store.t
+  -> ?title:string
   -> ?on_region:(string -> unit)
   -> ?observed_roots:string list
   -> ?asset_root:(string -> string)
@@ -47,6 +48,7 @@ val is_image_type : string -> bool
     the root itself when it is an image asset. No runtime descriptor is required. *)
 val row
   :  store:Store.t
+  -> ?title:string
   -> ?on_region:(string -> unit)
   -> scope:string
   -> root:string

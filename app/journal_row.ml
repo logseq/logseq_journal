@@ -120,12 +120,15 @@ let view
     else body ~render_source block
   in
   let content = V.column ~spacing:8. ~alignment:Leading (body :: metadata block) in
-  let labels = [ render_media ~root:id ~image_children content ] in
+  let labels =
+    [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
+  in
   let labels =
     labels
     @ List.map
         (fun (summary : Journal_graph_projection.child_summary) ->
            render_media
+             ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
              (V.text (render_source summary.source)))

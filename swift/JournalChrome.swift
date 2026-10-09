@@ -6,6 +6,7 @@ import SwiftUI
   private enum Mode: String, Decodable {
     case feedback, page, header, detail, unlock
     case bottomControls = "bottom-controls"
+    case toolbarControl = "toolbar-control"
   }
 
   private struct Properties: Decodable {
@@ -53,18 +54,18 @@ import SwiftUI
           }
           .safeAreaInset(edge: .top, spacing: 0) {
             if let title = properties.title {
-              ZStack {
+              HStack(alignment: .center, spacing: 12) {
                 Text(title)
                   .font(.headline)
+                  .fixedSize(horizontal: false, vertical: true)
+                  .frame(maxWidth: .infinity, alignment: .leading)
                   .accessibilityAddTraits(.isHeader)
                   .accessibilityIdentifier("favorites-header-title")
-                HStack {
-                  Spacer()
-                  controls
-                }
+                controls
               }
               .frame(minHeight: 44)
               .padding(.horizontal, 16)
+              .background(.bar)
             }
           }
       }
@@ -160,6 +161,10 @@ import SwiftUI
               child(1).fixedSize()
             }
           }
+        }
+      case .toolbarControl:
+        if context.childIDs.count == 1 {
+          child(0).fixedSize(horizontal: true, vertical: false)
         }
       case .bottomControls:
         if context.childIDs.count == 2 {

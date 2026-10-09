@@ -1150,6 +1150,16 @@ module View = struct
            mounted)
     ;;
 
+    (* The native bar proposes an icon-sized width to cancellation items.
+       Preserve the text label's intrinsic size before it enters that slot. *)
+    let mount_cancellation (item : item) : Lui_elements.t =
+      Journal_lui_native.mount
+        ~key:item.item_key
+        ~payload:{|{"mode":"toolbar-control"}|}
+        ~children:[ item.content.mount ]
+        Journal_lui_native.chrome_identifier
+    ;;
+
     let nav_button ~icon ~label ~on_press : Lui_elements.t =
       (* Icon-only button: the schema rejects empty text + icon without an
          accessibility label. *)
@@ -1207,7 +1217,10 @@ module View = struct
             else [])
            @ (if cancellation <> []
               then
-                [ emit_bar "cancellation-action" (List.map mount_icon_only cancellation) ]
+                [ emit_bar
+                    "cancellation-action"
+                    (List.map mount_cancellation cancellation)
+                ]
               else [])
            @ [ flexible_space ]
            @ (match principal, !nav_bar with
@@ -1893,8 +1906,8 @@ module View = struct
           ~presented
           ~on_presented_changed
           ?(interactive_dismiss = true)
-          ?sizing:_
-          ?detents:_
+          ?sizing
+          ?detents
           ?(title = "")
           ~content
           base
@@ -1908,6 +1921,23 @@ module View = struct
             then
               [ Lui_elements.sheet
                   ~text:(if String.equal title "" then "Sheet" else title)
+                  ~style_class:"navigation-content navigation-inline-title"
+                  ?sizing:
+                    (Option.bind sizing (function
+                       | Automatic -> None
+                       | Form -> Some "form"
+                       | Fitted -> Some "fitted"))
+                  ?detents:
+                    (Option.map
+                       (fun values ->
+                          String.concat
+                            ","
+                            (List.map
+                               (function
+                                 | Medium -> "medium"
+                                 | Large -> "large")
+                               values))
+                       detents)
                   ?on_dismiss:
                     (if interactive_dismiss
                      then
