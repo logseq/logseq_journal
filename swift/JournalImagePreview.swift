@@ -74,6 +74,20 @@ import UIKit
   }
 
   #if os(iOS)
+  private static func closeButton(identifier: String, onClose: @escaping () -> Void) -> UIBarButtonItem {
+    let button = UIButton(type: .system)
+    button.setImage(UIImage(systemName: "xmark"), for: .normal)
+    button.accessibilityLabel = Locale.current.language.languageCode?.identifier == "zh" ? "关闭" : "Close"
+    button.accessibilityIdentifier = identifier
+    button.widthAnchor.constraint(equalToConstant: 44).isActive = true
+    button.heightAnchor.constraint(equalToConstant: 44).isActive = true
+    button.addAction(UIAction { _ in onClose() }, for: .touchUpInside)
+    let item = UIBarButtonItem(customView: button)
+    // The shared glass capsule otherwise clips a custom button to 36pt tall.
+    item.hidesSharedBackground = true
+    return item
+  }
+
   // Quick Look accepts a display title independently of the immutable cache URL.
   struct Document: UIViewControllerRepresentable {
     let url: URL
@@ -98,10 +112,8 @@ import UIKit
     func makeUIViewController(context: Context) -> UINavigationController {
       let preview = QLPreviewController()
       preview.dataSource = context.coordinator
-      preview.navigationItem.leftBarButtonItem = UIBarButtonItem(
-        title: Locale.current.language.languageCode?.identifier == "zh" ? "关闭" : "Close",
-        primaryAction: UIAction { _ in onClose() })
-      preview.navigationItem.leftBarButtonItem?.accessibilityIdentifier = "journal-document-close"
+      preview.navigationItem.leftBarButtonItem = JournalImagePreview.closeButton(
+        identifier: "journal-document-close", onClose: onClose)
       return UINavigationController(rootViewController: preview)
     }
     func updateUIViewController(_ navigation: UINavigationController, context: Context) {}
@@ -267,10 +279,8 @@ import UIKit
     override func viewDidLoad() {
       super.viewDidLoad()
       view.backgroundColor = .systemBackground
-      navigationItem.leftBarButtonItem = UIBarButtonItem(
-        title: Self.text("Close", "关闭"),
-        primaryAction: UIAction { [weak self] _ in self?.onClose?() })
-      navigationItem.leftBarButtonItem?.accessibilityIdentifier = "journal-image-close"
+      navigationItem.leftBarButtonItem = JournalImagePreview.closeButton(
+        identifier: "journal-image-close", onClose: { [weak self] in self?.onClose?() })
       saveButton.accessibilityIdentifier = "journal-save-current-image"
       navigationItem.rightBarButtonItems = [saveButton, shareButton]
       save.onBusyChanged = { [weak self] busy in

@@ -1,6 +1,23 @@
 import LUIAppleBackend
 import SwiftUI
 
+/// The form sheet's native card transform still leaves at least a 44pt target.
+struct JournalSheetDismissButton: SwiftUI.View {
+  var label: LocalizedStringKey = "Close"
+  let action: () -> Void
+
+  var body: some SwiftUI.View {
+    Button(action: action) {
+      Image(systemName: "xmark")
+        .frame(width: 48, height: 48)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .fixedSize()
+    .accessibilityLabel(Text(label))
+  }
+}
+
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
@@ -164,7 +181,10 @@ import SwiftUI
         }
       case .toolbarControl:
         if context.childIDs.count == 1 {
-          child(0).fixedSize(horizontal: true, vertical: false)
+          child(0).fixedSize()
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(Text(properties?.title ?? "Close"))
+            .accessibilityAddTraits(.isButton)
         }
       case .bottomControls:
         if context.childIDs.count == 2 {

@@ -84,7 +84,8 @@ private struct JournalHost: View {
         }
         .toolbar {
           ToolbarItem(placement: .cancellationAction) {
-            Button("Close", role: .cancel) { signInPresented = false }
+            JournalSheetDismissButton { signInPresented = false }
+              .accessibilityIdentifier("authentication-close")
           }
         }
       }

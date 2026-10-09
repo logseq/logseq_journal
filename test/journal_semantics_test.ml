@@ -2111,63 +2111,119 @@ let test_gallery_disposal_releases_preview_references_once () =
    already requests the sheet/preview correctly. Exercise the public renderer
    and native event contract without duplicating Worker or storage coverage. *)
 let test_sheet_has_native_navigation_and_keeps_cancel_delivery () =
-  let closed = ref 0 in
-  let close =
+  let check label =
+    let closed = ref 0 in
+    let close =
+      V.button
+        ~role:Cancel
+        ~on_press:(Ui.Event.Handler.create (fun _ -> incr closed))
+        ~child:(V.label ~title:(V.text label) ~icon:(V.symbol ~name:"xmark" ()) ())
+        ()
+    in
+    let content =
+      V.text "Sheet content"
+      |> V.Body.static
+      |> V.Body.toolbar
+           ~items:
+             [ V.Toolbar.item
+                 ~key:(Ui.Key.string "close")
+                 ~placement:Cancellation_action
+                 close
+             ]
+    in
+    let dismissed = ref false in
+    let view =
+      V.Sheet.create
+        ~title:"Diagnostics"
+        ~presented:true
+        ~on_presented_changed:
+          (Ui.Event.Handler.create (function
+             | Ui.Event.Payload.Bool false -> dismissed := true
+             | _ -> ()))
+        ~sizing:Form
+        ~detents:[ Large ]
+        ~content
+        (V.empty ())
+    in
+    with_mounted view (fun app ops ->
+      let sheet =
+        List.find_map
+          (function
+            | Lui_protocol.CreateNode (node, Sheet) -> Some node
+            | _ -> None)
+          (ops ())
+        |> Option.get
+      in
+      require
+        (List.exists
+           (function
+             | Lui_protocol.SetProp (node, StyleClass, StringValue style)
+               when node = sheet ->
+               List.mem "navigation-content" (String.split_on_char ' ' style)
+             | _ -> false)
+           (ops ()))
+        "sheet has no native navigation host for its Close toolbar";
+      let close =
+        List.find_map
+          (function
+            | Lui_protocol.CreateNode (node, Button) -> Some node
+            | _ -> None)
+          (ops ())
+        |> Option.get
+      in
+      let property key =
+        List.find_map
+          (function
+            | Lui_protocol.SetProp (node, actual, value) when node = close && actual = key
+              -> Some value
+            | _ -> None)
+          (List.rev (ops ()))
+      in
+      require
+        (property InlineIconName = Some (StringValue "app:xmark"))
+        "missing native close glyph";
+      require
+        (property AccessibilityLabel = Some (StringValue label))
+        "close lost its accessible name";
+      require
+        (property TextValue <> Some (StringValue label))
+        "cancellation still displays text";
+      require
+        (property WidthValue = Some (IntValue 44)
+         && property HeightValue = Some (IntValue 44))
+        "cancellation target is smaller than 44pt";
+      ignore (Lui_app.dispatch_event app (Press close));
+      ignore (Lui_app.flush app);
+      require (!closed = 1) "Close action no longer reaches its owner";
+      ignore (Lui_app.dispatch_event app (Dismiss sheet));
+      ignore (Lui_app.flush app);
+      require !dismissed "interactive dismissal no longer reaches its owner")
+  in
+  List.iter check [ "Close"; "Cancel" ]
+;;
+
+let test_labeled_content_keeps_interactive_value () =
+  let pressed = ref 0 in
+  let value =
     V.button
-      ~role:Cancel
-      ~on_press:(Ui.Event.Handler.create (fun _ -> incr closed))
-      ~child:(V.text "Close")
+      ~on_press:(Ui.Event.Handler.create (fun _ -> incr pressed))
+      ~child:(V.text "Retry")
       ()
   in
-  let content =
-    V.text "Sheet content"
-    |> V.Body.static
-    |> V.Body.toolbar
-         ~items:
-           [ V.Toolbar.item
-               ~key:(Ui.Key.string "close")
-               ~placement:Cancellation_action
-               close
-           ]
-  in
-  let dismissed = ref false in
-  let view =
-    V.Sheet.create
-      ~title:"Diagnostics"
-      ~presented:true
-      ~on_presented_changed:
-        (Ui.Event.Handler.create (function
-           | Ui.Event.Payload.Bool false -> dismissed := true
-           | _ -> ()))
-      ~sizing:Form
-      ~detents:[ Large ]
-      ~content
-      (V.empty ())
-  in
-  with_mounted view (fun app ops ->
-    let sheet =
-      List.find_map
-        (function
-          | Lui_protocol.CreateNode (node, Sheet) -> Some node
-          | _ -> None)
-        (ops ())
-      |> Option.get
-    in
-    require
-      (List.exists
-         (function
-           | Lui_protocol.SetProp (node, StyleClass, StringValue style) when node = sheet
-             -> List.mem "navigation-content" (String.split_on_char ' ' style)
-           | _ -> false)
-         (ops ()))
-      "sheet has no native navigation host for its Close toolbar";
-    let close = mounted_node (ops ()) TextValue (StringValue "Close") in
-    ignore (Lui_app.dispatch_event app (Press close));
-    ignore (Lui_app.flush app);
-    require (!closed = 1) "Close action no longer reaches its owner";
-    ignore (Lui_app.dispatch_event app (Dismiss sheet));
-    ignore (Lui_app.flush app);
-    require !dismissed "interactive dismissal no longer reaches its owner")
+  with_mounted
+    (V.labeled_content ~label:(V.text "Connection") ~value ())
+    (fun app ops ->
+       let button =
+         List.find_map
+           (function
+             | Lui_protocol.CreateNode (node, Button) -> Some node
+             | _ -> None)
+           (ops ())
+       in
+       require (Option.is_some button) "interactive labeled value became static text";
+       ignore (Lui_app.dispatch_event app (Press (Option.get button)));
+       ignore (Lui_app.flush app);
+       require (!pressed = 1) "labeled value lost its action")
 ;;
 
 let test_timeline_document_title_follows_its_asset_child () =
@@ -2254,6 +2310,7 @@ let tests =
     , test_timeline_document_title_follows_its_asset_child )
   ; ( "native sheet navigation and cancellation"
     , test_sheet_has_native_navigation_and_keeps_cancel_delivery )
+  ; "interactive labeled value", test_labeled_content_keeps_interactive_value
   ; ( "document friendly title and lease"
     , test_document_preview_preserves_friendly_title_path_and_lease )
   ; ( "single image save preview and document compatibility"

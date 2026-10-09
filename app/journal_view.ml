@@ -19,6 +19,7 @@ type t =
   ; test_id : string option
   ; mount : Lui_elements.t
   ; label_content : label_content option
+  ; control_label : string option
   }
 
 module Key = struct
@@ -36,7 +37,10 @@ module Test_id = struct
   let to_string s = s
 end
 
-let element ?key ?test_id mount = { key; test_id; mount; label_content = None }
+let element ?key ?test_id mount =
+  { key; test_id; mount; label_content = None; control_label = None }
+;;
+
 let mount t = t.mount
 let int_of_float_nan v = int_of_float (Float.round v)
 
@@ -793,15 +797,20 @@ module View = struct
       | Some _ as variant -> variant
       | None -> Option.map Button_style.lui_variant style
     in
-    element
-      ?key
-      (Lui_elements.button
-         ~disabled:(not enabled)
-         ?variant
-         ~autofocus
-         ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
-         (* Leaf controls carry label/icon as properties, not child nodes. *)
-         [ leaf_label child.label_content ])
+    let result =
+      element
+        ?key
+        (Lui_elements.button
+           ~disabled:(not enabled)
+           ?variant
+           ~autofocus
+           ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
+           (* Leaf controls carry label/icon as properties, not child nodes. *)
+           [ leaf_label child.label_content ])
+    in
+    { result with
+      control_label = Option.map (fun label -> label.title) child.label_content
+    }
   ;;
 
   let text_edit_handler ~session_id ~document_revision ~accepted_local_revision ~on_edit =
@@ -1150,13 +1159,36 @@ module View = struct
            mounted)
     ;;
 
-    (* The native bar proposes an icon-sized width to cancellation items.
-       Preserve the text label's intrinsic size before it enters that slot. *)
+    (* Cancellation glyphs retain the original accessible label and action.
+       Give the native button a full 44pt target before entering the bar. *)
     let mount_cancellation (item : item) : Lui_elements.t =
+      let child context parent =
+        let previous = !icon_only
+        and previous_nodes = !icon_only_collapsed_nodes in
+        icon_only := true;
+        icon_only_collapsed_nodes := [];
+        Fun.protect
+          ~finally:(fun () ->
+            icon_only := previous;
+            icon_only_collapsed_nodes := previous_nodes)
+          (fun () ->
+             let node = item.content.mount context parent in
+             if node_is_standard context node
+             then (
+               Lui_ui.width context node 44;
+               Lui_ui.height context node 44);
+             node)
+      in
       Journal_lui_native.mount
         ~key:item.item_key
-        ~payload:{|{"mode":"toolbar-control"}|}
-        ~children:[ item.content.mount ]
+        ~payload:
+          (Yojson.Safe.to_string
+             (`Assoc
+                 [ "mode", `String "toolbar-control"
+                 ; ( "title"
+                   , `String (Option.value item.content.control_label ~default:"Close") )
+                 ]))
+        ~children:[ child ]
         Journal_lui_native.chrome_identifier
     ;;
 

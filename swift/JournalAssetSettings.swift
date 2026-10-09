@@ -86,8 +86,9 @@ import SwiftUI
             .formStyle(.grouped)
             .navigationTitle("Attachment settings")
             .toolbar {
-              ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { emit("dismissed") }
+              ToolbarItem(placement: .cancellationAction) {
+                JournalSheetDismissButton(label: "Done") { emit("dismissed") }
+                  .accessibilityIdentifier("journal-settings-close")
               }
             }
           }

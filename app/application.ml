@@ -1601,7 +1601,7 @@ let dismiss_toolbar ~test_id ~command dispatch body =
     V.button
       ~style:Plain
       ~on_press:(bind_action dispatch command)
-      ~child:(V.text "Close")
+      ~child:(V.label ~title:(V.text "Close") ~icon:(V.symbol ~name:"xmark" ()) ())
       ()
     |> V.with_test_id (Ui.Test_id.string test_id)
   in
@@ -2209,7 +2209,11 @@ let composer_page
   =
   let can_submit = composer_can_submit ~capture ~saving ~enabled in
   let close =
-    V.button ~style:Plain ~on_press:on_close ~child:(V.text "Cancel") ()
+    V.button
+      ~style:Plain
+      ~on_press:on_close
+      ~child:(V.label ~title:(V.text "Cancel") ~icon:(V.symbol ~name:"xmark" ()) ())
+      ()
     |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
   in
   composer_content
