@@ -1,3 +1,12 @@
+let advance_server_cursor cursor count =
+  let module Cursor = Logseq_db_types.Server_cursor in
+  let value = Cursor.to_int64 cursor in
+  let count = Int64.of_int count in
+  if count < 0L || value > Int64.sub Int64.max_int count
+  then invalid_arg "test cursor interval overflows";
+  Cursor.of_int64 (Int64.add value count) |> Result.get_ok
+;;
+
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Core = Service
 module Worker = Logseq_db_worker_lui.Journal_worker
@@ -185,7 +194,11 @@ let fail_worker context phase reason =
     | None -> "unknown", "none", "none", "none", "none"
     | Some state ->
       ( sync_phase_name state.snapshot.sync_phase
-      , Option.fold ~none:"none" ~some:string_of_int state.snapshot.applied_server_t
+      , Option.fold
+          ~none:"none"
+          ~some:(fun cursor ->
+            Int64.to_string (Logseq_db_types.Server_cursor.to_int64 cursor))
+          state.snapshot.applied_server_t
       , startup_failure_stage_name state.snapshot.startup.failure
       , sync_error_kind state.snapshot.last_error
       , Option.fold ~none:"none" ~some:String.escaped state.snapshot.last_error )
@@ -214,7 +227,11 @@ let handle_public_state context state =
     Printf.sprintf
       "%s:%s:%s"
       (sync_phase_name snapshot.sync_phase)
-      (Option.fold ~none:"none" ~some:string_of_int snapshot.applied_server_t)
+      (Option.fold
+         ~none:"none"
+         ~some:(fun cursor ->
+           Int64.to_string (Logseq_db_types.Server_cursor.to_int64 cursor))
+         snapshot.applied_server_t)
       (sync_error_kind snapshot.last_error)
   in
   if not (List.mem marker context.state_history)
@@ -362,7 +379,8 @@ let await_authoritative_current context ~after_server_t phase =
     match context.last_state with
     | Some state ->
       (match state.snapshot.sync_phase, state.snapshot.applied_server_t with
-       | Current, Some cursor when cursor > after_server_t -> cursor
+       | Current, Some cursor
+         when Logseq_db_types.Server_cursor.compare cursor after_server_t > 0 -> cursor
        | _ ->
          Unix.sleepf 0.01;
          loop ())
@@ -768,7 +786,11 @@ let run_deployed_protocol_contract
              "hello-second";
            let first_t = probe_hello clock first in
            let second_t = probe_hello clock second in
-           let baseline = Int.max first_t second_t in
+           let baseline =
+             if Logseq_db_types.Server_cursor.compare first_t second_t >= 0
+             then first_t
+             else second_t
+           in
            let _, _, source_history = probe_pull clock first ~since:source_cursor in
            let protected_title =
              match
@@ -802,19 +824,27 @@ let run_deployed_protocol_contract
            in
            probe_send first group "group-submit";
            let group_t, _ = probe_expect_accepted clock first "group-submit" in
-           if group_t <> baseline + 2
+           if
+             not
+               (Logseq_db_types.Server_cursor.equal
+                  group_t
+                  (advance_server_cursor baseline 2))
            then fail "deployed group cursors are not contiguous in member order";
            let pulled_t, _, pulled = probe_pull clock second ~since:baseline in
-           if pulled_t < group_t
+           if Logseq_db_types.Server_cursor.compare pulled_t group_t < 0
            then fail "deployed pull did not reach the accepted group";
            let group_members =
              pulled
              |> List.filter (fun transaction ->
-               transaction.Sync_protocol.Server.t > baseline && transaction.t <= group_t)
+               Logseq_db_types.Server_cursor.compare
+                 transaction.Sync_protocol.Server.t
+                 baseline
+               > 0
+               && Logseq_db_types.Server_cursor.compare transaction.t group_t <= 0)
            in
            if
              List.map (fun tx -> tx.Sync_protocol.Server.t) group_members
-             <> [ baseline + 1; baseline + 2 ]
+             <> [ advance_server_cursor baseline 1; advance_server_cursor baseline 2 ]
            then fail "deployed group interval was interleaved or reordered";
            List.iter2
              (fun (expected_uuid, expected) transaction ->
@@ -831,7 +861,7 @@ let run_deployed_protocol_contract
            probe_send first group "stale-retry";
            (match probe_batch_result clock first with
             | `Rejected { reason = Sync_protocol.Stale; t = Some retry_t; _ }
-              when retry_t = group_t -> ()
+              when Logseq_db_types.Server_cursor.equal retry_t group_t -> ()
             | `Rejected _ -> fail "deployed retry did not return the current stale cursor"
             | `Accepted _ -> fail "deployed retry unexpectedly executed twice");
            let accepted_delete_id = fresh_uuid () in
@@ -858,7 +888,7 @@ let run_deployed_protocol_contract
            let later_remote_t, _ =
              probe_expect_accepted clock second "remote-after-delete"
            in
-           if delete_t >= later_remote_t
+           if Logseq_db_types.Server_cursor.compare delete_t later_remote_t >= 0
            then fail "deployed accepted delete did not precede the remote transaction";
            let stale_block = fresh_uuid () in
            let create_stale_id = fresh_uuid () in
@@ -905,7 +935,8 @@ let run_deployed_protocol_contract
                 ; failed_tx_id = None
                 ; _
                 }
-              when rejection_t >= intervening_t -> ()
+              when Logseq_db_types.Server_cursor.compare rejection_t intervening_t >= 0 ->
+              ()
             | `Rejected _ ->
               fail "deployed stale delete lacked batch-level non-execution evidence"
             | `Accepted _ -> fail "deployed stale t_before delete executed");
@@ -926,7 +957,7 @@ let run_deployed_protocol_contract
              "second-group-marker-cleanup";
            ignore
              (probe_expect_accepted clock first "second-group-marker-cleanup"
-              : int * string option))));
+              : Sync_protocol.cursor * string option))));
   report_phase "protocol-contract-complete"
 ;;
 
@@ -1006,7 +1037,7 @@ let with_client ~label ~support ~credentials ~cognito f =
 ;;
 
 type durable_facts =
-  { cursor : int
+  { cursor : Logseq_db_types.Server_cursor.t
   ; checksum : string
   ; outbox_empty : bool
   }
@@ -1043,7 +1074,8 @@ let durable_facts support graph_id =
 ;;
 
 let require_durable_advance facts initial_cursor label =
-  if facts.cursor <= initial_cursor then fail "%s durable cursor did not advance" label;
+  if Logseq_db_types.Server_cursor.compare facts.cursor initial_cursor <= 0
+  then fail "%s durable cursor did not advance" label;
   if String.equal facts.checksum "0000000000000000"
   then fail "%s durable checksum did not advance" label;
   if not facts.outbox_empty then fail "%s durable outbox is not empty" label
@@ -1078,7 +1110,8 @@ let best_effort_cleanup
       if Logseq_db_types.Graph_types.Uuid.equal graph.graph_id graph_id
       then
         ignore
-          (cleanup_block context ~block_uuid ~parent_uuid ~title ~opening_cursor : int));
+          (cleanup_block context ~block_uuid ~parent_uuid ~title ~opening_cursor
+           : Logseq_db_types.Server_cursor.t));
     report_phase "best-effort-cleanup-complete"
   with
   | _ -> report_phase "best-effort-cleanup-failed"
@@ -1255,7 +1288,11 @@ let run () =
            report_phase "sender-closed";
            let sender_facts = durable_facts sender_support sender_graph.graph_id in
            require_durable_advance sender_facts sender_opening_cursor "sender";
-           if sender_facts.cursor < sender_submitted_cursor
+           if
+             Logseq_db_types.Server_cursor.compare
+               sender_facts.cursor
+               sender_submitted_cursor
+             < 0
            then fail "sender durable cursor is behind public state";
            let receiver_opening_cursor, receiver_final_cursor, receiver_graph =
              report_phase "receiver-start";
@@ -1289,11 +1326,19 @@ let run () =
                   opening_cursor, final_cursor, graph)
            in
            report_phase "receiver-closed";
-           if receiver_opening_cursor < sender_facts.cursor
+           if
+             Logseq_db_types.Server_cursor.compare
+               receiver_opening_cursor
+               sender_facts.cursor
+             < 0
            then fail "receiver did not recover the sender cursor";
            let receiver_facts = durable_facts receiver_support receiver_graph.graph_id in
            require_durable_advance receiver_facts receiver_opening_cursor "receiver";
-           if receiver_facts.cursor < receiver_final_cursor
+           if
+             Logseq_db_types.Server_cursor.compare
+               receiver_facts.cursor
+               receiver_final_cursor
+             < 0
            then fail "receiver durable cursor is behind public state";
            run_deployed_protocol_contract
              ~token:cognito.id_token

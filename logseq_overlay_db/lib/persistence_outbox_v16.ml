@@ -599,7 +599,7 @@ let transport_state_to_yojson = function
   | Stale_rejected_pending_authoritative { batch_id; through } ->
     `Assoc
       [ "batchId", `String (Types.Submission_batch_id.to_string batch_id)
-      ; "through", `String (Types.Server_cursor.to_string through)
+      ; "through", `String (Persistence_json.server_cursor_to_string through)
       ; "type", `String "staleRejectedPendingAuthoritative"
       ]
   | Blocked -> `Assoc [ "type", `String "blocked" ]
@@ -620,7 +620,7 @@ let transport_state_of_yojson = function
       ; ("type", `String "staleRejectedPendingAuthoritative")
       ] ->
     let* batch_id = Types.Submission_batch_id.of_string id in
-    let* through = Types.Server_cursor.of_string through in
+    let* through = Persistence_json.server_cursor_of_string through in
     Ok (Types.Stale_rejected_pending_authoritative { batch_id; through })
   | `Assoc [ ("type", `String "blocked") ] -> Ok Types.Blocked
   | _ -> Error "invalid transport state"
@@ -639,13 +639,13 @@ type acceptance_barrier_v16 =
 
 let acceptance_barrier_to_dto (barrier : Types.acceptance_barrier) =
   { checksum = Types.Checksum.to_string barrier.checksum
-  ; through = Types.Server_cursor.to_string barrier.through
+  ; through = Persistence_json.server_cursor_to_string barrier.through
   }
 ;;
 
 let acceptance_barrier_of_dto barrier =
   let* checksum = Types.Checksum.of_string barrier.checksum in
-  let* through = Types.Server_cursor.of_string barrier.through in
+  let* through = Persistence_json.server_cursor_of_string barrier.through in
   Ok Types.{ through; checksum }
 ;;
 
@@ -719,13 +719,15 @@ let encode ~sync_revision (record : t) =
    ; state = record.transport_state
    ; same_id_retry_eligible = record.same_id_retry_eligible
    ; submission_t_before =
-       Option.map Types.Server_cursor.to_string record.submission_t_before
+       Option.map Persistence_json.server_cursor_to_string record.submission_t_before
    ; submission_ordinal = record.submission_ordinal
    ; submission_count = record.submission_count
    ; observed_origin_cursor =
-       Option.map Types.Server_cursor.to_string record.observed_origin_cursor
+       Option.map Persistence_json.server_cursor_to_string record.observed_origin_cursor
    ; stale_earliest_conflict_cursor =
-       Option.map Types.Server_cursor.to_string record.stale_earliest_conflict_cursor
+       Option.map
+         Persistence_json.server_cursor_to_string
+         record.stale_earliest_conflict_cursor
    ; stale_conflicts = List.map Delete_conflict.code record.stale_conflicts
    ; sync_revision
    }
@@ -813,13 +815,15 @@ let decode source =
         | Some value -> Result.map Option.some (acceptance_barrier_of_dto value)
       in
       let* submission_t_before =
-        optional_token Types.Server_cursor.of_string dto.submission_t_before
+        optional_token Persistence_json.server_cursor_of_string dto.submission_t_before
       in
       let* observed_origin_cursor =
-        optional_token Types.Server_cursor.of_string dto.observed_origin_cursor
+        optional_token Persistence_json.server_cursor_of_string dto.observed_origin_cursor
       in
       let* stale_earliest_conflict_cursor =
-        optional_token Types.Server_cursor.of_string dto.stale_earliest_conflict_cursor
+        optional_token
+          Persistence_json.server_cursor_of_string
+          dto.stale_earliest_conflict_cursor
       in
       let* stale_conflicts = decode_conflicts dto.stale_conflicts in
       Ok

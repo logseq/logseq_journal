@@ -1,4 +1,5 @@
 module Overlay = Logseq_overlay_db.Types
+module Server_cursor = Overlay.Server_cursor
 
 type graph_id = Logseq_db_types.Graph_types.Uuid.t
 type graph = Logseq_db_types.Managed_graph.t
@@ -50,7 +51,7 @@ type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
-  ; applied_server_t : int option
+  ; applied_server_t : Server_cursor.t option
   ; timeline_presentation_pending : bool
   ; startup : startup_facts
   ; last_error : string option
@@ -560,7 +561,7 @@ type mirror_request =
 type snapshot_activation_request =
   { artifact : staged_artifact
   ; scope : graph_scope
-  ; applied_server_t : int
+  ; applied_server_t : Server_cursor.t
   ; key : graph_key_handle option
   }
 
@@ -699,7 +700,7 @@ type submission_owner =
   { batch_id : Overlay.submission_batch_id
   ; mutation_ids : graph_id list
   ; connection : connection_scope
-  ; accepted_through : int option
+  ; accepted_through : Server_cursor.t option
   ; response_timer : timer_id option
   }
 
@@ -710,7 +711,7 @@ type pull_stage =
 
 type pull_owner =
   { pull_connection : connection_scope
-  ; issued_since : int
+  ; issued_since : Server_cursor.t
   ; pull_stage : pull_stage
   }
 
@@ -744,14 +745,14 @@ type t =
   ; pending_encrypted_graph_key : string option
   ; pending_private_key_package : string option
   ; snapshot_scope : graph_scope option
-  ; snapshot_server_t : int option
+  ; snapshot_server_t : Server_cursor.t option
   ; active_snapshot_download : graph_scope option
   ; sync_view : Overlay.sync_view option
   ; pending_sync_inspection : graph_scope option
   ; pending_outbox_transition : outbox_transition_request option
   ; submission_owner : submission_owner option
   ; pull_owner : pull_owner option
-  ; pull_wanted : (graph_scope * int) option
+  ; pull_wanted : (graph_scope * Server_cursor.t) option
   ; pull_retry_delay : float
   ; active_authoritative_batch : authoritative_batch option
   ; queued_authoritative_batch : authoritative_batch option
@@ -989,30 +990,11 @@ let start_websocket core graph =
   { next; effects = [ publish next; Run (Start_websocket { scope; uri }) ] }
 ;;
 
-let server_cursor value =
-  Overlay.Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" value)
-;;
-
 let checksum value = Overlay.Checksum.of_string ("checksum:v1:" ^ value)
 
-let server_cursor_number cursor =
-  Overlay.Server_cursor.to_string cursor
-  |> String.split_on_char ':'
-  |> List.rev
-  |> List.hd
-  |> int_of_string
-;;
-
 let decode_snapshot_baseline source =
-  try
-    match Yojson.Safe.from_string source with
-    | `Assoc fields ->
-      (match List.assoc_opt "type" fields, List.assoc_opt "t" fields with
-       | Some (`String "pull/ok"), Some (`Int server_t) when server_t >= 0 -> Ok server_t
-       | _ -> Error "snapshot baseline pull is invalid")
-    | _ -> Error "snapshot baseline pull must be an object"
-  with
-  | Yojson.Json_error _ -> Error "snapshot baseline pull is not valid JSON"
+  Sync_protocol.decode_snapshot_baseline source
+  |> Result.map_error Sync_protocol.error_to_string
 ;;
 
 let decode_snapshot_uri source =
@@ -1379,8 +1361,7 @@ let graph_attached core (attachment : graph_attachment) =
     let snapshot =
       { core.public_state.snapshot with
         sync_phase = Current
-      ; applied_server_t =
-          Some (server_cursor_number (Overlay.sync_view_checkpoint attachment.sync))
+      ; applied_server_t = Some (Overlay.sync_view_checkpoint attachment.sync)
       ; timeline_presentation_pending = true
       ; startup
       ; last_error = None
@@ -1414,14 +1395,14 @@ let submission_message batch =
   Sync_protocol.Client.Tx_batch
     { client_revision =
         Some (Overlay.Submission_batch_id.to_string (Overlay.submission_batch_id batch))
-    ; t_before = server_cursor_number (Overlay.submission_batch_t_before batch)
+    ; t_before = Overlay.submission_batch_t_before batch
     ; txs
     }
 ;;
 
 let pull_target_pending core graph cursor =
   match core.pull_wanted with
-  | Some (scope, target) -> scope = graph && target > cursor
+  | Some (scope, target) -> scope = graph && Server_cursor.compare target cursor > 0
   | None -> false
 ;;
 
@@ -1583,7 +1564,8 @@ let note_pull_target core graph through =
   in
   let target =
     match previous, through with
-    | Some old, Some target -> Some (max old target)
+    | Some old, Some target ->
+      Some (if Server_cursor.compare old target >= 0 then old else target)
     | None, target | target, None -> target
   in
   { core with pull_wanted = Option.map (fun target -> graph, target) target }
@@ -1642,7 +1624,9 @@ let request_pull ?through ?(force = false) core =
 ;;
 
 let pull_no_progress core (connection : connection_scope) =
-  let cursor = Option.value core.public_state.snapshot.applied_server_t ~default:0 in
+  let cursor =
+    Option.value core.public_state.snapshot.applied_server_t ~default:Server_cursor.zero
+  in
   let core = { core with pull_owner = None } in
   if not (pull_target_pending core connection.graph cursor)
   then unchanged { core with pull_retry_delay = 1. }
@@ -1762,14 +1746,11 @@ let outbox_transition_applied core (result : outbox_transition_result) =
         | Overlay.Accept_group _ | Reject_group _ ->
           let through =
             match result.commit.transition with
-            | Overlay.Accept_group { barrier; _ } ->
-              Some (server_cursor_number barrier.through)
-            | Reject_group { resolution = Stale { through }; _ } ->
-              Some (server_cursor_number through)
+            | Overlay.Accept_group { barrier; _ } -> Some barrier.through
+            | Reject_group { resolution = Stale { through }; _ } -> Some through
             | Reject_group { resolution = Definitive { partition; _ }; _ } ->
               Option.map
-                (fun (barrier : Overlay.acceptance_barrier) ->
-                   server_cursor_number barrier.through)
+                (fun (barrier : Overlay.acceptance_barrier) -> barrier.through)
                 partition.acceptance_barrier
             | Submit_group _ | Retry_group _ -> None
           in
@@ -1807,42 +1788,51 @@ let websocket_opened core connection =
 ;;
 
 let authoritative_input core t checksum_value txs =
-  let current = Option.value core.public_state.snapshot.applied_server_t ~default:(-1) in
-  let txs = List.filter (fun tx -> tx.Sync_protocol.Server.t > current) txs in
-  if t >= current && txs = []
+  let current = core.public_state.snapshot.applied_server_t in
+  let ahead cursor =
+    Option.fold
+      ~none:true
+      ~some:(fun current -> Server_cursor.compare cursor current > 0)
+      current
+  in
+  let txs = List.filter (fun tx -> ahead tx.Sync_protocol.Server.t) txs in
+  if
+    txs = []
+    && Option.fold
+         ~none:true
+         ~some:(fun current -> Server_cursor.compare t current >= 0)
+         current
   then Ok None
   else (
     let rec encode acc = function
       | [] -> Ok (List.rev acc)
       | tx :: rest ->
-        (match server_cursor tx.Sync_protocol.Server.t with
-         | Error message -> Error message
-         | Ok cursor ->
-           (match
-              Overlay.encoded_transaction_of_string
-                ~maximum_bytes:core.config.limits.maximum_response_bytes
-                tx.tx
-            with
-            | Error _ -> Error "invalid encoded transaction"
-            | Ok transaction ->
-              encode (Overlay.authoritative_transaction ~cursor ~transaction :: acc) rest))
+        (match
+           Overlay.encoded_transaction_of_string
+             ~maximum_bytes:core.config.limits.maximum_response_bytes
+             tx.Sync_protocol.Server.tx
+         with
+         | Error _ -> Error "invalid encoded transaction"
+         | Ok transaction ->
+           encode
+             (Overlay.authoritative_transaction ~cursor:tx.t ~transaction :: acc)
+             rest)
     in
     Result.bind (encode [] txs) (fun transactions ->
-      Result.bind (server_cursor t) (fun through ->
-        let checksum =
-          match checksum_value with
-          | None -> Ok None
-          | Some value -> Result.map Option.some (checksum value)
-        in
-        Result.bind checksum (fun checksum ->
-          Overlay.authoritative_batch
-            ~maximum_count:4096
-            ~maximum_bytes:core.config.limits.maximum_response_bytes
-            ~transactions
-            ~through
-            ~checksum
-          |> Result.map Option.some
-          |> Result.map_error (fun _ -> "invalid authoritative batch")))))
+      let checksum =
+        match checksum_value with
+        | None -> Ok None
+        | Some value -> Result.map Option.some (checksum value)
+      in
+      Result.bind checksum (fun checksum ->
+        Overlay.authoritative_batch
+          ~maximum_count:4096
+          ~maximum_bytes:core.config.limits.maximum_response_bytes
+          ~transactions
+          ~through:t
+          ~checksum
+        |> Result.map Option.some
+        |> Result.map_error (fun _ -> "invalid authoritative batch"))))
 ;;
 
 let enqueue_authoritative core batch =
@@ -1856,8 +1846,9 @@ let enqueue_authoritative core batch =
 ;;
 
 let apply_accept core owner t checksum_value =
-  match core.sync_view, checksum_value, server_cursor t with
-  | Some sync, Some checksum_value, Ok through ->
+  match core.sync_view, checksum_value with
+  | Some sync, Some checksum_value ->
+    let through = t in
     (match checksum checksum_value with
      | Error _ -> fail core During_catalog "invalid acceptance checksum"
      | Ok checksum ->
@@ -1912,10 +1903,9 @@ let apply_rejection core owner rejection =
       | _ :: _ ->
         (match rejection.t, rejection.checksum with
          | Some through, Some checksum_value ->
-           Result.bind (server_cursor through) (fun through ->
-             Result.map
-               (fun checksum -> Some Overlay.{ through; checksum })
-               (checksum checksum_value))
+           Result.map
+             (fun checksum -> Some Overlay.{ through; checksum })
+             (checksum checksum_value)
          | _ -> Error "partial rejection omitted its acceptance barrier")
     in
     let reason =
@@ -1929,8 +1919,7 @@ let apply_rejection core owner rejection =
     in
     let resolution =
       match rejection.Sync_protocol.reason, rejection.t with
-      | Sync_protocol.Stale, Some through ->
-        Result.map (fun through -> Overlay.Stale { through }) (server_cursor through)
+      | Sync_protocol.Stale, Some through -> Ok (Overlay.Stale { through })
       | Stale, None -> Error "stale rejection omitted cursor"
       | _, _ ->
         Result.bind (partition ()) (fun (failed_member, unexecuted_suffix) ->
@@ -1992,7 +1981,7 @@ let websocket_message core connection message =
           ~none:(Option.is_none core.active_authoritative_batch)
           ~some:(fun owner ->
             owner.pull_connection = connection
-            && t >= owner.issued_since
+            && Server_cursor.compare t owner.issued_since >= 0
             &&
             match owner.pull_stage with
             | Awaiting_pull_response _ -> true
@@ -2057,7 +2046,7 @@ let authoritative_applied core (result : authoritative_commit_result) =
     || Option.is_none core.active_authoritative_batch
   then unchanged core
   else (
-    let applied_server_t = server_cursor_number result.commit.checkpoint in
+    let applied_server_t = result.commit.checkpoint in
     let receipt_mutation_id (receipt : Overlay.mutation_receipt) =
       match receipt with
       | Applied_receipt { mutation_id; _ }
@@ -2093,7 +2082,7 @@ let authoritative_applied core (result : authoritative_commit_result) =
         then None
         else (
           match owner.accepted_through with
-          | Some through when applied_server_t >= through -> None
+          | Some through when Server_cursor.compare applied_server_t through >= 0 -> None
           | _ -> Some owner)
       | None -> None
     in

@@ -551,7 +551,7 @@ let test_standalone_sync_protocol_boundary root =
   require_text
     root
     "logseq_sync/spec/pure_reducer/sync_protocol.mli"
-    [ "type cursor = int"
+    [ "type cursor = Logseq_db_types.Server_cursor.t"
     ; "type checksum = string"
     ; "module Client : sig"
     ; "module Server : sig"
@@ -583,7 +583,7 @@ let test_standalone_sync_protocol_boundary root =
   require_text
     root
     "logseq_sync/lib/pure_reducer/sync_protocol.ml"
-    [ "type cursor = int"
+    [ "type cursor = Logseq_db_types.Server_cursor.t"
     ; "type checksum = string"
     ; "module Client = struct"
     ; "module Server = struct"

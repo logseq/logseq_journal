@@ -100,7 +100,7 @@ let encode_mutation (mutation_id, fingerprint, entry) =
             Types.delete_conflict_kinds receipt.conflicts |> List.map Delete_conflict.code
         ; earliest_conflict_cursor =
             Option.map
-              Types.Server_cursor.to_string
+              Persistence_json.server_cursor_to_string
               (Types.remote_won_proof_earliest_conflict_cursor proof)
         ; fingerprint
         ; format_version = 1
@@ -113,11 +113,11 @@ let encode_mutation (mutation_id, fingerprint, entry) =
              | Proven_unexecuted -> "provenUnexecuted")
         ; rejection_through =
             Option.map
-              Types.Server_cursor.to_string
+              Persistence_json.server_cursor_to_string
               (Types.remote_won_proof_rejection_through proof)
         ; t_before =
             Option.map
-              Types.Server_cursor.to_string
+              Persistence_json.server_cursor_to_string
               (Types.remote_won_proof_t_before proof)
         }
   in
@@ -218,12 +218,16 @@ let decode_remote_won ~key json =
       let* batch_id =
         optional_token Types.Submission_batch_id.of_string receipt.batch_id
       in
-      let* t_before = optional_token Types.Server_cursor.of_string receipt.t_before in
+      let* t_before =
+        optional_token Persistence_json.server_cursor_of_string receipt.t_before
+      in
       let* rejection_through =
-        optional_token Types.Server_cursor.of_string receipt.rejection_through
+        optional_token Persistence_json.server_cursor_of_string receipt.rejection_through
       in
       let* earliest_conflict_cursor =
-        optional_token Types.Server_cursor.of_string receipt.earliest_conflict_cursor
+        optional_token
+          Persistence_json.server_cursor_of_string
+          receipt.earliest_conflict_cursor
       in
       let* proof =
         Types.remote_won_proof
@@ -294,8 +298,9 @@ let encode_terminal_batch receipt =
       stale_terminal_batch_receipt_v1_to_yojson
         { batch_id = Types.Submission_batch_id.to_string receipt.terminal_batch_id
         ; format_version = 1
-        ; through = Types.Server_cursor.to_string through
-        ; executed_through = Option.map Types.Server_cursor.to_string executed_through
+        ; through = Persistence_json.server_cursor_to_string through
+        ; executed_through =
+            Option.map Persistence_json.server_cursor_to_string executed_through
         ; receipt_type = "staleBatch"
         }
     | Terminal_accepted barrier ->
@@ -304,7 +309,7 @@ let encode_terminal_batch receipt =
         ; format_version = 1
         ; checksum = Types.Checksum.to_string barrier.checksum
         ; receipt_type = "acceptedBatch"
-        ; through = Types.Server_cursor.to_string barrier.through
+        ; through = Persistence_json.server_cursor_to_string barrier.through
         }
     | Terminal_proven_unexecuted { mutation_id; fingerprint } ->
       proven_unexecuted_terminal_batch_receipt_v1_to_yojson
@@ -327,11 +332,12 @@ let decode_terminal_batch (key, source) =
        | Some (`String "staleBatch") ->
          let* receipt = stale_terminal_batch_receipt_v1_of_yojson json in
          let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
-         let* through = Types.Server_cursor.of_string receipt.through in
+         let* through = Persistence_json.server_cursor_of_string receipt.through in
          let* executed_through =
            match receipt.executed_through with
            | None -> Ok None
-           | Some value -> Result.map Option.some (Types.Server_cursor.of_string value)
+           | Some value ->
+             Result.map Option.some (Persistence_json.server_cursor_of_string value)
          in
          if
            receipt.format_version <> 1
@@ -351,7 +357,7 @@ let decode_terminal_batch (key, source) =
          then Error "invalid terminal batch receipt identity or version"
          else
            let* checksum = Types.Checksum.of_string receipt.checksum in
-           let* through = Types.Server_cursor.of_string receipt.through in
+           let* through = Persistence_json.server_cursor_of_string receipt.through in
            Ok
              { terminal_batch_id
              ; terminal_outcome = Terminal_accepted Types.{ through; checksum }

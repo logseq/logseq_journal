@@ -168,7 +168,8 @@ let worker_open_graph_transition () =
             |> Result.get_ok
           in
           let checkpoint =
-            Logseq_overlay_db.Types.Server_cursor.of_string "server-cursor:v1:0"
+            Logseq_overlay_db.Types.Server_cursor.of_int64 0L
+            |> Result.map_error (fun `Negative_cursor -> "negative cursor")
             |> Result.get_ok
           in
           let sync =

@@ -43,7 +43,8 @@ let commit_insert database behavior ordinal =
 ;;
 
 let server_cursor ordinal =
-  Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" ordinal)
+  Server_cursor.of_int64 (Int64.of_int ordinal)
+  |> Result.map_error (fun `Negative_cursor -> "negative cursor")
   |> T.require_ok ~behavior:"construct listener server cursor"
 ;;
 
@@ -520,7 +521,11 @@ let authoritative_membership_change_reports_structure_interests database =
     |> encoded_transaction_of_string ~maximum_bytes:4096
     |> T.require_ok ~behavior
   in
-  let cursor = Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior in
+  let cursor =
+    Server_cursor.of_int64 1L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> T.require_ok ~behavior
+  in
   let batch =
     authoritative_batch
       ~maximum_count:16

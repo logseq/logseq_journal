@@ -4,7 +4,8 @@ module Types = Logseq_overlay_db.Types
 open Types
 
 let server_cursor value =
-  Server_cursor.of_string (Printf.sprintf "server-cursor:v1:%d" value)
+  Server_cursor.of_int64 (Int64.of_int value)
+  |> Result.map_error (fun `Negative_cursor -> "negative cursor")
   |> T.require_ok ~behavior:"construct server cursor"
 ;;
 
@@ -3718,8 +3719,32 @@ let stale_invalid_barrier_is_rejected database =
   | _ -> Alcotest.fail "non-advancing Stale barrier was admitted as non-execution proof"
 ;;
 
+let numeric_cursor_construction_and_comparison () =
+  let cursor n =
+    Server_cursor.of_int64 n
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+  in
+  List.iter
+    (fun n ->
+       T.require
+         (Result.is_error (cursor n))
+         "negative authoritative cursor was constructible")
+    [ -1L; Int64.min_int ];
+  List.iter
+    (fun (a, b) ->
+       let a = cursor a |> T.require_ok ~behavior:"numeric cursor" in
+       let b = cursor b |> T.require_ok ~behavior:"numeric cursor" in
+       T.require (Server_cursor.compare a b < 0) "numeric comparison reversed";
+       T.require (Server_cursor.equal a a) "numeric equality changed")
+    [ 0L, 1L; Int64.pred Int64.max_int, Int64.max_int ]
+;;
+
 let pure_cases =
   [ Alcotest.test_case
+      "numeric cursor construction and comparison"
+      `Quick
+      numeric_cursor_construction_and_comparison
+  ; Alcotest.test_case
       "revision codecs reject unknown versions"
       `Quick
       revision_codecs_reject_unknown_versions

@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Database = Logseq_overlay_db.Database
 module Graph = Logseq_db_types.Graph_types
 module Types = Logseq_overlay_db.Types
@@ -235,7 +239,7 @@ let seed_mirror ?(graph_id = graph_uuid) support =
     Logseq_db_types.Sync_checkpoint.create
       ~graph_id
       ~schema:Graph.{ major = 65; minor = 33 }
-      ~applied_server_t:0
+      ~applied_server_t:(server_cursor_of_int 0)
       ~checksum:"0000000000000000"
     |> require_ok ~behavior:"construct fixture checkpoint"
   in

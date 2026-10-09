@@ -6,7 +6,7 @@ open Pure_reducer_bad_case_support
 let run () =
   let fixture, current = current_connected_fixture () in
   let scope = fixture.connection.graph in
-  let checkpoint = token Overlay.Server_cursor.of_string "server-cursor:v1:0" in
+  let checkpoint = token Overlay.Server_cursor.of_int64 0L in
   let sync_token = token Overlay.sync_token_of_string "sync-token:v1:bc09" in
   let sync = queued_sync sync_token checkpoint (List.hd mutation_ids) in
   let event = Core.Sync_inspected { scope; sync } in

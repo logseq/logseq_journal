@@ -1,4 +1,4 @@
-type cursor = int
+type cursor = Logseq_db_types.Server_cursor.t
 type checksum = string
 
 type rejection_reason =
@@ -231,22 +231,47 @@ let required_nullable_string context path ?maximum name fields =
     Ok (Some value)
 ;;
 
-let non_negative_int context path = function
-  | `Int value when value >= 0 -> Ok value
-  | `Int _ -> error context path (Invalid_field { expected = "non-negative integer" })
-  | _ -> error context path (Invalid_field { expected = "non-negative integer" })
+let maximum_wire_cursor = 9007199254740991L
+
+let cursor_of_json context path value =
+  let number =
+    match value with
+    | `Int value -> Some (Int64.of_int value)
+    | `Intlit value
+      when String.length value > 0
+           && String.for_all
+                (function
+                  | '0' .. '9' -> true
+                  | _ -> false)
+                value -> Int64.of_string_opt value
+    | _ -> None
+  in
+  match number with
+  | Some value when value >= 0L && value <= maximum_wire_cursor ->
+    (match Logseq_db_types.Server_cursor.of_int64 value with
+     | Ok cursor -> Ok cursor
+     | Error `Negative_cursor -> assert false)
+  | _ ->
+    error
+      context
+      path
+      (Invalid_field { expected = "integer cursor between 0 and 9007199254740991" })
+;;
+
+let cursor_json value =
+  `Intlit (Int64.to_string (Logseq_db_types.Server_cursor.to_int64 value))
 ;;
 
 let required_cursor context path name fields =
   let* value = required_field context path name fields in
-  non_negative_int context (path @ [ name ]) value
+  cursor_of_json context (path @ [ name ]) value
 ;;
 
 let optional_cursor context path name fields =
   match field name fields with
   | None -> Ok None
   | Some value ->
-    let* value = non_negative_int context (path @ [ name ]) value in
+    let* value = cursor_of_json context (path @ [ name ]) value in
     Ok (Some value)
 ;;
 
@@ -503,9 +528,9 @@ let decode_server_fields context message_type fields =
   | unsupported -> error context [] (Unsupported_message_type unsupported)
 ;;
 
-let decode direction decode_fields wire =
+let decode ?maximum direction decode_fields wire =
   let context = { direction; message_type = None } in
-  let maximum = maximum_wire_bytes direction in
+  let maximum = Option.value maximum ~default:(maximum_wire_bytes direction) in
   if String.length wire > maximum
   then error context [] (Limit_exceeded { maximum })
   else (
@@ -518,6 +543,16 @@ let decode direction decode_fields wire =
       | _ -> error context [] Expected_object
     with
     | Yojson.Json_error _ -> error context [] Invalid_json)
+;;
+
+let decode_snapshot_baseline =
+  decode
+    ~maximum:Logseq_db_types.Limits.maximum_snapshot_baseline_response_bytes
+    Server
+    (fun context message_type fields ->
+       if message_type = "pull/ok"
+       then required_cursor context [] "t" fields
+       else error context [] (Unsupported_message_type message_type))
 ;;
 
 let decode_client_message = decode Client decode_client_fields
@@ -557,7 +592,7 @@ let client_message_json = function
     `Assoc fields
   | Client.Pull { since } ->
     let fields = [ "type", `String "pull" ] in
-    `Assoc (add_optional "since" (fun value -> `Int value) since fields)
+    `Assoc (add_optional "since" cursor_json since fields)
   | Client.Tx_batch { client_revision; t_before; txs } ->
     let fields = [ "type", `String "tx/batch" ] in
     let fields =
@@ -565,7 +600,7 @@ let client_message_json = function
     in
     `Assoc
       (fields
-       @ [ "t-before", `Int t_before
+       @ [ "t-before", cursor_json t_before
          ; "txs", `List (List.map client_transaction_json txs)
          ])
   | Client.Ping -> `Assoc [ "type", `String "ping" ]
@@ -580,7 +615,7 @@ let user_presence_json (user : user_presence) =
 ;;
 
 let pull_transaction_json (transaction : Server.pull_transaction) =
-  [ "t", `Int transaction.Server.t; "tx", `String transaction.tx ]
+  [ "t", cursor_json transaction.Server.t; "tx", `String transaction.tx ]
   |> add_optional "outliner-op" (fun value -> `String value) transaction.outliner_op
   |> fun fields -> `Assoc fields
 ;;
@@ -604,7 +639,7 @@ let rejection_json (rejection : rejection) =
   [ "type", `String "tx/reject"
   ; "reason", `String (rejection_reason_json rejection.reason)
   ]
-  |> add_optional "t" (fun value -> `Int value) rejection.t
+  |> add_optional "t" cursor_json rejection.t
   |> add_optional "checksum" (fun value -> `String value) rejection.checksum
   |> add_non_empty_list "success-tx-ids" uuid_json rejection.success_tx_ids
   |> add_optional "failed-tx-id" uuid_json rejection.failed_tx_id
@@ -616,7 +651,7 @@ let rejection_json (rejection : rejection) =
 
 let server_message_json = function
   | Server.Hello { t; checksum } ->
-    let fields = [ "type", `String "hello"; "t", `Int t ] in
+    let fields = [ "type", `String "hello"; "t", cursor_json t ] in
     `Assoc (add_optional "checksum" (fun value -> `String value) checksum fields)
   | Server.Online_users { online_users } ->
     `Assoc
@@ -630,13 +665,13 @@ let server_message_json = function
       ; "editing-block-uuid", nullable_string_json editing_block_uuid
       ]
   | Server.Pull_ok { t; checksum; txs } ->
-    let fields = [ "type", `String "pull/ok"; "t", `Int t ] in
+    let fields = [ "type", `String "pull/ok"; "t", cursor_json t ] in
     let fields = add_optional "checksum" (fun value -> `String value) checksum fields in
     `Assoc (fields @ [ "txs", `List (List.map pull_transaction_json txs) ])
   | Server.Tx_batch_ok { t; checksum } ->
-    let fields = [ "type", `String "tx/batch/ok"; "t", `Int t ] in
+    let fields = [ "type", `String "tx/batch/ok"; "t", cursor_json t ] in
     `Assoc (add_optional "checksum" (fun value -> `String value) checksum fields)
-  | Server.Changed { t } -> `Assoc [ "type", `String "changed"; "t", `Int t ]
+  | Server.Changed { t } -> `Assoc [ "type", `String "changed"; "t", cursor_json t ]
   | Server.Tx_reject rejection -> rejection_json rejection
   | Server.Pong -> `Assoc [ "type", `String "pong" ]
   | Server.Error { message } ->

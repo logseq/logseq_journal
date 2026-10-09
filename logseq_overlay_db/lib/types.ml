@@ -63,9 +63,7 @@ module Mirror_generation = Make_versioned_token (struct
     let prefix = "mirror-generation"
   end)
 
-module Server_cursor = Make_versioned_token (struct
-    let prefix = "server-cursor"
-  end)
+module Server_cursor = Server_cursor
 
 module Checksum = Make_versioned_token (struct
     let prefix = "checksum"

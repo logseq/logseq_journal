@@ -1,3 +1,7 @@
+let server_cursor_of_int value =
+  Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
+;;
+
 module Protocol = Logseq_sync_pure_reducer.Sync_protocol
 module Client = Protocol.Client
 module Server = Protocol.Server
@@ -48,11 +52,12 @@ let test_all_client_messages_round_trip () =
     ; Client.Presence { editing_block_uuid = None }
     ; Client.Presence { editing_block_uuid = Some "block-1" }
     ; Client.Pull { since = None }
-    ; Client.Pull { since = Some 7 }
-    ; Client.Tx_batch { client_revision = None; t_before = 7; txs = [] }
+    ; Client.Pull { since = Some (server_cursor_of_int 7) }
+    ; Client.Tx_batch
+        { client_revision = None; t_before = server_cursor_of_int 7; txs = [] }
     ; Client.Tx_batch
         { client_revision = Some "revision-1"
-        ; t_before = 7
+        ; t_before = server_cursor_of_int 7
         ; txs =
             [ { tx = "transit"; tx_id = Some tx_id; outliner_op = Some "save-block" }
             ; { tx = "second"; tx_id = None; outliner_op = None }
@@ -72,7 +77,8 @@ let test_all_client_messages_round_trip () =
   Alcotest.(check string)
     "pull uses canonical since"
     {|{"type":"pull","since":7}|}
-    (Protocol.encode_client_message (Client.Pull { since = Some 7 })
+    (Protocol.encode_client_message
+       (Client.Pull { since = Some (server_cursor_of_int 7) })
      |> require_ok "encode canonical pull")
 ;;
 
@@ -100,7 +106,7 @@ let rejection
 
 let test_all_server_messages_round_trip () =
   let messages =
-    [ Server.Hello { t = 7; checksum = Some "0123456789abcdef" }
+    [ Server.Hello { t = server_cursor_of_int 7; checksum = Some "0123456789abcdef" }
     ; Server.Online_users
         { online_users =
             [ { user_id = "user-1"
@@ -114,12 +120,13 @@ let test_all_server_messages_round_trip () =
     ; Server.Presence { user_id = "user-1"; editing_block_uuid = None }
     ; Server.Presence { user_id = "user-1"; editing_block_uuid = Some "block-1" }
     ; Server.Pull_ok
-        { t = 8
+        { t = server_cursor_of_int 8
         ; checksum = None
-        ; txs = [ { t = 8; tx = "transit"; outliner_op = None } ]
+        ; txs = [ { t = server_cursor_of_int 8; tx = "transit"; outliner_op = None } ]
         }
-    ; Server.Tx_batch_ok { t = 8; checksum = Some "fedcba9876543210" }
-    ; Server.Changed { t = 9 }
+    ; Server.Tx_batch_ok
+        { t = server_cursor_of_int 8; checksum = Some "fedcba9876543210" }
+    ; Server.Changed { t = server_cursor_of_int 9 }
     ; Server.Pong
     ; Server.Error { message = "server error" }
     ]
@@ -136,14 +143,15 @@ let test_all_server_messages_round_trip () =
 
 let test_all_rejection_shapes_round_trip () =
   let messages =
-    [ Server.Tx_reject (rejection ~t:9 Protocol.Stale)
+    [ Server.Tx_reject (rejection ~t:(server_cursor_of_int 9) Protocol.Stale)
     ; Server.Tx_reject (rejection Protocol.Empty_tx_data)
     ; Server.Tx_reject (rejection Protocol.Invalid_tx)
     ; Server.Tx_reject (rejection Protocol.Invalid_t_before)
-    ; Server.Tx_reject (rejection ~t:9 Protocol.Snapshot_upload_in_progress)
+    ; Server.Tx_reject
+        (rejection ~t:(server_cursor_of_int 9) Protocol.Snapshot_upload_in_progress)
     ; Server.Tx_reject
         (rejection
-           ~t:10
+           ~t:(server_cursor_of_int 10)
            ~checksum:"0123456789abcdef"
            ~success_tx_ids:[ tx_id ]
            ~failed_tx_id
@@ -328,7 +336,7 @@ let test_protocol_validation_is_fail_closed () =
     Alcotest.bool
     "negative typed cursor cannot be encoded"
     true
-    (Result.is_error (Protocol.encode_client_message (Client.Pull { since = Some (-1) })));
+    (Result.is_error (Logseq_db_types.Server_cursor.of_int64 (-1L)));
   let oversized = String.make (Logseq_db_types.Limits.maximum_response_bytes + 1) 'x' in
   let error =
     Protocol.decode_server_message oversized |> require_error "oversized server message"
@@ -342,8 +350,41 @@ let test_protocol_validation_is_fail_closed () =
     )
 ;;
 
+let test_cursor_wire_range () =
+  List.iter
+    (fun n ->
+       let server = Printf.sprintf {|{"type":"changed","t":%s}|} n in
+       let client = Printf.sprintf {|{"type":"pull","since":%s}|} n in
+       ignore (Protocol.decode_server_message server |> require_ok "valid wire cursor");
+       ignore (Protocol.decode_client_message client |> require_ok "valid wire cursor"))
+    [ "0"; "9007199254740991" ];
+  List.iter
+    (fun n ->
+       let server = Printf.sprintf {|{"type":"changed","t":%s}|} n in
+       let client = Printf.sprintf {|{"type":"pull","since":%s}|} n in
+       Alcotest.(check bool)
+         "server rejects unsafe cursor"
+         true
+         (Result.is_error (Protocol.decode_server_message server));
+       Alcotest.(check bool)
+         "client rejects unsafe cursor"
+         true
+         (Result.is_error (Protocol.decode_client_message client)))
+    [ "-1"; "9007199254740992"; "9223372036854775808"; "1.5"; "null"; "\"9\"" ];
+  Alcotest.(check bool)
+    "outbound client rejects unsafe cursor"
+    true
+    (Result.is_error
+       (Protocol.encode_client_message
+          (Client.Pull { since = Some (server_cursor_of_int 9007199254740992) })))
+;;
+
 let scenarios =
   [ Alcotest.test_case
+      "numeric cursor wire safe integer range"
+      `Quick
+      test_cursor_wire_range
+  ; Alcotest.test_case
       "all client messages round trip"
       `Quick
       test_all_client_messages_round_trip

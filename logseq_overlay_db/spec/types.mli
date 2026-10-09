@@ -20,7 +20,7 @@ module Block_state_revision : VERSIONED_TOKEN
 module Page_state_revision : VERSIONED_TOKEN
 module Scope_revision : VERSIONED_TOKEN
 module Mirror_generation : VERSIONED_TOKEN
-module Server_cursor : VERSIONED_TOKEN
+module Server_cursor = Server_cursor
 module Checksum : VERSIONED_TOKEN
 module Crypto_item_id : VERSIONED_TOKEN
 module Submission_batch_id : VERSIONED_TOKEN

@@ -37,7 +37,11 @@ let initialize_database db checkpoint =
               (Graph_types.Uuid.to_string checkpoint.graph_id));
          Sqlite3.Rc.check (Sqlite3.bind_int statement 3 checkpoint.schema.major);
          Sqlite3.Rc.check (Sqlite3.bind_int statement 4 checkpoint.schema.minor);
-         Sqlite3.Rc.check (Sqlite3.bind_int statement 5 checkpoint.applied_server_t);
+         Sqlite3.Rc.check
+           (Sqlite3.bind_int64
+              statement
+              5
+              (Server_cursor.to_int64 checkpoint.applied_server_t));
          Sqlite3.Rc.check (Sqlite3.bind_text statement 6 checkpoint.checksum);
          Sqlite3.Rc.check
            (Sqlite3.bind_text
@@ -104,7 +108,14 @@ let read_database db =
            let graph_id = Sqlite3.column_text statement 1 in
            let major = Sqlite3.column_int statement 2 in
            let minor = Sqlite3.column_int statement 3 in
-           let applied_server_t = Sqlite3.column_int statement 4 in
+           let applied_server_t =
+             match Sqlite3.column statement 4 with
+             | Sqlite3.Data.INT value ->
+               Server_cursor.of_int64 value
+               |> Result.map_error (fun `Negative_cursor ->
+                 "sync_meta cursor is negative")
+             | _ -> Error "sync_meta cursor is not an integer"
+           in
            let checksum = Sqlite3.column_text statement 5 in
            let status =
              match Sqlite3.column statement 6 with
@@ -124,9 +135,10 @@ let read_database db =
              match Graph_types.Uuid.of_string graph_id with
              | Error _ -> Error "sync_meta graph id is invalid"
              | Ok graph_id ->
-               (match status, last_error with
-                | Error message, _ | _, Error message -> Error message
-                | Ok status, Ok last_error ->
+               (match applied_server_t, status, last_error with
+                | Error message, _, _ | _, Error message, _ | _, _, Error message ->
+                  Error message
+                | Ok applied_server_t, Ok status, Ok last_error ->
                   (match
                      Sync_checkpoint.create_full
                        ~graph_id
@@ -169,7 +181,11 @@ let update_database db checkpoint =
                 (Graph_types.Uuid.to_string checkpoint.graph_id));
            Sqlite3.Rc.check (Sqlite3.bind_int statement 3 checkpoint.schema.major);
            Sqlite3.Rc.check (Sqlite3.bind_int statement 4 checkpoint.schema.minor);
-           Sqlite3.Rc.check (Sqlite3.bind_int statement 5 checkpoint.applied_server_t);
+           Sqlite3.Rc.check
+             (Sqlite3.bind_int64
+                statement
+                5
+                (Server_cursor.to_int64 checkpoint.applied_server_t));
            Sqlite3.Rc.check (Sqlite3.bind_text statement 6 checkpoint.checksum);
            Sqlite3.Rc.check
              (Sqlite3.bind_text

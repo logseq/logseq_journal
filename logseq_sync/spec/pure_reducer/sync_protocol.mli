@@ -1,7 +1,7 @@
 (** Typed application-level WebSocket protocol shared by the sync client and server. *)
 
 (** A non-negative authoritative transaction cursor. Codec functions reject negative values. *)
-type cursor = int
+type cursor = Logseq_db_types.Server_cursor.t
 
 (** A 16-character hexadecimal entity checksum. *)
 type checksum = string
@@ -136,6 +136,9 @@ val encode_server_message : Server.message -> (string, codec_error) result
 
 (** Strictly decode one bounded server JSON message. *)
 val decode_server_message : string -> (Server.message, codec_error) result
+
+(** Decode the cursor of the HTTP snapshot baseline using the wire range rules. *)
+val decode_snapshot_baseline : string -> (cursor, codec_error) result
 
 (** Render safe diagnostic text without including raw payloads or invalid field values. *)
 val error_to_string : codec_error -> string

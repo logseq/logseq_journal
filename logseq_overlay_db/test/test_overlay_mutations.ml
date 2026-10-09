@@ -774,7 +774,11 @@ let append_orders_follow_existing_tail database =
                  ])
             [ T.authoritative_block_uuid, "a0"; T.reference_source_uuid, "a1" ]))
   in
-  let cursor = Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior in
+  let cursor =
+    Server_cursor.of_int64 1L
+    |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+    |> T.require_ok ~behavior
+  in
   let transaction =
     encoded_transaction_of_string ~maximum_bytes:4096 wire |> T.require_ok ~behavior
   in
@@ -1026,7 +1030,9 @@ let orders_survive_reopen_and_outbox_drain () =
             |> T.require_ok ~behavior
           in
           let cursor =
-            Server_cursor.of_string "server-cursor:v1:1" |> T.require_ok ~behavior
+            Server_cursor.of_int64 1L
+            |> Result.map_error (fun `Negative_cursor -> "negative cursor")
+            |> T.require_ok ~behavior
           in
           let batch =
             authoritative_batch

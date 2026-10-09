@@ -67,7 +67,7 @@ let snapshot_baseline ~base_url ~graph_id ~token =
     ~path:(graph_path graph_id "pull")
     ~query:[]
     ~token
-    ~maximum_response_bytes:(64 * 1024 * 1024)
+    ~maximum_response_bytes:Limits.maximum_snapshot_baseline_response_bytes
     ()
 ;;
 

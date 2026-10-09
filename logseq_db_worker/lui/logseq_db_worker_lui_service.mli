@@ -43,7 +43,7 @@ type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
-  ; applied_server_t : int option
+  ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
   ; startup : startup_facts
   ; last_error : string option
