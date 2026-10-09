@@ -69,7 +69,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
               controls.padding(.trailing, 16)
             }
           }
-          .safeAreaInset(edge: .top, spacing: 0) {
+          .safeAreaBar(edge: .top, spacing: 0) {
             if let title = properties.title {
               HStack(alignment: .center, spacing: 12) {
                 Text(title)
@@ -82,7 +82,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
               }
               .frame(minHeight: 44)
               .padding(.horizontal, 16)
-              .background(.bar)
+              // The native bar participates in the soft scroll edge, keeping
+              // content visible beneath the title without another material.
             }
           }
       }
