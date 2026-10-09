@@ -1,0 +1,4 @@
+interface:
+  display_name: "Journal Code Review"
+  short_description: "只读审查 Journal 代码的性能、UX 与类型约束，仅报告有证据的问题"
+  default_prompt: "使用 $journal-code-review 只读审查指定范围，简短报告有证据的性能、UX 与类型问题。"
