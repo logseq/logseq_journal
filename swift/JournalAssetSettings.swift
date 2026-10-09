@@ -32,10 +32,11 @@ import SwiftUI
       if deliveredDays != days && emit("days:\(days)") { deliveredDays = days }
     }
     var body: some SwiftUI.View {
-      context.content
-        // The root column's proposal is the full viewport; expand to fill it
-        // and anchor the page at the top so bar rows don't drift to center.
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+      ZStack {
+        context.content
+        // Settings is mounted without children. EmptyView cannot own a sheet.
+        Color.clear.frame(width: 0, height: 0)
+      }
         .task { deliver() }
         .onChange(of: days) { _, value in
           if preferences.save(recentDays: value) { deliver() }
@@ -85,8 +86,9 @@ import SwiftUI
             .formStyle(.grouped)
             .navigationTitle("Attachment settings")
             .toolbar {
-              ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { emit("dismissed") }
+              ToolbarItem(placement: .cancellationAction) {
+                JournalSheetDismissButton(label: "Done") { emit("dismissed") }
+                  .accessibilityIdentifier("journal-settings-close")
               }
             }
           }

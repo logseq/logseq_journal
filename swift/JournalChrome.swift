@@ -1,11 +1,29 @@
 import LUIAppleBackend
 import SwiftUI
 
+/// The form sheet's native card transform still leaves at least a 44pt target.
+struct JournalSheetDismissButton: SwiftUI.View {
+  var label: LocalizedStringKey = "Close"
+  let action: () -> Void
+
+  var body: some SwiftUI.View {
+    Button(action: action) {
+      Image(systemName: "xmark")
+        .frame(width: 48, height: 48)
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .fixedSize()
+    .accessibilityLabel(Text(label))
+  }
+}
+
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
     case feedback, page, header, detail, unlock
     case bottomControls = "bottom-controls"
+    case toolbarControl = "toolbar-control"
   }
 
   private struct Properties: Decodable {
@@ -51,20 +69,21 @@ import SwiftUI
               controls.padding(.trailing, 16)
             }
           }
-          .safeAreaInset(edge: .top, spacing: 0) {
+          .safeAreaBar(edge: .top, spacing: 0) {
             if let title = properties.title {
-              ZStack {
+              HStack(alignment: .center, spacing: 12) {
                 Text(title)
                   .font(.headline)
+                  .fixedSize(horizontal: false, vertical: true)
+                  .frame(maxWidth: .infinity, alignment: .leading)
                   .accessibilityAddTraits(.isHeader)
                   .accessibilityIdentifier("favorites-header-title")
-                HStack {
-                  Spacer()
-                  controls
-                }
+                controls
               }
               .frame(minHeight: 44)
               .padding(.horizontal, 16)
+              // The native bar participates in the soft scroll edge, keeping
+              // content visible beneath the title without another material.
             }
           }
       }
@@ -160,6 +179,13 @@ import SwiftUI
               child(1).fixedSize()
             }
           }
+        }
+      case .toolbarControl:
+        if context.childIDs.count == 1 {
+          child(0).fixedSize()
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(Text(properties?.title ?? "Close"))
+            .accessibilityAddTraits(.isButton)
         }
       case .bottomControls:
         if context.childIDs.count == 2 {

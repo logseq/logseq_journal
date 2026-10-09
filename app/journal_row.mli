@@ -1,7 +1,8 @@
 val view
   :  ?render_source:(string -> string)
   -> render_media:
-       (root:string
+       (title:string
+        -> root:string
         -> image_children:(string * string) list
         -> Journal_view.View.t
         -> Journal_view.View.t)

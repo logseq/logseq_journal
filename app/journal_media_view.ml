@@ -157,6 +157,7 @@ let size_text size =
 
 let view_content
       ~store
+      ?title
       ?(on_region = fun _ -> ())
       ?(observed_roots = [])
       ?asset_root
@@ -526,15 +527,20 @@ let view_content
             ~equal:( = )
             (function
               | None -> L.column ~width:0 ~height:0 []
-              | Some ([ path ], _, false) ->
-                L.file_preview ~path ~on_dismiss:(fun _ -> close_preview ()) []
-              | Some (paths, selected_index, _) ->
+              | Some (paths, selected_index, image) ->
                 let payload =
                   Yojson.Safe.to_string
                     (`Assoc
-                        [ "paths", `List (List.map (fun path -> `String path) paths)
-                        ; "selected_index", `Int selected_index
-                        ])
+                        ([ "paths", `List (List.map (fun path -> `String path) paths)
+                         ; "selected_index", `Int selected_index
+                         ]
+                         @
+                         if image
+                         then []
+                         else
+                           [ "document", `Bool true
+                           ; "title", `String (Option.value title ~default:"Attachment")
+                           ]))
                 in
                 Journal_lui_native.image_preview
                   ~payload
@@ -599,6 +605,7 @@ let reactive_structure store ~roots ~on_region build =
 
 let view
       ~store
+      ?title
       ?(on_region = fun _ -> ())
       ?(observed_roots = [])
       ?asset_root
@@ -612,6 +619,7 @@ let view
   reactive_structure store ~roots ~on_region (fun () ->
     view_content
       ~store
+      ?title
       ~on_region
       ~observed_roots
       ?asset_root
@@ -627,6 +635,7 @@ let view
    keep their lease/event owner, even when the parent references the same asset. *)
 let row_content
       ~store
+      ?title
       ?(on_region = fun _ -> ())
       ~scope
       ~root
@@ -717,6 +726,7 @@ let row_content
   in
   view_content
     ~store
+    ?title
     ~on_region
     ~known_images:image_children
     ~observed_roots:(root :: List.map fst image_children)
@@ -728,10 +738,20 @@ let row_content
     child
 ;;
 
-let row ~store ?(on_region = fun _ -> ()) ~scope ~root ~image_children ~on_event child =
+let row
+      ~store
+      ?title
+      ?(on_region = fun _ -> ())
+      ~scope
+      ~root
+      ~image_children
+      ~on_event
+      child
+  =
   reactive_structure
     store
     ~roots:(root :: List.map fst image_children)
     ~on_region
-    (fun () -> row_content ~store ~on_region ~scope ~root ~image_children ~on_event child)
+    (fun () ->
+       row_content ~store ?title ~on_region ~scope ~root ~image_children ~on_event child)
 ;;

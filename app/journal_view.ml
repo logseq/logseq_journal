@@ -19,6 +19,7 @@ type t =
   ; test_id : string option
   ; mount : Lui_elements.t
   ; label_content : label_content option
+  ; control_label : string option
   }
 
 module Key = struct
@@ -36,7 +37,10 @@ module Test_id = struct
   let to_string s = s
 end
 
-let element ?key ?test_id mount = { key; test_id; mount; label_content = None }
+let element ?key ?test_id mount =
+  { key; test_id; mount; label_content = None; control_label = None }
+;;
+
 let mount t = t.mount
 let int_of_float_nan v = int_of_float (Float.round v)
 
@@ -793,15 +797,20 @@ module View = struct
       | Some _ as variant -> variant
       | None -> Option.map Button_style.lui_variant style
     in
-    element
-      ?key
-      (Lui_elements.button
-         ~disabled:(not enabled)
-         ?variant
-         ~autofocus
-         ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
-         (* Leaf controls carry label/icon as properties, not child nodes. *)
-         [ leaf_label child.label_content ])
+    let result =
+      element
+        ?key
+        (Lui_elements.button
+           ~disabled:(not enabled)
+           ?variant
+           ~autofocus
+           ~on_press:(fun _ -> invoke on_press Event.Payload.Unit)
+           (* Leaf controls carry label/icon as properties, not child nodes. *)
+           [ leaf_label child.label_content ])
+    in
+    { result with
+      control_label = Option.map (fun label -> label.title) child.label_content
+    }
   ;;
 
   let text_edit_handler ~session_id ~document_revision ~accepted_local_revision ~on_edit =
@@ -1150,6 +1159,39 @@ module View = struct
            mounted)
     ;;
 
+    (* Cancellation glyphs retain the original accessible label and action.
+       Give the native button a full 44pt target before entering the bar. *)
+    let mount_cancellation (item : item) : Lui_elements.t =
+      let child context parent =
+        let previous = !icon_only
+        and previous_nodes = !icon_only_collapsed_nodes in
+        icon_only := true;
+        icon_only_collapsed_nodes := [];
+        Fun.protect
+          ~finally:(fun () ->
+            icon_only := previous;
+            icon_only_collapsed_nodes := previous_nodes)
+          (fun () ->
+             let node = item.content.mount context parent in
+             if node_is_standard context node
+             then (
+               Lui_ui.width context node 44;
+               Lui_ui.height context node 44);
+             node)
+      in
+      Journal_lui_native.mount
+        ~key:item.item_key
+        ~payload:
+          (Yojson.Safe.to_string
+             (`Assoc
+                 [ "mode", `String "toolbar-control"
+                 ; ( "title"
+                   , `String (Option.value item.content.control_label ~default:"Close") )
+                 ]))
+        ~children:[ child ]
+        Journal_lui_native.chrome_identifier
+    ;;
+
     let nav_button ~icon ~label ~on_press : Lui_elements.t =
       (* Icon-only button: the schema rejects empty text + icon without an
          accessibility label. *)
@@ -1207,7 +1249,10 @@ module View = struct
             else [])
            @ (if cancellation <> []
               then
-                [ emit_bar "cancellation-action" (List.map mount_icon_only cancellation) ]
+                [ emit_bar
+                    "cancellation-action"
+                    (List.map mount_cancellation cancellation)
+                ]
               else [])
            @ [ flexible_space ]
            @ (match principal, !nav_bar with
@@ -1893,8 +1938,8 @@ module View = struct
           ~presented
           ~on_presented_changed
           ?(interactive_dismiss = true)
-          ?sizing:_
-          ?detents:_
+          ?sizing
+          ?detents
           ?(title = "")
           ~content
           base
@@ -1908,6 +1953,23 @@ module View = struct
             then
               [ Lui_elements.sheet
                   ~text:(if String.equal title "" then "Sheet" else title)
+                  ~style_class:"navigation-content navigation-inline-title"
+                  ?sizing:
+                    (Option.bind sizing (function
+                       | Automatic -> None
+                       | Form -> Some "form"
+                       | Fitted -> Some "fitted"))
+                  ?detents:
+                    (Option.map
+                       (fun values ->
+                          String.concat
+                            ","
+                            (List.map
+                               (function
+                                 | Medium -> "medium"
+                                 | Large -> "large")
+                               values))
+                       detents)
                   ?on_dismiss:
                     (if interactive_dismiss
                      then

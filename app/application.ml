@@ -1599,9 +1599,9 @@ end
 let dismiss_toolbar ~test_id ~command dispatch body =
   let close =
     V.button
-      ~role:Cancel
+      ~style:Plain
       ~on_press:(bind_action dispatch command)
-      ~child:(V.text "Close")
+      ~child:(V.label ~title:(V.text "Close") ~icon:(V.symbol ~name:"xmark" ()) ())
       ()
     |> V.with_test_id (Ui.Test_id.string test_id)
   in
@@ -1810,6 +1810,7 @@ let media_label
       ?(detail = false)
       state
       dispatch
+      ~title
       ~root
       child
   =
@@ -1818,6 +1819,7 @@ let media_label
     ~store
     ~on_region
     ~scope
+    ~title
     ~root
     ~on_event:(fun event -> dispatch.send (Media (scope, event)))
     child
@@ -1828,6 +1830,7 @@ let row_media_label
       ?(on_region = fun _ -> ())
       state
       dispatch
+      ~title
       ~root
       ~image_children
       child
@@ -1837,6 +1840,7 @@ let row_media_label
     ~store
     ~on_region
     ~scope
+    ~title
     ~root
     ~image_children
     ~on_event:(fun event -> dispatch.send (Media (scope, event)))
@@ -2002,7 +2006,10 @@ let favorites_view
                   match favorite.target with
                   | Page id | Block id -> id
                 in
-                key, V.column ~key:(Ui.Key.string key) [ render_media ~root row ])
+                ( key
+                , V.column
+                    ~key:(Ui.Key.string key)
+                    [ render_media ~title:favorite.title ~root row ] ))
              rows)
       in
       let footer =
@@ -2044,6 +2051,16 @@ type composer_assets =
   ; on_remove : string -> unit
   }
 
+let composer_can_submit ~capture ~saving ~enabled =
+  enabled
+  && (not saving)
+  && (Journal_capture.can_save capture
+      ||
+      match Journal_capture.phase capture with
+      | Failed _ -> true
+      | _ -> false)
+;;
+
 let composer_content
       ~scope
       ~placeholder
@@ -2057,15 +2074,7 @@ let composer_content
       ~assets
   =
   let ignored = Ui.Event.Handler.create (fun _ -> ()) in
-  let can_submit =
-    enabled
-    && (not saving)
-    && (Journal_capture.can_save capture
-        ||
-        match Journal_capture.phase capture with
-        | Failed _ -> true
-        | _ -> false)
-  in
+  let can_submit = composer_can_submit ~capture ~saving ~enabled in
   let task_selected = Journal_capture.task_state capture = Journal_model.Todo in
   let task =
     (* Circular icon capsule matching the composer actions row — buttons has
@@ -2198,8 +2207,13 @@ let composer_page
       ~error
       ~assets
   =
+  let can_submit = composer_can_submit ~capture ~saving ~enabled in
   let close =
-    V.button ~role:Cancel ~on_press:on_close ~child:(V.text "Close") ()
+    V.button
+      ~style:Plain
+      ~on_press:on_close
+      ~child:(V.label ~title:(V.text "Cancel") ~icon:(V.symbol ~name:"xmark" ()) ())
+      ()
     |> V.with_test_id (Ui.Test_id.string (scope ^ "-close"))
   in
   composer_content
@@ -2220,6 +2234,14 @@ let composer_page
              ~key:(Ui.Key.string "composer-close")
              ~placement:Cancellation_action
              close
+         ; V.Toolbar.item
+             ~key:(Ui.Key.string "composer-submit")
+             ~placement:Primary_action
+             (V.button
+                ~enabled:can_submit
+                ~on_press:on_save
+                ~child:(V.text (if scope = "journal-append" then "Add" else "Send"))
+                ())
          ]
 ;;
 
@@ -2592,7 +2614,8 @@ let diagnostics_page ~snapshot ~graph ~admission diagnostics dispatch =
           Presentation.section
             title
             (List.map
-               (fun (label, value) -> Presentation.labeled label (V.text value))
+               (fun (label, value) ->
+                  V.column ~spacing:4. ~alignment:Leading [ V.text label; V.text value ])
                rows))
        groups)
   |> dismiss_toolbar
@@ -2819,6 +2842,7 @@ let detail_page
                ~detail:true
                state
                dispatch
+               ~title:(Journal_model.source block)
                ~root:(Journal_model.id block))
       (Journal_detail.rows detail)
   in
@@ -2932,19 +2956,46 @@ let manager_page state dispatch =
       "Diagnostics"
       "stethoscope"
   in
-  let toolbar title actions body =
+  let toolbar ?(sign_out = false) title actions body =
+    let account_menu =
+      V.buttons
+        ~actions:
+          [ V.buttons_menu_action
+              ~label:"Account menu"
+              ~icon:"ellipsis"
+              ~on_select:
+                (Ui.Event.Handler.create (function
+                   | Ui.Event.Payload.Int64 1L -> dispatch.send Open_diagnostics
+                   | Int64 2L when sign_out -> dispatch.send Sign_out
+                   | _ -> ()))
+              ([ V.Menu.action ~id:1L ~title:"Diagnostics" ~icon:"stethoscope" () ]
+               @
+               if sign_out
+               then
+                 [ V.Menu.action
+                     ~id:2L
+                     ~title:"Sign out"
+                     ~icon:"rectangle.portrait.and.arrow.right"
+                     ()
+                 ]
+               else [])
+          ]
+        ()
+      |> V.with_test_id (Ui.Test_id.string "journal-startup-menu")
+    in
     body
     |> V.Body.toolbar
          ~items:
-           (V.Toolbar.item
-              ~key:(Ui.Key.string "startup-title")
-              ~placement:Principal
-              (V.text title)
-            :: V.Toolbar.item
-                 ~key:(Ui.Key.string "startup-diagnostics")
-                 ~placement:Secondary_action
-                 diagnostics
-            :: actions)
+           ((V.Toolbar.item
+               ~key:(Ui.Key.string "startup-title")
+               ~placement:Principal
+               (V.text title)
+             :: actions)
+            @ [ V.Toolbar.item
+                  ~key:(Ui.Key.string "startup-menu")
+                  ~placement:Primary_action
+                  account_menu
+              ])
   in
   let unavailable ~title ~symbol ~message ~actions =
     Presentation.unavailable ~title ~symbol ~message ~actions
@@ -3012,6 +3063,7 @@ let manager_page state dispatch =
         |> V.Body.with_test_id (Ui.Test_id.string "graph-picker-list")
     in
     toolbar
+      ~sign_out:snapshot.startup.authenticated
       "Choose a graph"
       [ V.Toolbar.item
           ~key:(Ui.Key.string "graph-picker-refresh")
@@ -6123,13 +6175,14 @@ let start
             ~render_source:(render_source state)
             ~render_media:
               (media_label ~store:media_store ~on_region:on_view_region state dispatch)
-            ~render_row_media:(fun ~root ~image_children child ->
+            ~render_row_media:(fun ~title ~root ~image_children child ->
               on_view_region "timeline-row";
               row_media_label
                 ~store:media_store
                 ~on_region:on_view_region
                 state
                 dispatch
+                ~title
                 ~root
                 ~image_children
                 child)

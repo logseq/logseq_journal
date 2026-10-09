@@ -12,6 +12,8 @@ import UIKit
   struct Properties: Decodable {
     let paths: [String]
     let selected_index: Int
+    let document: Bool?
+    let title: String?
   }
 
   struct View: SwiftUI.View {
@@ -38,10 +40,15 @@ import UIKit
         Color.clear
           .frame(width: 0, height: 0)
           .fullScreenCover(isPresented: $presented, onDismiss: dismissed) {
-            Pager(urls: urls, selectedIndex: properties.selected_index) {
-              presented = false
+            if properties.document == true, let url = urls.first {
+              Document(url: url, title: properties.title ?? "Attachment") {
+                presented = false
+              }.ignoresSafeArea()
+            } else {
+              Pager(urls: urls, selectedIndex: properties.selected_index) {
+                presented = false
+              }.ignoresSafeArea()
             }
-            .ignoresSafeArea()
           }
           .onAppear {
             guard !opened, urls.indices.contains(properties.selected_index) else { return }
@@ -67,6 +74,51 @@ import UIKit
   }
 
   #if os(iOS)
+  private static func closeButton(identifier: String, onClose: @escaping () -> Void) -> UIBarButtonItem {
+    let button = UIButton(type: .system)
+    button.setImage(UIImage(systemName: "xmark"), for: .normal)
+    button.accessibilityLabel = Locale.current.language.languageCode?.identifier == "zh" ? "关闭" : "Close"
+    button.accessibilityIdentifier = identifier
+    button.widthAnchor.constraint(equalToConstant: 44).isActive = true
+    button.heightAnchor.constraint(equalToConstant: 44).isActive = true
+    button.addAction(UIAction { _ in onClose() }, for: .touchUpInside)
+    let item = UIBarButtonItem(customView: button)
+    // The shared glass capsule otherwise clips a custom button to 36pt tall.
+    item.hidesSharedBackground = true
+    return item
+  }
+
+  // Quick Look accepts a display title independently of the immutable cache URL.
+  struct Document: UIViewControllerRepresentable {
+    let url: URL
+    let title: String
+    let onClose: () -> Void
+
+    final class Item: NSObject, QLPreviewItem {
+      let previewItemURL: URL?
+      let previewItemTitle: String?
+      init(url: URL, title: String) {
+        previewItemURL = url
+        previewItemTitle = title
+      }
+    }
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+      let item: Item
+      init(url: URL, title: String) { item = Item(url: url, title: title) }
+      func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+      func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { item }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(url: url, title: title) }
+    func makeUIViewController(context: Context) -> UINavigationController {
+      let preview = QLPreviewController()
+      preview.dataSource = context.coordinator
+      preview.navigationItem.leftBarButtonItem = JournalImagePreview.closeButton(
+        identifier: "journal-document-close", onClose: onClose)
+      return UINavigationController(rootViewController: preview)
+    }
+    func updateUIViewController(_ navigation: UINavigationController, context: Context) {}
+  }
+
   struct Pager: UIViewControllerRepresentable {
     let urls: [URL]
     let selectedIndex: Int
@@ -227,8 +279,8 @@ import UIKit
     override func viewDidLoad() {
       super.viewDidLoad()
       view.backgroundColor = .systemBackground
-      navigationItem.leftBarButtonItem = UIBarButtonItem(
-        systemItem: .done, primaryAction: UIAction { [weak self] _ in self?.onClose?() })
+      navigationItem.leftBarButtonItem = JournalImagePreview.closeButton(
+        identifier: "journal-image-close", onClose: { [weak self] in self?.onClose?() })
       saveButton.accessibilityIdentifier = "journal-save-current-image"
       navigationItem.rightBarButtonItems = [saveButton, shareButton]
       save.onBusyChanged = { [weak self] busy in
