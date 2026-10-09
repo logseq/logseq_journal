@@ -684,6 +684,52 @@ let window n uuids interests =
     }
 ;;
 
+let runtime_unconfigured_changes after_shutdown () =
+  let sent = Queue.create () in
+  let r =
+    Runtime.create
+      ~send:(fun request -> Queue.add request sent; true)
+      ~changed:(fun _ _ _ -> ())
+  in
+  if after_shutdown then (
+    Runtime.refresh
+      r
+      ~graph_generation:1
+      ~today:20260301
+      ~settings:(P.settings ~recent_days:0 |> Result.get_ok);
+    Runtime.shutdown r;
+    Queue.clear sent);
+  (* Graph owns this inline-reference source and its target reads. No offline
+     configuration has admitted any recursive root or attachment consumer. *)
+  raw r 600 (block 200 1 1 []);
+  for n = 1 to 4 do
+    let request =
+      Wire.
+        { api_version = 2
+        ; request_id = uuid (600 + n)
+        ; command = V2_get_block { block = uuid n; revision = None }
+        }
+    in
+    Runtime.observe_request r request;
+    Runtime.forget_request r ~request_id:request.request_id
+  done;
+  Runtime.changes r [ window 1 [ 1; 2; 3; 4 ] [] ];
+  Runtime.pump r;
+  check
+    (Queue.is_empty sent)
+    "unconfigured offline owner must not duplicate Graph reference target reads";
+  Runtime.changes
+    r
+    [ { (window 2 [] [ Wire.V2_children_interest (uuid 99) ]) with
+        page_uuids = [ uuid 98 ]
+      }
+    ];
+  Runtime.pump r;
+  check
+    (Queue.is_empty sent)
+    "unconfigured offline owner must not discover structure or page dependencies"
+;;
+
 let runtime_title_only () =
   let r, sent = runtime_fixture () in
   let original = block 2 1 1 [] in
@@ -1204,7 +1250,9 @@ let () =
        | exn ->
          incr failed;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "runtime unknown old parent", runtime_unknown_old_parent
+    [ "runtime never configured changes", runtime_unconfigured_changes false
+    ; "runtime shutdown changes", runtime_unconfigured_changes true
+    ; "runtime unknown old parent", runtime_unknown_old_parent
     ; "runtime dependency reject", runtime_dependency_failure true
     ; "runtime dependency failed", runtime_dependency_failure false
     ; "runtime hidden negative holder", runtime_hidden_holder_fanout

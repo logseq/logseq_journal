@@ -423,6 +423,7 @@ let run_favorites_native_visibility
   let acquire_release = Atomic.make false in
   let released_files = Atomic.make 0 in
   let media_checksum = Atomic.make 'a' in
+  let media_metadata_changed = Atomic.make false in
   let detail_fixture = Atomic.make false in
   let released_demands = Atomic.make 0 in
   let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
@@ -444,30 +445,6 @@ let run_favorites_native_visibility
     ; graph_id = uuid 900
     ; graph_generation = 1
     }
-  in
-  let items =
-    List.mapi
-      (fun n root ->
-         { P.membership_uuid = uuid (1000 + n)
-         ; membership_order = Printf.sprintf "%03d" n
-         ; membership_revision = "membership-1"
-         ; target =
-             (if n mod 2 = 0
-              then
-                P.V2_favorite_page
-                  { uuid = root
-                  ; title = Printf.sprintf "Fixture %d" n
-                  ; revision = "page-1"
-                  }
-              else
-                P.V2_favorite_block
-                  { uuid = root
-                  ; title = Printf.sprintf "Fixture %d" n
-                  ; task_status = None
-                  ; revision = "block-1"
-                  })
-         })
-      roots
   in
   let page : G.page =
     { uuid = uuid 10000
@@ -502,6 +479,69 @@ let run_favorites_native_visibility
     ; tag_titles = []
     }
   in
+  let favorites_page =
+    { page with
+      uuid = uuid 40000
+    ; name = "$$$favorites"
+    ; title = "Favorites"
+    ; kind = Hidden_page
+    }
+  in
+  let favorite_target_uuid n =
+    if n mod 2 = 0 then uuid (30000 + n) else List.nth roots n
+  in
+  let favorite_page n =
+    { page with
+      uuid = favorite_target_uuid n
+    ; name = Printf.sprintf "fixture-%d" n
+    ; title = Printf.sprintf "Fixture %d" n
+    ; kind = Ordinary_page
+    }
+  in
+  let favorite_label n =
+    if n mod 2 = 0 then (favorite_page n).title else (timeline_block n).block.title
+  in
+  let favorite_items () =
+    List.init 65 (fun n ->
+      { P.membership_uuid = uuid (1000 + n)
+      ; membership_order = Printf.sprintf "%03d" n
+      ; membership_revision = "membership-1"
+      ; target =
+          (if n mod 2 = 0
+           then
+             P.V2_favorite_page
+               { uuid = favorite_target_uuid n
+               ; title = favorite_label n
+               ; revision = "page-1"
+               }
+           else
+             P.V2_favorite_block
+               { uuid = favorite_target_uuid n
+               ; title = favorite_label n
+               ; task_status = None
+               ; revision = "root"
+               })
+      })
+  in
+  let favorite_membership n =
+    let value = timeline_block n in
+    { P.value =
+        { value with
+          block =
+            { value.block with
+              uuid = uuid (1000 + n)
+            ; title = ""
+            ; parent = favorites_page.uuid
+            ; page = favorites_page.uuid
+            ; refs = []
+            ; properties = []
+            }
+        ; rendered_page_title = favorites_page.title
+        }
+    ; revision = "membership-1"
+    }
+  in
+  let changes_acknowledged = Atomic.make false in
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current
@@ -702,18 +742,24 @@ let run_favorites_native_visibility
                     [ { id = "covered-update"
                       ; predecessor = "p"
                       ; successor = "p2"
-                      ; block_uuids = [ uuid 2 ]
+                      ; block_uuids =
+                          (if Atomic.get media_metadata_changed
+                           then [ uuid 20000 ]
+                           else [ uuid 2 ])
                       ; page_uuids = []
                       ; structure_interests = []
                       }
                     ]
                 }
             | V2_ack_changes _ ->
+              Atomic.set changes_acknowledged true;
               V2_changes_acknowledged { generation = "g"; through = "p2" }
             | V2_get_block { block; _ } ->
-              let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
               V2_block_outcome
-                (V2_present_block { value = timeline_block n; revision = "root" })
+                (match List.find_index (G.Uuid.equal block) roots with
+                 | Some n ->
+                   V2_present_block { value = timeline_block n; revision = "root" }
+                 | None -> V2_missing_block { uuid = block; revision = "p" })
             | V2_get_block_summary { block; _ } when check_capture_imports ->
               let root = Atomic.get capture_root |> Option.get in
               let page = Atomic.get capture_page |> Option.get in
@@ -745,25 +791,76 @@ let run_favorites_native_visibility
                 ; generation = "g"
                 ; projection_revision = "p2"
                 }
-            | V2_get_page { page = requested; _ } when check_capture_imports ->
-              let journal_day =
-                Scanf.sscanf
-                  (G.Uuid.to_string requested)
-                  "00000001-%4d-%4d-0000-000000000000"
-                  (fun year month_day -> (year * 10000) + month_day)
+            | V2_get_page { page = requested; _ } ->
+              let known =
+                if G.Uuid.equal requested page.uuid
+                then Some page
+                else if G.Uuid.equal requested favorites_page.uuid
+                then Some favorites_page
+                else
+                  List.find_map
+                    (fun n ->
+                       if n mod 2 = 0 && G.Uuid.equal requested (favorite_target_uuid n)
+                       then Some (favorite_page n)
+                       else None)
+                    (List.init 65 Fun.id)
               in
-              let name = Printf.sprintf "%08d" journal_day in
-              let page =
-                { page with
-                  uuid = requested
-                ; name
-                ; title = name
-                ; kind = Journal_page { journal_day }
-                }
+              let capture_day =
+                if not check_capture_imports
+                then None
+                else (
+                  try
+                    Scanf.sscanf
+                      (G.Uuid.to_string requested)
+                      "00000001-%4d-%4d-0000-000000000000%!"
+                      (fun year month_day ->
+                         let month = month_day / 100
+                         and day = month_day mod 100 in
+                         let leap =
+                           year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0)
+                         in
+                         let maximum_day =
+                           match month with
+                           | 2 -> if leap then 29 else 28
+                           | 4 | 6 | 9 | 11 -> 30
+                           | 1 | 3 | 5 | 7 | 8 | 10 | 12 -> 31
+                           | _ -> 0
+                         in
+                         if
+                           year > 0
+                           && day >= 1
+                           && day <= maximum_day
+                           && G.Uuid.to_string requested
+                              = Printf.sprintf
+                                  "00000001-%04d-%04d-0000-000000000000"
+                                  year
+                                  month_day
+                         then Some ((year * 10000) + month_day)
+                         else None)
+                  with
+                  | Scanf.Scan_failure _ | End_of_file | Failure _ -> None)
               in
-              Atomic.set capture_page (Some page);
-              V2_page_outcome (V2_present_page { page; revision = "p" })
-            | V2_get_page _ -> V2_page_outcome (V2_present_page { page; revision = "p" })
+              let known =
+                match known, capture_day with
+                | Some _, _ -> known
+                | None, Some journal_day ->
+                  let name = Printf.sprintf "%08d" journal_day in
+                  let captured =
+                    { page with
+                      uuid = requested
+                    ; name
+                    ; title = name
+                    ; kind = Journal_page { journal_day }
+                    }
+                  in
+                  Atomic.set capture_page (Some captured);
+                  Some captured
+                | None, None -> None
+              in
+              V2_page_outcome
+                (match known with
+                 | Some page -> V2_present_page { page; revision = "p" }
+                 | None -> V2_missing_page { uuid = requested; revision = "p" })
             | V2_get_children { parent; _ }
               when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
               let value = timeline_block 1 in
@@ -783,16 +880,33 @@ let run_favorites_native_visibility
                 { parent
                 ; revision_scope = V2_children_revision parent
                 ; scope_revision = "children"
-                ; items = []
+                ; items =
+                    (if G.Uuid.equal parent favorites_page.uuid
+                     then List.init 65 favorite_membership
+                     else [])
                 ; next_cursor = None
                 }
-            | V2_list_favorites _ ->
+            | V2_list_favorites { limit; cursor } ->
+              let offset =
+                match cursor with
+                | None -> 0
+                | Some cursor -> int_of_string (G.Cursor.to_string cursor)
+              in
+              let items =
+                favorite_items ()
+                |> List.filteri (fun n _ -> n >= offset && n < offset + limit)
+              in
+              let through = offset + List.length items in
               V2_favorites_outcome
-                { favorites_page = None
+                { favorites_page = Some favorites_page.uuid
                 ; generation = "g"
                 ; projection_revision = "p"
                 ; items
-                ; next_cursor = None
+                ; next_cursor =
+                    (if through < 65
+                     then
+                       Some (G.Cursor.of_string (string_of_int through) |> Result.get_ok)
+                     else None)
                 }
             | V2_list_assets { roots; _ } ->
               Atomic.set queried (List.rev_append roots (Atomic.get queried));
@@ -948,6 +1062,41 @@ let run_favorites_native_visibility
       Unix.sleepf 0.001
     done;
     Alcotest.(check bool) label true (predicate ())
+  in
+  let load_all_favorites label =
+    wait label (fun () -> Option.is_some (find "text" "Fixture 48"));
+    if Option.is_none (find "text" "Fixture 64")
+    then (
+      let rec list_ancestor id =
+        if
+          List.assoc_opt
+            "_extension"
+            (Option.value (Hashtbl.find_opt props id) ~default:[])
+          = Some (`String "journal-list")
+        then id
+        else list_ancestor (Hashtbl.find parents id)
+      in
+      let list_node = list_ancestor (Option.get (find "text" "Fixture 48")) in
+      hooks.extension_event
+        list_node
+        "event"
+        {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":38,\"last\":50}"}|}
+      |> consume);
+    wait "second Favorite page loaded" (fun () ->
+      Option.is_some (find "text" "Fixture 64"))
+  in
+  let settle_worker () =
+    let idle_rounds = ref 0 in
+    wait "background hydration completes" (fun () ->
+      let client = Option.get !client in
+      let metrics = W.Private.metrics (W.Private.pack_client client) in
+      if
+        metrics.queued_requests = 0
+        && metrics.active_request_fibers = 0
+        && W.For_testing.pending_output_count client = 0
+      then incr idle_rounds
+      else idle_rounds := 0;
+      !idle_rounds >= 12)
   in
   let startup =
     Logseq_db_worker.Config.create
@@ -1167,8 +1316,7 @@ let run_favorites_native_visibility
            !clipboard_requests <> []);
          dispatch
            (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites")));
-         wait "copy Favorites loaded" (fun () ->
-           Option.is_some (find "text" "Fixture 64"));
+         load_all_favorites "copy Favorites loaded";
          let list = Option.get (find "_extension" "journal-list") in
          check_copy_text list (G.Uuid.to_string (uuid 1001)) "Timeline fixture 1";
          clipboard_requests := [];
@@ -1739,11 +1887,23 @@ let run_favorites_native_visibility
                  publish
                    (Service.Asset.Failed
                       { failure = Network; attempts = 1; retry_scheduled = false });
-                 wait "invalidated file closes preview" (fun () -> previews () = []);
+                 settle ();
+                 Alcotest.(check bool)
+                   "late Failed retains successful preview URL"
+                   true
+                   (List.mem preview (previews ()) && preview_has_path preview);
                  Alcotest.(check int)
-                   "invalidated preview leaves no URL"
+                   "late Failed releases no successful file"
                    0
-                   (List.length (files ())))
+                   (Atomic.get released_files);
+                 Alcotest.(check int)
+                   "late Failed releases no preview demand"
+                   0
+                   (Atomic.get released_demands);
+                 Alcotest.(check int)
+                   "late Failed cannot reacquire successful file"
+                   acquired
+                   (Atomic.get acquire_entered))
                else (
                  native_range 2 (count + 1);
                  settle ();
@@ -1772,15 +1932,39 @@ let run_favorites_native_visibility
                    (List.for_all preview_has_path (previews ())));
                if scenario = `Preview_replaced
                then (
+                 let reads = List.length (Atomic.get queried) in
+                 Atomic.set changes_acknowledged false;
                  Atomic.set media_checksum 'b';
+                 Atomic.set media_metadata_changed true;
                  W.Session_context.emit
                    (Option.get !worker_context)
                    ~topic:Service.invalidation_topic
                    (Service.Graph_push
                       (P.V2_changes_available
                          { api_version = 2; generation = "g"; through = "p2" }));
-                 wait "descriptor replacement clears old preview" (fun () ->
-                   files () = []));
+                 wait "metadata changes acknowledged" (fun () ->
+                   Atomic.get changes_acknowledged);
+                 settle ();
+                 Alcotest.(check bool)
+                   "same UUID metadata retains preview URL"
+                   true
+                   (List.mem preview (previews ()) && preview_has_path preview);
+                 Alcotest.(check int)
+                   "metadata window does not read successful File again"
+                   reads
+                   (List.length (Atomic.get queried));
+                 Alcotest.(check int)
+                   "metadata window releases no file"
+                   0
+                   (Atomic.get released_files);
+                 Alcotest.(check int)
+                   "metadata window releases no demand"
+                   0
+                   (Atomic.get released_demands);
+                 Alcotest.(check int)
+                   "metadata window cannot reacquire successful file"
+                   acquired
+                   (Atomic.get acquire_entered));
                if scenario = `Preview_graph
                then (
                  Atomic.set graph_generation 2;
@@ -2317,7 +2501,8 @@ let run_favorites_native_visibility
              (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
          Hashtbl.clear regions;
          dispatch (Lui_protocol.Press favorites);
-         wait "Favorites loaded" (fun () -> Option.is_some (find "text" "Fixture 64"));
+         load_all_favorites "Favorites loaded";
+         settle_worker ();
          if check_chrome
          then (
            Hashtbl.clear regions;
@@ -2403,13 +2588,13 @@ let run_favorites_native_visibility
          if (not check_detail) && not check_generation
          then (
            let show n =
-             let text = Option.get (find "text" (Printf.sprintf "Fixture %d" n)) in
+             let text = Option.get (find "text" (favorite_label n)) in
              dispatch (Lui_protocol.Appear (ancestor_property text "appear-enabled"))
            in
            for n = 0 to 63 do
              show n;
              wait (Printf.sprintf "root %d query completed" n) (fun () ->
-               List.mem (List.nth roots n) (Atomic.get queried));
+               List.mem (favorite_target_uuid n) (Atomic.get queried));
              (* Drain the response as well, so the next root is not query-concurrency limited. *)
              for _ = 1 to 3 do
                hooks.pump () |> consume;
@@ -2429,7 +2614,7 @@ let run_favorites_native_visibility
            |> consume;
            show 64;
            wait "65th root admitted after real Favorites Int64_pair event" (fun () ->
-             List.mem (List.nth roots 64) (Atomic.get queried));
+             List.mem (favorite_target_uuid 64) (Atomic.get queried));
            let list_node = Option.get (find "_extension" "journal-list") in
            hooks.extension_event
              list_node
@@ -2449,7 +2634,9 @@ let run_favorites_native_visibility
              "same visible page root does not refetch"
              1
              (List.length
-                (List.filter (G.Uuid.equal (List.nth roots 64)) (Atomic.get queried))))))
+                (List.filter
+                   (G.Uuid.equal (favorite_target_uuid 64))
+                   (Atomic.get queried))))))
 ;;
 
 (* The root reducer has no Worker accepted-ID/terminal-event boundary. This
@@ -2568,6 +2755,14 @@ let test_reference_outer_terminals cancel =
         | Import_asset _ -> Error "unused import"
         | Graph_request request ->
           (match request.command with
+           | P.V2_get_block { block = target; _ }
+             when not (Array.exists (G.Uuid.equal target) targets) ->
+             completed
+               request
+               (V2_block_outcome
+                  (if G.Uuid.equal target block.uuid
+                   then V2_present_block { value = record block; revision = "root" }
+                   else V2_missing_block { uuid = target; revision = "p" }))
            | P.V2_get_block { block = target; _ } ->
              let index =
                Array.to_list targets
@@ -2666,12 +2861,12 @@ let test_reference_outer_terminals cancel =
                request
                (V2_changes
                   { generation = "g"
-                  ; from_exclusive = Some "r1"
+                  ; from_exclusive = Some "p"
                   ; through = "r2"
                   ; next = None
                   ; windows =
                       [ { id = "c1"
-                        ; predecessor = "r1"
+                        ; predecessor = "p"
                         ; successor = "r2"
                         ; block_uuids = Array.to_list (Array.sub targets 0 4)
                         ; page_uuids = []
@@ -2742,6 +2937,15 @@ let test_reference_outer_terminals cancel =
       consume (hooks.pump ());
       Unix.sleepf 0.001
     done;
+    if not (predicate ())
+    then
+      Printf.eprintf
+        "reference timeout=%s attempts=[%s] terminals=%d\n%!"
+        label
+        (String.concat
+           ";"
+           (Array.to_list attempts |> List.map (fun a -> string_of_int (Atomic.get a))))
+        !terminal_count;
     Alcotest.(check bool) label true (predicate ())
   in
   let startup =
@@ -3790,7 +3994,7 @@ let () =
               ~media_rows:3
               ~media_navigation:`Preview_graph
               ())
-        ; Alcotest.test_case "invalid availability closes preview URL" `Quick (fun () ->
+        ; Alcotest.test_case "late Failed preserves successful preview URL" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Preview_invalidated
@@ -3803,7 +4007,7 @@ let () =
                  ~media_rows:3
                  ~media_navigation:`Preview_repeat
                  ())
-        ; Alcotest.test_case "descriptor replacement retires preview" `Quick (fun () ->
+        ; Alcotest.test_case "same UUID metadata preserves preview" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Preview_replaced

@@ -177,7 +177,8 @@ let dependency_key = function
 let enqueue t dependency =
   let key = dependency_key dependency in
   if
-    (not t.degraded)
+    Option.is_some t.configuration
+    && (not t.degraded)
     && (not (Hashtbl.mem t.dependency_waiting key))
     && not
          (Hashtbl.fold
@@ -635,7 +636,7 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
 ;;
 
 let changes t windows =
-  if not t.degraded
+  if Option.is_some t.configuration && not t.degraded
   then (
     let affected = ref Uuids.empty in
     List.iter
