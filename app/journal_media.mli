@@ -10,6 +10,7 @@ type ticket = private
 type presentation =
   | Hidden
   | Placeholder of string
+  | Failed of string
   | File of string
   | External of string
 

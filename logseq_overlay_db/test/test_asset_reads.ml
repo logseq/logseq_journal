@@ -616,6 +616,333 @@ let restore_asset_mutations () =
                | _ -> Alcotest.fail "asset mutations did not survive reopen")))))
 ;;
 
+let property_holder_changes database register =
+  seed database;
+  let ident = "asset-test.property/reference" in
+  let definition =
+    [ add 8 "block/uuid" (Uuid (G.Uuid.to_string (id 8)))
+    ; add 8 "block/title" (String "Asset reference")
+    ; add 8 "block/tags" (Array [ Keyword "db/ident"; Keyword "logseq.class/Property" ])
+    ; add 8 "logseq.property/type" (Keyword "node")
+    ]
+  in
+  apply
+    database
+    2
+    ([ add 8 "db/ident" (Keyword ident)
+     ; add 8 "db/valueType" (Keyword "db.type/ref")
+     ; add 8 "db/cardinality" (Keyword "db.cardinality/one")
+     ; add 1 ident (Int 40006)
+     ; add 9 ident (Int 40006)
+     ]
+     @ if register then [] else definition);
+  let subscriber, predecessor = D.listen database |> get in
+  D.release_snapshot predecessor;
+  let changes = ref [] in
+  D.activate_subscription subscriber ~notify:(fun change -> changes := change :: !changes)
+  |> get;
+  apply
+    database
+    3
+    (if register
+     then definition
+     else
+       [ Transit.Array
+           [ Keyword "db/retract"
+           ; Int 40008
+           ; Keyword "block/tags"
+           ; Array [ Keyword "db/ident"; Keyword "logseq.class/Property" ]
+           ]
+       ]);
+  D.unlisten subscriber;
+  with_snapshot database (fun snapshot ->
+    T.require
+      (List.mem (id 6) (collect ~recursive:false snapshot [ id 1 ]) = register)
+      "property membership did not change";
+    T.require
+      (List.mem (id 6) (collect ~recursive:false snapshot [ id 9 ]) = register)
+      "page property membership did not change");
+  match !changes with
+  | [ Types.Exact { block_uuids; page_uuids; _ } ] ->
+    T.require (List.mem (id 1) block_uuids) "property definition omitted block holder";
+    T.require (List.mem (id 9) page_uuids) "property definition omitted page holder"
+  | _ -> Alcotest.fail "bounded property definition change must publish one exact event"
+;;
+
+let property_holder_overflow () =
+  let behavior = "bounded property holder fanout" in
+  let limits = { (T.limits ~behavior) with change_max_items = 2 } in
+  T.with_database_using_limits ~behavior limits (fun database ->
+    seed database;
+    let ident = "asset-test.property/many" in
+    apply
+      database
+      2
+      [ add 8 "db/ident" (Keyword ident)
+      ; add 8 "db/valueType" (Keyword "db.type/ref")
+      ; add 8 "db/cardinality" (Keyword "db.cardinality/one")
+      ; add 1 ident (Int 40005)
+      ; add 2 ident (Int 40005)
+      ; add 9 ident (Int 40005)
+      ];
+    let subscriber, predecessor = D.listen database |> get in
+    let revision = (D.snapshot_version predecessor).projection_revision in
+    D.release_snapshot predecessor;
+    let changes = ref [] in
+    D.activate_subscription subscriber ~notify:(fun change ->
+      changes := change :: !changes)
+    |> get;
+    apply
+      database
+      3
+      [ add 8 "block/uuid" (Uuid (G.Uuid.to_string (id 8)))
+      ; add 8 "block/title" (String "Many asset references")
+      ; add 8 "block/tags" (Array [ Keyword "db/ident"; Keyword "logseq.class/Property" ])
+      ; add 8 "logseq.property/type" (Keyword "node")
+      ];
+    D.unlisten subscriber;
+    T.require
+      (match !changes with
+       | [ Types.Projection_resync_required _ ] -> true
+       | _ -> false)
+      "property fanout overflow did not publish resync";
+    with_snapshot database (fun snapshot ->
+      T.require
+        (not
+           (Types.Projection_revision.equal
+              revision
+              (D.snapshot_version snapshot).projection_revision))
+        "property fanout resync did not advance projection revision"))
+;;
+
+let asset_target_classification_budget () =
+  let behavior = "bounded eligibility classification" in
+  let limits = { (T.limits ~behavior) with change_max_items = 2 } in
+  T.with_database_using_limits ~behavior limits (fun database ->
+    apply
+      database
+      1
+      (List.init 8 (fun n ->
+         add (100 + n) "block/uuid" (Uuid (G.Uuid.to_string (id (100 + n))))));
+    with_snapshot database (fun snapshot ->
+      T.require
+        (List.for_all
+           (function
+             | Types.Missing_block _ -> true
+             | _ -> false)
+           (D.get_blocks snapshot (List.init 8 (fun n -> id (100 + n))) |> get))
+        "unresolved reference stubs must not be projected blocks");
+    let subscriber, predecessor = D.listen database |> get in
+    let revision = (D.snapshot_version predecessor).projection_revision in
+    D.release_snapshot predecessor;
+    let changes = ref [] in
+    D.activate_subscription subscriber ~notify:(fun change ->
+      changes := change :: !changes)
+    |> get;
+    apply
+      database
+      2
+      (List.init 8 (fun n -> add (100 + n) "block/title" (String "Unresolved reference")));
+    D.unlisten subscriber;
+    T.require
+      (match !changes with
+       | [ Types.Projection_resync_required _ ] -> true
+       | _ -> false)
+      "eligibility classification exhausted its budget without explicit resync";
+    with_snapshot database (fun snapshot ->
+      T.require
+        (not
+           (Types.Projection_revision.equal
+              revision
+              (D.snapshot_version snapshot).projection_revision))
+        "classification resync must advance projection revision"))
+;;
+
+let negative_asset_holder_changes
+      ?(property_type = "asset")
+      ?(holder_page = false)
+      ?(expect_resync = false)
+      typed
+      database
+  =
+  seed database;
+  let attribute = if typed then "asset-test.property/negative" else "block/refs" in
+  let definition =
+    if typed
+    then
+      [ add 8 "db/ident" (Keyword attribute)
+      ; add 8 "db/valueType" (Keyword "db.type/ref")
+      ; add 8 "db/cardinality" (Keyword "db.cardinality/one")
+      ; add 8 "block/uuid" (Uuid (G.Uuid.to_string (id 8)))
+      ; add 8 "block/title" (String "Reference")
+      ; add 8 "block/tags" (Array [ Keyword "db/ident"; Keyword "logseq.class/Property" ])
+      ; add 8 "logseq.property/type" (Keyword property_type)
+      ]
+    else []
+  in
+  apply
+    database
+    2
+    (definition
+     @ [ add 90 "block/uuid" (Uuid (G.Uuid.to_string (id 90)))
+       ; add 90 "block/name" (String "negative-assets")
+       ; add 90 "block/title" (String "Page")
+       ; add 91 "block/uuid" (Uuid (G.Uuid.to_string (id 91)))
+       ; add 91 "block/title" (String "Hidden holder")
+       ; add 91 "block/parent" (Int 40090)
+       ; add 91 "block/page" (Int 40090)
+       ; add 91 "block/order" (String "a")
+       ; add 92 "block/uuid" (Uuid (G.Uuid.to_string (id 92)))
+       ; add 92 "block/title" (String "Initially not an asset")
+       ; add
+           (if holder_page then 90 else 91)
+           attribute
+           (Array [ Keyword "block/uuid"; Uuid (G.Uuid.to_string (id 92)) ])
+       ]);
+  with_snapshot database (fun snapshot ->
+    T.require
+      (collect snapshot [ id 90 ] = [])
+      "negative page must initially have no assets");
+  let subscription, predecessor = D.listen database |> get in
+  D.release_snapshot predecessor;
+  let changes = ref [] in
+  D.activate_subscription subscription ~notify:(fun change ->
+    changes := change :: !changes)
+  |> get;
+  apply
+    database
+    3
+    [ add 92 "block/tags" (Array [ Keyword "db/ident"; Keyword "logseq.class/Asset" ])
+    ; add 92 "logseq.property.asset/type" (String "png")
+    ];
+  D.unlisten subscription;
+  with_snapshot database (fun snapshot ->
+    T.require
+      (collect snapshot [ id 90 ] = [ id 92 ])
+      "new asset must become discoverable");
+  T.require
+    (List.exists
+       (function
+         | Types.Projection_resync_required _ when expect_resync -> true
+         | Types.Exact { block_uuids; page_uuids; _ } when not expect_resync ->
+           if holder_page
+           then List.mem (id 90) page_uuids
+           else List.mem (id 91) block_uuids
+         | _ -> false)
+       !changes)
+    "asset eligibility change omitted unchanged hidden reference holder"
+;;
+
+let negative_favorite_target_changes ?(link_changed = false) database =
+  seed database;
+  let favorite_page =
+    with_snapshot database (fun snapshot ->
+      Option.value
+        (D.get_favorites snapshot ~limit:50 ~cursor:None |> get).favorites_page
+        ~default:(id 99))
+  in
+  let page_fields =
+    if G.Uuid.equal favorite_page (id 99)
+    then
+      [ add 99 "block/uuid" (Uuid (G.Uuid.to_string (id 99)))
+      ; add 99 "block/name" (String "$$$favorites")
+      ; add 99 "block/title" (String "Favorites")
+      ]
+    else []
+  in
+  let favorite_page_ref =
+    Transit.Array [ Keyword "block/uuid"; Uuid (G.Uuid.to_string favorite_page) ]
+  in
+  apply
+    database
+    2
+    (page_fields
+     @ [ add 98 "block/uuid" (Uuid (G.Uuid.to_string (id 98)))
+       ; add 98 "block/title" (String "")
+       ; add 98 "block/parent" favorite_page_ref
+       ; add 98 "block/page" favorite_page_ref
+       ; add 98 "block/order" (String "a0")
+       ; add 96 "block/uuid" (Uuid (G.Uuid.to_string (id 96)))
+       ]
+     @
+     if link_changed
+     then
+       [ add 96 "block/title" (String "New favorite")
+       ; add 96 "block/parent" (Int 40000)
+       ; add 96 "block/page" (Int 40000)
+       ; add 96 "block/order" (String "a1")
+       ]
+     else
+       [ add
+           98
+           "block/link"
+           (Array [ Keyword "block/uuid"; Uuid (G.Uuid.to_string (id 96)) ])
+       ]);
+  with_snapshot database (fun snapshot ->
+    T.require
+      ((D.get_favorites snapshot ~limit:50 ~cursor:None |> get).items = [])
+      "incomplete favorite target must initially be absent");
+  let subscription, predecessor = D.listen database |> get in
+  D.release_snapshot predecessor;
+  let changes = ref [] in
+  D.activate_subscription subscription ~notify:(fun change ->
+    changes := change :: !changes)
+  |> get;
+  apply
+    database
+    3
+    (if link_changed
+     then
+       [ add
+           98
+           "block/link"
+           (Array [ Keyword "block/uuid"; Uuid (G.Uuid.to_string (id 96)) ])
+       ]
+     else
+       [ add 96 "block/title" (String "New favorite")
+       ; add 96 "block/parent" (Int 40000)
+       ; add 96 "block/page" (Int 40000)
+       ; add 96 "block/order" (String "a1")
+       ]);
+  D.unlisten subscription;
+  with_snapshot database (fun snapshot ->
+    let favorites = D.get_favorites snapshot ~limit:50 ~cursor:None |> get in
+    if List.length favorites.items <> 1
+    then (
+      let target =
+        match D.get_blocks snapshot [ id 96 ] |> get with
+        | [ Types.Present_block { value; _ } ] ->
+          Printf.sprintf
+            "%s parent=%s page=%s"
+            value.block.title
+            (G.Uuid.to_string value.block.parent)
+            (G.Uuid.to_string value.block.page)
+        | _ -> "missing"
+      in
+      let children =
+        match
+          D.get_structure
+            snapshot
+            (Types.Children { parent = favorite_page; limit = 200; cursor = None })
+          |> get
+        with
+        | Children_result { items; _ } -> List.length items
+        | _ -> -1
+      in
+      Alcotest.failf
+        "completed target not favorite: target=%s members=%d favoritesPage=%s"
+        target
+        children
+        (Option.fold ~none:"none" ~some:G.Uuid.to_string favorites.favorites_page)));
+  T.require
+    (List.exists
+       (function
+         | Types.Exact { block_uuids; _ } -> List.mem (id 98) block_uuids
+         | _ -> false)
+       !changes)
+    "target eligibility change omitted its unchanged favorite membership UUID"
+;;
+
 let () =
   Alcotest.run
     "asset reads"
@@ -623,6 +950,48 @@ let () =
       , [ Alcotest.test_case "reopen pending outbox" `Quick restore_asset_mutations
         ; Alcotest.test_case "reopen references" `Quick restore_asset_references
         ; Alcotest.test_case "reopen replacement" `Quick restore_binary_replacement
+        ] )
+    ; ( "property membership changes"
+      , [ T.database_case "register existing reference holders" (fun db ->
+            property_holder_changes db true)
+        ; T.database_case "unregister existing reference holders" (fun db ->
+            property_holder_changes db false)
+        ; Alcotest.test_case
+            "bounded holder fanout advances revision"
+            `Quick
+            property_holder_overflow
+        ; T.database_case
+            "negative favorite target becomes valid"
+            (negative_favorite_target_changes ~link_changed:false)
+        ; T.database_case
+            "negative favorite membership gains link"
+            (negative_favorite_target_changes ~link_changed:true)
+        ; T.database_case
+            "negative refs holder becomes discoverable"
+            (negative_asset_holder_changes false)
+        ; T.database_case
+            "negative typed asset holder becomes discoverable"
+            (negative_asset_holder_changes true)
+        ; Alcotest.test_case
+            "asset eligibility classification is bounded"
+            `Quick
+            asset_target_classification_budget
+        ; Alcotest.test_case
+            "bounded negative asset fanout requires resync"
+            `Quick
+            (fun () ->
+               let behavior = "bounded negative reference fanout" in
+               let limits = { (T.limits ~behavior) with change_max_items = 2 } in
+               T.with_database_using_limits
+                 ~behavior
+                 limits
+                 (negative_asset_holder_changes ~expect_resync:true false))
+        ; T.database_case
+            "negative typed node holder becomes discoverable"
+            (negative_asset_holder_changes ~property_type:"node" true)
+        ; T.database_case
+            "negative typed page holder becomes discoverable"
+            (negative_asset_holder_changes ~holder_page:true true)
         ] )
     ; ( "bounded graph metadata"
       , List.map

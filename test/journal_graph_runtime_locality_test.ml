@@ -478,6 +478,17 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
               ; items = []
               ; next_cursor = None
               } )
+        | V2_get_block { block = id; _ } ->
+          let value =
+            List.find
+              (fun (value : Protocol.v2_block_record) ->
+                 Graph.Uuid.equal value.block.uuid id)
+              records
+          in
+          ( "block"
+          , Protocol.V2_block_outcome (V2_present_block { value; revision = "block-2" }) )
+        | V2_get_page _ ->
+          "page", Protocol.V2_page_outcome (V2_present_page { page; revision = "page-2" })
         | _ -> Alcotest.fail "resync request outside retained interests"
       in
       Hashtbl.replace
@@ -496,7 +507,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
          kind
          expected
          (Option.value ~default:0 (Hashtbl.find_opt counts kind)))
-    [ "graph", 1; "journal", 1; "tree", 2; "children", 48 ]
+    [ "graph", 1; "journal", 1; "tree", 2; "children", 48; "block", 48; "page", 1 ]
 ;;
 
 let test_queued_resync_announces_feed_refresh () =
@@ -524,7 +535,7 @@ let test_queued_resync_announces_feed_refresh () =
     (List.length output.requests);
   Alcotest.(check int)
     "refresh ownership is announced before queued reads"
-    2
+    3
     (List.length output.responses);
   Alcotest.(check bool)
     "queued refresh retains its request generation"
@@ -3161,6 +3172,630 @@ let test_copy_result_fits_serialized_clipboard () =
     [ maximum - 19; maximum - 18 ]
 ;;
 
+let seed_ordinary_detail runtime =
+  set_calendar runtime;
+  let ordinary_page =
+    { page with kind = Ordinary_page; name = "reference"; title = "Reference" }
+  in
+  let request =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_detail
+         { block_id = Graph.Uuid.to_string block_uuid
+         ; after = None
+         ; limit = 3
+         ; request_generation = 91L
+         })
+    |> fun output -> only "ordinary detail root" output.requests
+  in
+  let request =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (Protocol.V2_block_outcome
+            (V2_present_block { value = record; revision = "root-1" })))
+    |> fun output -> only "ordinary detail page" output.requests
+  in
+  let request =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (Protocol.V2_page_outcome
+            (V2_present_page { page = ordinary_page; revision = "page-1" })))
+    |> fun output -> only "ordinary detail children" output.requests
+  in
+  let child =
+    { record with
+      block = { block with uuid = unrelated_uuid; title = "Child"; parent = block_uuid }
+    }
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (response
+          request
+          (Protocol.V2_children_outcome
+             { parent = block_uuid
+             ; revision_scope = V2_children_revision block_uuid
+             ; scope_revision = "children-1"
+             ; items = [ { value = child; revision = "child-1" } ]
+             ; next_cursor = None
+             })));
+  ordinary_page, child
+;;
+
+let test_ordinary_detail_point_change child_changed =
+  let runtime = Runtime.create () in
+  let _, child = seed_ordinary_detail runtime in
+  let value = if child_changed then child else record in
+  let output = changed runtime (window ~blocks:[ value.block.uuid ] ()) in
+  let request = only "ordinary detail changed identity" (hydration_requests output) in
+  (match request.command with
+   | V2_get_block { block; _ } ->
+     Alcotest.(check bool)
+       "only changed identity"
+       true
+       (Graph.Uuid.equal block value.block.uuid)
+   | _ -> Alcotest.fail "ordinary detail did not point-read its changed identity");
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (Protocol.V2_block_outcome
+            (V2_present_block
+               { value =
+                   { value with block = { value.block with title = "Updated detail" } }
+               ; revision = "detail-2"
+               })))
+  in
+  let published =
+    List.find_map
+      (fun result ->
+         match result.Runtime.payload with
+         | Block_updated { block; _ } -> Some block
+         | _ -> None)
+      output.responses
+  in
+  match published with
+  | Some block ->
+    Alcotest.(check string)
+      "fresh ordinary detail source"
+      "Updated detail"
+      (Journal_model.source block)
+  | None -> Alcotest.fail "ordinary detail changed identity did not publish"
+;;
+
+let test_detail_children_uses_latest_root () =
+  let runtime = Runtime.create () in
+  seed_children_interest runtime;
+  let output =
+    changed
+      runtime
+      (window
+         ~blocks:[ block_uuid ]
+         ~scopes:[ Protocol.V2_children_interest block_uuid ]
+         ())
+  in
+  let point =
+    List.find
+      (fun (request : Protocol.request) ->
+         match request.command with
+         | V2_get_block _ -> true
+         | _ -> false)
+      (hydration_requests output)
+  in
+  let children =
+    List.find
+      (fun (request : Protocol.request) ->
+         match request.command with
+         | V2_get_children _ -> true
+         | _ -> false)
+      (hydration_requests output)
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (response
+          point
+          (Protocol.V2_block_outcome
+             (V2_present_block
+                { value = { record with block = { block with title = "Fresh root" } }
+                ; revision = "root-2"
+                }))));
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         children
+         (Protocol.V2_children_outcome
+            { parent = block_uuid
+            ; revision_scope = V2_children_revision block_uuid
+            ; scope_revision = "children-2"
+            ; items = []
+            ; next_cursor = None
+            }))
+  in
+  match
+    List.find_map
+      (fun result ->
+         match result.Runtime.payload with
+         | Children_reconciled detail -> Some detail
+         | _ -> None)
+      output.responses
+  with
+  | Some detail ->
+    Alcotest.(check string)
+      "children must not restore stale root"
+      "Fresh root"
+      (Journal_model.source detail.root)
+  | None -> Alcotest.fail "changed children were not reconciled"
+;;
+
+let test_detail_resync_reads_latest_root () =
+  let runtime = Runtime.create () in
+  ignore (seed_ordinary_detail runtime);
+  let output =
+    Runtime.reconcile_push
+      runtime
+      ~request_generation:12L
+      (Protocol.V2_resync_required_push
+         { api_version = Protocol.api_version
+         ; generation = "generation-2"
+         ; reason = "overflow"
+         })
+  in
+  Alcotest.(check bool)
+    "resync must rehydrate ordinary detail root content"
+    true
+    (List.exists
+       (fun (request : Protocol.request) ->
+          match request.command with
+          | V2_get_block { block; _ } -> Graph.Uuid.equal block block_uuid
+          | _ -> false)
+       output.requests)
+;;
+
+let favorites_page_uuid = uuid "a1000000-0000-4000-8000-000000000009"
+let membership_uuid = uuid "a1000000-0000-4000-9000-000000000009"
+let ancestor_uuid = uuid "a1000000-0000-4000-9000-000000000008"
+
+let seed_favorite_dependencies
+      ?(negative = false)
+      ?(before_target = fun () -> ())
+      ?(target_title = fun _ -> block.title)
+      ?(on_output = fun (_ : Runtime.output) -> ())
+      runtime
+  =
+  set_calendar runtime;
+  let request : Journal_graph_request.favorites_request =
+    { graph_generation = 1; request_generation = 1L; limit = 50; cursor = None }
+  in
+  let read =
+    Runtime.submit runtime (Journal_graph_request.Load_favorites request)
+    |> fun output -> only "favorites read" output.requests
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         read
+         (Protocol.V2_favorites_outcome
+            { favorites_page = Some favorites_page_uuid
+            ; generation = "generation-1"
+            ; projection_revision = "revision-1"
+            ; items =
+                (if negative
+                 then []
+                 else
+                   [ { membership_uuid
+                     ; membership_order = "a"
+                     ; membership_revision = "membership-1"
+                     ; target =
+                         V2_favorite_block
+                           { uuid = block_uuid
+                           ; title = block.title
+                           ; task_status = None
+                           ; revision = "root-1"
+                           }
+                     }
+                   ])
+            ; next_cursor = None
+            }))
+  in
+  let visited = ref [] in
+  let target_reads = ref 0 in
+  let rec drain requests =
+    match requests with
+    | [] -> ()
+    | (request : Protocol.request) :: rest ->
+      let outcome =
+        match request.command with
+        | V2_get_children { parent; _ } when Graph.Uuid.equal parent favorites_page_uuid
+          ->
+          Protocol.V2_children_outcome
+            { parent
+            ; revision_scope = V2_children_revision parent
+            ; scope_revision = "favorites-memberships-1"
+            ; items =
+                [ { value =
+                      { record with
+                        block =
+                          { block with uuid = membership_uuid; parent; page = parent }
+                      }
+                  ; revision = "membership-1"
+                  }
+                ]
+            ; next_cursor = None
+            }
+        | V2_get_block { block = id; _ } ->
+          visited := Graph.Uuid.to_string id :: !visited;
+          let value =
+            if Graph.Uuid.equal id block_uuid
+            then (
+              incr target_reads;
+              if !target_reads = 1 then before_target ();
+              { record with
+                block =
+                  { block with
+                    parent = ancestor_uuid
+                  ; title = target_title !target_reads
+                  }
+              })
+            else if Graph.Uuid.equal id ancestor_uuid
+            then
+              { record with
+                block = { block with uuid = ancestor_uuid; parent = page_uuid }
+              }
+            else Alcotest.fail "dependency read escaped favorite ancestry"
+          in
+          Protocol.V2_block_outcome
+            (V2_present_block { value; revision = "dependency-1" })
+        | V2_get_page { page = id; _ } when Graph.Uuid.equal id page_uuid ->
+          Protocol.V2_page_outcome (V2_present_page { page; revision = "page-1" })
+        | _ -> Alcotest.fail "favorite dependency used an unbounded discovery request"
+      in
+      let output = Runtime.receive runtime (response request outcome) in
+      on_output output;
+      let pending = rest @ output.requests in
+      check_hydration_bound pending;
+      drain pending
+  in
+  check_hydration_bound output.requests;
+  drain output.requests;
+  !visited
+;;
+
+let invalidates_favorites output =
+  List.exists
+    (fun result ->
+       match result.Runtime.payload with
+       | Favorites_invalidated -> true
+       | _ -> false)
+    output.Runtime.responses
+;;
+
+let test_favorite_dependencies_are_read () =
+  let runtime = Runtime.create () in
+  let visited = seed_favorite_dependencies runtime in
+  Alcotest.(check (list string))
+    "favorite target and ancestors resolved using bounded point reads"
+    (List.sort
+       String.compare
+       [ Graph.Uuid.to_string block_uuid; Graph.Uuid.to_string ancestor_uuid ])
+    (List.sort_uniq String.compare visited)
+;;
+
+let test_favorite_pending_target_change_is_rechecked () =
+  let runtime = Runtime.create () in
+  let invalidated = ref false in
+  let visited =
+    seed_favorite_dependencies
+      runtime
+      ~before_target:(fun () ->
+        let output = changed runtime (window ~blocks:[ block_uuid ] ()) in
+        Alcotest.(check int)
+          "held point query retains one slot"
+          0
+          (List.length (hydration_requests output)))
+      ~target_title:(fun count -> if count = 1 then block.title else "Fresh favorite")
+      ~on_output:(fun output ->
+        invalidated := !invalidated || invalidates_favorites output)
+  in
+  Alcotest.(check int)
+    "owned target change rechecks once after old completion"
+    2
+    (List.length (List.filter (String.equal (Graph.Uuid.to_string block_uuid)) visited));
+  Alcotest.(check bool) "fresh target title invalidates old Favorites" true !invalidated
+;;
+
+let test_negative_favorite_membership_intersects () =
+  let runtime = Runtime.create () in
+  ignore (seed_favorite_dependencies ~negative:true runtime);
+  Alcotest.(check bool)
+    "negative membership is retained as a dependency"
+    true
+    (invalidates_favorites (changed runtime (window ~blocks:[ membership_uuid ] ())))
+;;
+
+let test_favorite_changes_locality () =
+  let runtime = Runtime.create () in
+  ignore (seed_favorite_dependencies runtime);
+  let request = pull runtime in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (Protocol.V2_changes
+            { generation = "generation-1"
+            ; from_exclusive = Some "revision-1"
+            ; through = "revision-2"
+            ; windows = [ window ~blocks:[ unrelated_uuid ] () ]
+            ; next = None
+            }))
+  in
+  Alcotest.(check bool)
+    "unrelated owned changes preserve favorites"
+    false
+    (invalidates_favorites output);
+  List.iter
+    (fun window ->
+       Alcotest.(check bool)
+         "membership intersection invalidates favorites"
+         true
+         (invalidates_favorites (changed runtime window)))
+    [ window ~blocks:[ membership_uuid ] ()
+    ; window ~scopes:[ Protocol.V2_children_interest favorites_page_uuid ] ()
+    ];
+  List.iter
+    (fun (window, outcome) ->
+       let runtime = Runtime.create () in
+       ignore (seed_favorite_dependencies runtime);
+       let out = changed runtime window in
+       Alcotest.(check bool)
+         "dependency facts are rechecked before invalidating"
+         false
+         (invalidates_favorites out);
+       let read = only "bounded dependency recheck" (hydration_requests out) in
+       let out = Runtime.receive runtime (response read outcome) in
+       Alcotest.(check bool)
+         "changed target or eligibility invalidates favorites"
+         true
+         (invalidates_favorites out))
+    [ ( window ~blocks:[ block_uuid ] ()
+      , Protocol.V2_block_outcome
+          (V2_present_block
+             { value =
+                 { record with
+                   block = { block with parent = ancestor_uuid; title = "Fresh favorite" }
+                 }
+             ; revision = "favorite-2"
+             }) )
+    ; ( window ~blocks:[ ancestor_uuid ] ()
+      , Protocol.V2_block_outcome
+          (V2_missing_block { uuid = ancestor_uuid; revision = "missing-2" }) )
+    ; ( window ~pages:[ page_uuid ] ()
+      , Protocol.V2_page_outcome
+          (V2_present_page { page = { page with recycled = true }; revision = "page-2" })
+      )
+    ]
+;;
+
+let test_favorite_sibling_structure_is_local () =
+  let runtime = Runtime.create () in
+  ignore (seed_favorite_dependencies runtime);
+  let output =
+    changed
+      runtime
+      (window
+         ~blocks:[ unrelated_uuid ]
+         ~pages:[ page_uuid ]
+         ~scopes:
+           [ Protocol.V2_children_interest page_uuid; V2_page_tree_interest page_uuid ]
+         ())
+  in
+  Alcotest.(check bool)
+    "Capture sibling window preserves Favorites"
+    false
+    (invalidates_favorites output);
+  List.iter
+    (fun (request : Protocol.request) ->
+       match request.command with
+       | V2_get_page { page = id; _ } when Graph.Uuid.equal id page_uuid ->
+         let output =
+           Runtime.receive
+             runtime
+             (response
+                request
+                (Protocol.V2_page_outcome (V2_present_page { page; revision = "page-2" })))
+         in
+         Alcotest.(check bool)
+           "unchanged live ancestor preserves Favorites"
+           false
+           (invalidates_favorites output)
+       | _ -> Alcotest.fail "sibling change escaped bounded ancestor point read")
+    (hydration_requests output)
+;;
+
+let test_favorite_ancestor_title_is_local () =
+  let runtime = Runtime.create () in
+  ignore (seed_favorite_dependencies runtime);
+  let output = changed runtime (window ~blocks:[ ancestor_uuid ] ()) in
+  Alcotest.(check bool)
+    "ancestor window rechecks first"
+    false
+    (invalidates_favorites output);
+  let read = only "ancestor point read" (hydration_requests output) in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         read
+         (Protocol.V2_block_outcome
+            (V2_present_block
+               { value =
+                   { record with
+                     block =
+                       { block with
+                         uuid = ancestor_uuid
+                       ; parent = page_uuid
+                       ; title = "Renamed ancestor"
+                       }
+                   }
+               ; revision = "ancestor-2"
+               })))
+  in
+  Alcotest.(check bool)
+    "ancestor title does not alter favorite membership"
+    false
+    (invalidates_favorites output)
+;;
+
+let test_favorite_dependency_limit () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let request : Journal_graph_request.favorites_request =
+    { graph_generation = 1; request_generation = 1L; limit = 50; cursor = None }
+  in
+  let read =
+    Runtime.submit runtime (Journal_graph_request.Load_favorites request)
+    |> fun out -> only "favorites" out.requests
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         read
+         (Protocol.V2_favorites_outcome
+            { favorites_page = Some favorites_page_uuid
+            ; generation = "generation-1"
+            ; projection_revision = "revision-1"
+            ; items = []
+            ; next_cursor = None
+            }))
+  in
+  let rec drain batch requests =
+    if batch > 20 then Alcotest.fail "Favorite dependencies exceeded 4096 without failure";
+    let read = only "bounded membership page" requests in
+    let items =
+      List.init 200 (fun offset ->
+        let uuid =
+          uuid (Printf.sprintf "a2000000-0000-4000-8000-%012d" ((batch * 200) + offset))
+        in
+        Protocol.
+          { value =
+              { record with
+                block =
+                  { block with
+                    uuid
+                  ; parent = favorites_page_uuid
+                  ; page = favorites_page_uuid
+                  }
+              }
+          ; revision = "member-1"
+          })
+    in
+    let next_cursor =
+      Some (Graph.Cursor.of_string (Printf.sprintf "members-%d" batch) |> Result.get_ok)
+    in
+    let out =
+      Runtime.receive
+        runtime
+        (response
+           read
+           (Protocol.V2_children_outcome
+              { parent = favorites_page_uuid
+              ; revision_scope = V2_children_revision favorites_page_uuid
+              ; scope_revision = "members-1"
+              ; items
+              ; next_cursor
+              }))
+    in
+    if
+      List.exists
+        (fun result ->
+           match result.Runtime.payload with
+           | Rejected _ -> true
+           | _ -> false)
+        out.responses
+    then Alcotest.(check int) "failure stops discovery" 0 (List.length out.requests)
+    else drain (batch + 1) out.requests
+  in
+  drain 0 output.requests
+;;
+
+let test_projection_changes_are_owned () =
+  let runtime = Runtime.create () in
+  let output =
+    Runtime.reconcile_push
+      runtime
+      ~request_generation:11L
+      (Protocol.V2_changes_available
+         { api_version = Protocol.api_version
+         ; generation = "generation-1"
+         ; through = "revision-2"
+         })
+  in
+  Alcotest.(check bool)
+    "push emits no premature projection invalidation"
+    false
+    (invalidates_favorites output);
+  let request = only "owned changes pull" output.requests in
+  let change = window ~blocks:[ unrelated_uuid ] () in
+  let completion =
+    response
+      request
+      (Protocol.V2_changes
+         { generation = "generation-1"
+         ; from_exclusive = None
+         ; through = "revision-2"
+         ; windows = [ change ]
+         ; next = None
+         })
+  in
+  let output = Runtime.receive runtime completion in
+  Alcotest.(check int)
+    "owned changes publish once"
+    1
+    (List.fold_left
+       (fun count result ->
+          match result.Runtime.payload with
+          | Projection_changes [ actual ] when actual = change -> count + 1
+          | _ -> count)
+       0
+       output.responses);
+  Alcotest.(check int)
+    "duplicate completion publishes nothing"
+    0
+    (List.length (Runtime.receive runtime completion).responses);
+  let output =
+    Runtime.reconcile_push
+      runtime
+      ~request_generation:12L
+      (Protocol.V2_resync_required_push
+         { api_version = Protocol.api_version
+         ; generation = "generation-2"
+         ; reason = "overflow"
+         })
+  in
+  Alcotest.(check bool)
+    "real resync emits projection resync"
+    true
+    (List.exists
+       (fun result ->
+          match result.Runtime.payload with
+          | Projection_resync -> true
+          | _ -> false)
+       output.responses);
+  Alcotest.(check bool)
+    "real resync invalidates favorites"
+    true
+    (invalidates_favorites output)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
@@ -3320,6 +3955,52 @@ let () =
           ; "update conflict", Update_conflict
           ; "delete conflict", Delete_conflict
           ] )
+    ; ( "projection dependencies"
+      , [ Alcotest.test_case "ordinary detail root changes" `Quick (fun () ->
+            test_ordinary_detail_point_change false)
+        ; Alcotest.test_case "ordinary detail child changes" `Quick (fun () ->
+            test_ordinary_detail_point_change true)
+        ; Alcotest.test_case
+            "children retain latest root"
+            `Quick
+            test_detail_children_uses_latest_root
+        ; Alcotest.test_case
+            "detail resync refreshes root"
+            `Quick
+            test_detail_resync_reads_latest_root
+        ; Alcotest.test_case
+            "favorites resolve ancestry"
+            `Quick
+            test_favorite_dependencies_are_read
+        ; Alcotest.test_case
+            "Favorite pending target changes recheck"
+            `Quick
+            test_favorite_pending_target_change_is_rechecked
+        ; Alcotest.test_case
+            "negative favorites retain membership dependencies"
+            `Quick
+            test_negative_favorite_membership_intersects
+        ; Alcotest.test_case
+            "favorites owned dependency intersection"
+            `Quick
+            test_favorite_changes_locality
+        ; Alcotest.test_case
+            "Favorite Capture sibling structure is local"
+            `Quick
+            test_favorite_sibling_structure_is_local
+        ; Alcotest.test_case
+            "Favorite ancestor title is local"
+            `Quick
+            test_favorite_ancestor_title_is_local
+        ; Alcotest.test_case
+            "Favorite dependency limit fails explicitly"
+            `Quick
+            test_favorite_dependency_limit
+        ; Alcotest.test_case
+            "projection changes ownership and real resync"
+            `Quick
+            test_projection_changes_are_owned
+        ] )
     ; ( "detail"
       , [ Alcotest.test_case
             "resolve unretained page"

@@ -263,6 +263,7 @@ let same_version a b =
 let update_descriptor t descriptor =
   match Assets.find_opt descriptor.Asset.uuid t.entries with
   | None -> t, []
+  | Some { phase = Cached _; _ } -> t, []
   | Some entry when same_version entry.descriptor descriptor ->
     ( { t with entries = Assets.add descriptor.uuid { entry with descriptor } t.entries }
     , [] )
@@ -410,14 +411,17 @@ let raw_step t = function
   | Downloaded (ticket, result) ->
     completed t ticket (Result.map Option.some result) false
   | Retry uuid ->
-    ( { t with
-        entries =
-          Assets.update
-            uuid
-            (Option.map (fun entry -> { (resume_entry entry) with attempts = 0 }))
-            t.entries
-      }
-    , [] )
+    (match Assets.find_opt uuid t.entries with
+     | Some ({ phase = Rejected _; _ } as entry) ->
+       ( { t with
+           entries =
+             Assets.add
+               uuid
+               { entry with phase = Pending; checked = false; attempts = 0 }
+               t.entries
+         }
+       , [] )
+     | None | Some _ -> t, [])
   | Retry_elapsed id ->
     ( { t with
         entries =

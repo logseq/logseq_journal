@@ -90,7 +90,7 @@ let pages () =
     "continue favorites beyond UI page";
   let s, ins = P.step s (Roots_loaded (r, [], None)) in
   check (ins = [] && P.progress s Favorites = Complete) "complete enumeration";
-  let s, ins = P.step s Graph_changed in
+  let s, ins = P.step s Resync in
   let r = read Favorites ins in
   check
     (not
@@ -203,7 +203,7 @@ let residency () =
   in
   let status = P.offline s Favorites in
   check (status.ready = 0 && status.failed = 1) "lost availability revokes completeness";
-  let s, ins = P.step s Graph_changed in
+  let s, ins = P.step s Resync in
   check
     ((P.offline s Favorites).enumeration = Enumerating)
     "replacement cannot claim completeness";
@@ -216,7 +216,7 @@ let residency () =
 
 (* Existing Refresh reproduces graph-push replacement in the baseline. GREEN
    separates this invalidation from unchanged lifecycle configuration. *)
-let changed state = P.step state Graph_changed
+let changed state = P.step state Resync
 
 let read_count ins =
   List.length
@@ -249,7 +249,7 @@ let burst_roots () =
   for _ = 1 to 32 do
     let s, ins = changed !state in
     state := s;
-    check (read_count ins = 0) "32 graph changes must coalesce behind each root read"
+    check (read_count ins = 0) "32 resync requests must coalesce behind each root read"
   done;
   let s, ins = P.step !state (Roots_loaded (old, [ uuid 9 ], Some cursor)) in
   let fresh = read Favorites ins in
@@ -313,9 +313,7 @@ let committed_and_finished () =
     (read_count ins = 0 && P.progress s Favorites = Complete)
     "same configuration must not rescan a finished enumeration";
   let s, ins = changed s in
-  check
-    (read_count ins = 1)
-    "actual graph change must restart finished Favorites only once";
+  check (read_count ins = 1) "explicit resync must restart finished Favorites only once";
   check
     (not
        (List.exists
@@ -388,6 +386,813 @@ let runtime_same_configuration () =
   check accepted "adapter must not swallow still-owned response on same configuration"
 ;;
 
+let completed_favorites () =
+  let s, ins = refresh P.empty in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], None)) in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [ asset 2 ], None)) in
+  let consumer, _ = demand ins in
+  let s, _ = P.step s (Demand_accepted consumer) in
+  s, consumer
+;;
+
+let unrelated_roots () =
+  let s, _ = completed_favorites () in
+  let state = ref s in
+  for _ = 1 to 55 do
+    let s, ins = P.step !state (Roots_changed [ uuid 99 ]) in
+    state := s;
+    check
+      (ins = [])
+      "unrelated roots must preserve completed offline demand without reads"
+  done
+;;
+
+let related_roots () =
+  let s, consumer = completed_favorites () in
+  let s, ins = P.step s (Roots_changed [ uuid 1 ]) in
+  check (read_count ins = 1) "one related batch only";
+  let ticket = read Favorites ins in
+  check
+    (ticket.query = Assets { roots = [ uuid 1 ]; cursor = None })
+    "membership updates must reread the related batch without index enumeration";
+  check (not (List.mem (P.Release consumer) ins)) "old demand remains during replacement";
+  let _, ins = P.step s (Assets_loaded (ticket, [], None)) in
+  check
+    (List.mem (P.Release consumer) ins)
+    "empty replacement releases removed attachments"
+;;
+
+let same_index_roots () =
+  let s, _ = completed_favorites () in
+  let s, ins = P.step s (Index_changed Favorites) in
+  check (read_count ins = 1) "only changed index enumerates";
+  let _, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], None)) in
+  check (ins = []) "unchanged index roots must not repeat recursive attachment reads"
+;;
+
+let shared_ready_uuid () =
+  let s, consumer = completed_favorites () in
+  let s, _ =
+    P.step s (Availability { consumer; asset = uuid 2; availability = Ready "resident" })
+  in
+  let s, ins = P.step s (Roots_changed [ uuid 1 ]) in
+  let version =
+    A.version ~checksum:(String.make 64 'b') ~file_type:"png" |> Result.get_ok
+  in
+  let changed =
+    A.create
+      ~uuid:(uuid 2)
+      ~source:(Managed (Some version))
+      ~current_checksum:None
+      ~size:None
+      ~dimensions:None
+    |> Result.get_ok
+  in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [ changed ], None)) in
+  let fresh, _ = demand ins in
+  let s, _ = P.step s (Demand_accepted fresh) in
+  check
+    ((P.offline s Favorites).ready = 1)
+    "same resident UUID must not lose readiness on descriptor replacement"
+;;
+
+let exact_batch_and_empty () =
+  let s, ins = refresh P.empty in
+  let first_roots = List.init 32 (fun n -> uuid (n + 100)) in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, first_roots, Some cursor)) in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [], None)) in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 200 ], None)) in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [ asset 300 ], None)) in
+  let consumer, _ = demand ins in
+  let s, _ = P.step s (Demand_accepted consumer) in
+  let s, ins = P.step s (Roots_changed [ uuid 100 ]) in
+  check (read_count ins = 1) "negative batch dependency causes exactly one read";
+  let ticket = read Favorites ins in
+  check
+    (ticket.query = Assets { roots = first_roots; cursor = None })
+    "preserve exact 32-root bounded owner";
+  let s, ins = P.step s (Assets_loaded (ticket, [], None)) in
+  check
+    (ins = [] && (P.offline s Favorites).total = 1)
+    "unrelated committed batch retained after empty replacement"
+;;
+
+let index_diff () =
+  let s, old = completed_favorites () in
+  let s, ins = P.step s (Index_changed Favorites) in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 3 ], None)) in
+  let ticket = read Favorites ins in
+  check
+    (ticket.query = Assets { roots = [ uuid 3 ]; cursor = None })
+    "only added index roots read attachments";
+  check
+    (not (List.mem (P.Release old) ins))
+    "removed root demand retained until added roots settle";
+  let _, ins = P.step s (Assets_loaded (ticket, [], None)) in
+  check (List.mem (P.Release old) ins) "removed index root retires its old demand"
+;;
+
+let selected_burst () =
+  let s, _ = completed_favorites () in
+  let s, ins = P.step s (Roots_changed [ uuid 1 ]) in
+  let old = read Favorites ins in
+  let state = ref s in
+  for _ = 1 to 32 do
+    let s, ins = P.step !state (Roots_changed [ uuid 1 ]) in
+    state := s;
+    check (ins = []) "selected batch burst holds one pending request"
+  done;
+  let s, ins = P.step !state (Assets_loaded (old, [], None)) in
+  check (read_count ins = 1) "selected batch burst has one bounded followup";
+  let _, ins = P.step s (Assets_loaded (read Favorites ins, [], None)) in
+  check (ins = []) "followup settles without recursive restarts"
+;;
+
+module Runtime = Journal_asset_runtime
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Wire = Logseq_db_worker.Protocol
+
+let block n parent page refs =
+  G.
+    { uuid = uuid n
+    ; title = "title"
+    ; parent = uuid parent
+    ; page = uuid page
+    ; order = "a0"
+    ; created_at_ms = 0L
+    ; updated_at_ms = 0L
+    ; refs = List.map uuid refs
+    ; tags = []
+    ; properties = []
+    }
+;;
+
+let present (block : G.block) =
+  Wire.V2_block_outcome
+    (V2_present_block
+       { value =
+           { block; task_status = None; rendered_page_title = "page"; tag_titles = [] }
+       ; revision = "r"
+       })
+;;
+
+let respond r request_id outcome =
+  let response = Wire.V2_response { api_version = 2; request_id; outcome } in
+  check (Runtime.receive r response) "runtime must retain the terminal owner"
+;;
+
+let raw r n (block : G.block) =
+  let request =
+    Wire.
+      { api_version = 2
+      ; request_id = uuid n
+      ; command = V2_get_block { block = block.uuid; revision = None }
+      }
+  in
+  Runtime.observe_request r request;
+  Runtime.observe_response
+    r
+    (V2_response
+       { api_version = 2; request_id = request.request_id; outcome = present block })
+;;
+
+let runtime_scope : Service.asset_scope =
+  { account =
+      { managed_sync_origin = Uri.of_string "https://sync.example"
+      ; user_id = "u"
+      ; account_generation = 1
+      ; presentation_generation = 1
+      ; lifecycle_generation = 1L
+      }
+  ; graph_id = uuid 3
+  ; graph_generation = 1
+  }
+;;
+
+let runtime_fixture
+      ?(favorite_block = false)
+      ?(root_parent = 3)
+      ?(initial_assets = [])
+      ?(initial_demand = fun _ -> ())
+      ?(changed = fun _ _ _ -> ())
+      ()
+  =
+  let sent = Queue.create () in
+  let r =
+    Runtime.create
+      ~send:(fun request ->
+        Queue.add request sent;
+        true)
+      ~changed
+  in
+  Runtime.refresh
+    r
+    ~graph_generation:1
+    ~today:20260301
+    ~settings:(P.settings ~recent_days:0 |> Result.get_ok);
+  let take () =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> failwith "expected graph read"
+  in
+  let roots = take () in
+  respond
+    r
+    roots.request_id
+    (Wire.V2_favorites_outcome
+       { favorites_page = Some (uuid 9)
+       ; generation = "g"
+       ; projection_revision = "r"
+       ; next_cursor = None
+       ; items =
+           [ { membership_uuid = uuid 10
+             ; membership_order = "a0"
+             ; membership_revision = "r"
+             ; target =
+                 (if favorite_block
+                  then
+                    V2_favorite_block
+                      { uuid = uuid 2
+                      ; title = "block"
+                      ; task_status = None
+                      ; revision = "r"
+                      }
+                  else V2_favorite_page { uuid = uuid 1; title = "page"; revision = "r" })
+             }
+           ]
+       });
+  while not (Queue.is_empty sent) do
+    match Queue.take sent with
+    | Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ } ->
+      initial_demand consumer;
+      Runtime.notice r runtime_scope (Asset_demand_accepted consumer)
+    | Service.Graph_request request ->
+      (match request.command with
+       | Wire.V2_list_assets _ ->
+         respond
+           r
+           request.request_id
+           (V2_assets_outcome
+              { generation = "g"
+              ; projection_revision = "r"
+              ; items = initial_assets
+              ; next_cursor = None
+              })
+       | V2_get_page { page; _ } ->
+         respond
+           r
+           request.request_id
+           (V2_page_outcome
+              (V2_present_page
+                 { page =
+                     G.
+                       { uuid = page
+                       ; name = "page"
+                       ; title = "page"
+                       ; kind = Ordinary_page
+                       ; created_at_ms = 0L
+                       ; updated_at_ms = 0L
+                       ; tags = []
+                       ; properties = []
+                       ; recycled = false
+                       }
+                 ; revision = "r"
+                 }))
+       | V2_get_block { block = target; _ } ->
+         respond
+           r
+           request.request_id
+           (if G.Uuid.equal target (uuid 2)
+            then present (block 2 root_parent 1 [])
+            else if G.Uuid.equal target (uuid 3)
+            then present (block 3 1 1 [])
+            else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+       | _ -> failwith "unexpected initial dependency")
+    | _ -> ()
+  done;
+  r, sent
+;;
+
+let window n uuids interests =
+  Wire.
+    { id = string_of_int n
+    ; predecessor = "r"
+    ; successor = "next"
+    ; block_uuids = List.map uuid uuids
+    ; page_uuids = []
+    ; structure_interests = interests
+    }
+;;
+
+let runtime_title_only () =
+  let r, sent = runtime_fixture () in
+  let original = block 2 1 1 [] in
+  raw r 600 original;
+  Runtime.changes r [ window 1 [ 2 ] [] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond r request.request_id (present { original with title = "edited" });
+  check (Queue.is_empty sent) "title-only raw delta must not issue an offline asset query"
+;;
+
+let runtime_unknown_unrelated () =
+  let r, sent = runtime_fixture () in
+  for n = 1 to 55 do
+    Runtime.changes r [ window n [ 99 ] [] ];
+    let rounds = ref 0 in
+    while not (Queue.is_empty sent) do
+      incr rounds;
+      check (!rounds <= 4) "unknown unrelated holder lookup must terminate";
+      match Queue.take sent with
+      | Service.Graph_request
+          ({ command = Wire.V2_get_block { block = target; _ }; _ } as request) ->
+        respond
+          r
+          request.request_id
+          (if G.Uuid.equal target (uuid 99)
+           then present (block 99 98 98 [])
+           else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+      | _ -> failwith "55 unknown unrelated deltas must not issue an asset/index read"
+    done
+  done
+;;
+
+let runtime_refs_delta () =
+  let r, sent = runtime_fixture () in
+  raw r 600 (block 2 1 1 []);
+  Runtime.changes r [ window 1 [ 2 ] [] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond r request.request_id (present (block 2 1 1 [ 50 ]));
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  check
+    (match request.command with
+     | V2_list_assets { roots; recursive = true; cursor = None; _ } -> roots = [ uuid 1 ]
+     | _ -> false)
+    "raw ref insertion reads only the matching offline batch";
+  respond
+    r
+    request.request_id
+    (V2_assets_outcome
+       { generation = "g"; projection_revision = "r"; items = []; next_cursor = None });
+  check (Queue.is_empty sent) "raw ref replacement settles"
+;;
+
+let runtime_sibling_structure () =
+  let r, sent = runtime_fixture () in
+  raw r 600 (block 2 1 1 []);
+  Runtime.changes r [ window 1 [] [ Wire.V2_children_interest (uuid 98) ] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond
+    r
+    request.request_id
+    (V2_block_outcome (V2_missing_block { uuid = uuid 98; revision = "r" }));
+  check
+    (Queue.is_empty sent)
+    "unrelated unknown children scope point read never becomes an offline assets/index \
+     read"
+;;
+
+let runtime_unknown_ancestor () =
+  let r, sent = runtime_fixture ~favorite_block:true () in
+  raw r 700 (block 2 4 1 []);
+  Runtime.changes r [ window 1 [ 4 ] [] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond
+    r
+    request.request_id
+    (V2_block_outcome (V2_missing_block { uuid = uuid 4; revision = "r" }));
+  let fresh =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> failwith "changed ancestor must follow its pre-change query"
+  in
+  respond
+    r
+    fresh.request_id
+    (V2_block_outcome (V2_missing_block { uuid = uuid 4; revision = "r" }));
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> failwith "unknown ancestor deletion must replace its dependent root batch"
+  in
+  check
+    (match request.command with
+     | V2_list_assets { roots; cursor = None; _ } -> roots = [ uuid 2 ]
+     | _ -> false)
+    "ancestor liveness has a precise favorite-root dependency"
+;;
+
+let runtime_late_fact () =
+  let r, sent = runtime_fixture () in
+  let old = block 2 1 1 [] in
+  raw r 600 old;
+  let late_request =
+    Wire.
+      { api_version = 2
+      ; request_id = uuid 601
+      ; command = V2_get_block { block = uuid 2; revision = None }
+      }
+  in
+  Runtime.observe_request r late_request;
+  Runtime.changes r [ window 1 [ 2 ] [] ];
+  Runtime.observe_response
+    r
+    (V2_response
+       { api_version = 2; request_id = late_request.request_id; outcome = present old });
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond r request.request_id (present (block 2 1 1 [ 50 ]));
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> failwith "late pre-change fact must not consume the dirty owner"
+  in
+  check
+    (match request.command with
+     | V2_list_assets _ -> true
+     | _ -> false)
+    "new membership survives a late old raw completion"
+;;
+
+let runtime_known_asset_immutable () =
+  let r, sent = runtime_fixture () in
+  let request =
+    Wire.
+      { api_version = 2
+      ; request_id = uuid 600
+      ; command = V2_get_asset_descriptors { assets = [ uuid 50 ] }
+      }
+  in
+  Runtime.observe_request r request;
+  Runtime.observe_response
+    r
+    (V2_response
+       { api_version = 2
+       ; request_id = request.request_id
+       ; outcome =
+           V2_assets_outcome
+             { generation = "g"
+             ; projection_revision = "r"
+             ; items = [ asset 50 ]
+             ; next_cursor = None
+             }
+       });
+  Runtime.changes r [ window 1 [ 50 ] [] ];
+  check
+    (Queue.is_empty sent)
+    "same known asset UUID metadata does not renew offline demand"
+;;
+
+let runtime_real_capture_sibling () =
+  let r, sent = runtime_fixture ~favorite_block:true () in
+  for n = 1 to 55 do
+    Runtime.changes
+      r
+      [ Wire.
+          { id = string_of_int n
+          ; predecessor = "r"
+          ; successor = "next"
+          ; block_uuids = [ uuid 7 ]
+          ; page_uuids = [ uuid 1 ]
+          ; structure_interests =
+              [ V2_children_interest (uuid 1); V2_page_tree_interest (uuid 1) ]
+          }
+      ];
+    let rounds = ref 0 in
+    while not (Queue.is_empty sent) do
+      incr rounds;
+      check (!rounds <= 2) "Capture dependency point reads remain bounded";
+      match Queue.take sent with
+      | Service.Graph_request ({ command = V2_get_block _; _ } as request) ->
+        respond r request.request_id (present (block 7 1 1 []))
+      | Service.Graph_request ({ command = V2_get_page { page; _ }; _ } as request) ->
+        respond
+          r
+          request.request_id
+          (V2_page_outcome
+             (V2_present_page
+                { page =
+                    G.
+                      { uuid = page
+                      ; name = "page"
+                      ; title = "page"
+                      ; kind = Ordinary_page
+                      ; created_at_ms = 0L
+                      ; updated_at_ms = 0L
+                      ; tags = []
+                      ; properties = []
+                      ; recycled = false
+                      }
+                ; revision = "r"
+                }))
+      | _ ->
+        failwith
+          "55 actual Capture page/tree windows must not reread a sibling favorite \
+           block's assets/index"
+    done
+  done
+;;
+
+let runtime_registry_capacity () =
+  let status = ref P.Inactive in
+  let r, sent =
+    runtime_fixture ~changed:(fun _ _ favorites -> status := favorites.P.enumeration) ()
+  in
+  for n = 1000 to 5199 do
+    Runtime.observe_request
+      r
+      Wire.
+        { api_version = 2
+        ; request_id = uuid n
+        ; command = V2_get_block { block = uuid 99; revision = None }
+        }
+  done;
+  check
+    (!status = P.Failed)
+    "4096 accepted nonterminal registrations expose capacity failure";
+  check (Queue.is_empty sent) "capacity failure cannot trigger an unbounded rescan";
+  Runtime.resync r;
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond
+    r
+    request.request_id
+    (V2_favorites_outcome
+       { favorites_page = Some (uuid 9)
+       ; generation = "g"
+       ; projection_revision = "r"
+       ; items = []
+       ; next_cursor = None
+       });
+  check (Queue.is_empty sent) "bounded registry preserves real resync terminal ownership"
+;;
+
+let dependency_capacity_status () =
+  let s, consumer = completed_favorites () in
+  let s, _ =
+    P.step s (Availability { consumer; asset = uuid 2; availability = Ready "resident" })
+  in
+  let s, ins = P.step s Dependencies_unavailable in
+  check
+    (ins = [] && P.progress s Favorites = Failed && (P.offline s Favorites).ready = 1)
+    "dependency capacity failure preserves verified readiness without a fallback read";
+  let _, ins = P.step s Shutdown in
+  check
+    (List.mem (P.Release consumer) ins)
+    "capacity failure must preserve and eventually release its existing lease"
+;;
+
+let index_pagination () =
+  let s, old = completed_favorites () in
+  let s, ins = P.step s (Index_changed Favorites) in
+  let s, ins = P.step s (Roots_loaded (read Favorites ins, [ uuid 1 ], Some cursor)) in
+  let ticket = read Favorites ins in
+  check
+    (ticket.query = Favorite_roots (Some cursor))
+    "root diff waits for the complete changed index";
+  let s, ins = P.step s (Roots_loaded (ticket, [ uuid 3 ], None)) in
+  let ticket = read Favorites ins in
+  check
+    (ticket.query = Assets { roots = [ uuid 3 ]; cursor = None })
+    "only added paginated index member reads assets";
+  let s, ins = P.step s (Assets_loaded (ticket, [], None)) in
+  check
+    ((not (List.mem (P.Release old) ins)) && (P.offline s Favorites).total = 1)
+    "unchanged roots retain committed offline demand"
+;;
+
+let pending_preserves_ready () =
+  let s, consumer = completed_favorites () in
+  let s, _ =
+    P.step s (Availability { consumer; asset = uuid 2; availability = Ready "resident" })
+  in
+  let s, _ = P.step s (Roots_changed [ uuid 1 ]) in
+  check
+    ((P.offline s Favorites).ready = 1)
+    "bounded membership read does not revoke a resident immutable UUID"
+;;
+
+let runtime_reference_order () =
+  let r, sent = runtime_fixture () in
+  raw r 600 (block 2 1 1 [ 50; 51 ]);
+  Runtime.changes r [ window 1 [ 2 ] [] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond r request.request_id (present (block 2 1 1 [ 51; 50 ]));
+  check (Queue.is_empty sent) "reference membership order cannot renew offline demand"
+;;
+
+let runtime_hidden_holder_fanout () =
+  let r, sent = runtime_fixture () in
+  (* Initial recursive enumeration is empty; no raw fact for holder H exists.
+     A's class declaration changes on a separate assets page. *)
+  Runtime.changes r [ window 1 [ 50; 2 ] [] ];
+  let queried = ref false in
+  while not (Queue.is_empty sent) do
+    match Queue.take sent with
+    | Service.Graph_request
+        ({ command = V2_get_block { block = target; _ }; _ } as request) ->
+      respond
+        r
+        request.request_id
+        (if G.Uuid.equal target (uuid 50)
+         then present (block 50 99 99 [])
+         else if G.Uuid.equal target (uuid 2)
+         then present (block 2 1 1 [ 50 ])
+         else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+    | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
+      queried := roots = [ uuid 1 ];
+      respond
+        r
+        request.request_id
+        (V2_assets_outcome
+           { generation = "g"
+           ; projection_revision = "r"
+           ; items = [ asset 50 ]
+           ; next_cursor = None
+           })
+    | Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ } ->
+      Runtime.notice
+        r
+        { account =
+            { managed_sync_origin = Uri.of_string "https://sync.example"
+            ; user_id = "u"
+            ; account_generation = 1
+            ; presentation_generation = 1
+            ; lifecycle_generation = 1L
+            }
+        ; graph_id = uuid 3
+        ; graph_generation = 1
+        }
+        (Asset_demand_accepted consumer)
+    | _ -> ()
+  done;
+  check
+    !queried
+    "new asset declaration needs bounded inverse H fanout; no H raw fact was seeded"
+;;
+
+let runtime_truncated_membership () =
+  let r, sent = runtime_fixture () in
+  let holder =
+    { (block 2 1 1 []) with
+      properties =
+        [ G.
+            { ident = "assets"
+            ; uuid = uuid 4
+            ; title = "Assets"
+            ; schema =
+                { property_type = Asset
+                ; cardinality = Many
+                ; hidden = false
+                ; public = true
+                }
+            ; values = [ Asset_value (uuid 50) ]
+            ; values_truncated = true
+            }
+        ]
+    }
+  in
+  raw r 600 holder;
+  Runtime.changes r [ window 1 [ 2 ] [] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  respond r request.request_id (present holder);
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> failwith "truncated membership cannot prove unchanged hidden references"
+  in
+  check
+    (match request.command with
+     | V2_list_assets { roots; cursor = None; _ } -> roots = [ uuid 1 ]
+     | _ -> false)
+    "truncated owned holder refresh selects only its offline batch"
+;;
+
+let ready_index_retirement () =
+  let s, consumer = completed_favorites () in
+  let s, _ =
+    P.step s (Availability { consumer; asset = uuid 2; availability = Ready "resident" })
+  in
+  let s, ins = P.step s (Roots_changed [ uuid 1 ]) in
+  let s, _ = P.step s (Assets_loaded (read Favorites ins, [], None)) in
+  let s, _ =
+    P.step s (Availability { consumer; asset = uuid 2; availability = Ready "late" })
+  in
+  let s, ins = P.step s (Roots_changed [ uuid 1 ]) in
+  let s, ins = P.step s (Assets_loaded (read Favorites ins, [ asset 2 ], None)) in
+  let fresh, _ = demand ins in
+  let s, _ = P.step s (Demand_accepted fresh) in
+  check
+    ((P.offline s Favorites).ready = 0)
+    "last consumer release retires successful UUID inheritance; late notice cannot \
+     revive it"
+;;
+
+let runtime_unknown_old_parent () =
+  let old = ref None
+  and released = ref false in
+  let r, sent =
+    runtime_fixture
+      ~favorite_block:true
+      ~root_parent:1
+      ~initial_assets:[ asset 50 ]
+      ~initial_demand:(fun consumer -> old := Some consumer)
+      ()
+  in
+  Runtime.changes
+    r
+    [ window
+        1
+        [ 4 ]
+        [ V2_children_interest (uuid 3)
+        ; V2_children_interest (uuid 7)
+        ; V2_page_tree_interest (uuid 1)
+        ]
+    ];
+  let queried = ref false in
+  while not (Queue.is_empty sent) do
+    match Queue.take sent with
+    | Service.Graph_request
+        ({ command = V2_get_block { block = target; _ }; _ } as request) ->
+      respond
+        r
+        request.request_id
+        (if G.Uuid.equal target (uuid 4)
+         then present (block 4 7 1 [])
+         else if G.Uuid.equal target (uuid 3)
+         then present (block 3 2 1 [])
+         else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+    | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
+      queried := roots = [ uuid 2 ];
+      respond
+        r
+        request.request_id
+        (V2_assets_outcome
+           { generation = "g"; projection_revision = "r"; items = []; next_cursor = None })
+    | Service.Asset_command { command = Release_asset_demand consumer; _ } ->
+      released := Some consumer = !old
+    | _ -> ()
+  done;
+  check
+    (!queried && !released)
+    "old unknown structural parent resolves the old batch owner after a hidden child \
+     moves out"
+;;
+
+let runtime_dependency_failure rejected () =
+  let status = ref P.Inactive in
+  let r, sent =
+    runtime_fixture ~changed:(fun _ _ favorites -> status := favorites.P.enumeration) ()
+  in
+  Runtime.changes r [ window 1 [ 99 ] [] ];
+  let request =
+    match Queue.take sent with
+    | Service.Graph_request request -> request
+    | _ -> assert false
+  in
+  if rejected
+  then Runtime.reject r ~request_id:request.request_id
+  else
+    respond r request.request_id (V2_failed { code = "storage"; message = "unavailable" });
+  check
+    (!status = P.Failed && Queue.is_empty sent)
+    "owned dependency failure must expose Failed without retrying or preserving false \
+     completeness"
+;;
+
 let () =
   let failed = ref 0 in
   List.iter
@@ -399,7 +1204,33 @@ let () =
        | exn ->
          incr failed;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "calendar", interval
+    [ "runtime unknown old parent", runtime_unknown_old_parent
+    ; "runtime dependency reject", runtime_dependency_failure true
+    ; "runtime dependency failed", runtime_dependency_failure false
+    ; "runtime hidden negative holder", runtime_hidden_holder_fanout
+    ; "runtime truncated membership", runtime_truncated_membership
+    ; "ready index retirement", ready_index_retirement
+    ; "runtime equivalent reference set", runtime_reference_order
+    ; "immutable pending residency", pending_preserves_ready
+    ; "runtime actual Capture sibling", runtime_real_capture_sibling
+    ; "runtime accepted registry capacity", runtime_registry_capacity
+    ; "dependency capacity preserves lease", dependency_capacity_status
+    ; "immutable paginated index diff", index_pagination
+    ; "runtime unknown ancestor", runtime_unknown_ancestor
+    ; "runtime late raw fact", runtime_late_fact
+    ; "runtime immutable asset UUID", runtime_known_asset_immutable
+    ; "runtime title-only raw facts", runtime_title_only
+    ; "runtime unknown unrelated 55", runtime_unknown_unrelated
+    ; "runtime raw ref insertion", runtime_refs_delta
+    ; "runtime unrelated structure", runtime_sibling_structure
+    ; "immutable resident UUID", shared_ready_uuid
+    ; "immutable exact negative batch", exact_batch_and_empty
+    ; "immutable index root diff", index_diff
+    ; "immutable selected burst 32", selected_burst
+    ; "immutable unrelated 55", unrelated_roots
+    ; "immutable related batch", related_roots
+    ; "immutable unchanged index", same_index_roots
+    ; "calendar", interval
     ; "paginated replacement", pages
     ; "fencing", fencing
     ; "visible", visible

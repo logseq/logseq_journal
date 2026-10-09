@@ -968,7 +968,7 @@ let test_file_cards_use_actual_metadata () =
 
 let test_attachment_unavailable_keeps_retry () =
   with_mounted
-    (media_view [ media_item 1 "jpg" (Placeholder "Not downloaded") None ])
+    (media_view [ media_item 1 "jpg" (Failed "Not downloaded") None ])
     (fun _ ops ->
        require
          (has_text (ops ()) "Not downloaded" && has_text (ops ()) "Retry")
@@ -1774,7 +1774,7 @@ let test_reactive_nonimage_structure_and_presentation () =
        update
          (Some
             (media_state
-               [ { pdf with presentation = Placeholder "Unable to open file" } ]));
+               [ { pdf with presentation = Failed "Unable to open file" } ]));
        require
          (current_text (ops ()) "Unable to open file" && current_text (ops ()) "Retry")
          "nonimage failure lost its current message or retry action";

@@ -1125,7 +1125,7 @@ let () =
   (* Journal uses the upstream native host ABI decoder; keep the OCaml
      installation and Apple package on the same validated revision. *)
   let compatible_lui_revision =
-    "git+https://github.com/logseq/lui.git#ee51c9747e584edd2ac09cc2cefee130622d8bda"
+    "git+https://github.com/logseq/lui.git#91aecb52a1cba2faaf23aac1d64a0bd1cb6549e7"
   in
   List.iter
     (fun relative -> require_occurrences root relative compatible_lui_revision 1)

@@ -46,10 +46,11 @@ type event =
       { graph_generation : int
       ; today : int
       ; settings : settings
-      }
-  (** A projection change or resync invalidates both configured scans. In-flight
-      reads finish before one fresh scan starts; their results are discarded. *)
-  | Graph_changed
+      } (** Only an explicit resync invalidates every configured scan. *)
+  | Resync
+  | Roots_changed of Graph.Uuid.t list
+  | Index_changed of reason
+  | Dependencies_unavailable
   | Roots_loaded of ticket * Graph.Uuid.t list * Graph.Cursor.t option
   | Assets_loaded of ticket * Asset.t list * Graph.Cursor.t option
   | Read_failed of ticket
@@ -81,6 +82,7 @@ val empty : t
 val progress : t -> reason -> progress
 val step : t -> event -> t * instruction list
 val page_size : int
+val roots : t -> reason -> Graph.Uuid.t Seq.t
 
 type offline =
   { enumeration : progress

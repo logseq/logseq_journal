@@ -850,6 +850,7 @@ let back_state state =
 
 let apply_worker_response_unstaged state (response : Journal_graph_runtime.response) =
   match response.payload with
+  | Projection_changes _ | Projection_resync -> state
   | Reference_sources_changed updates ->
     let reference_sources =
       List.fold_left
@@ -3458,12 +3459,16 @@ let start
   let copy_owner = ref None in
   let copy_sequence = ref 0L in
   let copy_worker_requests = Hashtbl.create 2 in
+  let projection_request_accepted = ref (fun _ -> ()) in
+  let projection_request_finished = ref (fun _ -> ()) in
   let cancel_copy () =
     let state, _ = Journal_graph_runtime.Copy.step !copy_state Cancel in
     copy_state := state;
     copy_owner := None;
     Hashtbl.iter
-      (fun request_id _ -> Worker.cancel client ~request_id)
+      (fun request_id (_, _, protocol_id) ->
+         !projection_request_finished protocol_id;
+         Worker.cancel client ~request_id)
       copy_worker_requests
   in
   let copy_current owner =
@@ -3523,6 +3528,7 @@ let start
              in
              match Worker.send client (Graph_service.Graph_request request) with
              | Accepted request_id ->
+               !projection_request_accepted request;
                Hashtbl.replace
                  copy_worker_requests
                  request_id
@@ -3636,10 +3642,30 @@ let start
         | Worker.Accepted worker_id ->
           (match request with
            | Graph_service.Graph_request request ->
-             Hashtbl.replace asset_worker_requests worker_id request.request_id
+             sync_media !state_ref;
+             Journal_media_runtime.observe_request media_runtime request;
+             Hashtbl.replace
+               asset_worker_requests
+               worker_id
+               (media_key !state_ref, request.request_id)
            | _ -> ());
           true
         | Full | Not_ready | Stopping -> false)
+  in
+  let observe_projection_request request =
+    sync_media !state_ref;
+    Journal_media_runtime.observe_request media_runtime request;
+    Journal_asset_runtime.observe_request asset_runtime request
+  in
+  let forget_projection_request request_id =
+    Journal_media_runtime.forget_request media_runtime request_id;
+    Journal_asset_runtime.forget_request asset_runtime ~request_id
+  in
+  projection_request_accepted := observe_projection_request;
+  projection_request_finished := forget_projection_request;
+  let observe_projection_response response =
+    Journal_media_runtime.observe_response media_runtime response;
+    Journal_asset_runtime.observe_response asset_runtime response
   in
   let asset_settings = ref None in
   let refresh_assets ~graph_generation calendar =
@@ -3653,11 +3679,6 @@ let start
       (Option.bind calendar (fun calendar ->
          Option.map (fun settings -> calendar, settings) !asset_settings))
   in
-  let invalidate_assets () =
-    Journal_media_runtime.refresh media_runtime;
-    if !state_ref.graph_state.phase = Graph_open
-    then Journal_asset_runtime.invalidate asset_runtime
-  in
   let started_graph_generation = ref None in
   let send_manager command =
     Effect.of_thunk (fun () ->
@@ -3669,12 +3690,24 @@ let start
     terminal_graph_state state (Transport_graph_error message)
   in
   let graph_worker_requests = Hashtbl.create 16 in
-  let deliver_output output =
+  let deliver_output (output : Journal_graph_runtime.output) =
+    List.iter
+      (fun response ->
+         match response.Journal_graph_runtime.payload with
+         | Projection_changes windows ->
+           Journal_media_runtime.changes media_runtime windows;
+           Journal_asset_runtime.changes asset_runtime windows
+         | Projection_resync ->
+           Journal_media_runtime.resync media_runtime;
+           Journal_asset_runtime.resync asset_runtime
+         | _ -> ())
+      output.responses;
     Journal_graph_transport.deliver
       ~runtime:graph_runtime
       ~send:(fun request ->
         match Worker.send client (Graph_service.Graph_request request) with
         | Accepted worker_id ->
+          observe_projection_request request;
           Hashtbl.replace graph_worker_requests worker_id request;
           Journal_graph_transport.Accepted
         | Full -> Full
@@ -3697,6 +3730,7 @@ let start
                  Worker.send client (Graph_service.Graph_request protocol_request)
                with
                | Accepted worker_request_id ->
+                 observe_projection_request protocol_request;
                  Hashtbl.replace
                    admission_worker_requests
                    worker_request_id
@@ -3821,8 +3855,8 @@ let start
           Journal_graph_runtime.reset graph_runtime;
           Hashtbl.clear graph_worker_requests;
           Hashtbl.clear favorites_worker_requests;
+          Hashtbl.clear admission_worker_requests;
           let current = !state_ref in
-          refresh_assets ~graph_generation:graph_state.generation current.calendar;
           let graph_info = Journal_graph_runtime.start graph_runtime in
           let feed_generation = current.next_request_generation in
           let feed_output =
@@ -3877,7 +3911,11 @@ let start
           in
           Effect.bind prepare ~f:(fun () ->
             Effect.bind
-              (Effect.of_thunk (fun () -> deliver_output output))
+              (Effect.of_thunk (fun () ->
+                 refresh_assets
+                   ~graph_generation:graph_state.generation
+                   !state_ref.calendar;
+                 deliver_output output))
               ~f:(fun delivery ->
                 set_state (fun state -> apply_delivery_responses state delivery))))
       | Graph_closed | Graph_opening | Graph_closing | Graph_failed ->
@@ -3960,8 +3998,14 @@ let start
         | Completed
             (Graph_service.Graph_response (Logseq_db_worker.Protocol.V2_response response))
           when Logseq_db_types.Graph_types.Uuid.equal response.request_id protocol_id ->
+          if copy_current owner
+          then
+            observe_projection_response (Logseq_db_worker.Protocol.V2_response response)
+          else forget_projection_request protocol_id;
           Journal_graph_runtime.Copy.Completed (ticket, response.outcome)
-        | _ -> Read_failed (ticket, "The copy request was cancelled or failed.")
+        | _ ->
+          forget_projection_request protocol_id;
+          Read_failed (ticket, "The copy request was cancelled or failed.")
       in
       copy_transition owner event
     | Worker.Response { request_id; outcome = Completed response; _ }
@@ -3977,7 +4021,6 @@ let start
       Journal_media_runtime.reject media_runtime ticket;
       flush_media set_state
     | Worker.Push { payload = Graph_service.Graph_push push; _ } ->
-      invalidate_assets ();
       let snapshot = !state_ref in
       let admission_refresh =
         trigger_admission
@@ -4028,24 +4071,60 @@ let start
         ; _
         }
       when Hashtbl.mem asset_worker_requests worker_id ->
+      let context, protocol_id = Hashtbl.find asset_worker_requests worker_id in
       Hashtbl.remove asset_worker_requests worker_id;
-      ignore (Journal_asset_runtime.receive asset_runtime response : bool);
+      let (Logseq_db_worker.Protocol.V2_response { request_id = actual; _ }) = response in
+      if context = media_key !state_ref && Option.is_some context
+      then
+        if
+          Logseq_db_types.Graph_types.Uuid.equal actual protocol_id
+          && Journal_asset_runtime.receive asset_runtime response
+        then Journal_media_runtime.observe_response media_runtime response
+        else (
+          forget_projection_request protocol_id;
+          Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id);
       Effect.ignore
     | Worker.Response
         { request_id
         ; outcome = Worker.Completed (Graph_service.Graph_response response)
         ; _
         } ->
-      (match response, Hashtbl.find_opt graph_worker_requests request_id with
-       | ( Logseq_db_worker.Protocol.V2_response
-             { request_id = actual; outcome = V2_resync_required _; _ }
-         , Some expected )
-         when expected.request_id = actual -> invalidate_assets ()
-       | _ -> ());
+      let expected =
+        match Hashtbl.find_opt graph_worker_requests request_id with
+        | Some request -> Some request
+        | None ->
+          (match Hashtbl.find_opt admission_worker_requests request_id with
+           | Some (_, request) -> Some request
+           | None ->
+             Option.map snd (Hashtbl.find_opt favorites_worker_requests request_id))
+      in
+      let (Logseq_db_worker.Protocol.V2_response { request_id = actual; _ }) = response in
+      let owned =
+        match expected with
+        | Some request
+          when Logseq_db_types.Graph_types.Uuid.equal request.request_id actual ->
+          observe_projection_response response;
+          true
+        | Some request ->
+          forget_projection_request request.request_id;
+          false
+        | None -> false
+      in
       Hashtbl.remove graph_worker_requests request_id;
       Hashtbl.remove admission_worker_requests request_id;
       Hashtbl.remove favorites_worker_requests request_id;
-      let output = Journal_graph_runtime.receive graph_runtime response in
+      let output =
+        if owned
+        then Journal_graph_runtime.receive graph_runtime response
+        else (
+          match expected with
+          | Some request ->
+            Journal_graph_runtime.fail_request
+              graph_runtime
+              request
+              ~message:"Worker response did not match the accepted request"
+          | None -> Journal_graph_runtime.{ requests = []; responses = [] })
+      in
       Effect.bind
         (Effect.of_thunk (fun () -> deliver_output output))
         ~f:(fun delivery ->
@@ -4090,7 +4169,7 @@ let start
             let refresh_after_worker_event =
               let (Logseq_db_worker.Protocol.V2_response { outcome; _ }) = response in
               match outcome with
-              | V2_mutation_committed _ ->
+              | V2_mutation_committed _ when owned ->
                 let snapshot = !state_ref in
                 trigger_admission
                   set_state_and_effect
@@ -4259,13 +4338,17 @@ let start
         | None | Some _ -> state)
     | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
       when Hashtbl.mem asset_worker_requests request_id ->
-      let protocol_id = Hashtbl.find asset_worker_requests request_id in
+      let context, protocol_id = Hashtbl.find asset_worker_requests request_id in
       Hashtbl.remove asset_worker_requests request_id;
-      Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id;
+      if context = media_key !state_ref && Option.is_some context
+      then (
+        forget_projection_request protocol_id;
+        Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id);
       Effect.ignore
     | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
       when Hashtbl.mem favorites_worker_requests request_id ->
       let request, protocol_request = Hashtbl.find favorites_worker_requests request_id in
+      forget_projection_request protocol_request.request_id;
       Journal_graph_runtime.abandon graph_runtime protocol_request;
       Hashtbl.remove favorites_worker_requests request_id;
       set_state (fun state ->
@@ -4275,6 +4358,7 @@ let start
     | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
       when Hashtbl.mem admission_worker_requests request_id ->
       let request, protocol_request = Hashtbl.find admission_worker_requests request_id in
+      forget_projection_request protocol_request.request_id;
       Journal_graph_runtime.abandon graph_runtime protocol_request;
       Hashtbl.remove admission_worker_requests request_id;
       update_admission set_state_and_effect (fun state ->
@@ -4287,6 +4371,7 @@ let start
       when Hashtbl.mem graph_worker_requests request_id ->
       let request = Hashtbl.find graph_worker_requests request_id in
       Hashtbl.remove graph_worker_requests request_id;
+      forget_projection_request request.request_id;
       let message =
         match outcome with
         | Failed message -> message
@@ -4557,6 +4642,7 @@ let start
                    Worker.send client (Graph_service.Graph_request protocol_request)
                  with
                  | Accepted worker_request_id ->
+                   observe_projection_request protocol_request;
                    Hashtbl.replace
                      favorites_worker_requests
                      worker_request_id

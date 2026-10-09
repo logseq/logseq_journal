@@ -102,6 +102,82 @@ let test_external_urls () =
 ;;
 
 let () =
+  let failed = ref 0 in
+  let run name test =
+    try
+      test ();
+      Printf.printf "PASS %s\n%!" name
+    with
+    | exn ->
+      incr failed;
+      Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn)
+  in
+  run "loading cannot Retry" (fun () ->
+    let loading, _ = P.step P.empty (show (asset 'a')) in
+    let _, effects = P.step loading Retry_requested in
+    check (effects = []) "loading ignores Retry instead of starting another download");
+  run "same UUID descriptor preserves successful File" (fun () ->
+    let loading, _ = P.step P.empty (show (asset 'a')) in
+    let pending, effects = ready loading "cached" in
+    let visible, _ =
+      P.step pending (Acquired (acquire effects, Some ("held", "/cache/held")))
+    in
+    let updated, effects = P.step visible (show (asset 'b')) in
+    check
+      (effects = [] && P.presentation updated = File "/cache/held")
+      "same UUID descriptor update neither releases nor reacquires a successful File");
+  run "failed Retry is one explicit attempt" (fun () ->
+    let loading, _ = P.step P.empty (show (asset 'a')) in
+    let failed, _ =
+      P.step
+        loading
+        (Availability
+           { scope
+           ; consumer = "visible"
+           ; availability =
+               Failed { failure = Network; attempts = 1; retry_scheduled = false }
+           })
+    in
+    let retrying, effects = P.step failed Retry_requested in
+    check (List.length effects = 1) "failed Retry starts one attempt";
+    let _, duplicate = P.step retrying Retry_requested in
+    check (duplicate = []) "repeated Retry while loading starts no additional attempt");
+  run "successful File ignores late statuses and Retry" (fun () ->
+    let loading, _ = P.step P.empty (show (asset 'a')) in
+    let pending, effects = ready loading "cached" in
+    let visible, _ =
+      P.step pending (Acquired (acquire effects, Some ("held", "/cache/held")))
+    in
+    List.iter
+      (fun availability ->
+         let stable, effects =
+           P.step visible (Availability { scope; consumer = "visible"; availability })
+         in
+         check
+           (effects = [] && P.presentation stable = File "/cache/held")
+           "successful File is stable across transfer notifications")
+      [ S.Asset.Queued
+      ; Downloading
+      ; Ready "other"
+      ; Failed { failure = Network; attempts = 1; retry_scheduled = false }
+      ];
+    let _, effects = P.step visible Retry_requested in
+    check (effects = []) "successful File cannot Retry");
+  run "offscreen releases then local acquisition is allowed" (fun () ->
+    let loading, _ = P.step P.empty (show (asset 'a')) in
+    let pending, effects = ready loading "cached" in
+    let visible, _ =
+      P.step pending (Acquired (acquire effects, Some ("held", "/cache/held")))
+    in
+    let hidden, effects = P.step visible Hide in
+    check (List.length (releases effects) = 1) "Hide releases exactly one lease";
+    let shown, _ = P.step hidden (show (asset 'b')) in
+    let _, effects = ready shown "cached" in
+    check (List.length effects = 1) "reappearance can acquire the local file once");
+  check (!failed = 0) (Printf.sprintf "%d media retry cases failed" !failed)
+;;
+
+let () =
   test_external_urls ();
   let state, effects = P.step P.empty (show (asset 'a')) in
   check
@@ -153,12 +229,10 @@ let () =
     (P.presentation hidden = Hidden && List.length (releases effects) = 1)
     "late acquisition is released without display";
   let replacement, effects = P.step visible (show (asset 'b')) in
-  check (List.length (releases effects) = 1) "version replacement releases old file";
+  check (effects = []) "same UUID metadata update preserves the displayed lease";
   check
-    (match P.presentation replacement with
-     | Placeholder _ -> true
-     | _ -> false)
-    "new version never displays old bytes";
+    (P.presentation replacement = File "/cache/a.png")
+    "DB descriptor updates preserve an already successful local file";
   let unchanged, effects =
     P.step
       replacement
