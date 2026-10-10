@@ -152,6 +152,12 @@ let can_attach t =
   t.phase <> Saving && List.length t.pending_attachments < attachment_limit
 ;;
 
+let submission_source t =
+  match source_is_blank (source t), t.pending_attachments with
+  | true, first :: _ -> Journal_asset_import.staged_title first
+  | _ -> source t
+;;
+
 let add_attachment t staged =
   let duplicate =
     List.exists
@@ -227,11 +233,7 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
   else (
     (* A blank capture only containing attachments names its block after the
        first pick so the entry stays visible on the timeline. *)
-    let source =
-      match source_is_blank (source t), t.pending_attachments with
-      | true, first :: _ -> Journal_asset_import.staged_title first
-      | _ -> source t
-    in
+    let source = submission_source t in
     let command : Journal_graph_projection.capture =
       { mutation_id
       ; block_id

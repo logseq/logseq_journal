@@ -46,6 +46,9 @@ val attachment_limit : int
 (** Assets picked for this draft, awaiting attach-on-save. *)
 val pending_attachments : t -> Journal_asset_import.staged list
 
+(** Exact draft text, or the first attachment's friendly title for a blank draft. *)
+val submission_source : t -> string
+
 (** Whether another attachment may be added (not saving, under the limit). *)
 val can_attach : t -> bool
 

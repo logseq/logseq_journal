@@ -168,6 +168,57 @@ type retained_drafts =
   ; next_rank : int64
   }
 
+let retained_attachments retained =
+  Drafts.fold
+    (fun _ draft items ->
+       List.rev_append (Journal_detail.retained_attachments draft.composer) items)
+    retained.composers
+    []
+;;
+
+let pending_attachments t =
+  let items =
+    Drafts.fold
+      (fun _ draft items ->
+         List.rev_append (Journal_detail.retained_attachments draft.composer) items)
+      t.drafts
+      []
+  in
+  Owners.fold
+    (fun _ view items ->
+       match view with
+       | Detail_view { detail; _ } ->
+         Option.fold
+           ~none:items
+           ~some:(fun capture ->
+             List.rev_append (Journal_capture.pending_attachments capture) items)
+           (Journal_detail.child_capture detail)
+       | _ -> items)
+    t.owners
+    items
+;;
+
+let child_attachment_imports t ~child ~parent =
+  let found =
+    Drafts.fold
+      (fun _ draft found ->
+         match found with
+         | Some _ -> found
+         | None ->
+           Journal_detail.retained_attachment_imports draft.composer ~child ~parent)
+      t.drafts
+      None
+  in
+  Owners.fold
+    (fun _ view found ->
+       match found, view with
+       | None, Detail_view { detail; _ } ->
+         Journal_detail.child_attachment_imports detail ~child ~parent
+       | _ -> found)
+    t.owners
+    found
+;;
+
 let retain_drafts ~interrupted t =
   let t = retain_live_composers t in
   { composers =

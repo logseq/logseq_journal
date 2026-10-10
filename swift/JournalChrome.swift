@@ -166,7 +166,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           SectionDate(title: title)
         }
       case .detail:
-        if let title = properties?.title, context.childIDs.count == 2 {
+        if let title = properties?.title, context.childIDs.count == 1 {
           GeometryReader { bounds in
             child(0).frame(width: bounds.size.width, height: bounds.size.height)
           }
@@ -174,11 +174,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .toolbar(.visible, for: .navigationBar)
           #endif
           .navigationTitle(title)
-          .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-              child(1).fixedSize()
-            }
-          }
         }
       case .toolbarControl:
         if context.childIDs.count == 1 {

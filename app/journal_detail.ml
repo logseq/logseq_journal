@@ -199,6 +199,41 @@ let session_id (t : t) = ID.Text_input.Session_id.of_int64 t.session_number
 let composer_revision (t : t) = t.composer_revision
 let reveal_id (t : t) = t.reveal_id
 let child_capture (t : t) = t.child_capture
+
+let map_child_capture (t : t) ~f =
+  match t.mode, t.child_capture with
+  | Saving_child, _ | _, None -> t
+  | (Reading | Failed _), Some capture ->
+    let next = f capture in
+    if next == capture
+    then t
+    else { t with child_capture = Some next; mode = Reading; pending = None }
+;;
+
+let matching_attachment_imports pending capture ~root_id ~child ~parent =
+  if matching_child pending ~root_id ~child ~parent
+  then
+    Option.bind capture (fun capture ->
+      match Journal_capture.pending_attachments capture with
+      | [] -> None
+      | items -> Some (Journal_model.id child, items))
+  else None
+;;
+
+let child_attachment_imports (t : t) ~child ~parent =
+  matching_attachment_imports t.pending t.child_capture ~root_id:t.root_id ~child ~parent
+;;
+
+let retained_attachment_imports draft ~child ~parent =
+  matching_attachment_imports
+    draft.draft_pending
+    (Some draft.draft_capture)
+    ~root_id:draft.draft_parent
+    ~child
+    ~parent
+;;
+
+let retained_attachments draft = Journal_capture.pending_attachments draft.draft_capture
 let expanded (t : t) ~block_id = (branch t block_id).expanded
 let continuation (t : t) ~parent_id = (branch t parent_id).continuation
 let request_back _ = `Close
@@ -419,7 +454,7 @@ let admit_child
         ; creation_time
         ; parent_block_id = t.root_id
         ; expected_parent_revision = Journal_model.revision (root t)
-        ; source = Journal_capture.source capture
+        ; source = Journal_capture.submission_source capture
         ; task_state = Journal_capture.task_state capture
         }
     in

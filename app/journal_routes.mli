@@ -74,6 +74,14 @@ val apply_detail_failure
 val detail : t -> Journal_detail.t option
 val update_detail : t -> Journal_detail.t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
+val pending_attachments : t -> Journal_asset_import.staged list
+
+val child_attachment_imports
+  :  t
+  -> child:Journal_model.t
+  -> parent:Journal_model.t
+  -> (string * Journal_asset_import.staged list) option
+
 val apply_child_failure : t -> block_id:string -> message:string -> t
 val back : t -> t
 val background : t -> t
@@ -111,5 +119,6 @@ end
 (** Process-local composer storage; the application owns its graph identity. *)
 type retained_drafts
 
+val retained_attachments : retained_drafts -> Journal_asset_import.staged list
 val retain_drafts : interrupted:bool -> t -> retained_drafts
 val restore_drafts : t -> retained_drafts -> t

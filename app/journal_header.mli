@@ -68,6 +68,7 @@ val feedback
 val date_header : title:string -> Journal_view.View.t
 
 val detail
-  :  actions:Journal_view.View.buttons_action list
+  :  capture_enabled:bool
+  -> on_capture:Journal_view.Event.Handler.t
   -> Journal_view.View.Body.t
   -> Journal_view.View.Body.t
