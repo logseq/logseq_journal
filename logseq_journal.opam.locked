@@ -23,7 +23,7 @@ pin-depends: [
   ]
   [
   "lui.0.1.0"
-  "git+https://github.com/logseq/lui.git#42fee7062144e0a2ddef6434b8271c73e8f04bf3"
+  "git+https://github.com/logseq/lui.git#c0b007ff80eea8934b75e631b59b4f0609bb4c72"
 ]
   [
     "melange-edn-core.0.5.0"
@@ -43,7 +43,7 @@ pin-depends: [
   ]
   [
   "ocaml-signal.0.1.0"
-  "git+https://github.com/logseq/ocaml-signal.git#main"
+  "git+https://github.com/logseq/ocaml-signal.git#02e18cdc5e0ad672aa223f638eaa3ba52fc9421e"
 ]
   [
     "persistent_sorted_set_ocaml.dev"
