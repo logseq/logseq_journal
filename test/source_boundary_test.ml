@@ -1125,16 +1125,19 @@ let () =
   (* Journal uses the upstream native host ABI decoder; keep the OCaml
      installation and Apple package on the same validated revision. *)
   let compatible_lui_revision =
-    "git+https://github.com/logseq/lui.git#8de2abae573499692dbcc169a2738c434944a0a8"
+    "git+https://github.com/logseq/lui.git#c0b007ff80eea8934b75e631b59b4f0609bb4c72"
   in
   List.iter
     (fun relative -> require_occurrences root relative compatible_lui_revision 1)
     [ "logseq_journal.opam"; "logseq_journal.opam.locked" ];
-  require_occurrences
-    root
-    "logseq_journal.opam"
-    "git+https://github.com/logseq/ocaml-signal.git#main"
-    1;
+  List.iter
+    (fun relative ->
+       require_occurrences
+         root
+         relative
+         "git+https://github.com/logseq/ocaml-signal.git#02e18cdc5e0ad672aa223f638eaa3ba52fc9421e"
+         1)
+    [ "logseq_journal.opam"; "logseq_journal.opam.locked" ];
   List.iter
     (fun relative ->
        forbid_text
