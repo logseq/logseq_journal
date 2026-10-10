@@ -522,8 +522,8 @@ let test_detail_capsules_mount_outside_toolbars () =
               |> List.sort_uniq Int.compare
             in
             require
-              (List.length surfaces = 1)
-              "Detail must have one action capsule; native navigation supplies Back";
+              (List.length surfaces = 2)
+              "Detail has Capture and Copy capsules; native navigation supplies Back";
             List.iter
               (fun (label, command, allowed) ->
                  let nodes =

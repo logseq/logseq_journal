@@ -2147,6 +2147,21 @@ let detail_children t ~generation ~page ~root ~limit ~after =
     ]
 ;;
 
+let detail_projection t ~page ~time_context ~root children =
+  Result.map
+    (fun (detail : Projection.detail) ->
+       let tagged block =
+         Journal_model.with_tag_titles block
+           ~tag_titles:(Option.value
+             (Hashtbl.find_opt t.tag_titles (Journal_model.id block)) ~default:[])
+       in
+       (* This is the already returned, bounded child page; metadata needs no reads. *)
+       { Projection.root = tagged detail.root
+       ; children = { detail.children with blocks = List.map tagged detail.children.blocks }
+       })
+    (Projection.detail_on_page ~page ~time_context ~root children)
+;;
+
 let read_child t command page =
   requests
     [ read
@@ -2709,7 +2724,7 @@ let receive_response t (protocol_response : Protocol.response) =
                       | Error _ -> ()
                       | Ok time_context ->
                         (match
-                           Projection.detail_on_page
+                           detail_projection t
                              ~page
                              ~time_context
                              ~root:interest.root
@@ -3224,7 +3239,7 @@ let receive_response t (protocol_response : Protocol.response) =
                       })
                ]
            | Ok time_context ->
-             (match Projection.detail_on_page ~page ~time_context ~root children with
+             (match detail_projection t ~page ~time_context ~root children with
               | Ok detail ->
                 Hashtbl.replace
                   t.projected_blocks
@@ -3330,7 +3345,7 @@ let receive_response t (protocol_response : Protocol.response) =
           (match projection_time_context t with
            | Error message -> reject message
            | Ok time_context ->
-             (match Projection.detail_on_page ~page ~time_context ~root children with
+             (match detail_projection t ~page ~time_context ~root children with
               | Ok detail -> responses [ response (Children_reconciled detail) ]
               | Error message -> reject message))
         | Capture_children { command; page; conflict_retries } ->

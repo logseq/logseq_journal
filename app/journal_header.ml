@@ -79,22 +79,53 @@ let bottom_controls ~key ~controls body =
   |> V.Body.static
 ;;
 
-let detail ~capture_enabled ~on_capture body =
+let detail_text ~id ~depth text =
+  Ui.Native_widget.widget
+    chrome
+    ~key:(Ui.Key.string ("detail-label:" ^ id))
+    ~props:(`Assoc [ "mode", `String "detail-text"; "id", `String id
+                  ; "level", `Int (min 2 depth); "text", `String text ])
+    ~on_event:(fun _ -> ())
+    ~children:[]
+    ()
+;;
+
+let detail_row ~depth body =
+  Ui.Native_widget.widget chrome
+    ~props:(`Assoc [ "mode", `String "detail-row"; "level", `Int (min 2 depth) ])
+    ~on_event:(fun _ -> ()) ~children:[ body ] ()
+;;
+
+let detail ~capture_enabled ~on_capture ~copy_enabled ~on_copy ~copy_feedback body =
   let capture =
     capture_control ~enabled:(fun () -> capture_enabled) ~on_capture
     |> test_id "journal-detail-capture-open"
+  in
+  let options =
+    V.buttons ~actions:
+      [ V.buttons_menu_action ~label:"Block options" ~icon:"ellipsis"
+          ~on_select:(Ui.Event.Handler.create (function
+            | Ui.Event.Payload.Int64 1L when copy_enabled ->
+              Ui.Event.Handler.Private.invoke on_copy Ui.Event.Payload.Unit
+            | _ -> ()))
+          [ V.Menu.action ~id:1L ~title:"Copy" ~icon:"doc.on.doc" ~enabled:copy_enabled () ] ] ()
   in
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string "journal-detail-header")
     ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
     ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body ]
+    ~children:[ V.Body.Private.to_widget body; options ]
     ()
   |> V.Body.static
   |> bottom_controls
        ~key:"journal-detail-bottom-controls"
-       ~controls:(V.row ~spacing:16. [ V.spacer (); capture ])
+       ~controls:(V.row ~spacing:16.
+         [ (match copy_feedback with
+            | None -> V.spacer ()
+            | Some message ->
+              V.text message |> V.semantics ~properties:(Ui.Semantics.create ~live_region:true ()) )
+         ; V.spacer (); capture ])
 ;;
 
 type account_action =

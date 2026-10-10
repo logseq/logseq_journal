@@ -1143,11 +1143,22 @@ let run_favorites_native_visibility
         | _ -> ())
   in
   let find key value =
-    Hashtbl.fold
+    let direct = Hashtbl.fold
       (fun id values found ->
          if List.assoc_opt key values = Some (`String value) then Some id else found)
       props
       None
+    in
+    match direct with
+    | Some _ -> direct
+    | None when key = "text" -> Hashtbl.fold (fun id values found ->
+        match List.assoc_opt "payload" values with
+        | Some (`String payload) ->
+          let p = Yojson.Safe.from_string payload in
+          if Yojson.Safe.Util.member "mode" p = `String "detail-text"
+             && Yojson.Safe.Util.member "text" p = `String value then Some id else found
+        | _ -> found) props None
+    | None -> None
   in
   let rec ancestor_property id key =
     if
@@ -1615,6 +1626,11 @@ let run_favorites_native_visibility
              Hashtbl.fold
                (fun _ values count ->
                   if List.assoc_opt "text" values = Some (`String "Updated covered row")
+                    || (match List.assoc_opt "payload" values with
+                        | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
+                          Yojson.Safe.Util.member "mode" p = `String "detail-text"
+                          && Yojson.Safe.Util.member "text" p = `String "Updated covered row"
+                        | _ -> false)
                   then count + 1
                   else count)
                props
@@ -1717,13 +1733,14 @@ let run_favorites_native_visibility
          dispatch
            (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
          let root_list = Option.get (find "_extension" "journal-list") in
-         let label = Option.get (find "text" "Timeline fixture 1") in
+         Atomic.set detail_fixture true;
+         let label = Option.get (find "text" "Timeline fixture 0") in
          dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
          wait "copy Detail loaded" (fun () ->
            Option.is_some
              (find
                 "accessibility-identifier"
-                ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+                ("detail-block:" ^ G.Uuid.to_string (uuid 1))));
          let detail_list =
            Hashtbl.fold
              (fun id values found ->
@@ -1736,7 +1753,108 @@ let run_favorites_native_visibility
              None
            |> Option.get
          in
-         check_copy_text detail_list row "Timeline fixture 1")
+         check_copy_text detail_list row "Timeline fixture 1";
+         (* Copy's pure reducer cannot reproduce the Detail toolbar binding or
+            host acknowledgement feedback. Exercise their public app boundary. *)
+         let current_root = ref (uuid 1) in
+         let rec under owner id =
+           id = owner || match Hashtbl.find_opt parents id with
+           | None -> false | Some parent -> under owner parent
+         in
+         let rec chrome mode id =
+           let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+           match List.assoc_opt "payload" values with
+           | Some (`String payload) when Yojson.Safe.Util.member "mode" (Yojson.Safe.from_string payload) = `String mode -> id
+           | _ -> chrome mode (Hashtbl.find parents id)
+         in
+         let detail_body root = Hashtbl.fold (fun id values found ->
+           match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+           | Some (`String "journal-list"), Some (`String payload) ->
+             let open Yojson.Safe.Util in
+             let p = Yojson.Safe.from_string payload in
+             (match p |> member "sections" |> to_list with
+              | section :: _ -> (match section |> member "rows" |> to_list with
+                | row :: _ when member "style" p = `String "detail"
+                  && member "key" row = `String ("block:" ^ G.Uuid.to_string root) -> Some id
+                | _ -> found)
+              | _ -> found)
+           | _ -> found) props None in
+         let current_body () =
+           Option.get (detail_body !current_root)
+         in
+         let find_current key value =
+           let owner = chrome "bottom-controls" (current_body ()) in
+           Hashtbl.fold (fun id values found ->
+             if under owner id && List.assoc_opt key values = Some (`String value)
+             then Some id else found) props None
+         in
+         let header_copy () =
+           let owner = chrome "detail" (current_body ()) in
+           let trigger = Option.get (Hashtbl.fold (fun id values found ->
+             if under owner id && List.assoc_opt "accessibility-label" values = Some (`String "Block options")
+             then Some id else found) props None) in
+           let under id = under trigger id in
+           let entries = Hashtbl.fold (fun id values acc ->
+             if under id && List.mem_assoc "text" values then
+               (id, List.assoc "text" values) :: acc else acc) props [] in
+           Alcotest.(check int) "Detail menu has only Copy" 1 (List.length entries);
+           match entries with
+           | [ (id, `String "Copy") ] -> id
+           | _ -> Alcotest.fail "Detail menu must contain only Copy"
+         in
+         let respond_copy copied =
+           let json = Yojson.Safe.to_string (`Assoc [ "copied", `Bool copied ]) in
+           let response = Bytes.make (32 + String.length json) '\000' in
+           Bytes.blit_string "LJP2" 0 response 0 4;
+           Bytes.set_uint16_le response 4 2;
+           Bytes.set_uint16_le response 6 29;
+           Bytes.set_int32_le response 24 (Int32.of_int (String.length json));
+           Bytes.blit_string json 0 response 32 (String.length json);
+           hooks.platform_response (Bytes.to_string response)
+         in
+         let copy_header expected =
+           clipboard_requests := [];
+           dispatch (Lui_protocol.Press (header_copy ()));
+           wait "Detail Copy progress" (fun () ->
+             Option.is_some (find_current "text" "Copying block and descendants…"));
+           wait "Detail header reaches shared clipboard chain" (fun () -> !clipboard_requests <> []);
+           let request = List.hd !clipboard_requests in
+           let json = Bytes.sub_string request 32 (Bytes.length request - 32) |> Yojson.Safe.from_string in
+           Alcotest.(check string) "header targets current Detail subtree" expected
+             Yojson.Safe.Util.(json |> member "text" |> to_string)
+         in
+         copy_header "Timeline fixture 0\n  - Timeline fixture 1";
+         respond_copy true;
+         wait "Detail Copy success after host acknowledgement" (fun () ->
+           Option.is_some (find_current "text" "Copied block and descendants"));
+         copy_header "Timeline fixture 0\n  - Timeline fixture 1";
+         let retired_copy = header_copy () in
+         let payload = Yojson.Safe.to_string (`Assoc [ "key", `String "open"; "row", `String row ]) in
+         let action = Yojson.Safe.to_string (`Assoc [ "type", `String "row_event"; "payload", `String payload ]) in
+         hooks.extension_event detail_list "event"
+           (Yojson.Safe.to_string (`Assoc [ "id", `Int 1; "payload", `String action ])) |> consume;
+         wait "nested Detail has its own root" (fun () ->
+           Option.is_some (detail_body (uuid 2)));
+         current_root := uuid 2;
+         respond_copy false;
+         for _ = 1 to 5 do hooks.pump () |> consume done;
+         Alcotest.(check bool) "old failure never becomes a new Detail/global notice" true
+           (Option.is_none (find "text" "Copy failed"));
+         Alcotest.(check bool) "old success is scoped to its Detail" true
+           (Option.is_none (find_current "text" "Copied block and descendants"));
+         clipboard_requests := [];
+         dispatch (Lui_protocol.Press retired_copy);
+         for _ = 1 to 5 do hooks.pump () |> consume done;
+         Alcotest.(check int) "retired toolbar cannot copy previous root" 0 (List.length !clipboard_requests);
+         copy_header "Timeline fixture 1";
+         respond_copy false;
+         wait "Detail Copy failure remains visible" (fun () ->
+           Option.is_some (find_current "text" "Copy failed: Clipboard write was not acknowledged."));
+         copy_header "Timeline fixture 1";
+         respond_copy true;
+         wait "retry succeeds without the previous failure" (fun () ->
+           Option.is_some (find_current "text" "Copied block and descendants")
+           && Option.is_none (find_current "text" "Copy failed: Clipboard write was not acknowledged.")))
        else if Option.is_some media_rows
        then (
          let count = Option.get media_rows in
@@ -1744,6 +1862,11 @@ let run_favorites_native_visibility
            Hashtbl.fold
              (fun id values ids ->
                 if List.assoc_opt key values = Some (`String value)
+                   || (key = "text" && match List.assoc_opt "payload" values with
+                       | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
+                         Yojson.Safe.Util.member "mode" p = `String "detail-text"
+                         && Yojson.Safe.Util.member "text" p = `String value
+                       | _ -> false)
                 then id :: ids
                 else ids)
              props
@@ -2120,9 +2243,10 @@ let run_favorites_native_visibility
                let expand expanded =
                  detail_event
                    (`Assoc
-                       [ "type", `String "expanded"
-                       ; "key", `String ("block:" ^ G.Uuid.to_string (uuid 1))
-                       ; "expanded", `Bool expanded
+                       [ "type", `String "row_event"
+                       ; "payload", `String (Yojson.Safe.to_string (`Assoc
+                           [ "row", `String ("block:" ^ G.Uuid.to_string (uuid 1))
+                           ; "key", `String (if expanded then "expand" else "collapse") ]))
                        ])
                in
                if scenario = `Detail_offscreen

@@ -1496,11 +1496,13 @@ module View = struct
       | Plain
       | Inset
       | Inset_grouped
+      | Detail
 
     let style_name = function
       | Plain -> "plain"
       | Inset -> "inset"
       | Inset_grouped -> "inset_grouped"
+      | Detail -> "detail"
     ;;
 
     type separator =
