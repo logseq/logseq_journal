@@ -2548,8 +2548,78 @@ let test_multiselect_graph_owner_and_cancel () =
     | _ -> assert false)
 ;;
 
+let test_retained_detail_picker_owner_and_terminal_delete () =
+  let module R = Journal_routes in
+  let root = block () in
+  let live = load_parent (R.create ()) root 980L in
+  let owner = entry_id live in
+  let live =
+    R.update_detail
+      live
+      (Journal_detail.update_child_source (Option.get (R.detail live)) "Owned draft")
+  in
+  let path = Filename.temp_file "journal-import-" ".txt" in
+  Fun.protect
+    ~finally:(fun () -> if Sys.file_exists path then Sys.remove path)
+    (fun () ->
+       let pick =
+         staged_pick
+           ~operation:"70000000-0000-4000-a000-00000000a090"
+           ~path
+           ~title:"Retained selection"
+           ~file_type:"txt"
+       in
+       let detached = R.pop_to_root live in
+       let updated =
+         R.map_child_capture_at
+           detached
+           ~entry_id:owner
+           ~request_generation:980L
+           ~f:(fun capture -> Journal_capture.add_attachment capture pick)
+       in
+       require
+         (List.length
+            (Journal_capture.pending_attachments
+               (Option.get
+                  (R.child_capture_at updated ~entry_id:owner ~request_generation:980L)))
+          = 1)
+         "late picker lost the detached draft owner";
+       require
+         (R.map_child_capture_at
+            updated
+            ~entry_id:owner
+            ~request_generation:979L
+            ~f:(fun capture ->
+              Journal_capture.remove_attachment
+                capture
+                ~token:(Journal_asset_import.staged_token pick))
+          == updated)
+         "stale picker generation modified a retained draft";
+       let reopened = load_parent updated root 990L in
+       let staged, undo = R.stage_delete reopened ~block_id:(Journal_model.id root) in
+       require
+         (List.length (R.pending_attachments staged) = 1)
+         "Undo staging retired the attachment too early";
+       let restored = R.undo_delete staged (Option.get undo) in
+       require
+         (List.length (R.pending_attachments restored) = 1)
+         "Undo failed to restore the attachment";
+       let committed, released =
+         R.commit_delete staged ~block_id:(Journal_model.id root)
+       in
+       require
+         (List.length released = 1 && R.pending_attachments committed = [])
+         "committed root deletion retained a draft or lost cleanup ownership";
+       let fresh = R.pop_to_root committed |> fun t -> load_parent t root 1000L in
+       require
+         (Journal_detail.child_capture (Option.get (R.detail fresh)) = None)
+         "committed deletion revived its retired draft")
+;;
+
 let tests =
-  [ "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
+  [ ( "retained picker and terminal delete"
+    , test_retained_detail_picker_owner_and_terminal_delete )
+  ; "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
   ; "multiselect batch boundary", test_multiselect_batch_boundary
   ; "multiselect order duplicates and readd", test_multiselect_order_duplicates_and_readd
   ; ( "multiselect rejected resource ownership"

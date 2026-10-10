@@ -234,6 +234,20 @@ let retained_attachment_imports draft ~child ~parent =
 ;;
 
 let retained_attachments draft = Journal_capture.pending_attachments draft.draft_capture
+let retained_capture draft = draft.draft_capture
+let retained_saving draft = draft.draft_mode = Saving_child
+
+let map_retained_capture draft ~f =
+  if retained_saving draft
+  then draft
+  else (
+    let capture = f draft.draft_capture in
+    if capture == draft.draft_capture
+    then draft
+    else
+      { draft with draft_capture = capture; draft_mode = Reading; draft_pending = None })
+;;
+
 let expanded (t : t) ~block_id = (branch t block_id).expanded
 let continuation (t : t) ~parent_id = (branch t parent_id).continuation
 let request_back _ = `Close

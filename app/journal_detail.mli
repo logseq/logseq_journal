@@ -86,6 +86,13 @@ val undo_delete : t -> staged_delete -> t
 type retained_composer
 
 val retained_attachments : retained_composer -> Journal_asset_import.staged list
+val retained_capture : retained_composer -> Journal_capture.t
+val retained_saving : retained_composer -> bool
+
+val map_retained_capture
+  :  retained_composer
+  -> f:(Journal_capture.t -> Journal_capture.t)
+  -> retained_composer
 
 val retained_attachment_imports
   :  retained_composer
