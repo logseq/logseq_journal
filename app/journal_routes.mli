@@ -74,6 +74,34 @@ val apply_detail_failure
 val detail : t -> Journal_detail.t option
 val update_detail : t -> Journal_detail.t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
+val pending_attachments : t -> Journal_asset_import.staged list
+
+(** Picker completion ownership survives navigation; stale generations are ignored. *)
+val child_capture_at
+  :  t
+  -> entry_id:string
+  -> request_generation:int64
+  -> Journal_capture.t option
+
+val child_saving_at : t -> entry_id:string -> request_generation:int64 -> bool
+
+val map_child_capture_at
+  :  t
+  -> entry_id:string
+  -> request_generation:int64
+  -> f:(Journal_capture.t -> Journal_capture.t)
+  -> t
+
+(** Retire committed root drafts and return their files to the application for cleanup.
+    Staging a delete and Undo do not retire them. *)
+val commit_delete : t -> block_id:string -> t * Journal_asset_import.staged list
+
+val child_attachment_imports
+  :  t
+  -> child:Journal_model.t
+  -> parent:Journal_model.t
+  -> (string * Journal_asset_import.staged list) option
+
 val apply_child_failure : t -> block_id:string -> message:string -> t
 val back : t -> t
 val background : t -> t
@@ -111,5 +139,6 @@ end
 (** Process-local composer storage; the application owns its graph identity. *)
 type retained_drafts
 
+val retained_attachments : retained_drafts -> Journal_asset_import.staged list
 val retain_drafts : interrupted:bool -> t -> retained_drafts
 val restore_drafts : t -> retained_drafts -> t

@@ -558,9 +558,7 @@ let test_detail_capsules_mount_outside_toolbars () =
                    (List.mem command !actions = allowed)
                    "%s action guard changed"
                    label)
-              [ "Append", Application.For_testing.Append, actions_enabled
-              ; "Attach file", Application.For_testing.Attach_file, actions_enabled
-              ]))
+              [ "Capture", Application.For_testing.Append, actions_enabled ]))
     [ loading, true, false; loaded, false, false; loaded, true, true ]
 ;;
 

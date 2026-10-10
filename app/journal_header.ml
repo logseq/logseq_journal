@@ -53,15 +53,48 @@ let date_header ~title =
     ()
 ;;
 
-let detail ~actions body =
+let capture_control ~enabled ~on_capture =
+  V.buttons
+    ~actions:
+      [ V.buttons_action
+          ~label:"Capture"
+          ~icon:"square.and.pencil"
+          ~on_press:
+            (Ui.Event.Handler.create (fun payload ->
+               if enabled () then Ui.Event.Handler.Private.invoke on_capture payload))
+          ()
+      ]
+    ()
+  |> V.semantics ~properties:(Ui.Semantics.create ~label:"Capture" ())
+;;
+
+let bottom_controls ~key ~controls body =
+  Ui.Native_widget.widget
+    chrome
+    ~key:(Ui.Key.string key)
+    ~props:(`Assoc [ "mode", `String "bottom-controls" ])
+    ~on_event:(fun _ -> ())
+    ~children:[ V.Body.Private.to_widget body; controls ]
+    ()
+  |> V.Body.static
+;;
+
+let detail ~capture_enabled ~on_capture body =
+  let capture =
+    capture_control ~enabled:(fun () -> capture_enabled) ~on_capture
+    |> test_id "journal-detail-capture-open"
+  in
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string "journal-detail-header")
     ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
     ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body; V.buttons ~actions () ]
+    ~children:[ V.Body.Private.to_widget body ]
     ()
   |> V.Body.static
+  |> bottom_controls
+       ~key:"journal-detail-bottom-controls"
+       ~controls:(V.row ~spacing:16. [ V.spacer (); capture ])
 ;;
 
 type account_action =
@@ -252,22 +285,12 @@ let view_impl
   in
   let capture =
     (* buttons has no disabled state — guard the handler instead. *)
-    V.buttons
-      ~actions:
-        [ V.buttons_action
-            ~label:"Capture"
-            ~icon:"square.and.pencil"
-            ~on_press:
-              (Ui.Event.Handler.create (fun payload ->
-                 if
-                   match presentation_signal with
-                   | None -> initial.capture_enabled
-                   | Some signal -> (Signal.sample signal).capture_enabled
-                 then Ui.Event.Handler.Private.invoke on_capture payload))
-            ()
-        ]
-      ()
-    |> V.semantics ~properties:(Ui.Semantics.create ~label:"Capture" ())
+    capture_control
+      ~enabled:(fun () ->
+        match presentation_signal with
+        | None -> initial.capture_enabled
+        | Some signal -> (Signal.sample signal).capture_enabled)
+      ~on_capture
     |> test_id "journal-capture-open"
   in
   let destinations =
@@ -373,18 +396,12 @@ let view_impl
   then
     (* The native inset reserves scrolling space; each buttons composite
        supplies its own glass without system toolbar chrome. *)
-    Ui.Native_widget.widget
-      chrome
-      ~key:(Ui.Key.string "journal-bottom-controls")
-      ~props:(`Assoc [ "mode", `String "bottom-controls" ])
-      ~on_event:(fun _ -> ())
-      ~children:
-        [ V.Body.Private.to_widget body
-        ; V.row ~spacing:16. [ destinations; V.spacer (); capture ]
-          |> test_id "journal-bottom-controls"
-        ]
-      ()
-    |> V.Body.static
+    bottom_controls
+      ~key:"journal-bottom-controls"
+      ~controls:
+        (V.row ~spacing:16. [ destinations; V.spacer (); capture ]
+         |> test_id "journal-bottom-controls")
+      body
   else body
 ;;
 

@@ -396,6 +396,7 @@ let run_favorites_native_visibility
       ?(check_error_control = false)
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
+      ?detail_capture
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
@@ -438,6 +439,13 @@ let run_favorites_native_visibility
   let import_probe = Atomic.make false in
   let import_probed = Atomic.make false in
   let staged_paths = ref [] in
+  let detail_captures = Atomic.make [] in
+  let child_attempts = Atomic.make 0 in
+  let child_release =
+    Atomic.make
+      (not (List.mem detail_capture [ Some "duplicate"; Some "offscreen-attachments" ]))
+  in
+  let import_targets = Atomic.make [] in
   let scope : Service.asset_scope =
     { account =
         { managed_sync_origin = Uri.of_string "https://example.invalid"
@@ -576,7 +584,9 @@ let run_favorites_native_visibility
       ~push_topic_count:6
       ~merge_push:Service.coalesce_push
       ~concurrency:
-        (if check_capture_imports then Concurrent { max_in_flight = 2 } else Serial)
+        (if check_capture_imports || Option.is_some detail_capture
+         then Concurrent { max_in_flight = 2 }
+         else Serial)
       ~init:(fun context _ ->
         worker_context := Some context;
         W.Session_context.emit
@@ -656,9 +666,18 @@ let run_favorites_native_visibility
           Ok Service.Client_command_completed
         | Client_command _ | Asset_command _ -> Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
-        | Import_asset { graph_generation; source } when check_capture_imports ->
+        | Import_asset { graph_generation; source }
+          when check_capture_imports || Option.is_some detail_capture ->
+          Atomic.set import_targets (Atomic.get import_targets @ [ source.target ]);
           Atomic.set imports_entered (Atomic.get imports_entered @ [ source.title ]);
+          if source.title = "First attachment" then
+            while not (Atomic.get import_release) do
+              Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+            done;
           if source.title = "First attachment"
+             && detail_capture <> Some "selection-error"
+             && (detail_capture <> Some "retry-imports"
+                 || List.length (List.filter (( = ) "First attachment") (Atomic.get imports_entered)) = 1)
           then (
             while not (Atomic.get import_release) do
               Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
@@ -760,10 +779,33 @@ let run_favorites_native_visibility
               V2_changes_acknowledged { generation = "g"; through = "p2" }
             | V2_get_block { block; _ } ->
               V2_block_outcome
-                (match List.find_index (G.Uuid.equal block) roots with
-                 | Some n ->
-                   V2_present_block { value = timeline_block n; revision = "root" }
-                 | None -> V2_missing_block { uuid = block; revision = "p" })
+                (match
+                   List.find_opt
+                     (fun (parent, (root : P.v2_block_tree)) ->
+                        let _ = parent in
+                        G.Uuid.equal root.uuid block)
+                     (Atomic.get detail_captures)
+                 with
+                 | Some (parent, root) ->
+                   let value = timeline_block 0 in
+                   V2_present_block
+                     { value =
+                         { value with
+                           block =
+                             { value.block with
+                               uuid = root.uuid
+                             ; title = root.title
+                             ; parent
+                             ; order = "999"
+                             }
+                         }
+                     ; revision = "appended"
+                     }
+                 | None ->
+                   (match List.find_index (G.Uuid.equal block) roots with
+                    | Some n ->
+                      V2_present_block { value = timeline_block n; revision = "root" }
+                    | None -> V2_missing_block { uuid = block; revision = "p" }))
             | V2_get_block_summary { block; _ } when check_capture_imports ->
               let root = Atomic.get capture_root |> Option.get in
               let page = Atomic.get capture_page |> Option.get in
@@ -865,6 +907,45 @@ let run_favorites_native_visibility
                 (match known with
                  | Some page -> V2_present_page { page; revision = "p" }
                  | None -> V2_missing_page { uuid = requested; revision = "p" })
+            | V2_get_children { parent; _ } when Option.is_some detail_capture ->
+              let existing =
+                if G.Uuid.equal parent (uuid 1)
+                then (
+                  let value = timeline_block 1 in
+                  [ { P.value = { value with block = { value.block with parent } }
+                    ; revision = "child"
+                    }
+                  ])
+                else []
+              in
+              V2_children_outcome
+                { parent
+                ; revision_scope = V2_children_revision parent
+                ; scope_revision = "children"
+                ; items =
+                    existing
+                    @ List.filter_map
+                        (fun (owner, (root : P.v2_block_tree)) ->
+                           if not (G.Uuid.equal owner parent)
+                           then None
+                           else (
+                             let value = timeline_block 0 in
+                             Some
+                               { P.value =
+                                   { value with
+                                     block =
+                                       { value.block with
+                                         uuid = root.uuid
+                                       ; title = root.title
+                                       ; parent
+                                       ; order = "999"
+                                       }
+                                   }
+                               ; revision = "appended"
+                               }))
+                        (Atomic.get detail_captures)
+                ; next_cursor = None
+                }
             | V2_get_children { parent; _ }
               when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
               let value = timeline_block 1 in
@@ -949,6 +1030,26 @@ let run_favorites_native_visibility
                      else [])
                 ; next_cursor = None
                 }
+            | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
+              when Option.is_some detail_capture ->
+              Atomic.incr child_attempts;
+              while not (Atomic.get child_release) do
+                Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+              done;
+              if detail_capture = Some "failure" && Atomic.get child_attempts = 1
+              then
+                V2_failed
+                  { code = Logseq_db_worker.Error.code_string Invalid_request
+                  ; message = "Fixture child write failed" }
+              else (
+                Atomic.set detail_captures (Atomic.get detail_captures @ [ parent, root ]);
+                V2_mutation_committed
+                  { mutation_id
+                  ; status = V2_applied
+                  ; generation = "g"
+                  ; before_projection_revision = "p"
+                  ; after_projection_revision = "p2"
+                  })
             | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
               when check_capture_imports ->
               let page = Atomic.get capture_page |> Option.get in
@@ -1116,6 +1217,7 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set child_release true;
       Atomic.set import_release true;
       Atomic.set acquire_release true;
       ignore (hooks.dispose ());
@@ -1125,7 +1227,7 @@ let run_favorites_native_visibility
     (fun () ->
        hooks.init 2 2 startup |> consume;
        on_initialized ();
-       if check_ios_capture || check_capture_imports
+       if check_ios_capture || check_capture_imports || Option.is_some detail_capture
        then (
          let snapshot = { Journal_environment.fallback with platform = "ios" } in
          let payload =
@@ -1147,6 +1249,286 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       (* Detail/Routes already own text admission, retry, outline ordering and
+          retained drafts, covered by their pure public reducer tests. They
+          cannot reproduce native Capture placement, shared Composer wiring,
+          picker callbacks or asynchronous Worker import ownership. Exercise
+          only that missing boundary through the public mounted Application. *)
+       Option.iter
+         (fun scenario ->
+            let all key value =
+              Hashtbl.fold
+                (fun id values ids ->
+                   if List.assoc_opt key values = Some (`String value) then id :: ids else ids)
+                props []
+            in
+            let enter n =
+              let label =
+                Option.get (find "text" (Printf.sprintf "Timeline fixture %d" n))
+              in
+              dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
+              wait "Detail root loads" (fun () ->
+                Option.is_some
+                  (find
+                     "accessibility-identifier"
+                     ("detail-block:" ^ G.Uuid.to_string (uuid (n + 1)))))
+            in
+            let open_capture () =
+              let scope = find "accessibility-identifier" "journal-detail-capture-open" in
+              Alcotest.(check bool)
+                "Detail has its own bottom Capture control"
+                true
+                (Option.is_some scope);
+              let rec inside id root =
+                id = root
+                || Option.fold
+                     ~none:false
+                     ~some:(fun parent -> inside parent root)
+                     (Hashtbl.find_opt parents id)
+              in
+              let label =
+                all "accessibility-label" "Capture"
+                |> List.find (fun id -> inside id (Option.get scope))
+              in
+              dispatch (Lui_protocol.Press label);
+              wait "Detail expands the shared Composer" (fun () ->
+                Option.is_some (find "accessibility-identifier" "journal-append-composer"))
+            in
+            let send () = Option.get (find "accessibility-label" "Send") in
+            let edit text =
+              dispatch
+                (Lui_protocol.TextChanged
+                   (Option.get (find "style-class" "composer-input"), text))
+            in
+            let collapse () =
+              dispatch
+                (Lui_protocol.Press
+                   (Option.get
+                      (find "accessibility-identifier" "journal-composer-dismiss")));
+              wait "collapse removes Composer" (fun () ->
+                Option.is_none (find "style-class" "composer-input"))
+            in
+            let back () =
+              let nav = Option.get (find "_extension" "navigation-stack") in
+              let payload () =
+                let revision =
+                  List.assoc "revision" (Hashtbl.find props nav)
+                  |> Yojson.Safe.Util.to_int
+                in
+                Yojson.Safe.to_string
+                  (`Assoc [ "revision", `Int revision; "length", `Int 0 ])
+              in
+              hooks.extension_event nav "path-changed" (payload ()) |> consume;
+              hooks.extension_event nav "settled" (payload ()) |> consume
+            in
+            enter 0;
+            Alcotest.(check bool)
+              "old Append toolbar action is removed"
+              true
+              (Option.is_none (find "accessibility-label" "Append"));
+            Alcotest.(check bool)
+              "old Attach file toolbar action is removed"
+              true
+              (Option.is_none (find "accessibility-label" "Attach file"));
+            open_capture ();
+            dispatch (Lui_protocol.Press (send ()));
+            edit "  \n ";
+            dispatch (Lui_protocol.Press (send ()));
+            settle_worker ();
+            Alcotest.(check int)
+              "empty and whitespace cannot insert a child"
+              0
+              (Atomic.get child_attempts);
+            edit
+              (if scenario = "attachment-only" then "" else "Detail child 中文\nsecond line");
+            if
+              List.mem
+                scenario
+                [ "attachments"; "attachment-only"; "offscreen-attachments"; "selection-error"; "picker-owner"; "retry-imports" ]
+            then (
+              dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "文件")));
+              let adapter, request =
+                Hashtbl.fold
+                  (fun id values found ->
+                     match
+                       List.assoc_opt "_extension" values, List.assoc_opt "payload" values
+                     with
+                     | Some (`String "journal-asset-import"), Some (`String payload) ->
+                       let open Yojson.Safe.Util in
+                       let request = member "request" (Yojson.Safe.from_string payload) in
+                       if
+                         member "staged" request = `Bool true
+                         && member "id" request |> to_int > 0
+                       then Some (id, request)
+                       else found
+                     | _ -> found)
+                  props
+                  None
+                |> Option.get
+              in
+              let item index title =
+                let path = Filename.temp_file "journal-import-" ".txt" in
+                staged_paths := !staged_paths @ [ path ];
+                `Assoc
+                  [ "operation", `String (G.Uuid.to_string (uuid (30000 + index)))
+                  ; "asset", `String (G.Uuid.to_string (uuid (31000 + index)))
+                  ; "localMutation", `String (G.Uuid.to_string (uuid (32000 + index)))
+                  ; "metadataMutation", `String (G.Uuid.to_string (uuid (33000 + index)))
+                  ; "path", `String path
+                  ; "title", `String title
+                  ; "type", `String "txt"
+                  ; "sourceIdentity", `String title
+                  ]
+              in
+              let first = item 1 "First attachment" in
+              let second = item 2 "Second attachment" in
+              let batch =
+                `Assoc
+                  [ "action", `String "picked-batch"
+                  ; "request", request
+                  ; ( "items"
+                    , `List [ first; second ] )
+                  ]
+              in
+              let batch = if scenario = "selection-error" then
+                match batch with `Assoc values -> `Assoc (("error", `String "Fixture partial selection failed") :: values) | _ -> assert false
+                else batch in
+              if scenario = "picker-owner" then (
+                collapse (); back (); enter 2; open_capture (); edit "Keep other root draft";
+                let open Yojson.Safe.Util in
+                wait "armed picker stays owned during another Composer" (fun () ->
+                  match List.assoc_opt "payload" (Hashtbl.find props adapter) with
+                  | Some (`String payload) -> member "id" (member "request" (Yojson.Safe.from_string payload)) = member "id" request
+                  | _ -> false));
+              hooks.extension_event
+                adapter
+                "event"
+                (Yojson.Safe.to_string
+                   (`Assoc
+                       [ "id", `Int 1; "payload", `String (Yojson.Safe.to_string batch) ])) |> consume;
+              if scenario = "picker-owner" then (
+                settle_worker ();
+                Alcotest.(check bool) "late selection cannot overwrite other draft" true
+                  (Option.is_some (find "text" "Keep other root draft"));
+                collapse (); back (); enter 0; open_capture ());
+              wait "Detail stages both Composer attachments" (fun () ->
+                List.length
+                  (all
+                     "accessibility-identifier"
+                     ("composer-attachment:" ^ G.Uuid.to_string (uuid 30002)))
+                = 1);
+              if scenario = "selection-error" then (
+                wait "partial selection failure is visible on its owner" (fun () -> Option.is_some (find "text" "Fixture partial selection failed"));
+                collapse (); back (); enter 2; open_capture ();
+                Alcotest.(check bool) "other Detail cannot show prior picker failure" true
+                  (Option.is_none (find "text" "Fixture partial selection failed"));
+                collapse (); back (); enter 0; open_capture ()));
+            collapse ();
+            open_capture ();
+            if scenario <> "attachment-only"
+            then
+              Alcotest.(check bool)
+                "cancel/reopen retains exact multiline draft"
+                true
+                (Option.is_some (find "text" "Detail child 中文\nsecond line"));
+            if scenario = "navigation"
+            then (
+              let stale_send = send () in
+              back ();
+              enter 2;
+              dispatch (Lui_protocol.Press stale_send);
+              settle_worker ();
+              Alcotest.(check int)
+                "old root Send cannot submit after navigation"
+                0
+                (Atomic.get child_attempts);
+              open_capture ();
+              edit "New root draft");
+            dispatch (Lui_protocol.Press (send ()));
+            wait "child command is admitted" (fun () -> Atomic.get child_attempts = 1);
+            if scenario = "duplicate"
+            then (
+              dispatch (Lui_protocol.Press (send ()));
+              Alcotest.(check int)
+                "repeated Send while Saving cannot duplicate"
+                1
+                (Atomic.get child_attempts);
+              Atomic.set child_release true);
+            if scenario = "offscreen-attachments"
+            then (
+              back ();
+              enter 2;
+              open_capture ();
+              edit "Keep new root draft";
+              Atomic.set child_release true);
+            if scenario = "failure"
+            then (
+              wait "write failure is visible in Composer" (fun () ->
+                Option.is_some (find "text" "Fixture child write failed"));
+              collapse ();
+              open_capture ();
+              dispatch (Lui_protocol.Press (send ())));
+            wait "one committed child is retained" (fun () ->
+              List.length (Atomic.get detail_captures) = 1);
+            let parent, child = List.hd (Atomic.get detail_captures) in
+            Alcotest.(check string)
+              "Send targets current Detail root"
+              (G.Uuid.to_string (uuid (if scenario = "navigation" then 3 else 1)))
+              (G.Uuid.to_string parent);
+            Alcotest.(check string)
+              "child preserves source or attachment-only friendly title"
+              (if scenario = "navigation"
+               then "New root draft"
+               else if scenario = "attachment-only"
+               then "First attachment"
+               else "Detail child 中文\nsecond line")
+              child.title;
+            if !staged_paths <> []
+            then (
+              wait "first import reaches Worker" (fun () ->
+                Atomic.get imports_entered <> []);
+              Alcotest.(check (list string))
+                "second import waits for first terminal result"
+                [ "First attachment" ]
+                (Atomic.get imports_entered);
+              Atomic.set import_release true;
+              wait "both imports finish" (fun () -> Atomic.get imports_finished = 2);
+              if scenario = "retry-imports" then (
+                wait "failed import exposes target retry" (fun () -> Option.is_some (find "accessibility-label" "Retry imports"));
+                Alcotest.(check bool) "failed import keeps its own staged file" true (Sys.file_exists (List.hd !staged_paths));
+                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Retry imports")));
+                wait "same child import retries" (fun () -> Atomic.get imports_finished = 3);
+                Alcotest.(check int) "import retry does not create another child" 1 (Atomic.get child_attempts));
+              if not (List.mem scenario [ "retry-imports"; "selection-error" ]) then (
+                wait "failed import offers explicit discard" (fun () -> Option.is_some (find "accessibility-label" "Dismiss"));
+                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss"))));
+              wait "all staging files are released" (fun () ->
+                List.for_all (fun p -> not (Sys.file_exists p)) !staged_paths);
+              Alcotest.(check (list string))
+                "imports target the newly appended child"
+                (List.init (if scenario = "retry-imports" then 3 else 2) (fun _ -> G.Uuid.to_string child.uuid))
+                (List.map G.Uuid.to_string (Atomic.get import_targets));
+              if scenario = "offscreen-attachments"
+              then
+                Alcotest.(check bool)
+                  "old completion preserves new root Composer"
+                  true
+                  (Option.is_some (find "text" "Keep new root draft")));
+            if scenario <> "offscreen-attachments"
+            then (
+              wait "completion closes Detail Composer" (fun () ->
+                Option.is_none (find "style-class" "composer-input"));
+              if scenario = "selection-error" then (
+                open_capture ();
+                Alcotest.(check bool) "completed Detail retires picker failure" true
+                  (Option.is_none (find "text" "Fixture partial selection failed"));
+                collapse (); back ();
+                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+                wait "Timeline Composer opens" (fun () -> Option.is_some (find "accessibility-identifier" "journal-capture-composer"));
+                Alcotest.(check bool) "Detail picker failure cannot leak to Timeline" true
+                  (Option.is_none (find "text" "Fixture partial selection failed")))))
+         detail_capture;
+       if Option.is_none detail_capture then (
        (* Routes reducers cannot own LUI mount/subscription retention. The
           public mounted Application boundary reproduces top-only teardown. *)
        if check_navigation
@@ -2302,11 +2684,13 @@ let run_favorites_native_visibility
                ; "sourceIdentity", `String title
                ]
            in
+           let first = item 1 "First attachment" in
+           let second = item 2 "Second attachment" in
            let batch =
              `Assoc
                [ "action", `String "picked-batch"
                ; "request", request
-               ; "items", `List [ item 1 "First attachment"; item 2 "Second attachment" ]
+               ; "items", `List [ first; second ]
                ]
            in
            hooks.extension_event
@@ -2340,8 +2724,10 @@ let run_favorites_native_visibility
            Atomic.set import_release true;
            wait "second attachment continues after first failure" (fun () ->
              Atomic.get imports_finished = 2);
-           wait "terminal import responses release both staging files" (fun () ->
-             List.for_all (fun path -> not (Sys.file_exists path)) !staged_paths);
+           wait "success releases staging while failure retains retry bytes" (fun () ->
+             match !staged_paths with
+             | [failed; successful] -> Sys.file_exists failed && not (Sys.file_exists successful)
+             | _ -> false);
            Alcotest.(check (list string))
              "batch preserves picker order"
              [ "First attachment"; "Second attachment" ]
@@ -2351,7 +2737,11 @@ let run_favorites_native_visibility
            dispatch
              (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
            wait "Error info retains the first batch failure" (fun () ->
-             Option.is_some (find "text" "Fixture first attachment failed")));
+             Option.is_some (find "text" "Fixture first attachment failed"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Close")));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss")));
+           wait "explicit discard releases failed retry bytes" (fun () ->
+             List.for_all (fun path -> not (Sys.file_exists path)) !staged_paths));
          if check_ios_capture
          then (
            dispatch
@@ -2565,7 +2955,7 @@ let run_favorites_native_visibility
                   "accessibility-identifier"
                   ("detail-block:" ^ G.Uuid.to_string (List.nth roots 1))));
            dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Append")));
+             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
            let editor = Option.get (find "style-class" "composer-input") in
            Alcotest.(check bool)
              "append sheet title is present"
@@ -2640,7 +3030,7 @@ let run_favorites_native_visibility
              (List.length
                 (List.filter
                    (G.Uuid.equal (favorite_target_uuid 64))
-                   (Atomic.get queried))))))
+                   (Atomic.get queried)))))))
 ;;
 
 (* The root reducer has no Worker accepted-ID/terminal-event boundary. This
@@ -3868,6 +4258,22 @@ let () =
         ; Alcotest.test_case "fixture early exit releases Worker" `Quick (fun () ->
             test_fixture_exception_cleanup Exit)
         ] )
+    ; ( "Detail shared Composer"
+      , List.map
+          (fun scenario ->
+             Alcotest.test_case scenario `Quick (fun () ->
+               run_favorites_native_visibility ~detail_capture:scenario ()))
+          [ "text"
+          ; "navigation"
+          ; "duplicate"
+          ; "failure"
+          ; "attachments"
+          ; "attachment-only"
+          ; "offscreen-attachments"
+          ; "selection-error"
+          ; "picker-owner"
+          ; "retry-imports"
+          ] )
     ; ( "Capture attachment imports"
       , [ Alcotest.test_case
             "ordered partial failure and staging release"

@@ -2305,8 +2305,70 @@ let test_document_preview_preserves_friendly_title_path_and_lease () =
     [ "pdf"; "txt" ]
 ;;
 
+let test_detail_uses_shared_capture_control () =
+  let projection : Journal_graph_projection.detail =
+    { root = block (); children = { blocks = []; continuation = None } }
+  in
+  let routes =
+    Journal_routes.create ()
+    |> fun routes ->
+    Journal_routes.open_detail routes ~block_id ~request_generation:1L
+    |> fun routes ->
+    Journal_routes.apply_detail_response routes ~request_generation:1L projection
+  in
+  List.iter
+    (fun write_enabled ->
+       let actions = ref [] in
+       let body =
+         Application.For_testing.detail_page ~routes ~write_enabled (fun action ->
+           actions := action :: !actions)
+       in
+       with_mounted (V.Body.Private.to_widget body) (fun app ops ->
+         (* Pure routes cannot reproduce native positional-slot mounting. The
+            public renderer must retain its body without an empty toolbar slot. *)
+         let header =
+           List.find_map
+             (function
+               | Lui_protocol.SetExtensionProp (id, "payload", StringValue value)
+                 when Yojson.Basic.Util.member "mode" (Yojson.Basic.from_string value)
+                      = `String "detail" -> Some id
+               | _ -> None)
+             (ops ())
+           |> Option.get
+         in
+         let slots =
+           List.filter_map
+             (function
+               | Lui_protocol.InsertChild (parent, child, _) when parent = header ->
+                 Some child
+               | _ -> None)
+             (ops ())
+         in
+         require
+           (List.length slots = 1)
+           "Detail native Chrome retains an empty toolbar slot";
+         let captures =
+           mounted_nodes (ops ()) AccessibilityLabel (StringValue "Capture")
+         in
+         require (List.length captures = 1) "Detail must have one shared Capture control";
+         List.iter
+           (fun label ->
+              require
+                (mounted_nodes (ops ()) AccessibilityLabel (StringValue label) = [])
+                "Detail retains removed toolbar action %s"
+                label)
+           [ "Append"; "Attach file" ];
+         ignore (Lui_app.dispatch_event app (Press (List.hd captures)));
+         ignore (Lui_app.flush app);
+         require
+           (!actions = if write_enabled then [ Application.For_testing.Append ] else [])
+           "Detail Capture failed to dispatch through its current write gate"))
+    [ true; false ]
+;;
+
 let tests =
-  [ ( "timeline asset child preview title"
+  [ "Detail shared Capture control", test_detail_uses_shared_capture_control
+  ; ( "timeline asset child preview title"
     , test_timeline_document_title_follows_its_asset_child )
   ; ( "native sheet navigation and cancellation"
     , test_sheet_has_native_navigation_and_keeps_cancel_delivery )

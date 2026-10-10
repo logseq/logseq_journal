@@ -40,6 +40,7 @@ type view =
 
 type detached =
   { block_id : string
+  ; request_generation : int64
   ; rank : int64
   ; composer : Journal_detail.retained_composer
   }
@@ -142,14 +143,17 @@ let track_detail_session t detail =
 
 let retain_owner t owner_id =
   match Owners.find_opt owner_id t.owners with
-  | Some (Detail_view { block_id; detail; _ }) ->
+  | Some (Detail_view { block_id; detail; request_generation }) ->
     let t = track_detail_session t detail in
     (match Journal_detail.retain_composer detail with
      | None -> { t with drafts = Drafts.remove owner_id t.drafts }
      | Some composer ->
        { t with
          drafts =
-           Drafts.add owner_id { block_id; composer; rank = t.next_retained } t.drafts
+           Drafts.add
+             owner_id
+             { block_id; request_generation; composer; rank = t.next_retained }
+             t.drafts
        ; next_retained = Int64.succ t.next_retained
        })
   | _ -> t
@@ -167,6 +171,115 @@ type retained_drafts =
   ; next_editor_session : int64
   ; next_rank : int64
   }
+
+let retained_attachments retained =
+  Drafts.fold
+    (fun _ draft items ->
+       List.rev_append (Journal_detail.retained_attachments draft.composer) items)
+    retained.composers
+    []
+;;
+
+let pending_attachments t =
+  let items =
+    Drafts.fold
+      (fun _ draft items ->
+         List.rev_append (Journal_detail.retained_attachments draft.composer) items)
+      t.drafts
+      []
+  in
+  Owners.fold
+    (fun _ view items ->
+       match view with
+       | Detail_view { detail; _ } ->
+         Option.fold
+           ~none:items
+           ~some:(fun capture ->
+             List.rev_append (Journal_capture.pending_attachments capture) items)
+           (Journal_detail.child_capture detail)
+       | _ -> items)
+    t.owners
+    items
+;;
+
+let child_capture_at t ~entry_id ~request_generation =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Detail_view owner) when owner.request_generation = request_generation ->
+    Journal_detail.child_capture owner.detail
+  | _ ->
+    Option.bind (Drafts.find_opt entry_id t.drafts) (fun draft ->
+      if draft.request_generation = request_generation
+      then Some (Journal_detail.retained_capture draft.composer)
+      else None)
+;;
+
+let child_saving_at t ~entry_id ~request_generation =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Detail_view owner) when owner.request_generation = request_generation ->
+    Journal_detail.mode owner.detail = Saving_child
+  | _ ->
+    Option.fold
+      ~none:false
+      ~some:(fun draft ->
+        draft.request_generation = request_generation
+        && Journal_detail.retained_saving draft.composer)
+      (Drafts.find_opt entry_id t.drafts)
+;;
+
+let map_child_capture_at t ~entry_id ~request_generation ~f =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Detail_view owner) when owner.request_generation = request_generation ->
+    let next = Journal_detail.map_child_capture owner.detail ~f in
+    if next == owner.detail
+    then t
+    else
+      { t with
+        owners = Owners.add entry_id (Detail_view { owner with detail = next }) t.owners
+      }
+  | _ ->
+    (match Drafts.find_opt entry_id t.drafts with
+     | Some draft when draft.request_generation = request_generation ->
+       let composer = Journal_detail.map_retained_capture draft.composer ~f in
+       if composer == draft.composer
+       then t
+       else { t with drafts = Drafts.add entry_id { draft with composer } t.drafts }
+     | _ -> t)
+;;
+
+let commit_delete t ~block_id =
+  let retired, kept =
+    Drafts.partition (fun _ draft -> draft.block_id = block_id) t.drafts
+  in
+  let files =
+    Drafts.fold
+      (fun _ draft files ->
+         List.rev_append (Journal_detail.retained_attachments draft.composer) files)
+      retired
+      []
+  in
+  if Drafts.is_empty retired then t, [] else { t with drafts = kept }, files
+;;
+
+let child_attachment_imports t ~child ~parent =
+  let found =
+    Drafts.fold
+      (fun _ draft found ->
+         match found with
+         | Some _ -> found
+         | None ->
+           Journal_detail.retained_attachment_imports draft.composer ~child ~parent)
+      t.drafts
+      None
+  in
+  Owners.fold
+    (fun _ view found ->
+       match found, view with
+       | None, Detail_view { detail; _ } ->
+         Journal_detail.child_attachment_imports detail ~child ~parent
+       | _ -> found)
+    t.owners
+    found
+;;
 
 let retain_drafts ~interrupted t =
   let t = retain_live_composers t in

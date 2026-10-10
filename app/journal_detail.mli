@@ -50,6 +50,17 @@ val composer_revision : t -> int64
 val reveal_id : t -> string option
 val request_back : t -> [ `Close ]
 val child_capture : t -> Journal_capture.t option
+
+(** Update the owned draft only while editable; an admitted child remains frozen. *)
+val map_child_capture : t -> f:(Journal_capture.t -> Journal_capture.t) -> t
+
+(** Staged imports for this exact child completion, before retiring its draft. *)
+val child_attachment_imports
+  :  t
+  -> child:Journal_model.t
+  -> parent:Journal_model.t
+  -> (string * Journal_asset_import.staged list) option
+
 val update_child_source : t -> string -> t
 val apply_child_edit : t -> Journal_view.Event.Payload.text_edit -> t
 val toggle_child_task : t -> t
@@ -73,6 +84,21 @@ val undo_delete : t -> staged_delete -> t
 
 (** Only composer ownership is retained; reopening loads a fresh outline projection. *)
 type retained_composer
+
+val retained_attachments : retained_composer -> Journal_asset_import.staged list
+val retained_capture : retained_composer -> Journal_capture.t
+val retained_saving : retained_composer -> bool
+
+val map_retained_capture
+  :  retained_composer
+  -> f:(Journal_capture.t -> Journal_capture.t)
+  -> retained_composer
+
+val retained_attachment_imports
+  :  retained_composer
+  -> child:Journal_model.t
+  -> parent:Journal_model.t
+  -> (string * Journal_asset_import.staged list) option
 
 val retain_composer : t -> retained_composer option
 val restore_composer : t -> retained_composer -> t

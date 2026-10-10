@@ -241,6 +241,10 @@ type capture_import_batch =
   ; batch_items : Journal_asset_import.staged list
   }
 
+type composer_owner =
+  | Timeline_composer
+  | Detail_composer of string * int64
+
 type state =
   { favorites : Journal_routes.Favorites.t
   ; favorites_media_roots : string Rrbvec.t
@@ -265,9 +269,12 @@ type state =
   ; asset_import_owner : (string * int64) option
   ; capture_pick_request : int
   ; capture_picker_armed : bool
+  ; capture_pick_owner : composer_owner option
   ; capture_pick_source : Journal_asset_import.source
   ; capture_imports : capture_import_batch option
+  ; failed_capture_imports : capture_import_batch list
   ; capture_error : capture_failure option
+  ; capture_error_owner : composer_owner option
   ; timeline_notice : timeline_notice option
   ; write_enabled : bool
   ; graph_ready : bool
@@ -352,9 +359,12 @@ let initial_state =
   ; asset_import_owner = None
   ; capture_pick_request = 0
   ; capture_picker_armed = false
+  ; capture_pick_owner = None
   ; capture_pick_source = Journal_asset_import.Files
   ; capture_imports = None
+  ; failed_capture_imports = []
   ; capture_error = None
+  ; capture_error_owner = None
   ; timeline_notice = None
   ; write_enabled = false
   ; graph_ready = false
@@ -378,6 +388,74 @@ let initial_state =
   ; environment = Journal_environment.fallback
   }
 ;;
+
+let current_composer_owner state =
+  match state.modal with
+  | Append_sheet ->
+    Option.map
+      (fun entry ->
+         Detail_composer (entry, Journal_routes.detail_request_generation state.routes))
+      (Journal_routes.active_entry_id state.routes)
+  | Capture_sheet -> Some Timeline_composer
+  | _ -> None
+;;
+
+let composer_capture state = function
+  | Timeline_composer -> state.direct_capture
+  | Detail_composer (entry_id, request_generation) ->
+    Journal_routes.child_capture_at state.routes ~entry_id ~request_generation
+;;
+
+let composer_saving state = function
+  | Timeline_composer ->
+    Option.fold
+      ~none:false
+      ~some:(fun capture -> Journal_capture.phase capture = Saving)
+      state.direct_capture
+  | Detail_composer (entry_id, request_generation) ->
+    Journal_routes.child_saving_at state.routes ~entry_id ~request_generation
+;;
+
+let map_composer_capture state owner ~f =
+  match owner with
+  | Timeline_composer -> { state with direct_capture = Option.map f state.direct_capture }
+  | Detail_composer (entry_id, request_generation) ->
+    let routes =
+      Journal_routes.map_child_capture_at state.routes ~entry_id ~request_generation ~f
+    in
+    if routes == state.routes then state else { state with routes }
+;;
+
+let composer_error state owner =
+  if Option.value state.capture_error_owner ~default:Timeline_composer = owner
+  then state.capture_error
+  else None
+;;
+
+let set_composer_error state owner error =
+  match error with
+  | Some _ -> { state with capture_error = error; capture_error_owner = Some owner }
+  | None when state.capture_error = None && state.capture_error_owner = None -> state
+  | None when Option.value state.capture_error_owner ~default:Timeline_composer = owner ->
+    { state with capture_error = None; capture_error_owner = None }
+  | None -> state
+;;
+
+let discard_import_batches batches =
+  List.iter
+    (fun batch -> List.iter Journal_asset_import.discard_staged_file batch.batch_items)
+    batches
+;;
+
+let retain_import_failure state batch =
+  if batch.batch_generation <> state.graph_state.generation
+  then (
+    discard_import_batches [ batch ];
+    state)
+  else { state with failed_capture_imports = state.failed_capture_imports @ [ batch ] }
+;;
+
+let picker_owner state = Option.value state.capture_pick_owner ~default:Timeline_composer
 
 let feed_projection_context (calendar : Journal_calendar.t) =
   { local_day = Journal_calendar.local_day calendar
@@ -426,6 +504,12 @@ let track_capture_session state =
 ;;
 
 let clear_graph_surface ?(discard_capture = true) state =
+  discard_import_batches state.failed_capture_imports;
+  if discard_capture
+  then
+    List.iter
+      Journal_asset_import.discard_staged_file
+      (Journal_routes.pending_attachments state.routes);
   (match state.direct_capture with
    | Some capture when discard_capture ->
      List.iter
@@ -434,6 +518,7 @@ let clear_graph_surface ?(discard_capture = true) state =
    | None | Some _ -> ());
   { state with
     capture_picker_armed = false
+  ; capture_pick_owner = None
   ; capture_pick_request =
       (state.capture_pick_request
        +
@@ -452,6 +537,8 @@ let clear_graph_surface ?(discard_capture = true) state =
   ; pending_delete = None
   ; pending_status = None
   ; capture_error = None
+  ; capture_error_owner = None
+  ; failed_capture_imports = []
   ; timeline_notice = None
   ; write_enabled = false
   ; graph_ready = false
@@ -484,7 +571,10 @@ let clear_account_drafts state =
             List.iter
               Journal_asset_import.discard_staged_file
               (Journal_capture.pending_attachments capture))
-         draft.capture_draft)
+         draft.capture_draft;
+       List.iter
+         Journal_asset_import.discard_staged_file
+         (Journal_routes.retained_attachments draft.append_drafts))
     state.graph_drafts;
   { (clear_graph_surface state) with
     draft_graph = None
@@ -1043,7 +1133,20 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
     { state with
       direct_capture = (if completed then None else state.direct_capture)
     ; modal = (if completed && state.modal = Capture_sheet then No_modal else state.modal)
-    ; capture_error = (if completed then None else state.capture_error)
+    ; capture_error =
+        (if
+           completed
+           && Option.value state.capture_error_owner ~default:Timeline_composer
+              = Timeline_composer
+         then None
+         else state.capture_error)
+    ; capture_error_owner =
+        (if
+           completed
+           && Option.value state.capture_error_owner ~default:Timeline_composer
+              = Timeline_composer
+         then None
+         else state.capture_error_owner)
     ; capture_imports =
         (match
            Option.bind completed_capture (fun capture ->
@@ -1130,17 +1233,35 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
           ~message:(failure_source_message failure)
     }
   | Child_created { child; parent; timeline_entry_update } ->
+    let imports = Journal_routes.child_attachment_imports state.routes ~child ~parent in
     let was_editing =
       Option.bind (Journal_routes.detail state.routes) Journal_detail.child_capture
       <> None
     in
     let routes = Journal_routes.apply_child_created state.routes ~child ~parent in
+    let state =
+      match state.capture_error_owner with
+      | Some (Detail_composer _ as owner)
+        when composer_capture state owner <> None
+             && composer_capture { state with routes } owner = None ->
+        set_composer_error state owner None
+      | _ -> state
+    in
     let completed_active =
       was_editing
       && Option.bind (Journal_routes.detail routes) Journal_detail.child_capture = None
     in
     { state with
       routes
+    ; capture_imports =
+        (match imports with
+         | None -> state.capture_imports
+         | Some (batch_target, batch_items) ->
+           Some
+             { batch_generation = state.graph_state.generation
+             ; batch_target
+             ; batch_items
+             })
     ; modal =
         (if state.modal = Append_sheet && completed_active then No_modal else state.modal)
     ; timeline =
@@ -1153,8 +1274,11 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
   | Subtree_deleted { block_id; parent; timeline_entry_update; _ } ->
     (match state.pending_delete with
      | Some pending when String.equal pending.block_id block_id ->
+       let routes, released = Journal_routes.commit_delete state.routes ~block_id in
+       List.iter Journal_asset_import.discard_staged_file released;
        { state with
-         timeline =
+         routes
+       ; timeline =
            Option.fold
              ~none:
                (Option.fold
@@ -1213,6 +1337,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
                    | Worker_failure _ ->
                      Worker_capture_failure (latest_worker_error state)
                    | Projection_failure message -> Local_capture_failure message)
+            ; capture_error_owner = Some Timeline_composer
             })
      | Status_mutation ->
        (match state.pending_status with
@@ -1290,6 +1415,7 @@ module Root_navigation = struct
     ; graph_ready = false
     ; feed_loaded = false
     ; capture_error = None
+    ; capture_error_owner = None
     ; timeline_notice = None
     }
   ;;
@@ -1336,6 +1462,7 @@ module Root_navigation = struct
       | Capture_picker_requested source ->
         { state with
           capture_picker_armed = true
+        ; capture_pick_owner = current_composer_owner state
         ; capture_pick_source = source
         ; capture_pick_request = state.capture_pick_request + 1
         }
@@ -1347,11 +1474,12 @@ module Root_navigation = struct
           | Capture_assets_picked (items, request_id, error) -> items, request_id, error
           | _ -> assert false
         in
+        let owner = picker_owner state in
         let owned =
           Option.fold
             ~none:[]
             ~some:Journal_capture.pending_attachments
-            state.direct_capture
+            (composer_capture state owner)
         in
         let discard_from owned item =
           if
@@ -1364,9 +1492,10 @@ module Root_navigation = struct
                  owned)
           then Journal_asset_import.discard_staged_file item
         in
-        (match state.direct_capture with
+        (match composer_capture state owner with
          | Some capture
            when request_id = Some state.capture_pick_request
+                && (not (composer_saving state owner))
                 && (state.capture_picker_armed
                     ||
                     match event with
@@ -1391,14 +1520,18 @@ module Root_navigation = struct
                Some "Some selections could not be added to this draft."
              | None -> None
            in
+           let state = map_composer_capture state owner ~f:(fun _ -> capture) in
+           let state =
+             set_composer_error
+               state
+               owner
+               (Option.map (fun message -> Local_capture_failure message) error)
+           in
            { state with
-             direct_capture = Some capture
-           ; capture_picker_armed =
+             capture_picker_armed =
                (match event with
                 | Capture_assets_picked _ -> false
                 | _ -> state.capture_picker_armed)
-           ; capture_error =
-               Option.map (fun message -> Local_capture_failure message) error
            }
          | None | Some _ ->
            List.iter (discard_from owned) items;
@@ -1420,6 +1553,7 @@ module Root_navigation = struct
            in
            if next == capture then state else { state with direct_capture = Some next })
       | Capture_edited source ->
+        let state = set_composer_error state Timeline_composer None in
         let capture, next_local_sequence =
           match state.direct_capture with
           | None ->
@@ -1432,18 +1566,14 @@ module Root_navigation = struct
           (match state.direct_capture with
            | Some previous -> previous == capture
            | None -> false)
-          && state.capture_error = None
+          && composer_error state Timeline_composer = None
         then state
-        else
-          { state with
-            direct_capture = Some capture
-          ; next_local_sequence
-          ; capture_error = None
-          }
+        else { state with direct_capture = Some capture; next_local_sequence }
       | Capture_admitted capture ->
+        let state = set_composer_error state Timeline_composer None in
         (match state.direct_capture with
-         | Some previous when previous == capture && state.capture_error = None -> state
-         | _ -> { state with direct_capture = Some capture; capture_error = None })
+         | Some previous when previous == capture -> state
+         | _ -> { state with direct_capture = Some capture })
       | Completed response -> apply_worker_response state response
       | Graph_replaced { generation; graph_id } ->
         let state = replace_graph state generation graph_id in
@@ -1472,7 +1602,6 @@ type command =
   | Select_journals
   | Select_favorites
   | Favorites_retry
-  | Open_asset_import
   | Refresh_catalog
   | Begin_online_recovery
   | Open_capture
@@ -1486,6 +1615,7 @@ type command =
   | Close_diagnostics
   | Open_error_info
   | Dismiss_operation_error
+  | Retry_capture_imports
   | Close_error_info
   | Switch_graph
   | Sign_out
@@ -1700,9 +1830,12 @@ let operation_feedback ~scope ~state dispatch body =
       ( summary
       , V.buttons
           ~actions:
-            [ action "Details" "exclamationmark.circle" Open_error_info
-            ; action "Dismiss" "xmark" Dismiss_operation_error
-            ]
+            ((if state.failed_capture_imports = []
+              then []
+              else [ action "Retry imports" "arrow.clockwise" Retry_capture_imports ])
+             @ [ action "Details" "exclamationmark.circle" Open_error_info
+               ; action "Dismiss" "xmark" Dismiss_operation_error
+               ])
           ()
         |> V.with_test_id (Ui.Test_id.string (scope ^ "-operation-actions")) )
   in
@@ -2889,22 +3022,10 @@ let detail_page
       |> V.Body.static
   in
   let actions_enabled = enabled && Option.is_some detail && not saving in
-  let action ~label ~icon command =
-    V.buttons_action
-      ~label
-      ~icon
-      ~on_press:
-        (Ui.Event.Handler.create (fun _ ->
-           if actions_enabled
-           then Ui.Event.Handler.Private.invoke (on_action command) Ui.Event.Payload.Unit))
-      ()
-  in
   content
   |> Journal_header.detail
-       ~actions:
-         [ action ~label:"Append" ~icon:"plus" Open_append
-         ; action ~label:"Attach file" ~icon:"paperclip" Open_asset_import
-         ]
+       ~capture_enabled:actions_enabled
+       ~on_capture:(on_action Open_append)
   |> Journal_asset_import.view
        ~key:(Ui.Key.string (scope ^ "import"))
        ~enabled:actions_enabled
@@ -4252,14 +4373,20 @@ let start
     | Worker.Response { request_id; outcome = Completed (Asset_imported result); _ } ->
       let pending = Hashtbl.find_opt import_worker_requests request_id in
       Hashtbl.remove import_worker_requests request_id;
-      (match pending with
-       | Some (_, operation, _) ->
-         (match Hashtbl.find_opt capture_staged_items operation with
-          | Some staged ->
-            Hashtbl.remove capture_staged_items operation;
-            Journal_asset_import.discard_staged_file staged
-          | None -> ())
-       | None -> ());
+      let capture_completion =
+        match pending with
+        | Some (_, operation, _) ->
+          (match Hashtbl.find_opt capture_staged_items operation with
+           | None -> Effect.ignore
+           | Some batch ->
+             Hashtbl.remove capture_staged_items operation;
+             (match result with
+              | Ok _ ->
+                discard_import_batches [ batch ];
+                Effect.ignore
+              | Error _ -> set_state (fun state -> retain_import_failure state batch)))
+        | None -> Effect.ignore
+      in
       let completion =
         let current =
           match pending with
@@ -4324,16 +4451,20 @@ let start
                        }))
               ])
       in
-      Effect.bind completion ~f:(fun () -> !drain_capture_imports ())
+      Effect.bind
+        (Effect.many [ capture_completion; completion ])
+        ~f:(fun () -> !drain_capture_imports ())
     | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
       when Hashtbl.mem import_worker_requests request_id ->
       let generation, operation, owner = Hashtbl.find import_worker_requests request_id in
       Hashtbl.remove import_worker_requests request_id;
-      (match Hashtbl.find_opt capture_staged_items operation with
-       | Some staged ->
-         Hashtbl.remove capture_staged_items operation;
-         Journal_asset_import.discard_staged_file staged
-       | None -> ());
+      let capture_completion =
+        match Hashtbl.find_opt capture_staged_items operation with
+        | None -> Effect.ignore
+        | Some batch ->
+          Hashtbl.remove capture_staged_items operation;
+          set_state (fun state -> retain_import_failure state batch)
+      in
       let completion =
         set_state (fun state ->
           if
@@ -4358,7 +4489,9 @@ let start
                 Some (operation, Some "Import was interrupted. Select the file again.")
             })
       in
-      Effect.bind completion ~f:(fun () -> !drain_capture_imports ())
+      Effect.bind
+        (Effect.many [ capture_completion; completion ])
+        ~f:(fun () -> !drain_capture_imports ())
     | Worker.Response { outcome = Completed (Asset_file _); _ } -> Effect.ignore
     | Worker.Response { outcome = Completed Client_command_completed; _ } -> Effect.ignore
     | Worker.Response { outcome = Completed (Graph_state graph_state); _ }
@@ -4794,17 +4927,31 @@ let start
           with
           | Accepted request_id ->
             Hashtbl.replace import_worker_requests request_id (generation, operation, None);
-            Hashtbl.replace capture_staged_items operation staged;
+            Hashtbl.replace
+              capture_staged_items
+              operation
+              { batch_generation = generation
+              ; batch_target = Logseq_db_types.Graph_types.Uuid.to_string target
+              ; batch_items = [ staged ]
+              };
             None
           | Full | Not_ready | Stopping ->
-            Some "Import is temporarily unavailable. Select the file again.")
+            Some
+              "Import is temporarily unavailable. Retry imports when the graph is ready.")
       in
       match failure with
       | None -> Effect.ignore
       | Some message ->
-        Journal_asset_import.discard_staged_file staged;
         Effect.bind
           (set_state (fun state ->
+             let state =
+               retain_import_failure
+                 state
+                 { batch_generation = generation
+                 ; batch_target = Logseq_db_types.Graph_types.Uuid.to_string target
+                 ; batch_items = [ staged ]
+                 }
+             in
              if state.graph_state.generation <> generation
              then state
              else
@@ -5024,6 +5171,7 @@ let start
                  { state with
                    capture_error =
                      Some (Local_capture_failure (Journal_calendar.error_message error))
+                 ; capture_error_owner = Some Timeline_composer
                  })
              | Ok calendar ->
                Journal_graph_runtime.set_calendar graph_runtime calendar;
@@ -5048,6 +5196,7 @@ let start
                     { state with
                       direct_capture = Some capture
                     ; capture_error = Some (Local_capture_failure message)
+                    ; capture_error_owner = Some Timeline_composer
                     })
                 | Ok (_, None) -> Effect.ignore
                 | Ok (capture, Some request) ->
@@ -5311,25 +5460,6 @@ let start
                  ~asset:event.asset
              | Next -> Journal_media_runtime.next media_runtime ~root:event.root)))
         ~f:(fun () -> flush_media set_state)
-    | Open_asset_import ->
-      update (fun state ->
-        if
-          state.write_enabled
-          && Option.is_none state.pending_delete
-          && Option.is_none state.pending_status
-          && Option.fold
-               ~none:false
-               ~some:(fun detail -> Journal_detail.mode detail <> Saving_child)
-               (Journal_routes.detail state.routes)
-        then
-          { state with
-            asset_import_request = state.asset_import_request + 1
-          ; asset_import_owner =
-              Option.map
-                (fun id -> id, Journal_routes.detail_request_generation state.routes)
-                (Journal_routes.active_entry_id state.routes)
-          }
-        else state)
     | Import_asset value ->
       let import_payload = value in
       if Journal_asset_import.is_dismissal import_payload
@@ -5377,7 +5507,9 @@ let start
                             (Journal_routes.active_entry_id snapshot.routes) );
                       None
                     | Full | Not_ready | Stopping ->
-                      Some "Import is temporarily unavailable. Select the file again.")))
+                      Some
+                        "Import is temporarily unavailable. Retry imports when the graph \
+                         is ready.")))
                ~f:(function
                  | None -> Effect.ignore
                  | Some message ->
@@ -5400,12 +5532,16 @@ let start
       update (fun state -> Root_navigation.step state Capture_discarded)
     | Capture_attach value ->
       update (fun state ->
-        match state.direct_capture with
-        | Some capture
+        match current_composer_owner state with
+        | Some owner
           when state.write_enabled
                && Option.is_none state.pending_delete
                && Option.is_none state.pending_status
-               && Journal_capture.can_attach capture ->
+               && (not (composer_saving state owner))
+               && Option.fold
+                    ~none:false
+                    ~some:Journal_capture.can_attach
+                    (composer_capture state owner) ->
           Root_navigation.step state (Capture_picker_requested value)
         | _ -> state)
     | Capture_asset value ->
@@ -5418,23 +5554,22 @@ let start
            else state)
        | Journal_asset_import.Unavailable message ->
          update (fun state ->
-           { state with capture_error = Some (Local_capture_failure message) })
+           set_composer_error
+             { state with capture_picker_armed = false }
+             (picker_owner state)
+             (Some (Local_capture_failure message)))
        | Journal_asset_import.Removed token ->
-         (match snapshot.direct_capture with
-          | Some capture ->
-            List.iter
-              (fun (staged : Journal_asset_import.staged) ->
-                 if String.equal (Journal_asset_import.staged_token staged) token
-                 then Journal_asset_import.discard_staged_file staged)
-              (Journal_capture.pending_attachments capture)
-          | None -> ());
          update (fun state ->
-           { state with
-             direct_capture =
-               Option.map
-                 (fun capture -> Journal_capture.remove_attachment capture ~token)
-                 state.direct_capture
-           })
+           match current_composer_owner state with
+           | Some owner when not (composer_saving state owner) ->
+             map_composer_capture state owner ~f:(fun capture ->
+               List.iter
+                 (fun staged ->
+                    if String.equal (Journal_asset_import.staged_token staged) token
+                    then Journal_asset_import.discard_staged_file staged)
+                 (Journal_capture.pending_attachments capture);
+               Journal_capture.remove_attachment capture ~token)
+           | _ -> state)
        | Journal_asset_import.Picked_batch (items, request_id, error) ->
          update (fun state ->
            Root_navigation.step state (Capture_assets_picked (items, request_id, error)))
@@ -5491,11 +5626,31 @@ let start
           && Option.is_none (operation_failure state.timeline_notice)
         then state
         else { state with modal = Error_info })
+    | Retry_capture_imports when snapshot.write_enabled ->
+      let batches = snapshot.failed_capture_imports in
+      Effect.bind
+        (update (fun state ->
+           { state with failed_capture_imports = []; timeline_notice = None }))
+        ~f:(fun () ->
+          List.iter
+            (fun batch ->
+               match Logseq_db_types.Graph_types.Uuid.of_string batch.batch_target with
+               | Error _ -> discard_import_batches [ batch ]
+               | Ok target ->
+                 List.iter
+                   (fun staged ->
+                      Queue.add
+                        (batch.batch_generation, target, staged)
+                        capture_import_queue)
+                   batch.batch_items)
+            batches;
+          !drain_capture_imports ())
     | Dismiss_operation_error ->
       update (fun state ->
         match state.timeline_notice with
         | Some (Delete_failed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
-          { state with timeline_notice = None }
+          discard_import_batches state.failed_capture_imports;
+          { state with timeline_notice = None; failed_capture_imports = [] }
         | None | Some Delete_undo -> state)
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
     | Switch_graph ->
@@ -5610,10 +5765,12 @@ let start
          (match Journal_calendar.Sampler.sample calendar_sampler with
           | Error error ->
             update (fun state ->
-              { state with
-                capture_error =
-                  Some (Local_capture_failure (Journal_calendar.error_message error))
-              })
+              set_composer_error
+                state
+                (Detail_composer
+                   ( Option.get (Journal_routes.active_entry_id state.routes)
+                   , Journal_routes.detail_request_generation state.routes ))
+                (Some (Local_capture_failure (Journal_calendar.error_message error))))
           | Ok calendar ->
             Journal_graph_runtime.set_calendar graph_runtime calendar;
             let creation_time = Journal_time.of_calendar calendar |> Result.get_ok in
@@ -5640,7 +5797,12 @@ let start
             (match admission with
              | Error message ->
                update (fun state ->
-                 { state with capture_error = Some (Local_capture_failure message) })
+                 set_composer_error
+                   state
+                   (Detail_composer
+                      ( Option.get (Journal_routes.active_entry_id state.routes)
+                      , Journal_routes.detail_request_generation state.routes ))
+                   (Some (Local_capture_failure message)))
              | Ok (_, None) -> Effect.ignore
              | Ok (detail, Some request) ->
                with_direct_request
@@ -5648,6 +5810,7 @@ let start
                    calendar = Some calendar
                  ; routes = Journal_routes.update_detail snapshot.routes detail
                  ; capture_error = None
+                 ; capture_error_owner = None
                  ; next_local_sequence = Int64.succ number
                  }
                  request))
@@ -5972,11 +6135,20 @@ let start
   in
   let equal_capture_presentation left right =
     left.direct_capture == right.direct_capture
+    && current_composer_owner left = current_composer_owner right
+    && (let owner = current_composer_owner left in
+        match owner with
+        | None -> true
+        | Some owner ->
+          composer_capture left owner == composer_capture right owner
+          && composer_saving left owner = composer_saving right owner)
     && left.modal = right.modal
     && left.graph_state.generation = right.graph_state.generation
     && left.write_enabled = right.write_enabled
     && left.capture_error == right.capture_error
+    && left.capture_error_owner = right.capture_error_owner
     && left.capture_picker_armed = right.capture_picker_armed
+    && left.capture_pick_owner = right.capture_pick_owner
     && left.capture_pick_request = right.capture_pick_request
     && left.capture_pick_source = right.capture_pick_source
     && left.import_completion = right.import_completion
@@ -6043,8 +6215,9 @@ let start
     | No_modal, No_modal -> true
     | Capture_sheet, Capture_sheet -> equal_capture_presentation left right
     | Append_sheet, Append_sheet ->
-      Journal_routes.active_entry_id left.routes
-      = Journal_routes.active_entry_id right.routes
+      equal_capture_presentation left right
+      && Journal_routes.active_entry_id left.routes
+         = Journal_routes.active_entry_id right.routes
       && Option.equal
            (fun left right ->
               Journal_detail.child_capture left == Journal_detail.child_capture right
@@ -6055,6 +6228,7 @@ let start
          = Journal_routes.detail_request_generation right.routes
       && left.write_enabled = right.write_enabled
       && left.capture_error == right.capture_error
+      && left.capture_error_owner = right.capture_error_owner
     | _ -> left == right
   in
   let equal_shell_presentation left right =
@@ -6085,10 +6259,33 @@ let start
       && Option.is_none state.pending_delete
       && Option.is_none state.pending_status
     in
-    let capture_assets state ~camera =
+    let capture_assets ?owner state ~camera =
+      let owner =
+        Option.value
+          owner
+          ~default:
+            (Option.value (current_composer_owner state) ~default:(picker_owner state))
+      in
+      let on_event payload =
+        match Journal_asset_import.decode_event payload with
+        | Ok event -> dispatch.send (Capture_asset event)
+        | Error _ -> ()
+      in
+      let dispatch =
+        match owner with
+        | Timeline_composer -> dispatch
+        | Detail_composer _ ->
+          let scope = Detail_outline.scope state.routes in
+          { dispatch with
+            send = (fun action -> dispatch.send (Detail_action (scope, action)))
+          }
+      in
       { request =
           Journal_asset_import.staged_request
-            ~id:(if state.capture_picker_armed then state.capture_pick_request else 0)
+            ~id:
+              (if state.capture_picker_armed && state.capture_pick_owner = Some owner
+               then state.capture_pick_request
+               else 0)
             ~source:state.capture_pick_source
             ~max_selections:
               (Journal_capture.attachment_limit
@@ -6096,20 +6293,56 @@ let start
                    ~none:0
                    ~some:(fun capture ->
                      List.length (Journal_capture.pending_attachments capture))
-                   state.direct_capture)
+                   (composer_capture state owner))
             ()
       ; camera
       ; completion = state.import_completion
       ; on_attach = (fun source -> dispatch.send (Capture_attach source))
-      ; on_event =
-          (fun payload ->
-            match Journal_asset_import.decode_event payload with
-            | Ok event -> dispatch.send (Capture_asset event)
-            | Error _ -> ())
+      ; on_event
       ; on_remove =
           (fun token ->
             dispatch.send (Capture_asset (Journal_asset_import.Removed token)))
       }
+    in
+    let append_composer state ~render =
+      Option.bind (Journal_routes.detail state.routes) (fun detail ->
+        Option.map
+          (fun capture ->
+             render
+               ~scope:"journal-append"
+               ~placeholder:"Append a block"
+               ~capture
+               ~saving:(Journal_detail.mode detail = Journal_detail.Saving_child)
+               ~enabled:state.write_enabled
+               ~on_edit:dispatch
+               ~on_toggle:
+                 (Ui.Event.Handler.create (function
+                    | Ui.Event.Payload.Bool selected
+                      when selected
+                           <> (Journal_capture.task_state capture = Journal_model.Todo) ->
+                      dispatch.send
+                        (Detail_action
+                           ( Detail_outline.scope state.routes
+                           , Detail_task_intent (Journal_capture.source capture) ))
+                    | _ -> ()))
+               ~on_save:
+                 (bind_action
+                    dispatch
+                    (Detail_action
+                       ( Detail_outline.scope state.routes
+                       , match Journal_detail.mode detail with
+                         | Failed _ -> Detail_retry
+                         | _ -> Detail_submit (Journal_capture.source capture) )))
+               ~error:
+                 (match Journal_detail.mode detail with
+                  | Failed message -> Some message
+                  | _ ->
+                    Option.map
+                      capture_failure_message
+                      (Option.bind (current_composer_owner state) (composer_error state)))
+               ~assets:
+                 (Some (capture_assets state ~camera:(state.environment.platform = "ios"))))
+          (Journal_detail.child_capture detail))
     in
     let floating_capture state =
       (* On iOS the capture composer expands directly into the bottom bar
@@ -6138,7 +6371,7 @@ let start
                         | _ -> ()))
                    ~on_save:(bind_action dispatch Capture_submit)
                    ~error:
-                     (match state.capture_error with
+                     (match composer_error state Timeline_composer with
                       | Some failure -> Some (capture_failure_message failure)
                       | None ->
                         (match Journal_capture.phase capture with
@@ -6147,14 +6380,19 @@ let start
                    ~assets:(Some (capture_assets state ~camera:true))
                ])
           state.direct_capture
+      | Append_sheet when state.environment.platform = "ios" ->
+        append_composer state ~render:composer_content
       | _ -> None
     in
     let floating_capture =
       region "capture" ~equal:equal_capture_presentation (fun current ->
-        if current.environment.platform = "ios" && current.modal = Capture_sheet
+        if
+          current.environment.platform = "ios"
+          && (current.modal = Capture_sheet || current.modal = Append_sheet)
         then
           V.stack
             [ V.tap_area ~on_press:(bind_action dispatch Close_composer) ()
+              |> V.with_test_id (Ui.Test_id.string "journal-composer-dismiss")
             ; V.column
                 ~spacing:0.
                 [ V.spacer ()
@@ -6249,15 +6487,24 @@ let start
     in
     let capture_adapter =
       region "capture-import" ~equal:equal_capture_presentation (fun current ->
-        match current.direct_capture with
+        let owner =
+          if current.capture_picker_armed
+          then picker_owner current
+          else
+            Option.value (current_composer_owner current) ~default:(picker_owner current)
+        in
+        match composer_capture current owner with
         | None -> V.empty ()
         | Some capture ->
           let assets =
-            capture_assets current ~camera:(current.environment.platform = "ios")
+            capture_assets ~owner current ~camera:(current.environment.platform = "ios")
           in
           Journal_asset_import.view
             ~key:(Ui.Key.string "journal-capture-asset-import")
-            ~enabled:(current.write_enabled && Journal_capture.can_attach capture)
+            ~enabled:
+              (current.write_enabled
+               && (not (composer_saving current owner))
+               && Journal_capture.can_attach capture)
             ~completion:assets.completion
             ~request:assets.request
             ~pending:(Journal_capture.pending_attachments capture)
@@ -6398,7 +6645,7 @@ let start
                  ~on_save:(bind_action dispatch Capture_submit)
                  ~on_close:(bind_action dispatch Close_composer)
                  ~error:
-                   (match state.capture_error with
+                   (match composer_error state Timeline_composer with
                     | Some failure -> Some (capture_failure_message failure)
                     | None ->
                       (match Journal_capture.phase capture with
@@ -6409,42 +6656,9 @@ let start
                       (capture_assets state ~camera:(state.environment.platform = "ios"))))
             state.direct_capture
       | Append_sheet ->
-        Option.bind (Journal_routes.detail state.routes) (fun detail ->
-          Option.map
-            (fun capture ->
-               composer_page
-                 ~scope:"journal-append"
-                 ~placeholder:"Append a block"
-                 ~saving:(Journal_detail.mode detail = Journal_detail.Saving_child)
-                 ~capture
-                 ~enabled:state.write_enabled
-                 ~on_edit:dispatch
-                 ~on_toggle:
-                   (Ui.Event.Handler.create (function
-                      | Ui.Event.Payload.Bool selected
-                        when selected
-                             <> (Journal_capture.task_state capture = Journal_model.Todo)
-                        ->
-                        dispatch.send
-                          (Detail_action
-                             ( Detail_outline.scope state.routes
-                             , Detail_task_intent (Journal_capture.source capture) ))
-                      | _ -> ()))
-                 ~on_save:
-                   (bind_action
-                      dispatch
-                      (Detail_action
-                         ( Detail_outline.scope state.routes
-                         , match Journal_detail.mode detail with
-                           | Failed _ -> Detail_retry
-                           | _ -> Detail_submit (Journal_capture.source capture) )))
-                 ~on_close:(bind_action dispatch Close_composer)
-                 ~assets:None
-                 ~error:
-                   (match Journal_detail.mode detail with
-                    | Failed message -> Some message
-                    | _ -> Option.map capture_failure_message state.capture_error))
-            (Journal_detail.child_capture detail))
+        append_composer
+          state
+          ~render:(composer_page ~on_close:(bind_action dispatch Close_composer))
       | Status_sheet block_id ->
         Option.map
           (fun block -> status_sheet_page ~tokens ~block dispatch)
@@ -6478,7 +6692,9 @@ let start
     let modal =
       region "modal" ~equal:equal_modal_presentation (fun current ->
         let content =
-          if current.modal = Capture_sheet && current.environment.platform = "ios"
+          if
+            (current.modal = Capture_sheet || current.modal = Append_sheet)
+            && current.environment.platform = "ios"
           then None
           else modal current
         in
@@ -6511,7 +6727,9 @@ let start
     let feedback =
       region
         "feedback"
-        ~equal:(fun left right -> left.timeline_notice = right.timeline_notice)
+        ~equal:(fun left right ->
+          left.timeline_notice = right.timeline_notice
+          && left.failed_capture_imports == right.failed_capture_imports)
         (fun current ->
            if current.timeline_notice = None
            then V.empty ()
@@ -6619,9 +6837,7 @@ let start
       (fun (_, _, staged) -> Journal_asset_import.discard_staged_file staged)
       capture_import_queue;
     Queue.clear capture_import_queue;
-    Hashtbl.iter
-      (fun _ staged -> Journal_asset_import.discard_staged_file staged)
-      capture_staged_items;
+    Hashtbl.iter (fun _ batch -> discard_import_batches [ batch ]) capture_staged_items;
     Hashtbl.clear capture_staged_items
   in
   let context =
@@ -6844,7 +7060,6 @@ module For_testing = struct
   let detail_page ~routes ~write_enabled on_action =
     let send = function
       | Detail_action (_, Open_append) -> on_action Append
-      | Detail_action (_, Open_asset_import) -> on_action Attach_file
       | Detail_action (_, Detail_open id) -> on_action (Open_block id)
       | Detail_action (_, Detail_delete id) -> on_action (Delete_block id)
       | Detail_action (_, Detail_expand id) -> on_action (Set_expanded (id, true))
