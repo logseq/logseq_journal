@@ -210,7 +210,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
           #if os(iOS)
           .toolbar(.visible, for: .navigationBar)
           .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { child(1) }
+            ToolbarItem(placement: .topBarTrailing) {
+              child(1).menuStyle(.button).buttonStyle(.plain)
+            }
           }
           #else
           .toolbar { ToolbarItem { child(1) } }
