@@ -6548,17 +6548,10 @@ let start
           left.timeline_notice = right.timeline_notice
           && left.failed_capture_imports == right.failed_capture_imports)
         (fun current ->
-           if current.timeline_notice = None
-           then V.empty ()
-           else
-             operation_feedback
-               ~scope:"root"
-               ~state:current
-               dispatch
-               (* The root feedback is a sibling of retained root content.
-                  A native flexible column gives its inset a full-page host;
-                  an empty Stack collapses instead of owning the bottom edge. *)
-               (V.Body.static (V.column ~spacing:0. [ V.spacer () ])))
+           (* Keep the same inset/body owner while its visibility changes.
+              Wrapping retained root content lets native safe-area layout
+              reserve room for Capture and navigation above the feedback. *)
+           operation_feedback ~scope:"root" ~state:current dispatch (V.Body.static root))
     in
     let navigator =
       V.of_lui (fun context parent ->
@@ -6585,8 +6578,7 @@ let start
           ~root:
             (* Keep feedback in the root native page so a pushed destination
                covers it together with the retained Timeline/Favorites. *)
-            (Lui_elements.column ~grow:1.0
-               [ Journal_view.mount (V.stack [ root; feedback ]) ])
+            (Lui_elements.column ~grow:1.0 [ Journal_view.mount feedback ])
           ~destination:(fun entry ->
             let initial =
               Option.value

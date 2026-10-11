@@ -1335,6 +1335,7 @@ let run_favorites_native_visibility
               hooks.extension_event nav "path-changed" (payload ()) |> consume;
               hooks.extension_event nav "settled" (payload ()) |> consume
             in
+            let original_root_content = Option.get (find "text" "Timeline fixture 1") in
             enter 0;
             Alcotest.(check bool)
               "old Append toolbar action is removed"
@@ -1566,15 +1567,13 @@ let run_favorites_native_visibility
                        (Hashtbl.find_opt parents id)
                 in
                 Alcotest.(check bool)
-                  "empty root feedback body fills its native page"
+                  "root feedback reserves space for the retained page content"
                   true
-                  (Hashtbl.fold
-                     (fun id values found ->
-                        found
-                        || (List.assoc_opt "_kind" values = Some (`String "spacer")
-                            && inside_body id))
-                     props
-                     false);
+                  (inside_body (Option.get (find "text" "Timeline fixture 1")));
+                Alcotest.(check int)
+                  "showing feedback preserves the original root content node"
+                  original_root_content
+                  (Option.get (find "text" "Timeline fixture 1"));
                 Alcotest.(check bool)
                   "failed import keeps its own staged file"
                   true
