@@ -3580,6 +3580,78 @@ let test_initial_staging_refresh_and_delete () =
              && R.initial_load !current = None
              && List.length (ids !current) = 129)
             "refresh resets attempts or charges unchanged root" )
+    ; ( "attempt-cap root Undo publishes immediately without refunding budgets"
+      , fun () ->
+          let run routes generation expected_draft =
+            let branches = children 128 (id 0) 100 in
+            let leaf = node ~parent:(id 100) 500 in
+            let pending, _, _ = admit (start ~routes ~generation branches) in
+            let current = ref (refresh pending (List.hd branches) [ leaf ]) in
+            let pending, _, _ = admit !current in
+            current := refresh pending leaf [];
+            for number = 101 to 225 do
+              let pending, parent, _ = admit !current in
+              require_string (id number) parent "spent initial attempt";
+              current := refresh pending (List.nth branches (number - 100)) []
+            done;
+            let pending, parent, old = admit !current in
+            require_string (id 226) parent "128th pending initial read";
+            let missing, undo = R.stage_delete pending ~block_id:(id 0) in
+            let restored = R.undo_delete missing (Option.get undo) in
+            require
+              (R.route restored = Detail && Option.is_some (R.detail restored))
+              "attempt-exhausted Undo leaves ready data in Loading";
+            require
+              (List.length (ids restored) = 130
+               && R.initial_load restored = None
+               && R.load_initial restored = (restored, []))
+              "Undo resets budgets or loses bounded rows";
+            require
+              (R.apply_detail_response
+                 restored
+                 ~request_generation:old
+                 (page (List.nth branches 126) [])
+               == restored)
+              "exhausted Undo accepts cancelled read";
+            let timed =
+              R.observe_loading_delay
+                restored
+                ~entry_id:(entry_id restored)
+                ~request_generation:generation
+                ~elapsed:0.1
+            in
+            require
+              (timed == restored && not (R.loading_indicator timed))
+              "Undo hangs after 100ms";
+            let outline = observe_outline (Option.get (R.detail restored)) in
+            require (D.next_automatic_load outline = None) "Undo refunds spent attempts";
+            require
+              (List.length (snd (D.step outline (Load_more (id 227)))) = 1)
+              "attempt-cap Undo loses explicit continuation";
+            require
+              (Option.map Journal_capture.source (D.child_capture outline)
+               = expected_draft)
+              "attempt-cap settlement loses the exact retained draft"
+          in
+          let failures = ref [] in
+          let check name test =
+            try test () with
+            | error ->
+              Printf.eprintf "ATTEMPT_CAP_RED %s: %s\n%!" name (Printexc.to_string error);
+              failures := name :: !failures
+          in
+          check "without draft" (fun () -> run (R.create ()) 500L None);
+          check "retained draft" (fun () ->
+            let prior = start [] in
+            let edited =
+              D.update_child_source (Option.get (R.detail prior)) "Ready-at-cap draft"
+            in
+            let detached = R.back (R.update_detail prior edited) in
+            run detached 800L (Some "Ready-at-cap draft"));
+          require
+            (!failures = [])
+            "Attempt-cap Undo variants: %s"
+            (String.concat ", " !failures) )
     ; ( "root deletion fences pending completion and Undo uses fresh generation"
       , fun () ->
           let pending, _, old = admit (start [ child ]) in

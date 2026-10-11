@@ -798,13 +798,15 @@ let undo_delete t staged =
               match before with
               | Detail_loading_view _ -> owner.block_id = deleted_id
               | _ -> true ->
-         { t with
-           owners = Owners.add entry_id before t.owners
-         ; drafts =
-             (match before with
-              | Detail_loading_view _ -> t.drafts
-              | _ -> Drafts.remove entry_id t.drafts)
-         }
+         settle_initial
+           { t with
+             owners = Owners.add entry_id before t.owners
+           ; drafts =
+               (match before with
+                | Detail_loading_view _ -> t.drafts
+                | _ -> Drafts.remove entry_id t.drafts)
+           }
+           ~entry_id
        | _ -> t)
     t
     staged
