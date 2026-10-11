@@ -96,6 +96,14 @@ val admit_child
 
 val apply_block : t -> Journal_model.t -> t
 val reconcile_children : t -> Journal_graph_projection.detail -> t
+
+(** Charge newly materialized shared updates to the still-hidden initial owner.
+    Existing nodes are not charged twice; consumed counters never decrease. *)
+val account_initial_update : previous:t -> t -> t
+
+(** Fence cancelled initial completions without refunding budgets or reusing
+    their generations. Restored branches can admit fresh bounded reads. *)
+val cancel_initial_reads : t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
 val stage_delete : t -> block_id:string -> (t * staged_delete) option
 val undo_delete : t -> staged_delete -> t

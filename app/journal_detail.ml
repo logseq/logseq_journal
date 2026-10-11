@@ -667,6 +667,43 @@ let reconcile_children (t : t) (detail : Journal_graph_projection.detail) =
       })
 ;;
 
+let cancel_initial_reads (t : t) =
+  if not (Blocks.exists (fun _ (branch : branch) -> branch.pending <> None) t.branches)
+  then t
+  else
+    invalidate_rows
+      { t with
+        branches =
+          Blocks.map (fun (branch : branch) -> { branch with pending = None }) t.branches
+      }
+;;
+
+let account_initial_update ~(previous : t) (t : t) =
+  let added =
+    if previous.blocks == t.blocks
+    then 0
+    else
+      Blocks.fold
+        (fun id _ count -> if Blocks.mem id previous.blocks then count else count + 1)
+        t.blocks
+        0
+  in
+  let materialized_blocks =
+    max t.materialized_blocks (previous.materialized_blocks + added)
+  in
+  let automatic_reads = max t.automatic_reads previous.automatic_reads in
+  let t =
+    if materialized_blocks = t.materialized_blocks && automatic_reads = t.automatic_reads
+    then t
+    else { t with materialized_blocks; automatic_reads }
+  in
+  (* A shared update can consume a page already reserved by another branch.
+     Keep the spent attempt and expose explicit continuation instead. *)
+  if t.materialized_blocks + page_limit > maximum_materialized_blocks
+  then cancel_initial_reads t
+  else t
+;;
+
 let apply_child_created (t : t) ~child ~parent =
   if matching_child t.pending ~root_id:t.root_id ~child ~parent
   then (

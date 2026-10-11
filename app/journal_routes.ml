@@ -39,6 +39,7 @@ type view =
   | Missing_detail_view of
       { block_id : string
       ; request_generation : int64
+      ; draft_owner : string option
       }
 
 type detached =
@@ -475,9 +476,10 @@ let map_details t ~f =
   Owners.fold
     (fun entry_id view t ->
        match view with
-       | Detail_view { detail; _ }
+       | Detail_view { detail; _ } -> update_detail_at t ~entry_id (f detail)
        | Detail_loading_view { staged_detail = Some detail; _ } ->
-         update_detail_at t ~entry_id (f detail)
+         let next = Journal_detail.account_initial_update ~previous:detail (f detail) in
+         update_detail_at t ~entry_id next
        | _ -> t)
     t.owners
     t
@@ -531,7 +533,8 @@ let apply_detail_failure
               && (block_id = None || block_id = Some loading.block_id) ->
          let view =
            if missing
-           then Missing_detail_view { block_id = loading.block_id; request_generation }
+           then Missing_detail_view { block_id = loading.block_id; request_generation
+             ; draft_owner = loading.draft_owner }
            else
              Failed_detail_view
                { block_id = loading.block_id; request_generation; message
@@ -656,6 +659,7 @@ let retry_detail_at t ~entry_id ~request_generation =
         match view with
         | Detail_loading_view loading -> loading.draft_owner
         | Failed_detail_view failed -> failed.draft_owner
+        | Missing_detail_view missing -> missing.draft_owner
         | _ -> None)
     in
     ( { t with
@@ -732,11 +736,38 @@ let stage_delete t ~block_id =
                   Missing_detail_view
                     { block_id = owner.block_id
                     ; request_generation = owner.request_generation
+                    ; draft_owner =
+                        (if Drafts.mem entry_id t.drafts then Some entry_id else None)
                     }
                 else Detail_view { owner with detail = hidden }
               in
               ( { t with owners = Owners.add entry_id next t.owners }
               , (entry_id, owner.request_generation, view, undo) :: staged ))
+         | Detail_loading_view ({ staged_detail = Some detail; _ } as owner) ->
+           let cancelled = Journal_detail.cancel_initial_reads detail in
+           (match Journal_detail.stage_delete cancelled ~block_id with
+            | None -> t, staged
+            | Some (hidden, undo) ->
+              let before =
+                Detail_loading_view { owner with staged_detail = Some cancelled }
+              in
+              let next =
+                if Journal_model.id (Journal_detail.root detail) = block_id
+                then
+                  { t with
+                    owners =
+                      Owners.add
+                        entry_id
+                        (Missing_detail_view
+                           { block_id = owner.block_id
+                           ; request_generation = owner.request_generation
+                           ; draft_owner = owner.draft_owner
+                           })
+                        t.owners
+                  }
+                else update_detail_at t ~entry_id hidden
+              in
+              next, (entry_id, owner.request_generation, before, undo) :: staged)
          | _ -> t, staged)
       t.owners
       (t, [])
@@ -748,7 +779,8 @@ let undo_delete t staged =
   List.fold_left
     (fun t (entry_id, generation, before, undo) ->
        match Owners.find_opt entry_id t.owners with
-       | Some (Detail_view { detail; _ }) as current
+       | ( Some (Detail_view { detail; _ })
+         | Some (Detail_loading_view { staged_detail = Some detail; _ }) ) as current
          when Option.fold
                 ~none:false
                 ~some:(fun view -> view_generation view = generation)
@@ -757,7 +789,10 @@ let undo_delete t staged =
        | Some (Missing_detail_view owner) when owner.request_generation = generation ->
          { t with
            owners = Owners.add entry_id before t.owners
-         ; drafts = Drafts.remove entry_id t.drafts
+         ; drafts =
+             (match before with
+              | Detail_loading_view _ -> t.drafts
+              | _ -> Drafts.remove entry_id t.drafts)
          }
        | _ -> t)
     t
