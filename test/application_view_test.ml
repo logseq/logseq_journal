@@ -3020,7 +3020,7 @@ let run_favorites_native_visibility
            publish (Ready "fixture-ready");
            wait "Ready enters real Acquire before completion" (fun () ->
              Atomic.get acquire_entered >= 1
-             && List.length (all "text" "Opening file") = shown_count);
+             && List.length (all "text" "Loading") = shown_count);
            settle ();
            record "ready";
            check_media_counts "Ready" shown_count;

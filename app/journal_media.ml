@@ -212,7 +212,7 @@ let status = function
   | Waiting_remote -> Placeholder "Waiting for upload"
   | Waiting_network -> Placeholder "Available when online"
   | Waiting_unlock -> Placeholder "Unlock graph to view file"
-  | Ready _ -> Placeholder "Opening file"
+  | Ready _ -> Placeholder "Loading"
   | Failed { failure; _ } ->
     Failed
       (match failure with
@@ -287,7 +287,7 @@ let step t = function
               ; available = Some (scope, handle)
               ; lease = None
               ; serial = ticket.id
-              ; status = Placeholder "Opening file"
+              ; status = Placeholder "Loading"
               }
             , release_file t @ [ Acquire ticket ] ))
         | _, _ ->
@@ -329,7 +329,7 @@ let step t = function
               pending = Some ticket
             ; lease = None
             ; serial = ticket.id
-            ; status = Placeholder "Opening file"
+            ; status = Placeholder "Loading"
             }
           , release_file t @ [ Acquire ticket ] )
         | None ->

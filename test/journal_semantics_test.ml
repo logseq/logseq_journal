@@ -1449,7 +1449,7 @@ let check_stable_image_slots ~entry ~images ~width ~height =
          ignore (Lui_app.flush app);
          check ())
       [ views (Placeholder "Waiting for file") 1
-      ; views (Placeholder "Opening file") (List.length images)
+      ; views (Placeholder "Loading") (List.length images)
       ; views (File "/tmp/synthetic-first.png") 1
       ; views (File "/tmp/synthetic-first.png") (List.length images)
       ; views Hidden (List.length images)
@@ -1682,7 +1682,7 @@ let test_reactive_child_gallery_routes_and_preserves_siblings () =
               (node PathValue "/tmp/synthetic-second.jpg" = sibling)
               "availability replaced the sibling image")
          [ Journal_media.Hidden
-         ; Placeholder "Opening file"
+         ; Placeholder "Loading"
          ; File "/tmp/reactive-child.png"
          ];
        assert_event (asset_id first) first.token;
@@ -1804,13 +1804,13 @@ let test_reactive_nonimage_structure_and_presentation () =
          "structure removal retained old chrome";
        update
          (Some
-            (media_state [ { rebound with presentation = Placeholder "Opening file" } ]));
+            (media_state [ { rebound with presentation = Placeholder "Loading" } ]));
        require
-         (current_text (ops ()) "Opening file")
+         (current_text (ops ()) "Loading")
          "replacement token did not get a fresh item subscription";
        update None;
        require
-         ((not (current_text (ops ()) "Opening file"))
+         ((not (current_text (ops ()) "Loading"))
           && not (current_text (ops ()) "Retry"))
          "empty structure kept an attachment item";
        require
