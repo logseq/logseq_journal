@@ -12,9 +12,30 @@ type branch =
   ; appended : string list
   ; continuation : Journal_graph_projection.block_cursor option
   ; loaded : bool
-  ; expanded : bool
   ; pending : (int64 * Journal_graph_projection.block_cursor option) option
   ; error : string option
+  }
+
+type row =
+  | Block of
+      { block : Journal_model.t
+      ; depth : int
+      }
+  | More of
+      { parent_id : string
+      ; depth : int
+      ; loading : bool
+      ; enabled : bool
+      ; error : string option
+      }
+
+type row_snapshot =
+  { snapshot_blocks : Journal_model.t Blocks.t
+  ; snapshot_branches : branch Blocks.t
+  ; snapshot_session : int64
+  ; values : row list
+  ; indexed : row array
+  ; reading : bool
   }
 
 type t =
@@ -23,6 +44,10 @@ type t =
   ; branches : branch Blocks.t
   ; session_number : int64
   ; next_request : int64
+  ; automatic_reads : int
+  ; materialized_blocks : int
+  ; visible_range : (int64 * int64) option
+  ; row_snapshot : row_snapshot option ref
   ; mode : mode
   ; pending : Journal_graph_request.t option
   ; child_capture : Journal_capture.t option
@@ -39,22 +64,9 @@ type staged_delete =
   ; was_appended : bool
   }
 
-type row =
-  | Block of
-      { block : Journal_model.t
-      ; depth : int
-      ; expanded : bool
-      ; leaf : bool
-      }
-  | More of
-      { parent_id : string
-      ; depth : int
-      ; loading : bool
-      ; error : string option
-      }
-
 type event =
-  | Set_branch_expanded of string * bool
+  | Observe_visible_range of int64 * int64
+  | Load_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -66,6 +78,8 @@ type retained_composer =
   ; draft_mode : mode
   ; draft_pending : Journal_graph_request.t option
   }
+
+let invalidate_rows (t : t) = { t with row_snapshot = ref None }
 
 let equal_presentation (left : t) (right : t) =
   left == right
@@ -112,13 +126,14 @@ let restore_composer (t : t) draft =
     let capture =
       Journal_capture.rebind draft.draft_capture ~session_number:t.session_number
     in
-    { t with
-      child_capture = Some capture
-    ; session_number =
-        ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture)
-    ; mode = draft.draft_mode
-    ; pending = draft.draft_pending
-    })
+    invalidate_rows
+      { t with
+        child_capture = Some capture
+      ; session_number =
+          ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture)
+      ; mode = draft.draft_mode
+      ; pending = draft.draft_pending
+      })
 ;;
 
 let complete_retained_composer draft ~child ~parent =
@@ -147,7 +162,6 @@ let empty_branch =
   ; appended = []
   ; continuation = None
   ; loaded = false
-  ; expanded = false
   ; pending = None
   ; error = None
   }
@@ -173,10 +187,13 @@ let create ~session_number (detail : Journal_graph_projection.detail) =
           children = List.map Journal_model.id detail.children.blocks
         ; continuation = detail.children.continuation
         ; loaded = true
-        ; expanded = true
         }
   ; session_number
   ; next_request = Int64.mul session_number 1_000_000L
+  ; automatic_reads = 0
+  ; materialized_blocks = 1 + List.length detail.children.blocks
+  ; visible_range = None
+  ; row_snapshot = ref None
   ; mode = Reading
   ; pending = None
   ; child_capture = None
@@ -248,58 +265,170 @@ let map_retained_capture draft ~f =
       { draft with draft_capture = capture; draft_mode = Reading; draft_pending = None })
 ;;
 
-let expanded (t : t) ~block_id = (branch t block_id).expanded
 let continuation (t : t) ~parent_id = (branch t parent_id).continuation
 let request_back _ = `Close
 
-let load (t : t) id =
-  match Blocks.find_opt id t.blocks with
-  | None -> t, []
-  | Some _ ->
+(* Root is level one; typography independently caps at three levels. *)
+let maximum_depth = 9
+let maximum_automatic_reads = 128
+let page_limit = 128
+let maximum_materialized_blocks = 384
+
+(* Zero descendant count is unknown until a branch returns its own page. *)
+let needs_children current = not current.loaded
+
+(* The snapshot belongs to this outline owner. Structural transitions allocate
+   a fresh cell; draft/range/budget changes share the existing pure snapshot. *)
+let snapshot (t : t) =
+  match !(t.row_snapshot) with
+  | Some cached
+    when cached.snapshot_blocks == t.blocks
+         && cached.snapshot_branches == t.branches
+         && cached.snapshot_session = t.session_number -> cached
+  | _ ->
+    let reading =
+      Blocks.exists (fun _ (branch : branch) -> branch.pending <> None) t.branches
+    in
+    let rec visit ancestors depth id rows =
+      if depth > maximum_depth || List.mem id ancestors
+      then rows
+      else (
+        match Blocks.find_opt id t.blocks with
+        | None -> rows
+        | Some block ->
+          let current = branch t id in
+          let rows = Block { block; depth } :: rows in
+          if depth = maximum_depth
+          then rows
+          else (
+            let rows =
+              List.fold_left
+                (fun rows child -> visit (id :: ancestors) (depth + 1) child rows)
+                rows
+                current.children
+            in
+            if
+              needs_children current
+              || current.error <> None
+              || current.continuation <> None
+            then
+              More
+                { parent_id = id
+                ; depth = depth + 1
+                ; loading = current.pending <> None
+                ; enabled = not reading
+                ; error = current.error
+                }
+              :: rows
+            else rows))
+    in
+    let values = List.rev (visit [] 0 t.root_id []) in
+    let cached =
+      { snapshot_blocks = t.blocks
+      ; snapshot_branches = t.branches
+      ; snapshot_session = t.session_number
+      ; values
+      ; indexed = Array.of_list values
+      ; reading
+      }
+    in
+    t.row_snapshot := Some cached;
+    cached
+;;
+
+let rows (t : t) = (snapshot t).values
+let read_pending (t : t) = (snapshot t).reading
+
+let next_automatic_load (t : t) =
+  if
+    t.automatic_reads >= maximum_automatic_reads
+    || t.materialized_blocks + page_limit > maximum_materialized_blocks
+  then None
+  else (
+    match t.visible_range with
+    | None -> None
+    | Some (first, last) ->
+      let current_rows = snapshot t in
+      if current_rows.reading
+      then None
+      else (
+        let bounded index =
+          Int64.to_int
+            (Int64.min (Int64.of_int (Array.length current_rows.indexed)) index)
+        in
+        let last = bounded last in
+        let rec find index =
+          if index >= last
+          then None
+          else (
+            let id, depth =
+              match current_rows.indexed.(index) with
+              | Block { block; depth } -> Journal_model.id block, depth
+              | More { parent_id; depth; _ } -> parent_id, depth - 1
+            in
+            let current = branch t id in
+            if depth < maximum_depth && needs_children current && current.error = None
+            then Some id
+            else find (index + 1))
+        in
+        find (bounded first)))
+;;
+
+let load ?(automatic = false) (t : t) id =
+  if
+    read_pending t
+    || ((not automatic)
+        && not
+             (List.exists
+                (function
+                  | More { parent_id; _ } -> parent_id = id
+                  | Block _ -> false)
+                (rows t)))
+  then t, []
+  else (
     let current = branch t id in
-    if
-      Option.is_some current.pending
-      || (current.loaded && current.continuation = None && current.error = None)
-    then t, []
-    else (
-      let generation = t.next_request in
-      let request =
-        Journal_graph_request.Load_detail
-          { block_id = id
-          ; after = current.continuation
-          ; limit = 128
-          ; request_generation = generation
-          }
-      in
-      ( { t with
+    let generation = t.next_request in
+    let request =
+      Journal_graph_request.Load_detail
+        { block_id = id
+        ; after = current.continuation
+        ; limit = page_limit
+        ; request_generation = generation
+        }
+    in
+    ( invalidate_rows
+        { t with
           next_request = Int64.succ generation
         ; branches =
             Blocks.add
               id
               { current with
-                expanded = true
-              ; pending = Some (generation, current.continuation)
+                pending = Some (generation, current.continuation)
               ; error = None
               }
               t.branches
         }
-      , [ request ] ))
+    , [ request ] ))
 ;;
 
 let step (t : t) = function
+  | Observe_visible_range (first, last) ->
+    let first = Int64.max 0L first in
+    let range = Some (first, Int64.max first last) in
+    (if range = t.visible_range then t else { t with visible_range = range }), []
   | Append_failed (block_id, message) ->
     (if pending_child t.pending block_id then { t with mode = Failed message } else t), []
-  | Set_branch_expanded (id, expanded) ->
-    if not (Blocks.mem id t.blocks)
-    then t, []
-    else (
-      let current = branch t id in
-      if current.expanded = expanded
-      then t, []
-      else if (not expanded) || current.loaded || current.pending <> None
-      then { t with branches = Blocks.add id { current with expanded } t.branches }, []
-      else load t id)
-  | Load_more id -> load t id
+  | Load_next ->
+    (match next_automatic_load t with
+     | None -> t, []
+     | Some id ->
+       load ~automatic:true { t with automatic_reads = t.automatic_reads + 1 } id)
+  | Load_more id ->
+    let next, requests = load t id in
+    ( (if requests = []
+       then next
+       else { next with automatic_reads = 0; materialized_blocks = 0 })
+    , requests )
   | Loaded (generation, detail) ->
     let id = Journal_model.id detail.Journal_graph_projection.root in
     let current = branch t id in
@@ -341,68 +470,42 @@ let step (t : t) = function
              (max (List.length children) (Journal_model.child_count detail.root))
          |> Result.get_ok
        in
-       ( { t with
-           blocks = Blocks.add id root blocks
-         ; branches = Blocks.add id next t.branches
-         }
+       ( invalidate_rows
+           { t with
+             materialized_blocks =
+               t.materialized_blocks + List.length detail.children.blocks
+           ; blocks = Blocks.add id root blocks
+           ; branches = Blocks.add id next t.branches
+           }
        , [] )
      | _ -> t, [])
   | Load_failed (generation, stale_cursor, message) ->
-    let branches =
-      Blocks.map
-        (fun (current : branch) ->
+    let matches =
+      Blocks.exists
+        (fun _ (current : branch) ->
            match current.pending with
-           | Some (expected, _) when generation = expected ->
-             { current with
-               pending = None
-             ; error = Some message
-             ; continuation = (if stale_cursor then None else current.continuation)
-             ; loaded = current.loaded && not stale_cursor
-             }
-           | _ -> current)
+           | Some (expected, _) -> expected = generation
+           | None -> false)
         t.branches
     in
-    { t with branches }, []
-;;
-
-let rows (t : t) =
-  let rec visit seen depth id =
-    if List.mem id seen
-    then []
+    if not matches
+    then t, []
     else (
-      match Blocks.find_opt id t.blocks with
-      | None -> []
-      | Some block ->
-        let current = branch t id in
-        let leaf =
-          current.loaded && current.children = [] && current.continuation = None
-        in
-        let row = Block { block; depth; expanded = current.expanded; leaf } in
-        if not current.expanded
-        then [ row ]
-        else (
-          let children =
-            List.concat_map (visit (id :: seen) (depth + 1)) current.children
-          in
-          let more =
-            if
-              (not current.loaded)
-              || current.pending <> None
-              || current.error <> None
-              || current.continuation <> None
-            then
-              [ More
-                  { parent_id = id
-                  ; depth = depth + 1
-                  ; loading = current.pending <> None
-                  ; error = current.error
-                  }
-              ]
-            else []
-          in
-          row :: (children @ more)))
-  in
-  visit [] 0 t.root_id
+      let branches =
+        Blocks.map
+          (fun (current : branch) ->
+             match current.pending with
+             | Some (expected, _) when generation = expected ->
+               { current with
+                 pending = None
+               ; error = Some message
+               ; continuation = (if stale_cursor then None else current.continuation)
+               ; loaded = current.loaded && not stale_cursor
+               }
+             | _ -> current)
+          t.branches
+      in
+      invalidate_rows { t with branches }, [])
 ;;
 
 let row_key = function
@@ -488,7 +591,9 @@ let retry (t : t) =
 
 let apply_block (t : t) block =
   let id = Journal_model.id block in
-  if Blocks.mem id t.blocks then { t with blocks = Blocks.add id block t.blocks } else t
+  if Blocks.mem id t.blocks
+  then invalidate_rows { t with blocks = Blocks.add id block t.blocks }
+  else t
 ;;
 
 let reconcile_children (t : t) (detail : Journal_graph_projection.detail) =
@@ -521,20 +626,21 @@ let reconcile_children (t : t) (detail : Journal_graph_projection.detail) =
                | _ -> false)
             current.children
     in
-    { t with
-      blocks = add_blocks t.blocks (detail.root :: detail.children.blocks)
-    ; branches =
-        Blocks.add
-          id
-          { current with
-            children
-          ; loaded = true
-          ; continuation = detail.children.continuation
-          ; pending = None
-          ; error = None
-          }
-          t.branches
-    })
+    invalidate_rows
+      { t with
+        blocks = add_blocks t.blocks (detail.root :: detail.children.blocks)
+      ; branches =
+          Blocks.add
+            id
+            { current with
+              children
+            ; loaded = true
+            ; continuation = detail.children.continuation
+            ; pending = None
+            ; error = None
+            }
+            t.branches
+      })
 ;;
 
 let apply_child_created (t : t) ~child ~parent =
@@ -542,35 +648,37 @@ let apply_child_created (t : t) ~child ~parent =
   then (
     let current = branch t t.root_id in
     let id = Journal_model.id child in
-    { t with
-      blocks = add_blocks t.blocks [ child; parent ]
-    ; branches =
-        Blocks.add
-          t.root_id
-          { expanded = true
-          ; appended = id :: current.appended
-          ; children = List.filter (( <> ) id) current.children @ [ id ]
-          ; loaded =
-              current.loaded && current.continuation = None && current.pending = None
-          ; continuation = None
-          ; pending = None
-          ; error = None
-          }
-          t.branches
-    ; mode = Reading
-    ; pending = None
-    ; session_number =
-        Int64.succ
-          (Option.fold
-             ~none:t.session_number
-             ~some:(fun capture ->
-               ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture))
-             t.child_capture)
-    ; child_capture = None
-    ; composer_revision = Int64.succ t.composer_revision
-    ; reveal_id = Some id
-    ; reveal_outcome = None
-    })
+    invalidate_rows
+      { t with
+        blocks = add_blocks t.blocks [ child; parent ]
+      ; branches =
+          Blocks.add
+            t.root_id
+            { appended = id :: current.appended
+            ; children = List.filter (( <> ) id) current.children @ [ id ]
+            ; loaded =
+                current.loaded && current.continuation = None && current.pending = None
+            ; continuation = None
+            ; pending = None
+            ; error = None
+            }
+            t.branches
+      ; mode = Reading
+      ; pending = None
+      ; automatic_reads = 0
+      ; materialized_blocks = 0
+      ; session_number =
+          Int64.succ
+            (Option.fold
+               ~none:t.session_number
+               ~some:(fun capture ->
+                 ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture))
+               t.child_capture)
+      ; child_capture = None
+      ; composer_revision = Int64.succ t.composer_revision
+      ; reveal_id = Some id
+      ; reveal_outcome = None
+      })
   else t
 ;;
 
@@ -624,7 +732,7 @@ let stage_delete (t : t) ~block_id =
       | None -> blocks
     in
     Some
-      ( { t with blocks; branches }
+      ( invalidate_rows { t with blocks; branches }
       , { root_id = block_id
         ; blocks = removed
         ; branches = removed_branches
@@ -679,7 +787,7 @@ let undo_delete (t : t) (staged : staged_delete) =
                |> Result.get_ok))
             blocks ))
   in
-  { t with blocks; branches }
+  invalidate_rows { t with blocks; branches }
 ;;
 
 let reveal_outcome t = t.reveal_outcome

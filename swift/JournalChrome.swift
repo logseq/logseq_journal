@@ -52,7 +52,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       self.text = text
       self.id = id
       let tier = min(2, max(0, level))
-      _size = ScaledMetric(wrappedValue: [26, 21, 17][tier], relativeTo: .body)
+      _size = ScaledMetric(wrappedValue: [24, 19, 15][tier], relativeTo: .body)
       _targetLineHeight = ScaledMetric(wrappedValue: [40, 33, 27][tier], relativeTo: .body)
     }
 
@@ -108,6 +108,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
         content.frame(width: bounds.size.width, height: bounds.size.height)
           .scrollContentBackground(.hidden)
           #if os(iOS)
+          // Journals has no section title; named sections retain native indicators.
+          .scrollIndicators(properties.title == nil ? .hidden : .automatic)
           .scrollEdgeEffectHidden(true, for: .bottom)
           .scrollEdgeEffectStyle(.soft, for: .top)
           #endif

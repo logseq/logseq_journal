@@ -386,6 +386,8 @@ let run_favorites_native_visibility
       ?(check_hidden = false)
       ?(check_draft = false)
       ?(check_detail = false)
+      ?(check_detail_discovery = false)
+      ?(check_detail_wait = false)
       ?(check_copy = false)
       ?(check_navigation = false)
       ?(check_detail_row_action = false)
@@ -431,6 +433,8 @@ let run_favorites_native_visibility
   let media_metadata_changed = Atomic.make false in
   let detail_fixture = Atomic.make false in
   let detail_initial_limit = Atomic.make None in
+  let discovery_reads = Atomic.make [] in
+  let detail_wait_release = Atomic.make false in
   let released_demands = Atomic.make 0 in
   let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
   let capture_page : G.page option Atomic.t = Atomic.make None in
@@ -957,13 +961,20 @@ let run_favorites_native_visibility
                 ; revision_scope = V2_children_revision parent
                 ; scope_revision = "children"
                 ; items =
-                    [ { value = { value with block = { value.block with parent } }
-                      ; revision = "child"
-                      }
-                    ]
+                    (List.init (if check_detail_wait then 2 else 1) (fun i ->
+                       let value = if i = 0 then value else timeline_block 2 in
+                       { P.value = { value with block = { value.block with parent } }
+                       ; revision = "child"
+                       }))
                 ; next_cursor = None
                 }
-            | V2_get_children { parent; _ } ->
+            | V2_get_children { parent; limit; _ } ->
+              if (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
+              then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
+              if check_detail_wait && G.Uuid.equal parent (uuid 2) then
+                while not (Atomic.get detail_wait_release) do
+                  Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+                done;
               V2_children_outcome
                 { parent
                 ; revision_scope = V2_children_revision parent
@@ -1232,6 +1243,7 @@ let run_favorites_native_visibility
   Fun.protect
     ~finally:(fun () ->
       Atomic.set child_release true;
+      Atomic.set detail_wait_release true;
       Atomic.set import_release true;
       Atomic.set acquire_release true;
       ignore (hooks.dispose ());
@@ -1263,6 +1275,131 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       if check_detail_wait then (
+         Atomic.set detail_fixture true;
+         let root_list = Option.get (find "_extension" "journal-list") in
+         let label = Option.get (find "text" "Timeline fixture 0") in
+         dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
+         let more_id = "detail-more:" ^ G.Uuid.to_string (uuid 3) in
+         wait "second unknown branch mounted" (fun () ->
+           Option.is_some (find "accessibility-identifier" more_id));
+         Alcotest.(check bool) "idle branch has no wait explanation" true
+           (Option.is_none (find "text" "Waiting for another branch to finish"));
+         let list = Hashtbl.fold (fun id values found ->
+           if id <> root_list && List.assoc_opt "_extension" values = Some (`String "journal-list")
+           then Some id else found) props None |> Option.get in
+         let range first last = hooks.extension_event list "event"
+           (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String
+             (Yojson.Safe.to_string (`Assoc ["type", `String "visible_range";
+               "first", `Int first; "last", `Int last]))])) |> consume in
+         range 2 3;
+         wait "first branch is pending" (fun () -> Atomic.get discovery_reads = [128]);
+         range 4 5;
+         let more = Option.get (find "accessibility-identifier" more_id) in
+         Alcotest.(check bool) "other branch stays disabled while first is pending" true
+           (List.assoc_opt "enabled" (Hashtbl.find props more) = Some (`Bool false));
+         Alcotest.(check bool) "disabled branch explains serialized wait" true
+           (Option.is_some (find "text" "Waiting for another branch to finish"));
+         Atomic.set detail_wait_release true;
+         wait "wait explanation retires with pending read" (fun () ->
+           Option.is_none (find "text" "Waiting for another branch to finish"));
+         let navigator = Option.get (find "_extension" "navigation-stack") in
+         List.iter (fun name ->
+           let revision = List.assoc "revision" (Hashtbl.find props navigator)
+             |> Yojson.Safe.Util.to_int in
+           hooks.extension_event navigator name
+             (Yojson.Safe.to_string (`Assoc ["revision", `Int revision; "length", `Int 0]))
+           |> consume) ["path-changed"; "settled"];
+         wait "wait scenario returns to root before shared checks" (fun () ->
+           not (Hashtbl.mem props list));
+         Atomic.set detail_fixture false);
+       if check_detail_discovery
+       then (
+         Atomic.set detail_fixture true;
+         let root_list = Option.get (find "_extension" "journal-list") in
+         let label = Option.get (find "text" "Timeline fixture 0") in
+         dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
+         wait "Detail initial projection mounted" (fun () ->
+           Option.is_some
+             (find
+                "accessibility-identifier"
+                ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+         for _ = 1 to 10 do
+           hooks.pump () |> consume;
+           Unix.sleepf 0.001
+         done;
+         Alcotest.(check (list int))
+           "no discovery before native range"
+           []
+           (Atomic.get discovery_reads);
+         let more =
+           find "accessibility-identifier" ("detail-more:" ^ G.Uuid.to_string (uuid 2))
+           |> Option.get
+         in
+         Alcotest.(check bool)
+           "unobserved More remains actionable"
+           true
+           (List.assoc_opt "enabled" (Hashtbl.find props more) = Some (`Bool true));
+         let list =
+           Hashtbl.fold
+             (fun id values found ->
+                if
+                  id <> root_list
+                  && List.assoc_opt "_extension" values = Some (`String "journal-list")
+                then Some id
+                else found)
+             props
+             None
+           |> Option.get
+         in
+         let range () =
+           hooks.extension_event
+             list
+             "event"
+             {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":2,\"last\":3}"}|}
+           |> consume
+         in
+         range ();
+         wait "first native range activates unknown visible child" (fun () ->
+           Atomic.get discovery_reads = [ 128 ]);
+         wait "authoritative empty child retires More" (fun () ->
+           Option.is_none (find "text" "Load more"));
+         for _ = 1 to 10 do
+           range ();
+           hooks.pump () |> consume
+         done;
+         Alcotest.(check (list int))
+           "duplicate native ranges do not reread"
+           [ 128 ]
+           (Atomic.get discovery_reads);
+         Printf.printf
+           "FOLLOWUP_APPLICATION first_range reads=1 limit=128 repeated_range=10 \
+            duplicate_reads=0\n\
+            %!";
+         let navigator = Option.get (find "_extension" "navigation-stack") in
+         let back name =
+           let revision =
+             List.assoc "revision" (Hashtbl.find props navigator)
+             |> Yojson.Safe.Util.to_int
+           in
+           hooks.extension_event
+             navigator
+             name
+             (Yojson.Safe.to_string
+                (`Assoc [ "revision", `Int revision; "length", `Int 0 ]))
+           |> consume
+         in
+         back "path-changed";
+         back "settled";
+         wait "native Back retires Detail visibility owner" (fun () ->
+           not (Hashtbl.mem props list));
+         range ();
+         hooks.pump () |> consume;
+         Alcotest.(check (list int))
+           "retired range cannot activate hidden reads"
+           [ 128 ]
+           (Atomic.get discovery_reads);
+         Atomic.set detail_fixture false);
        (* Detail/Routes already own text admission, retry, outline ordering and
           retained drafts, covered by their pure public reducer tests. They
           cannot reproduce native Capture placement, shared Composer wiring,
@@ -2155,8 +2292,8 @@ let run_favorites_native_visibility
              if
                List.mem
                  scenario
-                 [ `Detail_collapse
-                 ; `Detail_reopen
+                 [ `Detail_range_exit
+                 ; `Detail_range_reentry
                  ; `Detail_shared
                  ; `Detail_pending
                  ; `Detail_offscreen
@@ -2271,8 +2408,8 @@ let run_favorites_native_visibility
                  native_path 0;
                  assert_ready "natural Back without appearance replay"
                done
-             | `Detail_collapse
-             | `Detail_reopen
+             | `Detail_range_exit
+             | `Detail_range_reentry
              | `Detail_shared
              | `Detail_pending
              | `Detail_offscreen
@@ -2350,29 +2487,23 @@ let run_favorites_native_visibility
                  |> consume;
                  settle ()
                in
-               let expand expanded =
-                 detail_event
-                   (`Assoc
-                       [ "type", `String "row_event"
-                       ; "payload", `String (Yojson.Safe.to_string (`Assoc
-                           [ "row", `String ("block:" ^ G.Uuid.to_string (uuid 1))
-                           ; "key", `String (if expanded then "expand" else "collapse") ]))
-                       ])
-               in
-               if scenario = `Detail_offscreen
-               then
+               let child_range visible =
                  detail_event
                    (`Assoc
                        [ "type", `String "visible_range"
                        ; "first", `Int 0
-                       ; "last", `Int 1
+                       ; "last", `Int (if visible then 2 else 1)
                        ])
-               else (
-                 expand false;
-                 Alcotest.(check int)
-                   "collapsed child native media node removed"
-                   0
-                   (List.length (child_files ())));
+               in
+               child_range false;
+               if scenario = `Detail_preview
+               then (
+                 Alcotest.(check int) "offscreen preview retains its child lease"
+                   0 (Atomic.get released_files - before_released);
+                 Alcotest.(check int) "offscreen child keeps its open preview"
+                   1 (List.length (previews ()));
+                 dismiss_preview (List.hd (previews ()));
+                 settle ());
                if scenario = `Detail_pending
                then (
                  Alcotest.(check int)
@@ -2400,7 +2531,7 @@ let run_favorites_native_visibility
                  1
                  (Atomic.get released_demands - before_demands);
                Printf.printf
-                 "REVIEW_COLLAPSE acquired=%d released=%d collapse_release_delta=%d \
+                 "REVIEW_RANGE_EXIT acquired=%d released=%d range_release_delta=%d \
                   files=%d\n\
                   %!"
                  (Atomic.get acquire_entered)
@@ -2417,27 +2548,27 @@ let run_favorites_native_visibility
                if scenario = `Detail_preview
                then
                  Alcotest.(check int)
-                   "unmounted child removes preview path"
+                   "dismissed offscreen child removes preview path"
                    0
                    (List.length (previews ()));
-               if scenario = `Detail_reopen
+               if scenario = `Detail_range_reentry
                then (
-                 expand true;
-                 wait "reopened child remounts" (fun () ->
+                 child_range true;
+                 wait "visible child remounts" (fun () ->
                    all "text" "Timeline fixture 1"
                    |> List.exists (fun id -> within id detail_list));
                  appear_with_ancestors (waiting_for_row (child_label ())) detail_list;
-                 wait "reopened child sends one new demand" (fun () ->
+                 wait "visible child sends one new demand" (fun () ->
                    List.length (Atomic.get demands) = 3);
                  child_ready ();
-                 wait "reopened child acquires fresh lease" (fun () ->
+                 wait "visible child acquires fresh lease" (fun () ->
                    Atomic.get acquire_entered = 3 && List.length (child_files ()) = 1);
                  Alcotest.(check bool)
-                   "reopened child gets a fresh native leaf"
+                   "visible child gets a fresh native leaf"
                    true
                    (List.hd (child_files ()) <> old_leaf);
-                 expand false;
-                 wait "second collapse releases fresh child lease" (fun () ->
+                 child_range false;
+                 wait "second range exit releases fresh child lease" (fun () ->
                    Atomic.get released_files = before_released + 2));
                if scenario = `Detail_graph
                then (
@@ -2455,7 +2586,7 @@ let run_favorites_native_visibility
                else (
                  native_path 0;
                  wait "entry retirement releases remaining root" (fun () ->
-                   Atomic.get released_files = if scenario = `Detail_reopen then 3 else 2))
+                   Atomic.get released_files = if scenario = `Detail_range_reentry then 3 else 2))
              | `Preview_offscreen
              | `Preview_navigation
              | `Preview_detail_pop
@@ -4455,6 +4586,10 @@ let () =
               ~check_covered_update:true
               ~timeline_rows:50
               ())
+        ; Alcotest.test_case "Detail first native range activates discovery" `Quick (fun () ->
+            run_favorites_native_visibility ~check_detail_discovery:true ())
+        ; Alcotest.test_case "Detail disabled branch explains serialized wait" `Quick (fun () ->
+            run_favorites_native_visibility ~check_detail_wait:true ())
         ; Alcotest.test_case "Copy menus and replacement ownership" `Quick (fun () ->
             run_favorites_native_visibility ~check_copy:true ())
         ; Alcotest.test_case "Detail native context menu dispatch" `Quick (fun () ->
@@ -4581,30 +4716,30 @@ let () =
                  ~media_rows:3
                  ~media_navigation:`Restore_early
                  ())
-        ; Alcotest.test_case "collapsed Detail retires media ownership" `Quick (fun () ->
+        ; Alcotest.test_case "Detail range exit retires media ownership" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
-              ~media_navigation:`Detail_collapse
+              ~media_navigation:`Detail_range_exit
               ())
         ; Alcotest.test_case "review preview offscreen reference" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Preview_offscreen
               ())
-        ; Alcotest.test_case "Detail reopens after media retirement" `Quick (fun () ->
+        ; Alcotest.test_case "Detail range reentry after media retirement" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
-              ~media_navigation:`Detail_reopen
+              ~media_navigation:`Detail_range_reentry
               ())
         ; Alcotest.test_case
-            "Detail collapse preserves Timeline shared owner"
+            "Detail range exit preserves Timeline shared owner"
             `Quick
             (fun () ->
                run_favorites_native_visibility
                  ~media_rows:3
                  ~media_navigation:`Detail_shared
                  ())
-        ; Alcotest.test_case "Detail collapse fences pending Acquire" `Quick (fun () ->
+        ; Alcotest.test_case "Detail range exit fences pending Acquire" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Detail_pending
@@ -4622,7 +4757,7 @@ let () =
               ~media_rows:3
               ~media_navigation:`Detail_graph
               ())
-        ; Alcotest.test_case "Detail child removal retires its preview" `Quick (fun () ->
+        ; Alcotest.test_case "Detail offscreen preview retains until dismissal" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Detail_preview
