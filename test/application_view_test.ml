@@ -681,14 +681,16 @@ let run_favorites_native_visibility
             done;
           if source.title = "First attachment"
              && detail_capture <> Some "selection-error"
-             && (detail_capture <> Some "retry-imports"
+             && (not (List.mem detail_capture [Some "retry-imports"; Some "interrupted-imports"])
                  || List.length (List.filter (( = ) "First attachment") (Atomic.get imports_entered)) = 1)
           then (
             while not (Atomic.get import_release) do
               Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
             done;
             Atomic.incr imports_finished;
-            Ok (Service.Asset_imported (Error "Fixture first attachment failed")))
+            if List.mem detail_capture [Some "interrupted-imports"; Some "legacy-interrupted"]
+            then Error "Fixture interrupted import"
+            else Ok (Service.Asset_imported (Error "Fixture first attachment failed")))
           else
             let module A = Logseq_db_types.Asset_descriptor in
             let asset =
@@ -1474,6 +1476,38 @@ let run_favorites_native_visibility
             in
             let original_root_content = Option.get (find "text" "Timeline fixture 1") in
             enter 0;
+            if scenario = "legacy-interrupted" then (
+              (* No pure reducer owns native completion copy or the Worker queue.
+                 The existing non-staged adapter is tested via its public callback;
+                 it has no visible iOS opener, so this is not a GUI claim. *)
+              let adapter = Hashtbl.fold (fun id values found ->
+                match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+                | Some (`String "journal-asset-import"), Some (`String payload) ->
+                  let request = Yojson.Safe.Util.member "request" (Yojson.Safe.from_string payload) in
+                  if Yojson.Safe.Util.member "staged" request = `Bool false then Some id else found
+                | _ -> found) props None |> Option.get in
+              let operation = G.Uuid.to_string (uuid 34001) in
+              let path = Filename.temp_file "journal-legacy-import-" ".txt" in
+              Fun.protect ~finally:(fun () -> Sys.remove path) (fun () ->
+                let picked = `Assoc [
+                  "operation",`String operation;"asset",`String (G.Uuid.to_string (uuid 34002));
+                  "localMutation",`String (G.Uuid.to_string (uuid 34003));
+                  "metadataMutation",`String (G.Uuid.to_string (uuid 34004));
+                  "path",`String path;"title",`String "First attachment";"type",`String "txt"] in
+                hooks.extension_event adapter "event" (Yojson.Safe.to_string
+                  (`Assoc ["id",`Int 1;"payload",`String (Yojson.Safe.to_string picked)])) |> consume;
+                Atomic.set import_release true;
+                wait "non-staged interruption requires source reselection" (fun () ->
+                  Hashtbl.fold (fun _ values found -> found ||
+                    match List.assoc_opt "payload" values with
+                    | Some (`String payload) ->
+                      let json = Yojson.Safe.from_string payload in
+                      Yojson.Safe.Util.member "completion" json = `String operation
+                      && Yojson.Safe.Util.member "error" json =
+                         `String "Import was interrupted. Select the file again."
+                    | _ -> false) props false);
+                Alcotest.(check bool) "non-staged import cannot offer retained-byte retry" true
+                  (Option.is_none (find "accessibility-label" "Retry imports"))));
             Alcotest.(check bool)
               "old Append toolbar action is removed"
               true
@@ -1496,7 +1530,7 @@ let run_favorites_native_visibility
             if
               List.mem
                 scenario
-                [ "attachments"; "attachment-only"; "offscreen-attachments"; "selection-error"; "picker-owner"; "retry-imports" ]
+                [ "attachments"; "attachment-only"; "offscreen-attachments"; "selection-error"; "picker-owner"; "retry-imports"; "attachment-limit"; "interrupted-imports" ]
             then (
               dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "文件")));
               let adapter, request =
@@ -1539,7 +1573,9 @@ let run_favorites_native_visibility
                   [ "action", `String "picked-batch"
                   ; "request", request
                   ; ( "items"
-                    , `List [ first; second ] )
+                    , `List (if scenario = "attachment-limit" then
+                        first :: second :: List.init 7 (fun i -> item (i + 3) (Printf.sprintf "Extra attachment %d" (i + 3)))
+                        else [ first; second ]) )
                   ]
               in
               let batch = if scenario = "selection-error" then
@@ -1569,6 +1605,24 @@ let run_favorites_native_visibility
                      "accessibility-identifier"
                      ("composer-attachment:" ^ G.Uuid.to_string (uuid 30002)))
                 = 1);
+              if scenario = "attachment-limit" then (
+                (* Capture.can_attach already rejects the tenth pick; only the
+                   real view boundary owns disabled controls and cap feedback. *)
+                let check enabled = List.iter (fun label ->
+                  let node = Option.get (find "accessibility-label" label) in
+                  Alcotest.(check (option bool)) (label ^ " enabled matches capacity")
+                    (Some enabled)
+                    (Option.map Yojson.Safe.Util.to_bool
+                      (List.assoc_opt "enabled" (Hashtbl.find props node)))) ["文件";"照片";"相机"] in
+                check false;
+                Alcotest.(check bool) "cap explains how to add another attachment" true
+                  (Option.is_some (find "text" "9 attachments maximum. Remove one to add another."));
+                for i = 3 to 9 do
+                  dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" (Printf.sprintf "Remove Extra attachment %d" i))))
+                done;
+                check true;
+                Alcotest.(check bool) "removal retires cap feedback" true
+                  (Option.is_none (find "text" "9 attachments maximum. Remove one to add another.")));
               if scenario = "selection-error" then (
                 wait "partial selection failure is visible on its owner" (fun () -> Option.is_some (find "text" "Fixture partial selection failed"));
                 collapse (); back (); enter 2; open_capture ();
@@ -1645,10 +1699,21 @@ let run_favorites_native_visibility
                 (Atomic.get imports_entered);
               Atomic.set import_release true;
               wait "both imports finish" (fun () -> Atomic.get imports_finished = 2);
-              if scenario = "retry-imports"
+              if List.mem scenario ["retry-imports";"interrupted-imports"]
               then (
                 wait "failed import exposes target retry" (fun () ->
                   Option.is_some (find "accessibility-label" "Retry imports"));
+                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Details")));
+                wait "retained imports explain in-place retry" (fun () ->
+                  Option.is_some (find "text"
+                    "Your journal entry and other attachments are kept. Select Retry imports to try again."));
+                if scenario = "interrupted-imports" then
+                  Alcotest.(check bool) "interrupted retained import gives retry guidance" true
+                    (Option.is_some (find "text" "Import was interrupted. Select Retry imports to try again."));
+                Alcotest.(check bool) "retained import never requires reselection" true
+                  (Option.is_none (find "text"
+                    "Your journal entry and other attachments are kept. Select the file again to retry."));
+                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Close")));
                 (* Routes reducers own the path, but cannot express native
                    feedback ancestry or layout. Mount the real failure through the
                    public Application boundary; navigation must cover the
@@ -1748,14 +1813,14 @@ let run_favorites_native_visibility
                   "import retry does not create another child"
                   1
                   (Atomic.get child_attempts));
-              if not (List.mem scenario [ "retry-imports"; "selection-error" ]) then (
+              if not (List.mem scenario [ "retry-imports"; "interrupted-imports"; "selection-error" ]) then (
                 wait "failed import offers explicit discard" (fun () -> Option.is_some (find "accessibility-label" "Dismiss"));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss"))));
               wait "all staging files are released" (fun () ->
                 List.for_all (fun p -> not (Sys.file_exists p)) !staged_paths);
               Alcotest.(check (list string))
                 "imports target the newly appended child"
-                (List.init (if scenario = "retry-imports" then 3 else 2) (fun _ -> G.Uuid.to_string child.uuid))
+                (List.init (if List.mem scenario ["retry-imports";"interrupted-imports"] then 3 else 2) (fun _ -> G.Uuid.to_string child.uuid))
                 (List.map G.Uuid.to_string (Atomic.get import_targets));
               if scenario = "offscreen-attachments"
               then
@@ -3122,6 +3187,11 @@ let run_favorites_native_visibility
              true
              (Option.is_some (find "style-class" "composer-input"));
            let editor = Option.get (find "style-class" "composer-input") in
+           (* Navigation/Capture reducers cannot express the native keyboard label. *)
+           Alcotest.(check (option bool)) "multiline composer requests Return"
+             (Some false)
+             (Option.map Yojson.Safe.Util.to_bool
+                (List.assoc_opt "submit-on-enter" (Hashtbl.find props editor)));
            Hashtbl.clear regions;
            dispatch (Lui_protocol.TextChanged (editor, "iOS persistent draft"));
            for _ = 1 to 10 do
@@ -4649,6 +4719,9 @@ let () =
           ; "selection-error"
           ; "picker-owner"
           ; "retry-imports"
+          ; "attachment-limit"
+          ; "interrupted-imports"
+          ; "legacy-interrupted"
           ] )
     ; ( "Capture attachment imports"
       , [ Alcotest.test_case
