@@ -2520,7 +2520,41 @@ let test_bottom_controls_reuse_lui_inset_and_keep_capture () =
     require !pressed "native inset swallowed the shared Capture event")
 ;;
 
+
+let test_detail_initial_blank_preserves_chrome () =
+  let routes = Journal_routes.open_detail (Journal_routes.create ()) ~block_id ~request_generation:700L in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+  with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+    require (not (current_text (ops ()) "Loading block")) "initial grace period renders loading";
+    (* Native Chrome requires two positional children even for a blank body;
+       the pure route owner cannot reproduce this mounting contract. *)
+    let header = List.find_map (function
+      | Lui_protocol.SetExtensionProp (id, "payload", StringValue value)
+        when Yojson.Basic.Util.member "mode" (Yojson.Basic.from_string value)
+             = `String "detail" -> Some id
+      | _ -> None) (ops ()) |> Option.get in
+    let slots = List.filter_map (function
+      | Lui_protocol.InsertChild (parent, child, _) when parent = header -> Some child
+      | _ -> None) (ops ()) in
+    require (List.length slots = 2) "blank body removes native Detail Chrome";
+    require (List.length (mounted_nodes (ops ()) AccessibilityLabel (StringValue "Block options")) = 1) "initial grace period drops the existing menu")
+;;
+
+(* Known graph asset identity must reserve its slot before media descriptors or
+   files arrive. This composition is not reproducible in the route reducer. *)
+let test_detail_known_image_reserves_initial_slot () =
+  let root = Journal_model.with_asset_file_type (block ~source:"Image attachment" ()) ~asset_file_type:(Some "jpg") in
+  let routes = Journal_routes.open_detail (Journal_routes.create ()) ~block_id ~request_generation:701L in
+  let routes = Journal_routes.apply_detail_response routes ~request_generation:701L {root;children={blocks=[];continuation=None}} in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+  with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+    require (List.length (mounted_nodes (ops ()) AccessibilityIdentifier (StringValue ("journal-image-slot:" ^ block_id))) = 1) "Detail known image has no stable slot before descriptor arrival";
+    require (current_text (ops ()) "Waiting for file") "known slot does not explain pending media")
+;;
+
 let tests =
+  [ "Detail initial blank preserves chrome", test_detail_initial_blank_preserves_chrome
+  ; "Detail known image initial slot", test_detail_known_image_reserves_initial_slot ] @
   [ "Feedback native inset visibility and events", test_feedback_reuses_lui_inset_and_keeps_control_events
   ; "Bottom native inset retains Capture", test_bottom_controls_reuse_lui_inset_and_keep_capture
   ] @

@@ -22,6 +22,7 @@ type view =
       ; request_generation : int64
       ; session_number : int64
       ; draft_owner : string option
+      ; loading_indicator : bool
       }
   | Detail_view of
       { block_id : string
@@ -101,6 +102,35 @@ let view_route = function
 ;;
 
 let route t = view_route (current_view t)
+
+let loading_indicator t =
+  match current_view t with
+  | Detail_loading_view owner -> owner.loading_indicator
+  | _ -> false
+;;
+
+let loading_requests t =
+  Owners.fold
+    (fun entry_id view requests ->
+       match view with
+       | Detail_loading_view owner when not owner.loading_indicator ->
+         (entry_id, owner.request_generation) :: requests
+       | _ -> requests)
+    t.owners
+    []
+;;
+
+let observe_loading_delay t ~entry_id ~request_generation ~elapsed =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Detail_loading_view owner)
+    when owner.request_generation = request_generation
+         && elapsed >= 0.1 && not owner.loading_indicator ->
+    { t with
+      owners = Owners.add entry_id
+        (Detail_loading_view { owner with loading_indicator = true }) t.owners
+    }
+  | _ -> t
+;;
 
 let view_block_id = function
   | Timeline_view -> None
@@ -345,7 +375,7 @@ let open_detail t ~block_id ~request_generation =
   ; owners =
       Owners.add
         owner_id
-        (Detail_loading_view { block_id; request_generation; session_number; draft_owner })
+        (Detail_loading_view { block_id; request_generation; session_number; draft_owner; loading_indicator = false })
         t.owners
   }
 ;;
@@ -558,7 +588,7 @@ let retry_detail_at t ~entry_id ~request_generation =
           Owners.add
             entry_id
             (Detail_loading_view
-               { block_id; request_generation; session_number; draft_owner })
+               { block_id; request_generation; session_number; draft_owner; loading_indicator = false })
             t.owners
       ; next_session = Int64.succ session_number
       ; focus = None

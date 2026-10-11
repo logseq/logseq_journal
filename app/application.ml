@@ -1957,6 +1957,7 @@ let media_label
       ~store
       ?(on_region = fun _ -> ())
       ?(detail = false)
+      ?(known_images = [])
       state
       dispatch
       ~title
@@ -1970,6 +1971,7 @@ let media_label
     ~scope
     ~title
     ~root
+    ~known_images
     ~on_event:(fun event -> dispatch.send (Media (scope, event)))
     child
 ;;
@@ -2976,6 +2978,9 @@ let detail_page
                ~store:media_store
                ~on_region
                ~detail:true
+               ~known_images:(Option.fold ~none:[]
+                 ~some:(fun file_type -> [Journal_model.id block, file_type])
+                 (Journal_model.asset_file_type block))
                state
                dispatch
                ~title:(Journal_model.source block)
@@ -3005,7 +3010,10 @@ let detail_page
         ~children:(rows detail)
     | None ->
       (match Journal_routes.route state.routes with
-       | Detail_loading -> V.loading ~centered:true ~message:"Loading block" ()
+       | Detail_loading ->
+         if Journal_routes.loading_indicator state.routes
+         then V.loading ~centered:true ~message:"Loading block" ()
+         else V.column []
        | Missing_detail ->
          Presentation.unavailable
            ~title:"Block unavailable"
@@ -5065,6 +5073,21 @@ let start
             if !running then Journal_pump.enqueue pump thunk)
          ())
   in
+  let detail_loading_key state =
+    state.graph_state.generation, Journal_routes.loading_requests state.routes
+  in
+  let prev_detail_loading_key = ref (detail_loading_key initial_state) in
+  let arm_detail_loading_timer graph_generation entry_id request_generation =
+    let started = Core.Time_ns.now () in
+    schedule_after 0.1 (fun () ->
+      Effect.run (set_state (fun state ->
+        if state.graph_state.generation <> graph_generation then state
+        else
+          let elapsed = Core.Time_ns.(Span.to_sec (diff (now ()) started)) in
+          let routes = Journal_routes.observe_loading_delay state.routes
+            ~entry_id ~request_generation ~elapsed in
+          if routes == state.routes then state else { state with routes })))
+  in
   let arm_delete_timer mutation_id deadline =
     incr delete_timer_generation;
     let generation = !delete_timer_generation in
@@ -6091,6 +6114,15 @@ let start
      then (
        prev_timeline_drain_key := key;
        Effect.run (timeline_drain_callback key)));
+    (let generation, requests = detail_loading_key model in
+     let previous_generation, previous_requests = !prev_detail_loading_key in
+     prev_detail_loading_key := generation, requests;
+     List.iter
+       (fun (entry_id, request_generation) ->
+          if generation <> previous_generation
+             || not (List.mem (entry_id, request_generation) previous_requests)
+          then arm_detail_loading_timer generation entry_id request_generation)
+       requests);
     (let key = detail_drain_key model in
      if not (!prev_detail_drain_key = key)
      then (
@@ -6261,6 +6293,7 @@ let start
   let equal_detail_presentation left right =
     left.graph_state.generation = right.graph_state.generation
     && Journal_routes.route left.routes = Journal_routes.route right.routes
+    && Journal_routes.loading_indicator left.routes = Journal_routes.loading_indicator right.routes
     && Journal_routes.detail_request_generation left.routes
        = Journal_routes.detail_request_generation right.routes
     && Option.equal

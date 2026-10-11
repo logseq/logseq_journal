@@ -3183,7 +3183,79 @@ let test_followup_review_regressions () =
     (String.concat ", " (List.rev !failures))
 ;;
 
+
+(* Initial Detail publication owns the complete bounded page, while the delayed
+   indicator belongs to its route/request identity rather than asset work. *)
+let test_detail_initial_loading_delay_and_ownership () =
+  let module R = Journal_routes in
+  let cases = [
+    "fast completion", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9000L in
+      require (not (R.loading_indicator t)) "initial Detail shows loading before 100ms";
+      let t = R.observe_loading_delay t ~entry_id:(entry_id t) ~request_generation:9000L ~elapsed:0.099 in
+      require (not (R.loading_indicator t)) "99ms exposes the indicator";
+      let root = block () in
+      let child = block ~id:"70000000-0000-4000-a000-000000000099" ~parent_id:(Some (Journal_model.id root)) () in
+      let ready = R.apply_detail_response t ~request_generation:9000L { root; children={blocks=[child];continuation=None} } in
+      require (R.route ready = Detail && not (R.loading_indicator ready)) "fast body is artificially delayed";
+      require (List.length (List.filter (function Journal_detail.Block _ -> true | More _ -> false) (Journal_detail.rows (Option.get (R.detail ready)))) = 2) "root published without its bounded children page";
+      require (R.observe_loading_delay ready ~entry_id:(entry_id ready) ~request_generation:9000L ~elapsed:1. == ready) "late timer changes ready body");
+    "slow delay boundary", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9001L in
+      let id = entry_id t in
+      require (not (R.loading_indicator t)) "slow route starts with a spinner";
+      require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:(-1.) == t) "negative elapsed time changes owner";
+      require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.099 == t) "early callback changes owner";
+      let slow = R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.1 in
+      require (R.loading_indicator slow) "100ms pending route has no indicator";
+      require (R.detail slow = None) "pending route exposes a partial root";
+      require (R.observe_loading_delay slow ~entry_id:id ~request_generation:9001L ~elapsed:0.2 == slow) "duplicate delay republishes owner");
+    "failure and retry", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9002L in
+      let id = entry_id t in
+      let failed = R.apply_detail_failure t ~request_generation:9002L ~missing:false ~message:"read failed" in
+      require (not (R.loading_indicator failed)) "failure retains spinner";
+      require (R.observe_loading_delay failed ~entry_id:id ~request_generation:9002L ~elapsed:1. == failed) "late timer overwrites failure";
+      let retry, request = R.retry_detail failed ~request_generation:9003L in
+      require (Option.is_some request && not (R.loading_indicator retry)) "retry skips its fresh grace period";
+      require (R.observe_loading_delay retry ~entry_id:id ~request_generation:9002L ~elapsed:1. == retry) "old timer activates retry";
+      require (R.apply_detail_response retry ~request_generation:9002L (detail ()) == retry) "old completion activates retry";
+      let missing = R.apply_missing_detail retry ~request_generation:9003L in
+      require (R.route missing = Missing_detail && not (R.loading_indicator missing)) "missing route retains progress");
+    "back and new route", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9004L in
+      let old = entry_id t in
+      let back = R.back t in
+      require (R.observe_loading_delay back ~entry_id:old ~request_generation:9004L ~elapsed:1. == back) "cancelled timer recreates route";
+      require (R.apply_detail_response back ~request_generation:9004L (detail ()) == back) "cancelled completion recreates route";
+      let fresh = R.open_detail back ~block_id:(Journal_model.id (block ())) ~request_generation:9005L in
+      require (entry_id fresh <> old && not (R.loading_indicator fresh)) "reentry inherits progress";
+      require (R.observe_loading_delay fresh ~entry_id:old ~request_generation:9004L ~elapsed:1. == fresh) "retired timer affects reentry";
+      let reset = R.graph_unavailable fresh in
+      require (R.observe_loading_delay reset ~entry_id:(entry_id fresh) ~request_generation:9005L ~elapsed:1. == reset) "graph reset accepts timer");
+    "rapid nested routes", (fun () ->
+      let a = block () and b = block ~id:"70000000-0000-4000-a000-000000000002" () in
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:9006L in
+      let a_id = entry_id t in
+      let t = R.open_detail t ~block_id:(Journal_model.id b) ~request_generation:9007L in
+      let b_id = entry_id t in
+      let t = R.observe_loading_delay t ~entry_id:a_id ~request_generation:9006L ~elapsed:0.2 in
+      require (not (R.loading_indicator t) && R.loading_indicator (entry t a_id)) "covered timer leaks into top route";
+      require (R.observe_loading_delay t ~entry_id:b_id ~request_generation:9006L ~elapsed:0.2 == t) "timer accepts wrong generation";
+      let t = R.apply_detail_response t ~request_generation:9006L (detail ~root:a ()) in
+      require (R.route t = Detail_loading && not (R.loading_indicator t)) "covered completion reveals top body";
+      let t = R.apply_detail_response t ~request_generation:9007L (detail ~root:b ()) in
+      require (R.route t = Detail) "current completion does not reveal body");
+  ] in
+  let failures = ref [] in
+  List.iter (fun (name, test) -> try test () with exn ->
+    Printf.eprintf "DETAIL_LOADING_RED %s: %s\n%!" name (Printexc.to_string exn);
+    failures := name :: !failures) cases;
+  require (!failures = []) "Detail loading cases failed: %s" (String.concat ", " !failures)
+;;
+
 let tests =
+  [ "Detail initial loading delay and ownership", test_detail_initial_loading_delay_and_ownership ] @
   [ "Unicode blank Capture admission", test_unicode_blank_capture_admission
   ] @
   [ "PR63 public review regressions", test_followup_review_regressions

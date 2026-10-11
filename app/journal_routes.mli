@@ -22,6 +22,13 @@ val open_favorite
 val destination : t -> destination
 val select_destination : t -> destination -> t
 val route : t -> route
+
+(** Initial body progress becomes visible only while the same request remains
+    pending after its grace period. Content completion has no minimum delay. *)
+val loading_indicator : t -> bool
+val loading_requests : t -> (string * int64) list
+val observe_loading_delay
+  : t -> entry_id:string -> request_generation:int64 -> elapsed:float -> t
 val open_detail : t -> block_id:string -> request_generation:int64 -> t
 val detail_block_id : t -> string option
 val detail_request_generation : t -> int64
