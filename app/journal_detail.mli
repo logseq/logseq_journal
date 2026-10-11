@@ -12,18 +12,18 @@ type row =
   | Block of
       { block : Journal_model.t
       ; depth : int
-      ; expanded : bool
-      ; leaf : bool
       }
   | More of
       { parent_id : string
       ; depth : int
       ; loading : bool
+      ; enabled : bool
       ; error : string option
       }
 
 type event =
-  | Set_branch_expanded of string * bool
+  | Observe_visible_range of int64 * int64
+  | Load_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -39,10 +39,21 @@ val root : t -> Journal_model.t
 val find_block : t -> block_id:string -> Journal_model.t option
 val children : t -> Journal_model.t list
 val children_of : t -> parent_id:string -> Journal_model.t list
-val expanded : t -> block_id:string -> bool
 val continuation : t -> parent_id:string -> Journal_graph_projection.block_cursor option
 val rows : t -> row list
 val row_key : row -> string
+
+(** Next bounded first-page read demanded by the native visible index range.
+    Before the first observation no automatic read is admitted. Each round
+    reserves complete 128-item pages against a conservative 384-block counter
+    and at most 128 reads. Initially the counter includes the root and its
+    projection page. A successfully admitted explicit action starts a new
+    round counting returned pages; earlier explicit rows and external updates
+    remain available and are not globally truncated.
+    Continuations and
+    failed reads remain explicit Load more actions. *)
+val next_automatic_load : t -> string option
+
 val step : t -> event -> t * Journal_graph_request.t list
 val mode : t -> mode
 val session_id : t -> ID.Text_input.session_id
