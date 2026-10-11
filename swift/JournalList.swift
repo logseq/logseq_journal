@@ -368,8 +368,27 @@ import Observation
     }
 
     @ViewBuilder private func rowActions(_ row: Row) -> some SwiftUI.View {
-      childContent(row.content_index)
+      let branchAction = properties?.style == "detail"
+        ? row.context_menu?.actions.first(where: { $0.key == "expand" || $0.key == "collapse" })
+        : nil
+      Group {
+        if let branchAction {
+          childContent(row.content_index)
+            .contentShape(Rectangle())
+            .onTapGesture {
+              if actionInteractive(branchAction) { rowEvent(action: branchAction.key, row: row.key) }
+            }
+            .accessibilityHint(branchAction.title)
+            .accessibilityAction(named: Text(branchAction.title)) {
+              if actionInteractive(branchAction) { rowEvent(action: branchAction.key, row: row.key) }
+            }
+        } else {
+          childContent(row.content_index)
+        }
+      }
         .id(row.key)
+        .listRowInsets(properties?.style == "detail"
+          ? EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20) : nil)
         .listRowSeparator(separatorVisibility(row.separator))
         .accessibilityIdentifier(row.test_id ?? row.key)
         .contextMenu {
@@ -418,6 +437,7 @@ import Observation
 
     private var style: ListStyleConfiguration {
       switch properties?.style {
+      case "detail": return .detail
       case "inset": return .inset
       case "inset_grouped": return .insetGrouped
       default: return .plain
@@ -472,13 +492,16 @@ import Observation
   }
 
   private enum ListStyleConfiguration {
-    case plain, inset, insetGrouped
+    case plain, inset, insetGrouped, detail
   }
 
   private struct ListStyleModifier: ViewModifier {
     let style: ListStyleConfiguration
     func body(content: Content) -> some SwiftUI.View {
       Group {
+        if style == .detail {
+          content.listStyle(.plain).environment(\.defaultMinListRowHeight, 0)
+        } else {
         #if os(macOS)
         if style == .plain {
           content.listStyle(.plain)
@@ -494,6 +517,7 @@ import Observation
           content.listStyle(.insetGrouped)
         }
         #endif
+        }
       }
     }
   }

@@ -1094,7 +1094,8 @@ let test_favorite_target_origin_and_undo () =
     (Journal_routes.destination (Journal_routes.back routes) = Favorites)
     "favorite Back lost its destination";
   (match request with
-   | Some (Journal_graph_request.Load_detail { block_id; _ }) ->
+   | Some (Journal_graph_request.Load_detail { block_id; limit; _ }) ->
+     require (limit = 128) "favorite Detail must request at most 128 children";
      require
        (block_id = G.Uuid.to_string target)
        "favorite loaded membership instead of target"
@@ -1697,7 +1698,7 @@ let test_native_disclosure_state_is_idempotent () =
   let opened, requests = D.step same (Set_branch_expanded (child_id, true)) in
   let generation =
     match requests with
-    | [ Journal_graph_request.Load_detail { request_generation; limit = 64; _ } ] ->
+    | [ Journal_graph_request.Load_detail { request_generation; limit = 128; _ } ] ->
       request_generation
     | _ -> fail "native disclosure did not admit a single bounded child request"
   in
@@ -2616,6 +2617,80 @@ let test_retained_detail_picker_owner_and_terminal_delete () =
          "committed deletion revived its retired draft")
 ;;
 
+let test_detail_128_item_pages_preserve_order_and_completion () =
+  let module D = Journal_detail in
+  let root = block () in
+  let parent = block ~id:(generated_block_id 1099)
+      ~parent_id:(Some (Journal_model.id root)) ~child_count:260 () in
+  let parent_id = Journal_model.id parent in
+  let children = List.init 260 (fun index ->
+    let ordinal = index + 1 in
+    block ~id:(generated_block_id (1100 + ordinal)) ~parent_id:(Some parent_id)
+      ~order:(Printf.sprintf "%06d" ordinal) ~child_count:0 ()) in
+  let page start count continuation : Journal_graph_projection.detail =
+    { root = parent; children =
+        { blocks = List.filteri (fun i _ -> i >= start && i < start + count) children
+        ; continuation } } in
+  let cursor ordinal : Journal_graph_projection.block_cursor =
+    { after_sibling_order = Printf.sprintf "%06d" ordinal
+    ; after_block_id = Journal_model.id (List.nth children (ordinal - 1))
+    ; protocol_cursor = Some (Logseq_db_types.Graph_types.Cursor.of_string
+        (Printf.sprintf "detail-page-%d" ordinal) |> Result.get_ok) } in
+  let request after = function
+    | [ Journal_graph_request.Load_detail
+          { block_id; limit; after = actual; request_generation } ] ->
+      require (block_id = parent_id && actual = after)
+        "128-item paging lost parent or opaque cursor";
+      require (limit = 128) "Detail page budget expected 128, got %d" limit;
+      request_generation
+    | _ -> fail "Detail paging must issue exactly one bounded read" in
+  let initial = D.create ~session_number:128L
+      { root; children = { blocks = [ parent ]; continuation = None } } in
+  let first, requests = D.step initial (Set_branch_expanded (parent_id, true)) in
+  let generation = request None requests in
+  let first, _ = D.step first (Loaded (generation, page 0 128 (Some (cursor 128)))) in
+  require (List.length (D.children_of first ~parent_id) = 128)
+    "initial 128-item page was truncated";
+  let second, requests = D.step first (Load_more parent_id) in
+  let generation = request (Some (cursor 128)) requests in
+  let second, duplicate = D.step second (Load_more parent_id) in
+  require (duplicate = []) "pending 128-item page admitted a duplicate read";
+  let second, _ = D.step second (Loaded (generation, page 128 128 (Some (cursor 256)))) in
+  require (List.length (D.children_of second ~parent_id) = 256)
+    "second 128-item page lost previously loaded children";
+  let last, requests = D.step second (Load_more parent_id) in
+  let generation = request (Some (cursor 256)) requests in
+  let completion = D.Loaded (generation, page 256 4 None) in
+  let last, _ = D.step last completion in
+  let replayed, _ = D.step last completion in
+  require
+    (List.map Journal_model.id (D.children_of replayed ~parent_id)
+     = List.map Journal_model.id children)
+    "128/128/4 pages duplicated, omitted or reordered children";
+  require (D.continuation replayed ~parent_id = None) "final page retained a cursor";
+  let _, requests = D.step replayed (Load_more parent_id) in
+  require (requests = []) "completed 128-item paging kept requesting";
+  require
+    (List.filter_map (function D.Block { block; _ } -> Some (Journal_model.id block)
+      | D.More _ -> None) (D.rows replayed)
+     = List.map Journal_model.id (root :: parent :: children))
+    "flat Detail traversal lost the complete 260-child order"
+;;
+
+let test_detail_retry_uses_128_item_first_page () =
+  let module R = Journal_routes in
+  let root = block () in
+  let routes = R.create () |> fun t ->
+      R.open_detail t ~block_id:(Journal_model.id root) ~request_generation:127L in
+  let routes = R.apply_detail_response routes ~request_generation:127L (detail ~root ()) in
+  let _, request = R.retry_detail routes ~request_generation:128L in
+  match request with
+  | Some (Journal_graph_request.Load_detail { block_id; after = None; limit; request_generation = 128L }) ->
+    require (block_id = Journal_model.id root && limit = 128)
+      "Detail retry must restart its root with a 128-item first page"
+  | _ -> fail "Detail retry lost its first-page owner"
+;;
+
 let tests =
   [ ( "retained picker and terminal delete"
     , test_retained_detail_picker_owner_and_terminal_delete )
@@ -2639,6 +2714,8 @@ let tests =
     , test_child_refresh_replaces_cursor_and_fences_pending_read )
   ; "hidden favorites pagination", test_favorites_hidden_rows_do_not_block_pagination
   ; "native disclosure state is idempotent", test_native_disclosure_state_is_idempotent
+  ; "Detail 128-item pages preserve order", test_detail_128_item_pages_preserve_order_and_completion
+  ; "Detail retry uses 128-item first page", test_detail_retry_uses_128_item_first_page
   ; "Append editor session after save", test_append_editor_session_after_save
   ; ( "Capture editor sessions are never reused"
     , test_capture_editor_sessions_are_not_reused )

@@ -24,16 +24,18 @@ let creation_time =
 ;;
 
 let block
+      ?(id = block_id)
+      ?parent_id
       ?(source = "Literal #journal @person 👩🏽‍💻")
       ?(task_state = Journal_model.Done)
       ?(child_count = 3)
       ()
   =
   Journal_model.create
-    ~id:block_id
+    ~id
     ~page_id
     ~journal_day:20260809
-    ~parent_id:None
+    ~parent_id
     ~sibling_order:"000000000001"
     ~source
     ~task_state
@@ -2345,8 +2347,11 @@ let test_detail_uses_shared_capture_control () =
              (ops ())
          in
          require
-           (List.length slots = 1)
-           "Detail native Chrome retains an empty toolbar slot";
+           (List.length slots = 2)
+           "Detail native Chrome must retain body and one options control";
+         require
+           (List.length (mounted_nodes (ops ()) AccessibilityLabel (StringValue "Block options")) = 1)
+           "Detail must have one discoverable options menu";
          let captures =
            mounted_nodes (ops ()) AccessibilityLabel (StringValue "Capture")
          in
@@ -2366,7 +2371,79 @@ let test_detail_uses_shared_capture_control () =
     [ true; false ]
 ;;
 
+let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
+  let id n = Printf.sprintf "20000000-0000-4000-a000-%012d" n in
+  let root = block ~source:"周末去山里走走，\n顺便记录这次路线和沿途的风景。" ()
+    |> Journal_model.with_tag_titles ~tag_titles:[ "周末"; "trip" ] in
+  let child = block ~id:(id 2) ~parent_id:block_id ~source:"出发前的准备" () in
+  let grandchild = block ~id:(id 3) ~parent_id:(id 2) ~source:"带上雨衣和充电宝\n下载离线地图" () in
+  let deep = block ~id:(id 4) ~parent_id:(id 3) ~source:"更深一层，完整保留中文内容" () in
+  let deeper = block ~id:(id 5) ~parent_id:(id 4) ~source:"第四层以下仍然可以阅读" ~child_count:0 () in
+  let sibling = block ~id:(id 6) ~parent_id:block_id ~source:"沿途记录" ~child_count:0 () in
+  let projection root children : Journal_graph_projection.detail =
+    { root; children = { blocks = children; continuation = None } }
+  in
+  let routes = Journal_routes.create ()
+    |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
+    |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L (projection root [ child; sibling ])
+  in
+  let load detail parent children =
+    let detail, requests = Journal_detail.step detail (Set_branch_expanded (Journal_model.id parent, true)) in
+    let generation = match requests with
+      | [ Journal_graph_request.Load_detail { limit = 128; request_generation; _ } ] -> request_generation
+      | _ -> fail "Expanding one branch must issue exactly one bounded page read"
+    in
+    fst (Journal_detail.step detail (Loaded (generation, projection parent children)))
+  in
+  let detail = Option.get (Journal_routes.detail routes)
+    |> fun t -> load t child [ grandchild ]
+    |> fun t -> load t grandchild [ deep ]
+    |> fun t -> load t deep [ deeper ]
+  in
+  let routes = Journal_routes.update_detail routes detail in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+  with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+    let payloads = List.filter_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue s) -> Some (Yojson.Basic.from_string s)
+      | _ -> None) (ops ()) in
+    let list = List.find (fun p -> Yojson.Basic.Util.member "sections" p <> `Null) payloads in
+    let rows = Yojson.Basic.Util.(list |> member "sections" |> to_list |> List.hd |> member "rows" |> to_list) in
+    require (List.length rows = 6) "Detail flattens only visual layout, preserving all loaded descendants and order";
+    require (List.map (Yojson.Basic.Util.member "key") rows =
+      List.map (fun b -> `String ("block:" ^ Journal_model.id b))
+        [ root; child; grandchild; deep; deeper; sibling ]) "Detail changes owner traversal order";
+    List.iter (fun row ->
+      require (Yojson.Basic.Util.member "type" row = `String "row") "Detail retains disclosure nesting";
+      require (Yojson.Basic.Util.member "separator" row = `String "hidden") "Detail retains hierarchy separators") rows;
+    let labels = List.filter (fun p -> Yojson.Basic.Util.member "mode" p = `String "detail-text") payloads in
+    require (List.exists (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-tags:" ^ block_id)
+      && Yojson.Basic.Util.member "text" p = `String "#周末  #trip") labels) "Detail drops owned tags";
+    let expected = [ root, 0; child, 1; grandchild, 2; deep, 2; deeper, 2; sibling, 1 ] in
+    List.iter (fun (block, level) ->
+      let label = List.find (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-block:" ^ Journal_model.id block)) labels in
+      require (Yojson.Basic.Util.member "level" label = `Int level) "Detail loses the three-level typography cap";
+      require (Yojson.Basic.Util.member "text" label <> `Null) "Detail drops long or Chinese text") expected)
+;;
+
+let test_detail_flat_branch_keeps_explicit_collapse_action () =
+  let child = block ~id:"20000000-0000-4000-a000-000000000002" ~parent_id:block_id ~child_count:0 () in
+  let projection : Journal_graph_projection.detail =
+    { root = block (); children = { blocks = [ child ]; continuation = None } } in
+  let routes = Journal_routes.create ()
+    |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
+    |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L projection in
+  let actions = ref [] in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true (fun a -> actions := a :: !actions) in
+  with_mounted (V.Body.Private.to_widget body) (fun app ops ->
+    dispatch_row_action app (native_list_node (ops ())) ("block:" ^ block_id) "collapse";
+    require (!actions = [ Application.For_testing.Set_expanded (block_id, false) ])
+      "Removing disclosure chrome loses the existing bounded collapse action")
+;;
+
 let tests =
+  [ "Detail three typography tiers and deep flat rows", test_detail_three_tiers_keep_deep_order_and_plain_rows
+  ; "Detail flat branch retains collapse", test_detail_flat_branch_keeps_explicit_collapse_action
+  ] @
   [ "Detail shared Capture control", test_detail_uses_shared_capture_control
   ; ( "timeline asset child preview title"
     , test_timeline_document_title_follows_its_asset_child )

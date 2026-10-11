@@ -245,6 +245,17 @@ type composer_owner =
   | Timeline_composer
   | Detail_composer of string * int64
 
+type detail_copy_phase =
+  | Copying
+  | Copied
+  | Copy_failed_detail of string
+
+type detail_copy_feedback =
+  { copy_scope : string
+  ; copy_owner : int * int64
+  ; copy_phase : detail_copy_phase
+  }
+
 type state =
   { favorites : Journal_routes.Favorites.t
   ; favorites_media_roots : string Rrbvec.t
@@ -276,6 +287,7 @@ type state =
   ; capture_error : capture_failure option
   ; capture_error_owner : composer_owner option
   ; timeline_notice : timeline_notice option
+  ; detail_copy_feedback : detail_copy_feedback option
   ; write_enabled : bool
   ; graph_ready : bool
   ; feed_loaded : bool
@@ -366,6 +378,7 @@ let initial_state =
   ; capture_error = None
   ; capture_error_owner = None
   ; timeline_notice = None
+  ; detail_copy_feedback = None
   ; write_enabled = false
   ; graph_ready = false
   ; feed_loaded = false
@@ -2807,14 +2820,8 @@ module Detail_list = struct
         ~on_visible_range
         ~children
     =
-    let depth = function
-      | Journal_detail.Block row -> row.depth
-      | More row -> row.depth
-    in
-    let rec siblings level items =
-      match items with
-      | (row, label) :: rest when depth row = level ->
-        let nested, rest = siblings (level + 1) rest in
+    let rows =
+      List.map2 (fun row label ->
         let row_key = Ui.Key.string (Journal_detail.row_key row) in
         let item =
           match row with
@@ -2827,7 +2834,7 @@ module Detail_list = struct
             let context_menu =
               V.Context_menu.create
                 ~actions:
-                  [ V.Context_menu.action
+                  ([ V.Context_menu.action
                       ~key:(Ui.Key.string "open")
                       ~title:"Open block"
                       ~symbol:"arrow.up.right.square"
@@ -2849,31 +2856,21 @@ module Detail_list = struct
                       ~on_press:(bind_action on_action (Copy_block id))
                       ()
                   ]
+                  |> fun actions ->
+                  if leaf then actions else
+                    V.Context_menu.action
+                      ~key:(Ui.Key.string (if expanded then "collapse" else "expand"))
+                      ~title:(if expanded then "Hide children" else "Show children")
+                      ~on_press:(bind_action on_action
+                        (if expanded then Detail_collapse id else Detail_expand id))
+                      () :: actions)
                 ()
             in
-            if leaf
-            then V.Native_list.row ~key:row_key ~separator:Hidden ~context_menu label
-            else
-              V.Native_list.disclosure_row
-                ~key:row_key
-                ~separator:Hidden
-                ~context_menu
-                ~test_id:(Ui.Test_id.string ("detail-disclosure:" ^ id))
-                ~expanded
-                ~on_expanded_changed:
-                  (Ui.Event.Handler.create (function
-                     | Ui.Event.Payload.Bool expanded ->
-                       on_action.send
-                         (if expanded then Detail_expand id else Detail_collapse id)
-                     | _ -> ()))
-                ~label
-                nested
+            V.Native_list.row ~key:row_key ~separator:Hidden ~context_menu label
         in
-        let siblings, rest = siblings level rest in
-        item :: siblings, rest
-      | _ -> [], items
+        item)
+        (Journal_detail.rows detail) children
     in
-    let rows, _ = siblings 0 (List.combine (Journal_detail.rows detail) children) in
     let scroll_request =
       Option.map
         (fun id ->
@@ -2883,10 +2880,7 @@ module Detail_list = struct
                (V.Native_list.target
                   ~section:(Ui.Key.string "outline")
                   ~row_path:
-                    [ Ui.Key.string
-                        ("block:" ^ Journal_model.id (Journal_detail.root detail))
-                    ; Ui.Key.string ("block:" ^ id)
-                    ])
+                    [ Ui.Key.string ("block:" ^ id) ])
              ~anchor:Bottom
              ~animated:false
              ())
@@ -2894,7 +2888,7 @@ module Detail_list = struct
     in
     V.Native_list.vertical
       ~key
-      ~style:Plain
+      ~style:Detail
       ?scroll_request
       ~on_scroll_completed
       ~on_visible_range
@@ -2958,7 +2952,7 @@ let detail_page
                       then "Retry loading children"
                       else "Load more")
                  ])
-        | Block { block; _ } ->
+        | Block { block; depth; _ } ->
           let source =
             if Journal_model.task_state block = No_status
             then render_source state (Journal_model.source block)
@@ -2967,8 +2961,16 @@ let detail_page
               ^ "  "
               ^ render_source state (Journal_model.source block)
           in
-          V.text ~key:(Ui.Key.string ("detail-label:" ^ Journal_model.id block)) source
-          |> V.with_test_id (Ui.Test_id.string ("detail-block:" ^ Journal_model.id block))
+          let id = "detail-block:" ^ Journal_model.id block in
+          Journal_header.detail_text ~id ~depth source
+          |> fun text ->
+          let tags = Journal_model.tag_titles block in
+          V.column ~spacing:8. (text ::
+            (if tags = [] then [] else
+              [ Journal_header.detail_text
+                  ~id:("detail-tags:" ^ Journal_model.id block) ~depth:2
+                  (String.concat "  " (List.map (fun title -> "#" ^ title) tags)) ]))
+          |> V.with_test_id (Ui.Test_id.string id)
           |> media_label
                ~store:media_store
                ~on_region
@@ -2976,7 +2978,8 @@ let detail_page
                state
                dispatch
                ~title:(Journal_model.source block)
-               ~root:(Journal_model.id block))
+               ~root:(Journal_model.id block)
+          |> Journal_header.detail_row ~depth)
       (Journal_detail.rows detail)
   in
   let content =
@@ -3026,6 +3029,15 @@ let detail_page
   |> Journal_header.detail
        ~capture_enabled:actions_enabled
        ~on_capture:(on_action Open_append)
+       ~copy_enabled:(state.graph_ready && Option.is_some detail)
+       ~on_copy:(on_action (Copy_block
+         (Option.fold ~none:"" ~some:(fun d -> Journal_model.id (Journal_detail.root d)) detail)))
+       ~copy_feedback:(Option.bind state.detail_copy_feedback (fun feedback ->
+         if feedback.copy_scope <> scope then None else Some
+           (match feedback.copy_phase with
+            | Copying -> "Copying block and descendants…"
+            | Copied -> "Copied block and descendants"
+            | Copy_failed_detail message -> "Copy failed: " ^ message)))
   |> Journal_asset_import.view
        ~key:(Ui.Key.string (scope ^ "import"))
        ~enabled:actions_enabled
@@ -3638,6 +3650,7 @@ let start
     let state, _ = Journal_graph_runtime.Copy.step !copy_state Cancel in
     copy_state := state;
     copy_owner := None;
+    set_state (fun state -> { state with detail_copy_feedback = None }) ();
     Hashtbl.iter
       (fun request_id (_, _, protocol_id) ->
          !projection_request_finished protocol_id;
@@ -3654,7 +3667,11 @@ let start
   let copy_error owner message =
     set_state (fun state ->
       if copy_current owner
-      then { state with timeline_notice = Some (Copy_failed message) }
+      then (match state.detail_copy_feedback with
+        | Some feedback when feedback.copy_owner = owner ->
+          { state with detail_copy_feedback = Some
+              { feedback with copy_phase = Copy_failed_detail message } }
+        | _ -> { state with timeline_notice = Some (Copy_failed message) })
       else state)
   in
   let rec copy_transition owner event =
@@ -3682,7 +3699,12 @@ let start
              then Effect.ignore
              else (
                match Result.bind result Journal_platform.decode_copy_text_response with
-               | Ok () -> Effect.ignore
+               | Ok () -> set_state (fun state ->
+                   match state.detail_copy_feedback with
+                   | Some feedback when feedback.copy_owner = owner ->
+                     { state with detail_copy_feedback = Some
+                         { feedback with copy_phase = Copied } }
+                   | _ -> state)
                | Error message -> copy_error owner message)))
     | Read (ticket, command) ->
       Effect.bind
@@ -3721,7 +3743,14 @@ let start
       copy_sequence := Int64.succ !copy_sequence;
       let owner = !state_ref.graph_state.generation, !copy_sequence in
       copy_owner := Some owner;
-      copy_transition owner (Start root)
+      Effect.many
+        [ set_state (fun state ->
+            { state with detail_copy_feedback =
+                Option.map (fun _ ->
+                  { copy_scope = Detail_outline.scope state.routes; copy_owner = owner
+                  ; copy_phase = Copying })
+                  (Journal_routes.detail state.routes) })
+        ; copy_transition owner (Start root) ]
   in
   let graph_runtime =
     Journal_graph_runtime.create
@@ -5078,7 +5107,7 @@ let start
       with_direct_request
         { snapshot with routes; next_request_generation = Int64.succ generation }
         (Journal_graph_request.Load_detail
-           { block_id; after = None; limit = 64; request_generation = generation })
+           { block_id; after = None; limit = 128; request_generation = generation })
     in
     let open_favorite membership_id =
       match
@@ -6208,6 +6237,7 @@ let start
     && left.asset_import_request = right.asset_import_request
     && left.asset_import_owner = right.asset_import_owner
     && left.graph_ready = right.graph_ready
+    && left.detail_copy_feedback = right.detail_copy_feedback
     && operation_failure left.timeline_notice = operation_failure right.timeline_notice
   in
   let equal_modal_presentation left right =

@@ -658,6 +658,7 @@ module View : sig
       | Plain
       | Inset
       | Inset_grouped
+      | Detail
 
     type separator =
       | Automatic
