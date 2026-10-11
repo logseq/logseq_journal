@@ -67,6 +67,7 @@ type staged_delete =
 type event =
   | Observe_visible_range of int64 * int64
   | Load_next
+  | Load_initial_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -339,10 +340,43 @@ let snapshot (t : t) =
 let rows (t : t) = (snapshot t).values
 let read_pending (t : t) = (snapshot t).reading
 
+let automatic_budget_available (t : t) =
+  t.automatic_reads < maximum_automatic_reads
+  && t.materialized_blocks + page_limit <= maximum_materialized_blocks
+;;
+
+let next_unloaded_in t current_rows first last =
+  let rec find index =
+    if index >= last
+    then None
+    else (
+      let id, depth =
+        match current_rows.indexed.(index) with
+        | Block { block; depth } -> Journal_model.id block, depth
+        | More { parent_id; depth; _ } -> parent_id, depth - 1
+      in
+      let current = branch t id in
+      if depth < maximum_depth && needs_children current && current.error = None
+      then Some id
+      else find (index + 1))
+  in
+  find first
+;;
+
+let initial_staging (t : t) =
+  let current_rows = snapshot t in
+  if current_rows.reading
+  then `Waiting
+  else if not (automatic_budget_available t)
+  then `Ready
+  else
+    match next_unloaded_in t current_rows 0 (Array.length current_rows.indexed) with
+    | None -> `Ready
+    | Some id -> `Load id
+;;
+
 let next_automatic_load (t : t) =
-  if
-    t.automatic_reads >= maximum_automatic_reads
-    || t.materialized_blocks + page_limit > maximum_materialized_blocks
+  if not (automatic_budget_available t)
   then None
   else (
     match t.visible_range with
@@ -356,22 +390,7 @@ let next_automatic_load (t : t) =
           Int64.to_int
             (Int64.min (Int64.of_int (Array.length current_rows.indexed)) index)
         in
-        let last = bounded last in
-        let rec find index =
-          if index >= last
-          then None
-          else (
-            let id, depth =
-              match current_rows.indexed.(index) with
-              | Block { block; depth } -> Journal_model.id block, depth
-              | More { parent_id; depth; _ } -> parent_id, depth - 1
-            in
-            let current = branch t id in
-            if depth < maximum_depth && needs_children current && current.error = None
-            then Some id
-            else find (index + 1))
-        in
-        find (bounded first)))
+        next_unloaded_in t current_rows (bounded first) (bounded last)))
 ;;
 
 let load ?(automatic = false) (t : t) id =
@@ -422,6 +441,11 @@ let step (t : t) = function
     (match next_automatic_load t with
      | None -> t, []
      | Some id ->
+       load ~automatic:true { t with automatic_reads = t.automatic_reads + 1 } id)
+  | Load_initial_next ->
+    (match initial_staging t with
+     | `Waiting | `Ready -> t, []
+     | `Load id ->
        load ~automatic:true { t with automatic_reads = t.automatic_reads + 1 } id)
   | Load_more id ->
     let next, requests = load t id in

@@ -4951,15 +4951,25 @@ let start
     if not state.graph_ready
     then None
     else
-      Option.bind (Journal_routes.detail state.routes) (fun detail ->
-        Option.map
-          (fun block_id -> Journal_detail.session_id detail, block_id)
-          (Journal_detail.next_automatic_load detail))
+      match Journal_routes.initial_load state.routes with
+      | Some key -> Some (`Initial key)
+      | None ->
+        Option.bind (Journal_routes.detail state.routes) (fun detail ->
+          Option.map
+            (fun block_id -> `Visible (Journal_detail.session_id detail, block_id))
+            (Journal_detail.next_automatic_load detail))
   in
   let prev_detail_drain_key = ref (detail_drain_key initial_state) in
   let detail_drain_callback = function
     | None -> Effect.ignore
-    | Some (session, block_id) ->
+    | Some (`Initial key) ->
+      set_state_and_effect (fun state ->
+        if state.graph_ready && Journal_routes.initial_load state.routes = Some key
+        then
+          let routes, requests = Journal_routes.load_initial state.routes in
+          { state with routes }, Effect.many (List.map send requests)
+        else state, Effect.ignore)
+    | Some (`Visible (session, block_id)) ->
       set_state_and_effect (fun state ->
         match Journal_routes.detail state.routes with
         | Some detail when state.graph_ready && Journal_detail.session_id detail = session

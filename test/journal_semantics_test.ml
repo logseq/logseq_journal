@@ -2387,22 +2387,21 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
     |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
     |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L (projection root [ child; sibling ])
   in
-  let load detail parent children =
-    let detail, requests = Journal_detail.step detail (Load_more (Journal_model.id parent)) in
-    let generation = match requests with
-      | [ Journal_graph_request.Load_detail { limit = 128; request_generation; _ } ] -> request_generation
-      | _ -> fail "Expanding one branch must issue exactly one bounded page read"
-    in
-    fst (Journal_detail.step detail (Loaded (generation, projection parent children)))
+  let pages =
+    [ projection child [grandchild]; projection grandchild [deep]
+    ; projection deep [deeper]; projection deeper []; projection sibling [] ] in
+  let rec complete routes =
+    match Journal_routes.initial_load routes with
+    | None -> routes
+    | Some (_, parent) ->
+      let routes, requests = Journal_routes.load_initial routes in
+      let generation = match requests with
+        | [Journal_graph_request.Load_detail {limit=128;request_generation;_}] -> request_generation
+        | _ -> fail "Initial composition must use a bounded owned read" in
+      let page = List.find (fun page -> Journal_model.id page.Journal_graph_projection.root=parent) pages in
+      complete (Journal_routes.apply_detail_response routes ~request_generation:generation page)
   in
-  let detail = Option.get (Journal_routes.detail routes)
-    |> fun t -> load t child [ grandchild ]
-    |> fun t -> load t grandchild [ deep ]
-    |> fun t -> load t deep [ deeper ]
-    |> fun t -> load t deeper []
-    |> fun t -> load t sibling []
-  in
-  let routes = Journal_routes.update_detail routes detail in
+  let routes = complete routes in
   let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
   with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
     let payloads = List.filter_map (function
@@ -2434,6 +2433,12 @@ let test_detail_flat_branch_has_no_collapse_action () =
   let routes = Journal_routes.create ()
     |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
     |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L projection in
+  let routes, requests = Journal_routes.load_initial routes in
+  let generation = match requests with
+    | [Journal_graph_request.Load_detail {request_generation;_}] -> request_generation
+    | _ -> fail "Flat child composition needs one initial read" in
+  let routes = Journal_routes.apply_detail_response routes ~request_generation:generation
+    {root=child;children={blocks=[];continuation=None}} in
   let actions = ref [] in
   let body = Application.For_testing.detail_page ~routes ~write_enabled:true (fun a -> actions := a :: !actions) in
   with_mounted (V.Body.Private.to_widget body) (fun app ops ->

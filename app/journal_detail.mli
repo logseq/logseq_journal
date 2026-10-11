@@ -24,6 +24,7 @@ type row =
 type event =
   | Observe_visible_range of int64 * int64
   | Load_next
+  | Load_initial_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -53,6 +54,12 @@ val row_key : row -> string
     Continuations and
     failed reads remain explicit Load more actions. *)
 val next_automatic_load : t -> string option
+
+(** Initial body discovery uses the same depth, complete-page reservation and
+    attempt budgets as visible demand. It reads only unknown first pages of
+    materialized branches; continuation cursors remain explicit. Publication
+    must preserve these counters rather than starting another automatic round. *)
+val initial_staging : t -> [ `Waiting | `Ready | `Load of string ]
 
 val step : t -> event -> t * Journal_graph_request.t list
 val mode : t -> mode

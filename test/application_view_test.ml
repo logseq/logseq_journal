@@ -970,10 +970,12 @@ let run_favorites_native_visibility
                        }))
                 ; next_cursor = None
                 }
-            | V2_get_children { parent; limit; _ } ->
+            | V2_get_children { parent; limit; cursor; _ } ->
               if (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
               then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
-              if check_detail_wait && G.Uuid.equal parent (uuid 2) then
+              (* Initial first pages complete before publication. The wait
+                 scenario delays only a later explicit continuation read. *)
+              if check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
                 while not (Atomic.get detail_wait_release) do
                   Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
                 done;
@@ -984,8 +986,19 @@ let run_favorites_native_visibility
                 ; items =
                     (if G.Uuid.equal parent favorites_page.uuid
                      then List.init 65 favorite_membership
+                     else if check_detail_wait && cursor = None
+                          && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
+                     then
+                       let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
+                       [ { P.value = { value with block = { value.block with parent } }
+                         ; revision = "child-first-page"
+                         } ]
                      else [])
-                ; next_cursor = None
+                ; next_cursor =
+                    (if check_detail_wait && cursor = None
+                        && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
+                     then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
+                     else None)
                 }
             | V2_list_favorites { limit; cursor } ->
               let offset =
@@ -1294,8 +1307,11 @@ let run_favorites_native_visibility
            (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String
              (Yojson.Safe.to_string (`Assoc ["type", `String "visible_range";
                "first", `Int first; "last", `Int last]))])) |> consume in
-         range 2 3;
-         wait "first branch is pending" (fun () -> Atomic.get discovery_reads = [128]);
+         let first_more = Option.get (find "accessibility-identifier"
+           ("detail-more:" ^ G.Uuid.to_string (uuid 2))) in
+         dispatch (Lui_protocol.Press first_more);
+         wait "explicit first branch continuation is pending" (fun () ->
+           Atomic.get discovery_reads = [128;128]);
          range 4 5;
          let more = Option.get (find "accessibility-identifier" more_id) in
          Alcotest.(check bool) "other branch stays disabled while first is pending" true
@@ -1331,17 +1347,14 @@ let run_favorites_native_visibility
            Unix.sleepf 0.001
          done;
          Alcotest.(check (list int))
-           "no discovery before native range"
-           []
+           "bounded initial discovery completes before body publication"
+           [128]
            (Atomic.get discovery_reads);
-         let more =
-           find "accessibility-identifier" ("detail-more:" ^ G.Uuid.to_string (uuid 2))
-           |> Option.get
-         in
          Alcotest.(check bool)
-           "unobserved More remains actionable"
+           "authoritative empty child has no More at publication"
            true
-           (List.assoc_opt "enabled" (Hashtbl.find props more) = Some (`Bool true));
+           (Option.is_none (find "accessibility-identifier"
+              ("detail-more:" ^ G.Uuid.to_string (uuid 2))));
          let list =
            Hashtbl.fold
              (fun id values found ->
@@ -1362,7 +1375,7 @@ let run_favorites_native_visibility
            |> consume
          in
          range ();
-         wait "first native range activates unknown visible child" (fun () ->
+         wait "first native range preserves completed initial discovery" (fun () ->
            Atomic.get discovery_reads = [ 128 ]);
          wait "authoritative empty child retires More" (fun () ->
            Option.is_none (find "text" "Load more"));
@@ -1375,7 +1388,7 @@ let run_favorites_native_visibility
            [ 128 ]
            (Atomic.get discovery_reads);
          Printf.printf
-           "FOLLOWUP_APPLICATION first_range reads=1 limit=128 repeated_range=10 \
+           "FOLLOWUP_APPLICATION initial_staging reads=1 limit=128 repeated_range=10 \
             duplicate_reads=0\n\
             %!";
          let navigator = Option.get (find "_extension" "navigation-stack") in
@@ -4656,7 +4669,7 @@ let () =
               ~check_covered_update:true
               ~timeline_rows:50
               ())
-        ; Alcotest.test_case "Detail first native range activates discovery" `Quick (fun () ->
+        ; Alcotest.test_case "Detail initial staging and native range ownership" `Quick (fun () ->
             run_favorites_native_visibility ~check_detail_discovery:true ())
         ; Alcotest.test_case "Detail disabled branch explains serialized wait" `Quick (fun () ->
             run_favorites_native_visibility ~check_detail_wait:true ())

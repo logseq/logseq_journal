@@ -23,6 +23,7 @@ type view =
       ; session_number : int64
       ; draft_owner : string option
       ; loading_indicator : bool
+      ; staged_detail : Journal_detail.t option
       }
   | Detail_view of
       { block_id : string
@@ -33,6 +34,7 @@ type view =
       { block_id : string
       ; request_generation : int64
       ; message : string
+      ; draft_owner : string option
       }
   | Missing_detail_view of
       { block_id : string
@@ -150,6 +152,15 @@ let view_generation = function
 
 let detail_block_id t = view_block_id (current_view t)
 let detail_request_generation t = view_generation (current_view t)
+
+let initial_load t =
+  match current_view t with
+  | Detail_loading_view { staged_detail = Some detail; _ } ->
+    (match Journal_detail.initial_staging detail with
+     | `Load id -> Some (Journal_detail.session_id detail, id)
+     | `Waiting | `Ready -> None)
+  | _ -> None
+;;
 
 let detail t =
   match current_view t with
@@ -375,7 +386,9 @@ let open_detail t ~block_id ~request_generation =
   ; owners =
       Owners.add
         owner_id
-        (Detail_loading_view { block_id; request_generation; session_number; draft_owner; loading_indicator = false })
+        (Detail_loading_view { block_id; request_generation; session_number; draft_owner
+          ; loading_indicator = false; staged_detail = None
+          })
         t.owners
   }
 ;;
@@ -395,13 +408,61 @@ let open_favorite
            { block_id; after = None; limit = 128; request_generation }) )
 ;;
 
+let settle_initial t ~entry_id =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Detail_loading_view ({ staged_detail = Some detail; _ } as loading))
+    when Journal_detail.initial_staging detail = `Ready ->
+    let draft =
+      Option.bind loading.draft_owner (fun id -> Drafts.find_opt id t.drafts)
+    in
+    let detail =
+      match draft with
+      | None -> detail
+      | Some draft -> Journal_detail.restore_composer detail draft.composer
+    in
+    let t = track_detail_session t detail in
+    { t with
+      drafts =
+        (match loading.draft_owner with
+         | None -> t.drafts
+         | Some id -> Drafts.remove id t.drafts)
+    ; owners =
+        Owners.add entry_id
+          (Detail_view
+             { block_id = loading.block_id
+             ; request_generation = loading.request_generation
+             ; detail
+             })
+          t.owners
+    }
+  | _ -> t
+;;
+
 let update_detail_at t ~entry_id detail =
   match Owners.find_opt entry_id t.owners with
   | Some (Detail_view owner) when owner.detail == detail -> t
   | Some (Detail_view owner) ->
     let t = track_detail_session t detail in
     { t with owners = Owners.add entry_id (Detail_view { owner with detail }) t.owners }
+  | Some (Detail_loading_view ({ staged_detail = Some old; _ } as owner)) ->
+    if old == detail
+    then t
+    else
+      settle_initial
+        { t with
+          owners = Owners.add entry_id
+            (Detail_loading_view { owner with staged_detail = Some detail }) t.owners
+        }
+        ~entry_id
   | _ -> t
+;;
+
+let load_initial t =
+  match active_entry_id t, current_view t with
+  | Some entry_id, Detail_loading_view { staged_detail = Some detail; _ } ->
+    let next, requests = Journal_detail.step detail Load_initial_next in
+    update_detail_at t ~entry_id next, requests
+  | _ -> t, []
 ;;
 
 let update_detail t detail =
@@ -414,7 +475,9 @@ let map_details t ~f =
   Owners.fold
     (fun entry_id view t ->
        match view with
-       | Detail_view { detail; _ } -> update_detail_at t ~entry_id (f detail)
+       | Detail_view { detail; _ }
+       | Detail_loading_view { staged_detail = Some detail; _ } ->
+         update_detail_at t ~entry_id (f detail)
        | _ -> t)
     t.owners
     t
@@ -424,33 +487,24 @@ let apply_detail_response t ~request_generation projection =
   Owners.fold
     (fun entry_id view t ->
        match view with
-       | Detail_loading_view loading
+       | Detail_loading_view ({ staged_detail = None; _ } as loading)
          when loading.request_generation = request_generation
               && loading.block_id
                  = Journal_model.id projection.Journal_graph_projection.root ->
          let detail =
            Journal_detail.create ~session_number:loading.session_number projection
          in
-         let draft =
-           Option.bind loading.draft_owner (fun id -> Drafts.find_opt id t.drafts)
+         settle_initial
+           { t with
+             owners = Owners.add entry_id
+               (Detail_loading_view { loading with staged_detail = Some detail }) t.owners
+           }
+           ~entry_id
+       | Detail_loading_view { staged_detail = Some detail; _ } ->
+         let next, _ =
+           Journal_detail.step detail (Loaded (request_generation, projection))
          in
-         let detail =
-           match draft with
-           | None -> detail
-           | Some draft -> Journal_detail.restore_composer detail draft.composer
-         in
-         let t = track_detail_session t detail in
-         { t with
-           drafts =
-             (match loading.draft_owner with
-              | None -> t.drafts
-              | Some id -> Drafts.remove id t.drafts)
-         ; owners =
-             Owners.add
-               entry_id
-               (Detail_view { block_id = loading.block_id; request_generation; detail })
-               t.owners
-         }
+         update_detail_at t ~entry_id next
        | Detail_view { detail; _ } ->
          let next, _ =
            Journal_detail.step detail (Loaded (request_generation, projection))
@@ -472,7 +526,7 @@ let apply_detail_failure
   Owners.fold
     (fun entry_id view t ->
        match view with
-       | Detail_loading_view loading
+       | Detail_loading_view ({ staged_detail = None; _ } as loading)
          when loading.request_generation = request_generation
               && (block_id = None || block_id = Some loading.block_id) ->
          let view =
@@ -480,9 +534,29 @@ let apply_detail_failure
            then Missing_detail_view { block_id = loading.block_id; request_generation }
            else
              Failed_detail_view
-               { block_id = loading.block_id; request_generation; message }
+               { block_id = loading.block_id; request_generation; message
+               ; draft_owner = loading.draft_owner
+               }
          in
          { t with owners = Owners.add entry_id view t.owners }
+       | Detail_loading_view ({ staged_detail = Some detail; _ } as loading) ->
+         let next, _ =
+           Journal_detail.step detail
+             (Load_failed (request_generation, stale_cursor, message))
+         in
+         if next == detail
+         then t
+         else
+           { t with
+             owners = Owners.add entry_id
+               (Failed_detail_view
+                  { block_id = loading.block_id
+                  ; request_generation = loading.request_generation
+                  ; message
+                  ; draft_owner = loading.draft_owner
+                  })
+               t.owners
+           }
        | Detail_view { detail; _ } ->
          let next, _ =
            Journal_detail.step
@@ -581,6 +655,7 @@ let retry_detail_at t ~entry_id ~request_generation =
       else (
         match view with
         | Detail_loading_view loading -> loading.draft_owner
+        | Failed_detail_view failed -> failed.draft_owner
         | _ -> None)
     in
     ( { t with
@@ -588,7 +663,9 @@ let retry_detail_at t ~entry_id ~request_generation =
           Owners.add
             entry_id
             (Detail_loading_view
-               { block_id; request_generation; session_number; draft_owner; loading_indicator = false })
+               { block_id; request_generation; session_number; draft_owner
+          ; loading_indicator = false; staged_detail = None
+          })
             t.owners
       ; next_session = Int64.succ session_number
       ; focus = None

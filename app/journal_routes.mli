@@ -78,6 +78,12 @@ val apply_detail_failure
   -> message:string
   -> t
 
+(** A pending route keeps all initial non-asset content unpublished while
+    bounded first-page discovery runs. Query/admit only the current owner;
+    covered completions retain their own route identity. *)
+val initial_load : t -> (Journal_ids.Text_input.session_id * string) option
+val load_initial : t -> t * Journal_graph_request.t list
+
 val detail : t -> Journal_detail.t option
 val update_detail : t -> Journal_detail.t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
