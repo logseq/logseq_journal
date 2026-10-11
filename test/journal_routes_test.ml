@@ -3604,6 +3604,20 @@ let test_initial_staging_refresh_and_delete () =
             R.apply_detail_response pending ~request_generation:fresh (page child [])
           in
           require (ids ready = [ id 0; id 1 ]) "Undo cannot finish fresh initial body" )
+    ; ( "sibling deletion preserves an unaffected pending initial read"
+      , fun () ->
+          let tail = node ~parent:(id 0) 2 in
+          let pending, _, generation = admit (start [ child; tail ]) in
+          let hidden, undo = R.stage_delete pending ~block_id:(id 2) in
+          require
+            (Option.is_some undo && R.initial_load hidden = None && R.detail hidden = None)
+            "sibling deletion cancels and repeats an unrelated read";
+          let ready =
+            R.apply_detail_response hidden ~request_generation:generation (page child [])
+          in
+          require
+            (ids ready = [ id 0; id 1 ])
+            "unaffected completion cannot publish the surviving body" )
     ; ( "descendant deletion removes subtree and Undo fences its old read"
       , fun () ->
           let tail = node ~parent:(id 0) 2
@@ -3647,6 +3661,37 @@ let test_initial_staging_refresh_and_delete () =
           require
             (ids ready = [ id 0; id 1; id 3; id 2 ])
             "Undo loses subtree or siblings" )
+    ; ( "descendant Undo cannot restore a subsequently deleted staged root"
+      , fun () ->
+          let tail = node ~parent:(id 0) 2 in
+          let pending, _, old = admit (start [ child; tail ]) in
+          let hidden, child_undo = R.stage_delete pending ~block_id:(id 1) in
+          let missing, root_undo = R.stage_delete hidden ~block_id:(id 0) in
+          require
+            (R.route missing = Missing_detail
+             && Option.is_some child_undo
+             && Option.is_some root_undo)
+            "delete sequence lacks owned Undo targets";
+          require
+            (R.undo_delete missing (Option.get child_undo) == missing)
+            "descendant Undo revives a deleted root through same entry generation";
+          let restored =
+            R.undo_delete missing (Option.get root_undo)
+            |> fun t -> R.undo_delete t (Option.get child_undo)
+          in
+          let pending, _, fresh = admit restored in
+          require
+            (fresh <> old
+             && R.apply_detail_response pending ~request_generation:old (page child [])
+                == pending)
+            "ordered root/subtree Undo accepts cancelled read";
+          let ready =
+            finish
+              (R.apply_detail_response pending ~request_generation:fresh (page child []))
+          in
+          require
+            (ids ready = [ id 0; id 1; id 2 ])
+            "ordered Undo cannot restore the surviving body" )
     ; ( "delete Undo respects covered entry Back graph and retry identities"
       , fun () ->
           let pending, _, old = admit (start [ child ]) in

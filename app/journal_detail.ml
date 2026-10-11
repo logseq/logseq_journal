@@ -743,7 +743,7 @@ let apply_child_created (t : t) ~child ~parent =
   else t
 ;;
 
-let stage_delete (t : t) ~block_id =
+let stage_delete ?(fence_reads = false) (t : t) ~block_id =
   match Blocks.find_opt block_id t.blocks with
   | None -> None
   | Some block ->
@@ -763,6 +763,14 @@ let stage_delete (t : t) ~block_id =
     in
     let removed = Blocks.filter (fun id _ -> descendant [] id) t.blocks in
     let removed_branches = Blocks.filter (fun id _ -> Blocks.mem id removed) t.branches in
+    let removed_branches =
+      if fence_reads
+      then
+        Blocks.map
+          (fun (branch : branch) -> { branch with pending = None })
+          removed_branches
+      else removed_branches
+    in
     let branches =
       Blocks.filter_map
         (fun id (branch : branch) ->

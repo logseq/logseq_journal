@@ -105,7 +105,10 @@ val account_initial_update : previous:t -> t -> t
     their generations. Restored branches can admit fresh bounded reads. *)
 val cancel_initial_reads : t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
-val stage_delete : t -> block_id:string -> (t * staged_delete) option
+
+(** With [fence_reads], initial deletion fences only removed branch tickets, including in
+    Undo state; unrelated pending reads continue without a duplicate request. *)
+val stage_delete : ?fence_reads:bool -> t -> block_id:string -> (t * staged_delete) option
 val undo_delete : t -> staged_delete -> t
 
 (** Only composer ownership is retained; reopening loads a fresh outline projection. *)

@@ -706,7 +706,7 @@ let runtime_replaced t =
   t
 ;;
 
-type staged_delete = (string * int64 * view * Journal_detail.staged_delete) list
+type staged_delete = (string * int64 * view * string * Journal_detail.staged_delete) list
 
 let stage_delete t ~block_id =
   (* A missing root no longer carries its composer. Preserve it before changing
@@ -742,17 +742,23 @@ let stage_delete t ~block_id =
                 else Detail_view { owner with detail = hidden }
               in
               ( { t with owners = Owners.add entry_id next t.owners }
-              , (entry_id, owner.request_generation, view, undo) :: staged ))
+              , (entry_id, owner.request_generation, view, block_id, undo) :: staged ))
          | Detail_loading_view ({ staged_detail = Some detail; _ } as owner) ->
-           let cancelled = Journal_detail.cancel_initial_reads detail in
-           (match Journal_detail.stage_delete cancelled ~block_id with
+           let root_removed = Journal_model.id (Journal_detail.root detail) = block_id in
+           (match Journal_detail.stage_delete ~fence_reads:true detail ~block_id with
             | None -> t, staged
             | Some (hidden, undo) ->
               let before =
-                Detail_loading_view { owner with staged_detail = Some cancelled }
+                if root_removed
+                then
+                  Detail_loading_view
+                    { owner with
+                      staged_detail = Some (Journal_detail.cancel_initial_reads detail)
+                    }
+                else view
               in
               let next =
-                if Journal_model.id (Journal_detail.root detail) = block_id
+                if root_removed
                 then
                   { t with
                     owners =
@@ -767,7 +773,7 @@ let stage_delete t ~block_id =
                   }
                 else update_detail_at t ~entry_id hidden
               in
-              next, (entry_id, owner.request_generation, before, undo) :: staged)
+              next, (entry_id, owner.request_generation, before, block_id, undo) :: staged)
          | _ -> t, staged)
       t.owners
       (t, [])
@@ -777,7 +783,7 @@ let stage_delete t ~block_id =
 
 let undo_delete t staged =
   List.fold_left
-    (fun t (entry_id, generation, before, undo) ->
+    (fun t (entry_id, generation, before, deleted_id, undo) ->
        match Owners.find_opt entry_id t.owners with
        | ( Some (Detail_view { detail; _ })
          | Some (Detail_loading_view { staged_detail = Some detail; _ }) ) as current
@@ -786,7 +792,12 @@ let undo_delete t staged =
                 ~some:(fun view -> view_generation view = generation)
                 current ->
          update_detail_at t ~entry_id (Journal_detail.undo_delete detail undo)
-       | Some (Missing_detail_view owner) when owner.request_generation = generation ->
+       | Some (Missing_detail_view owner)
+         when owner.request_generation = generation
+              &&
+              match before with
+              | Detail_loading_view _ -> owner.block_id = deleted_id
+              | _ -> true ->
          { t with
            owners = Owners.add entry_id before t.owners
          ; drafts =
