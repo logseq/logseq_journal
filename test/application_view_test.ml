@@ -430,6 +430,7 @@ let run_favorites_native_visibility
   let media_checksum = Atomic.make 'a' in
   let media_metadata_changed = Atomic.make false in
   let detail_fixture = Atomic.make false in
+  let detail_initial_limit = Atomic.make None in
   let released_demands = Atomic.make 0 in
   let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
   let capture_page : G.page option Atomic.t = Atomic.make None in
@@ -946,8 +947,10 @@ let run_favorites_native_visibility
                         (Atomic.get detail_captures)
                 ; next_cursor = None
                 }
-            | V2_get_children { parent; _ }
+            | V2_get_children { parent; limit; _ }
               when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
+              if check_copy && Atomic.get detail_initial_limit = None
+              then Atomic.set detail_initial_limit (Some limit);
               let value = timeline_block 1 in
               V2_children_outcome
                 { parent
@@ -1741,6 +1744,10 @@ let run_favorites_native_visibility
              (find
                 "accessibility-identifier"
                 ("detail-block:" ^ G.Uuid.to_string (uuid 1))));
+         (* Pure routes retain navigation but do not issue Application's
+            ordinary Open block read; inspect that public worker boundary. *)
+         Alcotest.(check (option int)) "ordinary Detail first-page budget"
+           (Some 128) (Atomic.get detail_initial_limit);
          let detail_list =
            Hashtbl.fold
              (fun id values found ->

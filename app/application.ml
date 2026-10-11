@@ -5107,7 +5107,7 @@ let start
       with_direct_request
         { snapshot with routes; next_request_generation = Int64.succ generation }
         (Journal_graph_request.Load_detail
-           { block_id; after = None; limit = 64; request_generation = generation })
+           { block_id; after = None; limit = 128; request_generation = generation })
     in
     let open_favorite membership_id =
       match

@@ -2390,7 +2390,7 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
   let load detail parent children =
     let detail, requests = Journal_detail.step detail (Set_branch_expanded (Journal_model.id parent, true)) in
     let generation = match requests with
-      | [ Journal_graph_request.Load_detail { limit = 64; request_generation; _ } ] -> request_generation
+      | [ Journal_graph_request.Load_detail { limit = 128; request_generation; _ } ] -> request_generation
       | _ -> fail "Expanding one branch must issue exactly one bounded page read"
     in
     fst (Journal_detail.step detail (Loaded (generation, projection parent children)))
