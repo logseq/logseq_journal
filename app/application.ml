@@ -2938,7 +2938,10 @@ let detail_page
                      (if Option.is_some error
                       then "Retry loading children"
                       else "Load more")
-                 ])
+                 ]
+               @ if enabled
+                 then []
+                 else [ V.text "Waiting for another branch to finish" ])
         | Block { block; depth; _ } ->
           let source =
             if Journal_model.task_state block = No_status
