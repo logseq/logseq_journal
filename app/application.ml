@@ -6541,6 +6541,25 @@ let start
             ~on_select:assets.on_event
             (V.Body.static (V.empty ())))
     in
+    let feedback =
+      region
+        "feedback"
+        ~equal:(fun left right ->
+          left.timeline_notice = right.timeline_notice
+          && left.failed_capture_imports == right.failed_capture_imports)
+        (fun current ->
+           if current.timeline_notice = None
+           then V.empty ()
+           else
+             operation_feedback
+               ~scope:"root"
+               ~state:current
+               dispatch
+               (* The root feedback is a sibling of retained root content.
+                  A native flexible column gives its inset a full-page host;
+                  an empty Stack collapses instead of owning the bottom edge. *)
+               (V.Body.static (V.column ~spacing:0. [ V.spacer () ])))
+    in
     let navigator =
       V.of_lui (fun context parent ->
         let mapped =
@@ -6563,7 +6582,11 @@ let start
                    if routes == current.routes
                    then current
                    else { current with routes; modal = No_modal }))))
-          ~root:(Lui_elements.column ~grow:1.0 [ Journal_view.mount root ])
+          ~root:
+            (* Keep feedback in the root native page so a pushed destination
+               covers it together with the retained Timeline/Favorites. *)
+            (Lui_elements.column ~grow:1.0
+               [ Journal_view.mount (V.stack [ root; feedback ]) ])
           ~destination:(fun entry ->
             let initial =
               Option.value
@@ -6754,22 +6777,6 @@ let start
              dispatch
              (V.empty ()))
     in
-    let feedback =
-      region
-        "feedback"
-        ~equal:(fun left right ->
-          left.timeline_notice = right.timeline_notice
-          && left.failed_capture_imports == right.failed_capture_imports)
-        (fun current ->
-           if current.timeline_notice = None
-           then V.empty ()
-           else
-             operation_feedback
-               ~scope:"root"
-               ~state:current
-               dispatch
-               (V.Body.static (V.empty ())))
-    in
     let settings =
       region
         "settings"
@@ -6794,7 +6801,6 @@ let start
         ; capture_adapter
         ; modal
         ; confirmations
-        ; feedback
         ; settings
         ]
     in

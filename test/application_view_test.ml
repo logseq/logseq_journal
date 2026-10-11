@@ -1507,12 +1507,111 @@ let run_favorites_native_visibility
                 (Atomic.get imports_entered);
               Atomic.set import_release true;
               wait "both imports finish" (fun () -> Atomic.get imports_finished = 2);
-              if scenario = "retry-imports" then (
-                wait "failed import exposes target retry" (fun () -> Option.is_some (find "accessibility-label" "Retry imports"));
-                Alcotest.(check bool) "failed import keeps its own staged file" true (Sys.file_exists (List.hd !staged_paths));
-                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Retry imports")));
-                wait "same child import retries" (fun () -> Atomic.get imports_finished = 3);
-                Alcotest.(check int) "import retry does not create another child" 1 (Atomic.get child_attempts));
+              if scenario = "retry-imports"
+              then (
+                wait "failed import exposes target retry" (fun () ->
+                  Option.is_some (find "accessibility-label" "Retry imports"));
+                (* Routes reducers own the path, but cannot express native
+                   feedback ancestry or layout. Mount the real failure through the
+                   public Application boundary; navigation must cover the
+                   root feedback together with the root page. *)
+                let rec navigation_page id =
+                  let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+                  if List.assoc_opt "_extension" values = Some (`String "navigation-page")
+                  then List.assoc_opt "entry-id" values
+                  else Option.bind (Hashtbl.find_opt parents id) navigation_page
+                in
+                let root_actions =
+                  Option.get (find "accessibility-identifier" "root-operation-actions")
+                in
+                Alcotest.(check (option string))
+                  "root feedback is retained inside the native root page"
+                  (Some "root")
+                  (Option.map Yojson.Safe.Util.to_string (navigation_page root_actions));
+                let detail_actions =
+                  all "accessibility-label" "Retry imports"
+                  |> List.find (fun id -> navigation_page id <> Some (`String "root"))
+                in
+                Alcotest.(check bool)
+                  "Detail feedback belongs to its native destination"
+                  true
+                  (match navigation_page detail_actions with
+                   | Some (`String entry) -> entry <> "root"
+                   | _ -> false);
+                let rec inset_owner id =
+                  let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+                  if List.assoc_opt "_kind" values = Some (`String "edge-inset")
+                  then id
+                  else inset_owner (Hashtbl.find parents id)
+                in
+                let root_inset = inset_owner root_actions in
+                let root_body =
+                  Hashtbl.fold
+                    (fun id parent found ->
+                       if
+                         parent = root_inset
+                         && List.assoc_opt "_kind" (Hashtbl.find props id)
+                            = Some (`String "stack")
+                       then Some id
+                       else found)
+                    parents
+                    None
+                  |> Option.get
+                in
+                let rec inside_body id =
+                  id = root_body
+                  || Option.fold
+                       ~none:false
+                       ~some:inside_body
+                       (Hashtbl.find_opt parents id)
+                in
+                Alcotest.(check bool)
+                  "empty root feedback body fills its native page"
+                  true
+                  (Hashtbl.fold
+                     (fun id values found ->
+                        found
+                        || (List.assoc_opt "_kind" values = Some (`String "spacer")
+                            && inside_body id))
+                     props
+                     false);
+                Alcotest.(check bool)
+                  "failed import keeps its own staged file"
+                  true
+                  (Sys.file_exists (List.hd !staged_paths));
+                let retained_root = Option.get (find "text" "Timeline fixture 1") in
+                back ();
+                Alcotest.(check int)
+                  "Back retains the root feedback owner and its unresolved error"
+                  root_actions
+                  (Option.get (find "accessibility-identifier" "root-operation-actions"));
+                Alcotest.(check int)
+                  "feedback updates retain the root content"
+                  retained_root
+                  (Option.get (find "text" "Timeline fixture 1"));
+                enter 0;
+                dispatch (Lui_protocol.Press detail_actions);
+                settle_worker ();
+                Alcotest.(check int)
+                  "retired Detail feedback cannot start an import retry"
+                  2
+                  (Atomic.get imports_finished);
+                let current_retry =
+                  all "accessibility-label" "Retry imports"
+                  |> List.find (fun id ->
+                    match navigation_page id with
+                    | Some (`String entry) -> entry <> "root"
+                    | _ -> false)
+                in
+                dispatch (Lui_protocol.Press current_retry);
+                wait "same child import retries" (fun () ->
+                  Atomic.get imports_finished = 3);
+                wait "successful retry retires both feedback controls" (fun () ->
+                  all "accessibility-label" "Retry imports" = []);
+                Alcotest.(check int)
+                  "import retry does not create another child"
+                  1
+                  (Atomic.get child_attempts));
               if not (List.mem scenario [ "retry-imports"; "selection-error" ]) then (
                 wait "failed import offers explicit discard" (fun () -> Option.is_some (find "accessibility-label" "Dismiss"));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss"))));
