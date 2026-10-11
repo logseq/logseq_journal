@@ -1643,6 +1643,7 @@ type command =
   | Capture_asset of Journal_asset_import.event
   | Timeline_retry of string
   | Detail_open of string
+  | Detail_visible_range of int64 * int64
   | Detail_more of string
   | Detail_task_intent of string
   | Detail_submit of string
@@ -2911,29 +2912,25 @@ let detail_page
     { dispatch with send = (fun action -> dispatch.send (Detail_action (scope, action))) }
   in
   let on_action action = bind_action local action in
-  let button ~id ~command ~symbol title =
-    V.buttons
-      ~actions:
-        [ V.buttons_action
-            ~label:title
-            ~icon:symbol
-            ~text:title
-            ~on_press:(on_action command)
-            ()
-        ]
+  let button ?(enabled = true) ~id ~command ~symbol title =
+    V.button
+      ~enabled
+      ~on_press:(on_action command)
+      ~child:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
       ()
     |> V.with_test_id (Ui.Test_id.string id)
   in
   let rows detail =
     List.map
       (function
-        | Journal_detail.More { parent_id; loading; error; _ } ->
+        | Journal_detail.More { parent_id; loading; enabled; error; _ } ->
           if loading
           then V.loading ~message:"Loading children" ()
           else
             V.column
               (Option.to_list (Option.map live_region_text error)
                @ [ button
+                     ~enabled
                      ~id:("detail-more:" ^ parent_id)
                      ~command:(Detail_more parent_id)
                      ~symbol:
@@ -2984,6 +2981,7 @@ let detail_page
         ~on_visible_range:
           (Ui.Event.Handler.create (function
              | Ui.Event.Payload.Visible_range range ->
+               local.send (Detail_visible_range (range.first_index, range.last_exclusive));
                dispatch.send
                  (Media_range
                     ( media_presentation_scope state ~detail:true
@@ -5150,9 +5148,11 @@ let start
     let detail_event event =
       match Journal_routes.detail snapshot.routes with
       | None -> Effect.ignore
-      | Some detail ->
-        let detail, requests = Journal_detail.step detail event in
-        Effect.bind
+      | Some previous ->
+        let detail, requests = Journal_detail.step previous event in
+        if detail == previous && requests = []
+        then Effect.ignore
+        else Effect.bind
           (update (fun state ->
              { state with routes = Journal_routes.update_detail state.routes detail }))
           ~f:(fun () -> Effect.many (List.map send requests))
@@ -5767,6 +5767,8 @@ let start
          update (fun state ->
            { state with timeline = Journal_timeline_state.retry_day state.timeline ~day }))
     | Detail_open value -> open_block value
+    | Detail_visible_range (first, last) ->
+      detail_event (Observe_visible_range (first, last))
     | Detail_more value -> detail_event (Load_more value)
     | Detail_task_intent value -> update_draft ~toggle:true value
     | Detail_retry ->

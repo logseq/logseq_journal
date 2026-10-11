@@ -386,6 +386,7 @@ let run_favorites_native_visibility
       ?(check_hidden = false)
       ?(check_draft = false)
       ?(check_detail = false)
+      ?(check_detail_discovery = false)
       ?(check_copy = false)
       ?(check_navigation = false)
       ?(check_detail_row_action = false)
@@ -431,6 +432,7 @@ let run_favorites_native_visibility
   let media_metadata_changed = Atomic.make false in
   let detail_fixture = Atomic.make false in
   let detail_initial_limit = Atomic.make None in
+  let discovery_reads = Atomic.make [] in
   let released_demands = Atomic.make 0 in
   let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
   let capture_page : G.page option Atomic.t = Atomic.make None in
@@ -963,7 +965,9 @@ let run_favorites_native_visibility
                     ]
                 ; next_cursor = None
                 }
-            | V2_get_children { parent; _ } ->
+            | V2_get_children { parent; limit; _ } ->
+              if check_detail_discovery && G.Uuid.equal parent (uuid 2)
+              then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
               V2_children_outcome
                 { parent
                 ; revision_scope = V2_children_revision parent
@@ -1263,6 +1267,93 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       if check_detail_discovery
+       then (
+         Atomic.set detail_fixture true;
+         let root_list = Option.get (find "_extension" "journal-list") in
+         let label = Option.get (find "text" "Timeline fixture 0") in
+         dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
+         wait "Detail initial projection mounted" (fun () ->
+           Option.is_some
+             (find
+                "accessibility-identifier"
+                ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+         for _ = 1 to 10 do
+           hooks.pump () |> consume;
+           Unix.sleepf 0.001
+         done;
+         Alcotest.(check (list int))
+           "no discovery before native range"
+           []
+           (Atomic.get discovery_reads);
+         let more =
+           find "accessibility-identifier" ("detail-more:" ^ G.Uuid.to_string (uuid 2))
+           |> Option.get
+         in
+         Alcotest.(check bool)
+           "unobserved More remains actionable"
+           true
+           (List.assoc_opt "enabled" (Hashtbl.find props more) = Some (`Bool true));
+         let list =
+           Hashtbl.fold
+             (fun id values found ->
+                if
+                  id <> root_list
+                  && List.assoc_opt "_extension" values = Some (`String "journal-list")
+                then Some id
+                else found)
+             props
+             None
+           |> Option.get
+         in
+         let range () =
+           hooks.extension_event
+             list
+             "event"
+             {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":2,\"last\":3}"}|}
+           |> consume
+         in
+         range ();
+         wait "first native range activates unknown visible child" (fun () ->
+           Atomic.get discovery_reads = [ 128 ]);
+         wait "authoritative empty child retires More" (fun () ->
+           Option.is_none (find "text" "Load more"));
+         for _ = 1 to 10 do
+           range ();
+           hooks.pump () |> consume
+         done;
+         Alcotest.(check (list int))
+           "duplicate native ranges do not reread"
+           [ 128 ]
+           (Atomic.get discovery_reads);
+         Printf.printf
+           "FOLLOWUP_APPLICATION first_range reads=1 limit=128 repeated_range=10 \
+            duplicate_reads=0\n\
+            %!";
+         let navigator = Option.get (find "_extension" "navigation-stack") in
+         let back name =
+           let revision =
+             List.assoc "revision" (Hashtbl.find props navigator)
+             |> Yojson.Safe.Util.to_int
+           in
+           hooks.extension_event
+             navigator
+             name
+             (Yojson.Safe.to_string
+                (`Assoc [ "revision", `Int revision; "length", `Int 0 ]))
+           |> consume
+         in
+         back "path-changed";
+         back "settled";
+         wait "native Back retires Detail visibility owner" (fun () ->
+           not (Hashtbl.mem props list));
+         range ();
+         hooks.pump () |> consume;
+         Alcotest.(check (list int))
+           "retired range cannot activate hidden reads"
+           [ 128 ]
+           (Atomic.get discovery_reads);
+         Atomic.set detail_fixture false);
        (* Detail/Routes already own text admission, retry, outline ordering and
           retained drafts, covered by their pure public reducer tests. They
           cannot reproduce native Capture placement, shared Composer wiring,
@@ -4449,6 +4540,8 @@ let () =
               ~check_covered_update:true
               ~timeline_rows:50
               ())
+        ; Alcotest.test_case "Detail first native range activates discovery" `Quick (fun () ->
+            run_favorites_native_visibility ~check_detail_discovery:true ())
         ; Alcotest.test_case "Copy menus and replacement ownership" `Quick (fun () ->
             run_favorites_native_visibility ~check_copy:true ())
         ; Alcotest.test_case "Detail native context menu dispatch" `Quick (fun () ->

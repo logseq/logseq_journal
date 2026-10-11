@@ -17,10 +17,12 @@ type row =
       { parent_id : string
       ; depth : int
       ; loading : bool
+      ; enabled : bool
       ; error : string option
       }
 
 type event =
+  | Observe_visible_range of int64 * int64
   | Load_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
@@ -41,7 +43,14 @@ val continuation : t -> parent_id:string -> Journal_graph_projection.block_curso
 val rows : t -> row list
 val row_key : row -> string
 
-(** Next bounded first-page read within the selected outline; continuations and
+(** Next bounded first-page read demanded by the native visible index range.
+    Before the first observation no automatic read is admitted. Each round
+    reserves complete 128-item pages against a conservative 384-block counter
+    and at most 128 reads. Initially the counter includes the root and its
+    projection page. A successfully admitted explicit action starts a new
+    round counting returned pages; earlier explicit rows and external updates
+    remain available and are not globally truncated.
+    Continuations and
     failed reads remain explicit Load more actions. *)
 val next_automatic_load : t -> string option
 

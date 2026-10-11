@@ -1,6 +1,10 @@
 module ID = Journal_ids
 module Ui = Journal_view
 
+let observe_outline owner =
+  fst (Journal_detail.step owner (Observe_visible_range (0L, 10000L)))
+;;
+
 let fail format = Printf.ksprintf failwith format
 
 let require condition format =
@@ -1686,7 +1690,7 @@ let test_automatic_outline_reads_are_bounded_and_idempotent () =
     ; protocol_cursor = None } in
   let owner = D.create ~session_number:91L
       { root; children = { blocks = List.filteri (fun n _ -> n < 128) children
-        ; continuation = Some cursor } } in
+        ; continuation = Some cursor } } |> observe_outline in
   let owner, requests = D.step owner (Load_more (Journal_model.id root)) in
   let generation = match requests with
     | [ Journal_graph_request.Load_detail { request_generation; _ } ] -> request_generation
@@ -2639,7 +2643,7 @@ let test_projected_unknown_children_are_read_once () =
   require (Journal_model.child_count (List.hd projection.children.blocks) = 0)
     "public projection fixture must retain unknown child count";
   let module D = Journal_detail in
-  let owner = D.create ~session_number:134L projection in
+  let owner = D.create ~session_number:134L projection |> observe_outline in
   let child_id = G.Uuid.to_string child.block.uuid in
   require (D.next_automatic_load owner = Some child_id)
     "projected zero child count is unknown and must admit discovery";
@@ -2668,7 +2672,7 @@ let test_detail_default_outline_depth_and_cycle_boundaries () =
   let projection n : Journal_graph_projection.detail =
     { root = List.nth chain n; children =
         { blocks = [ List.nth chain (n + 1) ]; continuation = None } } in
-  let owner = D.create ~session_number:131L (projection 0) in
+  let owner = D.create ~session_number:131L (projection 0) |> observe_outline in
   require (List.exists (function D.More { parent_id; _ } -> parent_id = id 1
       | _ -> false) (D.rows owner))
     "default expanded child must expose loading/Load more without disclosure";
@@ -2697,7 +2701,7 @@ let test_detail_default_outline_depth_and_cycle_boundaries () =
     "ancestor cycle must terminate without hiding valid ancestors";
   let leaf = block ~id:(id 20) ~parent_id:(Some (id 0)) ~child_count:0 () in
   let leaf_owner = D.create ~session_number:132L
-      { root = List.hd chain; children = { blocks = [ leaf ]; continuation = None } } in
+      { root = List.hd chain; children = { blocks = [ leaf ]; continuation = None } } |> observe_outline in
   let leaf_owner, requests = D.step leaf_owner Load_next in
   let generation = match requests with
     | [ Journal_graph_request.Load_detail { request_generation; _ } ] -> request_generation
@@ -2807,7 +2811,342 @@ let test_detail_retry_uses_128_item_first_page () =
   | _ -> fail "Detail retry lost its first-page owner"
 ;;
 
+(* These regressions reproduce the review findings through Detail's public
+   owner, including native visibility observations and admitted completions. *)
+let followup_block number parent =
+  block
+    ~id:(Printf.sprintf "79000000-0000-4000-a000-%012d" number)
+    ~parent_id:parent
+    ~order:(Printf.sprintf "%06d" number)
+    ~child_count:0
+    ()
+;;
+
+let followup_page root children continuation : Journal_graph_projection.detail =
+  { root; children = { blocks = children; continuation } }
+;;
+
+let followup_read owner event =
+  let owner, requests = Journal_detail.step owner event in
+  match requests with
+  | [ Journal_graph_request.Load_detail
+        { block_id; limit = 128; request_generation; after }
+    ] -> owner, block_id, request_generation, after
+  | _ -> fail "followup expected exactly one 128-item public read"
+;;
+
+let followup_visible owner first last =
+  fst
+    (Journal_detail.step
+       owner
+       (Observe_visible_range (Int64.of_int first, Int64.of_int last)))
+;;
+
+let followup_counts owner =
+  let rows = Journal_detail.rows owner in
+  ( List.length
+      (List.filter
+         (function
+           | Journal_detail.Block _ -> true
+           | _ -> false)
+         rows)
+  , List.length rows )
+;;
+
+let test_followup_branch_loading_preserves_unrelated_errors () =
+  let module D = Journal_detail in
+  let root = followup_block 1 None in
+  let a, b, c =
+    ( followup_block 2 (Some (Journal_model.id root))
+    , followup_block 3 (Some (Journal_model.id root))
+    , followup_block 4 (Some (Journal_model.id root)) )
+  in
+  let owner = D.create ~session_number:151L (followup_page root [ a; b; c ] None) in
+  let owner, _, generation, _ = followup_read owner (Load_more (Journal_model.id a)) in
+  let owner, _ = D.step owner (Load_failed (generation, false, "A offline")) in
+  let owner, _, generation, _ = followup_read owner (Load_more (Journal_model.id b)) in
+  let more id state =
+    List.find
+      (function
+        | D.More { parent_id; _ } -> parent_id = id
+        | _ -> false)
+      (D.rows state)
+  in
+  (match more (Journal_model.id a) owner with
+   | D.More { loading = false; enabled = false; error = Some "A offline"; _ } -> ()
+   | _ -> fail "unrelated pending branch replaced A's error/Retry with loading");
+  (match more (Journal_model.id b) owner with
+   | D.More { loading = true; enabled = false; error = None; _ } -> ()
+   | _ -> fail "pending B must own its loading feedback");
+  (match more (Journal_model.id c) owner with
+   | D.More { loading = false; enabled = false; error = None; _ } -> ()
+   | _ -> fail "idle C must be waiting, not loading");
+  let refused, requests = D.step owner (Load_more (Journal_model.id a)) in
+  require
+    (refused == owner && requests = [])
+    "busy Retry reset state or admitted another read";
+  let owner, _ = D.step owner (Loaded (generation, followup_page b [] None)) in
+  (match more (Journal_model.id a) owner with
+   | D.More { loading = false; enabled = true; error = Some "A offline"; _ } -> ()
+   | _ -> fail "serialized completion did not restore A's Retry");
+  ignore (followup_read owner (Load_more (Journal_model.id a)))
+;;
+
+let test_followup_materialized_rows_are_bounded () =
+  let module D = Journal_detail in
+  List.iteri
+    (fun scenario (initial_count, pages) ->
+       let root = followup_block (10000 + (scenario * 1000)) None in
+       let children =
+         List.init initial_count (fun n ->
+           followup_block (10001 + (scenario * 1000) + n) (Some (Journal_model.id root)))
+       in
+       let owner =
+         D.create
+           ~session_number:(Int64.of_int (152 + scenario))
+           (followup_page root children None)
+         |> fun owner -> followup_visible owner 0 10000
+       in
+       let returned = ref 0
+       and reads = ref 0 in
+       let owner =
+         List.fold_left
+           (fun owner width ->
+              require
+                (D.next_automatic_load owner <> None)
+                "bounded sparse page stopped too soon";
+              let next, parent_id, generation, after = followup_read owner Load_next in
+              require (after = None) "auto read consumed a continuation";
+              let refused, requests = D.step next (Load_more parent_id) in
+              require
+                (refused == next && requests = [])
+                "rejected manual read reset row budget";
+              let parent = D.find_block next ~block_id:parent_id |> Option.get in
+              incr reads;
+              let blocks =
+                List.init width (fun n ->
+                  followup_block
+                    (20000 + (scenario * 1000) + (!reads * 128) + n)
+                    (Some parent_id))
+              in
+              returned := !returned + width;
+              fst (D.step next (Loaded (generation, followup_page parent blocks None))))
+           owner
+           pages
+       in
+       let block_count, total_rows = followup_counts owner in
+       require
+         (block_count <= 384 && total_rows <= 768)
+         "auto expansion exceeds materialized/flat row bound: blocks=%d rows=%d"
+         block_count
+         total_rows;
+       require
+         (D.next_automatic_load owner = None)
+         "auto read has no full 128-row reservation";
+       let same, requests = D.step owner Load_next in
+       require (same == owner && requests = []) "exhausted auto round kept reading";
+       require
+         (List.exists
+            (function
+              | D.More { loading = false; enabled = true; _ } -> true
+              | _ -> false)
+            (D.rows owner))
+         "row budget exhaustion removed explicit Load more";
+       Printf.printf
+         "FOLLOWUP_METRIC bounded-%d initial=%d reads=%d limit=128 returned=%d blocks=%d \
+          rows=%d\n\
+          %!"
+         scenario
+         (initial_count + 1)
+         !reads
+         !returned
+         block_count
+         total_rows;
+       let parent_id =
+         List.find_map
+           (function
+             | D.More { parent_id; _ } -> Some parent_id
+             | _ -> None)
+           (D.rows owner)
+         |> Option.get
+       in
+       let next, _, generation, _ = followup_read owner (Load_more parent_id) in
+       let parent = D.find_block next ~block_id:parent_id |> Option.get in
+       let blocks =
+         List.init 128 (fun n ->
+           followup_block (40000 + (scenario * 1000) + n) (Some parent_id))
+       in
+       let next, _ =
+         D.step next (Loaded (generation, followup_page parent blocks None))
+       in
+       require
+         (D.next_automatic_load next <> None)
+         "successful explicit read did not reopen a bounded round")
+    [ 128, [ 128 ]; 127, [ 128; 127 ]; 1, [ 127; 1; 128 ] ]
+;;
+
+let test_followup_visible_discovery_and_presentation_reuse () =
+  let module D = Journal_detail in
+  let root = followup_block 50000 None in
+  let children =
+    List.init 128 (fun n -> followup_block (50001 + n) (Some (Journal_model.id root)))
+  in
+  let owner = D.create ~session_number:156L (followup_page root children None) in
+  require
+    (D.next_automatic_load owner = None)
+    "Detail read offscreen before its first native range";
+  let initial_rows = D.rows owner in
+  require
+    (D.rows owner == initial_rows)
+    "unchanged outline repeatedly rebuilt row snapshots";
+  let owner = followup_visible owner 2 3 in
+  require
+    (D.rows owner == initial_rows
+     && D.equal_presentation owner (followup_visible owner 2 3))
+    "range-only changes rebuilt presentation";
+  let owner, target, generation, _ = followup_read owner Load_next in
+  require
+    (target = Journal_model.id (List.hd children))
+    "visible More did not discover its off-window parent";
+  let owner, _ =
+    D.step owner (Loaded (generation, followup_page (List.hd children) [] None))
+  in
+  require
+    (D.next_automatic_load owner = Some (Journal_model.id (List.nth children 1)))
+    "completion did not remap the saved indexes when More disappeared";
+  let owner, _, generation, _ = followup_read owner Load_next in
+  let owner, _ =
+    D.step owner (Loaded (generation, followup_page (List.nth children 1) [] None))
+  in
+  require
+    (D.next_automatic_load owner = None)
+    "visible empty-leaf discovery cascaded to offscreen siblings";
+  let rows = D.rows owner in
+  for _ = 1 to 25 do
+    let same = followup_visible owner 2 3 in
+    require
+      (same == owner && D.rows same == rows)
+      "repeated native range rebuilt state/rows";
+    let same, requests = D.step same Load_next in
+    require
+      (same == owner && requests = [] && D.rows same == rows)
+      "repeated pump performed work"
+  done;
+  let draft = D.update_child_source owner "Unrelated draft edit" in
+  require (D.rows draft == rows) "composer edit rebuilt unchanged outline rows";
+  let stale, _ = D.step draft (Loaded (0L, followup_page root [] None)) in
+  require (stale == draft && D.rows stale == rows) "stale completion rebuilt rows";
+  let offscreen = followup_visible owner 5000 6000 in
+  require
+    (D.next_automatic_load offscreen = None && D.rows offscreen == rows)
+    "out-of-range viewport caused hidden reads";
+  let blocks, flat = followup_counts owner in
+  Printf.printf
+    "FOLLOWUP_METRIC wide-empty initial=129 reads=2 limit=128 returned=0 blocks=%d \
+     rows=%d repeat_range=25 duplicate_reads=0\n\
+     %!"
+    blocks
+    flat
+;;
+
+let test_followup_snapshot_invalidation_and_owner_isolation () =
+  let module D = Journal_detail in
+  let root = followup_block 60000 None in
+  let child = followup_block 60001 (Some (Journal_model.id root)) in
+  let owner = D.create ~session_number:157L (followup_page root [ child ] None) in
+  let rows = D.rows owner in
+  require (D.rows owner == rows) "same owner rebuilt rows";
+  let other = D.create ~session_number:158L (followup_page root [ child ] None) in
+  require (D.rows other != rows) "row snapshot crossed Detail sessions";
+  let changed =
+    block
+      ~id:(Journal_model.id child)
+      ~parent_id:(Some (Journal_model.id root))
+      ~source:"Updated task/media source"
+      ~revision:"changed"
+      ~task_state:Done
+      ~child_count:0
+      ()
+    |> fun block -> Journal_model.with_tag_titles block ~tag_titles:[ "QA updated" ]
+  in
+  let old_owner = owner in
+  let owner = D.apply_block owner changed in
+  require
+    (D.rows owner != rows
+     && List.exists
+          (function
+            | D.Block { block; _ } ->
+              Journal_model.source block = "Updated task/media source"
+              && Journal_model.task_state block = Done
+              && Journal_model.tag_titles block = [ "QA updated" ]
+            | _ -> false)
+          (D.rows owner))
+    "block attributes did not invalidate rows";
+  require (D.rows old_owner == rows) "derived outline overwrote retained snapshot cache";
+  let rows = D.rows owner in
+  let owner, staged =
+    D.stage_delete owner ~block_id:(Journal_model.id child) |> Option.get
+  in
+  require
+    (D.rows owner != rows && fst (followup_counts owner) = 1)
+    "delete retained stale rows";
+  let deleted = D.rows owner in
+  let owner = D.undo_delete owner staged in
+  require
+    (D.rows owner != deleted && fst (followup_counts owner) = 2)
+    "Undo retained deleted rows";
+  let owner = D.reconcile_children owner (followup_page root [] None) in
+  require (fst (followup_counts owner) = 1) "authoritative refresh retained removed rows";
+  let owner = D.update_child_source owner "Appended QA block" in
+  let owner, request =
+    D.admit_child
+      owner
+      ~mutation_id:"79000000-0000-4000-9000-000000060001"
+      ~calendar_generation:1L
+      ~block_id:(Journal_model.id child)
+      ~sibling_order:"999"
+      ~creation_time:(creation_time 600)
+  in
+  require (request <> None) "append admission missing";
+  let rows = D.rows owner in
+  let owner = D.apply_child_created owner ~child ~parent:root in
+  require
+    (D.rows owner != rows && fst (followup_counts owner) = 2)
+    "append retained stale rows";
+  let owner = followup_visible owner 0 10 in
+  let owner, id, generation, _ = followup_read owner Load_next in
+  require (id = Journal_model.id child) "new append not discoverable";
+  let owner, _ = D.step owner (Loaded (generation, followup_page child [] None)) in
+  require (D.next_automatic_load owner = None) "append leaf read repeated";
+  Printf.printf
+    "FOLLOWUP_METRIC root-only reads=0 rows=1 append reads=1 returned=0 rows=%d\n%!"
+    (snd (followup_counts owner))
+;;
+
+let test_followup_review_regressions () =
+  let failures = ref [] in
+  List.iter
+    (fun (name, run) ->
+       try run () with
+       | error ->
+         Printf.eprintf "FOLLOWUP_RED %s: %s\n%!" name (Printexc.to_string error);
+         failures := name :: !failures)
+    [ "branch-specific loading", test_followup_branch_loading_preserves_unrelated_errors
+    ; "materialized row cap", test_followup_materialized_rows_are_bounded
+    ; ( "visible discovery and snapshot reuse"
+      , test_followup_visible_discovery_and_presentation_reuse )
+    ; ( "snapshot invalidation and isolation"
+      , test_followup_snapshot_invalidation_and_owner_isolation )
+    ];
+  require
+    (!failures = [])
+    "Review regressions failed: %s"
+    (String.concat ", " (List.rev !failures))
+;;
+
 let tests =
+  [ "PR63 public review regressions", test_followup_review_regressions
+  ] @
   [ "projected unknown children are read once", test_projected_unknown_children_are_read_once
   ; "Detail default ten levels and cycle boundaries", test_detail_default_outline_depth_and_cycle_boundaries
   ; "Detail serialized reads and retry feedback", test_detail_serial_reads_and_retry_feedback
