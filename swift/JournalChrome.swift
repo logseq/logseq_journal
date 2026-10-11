@@ -108,6 +108,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
         content.frame(width: bounds.size.width, height: bounds.size.height)
           .scrollContentBackground(.hidden)
           #if os(iOS)
+          // Journals has no section title; named sections retain native indicators.
+          .scrollIndicators(properties.title == nil ? .hidden : .automatic)
           .scrollEdgeEffectHidden(true, for: .bottom)
           .scrollEdgeEffectStyle(.soft, for: .top)
           #endif

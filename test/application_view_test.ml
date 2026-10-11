@@ -2155,8 +2155,8 @@ let run_favorites_native_visibility
              if
                List.mem
                  scenario
-                 [ `Detail_collapse
-                 ; `Detail_reopen
+                 [ `Detail_range_exit
+                 ; `Detail_range_reentry
                  ; `Detail_shared
                  ; `Detail_pending
                  ; `Detail_offscreen
@@ -2271,8 +2271,8 @@ let run_favorites_native_visibility
                  native_path 0;
                  assert_ready "natural Back without appearance replay"
                done
-             | `Detail_collapse
-             | `Detail_reopen
+             | `Detail_range_exit
+             | `Detail_range_reentry
              | `Detail_shared
              | `Detail_pending
              | `Detail_offscreen
@@ -2350,29 +2350,23 @@ let run_favorites_native_visibility
                  |> consume;
                  settle ()
                in
-               let expand expanded =
-                 detail_event
-                   (`Assoc
-                       [ "type", `String "row_event"
-                       ; "payload", `String (Yojson.Safe.to_string (`Assoc
-                           [ "row", `String ("block:" ^ G.Uuid.to_string (uuid 1))
-                           ; "key", `String (if expanded then "expand" else "collapse") ]))
-                       ])
-               in
-               if scenario = `Detail_offscreen
-               then
+               let child_range visible =
                  detail_event
                    (`Assoc
                        [ "type", `String "visible_range"
                        ; "first", `Int 0
-                       ; "last", `Int 1
+                       ; "last", `Int (if visible then 2 else 1)
                        ])
-               else (
-                 expand false;
-                 Alcotest.(check int)
-                   "collapsed child native media node removed"
-                   0
-                   (List.length (child_files ())));
+               in
+               child_range false;
+               if scenario = `Detail_preview
+               then (
+                 Alcotest.(check int) "offscreen preview retains its child lease"
+                   0 (Atomic.get released_files - before_released);
+                 Alcotest.(check int) "offscreen child keeps its open preview"
+                   1 (List.length (previews ()));
+                 dismiss_preview (List.hd (previews ()));
+                 settle ());
                if scenario = `Detail_pending
                then (
                  Alcotest.(check int)
@@ -2400,7 +2394,7 @@ let run_favorites_native_visibility
                  1
                  (Atomic.get released_demands - before_demands);
                Printf.printf
-                 "REVIEW_COLLAPSE acquired=%d released=%d collapse_release_delta=%d \
+                 "REVIEW_RANGE_EXIT acquired=%d released=%d range_release_delta=%d \
                   files=%d\n\
                   %!"
                  (Atomic.get acquire_entered)
@@ -2417,27 +2411,27 @@ let run_favorites_native_visibility
                if scenario = `Detail_preview
                then
                  Alcotest.(check int)
-                   "unmounted child removes preview path"
+                   "dismissed offscreen child removes preview path"
                    0
                    (List.length (previews ()));
-               if scenario = `Detail_reopen
+               if scenario = `Detail_range_reentry
                then (
-                 expand true;
-                 wait "reopened child remounts" (fun () ->
+                 child_range true;
+                 wait "visible child remounts" (fun () ->
                    all "text" "Timeline fixture 1"
                    |> List.exists (fun id -> within id detail_list));
                  appear_with_ancestors (waiting_for_row (child_label ())) detail_list;
-                 wait "reopened child sends one new demand" (fun () ->
+                 wait "visible child sends one new demand" (fun () ->
                    List.length (Atomic.get demands) = 3);
                  child_ready ();
-                 wait "reopened child acquires fresh lease" (fun () ->
+                 wait "visible child acquires fresh lease" (fun () ->
                    Atomic.get acquire_entered = 3 && List.length (child_files ()) = 1);
                  Alcotest.(check bool)
-                   "reopened child gets a fresh native leaf"
+                   "visible child gets a fresh native leaf"
                    true
                    (List.hd (child_files ()) <> old_leaf);
-                 expand false;
-                 wait "second collapse releases fresh child lease" (fun () ->
+                 child_range false;
+                 wait "second range exit releases fresh child lease" (fun () ->
                    Atomic.get released_files = before_released + 2));
                if scenario = `Detail_graph
                then (
@@ -2455,7 +2449,7 @@ let run_favorites_native_visibility
                else (
                  native_path 0;
                  wait "entry retirement releases remaining root" (fun () ->
-                   Atomic.get released_files = if scenario = `Detail_reopen then 3 else 2))
+                   Atomic.get released_files = if scenario = `Detail_range_reentry then 3 else 2))
              | `Preview_offscreen
              | `Preview_navigation
              | `Preview_detail_pop
@@ -4581,30 +4575,30 @@ let () =
                  ~media_rows:3
                  ~media_navigation:`Restore_early
                  ())
-        ; Alcotest.test_case "collapsed Detail retires media ownership" `Quick (fun () ->
+        ; Alcotest.test_case "Detail range exit retires media ownership" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
-              ~media_navigation:`Detail_collapse
+              ~media_navigation:`Detail_range_exit
               ())
         ; Alcotest.test_case "review preview offscreen reference" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Preview_offscreen
               ())
-        ; Alcotest.test_case "Detail reopens after media retirement" `Quick (fun () ->
+        ; Alcotest.test_case "Detail range reentry after media retirement" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
-              ~media_navigation:`Detail_reopen
+              ~media_navigation:`Detail_range_reentry
               ())
         ; Alcotest.test_case
-            "Detail collapse preserves Timeline shared owner"
+            "Detail range exit preserves Timeline shared owner"
             `Quick
             (fun () ->
                run_favorites_native_visibility
                  ~media_rows:3
                  ~media_navigation:`Detail_shared
                  ())
-        ; Alcotest.test_case "Detail collapse fences pending Acquire" `Quick (fun () ->
+        ; Alcotest.test_case "Detail range exit fences pending Acquire" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Detail_pending
@@ -4622,7 +4616,7 @@ let () =
               ~media_rows:3
               ~media_navigation:`Detail_graph
               ())
-        ; Alcotest.test_case "Detail child removal retires its preview" `Quick (fun () ->
+        ; Alcotest.test_case "Detail offscreen preview retains until dismissal" `Quick (fun () ->
             run_favorites_native_visibility
               ~media_rows:3
               ~media_navigation:`Detail_preview

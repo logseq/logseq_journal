@@ -12,8 +12,6 @@ type row =
   | Block of
       { block : Journal_model.t
       ; depth : int
-      ; expanded : bool
-      ; leaf : bool
       }
   | More of
       { parent_id : string
@@ -23,7 +21,7 @@ type row =
       }
 
 type event =
-  | Set_branch_expanded of string * bool
+  | Load_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -39,10 +37,14 @@ val root : t -> Journal_model.t
 val find_block : t -> block_id:string -> Journal_model.t option
 val children : t -> Journal_model.t list
 val children_of : t -> parent_id:string -> Journal_model.t list
-val expanded : t -> block_id:string -> bool
 val continuation : t -> parent_id:string -> Journal_graph_projection.block_cursor option
 val rows : t -> row list
 val row_key : row -> string
+
+(** Next bounded first-page read within the selected outline; continuations and
+    failed reads remain explicit Load more actions. *)
+val next_automatic_load : t -> string option
+
 val step : t -> event -> t * Journal_graph_request.t list
 val mode : t -> mode
 val session_id : t -> ID.Text_input.session_id

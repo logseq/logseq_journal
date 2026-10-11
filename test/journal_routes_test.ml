@@ -662,7 +662,7 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
        require
          (List.exists
             (function
-              | D.More _ -> true
+              | D.More { parent_id; _ } -> parent_id = root_id
               | _ -> false)
             (D.rows created)
           = partial)
@@ -757,8 +757,9 @@ let test_outline_branches_append_and_delete () =
   require
     (D.continuation initial ~parent_id:root_id = Some cursor)
     "root lost continuation";
-  require (not (D.expanded initial ~block_id:child_id)) "deeper branch expanded eagerly";
-  let opened, requests = D.step initial (Set_branch_expanded (child_id, true)) in
+  require (List.exists (function D.More { parent_id; _ } -> parent_id = child_id | _ -> false) (D.rows initial))
+    "default outline has no child loading action";
+  let opened, requests = D.step initial (Load_more child_id) in
   let generation =
     match requests with
     | [ Journal_graph_request.Load_detail
@@ -848,7 +849,7 @@ let test_outline_branches_append_and_delete () =
   require
     (D.mode created = Reading && D.child_capture created = None)
     "append did not reset composer";
-  require (D.expanded created ~block_id:child_id) "append discarded expanded branch";
+  require (List.exists (function D.Block { block; _ } -> Journal_model.id block = Journal_model.id grandchild | _ -> false) (D.rows created)) "append discarded visible descendant";
   let second =
     block
       ~id:"70000000-0000-4000-a000-000000000004"
@@ -928,7 +929,7 @@ let test_outline_branches_append_and_delete () =
     (D.find_block deleted ~block_id:(Journal_model.id grandchild) = None)
     "staged descendant remained visible";
   let restored = D.undo_delete deleted staged in
-  require (D.expanded restored ~block_id:child_id) "Undo lost expansion";
+  require (List.exists (function D.Block { block; _ } -> Journal_model.id block = Journal_model.id grandchild | _ -> false) (D.rows restored)) "Undo lost visible descendant";
   require
     (Option.is_some (D.find_block restored ~block_id:(Journal_model.id new_child)))
     "Undo discarded unrelated appended child";
@@ -1674,61 +1675,54 @@ let test_append_editor_session_after_save () =
     "parent navigation reused a completed editor session"
 ;;
 
-let test_native_disclosure_state_is_idempotent () =
+let test_automatic_outline_reads_are_bounded_and_idempotent () =
   let module D = Journal_detail in
-  let root = block () in
-  let child =
-    block
-      ~id:"70000000-0000-4000-a000-000000000002"
-      ~parent_id:(Some (Journal_model.id root))
-      ()
-  in
-  let initial =
-    D.create
-      ~session_number:91L
-      { root; children = { blocks = [ child ]; continuation = None } }
-  in
-  let same, requests =
-    D.step initial (Set_branch_expanded (Journal_model.id root, true))
-  in
-  require
-    (D.expanded same ~block_id:(Journal_model.id root) && requests = [])
-    "repeated native expanded=true collapsed the branch";
-  let child_id = Journal_model.id child in
-  let opened, requests = D.step same (Set_branch_expanded (child_id, true)) in
-  let generation =
-    match requests with
-    | [ Journal_graph_request.Load_detail { request_generation; limit = 128; _ } ] ->
-      request_generation
-    | _ -> fail "native disclosure did not admit a single bounded child request"
-  in
-  let duplicated, requests = D.step opened (Set_branch_expanded (child_id, true)) in
-  require
-    (D.expanded duplicated ~block_id:child_id && requests = [])
-    "duplicate expansion toggled state or restarted loading";
-  let closed, _ = D.step duplicated (Set_branch_expanded (child_id, false)) in
-  let still_closed, requests = D.step closed (Set_branch_expanded (child_id, false)) in
-  require
-    ((not (D.expanded still_closed ~block_id:child_id)) && requests = [])
-    "repeated collapse reopened the branch";
-  let reopening, requests = D.step still_closed (Set_branch_expanded (child_id, true)) in
-  require
-    (D.expanded reopening ~block_id:child_id && requests = [])
-    "reopening an in-flight branch stayed collapsed or duplicated the read";
-  let still_closed, _ = D.step reopening (Set_branch_expanded (child_id, false)) in
-  let loaded, _ =
-    D.step
-      still_closed
-      (Loaded
-         (generation, { root = child; children = { blocks = []; continuation = None } }))
-  in
-  require
-    (not (D.expanded loaded ~block_id:child_id))
-    "child completion reopened collapsed disclosure";
-  let reopened, requests = D.step loaded (Set_branch_expanded (child_id, true)) in
-  require
-    (D.expanded reopened ~block_id:child_id && requests = [])
-    "reopening a loaded branch performed an unnecessary read"
+  let root = block ~child_count:130 () in
+  let children = List.init 130 (fun n ->
+    block ~id:(generated_block_id (1000 + n)) ~parent_id:(Some (Journal_model.id root))
+      ~order:(Printf.sprintf "%06d" n) ~child_count:1 ()) in
+  let cursor : Journal_graph_projection.block_cursor =
+    { after_sibling_order = "000127"; after_block_id = Journal_model.id (List.nth children 127)
+    ; protocol_cursor = None } in
+  let owner = D.create ~session_number:91L
+      { root; children = { blocks = List.filteri (fun n _ -> n < 128) children
+        ; continuation = Some cursor } } in
+  let owner, requests = D.step owner (Load_more (Journal_model.id root)) in
+  let generation = match requests with
+    | [ Journal_graph_request.Load_detail { request_generation; _ } ] -> request_generation
+    | _ -> fail "root continuation must remain explicit" in
+  let owner, _ = D.step owner (Loaded (generation,
+      { root; children = { blocks = List.filteri (fun n _ -> n >= 128) children; continuation = None } })) in
+  let rec finish owner n =
+    if n = 128 then owner else
+      let expected = Journal_model.id (List.nth children n) in
+      require (D.next_automatic_load owner = Some expected) "automatic order changed";
+      let owner, requests = D.step owner Load_next in
+      let generation = match requests with
+        | [ Journal_graph_request.Load_detail { block_id; after = None; limit = 128; request_generation } ]
+          when block_id = expected -> request_generation
+        | _ -> fail "automatic branch did not issue its single bounded first page" in
+      let duplicate, requests = D.step owner Load_next in
+      require (requests = [] && D.next_automatic_load duplicate = None)
+        "automatic loading admitted a duplicate/concurrent read";
+      let owner, _ = D.step duplicate (Loaded (generation,
+          { root = List.nth children n; children = { blocks = []; continuation = None } })) in
+      finish owner (n + 1) in
+  let owner = finish owner 0 in
+  require (D.next_automatic_load owner = None) "automatic branch budget exceeded 128";
+  let manual = Journal_model.id (List.nth children 128) in
+  require (List.exists (function D.More { parent_id; loading = false; _ } -> parent_id = manual
+      | _ -> false) (D.rows owner)) "budget exhaustion removed Load more";
+  let owner, requests = D.step owner (Load_more manual) in
+  let generation = match requests with
+    | [ Journal_graph_request.Load_detail { request_generation; _ } ] -> request_generation
+    | _ -> fail "manual Load more did not continue after automatic budget" in
+  let failed, _ = D.step owner (Load_failed (generation, false, "offline")) in
+  require (D.next_automatic_load failed = Some (Journal_model.id (List.nth children 129)))
+    "failed branch blocked another eligible branch or retried automatically";
+  let retried, requests = D.step failed (Load_more manual) in
+  require (List.length requests = 1 && D.next_automatic_load retried = None)
+    "explicit retry must retain single-read admission"
 ;;
 
 let test_favorites_hidden_rows_do_not_block_pagination () =
@@ -2106,7 +2100,7 @@ let test_typed_covered_failure_missing_and_branch () =
   in
   let owner = entry_detail ready a_id in
   let owner, requests =
-    Journal_detail.step owner (Set_branch_expanded (Journal_model.id child, true))
+    Journal_detail.step owner (Load_more (Journal_model.id child))
   in
   let generation =
     match requests with
@@ -2617,6 +2611,128 @@ let test_retained_detail_picker_owner_and_terminal_delete () =
          "committed deletion revived its retired draft")
 ;;
 
+(* Detail owns traversal and paging; all regressions exercise its public state,
+   admitted reads and completions, without injecting incorrect state. *)
+let test_projected_unknown_children_are_read_once () =
+  let module G = Logseq_db_types.Graph_types in
+  let module P = Journal_graph_projection in
+  let uuid n = G.Uuid.of_string (Printf.sprintf "78000000-0000-4000-a000-%012d" n) |> Result.get_ok in
+  let page : G.page =
+    { uuid = uuid 100; name = "20260809"; title = "2026-08-09"
+    ; kind = G.Journal_page { journal_day = 20260809 }
+    ; created_at_ms = 1_786_204_800_000L; updated_at_ms = 1_786_204_800_000L
+    ; recycled = false; tags = []; properties = [] } in
+  let member n parent : P.block_member =
+    { block =
+        { uuid = uuid n; title = Printf.sprintf "Level %d" n; parent; page = page.uuid
+        ; order = "a"; created_at_ms = page.created_at_ms; updated_at_ms = page.updated_at_ms
+        ; refs = []; tags = []; properties = [] }
+    ; revision = "fixture-1" } in
+  let root = member 1 page.uuid in
+  let child = member 2 (uuid 1) in
+  let grandchild = member 3 (uuid 2) in
+  let project root children =
+    P.detail_on_page ~page ~time_context:{ localtime = Unix.gmtime } ~root
+      { G.items = children; continuation = None }
+    |> Result.get_ok in
+  let projection = project root [ child ] in
+  require (Journal_model.child_count (List.hd projection.children.blocks) = 0)
+    "public projection fixture must retain unknown child count";
+  let module D = Journal_detail in
+  let owner = D.create ~session_number:134L projection in
+  let child_id = G.Uuid.to_string child.block.uuid in
+  require (D.next_automatic_load owner = Some child_id)
+    "projected zero child count is unknown and must admit discovery";
+  let load owner (parent : P.block_member) children =
+    let owner, requests = D.step owner Load_next in
+    let generation = match requests with
+      | [ Journal_graph_request.Load_detail { block_id; limit = 128; after = None; request_generation } ]
+        when block_id = G.Uuid.to_string parent.P.block.uuid -> request_generation
+      | _ -> fail "projected unknown branch must admit one bounded first page" in
+    fst (D.step owner (Loaded (generation, project parent children))) in
+  let owner = load owner child [ grandchild ] in
+  let owner = load owner grandchild [] in
+  require (D.next_automatic_load owner = None) "confirmed empty leaf was read twice";
+  require (List.filter_map (function D.Block { depth; _ } -> Some depth | _ -> None)
+      (D.rows owner) = [ 0; 1; 2 ]) "real projected descendants did not auto-expand";
+  require (not (List.exists (function D.More _ -> true | _ -> false) (D.rows owner)))
+    "confirmed leaves retained a spurious Load more"
+;;
+
+let test_detail_default_outline_depth_and_cycle_boundaries () =
+  let module D = Journal_detail in
+  let id n = generated_block_id (1300 + n) in
+  let chain = List.init 12 (fun n ->
+    block ~id:(id n) ~parent_id:(if n = 0 then None else Some (id (n - 1)))
+      ~child_count:(if n = 11 then 0 else 1) ()) in
+  let projection n : Journal_graph_projection.detail =
+    { root = List.nth chain n; children =
+        { blocks = [ List.nth chain (n + 1) ]; continuation = None } } in
+  let owner = D.create ~session_number:131L (projection 0) in
+  require (List.exists (function D.More { parent_id; _ } -> parent_id = id 1
+      | _ -> false) (D.rows owner))
+    "default expanded child must expose loading/Load more without disclosure";
+  let rec load owner n =
+    if n >= 9 then owner else
+      let next, requests = D.step owner Load_next in
+      let generation = match requests with
+        | [ Journal_graph_request.Load_detail { request_generation; limit = 128; _ } ] -> request_generation
+        | _ -> fail "visible descendant did not admit one bounded page" in
+      let next, _ = D.step next (Loaded (generation, projection n)) in
+      load next (n + 1) in
+  let owner = load owner 1 in
+  require (List.filter_map (function D.Block { depth; _ } -> Some depth | _ -> None)
+      (D.rows owner) = List.init 10 Fun.id)
+    "Detail must display ten data levels including the root";
+  require (not (List.exists (function D.More { parent_id; _ } -> parent_id = id 9
+      | _ -> false) (D.rows owner)))
+    "depth ten must not expose a read for depth eleven";
+  require (D.next_automatic_load owner = None) "automatic traversal crossed the depth limit";
+  let _, requests = D.step owner (Load_more (id 9)) in
+  require (requests = []) "depth limit admitted a hidden subtree read";
+  let cycle = D.reconcile_children owner
+      { root = List.nth chain 2; children = { blocks = [ List.nth chain 0 ]; continuation = None } } in
+  require (List.filter_map (function D.Block { block; _ } -> Some (Journal_model.id block)
+      | _ -> None) (D.rows cycle) = [ id 0; id 1; id 2 ])
+    "ancestor cycle must terminate without hiding valid ancestors";
+  let leaf = block ~id:(id 20) ~parent_id:(Some (id 0)) ~child_count:0 () in
+  let leaf_owner = D.create ~session_number:132L
+      { root = List.hd chain; children = { blocks = [ leaf ]; continuation = None } } in
+  let leaf_owner, requests = D.step leaf_owner Load_next in
+  let generation = match requests with
+    | [ Journal_graph_request.Load_detail { request_generation; _ } ] -> request_generation
+    | _ -> fail "unknown zero count must be read once" in
+  let leaf_owner, _ = D.step leaf_owner (Loaded (generation,
+      { root = leaf; children = { blocks = []; continuation = None } })) in
+  require (not (List.exists (function D.More { parent_id; _ } -> parent_id = id 20
+      | _ -> false) (D.rows leaf_owner)))
+    "confirmed empty leaf must not offer another empty-page read";
+  let _, requests = D.step leaf_owner (Load_more (id 20)) in
+  require (requests = []) "confirmed leaf admitted an unnecessary read"
+;;
+
+let test_detail_serial_reads_and_retry_feedback () =
+  let module D = Journal_detail in
+  let root = block ~child_count:2 () in
+  let child n = block ~id:(generated_block_id (1400 + n))
+      ~parent_id:(Some (Journal_model.id root)) () in
+  let a, b = child 1, child 2 in
+  let owner = D.create ~session_number:140L
+      { root; children = { blocks = [ a; b ]; continuation = None } } in
+  let owner, requests = D.step owner (Load_more (Journal_model.id a)) in
+  let generation = match requests with
+    | [ Journal_graph_request.Load_detail { request_generation; _ } ] -> request_generation
+    | _ -> fail "first branch must admit its bounded read" in
+  let same, requests = D.step owner (Load_more (Journal_model.id b)) in
+  require (requests = []) "Detail admitted concurrent automatic branch reads";
+  let failed, _ = D.step same (Load_failed (generation, false, "offline")) in
+  require (List.exists (function D.More { parent_id; error = Some "offline"; loading = false; _ } ->
+      parent_id = Journal_model.id a | _ -> false) (D.rows failed))
+    "failed read must remain visible and retryable";
+  let _, requests = D.step failed (Load_more (Journal_model.id a)) in
+  require (List.length requests = 1) "visible failure cannot retry"
+;;
+
 let test_detail_128_item_pages_preserve_order_and_completion () =
   let module D = Journal_detail in
   let root = block () in
@@ -2646,7 +2762,7 @@ let test_detail_128_item_pages_preserve_order_and_completion () =
     | _ -> fail "Detail paging must issue exactly one bounded read" in
   let initial = D.create ~session_number:128L
       { root; children = { blocks = [ parent ]; continuation = None } } in
-  let first, requests = D.step initial (Set_branch_expanded (parent_id, true)) in
+  let first, requests = D.step initial (Load_more parent_id) in
   let generation = request None requests in
   let first, _ = D.step first (Loaded (generation, page 0 128 (Some (cursor 128)))) in
   require (List.length (D.children_of first ~parent_id) = 128)
@@ -2692,6 +2808,10 @@ let test_detail_retry_uses_128_item_first_page () =
 ;;
 
 let tests =
+  [ "projected unknown children are read once", test_projected_unknown_children_are_read_once
+  ; "Detail default ten levels and cycle boundaries", test_detail_default_outline_depth_and_cycle_boundaries
+  ; "Detail serialized reads and retry feedback", test_detail_serial_reads_and_retry_feedback
+  ] @
   [ ( "retained picker and terminal delete"
     , test_retained_detail_picker_owner_and_terminal_delete )
   ; "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
@@ -2713,7 +2833,7 @@ let tests =
   ; ( "child refresh replaces opaque cursor"
     , test_child_refresh_replaces_cursor_and_fences_pending_read )
   ; "hidden favorites pagination", test_favorites_hidden_rows_do_not_block_pagination
-  ; "native disclosure state is idempotent", test_native_disclosure_state_is_idempotent
+  ; "automatic outline reads are bounded and idempotent", test_automatic_outline_reads_are_bounded_and_idempotent
   ; "Detail 128-item pages preserve order", test_detail_128_item_pages_preserve_order_and_completion
   ; "Detail retry uses 128-item first page", test_detail_retry_uses_128_item_first_page
   ; "Append editor session after save", test_append_editor_session_after_save

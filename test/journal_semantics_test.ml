@@ -2388,7 +2388,7 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
     |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L (projection root [ child; sibling ])
   in
   let load detail parent children =
-    let detail, requests = Journal_detail.step detail (Set_branch_expanded (Journal_model.id parent, true)) in
+    let detail, requests = Journal_detail.step detail (Load_more (Journal_model.id parent)) in
     let generation = match requests with
       | [ Journal_graph_request.Load_detail { limit = 128; request_generation; _ } ] -> request_generation
       | _ -> fail "Expanding one branch must issue exactly one bounded page read"
@@ -2399,6 +2399,8 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
     |> fun t -> load t child [ grandchild ]
     |> fun t -> load t grandchild [ deep ]
     |> fun t -> load t deep [ deeper ]
+    |> fun t -> load t deeper []
+    |> fun t -> load t sibling []
   in
   let routes = Journal_routes.update_detail routes detail in
   let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
@@ -2425,7 +2427,7 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
       require (Yojson.Basic.Util.member "text" label <> `Null) "Detail drops long or Chinese text") expected)
 ;;
 
-let test_detail_flat_branch_keeps_explicit_collapse_action () =
+let test_detail_flat_branch_has_no_collapse_action () =
   let child = block ~id:"20000000-0000-4000-a000-000000000002" ~parent_id:block_id ~child_count:0 () in
   let projection : Journal_graph_projection.detail =
     { root = block (); children = { blocks = [ child ]; continuation = None } } in
@@ -2436,8 +2438,19 @@ let test_detail_flat_branch_keeps_explicit_collapse_action () =
   let body = Application.For_testing.detail_page ~routes ~write_enabled:true (fun a -> actions := a :: !actions) in
   with_mounted (V.Body.Private.to_widget body) (fun app ops ->
     dispatch_row_action app (native_list_node (ops ())) ("block:" ^ block_id) "collapse";
-    require (!actions = [ Application.For_testing.Set_expanded (block_id, false) ])
-      "Removing disclosure chrome loses the existing bounded collapse action")
+    dispatch_row_action app (native_list_node (ops ())) ("block:" ^ block_id) "expand";
+    require (!actions = []) "Detail retains a collapse/expand action";
+    let payloads = List.filter_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue s) -> Some (Yojson.Basic.from_string s)
+      | _ -> None) (ops ()) in
+    let list = List.find (fun p -> Yojson.Basic.Util.member "sections" p <> `Null) payloads in
+    let rows = Yojson.Basic.Util.(list |> member "sections" |> to_list |> List.hd |> member "rows" |> to_list) in
+    List.iter (fun row ->
+      let menu = Yojson.Basic.Util.member "context_menu" row in
+      let actions = if menu = `Null then [] else Yojson.Basic.Util.(menu |> member "actions" |> to_list) in
+      require (not (List.exists (fun action ->
+        List.mem (Yojson.Basic.Util.member "key" action) [ `String "collapse"; `String "expand" ]) actions))
+        "Detail menu advertises collapse/expand") rows)
 ;;
 
 (* Composition and native placement have no pure reducer owner. Exercise the
@@ -2512,7 +2525,7 @@ let tests =
   ; "Bottom native inset retains Capture", test_bottom_controls_reuse_lui_inset_and_keep_capture
   ] @
   [ "Detail three typography tiers and deep flat rows", test_detail_three_tiers_keep_deep_order_and_plain_rows
-  ; "Detail flat branch retains collapse", test_detail_flat_branch_keeps_explicit_collapse_action
+  ; "Detail flat branch removes collapse", test_detail_flat_branch_has_no_collapse_action
   ] @
   [ "Detail shared Capture control", test_detail_uses_shared_capture_control
   ; ( "timeline asset child preview title"

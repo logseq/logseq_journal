@@ -12,7 +12,6 @@ type branch =
   ; appended : string list
   ; continuation : Journal_graph_projection.block_cursor option
   ; loaded : bool
-  ; expanded : bool
   ; pending : (int64 * Journal_graph_projection.block_cursor option) option
   ; error : string option
   }
@@ -23,6 +22,7 @@ type t =
   ; branches : branch Blocks.t
   ; session_number : int64
   ; next_request : int64
+  ; automatic_reads : int
   ; mode : mode
   ; pending : Journal_graph_request.t option
   ; child_capture : Journal_capture.t option
@@ -43,8 +43,6 @@ type row =
   | Block of
       { block : Journal_model.t
       ; depth : int
-      ; expanded : bool
-      ; leaf : bool
       }
   | More of
       { parent_id : string
@@ -54,7 +52,7 @@ type row =
       }
 
 type event =
-  | Set_branch_expanded of string * bool
+  | Load_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -147,7 +145,6 @@ let empty_branch =
   ; appended = []
   ; continuation = None
   ; loaded = false
-  ; expanded = false
   ; pending = None
   ; error = None
   }
@@ -173,10 +170,10 @@ let create ~session_number (detail : Journal_graph_projection.detail) =
           children = List.map Journal_model.id detail.children.blocks
         ; continuation = detail.children.continuation
         ; loaded = true
-        ; expanded = true
         }
   ; session_number
   ; next_request = Int64.mul session_number 1_000_000L
+  ; automatic_reads = 0
   ; mode = Reading
   ; pending = None
   ; child_capture = None
@@ -248,58 +245,87 @@ let map_retained_capture draft ~f =
       { draft with draft_capture = capture; draft_mode = Reading; draft_pending = None })
 ;;
 
-let expanded (t : t) ~block_id = (branch t block_id).expanded
 let continuation (t : t) ~parent_id = (branch t parent_id).continuation
 let request_back _ = `Close
 
+(* Root is level one; typography independently caps at three levels. *)
+let maximum_depth = 9
+let maximum_automatic_reads = 128
+
+let read_pending (t : t) =
+  Blocks.exists (fun _ (branch : branch) -> branch.pending <> None) t.branches
+;;
+
+(* Child projections do not carry descendant counts: zero is unknown until
+   this branch has returned its own page, including an authoritative empty page. *)
+let needs_children current = not current.loaded
+
+let find_visible (t : t) predicate =
+  let rec visit ancestors depth id =
+    if depth > maximum_depth || List.mem id ancestors
+    then None
+    else
+      match Blocks.find_opt id t.blocks with
+      | None -> None
+      | Some block ->
+        let current = branch t id in
+        if predicate depth block current
+        then Some id
+        else if depth = maximum_depth
+        then None
+        else children (id :: ancestors) (depth + 1) current.children
+  and children ancestors depth = function
+    | [] -> None
+    | id :: rest ->
+      match visit ancestors depth id with
+      | Some _ as found -> found
+      | None -> children ancestors depth rest
+  in
+  visit [] 0 t.root_id
+;;
+
+let next_automatic_load (t : t) =
+  if t.automatic_reads >= maximum_automatic_reads || read_pending t
+  then None
+  else
+    find_visible t (fun depth _block current ->
+      depth < maximum_depth && needs_children current && current.error = None)
+;;
+
 let load (t : t) id =
-  match Blocks.find_opt id t.blocks with
+  match
+    find_visible t (fun depth block current ->
+      depth < maximum_depth && Journal_model.id block = id
+      && (needs_children current || current.continuation <> None || current.error <> None))
+  with
   | None -> t, []
+  | Some _ when read_pending t -> t, []
   | Some _ ->
     let current = branch t id in
-    if
-      Option.is_some current.pending
-      || (current.loaded && current.continuation = None && current.error = None)
-    then t, []
-    else (
-      let generation = t.next_request in
-      let request =
-        Journal_graph_request.Load_detail
-          { block_id = id
-          ; after = current.continuation
-          ; limit = 128
-          ; request_generation = generation
-          }
-      in
-      ( { t with
-          next_request = Int64.succ generation
-        ; branches =
-            Blocks.add
-              id
-              { current with
-                expanded = true
-              ; pending = Some (generation, current.continuation)
-              ; error = None
-              }
-              t.branches
-        }
-      , [ request ] ))
+    let generation = t.next_request in
+    let request =
+      Journal_graph_request.Load_detail
+        { block_id = id; after = current.continuation; limit = 128
+        ; request_generation = generation }
+    in
+    ( { t with
+        next_request = Int64.succ generation
+      ; branches = Blocks.add id
+          { current with pending = Some (generation, current.continuation); error = None }
+          t.branches }
+    , [ request ] )
 ;;
 
 let step (t : t) = function
   | Append_failed (block_id, message) ->
     (if pending_child t.pending block_id then { t with mode = Failed message } else t), []
-  | Set_branch_expanded (id, expanded) ->
-    if not (Blocks.mem id t.blocks)
-    then t, []
-    else (
-      let current = branch t id in
-      if current.expanded = expanded
-      then t, []
-      else if (not expanded) || current.loaded || current.pending <> None
-      then { t with branches = Blocks.add id { current with expanded } t.branches }, []
-      else load t id)
-  | Load_more id -> load t id
+  | Load_next ->
+    (match next_automatic_load t with
+     | None -> t, []
+     | Some id -> load { t with automatic_reads = t.automatic_reads + 1 } id)
+  | Load_more id ->
+    let next, requests = load t id in
+    (if requests = [] then next else { next with automatic_reads = 0 }), requests
   | Loaded (generation, detail) ->
     let id = Journal_model.id detail.Journal_graph_projection.root in
     let current = branch t id in
@@ -366,43 +392,27 @@ let step (t : t) = function
 ;;
 
 let rows (t : t) =
-  let rec visit seen depth id =
-    if List.mem id seen
-    then []
-    else (
+  let loading = read_pending t in
+  let rec visit ancestors depth id rows =
+    if depth > maximum_depth || List.mem id ancestors
+    then rows
+    else
       match Blocks.find_opt id t.blocks with
-      | None -> []
+      | None -> rows
       | Some block ->
         let current = branch t id in
-        let leaf =
-          current.loaded && current.children = [] && current.continuation = None
-        in
-        let row = Block { block; depth; expanded = current.expanded; leaf } in
-        if not current.expanded
-        then [ row ]
-        else (
-          let children =
-            List.concat_map (visit (id :: seen) (depth + 1)) current.children
-          in
-          let more =
-            if
-              (not current.loaded)
-              || current.pending <> None
-              || current.error <> None
-              || current.continuation <> None
-            then
-              [ More
-                  { parent_id = id
-                  ; depth = depth + 1
-                  ; loading = current.pending <> None
-                  ; error = current.error
-                  }
-              ]
-            else []
-          in
-          row :: (children @ more)))
+        let rows = Block { block; depth } :: rows in
+        if depth = maximum_depth
+        then rows
+        else
+          let rows = List.fold_left
+              (fun rows child -> visit (id :: ancestors) (depth + 1) child rows)
+              rows current.children in
+          if needs_children current || current.error <> None || current.continuation <> None
+          then More { parent_id = id; depth = depth + 1; loading; error = current.error } :: rows
+          else rows
   in
-  visit [] 0 t.root_id
+  List.rev (visit [] 0 t.root_id [])
 ;;
 
 let row_key = function
@@ -547,8 +557,7 @@ let apply_child_created (t : t) ~child ~parent =
     ; branches =
         Blocks.add
           t.root_id
-          { expanded = true
-          ; appended = id :: current.appended
+          { appended = id :: current.appended
           ; children = List.filter (( <> ) id) current.children @ [ id ]
           ; loaded =
               current.loaded && current.continuation = None && current.pending = None

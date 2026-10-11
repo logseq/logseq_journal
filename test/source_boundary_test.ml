@@ -1522,13 +1522,13 @@ let () =
          ; "top_corner_radius"
          ])
     [ "app/journal_visual_tokens.ml"; "app/journal_visual_tokens.mli" ];
+  forbid_text root "app/application.ml" [ "Detail_expand"; "Detail_collapse" ];
+  forbid_text root "app/journal_detail.ml" [ "Set_branch_expanded" ];
   require_text
     root
     "app/application.ml"
     [ "Timeline_open_block"
     ; "Favorite_open_block"
-    ; "Detail_expand"
-    ; "Detail_collapse"
     ; "Detail_submit"
     ; "V.secure_field"
     ; "Graph_service.Submit_e2ee_password"

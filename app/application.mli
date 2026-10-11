@@ -52,7 +52,6 @@ module For_testing : sig
     | Attach_file
     | Open_block of string
     | Delete_block of string
-    | Set_expanded of string * bool
     | Load_more of string
     | Retry
     | Submit of string

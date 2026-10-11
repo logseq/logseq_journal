@@ -1643,8 +1643,6 @@ type command =
   | Capture_asset of Journal_asset_import.event
   | Timeline_retry of string
   | Detail_open of string
-  | Detail_expand of string
-  | Detail_collapse of string
   | Detail_more of string
   | Detail_task_intent of string
   | Detail_submit of string
@@ -2827,7 +2825,7 @@ module Detail_list = struct
           match row with
           | Journal_detail.More _ ->
             V.Native_list.row ~key:row_key ~separator:Hidden label
-          | Block { block; expanded; leaf; _ } ->
+          | Block { block; _ } ->
             let id = Journal_model.id block in
             let delete = bind_action on_action (Detail_delete id) in
             let open_block = bind_action on_action (Detail_open id) in
@@ -2855,15 +2853,7 @@ module Detail_list = struct
                       ~symbol:"doc.on.doc"
                       ~on_press:(bind_action on_action (Copy_block id))
                       ()
-                  ]
-                  |> fun actions ->
-                  if leaf then actions else
-                    V.Context_menu.action
-                      ~key:(Ui.Key.string (if expanded then "collapse" else "expand"))
-                      ~title:(if expanded then "Hide children" else "Show children")
-                      ~on_press:(bind_action on_action
-                        (if expanded then Detail_collapse id else Detail_expand id))
-                      () :: actions)
+                  ])
                 ()
             in
             V.Native_list.row ~key:row_key ~separator:Hidden ~context_menu label
@@ -4932,6 +4922,28 @@ let start
                   }
                 | _ -> state)))
   in
+  let detail_drain_key state =
+    if not state.graph_ready
+    then None
+    else
+      Option.bind (Journal_routes.detail state.routes) (fun detail ->
+        Option.map
+          (fun block_id -> Journal_detail.session_id detail, block_id)
+          (Journal_detail.next_automatic_load detail))
+  in
+  let prev_detail_drain_key = ref (detail_drain_key initial_state) in
+  let detail_drain_callback = function
+    | None -> Effect.ignore
+    | Some (session, block_id) ->
+      set_state_and_effect (fun state ->
+        match Journal_routes.detail state.routes with
+        | Some detail when state.graph_ready && Journal_detail.session_id detail = session
+            && Journal_detail.next_automatic_load detail = Some block_id ->
+          let detail, requests = Journal_detail.step detail Load_next in
+          { state with routes = Journal_routes.update_detail state.routes detail },
+          Effect.many (List.map send requests)
+        | _ -> state, Effect.ignore)
+  in
   let prev_capture_imports_key = ref initial_state.capture_imports in
   let rec drain_imports () =
     if Hashtbl.length capture_staged_items > 0 || Queue.is_empty capture_import_queue
@@ -5755,8 +5767,6 @@ let start
          update (fun state ->
            { state with timeline = Journal_timeline_state.retry_day state.timeline ~day }))
     | Detail_open value -> open_block value
-    | Detail_expand value -> detail_event (Set_branch_expanded (value, true))
-    | Detail_collapse value -> detail_event (Set_branch_expanded (value, false))
     | Detail_more value -> detail_event (Load_more value)
     | Detail_task_intent value -> update_draft ~toggle:true value
     | Detail_retry ->
@@ -6060,6 +6070,11 @@ let start
      then (
        prev_timeline_drain_key := key;
        Effect.run (timeline_drain_callback key)));
+    (let key = detail_drain_key model in
+     if not (!prev_detail_drain_key = key)
+     then (
+       prev_detail_drain_key := key;
+       Effect.run (detail_drain_callback key)));
     (let key = upload_context model in
      if not (!prev_upload_key = key)
      then (
@@ -7060,7 +7075,6 @@ module For_testing = struct
     | Attach_file
     | Open_block of string
     | Delete_block of string
-    | Set_expanded of string * bool
     | Load_more of string
     | Retry
     | Submit of string
@@ -7090,8 +7104,6 @@ module For_testing = struct
       | Detail_action (_, Open_append) -> on_action Append
       | Detail_action (_, Detail_open id) -> on_action (Open_block id)
       | Detail_action (_, Detail_delete id) -> on_action (Delete_block id)
-      | Detail_action (_, Detail_expand id) -> on_action (Set_expanded (id, true))
-      | Detail_action (_, Detail_collapse id) -> on_action (Set_expanded (id, false))
       | Detail_action (_, Detail_more id) -> on_action (Load_more id)
       | Detail_action (_, Detail_retry) -> on_action Retry
       | Detail_action (_, Detail_submit source) -> on_action (Submit source)
