@@ -362,7 +362,7 @@ let open_favorite
     ( open_detail t ~block_id ~request_generation
     , Some
         (Journal_graph_request.Load_detail
-           { block_id; after = None; limit = 64; request_generation }) )
+           { block_id; after = None; limit = 128; request_generation }) )
 ;;
 
 let update_detail_at t ~entry_id detail =
@@ -565,7 +565,7 @@ let retry_detail_at t ~entry_id ~request_generation =
       }
     , Some
         (Journal_graph_request.Load_detail
-           { block_id; after = None; limit = 64; request_generation }) )
+           { block_id; after = None; limit = 128; request_generation }) )
 ;;
 
 let retry_detail t ~request_generation =

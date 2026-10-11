@@ -1,5 +1,8 @@
 import LUIAppleBackend
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 /// The form sheet's native card transform still leaves at least a 44pt target.
 struct JournalSheetDismissButton: SwiftUI.View {
@@ -21,20 +24,71 @@ struct JournalSheetDismissButton: SwiftUI.View {
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
-    case feedback, page, header, detail, unlock
-    case bottomControls = "bottom-controls"
+    case page, header, detail, unlock
     case toolbarControl = "toolbar-control"
+    case detailText = "detail-text"
+    case detailRow = "detail-row"
   }
 
   private struct Properties: Decodable {
     let mode: Mode
-    let top: Bool?
-    let visible: Bool?
     let title: String?
     let connecting: Bool?
     let controls: Bool?
     let pending: Bool?
     let error: String?
+    let text: String?
+    let id: String?
+    let level: Int?
+  }
+
+  private struct DetailText: SwiftUI.View {
+    let text: String
+    let id: String
+    @ScaledMetric(relativeTo: .body) private var size: CGFloat = 17
+    @ScaledMetric(relativeTo: .body) private var targetLineHeight: CGFloat = 27
+
+    init(text: String, id: String, level: Int) {
+      self.text = text
+      self.id = id
+      let tier = min(2, max(0, level))
+      _size = ScaledMetric(wrappedValue: [26, 21, 17][tier], relativeTo: .body)
+      _targetLineHeight = ScaledMetric(wrappedValue: [40, 33, 27][tier], relativeTo: .body)
+    }
+
+    private var lineSpacing: CGFloat {
+      #if os(iOS)
+      max(0, targetLineHeight - UIFont.systemFont(ofSize: size).lineHeight)
+      #else
+      max(0, targetLineHeight - size * 1.2)
+      #endif
+    }
+
+    var body: some SwiftUI.View {
+      Text(text)
+        .font(.system(size: size, weight: .regular))
+        .foregroundStyle(.primary)
+        .lineSpacing(lineSpacing)
+        .multilineTextAlignment(.leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier(id)
+    }
+  }
+
+  private struct DetailRow: SwiftUI.View {
+    let content: AnyView
+    @ScaledMetric(relativeTo: .body) private var paragraphGap: CGFloat = 12
+
+    init(content: AnyView, level: Int) {
+      self.content = content
+      _paragraphGap = ScaledMetric(wrappedValue: [24, 18, 12][min(2, max(0, level))], relativeTo: .body)
+    }
+
+    var body: some SwiftUI.View {
+      content.frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, paragraphGap)
+    }
   }
 
   fileprivate struct ControlsSizeKey: EnvironmentKey {
@@ -138,23 +192,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     var body: some SwiftUI.View {
       switch properties?.mode {
-      case .feedback:
-        if let properties, context.childIDs.count == 3,
-          properties.top != nil, properties.visible != nil {
-          GeometryReader { bounds in
-            child(0).frame(width: bounds.size.width, height: bounds.size.height)
-          }
-          .safeAreaInset(edge: properties.top! ? .top : .bottom, spacing: 0) {
-            if properties.visible! {
-              ViewThatFits(in: .horizontal) {
-                child(1)
-                child(2)
-              }
-              .frame(maxWidth: .infinity)
-              .background(.bar)
-            }
-          }
-        }
       case .page:
         if let properties, context.childIDs.count == 3,
           properties.connecting != nil, properties.controls != nil {
@@ -166,14 +203,31 @@ struct JournalSheetDismissButton: SwiftUI.View {
           SectionDate(title: title)
         }
       case .detail:
-        if let title = properties?.title, context.childIDs.count == 1 {
+        if let title = properties?.title, context.childIDs.count == 2 {
           GeometryReader { bounds in
             child(0).frame(width: bounds.size.width, height: bounds.size.height)
           }
           #if os(iOS)
           .toolbar(.visible, for: .navigationBar)
+          .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+              child(1).menuStyle(.button).buttonStyle(.plain)
+            }
+            .sharedBackgroundVisibility(.hidden)
+          }
+          #else
+          .toolbar { ToolbarItem { child(1) } }
           #endif
           .navigationTitle(title)
+        }
+      case .detailText:
+        if let properties, let text = properties.text, let id = properties.id,
+          let level = properties.level, context.childIDs.isEmpty {
+          DetailText(text: text, id: id, level: level)
+        }
+      case .detailRow:
+        if let level = properties?.level, context.childIDs.count == 1 {
+          DetailRow(content: child(0), level: level)
         }
       case .toolbarControl:
         if context.childIDs.count == 1 {
@@ -181,18 +235,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(Text(properties?.title ?? "Close"))
             .accessibilityAddTraits(.isButton)
-        }
-      case .bottomControls:
-        if context.childIDs.count == 2 {
-          GeometryReader { bounds in
-            child(0).frame(width: bounds.size.width, height: bounds.size.height)
-          }
-          .safeAreaInset(edge: .bottom, spacing: 0) {
-            child(1)
-              .frame(maxWidth: .infinity)
-              .padding(.horizontal, 16)
-              .padding(.vertical, 8)
-          }
         }
       case .unlock:
         if let properties, let title = properties.title, context.childIDs.count == 4 {

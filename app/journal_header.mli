@@ -67,8 +67,14 @@ val feedback
 
 val date_header : title:string -> Journal_view.View.t
 
+val detail_text : id:string -> depth:int -> string -> Journal_view.View.t
+val detail_row : depth:int -> Journal_view.View.t -> Journal_view.View.t
+
 val detail
   :  capture_enabled:bool
   -> on_capture:Journal_view.Event.Handler.t
+  -> copy_enabled:bool
+  -> on_copy:Journal_view.Event.Handler.t
+  -> copy_feedback:string option
   -> Journal_view.View.Body.t
   -> Journal_view.View.Body.t

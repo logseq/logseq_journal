@@ -24,16 +24,18 @@ let creation_time =
 ;;
 
 let block
+      ?(id = block_id)
+      ?parent_id
       ?(source = "Literal #journal @person 👩🏽‍💻")
       ?(task_state = Journal_model.Done)
       ?(child_count = 3)
       ()
   =
   Journal_model.create
-    ~id:block_id
+    ~id
     ~page_id
     ~journal_day:20260809
-    ~parent_id:None
+    ~parent_id
     ~sibling_order:"000000000001"
     ~source
     ~task_state
@@ -2345,8 +2347,11 @@ let test_detail_uses_shared_capture_control () =
              (ops ())
          in
          require
-           (List.length slots = 1)
-           "Detail native Chrome retains an empty toolbar slot";
+           (List.length slots = 2)
+           "Detail native Chrome must retain body and one options control";
+         require
+           (List.length (mounted_nodes (ops ()) AccessibilityLabel (StringValue "Block options")) = 1)
+           "Detail must have one discoverable options menu";
          let captures =
            mounted_nodes (ops ()) AccessibilityLabel (StringValue "Capture")
          in
@@ -2366,7 +2371,149 @@ let test_detail_uses_shared_capture_control () =
     [ true; false ]
 ;;
 
+let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
+  let id n = Printf.sprintf "20000000-0000-4000-a000-%012d" n in
+  let root = block ~source:"周末去山里走走，\n顺便记录这次路线和沿途的风景。" ()
+    |> Journal_model.with_tag_titles ~tag_titles:[ "周末"; "trip" ] in
+  let child = block ~id:(id 2) ~parent_id:block_id ~source:"出发前的准备" () in
+  let grandchild = block ~id:(id 3) ~parent_id:(id 2) ~source:"带上雨衣和充电宝\n下载离线地图" () in
+  let deep = block ~id:(id 4) ~parent_id:(id 3) ~source:"更深一层，完整保留中文内容" () in
+  let deeper = block ~id:(id 5) ~parent_id:(id 4) ~source:"第四层以下仍然可以阅读" ~child_count:0 () in
+  let sibling = block ~id:(id 6) ~parent_id:block_id ~source:"沿途记录" ~child_count:0 () in
+  let projection root children : Journal_graph_projection.detail =
+    { root; children = { blocks = children; continuation = None } }
+  in
+  let routes = Journal_routes.create ()
+    |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
+    |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L (projection root [ child; sibling ])
+  in
+  let load detail parent children =
+    let detail, requests = Journal_detail.step detail (Set_branch_expanded (Journal_model.id parent, true)) in
+    let generation = match requests with
+      | [ Journal_graph_request.Load_detail { limit = 128; request_generation; _ } ] -> request_generation
+      | _ -> fail "Expanding one branch must issue exactly one bounded page read"
+    in
+    fst (Journal_detail.step detail (Loaded (generation, projection parent children)))
+  in
+  let detail = Option.get (Journal_routes.detail routes)
+    |> fun t -> load t child [ grandchild ]
+    |> fun t -> load t grandchild [ deep ]
+    |> fun t -> load t deep [ deeper ]
+  in
+  let routes = Journal_routes.update_detail routes detail in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+  with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+    let payloads = List.filter_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue s) -> Some (Yojson.Basic.from_string s)
+      | _ -> None) (ops ()) in
+    let list = List.find (fun p -> Yojson.Basic.Util.member "sections" p <> `Null) payloads in
+    let rows = Yojson.Basic.Util.(list |> member "sections" |> to_list |> List.hd |> member "rows" |> to_list) in
+    require (List.length rows = 6) "Detail flattens only visual layout, preserving all loaded descendants and order";
+    require (List.map (Yojson.Basic.Util.member "key") rows =
+      List.map (fun b -> `String ("block:" ^ Journal_model.id b))
+        [ root; child; grandchild; deep; deeper; sibling ]) "Detail changes owner traversal order";
+    List.iter (fun row ->
+      require (Yojson.Basic.Util.member "type" row = `String "row") "Detail retains disclosure nesting";
+      require (Yojson.Basic.Util.member "separator" row = `String "hidden") "Detail retains hierarchy separators") rows;
+    let labels = List.filter (fun p -> Yojson.Basic.Util.member "mode" p = `String "detail-text") payloads in
+    require (List.exists (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-tags:" ^ block_id)
+      && Yojson.Basic.Util.member "text" p = `String "#周末  #trip") labels) "Detail drops owned tags";
+    let expected = [ root, 0; child, 1; grandchild, 2; deep, 2; deeper, 2; sibling, 1 ] in
+    List.iter (fun (block, level) ->
+      let label = List.find (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-block:" ^ Journal_model.id block)) labels in
+      require (Yojson.Basic.Util.member "level" label = `Int level) "Detail loses the three-level typography cap";
+      require (Yojson.Basic.Util.member "text" label <> `Null) "Detail drops long or Chinese text") expected)
+;;
+
+let test_detail_flat_branch_keeps_explicit_collapse_action () =
+  let child = block ~id:"20000000-0000-4000-a000-000000000002" ~parent_id:block_id ~child_count:0 () in
+  let projection : Journal_graph_projection.detail =
+    { root = block (); children = { blocks = [ child ]; continuation = None } } in
+  let routes = Journal_routes.create ()
+    |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
+    |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L projection in
+  let actions = ref [] in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true (fun a -> actions := a :: !actions) in
+  with_mounted (V.Body.Private.to_widget body) (fun app ops ->
+    dispatch_row_action app (native_list_node (ops ())) ("block:" ^ block_id) "collapse";
+    require (!actions = [ Application.For_testing.Set_expanded (block_id, false) ])
+      "Removing disclosure chrome loses the existing bounded collapse action")
+;;
+
+(* Composition and native placement have no pure reducer owner. Exercise the
+   public mounted controls, including visibility updates without remounting. *)
+let test_feedback_reuses_lui_inset_and_keeps_control_events () =
+  let current = ref None in
+  let pressed = ref [] in
+  let action name =
+    V.button ~on_press:(Ui.Event.Handler.create (fun _ -> pressed := name :: !pressed))
+      ~child:(V.text name) ()
+  in
+  let slot = Signal.state_slot "feedback-visibility" in
+  let view = V.of_lui (fun context parent ->
+    let visible = Signal.state_at context.ui_scheduler context.ui_state_scope slot false in
+    current := Some visible;
+    Lui_elements.dyn (fun visible ->
+      Journal_header.feedback ~key:(Ui.Key.string "feedback-owner") ~top:false ~visible
+        ~compact:(action "Compact action") ~expanded:(action "Expanded action")
+        (V.Body.static (V.text "Retained body"))
+      |> V.Body.Private.to_widget |> Ui.mount)
+      (Signal.value visible) context parent)
+  in
+  with_mounted view (fun app ops ->
+    let inset = List.find_map (function
+      | Lui_protocol.CreateNode (id, EdgeInset) -> Some id | _ -> None) (ops ()) in
+    require (Option.is_some inset) "feedback still uses an application native layout";
+    let inset = Option.get inset in
+    let initial = ops () in
+    require (mounted_nodes initial EdgeValue (StringValue "bottom") = [ inset ])
+      "feedback lost its requested native edge";
+    require (mounted_nodes initial Visible (BoolValue false) = [ inset ])
+      "feedback lost initial hidden state";
+    require (has_text initial "Retained body") "hidden feedback lost its body";
+    let controls = List.map (fun label ->
+      mounted_nodes initial TextValue (StringValue label) |> List.hd)
+      [ "Compact action"; "Expanded action" ] in
+    Signal.set (Option.get !current) true;
+    ignore (Lui_app.flush app);
+    require (mounted_nodes (ops ()) Visible (BoolValue true) = [ inset ])
+      "feedback visibility failed to update the existing native inset";
+    List.iter (fun id -> ignore (Lui_app.dispatch_event app (Press id))) controls;
+    ignore (Lui_app.flush app);
+    require (List.rev !pressed = [ "Compact action"; "Expanded action" ])
+      "feedback candidates lost their public control events";
+    require (not (List.exists (function
+      | Lui_protocol.DropNode id -> id = inset || List.mem id controls
+      | _ -> false) (ops ()))) "visibility remounted the feedback owner or controls")
+;;
+
+let test_bottom_controls_reuse_lui_inset_and_keep_capture () =
+  let pressed = ref false in
+  let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+  let body = Journal_header.detail ~capture_enabled:true
+      ~on_capture:(Ui.Event.Handler.create (fun _ -> pressed := true))
+      ~copy_enabled:true ~on_copy:ignored ~copy_feedback:None
+      (V.Body.static (V.text "Scrolling body")) in
+  with_mounted (V.Body.Private.to_widget body) (fun app ops ->
+    let inset = List.find_map (function
+      | Lui_protocol.CreateNode (id, EdgeInset) -> Some id | _ -> None) (ops ()) in
+    require (Option.is_some inset) "bottom controls still use an application native layout";
+    let inset = Option.get inset in
+    require (mounted_nodes (ops ()) EdgeValue (StringValue "bottom") = [ inset ])
+      "bottom controls lost native safe-area placement";
+    require (has_text (ops ()) "Scrolling body") "bottom controls lost scrolling content";
+    let capture = mounted_nodes (ops ()) AccessibilityLabel (StringValue "Capture") |> List.hd in
+    ignore (Lui_app.dispatch_event app (Press capture)); ignore (Lui_app.flush app);
+    require !pressed "native inset swallowed the shared Capture event")
+;;
+
 let tests =
+  [ "Feedback native inset visibility and events", test_feedback_reuses_lui_inset_and_keeps_control_events
+  ; "Bottom native inset retains Capture", test_bottom_controls_reuse_lui_inset_and_keep_capture
+  ] @
+  [ "Detail three typography tiers and deep flat rows", test_detail_three_tiers_keep_deep_order_and_plain_rows
+  ; "Detail flat branch retains collapse", test_detail_flat_branch_keeps_explicit_collapse_action
+  ] @
   [ "Detail shared Capture control", test_detail_uses_shared_capture_control
   ; ( "timeline asset child preview title"
     , test_timeline_document_title_follows_its_asset_child )

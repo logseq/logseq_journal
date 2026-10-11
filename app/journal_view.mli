@@ -11,6 +11,7 @@ module Key : sig
   val string : string -> t
   val int : int -> t
   val int64 : int64 -> t
+  val to_string : t -> string
 end
 
 module Test_id : sig
@@ -658,6 +659,7 @@ module View : sig
       | Plain
       | Inset
       | Inset_grouped
+      | Detail
 
     type separator =
       | Automatic

@@ -869,7 +869,7 @@ let test_older_feed_uses_calendar_upper_bound () =
     ]
 ;;
 
-let test_detail_resolves_unretained_page () =
+let test_detail_resolves_unretained_page ?(tagged = false) () =
   let runtime = Runtime.create () in
   set_calendar runtime;
   let read =
@@ -889,7 +889,9 @@ let test_detail_resolves_unretained_page () =
       (response
          read
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "block-1" })))
+            (V2_present_block
+               { value = (if tagged then { record with tag_titles = [ "周末"; "旅行" ] } else record)
+               ; revision = "block-1" })))
   in
   let read = only "unretained owning-page read" output.requests in
   (match read.command with
@@ -907,6 +909,7 @@ let test_detail_resolves_unretained_page () =
             (V2_present_page { page = ordinary_page; revision = "ordinary-page-1" })))
   in
   let children = only "ordinary page direct children" output.requests in
+  let child_uuid = Graph.Uuid.of_string "a1000000-0000-4000-9000-000000000003" |> Result.get_ok in
   let output =
     Runtime.receive
       runtime
@@ -916,7 +919,11 @@ let test_detail_resolves_unretained_page () =
             { parent = block_uuid
             ; revision_scope = V2_children_revision block_uuid
             ; scope_revision = "children-1"
-            ; items = []
+            ; items = (if tagged then
+                [ { Protocol.value = { record with block =
+                      { block with uuid = child_uuid; parent = block_uuid; title = "Child" }
+                    ; tag_titles = [ "地图" ] }
+                  ; revision = "child-1" } ] else [])
             ; next_cursor = None
             }))
   in
@@ -925,7 +932,12 @@ let test_detail_resolves_unretained_page () =
     Alcotest.(check (option int))
       "ordinary page does not fabricate a journal date"
       None
-      (Journal_model.journal_day_opt detail.root)
+      (Journal_model.journal_day_opt detail.root);
+    if tagged then (
+      Alcotest.(check (list string)) "Detail preserves root tags returned by its reader"
+        [ "周末"; "旅行" ] (Journal_model.tag_titles detail.root);
+      Alcotest.(check (list string)) "Detail preserves child tags returned by its reader"
+        [ "地图" ] (Journal_model.tag_titles (only "tagged child" detail.children.blocks)))
   | _ -> Alcotest.fail "ordinary page detail did not load"
 ;;
 
@@ -3302,7 +3314,7 @@ let test_detail_children_uses_latest_root () =
           point
           (Protocol.V2_block_outcome
              (V2_present_block
-                { value = { record with block = { block with title = "Fresh root" } }
+                { value = { record with block = { block with title = "Fresh root" }; tag_titles = [ "Fresh tags" ] }
                 ; revision = "root-2"
                 }))));
   let output =
@@ -3331,6 +3343,8 @@ let test_detail_children_uses_latest_root () =
       "children must not restore stale root"
       "Fresh root"
       (Journal_model.source detail.root)
+    ; Alcotest.(check (list string)) "reconciled Detail keeps latest root tags"
+        [ "Fresh tags" ] (Journal_model.tag_titles detail.root)
   | None -> Alcotest.fail "changed children were not reconciled"
 ;;
 
@@ -4005,7 +4019,9 @@ let () =
       , [ Alcotest.test_case
             "resolve unretained page"
             `Quick
-            test_detail_resolves_unretained_page
+            (fun () -> test_detail_resolves_unretained_page ())
+        ; Alcotest.test_case "Detail reader preserves root and child tags" `Quick
+            (fun () -> test_detail_resolves_unretained_page ~tagged:true ())
         ; Alcotest.test_case
             "retain child cursor"
             `Quick

@@ -430,6 +430,7 @@ let run_favorites_native_visibility
   let media_checksum = Atomic.make 'a' in
   let media_metadata_changed = Atomic.make false in
   let detail_fixture = Atomic.make false in
+  let detail_initial_limit = Atomic.make None in
   let released_demands = Atomic.make 0 in
   let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
   let capture_page : G.page option Atomic.t = Atomic.make None in
@@ -946,8 +947,10 @@ let run_favorites_native_visibility
                         (Atomic.get detail_captures)
                 ; next_cursor = None
                 }
-            | V2_get_children { parent; _ }
+            | V2_get_children { parent; limit; _ }
               when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
+              if check_copy && Atomic.get detail_initial_limit = None
+              then Atomic.set detail_initial_limit (Some limit);
               let value = timeline_block 1 in
               V2_children_outcome
                 { parent
@@ -1143,11 +1146,22 @@ let run_favorites_native_visibility
         | _ -> ())
   in
   let find key value =
-    Hashtbl.fold
+    let direct = Hashtbl.fold
       (fun id values found ->
          if List.assoc_opt key values = Some (`String value) then Some id else found)
       props
       None
+    in
+    match direct with
+    | Some _ -> direct
+    | None when key = "text" -> Hashtbl.fold (fun id values found ->
+        match List.assoc_opt "payload" values with
+        | Some (`String payload) ->
+          let p = Yojson.Safe.from_string payload in
+          if Yojson.Safe.Util.member "mode" p = `String "detail-text"
+             && Yojson.Safe.Util.member "text" p = `String value then Some id else found
+        | _ -> found) props None
+    | None -> None
   in
   let rec ancestor_property id key =
     if
@@ -1321,6 +1335,7 @@ let run_favorites_native_visibility
               hooks.extension_event nav "path-changed" (payload ()) |> consume;
               hooks.extension_event nav "settled" (payload ()) |> consume
             in
+            let original_root_content = Option.get (find "text" "Timeline fixture 1") in
             enter 0;
             Alcotest.(check bool)
               "old Append toolbar action is removed"
@@ -1493,12 +1508,109 @@ let run_favorites_native_visibility
                 (Atomic.get imports_entered);
               Atomic.set import_release true;
               wait "both imports finish" (fun () -> Atomic.get imports_finished = 2);
-              if scenario = "retry-imports" then (
-                wait "failed import exposes target retry" (fun () -> Option.is_some (find "accessibility-label" "Retry imports"));
-                Alcotest.(check bool) "failed import keeps its own staged file" true (Sys.file_exists (List.hd !staged_paths));
-                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Retry imports")));
-                wait "same child import retries" (fun () -> Atomic.get imports_finished = 3);
-                Alcotest.(check int) "import retry does not create another child" 1 (Atomic.get child_attempts));
+              if scenario = "retry-imports"
+              then (
+                wait "failed import exposes target retry" (fun () ->
+                  Option.is_some (find "accessibility-label" "Retry imports"));
+                (* Routes reducers own the path, but cannot express native
+                   feedback ancestry or layout. Mount the real failure through the
+                   public Application boundary; navigation must cover the
+                   root feedback together with the root page. *)
+                let rec navigation_page id =
+                  let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+                  if List.assoc_opt "_extension" values = Some (`String "navigation-page")
+                  then List.assoc_opt "entry-id" values
+                  else Option.bind (Hashtbl.find_opt parents id) navigation_page
+                in
+                let root_actions =
+                  Option.get (find "accessibility-identifier" "root-operation-actions")
+                in
+                Alcotest.(check (option string))
+                  "root feedback is retained inside the native root page"
+                  (Some "root")
+                  (Option.map Yojson.Safe.Util.to_string (navigation_page root_actions));
+                let detail_actions =
+                  all "accessibility-label" "Retry imports"
+                  |> List.find (fun id -> navigation_page id <> Some (`String "root"))
+                in
+                Alcotest.(check bool)
+                  "Detail feedback belongs to its native destination"
+                  true
+                  (match navigation_page detail_actions with
+                   | Some (`String entry) -> entry <> "root"
+                   | _ -> false);
+                let rec inset_owner id =
+                  let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+                  if List.assoc_opt "_kind" values = Some (`String "edge-inset")
+                  then id
+                  else inset_owner (Hashtbl.find parents id)
+                in
+                let root_inset = inset_owner root_actions in
+                let root_body =
+                  Hashtbl.fold
+                    (fun id parent found ->
+                       if
+                         parent = root_inset
+                         && List.assoc_opt "_kind" (Hashtbl.find props id)
+                            = Some (`String "stack")
+                       then Some id
+                       else found)
+                    parents
+                    None
+                  |> Option.get
+                in
+                let rec inside_body id =
+                  id = root_body
+                  || Option.fold
+                       ~none:false
+                       ~some:inside_body
+                       (Hashtbl.find_opt parents id)
+                in
+                Alcotest.(check bool)
+                  "root feedback reserves space for the retained page content"
+                  true
+                  (inside_body (Option.get (find "text" "Timeline fixture 1")));
+                Alcotest.(check int)
+                  "showing feedback preserves the original root content node"
+                  original_root_content
+                  (Option.get (find "text" "Timeline fixture 1"));
+                Alcotest.(check bool)
+                  "failed import keeps its own staged file"
+                  true
+                  (Sys.file_exists (List.hd !staged_paths));
+                let retained_root = Option.get (find "text" "Timeline fixture 1") in
+                back ();
+                Alcotest.(check int)
+                  "Back retains the root feedback owner and its unresolved error"
+                  root_actions
+                  (Option.get (find "accessibility-identifier" "root-operation-actions"));
+                Alcotest.(check int)
+                  "feedback updates retain the root content"
+                  retained_root
+                  (Option.get (find "text" "Timeline fixture 1"));
+                enter 0;
+                dispatch (Lui_protocol.Press detail_actions);
+                settle_worker ();
+                Alcotest.(check int)
+                  "retired Detail feedback cannot start an import retry"
+                  2
+                  (Atomic.get imports_finished);
+                let current_retry =
+                  all "accessibility-label" "Retry imports"
+                  |> List.find (fun id ->
+                    match navigation_page id with
+                    | Some (`String entry) -> entry <> "root"
+                    | _ -> false)
+                in
+                dispatch (Lui_protocol.Press current_retry);
+                wait "same child import retries" (fun () ->
+                  Atomic.get imports_finished = 3);
+                wait "successful retry retires both feedback controls" (fun () ->
+                  all "accessibility-label" "Retry imports" = []);
+                Alcotest.(check int)
+                  "import retry does not create another child"
+                  1
+                  (Atomic.get child_attempts));
               if not (List.mem scenario [ "retry-imports"; "selection-error" ]) then (
                 wait "failed import offers explicit discard" (fun () -> Option.is_some (find "accessibility-label" "Dismiss"));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss"))));
@@ -1615,6 +1727,11 @@ let run_favorites_native_visibility
              Hashtbl.fold
                (fun _ values count ->
                   if List.assoc_opt "text" values = Some (`String "Updated covered row")
+                    || (match List.assoc_opt "payload" values with
+                        | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
+                          Yojson.Safe.Util.member "mode" p = `String "detail-text"
+                          && Yojson.Safe.Util.member "text" p = `String "Updated covered row"
+                        | _ -> false)
                   then count + 1
                   else count)
                props
@@ -1717,13 +1834,18 @@ let run_favorites_native_visibility
          dispatch
            (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
          let root_list = Option.get (find "_extension" "journal-list") in
-         let label = Option.get (find "text" "Timeline fixture 1") in
+         Atomic.set detail_fixture true;
+         let label = Option.get (find "text" "Timeline fixture 0") in
          dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
          wait "copy Detail loaded" (fun () ->
            Option.is_some
              (find
                 "accessibility-identifier"
-                ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+                ("detail-block:" ^ G.Uuid.to_string (uuid 1))));
+         (* Pure routes retain navigation but do not issue Application's
+            ordinary Open block read; inspect that public worker boundary. *)
+         Alcotest.(check (option int)) "ordinary Detail first-page budget"
+           (Some 128) (Atomic.get detail_initial_limit);
          let detail_list =
            Hashtbl.fold
              (fun id values found ->
@@ -1736,7 +1858,113 @@ let run_favorites_native_visibility
              None
            |> Option.get
          in
-         check_copy_text detail_list row "Timeline fixture 1")
+         check_copy_text detail_list row "Timeline fixture 1";
+         (* Copy's pure reducer cannot reproduce the Detail toolbar binding or
+            host acknowledgement feedback. Exercise their public app boundary. *)
+         let current_root = ref (uuid 1) in
+         let rec under owner id =
+           id = owner || match Hashtbl.find_opt parents id with
+           | None -> false | Some parent -> under owner parent
+         in
+         let rec chrome mode id =
+           let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+           match List.assoc_opt "payload" values with
+           | Some (`String payload) when Yojson.Safe.Util.member "mode" (Yojson.Safe.from_string payload) = `String mode -> id
+           | _ -> chrome mode (Hashtbl.find parents id)
+         in
+         let detail_body root = Hashtbl.fold (fun id values found ->
+           match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+           | Some (`String "journal-list"), Some (`String payload) ->
+             let open Yojson.Safe.Util in
+             let p = Yojson.Safe.from_string payload in
+             (match p |> member "sections" |> to_list with
+              | section :: _ -> (match section |> member "rows" |> to_list with
+                | row :: _ when member "style" p = `String "detail"
+                  && member "key" row = `String ("block:" ^ G.Uuid.to_string root) -> Some id
+                | _ -> found)
+              | _ -> found)
+           | _ -> found) props None in
+         let current_body () =
+           Option.get (detail_body !current_root)
+         in
+         let find_current key value =
+           let rec owning_inset id =
+             let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+             if List.assoc_opt "edge" values = Some (`String "bottom")
+             then id else owning_inset (Hashtbl.find parents id)
+           in
+           let owner = owning_inset (current_body ()) in
+           Hashtbl.fold (fun id values found ->
+             if under owner id && List.assoc_opt key values = Some (`String value)
+             then Some id else found) props None
+         in
+         let header_copy () =
+           let owner = chrome "detail" (current_body ()) in
+           let trigger = Option.get (Hashtbl.fold (fun id values found ->
+             if under owner id && List.assoc_opt "accessibility-label" values = Some (`String "Block options")
+             then Some id else found) props None) in
+           let under id = under trigger id in
+           let entries = Hashtbl.fold (fun id values acc ->
+             if under id && List.mem_assoc "text" values then
+               (id, List.assoc "text" values) :: acc else acc) props [] in
+           Alcotest.(check int) "Detail menu has only Copy" 1 (List.length entries);
+           match entries with
+           | [ (id, `String "Copy") ] -> id
+           | _ -> Alcotest.fail "Detail menu must contain only Copy"
+         in
+         let respond_copy copied =
+           let json = Yojson.Safe.to_string (`Assoc [ "copied", `Bool copied ]) in
+           let response = Bytes.make (32 + String.length json) '\000' in
+           Bytes.blit_string "LJP2" 0 response 0 4;
+           Bytes.set_uint16_le response 4 2;
+           Bytes.set_uint16_le response 6 29;
+           Bytes.set_int32_le response 24 (Int32.of_int (String.length json));
+           Bytes.blit_string json 0 response 32 (String.length json);
+           hooks.platform_response (Bytes.to_string response)
+         in
+         let copy_header expected =
+           clipboard_requests := [];
+           dispatch (Lui_protocol.Press (header_copy ()));
+           wait "Detail Copy progress" (fun () ->
+             Option.is_some (find_current "text" "Copying block and descendants…"));
+           wait "Detail header reaches shared clipboard chain" (fun () -> !clipboard_requests <> []);
+           let request = List.hd !clipboard_requests in
+           let json = Bytes.sub_string request 32 (Bytes.length request - 32) |> Yojson.Safe.from_string in
+           Alcotest.(check string) "header targets current Detail subtree" expected
+             Yojson.Safe.Util.(json |> member "text" |> to_string)
+         in
+         copy_header "Timeline fixture 0\n  - Timeline fixture 1";
+         respond_copy true;
+         wait "Detail Copy success after host acknowledgement" (fun () ->
+           Option.is_some (find_current "text" "Copied block and descendants"));
+         copy_header "Timeline fixture 0\n  - Timeline fixture 1";
+         let retired_copy = header_copy () in
+         let payload = Yojson.Safe.to_string (`Assoc [ "key", `String "open"; "row", `String row ]) in
+         let action = Yojson.Safe.to_string (`Assoc [ "type", `String "row_event"; "payload", `String payload ]) in
+         hooks.extension_event detail_list "event"
+           (Yojson.Safe.to_string (`Assoc [ "id", `Int 1; "payload", `String action ])) |> consume;
+         wait "nested Detail has its own root" (fun () ->
+           Option.is_some (detail_body (uuid 2)));
+         current_root := uuid 2;
+         respond_copy false;
+         for _ = 1 to 5 do hooks.pump () |> consume done;
+         Alcotest.(check bool) "old failure never becomes a new Detail/global notice" true
+           (Option.is_none (find "text" "Copy failed"));
+         Alcotest.(check bool) "old success is scoped to its Detail" true
+           (Option.is_none (find_current "text" "Copied block and descendants"));
+         clipboard_requests := [];
+         dispatch (Lui_protocol.Press retired_copy);
+         for _ = 1 to 5 do hooks.pump () |> consume done;
+         Alcotest.(check int) "retired toolbar cannot copy previous root" 0 (List.length !clipboard_requests);
+         copy_header "Timeline fixture 1";
+         respond_copy false;
+         wait "Detail Copy failure remains visible" (fun () ->
+           Option.is_some (find_current "text" "Copy failed: Clipboard write was not acknowledged."));
+         copy_header "Timeline fixture 1";
+         respond_copy true;
+         wait "retry succeeds without the previous failure" (fun () ->
+           Option.is_some (find_current "text" "Copied block and descendants")
+           && Option.is_none (find_current "text" "Copy failed: Clipboard write was not acknowledged.")))
        else if Option.is_some media_rows
        then (
          let count = Option.get media_rows in
@@ -1744,6 +1972,11 @@ let run_favorites_native_visibility
            Hashtbl.fold
              (fun id values ids ->
                 if List.assoc_opt key values = Some (`String value)
+                   || (key = "text" && match List.assoc_opt "payload" values with
+                       | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
+                         Yojson.Safe.Util.member "mode" p = `String "detail-text"
+                         && Yojson.Safe.Util.member "text" p = `String value
+                       | _ -> false)
                 then id :: ids
                 else ids)
              props
@@ -2120,9 +2353,10 @@ let run_favorites_native_visibility
                let expand expanded =
                  detail_event
                    (`Assoc
-                       [ "type", `String "expanded"
-                       ; "key", `String ("block:" ^ G.Uuid.to_string (uuid 1))
-                       ; "expanded", `Bool expanded
+                       [ "type", `String "row_event"
+                       ; "payload", `String (Yojson.Safe.to_string (`Assoc
+                           [ "row", `String ("block:" ^ G.Uuid.to_string (uuid 1))
+                           ; "key", `String (if expanded then "expand" else "collapse") ]))
                        ])
                in
                if scenario = `Detail_offscreen
@@ -2955,7 +3189,14 @@ let run_favorites_native_visibility
                   "accessibility-identifier"
                   ("detail-block:" ^ G.Uuid.to_string (List.nth roots 1))));
            dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+             (Lui_protocol.Press
+                (let scope = Option.get (find "accessibility-identifier" "journal-detail-capture-open") in
+                 let rec under id =
+                   id = scope || Option.fold ~none:false ~some:under (Hashtbl.find_opt parents id)
+                 in
+                 Hashtbl.fold (fun id values found ->
+                   if under id && List.assoc_opt "accessibility-label" values = Some (`String "Capture")
+                   then Some id else found) props None |> Option.get));
            let editor = Option.get (find "style-class" "composer-input") in
            Alcotest.(check bool)
              "append sheet title is present"

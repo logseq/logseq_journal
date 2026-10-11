@@ -19,6 +19,7 @@ let journalIconNames: [String] = [
     "circle.fill",
     "clock",
     "doc",
+    "doc.on.doc",
     "doc.text",
     "ellipsis",
     "exclamationmark.circle",

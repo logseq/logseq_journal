@@ -29,19 +29,22 @@ let chrome =
     ()
 ;;
 
-let feedback ~key ~top ~visible ~compact ~expanded body =
-  Ui.Native_widget.widget
-    chrome
-    ~key
-    ~props:
-      (`Assoc [ "mode", `String "feedback"; "top", `Bool top; "visible", `Bool visible ])
-    ~on_event:(fun _ -> ())
-      (* Chrome slots are positional on the native side — absent slots must
-       still mount a (zero-size) node or the host's index lookup shifts. *)
-    ~children:
-      [ V.Body.Private.to_widget body; V.column [ compact ]; V.column [ expanded ] ]
-    ()
+let feedback_with_visibility ?visible_signal ~key ~top ~visible ~compact ~expanded body =
+  V.of_lui
+    (Lui_elements.edge_inset
+       ~key:(Ui.Key.to_string key) ~edge:(if top then `top else `bottom)
+       ~visible ?visible_signal ~gap:0 ~grow:1.0 ~background:"bar"
+       [ Lui_elements.stack ~grow:1.0 [ Ui.mount (V.Body.Private.to_widget body) ]
+       ; Lui_elements.view_that_fits ~orientation:`horizontal
+           (* Empty candidates still need their own node so the native fit
+              preference retains compact before expanded. *)
+           [ Ui.mount (V.column [ compact ]); Ui.mount (V.column [ expanded ]) ]
+       ])
   |> V.Body.static
+;;
+
+let feedback ~key ~top ~visible ~compact ~expanded body =
+  feedback_with_visibility ~key ~top ~visible ~compact ~expanded body
 ;;
 
 let date_header ~title =
@@ -69,32 +72,61 @@ let capture_control ~enabled ~on_capture =
 ;;
 
 let bottom_controls ~key ~controls body =
-  Ui.Native_widget.widget
-    chrome
-    ~key:(Ui.Key.string key)
-    ~props:(`Assoc [ "mode", `String "bottom-controls" ])
-    ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body; controls ]
-    ()
+  V.of_lui
+    (Lui_elements.edge_inset ~key ~edge:`bottom ~gap:0 ~grow:1.0
+       ~padding_horizontal:16 ~padding_vertical:8
+       [ Lui_elements.stack ~grow:1.0 [ Ui.mount (V.Body.Private.to_widget body) ]
+       ; Ui.mount controls ])
   |> V.Body.static
 ;;
 
-let detail ~capture_enabled ~on_capture body =
+let detail_text ~id ~depth text =
+  Ui.Native_widget.widget
+    chrome
+    ~key:(Ui.Key.string ("detail-label:" ^ id))
+    ~props:(`Assoc [ "mode", `String "detail-text"; "id", `String id
+                  ; "level", `Int (min 2 depth); "text", `String text ])
+    ~on_event:(fun _ -> ())
+    ~children:[]
+    ()
+;;
+
+let detail_row ~depth body =
+  Ui.Native_widget.widget chrome
+    ~props:(`Assoc [ "mode", `String "detail-row"; "level", `Int (min 2 depth) ])
+    ~on_event:(fun _ -> ()) ~children:[ body ] ()
+;;
+
+let detail ~capture_enabled ~on_capture ~copy_enabled ~on_copy ~copy_feedback body =
   let capture =
     capture_control ~enabled:(fun () -> capture_enabled) ~on_capture
     |> test_id "journal-detail-capture-open"
+  in
+  let options =
+    V.buttons ~actions:
+      [ V.buttons_menu_action ~label:"Block options" ~icon:"ellipsis"
+          ~on_select:(Ui.Event.Handler.create (function
+            | Ui.Event.Payload.Int64 1L when copy_enabled ->
+              Ui.Event.Handler.Private.invoke on_copy Ui.Event.Payload.Unit
+            | _ -> ()))
+          [ V.Menu.action ~id:1L ~title:"Copy" ~icon:"doc.on.doc" ~enabled:copy_enabled () ] ] ()
   in
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string "journal-detail-header")
     ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
     ~on_event:(fun _ -> ())
-    ~children:[ V.Body.Private.to_widget body ]
+    ~children:[ V.Body.Private.to_widget body; options ]
     ()
   |> V.Body.static
   |> bottom_controls
        ~key:"journal-detail-bottom-controls"
-       ~controls:(V.row ~spacing:16. [ V.spacer (); capture ])
+       ~controls:(V.row ~spacing:16.
+         [ (match copy_feedback with
+            | None -> V.spacer ()
+            | Some message ->
+              V.text message |> V.semantics ~properties:(Ui.Semantics.create ~live_region:true ()) )
+         ; V.spacer (); capture ])
 ;;
 
 type account_action =
@@ -336,24 +368,23 @@ let view_impl
     match context with
     | Context.Journals -> body
     | Favorites ->
-      reactive_widget
-        ~key
-        ~props_for:(fun presentation ->
-          `Assoc
-            [ "mode", `String "feedback"
-            ; "top", `Bool true
-            ; ( "visible"
-              , `Bool
-                  (presentation.sync_phase = Some Graph_service.Connecting
-                   || Option.is_some presentation.sync_error) )
-            ])
-        ~children:
-          [ V.Body.Private.to_widget body
-          ; V.column [ sync_feedback ]
-          ; V.column [ sync_feedback ]
-          ]
-        ()
-      |> V.Body.static
+      let visible presentation =
+        presentation.sync_phase = Some Graph_service.Connecting
+        || Option.is_some presentation.sync_error
+      in
+      let wrap ?visible_signal () =
+        feedback_with_visibility ?visible_signal ~key ~top:true
+          ~visible:(visible initial) ~compact:sync_feedback ~expanded:sync_feedback body
+      in
+      (match presentation_signal with
+       | None -> wrap ()
+       | Some source ->
+         V.of_lui (fun context parent ->
+           let visible_signal = Signal.map visible source in
+           Signal.on_dispose context.Lui_ui.ui_scope (fun () ->
+             Signal.dispose_signal visible_signal);
+           Ui.mount (V.Body.Private.to_widget (wrap ~visible_signal ())) context parent)
+         |> V.Body.static)
   in
   let body = body |> V.Body.with_test_id (Ui.Test_id.string "journal-root-navigation") in
   let body =

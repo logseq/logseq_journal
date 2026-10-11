@@ -267,7 +267,7 @@ let load (t : t) id =
         Journal_graph_request.Load_detail
           { block_id = id
           ; after = current.continuation
-          ; limit = 64
+          ; limit = 128
           ; request_generation = generation
           }
       in
