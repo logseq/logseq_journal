@@ -1790,7 +1790,12 @@ let run_favorites_native_visibility
            Option.get (detail_body !current_root)
          in
          let find_current key value =
-           let owner = chrome "bottom-controls" (current_body ()) in
+           let rec owning_inset id =
+             let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+             if List.assoc_opt "edge" values = Some (`String "bottom")
+             then id else owning_inset (Hashtbl.find parents id)
+           in
+           let owner = owning_inset (current_body ()) in
            Hashtbl.fold (fun id values found ->
              if under owner id && List.assoc_opt key values = Some (`String value)
              then Some id else found) props None
@@ -3086,7 +3091,14 @@ let run_favorites_native_visibility
                   "accessibility-identifier"
                   ("detail-block:" ^ G.Uuid.to_string (List.nth roots 1))));
            dispatch
-             (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+             (Lui_protocol.Press
+                (let scope = Option.get (find "accessibility-identifier" "journal-detail-capture-open") in
+                 let rec under id =
+                   id = scope || Option.fold ~none:false ~some:under (Hashtbl.find_opt parents id)
+                 in
+                 Hashtbl.fold (fun id values found ->
+                   if under id && List.assoc_opt "accessibility-label" values = Some (`String "Capture")
+                   then Some id else found) props None |> Option.get));
            let editor = Option.get (find "style-class" "composer-input") in
            Alcotest.(check bool)
              "append sheet title is present"

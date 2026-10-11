@@ -2440,7 +2440,77 @@ let test_detail_flat_branch_keeps_explicit_collapse_action () =
       "Removing disclosure chrome loses the existing bounded collapse action")
 ;;
 
+(* Composition and native placement have no pure reducer owner. Exercise the
+   public mounted controls, including visibility updates without remounting. *)
+let test_feedback_reuses_lui_inset_and_keeps_control_events () =
+  let current = ref None in
+  let pressed = ref [] in
+  let action name =
+    V.button ~on_press:(Ui.Event.Handler.create (fun _ -> pressed := name :: !pressed))
+      ~child:(V.text name) ()
+  in
+  let slot = Signal.state_slot "feedback-visibility" in
+  let view = V.of_lui (fun context parent ->
+    let visible = Signal.state_at context.ui_scheduler context.ui_state_scope slot false in
+    current := Some visible;
+    Lui_elements.dyn (fun visible ->
+      Journal_header.feedback ~key:(Ui.Key.string "feedback-owner") ~top:false ~visible
+        ~compact:(action "Compact action") ~expanded:(action "Expanded action")
+        (V.Body.static (V.text "Retained body"))
+      |> V.Body.Private.to_widget |> Ui.mount)
+      (Signal.value visible) context parent)
+  in
+  with_mounted view (fun app ops ->
+    let inset = List.find_map (function
+      | Lui_protocol.CreateNode (id, EdgeInset) -> Some id | _ -> None) (ops ()) in
+    require (Option.is_some inset) "feedback still uses an application native layout";
+    let inset = Option.get inset in
+    let initial = ops () in
+    require (mounted_nodes initial EdgeValue (StringValue "bottom") = [ inset ])
+      "feedback lost its requested native edge";
+    require (mounted_nodes initial Visible (BoolValue false) = [ inset ])
+      "feedback lost initial hidden state";
+    require (has_text initial "Retained body") "hidden feedback lost its body";
+    let controls = List.map (fun label ->
+      mounted_nodes initial TextValue (StringValue label) |> List.hd)
+      [ "Compact action"; "Expanded action" ] in
+    Signal.set (Option.get !current) true;
+    ignore (Lui_app.flush app);
+    require (mounted_nodes (ops ()) Visible (BoolValue true) = [ inset ])
+      "feedback visibility failed to update the existing native inset";
+    List.iter (fun id -> ignore (Lui_app.dispatch_event app (Press id))) controls;
+    ignore (Lui_app.flush app);
+    require (List.rev !pressed = [ "Compact action"; "Expanded action" ])
+      "feedback candidates lost their public control events";
+    require (not (List.exists (function
+      | Lui_protocol.DropNode id -> id = inset || List.mem id controls
+      | _ -> false) (ops ()))) "visibility remounted the feedback owner or controls")
+;;
+
+let test_bottom_controls_reuse_lui_inset_and_keep_capture () =
+  let pressed = ref false in
+  let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+  let body = Journal_header.detail ~capture_enabled:true
+      ~on_capture:(Ui.Event.Handler.create (fun _ -> pressed := true))
+      ~copy_enabled:true ~on_copy:ignored ~copy_feedback:None
+      (V.Body.static (V.text "Scrolling body")) in
+  with_mounted (V.Body.Private.to_widget body) (fun app ops ->
+    let inset = List.find_map (function
+      | Lui_protocol.CreateNode (id, EdgeInset) -> Some id | _ -> None) (ops ()) in
+    require (Option.is_some inset) "bottom controls still use an application native layout";
+    let inset = Option.get inset in
+    require (mounted_nodes (ops ()) EdgeValue (StringValue "bottom") = [ inset ])
+      "bottom controls lost native safe-area placement";
+    require (has_text (ops ()) "Scrolling body") "bottom controls lost scrolling content";
+    let capture = mounted_nodes (ops ()) AccessibilityLabel (StringValue "Capture") |> List.hd in
+    ignore (Lui_app.dispatch_event app (Press capture)); ignore (Lui_app.flush app);
+    require !pressed "native inset swallowed the shared Capture event")
+;;
+
 let tests =
+  [ "Feedback native inset visibility and events", test_feedback_reuses_lui_inset_and_keeps_control_events
+  ; "Bottom native inset retains Capture", test_bottom_controls_reuse_lui_inset_and_keep_capture
+  ] @
   [ "Detail three typography tiers and deep flat rows", test_detail_three_tiers_keep_deep_order_and_plain_rows
   ; "Detail flat branch retains collapse", test_detail_flat_branch_keeps_explicit_collapse_action
   ] @

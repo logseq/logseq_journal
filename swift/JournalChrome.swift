@@ -24,8 +24,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
-    case feedback, page, header, detail, unlock
-    case bottomControls = "bottom-controls"
+    case page, header, detail, unlock
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
     case detailRow = "detail-row"
@@ -33,8 +32,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   private struct Properties: Decodable {
     let mode: Mode
-    let top: Bool?
-    let visible: Bool?
     let title: String?
     let connecting: Bool?
     let controls: Bool?
@@ -195,23 +192,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     var body: some SwiftUI.View {
       switch properties?.mode {
-      case .feedback:
-        if let properties, context.childIDs.count == 3,
-          properties.top != nil, properties.visible != nil {
-          GeometryReader { bounds in
-            child(0).frame(width: bounds.size.width, height: bounds.size.height)
-          }
-          .safeAreaInset(edge: properties.top! ? .top : .bottom, spacing: 0) {
-            if properties.visible! {
-              ViewThatFits(in: .horizontal) {
-                child(1)
-                child(2)
-              }
-              .frame(maxWidth: .infinity)
-              .background(.bar)
-            }
-          }
-        }
       case .page:
         if let properties, context.childIDs.count == 3,
           properties.connecting != nil, properties.controls != nil {
@@ -252,18 +232,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(Text(properties?.title ?? "Close"))
             .accessibilityAddTraits(.isButton)
-        }
-      case .bottomControls:
-        if context.childIDs.count == 2 {
-          GeometryReader { bounds in
-            child(0).frame(width: bounds.size.width, height: bounds.size.height)
-          }
-          .safeAreaInset(edge: .bottom, spacing: 0) {
-            child(1)
-              .frame(maxWidth: .infinity)
-              .padding(.horizontal, 16)
-              .padding(.vertical, 8)
-          }
         }
       case .unlock:
         if let properties, let title = properties.title, context.childIDs.count == 4 {

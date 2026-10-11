@@ -28,6 +28,7 @@ module Key = struct
   let string s = s
   let int i = string_of_int i
   let int64 i = Int64.to_string i
+  let to_string s = s
 end
 
 module Test_id = struct
