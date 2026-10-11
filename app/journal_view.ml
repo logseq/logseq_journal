@@ -867,7 +867,7 @@ module View = struct
         ~placeholder
         ~text:(Text_editing.Value.text value)
         ~autofocus
-        ~submit_on_enter:true
+        ~submit_on_enter:false
         ~send_disabled_signal:(Signal.constant context.Lui_ui.ui_scheduler send_disabled)
         ~actions:(List.map (fun action -> action.mount) actions)
         ~on_input:

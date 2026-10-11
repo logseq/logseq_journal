@@ -133,7 +133,27 @@ let rebind t ~session_number =
 ;;
 
 let phase t = t.phase
-let source_is_blank source = String.equal (String.trim source) ""
+(* Unicode White_Space, shared by button admission and attachment-only naming.
+   Do not trim meaningful drafts or treat format characters as whitespace. *)
+let source_is_blank source =
+  let whitespace code =
+    (code >= 0x0009 && code <= 0x000d)
+    || (code >= 0x2000 && code <= 0x200a)
+    || match code with
+       | 0x0020 | 0x0085 | 0x00a0 | 0x1680
+       | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 -> true
+       | _ -> false
+  in
+  let rec loop offset =
+    if offset = String.length source then true
+    else
+      let decoded = String.get_utf_8_uchar source offset in
+      Uchar.utf_decode_is_valid decoded
+      && whitespace (Uchar.to_int (Uchar.utf_decode_uchar decoded))
+      && loop (offset + Uchar.utf_decode_length decoded)
+  in
+  loop 0
+;;
 
 let can_save t =
   t.phase = Editing && ((not (source_is_blank (source t))) || t.pending_attachments <> [])

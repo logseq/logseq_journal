@@ -148,7 +148,7 @@ type timeline_notice =
   | Copy_failed of string
   | Import_failed of string
 
-let operation_failure = function
+let operation_failure ?(can_retry_imports = false) = function
   | Some (Delete_failed message) ->
     Some
       ( "Delete failed"
@@ -165,8 +165,12 @@ let operation_failure = function
     Some
       ( "Attachment not added"
       , message
-      , "Your journal entry and other attachments are kept. Select the file again to \
-         retry." )
+      , if can_retry_imports then
+          "Your journal entry and other attachments are kept. Select Retry imports to \
+           try again."
+        else
+          "Your journal entry and other attachments are kept. Select the file again to \
+           retry." )
   | None | Some Delete_undo -> None
 ;;
 
@@ -2246,26 +2250,24 @@ let composer_content
     match assets with
     | None -> []
     | Some assets ->
+      let disabled = not (enabled && not saving && Journal_capture.can_attach capture) in
+      (* The shared buttons composite has no disabled state. Native leaf buttons
+         retain the same glass capsule and 44-point hit areas. *)
       let action ~label ~icon source =
-        V.buttons_action
-          ~label
-          ~icon
-          ~on_press:
-            (Ui.Event.Handler.create (fun _ ->
-               if enabled && (not saving) && Journal_capture.can_attach capture
-               then assets.on_attach source))
-          ()
+        Lui_elements.button
+          ~label ~icon:(`app icon) ~variant:`ghost ~size:`icon
+          ~foreground:"foreground" ~width:44 ~height:44 ~disabled
+          ~on_press:(fun _ -> if not disabled then assets.on_attach source)
+          []
       in
-      [ V.buttons
-          ~actions:
-            ([ action ~label:"文件" ~icon:"doc" Journal_asset_import.Files
-             ; action ~label:"照片" ~icon:"photo" Journal_asset_import.Photos
-             ]
-             @
-             if assets.camera
-             then [ action ~label:"相机" ~icon:"camera" Journal_asset_import.Camera ]
-             else [])
-          ()
+      [ V.of_lui
+          (Lui_elements.button_group ~gap:0 ~height:44 ~background:"glass"
+             ~corner_radius:999
+             ([ action ~label:"文件" ~icon:"doc" Journal_asset_import.Files
+              ; action ~label:"照片" ~icon:"photo" Journal_asset_import.Photos ]
+              @ if assets.camera then
+                  [ action ~label:"相机" ~icon:"camera" Journal_asset_import.Camera ]
+                else []))
         |> V.with_test_id (Ui.Test_id.string (scope ^ "-attach"))
       ]
   in
@@ -2324,7 +2326,16 @@ let composer_content
       ~value:(Journal_capture.value capture)
       ~send_disabled:(not can_submit)
       ?attachments
-      ?feedback:(Option.map live_region_text error)
+      ?feedback:
+        (let messages =
+           Option.to_list error
+           @ if List.length pending >= Journal_capture.attachment_limit then
+               [ "9 attachments maximum. Remove one to add another." ]
+             else []
+         in
+         match messages with
+         | [] -> None
+         | messages -> Some (V.column (List.map live_region_text messages)))
       ~actions:(attach @ [ task ] @ discard)
       ~on_edit:on_edit.native
       ~on_submit:ignored
@@ -4487,6 +4498,11 @@ let start
       when Hashtbl.mem import_worker_requests request_id ->
       let generation, operation, owner = Hashtbl.find import_worker_requests request_id in
       Hashtbl.remove import_worker_requests request_id;
+      let interruption =
+        if Hashtbl.mem capture_staged_items operation then
+          "Import was interrupted. Select Retry imports to try again."
+        else "Import was interrupted. Select the file again."
+      in
       let capture_completion =
         match Hashtbl.find_opt capture_staged_items operation with
         | None -> Effect.ignore
@@ -4512,10 +4528,10 @@ let start
               timeline_notice =
                 (match owner with
                  | None ->
-                   Some (Import_failed "Import was interrupted. Select the file again.")
+                   Some (Import_failed interruption)
                  | Some _ -> state.timeline_notice)
             ; import_completion =
-                Some (operation, Some "Import was interrupted. Select the file again.")
+                Some (operation, Some interruption)
             })
       in
       Effect.bind
@@ -6721,7 +6737,10 @@ let start
         Some
           (error_info_page
              ~sync_error:(Option.bind state.manager (fun manager -> manager.last_error))
-             ~operation_failure:(operation_failure state.timeline_notice)
+             ~operation_failure:
+               (operation_failure
+                  ~can_retry_imports:(state.failed_capture_imports <> [])
+                  state.timeline_notice)
              (newest_first_worker_errors state)
              dispatch)
     in

@@ -2691,8 +2691,48 @@ let test_detail_retry_uses_128_item_first_page () =
   | _ -> fail "Detail retry lost its first-page owner"
 ;;
 
+(* Capture owns admission, source preservation and attachment-only naming;
+   reproduce Unicode blank input through its public reducer boundary. *)
+let test_unicode_blank_capture_admission () =
+  let whitespace = List.init 5 (fun i -> Uchar.of_int (i + 9))
+    @ List.map Uchar.of_int [0x20;0x85;0xa0;0x1680]
+    @ List.init 11 (fun i -> Uchar.of_int (i + 0x2000))
+    @ List.map Uchar.of_int [0x2028;0x2029;0x202f;0x205f;0x3000] in
+  let encoded chars =
+    let b = Buffer.create 64 in
+    List.iter (Buffer.add_utf_8_uchar b) chars; Buffer.contents b in
+  let blank_sources = "" :: "　　\n　" :: encoded whitespace :: List.map (fun c -> encoded [c]) whitespace in
+  let admit capture = Journal_capture.admit_save capture
+    ~mutation_id:"70000000-0000-4000-9000-000000000014"
+    ~block_id:"70000000-0000-4000-a000-000000000014"
+    ~sibling_order:"000000000014" ~calendar_generation:7L
+    ~creation_time:(creation_time 543) in
+  let pick = staged_pick ~operation:"70000000-0000-4000-a000-00000000a014"
+    ~path:"/tmp/blank-title.txt" ~title:"blank-title.txt" ~file_type:"txt" in
+  List.iter (fun source ->
+    let capture = Journal_capture.create ~session_number:14L ~source in
+    require (not (Journal_capture.can_save capture)) "Unicode blank %S enabled Send" source;
+    require (Option.is_none (snd (admit capture))) "Unicode blank %S admitted Save" source;
+    let attached = Journal_capture.add_attachment capture pick in
+    require (Journal_capture.can_save attached) "Unicode blank attachment-only disabled Save";
+    match snd (admit attached) with
+    | Some (Journal_graph_request.Capture {command;_}) ->
+      require_string "blank-title.txt" command.source "blank attachment-only title"
+    | _ -> fail "Unicode blank attachment-only did not admit Save") blank_sources;
+  List.iter (fun source ->
+    let capture = Journal_capture.create ~session_number:15L ~source:"" in
+    let capture = Journal_capture.update_source capture ~source in
+    require (Journal_capture.can_save capture) "Meaningful text %S disabled Send" source;
+    match snd (admit capture) with
+    | Some (Journal_graph_request.Capture {command;_}) ->
+      require_string source command.source "meaningful source must remain exact"
+    | _ -> fail "Meaningful text %S did not admit Save" source)
+    ["　中文\n　second line　";" 🌱 ";"​";"﻿"]
+;;
+
 let tests =
-  [ ( "retained picker and terminal delete"
+  [ "Unicode blank Capture admission", test_unicode_blank_capture_admission
+  ; ( "retained picker and terminal delete"
     , test_retained_detail_picker_owner_and_terminal_delete )
   ; "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
   ; "multiselect batch boundary", test_multiselect_batch_boundary
