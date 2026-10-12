@@ -1,7 +1,11 @@
+module Core = Logseq_sync_pure_reducer.Core
+
 type connect_error =
   | Unauthorized
   | Forbidden
   | Connection_failed of string
+  | Protocol_failed of string
+  | Authentication_failed of string
 
 type liveness =
   | Disabled
@@ -17,7 +21,10 @@ type outgoing =
   }
 
 type t =
-  { mutable terminal : string option option
+  { mutable terminal : Core.websocket_termination option
+  ; mutable local_closing : bool
+  ; mutable peer_termination : Core.websocket_termination option
+  ; retired : unit Eio.Promise.t
   ; mutable activated : bool
   ; mutable closing : bool
   ; mutable peer_closed : bool
@@ -48,21 +55,51 @@ let maximum_queue_count = 128
 let close_timeout = 1.
 let protocol_error message = raise (Protocol_error message)
 
+let termination_message = function
+  | Core.Recoverable_close reason -> Option.value reason ~default:"WebSocket closed"
+  | Core.Local_close -> "WebSocket closed locally"
+  | Core.Authentication_failure message | Core.Protocol_failure message -> message
+;;
+
+let connection_error = function
+  | Core.Authentication_failure message -> Authentication_failed message
+  | Core.Protocol_failure message -> Protocol_failed message
+  | reason -> Connection_failed (termination_message reason)
+;;
+
+let peer_termination payload =
+  if String.length payload < 2
+  then Core.Recoverable_close None
+  else (
+    match (Char.code payload.[0] lsl 8) lor Char.code payload.[1] with
+    | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 ->
+      Core.Protocol_failure "WebSocket peer rejected the protocol or policy"
+    | _ -> Core.Recoverable_close None)
+;;
+
+let closed_reason t =
+  if t.local_closing
+  then Core.Local_close
+  else Option.value t.peer_termination ~default:(Core.Recoverable_close None)
+;;
+
 let stop t reason =
   if t.terminal = None
   then (
-    t.terminal <- Some reason;
+    t.terminal <- Some (if t.local_closing then Core.Local_close else reason);
     ignore (Eio.Promise.try_resolve t.stopped () : bool))
 ;;
 
-let abort t = stop t (Some "WebSocket aborted")
+let abort t =
+  t.local_closing <- true;
+  stop t Core.Local_close
+;;
+
+let await_retired t = Eio.Promise.await t.retired
 
 let activate t ~on_open =
   match t.terminal with
-  | Some reason ->
-    Error
-      (Connection_failed
-         (Option.value reason ~default:"WebSocket closed before activation"))
+  | Some reason -> Error (connection_error reason)
   | None when t.closing -> Error (Connection_failed "WebSocket closed before activation")
   | None when t.activated -> Error (Connection_failed "WebSocket already activated")
   | None ->
@@ -82,7 +119,7 @@ let enqueue_control t opcode payload =
   if t.terminal = None
   then
     if Queue.length t.control >= 16
-    then stop t (Some "WebSocket control queue exceeds its bound")
+    then stop t (Core.Protocol_failure "WebSocket control queue exceeds its bound")
     else (
       Queue.add { opcode; payload; application = false } t.control;
       t.wake_writer ())
@@ -101,7 +138,10 @@ let request_close t payload =
       enqueue_control t 8 payload))
 ;;
 
-let close t = request_close t "\x03\xe8"
+let close t =
+  t.local_closing <- true;
+  request_close t "\x03\xe8"
+;;
 
 let send t payload =
   let length = String.length payload in
@@ -158,8 +198,9 @@ let input_handlers t maximum =
              | Some _ | None -> ())
           | `Connection_close ->
             t.peer_closed <- true;
+            t.peer_termination <- Some (peer_termination value);
             request_close t value;
-            if t.close_sent then stop t None
+            if t.close_sent then stop t (closed_reason t)
           | `Text | `Binary | `Continuation ->
             (match opcode with
              | `Text | `Binary -> Buffer.clear fragments
@@ -193,23 +234,33 @@ let input_handlers t maximum =
     stop
       t
       (match error with
-       | Some _ -> Some "WebSocket protocol failed"
-       | None when t.peer_closed && t.close_sent -> None
-       | None -> Some "WebSocket peer EOF")
+       | Some _ -> Core.Protocol_failure "WebSocket protocol failed"
+       | None when t.peer_closed && t.close_sent -> closed_reason t
+       | None -> Core.Recoverable_close (Some "WebSocket peer EOF"))
   in
   { Httpun_ws.Websocket_connection.frame; eof }
 ;;
 
-let read_loop t flow protocol =
+let read_loop t ~maximum_frame_bytes flow protocol =
   let module Client = Httpun_ws.Client_connection in
   let capacity = 16384 in
   let buffer = Bigstringaf.create capacity in
   let rec loop retained parse =
     if t.terminal = None
     then (
+      (* Never yield inside payload callbacks. Gate the driver before it advances
+         another queued frame, including the connect-to-activation interval. *)
+      while
+        t.terminal = None
+        && (not t.closing)
+        && (t.input_count >= maximum_queue_count
+            || maximum_frame_bytes > maximum_queue_bytes - t.input_bytes)
+      do
+        Eio.Condition.await_no_mutex t.input_changed
+      done;
       let before = t.read_progress in
       match Client.next_read_operation protocol with
-      | `Close -> stop t (Some "WebSocket reader closed")
+      | `Close -> stop t (Core.Recoverable_close (Some "WebSocket reader closed"))
       | `Yield ->
         let resumed, resume = Eio.Promise.create () in
         Client.yield_reader protocol (fun () ->
@@ -239,7 +290,9 @@ let read_loop t flow protocol =
             ignore (Client.read_eof protocol buffer ~off:0 ~len:retained : int);
             stop
               t
-              (if t.peer_closed && t.close_sent then None else Some "WebSocket peer EOF")))
+              (if t.peer_closed && t.close_sent
+               then closed_reason t
+               else Core.Recoverable_close (Some "WebSocket peer EOF"))))
   in
   loop 0 false
 ;;
@@ -276,7 +329,7 @@ let write_loop t flow protocol =
          if frame.opcode = 8
          then (
            t.close_sent <- true;
-           if t.peer_closed then stop t None))
+           if t.peer_closed then stop t (closed_reason t)))
       !in_flight;
     in_flight := None
   in
@@ -316,7 +369,8 @@ let write_loop t flow protocol =
          | None -> wait ())
       | `Close _ ->
         drained ();
-        if not t.closing then stop t (Some "WebSocket writer closed"))
+        if not t.closing
+        then stop t (Core.Recoverable_close (Some "WebSocket writer closed")))
   and wait () =
     let resumed, resume = Eio.Promise.create () in
     let wake () = ignore (Eio.Promise.try_resolve resume () : bool) in
@@ -336,9 +390,12 @@ let deliver_loop t activation on_message =
     else (
       let message = Queue.take t.input in
       (* Retain its budget while the callback is in flight. *)
-      on_message message;
+      (try on_message message with
+       | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
+       | _ -> protocol_error "WebSocket message callback failed");
       t.input_count <- t.input_count - 1;
-      t.input_bytes <- t.input_bytes - String.length message)
+      t.input_bytes <- t.input_bytes - String.length message;
+      Eio.Condition.broadcast t.input_changed)
   done
 ;;
 
@@ -362,7 +419,8 @@ let heartbeat t clock = function
              Eio.Promise.await pong)
          with
          | Eio.Time.Timeout ->
-           if not t.closing then stop t (Some "WebSocket Pong deadline expired"));
+           if not t.closing
+           then stop t (Core.Recoverable_close (Some "WebSocket Pong deadline expired")));
         t.pong <- None)
     done
 ;;
@@ -373,6 +431,13 @@ let failure_message = function
   | Eio.Time.Timeout -> "WebSocket establishment timed out"
   | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> "WebSocket TLS termination"
   | _ -> "WebSocket transport failed"
+;;
+
+let failure_reason = function
+  | Protocol_error message -> Core.Protocol_failure message
+  | Tls_eio.Tls_failure (`Error (`AuthenticationFailure _)) ->
+    Core.Authentication_failure "WebSocket TLS authentication failed"
+  | exn -> Core.Recoverable_close (Some (failure_message exn))
 ;;
 
 let connect
@@ -393,7 +458,10 @@ let connect
     | Some "wss", Some host, None, None -> host <> ""
     | _ -> false
   in
-  if (not valid_uri) || maximum_frame_bytes <= 0
+  if
+    (not valid_uri)
+    || maximum_frame_bytes <= 0
+    || maximum_frame_bytes > maximum_queue_bytes
   then Error (Connection_failed "invalid WebSocket connection parameters")
   else (
     let ready, resolve_ready = Eio.Promise.create () in
@@ -403,6 +471,9 @@ let connect
     let finished, resolve_finished = Eio.Promise.create () in
     let t =
       { terminal = None
+      ; local_closing = false
+      ; peer_termination = None
+      ; retired = finished
       ; activated = false
       ; closing = false
       ; peer_closed = false
@@ -431,7 +502,7 @@ let connect
            let guarded f () =
              try f () with
              | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-             | exception_ -> stop t (Some (failure_message exception_))
+             | exception_ -> stop t (failure_reason exception_)
            in
            let setup () =
              let host = Option.get (Uri.host uri) in
@@ -444,54 +515,59 @@ let connect
                  ~host
                  ~port:(Option.value (Uri.port uri) ~default:443)
              with
+             | Error Tls_client_eio.Authentication_failed ->
+               Error (Authentication_failed "WebSocket TLS authentication failed")
              | Error _ -> Error (Connection_failed "WebSocket TLS setup failed")
              | Ok flow ->
-               let opened, resolve_opened = Eio.Promise.create () in
-               let websocket_handler descriptor =
-                 t.descriptor <- Some descriptor;
-                 t.wake_writer ();
-                 ignore (Eio.Promise.try_resolve resolve_opened (Ok ()) : bool);
-                 input_handlers t maximum_frame_bytes
-               in
-               let error_handler error =
-                 let failure =
-                   match error with
-                   | `Handshake_failure (response, _) ->
-                     (match Httpun.Status.to_code response.Httpun.Response.status with
-                      | 401 -> Unauthorized
-                      | 403 -> Forbidden
-                      | _ -> Connection_failed "WebSocket Upgrade rejected")
-                   | `Malformed_response _ | `Invalid_response_body_length _ | `Exn _ ->
-                     Connection_failed "WebSocket protocol failed"
+               Eio.Time.with_timeout_exn clock 30. (fun () ->
+                 let opened, resolve_opened = Eio.Promise.create () in
+                 let websocket_handler descriptor =
+                   t.descriptor <- Some descriptor;
+                   t.wake_writer ();
+                   ignore (Eio.Promise.try_resolve resolve_opened (Ok ()) : bool);
+                   input_handlers t maximum_frame_bytes
                  in
-                 ignore (Eio.Promise.try_resolve resolve_opened (Error failure) : bool);
-                 (* Preserve typed authentication failure before the stop signal
+                 let error_handler error =
+                   let failure =
+                     match error with
+                     | `Handshake_failure (response, _) ->
+                       (match Httpun.Status.to_code response.Httpun.Response.status with
+                        | 401 -> Unauthorized
+                        | 403 -> Forbidden
+                        | _ -> Connection_failed "WebSocket Upgrade rejected")
+                     | `Malformed_response _ | `Invalid_response_body_length _ | `Exn _ ->
+                       Protocol_failed "WebSocket protocol failed"
+                   in
+                   ignore (Eio.Promise.try_resolve resolve_opened (Error failure) : bool);
+                   (* Preserve typed authentication failure before the stop signal
                     races the establishment waiter. The caller still awaits retirement. *)
-                 ignore (Eio.Promise.try_resolve resolve_ready (Error failure) : bool);
-                 stop t (Some "WebSocket protocol failed")
-               in
-               let port = Option.value (Uri.port uri) ~default:443 in
-               let host_header =
-                 if port = 443 then host else Printf.sprintf "%s:%d" host port
-               in
-               let headers =
-                 Httpun.Headers.of_list
-                   [ "host", host_header; "authorization", "Bearer " ^ token ]
-               in
-               let target = Uri.path_and_query uri in
-               let protocol =
-                 Httpun_ws.Client_connection.connect
-                   ~nonce:(Mirage_crypto_rng.generate 16)
-                   ~headers
-                   ~sha1:(fun value ->
-                     Digestif.SHA1.digest_string value |> Digestif.SHA1.to_raw_string)
-                   ~error_handler
-                   ~websocket_handler
-                   (if target = "" then "/" else target)
-               in
-               Eio.Fiber.fork ~sw:owner (guarded (fun () -> write_loop t flow protocol));
-               Eio.Fiber.fork ~sw:owner (guarded (fun () -> read_loop t flow protocol));
-               Eio.Promise.await opened
+                   ignore (Eio.Promise.try_resolve resolve_ready (Error failure) : bool);
+                   stop t (Core.Protocol_failure "WebSocket protocol failed")
+                 in
+                 let port = Option.value (Uri.port uri) ~default:443 in
+                 let host_header =
+                   if port = 443 then host else Printf.sprintf "%s:%d" host port
+                 in
+                 let headers =
+                   Httpun.Headers.of_list
+                     [ "host", host_header; "authorization", "Bearer " ^ token ]
+                 in
+                 let target = Uri.path_and_query uri in
+                 let protocol =
+                   Httpun_ws.Client_connection.connect
+                     ~nonce:(Mirage_crypto_rng.generate 16)
+                     ~headers
+                     ~sha1:(fun value ->
+                       Digestif.SHA1.digest_string value |> Digestif.SHA1.to_raw_string)
+                     ~error_handler
+                     ~websocket_handler
+                     (if target = "" then "/" else target)
+                 in
+                 Eio.Fiber.fork ~sw:owner (guarded (fun () -> write_loop t flow protocol));
+                 Eio.Fiber.fork
+                   ~sw:owner
+                   (guarded (fun () -> read_loop t ~maximum_frame_bytes flow protocol));
+                 Eio.Promise.await opened)
            in
            Eio.Fiber.fork
              ~sw:owner
@@ -511,27 +587,32 @@ let connect
              (guarded (fun () ->
                 Eio.Promise.await close_requested;
                 Eio.Time.sleep clock close_timeout;
-                stop t (Some "WebSocket close deadline expired")));
+                stop t (Core.Recoverable_close (Some "WebSocket close deadline expired"))));
            (* Setup and both pumps share this owner from before DNS through final
               retirement, including a failure before a handle can be returned. *)
            let setup_result =
-             Eio.Fiber.first
-               (fun () -> Eio.Time.with_timeout_exn clock 30. setup)
-               (fun () ->
-                  Eio.Promise.await stopped;
-                  raise Stop_owner)
+             Eio.Fiber.first setup (fun () ->
+               Eio.Promise.await stopped;
+               raise Stop_owner)
            in
            (match setup_result with
             | Error failure ->
               ignore (Eio.Promise.try_resolve resolve_ready (Error failure) : bool);
-              stop t (Some "WebSocket establishment rejected")
+              stop
+                t
+                (match failure with
+                 | Unauthorized -> Core.Authentication_failure "Authentication failed."
+                 | Forbidden -> Core.Authentication_failure "Authorization failed."
+                 | Authentication_failed message -> Core.Authentication_failure message
+                 | Protocol_failed message -> Core.Protocol_failure message
+                 | Connection_failed message -> Core.Recoverable_close (Some message))
             | Ok () -> ignore (Eio.Promise.try_resolve resolve_ready (Ok t) : bool));
            Eio.Promise.await stopped;
            raise Stop_owner)
        with
        | Stop_owner -> ()
-       | Eio.Cancel.Cancelled _ -> stop t (Some "WebSocket cancelled")
-       | exception_ -> stop t (Some (failure_message exception_)));
+       | Eio.Cancel.Cancelled _ -> stop t Core.Local_close
+       | exception_ -> stop t (failure_reason exception_));
       Queue.clear t.input;
       Queue.clear t.output;
       Queue.clear t.control;
@@ -539,15 +620,13 @@ let connect
       t.pending_count <- 0;
       t.input_count <- 0;
       t.input_bytes <- 0;
-      let reason = Option.value t.terminal ~default:(Some "WebSocket owner stopped") in
+      let reason =
+        Option.value
+          t.terminal
+          ~default:(Core.Recoverable_close (Some "WebSocket owner stopped"))
+      in
       ignore
-        (Eio.Promise.try_resolve
-           resolve_ready
-           (Error
-              (Connection_failed
-                 (Option.value reason ~default:"WebSocket closed before activation")))
-         : bool);
-      ignore (Eio.Promise.try_resolve resolve_finished () : bool);
+        (Eio.Promise.try_resolve resolve_ready (Error (connection_error reason)) : bool);
       Eio.traceln "sync WebSocket owner retired activated=%b" t.activated;
       if t.activated
       then (
@@ -555,13 +634,16 @@ let connect
           Eio.Promise.await activation;
           on_close reason
         with
-        | _ -> ()));
+        | _ -> ());
+      (* Retirement includes the terminal callback, which may itself wait on the
+         caller's bounded event sink. Await this only from a separate fiber. *)
+      ignore (Eio.Promise.try_resolve resolve_finished () : bool));
     try
       match Eio.Promise.await ready with
       | Ok _ as result when t.terminal = None && not t.closing -> result
       | Ok _ ->
         Eio.Promise.await finished;
-        Error (Connection_failed "WebSocket closed before activation")
+        Error (connection_error (Option.value t.terminal ~default:Core.Local_close))
       | Error _ as error ->
         Eio.Promise.await finished;
         error

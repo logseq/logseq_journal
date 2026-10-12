@@ -2489,7 +2489,8 @@ let deletion_blocked_events scope sync =
   ; Core.Snapshot_activated { scope }
   ; Core.Mirror_inspected (Core.Mirror_available { graph; scope })
   ; Core.Websocket_opened { graph = scope; connection_generation = 1 }
-  ; Core.Websocket_closed ({ graph = scope; connection_generation = 1 }, Some "late")
+  ; Core.Websocket_closed
+      ({ graph = scope; connection_generation = 1 }, Core.Recoverable_close (Some "late"))
   ]
 ;;
 
@@ -3205,14 +3206,27 @@ let check_submitted_delete_recovery ?(reject = false) core connection sync wire_
     batch
 ;;
 
+let restart_after_retirement core connection =
+  let retired = Core.step core (Core.Websocket_retired connection) in
+  let timer =
+    List.find_map
+      (function
+        | Core.Run (Core.Schedule_timer timer) -> Some timer
+        | _ -> None)
+      retired.effects
+    |> Option.get
+  in
+  Core.step retired.next (Core.Timer_elapsed timer.id)
+;;
+
 let submitted_delete_survives_disconnect_reconnect () =
   let submitted, connection, sync, wire_batch = submitted_delete_recovery_fixture () in
-  let closed = Core.step submitted.next (Core.Websocket_closed (connection, None)) in
-  let restarting =
+  let closed =
     Core.step
-      closed.next
-      (Core.Foreground_changed { foreground = true; lifecycle_generation = 1L })
+      submitted.next
+      (Core.Websocket_closed (connection, Core.Recoverable_close None))
   in
+  let restarting = restart_after_retirement closed.next connection in
   let current_connection = recovery_connection restarting.effects in
   Alcotest.(check bool)
     "reconnect advances the connection generation"
@@ -3305,7 +3319,9 @@ let recovery_stale_connection_and_interrupted_retry () =
     defer_recovered_delete fresh connection (Overlay.submission_batch_id wire_batch)
   in
   let request = recovery_request retry.effects in
-  let closed = Core.step retry.next (Core.Websocket_closed (connection, None)) in
+  let closed =
+    Core.step retry.next (Core.Websocket_closed (connection, Core.Recoverable_close None))
+  in
   let committed =
     Core.step closed.next (recovery_commit request sync (Some wire_batch))
   in
@@ -3317,11 +3333,7 @@ let recovery_stale_connection_and_interrupted_retry () =
          | Core.Run (Core.Send_websocket _) -> true
          | _ -> false)
        committed.effects);
-  let restarted =
-    Core.step
-      committed.next
-      (Core.Foreground_changed { foreground = true; lifecycle_generation = 1L })
-  in
+  let restarted = restart_after_retirement committed.next connection in
   let new_connection = recovery_connection restarted.effects in
   let opened = Core.step restarted.next (Core.Websocket_opened new_connection) in
   let late =
@@ -3359,8 +3371,9 @@ let recovery_submission_timeout () =
          | Core.Run (Core.Close_websocket scope) -> scope = connection
          | _ -> false)
        expired.effects);
-  let new_connection = recovery_connection expired.effects in
-  let opened = Core.step expired.next (Core.Websocket_opened new_connection) in
+  let retired = Core.step expired.next (Core.Websocket_retired connection) in
+  let new_connection = recovery_connection retired.effects in
+  let opened = Core.step retired.next (Core.Websocket_opened new_connection) in
   let replay = Core.step opened.next (Core.Timer_elapsed timer.id) in
   check_instructions "old timeout is consumed" [] replay.effects;
   check_submitted_delete_recovery replay.next new_connection sync wire_batch
@@ -3699,8 +3712,9 @@ let pull_timeout_reconnects_and_fences_old_work () =
          | Core.Run (Core.Close_websocket scope) -> scope = connection
          | _ -> false)
        expired.effects);
-  let replacement = recovery_connection expired.effects in
-  let reopened = Core.step expired.next (Core.Websocket_opened replacement) in
+  let retired = Core.step expired.next (Core.Websocket_retired connection) in
+  let replacement = recovery_connection retired.effects in
+  let reopened = Core.step retired.next (Core.Websocket_opened replacement) in
   check_pull_count "reconnect starts one fresh baseline pull" 1 reopened.effects;
   let old_timeout = Core.step reopened.next (Core.Timer_elapsed timer.id) in
   check_instructions "old timeout cannot clear replacement owner" [] old_timeout.effects;
@@ -4742,4 +4756,322 @@ let asset_scenarios =
       `Quick
       asset_retry_completion_is_consumed_once
   ]
+;;
+
+(* Reconnect policy belongs to Core. Physical retirement and socket peaks are
+   checked separately at the public Runner boundary, which executes resources. *)
+let websocket_starts effects =
+  List.filter_map
+    (function
+      | Core.Run (Core.Start_websocket r) -> Some r
+      | _ -> None)
+    effects
+;;
+
+let websocket_retry_timer effects =
+  List.find_map
+    (function
+      | Core.Run (Core.Schedule_timer r) -> Some r
+      | _ -> None)
+    effects
+  |> function
+  | Some r -> r
+  | None -> Alcotest.fail "recoverable close did not schedule retry"
+;;
+
+let websocket_retirement_required scope effects =
+  Alcotest.(check bool)
+    "exact owner retirement requested"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Close_websocket s) -> s = scope
+         | _ -> false)
+       effects);
+  Alcotest.(check int)
+    "replacement waits for retirement"
+    0
+    (List.length (websocket_starts effects))
+;;
+
+let reconnect_fixture () =
+  let fixture, current = Pure_reducer_bad_case_support.current_connected_fixture () in
+  fixture.connection, current.next
+;;
+
+let reconnect_waits_for_retirement_and_consumes_retry () =
+  let scope, core = reconnect_fixture () in
+  let closed =
+    Core.step core (Core.Websocket_closed (scope, Core.Recoverable_close None))
+  in
+  websocket_retirement_required scope closed.effects;
+  let duplicate =
+    Core.step closed.next (Core.Websocket_closed (scope, Core.Recoverable_close None))
+  in
+  check_instructions "duplicate termination" [] duplicate.effects;
+  let late = Core.step duplicate.next (Core.Websocket_opened scope) in
+  check_instructions "late open cannot resurrect retiring owner" [] late.effects;
+  let retired = Core.step late.next (Core.Websocket_retired scope) in
+  let timer = websocket_retry_timer retired.effects in
+  Alcotest.(check (float 0.)) "first retry delay" 1. timer.delay_seconds;
+  let expired = Core.step retired.next (Core.Timer_elapsed timer.id) in
+  let replacement =
+    match websocket_starts expired.effects with
+    | [ r ] -> r.scope
+    | _ -> Alcotest.fail "retry must start exactly one owner"
+  in
+  Alcotest.(check bool)
+    "replacement generation is fresh"
+    true
+    (replacement.connection_generation > scope.connection_generation);
+  check_instructions
+    "duplicate retry timer"
+    []
+    (Core.step expired.next (Core.Timer_elapsed timer.id)).effects;
+  check_instructions
+    "duplicate retirement"
+    []
+    (Core.step expired.next (Core.Websocket_retired scope)).effects;
+  List.iter
+    (fun event ->
+       check_instructions
+         "late old connection event"
+         []
+         (Core.step expired.next event).effects)
+    [ Core.Websocket_opened scope
+    ; Core.Websocket_closed (scope, Core.Recoverable_close (Some "late"))
+    ; Core.Websocket_message
+        ( scope
+        , Logseq_sync_pure_reducer.Sync_protocol.Server.Changed
+            { t = server_cursor_of_int 42 } )
+    ];
+  let repeated =
+    Core.step
+      expired.next
+      (Core.Foreground_changed { foreground = true; lifecycle_generation = 1L })
+  in
+  Alcotest.(check int)
+    "foreground cannot duplicate an opening owner"
+    0
+    (List.length (websocket_starts repeated.effects))
+;;
+
+let reconnect_backoff_is_capped_and_not_reset_by_handshake () =
+  let scope, core = reconnect_fixture () in
+  let rec attempt scope core = function
+    | [] -> ()
+    | delay :: rest ->
+      let failed =
+        Core.step
+          core
+          (Core.Websocket_closed (scope, Core.Recoverable_close (Some "EOF")))
+      in
+      let retired = Core.step failed.next (Core.Websocket_retired scope) in
+      let timer = websocket_retry_timer retired.effects in
+      Alcotest.(check (float 0.)) "capped retry backoff" delay timer.delay_seconds;
+      let opening = Core.step retired.next (Core.Timer_elapsed timer.id) in
+      let scope =
+        match websocket_starts opening.effects with
+        | [ r ] -> r.scope
+        | _ -> Alcotest.fail "missing retry"
+      in
+      let opened = Core.step opening.next (Core.Websocket_opened scope) in
+      attempt scope opened.next rest
+  in
+  attempt scope core [ 1.; 2.; 4.; 8.; 16.; 30.; 30. ]
+;;
+
+let reconnect_terminal_failures_do_not_retry () =
+  List.iter
+    (fun reason ->
+       let scope, core = reconnect_fixture () in
+       let closed = Core.step core (Core.Websocket_closed (scope, reason)) in
+       websocket_retirement_required scope closed.effects;
+       let retired = Core.step closed.next (Core.Websocket_retired scope) in
+       Alcotest.(check bool)
+         "terminal close has no automatic retry"
+         false
+         (List.exists
+            (function
+              | Core.Run (Core.Schedule_timer _ | Core.Start_websocket _) -> true
+              | _ -> false)
+            retired.effects))
+    [ Core.Local_close
+    ; Core.Authentication_failure "401"
+    ; Core.Protocol_failure "bad frame"
+    ]
+;;
+
+let reconnect_background_shutdown_and_scope_fence () =
+  let scope, core = reconnect_fixture () in
+  let closed =
+    Core.step core (Core.Websocket_closed (scope, Core.Recoverable_close None))
+  in
+  let retired = Core.step closed.next (Core.Websocket_retired scope) in
+  let timer = websocket_retry_timer retired.effects in
+  let background =
+    Core.step
+      retired.next
+      (Core.Foreground_changed { foreground = false; lifecycle_generation = 1L })
+  in
+  Alcotest.(check bool)
+    "background cancels scoped retry"
+    true
+    (List.exists
+       (function
+         | Core.Run (Core.Cancel_effects _) -> true
+         | _ -> false)
+       background.effects);
+  check_instructions
+    "background retry timer is inert"
+    []
+    (Core.step background.next (Core.Timer_elapsed timer.id)).effects;
+  let foreground =
+    Core.step
+      background.next
+      (Core.Foreground_changed { foreground = true; lifecycle_generation = 2L })
+  in
+  Alcotest.(check int)
+    "foreground starts one owner"
+    1
+    (List.length (websocket_starts foreground.effects));
+  let duplicate =
+    Core.step
+      foreground.next
+      (Core.Foreground_changed { foreground = true; lifecycle_generation = 3L })
+  in
+  Alcotest.(check int)
+    "repeated foreground does not dial again"
+    0
+    (List.length (websocket_starts duplicate.effects));
+  let stopped = Core.step retired.next Core.Shutdown in
+  check_instructions
+    "shutdown retry timer is inert"
+    []
+    (Core.step stopped.next (Core.Timer_elapsed timer.id)).effects;
+  let switched = Core.step retired.next Core.Graph_picker_requested in
+  check_instructions
+    "old graph retry timer is inert"
+    []
+    (Core.step switched.next (Core.Timer_elapsed timer.id)).effects;
+  let logged_out =
+    Core.step retired.next (Core.Account_authenticated { user_id = None })
+  in
+  check_instructions
+    "old account retry timer is inert"
+    []
+    (Core.step logged_out.next (Core.Timer_elapsed timer.id)).effects
+;;
+
+let reconnect_scope_switch_waits_for_old_opening_owner () =
+  let fixture = Pure_reducer_bad_case_support.connected_fixture () in
+  let switched = Core.step fixture.attached.next (Core.Graph_selected graph_id) in
+  websocket_retirement_required fixture.connection switched.effects;
+  let request =
+    List.find_map
+      (function
+        | Core.Delegate (Core.Inspect_mirror r) -> Some r
+        | _ -> None)
+      switched.effects
+    |> Option.get
+  in
+  let inspected =
+    Core.step switched.next (Core.Mirror_inspected (Core.Mirror_available request))
+  in
+  let attached =
+    Core.step
+      inspected.next
+      (Core.Graph_attached { scope = request.scope; sync = fixture.attachment.sync })
+  in
+  Alcotest.(check int)
+    "attachment cannot overlap old setup"
+    0
+    (List.length (websocket_starts attached.effects));
+  check_instructions
+    "late opening completion is fenced"
+    []
+    (Core.step attached.next (Core.Websocket_opened fixture.connection)).effects;
+  let wrong =
+    { fixture.connection with
+      connection_generation = fixture.connection.connection_generation + 100
+    }
+  in
+  check_instructions
+    "unrelated retirement cannot release owner"
+    []
+    (Core.step attached.next (Core.Websocket_retired wrong)).effects;
+  let retired = Core.step attached.next (Core.Websocket_retired fixture.connection) in
+  let next =
+    match websocket_starts retired.effects with
+    | [ r ] -> r
+    | _ -> Alcotest.fail "retirement must start latest attached target"
+  in
+  Alcotest.(check bool)
+    "latest graph generation selected"
+    true
+    (next.scope.graph = request.scope)
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "reconnect waits for retirement and consumes retry"
+        `Quick
+        reconnect_waits_for_retirement_and_consumes_retry
+    ; Alcotest.test_case
+        "reconnect capped backoff survives short handshakes"
+        `Quick
+        reconnect_backoff_is_capped_and_not_reset_by_handshake
+    ; Alcotest.test_case
+        "reconnect terminal failures do not retry"
+        `Quick
+        reconnect_terminal_failures_do_not_retry
+    ; Alcotest.test_case
+        "reconnect background shutdown and scope fencing"
+        `Quick
+        reconnect_background_shutdown_and_scope_fence
+    ; Alcotest.test_case
+        "reconnect scope switch waits for opening owner"
+        `Quick
+        reconnect_scope_switch_waits_for_old_opening_owner
+    ]
+;;
+
+let reconnect_resets_backoff_after_durable_nonempty_pull () =
+  let opened, old_connection, sync = pull_fixture () in
+  let closed =
+    Core.step
+      opened.next
+      (Core.Websocket_closed (old_connection, Core.Recoverable_close None))
+  in
+  let restarting = restart_after_retirement closed.next old_connection in
+  let connection = recovery_connection restarting.effects in
+  let opened = Core.step restarting.next (Core.Websocket_opened connection) in
+  let received = pull_response opened.next connection ~after:0 1 in
+  let committed =
+    recovery_apply received.next connection (recovery_sync sync ~checkpoint:1 1 [])
+  in
+  Alcotest.(check bool)
+    "nonempty opening pull is durably current"
+    true
+    ((Core.state committed.next).snapshot.sync_phase = Core.Current);
+  let closed =
+    Core.step
+      committed.next
+      (Core.Websocket_closed (connection, Core.Recoverable_close None))
+  in
+  let retired = Core.step closed.next (Core.Websocket_retired connection) in
+  Alcotest.(check (float 0.))
+    "confirmed healthy connection resets reconnect backoff"
+    1.
+    (websocket_retry_timer retired.effects).delay_seconds
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "reconnect resets after durable nonempty pull"
+        `Quick
+        reconnect_resets_backoff_after_durable_nonempty_pull
+    ]
 ;;

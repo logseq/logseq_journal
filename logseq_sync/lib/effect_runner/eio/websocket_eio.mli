@@ -4,6 +4,8 @@ type connect_error =
   | Unauthorized
   | Forbidden
   | Connection_failed of string
+  | Protocol_failed of string
+  | Authentication_failed of string
 
 type liveness =
   | Disabled
@@ -22,7 +24,7 @@ val connect
   -> token:string
   -> maximum_frame_bytes:int
   -> on_message:(string -> unit)
-  -> on_close:(string option -> unit)
+  -> on_close:(Logseq_sync_pure_reducer.Core.websocket_termination -> unit)
   -> (t, connect_error) result
 
 (** Register and publish open inside [on_open] before enabling message delivery.
@@ -37,3 +39,7 @@ val close : t -> unit
 
 (** Interrupt setup, active use, or graceful close without waiting. *)
 val abort : t -> unit
+
+(** Wait until socket ownership, I/O and all callbacks have retired. Never call
+    this from one of the connection's callbacks. *)
+val await_retired : t -> unit

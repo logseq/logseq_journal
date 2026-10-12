@@ -490,6 +490,12 @@ type websocket_send =
   ; message : Sync_protocol.Client.message
   }
 
+type websocket_termination =
+  | Recoverable_close of string option
+  | Local_close
+  | Authentication_failure of string
+  | Protocol_failure of string
+
 type timer_id = int
 
 type timer_request =
@@ -690,7 +696,8 @@ type event =
   | Websocket_opened of connection_scope
   | Websocket_message of connection_scope * Sync_protocol.Server.message
   | Websocket_protocol_error of connection_scope * Sync_protocol.codec_error
-  | Websocket_closed of connection_scope * string option
+  | Websocket_closed of connection_scope * websocket_termination
+  | Websocket_retired of connection_scope
   | Timer_elapsed of timer_id
   | Shutdown
 
@@ -719,6 +726,16 @@ type pending_asset =
   { asset_ticket : asset_ticket
   ; asset_cancelled : bool
   ; asset_notify : bool
+  }
+
+type websocket_phase =
+  | Opening
+  | Open
+  | Retiring
+
+type websocket_owner =
+  { physical_scope : connection_scope
+  ; phase : websocket_phase
   }
 
 type t =
@@ -758,6 +775,13 @@ type t =
   ; queued_authoritative_batch : authoritative_batch option
   ; deferred_authoritative_owner : Overlay.submission_batch_id option
   ; websocket_live : bool
+  ; foreground : bool
+  ; foreground_generation : lifecycle_generation option
+  ; websocket_owner : websocket_owner option
+  ; wanted_websocket : websocket_request option
+  ; reconnect_timer : (timer_id * connection_scope) option
+  ; reconnect_pending : bool
+  ; reconnect_delay : float
   ; closed : bool
   }
 
@@ -826,6 +850,13 @@ let initial config =
     ; queued_authoritative_batch = None
     ; deferred_authoritative_owner = None
     ; websocket_live = false
+    ; foreground = true
+    ; foreground_generation = None
+    ; websocket_owner = None
+    ; wanted_websocket = None
+    ; reconnect_timer = None
+    ; reconnect_pending = false
+    ; reconnect_delay = 1.
     ; closed = false
     }
 ;;
@@ -2535,7 +2566,13 @@ let consume_completion core = function
            | _ -> fail core During_catalog message)))
 ;;
 
-let websocket_closed core connection message =
+let websocket_closed core connection termination =
+  let message =
+    match termination with
+    | Recoverable_close message -> message
+    | Local_close -> None
+    | Authentication_failure message | Protocol_failure message -> Some message
+  in
   if not (connection_is_current core connection)
   then unchanged core
   else (
@@ -2783,6 +2820,7 @@ let step core event =
       fail core During_catalog (Sync_protocol.error_to_string error)
     | Websocket_protocol_error _ -> unchanged core
     | Websocket_closed (connection, message) -> websocket_closed core connection message
+    | Websocket_retired _ -> unchanged core
     | Authoritative_batch_applied result -> authoritative_applied core result
     | Authoritative_batch_deferred result -> authoritative_deferred core result
     | Snapshot_activated activation ->
@@ -3355,4 +3393,231 @@ let step core event =
                (Error (Effect_failed "Protected-value request expired")))
           retired
   }
+;;
+
+(* Physical ownership is distinct from the current graph. A scope change may
+   invalidate business events while the old socket still requires retirement. *)
+let step_business = step
+
+let cancel_reconnect core =
+  match core.reconnect_timer with
+  | None -> core, []
+  | Some (_, scope) ->
+    ( { core with reconnect_timer = None }
+    , [ Run (Cancel_effects (effect_scope_of_connection scope)) ] )
+;;
+
+let enforce_websocket_owner before (transition : transition) =
+  let next = transition.next in
+  let next =
+    match next.websocket_owner with
+    | Some owner
+      when owner.phase = Open
+           && next.websocket_live
+           && connection_is_current next owner.physical_scope
+           && next.public_state.snapshot.sync_phase = Current ->
+      { next with reconnect_delay = 1. }
+    | _ -> next
+  in
+  let target_changed = before.current_graph_scope <> next.current_graph_scope in
+  let next, cancelled =
+    if target_changed || (not next.foreground) || next.closed
+    then cancel_reconnect next
+    else next, []
+  in
+  let wanted =
+    List.fold_left
+      (fun wanted -> function
+         | Run (Start_websocket request) -> Some request
+         | _ -> wanted)
+      (if target_changed then None else next.wanted_websocket)
+      transition.effects
+  in
+  let wanted =
+    match wanted with
+    | Some request
+      when next.foreground
+           && (not next.closed)
+           && next.current_graph_scope = Some request.scope.graph -> wanted
+    | Some _ | None -> None
+  in
+  let close_requested =
+    List.exists
+      (function
+        | Run (Close_websocket _) -> true
+        | _ -> false)
+      transition.effects
+  in
+  let effects =
+    List.filter
+      (function
+        | Run (Start_websocket _ | Close_websocket _) -> false
+        | _ -> true)
+      transition.effects
+  in
+  let next =
+    { next with
+      wanted_websocket = wanted
+    ; reconnect_pending =
+        next.reconnect_pending
+        && (not target_changed)
+        && next.foreground
+        && not next.closed
+    }
+  in
+  match next.websocket_owner with
+  | Some owner ->
+    let replace =
+      Option.fold
+        ~none:false
+        ~some:(fun (request : websocket_request) -> request.scope <> owner.physical_scope)
+        wanted
+    in
+    if
+      owner.phase <> Retiring
+      && (close_requested
+          || replace
+          || target_changed
+          || (not next.foreground)
+          || next.closed)
+    then
+      { next = { next with websocket_owner = Some { owner with phase = Retiring } }
+      ; effects = cancelled @ effects @ [ Run (Close_websocket owner.physical_scope) ]
+      }
+    else { next; effects = cancelled @ effects }
+  | None ->
+    (match wanted with
+     | Some request ->
+       { next =
+           { next with
+             websocket_owner = Some { physical_scope = request.scope; phase = Opening }
+           ; wanted_websocket = None
+           }
+       ; effects = cancelled @ effects @ [ Run (Start_websocket request) ]
+       }
+     | None -> { next; effects = cancelled @ effects })
+;;
+
+let websocket_retired core scope =
+  match core.websocket_owner with
+  | Some owner when owner.physical_scope = scope && owner.phase = Retiring ->
+    let next = { core with websocket_owner = None } in
+    let cancelled = Run (Cancel_effects (effect_scope_of_connection scope)) in
+    if
+      next.reconnect_pending
+      && next.foreground
+      && (not next.closed)
+      && next.current_graph_scope = Some scope.graph
+      && next.wanted_websocket = None
+    then (
+      let timer = next.next_effect_id in
+      let timer_scope =
+        { scope with connection_generation = next.connection_generation }
+      in
+      { next =
+          { next with
+            next_effect_id = timer + 1
+          ; reconnect_timer = Some (timer, timer_scope)
+          ; reconnect_pending = false
+          ; reconnect_delay = min 30. (next.reconnect_delay *. 2.)
+          }
+      ; effects =
+          [ cancelled
+          ; Run
+              (Schedule_timer
+                 { id = timer
+                 ; scope = effect_scope_of_connection timer_scope
+                 ; delay_seconds = next.reconnect_delay
+                 })
+          ]
+      })
+    else
+      enforce_websocket_owner
+        core
+        { next = { next with reconnect_pending = false }; effects = [ cancelled ] }
+  | _ -> unchanged core
+;;
+
+let step core event =
+  match event with
+  | Websocket_retired scope -> websocket_retired core scope
+  | Websocket_closed (scope, termination) ->
+    (match core.websocket_owner with
+     | Some owner
+       when owner.physical_scope = scope && owner.phase <> Retiring && not core.closed ->
+       let transition = step_business core event in
+       let retry =
+         match termination with
+         | Recoverable_close _ -> true
+         | Local_close | Authentication_failure _ | Protocol_failure _ -> false
+       in
+       let next =
+         { transition.next with
+           connection_generation = core.connection_generation + 1
+         ; reconnect_pending =
+             retry && core.foreground && core.current_graph_scope = Some scope.graph
+         ; wanted_websocket = None
+         ; websocket_owner = Some { owner with phase = Retiring }
+         }
+       in
+       { next; effects = transition.effects @ [ Run (Close_websocket scope) ] }
+     | _ -> unchanged core)
+  | Websocket_opened scope
+  | Websocket_message (scope, _)
+  | Websocket_protocol_error (scope, _) ->
+    (match core.websocket_owner with
+     | Some owner
+       when owner.physical_scope = scope
+            && owner.phase <> Retiring
+            && connection_is_current core scope
+            && not core.closed ->
+       let core =
+         match event with
+         | Websocket_opened _ ->
+           { core with websocket_owner = Some { owner with phase = Open } }
+         | _ -> core
+       in
+       let transition = step_business core event in
+       let transition =
+         match event with
+         | Websocket_protocol_error _ ->
+           { transition with
+             effects = transition.effects @ [ Run (Close_websocket scope) ]
+           }
+         | _ -> transition
+       in
+       enforce_websocket_owner core transition
+     | _ -> unchanged core)
+  | Foreground_changed { foreground; lifecycle_generation } ->
+    if
+      Option.fold
+        ~none:false
+        ~some:(fun previous -> lifecycle_generation <= previous)
+        core.foreground_generation
+    then unchanged core
+    else (
+      let same = foreground = core.foreground in
+      let core =
+        { core with
+          foreground
+        ; foreground_generation = Some lifecycle_generation
+        ; lifecycle_generation
+        }
+      in
+      if same
+      then unchanged core
+      else enforce_websocket_owner core (step_business core event))
+  | Timer_elapsed id
+    when Option.fold ~none:false ~some:(fun (timer, _) -> timer = id) core.reconnect_timer
+    ->
+    let _, scope = Option.get core.reconnect_timer in
+    let next = { core with reconnect_timer = None } in
+    if
+      core.foreground
+      && (not core.closed)
+      && core.current_graph_scope = Some scope.graph
+      && core.websocket_owner = None
+    then enforce_websocket_owner core (start_websocket next scope.graph)
+    else unchanged next
+  | _ -> enforce_websocket_owner core (step_business core event)
 ;;

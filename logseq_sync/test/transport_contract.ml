@@ -9,7 +9,7 @@ let crypto = Runner_contract.crypto
    production transports only through the public Runner API. *)
 let peer =
   {python|
-import base64, hashlib, json, os, select, socket, ssl, subprocess, sys, time, threading
+import base64, hashlib, json, os, select, socket, ssl, struct, subprocess, sys, time, threading
 root = sys.argv[1]
 with open(root+'/cases.json') as f: cases = json.load(f)
 key, cert = root + '/key.pem', root + '/cert.pem'
@@ -50,7 +50,10 @@ try:
       item={'closed':False}; report.append(item)
       worker=threading.Thread(target=observe_stalled_tls,args=(raw,item),daemon=True)
       worker.start(); stalled.append(worker); continue
-    conn=ctx.wrap_socket(raw,server_side=True)
+    time.sleep(case.get('tls_delay',0))
+    try: conn=ctx.wrap_socket(raw,server_side=True)
+    except (ssl.SSLError,OSError):
+      raw.close(); report.append({'closed':True,'frames':[]}); continue
     request=b''
     while b'\r\n\r\n' not in request:
       part=conn.recv(16384)
@@ -63,13 +66,18 @@ try:
       part=conn.recv(16384)
       if not part: raise RuntimeError('truncated request body')
       request+=part
+    time.sleep(case.get('response_delay',0))
     wire=bytes.fromhex(case.get('wire',''))
     if case.get('ws'):
       headers=dict(line.split(b':',1) for line in request.split(b'\r\n')[1:] if b':' in line)
       nonce=next(v.strip() for k,v in headers.items() if k.lower()==b'sec-websocket-key')
       accept=base64.b64encode(hashlib.sha1(nonce+b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+      frames_wire=wire
       wire=(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
             b'Sec-WebSocket-Accept: '+accept+b'\r\n'+case.get('extra','').encode()+b'\r\n'+wire)
+    if case.get('ws') and case.get('frame_delay'):
+      header_end=wire.index(b'\r\n\r\n')+4
+      conn.sendall(wire[:header_end]); time.sleep(case['frame_delay']); wire=frames_wire
     step=case.get('segment',len(wire) or 1)
     for offset in range(0,len(wire),step):
       try: conn.sendall(wire[offset:offset+step])
@@ -77,6 +85,7 @@ try:
       if step<32: time.sleep(.0005)
     with open(root+'/sent','w') as f: f.write('sent')
     if case.get('eof'):
+      if case.get('reset'): conn.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('ii',1,0))
       conn.close(); report.append({'request':request.hex(),'closed':True,'frames':[]}); continue
     closed=False; frames=[]; pending=b''
     deadline=time.monotonic()+1.5
@@ -150,6 +159,18 @@ let read_file path =
   Fun.protect
     ~finally:(fun () -> close_in_noerr input)
     (fun () -> really_input_string input (in_channel_length input))
+;;
+
+let scaled_clock clock scale =
+  let module Clock = struct
+    type t = unit
+    type time = float
+
+    let now () = Eio.Time.now clock *. scale
+    let sleep_until () deadline = Eio.Time.sleep_until clock (deadline /. scale)
+  end
+  in
+  Eio.Resource.T ((), Eio.Time.Pi.clock (module Clock))
 ;;
 
 let with_peer cases f =
@@ -457,10 +478,12 @@ let asset_stage t ~clock ~posted core scope source_file =
 let runner
       ?(websocket_liveness = Runner.Disabled)
       ?network
+      ?clock
       ?secrets_dependency
       ?crypto_dependency
       ?(acquire = fun _ -> Ok "fixture-token")
       ?(on_invalidate = fun _ -> ())
+      ?(on_post = fun _ -> ())
       ?asset_cache_budget_bytes
       ?asset_maximum_file_bytes
       ?asset_pending_budget_bytes
@@ -476,7 +499,7 @@ let runner
       ~websocket_liveness
       ~tls_authenticator:(Runner.tls_authenticator (fun ?ip:_ ~host:_ _ -> Ok None))
       ~network:(Option.value network ~default:(Eio.Stdenv.net environment))
-      ~clock:(Eio.Stdenv.clock environment)
+      ~clock:(Option.value clock ~default:(Eio.Stdenv.clock environment))
     |> Result.get_ok
   in
   let dependencies =
@@ -506,7 +529,9 @@ let runner
            on_invalidate token))
     |> Result.get_ok
   in
-  Runner.create ~sw dependencies ~post:(fun event -> posted := !posted @ [ event ])
+  Runner.create ~sw dependencies ~post:(fun event ->
+    on_post event;
+    posted := !posted @ [ event ])
   |> Result.get_ok
 ;;
 
@@ -1334,7 +1359,8 @@ let test_alternate_address ~websocket () =
       (fun ~environment ~sw ~support ~origin ->
          let posted = ref []
          and invalidations = ref 0 in
-         let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+         let clock = scaled_clock (Eio.Stdenv.clock environment) 10. in
+         let t = runner ~clock ~environment ~sw ~support ~posted ~invalidations () in
          if websocket
          then (
            let _, graph = bootstrap origin in
@@ -1486,6 +1512,7 @@ let test_stalled_tcp ~cancel () =
       (if cancel then [] else [ case (response "x") ])
       (fun ~environment ~sw ~support ~origin ->
          let clock = Eio.Stdenv.clock environment in
+         let transport_clock = scaled_clock clock 10. in
          let attempts = ref 0
          and released = ref false in
          let network =
@@ -1495,11 +1522,21 @@ let test_stalled_tcp ~cancel () =
              then
                Fun.protect
                  ~finally:(fun () -> released := true)
-                 (fun () -> Eio.Time.sleep clock 30.))
+                 (fun () -> Eio.Time.sleep transport_clock 30.))
          in
          let posted = ref []
          and invalidations = ref 0 in
-         let t = runner ~network ~environment ~sw ~support ~posted ~invalidations () in
+         let t =
+           runner
+             ~network
+             ~clock:transport_clock
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations
+             ()
+         in
          let op = operation ~download:false origin in
          Runner.submit t op;
          wait clock (fun () -> !attempts > 0);
@@ -1649,10 +1686,10 @@ let test_close_with_pending_pong ~reply () =
       in
       wait clock (fun () -> closures () <> []);
       let elapsed = Eio.Time.now clock -. started in
-      Alcotest.(check (list (option string)))
-        "Close handshake or Close deadline owns termination"
-        [ (if reply then None else Some "WebSocket close deadline expired") ]
-        (closures ());
+      Alcotest.(check bool)
+        "intentional Close is classified locally and terminates exactly once"
+        true
+        (closures () = [ Core.Local_close ]);
       Alcotest.(check bool)
         "pending Pong never shortens close grace"
         true
@@ -2931,4 +2968,803 @@ let scenarios =
       ; "cache account cleanup via submit", test_downloaded_cache_account_cleanup
       ; "cache graph cleanup via submit", test_downloaded_cache_graph_cleanup
       ]
+;;
+
+(* These failures execute transport framing/deadlines, not Core policy. There is
+   no pure reducer boundary that can parse coalesced TLS bytes or own DNS/socket
+   cancellation. All fixtures enter through public Runner.transport/submit. *)
+let test_early_frame_backpressure () =
+  let message = {|{"type":"changed","t":42}|} in
+  let wire = String.concat "" (List.init 129 (fun _ -> frame 1 message)) in
+  let report =
+    with_peer
+      [ case ~ws:true wire ]
+      (fun ~environment ~sw ~support ~origin ->
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+         let start = websocket_start origin in
+         let scope =
+           match start with
+           | Core.Start_websocket r -> r.scope
+           | _ -> assert false
+         in
+         Runner.submit t start;
+         let count () =
+           List.length
+             (List.filter
+                (function
+                  | Core.Websocket_message _ -> true
+                  | _ -> false)
+                !posted)
+         in
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           count () = 129
+           || List.exists
+                (function
+                  | Core.Websocket_closed _ -> true
+                  | _ -> false)
+                !posted);
+         Alcotest.(check int)
+           "all small coalesced messages delivered without rejection"
+           129
+           (count ());
+         Runner.submit t (websocket_close scope);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           List.exists
+             (function
+               | Core.Websocket_closed _ -> true
+               | _ -> false)
+             !posted);
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let test_segmented_backpressure_control () =
+  let message = {|{"type":"changed","t":42}|} in
+  ws_test
+    ~messages:129
+    ~terminal:false
+    ~segment:26
+    (String.concat "" (List.init 129 (fun _ -> frame 1 message)))
+    ()
+;;
+
+let delayed_case ?(tls_delay = 0.) ?(response_delay = 0.) wire =
+  match case wire with
+  | `Assoc fields ->
+    `Assoc
+      (("tls_delay", `Float tls_delay)
+       :: ("response_delay", `Float response_delay)
+       :: fields)
+  | _ -> assert false
+;;
+
+let test_tls_slow_legal_handshake () =
+  let report =
+    with_peer
+      [ delayed_case ~tls_delay:1.1 (response "x") ]
+      (fun ~environment ~sw ~support ~origin ->
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+         Runner.submit t (operation ~download:false origin);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Option.is_some (completed !posted));
+         Alcotest.(check bool)
+           "valid handshake beyond one second succeeds"
+           true
+           (Result.is_ok (Option.get (completed !posted)));
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let test_phased_response_deadline () =
+  let report =
+    with_peer
+      [ delayed_case ~tls_delay:0.3 ~response_delay:0.9 (response "x") ]
+      (fun ~environment ~sw ~support ~origin ->
+         let clock = scaled_clock (Eio.Stdenv.clock environment) 20. in
+         let network =
+           delayed_network (Eio.Stdenv.net environment) (fun () ->
+             Eio.Time.sleep clock 10.)
+         in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner ~network ~clock ~environment ~sw ~support ~posted ~invalidations ()
+         in
+         let before = Eio.Time.now clock in
+         Runner.submit t (operation ~download:false origin);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Option.is_some (completed !posted));
+         Alcotest.(check bool)
+           "response retains its budget after independent dial and TLS"
+           true
+           (Result.is_ok (Option.get (completed !posted)));
+         Alcotest.(check bool)
+           "total operation legitimately exceeds old outer 30s"
+           true
+           (Eio.Time.now clock -. before > 30.);
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let test_shared_dial_deadline () =
+  Runner_contract.with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let clock = scaled_clock (Eio.Stdenv.clock environment) 30. in
+        let attempts = ref 0 in
+        let network =
+          delayed_network (Eio.Stdenv.net environment) (fun () ->
+            incr attempts;
+            Eio.Time.sleep clock 100.)
+        in
+        let posted = ref []
+        and invalidations = ref 0 in
+        let t =
+          runner ~network ~clock ~environment ~sw ~support ~posted ~invalidations ()
+        in
+        let before = Eio.Time.now clock in
+        Runner.submit t (operation ~download:false (Uri.of_string "https://localhost:1"));
+        wait (Eio.Stdenv.clock environment) (fun () -> Option.is_some (completed !posted));
+        let elapsed = Eio.Time.now clock -. before in
+        Alcotest.(check bool)
+          "shared DNS/TCP window reaches 30s"
+          true
+          (elapsed >= 29. && elapsed < 33.);
+        Alcotest.(check bool)
+          "address fallback uses the shared remaining window"
+          true
+          (!attempts >= 2);
+        Alcotest.(check bool)
+          "dial deadline returns a transport failure"
+          true
+          (Result.is_error (Option.get (completed !posted)));
+        Runner.shutdown t)))
+;;
+
+let test_tls_independent_deadline () =
+  let report =
+    with_peer
+      [ `Assoc [ "stall_tls", `Bool true ] ]
+      (fun ~environment ~sw ~support ~origin ->
+         let clock = scaled_clock (Eio.Stdenv.clock environment) 20. in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t = runner ~clock ~environment ~sw ~support ~posted ~invalidations () in
+         let before = Eio.Time.now clock in
+         Runner.submit t (operation ~download:false origin);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Option.is_some (completed !posted));
+         let elapsed = Eio.Time.now clock -. before in
+         Alcotest.(check bool)
+           "TLS has independent 10s window"
+           true
+           (elapsed >= 9. && elapsed < 13.);
+         Alcotest.(check bool)
+           "TLS timeout is a transport failure"
+           true
+           (Result.is_error (Option.get (completed !posted)));
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let test_redirect_response_budget_is_shared () =
+  let report =
+    with_peer
+      [ delayed_case
+          ~response_delay:0.9
+          (response ~status:302 ~headers:"Content-Length: 1\r\nLocation: /next\r\n" "x")
+      ; delayed_case ~response_delay:0.9 (response "x")
+      ]
+      (fun ~environment ~sw ~support ~origin ->
+         let clock = scaled_clock (Eio.Stdenv.clock environment) 20. in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t = runner ~clock ~environment ~sw ~support ~posted ~invalidations () in
+         Runner.submit t (operation ~download:false origin);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Option.is_some (completed !posted));
+         Alcotest.(check bool)
+           "redirect does not reset response deadline"
+           true
+           (Result.is_error (Option.get (completed !posted)));
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "early frames drain bounded backpressure"
+        `Quick
+        test_early_frame_backpressure
+    ; Alcotest.test_case
+        "segmented early frames control"
+        `Quick
+        test_segmented_backpressure_control
+    ; Alcotest.test_case
+        "TLS legal slow handshake succeeds"
+        `Quick
+        test_tls_slow_legal_handshake
+    ; Alcotest.test_case
+        "dial TLS and response deadlines are independent"
+        `Quick
+        test_phased_response_deadline
+    ; Alcotest.test_case
+        "DNS TCP address attempts share dial deadline"
+        `Quick
+        test_shared_dial_deadline
+    ; Alcotest.test_case
+        "TLS independent ten second deadline"
+        `Quick
+        test_tls_independent_deadline
+    ; Alcotest.test_case
+        "redirect response deadline remains shared"
+        `Quick
+        test_redirect_response_budget_is_shared
+    ]
+;;
+
+let test_backpressure_close_unblocks_full_event_sink () =
+  let message = {|{"type":"changed","t":42}|} in
+  let wire = String.concat "" (List.init 129 (fun _ -> frame 1 message)) in
+  let report =
+    with_peer
+      [ case ~ws:true wire ]
+      (fun ~environment ~sw ~support ~origin ->
+         let sink = Eio.Stream.create 1 in
+         let entered = ref false in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations
+             ~on_post:(fun event ->
+               (match event with
+                | Core.Websocket_message _ -> entered := true
+                | _ -> ());
+               Eio.Stream.add sink event)
+             ()
+         in
+         let start = websocket_start origin in
+         let scope =
+           match start with
+           | Core.Start_websocket r -> r.scope
+           | _ -> assert false
+         in
+         Runner.submit t start;
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           !entered
+           || List.exists
+                (function
+                  | Core.Websocket_closed _ -> true
+                  | _ -> false)
+                !posted);
+         Alcotest.(check bool) "consumer reached bounded sink before close" true !entered;
+         let before = Eio.Time.now (Eio.Stdenv.clock environment) in
+         Runner.submit t (websocket_close scope);
+         Alcotest.(check bool)
+           "close submit never joins on the event consumer"
+           true
+           (Eio.Time.now (Eio.Stdenv.clock environment) -. before < 0.1);
+         Eio.Time.with_timeout_exn (Eio.Stdenv.clock environment) 3. (fun () ->
+           let rec drain () =
+             match Eio.Stream.take sink with
+             | Core.Websocket_retired retired when retired = scope -> ()
+             | _ -> drain ()
+           in
+           drain ());
+         let callbacks = List.length !posted in
+         Eio.Time.sleep (Eio.Stdenv.clock environment) 0.03;
+         Alcotest.(check int)
+           "retired owner cannot emit late callbacks"
+           callbacks
+           (List.length !posted);
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let test_message_callback_exception_retires_owner () =
+  let report =
+    with_peer
+      [ case ~ws:true (frame 1 {|{"type":"changed","t":42}|}) ]
+      (fun ~environment ~sw ~support ~origin ->
+         let calls = ref 0 in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations
+             ~on_post:(function
+               | Core.Websocket_message _ ->
+                 incr calls;
+                 failwith "fixture callback failure"
+               | _ -> ())
+             ()
+         in
+         Runner.submit t (websocket_start origin);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           List.exists
+             (function
+               | Core.Websocket_closed _ -> true
+               | _ -> false)
+             !posted);
+         Alcotest.(check int) "failing callback executes once" 1 !calls;
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+type socket_peaks =
+  { mutable sockets : int
+  ; mutable socket_peak : int
+  ; mutable dials : int
+  ; mutable dial_peak : int
+  ; mutable owner_peak : int
+  ; mutable attempts : int
+  }
+
+let metered_network ?(fail_first = false) network peaks =
+  let module Socket = struct
+    type t =
+      { flow : [ `Generic | `Unix ] Eio.Net.stream_socket_ty Eio.Resource.t
+      ; retire : unit -> unit
+      }
+
+    type tag =
+      [ `Generic
+      | `Unix
+      ]
+
+    let read_methods = []
+    let single_read t = Eio.Flow.single_read t.flow
+    let single_write t = Eio.Flow.single_write t.flow
+    let copy t ~src = Eio.Flow.copy src t.flow
+    let shutdown t = Eio.Flow.shutdown t.flow
+    let close t = Fun.protect ~finally:t.retire (fun () -> Eio.Resource.close t.flow)
+  end
+  in
+  let module Network = struct
+    type t = Eio_unix.Net.t
+
+    type tag =
+      [ `Generic
+      | `Unix
+      ]
+
+    let listen net ~reuse_addr ~reuse_port ~backlog ~sw address =
+      Eio.Net.listen net ~reuse_addr ~reuse_port ~backlog ~sw address
+    ;;
+
+    let connect net ~sw address =
+      peaks.attempts <- peaks.attempts + 1;
+      peaks.dials <- peaks.dials + 1;
+      peaks.dial_peak <- max peaks.dial_peak peaks.dials;
+      peaks.owner_peak <- max peaks.owner_peak (peaks.dials + peaks.sockets);
+      let flow =
+        Fun.protect
+          ~finally:(fun () -> peaks.dials <- peaks.dials - 1)
+          (fun () -> Eio.Net.connect net ~sw address)
+      in
+      peaks.sockets <- peaks.sockets + 1;
+      peaks.socket_peak <- max peaks.socket_peak peaks.sockets;
+      peaks.owner_peak <- max peaks.owner_peak (peaks.dials + peaks.sockets);
+      let released = ref false in
+      let retire () =
+        if not !released
+        then (
+          released := true;
+          peaks.sockets <- peaks.sockets - 1)
+      in
+      Eio.Switch.on_release sw retire;
+      if fail_first && peaks.attempts = 1 then raise End_of_file;
+      Eio.Resource.T (Socket.{ flow; retire }, Eio.Net.Pi.stream_socket (module Socket))
+    ;;
+
+    let datagram_socket net ~reuse_addr ~reuse_port ~sw address =
+      Eio.Net.datagram_socket net ~reuse_addr ~reuse_port ~sw address
+    ;;
+
+    let getaddrinfo net ~service host = Eio.Net.getaddrinfo net ~service host
+    let getnameinfo net address = Eio.Net.getnameinfo net address
+  end
+  in
+  Eio.Resource.T (network, Eio.Net.Pi.network (module Network))
+;;
+
+let test_runtime_single_owner_and_scope_switch ?(eof = false) ?(reset = false) () =
+  let peer_case wire =
+    match case ~ws:true wire with
+    | `Assoc fields ->
+      `Assoc (("frame_delay", `Float 0.1) :: ("close_delay", `Float 0.1) :: fields)
+    | _ -> assert false
+  in
+  let first_case =
+    match peer_case (if eof then "" else frame 8 "\x03\xe8") with
+    | `Assoc fields ->
+      `Assoc
+        (("eof", `Bool eof) :: ("reset", `Bool reset) :: List.remove_assoc "eof" fields)
+    | _ -> assert false
+  in
+  let report =
+    with_peer
+      [ first_case; peer_case ""; peer_case "" ]
+      (fun ~environment ~sw ~support ~origin ->
+         let peaks =
+           { sockets = 0
+           ; socket_peak = 0
+           ; dials = 0
+           ; dial_peak = 0
+           ; owner_peak = 0
+           ; attempts = 0
+           }
+         in
+         let network = metered_network (Eio.Stdenv.net environment) peaks in
+         let events = Eio.Stream.create 2 in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner
+             ~network
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations
+             ~on_post:(Eio.Stream.add events)
+             ()
+         in
+         let start = websocket_start origin in
+         let first =
+           match start with
+           | Core.Start_websocket r -> r.scope
+           | _ -> assert false
+         in
+         let core = ref (websocket_core first) in
+         let retry = ref None
+         and retirement_seen = ref false
+         and opened = ref []
+         and running = ref true in
+         let apply event =
+           let transition = Core.step !core event in
+           core := transition.next;
+           (match event with
+            | Core.Websocket_opened s -> opened := s :: !opened
+            | _ -> ());
+           List.iter
+             (function
+               | Core.Run runnable ->
+                 (match runnable with
+                  | Core.Schedule_timer timer when timer.delay_seconds < 30. ->
+                    retry := Some timer
+                  | _ -> ());
+                 Runner.submit t runnable
+               | Core.Delegate (Core.Inspect_mirror r) ->
+                 Eio.Fiber.fork ~sw (fun () ->
+                   Eio.Stream.add events (Core.Mirror_inspected (Core.Mirror_available r)))
+               | Core.Delegate (Core.Attach_graph r) ->
+                 let sync =
+                   Logseq_overlay_db.Types.sync_view
+                     ~token:
+                       (Logseq_overlay_db.Types.sync_token_of_string
+                          "sync-token:v1:singleton"
+                        |> Result.get_ok)
+                     ~checkpoint:
+                       (Logseq_overlay_db.Types.Server_cursor.of_int64 0L |> Result.get_ok)
+                     ~submissions:[]
+                 in
+                 Eio.Fiber.fork ~sw (fun () ->
+                   Eio.Stream.add events (Core.Graph_attached { scope = r.scope; sync }))
+               | _ -> ())
+             transition.effects;
+           match event with
+           | Core.Websocket_retired scope when scope = first -> retirement_seen := true
+           | _ -> ()
+         in
+         Eio.Fiber.fork ~sw (fun () ->
+           while !running do
+             let event = Eio.Stream.take events in
+             apply event
+           done);
+         Runner.submit t start;
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Option.is_some !retry || !retirement_seen);
+         Alcotest.(check bool)
+           "real peer Close schedules reducer retry"
+           true
+           (Option.is_some !retry);
+         let timer = Option.get !retry in
+         Eio.Stream.add events (Core.Timer_elapsed timer.id);
+         Eio.Stream.add events (Core.Timer_elapsed timer.id);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           List.exists
+             (fun (s : Core.connection_scope) ->
+                s.connection_generation > first.connection_generation)
+             !opened);
+         Eio.Stream.add
+           events
+           (Core.Foreground_changed { foreground = true; lifecycle_generation = 1L });
+         Eio.Stream.add
+           events
+           (Core.Foreground_changed { foreground = true; lifecycle_generation = 2L });
+         Eio.Stream.add events (Core.Graph_selected first.graph.graph_id);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           List.exists
+             (fun (s : Core.connection_scope) ->
+                s.graph.graph_generation > first.graph.graph_generation)
+             !opened);
+         Eio.Stream.add events (Core.Websocket_opened first);
+         Eio.Stream.add
+           events
+           (Core.Websocket_closed (first, Core.Recoverable_close None));
+         Eio.Stream.add
+           events
+           (Core.Websocket_message
+              ( first
+              , Logseq_sync_pure_reducer.Sync_protocol.Server.Changed
+                  { t = Core_contract.server_cursor_of_int 42 } ));
+         Eio.Time.sleep (Eio.Stdenv.clock environment) 0.03;
+         Runner.shutdown t;
+         running := false;
+         Eio.Stream.add events Core.Shutdown;
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           peaks.sockets = 0 && peaks.dials = 0);
+         Alcotest.(check int) "actual live TCP socket peak" 1 peaks.socket_peak;
+         Alcotest.(check int) "connected plus opening socket peak" 1 peaks.owner_peak;
+         Alcotest.(check int) "actual simultaneous connect attempt peak" 1 peaks.dial_peak;
+         Alcotest.(check int)
+           "exactly initial retry and scope replacement dial"
+           3
+           peaks.attempts)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "close drains full callback sink without join deadlock"
+        `Quick
+        test_backpressure_close_unblocks_full_event_sink
+    ; Alcotest.test_case
+        "callback exception retires WebSocket owner"
+        `Quick
+        test_message_callback_exception_retires_owner
+    ; Alcotest.test_case
+        "real Runner Core singleton and scope switch"
+        `Quick
+        test_runtime_single_owner_and_scope_switch
+    ]
+;;
+
+let test_runtime_duplicate_opening_has_one_socket () =
+  let report =
+    with_peer
+      [ case ~ws:true "" ]
+      (fun ~environment ~sw ~support ~origin ->
+         let peaks =
+           { sockets = 0
+           ; socket_peak = 0
+           ; dials = 0
+           ; dial_peak = 0
+           ; owner_peak = 0
+           ; attempts = 0
+           }
+         in
+         let network = metered_network (Eio.Stdenv.net environment) peaks in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t = runner ~network ~environment ~sw ~support ~posted ~invalidations () in
+         let start = websocket_start origin in
+         let scope =
+           match start with
+           | Core.Start_websocket r -> r.scope
+           | _ -> assert false
+         in
+         let core = ref (websocket_core scope) in
+         Runner.submit t start;
+         List.iter
+           (fun generation ->
+              let tr =
+                Core.step
+                  !core
+                  (Core.Foreground_changed
+                     { foreground = true; lifecycle_generation = generation })
+              in
+              core := tr.next;
+              List.iter
+                (function
+                  | Core.Run r -> Runner.submit t r
+                  | _ -> ())
+                tr.effects)
+           [ 1L; 2L ];
+         Eio.Time.sleep (Eio.Stdenv.clock environment) 0.15;
+         Alcotest.(check int)
+           "repeat foreground during opening creates one actual socket"
+           1
+           peaks.socket_peak;
+         Alcotest.(check int) "one actual dial attempt admitted" 1 peaks.attempts;
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "duplicate opening actual socket peak"
+        `Quick
+        test_runtime_duplicate_opening_has_one_socket
+    ]
+;;
+
+let test_upgrade_failure_is_typed_terminal status () =
+  let cases =
+    List.init (if status = 401 then 2 else 1) (fun _ -> case (response ~status "x"))
+  in
+  let report =
+    with_peer cases (fun ~environment ~sw ~support ~origin ->
+      let posted = ref []
+      and invalidations = ref 0 in
+      let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+      Runner.submit t (websocket_start origin);
+      wait (Eio.Stdenv.clock environment) (fun () ->
+        List.exists
+          (function
+            | Core.Websocket_closed _ -> true
+            | _ -> false)
+          !posted);
+      Alcotest.(check bool)
+        "authentication failure cannot enter network retry"
+        true
+        (List.exists
+           (function
+             | Core.Websocket_closed (_, Core.Authentication_failure _) -> true
+             | _ -> false)
+           !posted);
+      Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "real Runner Core recovers peer EOF"
+        `Quick
+        (test_runtime_single_owner_and_scope_switch ~eof:true)
+    ; Alcotest.test_case
+        "real Runner Core recovers TCP reset"
+        `Quick
+        (test_runtime_single_owner_and_scope_switch ~eof:true ~reset:true)
+    ; Alcotest.test_case
+        "Upgrade 401 typed terminal failure"
+        `Quick
+        (test_upgrade_failure_is_typed_terminal 401)
+    ; Alcotest.test_case
+        "Upgrade 403 typed terminal failure"
+        `Quick
+        (test_upgrade_failure_is_typed_terminal 403)
+    ]
+;;
+
+let test_shutdown_does_not_wait_for_stopped_event_consumer ~during_open () =
+  let config =
+    match case ~ws:true (if during_open then "" else frame 8 "\x03\xe8") with
+    | `Assoc fields -> `Assoc (("frame_delay", `Float 0.1) :: fields)
+    | _ -> assert false
+  in
+  let report =
+    with_peer [ config ] (fun ~environment ~sw:_ ~support ~origin ->
+      let clock = Eio.Stdenv.clock environment in
+      let result =
+        Eio.Time.with_timeout clock 2. (fun () ->
+          Eio.Switch.run (fun owner ->
+            let sink = Eio.Stream.create 1 in
+            if during_open then Eio.Stream.add sink Core.Local_feed_acknowledged;
+            let entered = ref false in
+            let posted = ref []
+            and invalidations = ref 0 in
+            let t =
+              runner
+                ~environment
+                ~sw:owner
+                ~support
+                ~posted
+                ~invalidations
+                ~on_post:(fun event ->
+                  (match event with
+                   | Core.Websocket_opened _ when during_open -> entered := true
+                   | Core.Websocket_closed _ when not during_open -> entered := true
+                   | _ -> ());
+                  Eio.Stream.add sink event)
+                ()
+            in
+            Runner.submit t (websocket_start origin);
+            wait clock (fun () -> !entered);
+            Runner.shutdown t);
+          Ok ())
+      in
+      Alcotest.(check bool)
+        "shutdown joins without draining the stopped consumer's sink"
+        true
+        (Result.is_ok result))
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "shutdown cancels blocked open callback"
+        `Quick
+        (test_shutdown_does_not_wait_for_stopped_event_consumer ~during_open:true)
+    ; Alcotest.test_case
+        "shutdown cancels blocked terminal callback"
+        `Quick
+        (test_shutdown_does_not_wait_for_stopped_event_consumer ~during_open:false)
+    ]
+;;
+
+let test_failed_dial_retires_allocated_socket_before_fallback () =
+  let report =
+    with_peer
+      [ `Assoc [ "stall_tls", `Bool true ]; case (response "x") ]
+      (fun ~environment ~sw ~support ~origin ->
+         let peaks =
+           { sockets = 0
+           ; socket_peak = 0
+           ; dials = 0
+           ; dial_peak = 0
+           ; owner_peak = 0
+           ; attempts = 0
+           }
+         in
+         let network =
+           metered_network ~fail_first:true (Eio.Stdenv.net environment) peaks
+         in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t = runner ~network ~environment ~sw ~support ~posted ~invalidations () in
+         Runner.submit t (operation ~download:false origin);
+         wait (Eio.Stdenv.clock environment) (fun () ->
+           Option.is_some (completed !posted));
+         Alcotest.(check bool)
+           "real fallback response succeeds"
+           true
+           (Result.is_ok (Option.get (completed !posted)));
+         Alcotest.(check int)
+           "failed backend allocation retires before next dial"
+           1
+           peaks.owner_peak;
+         Alcotest.(check int) "all actual allocated sockets released" 0 peaks.sockets;
+         Runner.shutdown t)
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "failed dial retires allocated socket before fallback"
+        `Quick
+        test_failed_dial_retires_allocated_socket_before_fallback
+    ]
 ;;

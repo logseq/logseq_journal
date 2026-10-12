@@ -346,6 +346,14 @@ type websocket_send =
   ; message : Sync_protocol.Client.message
   }
 
+(** Only recoverable peer closure or transport failure is eligible for retry.
+    Local closure, authentication rejection and protocol failure do not retry. *)
+type websocket_termination =
+  | Recoverable_close of string option
+  | Local_close
+  | Authentication_failure of string
+  | Protocol_failure of string
+
 type timer_id
 
 type timer_request =
@@ -360,6 +368,8 @@ type runner_effect = private
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
   | Start_websocket of websocket_request
   | Send_websocket of websocket_send
+  (** Cancel setup or close the exact owner, join its I/O and callback fibers,
+      then emit [Websocket_retired]. Duplicate requests are idempotent. *)
   | Close_websocket of connection_scope
   | Schedule_timer of timer_request
   | Cancel_effects of effect_scope
@@ -515,7 +525,12 @@ type event =
   | Websocket_opened of connection_scope
   | Websocket_message of connection_scope * Sync_protocol.Server.message
   | Websocket_protocol_error of connection_scope * Sync_protocol.codec_error
-  | Websocket_closed of connection_scope * string option
+  (** Termination classification; replacement waits for [Websocket_retired]. *)
+  | Websocket_closed of connection_scope * websocket_termination
+  (** The exact owner's resources are closed and its I/O and callback fibers have
+      completed. No further callbacks may be emitted. Match the retained owner
+      even after a graph/lifecycle change; unrelated or duplicate events are inert. *)
+  | Websocket_retired of connection_scope
   | Timer_elapsed of timer_id
   | Shutdown
 
