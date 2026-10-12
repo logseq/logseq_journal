@@ -44,7 +44,9 @@ struct JournalRuntimeHost: View {
       // Capture the container inset before the descendant NavigationStack
       // adds its navigation bar; floating pages retain their original layout.
       GeometryReader { container in
-        content.environment(\.journalContainerTopInset, container.safeAreaInsets.top)
+        content
+          .environment(\.journalContainerTopInset, container.safeAreaInsets.top)
+          .environment(\.journalStartupContainerFrame, container.frame(in: .global))
       }
       #else
       content
@@ -118,22 +120,19 @@ struct JournalStartupLoadingSurface: View {
   private var visible: Bool { active && (loading || (initial && clock?.elapsed == true)) }
   var body: some View {
     VStack(spacing: 12) {
-      Spacer()
-      VStack(spacing: 12) {
-        Group {
-          if let value { ProgressView(value: value).frame(width: 160) }
-          else { ProgressView() }
-        }.frame(height: 24).accessibilityIdentifier("journal-startup-loading")
-        Text("Loading journal")
-        Text(message).font(.footnote).foregroundStyle(.secondary).frame(height: 20)
-      }
-      .opacity(visible ? 1 : 0)
-      .accessibilityHidden(!visible)
-      Spacer()
-      action
+      Group {
+        if let value { ProgressView(value: value).frame(width: 160) }
+        else { ProgressView() }
+      }.frame(height: 24).accessibilityIdentifier("journal-startup-loading")
+      Text("Loading journal")
+      Text(message).font(.footnote).foregroundStyle(.secondary).frame(height: 20)
     }
-    .padding(24)
+    .opacity(visible ? 1 : 0)
+    .accessibilityHidden(!visible)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+    // Recovery actions do not change the centered waiting canvas.
+    .overlay(alignment: .bottom) { action }
+    .padding(24)
     .background(.background)
     .accessibilityIdentifier("journal-startup-waiting")
     .onAppear { clock?.begin() }

@@ -187,6 +187,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
+    @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
 
     private var properties: Properties? {
       JournalExtensions.decode(Properties.self, context: context)
@@ -207,9 +208,18 @@ struct JournalSheetDismissButton: SwiftUI.View {
         }
       case .startup:
         if let properties, context.childIDs.count == 1 {
-          JournalStartupLoadingSurface(loading: properties.loading == true,
-            initial: properties.initial == true, active: properties.active != false,
-            value: properties.value, message: properties.message ?? "", action: child(0))
+          GeometryReader { bounds in
+            JournalStartupLoadingSurface(loading: properties.loading == true,
+              initial: properties.initial == true, active: properties.active != false,
+              value: properties.value, message: properties.message ?? "", action: child(0))
+              // Ancestor columns have already consumed the navigation inset.
+              // Keep the same safe-area canvas as native preparation instead.
+              .frame(width: bounds.size.width,
+                height: startupContainerFrame?.height ?? bounds.size.height)
+              .offset(y: startupContainerFrame.map {
+                $0.minY - bounds.frame(in: .global).minY
+              } ?? 0)
+          }
         }
       case .header:
         if let properties, context.childIDs.isEmpty, let title = properties.title {
@@ -333,5 +343,15 @@ extension EnvironmentValues {
   var journalContainerTopInset: CGFloat {
     get { self[JournalContainerTopInsetKey.self] }
     set { self[JournalContainerTopInsetKey.self] = newValue }
+  }
+}
+
+private struct JournalStartupContainerFrameKey: EnvironmentKey {
+  static let defaultValue: CGRect? = nil
+}
+extension EnvironmentValues {
+  var journalStartupContainerFrame: CGRect? {
+    get { self[JournalStartupContainerFrameKey.self] }
+    set { self[JournalStartupContainerFrameKey.self] = newValue }
   }
 }
