@@ -24,7 +24,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
-    case page, header, detail, unlock
+    case page, header, detail, unlock, startup
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
     case detailRow = "detail-row"
@@ -40,6 +40,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let text: String?
     let id: String?
     let level: Int?
+    let loading: Bool?
+    let initial: Bool?
+    let active: Bool?
+    let value: Double?
+    let message: String?
   }
 
   private struct DetailText: SwiftUI.View {
@@ -182,6 +187,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
+    @Environment(\.journalStartupContainerFrame) private var startupContainerFrame
 
     private var properties: Properties? {
       JournalExtensions.decode(Properties.self, context: context)
@@ -199,6 +205,21 @@ struct JournalSheetDismissButton: SwiftUI.View {
           properties.connecting != nil, properties.controls != nil {
           FloatingChrome(content: child(0), cluster: child(1),
             progress: child(2), properties: properties)
+        }
+      case .startup:
+        if let properties, context.childIDs.count == 1 {
+          GeometryReader { bounds in
+            JournalStartupLoadingSurface(loading: properties.loading == true,
+              initial: properties.initial == true, active: properties.active != false,
+              value: properties.value, message: properties.message ?? "", action: child(0))
+              // Ancestor columns have already consumed the navigation inset.
+              // Keep the same safe-area canvas as native preparation instead.
+              .frame(width: bounds.size.width,
+                height: startupContainerFrame?.height ?? bounds.size.height)
+              .offset(y: startupContainerFrame.map {
+                $0.minY - bounds.frame(in: .global).minY
+              } ?? 0)
+          }
         }
       case .header:
         if let properties, context.childIDs.isEmpty, let title = properties.title {
@@ -322,5 +343,15 @@ extension EnvironmentValues {
   var journalContainerTopInset: CGFloat {
     get { self[JournalContainerTopInsetKey.self] }
     set { self[JournalContainerTopInsetKey.self] = newValue }
+  }
+}
+
+private struct JournalStartupContainerFrameKey: EnvironmentKey {
+  static let defaultValue: CGRect? = nil
+}
+extension EnvironmentValues {
+  var journalStartupContainerFrame: CGRect? {
+    get { self[JournalStartupContainerFrameKey.self] }
+    set { self[JournalStartupContainerFrameKey.self] = newValue }
   }
 }

@@ -22,6 +22,13 @@ val open_favorite
 val destination : t -> destination
 val select_destination : t -> destination -> t
 val route : t -> route
+
+(** Initial body progress becomes visible only while the same request remains
+    pending after its grace period. Content completion has no minimum delay. *)
+val loading_indicator : t -> bool
+val loading_requests : t -> (string * int64) list
+val observe_loading_delay
+  : t -> entry_id:string -> request_generation:int64 -> elapsed:float -> t
 val open_detail : t -> block_id:string -> request_generation:int64 -> t
 val detail_block_id : t -> string option
 val detail_request_generation : t -> int64
@@ -70,6 +77,12 @@ val apply_detail_failure
   -> missing:bool
   -> message:string
   -> t
+
+(** A pending route keeps all initial non-asset content unpublished while
+    bounded first-page discovery runs. Query/admit only the current owner;
+    covered completions retain their own route identity. *)
+val initial_load : t -> (Journal_ids.Text_input.session_id * string) option
+val load_initial : t -> t * Journal_graph_request.t list
 
 val detail : t -> Journal_detail.t option
 val update_detail : t -> Journal_detail.t -> t

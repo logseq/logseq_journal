@@ -1449,7 +1449,7 @@ let check_stable_image_slots ~entry ~images ~width ~height =
          ignore (Lui_app.flush app);
          check ())
       [ views (Placeholder "Waiting for file") 1
-      ; views (Placeholder "Opening file") (List.length images)
+      ; views (Placeholder "Loading") (List.length images)
       ; views (File "/tmp/synthetic-first.png") 1
       ; views (File "/tmp/synthetic-first.png") (List.length images)
       ; views Hidden (List.length images)
@@ -1682,7 +1682,7 @@ let test_reactive_child_gallery_routes_and_preserves_siblings () =
               (node PathValue "/tmp/synthetic-second.jpg" = sibling)
               "availability replaced the sibling image")
          [ Journal_media.Hidden
-         ; Placeholder "Opening file"
+         ; Placeholder "Loading"
          ; File "/tmp/reactive-child.png"
          ];
        assert_event (asset_id first) first.token;
@@ -1804,13 +1804,13 @@ let test_reactive_nonimage_structure_and_presentation () =
          "structure removal retained old chrome";
        update
          (Some
-            (media_state [ { rebound with presentation = Placeholder "Opening file" } ]));
+            (media_state [ { rebound with presentation = Placeholder "Loading" } ]));
        require
-         (current_text (ops ()) "Opening file")
+         (current_text (ops ()) "Loading")
          "replacement token did not get a fresh item subscription";
        update None;
        require
-         ((not (current_text (ops ()) "Opening file"))
+         ((not (current_text (ops ()) "Loading"))
           && not (current_text (ops ()) "Retry"))
          "empty structure kept an attachment item";
        require
@@ -2387,22 +2387,21 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
     |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
     |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L (projection root [ child; sibling ])
   in
-  let load detail parent children =
-    let detail, requests = Journal_detail.step detail (Load_more (Journal_model.id parent)) in
-    let generation = match requests with
-      | [ Journal_graph_request.Load_detail { limit = 128; request_generation; _ } ] -> request_generation
-      | _ -> fail "Expanding one branch must issue exactly one bounded page read"
-    in
-    fst (Journal_detail.step detail (Loaded (generation, projection parent children)))
+  let pages =
+    [ projection child [grandchild]; projection grandchild [deep]
+    ; projection deep [deeper]; projection deeper []; projection sibling [] ] in
+  let rec complete routes =
+    match Journal_routes.initial_load routes with
+    | None -> routes
+    | Some (_, parent) ->
+      let routes, requests = Journal_routes.load_initial routes in
+      let generation = match requests with
+        | [Journal_graph_request.Load_detail {limit=128;request_generation;_}] -> request_generation
+        | _ -> fail "Initial composition must use a bounded owned read" in
+      let page = List.find (fun page -> Journal_model.id page.Journal_graph_projection.root=parent) pages in
+      complete (Journal_routes.apply_detail_response routes ~request_generation:generation page)
   in
-  let detail = Option.get (Journal_routes.detail routes)
-    |> fun t -> load t child [ grandchild ]
-    |> fun t -> load t grandchild [ deep ]
-    |> fun t -> load t deep [ deeper ]
-    |> fun t -> load t deeper []
-    |> fun t -> load t sibling []
-  in
-  let routes = Journal_routes.update_detail routes detail in
+  let routes = complete routes in
   let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
   with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
     let payloads = List.filter_map (function
@@ -2434,6 +2433,12 @@ let test_detail_flat_branch_has_no_collapse_action () =
   let routes = Journal_routes.create ()
     |> fun t -> Journal_routes.open_detail t ~block_id ~request_generation:1L
     |> fun t -> Journal_routes.apply_detail_response t ~request_generation:1L projection in
+  let routes, requests = Journal_routes.load_initial routes in
+  let generation = match requests with
+    | [Journal_graph_request.Load_detail {request_generation;_}] -> request_generation
+    | _ -> fail "Flat child composition needs one initial read" in
+  let routes = Journal_routes.apply_detail_response routes ~request_generation:generation
+    {root=child;children={blocks=[];continuation=None}} in
   let actions = ref [] in
   let body = Application.For_testing.detail_page ~routes ~write_enabled:true (fun a -> actions := a :: !actions) in
   with_mounted (V.Body.Private.to_widget body) (fun app ops ->
@@ -2520,7 +2525,41 @@ let test_bottom_controls_reuse_lui_inset_and_keep_capture () =
     require !pressed "native inset swallowed the shared Capture event")
 ;;
 
+
+let test_detail_initial_blank_preserves_chrome () =
+  let routes = Journal_routes.open_detail (Journal_routes.create ()) ~block_id ~request_generation:700L in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+  with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+    require (not (current_text (ops ()) "Loading block")) "initial grace period renders loading";
+    (* Native Chrome requires two positional children even for a blank body;
+       the pure route owner cannot reproduce this mounting contract. *)
+    let header = List.find_map (function
+      | Lui_protocol.SetExtensionProp (id, "payload", StringValue value)
+        when Yojson.Basic.Util.member "mode" (Yojson.Basic.from_string value)
+             = `String "detail" -> Some id
+      | _ -> None) (ops ()) |> Option.get in
+    let slots = List.filter_map (function
+      | Lui_protocol.InsertChild (parent, child, _) when parent = header -> Some child
+      | _ -> None) (ops ()) in
+    require (List.length slots = 2) "blank body removes native Detail Chrome";
+    require (List.length (mounted_nodes (ops ()) AccessibilityLabel (StringValue "Block options")) = 1) "initial grace period drops the existing menu")
+;;
+
+(* Known graph asset identity must reserve its slot before media descriptors or
+   files arrive. This composition is not reproducible in the route reducer. *)
+let test_detail_known_image_reserves_initial_slot () =
+  let root = Journal_model.with_asset_file_type (block ~source:"Image attachment" ()) ~asset_file_type:(Some "jpg") in
+  let routes = Journal_routes.open_detail (Journal_routes.create ()) ~block_id ~request_generation:701L in
+  let routes = Journal_routes.apply_detail_response routes ~request_generation:701L {root;children={blocks=[];continuation=None}} in
+  let body = Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+  with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+    require (List.length (mounted_nodes (ops ()) AccessibilityIdentifier (StringValue ("journal-image-slot:" ^ block_id))) = 1) "Detail known image has no stable slot before descriptor arrival";
+    require (current_text (ops ()) "Waiting for file") "known slot does not explain pending media")
+;;
+
 let tests =
+  [ "Detail initial blank preserves chrome", test_detail_initial_blank_preserves_chrome
+  ; "Detail known image initial slot", test_detail_known_image_reserves_initial_slot ] @
   [ "Feedback native inset visibility and events", test_feedback_reuses_lui_inset_and_keeps_control_events
   ; "Bottom native inset retains Capture", test_bottom_controls_reuse_lui_inset_and_keep_capture
   ] @

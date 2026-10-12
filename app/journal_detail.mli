@@ -24,6 +24,7 @@ type row =
 type event =
   | Observe_visible_range of int64 * int64
   | Load_next
+  | Load_initial_next
   | Load_more of string
   | Loaded of int64 * Journal_graph_projection.detail
   | Load_failed of int64 * bool * string
@@ -53,6 +54,12 @@ val row_key : row -> string
     Continuations and
     failed reads remain explicit Load more actions. *)
 val next_automatic_load : t -> string option
+
+(** Initial body discovery uses the same depth, complete-page reservation and
+    attempt budgets as visible demand. It reads only unknown first pages of
+    materialized branches; continuation cursors remain explicit. Publication
+    must preserve these counters rather than starting another automatic round. *)
+val initial_staging : t -> [ `Waiting | `Ready | `Load of string ]
 
 val step : t -> event -> t * Journal_graph_request.t list
 val mode : t -> mode
@@ -89,8 +96,19 @@ val admit_child
 
 val apply_block : t -> Journal_model.t -> t
 val reconcile_children : t -> Journal_graph_projection.detail -> t
+
+(** Charge newly materialized shared updates to the still-hidden initial owner.
+    Existing nodes are not charged twice; consumed counters never decrease. *)
+val account_initial_update : previous:t -> t -> t
+
+(** Fence cancelled initial completions without refunding budgets or reusing
+    their generations. Restored branches can admit fresh bounded reads. *)
+val cancel_initial_reads : t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
-val stage_delete : t -> block_id:string -> (t * staged_delete) option
+
+(** With [fence_reads], initial deletion fences only removed branch tickets, including in
+    Undo state; unrelated pending reads continue without a duplicate request. *)
+val stage_delete : ?fence_reads:bool -> t -> block_id:string -> (t * staged_delete) option
 val undo_delete : t -> staged_delete -> t
 
 (** Only composer ownership is retained; reopening loads a fresh outline projection. *)

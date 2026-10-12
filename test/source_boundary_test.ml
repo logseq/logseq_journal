@@ -1125,7 +1125,7 @@ let () =
   (* Journal uses the upstream native host ABI decoder; keep the OCaml
      installation and Apple package on the same validated revision. *)
   let compatible_lui_revision =
-    "git+https://github.com/logseq/lui.git#38551254511c59d9141a8f9b276c78783cbac044"
+    "git+https://github.com/logseq/lui.git#4fdb9136026af7863a8d025133871e34864eace1"
   in
   List.iter
     (fun relative -> require_occurrences root relative compatible_lui_revision 1)
@@ -1279,7 +1279,7 @@ let () =
     ; "V.composer"
     ; "if favorites_selected"
     ; "Detail_list.view"
-    ; "V.progress"
+    ; "Journal_header.startup"
     ];
   require_text
     root
@@ -1586,7 +1586,7 @@ let () =
   require_text
     root
     "swift/App.swift"
-    [ "JournalRuntimeHost("
+    [ "JournalHost("
     ; "applicationShouldTerminate"
     ; ".terminateLater"
     ; "reply(toApplicationShouldTerminate:"
@@ -1596,6 +1596,14 @@ let () =
     root
     "swift/JournalApplicationPlatform.swift"
     [ "JournalPlatformEvents"; "beginShutdown"; "terminationReady" ];
+  (* The app scene delegates native startup/account presentation to the host,
+     which still owns the RuntimeHost and native progress component. *)
+  require_text root "swift/JournalRuntimeHost.swift"
+    [ "struct JournalHost: View"
+    ; "JournalRuntimeHost(platform:"
+    ; "JournalStartupLoadingSurface("
+    ; "ProgressView()"
+    ];
   forbid_text root "swift/App.swift" [ "Darwin.exit" ];
   require_text
     root

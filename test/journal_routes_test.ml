@@ -2098,10 +2098,15 @@ let test_typed_covered_failure_missing_and_branch () =
     R.apply_detail_response
       retry
       ~request_generation:830L
-      { Journal_graph_projection.root = a
-      ; children = { blocks = [ child ]; continuation = None }
-      }
+      (detail ~root:a ())
   in
+  (* This regression concerns a later branch read on an already published
+     owner. Reconcile the newly observed child through the public outline API. *)
+  let ready = R.update_detail_at ready ~entry_id:a_id
+      (Journal_detail.reconcile_children (entry_detail ready a_id)
+         { Journal_graph_projection.root = a
+         ; children = { blocks = [ child ]; continuation = None }
+         }) in
   let owner = entry_detail ready a_id in
   let owner, requests =
     Journal_detail.step owner (Load_more (Journal_model.id child))
@@ -3183,7 +3188,680 @@ let test_followup_review_regressions () =
     (String.concat ", " (List.rev !failures))
 ;;
 
+
+(* Initial Detail publication owns the complete bounded page, while the delayed
+   indicator belongs to its route/request identity rather than asset work. *)
+let test_detail_initial_loading_delay_and_ownership () =
+  let module R = Journal_routes in
+  let cases = [
+    "fast completion", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9000L in
+      require (not (R.loading_indicator t)) "initial Detail shows loading before 100ms";
+      let t = R.observe_loading_delay t ~entry_id:(entry_id t) ~request_generation:9000L ~elapsed:0.099 in
+      require (not (R.loading_indicator t)) "99ms exposes the indicator";
+      let root = block () in
+      let child = block ~id:"70000000-0000-4000-a000-000000000099" ~parent_id:(Some (Journal_model.id root)) () in
+      let staged = R.apply_detail_response t ~request_generation:9000L { root; children={blocks=[child];continuation=None} } in
+      let pending, requests = R.load_initial staged in
+      let generation = match requests with
+        | [Journal_graph_request.Load_detail {request_generation;_}] -> request_generation
+        | _ -> fail "fast initial child discovery was not admitted" in
+      let ready = R.apply_detail_response pending ~request_generation:generation (detail ~root:child ()) in
+      require (R.route ready = Detail && not (R.loading_indicator ready)) "fast body is artificially delayed";
+      require (List.length (List.filter (function Journal_detail.Block _ -> true | More _ -> false) (Journal_detail.rows (Option.get (R.detail ready)))) = 2) "root published without its bounded children page";
+      require (R.observe_loading_delay ready ~entry_id:(entry_id ready) ~request_generation:9000L ~elapsed:1. == ready) "late timer changes ready body");
+    "slow delay boundary", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9001L in
+      let id = entry_id t in
+      require (not (R.loading_indicator t)) "slow route starts with a spinner";
+      require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:(-1.) == t) "negative elapsed time changes owner";
+      require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.099 == t) "early callback changes owner";
+      let slow = R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.1 in
+      require (R.loading_indicator slow) "100ms pending route has no indicator";
+      require (R.detail slow = None) "pending route exposes a partial root";
+      require (R.observe_loading_delay slow ~entry_id:id ~request_generation:9001L ~elapsed:0.2 == slow) "duplicate delay republishes owner");
+    "failure and retry", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9002L in
+      let id = entry_id t in
+      let failed = R.apply_detail_failure t ~request_generation:9002L ~missing:false ~message:"read failed" in
+      require (not (R.loading_indicator failed)) "failure retains spinner";
+      require (R.observe_loading_delay failed ~entry_id:id ~request_generation:9002L ~elapsed:1. == failed) "late timer overwrites failure";
+      let retry, request = R.retry_detail failed ~request_generation:9003L in
+      require (Option.is_some request && not (R.loading_indicator retry)) "retry skips its fresh grace period";
+      require (R.observe_loading_delay retry ~entry_id:id ~request_generation:9002L ~elapsed:1. == retry) "old timer activates retry";
+      require (R.apply_detail_response retry ~request_generation:9002L (detail ()) == retry) "old completion activates retry";
+      let missing = R.apply_missing_detail retry ~request_generation:9003L in
+      require (R.route missing = Missing_detail && not (R.loading_indicator missing)) "missing route retains progress");
+    "back and new route", (fun () ->
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9004L in
+      let old = entry_id t in
+      let back = R.back t in
+      require (R.observe_loading_delay back ~entry_id:old ~request_generation:9004L ~elapsed:1. == back) "cancelled timer recreates route";
+      require (R.apply_detail_response back ~request_generation:9004L (detail ()) == back) "cancelled completion recreates route";
+      let fresh = R.open_detail back ~block_id:(Journal_model.id (block ())) ~request_generation:9005L in
+      require (entry_id fresh <> old && not (R.loading_indicator fresh)) "reentry inherits progress";
+      require (R.observe_loading_delay fresh ~entry_id:old ~request_generation:9004L ~elapsed:1. == fresh) "retired timer affects reentry";
+      let reset = R.graph_unavailable fresh in
+      require (R.observe_loading_delay reset ~entry_id:(entry_id fresh) ~request_generation:9005L ~elapsed:1. == reset) "graph reset accepts timer");
+    "rapid nested routes", (fun () ->
+      let a = block () and b = block ~id:"70000000-0000-4000-a000-000000000002" () in
+      let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:9006L in
+      let a_id = entry_id t in
+      let t = R.open_detail t ~block_id:(Journal_model.id b) ~request_generation:9007L in
+      let b_id = entry_id t in
+      let t = R.observe_loading_delay t ~entry_id:a_id ~request_generation:9006L ~elapsed:0.2 in
+      require (not (R.loading_indicator t) && R.loading_indicator (entry t a_id)) "covered timer leaks into top route";
+      require (R.observe_loading_delay t ~entry_id:b_id ~request_generation:9006L ~elapsed:0.2 == t) "timer accepts wrong generation";
+      let t = R.apply_detail_response t ~request_generation:9006L (detail ~root:a ()) in
+      require (R.route t = Detail_loading && not (R.loading_indicator t)) "covered completion reveals top body";
+      let t = R.apply_detail_response t ~request_generation:9007L (detail ~root:b ()) in
+      require (R.route t = Detail) "current completion does not reveal body");
+  ] in
+  let failures = ref [] in
+  List.iter (fun (name, test) -> try test () with exn ->
+    Printf.eprintf "DETAIL_LOADING_RED %s: %s\n%!" name (Printexc.to_string exn);
+    failures := name :: !failures) cases;
+  require (!failures = []) "Detail loading cases failed: %s" (String.concat ", " !failures)
+;;
+
+
+(* The route owns unpublished initial text. Only public queries, admitted
+   requests and matching completions are used to verify publication. *)
+let test_detail_initial_nested_body_staging () =
+  let module R = Journal_routes in
+  let module D = Journal_detail in
+  let id n = Printf.sprintf "70000000-0000-4000-a000-%012d" (6000+n) in
+  let node ?parent ?(order="a") ?(source="Initial text") n =
+    block ~id:(id n) ~parent_id:parent ~order ~source ~child_count:0 ()
+  in
+  let projection ?continuation root blocks : Journal_graph_projection.detail =
+    {root;children={blocks;continuation}}
+  in
+  let start ?(generation=9500L) projection =
+    R.open_detail (R.create ()) ~block_id:(Journal_model.id projection.Journal_graph_projection.root) ~request_generation:generation
+    |> fun t -> R.apply_detail_response t ~request_generation:generation projection
+  in
+  let text_ids t =
+    D.rows (Option.get (R.detail t))
+    |> List.filter_map (function D.Block {block;_} -> Some (Journal_model.id block) | More _ -> None)
+  in
+  let admit t =
+    let _, parent = Option.get (R.initial_load t) in
+    let pending, commands = R.load_initial t in
+    match commands with
+    | [Journal_graph_request.Load_detail {block_id;after=None;limit=128;request_generation}] ->
+      require_string parent block_id "initial read parent";
+      require (R.route pending = Detail_loading && R.detail pending = None) "admitted read exposes partial text";
+      require (R.initial_load pending = None && R.load_initial pending = (pending, [])) "initial read is duplicated while pending";
+      pending, parent, request_generation
+    | _ -> fail "initial staging must admit one bounded first page"
+  in
+  let finish t projections =
+    let rec drain t calls =
+      match R.initial_load t with
+      | None -> require (R.route t = Detail) "initial text never publishes"; t, List.rev calls
+      | Some _ ->
+        require (R.detail t = None) "initial partial text is visible";
+        let pending, parent, generation = admit t in
+        let value = List.find (fun p -> Journal_model.id p.Journal_graph_projection.root = parent) projections in
+        let next = R.apply_detail_response pending ~request_generation:generation value in
+        require (R.apply_detail_response next ~request_generation:generation value == next) "duplicate completion changes initial owner";
+        drain next (parent::calls)
+    in
+    drain t []
+  in
+  let root=node 0 and child=node ~parent:(id 0) 1 and tail=node ~parent:(id 0) ~order:"z" 2 in
+  let grandchild=node ~parent:(id 1) 3 and extra=node ~parent:(id 1) ~order:"b" 4 in
+  let small=projection root [child;tail] in
+  let small_pages=[projection child [grandchild;extra];projection grandchild [];projection extra [];projection tail []] in
+  let cases=[
+    "three levels publish all text once", (fun () ->
+      let t=start small in
+      require (R.route t = Detail_loading && R.detail t = None) "first direct page publishes ahead of deeper text";
+      let ready,calls=finish t small_pages in
+      require (text_ids ready = List.map id [0;1;3;4;2]) "three-level first body is incomplete or unordered";
+      require (List.length calls=4) "small tree has unexpected discovery reads";
+      let visible=observe_outline (Option.get (R.detail ready)) in
+      require (D.next_automatic_load visible=None) "small body inserts more text after publication");
+    "ten levels and following sibling publish together", (fun () ->
+      let chain=List.init 11 (fun depth -> node ?parent:(if depth=0 then None else Some (id (depth-1))) depth) in
+      let tail=node ~parent:(id 0) ~order:"z" 20 in
+      let pages=List.init 8 (fun i -> projection (List.nth chain (i+1)) [List.nth chain (i+2)]) @ [projection tail []] in
+      let t=start (projection (List.hd chain) [List.nth chain 1;tail]) in
+      require (R.detail t=None) "ten-level direct page is published early";
+      let ready,calls=finish t pages in
+      require (text_ids ready = List.init 10 id @ [id 20]) "ten-level first body is incomplete";
+      require (List.length calls=9 && not (List.mem (id 9) calls)) "staging exceeds ten levels or repeats a branch";
+      require (D.next_automatic_load (observe_outline (Option.get (R.detail ready)))=None) "ten-level body continues inserting after publication");
+    "wide tree stops at material budget and retains continuation", (fun () ->
+      let branches=List.init 128 (fun i -> node ~parent:(id 0) ~order:(Printf.sprintf "%04d" i) (100+i)) in
+      let children=List.init 128 (fun i -> node ~parent:(id 100) ~order:(Printf.sprintf "%04d" i) (300+i)) in
+      let t=start (projection root branches) in
+      require (R.detail t=None) "wide direct page publishes before bounded staging";
+      let ready,calls=finish t [projection (List.hd branches) children] in
+      require (calls=[id 100] && List.length (text_ids ready)=257) "wide staging exceeds conservative 384-block reservation";
+      let outline=observe_outline (Option.get (R.detail ready)) in
+      require (D.next_automatic_load outline=None) "publication resets material budget";
+      let _,commands=D.step outline (Load_more (id 101)) in
+      require (List.length commands=1) "budget stop loses explicit continuation");
+    "128 attempts bound unknown zero-count discovery", (fun () ->
+      let branches=List.init 128 (fun i -> node ~parent:(id 0) ~order:(Printf.sprintf "%04d" i) (100+i)) in
+      let leaf=node ~parent:(id 100) 500 in
+      let pages=projection (List.hd branches) [leaf] :: projection leaf [] :: List.map (fun b -> projection b []) (List.tl branches) in
+      let t=start (projection root branches) in
+      require (R.detail t=None) "zero count is assumed to be a leaf before its own read";
+      let ready,calls=finish t pages in
+      require (List.length calls=128 && List.length (List.sort_uniq String.compare calls)=128) "unknown branches exceed attempt budget or repeat";
+      require (List.length (text_ids ready)=130) "bounded attempt result loses discovered text";
+      let outline=observe_outline (Option.get (R.detail ready)) in
+      require (D.next_automatic_load outline=None) "attempt cap resets at publication";
+      require (List.exists (function D.More {enabled=true;_} -> true | _ -> false) (D.rows outline)) "attempt cap loses explicit continue action");
+    "initial descendant failure and explicit fresh Retry", (fun () ->
+      let t=start small in
+      require (R.detail t=None) "partial body visible before failure";
+      let pending,parent,generation=admit t in
+      let failed=R.apply_detail_failure ~block_id:parent pending ~request_generation:generation ~missing:true ~message:"descendant unavailable" in
+      require (R.route failed=Failed_detail "descendant unavailable" && R.detail failed=None && not (R.loading_indicator failed)) "descendant failure exposes partial body or wrong missing-root state";
+      let retry,request=R.retry_detail failed ~request_generation:9600L in
+      require (Option.is_some request && not (R.loading_indicator retry)) "explicit Retry has no fresh initial grace period";
+      require (R.apply_detail_response retry ~request_generation:generation (projection child [grandchild]) == retry) "late staging completion contaminates Retry";
+      let ready,_=finish (R.apply_detail_response retry ~request_generation:9600L small) small_pages in
+      require (List.length (text_ids ready)=5) "Retry never publishes complete small tree";
+      let prior = start (projection root []) in
+      let edited = D.update_child_source (Option.get (R.detail prior)) "Retained initial draft" in
+      let detached = R.back (R.update_detail prior edited) in
+      let reopened = R.open_detail detached ~block_id:(id 0) ~request_generation:9650L
+        |> fun t -> R.apply_detail_response t ~request_generation:9650L small in
+      let pending,parent,generation = admit reopened in
+      let failed = R.apply_detail_failure ~block_id:parent pending
+        ~request_generation:generation ~missing:false ~message:"initial branch failed" in
+      let retry,_ = R.retry_detail failed ~request_generation:9651L in
+      let restored,_ = finish (R.apply_detail_response retry ~request_generation:9651L small) small_pages in
+      require_string "Retained initial draft"
+        (Option.fold ~none:"" ~some:Journal_capture.source
+           (D.child_capture (Option.get (R.detail restored))))
+        "initial staged failure retains the exact detached composer");
+    "Back graph replacement and covered route fence staged reads", (fun () ->
+      let t=start (projection root [child]) in
+      require (R.detail t=None) "staging owner prematurely visible";
+      let pending,_,generation=admit t in
+      let response=projection child [] in
+      let back=R.back pending in
+      require (R.apply_detail_response back ~request_generation:generation response==back) "Back accepts retired staging completion";
+      let reset=R.graph_unavailable pending in
+      require (R.apply_detail_response reset ~request_generation:generation response==reset) "graph replacement accepts old staging completion";
+      let b=node 90 in
+      let nested=R.open_detail pending ~block_id:(id 90) ~request_generation:9700L
+        |> fun t -> R.apply_detail_response t ~request_generation:9700L (projection b []) in
+      let ready=R.apply_detail_response nested ~request_generation:generation response in
+      require (text_ids ready=[id 90]) "covered completion replaces current target";
+      require (text_ids (R.back ready)=[id 0;id 1]) "covered completed owner loses staged text";
+      let replaced=R.runtime_replaced pending in
+      require (R.apply_detail_response replaced ~request_generation:generation response==replaced) "runtime replacement accepts old staged read");
+    "asset-bearing text never waits for asset availability", (fun () ->
+      let asset=node ~parent:(id 0) ~source:"![local attachment](../assets/image.png)" 70 in
+      let t=start (projection root [asset]) in
+      require (R.detail t=None) "asset-bearing direct text publishes before initial staging";
+      let ready,calls=finish t [projection asset []] in
+      require (calls=[id 70] && text_ids ready=[id 0;id 70]) "asset state gates non-asset body completion");
+    "first-page continuation remains an explicit action", (fun () ->
+      let cursor : Journal_graph_projection.block_cursor = {after_sibling_order="a";after_block_id=id 1;protocol_cursor=None} in
+      let t=start (projection ~continuation:cursor root [child]) in
+      require (R.detail t=None) "continuation direct page publishes early";
+      let ready,calls=finish t [projection child []] in
+      require (calls=[id 1]) "initial staging automatically follows a continuation";
+      let outline=Option.get (R.detail ready) in
+      require (D.continuation outline ~parent_id:(id 0)=Some cursor) "staging discards pagination cursor";
+      let _,commands=D.step outline (Load_more (id 0)) in
+      require (match commands with [Journal_graph_request.Load_detail {after=Some value;limit=128;_}] -> value=cursor | _ -> false) "explicit continuation cannot load next page");
+    "100ms belongs to the whole initial body without a minimum delay", (fun () ->
+      let t=start (projection root [child]) in
+      require (R.route t=Detail_loading && not (R.loading_indicator t)) "root response ends the grace period with partial body";
+      let identity=entry_id t in
+      let early=R.observe_loading_delay t ~entry_id:identity ~request_generation:9500L ~elapsed:0.099 in
+      require (early==t) "root response restarts or changes grace period";
+      let slow=R.observe_loading_delay t ~entry_id:identity ~request_generation:9500L ~elapsed:0.1 in
+      require (R.loading_indicator slow) "staging at 100ms lacks initial indicator";
+      let ready,_=finish slow [projection child []] in
+      require (not (R.loading_indicator ready)) "completed body retains indicator";
+      let fast,_=finish t [projection child []] in
+      require (R.route fast=Detail && not (R.loading_indicator fast)) "completed small tree has a minimum artificial delay")
+  ] in
+  let failures=ref [] in
+  List.iter (fun (name,test) -> try test () with error ->
+    Printf.eprintf "INITIAL_STAGING_RED %s: %s\n%!" name (Printexc.to_string error);
+    failures:=name::!failures) cases;
+  require (!failures=[]) "Initial staging regressions: %s" (String.concat ", " (List.rev !failures))
+;;
+
+let test_initial_staging_refresh_and_delete () =
+  let module R = Journal_routes in
+  let module D = Journal_detail in
+  let id n = Printf.sprintf "98000000-0000-4000-8000-%012d" n in
+  let node ?parent n =
+    block ~id:(id n) ~parent_id:parent ~order:(Printf.sprintf "%08d" n) ~child_count:0 ()
+  in
+  let page root blocks : Journal_graph_projection.detail =
+    { root; children = { blocks; continuation = None } }
+  in
+  let root = node 0
+  and child = node ~parent:(id 0) 1 in
+  let start ?(routes = R.create ()) ?(generation = 500L) children =
+    R.open_detail routes ~block_id:(id 0) ~request_generation:generation
+    |> fun t ->
+    R.apply_detail_response t ~request_generation:generation (page root children)
+  in
+  let admit t =
+    match R.load_initial t with
+    | ( pending
+      , [ Journal_graph_request.Load_detail
+            { block_id; request_generation; limit = 128; after = None }
+        ] ) -> pending, block_id, request_generation
+    | _ -> fail "expected public initial admission"
+  in
+  let refresh t root blocks =
+    R.map_details t ~f:(fun d -> D.reconcile_children d (page root blocks))
+  in
+  let ids t =
+    D.rows (Option.get (R.detail t))
+    |> List.filter_map (function
+      | D.Block { block; _ } -> Some (Journal_model.id block)
+      | More _ -> None)
+  in
+  let children count parent first = List.init count (fun i -> node ~parent (first + i)) in
+  let finish t =
+    let rec drain t =
+      match R.initial_load t with
+      | None ->
+        require (R.route t = Detail) "staged body never published";
+        t
+      | Some (_, parent) ->
+        let pending, _, generation = admit t in
+        let parent_node = node ~parent:(id 0) (int_of_string (String.sub parent 24 12)) in
+        drain
+          (R.apply_detail_response
+             pending
+             ~request_generation:generation
+             (page parent_node []))
+    in
+    drain t
+  in
+  let cases =
+    [ ( "refresh counts root and blocks before another complete page"
+      , fun () ->
+          let branches = children 128 (id 0) 100 in
+          let descendants = children 128 (id 100) 300 in
+          let pending, parent, generation = admit (start branches) in
+          require_string (id 100) parent "first branch";
+          let ready = refresh pending (List.hd branches) descendants in
+          require
+            (R.route ready = Detail && List.length (ids ready) = 257)
+            "refresh bypasses root-inclusive 384-block reservation";
+          require
+            (R.initial_load ready = None && snd (R.load_initial ready) = [])
+            "refresh allows 385th initial block";
+          require
+            (R.apply_detail_response
+               ready
+               ~request_generation:generation
+               (page (List.hd branches) descendants)
+             == ready)
+            "late refreshed read is accepted";
+          require
+            (D.next_automatic_load (observe_outline (Option.get (R.detail ready))) = None)
+            "publication resets refresh budget";
+          require
+            (List.length (snd (D.step (Option.get (R.detail ready)) (Load_more (id 300))))
+             = 1)
+            "budget stop loses explicit continuation" )
+    ; ( "unrelated refresh cannot consume a pending page reservation"
+      , fun () ->
+          let branches = children 128 (id 0) 100 in
+          let pending, _, generation = admit (start branches) in
+          let refreshed =
+            refresh pending (List.nth branches 1) (children 128 (id 101) 600)
+          in
+          let late =
+            R.apply_detail_response
+              refreshed
+              ~request_generation:generation
+              (page (List.hd branches) (children 128 (id 100) 300))
+          in
+          require
+            (late == refreshed && R.route late = Detail && List.length (ids late) = 257)
+            "unrelated refresh leaves an admitted page able to publish %d blocks"
+            (List.length (ids late));
+          require
+            (List.length (snd (D.step (Option.get (R.detail late)) (Load_more (id 100))))
+             = 1)
+            "cancelled page loses explicit continuation" )
+    ; ( "multiple refreshes accumulate without duplicate charge or attempt reset"
+      , fun () ->
+          let first = children 32 (id 0) 100 in
+          let current = ref (start first)
+          and expected = ref (List.hd first) in
+          for depth = 1 to 7 do
+            let pending, parent, generation = admit !current in
+            require_string (Journal_model.id !expected) parent "cumulative first branch";
+            let values = children 32 parent (1000 * depth) in
+            let next = refresh pending !expected values in
+            let duplicate = refresh next !expected values in
+            require
+              (R.apply_detail_response
+                 duplicate
+                 ~request_generation:generation
+                 (page !expected values)
+               == duplicate)
+              "refresh late completion changed owner";
+            current := duplicate;
+            expected := List.hd values;
+            if depth < 7
+            then
+              require
+                (R.route !current = Detail_loading)
+                "duplicate refresh is charged as another materialization"
+          done;
+          require
+            (R.route !current = Detail
+             && List.length (ids !current) = 257
+             && R.initial_load !current = None)
+            "multi-refresh initial budget permits 385/1153 blocks" )
+    ; ( "empty refreshes preserve consumed automatic attempts"
+      , fun () ->
+          let first = children 128 (id 0) 100 in
+          let current = ref (start first) in
+          for i = 0 to 127 do
+            let pending, parent, _ = admit !current in
+            require_string (id (100 + i)) parent "empty refresh attempt";
+            current := refresh pending (List.nth first i) []
+          done;
+          require
+            (R.route !current = Detail
+             && R.initial_load !current = None
+             && List.length (ids !current) = 129)
+            "refresh resets attempts or charges unchanged root" )
+    ; ( "attempt-cap root Undo publishes immediately without refunding budgets"
+      , fun () ->
+          let run routes generation expected_draft =
+            let branches = children 128 (id 0) 100 in
+            let leaf = node ~parent:(id 100) 500 in
+            let pending, _, _ = admit (start ~routes ~generation branches) in
+            let current = ref (refresh pending (List.hd branches) [ leaf ]) in
+            let pending, _, _ = admit !current in
+            current := refresh pending leaf [];
+            for number = 101 to 225 do
+              let pending, parent, _ = admit !current in
+              require_string (id number) parent "spent initial attempt";
+              current := refresh pending (List.nth branches (number - 100)) []
+            done;
+            let pending, parent, old = admit !current in
+            require_string (id 226) parent "128th pending initial read";
+            let missing, undo = R.stage_delete pending ~block_id:(id 0) in
+            let restored = R.undo_delete missing (Option.get undo) in
+            require
+              (R.route restored = Detail && Option.is_some (R.detail restored))
+              "attempt-exhausted Undo leaves ready data in Loading";
+            require
+              (List.length (ids restored) = 130
+               && R.initial_load restored = None
+               && R.load_initial restored = (restored, []))
+              "Undo resets budgets or loses bounded rows";
+            require
+              (R.apply_detail_response
+                 restored
+                 ~request_generation:old
+                 (page (List.nth branches 126) [])
+               == restored)
+              "exhausted Undo accepts cancelled read";
+            let timed =
+              R.observe_loading_delay
+                restored
+                ~entry_id:(entry_id restored)
+                ~request_generation:generation
+                ~elapsed:0.1
+            in
+            require
+              (timed == restored && not (R.loading_indicator timed))
+              "Undo hangs after 100ms";
+            let outline = observe_outline (Option.get (R.detail restored)) in
+            require (D.next_automatic_load outline = None) "Undo refunds spent attempts";
+            require
+              (List.length (snd (D.step outline (Load_more (id 227)))) = 1)
+              "attempt-cap Undo loses explicit continuation";
+            require
+              (Option.map Journal_capture.source (D.child_capture outline)
+               = expected_draft)
+              "attempt-cap settlement loses the exact retained draft"
+          in
+          let failures = ref [] in
+          let check name test =
+            try test () with
+            | error ->
+              Printf.eprintf "ATTEMPT_CAP_RED %s: %s\n%!" name (Printexc.to_string error);
+              failures := name :: !failures
+          in
+          check "without draft" (fun () -> run (R.create ()) 500L None);
+          check "retained draft" (fun () ->
+            let prior = start [] in
+            let edited =
+              D.update_child_source (Option.get (R.detail prior)) "Ready-at-cap draft"
+            in
+            let detached = R.back (R.update_detail prior edited) in
+            run detached 800L (Some "Ready-at-cap draft"));
+          require
+            (!failures = [])
+            "Attempt-cap Undo variants: %s"
+            (String.concat ", " !failures) )
+    ; ( "root deletion fences pending completion and Undo uses fresh generation"
+      , fun () ->
+          let pending, _, old = admit (start [ child ]) in
+          let missing, undo = R.stage_delete pending ~block_id:(id 0) in
+          require
+            (R.route missing = Missing_detail
+             && Option.is_some undo
+             && not (R.loading_indicator missing))
+            "staged root deletion is ignored";
+          require
+            (R.apply_detail_response missing ~request_generation:old (page child [])
+             == missing)
+            "deleted root is republished by late completion";
+          let restored = R.undo_delete missing (Option.get undo) in
+          let pending, _, fresh = admit restored in
+          require (fresh <> old) "Undo reuses cancelled initial generation";
+          require
+            (R.apply_detail_response pending ~request_generation:old (page child [])
+             == pending)
+            "Undo accepts cancelled completion";
+          let ready =
+            R.apply_detail_response pending ~request_generation:fresh (page child [])
+          in
+          require (ids ready = [ id 0; id 1 ]) "Undo cannot finish fresh initial body" )
+    ; ( "sibling deletion preserves an unaffected pending initial read"
+      , fun () ->
+          let tail = node ~parent:(id 0) 2 in
+          let pending, _, generation = admit (start [ child; tail ]) in
+          let hidden, undo = R.stage_delete pending ~block_id:(id 2) in
+          require
+            (Option.is_some undo && R.initial_load hidden = None && R.detail hidden = None)
+            "sibling deletion cancels and repeats an unrelated read";
+          let ready =
+            R.apply_detail_response hidden ~request_generation:generation (page child [])
+          in
+          require
+            (ids ready = [ id 0; id 1 ])
+            "unaffected completion cannot publish the surviving body" )
+    ; ( "descendant deletion removes subtree and Undo fences its old read"
+      , fun () ->
+          let tail = node ~parent:(id 0) 2
+          and grandchild = node ~parent:(id 1) 3 in
+          let pending, _, generation = admit (start [ child; tail ]) in
+          let staged =
+            R.apply_detail_response
+              pending
+              ~request_generation:generation
+              (page child [ grandchild ])
+          in
+          let pending, parent, old = admit staged in
+          require_string (id 3) parent "grandchild read";
+          let hidden, undo = R.stage_delete pending ~block_id:(id 1) in
+          require
+            (Option.is_some undo && Option.map snd (R.initial_load hidden) = Some (id 2))
+            "deletion leaves subtree read pending";
+          require
+            (R.apply_detail_response hidden ~request_generation:old (page grandchild [])
+             == hidden)
+            "removed subtree is revived";
+          let ready = finish hidden in
+          require (ids ready = [ id 0; id 2 ]) "deleted subtree remains in published text";
+          let restored = R.undo_delete hidden (Option.get undo) in
+          let pending, _, fresh = admit restored in
+          require
+            (fresh <> old
+             && R.apply_detail_response
+                  pending
+                  ~request_generation:old
+                  (page grandchild [])
+                == pending)
+            "descendant Undo accepts old read";
+          let ready =
+            finish
+              (R.apply_detail_response
+                 pending
+                 ~request_generation:fresh
+                 (page grandchild []))
+          in
+          require
+            (ids ready = [ id 0; id 1; id 3; id 2 ])
+            "Undo loses subtree or siblings" )
+    ; ( "descendant Undo cannot restore a subsequently deleted staged root"
+      , fun () ->
+          let tail = node ~parent:(id 0) 2 in
+          let pending, _, old = admit (start [ child; tail ]) in
+          let hidden, child_undo = R.stage_delete pending ~block_id:(id 1) in
+          let missing, root_undo = R.stage_delete hidden ~block_id:(id 0) in
+          require
+            (R.route missing = Missing_detail
+             && Option.is_some child_undo
+             && Option.is_some root_undo)
+            "delete sequence lacks owned Undo targets";
+          require
+            (R.undo_delete missing (Option.get child_undo) == missing)
+            "descendant Undo revives a deleted root through same entry generation";
+          let restored =
+            R.undo_delete missing (Option.get root_undo)
+            |> fun t -> R.undo_delete t (Option.get child_undo)
+          in
+          let pending, _, fresh = admit restored in
+          require
+            (fresh <> old
+             && R.apply_detail_response pending ~request_generation:old (page child [])
+                == pending)
+            "ordered root/subtree Undo accepts cancelled read";
+          let ready =
+            finish
+              (R.apply_detail_response pending ~request_generation:fresh (page child []))
+          in
+          require
+            (ids ready = [ id 0; id 1; id 2 ])
+            "ordered Undo cannot restore the surviving body" )
+    ; ( "delete Undo respects covered entry Back graph and retry identities"
+      , fun () ->
+          let pending, _, old = admit (start [ child ]) in
+          let target = node 90 in
+          let covered =
+            R.open_detail pending ~block_id:(id 90) ~request_generation:600L
+            |> fun t ->
+            R.apply_detail_response t ~request_generation:600L (page target [])
+          in
+          let hidden, undo = R.stage_delete covered ~block_id:(id 0) in
+          require
+            (ids hidden = [ id 90 ] && R.route (R.back hidden) = Missing_detail)
+            "covered deletion replaces active entry or leaves deleted root";
+          require
+            (R.apply_detail_response hidden ~request_generation:old (page child [])
+             == hidden)
+            "covered deleted read is accepted";
+          let absent = R.pop_to_root hidden in
+          require
+            (R.undo_delete absent (Option.get undo) == absent)
+            "Undo revives popped owner";
+          let absent = R.graph_unavailable hidden in
+          require
+            (R.undo_delete absent (Option.get undo) == absent)
+            "Undo revives owner from prior graph";
+          let missing = R.back hidden in
+          let retry, _ = R.retry_detail missing ~request_generation:700L in
+          require
+            (R.undo_delete retry (Option.get undo) == retry)
+            "old Undo replaces fresh initial retry";
+          require
+            (R.apply_detail_response retry ~request_generation:old (page child [])
+             == retry)
+            "deleted read contaminates retry" )
+    ; ( "missing staged root preserves the detached draft through Retry and Undo"
+      , fun () ->
+          let prior = start [] in
+          let edited =
+            D.update_child_source
+              (Option.get (R.detail prior))
+              "Retained across staged deletion"
+          in
+          let detached = R.back (R.update_detail prior edited) in
+          let pending, _, old =
+            admit (start ~routes:detached ~generation:800L [ child ])
+          in
+          let missing, undo = R.stage_delete pending ~block_id:(id 0) in
+          require
+            (R.route missing = Missing_detail && Option.is_some undo)
+            "draft owner root deletion is ignored";
+          let retry, _ = R.retry_detail missing ~request_generation:801L in
+          let ready =
+            finish
+              (R.apply_detail_response
+                 retry
+                 ~request_generation:801L
+                 (page root [ child ]))
+          in
+          require_string
+            "Retained across staged deletion"
+            (Journal_capture.source
+               (Option.get (D.child_capture (Option.get (R.detail ready)))))
+            "missing Retry loses original draft";
+          let restored = finish (R.undo_delete missing (Option.get undo)) in
+          require_string
+            "Retained across staged deletion"
+            (Journal_capture.source
+               (Option.get (D.child_capture (Option.get (R.detail restored)))))
+            "root Undo loses original draft";
+          require
+            (R.apply_detail_response restored ~request_generation:old (page child [])
+             == restored)
+            "restored draft accepts stale initial completion";
+          let committed, _ = R.commit_delete missing ~block_id:(id 0) in
+          let reopened = start ~routes:(R.pop_to_root committed) ~generation:802L [] in
+          require
+            (D.child_capture (Option.get (R.detail reopened)) = None)
+            "terminal deletion retains retired draft" )
+    ]
+  in
+  let failures = ref [] in
+  List.iter
+    (fun (name, test) ->
+       try test () with
+       | error ->
+         Printf.eprintf "STAGING_REVIEW_RED %s: %s\n%!" name (Printexc.to_string error);
+         failures := name :: !failures)
+    cases;
+  require
+    (!failures = [])
+    "Staging review regressions: %s"
+    (String.concat ", " (List.rev !failures))
+;;
+
 let tests =
+  [ "Initial staging refresh and delete review regressions", test_initial_staging_refresh_and_delete ] @
+  [ "Detail bounded initial nested body staging", test_detail_initial_nested_body_staging ] @
+  [ "Detail initial loading delay and ownership", test_detail_initial_loading_delay_and_ownership ] @
   [ "Unicode blank Capture admission", test_unicode_blank_capture_admission
   ] @
   [ "PR63 public review regressions", test_followup_review_regressions

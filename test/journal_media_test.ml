@@ -112,6 +112,87 @@ let () =
       incr failed;
       Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn)
   in
+  run "typed local readiness shows Loading until acquisition" (fun () ->
+    let waiting, _ = P.step P.empty (show (asset 'a')) in
+    let pending, effects = ready waiting "local" in
+    check
+      (P.presentation pending = Placeholder "Loading")
+      "Ready opens locally as Loading";
+    check (List.length effects = 1) "local readiness only acquires a file";
+    let ticket = acquire effects in
+    let duplicate, effects = ready pending "local" in
+    check
+      (effects = [] && P.presentation duplicate = Placeholder "Loading")
+      "duplicate Ready preserves acquisition";
+    let visible, effects =
+      P.step duplicate (Acquired (ticket, Some ("lease", "/cache/local")))
+    in
+    check
+      (effects = [] && P.presentation visible = File "/cache/local")
+      "local completion publishes retained file");
+  run "typed download transitions into local Loading" (fun () ->
+    let waiting, _ = P.step P.empty (show (asset 'a')) in
+    let downloading, effects =
+      P.step
+        waiting
+        (Availability { scope; consumer = "visible"; availability = Downloading })
+    in
+    check
+      (effects = [] && P.presentation downloading = Placeholder "Downloading")
+      "only typed Downloading says Downloading";
+    let pending, effects = ready downloading "downloaded-local" in
+    check
+      (P.presentation pending = Placeholder "Loading")
+      "remote completion starts local Loading";
+    let visible, effects =
+      P.step pending (Acquired (acquire effects, Some ("lease", "/cache/downloaded")))
+    in
+    check
+      (effects = [] && P.presentation visible = File "/cache/downloaded")
+      "remote then local completion publishes file");
+  run "queued and unavailable states never masquerade as downloads" (fun () ->
+    let waiting, _ = P.step P.empty (show (asset 'a')) in
+    List.iter
+      (fun (availability, label) ->
+         let state, effects =
+           P.step waiting (Availability { scope; consumer = "visible"; availability })
+         in
+         check
+           (effects = [] && P.presentation state = Placeholder label)
+           "typed wait retains its specific label")
+      [ S.Asset.Queued, "Waiting for file"
+      ; Waiting_remote, "Waiting for upload"
+      ; Waiting_network, "Available when online"
+      ; Waiting_unlock, "Unlock graph to view file"
+      ]);
+  run "failed local open retries only acquisition and fences late completion" (fun () ->
+    let waiting, _ = P.step P.empty (show (asset 'a')) in
+    let pending, effects = ready waiting "local" in
+    let old = acquire effects in
+    let failed, effects = P.step pending (Acquired (old, None)) in
+    check
+      (effects = [] && P.presentation failed = Failed "Unable to open file")
+      "local failure has explicit Retry";
+    let pending, effects = P.step failed Retry_requested in
+    check
+      (P.presentation pending = Placeholder "Loading" && List.length effects = 1)
+      "local Retry only reacquires";
+    let current = acquire effects in
+    let stable, effects =
+      P.step pending (Acquired (old, Some ("orphan", "/cache/old")))
+    in
+    check
+      (P.presentation stable = Placeholder "Loading" && List.length (releases effects) = 1)
+      "late completion releases orphan without replacing Loading";
+    let visible, _ =
+      P.step stable (Acquired (current, Some ("held", "/cache/current")))
+    in
+    let stable, effects =
+      P.step visible (Acquired (current, Some ("held", "/cache/current")))
+    in
+    check
+      (effects = [] && P.presentation stable = File "/cache/current")
+      "duplicate local completion retains displayed lease");
   run "loading cannot Retry" (fun () ->
     let loading, _ = P.step P.empty (show (asset 'a')) in
     let _, effects = P.step loading Retry_requested in

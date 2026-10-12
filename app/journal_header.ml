@@ -56,6 +56,15 @@ let date_header ~title =
     ()
 ;;
 
+let startup ~loading ~initial ~active ?value ~message action =
+  Ui.Native_widget.widget chrome
+    ~key:(Ui.Key.string "journal-startup-surface")
+    ~props:(`Assoc (["mode",`String "startup";"loading",`Bool loading;
+      "initial",`Bool initial;"active",`Bool active;"message",`String message]
+      @ Option.to_list (Option.map (fun value -> "value",`Float value) value)))
+    ~on_event:(fun _ -> ()) ~children:[V.column [action]] () |> V.Body.static
+;;
+
 let capture_control ~enabled ~on_capture =
   V.buttons
     ~actions:

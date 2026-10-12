@@ -312,6 +312,7 @@ type state =
   ; modal : modal
   ; confirmation_sequence : int64
   ; environment : Journal_environment.snapshot
+  ; startup_presentation : Journal_startup.Presentation.t
   }
 
 let favorites_event state event =
@@ -403,7 +404,17 @@ let initial_state =
   ; modal = No_modal
   ; confirmation_sequence = 0L
   ; environment = Journal_environment.fallback
+  ; startup_presentation = Journal_startup.Presentation.create ()
   }
+;;
+
+let sync_startup_presentation state =
+  let startup_presentation = Journal_startup.Presentation.step state.startup_presentation
+    (Observe {manager=state.manager;graph=state.graph_state;graph_ready=state.graph_ready;
+      feed_loaded=state.feed_loaded;password_pending=state.e2ee_submission_pending;
+      graph_error=Option.is_some state.graph_error}) in
+  if startup_presentation == state.startup_presentation then state
+  else {state with startup_presentation}
 ;;
 
 let current_composer_owner state =
@@ -1620,6 +1631,7 @@ type command =
   | Select_favorites
   | Favorites_retry
   | Refresh_catalog
+  | Startup_retry
   | Begin_online_recovery
   | Open_capture
   | Close_composer
@@ -1957,6 +1969,7 @@ let media_label
       ~store
       ?(on_region = fun _ -> ())
       ?(detail = false)
+      ?(known_images = [])
       state
       dispatch
       ~title
@@ -1970,6 +1983,7 @@ let media_label
     ~scope
     ~title
     ~root
+    ~known_images
     ~on_event:(fun event -> dispatch.send (Media (scope, event)))
     child
 ;;
@@ -2976,6 +2990,9 @@ let detail_page
                ~store:media_store
                ~on_region
                ~detail:true
+               ~known_images:(Option.fold ~none:[]
+                 ~some:(fun file_type -> [Journal_model.id block, file_type])
+                 (Journal_model.asset_file_type block))
                state
                dispatch
                ~title:(Journal_model.source block)
@@ -3005,7 +3022,10 @@ let detail_page
         ~children:(rows detail)
     | None ->
       (match Journal_routes.route state.routes with
-       | Detail_loading -> V.loading ~centered:true ~message:"Loading block" ()
+       | Detail_loading ->
+         if Journal_routes.loading_indicator state.routes
+         then V.loading ~centered:true ~message:"Loading block" ()
+         else V.column []
        | Missing_detail ->
          Presentation.unavailable
            ~title:"Block unavailable"
@@ -3153,17 +3173,13 @@ let manager_page state dispatch =
         && Option.is_none snapshot.local_deletion)
       state.manager
   in
-  let busy ?value ?(allow_graph_selection = false) title message =
-    V.column
-      ~spacing:12.
-      [ V.progress ?value ~style:(if Option.is_some value then Linear else Circular) ()
-      ; V.text title
-      ; V.text message
-      ; (if allow_graph_selection && can_choose_graph then choose_graph else V.empty ())
-      ]
-    |> V.frame ~max_width:Fill ~max_height:Fill
-    |> V.padding ~insets:(Ui.Layout.Edge_insets.all 24.)
-    |> V.Body.static
+  let busy ?value ?(allow_graph_selection = false) _title message =
+    Journal_header.startup
+      ~loading:(Journal_startup.Presentation.loading_indicator state.startup_presentation)
+      ~initial:(Journal_startup.Presentation.initial_attempt state.startup_presentation)
+      ~active:(Journal_startup.Presentation.foreground state.startup_presentation)
+      ?value ~message
+      (if allow_graph_selection && can_choose_graph then choose_graph else V.empty ())
   in
   let graph_picker snapshot =
     let refresh =
@@ -3305,11 +3321,23 @@ let manager_page state dispatch =
                diagnostics
            ]
   in
+  let presentation = Journal_startup.Presentation.screen state.startup_presentation in
   let body =
-    match state.manager with
-    | None -> busy "Preparing your account" "" |> toolbar "Journals" []
-    | Some snapshot ->
-      let startup = Journal_startup.derive ~snapshot ~graph:state.graph_state in
+    match presentation,state.manager with
+    | Account_failure,_ ->
+      unavailable ~title:"Unable to prepare your account" ~symbol:"person.crop.circle.badge.exclamationmark"
+        ~message:"Retry to check your account and open your journal."
+        ~actions:(capsule ~id:"journal-startup-retry" ~command:Startup_retry "Retry" "arrow.clockwise")
+      |> toolbar "Journals" []
+    | Interaction {phase=Signed_out;_},None ->
+      unavailable ~title:"Sign in to open a graph" ~symbol:"person.crop.circle"
+        ~message:"Connect your account to access your graphs." ~actions:(V.empty ())
+      |> toolbar "Journals" []
+    | _,None -> busy "Loading journal" "" |> toolbar "" []
+    | _,Some snapshot ->
+      let startup = match presentation with
+        | Interaction startup -> startup
+        | _ -> Journal_startup.derive ~snapshot ~graph:state.graph_state in
       (match startup.phase with
        | _ when state.e2ee_submission_pending -> unlock None
        | Awaiting_selection -> graph_picker snapshot
@@ -3324,6 +3352,8 @@ let manager_page state dispatch =
            (Option.map
               (fun (error : Journal_startup.startup_error) -> error.message)
               startup.error)
+       | Signed_out when presentation=Waiting ->
+         busy ~allow_graph_selection:true "Loading journal" "" |> toolbar "" []
        | Signed_out ->
          unavailable
            ~title:"Sign in to open a graph"
@@ -3333,8 +3363,8 @@ let manager_page state dispatch =
          |> toolbar "Journals" []
        | Loading_catalog ->
          busy ~allow_graph_selection:true "Loading your graphs" ""
-         |> toolbar "Journals" []
-       | (Ready | Restoring_local)
+         |> toolbar "" []
+       | _
          when Option.is_some state.graph_error
               && state.graph_state.phase = Graph_open
               && state.graph_state.generation = snapshot.startup.graph_generation
@@ -3354,10 +3384,10 @@ let manager_page state dispatch =
          |> V.Body.static
          |> toolbar "Journals" []
        | Ready ->
-         busy ~allow_graph_selection:true "Opening journal" "" |> toolbar "Journals" []
+         busy ~allow_graph_selection:true "Opening journal" "" |> toolbar "" []
        | Restoring_local ->
          busy ~allow_graph_selection:true "Restoring your graph" ""
-         |> toolbar "Journals" []
+         |> toolbar "" []
        | Deleting_local ->
          let message =
            match snapshot.local_deletion with
@@ -3367,7 +3397,7 @@ let manager_page state dispatch =
              "Clearing the saved selection"
            | None | Some (Deletion_failed _) -> "Deleting the local copy"
          in
-         busy message "" |> toolbar "Journals" []
+         busy message "" |> toolbar "" []
        | Bootstrapping ->
          let value, message =
            match state.bootstrap_progress with
@@ -3386,7 +3416,7 @@ let manager_page state dispatch =
              value, Printf.sprintf "Downloaded %Ld bytes" progress.received_bytes
          in
          busy ?value ~allow_graph_selection:true "Downloading graph" message
-         |> toolbar "Journals" []
+         |> toolbar "" []
        | Failed ->
          let message, recovery =
            match startup.error with
@@ -4661,10 +4691,14 @@ let start
     | Error _ -> Effect.ignore
     | Ok (Backgrounded _) ->
       calendar_foreground := false;
-      send_manager (Graph_service.Set_foreground false)
+      Effect.bind (set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation (Foreground false)}))
+        ~f:(fun () -> send_manager (Graph_service.Set_foreground false))
     | Ok (Foreground_resumed _) ->
       calendar_foreground := true;
-      Effect.bind (sample_calendar ()) ~f:(function
+      Effect.bind (set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation (Foreground true)}))
+      ~f:(fun () -> Effect.bind (sample_calendar ()) ~f:(function
         | Error error ->
           Effect.many
             [ set_state (fun state ->
@@ -4673,28 +4707,34 @@ let start
             ]
         | Ok calendar ->
           Effect.bind (install_calendar set_state calendar) ~f:(fun () ->
-            send_manager (Graph_service.Set_foreground true)))
+            send_manager (Graph_service.Set_foreground true))))
   in
-  let apply_authenticated_user payload =
-    match Journal_platform.decode_authenticated_user payload with
-    | Error _ -> Effect.ignore
+  let apply_authenticated_user ?ticket payload =
+    let key = Option.value ticket ~default:(Journal_startup.Presentation.account_ticket !state_ref.startup_presentation) in
+    if key <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation then Effect.ignore
+    else match Journal_platform.decode_authenticated_user payload with
+    | Error _ -> set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation (Account_error key)})
     | Ok user_id ->
-      (match user_id with
-       | None -> sign_out_in_flight := true
-       | Some _ -> ());
-      send_manager (Graph_service.Reconcile_authenticated_user { user_id })
+      (match user_id with None -> sign_out_in_flight := true | Some _ -> ());
+      Effect.bind (set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation
+          (Account(key,if user_id=None then No_user else User))}))
+        ~f:(fun () -> send_manager (Graph_service.Reconcile_authenticated_user { user_id }))
   in
-  let apply_local_account_binding result =
+  let apply_local_account_binding ticket result =
     match result with
     | Error _ -> Effect.ignore
     | Ok payload ->
       (match Journal_platform.decode_local_account_binding payload with
-       | Error _ | Ok None -> Effect.ignore
+       | Error _ | Ok None -> set_state (fun state -> {state with startup_presentation=
+           Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))})
        | Ok (Some binding) ->
          if String.equal binding.managed_sync_origin !managed_sync_origin
-         then
-           send_manager
-             (Graph_service.Restore_local_account { user_id = binding.user_id })
+            && ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
+         then Effect.bind (set_state (fun state -> {state with startup_presentation=
+           Journal_startup.Presentation.step state.startup_presentation (Account(ticket,Local))}))
+           ~f:(fun () -> send_manager (Graph_service.Restore_local_account { user_id = binding.user_id }))
          else Effect.ignore)
   in
   let apply_platform payload =
@@ -4712,12 +4752,15 @@ let start
       | Ok _ -> apply_network_lifecycle payload
       | Error _ -> apply_authenticated_user payload)
   in
-  let managed_startup =
-    platform_request Journal_platform.local_account_binding_request ~f:(fun binding ->
-      Effect.bind (apply_local_account_binding binding) ~f:(fun () ->
+  let managed_startup : unit Effect.t = fun () ->
+    let ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation in
+    Effect.run (platform_request Journal_platform.local_account_binding_request ~f:(fun binding ->
+      if ticket <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation then Effect.ignore
+      else Effect.bind (apply_local_account_binding ticket binding) ~f:(fun () ->
         platform_request Journal_platform.authenticated_user_request ~f:(function
-          | Error _ -> Effect.ignore
-          | Ok payload -> apply_authenticated_user payload)))
+          | Error _ -> set_state (fun state -> {state with startup_presentation=
+              Journal_startup.Presentation.step state.startup_presentation (Account_error ticket)})
+          | Ok payload -> apply_authenticated_user ~ticket payload))))
   in
   let calendar_startup =
     Effect.bind (sample_calendar ()) ~f:(function
@@ -4943,15 +4986,25 @@ let start
     if not state.graph_ready
     then None
     else
-      Option.bind (Journal_routes.detail state.routes) (fun detail ->
-        Option.map
-          (fun block_id -> Journal_detail.session_id detail, block_id)
-          (Journal_detail.next_automatic_load detail))
+      match Journal_routes.initial_load state.routes with
+      | Some key -> Some (`Initial key)
+      | None ->
+        Option.bind (Journal_routes.detail state.routes) (fun detail ->
+          Option.map
+            (fun block_id -> `Visible (Journal_detail.session_id detail, block_id))
+            (Journal_detail.next_automatic_load detail))
   in
   let prev_detail_drain_key = ref (detail_drain_key initial_state) in
   let detail_drain_callback = function
     | None -> Effect.ignore
-    | Some (session, block_id) ->
+    | Some (`Initial key) ->
+      set_state_and_effect (fun state ->
+        if state.graph_ready && Journal_routes.initial_load state.routes = Some key
+        then
+          let routes, requests = Journal_routes.load_initial state.routes in
+          { state with routes }, Effect.many (List.map send requests)
+        else state, Effect.ignore)
+    | Some (`Visible (session, block_id)) ->
       set_state_and_effect (fun state ->
         match Journal_routes.detail state.routes with
         | Some detail when state.graph_ready && Journal_detail.session_id detail = session
@@ -5064,6 +5117,30 @@ let start
             if span > 0. then Unix.sleepf span;
             if !running then Journal_pump.enqueue pump thunk)
          ())
+  in
+  let startup_loading_key state = Journal_startup.Presentation.loading_request state.startup_presentation in
+  let prev_startup_loading_key = ref None in
+  let arm_startup_loading_timer key =
+    let started = Core.Time_ns.now () in
+    schedule_after 0.1 (fun () -> Effect.run (set_state (fun state ->
+      let elapsed = Core.Time_ns.(Span.to_sec (diff (now ()) started)) in
+      let next = Journal_startup.Presentation.step state.startup_presentation (Elapsed(key,elapsed)) in
+      if next == state.startup_presentation then state else {state with startup_presentation=next})))
+  in
+  let detail_loading_key state =
+    state.graph_state.generation, Journal_routes.loading_requests state.routes
+  in
+  let prev_detail_loading_key = ref (detail_loading_key initial_state) in
+  let arm_detail_loading_timer graph_generation entry_id request_generation =
+    let started = Core.Time_ns.now () in
+    schedule_after 0.1 (fun () ->
+      Effect.run (set_state (fun state ->
+        if state.graph_state.generation <> graph_generation then state
+        else
+          let elapsed = Core.Time_ns.(Span.to_sec (diff (now ()) started)) in
+          let routes = Journal_routes.observe_loading_delay state.routes
+            ~entry_id ~request_generation ~elapsed in
+          if routes == state.routes then state else { state with routes })))
   in
   let arm_delete_timer mutation_id deadline =
     incr delete_timer_generation;
@@ -5286,6 +5363,9 @@ let start
            | Native_payload (Ui.Event.Payload.Navigation_path_changed _) -> false
            | Asset_settings _ -> false
            | _ -> true -> Effect.ignore
+    | Startup_retry ->
+      Effect.bind (update (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation Retry})) ~f:(fun () -> managed_startup)
     | Open_asset_settings ->
       update (fun state -> { state with asset_settings_open = true })
     | Asset_settings text ->
@@ -5732,7 +5812,8 @@ let start
       cancel_copy ();
       sign_out_in_flight := true;
       Effect.many
-        [ update (fun state -> Root_navigation.step state Account_cleared)
+        [ update (fun state -> let state=Root_navigation.step state Account_cleared in
+            {state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation Signed_out})
         ; send_manager (Graph_service.Reconcile_authenticated_user { user_id = None })
         ]
     | Submit_e2ee_password ->
@@ -6091,6 +6172,19 @@ let start
      then (
        prev_timeline_drain_key := key;
        Effect.run (timeline_drain_callback key)));
+    (let key = startup_loading_key model in
+     if key <> !prev_startup_loading_key then (
+       prev_startup_loading_key := key;
+       Option.iter arm_startup_loading_timer key));
+    (let generation, requests = detail_loading_key model in
+     let previous_generation, previous_requests = !prev_detail_loading_key in
+     prev_detail_loading_key := generation, requests;
+     List.iter
+       (fun (entry_id, request_generation) ->
+          if generation <> previous_generation
+             || not (List.mem (entry_id, request_generation) previous_requests)
+          then arm_detail_loading_timer generation entry_id request_generation)
+       requests);
     (let key = detail_drain_key model in
      if not (!prev_detail_drain_key = key)
      then (
@@ -6172,7 +6266,7 @@ let start
       state_ref := model;
       Effect.run eff;
       state_ref := model;
-      let model = run_edge_callbacks model |> prepare_presentation in
+      let model = sync_startup_presentation model |> run_edge_callbacks |> prepare_presentation in
       state_ref := model;
       model
     | Platform_response (tag, result) ->
@@ -6183,7 +6277,7 @@ let start
        | None -> ());
       model
     | Environment_changed snapshot ->
-      prepare_presentation { model with environment = snapshot }
+      prepare_presentation (sync_startup_presentation { model with environment = snapshot })
   in
   (* These subscriptions use complete presentation dependencies. They compare
      persistent owners rather than walking retained rows on every input event. *)
@@ -6237,7 +6331,8 @@ let start
     if (not left.graph_ready) || not right.graph_ready
     then left == right
     else
-      left.graph_state.generation = right.graph_state.generation
+      Journal_startup.Presentation.equal_presentation left.startup_presentation right.startup_presentation
+      && left.graph_state.generation = right.graph_state.generation
       && left.environment.platform = right.environment.platform
       && Journal_routes.destination left.routes = Journal_routes.destination right.routes
       && same_actions left right
@@ -6261,6 +6356,7 @@ let start
   let equal_detail_presentation left right =
     left.graph_state.generation = right.graph_state.generation
     && Journal_routes.route left.routes = Journal_routes.route right.routes
+    && Journal_routes.loading_indicator left.routes = Journal_routes.loading_indicator right.routes
     && Journal_routes.detail_request_generation left.routes
        = Journal_routes.detail_request_generation right.routes
     && Option.equal
@@ -6469,9 +6565,9 @@ let start
     in
     let root =
       region "root" ~equal:equal_root_presentation (fun state ->
-        match state.graph_ready, state.manager with
-        | false, Some _ -> manager_page state dispatch
-        | false, None | true, _ ->
+        match Journal_startup.Presentation.screen state.startup_presentation with
+        | Waiting | Interaction _ | Account_failure -> manager_page state dispatch
+        | Timeline ->
           timeline_page
             ~header_signal:(Some header_signal)
             ~timeline_store:(Some timeline_store)
@@ -6898,6 +6994,8 @@ let start
       view
   in
   app_cell := Some app;
+  prev_startup_loading_key := startup_loading_key initial_state;
+  Option.iter arm_startup_loading_timer !prev_startup_loading_key;
   let release_staging () =
     ignore (clear_account_drafts !state_ref);
     Queue.iter
