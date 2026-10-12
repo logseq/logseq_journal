@@ -55,3 +55,36 @@ type t = Logseq_db_worker.Config.t
 val encode : t -> (bytes, Error.t) result
 
 val decode : bytes -> (t, Error.t) result
+
+(** Own the initial root presentation and its delayed progress lifetime. *)
+module Presentation : sig
+  type ticket = private int64
+  type observation =
+    { manager : Logseq_db_worker_lui.Logseq_db_worker_lui_service.snapshot option
+    ; graph : Logseq_db_worker.graph_state
+    ; graph_ready : bool
+    ; feed_loaded : bool
+    ; password_pending : bool
+    ; graph_error : bool
+    }
+  type account_result = Local | No_local | User | No_user
+  type screen = Waiting | Timeline | Interaction of startup_state | Account_failure
+  type t
+  type event =
+    | Observe of observation
+    | Account of ticket * account_result
+    | Account_error of ticket
+    | Retry
+    | Signed_out
+    | Foreground of bool
+    | Elapsed of ticket * float
+  val create : unit -> t
+  val foreground : t -> bool
+  val screen : t -> screen
+  val loading_indicator : t -> bool
+  val loading_request : t -> ticket option
+  val account_ticket : t -> ticket
+  val initial_attempt : t -> bool
+  val equal_presentation : t -> t -> bool
+  val step : t -> event -> t
+end

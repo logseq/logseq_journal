@@ -24,7 +24,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 /// Native chrome layout only. List sections own all date scrolling and pinning.
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
-    case page, header, detail, unlock
+    case page, header, detail, unlock, startup
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
     case detailRow = "detail-row"
@@ -40,6 +40,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let text: String?
     let id: String?
     let level: Int?
+    let loading: Bool?
+    let initial: Bool?
+    let active: Bool?
+    let value: Double?
+    let message: String?
   }
 
   private struct DetailText: SwiftUI.View {
@@ -199,6 +204,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
           properties.connecting != nil, properties.controls != nil {
           FloatingChrome(content: child(0), cluster: child(1),
             progress: child(2), properties: properties)
+        }
+      case .startup:
+        if let properties, context.childIDs.count == 1 {
+          JournalStartupLoadingSurface(loading: properties.loading == true,
+            initial: properties.initial == true, active: properties.active != false,
+            value: properties.value, message: properties.message ?? "", action: child(0))
         }
       case .header:
         if let properties, context.childIDs.isEmpty, let title = properties.title {

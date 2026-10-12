@@ -234,7 +234,124 @@ let test_deletion_failure_has_no_recovery () =
     "deletion failure offered recovery"
 ;;
 
+let test_stable_startup_presentation () =
+  let open Journal_startup in
+  let module P = Journal_startup.Presentation in
+  let observe ?manager ?(graph=graph_state ()) ?(graph_ready=false)
+      ?(feed_loaded=false) ?(password_pending=false) ?(graph_error=false) t =
+    P.step t (Observe {manager;graph;graph_ready;feed_loaded;password_pending;graph_error}) in
+  let timer t = Option.get (P.loading_request t) in
+  let account t result = P.step t (Account (P.account_ticket t,result)) in
+  let cases=[
+    "anonymous local restore is not signed out",(fun () ->
+      let phase=Journal_startup.derive ~snapshot:(startup_snapshot ~authenticated:false ~restoring_local:true ())
+          ~graph:(graph_state ~phase:Graph_closed ()) in
+      require (phase.phase=Restoring_local) "local restore flashes signed-out UI";
+      let phase=Journal_startup.derive ~snapshot:(startup_snapshot ~authenticated:false ~failure:During_local_restore ())
+          ~graph:(graph_state ~phase:Graph_closed ()) in
+      require (phase.phase=Failed) "anonymous restore failure hides recovery");
+    "initial and unresolved account stay blank",(fun () ->
+      let t=P.create () in
+      require (P.screen t=Waiting && not(P.loading_indicator t) && P.loading_request t<>None)
+        "initial startup mounts transient Timeline or immediate spinner";
+      let t=observe ~manager:(startup_snapshot ~authenticated:false ()) ~graph:(graph_state ~phase:Graph_closed ()) t in
+      require (P.screen t=Waiting) "account discovery flashes sign-in";
+      let t=account t Local in
+      let t=observe ~manager:(startup_snapshot ~authenticated:false ~restoring_local:true ()) ~graph:(graph_state ~phase:Graph_closed ()) t in
+      require (P.screen t=Waiting) "local binding restore flashes intermediate page");
+    "one 100ms grace spans catalog restore and first feed",(fun () ->
+      let t=observe ~manager:(startup_snapshot ~catalog_loading:true ()) ~graph:(graph_state ~phase:Graph_closed ()) (P.create ()) in
+      let key=timer t in
+      let early=P.step t (Elapsed(key,0.099)) in
+      require (not(P.loading_indicator early)) "99ms shows loading";
+      let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) early in
+      require (timer t=key) "busy phase restarts grace";
+      let slow=P.step t (Elapsed(key,0.1)) in
+      require (P.screen slow=Waiting && P.loading_indicator slow) "100ms waiting has no loading";
+      require (P.step slow (Elapsed(key,0.2))==slow) "duplicate elapsed changes owner";
+      let ready=observe ~manager:(startup_snapshot ()) ~graph_ready:true ~feed_loaded:true slow in
+      require (P.screen ready=Timeline && not(P.loading_indicator ready)) "ready body retains loading";
+      require (P.step ready (Elapsed(key,2.))==ready) "late timer changes ready Timeline");
+    "Graph_open waits for first feed and an empty feed completes",(fun () ->
+      let t=observe ~manager:(startup_snapshot ()) ~graph_ready:true (P.create ()) in
+      require (P.screen t=Waiting) "Graph_open mounts feed's transient loading page";
+      let ready=observe ~manager:(startup_snapshot ~timeline_presentation_pending:true ())
+        ~graph_ready:true ~feed_loaded:true t in
+      require (P.screen ready=Timeline) "presentation handshake or empty feed deadlocks Timeline";
+      let refreshing=observe ~manager:(startup_snapshot ~sync_phase:Pulling ~catalog_loading:true ())
+        ~graph_ready:true ~feed_loaded:true ready in
+      require (P.screen refreshing=Timeline) "cached background refresh hides existing content");
+    "required input and errors remain immediately available",(fun () ->
+      let t=account (P.create ()) No_user in
+      require (match P.screen t with Interaction {phase=Signed_out;_}->true|_->false) "signed-out result is hidden";
+      List.iter(fun phase ->
+        let snapshot=match phase with
+          | Awaiting_selection -> startup_snapshot ~awaiting_selection:true ()
+          | Awaiting_e2ee_password -> startup_snapshot ~awaiting_e2ee_password:true ()
+          | _ -> startup_snapshot ~failure:During_bootstrap () in
+        let t=observe ~manager:snapshot ~graph:(graph_state ~phase:Graph_closed ()) (P.create ()) in
+        require (match P.screen t with Interaction s->s.phase=phase|_->false) "required input/failure is masked";
+        require (not(P.loading_indicator t)) "required input is covered by startup loading")
+        [Awaiting_selection;Awaiting_e2ee_password;Failed]);
+    "unlock submission retains its form and does not remount busy page",(fun () ->
+      let t=observe ~manager:(startup_snapshot ~awaiting_e2ee_password:true ())
+        ~graph:(graph_state ~phase:Graph_closed ()) (P.create ()) in
+      let pending=observe ~manager:(startup_snapshot ~bootstrapping:true ())
+        ~graph:(graph_state ~phase:Graph_closed ()) ~password_pending:true t in
+      require (match P.screen pending with Interaction {phase=Awaiting_e2ee_password;_}->true|_->false)
+        "password submission flashes a different waiting page");
+    "account lookup failure Retry and stale replies",(fun () ->
+      let initial=P.create () in let old=P.account_ticket initial in
+      let failed=P.step initial (Account_error old) in
+      require (P.screen failed=Account_failure) "lookup failure has no explicit recovery";
+      let retry=P.step failed Retry in
+      require (P.screen retry=Waiting && not(P.loading_indicator retry) && P.account_ticket retry<>old)
+        "Retry does not start fresh discovery/grace";
+      require (P.step retry (Account(old,No_user))==retry) "old account result replaces retry";
+      require (P.step retry (Account_error old)==retry) "old lookup failure replaces retry");
+    "local offline recovery is independent of online auth and assets",(fun () ->
+      let t=account (P.create ()) Local in
+      let t=P.step t (Account_error(P.account_ticket t)) in
+      let ready=observe ~manager:(startup_snapshot ~sync_phase:Offline ())
+        ~graph_ready:true ~feed_loaded:true t in
+      require (P.screen ready=Timeline) "valid cached Timeline waits for online auth/assets");
+    "graph replacement rejects old ready data and old timer",(fun () ->
+      let ready=observe ~manager:(startup_snapshot ()) ~graph_ready:true ~feed_loaded:true (P.create ()) in
+      let other={ (startup_snapshot ~graph_generation:8 ()) with selected_graph=Some graph_id } in
+      let waiting=observe ~manager:other ~graph:(graph_state ~generation:7 ())
+        ~graph_ready:true ~feed_loaded:true ready in
+      require (P.screen waiting=Waiting) "stale graph falsely publishes ready data";
+      let key=timer waiting in
+      let picker=observe ~manager:(startup_snapshot ~awaiting_selection:true ~graph_generation:8 ())
+        ~graph:(graph_state ~phase:Graph_closed ~generation:8 ()) waiting in
+      let fresh=observe ~manager:(startup_snapshot ~graph_generation:9 ~restoring_local:true ())
+        ~graph:(graph_state ~phase:Graph_opening ~generation:9 ()) picker in
+      require (timer fresh<>key && P.step fresh (Elapsed(key,1.))==fresh)
+        "old graph journey timer enables new loading");
+    "background interruption fences elapsed and resumes a fresh grace",(fun () ->
+      let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) (P.create ()) in
+      let old=timer t in let inactive=P.step t (Foreground false) in
+      require (P.loading_request inactive=None && P.step inactive (Elapsed(old,1.))==inactive)
+        "background keeps an active loading timer";
+      let resumed=P.step inactive (Foreground true) in
+      require (timer resumed<>old && not(P.loading_indicator resumed)) "resume reuses old grace";
+      require (P.step resumed (Elapsed(old,1.))==resumed) "late background timer changes resume");
+    "negative/NaN elapsed and explicit signout are safe",(fun () ->
+      let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) (P.create ()) in
+      let key=timer t in
+      require (P.step t (Elapsed(key,-1.))==t && P.step t (Elapsed(key,nan))==t) "invalid elapsed changes owner";
+      let signed=P.step t P.Signed_out in
+      require (match P.screen signed with Interaction {phase=Signed_out;_}->true|_->false) "signout entry is hidden";
+      require (P.step signed (Elapsed(key,2.))==signed) "signout leaves stale timer active")
+  ] in
+  let failures=ref [] in
+  List.iter(fun(name,test)->try test () with error->
+    Printf.eprintf "STARTUP_RED %s: %s\n%!" name (Printexc.to_string error);failures:=name::!failures) cases;
+  require (!failures=[]) "Startup regressions: %s" (String.concat ", " (List.rev !failures))
+;;
+
 let () =
+  test_stable_startup_presentation ();
   test_deletion_failure_has_no_recovery ();
   test_exact_codec_and_round_trip ();
   test_bounded_rejection ();

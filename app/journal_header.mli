@@ -78,3 +78,7 @@ val detail
   -> copy_feedback:string option
   -> Journal_view.View.Body.t
   -> Journal_view.View.Body.t
+
+(** Stable native startup surface; action remains reachable during waiting. *)
+val startup : loading:bool -> initial:bool -> active:bool -> ?value:float
+  -> message:string -> Journal_view.View.t -> Journal_view.View.Body.t

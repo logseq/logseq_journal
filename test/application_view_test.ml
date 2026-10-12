@@ -622,7 +622,10 @@ let run_favorites_native_visibility
             (Atomic.exchange media_notices []);
           let sync_phase = Atomic.exchange publish_phase None in
           let error = Atomic.exchange publish_error None in
+          (* A current graph must carry the same manager generation. The
+             startup owner deliberately rejects mixed old/new graph snapshots. *)
           if sync_phase <> None || error <> None
+             || Atomic.get graph_generation <> manager.snapshot.startup.graph_generation
           then
             W.Request_context.emit
               context
@@ -633,6 +636,8 @@ let run_favorites_native_visibility
                      { manager.snapshot with
                        sync_phase = Option.value sync_phase ~default:Service.Current
                      ; last_error = Option.value error ~default:None
+                     ; startup = { manager.snapshot.startup with
+                         graph_generation = Atomic.get graph_generation }
                      }
                  });
           Ok
