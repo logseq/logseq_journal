@@ -3881,14 +3881,22 @@ let test_feed_continuation_reads_only_missing_days () =
   let valid : Protocol.v2_journal_item =
     { page; journal_day = 20260901; revision = "journal-first" }
   in
-  let filtered = { valid with page = { page with recycled = true } } in
+  let filtered n =
+    { valid with
+      page =
+        { page with
+          uuid = uuid (Printf.sprintf "a3000000-0000-4000-8000-%012d" (100 + n))
+        ; recycled = true
+        }
+    }
+  in
   let output =
     Runtime.receive
       runtime
       (response
          request
          (V2_journals_outcome
-            { items = [ valid; filtered; filtered ]; next_cursor = Some cursor }))
+            { items = [ valid; filtered 1; filtered 2 ]; next_cursor = Some cursor }))
   in
   Alcotest.(check int)
     "no feed failure while listing continues"
