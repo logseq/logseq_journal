@@ -908,7 +908,7 @@ let feed_request
     (Protocol.V2_list_journals
        { from_day = 0
        ; through_day = Option.fold ~none:99_999_999 ~some:previous_journal_day before_day
-       ; limit = Protocol.maximum_page_size
+       ; limit = min Protocol.maximum_page_size (day_limit - List.length pages)
        ; cursor
        ; revision = None
        })

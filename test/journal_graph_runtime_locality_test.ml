@@ -3810,10 +3810,226 @@ let test_projection_changes_are_owned () =
     (invalidates_favorites output)
 ;;
 
+let feed_window_request runtime ~days ~slots =
+  Runtime.submit
+    runtime
+    (Journal_graph_request.Load_feed
+       { before_day = None
+       ; day_limit = days
+       ; blocks_per_day = 1
+       ; slot_limit = slots
+       ; request_generation = 7L
+       })
+  |> fun output -> only "journal window request" output.requests
+;;
+
+let journal_request_limit request =
+  match request.Protocol.command with
+  | V2_list_journals { limit; _ } -> limit
+  | _ -> Alcotest.fail "expected journal listing"
+;;
+
+let test_feed_window_fits_encoded_response_budget () =
+  let runtime = Runtime.create () in
+  let request = feed_window_request runtime ~days:7 ~slots:128 in
+  let property : Graph.property_summary =
+    { ident = "fixture/property"
+    ; uuid = unrelated_uuid
+    ; title = String.make 2048 'p'
+    ; schema =
+        { property_type = String; cardinality = One; hidden = false; public = true }
+    ; values = [ String_value "complete value" ]
+    ; values_truncated = false
+    }
+  in
+  let item n : Protocol.v2_journal_item =
+    let id = uuid (Printf.sprintf "a3000000-0000-4000-8000-%012d" n) in
+    { page = { page with uuid = id; properties = [ property ] }
+    ; journal_day = 20260901
+    ; revision = "page-window-revision"
+    }
+  in
+  let encoded count =
+    response
+      request
+      (V2_journals_outcome { items = List.init count item; next_cursor = None })
+    |> Protocol.encoded_response_bytes
+  in
+  Alcotest.(check bool)
+    "full 200-item metadata batch exceeds real byte budget"
+    true
+    (encoded Protocol.maximum_page_size > Protocol.maximum_response_bytes);
+  Alcotest.(check bool)
+    "requested feed metadata fits unchanged byte budget"
+    true
+    (encoded (journal_request_limit request) <= Protocol.maximum_response_bytes);
+  Alcotest.(check int)
+    "read only the seven requested days"
+    7
+    (journal_request_limit request)
+;;
+
+let test_feed_continuation_reads_only_missing_days () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let request = feed_window_request runtime ~days:3 ~slots:16 in
+  Alcotest.(check int)
+    "initial request needs three days"
+    3
+    (journal_request_limit request);
+  let cursor = Graph.Cursor.of_string "journal-after-one" |> Result.get_ok in
+  let valid : Protocol.v2_journal_item =
+    { page; journal_day = 20260901; revision = "journal-first" }
+  in
+  let filtered = { valid with page = { page with recycled = true } } in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (V2_journals_outcome
+            { items = [ valid; filtered; filtered ]; next_cursor = Some cursor }))
+  in
+  Alcotest.(check int)
+    "no feed failure while listing continues"
+    0
+    (List.length output.responses);
+  let next = only "one sequential journal continuation" output.requests in
+  (match next.command with
+   | V2_list_journals { limit; cursor = Some actual; _ } ->
+     Alcotest.(check int) "only two valid days remain" 2 limit;
+     Alcotest.(check string)
+       "original opaque cursor"
+       (Graph.Cursor.to_string cursor)
+       (Graph.Cursor.to_string actual)
+   | _ -> Alcotest.fail "journal continuation lost its cursor");
+  let second n : Protocol.v2_journal_item =
+    let id = uuid (Printf.sprintf "a3000000-0000-4000-8000-%012d" n) in
+    let day = 20260831 - n in
+    { page = { page with uuid = id; kind = Journal_page { journal_day = day } }
+    ; journal_day = day
+    ; revision = "journal-next"
+    }
+  in
+  let more = Graph.Cursor.of_string "journal-more" |> Result.get_ok in
+  let trees =
+    Runtime.receive
+      runtime
+      (response
+         next
+         (V2_journals_outcome { items = [ second 1; second 2 ]; next_cursor = Some more }))
+  in
+  Alcotest.(check int)
+    "all three complete page records reach tree loading"
+    3
+    (List.length trees.requests);
+  let completed =
+    List.fold_left
+      (fun _ request ->
+         match request.Protocol.command with
+         | V2_get_page_tree { page; maximum_depth; _ } ->
+           Runtime.receive
+             runtime
+             (response
+                request
+                (V2_page_tree_outcome
+                   { page; maximum_depth; items = []; next_cursor = None }))
+         | _ -> Alcotest.fail "unexpected extra journal read")
+      trees
+      trees.requests
+  in
+  Alcotest.(check bool)
+    "older days remain available"
+    true
+    (List.exists
+       (fun (r : Runtime.response) ->
+          match r.payload with
+          | Feed_loaded { feed; _ } -> feed.has_more_days
+          | _ -> false)
+       completed.responses)
+;;
+
+let test_feed_window_bounds_and_singleton_failure () =
+  List.iter
+    (fun (days, slots, expected) ->
+       let runtime = Runtime.create () in
+       let request = feed_window_request runtime ~days ~slots in
+       Alcotest.(check int)
+         "day, slot and protocol bounds"
+         expected
+         (journal_request_limit request))
+    [ 1, 2, 1; 10, 6, 3; 500, 1000, Protocol.maximum_page_size ];
+  let runtime = Runtime.create () in
+  let request = feed_window_request runtime ~days:1 ~slots:2 in
+  let oversized_page =
+    { page with
+      properties =
+        List.init 5 (fun n ->
+          { Graph.ident = Printf.sprintf "fixture/large-property-%d" n
+          ; uuid = uuid (Printf.sprintf "a4000000-0000-4000-8000-%012d" n)
+          ; title = String.make Protocol.maximum_title_bytes 'x'
+          ; schema =
+              { property_type = String; cardinality = One; hidden = false; public = true }
+          ; values = []
+          ; values_truncated = false
+          })
+    }
+  in
+  let oversized =
+    response
+      request
+      (V2_journals_outcome
+         { items =
+             [ { page = oversized_page
+               ; journal_day = 20260901
+               ; revision = "large-singleton"
+               }
+             ]
+         ; next_cursor = None
+         })
+  in
+  Alcotest.(check bool)
+    "one complete oversized item cannot fit"
+    true
+    (Protocol.encoded_response_bytes oversized > Protocol.maximum_response_bytes);
+  let failed =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (V2_failed
+            { code = "responseTooLarge"
+            ; message = "The encoded read response exceeded its byte limit."
+            }))
+  in
+  Alcotest.(check int) "no automatic singleton retry loop" 0 (List.length failed.requests);
+  match (only "visible singleton failure" failed.responses).payload with
+  | Feed_failed { failure = Worker_failure failure; _ } ->
+    Alcotest.(check string)
+      "failure keeps operation identity"
+      "listFeedPages"
+      failure.operation
+  | _ -> Alcotest.fail "oversized singleton was hidden or truncated"
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "copy subtree"
+    [ ( "journal window budget"
+      , [ Alcotest.test_case
+            "complete metadata fits requested window"
+            `Quick
+            test_feed_window_fits_encoded_response_budget
+        ; Alcotest.test_case
+            "continuation reads missing days"
+            `Quick
+            test_feed_continuation_reads_only_missing_days
+        ; Alcotest.test_case
+            "bounds and oversized singleton remain explicit"
+            `Quick
+            test_feed_window_bounds_and_singleton_failure
+        ] )
+    ; ( "copy subtree"
       , [ Alcotest.test_case
             "serialized clipboard payload bound"
             `Quick
