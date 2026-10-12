@@ -33,12 +33,48 @@ let schema db =
        | _ -> Error "unsupported sync outbox storage format")
 ;;
 
+type mutation_identity = { mutation_id : string } [@@deriving yojson { strict = false }]
+
+type mutation_identity_wire =
+  | Save_block of mutation_identity
+  | Publish_asset of mutation_identity
+  | Set_asset_reference of mutation_identity
+  | Insert_blocks of mutation_identity
+  | Delete_blocks of mutation_identity
+  | Create_journal_page of mutation_identity
+  | Set_task_status of mutation_identity
+  | Clear_task_status of mutation_identity
+[@@deriving yojson]
+
+type payload_header =
+  { format_version : int
+  ; mutation : mutation_identity_wire
+  ; sequence : int
+  ; sync_revision : int
+  }
+[@@deriving yojson { strict = false }]
+
 let payload_identity record =
-  let open Yojson.Safe.Util in
-  let json = Yojson.Safe.from_string record in
-  ( json |> member "mutation" |> member "mutationId" |> to_string
-  , json |> member "sequence" |> to_int
-  , json |> member "syncRevision" |> to_int )
+  match
+    Logseq_db_types.Json_codec.decode
+      payload_header_of_yojson
+      (Yojson.Safe.from_string record)
+  with
+  | Error error -> failwith ("unsupported or invalid sync outbox JSON: " ^ error)
+  | Ok header ->
+    if header.format_version <> 17 then failwith "unsupported sync outbox JSON format";
+    let identity =
+      match header.mutation with
+      | Save_block x
+      | Publish_asset x
+      | Set_asset_reference x
+      | Insert_blocks x
+      | Delete_blocks x
+      | Create_journal_page x
+      | Set_task_status x
+      | Clear_task_status x -> x
+    in
+    identity.mutation_id, header.sequence, header.sync_revision
 ;;
 
 let validate_rows rows =
@@ -157,7 +193,7 @@ let upsert_rows db rows =
   Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
     let rec loop = function
       | [] -> Ok ()
-      | row :: rest ->
+      | (row : row) :: rest ->
         Sqlite3.Rc.check (Sqlite3.reset statement);
         Sqlite3.Rc.check (Sqlite3.bind_text statement 1 row.mutation_id);
         Sqlite3.Rc.check (Sqlite3.bind_int statement 2 row.sequence);

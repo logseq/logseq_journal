@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-from audit_journal_pagination import INSTRUMENTATION
+from audit_journal_pagination import INSTRUMENTATION, probe_ppx_flags
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -114,7 +114,7 @@ let assert_released () = ()
     libraries.sort(key=lambda x: 0 if x.endswith('/datascript_types.cmxa') else 1)
     includes = {str(Path(x).parent) for x in libraries}
     includes.update(str(p) for p in (source / '_build/default').glob('**/.*.objs/byte'))
-    compiler = [command[0], '-thread', '-O3', '-w', '-58']
+    compiler = [command[0], '-thread', '-O3', '-w', '-58'] + probe_ppx_flags()
     for path in sorted(includes):
         compiler += ['-I', path]
     probe = output / 'read_reuse_probe.ml'

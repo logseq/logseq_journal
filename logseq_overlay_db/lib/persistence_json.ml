@@ -1,68 +1,51 @@
 module Graph = Logseq_db_types.Graph_types
 
-let uuid_to_yojson uuid = `String (Graph.Uuid.to_string uuid)
+type task_status = Types.task_status =
+  | Todo
+  | Doing
+  | In_review
+  | Now
+  | Done
+  | Canceled
+  | Backlog
+  | Waiting
+  | Later
+[@@deriving yojson]
 
-let uuid_of_yojson = function
-  | `String value -> Graph.Uuid.of_string value
-  | _ -> Error "UUID is not a string"
-;;
+type block_reason = Types.block_reason =
+  | Rejected
+  | Stale_barrier
+  | Dependency_blocked of Graph.Uuid.t
+  | Authoritative_mismatch
+  | Planner_dependency_changed
+[@@deriving yojson]
 
-let task_status_to_string = function
-  | Types.Todo -> "todo"
-  | Doing -> "doing"
-  | In_review -> "in-review"
-  | Now -> "now"
-  | Done -> "done"
-  | Canceled -> "canceled"
-  | Backlog -> "backlog"
-  | Waiting -> "waiting"
-  | Later -> "later"
-;;
+type local_status = Types.local_status =
+  | Applied
+  | No_change
+  | Already_applied
+[@@deriving yojson]
 
-let task_status_of_string = function
-  | "todo" -> Ok Types.Todo
-  | "doing" -> Ok Doing
-  | "in-review" -> Ok In_review
-  | "now" -> Ok Now
-  | "done" -> Ok Done
-  | "canceled" -> Ok Canceled
-  | "backlog" -> Ok Backlog
-  | "waiting" -> Ok Waiting
-  | "later" -> Ok Later
-  | _ -> Error "invalid task status"
-;;
+type remote_won_reason = Types.remote_won_reason =
+  | Before_submission
+  | Proven_unexecuted
+[@@deriving yojson]
 
-let optional_of_yojson decode = function
-  | `Null -> Ok None
-  | value -> Result.map Option.some (decode value)
-;;
+type auxiliary_delete_fact = Types.auxiliary_delete_fact =
+  | Comment_area
+  | Default_property_holder
+  | Rewritten_source_title
+  | Timestamp
+  | Transaction_metadata
+[@@deriving yojson]
 
-let optional_to_yojson encode = function
-  | None -> `Null
-  | Some value -> encode value
-;;
-
-let block_reason_to_yojson = function
-  | Types.Rejected -> `String "rejected"
-  | Stale_barrier -> `String "staleBarrier"
-  | Dependency_blocked mutation_id ->
-    `Assoc
-      [ "mutationId", uuid_to_yojson mutation_id; "type", `String "dependencyBlocked" ]
-  | Authoritative_mismatch -> `String "authoritativeMismatch"
-  | Planner_dependency_changed -> `String "plannerDependencyChanged"
-;;
-
-let block_reason_of_yojson = function
-  | `String "rejected" -> Ok Types.Rejected
-  | `String "staleBarrier" -> Ok Types.Stale_barrier
-  | `Assoc [ ("mutationId", mutation_id); ("type", `String "dependencyBlocked") ] ->
-    Result.map
-      (fun mutation_id -> Types.Dependency_blocked mutation_id)
-      (uuid_of_yojson mutation_id)
-  | `String "authoritativeMismatch" -> Ok Types.Authoritative_mismatch
-  | `String "plannerDependencyChanged" -> Ok Types.Planner_dependency_changed
-  | _ -> Error "invalid block reason"
-;;
+type delete_conflict_kind = Types.delete_conflict_kind =
+  | Frontier_fact_changed
+  | Descendant_closure_changed
+  | Incoming_reference_changed
+  | Auxiliary_write_footprint_changed of auxiliary_delete_fact
+  | Page_lifecycle_changed
+[@@deriving yojson]
 
 let server_cursor_to_string cursor =
   "server-cursor:v1:" ^ Int64.to_string (Types.Server_cursor.to_int64 cursor)

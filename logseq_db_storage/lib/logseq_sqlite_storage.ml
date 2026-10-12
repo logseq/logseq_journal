@@ -277,19 +277,13 @@ let prepared db sql bind read =
        read statement)
 ;;
 
-let addresses_json addresses =
-  match addresses with
+type storage_addresses = int64 list [@@deriving yojson]
+
+let addresses_json = function
   | [] -> Sqlite3.Data.NULL
   | addresses ->
-    let values =
-      List.map
-        (fun address ->
-           match int_of_string_opt address with
-           | Some address -> `Int address
-           | None -> invalid_arg "storage address is not an integer")
-        addresses
-    in
-    Sqlite3.Data.TEXT (Yojson.Safe.to_string (`List values))
+    let values = List.map Int64.of_string addresses in
+    Sqlite3.Data.TEXT (Yojson.Safe.to_string (storage_addresses_to_yojson values))
 ;;
 
 let open_database path =
@@ -354,15 +348,12 @@ let open_database path =
                    if Sqlite3.column_is_null statement 1
                    then []
                    else (
-                     match Yojson.Safe.from_string (Sqlite3.column_text statement 1) with
-                     | `List values ->
-                       List.map
-                         (function
-                           | `Int value -> string_of_int value
-                           | `Intlit value -> value
-                           | _ -> invalid_arg "invalid addresses JSON")
-                         values
-                     | _ -> invalid_arg "invalid addresses JSON")
+                     match
+                       storage_addresses_of_yojson
+                         (Yojson.Safe.from_string (Sqlite3.column_text statement 1))
+                     with
+                     | Ok values -> List.map Int64.to_string values
+                     | Error message -> invalid_arg ("invalid addresses JSON: " ^ message))
                  in
                  (match
                     Logseq_sqlite_codec.decode_physical_payload ~content ~addresses

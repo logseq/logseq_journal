@@ -19,12 +19,24 @@ module V = Ui.View
 
 let test_id id view = V.with_test_id (Ui.Test_id.string id) view
 
+module Json = struct
+  type props =
+    { mode : string; title : string option [@default None]; connecting : bool option [@default None]; controls : bool option [@default None]
+    ; text : string option [@default None]; id : string option [@default None]; level : int option [@default None]
+    ; loading : bool option [@default None]; initial : bool option [@default None]; active : bool option [@default None]; value : float option [@default None]; message : string option [@default None] }
+  [@@deriving yojson]
+end
+
+let props ~mode ?title ?connecting ?controls ?text ?id ?level ?loading ?initial ?active ?value ?message () : Json.props =
+  { mode; title; connecting; controls; text; id; level; loading; initial; active; value; message }
+;;
+
 let chrome =
   Ui.Native_widget.Extension.create
     ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
     ~version:2
     ~capabilities:[ Stateful; Semantics ]
-    ~encode_props:(fun props -> Yojson.Basic.to_string props |> Bytes.of_string)
+    ~encode_props:(fun props -> Json.props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
     ~decode_event:(fun ~event_id:_ _ -> Error "Chrome uses child control events")
     ()
 ;;
@@ -50,7 +62,7 @@ let feedback ~key ~top ~visible ~compact ~expanded body =
 let date_header ~title =
   Ui.Native_widget.widget
     chrome
-    ~props:(`Assoc [ "mode", `String "header"; "title", `String title ])
+    ~props:(props ~mode:"header" ~title ())
     ~on_event:(fun _ -> ())
     ~children:[]
     ()
@@ -59,9 +71,7 @@ let date_header ~title =
 let startup ~loading ~initial ~active ?value ~message action =
   Ui.Native_widget.widget chrome
     ~key:(Ui.Key.string "journal-startup-surface")
-    ~props:(`Assoc (["mode",`String "startup";"loading",`Bool loading;
-      "initial",`Bool initial;"active",`Bool active;"message",`String message]
-      @ Option.to_list (Option.map (fun value -> "value",`Float value) value)))
+    ~props:(props ~mode:"startup" ~loading ~initial ~active ~message ?value ())
     ~on_event:(fun _ -> ()) ~children:[V.column [action]] () |> V.Body.static
 ;;
 
@@ -93,8 +103,7 @@ let detail_text ~id ~depth text =
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string ("detail-label:" ^ id))
-    ~props:(`Assoc [ "mode", `String "detail-text"; "id", `String id
-                  ; "level", `Int (min 2 depth); "text", `String text ])
+    ~props:(props ~mode:"detail-text" ~id ~level:(min 2 depth) ~text ())
     ~on_event:(fun _ -> ())
     ~children:[]
     ()
@@ -102,7 +111,7 @@ let detail_text ~id ~depth text =
 
 let detail_row ~depth body =
   Ui.Native_widget.widget chrome
-    ~props:(`Assoc [ "mode", `String "detail-row"; "level", `Int (min 2 depth) ])
+    ~props:(props ~mode:"detail-row" ~level:(min 2 depth) ())
     ~on_event:(fun _ -> ()) ~children:[ body ] ()
 ;;
 
@@ -123,7 +132,7 @@ let detail ~capture_enabled ~on_capture ~copy_enabled ~on_copy ~copy_feedback bo
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string "journal-detail-header")
-    ~props:(`Assoc [ "mode", `String "detail"; "title", `String "Block" ])
+    ~props:(props ~mode:"detail" ~title:"Block" ())
     ~on_event:(fun _ -> ())
     ~children:[ V.Body.Private.to_widget body; options ]
     ()
@@ -400,15 +409,9 @@ let view_impl
     reactive_widget
       ~key
       ~props_for:(fun presentation ->
-        `Assoc
-          [ "mode", `String "page"
-          ; ( "title"
-            , match context with
-              | Journals -> `Null
-              | Favorites -> `String "Favorites" )
-          ; "connecting", `Bool (presentation.sync_phase = Some Graph_service.Connecting)
-          ; "controls", `Bool (controls presentation)
-          ]) (* Keep absent slots mounted so the native child indexes stay stable. *)
+        props ~mode:"page" ?title:(match context with Journals -> None | Favorites -> Some "Favorites")
+          ~connecting:(presentation.sync_phase = Some Graph_service.Connecting)
+          ~controls:(controls presentation) ()) (* Keep absent slots mounted so the native child indexes stay stable. *)
       ~children:
         [ V.Body.Private.to_widget body
         ; cluster

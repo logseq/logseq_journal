@@ -54,11 +54,23 @@ import Observation
       let section: String
       let row_path: [String]
     }
-    let token: String
+    let token: Int64
     let target: Target
     let anchor: String?
     let animated: Bool?
   }
+  private struct RowEvent: Encodable { let key: String; let row: String }
+  private struct Event: Encodable {
+    let type: String
+    var first: Int64? = nil
+    var last: Int64? = nil
+    var token: Int64? = nil
+    var outcome: String? = nil
+    var key: String? = nil
+    var expanded: Bool? = nil
+    var payload: String? = nil
+  }
+
   struct Properties: Decodable {
     let style: String
     let sections: [SectionModel]
@@ -239,9 +251,8 @@ import Observation
           self.active, !self.dirty, let context = self.context,
           self.snapshot?.properties.track_visible_range == true,
           self.range == next else { return }
-        guard let data = try? JSONSerialization.data(withJSONObject:
-          ["type": "visible_range", "first": next.lowerBound, "last": next.upperBound],
-          options: [.sortedKeys]) else { return }
+        guard let data = try? JSONEncoder().encode(Event(type: "visible_range",
+          first: Int64(next.lowerBound), last: Int64(next.upperBound))) else { return }
         if JournalExtensions.emit(context: context, payload: data) {
           self.delivered = next
         }
@@ -265,19 +276,15 @@ import Observation
       prepared.snapshot?.properties
     }
 
-    private func emit(_ fields: [String: Any]) {
-      guard let data = try? JSONSerialization.data(
-        withJSONObject: fields, options: [.sortedKeys])
-      else { return }
+    private func emit(_ event: Event) {
+      guard let data = try? JSONEncoder().encode(event) else { return }
       JournalExtensions.emit(context: context, payload: data)
     }
 
     private func rowEvent(action: String, row: String) {
-      guard let inner = try? JSONSerialization.data(
-        withJSONObject: ["key": action, "row": row], options: [.sortedKeys]),
-        let payload = String(data: inner, encoding: .utf8)
-      else { return }
-      emit(["type": "row_event", "payload": payload])
+      guard let inner = try? JSONEncoder().encode(RowEvent(key: action, row: row)),
+        let payload = String(data: inner, encoding: .utf8) else { return }
+      emit(Event(type: "row_event", payload: payload))
     }
 
     private func childContent(_ index: Int) -> AnyView {
@@ -289,8 +296,8 @@ import Observation
 
     private var positions: [String: Int] { prepared.snapshot?.positions ?? [:] }
 
-    private func completeScroll(_ token: String, _ outcome: String) {
-      emit(["type": "scroll_completed", "token": token, "outcome": outcome])
+    private func completeScroll(_ token: Int64, _ outcome: String) {
+      emit(Event(type: "scroll_completed", token: token, outcome: outcome))
     }
 
     /// Walk target.row_path from the section's top-level rows; intermediate
@@ -312,7 +319,8 @@ import Observation
     }
 
     private func applyScrollRequest(_ request: ScrollRequest) {
-      guard let token = Int64(request.token), token > handledScrollToken else {
+      let token = request.token
+      guard token > handledScrollToken else {
         return
       }
       handledScrollToken = token
@@ -422,7 +430,7 @@ import Observation
           isExpanded: Binding(
             get: { row.expanded == true },
             set: { value in
-              emit(["type": "expanded", "key": row.key, "expanded": value])
+              emit(Event(type: "expanded", key: row.key, expanded: value))
             })
         ) {
           ForEach(row.children ?? []) { child in

@@ -152,6 +152,16 @@ let checksum inspection =
   | _ -> failwith "published checksum missing"
 ;;
 
+type sample_report =
+  { fixture : string
+  ; sample : int
+  ; expected_checksum : bool
+  ; retry : bool
+  ; digest : string
+  ; events : Yojson.Safe.t
+  }
+[@@deriving yojson]
+
 let sample ~verify ~root ~name ~graph_id ~path ~expected_rows ~expected ~retry iteration =
   let support =
     Filename.concat
@@ -203,11 +213,8 @@ let sample ~verify ~root ~name ~graph_id ~path ~expected_rows ~expected ~retry i
        let events = A.json () in
        let count phase =
          List.fold_left
-           (fun count json ->
-              let open Yojson.Safe.Util in
-              if
-                json |> member "operation" |> to_string = "checksum"
-                && json |> member "phase" |> to_string = phase
+           (fun count (event : A.event) ->
+              if event.operation = "checksum" && event.phase = phase
               then count + 1
               else count)
            0
@@ -224,14 +231,14 @@ let sample ~verify ~root ~name ~graph_id ~path ~expected_rows ~expected ~retry i
          (fun expected -> require (T.Checksum.equal digest expected) "digest parity")
          expected;
        let json =
-         `Assoc
-           [ "fixture", `String name
-           ; "sample", `Int iteration
-           ; "expected_checksum", `Bool (Option.is_some expected)
-           ; "retry", `Bool retry
-           ; "digest", `String (T.Checksum.to_string digest)
-           ; "events", events
-           ]
+         sample_report_to_yojson
+           { fixture = name
+           ; sample = iteration
+           ; expected_checksum = Option.is_some expected
+           ; retry
+           ; digest = T.Checksum.to_string digest
+           ; events
+           }
        in
        print_endline (Yojson.Safe.to_string json);
        digest)

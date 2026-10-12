@@ -10,6 +10,9 @@
   persistent_sorted_set_ocaml
   sqlite3
   unix
+  ppx_deriving_yojson.runtime
   yojson)
+ (preprocess
+  (pps ppx_deriving_yojson))
  (flags
   (:standard -open Logseq_db_types)))

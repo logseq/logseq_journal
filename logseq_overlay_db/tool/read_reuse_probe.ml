@@ -17,6 +17,38 @@ let uuid x = G.Uuid.of_string x |> ok "uuid"
 let phase = ref "setup"
 let allocated_work = ref 0.
 
+type measurement_report =
+  { scenario : string
+  ; api : string
+  ; ms : float
+  ; allocated_bytes : float
+  ; metrics : Yojson.Safe.t
+  }
+[@@deriving yojson]
+
+type digest_report =
+  { result : string
+  ; digest : string
+  }
+[@@deriving yojson]
+
+type transactions_report = { submitted_transactions : string list } [@@deriving yojson]
+type plaintexts_report = { prepared_plaintexts : string list } [@@deriving yojson]
+
+type allocation_report =
+  { allocation_tradeoff : string
+  ; allocated_bytes : float
+  }
+[@@deriving yojson]
+
+type fixture_report =
+  { fixture_datoms : int
+  ; fixture_sha256 : string
+  }
+[@@deriving yojson]
+
+type gates_report = { failed_gates : string list } [@@deriving yojson]
+
 let measure name f =
   A.reset ();
   let allocated = Gc.allocated_bytes () in
@@ -26,13 +58,13 @@ let measure name f =
   Printf.printf
     "%s\n%!"
     (Yojson.Safe.to_string
-       (`Assoc
-           [ "scenario", `String !phase
-           ; "api", `String name
-           ; "ms", `Float ((Unix.gettimeofday () -. t) *. 1000.)
-           ; "allocated_bytes", `Float (Gc.allocated_bytes () -. allocated)
-           ; "metrics", A.json ()
-           ]));
+       (measurement_report_to_yojson
+          { scenario = !phase
+          ; api = name
+          ; ms = (Unix.gettimeofday () -. t) *. 1000.
+          ; allocated_bytes = Gc.allocated_bytes () -. allocated
+          ; metrics = A.json ()
+          }));
   x
 ;;
 
@@ -47,8 +79,7 @@ let run name f =
     in
     Printf.printf
       "%s\n%!"
-      (Yojson.Safe.to_string
-         (`Assoc [ "result", `String name; "digest", `String digest ])));
+      (Yojson.Safe.to_string (digest_report_to_yojson { result = name; digest })));
   A.assert_released ();
   result
 ;;
@@ -219,7 +250,7 @@ let submit db ids =
   Printf.printf
     "%s\n%!"
     (Yojson.Safe.to_string
-       (`Assoc [ "submitted_transactions", `List (List.map (fun s -> `String s) wires) ]))
+       (transactions_report_to_yojson { submitted_transactions = wires }))
 ;;
 
 let capture_transactions db ids =
@@ -232,9 +263,7 @@ let capture_transactions db ids =
   Printf.printf
     "%s\n%!"
     (Yojson.Safe.to_string
-       (`Assoc
-           [ "prepared_plaintexts", `List (List.map (fun (_, s) -> `String s) plaintexts)
-           ]));
+       (plaintexts_report_to_yojson { prepared_plaintexts = List.map snd plaintexts }));
   ignore (Sys.opaque_identity preparation)
 ;;
 
@@ -315,6 +344,7 @@ let shadow_insert db =
        expected
        (T.Insert_blocks
           { mutation_id = mid 22
+          ; asset = None
           ; parent = page
           ; tree = T.{ uuid = mid 501; title = "Before shadow removal"; children = [] }
           }));
@@ -337,6 +367,7 @@ let shadow_insert db =
        expected
        (T.Insert_blocks
           { mutation_id = mid 21
+          ; asset = None
           ; parent = page
           ; tree = T.{ uuid = mid 500; title = "After shadow"; children = [] }
           }));
@@ -418,6 +449,7 @@ let structural_eligibility db =
        expected
        (T.Insert_blocks
           { mutation_id = mid 31
+          ; asset = None
           ; parent = page
           ; tree = T.{ uuid = mid 603; title = "After incomplete sibling"; children = [] }
           }));
@@ -468,7 +500,7 @@ let selected db =
        db
        "Insert_blocks/10"
        expected
-       (T.Insert_blocks { mutation_id = mid 5; tree; parent = page }));
+       (T.Insert_blocks { mutation_id = mid 5; tree; asset = None; parent = page }));
   metadata_gate "insert";
   gate "insert one sibling enumeration" (calls "datoms:Avet:*:block/parent:value" = 1);
   gate "insert no full sibling payload scan" (calls "seek:Eavt:entity:*" = 0);
@@ -515,18 +547,18 @@ let selected db =
        db
        "Insert_blocks/additional-scopes"
        expected
-       (T.Insert_blocks { mutation_id = mid 8; tree; parent = page }));
+       (T.Insert_blocks { mutation_id = mid 8; tree; asset = None; parent = page }));
   metadata_gate "insert extra scopes";
   if !allocated_work >= 400_000_000.
   then
     Printf.printf
       "%s\n%!"
       (Yojson.Safe.to_string
-         (`Assoc
-             [ ( "allocation_tradeoff"
-               , `String "wide admission exceeds the measured baseline allocation range" )
-             ; "allocated_bytes", `Float !allocated_work
-             ]));
+         (allocation_report_to_yojson
+            { allocation_tradeoff =
+                "wide admission exceeds the measured baseline allocation range"
+            ; allocated_bytes = !allocated_work
+            }));
   gate
     "insert extra scopes share target scan"
     (calls "datoms:Avet:*:block/parent:value" = 2);
@@ -536,7 +568,11 @@ let selected db =
         db
         ~expected
         (T.Insert_blocks
-           { mutation_id = mid 9; tree = { tree with uuid = mid 301 }; parent = page }))
+           { mutation_id = mid 9
+           ; tree = { tree with uuid = mid 301 }
+           ; asset = None
+           ; parent = page
+           }))
   in
   (match stale with
    | Error T.Target_precondition_conflict -> ()
@@ -664,10 +700,10 @@ let () =
   Printf.printf
     "%s\n%!"
     (Yojson.Safe.to_string
-       (`Assoc
-           [ "fixture_datoms", `Int count
-           ; "fixture_sha256", `String (Digestif.SHA256.get hash |> Digestif.SHA256.to_hex)
-           ]));
+       (fixture_report_to_yojson
+          { fixture_datoms = count
+          ; fixture_sha256 = Digestif.SHA256.get hash |> Digestif.SHA256.to_hex
+          }));
   S.close (S.connection_callbacks connection) |> ok "fixture identity close";
   phase := "100000-blocks-empty-outbox";
   Eio_main.run (fun _ ->
@@ -679,7 +715,6 @@ let () =
       selected db));
   Printf.printf
     "%s\n%!"
-    (Yojson.Safe.to_string
-       (`Assoc [ "failed_gates", `List (List.rev_map (fun s -> `String s) !failures) ]));
+    (Yojson.Safe.to_string (gates_report_to_yojson { failed_gates = List.rev !failures }));
   if !failures <> [] && Sys.argv.(2) = "check" then exit 1
 ;;

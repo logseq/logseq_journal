@@ -9,29 +9,38 @@ import shutil
 import sys
 
 sys.dont_write_bytecode = True
-from audit_journal_pagination import ROOT, run
+from audit_journal_pagination import ROOT, run, probe_ppx_flags
 
 INSTRUMENTATION = r'''
 include Datascript
 let nodes = ref 0
 let rows = ref 0
 let phase = ref "setup"
-let events : Yojson.Safe.t list ref = ref []
+type event =
+  { operation : string
+  ; phase : string
+  ; ms : float
+  ; allocated_bytes : float
+  ; sqlite_node_restores : int
+  ; returned_checksum_datoms : int
+  } [@@deriving yojson]
+type event_list = event list [@@deriving yojson]
+let events : event list ref = ref []
 let reset () = nodes := 0; rows := 0; events := []
 let measure name f =
   let n = !nodes and r = !rows in
   let allocated = Gc.allocated_bytes () in
   let started = Unix.gettimeofday () in
   Fun.protect ~finally:(fun () ->
-    events := `Assoc ["operation", `String name; "phase", `String !phase;
-      "ms", `Float ((Unix.gettimeofday () -. started) *. 1000.);
-      "allocated_bytes", `Float (Gc.allocated_bytes () -. allocated);
-      "sqlite_node_restores", `Int (!nodes - n);
-      "returned_checksum_datoms", `Int (!rows - r)] :: !events) f
+    events := { operation = name; phase = !phase;
+      ms = (Unix.gettimeofday () -. started) *. 1000.;
+      allocated_bytes = Gc.allocated_bytes () -. allocated;
+      sqlite_node_restores = !nodes - n;
+      returned_checksum_datoms = !rows - r } :: !events) f
 let datoms db index ?e ?a ?v ?tx () =
   Datascript.datoms db index ?e ?a ?v ?tx ()
   |> Seq.map (fun d -> incr rows; d)
-let json () = `List (List.rev !events)
+let json () = event_list_to_yojson (List.rev !events)
 '''
 
 
@@ -110,7 +119,7 @@ let inspect_database database_path graph_id =''')
                     for p in (source / '_build/default').glob(pattern))
     probe = output / 'snapshot_checksum_probe.ml'
     shutil.copy2(ROOT / 'logseq_overlay_db/tool/snapshot_checksum_probe.ml', probe)
-    compiler = [command[0], '-thread', '-O3']
+    compiler = [command[0], '-thread', '-O3'] + probe_ppx_flags()
     for path in sorted(includes):
         compiler += ['-I', path]
     run(compiler + libraries + [str(probe), '-o', str(output / 'probe')])

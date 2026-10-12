@@ -7,7 +7,7 @@ with tempfile.TemporaryDirectory(prefix='journal-cognito-') as directory:
     destination = Path(directory)
     sources = ['JournalPlatformWire.swift', 'JournalPlatformServices.swift',
                'JournalAuthentication.swift', 'JournalCognitoOAuth.swift', 'JournalCognitoSession.swift']
-    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-module-cache-path',
+    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-Xfrontend', '-disable-sandbox', '-module-cache-path',
         str(destination/'modules'), *[str(root/'swift'/s) for s in sources],
         str(root/'apple-tests/authentication/JournalCognitoTests.swift'),
         '-o', str(destination/'tests')], check=True)

@@ -214,7 +214,7 @@ import AppKit
   /// connected runtimes receive changed samples as LJP2 tag-24 events.
   func pushEnvironment(_ sample: JournalEnvironmentSample) {
     guard sample != lastEnvironment else { return }
-    guard let data = try? JournalPlatformWire.environment(sample.jsonObject())
+    guard let data = try? JournalPlatformWire.environment(sample)
     else { return }
     lastEnvironment = sample
     guard connected else { return }

@@ -68,6 +68,7 @@ type measurement =
   ; allocation_bytes : float
   ; rss_bytes : int
   }
+[@@deriving yojson]
 
 let measure operation =
   let allocation_before = Gc.allocated_bytes () in
@@ -292,13 +293,29 @@ let measure_reopen open_database =
     Database.close database |> get_ok "close measured reopen")
 ;;
 
-let measurement_json measurement =
-  `Assoc
-    [ "wall_time_ms", `Float measurement.elapsed_ms
-    ; "allocation_bytes", `Float measurement.allocation_bytes
-    ; "rss_bytes", `Int measurement.rss_bytes
-    ]
-;;
+type sample =
+  { active_outbox_records : int
+  ; active_outbox_bytes : int
+  ; status : string
+  ; wall_time_samples : float list
+  ; allocation_samples : float list
+  ; rss_samples : int list
+  ; get_blocks_64 : measurement list
+  ; get_structure_200 : measurement list
+  ; get_journals_200 : measurement list
+  ; single_block_change_classification : measurement list
+  ; replan_and_diff : measurement list
+  ; reopen : measurement list
+  ; delete_conflict : measurement list
+  }
+[@@deriving yojson]
+
+type report =
+  { block_count : int
+  ; fixture_checksum : string
+  ; samples : sample list
+  }
+[@@deriving yojson]
 
 let benchmark ~open_database ~database_path ~block_count required_sizes =
   List.map
@@ -360,34 +377,20 @@ let benchmark ~open_database ~database_path ~block_count required_sizes =
            [])
        in
        let values select = List.map select point_samples in
-       `Assoc
-         [ "active_outbox_records", `Int active_outbox_records
-         ; "active_outbox_bytes", `Int active_outbox_bytes
-         ; "status", `String "Measured"
-         ; ( "wall_time_samples"
-           , `List
-               (List.map
-                  (fun value -> `Float value)
-                  (values (fun value -> value.elapsed_ms))) )
-         ; ( "allocation_samples"
-           , `List
-               (List.map
-                  (fun value -> `Float value)
-                  (values (fun value -> value.allocation_bytes))) )
-         ; ( "rss_samples"
-           , `List
-               (List.map
-                  (fun value -> `Int value)
-                  (values (fun value -> value.rss_bytes))) )
-         ; "get_blocks_64", `List (List.map measurement_json point_samples)
-         ; "get_structure_200", `List (List.map measurement_json structure_samples)
-         ; "get_journals_200", `List (List.map measurement_json journal_samples)
-         ; ( "single_block_change_classification"
-           , `List (List.map measurement_json single_block_samples) )
-         ; "replan_and_diff", `List (List.map measurement_json rebase_samples)
-         ; "reopen", `List (List.map measurement_json reopen_samples)
-         ; "delete_conflict", `List (List.map measurement_json delete_conflict_samples)
-         ])
+       { active_outbox_records
+       ; active_outbox_bytes
+       ; status = "Measured"
+       ; wall_time_samples = values (fun value -> value.elapsed_ms)
+       ; allocation_samples = values (fun value -> value.allocation_bytes)
+       ; rss_samples = values (fun value -> value.rss_bytes)
+       ; get_blocks_64 = point_samples
+       ; get_structure_200 = structure_samples
+       ; get_journals_200 = journal_samples
+       ; single_block_change_classification = single_block_samples
+       ; replan_and_diff = rebase_samples
+       ; reopen = reopen_samples
+       ; delete_conflict = delete_conflict_samples
+       })
     required_sizes
 ;;
 
@@ -436,10 +439,6 @@ let () =
            in
            Yojson.Safe.pretty_to_channel
              stdout
-             (`Assoc
-                 [ "block_count", `Int block_count
-                 ; "fixture_checksum", `String checksum
-                 ; "samples", `List samples
-                 ]);
+             (report_to_yojson { block_count; fixture_checksum = checksum; samples });
            output_char stdout '\n')))
 ;;

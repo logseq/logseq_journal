@@ -26,12 +26,19 @@ let decode payload =
   else None
 ;;
 
+module Json = struct
+  type upload = { id : string; title : string; message : string; busy : bool; retry : bool }
+  [@@deriving yojson]
+  type props = { presented : bool; recent : string; favorites : string; uploads : upload list }
+  [@@deriving yojson]
+end
+
 let extension =
   Ui.Native_widget.Extension.create
     ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2106)
     ~version:1
     ~capabilities:[ Stateful; Semantics ]
-    ~encode_props:(fun json -> Yojson.Basic.to_string json |> Bytes.of_string)
+    ~encode_props:(fun props -> Json.props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
     ~decode_event:(fun ~event_id:_ bytes -> Ok (Bytes.to_string bytes))
     ()
 ;;
@@ -60,24 +67,10 @@ let view ~uploads ~offline ~presented ~on_event child =
   Ui.Native_widget.widget
     extension
     ~key:(Ui.Key.string "asset-settings")
-    ~props:
-      (`Assoc
-          [ "presented", `Bool presented
-          ; "recent", `String recent
-          ; "favorites", `String favorites
-          ; ( "uploads"
-            , `List
-                (List.map
-                   (fun (row : Journal_uploads.row) ->
-                      `Assoc
-                        [ "id", `String row.id
-                        ; "title", `String row.title
-                        ; "message", `String row.message
-                        ; "busy", `Bool row.busy
-                        ; "retry", `Bool row.retry
-                        ])
-                   uploads) )
-          ])
+    ~props:Json.
+      { presented; recent; favorites
+      ; uploads = List.map (fun (row : Journal_uploads.row) ->
+          { id = row.id; title = row.title; message = row.message; busy = row.busy; retry = row.retry }) uploads }
     ~on_event
     ~children:[ child ]
     ()

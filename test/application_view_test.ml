@@ -1513,7 +1513,7 @@ let run_favorites_native_visibility
                   "metadataMutation",`String (G.Uuid.to_string (uuid 34004));
                   "path",`String path;"title",`String "First attachment";"type",`String "txt"] in
                 hooks.extension_event adapter "event" (Yojson.Safe.to_string
-                  (`Assoc ["id",`Int 1;"payload",`String (Yojson.Safe.to_string picked)])) |> consume;
+                  (`Assoc ["id",`Int 1;"payload",`String (Yojson.Safe.to_string (`Assoc ["action", `String "picked"; "selection", picked]))])) |> consume;
                 Atomic.set import_release true;
                 wait "non-staged interruption requires source reselection" (fun () ->
                   Hashtbl.fold (fun _ values found -> found ||

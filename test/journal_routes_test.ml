@@ -232,7 +232,7 @@ let staged_pick ~operation ~path ~title ~file_type =
   match
     Journal_asset_import.decode_event
       (Printf.sprintf
-         {|{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s"}|}
+         {|{"action":"picked","selection":{"operation":"%s","asset":"%s","localMutation":"%s","metadataMutation":"%s","path":"%s","title":"%s","type":"%s"}}|}
          operation
          "70000000-0000-4000-a000-00000000a001"
          "70000000-0000-4000-a000-00000000a002"
@@ -251,7 +251,7 @@ let test_normal_attachment_pick_needs_no_replacement_metadata () =
     |> Result.get_ok
   in
   let payload =
-    {|{"operation":"70000000-0000-4000-a000-00000000a010","asset":"70000000-0000-4000-a000-00000000a001","localMutation":"70000000-0000-4000-a000-00000000a002","metadataMutation":"70000000-0000-4000-a000-00000000a003","path":"/tmp/synthetic-attachment.png","title":"Existing picker selection","type":"png","request":{"id":4,"source":"files","staged":false}}|}
+    {|{"action":"picked","selection":{"operation":"70000000-0000-4000-a000-00000000a010","asset":"70000000-0000-4000-a000-00000000a001","localMutation":"70000000-0000-4000-a000-00000000a002","metadataMutation":"70000000-0000-4000-a000-00000000a003","path":"/tmp/synthetic-attachment.png","title":"Existing picker selection","type":"png"},"request":{"id":4,"source":"files","staged":false}}|}
   in
   let imported =
     match Journal_asset_import.decode ~target payload with
@@ -2347,10 +2347,10 @@ let multiselect_pick index path source_identity =
 let multiselect_staged index path source_identity =
   match
     Journal_asset_import.decode_event
-      (Yojson.Basic.to_string (multiselect_pick index path source_identity))
+      (Yojson.Basic.to_string (`Assoc ["action", `String "picked"; "selection", multiselect_pick index path source_identity]))
   with
   | Ok (Picked (staged, _)) -> staged
-  | _ -> fail "valid legacy selection did not decode"
+  | _ -> fail "valid generated selection did not decode"
 ;;
 
 let with_multiselect_files count f =
@@ -2515,7 +2515,7 @@ let test_multiselect_graph_owner_and_cancel () =
       let pick = multiselect_staged 1 kept "photos:kept" in
       let selected = R.step start (Capture_asset_picked (pick, Some 1)) in
       require
-        (Journal_asset_import.is_dismissal {|{"action":"dismissed","request":1}|})
+        (Journal_asset_import.is_dismissal {|{"action":"dismissed","request":{"id":1}}|})
         "picker cancellation did not decode";
       let collapsed = R.step selected Capture_closed in
       require

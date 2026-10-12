@@ -185,8 +185,58 @@ let test_clipboard_is_bounded_and_acknowledged () =
     "failed clipboard write was accepted"
 ;;
 
+let test_generated_native_decoders_reject_untyped_payloads () =
+  require
+    (Result.is_error
+       (Journal_environment.decode_json
+          (`Assoc
+             [ "brightness", `String "light"; "platform", `String "ios"
+             ; "accessibleNavigation", `Bool false; "highContrast", `Bool false
+             ; "unsupported", `Bool true ])))
+    "environment accepted an unknown generated-record field";
+  require
+    (Result.is_error
+       (Journal_platform.decode_notice_response ~token:7L
+          (envelope 26
+             (Bytes.of_string {|{"token":7,"result":"action","unexpected":true}|}))))
+    "notice accepted an unknown generated-record field";
+  require
+    (Result.is_error (Journal_asset_import.decode_event {|{"action":"unavailable"}|}))
+    "picker accepted unavailable without its required reason";
+  require
+    (Result.is_error
+       (Journal_asset_import.decode_event {|{"action":"picked-batch","items":[],"request":{"id":"7"}}|}))
+    "picker accepted a malformed request identity"
+;;
+
+let test_generated_environment_roundtrip () =
+  List.iter
+    (fun (brightness : Journal_environment.brightness) ->
+       let snapshot : Journal_environment.snapshot =
+         { brightness; platform = "ios"; accessible_navigation = true; high_contrast = false }
+       in
+       require
+         (Journal_environment.decode_json (Journal_environment.encode_json snapshot) = Ok snapshot)
+         "environment did not roundtrip")
+    [ Light; Dark ]
+;;
+
+let test_generated_picker_preserves_uuid_validation () =
+  let payload =
+    {|{"action":"picked","selection":{"operation":"invalid","asset":"11111111-1111-4111-8111-111111111111","localMutation":"22222222-2222-4222-8222-222222222222","metadataMutation":"33333333-3333-4333-8333-333333333333","path":"/tmp/pick.png","title":"pick","type":"png"}}|}
+  in
+  require (Result.is_error (Journal_asset_import.decode_event payload))
+    "generated picker decoder bypassed UUID validation";
+  require
+    (Result.is_error (Journal_asset_import.decode_event {|{"action":"picked-batch","items":[{}]}|}))
+    "generated picker decoder accepted an invalid batch member"
+;;
+
 let tests =
-  [ "clipboard text", test_clipboard_is_bounded_and_acknowledged
+  [ "generated native decoders", test_generated_native_decoders_reject_untyped_payloads
+  ; "generated environment roundtrip", test_generated_environment_roundtrip
+  ; "generated picker UUIDs", test_generated_picker_preserves_uuid_validation
+  ; "clipboard text", test_clipboard_is_bounded_and_acknowledged
   ; ( "bounded auth capability"
     , test_auth_capability_envelopes_are_bounded_and_protocol_free )
   ; "sign-out capability", test_sign_out_capability_is_bounded_and_acknowledged

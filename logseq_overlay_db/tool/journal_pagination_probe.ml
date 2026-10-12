@@ -54,6 +54,16 @@ let with_database support graph_id f =
 
 let samples : (string * Yojson.Safe.t) list ref = ref []
 
+type measurement_report =
+  { name : string
+  ; limit : int
+  ; items : int
+  ; has_more : bool
+  ; elapsed_ms : float
+  ; metrics : Yojson.Safe.t
+  }
+[@@deriving yojson]
+
 let measured name snapshot ~limit ~cursor =
   A.reset ();
   let start = Unix.gettimeofday () in
@@ -84,14 +94,14 @@ let measured name snapshot ~limit ~cursor =
     (count "full_page_hydration" <= List.length result.items)
     "probe hydrated a page";
   let json =
-    `Assoc
-      [ "name", `String name
-      ; "limit", `Int limit
-      ; "items", `Int (List.length result.items)
-      ; "has_more", `Bool (Option.is_some result.next_cursor)
-      ; "elapsed_ms", `Float elapsed
-      ; "metrics", metrics
-      ]
+    measurement_report_to_yojson
+      { name
+      ; limit
+      ; items = List.length result.items
+      ; has_more = Option.is_some result.next_cursor
+      ; elapsed_ms = elapsed
+      ; metrics
+      }
   in
   samples := (name, metrics) :: !samples;
   Yojson.Safe.to_string json |> print_endline;
@@ -207,7 +217,7 @@ let seed support unrelated =
         [ datom e "block/uuid" (Uuid (G.Uuid.to_string (journal_uuid n)))
         ; datom e "block/name" (String (Printf.sprintf "audit journal %d" n))
         ; datom e "block/title" (String (Printf.sprintf "Audit journal %d" n))
-        ; datom e "block/journal-day" (Int (date n))
+        ; datom e "block/journal-day" (Int64 (Int64.of_int (date n)))
         ; datom e "block/tags" (Ref tag)
         ]
         @ List.init 20 (fun p ->
@@ -231,8 +241,8 @@ let seed support unrelated =
       |> List.concat
     in
     let invalid =
-      [ datom 900000 "block/journal-day" (Int 20260902)
-      ; datom 900001 "block/journal-day" (Int 20260902)
+      [ datom 900000 "block/journal-day" (Int64 20260902L)
+      ; datom 900001 "block/journal-day" (Int64 20260902L)
       ; datom 900001 "block/uuid" (Uuid "85000000-0000-4000-8000-000000000001")
       ; datom 900001 "block/name" (String "built in journal")
       ; datom 900001 "block/title" (String "Built in journal")

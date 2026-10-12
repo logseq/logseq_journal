@@ -11,6 +11,7 @@ depends: [
   "rrbvec" {= "dev"}
   "ocaml" {>= "5.5"}
   "dune" {= "3.23.1"}
+  "ppx_deriving_yojson" {>= "3.9.1"}
   "logseq_db_worker" {= "0.1.0"}
   "logseq_db_types" {= "0.1.0"}
   "logseq_sync" {= "0.1.0"}

@@ -2,6 +2,8 @@
  (name logseq_db_worker_contract)
  (public_name logseq_db_worker.contract)
  (modules config error protocol)
- (libraries logseq_db_types uri yojson)
+ (libraries logseq_db_types ppx_deriving_yojson.runtime uri yojson)
+ (preprocess
+  (pps ppx_deriving_yojson))
  (flags
   (:standard -open Logseq_db_types)))

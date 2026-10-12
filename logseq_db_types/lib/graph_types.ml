@@ -1,5 +1,5 @@
 module Uuid = struct
-  type t = string
+  type t = string [@@deriving yojson]
 
   let is_hex = function
     | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
@@ -27,10 +27,11 @@ module Uuid = struct
   let to_string value = value
   let equal = String.equal
   let compare = String.compare
+  let of_yojson json = Result.bind (of_yojson json) of_string
 end
 
 module Cursor = struct
-  type t = string
+  type t = string [@@deriving yojson]
 
   let of_string value =
     if String.length value = 0 || String.length value > 16_384
@@ -39,18 +40,20 @@ module Cursor = struct
   ;;
 
   let to_string value = value
+  let of_yojson json = Result.bind (of_yojson json) of_string
 end
 
-type block_uuid = Uuid.t
-type page_uuid = Uuid.t
-type class_uuid = Uuid.t
-type property_uuid = Uuid.t
-type qualified_ident = string
+type block_uuid = Uuid.t [@@deriving yojson]
+type page_uuid = Uuid.t [@@deriving yojson]
+type class_uuid = Uuid.t [@@deriving yojson]
+type property_uuid = Uuid.t [@@deriving yojson]
+type qualified_ident = string [@@deriving yojson]
 
 type schema_version =
   { major : int
   ; minor : int
   }
+[@@deriving yojson]
 
 type admission_fact =
   | Compatible_schema of
@@ -65,6 +68,7 @@ type admission_fact =
   | Synced_graph_identity of Uuid.t
   | Lossless_codec
   | Ownership_verified
+[@@deriving yojson]
 
 type page_kind =
   | Ordinary_page
@@ -73,6 +77,7 @@ type page_kind =
   | Property_page
   | Hidden_page
   | Built_in_page
+[@@deriving yojson]
 
 type page_kind_filter =
   | Any_page
@@ -112,10 +117,12 @@ type property_type =
   | String
   | Json
   | Raw_number
+[@@deriving yojson]
 
 type property_cardinality =
   | One
   | Many
+[@@deriving yojson]
 
 type internal_value =
   | Internal_null
@@ -126,6 +133,7 @@ type internal_value =
   | Internal_uuid of Uuid.t
   | Internal_list of internal_value list
   | Internal_map of (internal_value * internal_value) list
+[@@deriving yojson]
 
 type property_value =
   | Default_value of string
@@ -147,6 +155,7 @@ type property_value =
   | String_value of string
   | Json_value of string
   | Raw_number_value of string
+[@@deriving yojson]
 
 type property_schema =
   { property_type : property_type
@@ -154,6 +163,7 @@ type property_schema =
   ; hidden : bool
   ; public : bool
   }
+[@@deriving yojson]
 
 type property_summary =
   { ident : qualified_ident
@@ -163,6 +173,7 @@ type property_summary =
   ; values : property_value list
   ; values_truncated : bool
   }
+[@@deriving yojson]
 
 type block =
   { uuid : block_uuid
@@ -176,6 +187,7 @@ type block =
   ; tags : class_uuid list
   ; properties : property_summary list
   }
+[@@deriving yojson]
 
 type page =
   { uuid : page_uuid
@@ -188,6 +200,7 @@ type page =
   ; properties : property_summary list
   ; recycled : bool
   }
+[@@deriving yojson]
 
 type page_summary =
   { uuid : page_uuid
@@ -277,3 +290,10 @@ type reference_direction =
   | Referred_from
 
 let uuid_list_to_strings = List.map Uuid.to_string
+let block_uuid_of_yojson json = Json_codec.decode block_uuid_of_yojson json
+let page_uuid_of_yojson json = Json_codec.decode page_uuid_of_yojson json
+let schema_version_of_yojson json = Json_codec.decode schema_version_of_yojson json
+let admission_fact_of_yojson json = Json_codec.decode admission_fact_of_yojson json
+let page_kind_of_yojson json = Json_codec.decode page_kind_of_yojson json
+let block_of_yojson json = Json_codec.decode block_of_yojson json
+let page_of_yojson json = Json_codec.decode page_of_yojson json

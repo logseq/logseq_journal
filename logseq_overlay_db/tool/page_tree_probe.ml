@@ -75,6 +75,22 @@ let read snapshot page depth limit cursor =
   | T.Children_result _ -> failwith "unexpected children"
 ;;
 
+type measurement_report =
+  { name : string
+  ; depth : int
+  ; limit : int
+  ; items : int
+  ; has_more : bool
+  ; elapsed_ms : float
+  ; allocation_bytes : float
+  ; instrumented : bool
+  ; datom_calls : int option
+  ; datom_rows : int option
+  ; query_calls : int option
+  ; metrics : Yojson.Safe.t
+  }
+[@@deriving yojson]
+
 let measured name snapshot page depth limit cursor =
   A.reset ();
   let allocated = Gc.allocated_bytes () in
@@ -101,20 +117,20 @@ let measured name snapshot page depth limit cursor =
       (0, 0)
   in
   let json =
-    `Assoc
-      [ "name", `String name
-      ; "depth", `Int depth
-      ; "limit", `Int limit
-      ; "items", `Int (List.length items)
-      ; "has_more", `Bool (Option.is_some next)
-      ; "elapsed_ms", `Float elapsed_ms
-      ; "allocation_bytes", `Float allocation_bytes
-      ; "instrumented", `Bool !instrumented
-      ; ("datom_calls", if !instrumented then `Int datom_calls else `Null)
-      ; ("datom_rows", if !instrumented then `Int datom_rows else `Null)
-      ; ("query_calls", if !instrumented then `Int (calls "query") else `Null)
-      ; "metrics", metrics
-      ]
+    measurement_report_to_yojson
+      { name
+      ; depth
+      ; limit
+      ; items = List.length items
+      ; has_more = Option.is_some next
+      ; elapsed_ms
+      ; allocation_bytes
+      ; instrumented = !instrumented
+      ; datom_calls = (if !instrumented then Some datom_calls else None)
+      ; datom_rows = (if !instrumented then Some datom_rows else None)
+      ; query_calls = (if !instrumented then Some (calls "query") else None)
+      ; metrics
+      }
   in
   print_endline (Yojson.Safe.to_string json);
   flush stdout;
@@ -339,6 +355,7 @@ let audit_local support graph_id =
          ~expected
          (T.Insert_blocks
             { mutation_id = Fixture_generator.mutation_uuid 9901
+            ; asset = None
             ; parent = local_page
             ; tree =
                 { uuid = root

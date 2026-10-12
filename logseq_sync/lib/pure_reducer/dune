@@ -3,4 +3,6 @@
  (public_name logseq_sync.pure_reducer.impl)
  (implements logseq_sync_pure_reducer)
  (modules core sync_protocol asset_transfer)
- (libraries logseq_db_types logseq_overlay_db uri yojson))
+ (libraries logseq_db_types logseq_overlay_db ppx_deriving_yojson.runtime uri yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))

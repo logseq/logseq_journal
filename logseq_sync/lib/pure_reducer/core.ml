@@ -1,8 +1,23 @@
 module Overlay = Logseq_overlay_db.Types
 module Server_cursor = Overlay.Server_cursor
 
-type graph_id = Logseq_db_types.Graph_types.Uuid.t
-type graph = Logseq_db_types.Managed_graph.t
+type graph_id = Logseq_db_types.Graph_types.Uuid.t [@@deriving yojson]
+
+type cache_schema = Logseq_db_types.Managed_graph.schema =
+  { major : int
+  ; minor : int
+  ; exact : bool
+  }
+[@@deriving yojson]
+
+type graph = Logseq_db_types.Managed_graph.t =
+  { graph_id : graph_id
+  ; name : string
+  ; schema : cache_schema
+  ; encrypted : bool
+  }
+[@@deriving yojson]
+
 type account_generation = int
 type graph_generation = int
 type connection_generation = int
@@ -170,6 +185,7 @@ type catalog_cache =
   ; cache_graphs : graph list
   ; cache_selected_graph : graph_id option
   }
+[@@deriving yojson]
 
 let graph_key_handle ~id ~scope = { handle_id = id; handle_scope = scope }
 let graph_key_handle_id handle = handle.handle_id
@@ -217,70 +233,36 @@ let catalog_cache ~user_id ~graphs ~selected_graph =
 let catalog_cache_user_id cache = cache.cache_user_id
 let catalog_cache_graphs cache = cache.cache_graphs
 let catalog_cache_selected_graph cache = cache.cache_selected_graph
-
-let graph_to_json (graph : graph) =
-  `Assoc
-    [ "graphId", `String (Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id)
-    ; "name", `String graph.name
-    ; ( "schema"
-      , `Assoc
-          [ "major", `Int graph.schema.major
-          ; "minor", `Int graph.schema.minor
-          ; "exact", `Bool graph.schema.exact
-          ] )
-    ; "encrypted", `Bool graph.encrypted
-    ]
-;;
-
-let encode_catalog_cache cache =
-  `Assoc
-    [ "userId", `String cache.cache_user_id
-    ; "graphs", `List (List.map graph_to_json cache.cache_graphs)
-    ; ( "selectedGraph"
-      , Option.fold
-          ~none:`Null
-          ~some:(fun id -> `String (Logseq_db_types.Graph_types.Uuid.to_string id))
-          cache.cache_selected_graph )
-    ]
-  |> Yojson.Safe.to_string
-;;
+let encode_catalog_cache cache = catalog_cache_to_yojson cache |> Yojson.Safe.to_string
 
 let decode_catalog_cache source =
-  let open Yojson.Safe.Util in
+  let bounded_text value =
+    String.length value > 0
+    && String.length value <= 512
+    && String.is_valid_utf_8 value
+    && not (String.contains value '\000')
+  in
   try
-    let json = Yojson.Safe.from_string source in
-    let graph_of_json value =
-      let schema = value |> member "schema" in
-      Logseq_db_types.Managed_graph.
-        { graph_id =
-            value
-            |> member "graphId"
-            |> to_string
-            |> Logseq_db_types.Graph_types.Uuid.of_string
-            |> Result.get_ok
-        ; name = value |> member "name" |> to_string
-        ; schema =
-            { major = schema |> member "major" |> to_int
-            ; minor = schema |> member "minor" |> to_int
-            ; exact = schema |> member "exact" |> to_bool
-            }
-        ; encrypted = value |> member "encrypted" |> to_bool
-        }
-    in
-    let selected_graph =
-      match json |> member "selectedGraph" with
-      | `String value ->
-        Logseq_db_types.Graph_types.Uuid.of_string value |> Result.to_option
-      | `Null | _ -> None
-    in
-    Ok
-      { cache_user_id = json |> member "userId" |> to_string
-      ; cache_graphs = json |> member "graphs" |> to_list |> List.map graph_of_json
-      ; cache_selected_graph = selected_graph
-      }
+    match
+      Logseq_db_types.Json_codec.decode
+        catalog_cache_of_yojson
+        (Yojson.Safe.from_string source)
+    with
+    | Error _ -> Error "unsupported or invalid catalog cache format"
+    | Ok cache ->
+      if
+        (not (bounded_text cache.cache_user_id))
+        || List.exists
+             (fun (graph : graph) ->
+                (not (bounded_text graph.name))
+                || graph.schema.major < 0
+                || graph.schema.minor < 0)
+             cache.cache_graphs
+      then Error "catalog cache contains invalid domain values"
+      else Ok cache
   with
-  | Yojson.Json_error message | Type_error (message, _) | Invalid_argument message ->
-    Error message
+  | Yojson.Json_error _ | Failure _ | Invalid_argument _ ->
+    Error "unsupported or invalid catalog cache format"
 ;;
 
 type encryption_batch =
@@ -997,18 +979,25 @@ let decode_snapshot_baseline source =
   |> Result.map_error Sync_protocol.error_to_string
 ;;
 
+type snapshot_uri_response =
+  { ok : bool
+  ; url : string
+  }
+[@@deriving yojson { strict = false }]
+
 let decode_snapshot_uri source =
   try
-    match Yojson.Safe.from_string source with
-    | `Assoc fields ->
-      (match List.assoc_opt "ok" fields, List.assoc_opt "url" fields with
-       | Some (`Bool true), Some (`String value) ->
-         let uri = Uri.of_string value in
-         (match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
-          | Some "https", Some host, None, None when String.length host > 0 -> Ok uri
-          | _ -> Error "snapshot download URL is invalid")
-       | _ -> Error "snapshot metadata is invalid")
-    | _ -> Error "snapshot metadata must be an object"
+    match
+      Logseq_db_types.Json_codec.decode
+        snapshot_uri_response_of_yojson
+        (Yojson.Safe.from_string source)
+    with
+    | Ok { ok = true; url } ->
+      let uri = Uri.of_string url in
+      (match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
+       | Some "https", Some host, None, None when String.length host > 0 -> Ok uri
+       | _ -> Error "snapshot download URL is invalid")
+    | Ok _ | Error _ -> Error "snapshot metadata is invalid"
   with
   | Yojson.Json_error _ -> Error "snapshot metadata is not valid JSON"
 ;;

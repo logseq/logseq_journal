@@ -9,6 +9,8 @@
    and test_id so [For_testing] can recover them like the old widget
    identity did. *)
 
+type toolbar_control_props = { mode : string; title : string } [@@deriving yojson]
+
 type label_content =
   { title : string
   ; icon : string option
@@ -1183,12 +1185,9 @@ module View = struct
       Journal_lui_native.mount
         ~key:item.item_key
         ~payload:
-          (Yojson.Safe.to_string
-             (`Assoc
-                 [ "mode", `String "toolbar-control"
-                 ; ( "title"
-                   , `String (Option.value item.content.control_label ~default:"Close") )
-                 ]))
+          (toolbar_control_props_to_yojson
+             { mode = "toolbar-control"; title = Option.value item.content.control_label ~default:"Close" }
+           |> Yojson.Safe.to_string)
         ~children:[ child ]
         Journal_lui_native.chrome_identifier
     ;;
@@ -1577,33 +1576,40 @@ module View = struct
       { section_key = key; header; footer; separator; rows }
     ;;
 
-    let context_menu_json (actions : Context_menu.t) =
-      `Assoc
-        [ ( "actions"
-          , `List
-              (List.map
-                 (fun (a : Context_menu.action) ->
-                    `Assoc
-                      [ "key", `String a.key
-                      ; "enabled", `Bool a.enabled
-                      ; ( "role"
-                        , `String
-                            (match a.role with
-                             | Normal -> "normal"
-                             | Destructive -> "destructive") )
-                      ; ( "symbol"
-                        , match a.symbol with
-                          | Some s -> `String s
-                          | None -> `Null )
-                      ; "title", `String a.title
-                      ])
-                 actions) )
-        ]
+    module Json = struct
+      type action = { key : string; enabled : bool; role : string; symbol : string option [@default None]; title : string }
+      [@@deriving yojson]
+      type menu = { actions : action list } [@@deriving yojson]
+      type row =
+        { row_type : string [@key "type"]; key : string; content_index : int; separator : string
+        ; test_id : string option [@default None]; context_menu : menu option [@default None]; expanded : bool option [@default None]; children : row list option [@default None] }
+      [@@deriving yojson]
+      type section =
+        { key : string; separator : string; header_index : int option [@default None]; footer_index : int option [@default None]; rows : row list }
+      [@@deriving yojson]
+      type target = { section : string; row_path : string list } [@@deriving yojson]
+      type scroll = { token : int64; target : target; anchor : string option [@default None]; animated : bool option [@default None] }
+      [@@deriving yojson]
+      type props =
+        { style : string; sections : section list; scroll_request : scroll option [@default None]
+        ; track_visible_range : bool; track_scroll_completion : bool }
+      [@@deriving yojson]
+      type row_event = { row : string; key : string } [@@deriving yojson]
+      type event =
+        { event_type : string [@key "type"]; first : int64 option [@default None]; last : int64 option [@default None]
+        ; token : int64 option [@default None]; outcome : string option [@default None]; key : string option [@default None]; expanded : bool option [@default None]
+        ; payload : string option [@default None] }
+      [@@deriving yojson]
+    end
+
+    let context_menu_wire (actions : Context_menu.t) : Json.menu =
+      { actions = List.map (fun (a : Context_menu.action) -> Json.
+          { key = a.key; enabled = a.enabled
+          ; role = (match a.role with Normal -> "normal" | Destructive -> "destructive")
+          ; symbol = a.symbol; title = a.title }) actions }
     ;;
 
-    (* Content elements (headers, rows, footers, disclosure labels) mount as
-     extension children in a deterministic order; the payload lists their
-     index so the host binds each child node to its list position. *)
+    (* Content indexes retain the native child ownership order. *)
     let build sections ~style ~scroll_request ~track_visible ~track_scroll =
       let contents = ref Rrbvec.empty in
       let next_content_index = ref 0 in
@@ -1613,91 +1619,47 @@ module View = struct
         contents := Rrbvec.push_back !contents element;
         index
       in
-      let rec row_json (row : row) =
+      let rec row_wire (row : row) : Json.row =
         let content_index = push row.content in
-        let base =
-          [ "key", `String row.key
-          ; "content_index", `Int content_index
-          ; "separator", `String (separator_name row.separator)
-          ]
+        let row_type, expanded, children = match row.kind with
+          | Row -> "row", None, None
+          | Disclosure { expanded; children } -> "disclosure", Some expanded, Some (List.map row_wire children)
         in
-        let base =
-          match row.test_id with
-          | Some id -> ("test_id", `String id) :: base
-          | None -> base
-        in
-        let base =
-          match row.context_menu with
-          | Some menu -> ("context_menu", context_menu_json menu) :: base
-          | None -> base
-        in
-        match row.kind with
-        | Row -> `Assoc (("type", `String "row") :: base)
-        | Disclosure { expanded; children } ->
-          `Assoc
-            (("type", `String "disclosure")
-             :: ("expanded", `Bool expanded)
-             :: ("children", `List (List.map row_json children))
-             :: base)
+        { row_type; key = row.key; content_index; separator = separator_name row.separator
+        ; test_id = row.test_id; context_menu = Option.map context_menu_wire row.context_menu
+        ; expanded; children }
       in
-      let section_json (section : section) =
-        `Assoc
-          [ "key", `String section.section_key
-          ; "separator", `String (separator_name section.separator)
-          ; ( "header_index"
-            , match section.header with
-              | Some header -> `Int (push header)
-              | None -> `Null )
-          ; ( "footer_index"
-            , match section.footer with
-              | Some footer -> `Int (push footer)
-              | None -> `Null )
-          ; "rows", `List (List.map row_json section.rows)
-          ]
+      let section_wire (section : section) : Json.section =
+        let header_index = Option.map push section.header in
+        let footer_index = Option.map push section.footer in
+        { key = section.section_key; separator = separator_name section.separator
+        ; header_index; footer_index; rows = List.map row_wire section.rows }
       in
-      let payload =
-        `Assoc
-          [ "style", `String (style_name style)
-          ; "sections", `List (List.map section_json sections)
-          ; ( "scroll_request"
-            , match scroll_request with
-              | None -> `Null
-              | Some request ->
-                `Assoc
-                  [ "token", `String (Int64.to_string request.token)
-                  ; ( "target"
-                    , `Assoc
-                        [ "section", `String request.target.section
-                        ; ( "row_path"
-                          , `List
-                              (List.map (fun key -> `String key) request.target.row_path)
-                          )
-                        ] )
-                  ; ( "anchor"
-                    , match request.anchor with
-                      | Some Top -> `String "top"
-                      | Some Center -> `String "center"
-                      | Some Bottom -> `String "bottom"
-                      | None -> `Null )
-                  ; ( "animated"
-                    , match request.animated with
-                      | Some value -> `Bool value
-                      | None -> `Null )
-                  ] )
-          ; "track_visible_range", `Bool track_visible
-          ; "track_scroll_completion", `Bool track_scroll
-          ]
+      let scroll_wire (request : scroll_request) : Json.scroll =
+        { token = request.token
+        ; target = { section = request.target.section; row_path = request.target.row_path }
+        ; anchor = Option.map (function Top -> "top" | Center -> "center" | Bottom -> "bottom") request.anchor
+        ; animated = request.animated }
       in
-      Yojson.Basic.to_string payload, Rrbvec.to_list !contents
+      let wire : Json.props =
+        { style = style_name style; sections = List.map section_wire sections
+        ; scroll_request = Option.map scroll_wire scroll_request
+        ; track_visible_range = track_visible; track_scroll_completion = track_scroll }
+      in
+      Json.props_to_yojson wire |> Yojson.Safe.to_string, Rrbvec.to_list !contents
     ;;
 
     let decode_outcome = function
-      | `String "succeeded" -> Event.Payload.Succeeded
-      | `String "missing_target" -> Missing_target
-      | `String "cancelled" -> Cancelled
-      | `String "superseded" -> Superseded
-      | `String "positioning_failed" -> Positioning_failed
-      | _ -> Positioning_failed
+      | "succeeded" -> Some Event.Payload.Succeeded
+      | "missing_target" -> Some Missing_target
+      | "cancelled" -> Some Cancelled
+      | "superseded" -> Some Superseded
+      | "positioning_failed" -> Some Positioning_failed
+      | _ -> None
+    ;;
+
+    let read_json decoder payload =
+      try Logseq_db_types.Json_codec.decode decoder (Yojson.Safe.from_string payload) with Yojson.Json_error _ -> Error "invalid native list event"
     ;;
 
     let vertical
@@ -1746,76 +1708,38 @@ module View = struct
       in
       List.iter (fun section -> List.iter register section.rows) sections;
       let dispatch_row payload =
-        match
-          try Yojson.Basic.from_string payload with
-          | _ -> `Null
-        with
-        | `Assoc fields ->
-          (match List.assoc_opt "row" fields, List.assoc_opt "key" fields with
-           | Some (`String row), Some (`String key) ->
-             Option.iter
-               (fun handler -> invoke handler Event.Payload.Unit)
-               (Hashtbl.find_opt row_actions (row, key))
-           | _ -> ())
-        | _ -> ()
+        match read_json Json.row_event_of_yojson payload with
+        | Ok wire -> Option.iter (fun handler -> invoke handler Event.Payload.Unit)
+            (Hashtbl.find_opt row_actions (wire.row, wire.key))
+        | Error _ -> ()
       in
       let on_event (event : Journal_lui_native.event) =
-        match
-          try Yojson.Basic.from_string event.payload with
-          | _ -> `Null
-        with
-        | `Assoc fields ->
-          (match List.assoc_opt "type" fields with
-           | Some (`String "visible_range") ->
-             Option.iter
-               (fun handler ->
-                  let get_int64 name =
-                    match List.assoc_opt name fields with
-                    | Some (`Int v) -> Int64.of_int v
-                    | Some (`String s) -> Int64.of_string s
-                    | _ -> 0L
-                  in
-                  invoke
-                    handler
-                    (Event.Payload.Visible_range
-                       { first_index = get_int64 "first"
-                       ; last_exclusive = get_int64 "last"
-                       }))
-               on_visible_range
-           | Some (`String "scroll_completed") ->
-             Option.iter
-               (fun handler ->
-                  let token =
-                    match List.assoc_opt "token" fields with
-                    | Some (`Int v) -> Int64.of_int v
-                    | Some (`String s) -> Int64.of_string s
-                    | _ -> 0L
-                  in
-                  let outcome =
-                    match List.assoc_opt "outcome" fields with
-                    | Some json -> decode_outcome json
-                    | None -> Event.Payload.Positioning_failed
-                  in
-                  invoke handler (Event.Payload.Native_list_completion { token; outcome }))
-               on_scroll_completed
-           | Some (`String "expanded") ->
-             (match List.assoc_opt "key" fields, List.assoc_opt "expanded" fields with
-              | Some (`String key), Some (`Bool expanded) ->
-                List.iter
-                  (fun (row_key, handler) ->
-                     if String.equal row_key key
-                     then
-                       Option.iter
-                         (fun handler -> invoke handler (Event.Payload.Bool expanded))
-                         handler)
-                  expanded_handlers
-              | _ -> ())
-           | Some (`String "row_event") ->
-             (match List.assoc_opt "payload" fields with
-              | Some (`String payload) -> dispatch_row payload
-              | _ -> ())
-           | _ -> ())
-        | _ -> ()
+        match read_json Json.event_of_yojson event.payload with
+        | Error _ -> ()
+        | Ok wire ->
+          match wire.event_type with
+          | "visible_range" ->
+            (match wire.first, wire.last with
+             | Some first_index, Some last_exclusive
+               when first_index >= 0L && last_exclusive >= first_index ->
+               Option.iter (fun handler -> invoke handler
+                 (Event.Payload.Visible_range { first_index; last_exclusive })) on_visible_range
+             | _ -> ())
+          | "scroll_completed" ->
+            (match wire.token, Option.bind wire.outcome decode_outcome with
+             | Some token, Some outcome when token >= 0L ->
+               Option.iter (fun handler -> invoke handler
+                 (Event.Payload.Native_list_completion { token; outcome })) on_scroll_completed
+             | _ -> ())
+          | "expanded" ->
+            (match wire.key, wire.expanded with
+             | Some key, Some expanded -> List.iter
+                 (fun (row_key, handler) -> if String.equal row_key key then
+                   Option.iter (fun handler -> invoke handler (Event.Payload.Bool expanded)) handler)
+                 expanded_handlers
+             | _ -> ())
+          | "row_event" -> Option.iter dispatch_row wire.payload
+          | _ -> ()
       in
       element ?key (fun context parent ->
         Journal_lui_native.mount

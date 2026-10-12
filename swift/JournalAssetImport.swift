@@ -29,11 +29,25 @@ private actor JournalAssetStaging {
 }
 
 @MainActor enum JournalAssetImport {
-  struct Request: Decodable, Equatable {
+  struct Request: Codable, Equatable {
     let id: Int
     let source: String?
     let staged: Bool?
     let maxSelections: Int?
+  }
+
+  struct Pick: Codable {
+    let operation: String; let asset: String; let localMutation: String; let metadataMutation: String
+    let path: String; let title: String; let type: String; let sourceIdentity: String?
+  }
+  struct Event: Codable {
+    let action: String
+    var selection: Pick? = nil
+    var items: [Pick]? = nil
+    var request: Request? = nil
+    var error: String? = nil
+    var reason: String? = nil
+    var token: String? = nil
   }
 
   struct PendingItem: Decodable, Identifiable {
@@ -140,8 +154,8 @@ private actor JournalAssetStaging {
 
     private var request: Request? { properties?.request }
 
-    private func emit(_ object: [String: Any]) -> Bool {
-      guard let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
+    private func emit(_ event: Event) -> Bool {
+      guard let data = try? JSONEncoder().encode(event) else { return false }
       return JournalExtensions.emit(context: context, payload: data)
     }
 
@@ -153,36 +167,29 @@ private actor JournalAssetStaging {
     private func emitDismissed() {
       guard !handled else { return }
       handled = true
-      _ = emit(["action": "dismissed", "request": armedRequest?.id ?? 0])
+      _ = emit(Event(action: "dismissed", request: armedRequest))
     }
 
     private func emitUnavailable(_ reason: String, request: Request) {
       handled = true
-      _ = emit(["action": "unavailable", "reason": reason, "request": request.id])
+      _ = emit(Event(action: "unavailable", request: request, reason: reason))
     }
 
-    private func requestPayload(_ request: Request) -> [String: Any] {
-      ["id": request.id, "source": request.source ?? "files", "staged": request.staged ?? false]
+    private func pick(path: String, title: String, type: String, identity: String) -> Pick {
+      Pick(operation: UUID().uuidString.lowercased(), asset: UUID().uuidString.lowercased(),
+        localMutation: UUID().uuidString.lowercased(), metadataMutation: UUID().uuidString.lowercased(),
+        path: path, title: title, type: type.isEmpty ? "bin" : type, sourceIdentity: identity)
     }
 
-    private func pick(path: String, title: String, type: String, identity: String) -> [String: Any] {
-      ["operation": UUID().uuidString.lowercased(), "asset": UUID().uuidString.lowercased(),
-       "localMutation": UUID().uuidString.lowercased(), "metadataMutation": UUID().uuidString.lowercased(),
-       "path": path, "title": title, "type": type.isEmpty ? "bin" : type, "sourceIdentity": identity]
+    private func discard(_ items: [Pick]) {
+      for item in items { try? FileManager.default.removeItem(atPath: item.path) }
     }
 
-    private func discard(_ items: [[String: Any]]) {
-      for item in items {
-        guard let path = item["path"] as? String else { continue }
-        try? FileManager.default.removeItem(atPath: path)
-      }
-    }
-
-    private func emitBatch(_ items: [[String: Any]], failures: Int, request: Request, epoch: Int) {
+    private func emitBatch(_ items: [Pick], failures: Int, request: Request, epoch: Int) {
       guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
       handled = true
-      var payload: [String: Any] = ["action": "picked-batch", "request": requestPayload(request), "items": items]
-      if failures > 0 { payload["error"] = "\(failures) selected item(s) could not be added. Your other attachments are kept." }
+      let payload = Event(action: "picked-batch", items: items, request: request,
+        error: failures > 0 ? "\(failures) selected item(s) could not be added. Your other attachments are kept." : nil)
       if !emit(payload) {
         discard(items)
         error = "The destination is no longer available. Select the files again."
@@ -194,15 +201,14 @@ private actor JournalAssetStaging {
       handled = true
       guard request.staged == true else {
         guard let source = sources.first else { return }
-        var item = pick(path: source.path(percentEncoded: false), title: source.lastPathComponent,
+        let item = pick(path: source.path(percentEncoded: false), title: source.lastPathComponent,
                         type: source.pathExtension.lowercased(), identity: "files:" + source.standardizedFileURL.absoluteString)
-        let operation = item["operation"] as! String
+        let operation = item.operation
         selection.retain(source, operation: operation)
-        item["request"] = requestPayload(request)
-        if !emit(item) { selection.release(); error = "The destination is no longer available. Select the file again." }
+        if !emit(Event(action: "picked", selection: item, request: request)) { selection.release(); error = "The destination is no longer available. Select the file again." }
         return
       }
-      var items: [[String: Any]] = []
+      var items: [Pick] = []
       var seen = Set((properties?.pending ?? []).compactMap(\.sourceIdentity))
       var failures = 0
       let remaining = max(0, request.maxSelections ?? sources.count)
@@ -221,13 +227,13 @@ private actor JournalAssetStaging {
       emitBatch(items, failures: failures, request: request, epoch: epoch)
     }
 
-    private func stageData(_ data: Data, ext: String, title: String, identity: String) async -> [String: Any]? {
+    private func stageData(_ data: Data, ext: String, title: String, identity: String) async -> Pick? {
       guard let dest = await JournalAssetStaging.shared.write(data, ext: ext) else { return nil }
       return pick(path: dest.path(percentEncoded: false), title: title, type: ext, identity: identity)
     }
 
     private func importPhotos(_ selected: [PhotosPickerItem], request: Request, epoch: Int) async {
-      var items: [[String: Any]] = []
+      var items: [Pick] = []
       var seen = Set((properties?.pending ?? []).compactMap(\.sourceIdentity))
       var failures = 0
       let remaining = max(0, request.maxSelections ?? selected.count)
@@ -281,7 +287,7 @@ private actor JournalAssetStaging {
           let epoch = self.epoch
           importTask?.cancel()
           importTask = Task {
-            let item: [String: Any]?
+            let item: Pick?
             if let data = image.jpegData(compressionQuality: 0.9) {
               item = await stageData(data, ext: "jpg", title: "camera.jpg", identity: "camera:" + UUID().uuidString.lowercased())
             } else { item = nil }

@@ -21,6 +21,8 @@ let emit path =
     ; "local-account", P.local_account_binding_request
     ; "timeline-presented", P.timeline_presented_request
     ; "copy-text", P.copy_text_request ~text:"Root\n  - 中文😀" |> Result.get_ok
+    ; "notice", P.show_notice_request ~token:Int64.max_int ~message:"Fixture" ~action_label:None ~duration_ms:5000
+    ; "cancel-notice", P.notice_cancel_request ~token:Int64.max_int
     ]
   in
   Yojson.Safe.to_file
@@ -79,6 +81,15 @@ let verify path =
     "foreground-resumed"
     (P.decode_network_lifecycle (packet "foreground-resumed"))
     (Ok (P.Foreground_resumed { generation = Int64.max_int }));
+  require "notice" (P.decode_notice_response ~token:Int64.max_int (packet "notice")) (Ok P.Notice_action);
+  require "environment" (P.decode_environment_event (packet "environment"))
+    (Ok Journal_environment.{ brightness = Dark; platform = "ios"; accessible_navigation = true; high_contrast = false });
+  (match Journal_startup.decode (packet "startup") with
+   | Error error -> failwith ("Swift startup rejected: " ^ Journal_startup.Error.to_string error)
+   | Ok config ->
+     if config.application_support_directory <> "/tmp/journal-native-fixture"
+        || config.response_budget_bytes <> 262144 || config.default_page_size <> 50
+     then failwith "Swift startup facts changed");
   print_endline
     "OCaml: all Swift responses/events accepted; stale token challenge rejected"
 ;;

@@ -73,8 +73,28 @@ bootstrap = "\n".join(subprocess.run(['dune', 'ocaml', 'top', target], cwd=root,
     capture_output=True, text=True, check=True).stdout for target in ['logseq_overlay_db/test', 'logseq_sync'])
 bootstrap = "\n".join(line for line in dict.fromkeys(bootstrap.splitlines())
                       if not (line.startswith('#load ') and '/native_backend/' in line))
+# Compile the same binary yojson PPX AST used by production. The toplevel
+# cannot interpret deriving attributes, and pretty-printing a generated AST
+# can lose compiler-only identifiers.
+preprocessors = sorted((root/'_build/default/.ppx').glob('*/ppx.exe'))
+ppx = next((path for path in preprocessors
+            if 'yojson' in subprocess.check_output([str(path), '-print-transformations'], text=True).splitlines()), None)
+if ppx is None:
+    raise SystemExit('Build a yojson PPX library before generating the native fixture')
+fixture_source = host/'generate_fixture.ml'
+subprocess.run([str(ppx), '--impl', str(root/'apple-tests/warm-start/generate_fixture.ml'),
+                '-dump-ast', '-o', str(fixture_source)], check=True)
+fixture_includes = []
+for line in bootstrap.splitlines():
+    if line.startswith('#directory '):
+        path = Path(json.loads(line[len('#directory '):-2]))
+        if not path.is_absolute():
+            path = root/path
+        fixture_includes.extend(['-I', str(path)])
+subprocess.run(['ocamlc', '-thread', *fixture_includes, '-c', fixture_source.name],
+               cwd=host, check=True)
 generator = host/'generate.ml'
-generator.write_text(bootstrap+'\n#use '+json.dumps(str(root/'apple-tests/warm-start/generate_fixture.ml'))+';;\n')
+generator.write_text(bootstrap+'\n#load '+json.dumps(str(fixture_source.with_suffix('.cmo')))+';;\n')
 
 sources = [root/'swift'/name for name in
            ['JournalE2EECrypto.swift', 'JournalPlatformWire.swift', 'JournalPlatformServices.swift',
@@ -86,8 +106,13 @@ for tracked in sources + [source]:
 lui_probe_host.stage(host, app_swift=source.read_text(),
                      bundle_id='org.logseq.journal.warm-start-probe',
                      display_name='Logseq Journal')
-# Preserve the repository's resolved dependency versions in the isolated host.
-shutil.copy2(root/'swift/Package.resolved', host/'swift/Package.resolved')
+# Reuse a resolution file when present; a Git worktree need not contain the
+# original checkout's untracked SwiftPM lock. The isolated host resolves its
+# dependencies against the explicitly supplied LUI package source.
+resolution = root/'swift/Package.resolved'
+if resolution.is_file():
+    shutil.copy2(resolution, host/'swift/Package.resolved')
+    record['swiftPackageResolution'] = hashlib.sha256(resolution.read_bytes()).hexdigest()
 
 for case in ['valid', 'missing']:
     support = host/('support-'+case)
@@ -101,6 +126,11 @@ app = lui_probe_host.build(host, platform=arguments.platform,
                            app_name='JournalWarmStartProbe.app',
                            native_object=artifact,
                            extra_env={'XCODE_XCCONFIG_FILE': str(debug_config)})
+
+host_resolution = host/'swift/Package.resolved'
+if host_resolution.is_file():
+    record['hostSwiftPackageResolution'] = hashlib.sha256(host_resolution.read_bytes()).hexdigest()
+(host/'results.json').write_text(json.dumps(record, indent=2)+'\n')
 
 if arguments.platform == 'ios-simulator':
     print('Install', app, 'in the org.logseq.journal.warm-start-probe container.', flush=True)

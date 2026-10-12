@@ -728,6 +728,31 @@ let delete_mirror inspection =
              Error (Types.Mirror_delete_failed (Printexc.to_string exn)))))
 ;;
 
+let read_terminal_receipts sqlite =
+  let rows = ref [] in
+  let rc =
+    Sqlite3.exec
+      sqlite
+      "SELECT batch_key, receipt FROM overlay_terminal_batch_receipts ORDER BY batch_key"
+      ~cb:(fun row _ -> rows := (Option.get row.(0), Option.get row.(1)) :: !rows)
+  in
+  if Sqlite3.Rc.is_success rc then Ok (List.rev !rows) else Error (Sqlite3.errmsg sqlite)
+;;
+
+let validate_receipts mutation_receipts terminal_receipts =
+  let rec validate decode = function
+    | [] -> Ok ()
+    | row :: rest -> Result.bind (decode row) (fun _ -> validate decode rest)
+  in
+  Result.bind
+    (validate
+       (Persistence_receipt_v1.decode_mutation
+          ~startup_generation
+          ~projection_revision:(projection_revision 0))
+       mutation_receipts)
+    (fun () -> validate Persistence_receipt_v1.decode_terminal_batch terminal_receipts)
+;;
+
 let collect_garbage inspection =
   match inspection.presence with
   | Types.Absent _ -> Error Types.Garbage_collection_stale
@@ -759,27 +784,19 @@ let collect_garbage inspection =
                with
                | Error message -> Error (Types.Garbage_collection_failed message)
                | Ok receipts ->
-                 let retained_terminal_batch_receipts =
-                   List.fold_left
-                     (fun count (_, source) ->
-                        try
-                          match Yojson.Safe.from_string source with
-                          | `Assoc fields
-                            when List.assoc_opt "receiptType" fields
-                                 = Some (`String "acceptedBatch") -> count + 1
-                          | _ -> count
-                        with
-                        | Yojson.Json_error _ -> count)
-                     0
-                     receipts
-                 in
-                 Ok
-                   { Types.mirror_generation = expected
-                   ; reclaimed_bytes = 0L
-                   ; retained_mutation_receipts =
-                       List.length receipts - retained_terminal_batch_receipts
-                   ; retained_terminal_batch_receipts
-                   })))
+                 (match read_terminal_receipts sqlite with
+                  | Error message -> Error (Types.Garbage_collection_failed message)
+                  | Ok terminal_receipts ->
+                    (match validate_receipts receipts terminal_receipts with
+                     | Error message -> Error (Types.Garbage_collection_failed message)
+                     | Ok () ->
+                       Ok
+                         { Types.mirror_generation = expected
+                         ; reclaimed_bytes = 0L
+                         ; retained_mutation_receipts = List.length receipts
+                         ; retained_terminal_batch_receipts =
+                             List.length terminal_receipts
+                         })))))
 ;;
 
 let page_kind_of_datoms database datoms =
@@ -1633,17 +1650,13 @@ let validate_durable_receipts path =
   Fun.protect
     ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
     (fun () ->
-       Result.bind
-         (Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
-         (fun () ->
-            Logseq_db_storage.Mutation_receipt_store.validate_database
-              sqlite
-              ~is_valid:(fun key source ->
-                Result.is_ok
-                  (Persistence_receipt_v1.decode_mutation
-                     ~startup_generation
-                     ~projection_revision:(projection_revision 0)
-                     (key, source)))))
+       let ( let* ) = Result.bind in
+       let* () = Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite in
+       let* mutation_receipts =
+         Logseq_db_storage.Mutation_receipt_store.read_database sqlite
+       in
+       let* terminal_receipts = read_terminal_receipts sqlite in
+       validate_receipts mutation_receipts terminal_receipts)
 ;;
 
 let read_durable_receipt path mutation_id =
@@ -9063,25 +9076,14 @@ type asset_frame =
   | Asset_attributes of Graph.Uuid.t * string * int
   | Asset_children of Graph.Uuid.t * int * int
   | Asset_local_children of Graph.Uuid.t * int * int
+[@@deriving yojson]
 
-let asset_frame_json = function
-  | Asset_reference uuid ->
-    `List [ `String "reference"; `String (Graph.Uuid.to_string uuid) ]
-  | Asset_node (uuid, depth) ->
-    `List [ `String "node"; `String (Graph.Uuid.to_string uuid); `Int depth ]
-  | Asset_attributes (uuid, attribute, after) ->
-    `List
-      [ `String "attributes"
-      ; `String (Graph.Uuid.to_string uuid)
-      ; `String attribute
-      ; `Int after
-      ]
-  | Asset_children (uuid, depth, after) ->
-    `List
-      [ `String "children"; `String (Graph.Uuid.to_string uuid); `Int depth; `Int after ]
-  | Asset_local_children (uuid, depth, after) ->
-    `List [ `String "local"; `String (Graph.Uuid.to_string uuid); `Int depth; `Int after ]
-;;
+type asset_cursor_wire =
+  { version : string
+  ; roots : string
+  ; frames : asset_frame list
+  }
+[@@deriving yojson]
 
 let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
   with_snapshot_read snapshot (fun snapshot ->
@@ -9096,25 +9098,17 @@ let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
       then invalid "Invalid asset query bounds";
       let version = state_digest snapshot.version
       and roots_key = state_digest (recursive, roots) in
-      let parse_uuid s =
-        match Graph.Uuid.of_string s with
-        | Ok u -> u
-        | Error _ -> invalid "Invalid asset cursor UUID"
-      in
-      let parse_frame = function
-        | `List [ `String "reference"; `String uuid ] -> Asset_reference (parse_uuid uuid)
-        | `List [ `String "node"; `String uuid; `Int depth ]
-          when depth >= 0 && depth <= 256 && (recursive || depth = 0) ->
-          Asset_node (parse_uuid uuid, depth)
-        | `List [ `String "attributes"; `String uuid; `String attribute; `Int after ]
-          when String.length attribute <= 1024 && after >= -1 && after < max_int ->
-          Asset_attributes (parse_uuid uuid, attribute, after)
-        | `List [ `String "children"; `String uuid; `Int depth; `Int after ]
+      let validate_frame = function
+        | Asset_reference _ as frame -> frame
+        | Asset_node (_, depth) as frame
+          when depth >= 0 && depth <= 256 && (recursive || depth = 0) -> frame
+        | Asset_attributes (_, attribute, after) as frame
+          when String.length attribute <= 1024 && after >= -1 && after < max_int -> frame
+        | Asset_children (_, depth, after) as frame
           when recursive && depth >= 0 && depth <= 256 && after >= 0 && after < max_int ->
-          Asset_children (parse_uuid uuid, depth, after)
-        | `List [ `String "local"; `String uuid; `Int depth; `Int after ]
-          when recursive && depth >= 0 && depth <= 256 && after >= 0 ->
-          Asset_local_children (parse_uuid uuid, depth, after)
+          frame
+        | Asset_local_children (_, depth, after) as frame
+          when recursive && depth >= 0 && depth <= 256 && after >= 0 -> frame
         | _ -> invalid "Invalid asset cursor frame"
       in
       let frames =
@@ -9127,18 +9121,14 @@ let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
             try Yojson.Safe.from_string source with
             | Yojson.Json_error _ -> invalid "Invalid asset cursor JSON"
           in
-          (match json with
-           | `List
-               [ `String "assets-v1"
-               ; `String actual_version
-               ; `String actual_roots
-               ; `List frames
-               ] ->
-             if actual_version <> version then raise (Read_error Types.Stale_read_cursor);
-             if actual_roots <> roots_key then invalid "Asset cursor roots changed";
-             if List.length frames > 1024 then invalid "Oversized asset cursor stack";
-             List.map parse_frame frames
-           | _ -> invalid "Invalid asset cursor")
+          (match Logseq_db_types.Json_codec.decode asset_cursor_wire_of_yojson json with
+           | Ok cursor ->
+             if cursor.version <> version then raise (Read_error Types.Stale_read_cursor);
+             if cursor.roots <> roots_key then invalid "Asset cursor roots changed";
+             if List.length cursor.frames > 1024
+             then invalid "Oversized asset cursor stack";
+             List.map validate_frame cursor.frames
+           | Error _ -> invalid "Unsupported or invalid asset cursor")
       in
       let database = Option.get snapshot.authoritative_database in
       let tree_cache =
@@ -9384,13 +9374,8 @@ let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
         | [] -> None
         | frames ->
           let source =
-            Yojson.Safe.to_string
-              (`List
-                  [ `String "assets-v1"
-                  ; `String version
-                  ; `String roots_key
-                  ; `List (List.map asset_frame_json frames)
-                  ])
+            asset_cursor_wire_to_yojson { version; roots = roots_key; frames }
+            |> Yojson.Safe.to_string
           in
           if String.length source > 16384
           then raise (Read_error Types.Read_limit_exceeded);

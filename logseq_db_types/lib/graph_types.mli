@@ -7,6 +7,10 @@ module Uuid : sig
   val to_string : t -> string
   val equal : t -> t -> bool
   val compare : t -> t -> int
+  val to_yojson : t -> Yojson.Safe.t
+
+  (** Decode with [of_string], including UUID validation and normalization. *)
+  val of_yojson : Yojson.Safe.t -> (t, string) result
 end
 
 module Cursor : sig
@@ -14,6 +18,10 @@ module Cursor : sig
 
   val of_string : string -> (t, string) result
   val to_string : t -> string
+  val to_yojson : t -> Yojson.Safe.t
+
+  (** Decode with [of_string], including the nonempty and length constraints. *)
+  val of_yojson : Yojson.Safe.t -> (t, string) result
 end
 
 type block_uuid = Uuid.t
@@ -252,3 +260,20 @@ type reference_direction =
   | Referred_from
 
 val uuid_list_to_strings : Uuid.t list -> string list
+
+(** Generated codecs used by the worker protocol. UUID fields use [Uuid.of_yojson]. *)
+val block_uuid_to_yojson : block_uuid -> Yojson.Safe.t
+
+val block_uuid_of_yojson : Yojson.Safe.t -> (block_uuid, string) result
+val page_uuid_to_yojson : page_uuid -> Yojson.Safe.t
+val page_uuid_of_yojson : Yojson.Safe.t -> (page_uuid, string) result
+val schema_version_to_yojson : schema_version -> Yojson.Safe.t
+val schema_version_of_yojson : Yojson.Safe.t -> (schema_version, string) result
+val admission_fact_to_yojson : admission_fact -> Yojson.Safe.t
+val admission_fact_of_yojson : Yojson.Safe.t -> (admission_fact, string) result
+val page_kind_to_yojson : page_kind -> Yojson.Safe.t
+val page_kind_of_yojson : Yojson.Safe.t -> (page_kind, string) result
+val block_to_yojson : block -> Yojson.Safe.t
+val block_of_yojson : Yojson.Safe.t -> (block, string) result
+val page_to_yojson : page -> Yojson.Safe.t
+val page_of_yojson : Yojson.Safe.t -> (page, string) result

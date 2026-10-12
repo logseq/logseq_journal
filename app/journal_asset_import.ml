@@ -48,50 +48,52 @@ let staged_title (staged : staged) = staged.title
 let staged_type (staged : staged) = staged.file_type
 let staged_source_identity (staged : staged) = staged.source_identity
 
+module Json = struct
+  type request = { id : int; source : string option [@default None]; staged : bool option [@default None]; maxSelections : int option [@default None] }
+  [@@deriving yojson]
+  type pick =
+    { operation : string; asset : string; localMutation : string; metadataMutation : string
+    ; path : string; title : string; file_type : string [@key "type"]; sourceIdentity : string option [@default None] }
+  [@@deriving yojson]
+  type event =
+    { action : string; selection : pick option [@default None]; items : pick list option [@default None]; request : request option [@default None]
+    ; error : string option [@default None]; reason : string option [@default None]; token : string option [@default None] }
+  [@@deriving yojson]
+  type pending =
+    { token : string; path : string; title : string; file_type : string [@key "type"]
+    ; sourceIdentity : string option [@default None] }
+  [@@deriving yojson]
+  type props =
+    { enabled : bool; completion : string option [@default None]; error : string option [@default None]
+    ; request : request; pending : pending list }
+  [@@deriving yojson]
+end
+
+let read_event payload =
+  try Logseq_db_types.Json_codec.decode Json.event_of_yojson (Yojson.Safe.from_string payload)
+  with Yojson.Json_error _ -> Error "Invalid attachment selection"
+;;
+
+let staged_of_pick (pick : Json.pick) =
+  let ( let* ) = Result.bind in
+  let uuid text = Result.map_error (fun _ -> "Invalid import identity") (Uuid.of_string text) in
+  let* operation = uuid pick.operation in
+  let* asset = uuid pick.asset in
+  let* local_mutation = uuid pick.localMutation in
+  let* metadata_mutation = uuid pick.metadataMutation in
+  Ok
+    { token = Uuid.to_string operation; operation; asset; local_mutation; metadata_mutation
+    ; source_file = pick.path; title = pick.title; file_type = pick.file_type
+    ; source_identity = pick.sourceIdentity }
+;;
+
 let parse payload =
   let ( let* ) = Result.bind in
-  try
-    let json = Yojson.Basic.from_string payload in
-    let field key =
-      match Yojson.Basic.Util.member key json with
-      | `String value -> Ok value
-      | _ -> Error "Invalid attachment selection"
-    in
-    let uuid key =
-      let* text = field key in
-      Result.map_error (fun _ -> "Invalid import identity") (Uuid.of_string text)
-    in
-    let* operation = uuid "operation" in
-    let* asset = uuid "asset" in
-    let* local_mutation = uuid "localMutation" in
-    let* metadata_mutation = uuid "metadataMutation" in
-    let* source_file = field "path" in
-    let* title = field "title" in
-    let* file_type = field "type" in
-    let request_id =
-      match Yojson.Basic.Util.member "request" json with
-      | `Assoc request_fields ->
-        (match List.assoc_opt "id" request_fields with
-         | Some (`Int id) -> Some id
-         | _ -> None)
-      | _ -> None
-    in
-    Ok
-      ( { token = Uuid.to_string operation
-        ; operation
-        ; asset
-        ; local_mutation
-        ; metadata_mutation
-        ; source_file
-        ; title
-        ; file_type
-        ; source_identity =
-            (match Yojson.Basic.Util.member "sourceIdentity" json with
-             | `String value -> Some value
-             | _ -> None)
-        }
-      , request_id )
-  with
+  let* wire = read_event payload in
+  match wire.action, wire.selection with
+  | "picked", Some selection ->
+    let* staged = staged_of_pick selection in
+    Ok (staged, Option.map (fun (request : Json.request) -> request.id) wire.request)
   | _ -> Error "Invalid attachment selection"
 ;;
 
@@ -134,56 +136,28 @@ type event =
   | Unavailable of string
 
 let decode_event payload =
-  match
-    try Yojson.Basic.from_string payload with
-    | _ -> `Null
-  with
-  | `Assoc fields ->
-    (match List.assoc_opt "action" fields with
-     | Some (`String "picked-batch") ->
-       let request_id =
-         match Yojson.Basic.Util.member "request" (`Assoc fields) with
-         | `Assoc request ->
-           (match List.assoc_opt "id" request with
-            | Some (`Int id) -> Some id
-            | _ -> None)
-         | _ -> None
+  let ( let* ) = Result.bind in
+  let* wire = read_event payload in
+  let request_id = Option.map (fun (request : Json.request) -> request.id) wire.request in
+  match wire.action with
+  | "picked" -> Result.map (fun (staged, id) -> Picked (staged, id)) (parse payload)
+  | "picked-batch" ->
+    (match wire.items with
+     | None -> Error "Invalid attachment batch"
+     | Some items ->
+       let rec decode reversed = function
+         | [] -> Ok (Picked_batch (List.rev reversed, request_id, wire.error))
+         | pick :: rest ->
+           let* staged = staged_of_pick pick in
+           decode (staged :: reversed) rest
        in
-       let error =
-         match List.assoc_opt "error" fields with
-         | Some (`String message) -> Some message
-         | _ -> None
-       in
-       (match List.assoc_opt "items" fields with
-        | Some (`List items) ->
-          let rec decode reversed = function
-            | [] -> Ok (Picked_batch (List.rev reversed, request_id, error))
-            | item :: rest ->
-              (match parse (Yojson.Basic.to_string item) with
-               | Ok (staged, _) -> decode (staged :: reversed) rest
-               | Error message -> Error message)
-          in
-          decode [] items
-        | _ -> Error "Invalid attachment batch")
-     | Some (`String "dismissed") ->
-       (match List.assoc_opt "request" fields with
-        | Some (`Int id) -> Ok (Picker_dismissed (Some id))
-        | _ -> Ok Dismissed)
-     | Some (`String "unavailable") ->
-       Ok
-         (Unavailable
-            (match List.assoc_opt "reason" fields with
-             | Some (`String reason) -> reason
-             | _ -> "This attachment source is not available."))
-     | Some (`String "remove") ->
-       (match List.assoc_opt "token" fields with
-        | Some (`String token) -> Ok (Removed token)
-        | _ -> Error "Invalid attachment selection")
-     | _ ->
-       Result.map
-         (fun (staged, request_id) -> Picked (staged, request_id))
-         (parse payload))
-  | _ -> Error "Invalid attachment selection"
+       decode [] items)
+  | "dismissed" -> Ok (match request_id with None -> Dismissed | Some _ -> Picker_dismissed request_id)
+  | "unavailable" ->
+    (match wire.reason with Some reason -> Ok (Unavailable reason) | None -> Error "Invalid attachment source")
+  | "remove" ->
+    (match wire.token with Some token -> Ok (Removed token) | None -> Error "Invalid attachment selection")
+  | _ -> Error "Invalid attachment action"
 ;;
 
 let extension =
@@ -191,7 +165,7 @@ let extension =
     ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2104)
     ~version:1
     ~capabilities:[ Stateful; Resource; Semantics ]
-    ~encode_props:(fun props -> Bytes.of_string (Yojson.Basic.to_string props))
+    ~encode_props:(fun props -> Json.props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
     ~decode_event:(fun ~event_id:_ bytes -> Ok (Bytes.to_string bytes))
     ()
 ;;
@@ -212,50 +186,16 @@ let is_dismissal payload =
 ;;
 
 let view ~key ~enabled ~completion ~request ~pending ~on_select body =
-  let operation, error =
-    match completion with
-    | None -> `Null, `Null
-    | Some (operation, error) ->
-      ( `String operation
-      , (match error with
-         | None -> `Null
-         | Some message -> `String message) )
+  let completion, error = match completion with None -> None, None | Some (operation, error) -> Some operation, error in
+  let wire_request : Json.request =
+    { id = request.id; source = Some (source_to_string request.source); staged = Some request.staged
+    ; maxSelections = request.max_selections }
   in
-  Ui.Native_widget.widget
-    extension
-    ~key
-    ~props:
-      (`Assoc
-          [ "enabled", `Bool enabled
-          ; "completion", operation
-          ; "error", error
-          ; ( "request"
-            , `Assoc
-                [ "id", `Int request.id
-                ; "source", `String (source_to_string request.source)
-                ; "staged", `Bool request.staged
-                ; ( "maxSelections"
-                  , match request.max_selections with
-                    | None -> `Null
-                    | Some count -> `Int count )
-                ] )
-          ; ( "pending"
-            , `List
-                (List.map
-                   (fun (item : staged) ->
-                      `Assoc
-                        [ "token", `String item.token
-                        ; "path", `String item.source_file
-                        ; "title", `String item.title
-                        ; "type", `String item.file_type
-                        ; ( "sourceIdentity"
-                          , match item.source_identity with
-                            | None -> `Null
-                            | Some identity -> `String identity )
-                        ])
-                   pending) )
-          ])
-    ~on_event:on_select
-    ~children:[ Ui.View.Body.Private.to_widget body ]
-    ()
+  Ui.Native_widget.widget extension ~key
+    ~props:Json.
+      { enabled; completion; error; request = wire_request
+      ; pending = List.map (fun (item : staged) ->
+          { token = item.token; path = item.source_file; title = item.title
+          ; file_type = item.file_type; sourceIdentity = item.source_identity }) pending }
+    ~on_event:on_select ~children:[ Ui.View.Body.Private.to_widget body ] ()
 ;;

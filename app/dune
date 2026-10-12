@@ -49,7 +49,10 @@
   logseq_db_worker.lui
   threads
   unix
+  ppx_deriving_yojson.runtime
   yojson)
+ (preprocess
+  (pps ppx_deriving_yojson))
  (foreign_stubs
   (language c)
   (names journal_lui_bridge)))

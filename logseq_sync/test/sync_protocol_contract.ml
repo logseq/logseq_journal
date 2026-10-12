@@ -371,6 +371,15 @@ let test_cursor_wire_range () =
          true
          (Result.is_error (Protocol.decode_client_message client)))
     [ "-1"; "9007199254740992"; "9223372036854775808"; "1.5"; "null"; "\"9\"" ];
+  List.iter
+    (fun wire ->
+       Alcotest.(check bool)
+         "snapshot baseline rejects duplicated generated-decoder fields"
+         true
+         (Result.is_error (Protocol.decode_snapshot_baseline wire)))
+    [ {|{"type":"pull/ok","t":0,"t":9007199254740992}|}
+    ; {|{"type":"ping","type":"pull/ok","t":0}|}
+    ];
   Alcotest.(check bool)
     "outbound client rejects unsafe cursor"
     true

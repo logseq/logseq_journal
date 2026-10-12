@@ -16,6 +16,8 @@ import UIKit
     let title: String?
   }
 
+  private struct Event: Encodable { let type: String }
+
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
     @State private var opened = false
@@ -30,7 +32,9 @@ import UIKit
     }
 
     private func dismissed() {
-      JournalExtensions.emit(context: context, payload: Data("{\"type\":\"dismiss\"}".utf8))
+      if let data = try? JSONEncoder().encode(Event(type: "dismiss")) {
+        JournalExtensions.emit(context: context, payload: data)
+      }
     }
 
     var body: some SwiftUI.View {

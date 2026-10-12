@@ -8,7 +8,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from audit_journal_pagination import INSTRUMENTATION, ROOT, run
+from audit_journal_pagination import INSTRUMENTATION, ROOT, run, probe_ppx_flags
 
 
 def main():
@@ -71,7 +71,7 @@ let metrics : (string, int * int) Hashtbl.t = Hashtbl.create 0
     includes = {str(pathlib.Path(x).parent) for x in libraries}
     includes.update(str(p) for pattern in ('**/.*.objs/byte', '**/.*.objs/native')
                     for p in (source / '_build/default').glob(pattern))
-    compiler = [command[0], '-thread', '-O3']
+    compiler = [command[0], '-thread', '-O3'] + probe_ppx_flags()
     for path in sorted(includes):
         compiler += ['-I', path]
     probe = output / 'page_tree_probe.ml'

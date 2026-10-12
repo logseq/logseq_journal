@@ -156,6 +156,14 @@ module Asset_cache = struct
     | Stale
     | Checksum_mismatch
 
+  type manifest =
+    { asset : Uuid.t
+    ; file_type : string
+    ; checksum : string
+    ; size : int64
+    }
+  [@@deriving yojson]
+
   type record =
     { name : string
     ; file_type : string
@@ -274,54 +282,45 @@ module Asset_cache = struct
   ;;
 
   let read_manifest directory file =
+    let path = Filename.concat directory file in
+    let invalid () = Error (Invalid "Unsupported or invalid asset cache manifest") in
     try
-      let path = Filename.concat directory file in
       if (Unix.stat path).st_size > 1024
-      then None
+      then invalid ()
       else (
-        match Yojson.Safe.from_file path with
-        | `Assoc fields ->
+        match
+          Logseq_db_types.Json_codec.decode
+            manifest_of_yojson
+            (Yojson.Safe.from_file path)
+        with
+        | Error _ -> invalid ()
+        | Ok manifest ->
           (match
-             ( List.assoc_opt "asset" fields
-             , List.assoc_opt "type" fields
-             , List.assoc_opt "checksum" fields
-             , List.assoc_opt "size" fields )
+             Asset.version ~checksum:manifest.checksum ~file_type:manifest.file_type
            with
-           | ( Some (`String asset)
-             , Some (`String file_type)
-             , Some (`String checksum)
-             , Some (`String size) ) ->
-             (match
-                ( Uuid.of_string asset
-                , Asset.version ~checksum ~file_type
-                , Int64.of_string_opt size )
-              with
-              | Ok asset, Ok version, Some size
-                when size >= 0L && name asset version ^ ".json" = file ->
-                let name = name asset version in
-                Some
-                  { name
-                  ; file_type = version.file_type
-                  ; checksum
-                  ; size
-                  ; touched = (Unix.stat path).st_mtime
-                  ; pins = 0
-                  }
-              | _ -> None)
-           | _ -> None)
-        | _ -> None)
+           | Ok version
+             when manifest.size >= 0L && name manifest.asset version ^ ".json" = file ->
+             Ok
+               { name = name manifest.asset version
+               ; file_type = version.file_type
+               ; checksum = version.checksum
+               ; size = manifest.size
+               ; touched = (Unix.stat path).st_mtime
+               ; pins = 0
+               }
+           | Ok _ | Error _ -> invalid ()))
     with
-    | Sys_error _ | Unix.Unix_error _ | Yojson.Json_error _ -> None
+    | Yojson.Json_error _ | Failure _ | Invalid_argument _ -> invalid ()
   ;;
+
+  type account_identity = string * string [@@deriving to_yojson]
 
   let account_directory ~root (account : Core.account_scope) =
     let name =
       Asset_codec.checksum
-        (Yojson.Safe.to_string
-           (`List
-               [ `String (Uri.to_string account.managed_sync_origin)
-               ; `String account.user_id
-               ]))
+        (account_identity_to_yojson
+           (Uri.to_string account.managed_sync_origin, account.user_id)
+         |> Yojson.Safe.to_string)
     in
     Filename.concat root name
   ;;
@@ -340,6 +339,16 @@ module Asset_cache = struct
             (Uuid.to_string scope.graph_id)
         in
         mkdir directory;
+        (* Validate all persisted JSON before cleaning anything. Unsupported
+           internal formats require an explicit caller-visible failure. *)
+        let rec load_manifests records = function
+          | [] -> Ok (List.rev records)
+          | file :: rest when Filename.check_suffix file ".json" ->
+            let* record = read_manifest directory file in
+            load_manifests ((file, record) :: records) rest
+          | _ :: rest -> load_manifests records rest
+        in
+        let* manifests = load_manifests [] (Array.to_list (Sys.readdir directory)) in
         let pending = Filename.concat directory "pending" in
         if Sys.file_exists pending
         then
@@ -359,17 +368,17 @@ module Asset_cache = struct
           ; closed = false
           }
         in
+        List.iter
+          (fun (file, (record : record)) ->
+             if
+               record.size <= Int64.of_int maximum_file_bytes
+               && Sys.file_exists (data_path t record)
+             then Hashtbl.replace t.records record.name record
+             else unlink (Filename.concat directory file))
+          manifests;
         Array.iter
           (fun file ->
-             if Filename.check_suffix file ".json"
-             then (
-               match read_manifest directory file with
-               | Some record
-                 when record.size <= Int64.of_int maximum_file_bytes
-                      && Sys.file_exists (data_path t record) ->
-                 Hashtbl.replace t.records record.name record
-               | _ -> unlink (Filename.concat directory file))
-             else if Filename.check_suffix file ".part"
+             if Filename.check_suffix file ".part"
              then unlink (Filename.concat directory file))
           (Sys.readdir directory);
         let kept = Hashtbl.create (2 * Hashtbl.length t.records) in
@@ -475,13 +484,13 @@ module Asset_cache = struct
                  write temporary plaintext;
                  write
                    temporary_manifest
-                   (Yojson.Safe.to_string
-                      (`Assoc
-                          [ "asset", `String (Uuid.to_string asset)
-                          ; "type", `String version.file_type
-                          ; "checksum", `String version.checksum
-                          ; "size", `String (Int64.to_string size)
-                          ]));
+                   (manifest_to_yojson
+                      { asset
+                      ; file_type = version.file_type
+                      ; checksum = version.checksum
+                      ; size
+                      }
+                    |> Yojson.Safe.to_string);
                  if t.closed || not (current ())
                  then Error Stale
                  else (

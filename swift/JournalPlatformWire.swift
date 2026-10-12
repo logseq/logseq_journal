@@ -24,6 +24,19 @@ enum JournalPlatformWire {
   }
   enum Lifecycle: UInt16 { case backgrounded = 1, foregroundResumed = 2 }
 
+  private struct Account: Codable { let userId: String?; let managedSyncOrigin: String? }
+  private struct User: Codable { let userId: String? }
+  private struct Challenge: Codable { let challengeId: String }
+  private struct Token: Codable { let challengeId: String; let token: String }
+  private struct SignedOut: Codable { let signedOut: Bool }
+  private struct Ready: Codable { let ready: Bool }
+  private struct Presented: Codable { let presented: Bool }
+  private struct Notice: Codable { let token: Int64; let message: String; let actionLabel: String?; let durationMs: Int }
+  private struct NoticeResponse: Codable { let token: Int64; let result: String }
+  private struct Cancel: Codable { let token: Int64 }
+  private struct Text: Codable { let text: String }
+  private struct Copied: Codable { let copied: Bool }
+
   private static let headerSize = 32
   private static let maximumPayload = 256 * 1024
 
@@ -51,36 +64,17 @@ enum JournalPlatformWire {
       default: return .timelinePresented
       }
     case 8:
-      let fields = try object(payload)
-      guard fields.count == 1, let challenge = fields["challengeId"] as? String else {
-        throw Failure.invalidPacket
-      }
-      return .idToken(challengeID: challenge)
+      let value = try decode(Challenge.self, payload)
+      return .idToken(challengeID: value.challengeId)
     case 25:
-      let fields = try object(payload)
-      guard let token = fields["token"] as? String,
-        let message = fields["message"] as? String,
-        let durationMs = fields["durationMs"] as? Int, durationMs > 0
-      else { throw Failure.invalidPacket }
-      let actionLabel = fields["actionLabel"] as? String
-      guard actionLabel?.isEmpty == false || fields["actionLabel"] is NSNull
-        || fields["actionLabel"] == nil
-      else { throw Failure.invalidPacket }
-      return .showNotice(
-        token: token, message: message, actionLabel: actionLabel,
-        durationMs: durationMs)
+      let value = try decode(Notice.self, payload)
+      guard value.durationMs > 0, value.actionLabel?.isEmpty != true else { throw Failure.invalidPacket }
+      return .showNotice(token: String(value.token), message: value.message,
+        actionLabel: value.actionLabel, durationMs: value.durationMs)
     case 28:
-      let fields = try object(payload)
-      guard fields.count == 1, let text = fields["text"] as? String else {
-        throw Failure.invalidPacket
-      }
-      return .copyText(text)
+      return .copyText(try decode(Text.self, payload).text)
     case 27:
-      let fields = try object(payload)
-      guard let token = fields["token"] as? String else {
-        throw Failure.invalidPacket
-      }
-      return .cancelNotice(token: token)
+      return .cancelNotice(token: String(try decode(Cancel.self, payload).token))
     default:
       throw Failure.invalidPacket
     }
@@ -90,35 +84,36 @@ enum JournalPlatformWire {
     switch response {
     case .authenticatedUser(let user):
       if let user { try validate(user, maximum: 512) }
-      return try json(tag: 7, ["userId": user as Any? ?? NSNull()])
+      return try json(tag: 7, User(userId: user))
     case .idToken(let challenge, let token):
       try validate(token, maximum: maximumPayload)
-      return try json(tag: 9, ["challengeId": challenge, "token": token])
+      return try json(tag: 9, Token(challengeId: challenge, token: token))
     case .signedOut:
-      return try json(tag: 11, ["signedOut": true])
+      return try json(tag: 11, SignedOut(signedOut: true))
     case .terminationReady:
-      return try json(tag: 14, ["ready": true])
+      return try json(tag: 14, Ready(ready: true))
     case .localAccount(let user, let origin):
       try validate(user, maximum: 512)
       guard origin.utf8.count <= 2048,
         let url = URLComponents(string: origin), url.scheme == "https", url.host != nil
       else { throw Failure.invalidPacket }
-      return try json(tag: 21, ["userId": user, "managedSyncOrigin": origin])
+      return try json(tag: 21, Account(userId: user, managedSyncOrigin: origin))
     case .noLocalAccount:
-      return try json(tag: 21, ["userId": NSNull(), "managedSyncOrigin": NSNull()])
+      return try json(tag: 21, Account(userId: nil, managedSyncOrigin: nil))
     case .timelinePresented:
-      return try json(tag: 23, ["presented": true])
+      return try json(tag: 23, Presented(presented: true))
     case .textCopied:
-      return try json(tag: 29, ["copied": true])
+      return try json(tag: 29, Copied(copied: true))
     case .notice(let token, let result):
-      return try json(tag: 26, ["token": token, "result": result])
+      guard let token = Int64(token), NoticeResult(rawValue: result) != nil else { throw Failure.invalidPacket }
+      return try json(tag: 26, NoticeResponse(token: token, result: result))
     }
   }
 
   /// Host -> OCaml environment snapshot (tag 24), mirroring
   /// Journal_environment.decode_json's required fields.
-  static func environment(_ object: [String: Any]) throws -> Data {
-    try json(tag: 24, object)
+  static func environment<Value: Encodable>(_ sample: Value) throws -> Data {
+    try json(tag: 24, sample)
   }
 
   static func prepareToTerminate() -> Data {
@@ -141,17 +136,13 @@ enum JournalPlatformWire {
     }
   }
 
-  private static func object(_ payload: Data) throws -> [String: Any] {
-    guard String(data: payload, encoding: .utf8) != nil,
-      let value = try? JSONSerialization.jsonObject(with: payload),
-      let fields = value as? [String: Any]
-    else { throw Failure.invalidPacket }
-    return fields
+  private static func decode<Value: Decodable>(_ type: Value.Type, _ payload: Data) throws -> Value {
+    do { return try JSONDecoder().decode(type, from: payload) }
+    catch { throw Failure.invalidPacket }
   }
 
-  private static func json(tag: UInt16, _ object: [String: Any]) throws -> Data {
-    let payload = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-    return try frame(tag: tag, payload: payload)
+  private static func json<Value: Encodable>(tag: UInt16, _ value: Value) throws -> Data {
+    try frame(tag: tag, payload: JSONEncoder().encode(value))
   }
 
   private static func frame(tag: UInt16, payload: Data) throws -> Data {

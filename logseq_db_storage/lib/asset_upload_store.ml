@@ -4,100 +4,103 @@ module Asset = Logseq_db_types.Asset_descriptor
 
 let ( let* ) = Result.bind
 
-let phase_name = function
-  | Intent.Prepared -> "prepared"
-  | Local_committed -> "local_committed"
-  | Uploading -> "uploading"
-  | Remote_stored -> "remote_stored"
-  | Metadata_pending -> "metadata_pending"
-  | Complete -> "complete"
-  | Cancelled -> "cancelled"
-;;
+type phase = Intent.phase =
+  | Prepared
+  | Local_committed
+  | Uploading
+  | Remote_stored
+  | Metadata_pending
+  | Complete
+  | Cancelled
+[@@deriving yojson]
 
-let phase_of_name = function
-  | "prepared" -> Ok Intent.Prepared
-  | "local_committed" -> Ok Intent.Local_committed
-  | "uploading" -> Ok Intent.Uploading
-  | "remote_stored" -> Ok Intent.Remote_stored
-  | "metadata_pending" -> Ok Intent.Metadata_pending
-  | "complete" -> Ok Intent.Complete
-  | "cancelled" -> Ok Intent.Cancelled
-  | _ -> Error "Invalid upload checkpoint phase"
-;;
+type asset_version =
+  { checksum : string
+  ; file_type : string
+  }
+[@@deriving yojson]
+
+type checkpoint =
+  { format_version : int
+  ; operation_id : Uuid.t
+  ; origin : string
+  ; account : string
+  ; graph : Uuid.t
+  ; asset : Uuid.t
+  ; version : asset_version
+  ; title : string
+  ; size : int64
+  ; staged_file : string
+  ; replace_reference : Uuid.t option
+  ; target : Uuid.t
+  ; local_mutation : Uuid.t
+  ; metadata_mutation : Uuid.t
+  ; phase : phase
+  ; revision : int
+  }
+[@@deriving yojson]
 
 let encode (i : Intent.t) =
-  Yojson.Safe.to_string
-    (`Assoc
-        [ "operation", `String (Uuid.to_string i.operation_id)
-        ; "origin", `String i.origin
-        ; "account", `String i.account
-        ; "graph", `String (Uuid.to_string i.graph)
-        ; "asset", `String (Uuid.to_string i.asset)
-        ; "checksum", `String i.version.checksum
-        ; "type", `String i.version.file_type
-        ; "title", `String i.title
-        ; "size", `String (Int64.to_string i.size)
-        ; "staged_file", `String i.staged_file
-        ; ( "replace_reference"
-          , Option.fold
-              ~none:`Null
-              ~some:(fun id -> `String (Uuid.to_string id))
-              i.replace_reference )
-        ; "target", `String (Uuid.to_string i.target)
-        ; "local_mutation", `String (Uuid.to_string i.local_mutation)
-        ; "metadata_mutation", `String (Uuid.to_string i.metadata_mutation)
-        ; "phase", `String (phase_name i.phase)
-        ; "revision", `Int i.revision
-        ])
+  checkpoint_to_yojson
+    { format_version = 1
+    ; operation_id = i.operation_id
+    ; origin = i.origin
+    ; account = i.account
+    ; graph = i.graph
+    ; asset = i.asset
+    ; version = { checksum = i.version.checksum; file_type = i.version.file_type }
+    ; title = i.title
+    ; size = i.size
+    ; staged_file = i.staged_file
+    ; replace_reference = i.replace_reference
+    ; target = i.target
+    ; local_mutation = i.local_mutation
+    ; metadata_mutation = i.metadata_mutation
+    ; phase = i.phase
+    ; revision = i.revision
+    }
+  |> Yojson.Safe.to_string
 ;;
 
 let decode payload =
   try
     if String.length payload > 8192
     then Error "Upload checkpoint exceeds size limit"
-    else (
-      let json = Yojson.Safe.from_string payload in
-      let field key = Yojson.Safe.Util.(json |> member key |> to_string) in
-      let* operation_id = Uuid.of_string (field "operation") in
-      let* graph = Uuid.of_string (field "graph") in
-      let* asset = Uuid.of_string (field "asset") in
-      let* replace_reference =
-        match json with
-        | `Assoc fields ->
-          (match List.assoc_opt "replace_reference" fields with
-           | Some `Null -> Ok None
-           | Some (`String id) -> Result.map Option.some (Uuid.of_string id)
-           | _ -> Error "Missing or invalid replacement reference")
-        | _ -> Error "Invalid upload checkpoint"
+    else
+      let* value =
+        Logseq_db_types.Json_codec.decode
+          checkpoint_of_yojson
+          (Yojson.Safe.from_string payload)
+        |> Result.map_error (fun error ->
+          "Unsupported or invalid upload checkpoint: " ^ error)
       in
-      let* target = Uuid.of_string (field "target") in
-      let* local_mutation = Uuid.of_string (field "local_mutation") in
-      let* metadata_mutation = Uuid.of_string (field "metadata_mutation") in
-      let* version =
-        Asset.version ~checksum:(field "checksum") ~file_type:(field "type")
-      in
-      let* phase = phase_of_name (field "phase") in
-      let revision = Yojson.Safe.Util.(json |> member "revision" |> to_int) in
-      let* prepared =
-        Intent.prepare
-          ~replace_reference
-          ~operation_id
-          ~origin:(field "origin")
-          ~account:(field "account")
-          ~graph
-          ~asset
-          ~version
-          ~title:(field "title")
-          ~size:(Int64.of_string (field "size"))
-          ~staged_file:(field "staged_file")
-          ~target
-          ~local_mutation
-          ~metadata_mutation
-      in
-      Intent.restore prepared ~phase ~revision)
+      if value.format_version <> 1
+      then Error "Unsupported upload checkpoint format"
+      else
+        let* version =
+          Asset.version
+            ~checksum:value.version.checksum
+            ~file_type:value.version.file_type
+        in
+        let* prepared =
+          Intent.prepare
+            ~operation_id:value.operation_id
+            ~origin:value.origin
+            ~account:value.account
+            ~graph:value.graph
+            ~asset:value.asset
+            ~version
+            ~title:value.title
+            ~size:value.size
+            ~staged_file:value.staged_file
+            ~replace_reference:value.replace_reference
+            ~target:value.target
+            ~local_mutation:value.local_mutation
+            ~metadata_mutation:value.metadata_mutation
+        in
+        Intent.restore prepared ~phase:value.phase ~revision:value.revision
   with
-  | Yojson.Json_error _ | Yojson.Safe.Util.Type_error _ | Failure _ ->
-    Error "Invalid upload checkpoint"
+  | Yojson.Json_error _ | Failure _ -> Error "Unsupported or invalid upload checkpoint"
 ;;
 
 let protect f =

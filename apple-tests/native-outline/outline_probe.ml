@@ -25,113 +25,30 @@ let reducer model = function
   | Expand value -> { model with expanded = value }
 ;;
 
-let on_list_event send (event : Journal_lui_native.event) =
-  match
-    try Yojson.Basic.from_string event.payload with
-    | _ -> `Null
-  with
-  | `Assoc fields ->
-    (match List.assoc_opt "type" fields with
-     | Some (`String "expanded") ->
-       (match List.assoc_opt "key" fields, List.assoc_opt "expanded" fields with
-        | Some (`String _), Some (`Bool value) -> ignore (send (Expand value))
-        | _ -> ())
-     | Some (`String "row_event") ->
-       (match List.assoc_opt "payload" fields with
-        | Some (`String inner) ->
-          (match
-             try Yojson.Basic.from_string inner with
-             | _ -> `Null
-           with
-           | `Assoc inner_fields ->
-             (match
-                List.assoc_opt "row" inner_fields, List.assoc_opt "key" inner_fields
-              with
-              | Some (`String row), Some (`String key) ->
-                ignore (send (Observe (key ^ ":" ^ row)))
-              | _ -> ())
-           | _ -> ())
-        | _ -> ())
-     | _ -> ())
-  | _ -> ()
-;;
-
-(* The payload mirrors Journal_view.Native_list's build output: sections and
-   row descriptors in JSON, content elements mounted as extension children in
-   the order the payload's content_index fields reference. *)
+(* Exercise the production generated Native_list codec and its public handlers. *)
 let outline_list ~expanded send : Lui_elements.t =
-  let contents = ref [] in
-  let push element =
-    contents := element :: !contents;
-    List.length !contents - 1
+  let module Ui = Journal_view in
+  let module V = Ui.View in
+  let module N = V.Native_list in
+  let label value = V.of_lui (text ~value []) in
+  let row id title =
+    let action = V.Context_menu.action ~key:(Ui.Key.string "delete")
+      ~role:Destructive ~title:"Delete"
+      ~on_press:(Ui.Event.Handler.create (fun _ -> ignore (send (Observe ("delete:" ^ id))))) ()
+    in
+    N.row ~key:(Ui.Key.string id) ~separator:Hidden
+      ~context_menu:(V.Context_menu.create ~actions:[action] ()) (label title)
   in
-  let context_menu_json =
-    ( "context_menu"
-    , `Assoc
-        [ ( "actions"
-          , `List
-              [ `Assoc
-                  [ "key", `String "delete"
-                  ; "enabled", `Bool true
-                  ; "role", `String "destructive"
-                  ; "symbol", `Null
-                  ; "title", `String "Delete"
-                  ]
-              ] )
-        ] )
+  let parent = N.disclosure_row ~key:(Ui.Key.string "parent") ~separator:Hidden
+    ~expanded ~on_expanded_changed:(Ui.Event.Handler.create (function
+      | Ui.Event.Payload.Bool value -> ignore (send (Expand value))
+      | _ -> ())) ~label:(label "Parent row")
+    [row "child" "Child row"; row "branch" "Unloaded branch row"]
   in
-  let row ~id ~label =
-    `Assoc
-      [ "type", `String "row"
-      ; "key", `String id
-      ; "content_index", `Int (push (text ~value:label []))
-      ; "separator", `String "hidden"
-      ; context_menu_json
-      ]
-  in
-  let disclosure ~id ~expanded children =
-    `Assoc
-      [ "type", `String "disclosure"
-      ; "key", `String id
-      ; "content_index", `Int (push (text ~value:"Parent row" []))
-      ; "separator", `String "hidden"
-      ; "expanded", `Bool expanded
-      ; "children", `List children
-      ]
-  in
-  let payload =
-    Yojson.Basic.to_string
-      (`Assoc
-          [ "style", `String "plain"
-          ; ( "sections"
-            , `List
-                [ `Assoc
-                    [ "key", `String "rows"
-                    ; "separator", `String "hidden"
-                    ; "header_index", `Null
-                    ; "footer_index", `Null
-                    ; ( "rows"
-                      , `List
-                          [ disclosure
-                              ~id:"parent"
-                              ~expanded
-                              [ row ~id:"child" ~label:"Child row"
-                              ; row ~id:"branch" ~label:"Unloaded branch row"
-                              ]
-                          ; row ~id:"sibling" ~label:"Sibling row"
-                          ] )
-                    ]
-                ] )
-          ; "scroll_request", `Null
-          ; "track_visible_range", `Bool false
-          ; "track_scroll_completion", `Bool false
-          ])
-  in
-  Journal_lui_native.list
-    ~key:"outline"
-    ~payload
-    ~children:(List.rev !contents)
-    ~on_event:(on_list_event send)
+  N.vertical ~key:(Ui.Key.string "outline") ~style:Plain
+    [N.section ~key:(Ui.Key.string "rows") ~separator:Hidden
+      [parent; row "sibling" "Sibling row"]]
+  |> Ui.mount
 ;;
 
 let view _context model_source send =
@@ -211,6 +128,7 @@ let native_hooks : Journal_bridge.hooks =
   ; pump
   ; platform_event = (fun _ -> ())
   ; platform_response = (fun _ -> ())
+  ; platform_failure = (fun _ -> ())
   ; dispose
   ; root_node
   }

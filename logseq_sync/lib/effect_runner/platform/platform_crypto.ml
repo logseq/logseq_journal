@@ -1,5 +1,3 @@
-open Yojson.Basic
-
 external call_raw : string -> string = "logseq_journal_crypto_call"
 
 let hex value =
@@ -31,21 +29,41 @@ let unhex value =
     | Invalid_argument _ -> Error "platform crypto returned invalid data")
 ;;
 
-let invoke operation fields =
+type request =
+  { operation : string
+  ; origin : string [@default ""]
+  ; user_id : string [@key "userId"] [@default ""]
+  ; graph_id : string option [@key "graphId"] [@default None]
+  ; password : string option [@default None]
+  ; iterations : int option [@default None]
+  ; salt : string option [@default None]
+  ; iv : string option [@default None]
+  ; ciphertext : string option [@default None]
+  ; encrypted_graph_key : string option [@key "encryptedGraphKey"] [@default None]
+  }
+[@@deriving yojson]
+
+type response =
+  { ok : bool
+  ; error : string option [@default None]
+  ; value : string option [@default None]
+  ; wrapped_keys_deleted : bool option [@key "wrappedKeysDeleted"] [@default None]
+  ; private_key_deleted : bool option [@key "privateKeyDeleted"] [@default None]
+  ; encrypted_graph_key : string option [@key "encryptedGraphKey"] [@default None]
+  ; ciphertext : string option [@default None]
+  }
+[@@deriving yojson]
+
+let invoke request =
   try
     match
-      call_raw (to_string (`Assoc (("operation", `String operation) :: fields)))
-      |> from_string
+      call_raw (request_to_yojson request |> Yojson.Safe.to_string)
+      |> Yojson.Safe.from_string
+      |> Logseq_db_types.Json_codec.decode response_of_yojson
     with
-    | `Assoc fields ->
-      (match List.assoc_opt "ok" fields with
-       | Some (`Bool true) -> Ok fields
-       | Some (`Bool false) ->
-         (match List.assoc_opt "error" fields with
-          | Some (`String error) -> Error error
-          | _ -> Error "platform crypto operation failed")
-       | _ -> Error "platform crypto operation failed")
-    | _ -> Error "platform crypto returned invalid data"
+    | Ok { ok = true; _ } as result -> result
+    | Ok { ok = false; error = Some error; _ } -> Error error
+    | Ok _ | Error _ -> Error "platform crypto operation failed"
   with
   | _ -> Error "platform crypto is unavailable"
 ;;
@@ -56,33 +74,43 @@ let bind result f =
   | Error _ as error -> error
 ;;
 
-let binary_field name fields =
-  match List.assoc_opt name fields with
-  | Some (`String value) -> unhex value
-  | _ -> Error "platform crypto response is incomplete"
+let binary_field response =
+  match response.value with
+  | Some value -> unhex value
+  | None -> Error "platform crypto response is incomplete"
 ;;
 
-let identity_fields ~managed_sync_origin ~user_id =
-  [ "origin", `String (Uri.to_string managed_sync_origin); "userId", `String user_id ]
+let identity_request operation ~managed_sync_origin ~user_id =
+  { operation
+  ; origin = Uri.to_string managed_sync_origin
+  ; user_id
+  ; graph_id = None
+  ; password = None
+  ; iterations = None
+  ; salt = None
+  ; iv = None
+  ; ciphertext = None
+  ; encrypted_graph_key = None
+  }
 ;;
 
-let graph_identity_fields ~managed_sync_origin ~user_id ~graph_id =
-  identity_fields ~managed_sync_origin ~user_id
-  @ [ "graphId", `String (Graph_types.Uuid.to_string graph_id) ]
+let graph_identity_request operation ~managed_sync_origin ~user_id ~graph_id =
+  { (identity_request operation ~managed_sync_origin ~user_id) with
+    graph_id = Some (Graph_types.Uuid.to_string graph_id)
+  }
 ;;
 
 let unlock_private_key ~managed_sync_origin ~user_id ~password ~private_key_package =
   bind (E2ee.private_key_package private_key_package) (fun package ->
     bind
       (invoke
-         "unlockPrivateKey"
-         (identity_fields ~managed_sync_origin ~user_id
-          @ [ "password", `String password
-            ; "iterations", `Int 600_000
-            ; "salt", `String (hex package.salt)
-            ; "iv", `String (hex package.iv)
-            ; "ciphertext", `String (hex package.ciphertext)
-            ]))
+         { (identity_request "unlockPrivateKey" ~managed_sync_origin ~user_id) with
+           password = Some password
+         ; iterations = Some 600_000
+         ; salt = Some (hex package.salt)
+         ; iv = Some (hex package.iv)
+         ; ciphertext = Some (hex package.ciphertext)
+         })
       (fun _ -> Ok ()))
 ;;
 
@@ -115,18 +143,18 @@ let unlock_graph_key ~managed_sync_origin ~user_id ~encrypted_graph_key =
   bind (E2ee.binary encrypted_graph_key) (fun encrypted_graph_key ->
     bind
       (invoke
-         "unwrapGraphKeyForEngine"
-         (identity_fields ~managed_sync_origin ~user_id
-          @ [ "ciphertext", `String (hex encrypted_graph_key) ]))
+         { (identity_request "unwrapGraphKeyForEngine" ~managed_sync_origin ~user_id) with
+           ciphertext = Some (hex encrypted_graph_key)
+         })
       (fun fields ->
-         bind (binary_field "value" fields) (fun key ->
+         bind (binary_field fields) (fun key ->
            if String.length key = 32 then Ok key else Error "invalid graph key")))
 ;;
 
-let string_field name fields =
-  match List.assoc_opt name fields with
-  | Some (`String value) -> Ok value
-  | _ -> Error "platform crypto response is incomplete"
+let string_field response =
+  match response.value with
+  | Some value -> Ok value
+  | None -> Error "platform crypto response is incomplete"
 ;;
 
 type wrapped_key_load_failure =
@@ -136,13 +164,16 @@ type wrapped_key_load_failure =
 let load_wrapped_graph_key ~managed_sync_origin ~user_id ~graph_id =
   match
     invoke
-      "loadAndVerifyWrappedGraphKey"
-      (graph_identity_fields ~managed_sync_origin ~user_id ~graph_id)
+      (graph_identity_request
+         "loadAndVerifyWrappedGraphKey"
+         ~managed_sync_origin
+         ~user_id
+         ~graph_id)
   with
   | Ok fields ->
     Result.map_error
       (fun diagnostic -> Wrapped_graph_key_unavailable diagnostic)
-      (string_field "value" fields)
+      (string_field fields)
   | Error "localPrivateKeyUnavailable" ->
     Error (Local_private_key_unavailable "local private key is unavailable")
   | Error diagnostic -> Error (Wrapped_graph_key_unavailable diagnostic)
@@ -156,14 +187,19 @@ let verify_and_save_wrapped_graph_key
   =
   bind
     (invoke
-       "verifyAndSaveWrappedGraphKey"
-       (graph_identity_fields ~managed_sync_origin ~user_id ~graph_id
-        @ [ "encryptedGraphKey", `String encrypted_graph_key ]))
+       { (graph_identity_request
+            "verifyAndSaveWrappedGraphKey"
+            ~managed_sync_origin
+            ~user_id
+            ~graph_id)
+         with
+         encrypted_graph_key = Some encrypted_graph_key
+       })
     (fun _ -> Ok ())
 ;;
 
 let delete_account_secrets ~managed_sync_origin ~user_id =
   bind
-    (invoke "deleteAccountSecrets" (identity_fields ~managed_sync_origin ~user_id))
+    (invoke (identity_request "deleteAccountSecrets" ~managed_sync_origin ~user_id))
     (fun _ -> Ok ())
 ;;

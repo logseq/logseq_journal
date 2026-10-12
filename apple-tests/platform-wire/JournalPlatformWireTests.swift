@@ -25,6 +25,8 @@ import Foundation
       "local-account": .localAccount,
       "timeline-presented": .timelinePresented,
       "copy-text": .copyText("Root\n  - 中文😀"),
+      "notice": .showNotice(token: String(Int64.max), message: "Fixture", actionLabel: nil, durationMs: 5000),
+      "cancel-notice": .cancelNotice(token: String(Int64.max)),
     ]
     var baseRequest = Data()
     for (name, expectedRequest) in expected {
@@ -34,7 +36,7 @@ import Foundation
       if name == "authenticated-user" { baseRequest = bytes }
     }
 
-    // A wire request from the existing Dart protocol fixture, with an opaque challenge.
+    // An independent native request fixture with an opaque challenge.
     var tokenRequest = baseRequest
     tokenRequest[6] = 8
     let challenge = Data(#"{"challengeId":"challenge-1"}"#.utf8)
@@ -64,6 +66,7 @@ import Foundation
       "sign-out": .signedOut, "termination-ready": .terminationReady,
       "local-account": .localAccount(userID: "fixture-user", origin: "https://api.logseq.io"),
       "no-local-account": .noLocalAccount, "timeline-presented": .timelinePresented,
+      "notice": .notice(token: String(Int64.max), result: "action"),
       "copy-text": .textCopied,
     ]
     var encoded: [String: String] = [:]
@@ -81,6 +84,11 @@ import Foundation
       rejects("invalid or oversized token response") { _ = try JournalPlatformWire.encodeResponse(.idToken(challengeID: "challenge-1", token: token)) }
     }
     rejects("insecure binding origin") { _ = try JournalPlatformWire.encodeResponse(.localAccount(userID: "fixture-user", origin: "http://api.logseq.io")) }
+    struct Environment: Encodable {
+      let brightness = "dark"; let platform = "ios"
+      let accessibleNavigation = true; let highContrast = false
+    }
+    encoded["environment"] = try JournalPlatformWire.environment(Environment()).hex
     encoded["startup"] = try JournalStartupConfiguration.encode(
       applicationSupportPath: "/tmp/journal-native-fixture", managedSyncOrigin: "https://api.logseq.io"
     ).hex
@@ -98,6 +106,13 @@ import Foundation
         fatalError("Invalid startup origin was accepted")
       } catch JournalStartupConfiguration.Failure.invalidConfiguration {}
     }
+    let binding = try JournalLocalAccountBindingStore.encode(userID: "fixture-user", managedSyncOrigin: "https://api.logseq.io")
+    let restored = try JournalLocalAccountBindingStore.decode(binding)
+    require(restored["userId"] as? String == "fixture-user", "generated account binding roundtrip")
+    do {
+      _ = try JournalLocalAccountBindingStore.decode(Data(#"{"version":1,"userId":"fixture-user","managedSyncOrigin":"https://api.logseq.io"}"#.utf8))
+      fatalError("Legacy account binding was accepted")
+    } catch {}
     try JSONEncoder().encode(encoded).write(to: directory.appendingPathComponent("responses.json"))
     print("Swift: OCaml requests accepted; invalid packets rejected; native responses emitted")
   }

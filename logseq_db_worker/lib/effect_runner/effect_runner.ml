@@ -124,6 +124,8 @@ let base64url_decode value =
     decode 0)
 ;;
 
+type token_claims = { exp : int64 } [@@deriving of_yojson { strict = false }]
+
 let token_expiration token =
   if String.length token = 0 || String.length token > 1024 * 1024
   then Error "ID token response is invalid."
@@ -135,16 +137,10 @@ let token_expiration token =
        | None -> Error "ID token response is invalid."
        | Some decoded ->
          (try
-            match Yojson.Safe.from_string decoded with
-            | `Assoc fields ->
-              (match List.assoc_opt "exp" fields with
-               | Some (`Int value) -> Ok (Float.of_int value)
-               | Some (`Intlit value) ->
-                 (match Float.of_string_opt value with
-                  | Some value -> Ok value
-                  | None -> Error "ID token response is invalid.")
-               | _ -> Error "ID token response is invalid.")
-            | _ -> Error "ID token response is invalid."
+            Yojson.Safe.from_string decoded
+            |> Logseq_db_types.Json_codec.decode token_claims_of_yojson
+            |> Result.map (fun claims -> Int64.to_float claims.exp)
+            |> Result.map_error (fun _ -> "ID token response is invalid.")
           with
           | Yojson.Json_error _ -> Error "ID token response is invalid."))
     | _ -> Error "ID token response is invalid.")

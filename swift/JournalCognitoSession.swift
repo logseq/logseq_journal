@@ -161,12 +161,14 @@ import Foundation
     request.httpBody = JournalCognitoOAuth.form(values)
     return request
   }
+  private struct TokenFailure: Decodable { let error: String }
+
   private func requestTokens(_ values: [String: String]) async throws -> JournalCognitoTokenResponse {
     let request = request(path: "/oauth2/token", values: values)
     let (data, response) = try await transport(request)
     guard response.url == request.url, data.count <= 131072 else { throw JournalCognitoError.request }
     guard response.statusCode == 200 else {
-      let error = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+      let error = (try? JSONDecoder().decode(TokenFailure.self, from: data))?.error
       if response.statusCode == 400, error == "invalid_grant" { throw JournalCognitoError.invalidGrant }
       throw JournalCognitoError.request
     }

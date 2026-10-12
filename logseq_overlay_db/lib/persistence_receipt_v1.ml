@@ -36,38 +36,40 @@ and terminal_batch_outcome =
 
 type simple_mutation_receipt_v1 =
   { fingerprint : string
-  ; format_version : int [@key "formatVersion"]
-  ; mutation_id : string [@key "mutationId"]
-  ; outcome : string
+  ; format_version : int
+  ; mutation_id : string
+  ; status : Json.local_status
   }
 [@@deriving yojson]
 
 type discarded_mutation_receipt_v1 =
   { fingerprint : string
-  ; format_version : int [@key "formatVersion"]
-  ; mutation_id : string [@key "mutationId"]
-  ; outcome : string
+  ; format_version : int
+  ; mutation_id : string
   ; prior_reason :
       (Types.block_reason
       [@to_yojson Json.block_reason_to_yojson] [@of_yojson Json.block_reason_of_yojson])
-        [@key "priorReason"]
   }
 [@@deriving yojson]
 
 type remote_won_mutation_receipt_v1 =
-  { batch_id : string option [@key "batchId"]
-  ; conflicts : string list
-  ; earliest_conflict_cursor : string option [@key "earliestConflictCursor"]
+  { batch_id : string option
+  ; conflicts : Json.delete_conflict_kind list
+  ; earliest_conflict_cursor : string option
   ; fingerprint : string
-  ; format_version : int [@key "formatVersion"]
-  ; mutation_id : string [@key "mutationId"]
-  ; operation : string
-  ; outcome : string
-  ; reason : string
-  ; rejection_through : string option [@key "rejectionThrough"]
-  ; t_before : string option [@key "tBefore"]
+  ; format_version : int
+  ; mutation_id : string
+  ; reason : Json.remote_won_reason
+  ; rejection_through : string option
+  ; t_before : string option
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
+
+type mutation_receipt_wire =
+  | Simple of simple_mutation_receipt_v1
+  | Discarded of discarded_mutation_receipt_v1
+  | Remote_won of remote_won_mutation_receipt_v1
+[@@deriving yojson]
 
 let receipt_key = Mutation_receipt.mutation_key
 
@@ -75,42 +77,36 @@ let encode_mutation (mutation_id, fingerprint, entry) =
   let json =
     match entry with
     | Commit_receipt commit ->
-      simple_mutation_receipt_v1_to_yojson
+      Simple
         { fingerprint
-        ; format_version = 1
+        ; format_version = 2
         ; mutation_id = Graph.Uuid.to_string mutation_id
-        ; outcome = (if commit.status = Types.No_change then "noChange" else "applied")
+        ; status =
+            (if commit.status = Types.No_change then Types.No_change else Types.Applied)
         }
     | Discarded_receipt (_, prior_reason) ->
-      discarded_mutation_receipt_v1_to_yojson
+      Discarded
         { fingerprint
-        ; format_version = 1
+        ; format_version = 2
         ; mutation_id = Graph.Uuid.to_string mutation_id
-        ; outcome = "discarded"
         ; prior_reason
         }
     | Remote_won_entry receipt ->
       let proof = receipt.Types.proof in
-      remote_won_mutation_receipt_v1_to_yojson
+      Remote_won
         { batch_id =
             Option.map
               Types.Submission_batch_id.to_string
               (Types.remote_won_proof_batch_id proof)
-        ; conflicts =
-            Types.delete_conflict_kinds receipt.conflicts |> List.map Delete_conflict.code
+        ; conflicts = Types.delete_conflict_kinds receipt.conflicts
         ; earliest_conflict_cursor =
             Option.map
               Persistence_json.server_cursor_to_string
               (Types.remote_won_proof_earliest_conflict_cursor proof)
         ; fingerprint
-        ; format_version = 1
+        ; format_version = 2
         ; mutation_id = Graph.Uuid.to_string mutation_id
-        ; operation = "deleteBlocks"
-        ; outcome = "remoteWon"
-        ; reason =
-            (match receipt.reason with
-             | Before_submission -> "beforeSubmission"
-             | Proven_unexecuted -> "provenUnexecuted")
+        ; reason = receipt.reason
         ; rejection_through =
             Option.map
               Persistence_json.server_cursor_to_string
@@ -121,7 +117,8 @@ let encode_mutation (mutation_id, fingerprint, entry) =
               (Types.remote_won_proof_t_before proof)
         }
   in
-  Some (receipt_key mutation_id, Yojson.Safe.to_string json)
+  Some
+    (receipt_key mutation_id, Yojson.Safe.to_string (mutation_receipt_wire_to_yojson json))
 ;;
 
 let optional_token parse = function
@@ -140,12 +137,15 @@ let commit_entry ~startup_generation ~projection_revision mutation_id status =
     }
 ;;
 
-let decode_simple ~startup_generation ~projection_revision ~key json =
-  let* receipt = simple_mutation_receipt_v1_of_yojson json in
-  if
-    simple_mutation_receipt_v1_to_yojson receipt <> json
-    || receipt.format_version <> 1
-    || String.length receipt.fingerprint <> 64
+let decode_simple
+      ~startup_generation
+      ~projection_revision
+      ~key
+      (receipt : simple_mutation_receipt_v1)
+  =
+  if receipt.format_version <> 2
+  then Error "unsupported mutation receipt JSON format"
+  else if String.length receipt.fingerprint <> 64
   then Error "invalid canonical mutation receipt"
   else
     let* mutation_id = Graph.Uuid.of_string receipt.mutation_id in
@@ -153,9 +153,9 @@ let decode_simple ~startup_generation ~projection_revision ~key json =
     then Error "mutation receipt key does not match its UUID"
     else
       let* status =
-        match receipt.outcome with
-        | "applied" -> Ok Types.Applied
-        | "noChange" -> Ok Types.No_change
+        match receipt.status with
+        | Types.Applied -> Ok Types.Applied
+        | Types.No_change -> Ok Types.No_change
         | _ -> Error "invalid canonical mutation receipt"
       in
       Ok
@@ -164,13 +164,15 @@ let decode_simple ~startup_generation ~projection_revision ~key json =
         , commit_entry ~startup_generation ~projection_revision mutation_id status )
 ;;
 
-let decode_discarded ~startup_generation ~projection_revision ~key json =
-  let* receipt = discarded_mutation_receipt_v1_of_yojson json in
-  if
-    discarded_mutation_receipt_v1_to_yojson receipt <> json
-    || receipt.format_version <> 1
-    || (not (String.equal receipt.outcome "discarded"))
-    || String.length receipt.fingerprint <> 64
+let decode_discarded
+      ~startup_generation
+      ~projection_revision
+      ~key
+      (receipt : discarded_mutation_receipt_v1)
+  =
+  if receipt.format_version <> 2
+  then Error "unsupported mutation receipt JSON format"
+  else if String.length receipt.fingerprint <> 64
   then Error "invalid canonical mutation receipt"
   else
     let* mutation_id = Graph.Uuid.of_string receipt.mutation_id in
@@ -190,13 +192,10 @@ let decode_discarded ~startup_generation ~projection_revision ~key json =
             , receipt.prior_reason ) )
 ;;
 
-let decode_remote_won ~key json =
-  let* receipt = remote_won_mutation_receipt_v1_of_yojson json in
-  if
-    receipt.format_version <> 1
-    || (not (String.equal receipt.operation "deleteBlocks"))
-    || (not (String.equal receipt.outcome "remoteWon"))
-    || String.length receipt.fingerprint <> 64
+let decode_remote_won ~key (receipt : remote_won_mutation_receipt_v1) =
+  if receipt.format_version <> 2
+  then Error "unsupported mutation receipt JSON format"
+  else if String.length receipt.fingerprint <> 64
   then Error "invalid remote-won receipt version or operation"
   else
     let* mutation_id = Graph.Uuid.of_string receipt.mutation_id in
@@ -207,13 +206,8 @@ let decode_remote_won ~key json =
         Types.Mutation_fingerprint.of_string
           ("mutation-fingerprint:v1:" ^ receipt.fingerprint)
       in
-      let* reason =
-        match receipt.reason with
-        | "beforeSubmission" -> Ok Types.Before_submission
-        | "provenUnexecuted" -> Ok Types.Proven_unexecuted
-        | _ -> Error "invalid remote-won reason"
-      in
-      let* conflict_kinds = list_map_result Delete_conflict.of_code receipt.conflicts in
+      let reason = receipt.reason in
+      let conflict_kinds = receipt.conflicts in
       let* conflicts = Types.delete_conflict_kind_set conflict_kinds in
       let* batch_id =
         optional_token Types.Submission_batch_id.of_string receipt.batch_id
@@ -247,46 +241,51 @@ let decode_remote_won ~key json =
 
 let decode_mutation ~startup_generation ~projection_revision (key, source) =
   try
-    let json = Yojson.Safe.from_string source in
-    match json with
-    | `Assoc fields ->
-      (match List.assoc_opt "outcome" fields with
-       | Some (`String "remoteWon") -> decode_remote_won ~key json
-       | Some (`String "discarded") ->
-         decode_discarded ~startup_generation ~projection_revision ~key json
-       | Some (`String ("applied" | "noChange")) ->
-         decode_simple ~startup_generation ~projection_revision ~key json
-       | _ -> Error "invalid canonical mutation receipt")
-    | _ -> Error "invalid canonical mutation receipt"
+    let* receipt =
+      Logseq_db_types.Json_codec.decode
+        mutation_receipt_wire_of_yojson
+        (Yojson.Safe.from_string source)
+      |> Result.map_error (fun error ->
+        "unsupported or invalid mutation receipt: " ^ error)
+    in
+    match receipt with
+    | Simple receipt ->
+      decode_simple ~startup_generation ~projection_revision ~key receipt
+    | Discarded receipt ->
+      decode_discarded ~startup_generation ~projection_revision ~key receipt
+    | Remote_won receipt -> decode_remote_won ~key receipt
   with
-  | Yojson.Json_error _ -> Error "invalid mutation receipt JSON"
+  | Yojson.Json_error _ -> Error "unsupported or invalid mutation receipt JSON"
 ;;
 
 type accepted_terminal_batch_receipt_v1 =
-  { batch_id : string [@key "batchId"]
-  ; format_version : int [@key "formatVersion"]
+  { batch_id : string
+  ; format_version : int
   ; checksum : string
-  ; receipt_type : string [@key "receiptType"]
   ; through : string
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type proven_unexecuted_terminal_batch_receipt_v1 =
-  { batch_id : string [@key "batchId"]
-  ; format_version : int [@key "formatVersion"]
+  { batch_id : string
+  ; format_version : int
   ; fingerprint : string
-  ; mutation_id : string [@key "mutationId"]
-  ; receipt_type : string [@key "receiptType"]
+  ; mutation_id : string
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type stale_terminal_batch_receipt_v1 =
-  { batch_id : string [@key "batchId"]
-  ; format_version : int [@key "formatVersion"]
+  { batch_id : string
+  ; format_version : int
   ; through : string
-  ; executed_through : string option [@key "executedThrough"]
-  ; receipt_type : string [@key "receiptType"]
+  ; executed_through : string option
   }
+[@@deriving yojson]
+
+type terminal_batch_wire =
+  | Stale of stale_terminal_batch_receipt_v1
+  | Accepted of accepted_terminal_batch_receipt_v1
+  | Proven_unexecuted of proven_unexecuted_terminal_batch_receipt_v1
 [@@deriving yojson]
 
 let terminal_batch_key = Mutation_receipt.terminal_batch_key
@@ -295,92 +294,89 @@ let encode_terminal_batch receipt =
   let json =
     match receipt.terminal_outcome with
     | Terminal_stale { through; executed_through } ->
-      stale_terminal_batch_receipt_v1_to_yojson
+      Stale
         { batch_id = Types.Submission_batch_id.to_string receipt.terminal_batch_id
-        ; format_version = 1
+        ; format_version = 2
         ; through = Persistence_json.server_cursor_to_string through
         ; executed_through =
             Option.map Persistence_json.server_cursor_to_string executed_through
-        ; receipt_type = "staleBatch"
         }
     | Terminal_accepted barrier ->
-      accepted_terminal_batch_receipt_v1_to_yojson
+      Accepted
         { batch_id = Types.Submission_batch_id.to_string receipt.terminal_batch_id
-        ; format_version = 1
+        ; format_version = 2
         ; checksum = Types.Checksum.to_string barrier.checksum
-        ; receipt_type = "acceptedBatch"
         ; through = Persistence_json.server_cursor_to_string barrier.through
         }
     | Terminal_proven_unexecuted { mutation_id; fingerprint } ->
-      proven_unexecuted_terminal_batch_receipt_v1_to_yojson
+      Proven_unexecuted
         { batch_id = Types.Submission_batch_id.to_string receipt.terminal_batch_id
-        ; format_version = 1
+        ; format_version = 2
         ; fingerprint
         ; mutation_id = Graph.Uuid.to_string mutation_id
-        ; receipt_type = "provenUnexecutedBatch"
         }
   in
-  terminal_batch_key receipt.terminal_batch_id, Yojson.Safe.to_string json
+  ( terminal_batch_key receipt.terminal_batch_id
+  , Yojson.Safe.to_string (terminal_batch_wire_to_yojson json) )
 ;;
 
 let decode_terminal_batch (key, source) =
   try
-    let json = Yojson.Safe.from_string source in
-    match json with
-    | `Assoc fields ->
-      (match List.assoc_opt "receiptType" fields with
-       | Some (`String "staleBatch") ->
-         let* receipt = stale_terminal_batch_receipt_v1_of_yojson json in
-         let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
-         let* through = Persistence_json.server_cursor_of_string receipt.through in
-         let* executed_through =
-           match receipt.executed_through with
-           | None -> Ok None
-           | Some value ->
-             Result.map Option.some (Persistence_json.server_cursor_of_string value)
-         in
-         if
-           receipt.format_version <> 1
-           || not (String.equal key (terminal_batch_key terminal_batch_id))
-         then Error "invalid stale terminal batch identity or version"
-         else
-           Ok
-             { terminal_batch_id
-             ; terminal_outcome = Terminal_stale { through; executed_through }
-             }
-       | Some (`String "acceptedBatch") ->
-         let* receipt = accepted_terminal_batch_receipt_v1_of_yojson json in
-         let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
-         if
-           receipt.format_version <> 1
-           || not (String.equal key (terminal_batch_key terminal_batch_id))
-         then Error "invalid terminal batch receipt identity or version"
-         else
-           let* checksum = Types.Checksum.of_string receipt.checksum in
-           let* through = Persistence_json.server_cursor_of_string receipt.through in
-           Ok
-             { terminal_batch_id
-             ; terminal_outcome = Terminal_accepted Types.{ through; checksum }
-             }
-       | Some (`String "provenUnexecutedBatch") ->
-         let* receipt = proven_unexecuted_terminal_batch_receipt_v1_of_yojson json in
-         let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
-         if
-           receipt.format_version <> 1
-           || not (String.equal key (terminal_batch_key terminal_batch_id))
-         then Error "invalid terminal batch receipt identity or version"
-         else if String.length receipt.fingerprint <> 64
-         then Error "invalid terminal batch fingerprint"
-         else
-           let* mutation_id = Graph.Uuid.of_string receipt.mutation_id in
-           Ok
-             { terminal_batch_id
-             ; terminal_outcome =
-                 Terminal_proven_unexecuted
-                   { mutation_id; fingerprint = receipt.fingerprint }
-             }
-       | _ -> Error "invalid terminal batch receipt type")
-    | _ -> Error "invalid canonical terminal batch receipt"
+    let* receipt =
+      Logseq_db_types.Json_codec.decode
+        terminal_batch_wire_of_yojson
+        (Yojson.Safe.from_string source)
+      |> Result.map_error (fun error ->
+        "unsupported or invalid terminal batch receipt: " ^ error)
+    in
+    match receipt with
+    | Stale receipt ->
+      let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
+      let* through = Persistence_json.server_cursor_of_string receipt.through in
+      let* executed_through =
+        match receipt.executed_through with
+        | None -> Ok None
+        | Some value ->
+          Result.map Option.some (Persistence_json.server_cursor_of_string value)
+      in
+      if
+        receipt.format_version <> 2
+        || not (String.equal key (terminal_batch_key terminal_batch_id))
+      then Error "invalid stale terminal batch identity or version"
+      else
+        Ok
+          { terminal_batch_id
+          ; terminal_outcome = Terminal_stale { through; executed_through }
+          }
+    | Accepted receipt ->
+      let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
+      if
+        receipt.format_version <> 2
+        || not (String.equal key (terminal_batch_key terminal_batch_id))
+      then Error "invalid terminal batch receipt identity or version"
+      else
+        let* checksum = Types.Checksum.of_string receipt.checksum in
+        let* through = Persistence_json.server_cursor_of_string receipt.through in
+        Ok
+          { terminal_batch_id
+          ; terminal_outcome = Terminal_accepted Types.{ through; checksum }
+          }
+    | Proven_unexecuted receipt ->
+      let* terminal_batch_id = Types.Submission_batch_id.of_string receipt.batch_id in
+      if
+        receipt.format_version <> 2
+        || not (String.equal key (terminal_batch_key terminal_batch_id))
+      then Error "invalid terminal batch receipt identity or version"
+      else if String.length receipt.fingerprint <> 64
+      then Error "invalid terminal batch fingerprint"
+      else
+        let* mutation_id = Graph.Uuid.of_string receipt.mutation_id in
+        Ok
+          { terminal_batch_id
+          ; terminal_outcome =
+              Terminal_proven_unexecuted
+                { mutation_id; fingerprint = receipt.fingerprint }
+          }
   with
   | Yojson.Json_error _ -> Error "invalid terminal batch receipt JSON"
 ;;

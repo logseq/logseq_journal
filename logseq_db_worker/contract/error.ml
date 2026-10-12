@@ -22,6 +22,7 @@ type code =
   | Response_too_large
   | Storage_busy
   | Closed_session
+[@@deriving yojson]
 
 type detail_value =
   | Detail_string of string
@@ -30,11 +31,13 @@ type detail_value =
   | Detail_uuid of Graph_types.Uuid.t
   | Detail_strings of string list
   | Detail_uuids of Graph_types.Uuid.t list
+[@@deriving yojson]
 
 type detail =
   { name : string
   ; value : detail_value
   }
+[@@deriving yojson]
 
 type component =
   | Logseq_db_worker
@@ -51,6 +54,7 @@ type component =
   | Worker_service
   | Operating_system
   | Dependency
+[@@deriving yojson]
 
 type cause =
   { component : component
@@ -58,12 +62,14 @@ type cause =
   ; code : string option
   ; message : string
   }
+[@@deriving yojson]
 
 type causal_trace =
   { contexts : cause list
   ; origin : cause
   ; truncated : bool
   }
+[@@deriving yojson]
 
 type t =
   { code : code
@@ -71,6 +77,7 @@ type t =
   ; details : detail list
   ; trace : causal_trace
   }
+[@@deriving yojson]
 
 let maximum_contexts = 16
 let maximum_message_bytes = 512
@@ -149,24 +156,6 @@ let component_string = function
   | Dependency -> "dependency"
 ;;
 
-let component_of_string = function
-  | "logseqDbWorker" -> Some Logseq_db_worker
-  | "ownership" -> Some Ownership
-  | "sqlite" -> Some Sqlite
-  | "storage" -> Some Storage
-  | "query" -> Some Query
-  | "readModel" -> Some Read_model
-  | "outliner" -> Some Outliner
-  | "mutationPlanner" -> Some Mutation_planner
-  | "engine" -> Some Engine
-  | "protocol" -> Some Protocol
-  | "managedSync" -> Some Managed_sync
-  | "workerService" -> Some Worker_service
-  | "operatingSystem" -> Some Operating_system
-  | "dependency" -> Some Dependency
-  | _ -> None
-;;
-
 let valid_name name =
   String.length name > 0
   && String.length name <= maximum_name_bytes
@@ -241,49 +230,6 @@ let valid_details details =
        details
 ;;
 
-let detail_to_yojson detail =
-  let kind, value =
-    match detail.value with
-    | Detail_string value -> "string", `String value
-    | Detail_int value -> "int64", `String (Int64.to_string value)
-    | Detail_bool value -> "bool", `Bool value
-    | Detail_uuid value -> "uuid", `String (Graph_types.Uuid.to_string value)
-    | Detail_strings values ->
-      "strings", `List (List.map (fun value -> `String value) values)
-    | Detail_uuids values ->
-      ( "uuids"
-      , `List (List.map (fun value -> `String (Graph_types.Uuid.to_string value)) values)
-      )
-  in
-  `Assoc
-    [ "name", `String detail.name
-    ; "value", `Assoc [ "type", `String kind; "value", value ]
-    ]
-;;
-
-let cause_to_yojson cause =
-  `Assoc
-    [ "component", `String (component_string cause.component)
-    ; "operation", `String cause.operation
-    ; "code", Option.fold ~none:`Null ~some:(fun value -> `String value) cause.code
-    ; "message", `String cause.message
-    ]
-;;
-
-let to_yojson value =
-  `Assoc
-    [ "code", `String (code_string value.code)
-    ; "message", `String value.message
-    ; "details", `List (List.map detail_to_yojson value.details)
-    ; ( "trace"
-      , `Assoc
-          [ "contexts", `List (List.map cause_to_yojson value.trace.contexts)
-          ; "origin", cause_to_yojson value.trace.origin
-          ; "truncated", `Bool value.trace.truncated
-          ] )
-    ]
-;;
-
 let encoded_bytes value = String.length (Yojson.Safe.to_string (to_yojson value))
 
 let validate_error value =
@@ -353,137 +299,25 @@ let message value = value.message
 let details value = value.details
 let trace value = value.trace
 
-let assoc_fields expected = function
-  | `Assoc fields ->
-    let actual = List.map fst fields |> List.sort String.compare in
-    let expected = List.sort String.compare expected in
-    if actual = expected then Ok fields else Error "unknown, duplicate, or missing field"
-  | _ -> Error "expected object"
-;;
-
-let field name fields =
-  match List.assoc_opt name fields with
-  | Some value -> Ok value
-  | None -> Error ("missing " ^ name)
-;;
-
-let bind_field name fields parse = Result.bind (field name fields) parse
-
-let parse_string = function
-  | `String value -> Ok value
-  | _ -> Error "expected string"
-;;
-
-let parse_code = function
-  | `Null -> Ok None
-  | `String value -> Ok (Some value)
-  | _ -> Error "invalid optional code"
-;;
-
-let cause_of_yojson json =
-  Result.bind
-    (assoc_fields [ "component"; "operation"; "code"; "message" ] json)
-    (fun fields ->
-       Result.bind (bind_field "component" fields parse_string) (fun component ->
-         match component_of_string component with
-         | None -> Error "unknown error component"
-         | Some component ->
-           Result.bind (bind_field "operation" fields parse_string) (fun operation ->
-             Result.bind (bind_field "code" fields parse_code) (fun code ->
-               Result.bind (bind_field "message" fields parse_string) (fun message ->
-                 create_cause ~component ~operation ~code ~message)))))
-;;
-
-let detail_of_yojson json =
-  Result.bind
-    (assoc_fields [ "name"; "value" ] json)
-    (fun fields ->
-       Result.bind (bind_field "name" fields parse_string) (fun name ->
-         Result.bind (field "value" fields) (fun value_json ->
-           Result.bind
-             (assoc_fields [ "type"; "value" ] value_json)
-             (fun value_fields ->
-                Result.bind (bind_field "type" value_fields parse_string) (fun kind ->
-                  Result.bind (field "value" value_fields) (fun value ->
-                    let parse_strings constructor = function
-                      | `List values ->
-                        let rec loop acc = function
-                          | [] -> Ok (constructor (List.rev acc))
-                          | `String value :: rest -> loop (value :: acc) rest
-                          | _ -> Error "invalid detail list"
-                        in
-                        loop [] values
-                      | _ -> Error "invalid detail list"
-                    in
-                    let parsed =
-                      match kind, value with
-                      | "string", `String value -> Ok (Detail_string value)
-                      | "int64", `String value ->
-                        (try Ok (Detail_int (Int64.of_string value)) with
-                         | Failure _ -> Error "invalid int detail")
-                      | "bool", `Bool value -> Ok (Detail_bool value)
-                      | "uuid", `String value ->
-                        Result.map
-                          (fun value -> Detail_uuid value)
-                          (Graph_types.Uuid.of_string value)
-                      | "strings", value ->
-                        parse_strings (fun values -> Detail_strings values) value
-                      | "uuids", `List values ->
-                        let rec loop acc = function
-                          | [] -> Ok (Detail_uuids (List.rev acc))
-                          | `String value :: rest ->
-                            Result.bind (Graph_types.Uuid.of_string value) (fun uuid ->
-                              loop (uuid :: acc) rest)
-                          | _ -> Error "invalid UUID detail list"
-                        in
-                        loop [] values
-                      | _ -> Error "invalid detail value"
-                    in
-                    Result.map (fun value -> { name; value }) parsed))))))
-;;
-
-let parse_list parse = function
-  | `List values ->
-    let rec loop acc = function
-      | [] -> Ok (List.rev acc)
-      | value :: rest -> Result.bind (parse value) (fun value -> loop (value :: acc) rest)
-    in
-    loop [] values
-  | _ -> Error "expected list"
-;;
-
 let of_yojson json =
   Result.bind
-    (assoc_fields [ "code"; "message"; "details"; "trace" ] json)
-    (fun fields ->
-       Result.bind (bind_field "code" fields parse_string) (fun raw_code ->
-         match code_of_string raw_code with
-         | None -> Error "unknown error code"
-         | Some code ->
-           Result.bind (bind_field "message" fields parse_string) (fun message ->
-             Result.bind
-               (bind_field "details" fields (parse_list detail_of_yojson))
-               (fun details ->
-                  Result.bind (field "trace" fields) (fun trace_json ->
-                    Result.bind
-                      (assoc_fields [ "contexts"; "origin"; "truncated" ] trace_json)
-                      (fun trace_fields ->
-                         Result.bind
-                           (bind_field
-                              "contexts"
-                              trace_fields
-                              (parse_list cause_of_yojson))
-                           (fun contexts ->
-                              Result.bind
-                                (bind_field "origin" trace_fields cause_of_yojson)
-                                (fun origin ->
-                                   Result.bind (field "truncated" trace_fields) (function
-                                     | `Bool truncated ->
-                                       validate_error
-                                         { code
-                                         ; message
-                                         ; details
-                                         ; trace = { contexts; origin; truncated }
-                                         }
-                                     | _ -> Error "invalid trace truncation flag")))))))))
+    (Logseq_db_types.Json_codec.decode
+       ~maximum_bytes:maximum_encoded_bytes
+       of_yojson
+       json)
+    (fun value ->
+       let valid_cause (cause : cause) =
+         Result.is_ok
+           (create_cause
+              ~component:cause.component
+              ~operation:cause.operation
+              ~code:cause.code
+              ~message:cause.message)
+       in
+       if
+         not
+           (valid_cause value.trace.origin
+            && List.for_all valid_cause value.trace.contexts)
+       then Error "invalid causal trace"
+       else validate_error value)
 ;;
