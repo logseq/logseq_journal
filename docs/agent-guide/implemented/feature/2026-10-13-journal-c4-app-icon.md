@@ -32,6 +32,10 @@ A loose image has no compiled AppIcon or generated bundle declaration; it does n
 - Simulator's Home Screen can cache icon artwork; verification must inspect the installed bundle and actual Home Screen.
 - Existing OCaml and Swift outputs are reused only with matching source and target identity.
 
+## Consequences
+
+The existing Apple build now includes a compiled icon catalog and platform-specific icon declarations. The approved original remains available for regenerating sizes. App runtime behavior and dependency identity remain unchanged.
+
 ## Questions
 
 None. The user selected C4, explicitly requested adding the app logo and separate PRs, and supplied the approved standalone opaque PNG.
