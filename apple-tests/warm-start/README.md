@@ -12,7 +12,7 @@ identity and checkpoint, a numbered catalog name and a numbered first entry.
 Block UUIDs deliberately repeat across graphs. The version 2 fixture JSON has a
 required `graphs` array; regenerate earlier single-graph fixture files.
 
-Create and close a Capture draft in graph 1, select graph 2 through Account menu
+Create and close a Capture draft in graph 1, select graph 2 through the Options menu
 and verify Capture is empty. Retain a different draft in graph 2, return to graph
 1 and save only its original draft, then save graph 2's draft there. Inspect each
 outbox separately and restart with graph 2 selected to verify direct restoration.

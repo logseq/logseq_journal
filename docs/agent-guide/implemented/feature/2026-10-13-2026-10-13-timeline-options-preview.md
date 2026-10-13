@@ -23,6 +23,8 @@ Rejected because visual lines depend on width, language and Dynamic Type. The in
 - Test hosts and screenshots stay in the task's external evidence directory. An independent host links the current production OCaml object restamped using the existing simulator build convention; only unchanged LUI modules/objects are read from the released cache. No dependency, Dune, protected spec/mli, phone, real graph or AppIcon change.
 - Repository-wide decision validation has the same three historical invalid documents as fixed main; this decision validates independently. The user subsequently authorized a separate non-draft PR and CI tracking; merge is not authorized.
 
+- Independent review found eleven existing Timeline/Favorites UI acceptance selectors still using Account menu. The two native-list acceptance sources now query Options, and the warm-start instructions use the same name. A narrow RED/GREEN comparison against saved actual native accessibility output verifies all eleven selectors; Swift parsing verifies both sources. No product change, full rebuild, Simulator rerun or phone operation was needed for this correction. Startup-specific Account menu labels remain valid.
+
 ## Risks
 
 - SwiftUI Text retains the Timeline's current verbatim markup/link presentation. Native layout, rather than source truncation, determines visible lines.

@@ -62,12 +62,12 @@ final class TopEdgeEffectAcceptance: XCTestCase {
     let app = app()
     defer { XCUIDevice.shared.orientation = .portrait }
     XCUIDevice.shared.orientation = .landscapeLeft
-    let account=app.buttons["Account menu"]
+    let account=app.buttons["Options"]
     let ready=XCTNSPredicateExpectation(predicate:NSPredicate(format:"isHittable == true"),object:account)
     XCTAssertEqual(XCTWaiter.wait(for:[ready],timeout:10),.completed)
     account.tap()
     XCTAssertTrue(app.buttons["Diagnostics"].waitForExistence(timeout:5))
-    record("Landscape account menu really opened",app)
+    record("Landscape Options menu really opened",app)
     app.coordinate(withNormalizedOffset:CGVector(dx:0.02,dy:0.5)).tap()
     XCUIDevice.shared.orientation = .portrait
     XCTAssertTrue(account.waitForExistence(timeout:10))
@@ -77,23 +77,23 @@ final class TopEdgeEffectAcceptance: XCTestCase {
   }
   @MainActor func testFloatingControls() {
     let app = app()
-    let account = app.buttons["Account menu"]
+    let account = app.buttons["Options"]
     XCTAssertTrue(account.isHittable)
     XCTAssertEqual(account.frame.minY,47,accuracy:1)
     account.tap()
     XCTAssertTrue(app.buttons["Diagnostics"].waitForExistence(timeout:5))
-    record("Account menu really opened",app)
+    record("Options menu really opened",app)
     point(app,10,400).tap()
     XCTAssertTrue(app.buttons["Diagnostics"].waitForNonExistence(timeout:5))
     point(app,81,790).tap()
     let favorites=app.staticTexts["favorites-header-title"]
     XCTAssertTrue(favorites.waitForExistence(timeout:10))
     XCTAssertTrue(favorites.isHittable)
-    let favoriteAccount=app.buttons["Account menu"]
+    let favoriteAccount=app.buttons["Options"]
     XCTAssertTrue(favoriteAccount.isHittable)
     favoriteAccount.tap()
     XCTAssertTrue(app.buttons["Diagnostics"].waitForExistence(timeout:5))
-    record("Favorites account menu really opened",app)
+    record("Favorites Options menu really opened",app)
     point(app,10,400).tap()
     point(app,38,790).tap()
     XCTAssertTrue(title(app).waitForExistence(timeout:10))
@@ -119,7 +119,7 @@ final class TopEdgeEffectAcceptance: XCTestCase {
     discard.tap()
     XCTAssertTrue(editor.waitForNonExistence(timeout:10))
     XCTAssertTrue(app.collectionViews.firstMatch.isHittable)
-    XCTAssertEqual(app.buttons["Account menu"].frame.minY,47,accuracy:1)
+    XCTAssertEqual(app.buttons["Options"].frame.minY,47,accuracy:1)
     record("Keyboard closed restores root",app)
   }
   @MainActor func testTopBack() {
