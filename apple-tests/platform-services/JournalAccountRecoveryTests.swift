@@ -9,6 +9,8 @@ import Security
   var calls = 0
   var held: CheckedContinuation<String?, Error>?
   var suspended = false
+  var suspendedToken = false
+  var heldToken: CheckedContinuation<String, Error>?
   func currentUserID() async throws -> String? {
     calls += 1
     try Task.checkCancellation()
@@ -16,7 +18,10 @@ import Security
     if let failure { throw failure }
     return user
   }
-  func freshIDToken() async throws -> String { "synthetic-token" }
+  func freshIDToken() async throws -> String {
+    if suspendedToken { return try await withCheckedThrowingContinuation { heldToken = $0 } }
+    return "synthetic-token"
+  }
   func signOut() async throws { user = nil }
 }
 
@@ -185,6 +190,45 @@ import Security
       check(delayedStore.bytes == original, "unaccepted binding write must restore the original record")
       check(owner.accountIssue?.kind == .accountChangeBlocked, "old save completion must not clear current error")
     }
+    for user: String? in ["different-user", nil] {
+      let delayedAuth = RecoveryAuth()
+      let original = try JournalLocalAccountBindingStore.encode(userID: "original-user", managedSyncOrigin: origin)
+      let delayedStore = RecoveryStore(original)
+      let owner = JournalPlatformServices(auth: delayedAuth, account: delayedStore.capability, managedSyncOrigin: origin)
+      _ = try await owner.response(for: .localAccount)
+      delayedAuth.user = user
+      delayedAuth.suspendedToken = true
+      let lookup = Task { try await owner.response(for: .idToken(challengeID: "graph-presented-during-token")) }
+      let deadline = ContinuousClock.now + .seconds(3)
+      while delayedAuth.heldToken == nil && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(1))
+      }
+      guard let held = delayedAuth.heldToken else {
+        lookup.cancel(); _ = try? await lookup.value
+        failures.append("token race never reached suspended token lookup")
+        continue
+      }
+      _ = try await owner.response(for: .timelinePresented)
+      held.resume(returning: "different-account-token")
+      do { _ = try await lookup.value; failures.append("late presented graph received an unverified account token") }
+      catch JournalPlatformServices.Failure.authenticationRequired { check(user == nil, "missing identity classification") }
+      catch let issue as JournalAccountIssue { check(user != nil && issue.kind == .accountChangeBlocked, "late token account classification") }
+      catch { failures.append("unexpected late token outcome") }
+      check(delayedStore.bytes == original && delayedStore.clears == 0 && delayedStore.writes == 0,
+        "late token rejection retains graph account binding")
+    }
+    let logoutAuth = RecoveryAuth()
+    let logoutStore = RecoveryStore(try JournalLocalAccountBindingStore.encode(userID: "original-user", managedSyncOrigin: origin))
+    let logoutOwner = JournalPlatformServices(auth: logoutAuth, account: logoutStore.capability, managedSyncOrigin: origin)
+    _ = try await logoutOwner.response(for: .localAccount)
+    _ = try await logoutOwner.response(for: .timelinePresented)
+    logoutAuth.user = "different-user"
+    do { _ = try await logoutOwner.response(for: .authenticatedUser); failures.append("logout fixture never rejected foreign account") }
+    catch { }
+    check(logoutOwner.accountIssue?.kind == .accountChangeBlocked, "logout fixture has prior recovery issue")
+    check(try await logoutOwner.response(for: .signOut) == .signedOut, "explicit synthetic sign-out completes")
+    check(logoutOwner.accountIssue == nil, "successful sign-out clears stale recovery issue")
+    check(!logoutOwner.timelinePresented && logoutStore.bytes == nil && logoutStore.clears == 1, "successful sign-out resets account session")
     if !failures.isEmpty {
       for failure in failures { print("FAIL: " + failure) }
       exit(1)

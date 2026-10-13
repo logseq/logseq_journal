@@ -214,6 +214,14 @@ struct JournalLocalAccount: Equatable, Sendable {
       }
       let token = try await auth.freshIDToken()
       try validateCompletion(generation)
+      // Startup can present its retained graph while token retrieval suspends.
+      // Admit the latest graph account before releasing this token to the worker.
+      if timelinePresented {
+        let user = try await auth.currentUserID()
+        try validateCompletion(generation)
+        guard let user else { throw Failure.authenticationRequired }
+        try validateGraphAccount(user)
+      }
       let response = JournalPlatformWire.Response.idToken(challengeID: challenge, token: token)
       _ = try JournalPlatformWire.encodeResponse(response)
       return response
@@ -228,6 +236,7 @@ struct JournalLocalAccount: Equatable, Sendable {
       try await account.clear()
       timelinePresented = false
       preparedUserID = nil
+      accountIssue = nil
       return .signedOut
     case .terminationReady:
       return .terminationReady
