@@ -11,4 +11,6 @@ sips --resampleHeightWidth 1024 1024 assets/apple/Source/Logseq-Journal-C4.png \
   --out assets/apple/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png
 ```
 
-`tool/build_journal_apple.sh` invokes `tool/package_journal_apple_icons.sh` before signing. The latter compiles the catalog with `actool` and merges its generated icon declarations into the assembled app's Info.plist. Validate both bundle layouts with `python3 tool/test_apple_app_icon.py` on macOS with Xcode installed.
+`tool/build_journal_apple.sh` invokes `tool/package_journal_apple_icons.sh` before signing. The latter compiles the C4 catalog with `actool` and adds its generated declarations to the freshly assembled app's icon-free Info.plist. Existing icon configurations and alternate icons are unsupported; the helper rejects such inputs before compiling resources. Probe plists derived from Journal's source plist can still override non-icon metadata such as the bundle ID and display name.
+
+Run the single basic packaging check for both iOS Simulator and macOS with `python3 tool/test_apple_app_icon.py` on macOS with Xcode installed.

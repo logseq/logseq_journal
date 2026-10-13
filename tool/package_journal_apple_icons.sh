@@ -23,6 +23,14 @@ case "$platform" in
   *) echo "unsupported icon platform: $platform" >&2; exit 2 ;;
 esac
 
+# Journal assembly starts from an icon-free plist and installs only C4.
+for key in CFBundleIcons 'CFBundleIcons~ipad' CFBundleIconFile CFBundleIconFiles CFBundleIconName; do
+  if plutil -extract "$key" xml1 -o /dev/null "$info_plist" 2>/dev/null; then
+    echo "Journal C4 packaging requires an Info.plist without existing icon declarations ($key)." >&2
+    exit 2
+  fi
+done
+
 temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/journal-app-icon.XXXXXX")
 trap 'rm -rf "$temporary_dir"' EXIT
 mkdir -p "$resources"
@@ -37,17 +45,8 @@ import plistlib
 import sys
 from pathlib import Path
 
-
-def merge_generated(target, generated):
-    for key, value in generated.items():
-        if isinstance(value, dict) and isinstance(target.get(key), dict):
-            merge_generated(target[key], value)
-        else:
-            target[key] = value
-
-
 info_path = Path(sys.argv[1])
 info = plistlib.loads(info_path.read_bytes())
-merge_generated(info, plistlib.loads(Path(sys.argv[2]).read_bytes()))
+info.update(plistlib.loads(Path(sys.argv[2]).read_bytes()))
 info_path.write_bytes(plistlib.dumps(info))
 PY
