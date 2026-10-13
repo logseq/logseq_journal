@@ -37,8 +37,17 @@ import plistlib
 import sys
 from pathlib import Path
 
+
+def merge_generated(target, generated):
+    for key, value in generated.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            merge_generated(target[key], value)
+        else:
+            target[key] = value
+
+
 info_path = Path(sys.argv[1])
 info = plistlib.loads(info_path.read_bytes())
-info.update(plistlib.loads(Path(sys.argv[2]).read_bytes()))
+merge_generated(info, plistlib.loads(Path(sys.argv[2]).read_bytes()))
 info_path.write_bytes(plistlib.dumps(info))
 PY
