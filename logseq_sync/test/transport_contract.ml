@@ -4009,3 +4009,64 @@ let scenarios = scenarios @
   ; Alcotest.test_case "unlock failure crypto category" `Quick test_unlock_crypto_classification
   ]
 ;;
+
+
+let test_unlock_response_structure ~expected ~success body () =
+  let logs = capture_unlock_classification (fun () ->
+    ignore (with_peer [case (unlock_json_wire body)] (fun ~environment ~sw ~support ~origin ->
+      let posted = ref [] and invalidations = ref 0 in
+      let t = runner ~acquire:(fun _ -> Ok "LOG_SECRET_TOKEN")
+        ~environment ~sw ~support ~posted ~invalidations () in
+      let _, request = unlock_classification_effect origin in
+      Fun.protect ~finally:(fun () -> Runner.shutdown t) (fun () ->
+        Runner.submit t request;
+        wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+        Alcotest.(check bool) "existing strict decode result unchanged" success
+          (List.exists (function
+           | Core.Runner_completed (Core.Completion (_,result)) -> Result.is_ok result
+           | _ -> false) !posted))) : Yojson.Basic.t)) in
+  let has value =
+    let n=String.length value in
+    let rec loop i=i+n<=String.length logs && (String.sub logs i n=value || loop(i+1)) in loop 0 in
+  Alcotest.(check bool) "required safe structure observation" true (has expected);
+  List.iter (fun secret -> Alcotest.(check bool) "field names and values excluded" false (has secret))
+    ["LOG_SECRET_USER";"LOG_SECRET_PASSWORD";"LOG_SECRET_TOKEN";"LOG_SECRET_BODY";
+     "LOG_SECRET_PACKAGE";"LOG_SECRET_WRAPPED";"LOG_SECRET_UNKNOWN_FIELD_NAME";
+     "LOG_SECRET_UNKNOWN_FIELD_NAME2"]
+;;
+
+let scenarios=scenarios @
+  [ Alcotest.test_case "unlock shape object extra secret field" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=object known_fields=1 unknown_fields=1 encrypted_key_present=true"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","LOG_SECRET_UNKNOWN_FIELD_NAME":"LOG_SECRET_BODY"}|})
+  ; Alcotest.test_case "unlock shape array" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=array known_fields=0 unknown_fields=0 encrypted_key_present=false"
+        {|[{"encrypted-aes-key":"LOG_SECRET_WRAPPED"}]|})
+  ; Alcotest.test_case "unlock shape string" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=string known_fields=0 unknown_fields=0 encrypted_key_present=false"
+        {|"LOG_SECRET_BODY"|})
+  ; Alcotest.test_case "unlock shape missing known field" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=object known_fields=0 unknown_fields=2 encrypted_key_present=false"
+        {|{"LOG_SECRET_UNKNOWN_FIELD_NAME":"LOG_SECRET_BODY","LOG_SECRET_UNKNOWN_FIELD_NAME2":"LOG_SECRET_WRAPPED"}|})
+  ; Alcotest.test_case "unlock shape valid strict object" `Quick
+      (test_unlock_response_structure ~success:true
+        ~expected:"json_kind=object known_fields=1 unknown_fields=0 encrypted_key_present=true"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED"}|})
+  ; Alcotest.test_case "unlock shape duplicate known field" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=object known_fields=2 unknown_fields=0 encrypted_key_present=true"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key":"LOG_SECRET_BODY"}|})
+  ; Alcotest.test_case "unlock shape malformed JSON" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=invalid known_fields=unavailable unknown_fields=unavailable encrypted_key_present=unavailable"
+        "LOG_SECRET_BODY")
+  ; Alcotest.test_case "unlock shape observation has independent byte cap" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=unavailable known_fields=unavailable unknown_fields=unavailable encrypted_key_present=unavailable"
+        ("\""^String.make (64*1024+1) 'x'^"\""))
+  ]
+;;

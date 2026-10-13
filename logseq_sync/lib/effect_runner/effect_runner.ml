@@ -5,7 +5,8 @@ module Asset_cache = Bootstrap.Asset_cache
 type unlock_failure_category = Token | Transport | Http_status | Decode | Crypto
 
 type unlock_failure_trace =
-  { mutable category : unlock_failure_category option
+  { operation_id : string
+  ; mutable category : unlock_failure_category option
   ; mutable http_status : int option
   }
 
@@ -587,6 +588,46 @@ let store_key t ticket scope plaintext =
 let map_error result = Result.map_error (fun message -> Core.Effect_failed message) result
 let run_secret_action t action = Eio.Mutex.use_rw ~protect:true t.secret_lock action
 
+let unlock_log_count = Atomic.make 0
+
+let unlock_log format =
+  Printf.ksprintf (fun fields ->
+    if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then (
+      let count = Atomic.fetch_and_add unlock_log_count 1 in
+      try
+        if count < 256 then Printf.eprintf "[journal-unlock] source=runner %s\n%!" fields
+        else if count = 256 then Printf.eprintf "[journal-unlock] source=runner limit=reached\n%!"
+      with _ -> ())) format
+;;
+
+(* Opt-in structural metadata only. Counts are top-level field occurrences;
+   no arbitrary names or values can reach the logger. The independent64KiB
+   observation cap avoids copying/parsing large responses for diagnostics. *)
+let observe_graph_key_response_shape body =
+  if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
+     && Atomic.get unlock_log_count <= 256
+  then Option.iter (fun trace ->
+    let kind, known, unknown, present =
+      if String.length body > 65_536 then "unavailable", "unavailable", "unavailable", "unavailable"
+      else try
+        let kind, known, unknown = match Yojson.Safe.from_string body with
+          | `Assoc fields ->
+            let known, unknown = List.fold_left (fun (known, unknown) (name, _) ->
+              if String.equal name "encrypted-aes-key" then known+1, unknown
+              else known, unknown+1) (0, 0) fields in
+            "object", known, unknown
+          | `List _ -> "array", 0, 0
+          | `String _ -> "string", 0, 0
+          | `Null -> "null", 0, 0
+          | `Bool _ -> "boolean", 0, 0
+          | `Int _ | `Intlit _ | `Float _ -> "number", 0, 0 in
+        kind, string_of_int known, string_of_int unknown, string_of_bool (known>0)
+      with _ -> "invalid", "unavailable", "unavailable", "unavailable"
+    in
+    unlock_log "op=%s request=fetch-e2ee-graph-key phase=response-shape json_kind=%s known_fields=%s unknown_fields=%s encrypted_key_present=%s"
+      trace.operation_id kind known unknown present) (Eio.Fiber.get unlock_failure_trace)
+;;
+
 let execute_request
   : type a.
     t -> a Core.effect_ticket -> a Core.runner_request -> (a, Core.effect_error) result
@@ -629,6 +670,7 @@ let execute_request
            ~graph_id:graph.graph_id
            ~token))
       (fun response ->
+         observe_graph_key_response_shape response.Http_eio.body;
          E2ee.graph_key_response response.Http_eio.body
          |> Result.map_error (fun message ->
            observe_unlock_failure Decode;
@@ -914,18 +956,6 @@ let cancel_scope t scope =
   | _ -> ()
 ;;
 
-let unlock_log_count = Atomic.make 0
-
-let unlock_log format =
-  Printf.ksprintf (fun fields ->
-    if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then (
-      let count = Atomic.fetch_and_add unlock_log_count 1 in
-      try
-        if count < 256 then Printf.eprintf "[journal-unlock] source=runner %s\n%!" fields
-        else if count = 256 then Printf.eprintf "[journal-unlock] source=runner limit=reached\n%!"
-      with _ -> ())) format
-;;
-
 let unlock_request_kind : type a. a Core.runner_request -> string option = function
   | Core.Fetch_catalog _ -> Some "fetch-catalog"
   | Fetch_e2ee_graph_key _ -> Some "fetch-e2ee-graph-key"
@@ -965,7 +995,7 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
   let diagnostic_kind = unlock_request_kind request in
   let failure_trace =
     if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" && Option.is_some diagnostic_kind
-    then Some { category = None; http_status = None }
+    then Some { operation_id = id; category = None; http_status = None }
     else None
   in
   let began = Unix.gettimeofday () in
