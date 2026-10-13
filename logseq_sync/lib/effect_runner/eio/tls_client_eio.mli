@@ -2,6 +2,7 @@ type error =
   | Invalid_dns_host
   | No_network_address
   | Setup_failed of string
+  | Authentication_failed
 
 val initialize_rng : unit -> unit
 
