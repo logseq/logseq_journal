@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Verify Apple app icon packaging
+        run: python3 tool/test_apple_app_icon.py
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.5.0"
