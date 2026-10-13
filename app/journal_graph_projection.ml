@@ -207,6 +207,18 @@ let asset_file_type (block : Graph.block) =
     block.properties
 ;;
 
+let attachment_reference (block : Graph.block) =
+  List.exists
+    (fun (property : Graph.property_summary) ->
+       List.exists
+         (function
+           | Graph.Asset_value _ -> true
+           | Node_value _ | Entity_value _ -> property.ident = "logseq.property/asset"
+           | _ -> false)
+         property.values)
+    block.properties
+;;
+
 let block_in_context
       ~page_id
       ~journal_day
@@ -232,7 +244,12 @@ let block_in_context
       ~revision
       ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
     |> Result.map (fun block ->
-      Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value))
+      Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value)
+      |> fun block ->
+      Journal_model.with_content_metadata
+        block
+        ~tags_present:(value.tags <> [])
+        ~attachments_present:(attachment_reference value))
 ;;
 
 let block ~page ~revision ~child_count ~time_context value =
@@ -292,22 +309,19 @@ let timeline_entry_page
         let order = String.compare left.block.order right.block.order in
         if order = 0 then Graph.Uuid.compare left.block.uuid right.block.uuid else order)
     in
-    let image_asset (block : Graph.block) =
-      Option.fold
-        ~none:false
-        ~some:Journal_model.is_image_file_type
-        (asset_file_type block)
-    in
     List.filter_map
       (fun (item : tree_member) ->
          let children = if item.depth = 0 then direct_children item.block else [] in
          if
            item.depth = 0
            && (String.trim item.block.title <> ""
-               || List.exists
-                    (fun (child : tree_member) -> image_asset child.block)
-                    children
-               || image_asset item.block)
+               || item.block.tags <> []
+               || tag_titles item.block.uuid <> []
+               || Option.fold
+                    ~none:false
+                    ~some:(fun t -> String.trim t <> "")
+                    (asset_file_type item.block)
+               || attachment_reference item.block)
          then Some (item, children)
          else None)
       result.items

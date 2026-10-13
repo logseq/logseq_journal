@@ -1483,9 +1483,8 @@ let refresh_response t page refresh result =
               String.equal (Journal_model.id entry.block) id)
            projected.entries
        in
-       (* Empty-source roots are filtered out of the timeline projection, so a
-          committed block with no title is not among the entries — project it
-          from the raw members to still confirm the completion. *)
+       (* Timeline filters parents without their own text, tags or attachments.
+          Confirm an invisible committed block from complete raw members. *)
        let project_invisible ~block_id ~missing ~complete =
          match
            List.find_opt

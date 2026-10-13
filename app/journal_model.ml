@@ -47,6 +47,8 @@ type t =
   ; asset_file_type : string option
   ; task_state : task_state
   ; tag_titles : string list
+  ; tags_present : bool
+  ; attachments_present : bool
   ; child_count : int
   ; creation_time : Journal_time.t
   ; revision : string
@@ -112,6 +114,8 @@ let create_on_page
         ; asset_file_type = None
         ; task_state
         ; tag_titles = []
+        ; tags_present = false
+        ; attachments_present = false
         ; child_count
         ; creation_time
         ; revision
@@ -170,6 +174,17 @@ let is_image_file_type value =
 
 let asset_file_type value = value.asset_file_type
 let with_asset_file_type value ~asset_file_type = { value with asset_file_type }
+let has_tags value = value.tags_present || value.tag_titles <> []
+
+let has_attachments value =
+  value.attachments_present
+  || Option.fold ~none:false ~some:(fun t -> String.trim t <> "") value.asset_file_type
+;;
+
+let with_content_metadata value ~tags_present ~attachments_present =
+  { value with tags_present; attachments_present }
+;;
+
 let task_state value = value.task_state
 let child_count value = value.child_count
 let creation_time value = value.creation_time

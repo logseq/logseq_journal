@@ -2,40 +2,43 @@
 
 ## Problem
 
-Timeline's menu contains application options but uses an account icon. Long row bodies expose local expansion rather than directing readers to Detail.
+Timeline's menu contains application options but uses an account icon. Long bodies expand inline, and empty parents can remain visible because a child contains an image.
 
 ## Decision
 
-Use Detail's ellipsis icon and Options accessibility label, preserving every menu action. Limit Timeline block text to four visual lines with native SwiftUI layout and remove local expansion. OCaml owns the limit; a generic bounded-text presentation in the existing native chrome adapter applies it. Detail and pagination retain their existing behavior. After the user clarified that the whole card may exceed four lines but must remain bounded, Timeline projections and the public row renderer retain only the first three child summaries in sibling order, including image/file summaries. Each text body still has four visual lines; the root plus three text summaries can occupy at most sixteen body lines. Raw members, true child count, Detail and Copy remain complete; no read strategy changes.
+Use Detail's ellipsis icon and Options accessibility label, preserving every existing menu action. Limit Timeline text to four visual lines with native SwiftUI layout and remove local expansion. OCaml owns policy; a generic bounded-text mode in the existing chrome adapter applies native wrapping. Retain at most three child summaries in sibling order, including image/file summaries. Each text summary also has four lines.
 
-A retained parent can have empty root text and three empty summaries while a later image keeps the entry valid. If the selected preview has no text, status, tags or known attachment, render the short “Open block” label under the same four-line policy. The existing whole-row navigation opens Detail. Resolve selected text only once and inspect only the three-summary prefix; do not search later children, remove the entry or add expansion.
+After viewing the actual screenshots, the user replaced the empty-preview policy: a Timeline parent appears only when its own text, tags or attachment metadata is present. Child content and child count do not qualify it. Remove the Open block placeholder. Task status is a separate property: status alone does not qualify a parent, while a real Task tag qualifies as a tag. Reuse existing root file type, typed asset references and tag membership/titles; do not request another attachment scan or broaden reads. Generic metadata presence travels through the app's OCaml model so Feed and canonical point updates make the same decision. Only the ordinary app model interface is extended; protected spec interfaces are unchanged.
+
+Detail and Copy remain complete. Canonical mutation completion still returns an invisible root with its true child count. Timeline state filters empty cards in complete and partial days, handles clearing an existing parent, and restores a newly qualifying parent in an already known day without depending on its child count or status. Day continuation and stable navigation identities retain their existing ownership.
 
 ## Alternatives considered
 
 ### Character or newline truncation
 
-Rejected because visual lines depend on width, language and Dynamic Type. The installed LUI text node only implements a three-line style, so a native bounded-text presentation is needed without modifying the dependency.
+Rejected because visual lines depend on width, language and Dynamic Type. The installed LUI text node exposes a three-line style, so native bounded text is required without changing the dependency.
+
+### Empty preview placeholder
+
+Replaced by the user's explicit parent-only visibility policy. Child images, later summaries and status alone no longer retain an otherwise empty Timeline parent.
 
 ## Consequences
 
-- Mounted production tests cover short and long English, Chinese, newlines, long words, markup, links and resolved references with the same four-line policy and intact source.
-- No row Show more/Show less action remains; the existing row navigation opens complete Detail. Menu actions remain clickable.
-- Actual iPhone 13 / iOS 26.1 screenshots show exactly four visual lines for English, Chinese, long words and verbatim Markdown/links; short text stays one line. Accessibility XXXL still shows four visual lines. Image attachments keep their native layout. Root body and each distinct child-block summary use the same limit; media discovery ownership is preserved.
-- Mounted RED fails for the old expansion and Account menu. Full build/native embed and all 21 Alcotest suites pass (730 cases, including 224 sync and 79 application cases), plus standalone semantic/adaptive/source boundary checks. All five menu callbacks retain their original actions; actual native Options opens Diagnostics and body taps open complete Detail.
-- Test hosts and screenshots stay in the task's external evidence directory. An independent host links the current production OCaml object restamped using the existing simulator build convention; only unchanged LUI modules/objects are read from the released cache. No dependency, Dune, protected spec/mli, phone, real graph or AppIcon change.
-- Repository-wide decision validation has the same three historical invalid documents as fixed main; this decision validates independently. The user subsequently authorized a separate non-draft PR and CI tracking; merge is not authorized.
-
-- Independent review found eleven existing Timeline/Favorites UI acceptance selectors still using Account menu. The two native-list acceptance sources now query Options, and the warm-start instructions use the same name. A narrow RED/GREEN comparison against saved actual native accessibility output verifies all eleven selectors; Swift parsing verifies both sources. No product change, full rebuild, Simulator rerun or phone operation was needed for this correction. Startup-specific Account menu labels remain valid.
-
-- The summary-count RED cases reproduced 199 summaries in Feed and 10,050 summaries after paginated Capture/Update/Status completions. Public Runtime GREEN covers Feed, day continuation, remote page-tree reconciliation, legacy refresh and mutation confirmation through the shared projection. The five new cases retain true counts and all 199 Detail/Copy children; the full 106 Runtime and 79 Application cases, 47 semantic cases and Timeline state regressions pass.
-- The public renderer invokes source/media callbacks only for the root and first three summaries. Measured allocation is 7,360 bytes for 3, 201 and 10,050 input summaries. This presentation follow-up changes only two OCaml implementation files and tests; no new Swift/native host build or Simulator/device run was needed. Earlier native screenshots establish the unchanged four-line typography, not the new summary-count cap.
-- Incremental review reproduced an unidentifiable historical row using public Runtime Feed completions and Timeline state: the first three child sources are empty and the fourth is an image. These owners preserve valid data but do not own visible labels, so a single mounted renderer regression covers the label and existing navigation, with guards for visible root/child text, status, tags and selected root/child images. RED fails on the missing label; GREEN retains the four-child count, three-summary prefix and block identity without visiting the fourth source. Row construction now allocates 7,536 bytes for each of 3, 201 and 10,050 input summaries. This measurement applies only to row construction; raw projection still traverses and sorts complete members. No GUI evidence was produced for this boundary.
+- Runtime RED reproduces empty child-image parents and status-only parents surviving in Feed and mutation confirmation. The same public owner covers Feed, day continuation, remote reconciliation, legacy refresh and Capture/Update/Status confirmation with text, tags, PNG, PDF and typed attachment-reference cases.
+- Public Timeline state regression covers multiple empty siblings, canonical clearing/restoration, tag/image/file-only parents and status-only point updates. Existing empty-day expectations now match parent-only visibility; no row-level duplicate behavior regression replaces these pure owners.
+- The old Open block mounted regression and child-image-only empty-parent gallery regression are removed because their policies are obsolete. Other rendering, media lease, menu, source, Dynamic Type and Detail tests remain.
+- Existing public Detail/Copy regression now begins with a hidden empty parent and 199 children, including an image child. Complete child order and the final source remain available through unchanged read limits and Copy traversal.
+- Status-setting operations only write the status property and timestamps; they do not automatically add a tag. The visibility condition deliberately has three qualifying facts.
+- Earlier screenshots at 097ac2e2 retain historical evidence for the replaced placeholder. Final parent-only Simulator screenshots are recorded separately outside Git; they must not be confused with the old Open block image.
+- Evidence, generated hosts and screenshots stay outside Git. Reuse unchanged LUI modules/objects read-only, compile current OCaml inputs, and keep synthetic fixture keys in memory. No Dune, protected spec, dependency, personal graph, phone or AppIcon change. Merge is not authorized.
+- Decision validation retains the same three historical invalid documents as the fixed main baseline; this decision validates independently.
 
 ## Risks
 
-- SwiftUI Text retains the Timeline's current verbatim markup/link presentation. Native layout, rather than source truncation, determines visible lines.
-- Child summaries count toward a three-item preview budget regardless of media type. Later children and attachments remain in Detail. The renderer takes the prefix before partitioning, resolving sources or constructing media views, so work does not grow with hidden summary count. Evidence stays outside Git; dependency caches remain read-only.
+- Timeline still presents markup and links verbatim. SwiftUI determines visual lines from width and Dynamic Type.
+- Root attachment eligibility uses metadata already supplied by its reader. Metadata for a child's image alone is insufficient to retain the parent. No extra discovery read is introduced.
+- Only row construction is bounded by the three-summary prefix. Raw projection still traverses and sorts complete members.
 
 ## Questions
 
-- None. The user clarified the aggregate card may exceed four lines while remaining bounded, and the parent explicitly authorized the three-summary display cap.
+- None. The user explicitly requested parent-only text, tags and attachment eligibility and removal of the placeholder.

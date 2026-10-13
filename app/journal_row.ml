@@ -93,42 +93,19 @@ let view
     then ""
     else render_source (Journal_model.source block)
   in
-  let text_children =
-    List.map
-      (fun (summary : Journal_graph_projection.child_summary) ->
-         summary, render_source summary.source)
-      text_children
-  in
-  let metadata = metadata block in
-  let empty_preview =
-    String.trim source = ""
-    && metadata = []
-    && image_children = []
-    && Option.is_none (Journal_model.asset_file_type block)
-    && List.for_all
-         (fun ((summary : Journal_graph_projection.child_summary), source) ->
-            String.trim source = "" && Option.is_none summary.asset_file_type)
-         text_children
-  in
-  let root_body =
-    (* A retained parent may have content only beyond the preview budget.
-       Keep its existing whole-row Detail action identifiable without looking
-       past the selected summaries or manufacturing persisted content. *)
-    if empty_preview then preview_text "Open block" else body source
-  in
-  let content = V.column ~spacing:8. ~alignment:Leading (root_body :: metadata) in
+  let content = V.column ~spacing:8. ~alignment:Leading (body source :: metadata block) in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
   let labels =
     labels
     @ List.map
-        (fun ((summary : Journal_graph_projection.child_summary), source) ->
+        (fun (summary : Journal_graph_projection.child_summary) ->
            render_media
              ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
-             (body source))
+             (body (render_source summary.source)))
         text_children
   in
   let labels =

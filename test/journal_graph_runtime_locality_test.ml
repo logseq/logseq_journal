@@ -1749,8 +1749,8 @@ let test_target_blank_image_and_deep_child () =
            1
            (Journal_model.child_count block);
          Alcotest.(check bool)
-           "only journal roots create timeline entries"
-           (not child_target)
+           "child image content does not retain an empty parent"
+           false
            (Option.is_some timeline_entry_update)
        | _ -> Alcotest.fail "deep child or blank image target was not confirmed")
     [ false; true ]
@@ -4199,9 +4199,65 @@ let test_bounded_preview_target_pages kind count () =
 
 let test_preview_preserves_full_detail_and_copy () =
   let count = 199 in
-  let children = summary_children count in
+  let children =
+    summary_children count
+    |> List.mapi (fun index (child : Protocol.v2_child_member) ->
+      if index = 0
+      then
+        { child with
+          Protocol.value =
+            { child.value with
+              block = { child.value.block with properties = [ asset_type_property ] }
+            }
+        }
+      else child)
+  in
+  let root = { record with block = { block with title = "" } } in
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
-  seed_feed runtime;
+  set_calendar runtime;
+  let journals =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 1
+         ; blocks_per_day = 200
+         ; slot_limit = 201
+         ; request_generation = 7L
+         })
+    |> fun output -> only "hidden parent feed" output.requests
+  in
+  let tree =
+    Runtime.receive
+      runtime
+      (response
+         journals
+         (V2_journals_outcome
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            ; next_cursor = None
+            }))
+    |> fun output -> only "hidden parent tree" output.requests
+  in
+  let items =
+    { Protocol.value = root; revision = "root-1"; depth = 0; parent = page_uuid }
+    :: List.map
+         (fun (child : Protocol.v2_child_member) ->
+            Protocol.
+              { value = child.value
+              ; revision = child.revision
+              ; depth = 1
+              ; parent = block_uuid
+              })
+         children
+  in
+  let output = Runtime.receive runtime (tree_page tree items None) in
+  (match (only "hidden parent projected" output.responses).payload with
+   | Feed_loaded { feed; _ } ->
+     Alcotest.(check int)
+       "child image cannot retain empty parent"
+       0
+       (List.length (List.hd feed.days).entries)
+   | _ -> Alcotest.fail "hidden parent feed failed");
   let root_read =
     Runtime.submit
       runtime
@@ -4219,7 +4275,7 @@ let test_preview_preserves_full_detail_and_copy () =
       (response
          root_read
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "root-1" })))
+            (V2_present_block { value = root; revision = "root-1" })))
     |> fun o -> only "complete Detail children" o.requests
   in
   let output =
@@ -4237,7 +4293,7 @@ let test_preview_preserves_full_detail_and_copy () =
        (Journal_model.source (List.nth detail.children.blocks 198))
    | _ -> Alcotest.fail "complete Detail result lost owner");
   let state, effects = copy_start block_uuid in
-  let state, effects = copy_root state effects block.title in
+  let state, effects = copy_root state effects root.block.title in
   let state, effects = copy_reply state effects (copy_children block_uuid children) in
   let state, effects =
     List.fold_left
@@ -4255,7 +4311,7 @@ let test_preview_preserves_full_detail_and_copy () =
     true
     (effects
      = [ Copy.Copied
-           (block.title
+           (root.block.title
             ^ String.concat
                 ""
                 (List.map
@@ -4264,10 +4320,283 @@ let test_preview_preserves_full_detail_and_copy () =
        ])
 ;;
 
+(* Runtime owns Timeline projection; canonical hidden roots remain available
+   to mutation completion, Detail and Copy through the same existing reads. *)
+let parent_visibility_fixture (page : Graph.page) =
+  let property ident property_type values =
+    { asset_type_property with
+      ident
+    ; schema = { asset_type_property.schema with property_type }
+    ; values
+    }
+  in
+  let root n title properties tags tag_titles task_status =
+    { record with
+      block =
+        { block with
+          uuid = uuid (Printf.sprintf "a5000000-0000-4000-8000-%012d" n)
+        ; title
+        ; page = page.Graph.uuid
+        ; parent = page.uuid
+        ; order = Printf.sprintf "a%02d" n
+        ; properties
+        ; tags
+        }
+    ; tag_titles
+    ; task_status
+    }
+  in
+  let tag = uuid "a5000000-0000-4000-b000-000000000001" in
+  let child_id n j = uuid (Printf.sprintf "a5000000-0000-4000-9000-%06d%06d" n j) in
+  let own_asset = property "logseq.property/asset" Asset [ Asset_value (child_id 1 4) ] in
+  let status =
+    property
+      "logseq.property/status"
+      Default
+      [ Default_value "logseq.property/status.doing" ]
+  in
+  let roots =
+    [ false, root 1 " \t\n" [] [] [] None
+    ; true, root 2 "Visible parent" [] [] [] None
+    ; true, root 3 "" [] [ tag ] [ "Work" ] None
+    ; true, root 4 "" [ asset_type_property ] [] [] None
+    ; ( true
+      , root
+          5
+          ""
+          [ { asset_type_property with values = [ String_value "pdf" ] } ]
+          []
+          []
+          None )
+    ; true, root 6 "" [ own_asset ] [] [] None
+    ; false, root 7 "" [ status ] [] [] (Some V2_doing)
+    ; true, root 8 "" [ status ] [ tag ] [ "Task" ] (Some V2_doing)
+    ]
+  in
+  let children n parent =
+    List.init 4 (fun offset ->
+      let j = offset + 1 in
+      { Protocol.value =
+          { record with
+            block =
+              { block with
+                uuid = child_id n j
+              ; page = page.uuid
+              ; parent
+              ; order = Printf.sprintf "a%d" j
+              ; title = (if j = 4 then "Child image" else " ")
+              ; properties = (if j = 4 then [ asset_type_property ] else [])
+              }
+          }
+      ; revision = "child-1"
+      })
+  in
+  let items =
+    List.mapi
+      (fun index (_, root) ->
+         { Protocol.value = root; revision = "root-1"; depth = 0; parent = page.uuid }
+         :: List.map
+              (fun (child : Protocol.v2_child_member) ->
+                 Protocol.
+                   { value = child.value
+                   ; revision = child.revision
+                   ; depth = 1
+                   ; parent = root.block.uuid
+                   })
+              (children (index + 1) root.block.uuid))
+      roots
+    |> List.concat
+  in
+  roots, children, items
+;;
+
+let check_parent_visibility roots entries =
+  let expected =
+    List.filter_map
+      (fun (visible, r) ->
+         if visible then Some (Graph.Uuid.to_string r.Protocol.block.uuid) else None)
+      roots
+  in
+  Alcotest.(check (list string))
+    "only parent text, tags or attachments qualify"
+    expected
+    (List.map
+       (fun (e : Journal_graph_projection.timeline_entry) -> Journal_model.id e.block)
+       entries);
+  let feed : Journal_graph_projection.feed =
+    { days =
+        [ { page =
+              { id = Graph.Uuid.to_string page_uuid; day = 20260901; title = page.title }
+          ; entries
+          ; has_more_entries = false
+          ; continuation = None
+          }
+        ]
+    ; slot_count = 1 + List.length entries
+    ; has_more_days = false
+    }
+  in
+  let state =
+    Journal_timeline_state.empty ~today:20260902
+    |> fun s ->
+    Journal_timeline_state.begin_request s ~generation:1L (Feed { before_day = None })
+    |> fun s -> Journal_timeline_state.apply_feed s ~generation:1L feed
+  in
+  let shown =
+    Journal_timeline_state.fold_slots
+      (fun ids -> function
+         | Top_level e -> Journal_model.id e.block :: ids
+         | _ -> ids)
+      []
+      state
+    |> List.rev
+  in
+  Alcotest.(check (list string))
+    "tag/attachment metadata survives Timeline state"
+    expected
+    shown
+;;
+
+let test_parent_visibility_tree_paths () =
+  let roots, _, items = parent_visibility_fixture page in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let journals =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 1
+         ; blocks_per_day = 200
+         ; slot_limit = 201
+         ; request_generation = 7L
+         })
+    |> fun o -> only "visibility feed" o.requests
+  in
+  let tree =
+    Runtime.receive
+      runtime
+      (response
+         journals
+         (V2_journals_outcome
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            ; next_cursor = None
+            }))
+    |> fun o -> only "visibility tree" o.requests
+  in
+  let cursor = Graph.Cursor.of_string "visibility-next" |> Result.get_ok in
+  let output = Runtime.receive runtime (tree_page tree items (Some cursor)) in
+  let day =
+    List.find_map
+      (fun r ->
+         match r.Runtime.payload with
+         | Feed_loaded { feed; _ } -> Some (List.hd feed.days)
+         | _ -> None)
+      output.responses
+    |> Option.get
+  in
+  check_parent_visibility roots day.entries;
+  let read =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_day_blocks
+         { day = 20260901
+         ; after = day.continuation
+         ; limit = 200
+         ; request_generation = 8L
+         })
+    |> fun o -> only "visibility continuation" o.requests
+  in
+  let output = Runtime.receive runtime (tree_page read items None) in
+  (match (only "visibility day" output.responses).payload with
+   | Day_blocks_loaded { page; _ } -> check_parent_visibility roots page.entries
+   | _ -> Alcotest.fail "visibility day owner lost");
+  let refresh =
+    changed runtime (window ~scopes:[ V2_page_tree_interest page_uuid ] ())
+    |> hydration_requests
+    |> only "visibility remote"
+  in
+  (match
+     (only
+        "visibility remote output"
+        (Runtime.receive runtime (tree_page refresh items None)).responses)
+       .payload
+   with
+   | Page_tree_reconciled { value; _ } -> check_parent_visibility roots value.entries
+   | _ -> Alcotest.fail "visibility remote owner lost");
+  let runtime, _, refresh = prepare_paged_refresh Delete_conflict in
+  let output = Runtime.receive runtime (tree_page refresh items None) in
+  let entries =
+    List.find_map
+      (fun r ->
+         match r.Runtime.payload with
+         | Page_tree_reconciled { value; _ } -> Some value.entries
+         | _ -> None)
+      output.responses
+    |> Option.get
+  in
+  check_parent_visibility roots entries
+;;
+
+let test_parent_visibility_confirmations () =
+  List.iter
+    (fun kind ->
+       List.iter
+         (fun (visible, index) ->
+            let runtime, page, refresh = target_refresh kind in
+            let roots, children, _ = parent_visibility_fixture page in
+            let _, canonical = List.nth roots index in
+            let canonical =
+              { canonical with block = { canonical.block with uuid = block_uuid } }
+            in
+            let output =
+              Runtime.receive
+                runtime
+                (summary_response
+                   refresh
+                   page
+                   (V2_present_block { value = canonical; revision = "canonical-2" })
+                   (children (index + 1) block_uuid)
+                   None
+                   "projection-2")
+            in
+            let actual, entry =
+              List.find_map
+                (fun r ->
+                   match r.Runtime.payload with
+                   | Block_captured { block; timeline_entry_update }
+                   | Block_updated { block; timeline_entry_update } ->
+                     Some (block, timeline_entry_update)
+                   | _ -> None)
+                output.responses
+              |> Option.get
+            in
+            Alcotest.(check bool)
+              "canonical parent visibility"
+              visible
+              (Option.is_some entry);
+            Alcotest.(check int)
+              "hidden completion retains raw children"
+              4
+              (Journal_model.child_count actual);
+            Alcotest.(check int)
+              "no new attachment or amplified read"
+              0
+              (List.length output.requests))
+         (List.mapi
+            (fun index (v, _) -> v, index)
+            (let roots, _, _ = parent_visibility_fixture page in
+             roots)))
+    [ `Capture; `Update; `Status ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "bounded Timeline preview"
+    [ ( "parent-only Timeline visibility"
+      , [Alcotest.test_case "feed day remote legacy and metadata" `Quick test_parent_visibility_tree_paths;
+         Alcotest.test_case "Capture Update Status completions" `Quick test_parent_visibility_confirmations])
+    ; ( "bounded Timeline preview"
       , [ Alcotest.test_case "feed, day, remote and legacy refresh paths" `Quick test_bounded_preview_tree_paths
         ; Alcotest.test_case "Capture 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Capture 10050)
         ; Alcotest.test_case "Update 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update 10050)

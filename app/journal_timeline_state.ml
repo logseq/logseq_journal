@@ -174,10 +174,10 @@ let slot_day = function
   | Feed_continuation _ -> None
 ;;
 
-let empty_placeholder (entry : Journal_graph_projection.timeline_entry) =
+let empty_parent (entry : Journal_graph_projection.timeline_entry) =
   String.equal (String.trim (Journal_model.source entry.block)) ""
-  && Journal_model.child_count entry.block = 0
-  && Journal_model.task_state entry.block = Journal_model.No_status
+  && not (Journal_model.has_tags entry.block)
+  && not (Journal_model.has_attachments entry.block)
 ;;
 
 let insert_day_slots slots day replacement =
@@ -234,10 +234,46 @@ let preserve_anchor (before : t) (state : t) =
 ;;
 
 let normalize_days (state : t) =
-  let slots = ref state.slots in
+  (* Apply parent visibility to point updates as well as projected pages.
+     Child count and status are deliberately not qualifying content. *)
+  let removed = Hashtbl.create 8 in
+  let candidates = Hashtbl.create 8 in
+  let slots =
+    ref
+      (filter_slots
+         (function
+           | Top_level entry when empty_parent entry ->
+             let day = Journal_model.journal_day entry.block in
+             Hashtbl.replace
+               removed
+               day
+               (1 + Option.value (Hashtbl.find_opt removed day) ~default:0);
+             if not (Hashtbl.mem candidates day) then Hashtbl.add candidates day entry;
+             false
+           | _ -> true)
+         state.slots)
+  in
   let days =
     Days.mapi
       (fun day knowledge ->
+         let block_count =
+           max
+             0
+             (knowledge.block_count
+              - Option.value (Hashtbl.find_opt removed day) ~default:0)
+         in
+         let hidden_entry =
+           if block_count = 0
+           then (
+             match Hashtbl.find_opt candidates day with
+             | Some entry -> Some entry
+             | None -> knowledge.hidden_entry)
+           else (
+             match knowledge.hidden_entry with
+             | Some entry when empty_parent entry -> None
+             | entry -> entry)
+         in
+         let knowledge = { knowledge with block_count; hidden_entry } in
          if
            (not knowledge.hidden)
            && ((not knowledge.complete) || knowledge.block_count > 1)
@@ -258,7 +294,7 @@ let normalize_days (state : t) =
              knowledge.complete
              && (knowledge.block_count = 0
                  || (knowledge.block_count = 1
-                     && Option.fold ~none:false ~some:empty_placeholder entry))
+                     && Option.fold ~none:false ~some:empty_parent entry))
            in
            if hidden
            then (
@@ -676,22 +712,50 @@ let replace_block (state : t) replacement =
   let state = invalidate_recovery_for_day state (Journal_model.journal_day replacement) in
   let replacement_id = Journal_model.id replacement in
   let before = state in
+  let retained = ref false in
+  let hidden_match = ref false in
   let state =
     update_day state (Journal_model.journal_day replacement) (fun knowledge ->
       match knowledge.hidden_entry with
       | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
-        { knowledge with hidden_entry = Some { entry with block = replacement } }
+        hidden_match := true;
+        let entry = { entry with block = replacement } in
+        { knowledge with
+          hidden_entry = Some entry
+        ; block_count =
+            (if empty_parent entry
+             then knowledge.block_count
+             else max 1 knowledge.block_count)
+        }
       | _ -> knowledge)
   in
   let slots =
     update_slots
       (function
         | Top_level entry when String.equal (Journal_model.id entry.block) replacement_id
-          -> Some (Top_level { entry with block = replacement })
+          ->
+          retained := true;
+          Some (Top_level { entry with block = replacement })
         | _ -> None)
       state.slots
   in
-  { state with slots } |> finish_change before
+  let state = { state with slots } in
+  let entry = { Journal_graph_projection.block = replacement; child_summaries = [] } in
+  let state =
+    if
+      (not !retained)
+      && (not !hidden_match)
+      && Journal_model.parent_id replacement = None
+      && (not (empty_parent entry))
+      && Days.mem (Journal_model.journal_day replacement) state.days
+    then
+      { state with slots = insert_entry state.slots entry }
+      |> fun state ->
+      update_day state (Journal_model.journal_day replacement) (fun k ->
+        { k with block_count = k.block_count + 1 })
+    else state
+  in
+  finish_change before state
 ;;
 
 let replace_timeline_entry
@@ -705,22 +769,48 @@ let replace_timeline_entry
   in
   let replacement_id = Journal_model.id replacement.Journal_graph_projection.block in
   let before = state in
+  let retained = ref false in
+  let hidden_match = ref false in
   let state =
     update_day state (Journal_model.journal_day replacement.block) (fun knowledge ->
       match knowledge.hidden_entry with
       | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
-        { knowledge with hidden_entry = Some replacement }
+        hidden_match := true;
+        { knowledge with
+          hidden_entry = Some replacement
+        ; block_count =
+            (if empty_parent replacement
+             then knowledge.block_count
+             else max 1 knowledge.block_count)
+        }
       | _ -> knowledge)
   in
   let slots =
     update_slots
       (function
         | Top_level entry when String.equal (Journal_model.id entry.block) replacement_id
-          -> Some (Top_level replacement)
+          ->
+          retained := true;
+          Some (Top_level replacement)
         | _ -> None)
       state.slots
   in
-  { state with slots } |> finish_change before
+  let state = { state with slots } in
+  let day = Journal_model.journal_day replacement.block in
+  let state =
+    if
+      (not !retained)
+      && (not !hidden_match)
+      && (not (empty_parent replacement))
+      && Journal_model.parent_id replacement.block = None
+      && Days.mem day state.days
+    then
+      { state with slots = insert_entry state.slots replacement }
+      |> fun state ->
+      update_day state day (fun k -> { k with block_count = k.block_count + 1 })
+    else state
+  in
+  finish_change before state
 ;;
 
 let replace_timeline_entry_page
