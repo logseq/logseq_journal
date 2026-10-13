@@ -40,6 +40,10 @@ let test_auth_capability_envelopes_are_bounded_and_protocol_free () =
     |> require_ok
   in
   require (authenticated = Some "cognito-user-1") "authenticated-user response changed";
+  require
+    (Journal_platform.decode_authenticated_user
+       (envelope 7 (Bytes.of_string {|{"userId":null}|})) = Ok None)
+    "explicit absent authenticated user was rejected";
   let token =
     envelope
       9
@@ -232,8 +236,29 @@ let test_generated_picker_preserves_uuid_validation () =
     "generated picker decoder accepted an invalid batch member"
 ;;
 
+(* Account JSON is owned by the platform byte decoder. The startup reducer only
+   sees its result and cannot reproduce omitted fields without injecting that result. *)
+let test_account_fields_are_required () =
+  let accepted tag decode sources =
+    List.filter_map
+      (fun source ->
+         if Result.is_error (decode (envelope tag (Bytes.of_string source))) then None
+         else Some (Printf.sprintf "tag %d %s" tag source)) sources
+  in
+  let malformed =
+    accepted 7 Journal_platform.decode_authenticated_user [ "{}" ]
+    @ accepted 21 Journal_platform.decode_local_account_binding
+        [ "{}"; {|{"userId":null}|}; {|{"managedSyncOrigin":null}|}
+        ; {|{"userId":"cognito-user-1"}|}
+        ; {|{"managedSyncOrigin":"https://api.logseq.io"}|} ]
+  in
+  require (malformed = []) "missing account fields accepted: %s"
+    (String.concat "; " malformed)
+;;
+
 let tests =
-  [ "generated native decoders", test_generated_native_decoders_reject_untyped_payloads
+  [ "required account fields", test_account_fields_are_required
+  ; "generated native decoders", test_generated_native_decoders_reject_untyped_payloads
   ; "generated environment roundtrip", test_generated_environment_roundtrip
   ; "generated picker UUIDs", test_generated_picker_preserves_uuid_validation
   ; "clipboard text", test_clipboard_is_bounded_and_acknowledged

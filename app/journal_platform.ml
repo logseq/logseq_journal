@@ -99,9 +99,9 @@ let local_account_binding_request = encode_envelope 20 Bytes.empty |> Result.get
 let timeline_presented_request = encode_envelope 22 Bytes.empty |> Result.get_ok
 
 module Json = struct
-  type account = { userId : string option [@default None]; managedSyncOrigin : string option [@default None] }
+  type account = { userId : string option; managedSyncOrigin : string option }
   [@@deriving yojson]
-  type user = { userId : string option [@default None] } [@@deriving yojson]
+  type user = { userId : string option } [@@deriving yojson]
   type challenge = { challengeId : string } [@@deriving yojson]
   type token = { challengeId : string; token : string } [@@deriving yojson]
   type sign_out = { signedOut : bool } [@@deriving yojson]

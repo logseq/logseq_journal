@@ -24,8 +24,24 @@ enum JournalPlatformWire {
   }
   enum Lifecycle: UInt16 { case backgrounded = 1, foregroundResumed = 2 }
 
-  private struct Account: Codable { let userId: String?; let managedSyncOrigin: String? }
-  private struct User: Codable { let userId: String? }
+  // Absence is an explicit null; omitted account fields indicate an invalid packet.
+  private struct Account: Encodable {
+    let userId: String?; let managedSyncOrigin: String?
+    private enum CodingKeys: String, CodingKey { case userId, managedSyncOrigin }
+    func encode(to encoder: Encoder) throws {
+      var fields = encoder.container(keyedBy: CodingKeys.self)
+      try fields.encode(userId, forKey: .userId)
+      try fields.encode(managedSyncOrigin, forKey: .managedSyncOrigin)
+    }
+  }
+  private struct User: Encodable {
+    let userId: String?
+    private enum CodingKeys: String, CodingKey { case userId }
+    func encode(to encoder: Encoder) throws {
+      var fields = encoder.container(keyedBy: CodingKeys.self)
+      try fields.encode(userId, forKey: .userId)
+    }
+  }
   private struct Challenge: Codable { let challengeId: String }
   private struct Token: Codable { let challengeId: String; let token: String }
   private struct SignedOut: Codable { let signedOut: Bool }

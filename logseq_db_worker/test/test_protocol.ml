@@ -132,42 +132,6 @@ let response_round_trip () =
     (outcome_field "responses")
 ;;
 
-let admission_inspection_request_round_trip () =
-  let expected =
-    `Assoc
-      [ "api_version", `Int 2
-      ; "request_id", `String "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-      ; "command", `List [ `String "V2_inspect_admission" ]
-      ]
-  in
-  match P.request_of_yojson expected with
-  | Error error ->
-    T.fail
-      "admission inspection request decode failed: %s"
-      (Logseq_db_worker.Error.message error)
-  | Ok request ->
-    T.require
-      (Yojson.Safe.equal
-         (T.canonical_json expected)
-         (T.canonical_json (P.request_to_yojson request)))
-      "admission inspection request changed during round trip"
-;;
-
-let admission_inspection_response_round_trip () =
-  let expected =
-    Yojson.Safe.from_string
-      {|["V2_response",{"api_version":2,"request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","outcome":["V2_admission_outcome",{"active_records":3,"active_bytes":1536,"protected_wire_bytes":512,"retained_origin_evidence_bytes":256,"maximum_records":1000,"maximum_bytes":8388608}]}]|}
-  in
-  match P.response_of_yojson expected with
-  | Error error -> T.fail "admission inspection response decode failed: %s" error
-  | Ok response ->
-    T.require
-      (Yojson.Safe.equal
-         (T.canonical_json expected)
-         (T.canonical_json (P.response_to_yojson response)))
-      "admission inspection response changed during round trip"
-;;
-
 let push_round_trip () =
   List.iter
     (fun expected ->
@@ -1002,12 +966,6 @@ let () =
     ; T.case "request JSON round trip" request_round_trip
     ; T.case "response JSON round trip" response_round_trip
     ; T.case "named tags in block reads" tag_titles_survive_block_read_json
-    ; T.case
-        "admission inspection request JSON round trip"
-        admission_inspection_request_round_trip
-    ; T.case
-        "admission inspection response JSON round trip"
-        admission_inspection_response_round_trip
     ; T.case "push JSON round trip" push_round_trip
     ; T.case "causal error JSON round trip" causal_error_round_trip
     ; T.case

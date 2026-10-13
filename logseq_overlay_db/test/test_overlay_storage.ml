@@ -2663,6 +2663,124 @@ let submit_interval_overflow_is_rejected () =
         Database.close reopened |> T.require_ok ~behavior)))
 ;;
 
+(* Receipt retention belongs to SQLite-backed Database opening, not a pure reducer.
+   Seed canonical receipts at its public storage boundary and observe peak live heap. *)
+let receipt_history_open_is_bounded () =
+  let behavior = "receipt history opening has bounded live heap" in
+  T.with_temp_directory "overlay-receipt-history-" (fun support ->
+    let path = T.seed_mirror support in
+    let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+    let module Store = Logseq_db_storage.Mutation_receipt_store in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         Store.initialize_database sqlite |> T.require_ok ~behavior;
+         Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN");
+         for n = 1 to 50_000 do
+           let id = Printf.sprintf "10000000-0000-4000-8000-%012d" n in
+           let key namespace =
+             Digestif.SHA256.(to_hex (digest_string (namespace ^ id)))
+           in
+           let mutation =
+             Printf.sprintf
+               {|["Simple",{"fingerprint":"%s","format_version":2,"mutation_id":"%s","status":["No_change"]}]|}
+               (String.make 64 'a')
+               id
+           in
+           let batch_id = "submission-batch:v1:" ^ id in
+           let terminal =
+             Printf.sprintf
+               {|["Stale",{"batch_id":"%s","format_version":2,"through":"server-cursor:v1:0","executed_through":null}]|}
+               batch_id
+           in
+           Store.upsert_mutations sqlite [ key "mutation-receipt:v1:", mutation ]
+           |> T.require_ok ~behavior;
+           Store.upsert_terminal_batches
+             sqlite
+             [ ( Digestif.SHA256.(
+                   to_hex (digest_string ("terminal-batch-receipt:v1:" ^ batch_id)))
+               , terminal )
+             ]
+           |> T.require_ok ~behavior
+         done;
+         Sqlite3.Rc.check (Sqlite3.exec sqlite "COMMIT");
+         Eio_main.run (fun _ ->
+           Eio.Switch.run (fun sw ->
+             let dependencies, _, inspection = location_and_inspection support behavior in
+             Gc.compact ();
+             let baseline = (Gc.stat ()).live_words in
+             let peak = ref baseline in
+             let alarm =
+               Gc.create_alarm (fun () -> peak := max !peak (Gc.stat ()).live_words)
+             in
+             Fun.protect
+               ~finally:(fun () -> Gc.delete_alarm alarm)
+               (fun () ->
+                  let database =
+                    Database.open_
+                      ~sw
+                      dependencies
+                      inspection
+                      ~graph_name:"receipt-history"
+                    |> T.require_ok ~behavior
+                  in
+                  Database.close database |> T.require_ok ~behavior);
+             let peak_bytes = 8 * (!peak - baseline) in
+             Printf.printf
+               "receipt history rows=100000 peak_live_growth_bytes=%d\n%!"
+               peak_bytes;
+             T.require
+               (peak_bytes < 4 * 1024 * 1024)
+               "opening retained unbounded receipt history";
+             let counts =
+               Database.collect_garbage (inspect_mirror support behavior)
+               |> T.require_ok ~behavior
+             in
+             Alcotest.(check int)
+               "all mutation receipts retained"
+               50_000
+               counts.retained_mutation_receipts;
+             Alcotest.(check int)
+               "all terminal receipts retained"
+               50_000
+               counts.retained_terminal_batch_receipts;
+             List.iter
+               (fun table ->
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec
+                       sqlite
+                       ("UPDATE " ^ table ^ " SET receipt = '{}' WHERE rowid = 25000"));
+                  (match
+                     Database.open_
+                       ~sw
+                       dependencies
+                       (inspect_mirror support behavior)
+                       ~graph_name:"invalid-receipt"
+                   with
+                   | Error _ -> ()
+                   | Ok opened ->
+                     ignore (Database.close opened);
+                     Alcotest.fail "invalid receipt accepted");
+                  (match Database.collect_garbage (inspect_mirror support behavior) with
+                   | Error _ -> ()
+                   | Ok _ -> Alcotest.fail "garbage collection accepted invalid receipt");
+                  let retained = ref 0 in
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec
+                       sqlite
+                       ("SELECT count(*) FROM " ^ table)
+                       ~cb:(fun row _ -> retained := int_of_string (Option.get row.(0))));
+                  Alcotest.(check int)
+                    "failed validation preserves history"
+                    50_000
+                    !retained;
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec
+                       sqlite
+                       ("DELETE FROM " ^ table ^ " WHERE rowid = 25000")))
+               [ "overlay_mutation_receipts"; "overlay_terminal_batch_receipts" ]))))
+;;
+
 let sqlite_full_int64_checkpoint () =
   let module Checkpoint = Logseq_db_types.Sync_checkpoint in
   let module Store = Logseq_db_storage.Sync_checkpoint_store in
@@ -2702,7 +2820,9 @@ let sqlite_full_int64_checkpoint () =
 let () =
   Alcotest.run
     "logseq_overlay_db storage"
-    [ ( "cursor checkpoint"
+    [ ( "receipt history"
+      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded ] )
+    ; ( "cursor checkpoint"
       , [ Alcotest.test_case
             "submit interval overflow is rejected"
             `Quick

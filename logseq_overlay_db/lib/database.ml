@@ -728,29 +728,43 @@ let delete_mirror inspection =
              Error (Types.Mirror_delete_failed (Printexc.to_string exn)))))
 ;;
 
-let read_terminal_receipts sqlite =
-  let rows = ref [] in
-  let rc =
-    Sqlite3.exec
-      sqlite
-      "SELECT batch_key, receipt FROM overlay_terminal_batch_receipts ORDER BY batch_key"
-      ~cb:(fun row _ -> rows := (Option.get row.(0), Option.get row.(1)) :: !rows)
+let validate_receipts sqlite =
+  let scan query decode =
+    let count = ref 0 in
+    let error = ref None in
+    let rc =
+      Sqlite3.exec sqlite query ~cb:(fun row _ ->
+        match !error with
+        | Some _ -> ()
+        | None ->
+          (match row.(0), row.(1) with
+           | Some key, Some source ->
+             (match decode (key, source) with
+              | Ok _ -> incr count
+              | Error message -> error := Some message)
+           | _ -> error := Some "invalid durable receipt row"))
+    in
+    if not (Sqlite3.Rc.is_success rc)
+    then Error (Sqlite3.errmsg sqlite)
+    else (
+      match !error with
+      | Some message -> Error message
+      | None -> Ok !count)
   in
-  if Sqlite3.Rc.is_success rc then Ok (List.rev !rows) else Error (Sqlite3.errmsg sqlite)
-;;
-
-let validate_receipts mutation_receipts terminal_receipts =
-  let rec validate decode = function
-    | [] -> Ok ()
-    | row :: rest -> Result.bind (decode row) (fun _ -> validate decode rest)
+  let ( let* ) = Result.bind in
+  let* mutations =
+    scan
+      "SELECT receipt_key, receipt FROM overlay_mutation_receipts"
+      (Persistence_receipt_v1.decode_mutation
+         ~startup_generation
+         ~projection_revision:(projection_revision 0))
   in
-  Result.bind
-    (validate
-       (Persistence_receipt_v1.decode_mutation
-          ~startup_generation
-          ~projection_revision:(projection_revision 0))
-       mutation_receipts)
-    (fun () -> validate Persistence_receipt_v1.decode_terminal_batch terminal_receipts)
+  let* terminals =
+    scan
+      "SELECT batch_key, receipt FROM overlay_terminal_batch_receipts"
+      Persistence_receipt_v1.decode_terminal_batch
+  in
+  Ok (mutations, terminals)
 ;;
 
 let collect_garbage inspection =
@@ -779,24 +793,16 @@ let collect_garbage inspection =
                match
                  Result.bind
                    (Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite)
-                   (fun () ->
-                      Logseq_db_storage.Mutation_receipt_store.read_database sqlite)
+                   (fun () -> validate_receipts sqlite)
                with
                | Error message -> Error (Types.Garbage_collection_failed message)
-               | Ok receipts ->
-                 (match read_terminal_receipts sqlite with
-                  | Error message -> Error (Types.Garbage_collection_failed message)
-                  | Ok terminal_receipts ->
-                    (match validate_receipts receipts terminal_receipts with
-                     | Error message -> Error (Types.Garbage_collection_failed message)
-                     | Ok () ->
-                       Ok
-                         { Types.mirror_generation = expected
-                         ; reclaimed_bytes = 0L
-                         ; retained_mutation_receipts = List.length receipts
-                         ; retained_terminal_batch_receipts =
-                             List.length terminal_receipts
-                         })))))
+               | Ok (retained_mutation_receipts, retained_terminal_batch_receipts) ->
+                 Ok
+                   { Types.mirror_generation = expected
+                   ; reclaimed_bytes = 0L
+                   ; retained_mutation_receipts
+                   ; retained_terminal_batch_receipts
+                   })))
 ;;
 
 let page_kind_of_datoms database datoms =
@@ -1652,11 +1658,7 @@ let validate_durable_receipts path =
     (fun () ->
        let ( let* ) = Result.bind in
        let* () = Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite in
-       let* mutation_receipts =
-         Logseq_db_storage.Mutation_receipt_store.read_database sqlite
-       in
-       let* terminal_receipts = read_terminal_receipts sqlite in
-       validate_receipts mutation_receipts terminal_receipts)
+       Result.map (fun _ -> ()) (validate_receipts sqlite))
 ;;
 
 let read_durable_receipt path mutation_id =

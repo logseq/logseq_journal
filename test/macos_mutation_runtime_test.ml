@@ -891,91 +891,76 @@ let test_canonical_target_summary_query () =
          |> ignore)
   in
   let query ?(limit = P.default_page_size) ordinal cursor =
-    P.request_of_yojson
-      (`Assoc
-          [ "apiVersion", `Int P.api_version
-          ; "requestId", `String (Graph.Uuid.to_string (Fixture.mutation_uuid ordinal))
-          ; ( "command"
-            , `Assoc
-                [ "type", `String "getBlockSummary"
-                ; "block", `String (Graph.Uuid.to_string target)
-                ; "limit", `Int limit
-                ; "cursor", cursor
-                ] )
-          ])
+    command ordinal (P.V2_get_block_summary { block = target; limit; cursor })
+    |> P.request_to_yojson
+    |> P.request_of_yojson
     |> Result.fold ~ok:Fun.id ~error:(fun error ->
       failwith ("target summary request rejected: " ^ Logseq_db_worker.Error.message error))
   in
   with_worker ~prepare (fun worker ->
-    let open Yojson.Safe.Util in
     let inspect ordinal cursor =
-      worker.request (query ordinal cursor) |> P.response_to_yojson |> member "outcome"
+      worker.request (query ordinal cursor)
+      |> P.response_to_yojson
+      |> P.response_of_yojson
+      |> Result.fold
+           ~ok:(fun (P.V2_response { outcome; _ }) -> outcome)
+           ~error:(fun message ->
+             failwith ("target summary response rejected: " ^ message))
     in
-    let too_large = worker.request (query ~limit:P.maximum_page_size 17999 `Null) in
+    let too_large = worker.request (query ~limit:P.maximum_page_size 17999 None) in
     require_response_limit
       "full target metadata obeys final bytes"
       P.maximum_response_bytes
       too_large;
-    let first = inspect 18000 `Null in
-    require
-      (first |> member "type" |> to_string = "blockSummary")
-      ("canonical query response: " ^ Yojson.Safe.to_string first);
-    require
-      (first |> member "items" |> to_list |> List.length = P.default_page_size)
-      "bounded direct children";
-    require
-      (first
-       |> member "lookup"
-       |> member "block"
-       |> member "title"
-       |> to_string
-       = "Canonical target")
-      "canonical target title";
-    require
-      (first
-       |> member "page"
-       |> member "page"
-       |> member "uuid"
-       |> to_string
-       = Graph.Uuid.to_string Fixture.page_uuid)
-      "owning page is canonical";
-    let cursor = first |> member "nextCursor" in
-    require (cursor <> `Null) "target child continuation";
-    let rec collect ordinal pages reversed output =
+    let first_outcome = inspect 18000 None in
+    match first_outcome with
+    | P.V2_block_summary_outcome first ->
+      require (List.length first.items = P.default_page_size) "bounded direct children";
+      (match first.lookup with
+       | P.V2_present_block { value; _ } ->
+         require (value.block.title = "Canonical target") "canonical target title"
+       | P.V2_missing_block _ -> failwith "canonical target is missing");
+      (match first.page with
+       | Some (P.V2_present_page { page; _ }) ->
+         require (Graph.Uuid.equal page.uuid Fixture.page_uuid) "owning page is canonical"
+       | Some (P.V2_missing_page _) | None -> failwith "owning page is missing");
+      let cursor = first.next_cursor in
+      require (Option.is_some cursor) "target child continuation";
+      let rec collect ordinal pages reversed = function
+        | P.V2_block_summary_outcome output ->
+          require
+            (String.equal first.generation output.generation
+             && String.equal first.projection_revision output.projection_revision)
+            "stable snapshot version across target pages";
+          require
+            (List.length output.items <= P.default_page_size)
+            "every target page is bounded";
+          let reversed = List.rev_append output.items reversed in
+          (match output.next_cursor with
+           | None -> pages, List.rev reversed
+           | Some _ as cursor ->
+             collect (ordinal + 1) (pages + 1) reversed (inspect ordinal cursor))
+        | _ -> failwith "target continuation did not return a block summary"
+      in
+      let pages, items = collect 18100 1 [] first_outcome in
+      require (pages = 5) "201 children use five bounded target pages";
       require
-        (member "generation" first = member "generation" output
-         && member "projectionRevision" first = member "projectionRevision" output)
-        "stable snapshot version across target pages";
-      let items = output |> member "items" |> to_list in
-      require (List.length items <= P.default_page_size) "every target page is bounded";
-      let reversed = List.rev_append items reversed in
-      match member "nextCursor" output with
-      | `Null -> pages, List.rev reversed
-      | cursor -> collect (ordinal + 1) (pages + 1) reversed (inspect ordinal cursor)
-    in
-    let pages, items = collect 18100 1 [] first in
-    require (pages = 5) "201 children use five bounded target pages";
-    require
-      (List.length items = 201)
-      "target pages return all direct children, no unrelated siblings";
-    List.iteri
-      (fun index item ->
-         require
-           (item
-            |> member "block"
-            |> member "uuid"
-            |> to_string
-            = Graph.Uuid.to_string (Fixture.mutation_uuid (17000 + index)))
-           "target-only children preserve canonical order")
-      items;
-    save worker 18002 target "Changed canonical title";
-    let stale = inspect 18003 cursor in
-    require
-      (stale |> member "type" |> to_string = "failed")
-      "stale target child cursor rejects mixed projection";
-    require
-      (stale |> member "code" |> to_string = "staleReadCursor")
-      "typed stale target cursor")
+        (List.length items = 201)
+        "target pages return all direct children, no unrelated siblings";
+      List.iteri
+        (fun index (item : P.v2_child_member) ->
+           require
+             (Graph.Uuid.equal
+                item.value.block.uuid
+                (Fixture.mutation_uuid (17000 + index)))
+             "target-only children preserve canonical order")
+        items;
+      save worker 18002 target "Changed canonical title";
+      (match inspect 18003 cursor with
+       | P.V2_failed { code; _ } ->
+         require (code = "staleReadCursor") "typed stale target cursor"
+       | _ -> failwith "stale target child cursor accepted a mixed projection")
+    | _ -> failwith "canonical query did not return a block summary")
 ;;
 
 let () =
