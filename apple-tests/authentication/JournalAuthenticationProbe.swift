@@ -27,7 +27,9 @@ import Observation
       if self.scenario == "prepare-error" {
         throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite)
       }
+      let previous = self.bytes
       self.bytes = try JournalLocalAccountBindingStore.encode(userID: binding.userID, managedSyncOrigin: binding.managedSyncOrigin)
+      return JournalAccountSave(commit: {}, rollback: { self.bytes = previous })
     }, clear: { preconditionFailure("Synthetic recovery must never clear the binding") }),
     managedSyncOrigin: "https://api.logseq.io")
   init() {

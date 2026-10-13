@@ -25,20 +25,35 @@ import Security
   var saveFailure: Error?
   var writes = 0
   var clears = 0
+  var suspendSave = false
+  var heldSave: CheckedContinuation<Void, Never>?
+  let access = JournalAccountStoreAccess()
   init(_ bytes: Data?) { self.bytes = bytes }
   var capability: JournalAccountStore {
     JournalAccountStore(load: {
+      let release = try await self.access.acquire()
+      defer { release() }
       if let failure = self.loadFailure { throw failure }
       guard let bytes = self.bytes else { return nil }
       let value = try JournalLocalAccountBindingStore.decode(bytes)
       return JournalLocalAccount(userID: value["userId"] as! String,
         managedSyncOrigin: value["managedSyncOrigin"] as! String)
     }, save: {
-      if let failure = self.saveFailure { throw failure }
-      self.bytes = try JournalLocalAccountBindingStore.encode(userID: $0.userID,
-        managedSyncOrigin: $0.managedSyncOrigin)
-      self.writes += 1
-    }, clear: { self.bytes = nil; self.clears += 1 })
+      let release = try await self.access.acquire()
+      do {
+        if let failure = self.saveFailure { throw failure }
+        let previous = self.bytes
+        if self.suspendSave { await withCheckedContinuation { self.heldSave = $0 } }
+        self.bytes = try JournalLocalAccountBindingStore.encode(userID: $0.userID,
+          managedSyncOrigin: $0.managedSyncOrigin)
+        self.writes += 1
+        return JournalAccountSave(commit: { release() }, rollback: { self.bytes = previous; release() })
+      } catch { release(); throw error }
+    }, clear: {
+      let release = try await self.access.acquire(respectCancellation: false)
+      defer { release() }
+      self.bytes = nil; self.clears += 1
+    })
   }
 }
 
@@ -139,6 +154,33 @@ import Security
     catch JournalPlatformServices.Failure.authenticationRequired { }
     catch { failures.append("missing active account must offer reconnection") }
     check(store.clears == 0, "missing session must not clear a presented account")
+    for retired in [false, true] {
+      let delayedAuth = RecoveryAuth()
+      let original = try JournalLocalAccountBindingStore.encode(userID: "original-user", managedSyncOrigin: origin)
+      let delayedStore = RecoveryStore(original)
+      let owner = JournalPlatformServices(auth: delayedAuth, account: delayedStore.capability, managedSyncOrigin: origin)
+      _ = try await owner.response(for: .localAccount)
+      delayedAuth.user = "replacement-user"
+      delayedStore.suspendSave = true
+      let lookup = Task { try await owner.response(for: .authenticatedUser) }
+      while delayedStore.heldSave == nil { await Task.yield() }
+      _ = try await owner.response(for: .timelinePresented)
+      if retired {
+        owner.cancelAuthenticationPreparation()
+        do { _ = try await owner.response(for: .idToken(challengeID: "newer-error")); failures.append("newer foreign token accepted") }
+        catch { }
+        check(owner.accountIssue?.kind == .accountChangeBlocked, "newer error recorded before old save completes")
+      }
+      delayedStore.heldSave!.resume()
+      do { _ = try await lookup.value; failures.append("delayed replacement published after original graph presented") }
+      catch is CancellationError { check(retired, "live account mismatch must be explained") }
+      catch let issue as JournalAccountIssue {
+        check(!retired && issue.kind == .accountChangeBlocked, "post-save account admission")
+      }
+      catch { failures.append("unexpected delayed-save outcome") }
+      check(delayedStore.bytes == original, "unaccepted binding write must restore the original record")
+      check(owner.accountIssue?.kind == .accountChangeBlocked, "old save completion must not clear current error")
+    }
     if !failures.isEmpty {
       for failure in failures { print("FAIL: " + failure) }
       exit(1)

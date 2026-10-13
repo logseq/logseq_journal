@@ -34,7 +34,9 @@ import Foundation
   var capability: JournalAccountStore {
     JournalAccountStore(load: { self.value }, save: {
       if self.failSave { throw CocoaError(.fileWriteUnknown) }
+      let previous = self.value
       self.writes += 1; self.value = $0
+      return JournalAccountSave(commit: {}, rollback: { self.value = previous })
     }, clear: { self.clears += 1; self.value = nil })
   }
 }

@@ -51,8 +51,50 @@ struct JournalLocalAccount: Equatable, Sendable {
 
 @MainActor struct JournalAccountStore {
   let load: () async throws -> JournalLocalAccount?
-  let save: (JournalLocalAccount) async throws -> Void
+  // Isolate the proposal from reads/other writes until its decision. Rejection
+  // restores the exact previous record; failed restoration must fail closed.
+  let save: (JournalLocalAccount) async throws -> JournalAccountSave
   let clear: () async throws -> Void
+}
+
+/// A proposed write remains isolated until the account owner accepts or undoes it.
+@MainActor final class JournalAccountSave {
+  private var commit: (() -> Void)?
+  private var rollback: (() async throws -> Void)?
+  init(commit: @escaping () -> Void, rollback: @escaping () async throws -> Void) {
+    self.commit = commit; self.rollback = rollback
+  }
+  func accept() {
+    let action = commit
+    commit = nil; rollback = nil
+    action?()
+  }
+  func reject() async throws {
+    let action = rollback
+    commit = nil; rollback = nil
+    try await action?()
+  }
+}
+
+/// Serializes complete proposals, including their admission/undo, without parking UI.
+@MainActor final class JournalAccountStoreAccess {
+  private final class Lease {
+    var released = false
+    var waiter: CheckedContinuation<Void, Never>?
+    func wait() async {
+      if !released { await withCheckedContinuation { waiter = $0 } }
+    }
+    func release() { released = true; waiter?.resume(); waiter = nil }
+  }
+  private var tail: Task<Void, Never>?
+  func acquire(respectCancellation: Bool = true) async throws -> () -> Void {
+    let previous = tail, lease = Lease()
+    tail = Task { if let previous { await previous.value }; await lease.wait() }
+    if let previous { await previous.value }
+    do { if respectCancellation { try Task.checkCancellation() } }
+    catch { lease.release(); throw error }
+    return { lease.release() }
+  }
 }
 
 /// Native capabilities behind the existing OCaml application protocol.
@@ -124,17 +166,33 @@ struct JournalLocalAccount: Equatable, Sendable {
         try validateGraphAccount(user)
         let response = JournalPlatformWire.Response.authenticatedUser(user)
         _ = try JournalPlatformWire.encodeResponse(response)
+        let proposal: JournalAccountSave?
         do {
-          try await account.save(JournalLocalAccount(userID: user, managedSyncOrigin: managedSyncOrigin))
-          accountIssue = nil
+          proposal = try await account.save(JournalLocalAccount(userID: user, managedSyncOrigin: managedSyncOrigin))
         } catch {
           try validateCompletion(generation)
           accountIssue = .classify(error, stage: .bindingWrite)
           // A rebuild must commit before recovery is reported complete. Existing
           // valid bindings remain advisory and preserve normal online behavior.
           if bindingFailure != nil { throw error }
+          proposal = nil
         }
-        try validateCompletion(generation)
+        do {
+          try validateCompletion(generation)
+          try validateGraphAccount(user)
+        } catch {
+          // Keep the proposal isolated until its exact previous bytes are restored.
+          // Never publish this identity or clear an error from a newer generation.
+          do { try await proposal?.reject() }
+          catch {
+            try validateCompletion(generation)
+            accountIssue = .classify(error, stage: .bindingWrite)
+            throw error
+          }
+          throw error
+        }
+        proposal?.accept()
+        if proposal != nil { accountIssue = nil }
         preparedUserID = user
         return response
       }
