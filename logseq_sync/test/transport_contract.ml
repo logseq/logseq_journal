@@ -3777,7 +3777,25 @@ let test_absent_dns_family_preserves_dial_budget () =
     with_peer
       [ case (response "x") ]
       (fun ~environment ~sw ~support ~origin ->
-         let clock = scaled_clock (Eio.Stdenv.clock environment) 10. in
+         let real_clock = Eio.Stdenv.clock environment in
+         let addresses =
+           Eio.Time.with_timeout_exn real_clock 5. (fun () ->
+             Eio.Net.getaddrinfo_stream
+               ~service:"443"
+               (Eio.Stdenv.net environment)
+               "ipv4only.arpa")
+         in
+         Alcotest.(check bool)
+           "fixture requires IPv4 without IPv6; DNS64 would invalidate this regression"
+           true
+           (addresses <> []
+            && List.for_all
+                 (function
+                   | `Tcp (ip, _) ->
+                     Eio.Net.Ipaddr.fold ~v4:(fun _ -> true) ~v6:(fun _ -> false) ip
+                   | `Unix _ -> false)
+                 addresses);
+         let clock = scaled_clock real_clock 10. in
          let attempts = ref 0 in
          let port = Uri.port origin |> Option.get in
          let network =
