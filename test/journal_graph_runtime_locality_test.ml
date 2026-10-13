@@ -1504,8 +1504,8 @@ let test_target_confirmation kind title count =
   (match entry with
    | Some entry ->
      Alcotest.(check int)
-       "canonical child summaries"
-       count
+       "bounded canonical child summaries"
+       (min 3 count)
        (List.length entry.child_summaries)
    | None -> Alcotest.(check string) "blank root is not fabricated as visible" "" title);
   let duplicate =
@@ -1576,8 +1576,8 @@ let test_target_children_continue () =
       201
       (Journal_model.child_count block);
     Alcotest.(check int)
-      "all target child summaries"
-      201
+      "bounded target child preview"
+      3
       (List.length entry.child_summaries)
   | _ -> Alcotest.fail "Capture lost its canonical children"
 ;;
@@ -4020,10 +4020,261 @@ let test_feed_window_bounds_and_singleton_failure () =
   | _ -> Alcotest.fail "oversized singleton was hidden or truncated"
 ;;
 
+
+(* Timeline preview ownership is exposed by Runtime's public requests and
+   completions. Raw member reads/counts and Detail/Copy have separate owners. *)
+let check_preview count (entry : Journal_graph_projection.timeline_entry) =
+  Alcotest.(check int)
+    "actual child count retained"
+    count
+    (Journal_model.child_count entry.block);
+  Alcotest.(check int)
+    "at most three projected child summaries"
+    (min 3 count)
+    (List.length entry.child_summaries);
+  Alcotest.(check (list string))
+    "first three ordered child summaries"
+    (List.init (min 3 count) (fun n -> Printf.sprintf "Canonical child %d" n))
+    (List.map
+       (fun (summary : Journal_graph_projection.child_summary) -> summary.source)
+       entry.child_summaries)
+;;
+
+let test_bounded_preview_tree_paths () =
+  let count = 199 in
+  let children = summary_children count in
+  let root : Protocol.v2_tree_member =
+    { value = record; revision = "root-1"; depth = 0; parent = page_uuid }
+  in
+  let items =
+    root
+    :: List.rev_map
+         (fun (child : Protocol.v2_child_member) ->
+            Protocol.
+              { value = child.value
+              ; revision = child.revision
+              ; depth = 1
+              ; parent = block_uuid
+              })
+         children
+  in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let journals =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { before_day = None
+         ; day_limit = 1
+         ; blocks_per_day = 200
+         ; slot_limit = 201
+         ; request_generation = 7L
+         })
+    |> fun o -> only "preview feed journals" o.requests
+  in
+  let tree =
+    Runtime.receive
+      runtime
+      (response
+         journals
+         (Protocol.V2_journals_outcome
+            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
+            ; next_cursor = None
+            }))
+    |> fun o -> only "preview feed tree" o.requests
+  in
+  let cursor = Graph.Cursor.of_string "preview-next-page" |> Result.get_ok in
+  let feed = Runtime.receive runtime (tree_page tree items (Some cursor)) in
+  let day =
+    List.find_map
+      (fun r ->
+         match r.Runtime.payload with
+         | Feed_loaded { feed; _ } -> Some (List.hd feed.days)
+         | _ -> None)
+      feed.responses
+    |> Option.get
+  in
+  check_preview count (only "feed entry" day.entries);
+  let day_read =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_day_blocks
+         { day = 20260901
+         ; after = day.continuation
+         ; limit = 200
+         ; request_generation = 8L
+         })
+    |> fun o -> only "preview day continuation" o.requests
+  in
+  (match day_read.command with
+   | V2_get_page_tree { cursor = Some actual; _ } ->
+     Alcotest.(check bool) "paging cursor unchanged" true (actual = cursor)
+   | _ -> Alcotest.fail "preview cap changed day paging");
+  let day_result = Runtime.receive runtime (tree_page day_read items None) in
+  (match (only "preview day result" day_result.responses).payload with
+   | Day_blocks_loaded { page; _ } -> check_preview count (only "day entry" page.entries)
+   | _ -> Alcotest.fail "preview day result lost owner");
+  let changed_output =
+    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page_uuid ] ())
+  in
+  let refresh = only "preview remote structure" (hydration_requests changed_output) in
+  let remote = Runtime.receive runtime (tree_page refresh items None) in
+  (match (only "preview remote result" remote.responses).payload with
+   | Page_tree_reconciled { value; _ } ->
+     check_preview count (only "remote entry" value.entries)
+   | _ -> Alcotest.fail "preview remote result lost owner");
+  (* Delete conflict exercises the legacy page-tree refresh projection rather
+     than canonical target-summary confirmation. *)
+  let runtime, _, refresh = prepare_paged_refresh Delete_conflict in
+  let legacy = Runtime.receive runtime (tree_page refresh items None) in
+  let value =
+    List.find_map
+      (fun r ->
+         match r.Runtime.payload with
+         | Page_tree_reconciled { value; _ } -> Some value
+         | _ -> None)
+      legacy.responses
+    |> Option.get
+  in
+  check_preview count (only "legacy refresh entry" value.entries)
+;;
+
+let test_bounded_preview_target_pages kind count () =
+  let runtime, page, first = target_refresh kind in
+  let canonical =
+    { record with block = { block with page = page.uuid; parent = page.uuid } }
+  in
+  let lookup =
+    Protocol.V2_present_block { value = canonical; revision = "canonical-2" }
+  in
+  let children = summary_children ~page:page.uuid count in
+  let rec complete request cursor batch = function
+    | [] ->
+      Runtime.receive
+        runtime
+        (summary_response request page lookup [] None "projection-2")
+    | remaining ->
+      check_target_summary request cursor;
+      let items = List.take Protocol.default_page_size remaining in
+      let tail = List.drop Protocol.default_page_size remaining in
+      let next =
+        if tail = []
+        then None
+        else
+          Some
+            (Graph.Cursor.of_string (Printf.sprintf "preview-target-%d" batch)
+             |> Result.get_ok)
+      in
+      let output =
+        Runtime.receive
+          runtime
+          (summary_response request page lookup items next "projection-2")
+      in
+      (match next with
+       | None -> output
+       | Some _ ->
+         Alcotest.(check int)
+           "all raw pages complete before confirmation"
+           0
+           (List.length output.responses);
+         complete
+           (only "unchanged target child continuation" output.requests)
+           next
+           (batch + 1)
+           tail)
+  in
+  let output = complete first None 0 children in
+  let entry =
+    List.find_map
+      (fun r ->
+         match r.Runtime.payload with
+         | Block_captured { timeline_entry_update = Some entry; _ }
+         | Block_updated { timeline_entry_update = Some entry; _ } -> Some entry
+         | _ -> None)
+      output.responses
+    |> Option.get
+  in
+  check_preview count entry
+;;
+
+let test_preview_preserves_full_detail_and_copy () =
+  let count = 199 in
+  let children = summary_children count in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  seed_feed runtime;
+  let root_read =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_detail
+         { block_id = Graph.Uuid.to_string block_uuid
+         ; after = None
+         ; limit = 200
+         ; request_generation = 99L
+         })
+    |> fun o -> only "complete Detail root" o.requests
+  in
+  let child_read =
+    Runtime.receive
+      runtime
+      (response
+         root_read
+         (Protocol.V2_block_outcome
+            (V2_present_block { value = record; revision = "root-1" })))
+    |> fun o -> only "complete Detail children" o.requests
+  in
+  let output =
+    Runtime.receive runtime (response child_read (copy_children block_uuid children))
+  in
+  (match (only "complete Detail" output.responses).payload with
+   | Detail_loaded { detail; _ } ->
+     Alcotest.(check int)
+       "Detail retains all raw children"
+       count
+       (List.length detail.children.blocks);
+     Alcotest.(check string)
+       "Detail retains final child text"
+       "Canonical child 198"
+       (Journal_model.source (List.nth detail.children.blocks 198))
+   | _ -> Alcotest.fail "complete Detail result lost owner");
+  let state, effects = copy_start block_uuid in
+  let state, effects = copy_root state effects block.title in
+  let state, effects = copy_reply state effects (copy_children block_uuid children) in
+  let state, effects =
+    List.fold_left
+      (fun (state, effects) (child : Protocol.v2_child_member) ->
+         copy_parent effects child.Protocol.value.block.uuid;
+         copy_reply state effects (copy_children child.value.block.uuid []))
+      (state, effects)
+      children
+  in
+  let _, effects =
+    copy_reply state effects (graph_info_outcome ~journal_title_format:None)
+  in
+  Alcotest.(check bool)
+    "Copy retains every original child, without preview truncation"
+    true
+    (effects
+     = [ Copy.Copied
+           (block.title
+            ^ String.concat
+                ""
+                (List.map
+                   (fun (c : Protocol.v2_child_member) -> "\n  - " ^ c.value.block.title)
+                   children))
+       ])
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "journal window budget"
+    [ ( "bounded Timeline preview"
+      , [ Alcotest.test_case "feed, day, remote and legacy refresh paths" `Quick test_bounded_preview_tree_paths
+        ; Alcotest.test_case "Capture 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Capture 10050)
+        ; Alcotest.test_case "Update 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update 10050)
+        ; Alcotest.test_case "Status 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Status 10050)
+        ; Alcotest.test_case "Detail and Copy remain complete" `Quick test_preview_preserves_full_detail_and_copy
+        ])
+    ; ( "journal window budget"
       , [ Alcotest.test_case
             "complete metadata fits requested window"
             `Quick

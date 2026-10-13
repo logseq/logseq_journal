@@ -91,23 +91,59 @@ let dropped_wire_nodes ops =
   dropped
 ;;
 
+(* Rendering work has no Runtime reducer owner: this public callback boundary
+   verifies bounded source/media work and allocation before a native mount. *)
 let test_timeline_media_targets () =
-  let targets = ref [] in
-  ignore
-    (Journal_row.view
-       ~show_timestamp:false
-       ~render_media:(fun ~title:_ ~root ~image_children:_ child ->
-         targets := root :: !targets;
-         child)
-       { Journal_graph_projection.block = block ()
-       ; child_summaries =
-           [ { block_id = "visible-child"; source = "Summary"; asset_file_type = None } ]
-       }
-     : V.t);
+  let run count =
+    let summaries =
+      List.init count (fun n ->
+        { Journal_graph_projection.block_id = Printf.sprintf "visible-child-%d" n
+        ; source = Printf.sprintf "Summary %d" n
+        ; asset_file_type = None
+        })
+    in
+    let parent = block ~child_count:count () in
+    let targets = ref []
+    and sources = ref [] in
+    let before = Gc.allocated_bytes () in
+    ignore
+      (Journal_row.view
+         ~show_timestamp:false
+         ~render_source:(fun source ->
+           sources := source :: !sources;
+           source)
+         ~render_media:(fun ~title:_ ~root ~image_children:_ child ->
+           targets := root :: !targets;
+           child)
+         { Journal_graph_projection.block = parent; child_summaries = summaries }
+       : V.t);
+    let allocated = Gc.allocated_bytes () -. before in
+    count, List.rev !targets, List.rev !sources, allocated
+  in
+  let observations = List.map run [ 0; 3; 201; 10050 ] in
+  List.iter
+    (fun (count, targets, sources, _) ->
+       require
+         (targets
+          = block_id :: List.init (min 3 count) (Printf.sprintf "visible-child-%d"))
+         "row media rendering visited more than the first three summaries (%d)"
+         count;
+       require
+         (List.length sources = 1 + min 3 count)
+         "row resolved hidden summary sources (%d)"
+         count)
+    observations;
+  let allocated count =
+    let _, _, _, n = List.find (fun (actual, _, _, _) -> actual = count) observations in
+    n
+  in
+  Printf.printf "bounded row allocations: 3=%.0f, 201=%.0f, 10050=%.0f bytes\n%!"
+    (allocated 3) (allocated 201) (allocated 10050);
   require
-    (List.sort String.compare !targets
-     = List.sort String.compare [ block_id; "visible-child" ])
-    "media discovery must target each displayed source, including summaries"
+    (allocated 10050 <= allocated 3 +. 1024.)
+    "row allocation grows with hidden summary count (3: %.0f, 10050: %.0f)"
+    (allocated 3)
+    (allocated 10050)
 ;;
 
 let test_native_lui_events () =
@@ -1164,7 +1200,7 @@ let image_paths ops =
     ops
 ;;
 
-let child_gallery_fixture ?(source = "Parent prose") ?(duplicates = false) () =
+let child_gallery_fixture ?(source = "Parent prose") ?(duplicates = false) ?(document_order = "d") () =
   let first = media_item 71 "png" (File "/tmp/synthetic-first.png") None in
   let second = media_item 72 "jpg" (File "/tmp/synthetic-second.jpg") None in
   let pdf = media_item 73 "pdf" (File "/tmp/synthetic-plan.pdf") (Some 32476L) in
@@ -1191,7 +1227,7 @@ let child_gallery_fixture ?(source = "Parent prose") ?(duplicates = false) () =
       ; ( 1
         , graph_node
             ~file_type:"pdf"
-            ~order:"d"
+            ~order:document_order
             ~id:(asset_id pdf)
             ~parent:block_id
             "plan.pdf" )
@@ -1221,8 +1257,8 @@ let test_direct_image_children_share_parent_gallery () =
       (not (has_text initial "asset-portrait.jpg"))
       "portrait asset title leaked into prose";
     require (has_text initial "photo.png") "ordinary note named photo.png was hidden";
-    require (has_text initial "plan.pdf") "non-image asset title was hidden";
-    require (has_text initial "PDF attachment") "file attachment card was removed";
+    require (not (has_text initial "plan.pdf")) "fourth child escaped preview bound";
+    require (not (has_text initial "PDF attachment")) "fourth child attachment escaped preview bound";
     require
       (image_paths initial = [ "/tmp/synthetic-first.png"; "/tmp/synthetic-second.jpg" ])
       "direct gallery lost sibling order, repeated parent references, or included \
@@ -2271,7 +2307,7 @@ let test_labeled_content_keeps_interactive_value () =
 ;;
 
 let test_timeline_document_title_follows_its_asset_child () =
-  let entry, views, _, _ = child_gallery_fixture () in
+  let entry, views, _, _ = child_gallery_fixture ~document_order:"0" () in
   with_mounted (projected_row ~views ~on_event:ignore entry) (fun app ops ->
     let card = mounted_node (ops ()) TextValue (StringValue "PDF attachment") in
     ignore (Lui_app.dispatch_event app (Press card));

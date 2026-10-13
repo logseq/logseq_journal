@@ -342,7 +342,8 @@ let timeline_entry_page
                 ; source = child.block.title
                 ; asset_file_type = asset_file_type child.block
                 })
-             children
+             (* Preview only: raw tree members and child_count stay complete. *)
+             (List.take 3 children)
          in
          project ({ block; child_summaries } :: reversed) rest)
   in

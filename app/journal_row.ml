@@ -76,7 +76,8 @@ let view
     List.partition
       (fun (summary : Journal_graph_projection.child_summary) ->
          is_image_asset summary.asset_file_type)
-      entry.child_summaries
+      (* Guard the public renderer before any partition/source/media work. *)
+      (List.take 3 entry.child_summaries)
   in
   let image_children =
     List.map
