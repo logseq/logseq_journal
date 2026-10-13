@@ -22,6 +22,10 @@ Internal persisted outbox mutations, terminal receipts and asset upload intents 
 
 The user explicitly authorized the eight Dune files, graph_types.mli and asset_descriptor.mli, dune-project and five package manifests, and explicit old-internal-format rejection paths on 2026-10-12. Implementation starts from merged main b2c32aa including PR 66. Worktree: codex/yojson-codecs-20261012 under the current task directory. Do not modify another checkout or shared pins/switch. Parallel feed work owns app/journal_graph_runtime.ml and its tests.
 
+## Decision
+
+Generate OCaml typed JSON codecs with the existing Yojson PPX. Internal wire and persisted formats use the generated representations without legacy fallback; external contracts use generated DTOs. Preserve validated constructors, generic JSON safety checks and actual encoded byte budgets. The approved lockfile additions use existing resolved versions.
+
 ## Alternatives considered
 
 ### Keep old internal wire through hand-written DTO mapping
@@ -75,4 +79,4 @@ Old internal JSON cannot be loaded by the new codecs. Unsynced outbox records, r
 
 ## Questions
 
-None for the approved implementation scope. The two minimal types/storage lockfile dependency additions are prepared separately and remain pending explicit authorization. sync_protocol.mli is unchanged; any necessary additional protected-file change must be separately reported.
+None for the approved implementation scope. The user explicitly authorized the two minimal types/storage lockfile dependency additions on 2026-10-13; they add existing resolved versions without changing pins or the switch. sync_protocol.mli is unchanged; any necessary additional protected-file change must be separately reported.
