@@ -30,8 +30,15 @@ import Foundation
 private final class JournalNativeAccountStorage: Sendable {
   private let queue = DispatchQueue(label: "com.logseq.journal.account-storage")
   @MainActor private static let access = JournalAccountStoreAccess()
-  private enum PendingRestore { case binding(previous: Data?, replacement: Data) }
-  @MainActor private static var pendingRestore: PendingRestore?
+  private struct Recovery: Codable, Sendable {
+    let version: Int
+    let id: UUID
+    let previous: Data?
+    let replacement: Data
+  }
+  // Acceptance is only a cache. Loss of it conservatively undoes the advisory
+  // binding on cold access; original bytes remain protected in Keychain.
+  @MainActor private static var acceptedRecovery: UUID?
 
   private func perform<Value: Sendable>(
     _ operation: @escaping @Sendable () throws -> Value
@@ -63,11 +70,21 @@ private final class JournalNativeAccountStorage: Sendable {
       try Task.checkCancellation()
       let replacement = try JournalLocalAccountBindingStore.encode(
         userID: binding.userID, managedSyncOrigin: binding.managedSyncOrigin)
-      Self.pendingRestore = .binding(previous: previous, replacement: replacement)
+      let recovery = Recovery(version: 1, id: UUID(), previous: previous, replacement: replacement)
+      let journal = try JSONEncoder().encode(recovery)
+      // Persist undo information BEFORE touching the canonical binding.
+      try await perform { try JournalLocalAccountBindingStore.writeRecoveryData(journal) }
       try await perform { try JournalLocalAccountBindingStore.writeData(replacement) }
       return JournalAccountSave(commit: {
-        Self.pendingRestore = nil
+        Self.acceptedRecovery = recovery.id
         release()
+        // Cleanup is not the safety boundary: a crash before it conservatively
+        // restores the durable snapshot. Try promptly, without blocking UI.
+        Task { @MainActor in
+          let done = try await Self.access.acquire(respectCancellation: false)
+          defer { done() }
+          if Self.acceptedRecovery == recovery.id { try? await self.repairIfNeeded() }
+        }
       }, rollback: {
         defer { release() }
         try await self.repairIfNeeded()
@@ -79,13 +96,30 @@ private final class JournalNativeAccountStorage: Sendable {
   }
 
   @MainActor private func repairIfNeeded() async throws {
-    guard case let .binding(previous, replacement) = Self.pendingRestore else { return }
-    try await perform {
-      let current = try JournalLocalAccountBindingStore.loadData()
-      // Preserve a replacement made outside this serialized owner.
-      if current == replacement { try JournalLocalAccountBindingStore.restoreData(previous) }
+    guard let bytes = try await perform({ try JournalLocalAccountBindingStore.loadRecoveryData() }) else {
+      Self.acceptedRecovery = nil
+      return
     }
-    Self.pendingRestore = nil
+    let recovery: Recovery
+    do {
+      recovery = try JSONDecoder().decode(Recovery.self, from: bytes)
+      guard recovery.version == 1 else { throw JournalPlatformServices.Failure.unavailable }
+    } catch {
+      throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite)
+    }
+    let accepted = Self.acceptedRecovery == recovery.id
+    try await perform {
+      if !accepted {
+        let current = try JournalLocalAccountBindingStore.loadData()
+        // Preserve a replacement made outside this serialized owner.
+        if current == recovery.replacement {
+          try JournalLocalAccountBindingStore.restoreData(recovery.previous)
+        }
+      }
+      // Failed undo or cleanup leaves the durable journal intact and fails closed.
+      try JournalLocalAccountBindingStore.clearRecoveryData()
+    }
+    Self.acceptedRecovery = nil
   }
 
   @MainActor func clear() async throws {

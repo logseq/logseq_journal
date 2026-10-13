@@ -11,6 +11,7 @@ import Security
   var suspended = false
   func currentUserID() async throws -> String? {
     calls += 1
+    try Task.checkCancellation()
     if suspended { return try await withCheckedThrowingContinuation { held = $0 } }
     if let failure { throw failure }
     return user
@@ -112,13 +113,16 @@ import Security
     check(store.bytes == legacy && store.writes == 0 && store.clears == 0, "network failure preserves record")
     auth.failure = nil; auth.suspended = true
     let stale = Task { try await services.response(for: .authenticatedUser) }
-    for _ in 0..<1000 { if auth.held != nil { break }; await Task.yield() }
+    let staleDeadline = ContinuousClock.now + .seconds(3)
+    while auth.held == nil && ContinuousClock.now < staleDeadline {
+      try await Task.sleep(for: .milliseconds(1))
+    }
     if let held = auth.held {
       services.invalidateConnection(); held.resume(returning: "retired-account")
       do { _ = try await stale.value; failures.append("stale identity committed") }
       catch is CancellationError { }
       catch { failures.append("stale completion classification") }
-    } else { _ = try? await stale.value; failures.append("stale case never reached identity lookup") }
+    } else { stale.cancel(); _ = try? await stale.value; failures.append("stale case never reached identity lookup") }
     check(store.bytes == legacy && store.writes == 0, "retired completion retains old record")
     auth.held = nil
     let retiredFailure = Task { try await services.response(for: .authenticatedUser) }

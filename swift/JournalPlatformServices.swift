@@ -78,7 +78,7 @@ struct JournalLocalAccount: Equatable, Sendable {
 
 /// Serializes complete proposals, including their admission/undo, without parking UI.
 @MainActor final class JournalAccountStoreAccess {
-  private final class Lease {
+  @MainActor private final class Lease {
     var released = false
     var waiter: CheckedContinuation<Void, Never>?
     func wait() async {

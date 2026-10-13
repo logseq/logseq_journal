@@ -63,7 +63,26 @@ enum JournalLocalAccountBindingStore {
   // Opaque snapshots are used only to undo this app's unaccepted write, never
   // to migrate, authorize or expose a rejected account record.
   static func loadData() throws -> Data? {
-    var lookup = query()
+    try loadData(query: query())
+  }
+
+  private static func recoveryQuery() -> [CFString: Any] {
+    var value = query()
+    value[kSecAttrService] = "com.logseq.journal.local-account-binding.recovery"
+    value[kSecAttrAccount] = "pending-account-proposal"
+    return value
+  }
+  static func loadRecoveryData() throws -> Data? { try loadData(query: recoveryQuery()) }
+  static func writeRecoveryData(_ data: Data) throws { try writeData(data, query: recoveryQuery()) }
+  static func clearRecoveryData() throws {
+    let status = SecItemDelete(recoveryQuery() as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite)
+    }
+  }
+
+  private static func loadData(query: [CFString: Any]) throws -> Data? {
+    var lookup = query
     lookup[kSecReturnData] = kCFBooleanTrue
     lookup[kSecMatchLimit] = kSecMatchLimitOne
     var item: CFTypeRef?
@@ -88,10 +107,14 @@ enum JournalLocalAccountBindingStore {
   }
 
   static func writeData(_ data: Data) throws {
+    try writeData(data, query: query())
+  }
+
+  private static func writeData(_ data: Data, query: [CFString: Any]) throws {
     // Keep the existing record if a replacement cannot be saved securely.
-    var status = SecItemUpdate(query() as CFDictionary, [kSecValueData: data] as CFDictionary)
+    var status = SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary)
     if status == errSecItemNotFound {
-      var addition = query()
+      var addition = query
       addition[kSecValueData] = data
       status = SecItemAdd(addition as CFDictionary, nil)
     }

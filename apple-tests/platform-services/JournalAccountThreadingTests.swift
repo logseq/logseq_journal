@@ -12,6 +12,7 @@ enum JournalLocalAccountBindingStore {
     var held: String?
     var gate: DispatchSemaphore?
     var failRestore = false
+    var recovery: Data?
   }
   static let state = Mutex(State())
 
@@ -72,6 +73,9 @@ enum JournalLocalAccountBindingStore {
     operation("clear")
     state.withLock { $0.value = nil }
   }
+  static func loadRecoveryData() throws -> Data? { state.withLock { $0.recovery } }
+  static func writeRecoveryData(_ data: Data) throws { state.withLock { $0.recovery = data } }
+  static func clearRecoveryData() throws { state.withLock { $0.recovery = nil } }
 }
 
 @MainActor final class JournalCognitoSession: JournalAuthCapability {
