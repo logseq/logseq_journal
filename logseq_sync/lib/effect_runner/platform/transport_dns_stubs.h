@@ -73,7 +73,10 @@ CAMLprim value logseq_transport_dns_start(value hostname, value ipv6) {
   struct logseq_dns_query *query = calloc(1, sizeof(*query));
   if (query == NULL) caml_raise_out_of_memory();
   *(struct logseq_dns_query **)Data_custom_val(handle) = query;
-  DNSServiceErrorType error = DNSServiceGetAddrInfo(&query->service, 0, 0,
+  /* Complete an absent family through NoSuchRecord instead of waiting out the
+     shared DNS/TCP deadline while the other family already has addresses. */
+  DNSServiceErrorType error = DNSServiceGetAddrInfo(&query->service,
+      kDNSServiceFlagsReturnIntermediates, 0,
       Bool_val(ipv6) ? kDNSServiceProtocol_IPv6 : kDNSServiceProtocol_IPv4,
       String_val(hostname), logseq_dns_reply, query);
   if (error != kDNSServiceErr_NoError) {

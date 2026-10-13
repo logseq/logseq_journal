@@ -1477,7 +1477,7 @@ let scenarios =
       [ 401; 403 ]
 ;;
 
-let delayed_network network before_connect =
+let delayed_network ?(destination = Fun.id) network before_connect =
   let module Network = struct
     type t = Eio_unix.Net.t * (unit -> unit)
 
@@ -1492,7 +1492,7 @@ let delayed_network network before_connect =
 
     let connect (net, before) ~sw address =
       before ();
-      Eio.Net.connect net ~sw address
+      Eio.Net.connect net ~sw (destination address)
     ;;
 
     let datagram_socket (net, _) ~reuse_addr ~reuse_port ~sw address =
@@ -3766,5 +3766,118 @@ let scenarios =
         "failed dial retires allocated socket before fallback"
         `Quick
         test_failed_dial_retires_allocated_socket_before_fallback
+    ]
+;;
+
+(* DNS-SD is executed by the public Runner transport, not Core. RFC7050's
+   IPv4-only name supplies a real absent-family reply. Only DNS is external:
+   every resulting TCP candidate is redirected to the independent loopback peer. *)
+let test_absent_dns_family_preserves_dial_budget () =
+  let report =
+    with_peer
+      [ case (response "x") ]
+      (fun ~environment ~sw ~support ~origin ->
+         let real_clock = Eio.Stdenv.clock environment in
+         let addresses =
+           Eio.Time.with_timeout_exn real_clock 5. (fun () ->
+             Eio.Net.getaddrinfo_stream
+               ~service:"443"
+               (Eio.Stdenv.net environment)
+               "ipv4only.arpa")
+         in
+         Alcotest.(check bool)
+           "fixture requires IPv4 without IPv6; DNS64 would invalidate this regression"
+           true
+           (addresses <> []
+            && List.for_all
+                 (function
+                   | `Tcp (ip, _) ->
+                     Eio.Net.Ipaddr.fold ~v4:(fun _ -> true) ~v6:(fun _ -> false) ip
+                   | `Unix _ -> false)
+                 addresses);
+         let clock = scaled_clock real_clock 10. in
+         let attempts = ref 0 in
+         let port = Uri.port origin |> Option.get in
+         let network =
+           delayed_network
+             ~destination:(fun _ -> `Tcp (Eio.Net.Ipaddr.V4.loopback, port))
+             (Eio.Stdenv.net environment)
+             (fun () -> incr attempts)
+         in
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner ~clock ~network ~environment ~sw ~support ~posted ~invalidations ()
+         in
+         Fun.protect
+           ~finally:(fun () -> Runner.shutdown t)
+           (fun () ->
+              Runner.submit
+                t
+                (operation ~download:false (Uri.with_host origin (Some "ipv4only.arpa")));
+              wait (Eio.Stdenv.clock environment) (fun () ->
+                Option.is_some (completed !posted));
+              Alcotest.(check bool)
+                "usable family completes HTTPS before shared deadline expires"
+                true
+                (Result.is_ok (Option.get (completed !posted)));
+              Alcotest.(check int) "one loopback connection" 1 !attempts))
+  in
+  check_retired report
+;;
+
+let test_unanswered_dns_obeys_shared_dial_deadline () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let clock = scaled_clock (Eio.Stdenv.clock environment) 30. in
+        let attempts = ref 0 in
+        let network =
+          delayed_network (Eio.Stdenv.net environment) (fun () ->
+            incr attempts;
+            failwith "unanswered DNS must not dial")
+        in
+        let posted = ref []
+        and invalidations = ref 0 in
+        let t =
+          runner ~clock ~network ~environment ~sw ~support ~posted ~invalidations ()
+        in
+        Fun.protect
+          ~finally:(fun () -> Runner.shutdown t)
+          (fun () ->
+             let host =
+               Printf.sprintf
+                 "logseq-deadline-%d-%d.local"
+                 (Unix.getpid ())
+                 (Random.bits ())
+             in
+             let before = Eio.Time.now clock in
+             Runner.submit
+               t
+               (operation ~download:false (Uri.of_string ("https://" ^ host)));
+             wait (Eio.Stdenv.clock environment) (fun () ->
+               Option.is_some (completed !posted));
+             let elapsed = Eio.Time.now clock -. before in
+             Alcotest.(check bool)
+               "unanswered families share the unchanged thirty-second window"
+               true
+               (elapsed >= 29. && elapsed < 33.);
+             Alcotest.(check bool)
+               "no addresses produce an explicit transport failure"
+               true
+               (Result.is_error (Option.get (completed !posted)));
+             Alcotest.(check int) "DNS timeout opens no socket" 0 !attempts))))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "absent DNS family preserves shared dial budget"
+        `Quick
+        test_absent_dns_family_preserves_dial_budget
+    ; Alcotest.test_case
+        "unanswered DNS obeys shared dial deadline"
+        `Quick
+        test_unanswered_dns_obeys_shared_dial_deadline
     ]
 ;;

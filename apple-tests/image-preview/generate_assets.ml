@@ -219,7 +219,8 @@ server.serve_forever()
                          ~tls_authenticator:
                            (Runner.tls_authenticator
                               (X509.Authenticator.chain_of_trust
-                                 ~time:(fun () -> Ptime.of_float_s (Unix.time ()))
+                               (* Unix.time truncates to the certificate's not-before second. *)
+                                 ~time:(fun () -> Ptime.of_float_s (Unix.gettimeofday ()))
                                  [ cert ]))
                          ~network
                          ~clock:(Eio.Stdenv.clock environment)
