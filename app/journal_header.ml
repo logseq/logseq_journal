@@ -265,7 +265,7 @@ let view_impl
                ]
            in
            V.buttons_menu_action
-             ~label:"Account menu"
+             ~label:"Options"
              ~icon:(Journal_symbols.name Journal_symbols.Account)
              ~on_select:
                (Ui.Event.Handler.create (function
@@ -311,8 +311,8 @@ let view_impl
             |> V.semantics
                  ~properties:
                    (Ui.Semantics.create
-                      ~label:"Account menu"
-                      ~hint:"Switch graphs, delete the local copy, or sign out"
+                      ~label:"Options"
+                      ~hint:"Attachment settings, diagnostics, graph and account actions"
                       ~role:Button
                       ())
             |> test_id "journal-account-menu-button"

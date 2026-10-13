@@ -42,7 +42,7 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     }
     XCTAssertTrue(app.staticTexts[dateTitle(daysAgo: 0)].waitForExistence(timeout: 20))
     let topDate = app.staticTexts[dateTitle(daysAgo: 0)]
-    let account = app.buttons["Account menu"]
+    let account = app.buttons["Options"]
     XCTAssertTrue(account.exists)
     XCTAssertTrue(app.navigationBars.allElementsBoundByIndex.allSatisfy { !$0.isHittable })
     XCTAssertGreaterThanOrEqual(account.frame.minY, 40)
@@ -75,7 +75,7 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     record("Date headers initial", app)
     drag(list, by: 40)
     let original = today.frame
-    XCTAssertEqual(original.midY, app.buttons["Account menu"].frame.midY, accuracy: 12)
+    XCTAssertEqual(original.midY, app.buttons["Options"].frame.midY, accuracy: 12)
     record("Today at native pin line", app)
     var displaced = false
     for step in 0..<40 {
@@ -157,7 +157,7 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     let app = launch(largeText: true, authFailure: true)
     let error = app.buttons["Error info"]
     XCTAssertTrue(error.waitForExistence(timeout: 15))
-    XCTAssertTrue(app.buttons["Account menu"].isHittable)
+    XCTAssertTrue(app.buttons["Options"].isHittable)
     record("Floating sync error controls", app)
     error.tap()
     XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 5))
@@ -168,14 +168,14 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     let ready = XCTNSPredicateExpectation(
       predicate: NSPredicate(format: "isHittable == true"), object: app.buttons["Error info"])
     XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 5), .completed)
-    XCTAssertTrue(app.buttons["Account menu"].isHittable)
+    XCTAssertTrue(app.buttons["Options"].isHittable)
     record("Landscape floating sync error controls", app)
     XCUIDevice.shared.orientation = .portrait
     app.buttons["Favorites"].tap()
     XCTAssertTrue(app.navigationBars.firstMatch.waitForExistence(timeout: 5))
     record("Favorites retains navigation chrome", app)
     app.buttons["Journals"].tap()
-    XCTAssertTrue(app.buttons["Account menu"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.buttons["Options"].waitForExistence(timeout: 5))
     XCTAssertTrue(app.navigationBars.allElementsBoundByIndex.allSatisfy { !$0.isHittable })
   }
 
@@ -185,14 +185,14 @@ final class JournalDateHeaderAcceptance: XCTestCase {
     record("Accessibility size initial", app)
     list.swipeUp(velocity: .slow)
     record("Accessibility size scrolling", app)
-    let account = app.buttons["Account menu"]
+    let account = app.buttons["Options"]
     XCTAssertTrue(account.isHittable)
     account.tap()
     XCTAssertTrue(app.buttons["Diagnostics"].waitForExistence(timeout: 5))
     app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.2)).tap()
     XCUIDevice.shared.orientation = .landscapeLeft
     record("Accessibility size landscape", app)
-    XCTAssertTrue(app.buttons["Account menu"].isHittable)
+    XCTAssertTrue(app.buttons["Options"].isHittable)
     XCUIDevice.shared.orientation = .portrait
   }
 }

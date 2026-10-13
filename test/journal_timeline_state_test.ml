@@ -1296,16 +1296,18 @@ let test_empty_day_visibility_boundaries () =
     [ []
     ; [ block ~day:20260808 ~source:"" 1 ]
     ; [ block ~day:20260808 ~source:" \t\r\n " 1 ]
+    ; [ block ~day:20260808 ~source:"" ~child_count:1 1 ]
+    ; [ block ~day:20260808 ~source:"" 1; block ~day:20260808 ~source:" " 2 ]
+    ; [ block ~day:20260808 ~source:"" ~task_state:Todo 1 ]
+    ; [ block ~day:20260808 ~source:"" ~task_state:Doing 1 ]
+    ; [ block ~day:20260808 ~source:"" ~task_state:Done 1 ]
     ];
   let visible =
     [ [ block ~day:20260808 ~source:"** **" 1 ]
-    ; [ block ~day:20260808 ~source:"" ~child_count:1 1 ]
-    ; [ block ~day:20260808 ~source:"" 1; block ~day:20260808 ~source:" " 2 ]
+    ; [ Journal_model.with_tag_titles (block ~day:20260808 ~source:"" 1) ~tag_titles:["Work"] ]
+    ; [ Journal_model.with_asset_file_type (block ~day:20260808 ~source:"" 1) ~asset_file_type:(Some "png") ]
+    ; [ Journal_model.with_asset_file_type (block ~day:20260808 ~source:"" 1) ~asset_file_type:(Some "pdf") ]
     ]
-    @ List.map
-        (fun task_state -> [ block ~day:20260808 ~source:"" ~task_state 1 ])
-        Journal_model.
-          [ Todo; Doing; In_review; Now; Done; Canceled; Backlog; Waiting; Later ]
   in
   List.iter
     (fun blocks ->
@@ -1348,14 +1350,14 @@ let test_empty_day_mutations_and_undo () =
   let task =
     Timeline.replace_block hidden (block ~day:20260808 ~source:"" ~task_state:Todo 1)
   in
-  require (Timeline.total_count task = 4) "task change did not restore day";
+  require (Timeline.total_count task = 2) "status-only parent restored its card";
   let child =
     Timeline.replace_block hidden (block ~day:20260808 ~source:"" ~child_count:1 1)
   in
-  require (Timeline.total_count child = 4) "child count did not restore day";
+  require (Timeline.total_count child = 2) "child count restored an empty parent";
   let hidden = Timeline.replace_block child placeholder in
   let two = Timeline.prepend_timeline_entry hidden (entry sibling) in
-  require (Timeline.total_count two = 5) "creation lost the hidden sibling";
+  require (Timeline.total_count two = 4) "creation restored an empty sibling";
   let deleted, backup =
     Option.get (Timeline.stage_delete two ~block_id:(Journal_model.id sibling))
   in
@@ -1428,7 +1430,6 @@ let test_hidden_day_restoration_orders_siblings () =
     (slot_keys restored)
     [ "day:20260808"
     ; "block:" ^ Journal_model.id earlier
-    ; "block:" ^ Journal_model.id placeholder
     ]
     "restoring a hidden sibling broke its source order";
   let parent = block ~day:20260808 ~order:"z" ~source:"" ~child_count:1 1 in
@@ -1528,8 +1529,8 @@ let test_empty_day_retained_fragment_and_anchor () =
       (List.init 511 (fun i -> i + 9))
   in
   require
-    (List.mem ("block:" ^ id "block" 520) (slot_keys fragment))
-    "one retained placeholder was mistaken for the full day";
+    (not (List.mem ("block:" ^ id "block" 520) (slot_keys fragment)))
+    "loaded nonempty siblings restored an empty parent";
   let placeholder = block ~day:20260808 ~source:"" 701 in
   let state =
     Timeline.empty ~today:20260809
@@ -1684,7 +1685,188 @@ let test_capture_scroll_terminal_ownership () =
       [ Succeeded; Missing_target; Cancelled; Superseded; Positioning_failed ]
 ;;
 
+let test_parent_only_cards_and_point_updates () =
+  let tagged =
+    Journal_model.with_tag_titles
+      (block ~day:20260808 ~source:"" 4)
+      ~tag_titles:[ "Work" ]
+  in
+  let image =
+    Journal_model.with_asset_file_type
+      (block ~day:20260808 ~source:"" 5)
+      ~asset_file_type:(Some "png")
+  in
+  let file =
+    Journal_model.with_asset_file_type
+      (block ~day:20260808 ~source:"" 6)
+      ~asset_file_type:(Some "pdf")
+  in
+  let invalid = block ~day:20260808 ~source:"" ~task_state:Doing ~child_count:10001 1 in
+  let content = block ~day:20260808 3 in
+  let state =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed
+                20260808
+                "Saturday"
+                [ invalid
+                ; block ~day:20260808 ~source:" \t" 2
+                ; content
+                ; tagged
+                ; image
+                ; file
+                ]
+            ])
+  in
+  require_equal_string_list
+    (slot_keys state)
+    ("day:20260808" :: List.map (fun n -> "block:" ^ id "block" n) [ 3; 4; 5; 6 ])
+    "children or status kept an empty parent, or metadata-only parent disappeared";
+  let cleared =
+    Timeline.replace_block state (block ~day:20260808 ~source:"" ~child_count:3 3)
+  in
+  require
+    (not (List.mem ("block:" ^ id "block" 3) (slot_keys cleared)))
+    "clearing a parent kept its card because children exist";
+  let restored = Timeline.replace_timeline_entry cleared (entry content) in
+  require
+    (List.mem ("block:" ^ id "block" 3) (slot_keys restored))
+    "canonical content could not restore a previously filtered parent";
+  let statuses = Timeline.replace_block restored invalid in
+  require
+    (not (List.mem ("block:" ^ id "block" 1) (slot_keys statuses)))
+    "status-only point update restored an empty card"
+;;
+
+let test_partial_day_parent_restore () =
+  let summary : Journal_graph_projection.child_summary =
+    { block_id = id "block" 771; source = "Preserved summary"; asset_file_type = None }
+  in
+  let original = block ~day:20260808 ~order:"b" ~child_count:4 770 in
+  let count state =
+    Timeline.fold_slots
+      (fun n -> function
+         | Top_level _ -> n + 1
+         | _ -> n)
+      0
+      state
+  in
+  let failures = ref [] in
+  List.iter
+    (fun partial ->
+       List.iter
+         (fun use_entry ->
+            List.iter
+              (fun restore ->
+                 try
+                   let first_entry = entry ~child_summaries:[ summary ] original in
+                   let day =
+                     { (day_feed ~more:partial 20260808 "Saturday" [ original ]) with
+                       entries = [ first_entry ]
+                     }
+                   in
+                   let first =
+                     Timeline.empty ~today:20260809
+                     |> begin_and_apply_feed
+                          ~generation:1L
+                          ~before_day:None
+                          (feed [ day ])
+                   in
+                   let update state value =
+                     if use_entry
+                     then
+                       Timeline.replace_timeline_entry
+                         state
+                         (entry ~child_summaries:[ summary ] value)
+                     else Timeline.replace_block state value
+                   in
+                   let cleared =
+                     update
+                       first
+                       (block ~day:20260808 ~order:"b" ~source:"" ~child_count:4 770)
+                   in
+                   require (count cleared = 0) "partial-day clear kept an empty card";
+                   let restored = update cleared restore in
+                   Printf.printf
+                     "partial=%b interface=%s cards=%d->%d->%d\n%!"
+                     partial
+                     (if use_entry then "entry" else "block")
+                     (count first)
+                     (count cleared)
+                     (count restored);
+                   require
+                     (count restored = 1)
+                     "partial=%b interface=%s qualifying parent did not restore"
+                     partial
+                     (if use_entry then "entry" else "block");
+                   let duplicate = update restored restore in
+                   require
+                     (count duplicate = 1)
+                     "repeated restoration duplicated the parent";
+                   let shown =
+                     Timeline.fold_slots
+                       (fun found -> function
+                          | Top_level e -> Some e
+                          | _ -> found)
+                       None
+                       duplicate
+                     |> Option.get
+                   in
+                   require
+                     (shown.child_summaries = [ summary ])
+                     "model restoration dropped retained child summaries";
+                   require
+                     (Timeline.pending_request duplicate = None)
+                     "restoration started another read";
+                   let cursors =
+                     Timeline.fold_slots
+                       (fun acc -> function
+                          | Day_continuation { after; _ } -> after :: acc
+                          | _ -> acc)
+                       []
+                       duplicate
+                   in
+                   require
+                     (cursors = if partial then [ day.continuation ] else [])
+                     "restoration changed continuation";
+                   let earlier = block ~day:20260808 ~order:"a" 769 in
+                   let sorted =
+                     Timeline.prepend_timeline_entry duplicate (entry earlier)
+                   in
+                   let ids =
+                     Timeline.fold_slots
+                       (fun acc -> function
+                          | Top_level e -> Journal_model.id e.block :: acc
+                          | _ -> acc)
+                       []
+                       sorted
+                     |> List.rev
+                   in
+                   require_equal_string_list
+                     ids
+                     [ Journal_model.id earlier; Journal_model.id original ]
+                     "restoration broke sibling order"
+                 with
+                 | Failure s -> failures := s :: !failures)
+              [ block ~day:20260808 ~order:"b" ~source:"Restored" ~child_count:4 770
+              ; Journal_model.with_tag_titles
+                  (block ~day:20260808 ~order:"b" ~source:"" ~child_count:4 770)
+                  ~tag_titles:[ "Work" ]
+              ; Journal_model.with_asset_file_type
+                  (block ~day:20260808 ~order:"b" ~source:"" ~child_count:4 770)
+                  ~asset_file_type:(Some "pdf")
+              ])
+         [ false; true ])
+    [ false; true ];
+  require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_partial_day_parent_restore ();
+  test_parent_only_cards_and_point_updates ();
   let failures = ref [] in
   List.iter
     (fun test ->

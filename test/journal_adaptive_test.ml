@@ -98,7 +98,7 @@ let test_environment_preference_changes_are_observable () =
 let test_sf_symbols_preserve_identity_and_appearance () =
   let cases =
     Journal_symbols.
-      [ Account, "person.crop.circle"
+      [ Account, "ellipsis"
       ; Add, "plus"
       ; Save, "arrow.up"
       ; Back, "chevron.left"

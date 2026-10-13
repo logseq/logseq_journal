@@ -2,50 +2,23 @@ module Ui = Journal_view
 module V = Ui.View
 module L = Lui_elements
 
-let expanded_slot = Signal.state_slot "journal-body-expanded"
-
-let body ~render_source block =
-  let source = render_source (Journal_model.source block) in
-  let long =
-    String.length source > 240 || List.length (String.split_on_char '\n' source) > 3
-  in
-  if String.trim source = ""
-  then V.column []
-  else if not long
-  then V.of_lui (L.text ~value:source [])
-  else
-    V.of_lui (fun context parent ->
-      let context =
-        Lui_ui.child_context context ("journal-body:" ^ Journal_model.id block)
-      in
-      let expanded =
-        Signal.state_at context.ui_scheduler context.ui_state_scope expanded_slot false
-      in
-      let label =
-        Signal.map
-          (fun full -> if full then "Show less" else "Show more")
-          (Signal.value expanded)
-      in
-      Signal.on_dispose context.ui_scope (fun () -> Signal.dispose_signal label);
-      L.column
-        ~gap:4
-        ~cross:`start
-        [ L.dyn
-            ~equal:Bool.equal
-            (fun full ->
-               L.text ~value:source ~style_class:(if full then "" else "line-clamp-3") [])
-            (Signal.value expanded)
-        ; L.text
-            ~key:"body-toggle"
-            ~value_signal:label
-            ~style_class:"caption"
-            ~foreground:"secondary"
-            ~on_press:(fun _ -> Signal.update expanded not)
-            []
-        ]
-        context
-        parent)
+(* OCaml owns the preview policy; native Text owns visual wrapping at the
+   available width and Dynamic Type size. Keep the full source for Detail. *)
+let preview_text source =
+  V.of_lui
+    (Journal_lui_native.mount
+       Journal_lui_native.chrome_identifier
+       ~payload:
+         (Yojson.Basic.to_string
+            (`Assoc
+                [ "mode", `String "bounded-text"
+                ; "text", `String source
+                ; "maxLines", `Int 4
+                ]))
+       ~children:[])
 ;;
+
+let body source = if String.trim source = "" then V.column [] else preview_text source
 
 let metadata block =
   let status = Journal_model.task_state block in
@@ -100,7 +73,8 @@ let view
     List.partition
       (fun (summary : Journal_graph_projection.child_summary) ->
          is_image_asset summary.asset_file_type)
-      entry.child_summaries
+      (* Guard the public renderer before any partition/source/media work. *)
+      (List.take 3 entry.child_summaries)
   in
   let image_children =
     List.map
@@ -114,12 +88,12 @@ let view
       (id, file_type) :: image_children
     | _ -> image_children
   in
-  let body =
+  let source =
     if is_image_asset (Journal_model.asset_file_type block)
-    then V.column []
-    else body ~render_source block
+    then ""
+    else render_source (Journal_model.source block)
   in
-  let content = V.column ~spacing:8. ~alignment:Leading (body :: metadata block) in
+  let content = V.column ~spacing:8. ~alignment:Leading (body source :: metadata block) in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
@@ -131,7 +105,7 @@ let view
              ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
-             (V.text (render_source summary.source)))
+             (body (render_source summary.source)))
         text_children
   in
   let labels =

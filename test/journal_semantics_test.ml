@@ -91,23 +91,59 @@ let dropped_wire_nodes ops =
   dropped
 ;;
 
+(* Rendering work has no Runtime reducer owner: this public callback boundary
+   verifies bounded source/media work and allocation before a native mount. *)
 let test_timeline_media_targets () =
-  let targets = ref [] in
-  ignore
-    (Journal_row.view
-       ~show_timestamp:false
-       ~render_media:(fun ~title:_ ~root ~image_children:_ child ->
-         targets := root :: !targets;
-         child)
-       { Journal_graph_projection.block = block ()
-       ; child_summaries =
-           [ { block_id = "visible-child"; source = "Summary"; asset_file_type = None } ]
-       }
-     : V.t);
+  let run count =
+    let summaries =
+      List.init count (fun n ->
+        { Journal_graph_projection.block_id = Printf.sprintf "visible-child-%d" n
+        ; source = Printf.sprintf "Summary %d" n
+        ; asset_file_type = None
+        })
+    in
+    let parent = block ~child_count:count () in
+    let targets = ref []
+    and sources = ref [] in
+    let before = Gc.allocated_bytes () in
+    ignore
+      (Journal_row.view
+         ~show_timestamp:false
+         ~render_source:(fun source ->
+           sources := source :: !sources;
+           source)
+         ~render_media:(fun ~title:_ ~root ~image_children:_ child ->
+           targets := root :: !targets;
+           child)
+         { Journal_graph_projection.block = parent; child_summaries = summaries }
+       : V.t);
+    let allocated = Gc.allocated_bytes () -. before in
+    count, List.rev !targets, List.rev !sources, allocated
+  in
+  let observations = List.map run [ 0; 3; 201; 10050 ] in
+  List.iter
+    (fun (count, targets, sources, _) ->
+       require
+         (targets
+          = block_id :: List.init (min 3 count) (Printf.sprintf "visible-child-%d"))
+         "row media rendering visited more than the first three summaries (%d)"
+         count;
+       require
+         (List.length sources = 1 + min 3 count)
+         "row resolved hidden summary sources (%d)"
+         count)
+    observations;
+  let allocated count =
+    let _, _, _, n = List.find (fun (actual, _, _, _) -> actual = count) observations in
+    n
+  in
+  Printf.printf "bounded row allocations: 3=%.0f, 201=%.0f, 10050=%.0f bytes\n%!"
+    (allocated 3) (allocated 201) (allocated 10050);
   require
-    (List.sort String.compare !targets
-     = List.sort String.compare [ block_id; "visible-child" ])
-    "media discovery must target each displayed source, including summaries"
+    (allocated 10050 <= allocated 3 +. 1024.)
+    "row allocation grows with hidden summary count (3: %.0f, 10050: %.0f)"
+    (allocated 3)
+    (allocated 10050)
 ;;
 
 let test_native_lui_events () =
@@ -313,6 +349,8 @@ let has_text ops expected =
   List.exists
     (function
       | Lui_protocol.SetProp (_, TextValue, StringValue value) -> value = expected
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+        Yojson.Basic.Util.member "text" (Yojson.Basic.from_string json) = `String expected
       | _ -> false)
     ops
 ;;
@@ -717,54 +755,76 @@ let test_mounted_input_revisions_remain_independent () =
          "simultaneous composer/password mounts shared revisions or changed Unicode text")
 ;;
 
-let test_long_body_can_expand () =
-  let source =
-    String.concat
-      "\n"
-      [ "First line"; "Second line"; "Third line"; "Fourth line retained" ]
+(* Row layout has no pure reducer owner: exercise the mounted production
+   renderer's full text and native line policy, including short sources whose
+   visual wrapping cannot be inferred from character count. *)
+let test_timeline_body_four_lines () =
+  let sources =
+    [ "Short"
+    ; String.concat "\n" (List.init 8 (Printf.sprintf "English line %d"))
+    ; String.concat "" (List.init 30 (fun _ -> "中文多行内容👩🏽‍💻"))
+    ; String.make 500 'x'
+    ; "**bold** [link](https://example.com/very/long/path) `code`\nsecond\nthird\nfourth\nfifth"
+    ; String.concat " " (List.init 80 (fun _ -> "wrapped words"))
+    ]
   in
-  let view =
-    Journal_row.view
-      ~show_timestamp:false
+  List.iter (fun source ->
+    let view = Journal_row.view ~show_timestamp:false
       ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
-      { Journal_graph_projection.block =
-          block ~source ~task_state:No_status ~child_count:0 ()
-      ; child_summaries = []
-      }
-  in
-  with_mounted view (fun app ops ->
-    let button =
-      List.find_map
-        (function
-          | Lui_protocol.SetProp (node, TextValue, StringValue "Show more") -> Some node
-          | _ -> None)
-        (ops ())
+      { Journal_graph_projection.block = block ~source ~task_state:No_status ()
+      ; child_summaries = [] }
     in
-    require (Option.is_some button) "long body has no expansion control";
-    require
-      (List.exists
-         (function
-           | Lui_protocol.SetProp (_, StyleClass, StringValue "line-clamp-3") -> true
-           | _ -> false)
-         (ops ()))
-      "body is not initially clamped";
-    ignore (Lui_app.dispatch_event app (Lui_protocol.Press (Option.get button)));
-    ignore (Lui_app.flush app);
-    require (has_text (ops ()) "Show less") "expansion did not reveal collapse action";
-    ignore (Lui_app.dispatch_event app (Lui_protocol.Press (Option.get button)));
-    ignore (Lui_app.flush app);
-    let last_label =
-      List.find_map
-        (function
-          | Lui_protocol.SetProp
-              (_, TextValue, StringValue (("Show more" | "Show less") as value)) ->
-            Some value
-          | _ -> None)
-        (List.rev (ops ()))
-    in
-    require
-      (last_label = Some "Show more")
-      "the native row's retained expansion action must collapse again")
+    with_mounted view (fun _ ops ->
+      let payloads = List.filter_map (function
+        | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+          let value = Yojson.Basic.from_string json in
+          if Yojson.Basic.Util.member "mode" value = `String "bounded-text"
+          then Some value else None
+        | _ -> None) (ops ()) in
+      require (List.length payloads = 1) "Timeline body has no native bounded text";
+      let payload = List.hd payloads in
+      require (Yojson.Basic.Util.member "text" payload = `String source)
+        "Timeline truncated or changed the full source";
+      require (Yojson.Basic.Util.member "maxLines" payload = `Int 4)
+        "Timeline body is not limited to four visual lines";
+      require (not (has_text (ops ()) "Show more" || has_text (ops ()) "Show less"))
+        "Timeline retained a local expansion action");
+    with_mounted (Journal_header.detail_text ~id:"full-detail" ~depth:0 source)
+      (fun _ ops ->
+        require (has_text (ops ()) source) "Detail lost the full source";
+        require (not (List.exists (function
+          | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+            Yojson.Basic.Util.member "maxLines" (Yojson.Basic.from_string json) <> `Null
+          | _ -> false) (ops ()))) "Detail inherited the Timeline line limit")) sources
+;;
+
+let test_timeline_options_menu () =
+  let actions = ref [] in
+  let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+  let view = Journal_header.view ~key:(Ui.Key.string "options") ~platform:"ios"
+    ~context:Journal_header.Context.journals ~sync_phase:None ~sync_error:None
+    ~on_error_info:None ~on_account_action:(Some (fun action -> actions := action :: !actions))
+    ~local_deletion_available:true ~on_journals:ignored ~on_favorites:ignored
+    ~on_capture:ignored ~capture_enabled:true ~capture_expanded:None
+    ~body:(V.Body.static (V.text "content")) in
+  with_mounted (V.Body.Private.to_widget view) (fun app ops ->
+    let trigger = List.find_map (function
+      | Lui_protocol.CreateNode (node, MenuTrigger) -> Some node | _ -> None) (ops ())
+      |> Option.get in
+    let property key expected = List.exists (function
+      | Lui_protocol.SetProp (node, actual, StringValue value) ->
+        node = trigger && actual = key && value = expected | _ -> false) (ops ()) in
+    require (property AccessibilityLabel "Options") "menu does not announce Options";
+    require (property InlineIconName "app:ellipsis") "menu does not use Detail's ellipsis";
+    List.iter (fun title ->
+      let node = List.find_map (function
+        | Lui_protocol.SetProp (node, TextValue, StringValue text) when text = title -> Some node
+        | _ -> None) (ops ()) |> Option.get in
+      ignore (Lui_app.dispatch_event app (Lui_protocol.Press node));
+      ignore (Lui_app.flush app))
+      [ "Attachment settings"; "Diagnostics"; "Switch graph"; "Delete local graph copy"; "Sign out" ];
+    require (List.rev !actions = Journal_header.[Open_asset_settings; Open_diagnostics;
+      Switch_graph; Request_local_cache_reset; Sign_out]) "Options lost an existing action")
 ;;
 
 let media_item n file_type presentation size =
@@ -1034,7 +1094,15 @@ let test_reference_body_and_summary () =
     require
       (has_text (ops ()) ("child " ^ source))
       "summary reference did not mount resolved content";
-    require (has_text (ops ()) "Show more") "resolved long content did not clamp";
+    require (not (has_text (ops ()) "Show more")) "reference retained local expansion";
+    let bounded = List.filter_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+        let value = Yojson.Basic.from_string json in
+        if Yojson.Basic.Util.member "mode" value = `String "bounded-text"
+        then Some value else None | _ -> None) (ops ()) in
+    require (List.length bounded = 2 && List.for_all (fun value ->
+      Yojson.Basic.Util.member "maxLines" value = `Int 4) bounded)
+      "resolved root/summary bodies do not share the four-line policy";
     require
       (Journal_model.source entry.block = token)
       "rendering changed persisted source")
@@ -1132,7 +1200,7 @@ let image_paths ops =
     ops
 ;;
 
-let child_gallery_fixture ?(source = "Parent prose") ?(duplicates = false) () =
+let child_gallery_fixture ?(source = "Parent prose") ?(duplicates = false) ?(document_order = "d") () =
   let first = media_item 71 "png" (File "/tmp/synthetic-first.png") None in
   let second = media_item 72 "jpg" (File "/tmp/synthetic-second.jpg") None in
   let pdf = media_item 73 "pdf" (File "/tmp/synthetic-plan.pdf") (Some 32476L) in
@@ -1159,7 +1227,7 @@ let child_gallery_fixture ?(source = "Parent prose") ?(duplicates = false) () =
       ; ( 1
         , graph_node
             ~file_type:"pdf"
-            ~order:"d"
+            ~order:document_order
             ~id:(asset_id pdf)
             ~parent:block_id
             "plan.pdf" )
@@ -1189,8 +1257,8 @@ let test_direct_image_children_share_parent_gallery () =
       (not (has_text initial "asset-portrait.jpg"))
       "portrait asset title leaked into prose";
     require (has_text initial "photo.png") "ordinary note named photo.png was hidden";
-    require (has_text initial "plan.pdf") "non-image asset title was hidden";
-    require (has_text initial "PDF attachment") "file attachment card was removed";
+    require (not (has_text initial "plan.pdf")) "fourth child escaped preview bound";
+    require (not (has_text initial "PDF attachment")) "fourth child attachment escaped preview bound";
     require
       (image_paths initial = [ "/tmp/synthetic-first.png"; "/tmp/synthetic-second.jpg" ])
       "direct gallery lost sibling order, repeated parent references, or included \
@@ -1346,15 +1414,6 @@ let test_image_children_load_without_title_flash () =
             event.action = Asset && event.root = asset_id first)
          !events)
       "aggregated image download event was routed to its parent instead of owner")
-;;
-
-let test_empty_parent_keeps_direct_images () =
-  let entry, views, _, _ = child_gallery_fixture ~source:"" () in
-  with_mounted (projected_row ~views ~on_event:ignore entry) (fun _ ops ->
-    require (List.length (image_paths (ops ())) = 2) "empty parent lost image gallery";
-    require
-      (not (has_text (ops ()) "camera.png"))
-      "empty parent substituted asset filename as prose")
 ;;
 
 let test_top_image_asset_has_no_filename_body () =
@@ -1608,6 +1667,11 @@ let mounted_nodes ops property expected =
          Hashtbl.replace values node value
        | Lui_protocol.RemoveProp (node, key) when key = property ->
          Hashtbl.remove values node
+       | Lui_protocol.SetExtensionProp (node, "payload", StringValue json)
+         when property = Lui_protocol.TextValue ->
+         (match Yojson.Basic.Util.member "text" (Yojson.Basic.from_string json) with
+          | `String text -> Hashtbl.replace values node (Lui_protocol.StringValue text)
+          | _ -> ())
        | _ -> ())
     ops;
   Hashtbl.fold
@@ -2234,7 +2298,7 @@ let test_labeled_content_keeps_interactive_value () =
 ;;
 
 let test_timeline_document_title_follows_its_asset_child () =
-  let entry, views, _, _ = child_gallery_fixture () in
+  let entry, views, _, _ = child_gallery_fixture ~document_order:"0" () in
   with_mounted (projected_row ~views ~on_event:ignore entry) (fun app ops ->
     let card = mounted_node (ops ()) TextValue (StringValue "PDF attachment") in
     ignore (Lui_app.dispatch_event app (Press card));
@@ -2610,14 +2674,14 @@ let tests =
   ; "known gallery stable slots", test_known_gallery_slots_survive_separate_arrivals
   ; "direct image child composition", test_direct_image_children_share_parent_gallery
   ; "late image child discovery", test_image_children_load_without_title_flash
-  ; "empty parent image gallery", test_empty_parent_keeps_direct_images
   ; "top image asset body", test_top_image_asset_has_no_filename_body
   ; "scoped theme wire properties", test_scoped_theme_wire_properties
   ; "loading indicator and message", test_loading_keeps_indicator_and_message
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron
-  ; "expand long body", test_long_body_can_expand
+  ; "Timeline four visual lines", test_timeline_body_four_lines
+  ; "Timeline Options menu", test_timeline_options_menu
   ; "single image beside body", test_single_image_beside_body
   ; "LUI image gallery and preview", test_images_use_lui_gallery_and_preview
   ; "file card metadata", test_file_cards_use_actual_metadata

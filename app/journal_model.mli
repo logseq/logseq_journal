@@ -57,6 +57,9 @@ val source : t -> string
 val is_image_file_type : string -> bool
 val asset_file_type : t -> string option
 val with_asset_file_type : t -> asset_file_type:string option -> t
+val has_tags : t -> bool
+val has_attachments : t -> bool
+val with_content_metadata : t -> tags_present:bool -> attachments_present:bool -> t
 val task_state : t -> task_state
 val child_count : t -> int
 val creation_time : t -> Journal_time.t
