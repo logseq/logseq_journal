@@ -182,6 +182,7 @@ if [[ $platform == macos ]]; then
   cp "$info_plist" "$app_dir/Contents/Info.plist"
   register_callback "$app_dir/Contents/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/Contents/MacOS/JournalApp"
+  bash "$repo_root/tool/package_journal_apple_icons.sh" "$platform" "$app_dir"
   # keychain-access-groups needs a real team id; without one the group is
   # invalid and AMFI kills the binary, so drop the key for local builds. With a
   # team id, sign with the Apple Development identity so the entitlement is
@@ -209,6 +210,7 @@ else
   cp "$info_plist" "$app_dir/Info.plist"
   register_callback "$app_dir/Info.plist"
   cp "$product_dir/JournalApp" "$app_dir/JournalApp"
+  bash "$repo_root/tool/package_journal_apple_icons.sh" "$platform" "$app_dir"
   # Plain adhoc signature — the sim's entitlements already live in the
   # __TEXT,__entitlements section embedded at link time above. Do NOT pass
   # --entitlements here: a signature-level entitlements blob is validated by
