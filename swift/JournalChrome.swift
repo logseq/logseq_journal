@@ -27,6 +27,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case page, header, detail, unlock, startup
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
+    case boundedText = "bounded-text"
     case detailRow = "detail-row"
   }
 
@@ -38,6 +39,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let pending: Bool?
     let error: String?
     let text: String?
+    let maxLines: Int?
     let id: String?
     let level: Int?
     let loading: Bool?
@@ -242,6 +244,17 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .toolbar { ToolbarItem { child(1) } }
           #endif
           .navigationTitle(title)
+        }
+      case .boundedText:
+        if let text = properties?.text, let maxLines = properties?.maxLines,
+          maxLines > 0, context.childIDs.isEmpty {
+          Text(verbatim: text)
+            .font(.body)
+            .multilineTextAlignment(.leading)
+            .lineLimit(maxLines)
+            .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
       case .detailText:
         if let properties, let text = properties.text, let id = properties.id,

@@ -313,6 +313,8 @@ let has_text ops expected =
   List.exists
     (function
       | Lui_protocol.SetProp (_, TextValue, StringValue value) -> value = expected
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+        Yojson.Basic.Util.member "text" (Yojson.Basic.from_string json) = `String expected
       | _ -> false)
     ops
 ;;
@@ -717,54 +719,76 @@ let test_mounted_input_revisions_remain_independent () =
          "simultaneous composer/password mounts shared revisions or changed Unicode text")
 ;;
 
-let test_long_body_can_expand () =
-  let source =
-    String.concat
-      "\n"
-      [ "First line"; "Second line"; "Third line"; "Fourth line retained" ]
+(* Row layout has no pure reducer owner: exercise the mounted production
+   renderer's full text and native line policy, including short sources whose
+   visual wrapping cannot be inferred from character count. *)
+let test_timeline_body_four_lines () =
+  let sources =
+    [ "Short"
+    ; String.concat "\n" (List.init 8 (Printf.sprintf "English line %d"))
+    ; String.concat "" (List.init 30 (fun _ -> "中文多行内容👩🏽‍💻"))
+    ; String.make 500 'x'
+    ; "**bold** [link](https://example.com/very/long/path) `code`\nsecond\nthird\nfourth\nfifth"
+    ; String.concat " " (List.init 80 (fun _ -> "wrapped words"))
+    ]
   in
-  let view =
-    Journal_row.view
-      ~show_timestamp:false
+  List.iter (fun source ->
+    let view = Journal_row.view ~show_timestamp:false
       ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
-      { Journal_graph_projection.block =
-          block ~source ~task_state:No_status ~child_count:0 ()
-      ; child_summaries = []
-      }
-  in
-  with_mounted view (fun app ops ->
-    let button =
-      List.find_map
-        (function
-          | Lui_protocol.SetProp (node, TextValue, StringValue "Show more") -> Some node
-          | _ -> None)
-        (ops ())
+      { Journal_graph_projection.block = block ~source ~task_state:No_status ()
+      ; child_summaries = [] }
     in
-    require (Option.is_some button) "long body has no expansion control";
-    require
-      (List.exists
-         (function
-           | Lui_protocol.SetProp (_, StyleClass, StringValue "line-clamp-3") -> true
-           | _ -> false)
-         (ops ()))
-      "body is not initially clamped";
-    ignore (Lui_app.dispatch_event app (Lui_protocol.Press (Option.get button)));
-    ignore (Lui_app.flush app);
-    require (has_text (ops ()) "Show less") "expansion did not reveal collapse action";
-    ignore (Lui_app.dispatch_event app (Lui_protocol.Press (Option.get button)));
-    ignore (Lui_app.flush app);
-    let last_label =
-      List.find_map
-        (function
-          | Lui_protocol.SetProp
-              (_, TextValue, StringValue (("Show more" | "Show less") as value)) ->
-            Some value
-          | _ -> None)
-        (List.rev (ops ()))
-    in
-    require
-      (last_label = Some "Show more")
-      "the native row's retained expansion action must collapse again")
+    with_mounted view (fun _ ops ->
+      let payloads = List.filter_map (function
+        | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+          let value = Yojson.Basic.from_string json in
+          if Yojson.Basic.Util.member "mode" value = `String "bounded-text"
+          then Some value else None
+        | _ -> None) (ops ()) in
+      require (List.length payloads = 1) "Timeline body has no native bounded text";
+      let payload = List.hd payloads in
+      require (Yojson.Basic.Util.member "text" payload = `String source)
+        "Timeline truncated or changed the full source";
+      require (Yojson.Basic.Util.member "maxLines" payload = `Int 4)
+        "Timeline body is not limited to four visual lines";
+      require (not (has_text (ops ()) "Show more" || has_text (ops ()) "Show less"))
+        "Timeline retained a local expansion action");
+    with_mounted (Journal_header.detail_text ~id:"full-detail" ~depth:0 source)
+      (fun _ ops ->
+        require (has_text (ops ()) source) "Detail lost the full source";
+        require (not (List.exists (function
+          | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+            Yojson.Basic.Util.member "maxLines" (Yojson.Basic.from_string json) <> `Null
+          | _ -> false) (ops ()))) "Detail inherited the Timeline line limit")) sources
+;;
+
+let test_timeline_options_menu () =
+  let actions = ref [] in
+  let ignored = Ui.Event.Handler.create (fun _ -> ()) in
+  let view = Journal_header.view ~key:(Ui.Key.string "options") ~platform:"ios"
+    ~context:Journal_header.Context.journals ~sync_phase:None ~sync_error:None
+    ~on_error_info:None ~on_account_action:(Some (fun action -> actions := action :: !actions))
+    ~local_deletion_available:true ~on_journals:ignored ~on_favorites:ignored
+    ~on_capture:ignored ~capture_enabled:true ~capture_expanded:None
+    ~body:(V.Body.static (V.text "content")) in
+  with_mounted (V.Body.Private.to_widget view) (fun app ops ->
+    let trigger = List.find_map (function
+      | Lui_protocol.CreateNode (node, MenuTrigger) -> Some node | _ -> None) (ops ())
+      |> Option.get in
+    let property key expected = List.exists (function
+      | Lui_protocol.SetProp (node, actual, StringValue value) ->
+        node = trigger && actual = key && value = expected | _ -> false) (ops ()) in
+    require (property AccessibilityLabel "Options") "menu does not announce Options";
+    require (property InlineIconName "app:ellipsis") "menu does not use Detail's ellipsis";
+    List.iter (fun title ->
+      let node = List.find_map (function
+        | Lui_protocol.SetProp (node, TextValue, StringValue text) when text = title -> Some node
+        | _ -> None) (ops ()) |> Option.get in
+      ignore (Lui_app.dispatch_event app (Lui_protocol.Press node));
+      ignore (Lui_app.flush app))
+      [ "Attachment settings"; "Diagnostics"; "Switch graph"; "Delete local graph copy"; "Sign out" ];
+    require (List.rev !actions = Journal_header.[Open_asset_settings; Open_diagnostics;
+      Switch_graph; Request_local_cache_reset; Sign_out]) "Options lost an existing action")
 ;;
 
 let media_item n file_type presentation size =
@@ -1034,7 +1058,15 @@ let test_reference_body_and_summary () =
     require
       (has_text (ops ()) ("child " ^ source))
       "summary reference did not mount resolved content";
-    require (has_text (ops ()) "Show more") "resolved long content did not clamp";
+    require (not (has_text (ops ()) "Show more")) "reference retained local expansion";
+    let bounded = List.filter_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+        let value = Yojson.Basic.from_string json in
+        if Yojson.Basic.Util.member "mode" value = `String "bounded-text"
+        then Some value else None | _ -> None) (ops ()) in
+    require (List.length bounded = 2 && List.for_all (fun value ->
+      Yojson.Basic.Util.member "maxLines" value = `Int 4) bounded)
+      "resolved root/summary bodies do not share the four-line policy";
     require
       (Journal_model.source entry.block = token)
       "rendering changed persisted source")
@@ -1608,6 +1640,11 @@ let mounted_nodes ops property expected =
          Hashtbl.replace values node value
        | Lui_protocol.RemoveProp (node, key) when key = property ->
          Hashtbl.remove values node
+       | Lui_protocol.SetExtensionProp (node, "payload", StringValue json)
+         when property = Lui_protocol.TextValue ->
+         (match Yojson.Basic.Util.member "text" (Yojson.Basic.from_string json) with
+          | `String text -> Hashtbl.replace values node (Lui_protocol.StringValue text)
+          | _ -> ())
        | _ -> ())
     ops;
   Hashtbl.fold
@@ -2617,7 +2654,8 @@ let tests =
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron
-  ; "expand long body", test_long_body_can_expand
+  ; "Timeline four visual lines", test_timeline_body_four_lines
+  ; "Timeline Options menu", test_timeline_options_menu
   ; "single image beside body", test_single_image_beside_body
   ; "LUI image gallery and preview", test_images_use_lui_gallery_and_preview
   ; "file card metadata", test_file_cards_use_actual_metadata

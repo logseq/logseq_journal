@@ -1189,7 +1189,7 @@ let run_favorites_native_visibility
         match List.assoc_opt "payload" values with
         | Some (`String payload) ->
           let p = Yojson.Safe.from_string payload in
-          if Yojson.Safe.Util.member "mode" p = `String "detail-text"
+          if (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
              && Yojson.Safe.Util.member "text" p = `String value then Some id else found
         | _ -> found) props None
     | None -> None
@@ -1949,7 +1949,7 @@ let run_favorites_native_visibility
                   if List.assoc_opt "text" values = Some (`String "Updated covered row")
                     || (match List.assoc_opt "payload" values with
                         | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
-                          Yojson.Safe.Util.member "mode" p = `String "detail-text"
+                          (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
                           && Yojson.Safe.Util.member "text" p = `String "Updated covered row"
                         | _ -> false)
                   then count + 1
@@ -2194,7 +2194,7 @@ let run_favorites_native_visibility
                 if List.assoc_opt key values = Some (`String value)
                    || (key = "text" && match List.assoc_opt "payload" values with
                        | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
-                         Yojson.Safe.Util.member "mode" p = `String "detail-text"
+                         (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
                          && Yojson.Safe.Util.member "text" p = `String value
                        | _ -> false)
                 then id :: ids
@@ -2284,7 +2284,12 @@ let run_favorites_native_visibility
                 Alcotest.(check bool)
                   (label ^ " retains row text " ^ title)
                   true
-                  (List.assoc_opt "text" (Hashtbl.find props id) = Some (`String title)))
+                  (let values = Hashtbl.find props id in
+                   List.assoc_opt "text" values = Some (`String title)
+                   || match List.assoc_opt "payload" values with
+                      | Some (`String payload) ->
+                        Yojson.Safe.Util.member "text" (Yojson.Safe.from_string payload) = `String title
+                      | _ -> false))
              title_ids
          in
          let check_media_counts label changed =
@@ -3775,8 +3780,13 @@ let test_reference_outer_terminals cancel =
       |> List.iter (fun op ->
         track_teardown op;
         match op |> member "op" |> to_string with
-        | "set-prop" when member "property" op = `String "text" ->
-          let text = member "value" op |> to_string in
+        | ("set-prop" | "set-extension-prop")
+          when member "property" op = `String "text"
+               || (member "property" op = `String "payload"
+                   && member "text" (Yojson.Safe.from_string (member "value" op |> to_string)) <> `Null) ->
+          let text =
+            if member "property" op = `String "text" then member "value" op |> to_string
+            else member "text" (Yojson.Safe.from_string (member "value" op |> to_string)) |> to_string in
           if
             List.exists
               (fun value -> String.trim value = "Late cancelled target")
@@ -3894,6 +3904,9 @@ let with_timeline_media_row run =
                match op with
                | Lui_protocol.SetProp (id, TextValue, StringValue text) ->
                  Hashtbl.replace texts id text
+               | Lui_protocol.SetExtensionProp (id, "payload", StringValue json) ->
+                 (match Yojson.Basic.Util.member "text" (Yojson.Basic.from_string json) with
+                  | `String text -> Hashtbl.replace texts id text | _ -> ())
                | _ -> ())
             batch.ops;
           true)
@@ -4011,12 +4024,15 @@ let test_timeline_media_identity_across_detail_routes () =
     [ Journal_routes.Journals; Favorites ]
 ;;
 
-let test_timeline_media_disclosure_and_owner_replacement () =
-  with_timeline_media_row (fun app block find_text update _ ->
+let test_timeline_media_bounded_body_and_owner_replacement () =
+  with_timeline_media_row (fun _ block find_text update ops ->
     let initial = Journal_routes.create () in
-    ignore (Lui_app.dispatch_event app (Lui_protocol.Press (find_text "Show more")));
-    ignore (Lui_app.flush app);
-    ignore (find_text "Show less");
+    let no_expansion () =
+      Alcotest.(check bool) "no local expansion action" false
+        (List.exists (function
+          | Lui_protocol.SetProp (_, TextValue, StringValue ("Show more" | "Show less")) -> true
+          | _ -> false) (ops ())) in
+    no_expansion ();
     let loading =
       Journal_routes.open_detail
         initial
@@ -4024,16 +4040,16 @@ let test_timeline_media_disclosure_and_owner_replacement () =
         ~request_generation:10L
     in
     update loading 1;
-    ignore (find_text "Show less");
+    no_expansion ();
     update (Journal_routes.back loading) 1;
-    ignore (find_text "Show less");
+    no_expansion ();
     let original = find_text (Journal_model.source block) in
     update initial 2;
     Alcotest.(check bool)
       "new graph/runtime generation replaces the row body"
       true
       (original <> find_text (Journal_model.source block));
-    ignore (find_text "Show more");
+    no_expansion ();
     let journals = find_text (Journal_model.source block) in
     update (Journal_routes.select_destination initial Favorites) 2;
     Alcotest.(check bool)
@@ -4904,9 +4920,9 @@ let () =
             `Quick
             test_timeline_media_identity_across_detail_routes
         ; Alcotest.test_case
-            "disclosure and presentation replacement"
+            "bounded body and presentation replacement"
             `Quick
-            test_timeline_media_disclosure_and_owner_replacement
+            test_timeline_media_bounded_body_and_owner_replacement
         ] )
     ; ( "reference Worker terminals"
       , [ Alcotest.test_case "outer Failed releases hydration" `Quick (fun () ->

@@ -28,7 +28,7 @@ let for_task_state = function
 let name = function
   | Journals -> "calendar"
   | Favorites -> "star"
-  | Account -> "person.crop.circle"
+  | Account -> "ellipsis"
   | Add -> "plus"
   | Save -> "arrow.up"
   | Back -> "chevron.left"
