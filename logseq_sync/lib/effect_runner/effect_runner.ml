@@ -867,11 +867,57 @@ let cancel_scope t scope =
   | _ -> ()
 ;;
 
+let unlock_log_count = Atomic.make 0
+
+let unlock_log format =
+  Printf.ksprintf (fun fields ->
+    if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then (
+      let count = Atomic.fetch_and_add unlock_log_count 1 in
+      try
+        if count < 256 then Printf.eprintf "[journal-unlock] source=runner %s\n%!" fields
+        else if count = 256 then Printf.eprintf "[journal-unlock] source=runner limit=reached\n%!"
+      with _ -> ())) format
+;;
+
+let unlock_request_kind : type a. a Core.runner_request -> string option = function
+  | Core.Fetch_catalog _ -> Some "fetch-catalog"
+  | Fetch_e2ee_graph_key _ -> Some "fetch-e2ee-graph-key"
+  | Fetch_e2ee_user_keys _ -> Some "fetch-e2ee-user-keys"
+  | Load_and_unlock_graph_key _ -> Some "load-and-unlock-graph-key"
+  | Fetch_and_unlock_graph_key _ -> Some "fetch-and-unlock-graph-key"
+  | Unlock_private_key _ -> Some "unlock-private-key"
+  | _ -> None
+;;
+
+let unlock_result : type a. (a, Core.effect_error) result -> string = function
+  | Ok _ -> "ok"
+  | Error (Core.Crypto_failed (Invalid_key_material, _)) -> "invalid-key-material"
+  | Error (Crypto_failed (Crypto_provider_unavailable, _)) -> "crypto-provider-unavailable"
+  | Error (Effect_failed message) ->
+    (match message with
+     | "Authentication failed." -> "authentication-failed"
+     | "Authorization failed." -> "authorization-failed"
+     | "localPrivateKeyUnavailable" -> "local-private-key-unavailable"
+     | "wrappedGraphKeyUnavailable" -> "wrapped-graph-key-unavailable"
+     | "cryptoOperationFailed" -> "crypto-failed"
+     | _ ->
+       let prefix = "sync HTTP request failed with status " in
+       let length = String.length prefix in
+       if String.length message = length + 3
+          && String.sub message 0 length = prefix
+          && String.for_all (fun c -> c >= '0' && c <= '9') (String.sub message length 3)
+       then "http-" ^ String.sub message length 3
+       else "effect-failed")
+;;
+
 exception Runner_cancelled
 
 let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request -> unit =
   fun t ticket request ->
   let id = Core.effect_ticket_id ticket |> Core.effect_id_to_string in
+  let diagnostic_kind = unlock_request_kind request in
+  let began = Unix.gettimeofday () in
+  Option.iter (fun kind -> unlock_log "op=%s request=%s phase=begin" id kind) diagnostic_kind;
   let cancelled, resolve_cancelled = Eio.Promise.create () in
   let operation =
     { scope = Core.effect_ticket_scope ticket
@@ -888,7 +934,7 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
           (Eio.Fiber.first
              (fun () ->
                 if operation.cancelled || t.closed then raise Runner_cancelled;
-                execute_request t ticket request)
+                Platform_crypto.with_diagnostic_operation id (fun () -> execute_request t ticket request))
              (fun () ->
                 Eio.Promise.await cancelled;
                 raise Runner_cancelled))
@@ -896,6 +942,13 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
       | Runner_cancelled -> None
     in
     Hashtbl.remove t.operations id;
+    Option.iter (fun kind ->
+      let outcome = match result with
+        | None -> "cancelled"
+        | Some _ when t.closed || operation.cancelled -> "retired"
+        | Some result -> unlock_result result in
+      unlock_log "op=%s request=%s phase=end result=%s elapsed_ms=%.0f"
+        id kind outcome (Float.max 0. ((Unix.gettimeofday () -. began) *. 1000.))) diagnostic_kind;
     match result with
     | Some result when (not t.closed) && not operation.cancelled ->
       t.post (Core.Runner_completed (Core.Completion (ticket, result)))

@@ -4,6 +4,55 @@ module Protocol = Logseq_db_worker_contract.Protocol
 module Pure_reducer = Logseq_db_worker_pure_reducer.Core
 module Effect_runner = Logseq_db_worker_effect_runner.Effect_runner
 
+module Sync = Logseq_sync_pure_reducer.Core
+
+let unlock_log_count = Atomic.make 0
+let unlock_attempt_count = Atomic.make 0
+
+let unlock_log format =
+  Printf.ksprintf (fun fields ->
+    if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then (
+      let count = Atomic.fetch_and_add unlock_log_count 1 in
+      try
+        if count < 256 then Printf.eprintf "[journal-unlock] source=core %s\n%!" fields
+        else if count = 256 then Printf.eprintf "[journal-unlock] source=core limit=reached\n%!"
+      with _ -> ())) format
+;;
+
+let unlock_failure = function
+  | None -> "none"
+  | Some Sync.During_e2ee -> "e2ee"
+  | Some During_catalog -> "catalog"
+  | Some During_authentication -> "authentication"
+  | Some During_local_restore -> "local-restore"
+  | Some During_bootstrap -> "bootstrap"
+;;
+
+let observe_unlock before (transition : Pure_reducer.transition) event =
+  if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then (
+    let previous = (Pure_reducer.view before).sync.snapshot.startup in
+    let next = (Pure_reducer.view transition.next).sync.snapshot.startup in
+    match event with
+    | Pure_reducer.Sync_event (Sync.E2ee_password_submitted _) ->
+      let attempt = Atomic.fetch_and_add unlock_attempt_count 1 in
+      let operation = List.find_map (function
+        | Pure_reducer.Run_sync (Sync.Request (ticket, Sync.Unlock_private_key _)) ->
+          Some (Sync.effect_ticket_id ticket |> Sync.effect_id_to_string)
+        | _ -> None) transition.effects in
+      unlock_log "attempt=%d op=%s phase=password decision=%s challenge_advertised=%b challenge_ready=%b failure=%s account_generation=%d graph_generation=%d"
+        attempt (Option.value operation ~default:"none")
+        (if Option.is_some operation then "accepted" else "ignored")
+        previous.awaiting_e2ee_password (Option.is_some operation)
+        (unlock_failure previous.failure) previous.account_generation previous.graph_generation
+    | Sync_event (Sync.Runner_completed (Sync.Completion (ticket, _))) ->
+      unlock_log "op=%s phase=completion effects=%d challenge_advertised=%b failure=%s account_generation=%d graph_generation=%d"
+        (Sync.effect_ticket_id ticket |> Sync.effect_id_to_string)
+        (List.length transition.effects)
+        next.awaiting_e2ee_password (unlock_failure next.failure)
+        next.account_generation next.graph_generation
+    | _ -> ())
+;;
+
 type graph_phase = Pure_reducer.graph_phase =
   | Graph_closed
   | Graph_opening
@@ -29,7 +78,9 @@ type t =
 type create_error = Invalid_create of string
 
 let dispatch t event =
-  let transition = Pure_reducer.step !(t.state) event in
+  let before = !(t.state) in
+  let transition = Pure_reducer.step before event in
+  observe_unlock before transition event;
   t.state := transition.next;
   List.iter (Effect_runner.submit t.runner) transition.effects
 ;;

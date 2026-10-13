@@ -7,6 +7,20 @@ module Protocol = Db.Protocol
 module Overlay = Logseq_overlay_db.Database
 module ID = Journal_worker_ids
 
+let unlock_log_count = Atomic.make 0
+
+let unlock_queue_log context =
+  if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
+  then (
+    let count = Atomic.fetch_and_add unlock_log_count 1 in
+    try
+      if count < 256 then Printf.eprintf
+        "[journal-unlock] source=queue request_id=%Ld phase=post-password\n%!"
+        (ID.Worker.Request_id.to_int64 (Journal_worker.Request_context.request_id context))
+      else if count = 256 then Printf.eprintf "[journal-unlock] source=queue limit=reached\n%!"
+    with _ -> ())
+;;
+
 type graph_id = Logseq_db_types.Graph_types.Uuid.t
 type graph = Logseq_db_types.Managed_graph.t
 
@@ -660,7 +674,7 @@ let create ~(dependencies : dependencies) =
                      ; auth_enqueued_sequence
                      ; auth_wake
                      }))))
-    ~handle:(fun _context session request ->
+    ~handle:(fun context session request ->
       match request with
       | Import_asset { graph_generation; source } ->
         Ok (Asset_imported (Db.import_asset session.worker ~graph_generation source))
@@ -721,6 +735,7 @@ let create ~(dependencies : dependencies) =
         if !(session.auth_seen) then session.queue_auth !(session.authenticated_user);
         Ok Client_command_completed
       | Client_command command ->
+        (match command with Submit_e2ee_password _ -> unlock_queue_log context | _ -> ());
         Db.post session.worker (client_event command);
         Ok Client_command_completed
       | Graph_request request -> Ok (Graph_response (Db.request session.worker request)))

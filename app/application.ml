@@ -6,6 +6,30 @@ module Worker = Logseq_db_worker_lui.Journal_worker
 module Journal_worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module Journal_worker_ids = Logseq_db_worker_lui.Journal_worker_ids
 
+let unlock_log_count = Atomic.make 0
+
+let unlock_log format =
+  Printf.ksprintf
+    (fun fields ->
+       if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
+       then (
+         let count = Atomic.fetch_and_add unlock_log_count 1 in
+         try
+           if count < 256 then Printf.eprintf "[journal-unlock] source=ui %s\n%!" fields
+           else if count = 256 then Printf.eprintf "[journal-unlock] source=ui limit=reached\n%!"
+         with _ -> ()))
+    format
+;;
+
+let unlock_failure = function
+  | None -> "none"
+  | Some Graph_service.During_e2ee -> "e2ee"
+  | Some During_catalog -> "catalog"
+  | Some During_authentication -> "authentication"
+  | Some During_local_restore -> "local-restore"
+  | Some During_bootstrap -> "bootstrap"
+;;
+
 type unlock_chrome_props = { mode : string; title : string; pending : bool; error : string option [@default None] }
 [@@deriving yojson]
 
@@ -674,6 +698,7 @@ let local_deletion_available state =
 ;;
 
 let apply_manager_state state (manager_state : Graph_service.state) =
+  let e2ee_submission_was_pending = state.e2ee_submission_pending in
   let snapshot = manager_state.snapshot in
   let state =
     match state.manager with
@@ -754,6 +779,10 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     ; graph_error = state.graph_error
     }
   in
+  if state.e2ee_submission_pending <> e2ee_submission_was_pending
+  then unlock_log "phase=state pending=%b challenge_advertised=%b failure=%s account_generation=%d graph_generation=%d"
+    state.e2ee_submission_pending is_awaiting_password (unlock_failure snapshot.startup.failure)
+    snapshot.startup.account_generation snapshot.startup.graph_generation;
   match snapshot.last_error with
   | Some message when previous_sync_error <> Some message ->
     show_sync_error state (Non_worker_sync_failure message)
@@ -3910,8 +3939,17 @@ let start
   let started_graph_generation = ref None in
   let send_manager command =
     Effect.of_thunk (fun () ->
-      ignore
-        (Worker.send client (Graph_service.Client_command command) : Worker.send_result))
+      let result = Worker.send client (Graph_service.Client_command command) in
+      (match command with
+       | Graph_service.Submit_e2ee_password _ ->
+         (match result with
+          | Worker.Accepted request_id ->
+            unlock_log "phase=queue result=accepted request_id=%Ld"
+              (Journal_worker_ids.Worker.Request_id.to_int64 request_id)
+          | Full -> unlock_log "phase=queue result=full"
+          | Not_ready -> unlock_log "phase=queue result=not-ready"
+          | Stopping -> unlock_log "phase=queue result=stopping")
+       | _ -> ()))
   in
   let submit request = Journal_graph_runtime.submit graph_runtime request in
   let fail_graph_transport state message =
@@ -5823,7 +5861,10 @@ let start
         || (not awaiting)
         || String.equal (String.trim password) ""
       then Effect.ignore
-      else
+      else (
+        unlock_log "phase=submit pending=true challenge_advertised=%b failure=%s"
+          (Option.fold ~none:false ~some:(fun manager -> manager.Graph_service.startup.awaiting_e2ee_password) snapshot.manager)
+          (unlock_failure (Option.bind snapshot.manager (fun manager -> manager.Graph_service.startup.failure)));
         Effect.bind
           (update (fun state ->
              { state with
@@ -5834,7 +5875,7 @@ let start
                    ~source:""
              ; next_local_sequence = Int64.succ state.next_local_sequence
              }))
-          ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password password))
+          ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password password)))
     | Request_local_cache_reset ->
       update (fun state ->
         match state.manager with

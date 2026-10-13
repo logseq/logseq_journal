@@ -49,6 +49,69 @@ private func makeFixture() throws -> (privateKey: Data, wrapped: String) {
   return (external, wrapped)
 }
 
+private func unlockLogTest() throws {
+  let capture = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("journal-unlock-log-\(UUID().uuidString)")
+  FileManager.default.createFile(atPath: capture.path, contents: nil)
+  let output = try FileHandle(forWritingTo: capture)
+  let previous = dup(STDERR_FILENO)
+  fflush(stderr)
+  dup2(output.fileDescriptor, STDERR_FILENO)
+  defer {
+    fflush(stderr)
+    dup2(previous, STDERR_FILENO)
+    close(previous)
+    try? output.close()
+    try? FileManager.default.removeItem(at: capture)
+    unsetenv("JOURNAL_UNLOCK_DIAGNOSTICS")
+  }
+  func invoke(_ object: [String: Any]) throws {
+    let data = try JSONSerialization.data(withJSONObject: object)
+    let response = String(decoding: data, as: UTF8.self).withCString {
+      logseqJournalCryptoJSON($0)
+    }
+    guard let response else { throw HarnessError.failed("missing crypto response") }
+    free(response)
+  }
+  let secrets = ["LOG_SECRET_PASSWORD", "LOG_SECRET_USER", "LOG_SECRET_KEY",
+    "LOG_SECRET_GRAPH", "LOG_SECRET_BODY", "LOG_SECRET_OPERATION"]
+  let request: [String: Any] = [
+    "operation": "unlockPrivateKey", "origin": "https://example.invalid",
+    "userId": secrets[1], "password": secrets[0], "graphId": secrets[3],
+    "privateKey": secrets[2], "encryptedGraphKey": secrets[4],
+    "iterations": 600_000, "salt": "00", "iv": "000000000000000000000000",
+    "ciphertext": "00000000000000000000000000000000", "diagnosticOperation": "109",
+  ]
+  unsetenv("JOURNAL_UNLOCK_DIAGNOSTICS")
+  try invoke(request)
+  let disabledLogs = try Data(contentsOf: capture)
+  try require(disabledLogs.isEmpty, "diagnostics must be opt-in")
+  setenv("JOURNAL_UNLOCK_DIAGNOSTICS", "1", 1)
+  try invoke(request)
+  var logs = try String(contentsOf: capture, encoding: .utf8)
+  try require(logs.contains("source=crypto op=109 request=unlockPrivateKey phase=begin"),
+    "native request must preserve the numeric runner operation ID")
+  try require(logs.contains("stage=derive-private-key") && logs.contains("stage=open-private-key"),
+    "native crypto must expose the actual failing stage")
+  try require(logs.contains("phase=end result=crypto-failed") && logs.contains("elapsed_ms="),
+    "native crypto must record a typed terminal result and duration")
+  try invoke(["operation": "loadAndVerifyWrappedGraphKey", "origin": "https://example.invalid",
+    "userId": secrets[1], "graphId": "10000000-0000-4000-8000-000000000999",
+    "diagnosticOperation": "110"])
+  logs = try String(contentsOf: capture, encoding: .utf8)
+  try require(logs.contains("result=wrapped-key-unavailable"), "missing cached wrapped key is distinct")
+  for _ in 0..<300 {
+    try invoke(["operation": secrets[5], "origin": "https://example.invalid",
+      "userId": secrets[1], "diagnosticOperation": secrets[4]])
+  }
+  logs = try String(contentsOf: capture, encoding: .utf8)
+  for secret in secrets {
+    try require(!logs.contains(secret), "native diagnostics leaked a sensitive marker")
+  }
+  try require(logs.contains("source=crypto limit=reached"), "native diagnostics must cap output")
+  try require(logs.split(separator: "\n").count <= 257, "native diagnostics exceeded the cap")
+}
+
 @main
 private enum WrappedGraphKeyCryptoTest {
   static func main() throws {
@@ -62,6 +125,8 @@ private enum WrappedGraphKeyCryptoTest {
       unsetenv("LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE")
       JournalE2EECrypto.resetTestMemoryPrivateKeys()
     }
+
+    try unlockLogTest()
 
     let malformed = "{\"operation\":\"deleteAccountSecrets\",\"origin\":\"\(origin)\",\"userId\":\"\(userID)\",\"iterations\":\"600000\"}"
     let malformedResponse = malformed.withCString { logseqJournalCryptoJSON($0) }

@@ -1,5 +1,13 @@
 external call_raw : string -> string = "logseq_journal_crypto_call"
 
+let diagnostic_operation = Eio.Fiber.create_key ()
+
+let with_diagnostic_operation id run =
+  if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
+  then Eio.Fiber.with_binding diagnostic_operation id run
+  else run ()
+;;
+
 let hex value =
   let digits = "0123456789abcdef" in
   String.init
@@ -31,6 +39,7 @@ let unhex value =
 
 type request =
   { operation : string
+  ; diagnostic_operation : string option [@key "diagnosticOperation"] [@default None]
   ; origin : string [@default ""]
   ; user_id : string [@key "userId"] [@default ""]
   ; graph_id : string option [@key "graphId"] [@default None]
@@ -57,6 +66,9 @@ type response =
 let invoke request =
   try
     match
+      let request = { request with diagnostic_operation =
+        (if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
+         then Eio.Fiber.get diagnostic_operation else None) } in
       call_raw (request_to_yojson request |> Yojson.Safe.to_string)
       |> Yojson.Safe.from_string
       |> Logseq_db_types.Json_codec.decode response_of_yojson
@@ -82,6 +94,7 @@ let binary_field response =
 
 let identity_request operation ~managed_sync_origin ~user_id =
   { operation
+  ; diagnostic_operation = None
   ; origin = Uri.to_string managed_sync_origin
   ; user_id
   ; graph_id = None

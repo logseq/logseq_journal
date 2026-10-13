@@ -4366,7 +4366,28 @@ let unlock_fixture () =
   hooks, submissions, release, client
 ;;
 
-let test_unlock_application () =
+let capture_unlock_logs run =
+  let path = Filename.temp_file "journal-unlock-ui-log-" "" in
+  let saved = Unix.dup Unix.stderr in
+  let output = Unix.openfile path [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+  let previous = Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" in
+  Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" "1";
+  Unix.dup2 output Unix.stderr;
+  Fun.protect
+    ~finally:(fun () ->
+      flush stderr;
+      Unix.dup2 saved Unix.stderr;
+      Unix.close saved;
+      Unix.close output;
+      Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" (Option.value previous ~default:"");
+      Sys.remove path)
+    (fun () ->
+       run ();
+       flush stderr;
+       In_channel.with_open_bin path In_channel.input_all)
+;;
+
+let run_unlock_application () =
   let hooks, submissions, release, client = unlock_fixture () in
   let props = Hashtbl.create 64 in
   let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
@@ -4479,6 +4500,23 @@ let test_unlock_application () =
        (* Native list activation is exercised on Simulator. Headless assertions
          above cover the shared Return/button admission and cancel boundary. *)
        ())
+;;
+
+let test_unlock_application () =
+  let logs = capture_unlock_logs run_unlock_application in
+  let has value =
+    let n = String.length value in
+    let rec loop i =
+      i + n <= String.length logs
+      && (String.sub logs i n = value || loop (i + 1))
+    in
+    loop 0
+  in
+  List.iter (fun value -> Alcotest.(check bool) value true (has value))
+    [ "source=ui"; "phase=submit"; "pending=true"; "phase=queue result=accepted"
+    ; "pending=false"; "failure=e2ee" ];
+  List.iter (fun value -> Alcotest.(check bool) "sensitive UI value excluded" false (has value))
+    [ "synthetic-only"; "Private Journal"; "Check your encryption password" ]
 ;;
 
 (* Root_navigation public reducer events do not own platform continuations,
