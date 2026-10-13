@@ -27,9 +27,10 @@ type transport =
       -> token:string
       -> maximum_frame_bytes:int
       -> on_message:(string -> unit)
-      -> on_close:(string option -> unit)
+      -> on_close:(Core.websocket_termination -> unit)
       -> (Websocket_eio.t, Websocket_eio.connect_error) result
   ; send_websocket : Websocket_eio.t -> string -> (unit, string) result
+  ; await_websocket_retired : Websocket_eio.t -> unit
   ; close_websocket : Websocket_eio.t -> unit
   ; abort_websocket : Websocket_eio.t -> unit
   ; activate_websocket :
@@ -134,6 +135,7 @@ let transport ~tls_authenticator ~network ~clock ~websocket_liveness =
               ~on_message
               ~on_close)
       ; send_websocket = Websocket_eio.send
+      ; await_websocket_retired = Websocket_eio.await_retired
       ; close_websocket = Websocket_eio.close
       ; abort_websocket = Websocket_eio.abort
       ; activate_websocket = Websocket_eio.activate
@@ -322,6 +324,14 @@ module Submitted_effects = Weak.Make (struct
     let hash instruction = Hashtbl.hash (Core.runner_effect_diagnostic instruction)
   end)
 
+type websocket_owner =
+  { physical_scope : Core.connection_scope
+  ; operation : operation
+  ; pending : Websocket_eio.t option ref
+  ; finished : unit Eio.Promise.t
+  ; mutable retirement_requested : bool
+  }
+
 type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
@@ -330,6 +340,8 @@ type t =
   ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (string, Core.connection_scope * Websocket_eio.t) Hashtbl.t
+  ; mutable websocket_owner : websocket_owner option
+  ; mutable last_retired_websocket : Core.connection_scope option
   ; asset_download_slots : Eio.Semaphore.t
   ; asset_upload_slots : Eio.Semaphore.t
   ; asset_codec_slot : Eio.Semaphore.t
@@ -349,6 +361,8 @@ let create ~sw dependencies ~post =
     ; submitted_operations = Submitted_effects.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
+    ; websocket_owner = None
+    ; last_retired_websocket = None
     ; asset_download_slots = Eio.Semaphore.make 3
     ; asset_upload_slots = Eio.Semaphore.make 1
     ; asset_codec_slot = Eio.Semaphore.make 1
@@ -785,6 +799,38 @@ let retire_websockets ?(remove = true) t matches retire =
   List.iter (fun (_, websocket) -> retire websocket) selected
 ;;
 
+let retire_websocket_owner ?(abort = false) t scope =
+  match t.websocket_owner with
+  | Some owner when owner.physical_scope = scope ->
+    if abort
+    then (
+      owner.operation.cancelled <- true;
+      owner.operation.cancel ());
+    if not owner.retirement_requested
+    then (
+      owner.retirement_requested <- true;
+      (match !(owner.pending) with
+       | Some handle -> t.dependencies.transport.close_websocket handle
+       | None ->
+         owner.operation.cancelled <- true;
+         owner.operation.cancel ());
+      (* submit runs on the event consumer. Joining here would deadlock a callback
+         waiting to publish into its full sink. The waiter is never a callback. *)
+      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+        (try Eio.Promise.await owner.finished with
+         | Eio.Cancel.Cancelled _ ->
+           Eio.Cancel.protect (fun () -> Eio.Promise.await owner.finished));
+        (match t.websocket_owner with
+         | Some current when current == owner -> t.websocket_owner <- None
+         | _ -> ());
+        t.last_retired_websocket <- Some scope;
+        if not t.closed then t.post (Core.Websocket_retired scope)))
+  | _ when t.last_retired_websocket = Some scope -> ()
+  | _ ->
+    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      if not t.closed then t.post (Core.Websocket_retired scope))
+;;
+
 let cancel_scope t scope =
   Hashtbl.iter
     (fun _ (operation : operation) ->
@@ -810,7 +856,15 @@ let cancel_scope t scope =
          { (Core.effect_scope_of_graph connection.Core.graph) with
            connection_generation = Some connection.connection_generation
          })
-    t.dependencies.transport.abort_websocket
+    t.dependencies.transport.abort_websocket;
+  match t.websocket_owner with
+  | Some owner
+    when scope_matches
+           scope
+           { (Core.effect_scope_of_graph owner.physical_scope.graph) with
+             connection_generation = Some owner.physical_scope.connection_generation
+           } -> retire_websocket_owner ~abort:true t owner.physical_scope
+  | _ -> ()
 ;;
 
 exception Runner_cancelled
@@ -881,103 +935,139 @@ let submit_nonasset t instruction =
         if (not t.closed) && not operation.cancelled
         then t.post (Core.Timer_elapsed request.id))
     | Start_websocket request ->
-      let key = Core.runner_effect_diagnostic instruction in
-      let cancelled, resolve_cancelled = Eio.Promise.create () in
-      let operation =
-        { scope = Core.runner_effect_scope instruction
-        ; asset_identity = None
-        ; cancelled = false
-        ; cancel =
-            (fun () -> ignore (Eio.Promise.try_resolve resolve_cancelled () : bool))
-        }
-      in
-      Hashtbl.replace t.operations key operation;
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        let pending = ref None
-        and registered = ref false in
-        Fun.protect
-          ~finally:(fun () ->
-            Hashtbl.remove t.operations key;
-            if not !registered
-            then Option.iter t.dependencies.transport.abort_websocket !pending)
-          (fun () ->
-             let connect token =
-               let result =
-                 t.dependencies.transport.connect_websocket
-                   ~sw:t.sw
-                   ~uri:request.uri
-                   ~token
-                   ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
-                   ~on_message:(fun payload ->
-                     if (not t.closed) && not operation.cancelled
-                     then (
-                       match Sync_protocol.decode_server_message payload with
-                       | Ok message ->
-                         t.post (Core.Websocket_message (request.scope, message))
-                       | Error error ->
-                         t.post (Core.Websocket_protocol_error (request.scope, error))))
-                   ~on_close:(fun message ->
-                     let current =
-                       match Hashtbl.find_opt t.websockets key, !pending with
-                       | Some (_, actual), Some expected -> actual == expected
-                       | None, _ -> true
-                       | Some _, None -> false
-                     in
-                     if current
-                     then (
-                       Hashtbl.remove t.websockets key;
-                       if (not t.closed) && not operation.cancelled
-                       then t.post (Core.Websocket_closed (request.scope, message))))
-               in
-               (match result with
-                | Ok handle -> pending := Some handle
-                | Error _ -> ());
-               result
-             in
-             let connect_with_token () =
-               authenticated_operation
-                 t.dependencies.id_token_provider
-                 ~account:request.scope.graph.account
-                 ~perform:(fun token ->
-                   match connect token with
-                   | Ok websocket -> Ok websocket
-                   | Error Websocket_eio.Unauthorized -> Error Unauthorized
-                   | Error Websocket_eio.Forbidden -> Error Forbidden
-                   | Error (Websocket_eio.Connection_failed message) ->
-                     Error (Request_failed message))
-             in
-             let result =
-               try
-                 Some
-                   (Eio.Fiber.first connect_with_token (fun () ->
-                      Eio.Promise.await cancelled;
-                      raise Runner_cancelled))
-               with
-               | Runner_cancelled -> None
-             in
-             if (not t.closed) && not operation.cancelled
-             then (
-               match result with
-               | None -> ()
-               | Some (Error message) ->
-                 t.post (Core.Websocket_closed (request.scope, Some message))
-               | Some (Ok websocket) ->
-                 (match
-                    t.dependencies.transport.activate_websocket
-                      websocket
-                      ~on_open:(fun () ->
-                        Option.iter
-                          (fun (_, old) -> t.dependencies.transport.abort_websocket old)
-                          (Hashtbl.find_opt t.websockets key);
-                        Hashtbl.replace t.websockets key (request.scope, websocket);
-                        registered := true;
-                        t.post (Core.Websocket_opened request.scope))
+      (match t.websocket_owner with
+       | Some owner when owner.physical_scope = request.scope -> ()
+       | Some _ ->
+         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+           if not t.closed
+           then
+             t.post
+               (Core.Websocket_closed
+                  ( request.scope
+                  , Core.Protocol_failure "Previous WebSocket owner has not retired" )))
+       | None ->
+         let key = Core.runner_effect_diagnostic instruction in
+         let cancelled, resolve_cancelled = Eio.Promise.create () in
+         let finished, resolve_finished = Eio.Promise.create () in
+         let pending = ref None in
+         let operation =
+           { scope = Core.runner_effect_scope instruction
+           ; asset_identity = None
+           ; cancelled = false
+           ; cancel =
+               (fun () ->
+                 ignore (Eio.Promise.try_resolve resolve_cancelled () : bool);
+                 Option.iter t.dependencies.transport.abort_websocket !pending)
+           }
+         in
+         let owner =
+           { physical_scope = request.scope
+           ; operation
+           ; pending
+           ; finished
+           ; retirement_requested = false
+           }
+         in
+         t.websocket_owner <- Some owner;
+         Hashtbl.replace t.operations key operation;
+         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+           let registered = ref false in
+           Fun.protect
+             ~finally:(fun () ->
+               Hashtbl.remove t.operations key;
+               if not !registered
+               then Option.iter t.dependencies.transport.abort_websocket !pending;
+               Eio.Cancel.protect (fun () ->
+                 Option.iter t.dependencies.transport.await_websocket_retired !pending);
+               ignore (Eio.Promise.try_resolve resolve_finished () : bool))
+             (fun () ->
+                let connect token =
+                  let result =
+                    t.dependencies.transport.connect_websocket
+                      ~sw:t.sw
+                      ~uri:request.uri
+                      ~token
+                      ~maximum_frame_bytes:Logseq_db_types.Limits.maximum_response_bytes
+                      ~on_message:(fun payload ->
+                        if (not t.closed) && not operation.cancelled
+                        then (
+                          match Sync_protocol.decode_server_message payload with
+                          | Ok message ->
+                            t.post (Core.Websocket_message (request.scope, message))
+                          | Error error ->
+                            t.post (Core.Websocket_protocol_error (request.scope, error))))
+                      ~on_close:(fun termination ->
+                        Hashtbl.remove t.websockets key;
+                        if (not t.closed) && not operation.cancelled
+                        then
+                          Eio.Fiber.first
+                            (fun () ->
+                               t.post (Core.Websocket_closed (request.scope, termination)))
+                            (fun () -> Eio.Promise.await cancelled))
+                  in
+                  (match result with
+                   | Ok handle -> pending := Some handle
+                   | Error _ -> ());
+                  result
+                in
+                let termination = function
+                  | Websocket_eio.Unauthorized ->
+                    Core.Authentication_failure "Authentication failed."
+                  | Websocket_eio.Forbidden ->
+                    Core.Authentication_failure "Authorization failed."
+                  | Websocket_eio.Authentication_failed message ->
+                    Core.Authentication_failure message
+                  | Websocket_eio.Protocol_failed message -> Core.Protocol_failure message
+                  | Websocket_eio.Connection_failed message ->
+                    Core.Recoverable_close (Some message)
+                in
+                let connect_with_token () =
+                  match
+                    t.dependencies.id_token_provider.acquire request.scope.graph.account
                   with
-                  | Ok () -> ()
-                  | Error _ ->
-                    t.post
-                      (Core.Websocket_closed
-                         (request.scope, Some "WebSocket closed before activation"))))))
+                  | Error message -> Error (Core.Authentication_failure message)
+                  | Ok token ->
+                    (match connect token with
+                     | Error Websocket_eio.Unauthorized ->
+                       t.dependencies.id_token_provider.invalidate
+                         request.scope.graph.account
+                         ~token;
+                       (match
+                          t.dependencies.id_token_provider.acquire
+                            request.scope.graph.account
+                        with
+                        | Error message -> Error (Core.Authentication_failure message)
+                        | Ok refreshed -> Result.map_error termination (connect refreshed))
+                     | result -> Result.map_error termination result)
+                in
+                try
+                  Eio.Fiber.first
+                    (fun () ->
+                       let result = connect_with_token () in
+                       if (not t.closed) && not operation.cancelled
+                       then (
+                         match result with
+                         | Error termination ->
+                           t.post (Core.Websocket_closed (request.scope, termination))
+                         | Ok handle ->
+                           (match
+                              t.dependencies.transport.activate_websocket
+                                handle
+                                ~on_open:(fun () ->
+                                  Hashtbl.replace t.websockets key (request.scope, handle);
+                                  registered := true;
+                                  t.post (Core.Websocket_opened request.scope))
+                            with
+                            | Ok () ->
+                              t.dependencies.transport.await_websocket_retired handle
+                            | Error error ->
+                              t.post
+                                (Core.Websocket_closed (request.scope, termination error)))))
+                    (fun () ->
+                       Eio.Promise.await cancelled;
+                       raise Runner_cancelled)
+                with
+                | Runner_cancelled -> ())))
     | Send_websocket request ->
       (match Sync_protocol.encode_client_message request.message with
        | Error error -> t.post (Core.Websocket_protocol_error (request.scope, error))
@@ -991,17 +1081,16 @@ let submit_nonasset t instruction =
                 match t.dependencies.transport.send_websocket websocket payload with
                 | Ok () -> ()
                 | Error message ->
-                  t.post (Core.Websocket_closed (request.scope, Some message))))
+                  t.post
+                    (Core.Websocket_closed
+                       (request.scope, Core.Recoverable_close (Some message)))))
            t.websockets;
          if not !sent
          then
-           t.post (Core.Websocket_closed (request.scope, Some "WebSocket is unavailable")))
-    | Close_websocket scope ->
-      retire_websockets
-        ~remove:false
-        t
-        (( = ) scope)
-        t.dependencies.transport.close_websocket)
+           t.post
+             (Core.Websocket_closed
+                (request.scope, Core.Recoverable_close (Some "WebSocket is unavailable"))))
+    | Close_websocket scope -> retire_websocket_owner t scope)
 ;;
 
 let shutdown t =

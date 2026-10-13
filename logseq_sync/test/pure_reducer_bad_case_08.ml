@@ -4,16 +4,32 @@ open Pure_reducer_bad_case_support
    The stale connection must be ignored without consuming the fresh scope. *)
 let run () =
   let fixture = connected_fixture () in
-  let recovery =
+  let background =
     Core.step
       fixture.attached.next
-      (Core.Foreground_changed { foreground = true; lifecycle_generation = 1L })
+      (Core.Foreground_changed { foreground = false; lifecycle_generation = 1L })
   in
+  let resumed =
+    Core.step
+      background.next
+      (Core.Foreground_changed { foreground = true; lifecycle_generation = 2L })
+  in
+  Alcotest.(check bool)
+    "BC08 replacement waits for physical retirement"
+    false
+    (List.exists
+       (function
+         | Core.Run (Core.Start_websocket _) -> true
+         | _ -> false)
+       resumed.effects);
+  let recovery = Core.step resumed.next (Core.Websocket_retired fixture.connection) in
   let fresh_connection =
-    match recovery.effects with
-    | [ Core.Publish (Core.State_changed _); Core.Run (Core.Start_websocket request) ] ->
-      request.scope
-    | _ -> Alcotest.fail "BC08 recovery did not start a fresh connection"
+    List.find_map
+      (function
+        | Core.Run (Core.Start_websocket request) -> Some request.scope
+        | _ -> None)
+      recovery.effects
+    |> Option.get
   in
   Alcotest.(check bool)
     "BC08 connection generations differ"

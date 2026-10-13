@@ -22,6 +22,7 @@ let header name headers =
 let exception_message = function
   | Transport_error message -> message
   | End_of_file -> "premature HTTP EOF"
+  | Eio.Time.Timeout -> "HTTP transport timed out"
   | Tls_eio.Tls_alert _ | Tls_eio.Tls_failure _ -> "TLS transport terminated"
   | Sys_error _ | Unix.Unix_error _ -> "transport file or socket operation failed"
   | _ -> "HTTP transport failed"
@@ -50,7 +51,7 @@ let tls_stream_socket flow =
   Eio.Resource.T (flow, Eio.Net.Pi.stream_socket (module Socket))
 ;;
 
-let with_attempt ~sw ~authenticator ~network ~clock request ~consume =
+let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~consume =
   Eio.Switch.check sw;
   let id = Atomic.fetch_and_add next_attempt 1 in
   let stage = ref "setup"
@@ -114,78 +115,92 @@ let with_attempt ~sw ~authenticator ~network ~clock request ~consume =
                 | Ok flow -> flow
                 | Error _ -> fail "TLS connection setup failed"
               in
-              let client =
-                Httpun_eio.Client.create_connection ~sw:owner (tls_stream_socket flow)
-              in
-              let error_handler error =
-                let message =
-                  match error with
-                  | `Malformed_response _ -> "malformed HTTP response"
-                  | `Invalid_response_body_length _ -> "invalid HTTP response body length"
-                  | `Exn exn -> exception_message exn
-                in
-                settle (Error message)
-              in
-              let request_method =
-                match request.Http.operation with
-                | Get -> `GET
-                | Put _ -> `PUT
-              in
-              let response_handler response body =
-                guard (fun () ->
-                  let status = Httpun.Status.to_code response.Httpun.Response.status in
-                  let headers = Httpun.Headers.to_list response.headers in
-                  let framing =
-                    match Httpun.Response.body_length ~request_method response with
-                    | `Fixed length -> Printf.sprintf "length:%Ld" length
-                    | `Chunked -> "chunked"
-                    | `Close_delimited -> "close-delimited"
-                    | `Error _ -> "invalid-framing"
-                  in
-                  stage := Printf.sprintf "body:%d:%s" status framing;
-                  consume ~status ~headers ~received ~guard ~settle body)
-              in
-              let host_header =
-                if port request.uri = 443
-                then host
-                else Printf.sprintf "%s:%d" host (port request.uri)
-              in
-              let request_headers =
-                match request.Http.operation with
-                | Get -> request.headers
-                | Put bytes ->
-                  ("content-length", string_of_int (String.length bytes))
-                  :: request.headers
-              in
-              let headers =
-                Httpun.Headers.of_list
-                  (("host", host_header) :: ("connection", "close") :: request_headers)
-              in
-              let target = Uri.path_and_query request.uri in
-              let descriptor =
-                Httpun.Request.create
-                  ~headers
-                  request_method
-                  (if target = "" then "/" else target)
-              in
-              stage := "headers";
-              let writer =
-                Httpun_eio.Client.request
-                  client
-                  descriptor
-                  ~error_handler
-                  ~response_handler
-              in
-              (match request.Http.operation with
-               | Get -> ()
-               | Put bytes -> Httpun.Body.Writer.write_string writer bytes);
-              Httpun.Body.Writer.close writer;
-              Eio.Promise.await completed;
-              Eio.Fiber.check ();
-              (* Cancellation of this private switch interrupts blocked I/O and joins
+              let started = Eio.Time.now clock in
+              Fun.protect
+                ~finally:(fun () ->
+                  response_budget
+                  := max 0. (!response_budget -. (Eio.Time.now clock -. started)))
+                (fun () ->
+                   Eio.Time.with_timeout_exn clock !response_budget (fun () ->
+                     let client =
+                       Httpun_eio.Client.create_connection
+                         ~sw:owner
+                         (tls_stream_socket flow)
+                     in
+                     let error_handler error =
+                       let message =
+                         match error with
+                         | `Malformed_response _ -> "malformed HTTP response"
+                         | `Invalid_response_body_length _ ->
+                           "invalid HTTP response body length"
+                         | `Exn exn -> exception_message exn
+                       in
+                       settle (Error message)
+                     in
+                     let request_method =
+                       match request.Http.operation with
+                       | Get -> `GET
+                       | Put _ -> `PUT
+                     in
+                     let response_handler response body =
+                       guard (fun () ->
+                         let status =
+                           Httpun.Status.to_code response.Httpun.Response.status
+                         in
+                         let headers = Httpun.Headers.to_list response.headers in
+                         let framing =
+                           match Httpun.Response.body_length ~request_method response with
+                           | `Fixed length -> Printf.sprintf "length:%Ld" length
+                           | `Chunked -> "chunked"
+                           | `Close_delimited -> "close-delimited"
+                           | `Error _ -> "invalid-framing"
+                         in
+                         stage := Printf.sprintf "body:%d:%s" status framing;
+                         consume ~status ~headers ~received ~guard ~settle body)
+                     in
+                     let host_header =
+                       if port request.uri = 443
+                       then host
+                       else Printf.sprintf "%s:%d" host (port request.uri)
+                     in
+                     let request_headers =
+                       match request.Http.operation with
+                       | Get -> request.headers
+                       | Put bytes ->
+                         ("content-length", string_of_int (String.length bytes))
+                         :: request.headers
+                     in
+                     let headers =
+                       Httpun.Headers.of_list
+                         (("host", host_header)
+                          :: ("connection", "close")
+                          :: request_headers)
+                     in
+                     let target = Uri.path_and_query request.uri in
+                     let descriptor =
+                       Httpun.Request.create
+                         ~headers
+                         request_method
+                         (if target = "" then "/" else target)
+                     in
+                     stage := "headers";
+                     let writer =
+                       Httpun_eio.Client.request
+                         client
+                         descriptor
+                         ~error_handler
+                         ~response_handler
+                     in
+                     (match request.Http.operation with
+                      | Get -> ()
+                      | Put bytes -> Httpun.Body.Writer.write_string writer bytes);
+                     Httpun.Body.Writer.close writer;
+                     Eio.Promise.await completed;
+                     Eio.Fiber.check ();
+                     (* Cancellation of this private switch interrupts blocked I/O and joins
               the adapter. Fence its cleanup callbacks before that cancellation. *)
-              fenced := true;
-              raise Retire_attempt))
+                     fenced := true;
+                     raise Retire_attempt))))
      with
      | Retire_attempt -> ());
     Eio.Fiber.check ();
@@ -219,12 +234,13 @@ let read_body ~maximum_bytes ~received ~guard ~settle ~on_chunk ~on_eof body =
   read ()
 ;;
 
-let request_once ~sw ~authenticator ~network ~clock request =
+let request_once ~sw ~authenticator ~network ~clock ~response_budget request =
   with_attempt
     ~sw
     ~authenticator
     ~network
     ~clock
+    ~response_budget
     request
     ~consume:(fun ~status ~headers ~received ~guard ~settle body ->
       let buffer = Buffer.create 4096 in
@@ -274,8 +290,8 @@ let follow_redirects attempt request =
   follow 3 request
 ;;
 
-let timed clock seconds f =
-  try Eio.Time.with_timeout_exn clock seconds f with
+let protected f =
+  try f () with
   | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
   | Eio.Time.Timeout -> Error "HTTP transport timed out"
   | exception_ -> Error (exception_message exception_)
@@ -283,9 +299,12 @@ let timed clock seconds f =
 
 let perform ~sw ~authenticator ~network ~clock request =
   Tls_client_eio.initialize_rng ();
-  timed clock 30. (fun () ->
+  let response_budget = ref 30. in
+  protected (fun () ->
     Result.bind
-      (follow_redirects (request_once ~sw ~authenticator ~network ~clock) request)
+      (follow_redirects
+         (request_once ~sw ~authenticator ~network ~clock ~response_budget)
+         request)
       (fun (request, response) ->
          if successful_status response.status
          then
@@ -301,6 +320,7 @@ let remove_partial path =
 ;;
 
 let download_once
+      ~response_budget
       ~sw
       ~authenticator
       ~network
@@ -323,6 +343,7 @@ let download_once
            ~authenticator
            ~network
            ~clock
+           ~response_budget
            request
            ~consume:(fun ~status ~headers ~received ~guard ~settle body ->
              if not (successful_status status)
@@ -395,13 +416,15 @@ let download
   Tls_client_eio.initialize_rng ();
   if maximum_bytes <= 0
   then Error "snapshot artifact bound must be positive"
-  else
-    timed clock 120. (fun () ->
+  else (
+    let response_budget = ref 120. in
+    protected (fun () ->
       Result.map
         snd
         (follow_redirects
            (fun request ->
               download_once
+                ~response_budget
                 ~sw
                 ~authenticator
                 ~network
@@ -410,5 +433,5 @@ let download
                 ~destination
                 ~maximum_bytes
                 ~on_progress)
-           request))
+           request)))
 ;;

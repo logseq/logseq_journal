@@ -79,6 +79,8 @@ Account-response options are required nullable fields, rather than absent-field 
 
 Review-fix validation includes the native regression script (9 PASS/1 FAIL before, 10 PASS after), the account missing-field matrix, Swift/OCaml wire integration, tool smoke and small synthetic fixture integration, complete build/native embed and full runtest. The initial Simulator evidence above was not rerun for these persistence/decoder fixes; no phone or real account was used.
 
+Integration with merged main 611d0ad3d36cd355c02c023c409687ad6e859518 preserves PR 67's reducer-owned reconnect/retirement, single physical WebSocket, bounded early-frame backpressure and independent transport phase budgets. The only content conflict was adjacent additions in core_contract.ml; both reconnect scenarios and generated catalog/domain scenarios remain. Production Core merged mechanically: its diff from main contains only the existing PPX catalog/snapshot JSON migration. The integrated tree passes complete build/native embed, 21 Alcotest suites / 730 cases (224 sync cases), native regressions 10/10, actual Swift/OCaml wire and tool integration. Simulator and iPhone acceptance remain parent-coordinated work after the final main merge.
+
 ## Consequences
 
 Old internal JSON cannot be loaded by the new codecs. Unsynced outbox records, receipts, upload intents and account bindings require explicit recovery decisions outside this code change. No real graph, account, pending upload or Keychain was purged. External protocols and binary formats retain their contracts.

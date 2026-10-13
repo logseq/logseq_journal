@@ -269,3 +269,16 @@ let pending_submission_fixture () =
   in
   { connected; origin = planned.next; request; commit; result_sync }
 ;;
+
+let retry_after_retirement core connection =
+  let retired = Core.step core (Core.Websocket_retired connection) in
+  let timer =
+    List.find_map
+      (function
+        | Core.Run (Core.Schedule_timer timer) -> Some timer
+        | _ -> None)
+      retired.effects
+    |> Option.get
+  in
+  Core.step retired.next (Core.Timer_elapsed timer.id)
+;;

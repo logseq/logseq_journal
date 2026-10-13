@@ -9,7 +9,9 @@ open Pure_reducer_bad_case_support
    connection generation. *)
 let run () =
   let fixture = connected_fixture () in
-  let closed_event = Core.Websocket_closed (fixture.connection, Some "closed") in
+  let closed_event =
+    Core.Websocket_closed (fixture.connection, Core.Recoverable_close (Some "closed"))
+  in
   let closed = Core.step fixture.opened.next closed_event in
   let late_message =
     Core.Websocket_message
@@ -18,10 +20,7 @@ let run () =
       )
   in
   let rejected = check_step "BC05" closed.next late_message (observe closed.next) [] in
-  let recovery_event =
-    Core.Foreground_changed { foreground = true; lifecycle_generation = 1L }
-  in
-  let recovery = Core.step rejected.next recovery_event in
+  let recovery = retry_after_retirement rejected.next fixture.connection in
   match recovery.effects with
   | [ Core.Publish (Core.State_changed _); Core.Run (Core.Start_websocket request) ] ->
     Alcotest.(check bool)
