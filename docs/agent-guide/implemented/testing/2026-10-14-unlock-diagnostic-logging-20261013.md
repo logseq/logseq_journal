@@ -42,3 +42,11 @@ None. Logging scope and Simulator update are authorized in the session. Credenti
 ## Validation so far
 
 Four existing public owner boundaries first failed because observations were missing. Native crypto then passed default-off, numeric ID correlation, actual KDF/AES stage, typed missing-key result, arbitrary secret-marker exclusion and 256-line cap checks. Actual Worker service tests and the 17-test runner suite pass. All 79 mounted Application tests pass. Full production OCaml was rebuilt in the task-owned external build directory. Prior live screenshot still shows disabled busy unlock UI; Mac locking currently prevents CUA interaction.
+
+## Consequences
+
+The complete cb0b76e product was installed in-place as Simulator1.5877.24 and launched with logging enabled. The previous busy screenshot was preserved. The actual startup logs correlate Core/Runner/native operation2: wrapped-key-copy OSStatus-25300 (Apple errSecItemNotFound), wrapped-key-unavailable, and Core During_local_restore with no advertised password challenge. Catalog operation3 succeeds. The actual page shows Unable to open graph / wrappedGraphKeyUnavailable / Retry. This does not establish that the prior busy UI had the identical preceding failure.
+
+Mac locking prevents CUA input. The user has been asked to unlock the Mac, press Retry once, then personally submit the encryption password once if prompted; recording remains active. No credentials were read or entered, no data was deleted or signed out, and no graph was switched. simctl relocated the data container UUID during its in-place install; nine files remain and the persisted account/graph were restored automatically. No claim of a complete data backup is made. Phone and PR72 remain unchanged. Each component caps its process output at256lines plus one limit notice.
+
+UI request IDs span queue admission/delivery. Core effect IDs span runner/native execution. Correlating a UI submission with the next Core password event relies on serial submission chronology; the protected Core event ABI is unchanged.
