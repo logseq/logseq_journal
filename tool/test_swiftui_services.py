@@ -12,6 +12,15 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-services-') as directo
                     str(root/'apple-tests/platform-services/JournalPlatformServicesTests.swift'),
                     '-o', str(executable)], check=True)
     subprocess.run([str(executable)], check=True, timeout=60)
+    recovery = Path(directory)/'recovery-tests'
+    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-Xfrontend', '-disable-sandbox',
+                    '-module-cache-path', str(Path(directory)/'modules'),
+                    str(root/'swift/JournalPlatformWire.swift'),
+                    str(root/'swift/JournalPlatformServices.swift'),
+                    str(root/'swift/JournalLocalAccountBindingStore.swift'),
+                    str(root/'apple-tests/platform-services/JournalAccountRecoveryTests.swift'),
+                    '-o', str(recovery)], check=True)
+    subprocess.run([str(recovery)], check=True, timeout=60)
     threading = Path(directory)/'account-threading-tests'
     subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-module-cache-path', str(Path(directory)/'modules'),
                     str(root/'swift/JournalPlatformWire.swift'),

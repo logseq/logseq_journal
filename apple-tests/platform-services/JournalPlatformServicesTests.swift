@@ -80,6 +80,11 @@ import Foundation
     precondition(store.value == old && store.clears == 0 && store.writes == 0)
 
     auth.user = "online-user"
+    do {
+      _ = try await platform.response(for: .authenticatedUser)
+      fatalError("A different identity must not take over a presented graph")
+    } catch let issue as JournalAccountIssue { precondition(issue.kind == .accountChangeBlocked) }
+    platform.invalidateConnection()
     require(try await platform.response(for: .authenticatedUser) == .authenticatedUser("online-user"))
     precondition(store.value?.userID == "online-user")
     store.failSave = true

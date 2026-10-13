@@ -52,6 +52,8 @@ import AppKit
 @Observable @MainActor final class JournalApplicationPlatform {
   private(set) var authenticationRequired = false
   private(set) var localAccountAvailable: Bool?
+  private(set) var accountIssue: JournalAccountIssue?
+  @ObservationIgnored private var accountAuthenticationPresented = false
   @ObservationIgnored private let services: JournalPlatformServices
   @ObservationIgnored private weak var runtime: JournalRuntime?
   @ObservationIgnored private var connection = UUID()
@@ -119,6 +121,7 @@ import AppKit
   /// Answers one LJP2 request envelope; `nil` suppresses the response (the
   /// old bridge surfaced these as request failures).
   func request(_ bytes: Data) async -> Data? {
+    let identity = connection
     let request: JournalPlatformWire.Request
     do {
       request = try JournalPlatformWire.decodeRequest(bytes)
@@ -136,7 +139,7 @@ import AppKit
     // Notice requests resolve through the presenter, not platform services.
     switch request {
     case .copyText(let text):
-      guard connected else { return nil }
+      guard connected, connection == identity else { return nil }
       #if os(iOS)
       UIPasteboard.general.string = text
       #elseif os(macOS)
@@ -161,7 +164,8 @@ import AppKit
     }
     do {
       let response = try await services.response(for: request)
-      guard connected else { return nil }
+      guard connected, connection == identity else { return nil }
+      accountIssue = services.accountIssue
       switch response {
       case .authenticatedUser(let user): authenticationRequired = user == nil
       case .signedOut:
@@ -176,16 +180,26 @@ import AppKit
       if request == .terminationReady { shutdown?.complete() }
       return encoded
     } catch JournalPlatformServices.Failure.authenticationRequired {
+      guard connected, connection == identity else { return nil }
       authenticationRequired = true
+      accountIssue = services.accountIssue
       return nil
     } catch {
+      guard connected, connection == identity else { return nil }
+      if !(error is CancellationError) {
+        switch request {
+        case .localAccount, .authenticatedUser, .idToken:
+          accountIssue = services.accountIssue ?? .classify(error, stage: .identityLookup)
+        default: break
+        }
+      }
       return nil
     }
   }
 
   /// Called after the first local timeline frame or successful native sign-in.
   func refreshAuthentication() {
-    guard !pending.terminating else { return }
+    guard !pending.terminating, !accountAuthenticationPresented else { return }
     refresh?.cancel()
     let identity = connection
     refresh = Task { [weak self] in
@@ -194,14 +208,59 @@ import AppKit
         let response = try await services.response(for: .authenticatedUser)
         try Task.checkCancellation()
         guard connection == identity, connected else { return }
+        accountIssue = services.accountIssue
         if case .authenticatedUser(let user) = response { authenticationRequired = user == nil }
         pending.authenticated(try JournalPlatformWire.encodeResponse(response))
         deliverEvents()
       } catch JournalPlatformServices.Failure.authenticationRequired {
-        if connection == identity { authenticationRequired = true }
+        if connection == identity {
+          authenticationRequired = true
+          accountIssue = services.accountIssue
+        }
       } catch {
         // A failed online lookup does not invalidate the restored offline graph.
+        if connection == identity, !(error is CancellationError) {
+          accountIssue = services.accountIssue ?? .classify(error, stage: .identityLookup)
+        }
       }
+    }
+  }
+
+  func setAccountAuthenticationPresented(_ presented: Bool) {
+    accountAuthenticationPresented = presented
+    if presented {
+      // Keep the entry available after a canceled/failed explicit recovery.
+      authenticationRequired = true
+      refresh?.cancel()
+      // Fence requests from the preceding credential identity before the
+      // browser can replace it, without dropping the graph-session protection.
+      services.cancelAuthenticationPreparation()
+    }
+  }
+
+  func cancelAccountPreparation() { services.cancelAuthenticationPreparation() }
+
+  /// Browser success is not UI success until the verified binding is ready.
+  func prepareAccount() async throws {
+    let identity = connection
+    do {
+      let response = try await services.response(for: .authenticatedUser)
+      try Task.checkCancellation()
+      guard connection == identity, connected else { throw CancellationError() }
+      accountIssue = services.accountIssue
+      if let issue = accountIssue { throw issue }
+      guard case .authenticatedUser(.some) = response else {
+        throw JournalPlatformServices.Failure.authenticationRequired
+      }
+      authenticationRequired = false
+      localAccountAvailable = true
+      pending.authenticated(try JournalPlatformWire.encodeResponse(response))
+      deliverEvents()
+    } catch {
+      if connection == identity, !(error is CancellationError) {
+        accountIssue = services.accountIssue ?? .classify(error, stage: .identityLookup)
+      }
+      throw error
     }
   }
 

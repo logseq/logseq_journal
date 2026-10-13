@@ -1,5 +1,43 @@
 import Foundation
 
+/// Only bounded diagnostic metadata crosses the native account boundary.
+struct JournalAccountIssue: Error, Equatable, Sendable, LocalizedError {
+  enum Kind: String { case unsupportedFormat, corruptBinding, secureStorageUnavailable, network, signInRequired, accountChangeBlocked, unavailable }
+  enum Stage: String { case bindingRead, bindingWrite, identityLookup }
+  let kind: Kind
+  let stage: Stage
+  var formatVersion: Int? = nil
+  var rejectsBinding: Bool { kind == .unsupportedFormat || kind == .corruptBinding }
+  var offersSignIn: Bool { rejectsBinding || kind == .signInRequired || kind == .accountChangeBlocked || kind == .unavailable }
+  var diagnostic: String {
+    "account.\(stage.rawValue).\(kind.rawValue)"
+      + (formatVersion.map { " · format \($0)" } ?? "")
+  }
+  var errorDescription: String? {
+    switch kind {
+    case .unsupportedFormat: "This app cannot read the saved account format. Sign in again to reconnect your account."
+    case .corruptBinding: "The saved account connection cannot be read. Sign in again to reconnect your account."
+    case .secureStorageUnavailable: "Secure account storage is unavailable. Unlock your device, then retry."
+    case .network: "Unable to connect to your account. Check your connection, then retry."
+    case .signInRequired: "Sign in again to connect your account."
+    case .accountChangeBlocked: "This session has a local graph open. Sign in to the original account to finish pending work before changing accounts."
+    case .unavailable: "Unable to prepare your account. Retry, or reopen sign-in."
+    }
+  }
+  static func classify(_ error: Error, stage: Stage) -> Self {
+    if let issue = error as? Self { return issue }
+    if case JournalPlatformServices.Failure.invalidBinding = error {
+      return Self(kind: .corruptBinding, stage: stage)
+    }
+    if error is URLError { return Self(kind: .network, stage: stage) }
+    let native = error as NSError
+    if native.domain == NSOSStatusErrorDomain {
+      return Self(kind: .secureStorageUnavailable, stage: stage)
+    }
+    return Self(kind: .unavailable, stage: stage)
+  }
+}
+
 @MainActor protocol JournalAuthCapability {
   func currentUserID() async throws -> String?
   func freshIDToken() async throws -> String
@@ -26,6 +64,8 @@ struct JournalLocalAccount: Equatable, Sendable {
   private(set) var timelinePresented = false
   private var authenticationGeneration: UInt64 = 0
   private var signingOut = false
+  private(set) var accountIssue: JournalAccountIssue?
+  private var preparedUserID: String?
 
   init(auth: any JournalAuthCapability, account: JournalAccountStore,
        managedSyncOrigin: String) {
@@ -38,9 +78,17 @@ struct JournalLocalAccount: Equatable, Sendable {
     switch request {
     case .localAccount:
       let generation = authenticationGeneration
-      let binding = try await localAccount()
+      let binding: JournalLocalAccount?
+      do { binding = try await localAccount() }
+      catch {
+        try validateCompletion(generation)
+        accountIssue = .classify(error, stage: .bindingRead)
+        throw error
+      }
       try validateCompletion(generation)
+      if accountIssue?.stage == .bindingRead { accountIssue = nil }
       guard let binding else { return .noLocalAccount }
+      preparedUserID = binding.userID
       return .localAccount(userID: binding.userID, origin: binding.managedSyncOrigin)
     case .timelinePresented:
       timelinePresented = true
@@ -48,24 +96,64 @@ struct JournalLocalAccount: Equatable, Sendable {
     case .authenticatedUser:
       let generation = authenticationGeneration
       try await admitAuthentication(generation)
-      let user = try await auth.currentUserID()
+      var binding: JournalLocalAccount?
+      var bindingFailure: Error?
+      do { binding = try await localAccount() }
+      catch { bindingFailure = error }
       try validateCompletion(generation)
+      if let failure = bindingFailure { accountIssue = .classify(failure, stage: .bindingRead) }
+      // A rejected advisory record is never an identity authority. OAuth still
+      // verifies the current account; inaccessible storage is never overwritten.
+      let user: String?
+      do { user = try await auth.currentUserID() }
+      catch {
+        try validateCompletion(generation)
+        if !(error is CancellationError) {
+          if case Failure.authenticationRequired = error {
+            if accountIssue?.rejectsBinding != true {
+              accountIssue = JournalAccountIssue(kind: .signInRequired, stage: .identityLookup)
+            }
+          } else { accountIssue = .classify(error, stage: .identityLookup) }
+        }
+        throw error
+      }
+      try validateCompletion(generation)
+      if let failure = bindingFailure,
+         !JournalAccountIssue.classify(failure, stage: .bindingRead).rejectsBinding { throw failure }
       if let user {
+        try validateGraphAccount(user)
         let response = JournalPlatformWire.Response.authenticatedUser(user)
         _ = try JournalPlatformWire.encodeResponse(response)
-        // This advisory binding must not prevent online reconciliation.
-        try? await account.save(JournalLocalAccount(userID: user, managedSyncOrigin: managedSyncOrigin))
+        do {
+          try await account.save(JournalLocalAccount(userID: user, managedSyncOrigin: managedSyncOrigin))
+          accountIssue = nil
+        } catch {
+          try validateCompletion(generation)
+          accountIssue = .classify(error, stage: .bindingWrite)
+          // A rebuild must commit before recovery is reported complete. Existing
+          // valid bindings remain advisory and preserve normal online behavior.
+          if bindingFailure != nil { throw error }
+        }
         try validateCompletion(generation)
+        preparedUserID = user
         return response
       }
       // Absence of a new SDK session is not an explicit account sign-out.
-      let binding = try await localAccount()
-      try validateCompletion(generation)
-      if binding != nil { throw Failure.authenticationRequired }
+      if binding != nil || bindingFailure != nil || preparedUserID != nil || timelinePresented {
+        if bindingFailure == nil { accountIssue = JournalAccountIssue(kind: .signInRequired, stage: .identityLookup) }
+        throw Failure.authenticationRequired
+      }
+      accountIssue = nil
       return .authenticatedUser(nil)
     case .idToken(let challenge):
       let generation = authenticationGeneration
       try await admitAuthentication(generation)
+      if timelinePresented {
+        let user = try await auth.currentUserID()
+        try validateCompletion(generation)
+        guard let user else { throw Failure.authenticationRequired }
+        try validateGraphAccount(user)
+      }
       let token = try await auth.freshIDToken()
       try validateCompletion(generation)
       let response = JournalPlatformWire.Response.idToken(challengeID: challenge, token: token)
@@ -80,6 +168,8 @@ struct JournalLocalAccount: Equatable, Sendable {
       // Once native sign-out succeeds, finish its local cleanup even if the
       // requesting runtime has gone away. The bridge fences the eventual reply.
       try await account.clear()
+      timelinePresented = false
+      preparedUserID = nil
       return .signedOut
     case .terminationReady:
       return .terminationReady
@@ -93,6 +183,16 @@ struct JournalLocalAccount: Equatable, Sendable {
   func invalidateConnection() {
     authenticationGeneration &+= 1
     timelinePresented = false
+    preparedUserID = nil
+  }
+  func cancelAuthenticationPreparation() { authenticationGeneration &+= 1 }
+
+  private func validateGraphAccount(_ user: String) throws {
+    if timelinePresented, let current = preparedUserID, current != user {
+      let issue = JournalAccountIssue(kind: .accountChangeBlocked, stage: .identityLookup)
+      accountIssue = issue
+      throw issue
+    }
   }
 
   private func localAccount() async throws -> JournalLocalAccount? {
@@ -106,9 +206,7 @@ struct JournalLocalAccount: Equatable, Sendable {
   private func admitAuthentication(_ generation: UInt64) async throws {
     try Task.checkCancellation()
     guard !signingOut else { throw Failure.unavailable }
-    // OCaml owns whether startup can present a graph or needs online recovery.
-    // A binding alone cannot establish that a timeline frame will ever arrive.
-    _ = try await localAccount()
+    // Account binding is advisory; native credentials remain independently usable.
     try validateCompletion(generation)
   }
 

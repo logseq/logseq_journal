@@ -1,5 +1,35 @@
 import SwiftUI
 
+/// This stays visible after browser cancellation or a failed account attempt.
+struct JournalAccountRecoveryView: View {
+  let issue: JournalAccountIssue?
+  let signInAvailable: Bool
+  let signIn: () -> Void
+  var retry: (() -> Void)? = nil
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(issue?.errorDescription ?? "Sign in to connect your account")
+        .accessibilityIdentifier("account-recovery-message")
+      if let issue {
+        Text("Your local graphs and pending changes are retained.")
+          .font(.callout).foregroundStyle(.secondary)
+        Text(issue.diagnostic).font(.caption).foregroundStyle(.secondary)
+          .accessibilityIdentifier("account-recovery-diagnostic")
+      }
+      HStack {
+        if signInAvailable {
+          Button("Sign in again", action: signIn).buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("journal-sign-in")
+        }
+        if let retry {
+          Button("Retry", action: retry).buttonStyle(.bordered)
+            .accessibilityIdentifier("account-recovery-retry")
+        }
+      }
+    }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
 struct JournalAuthenticationView: View {
   @State private var model: JournalAuthentication
   @State private var operation: Task<Void, Never>?

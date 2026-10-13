@@ -25,9 +25,12 @@ bundle = 'org.logseq.journal.authentication-probe'
         'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight'],
 }))
 sources = [root/'swift/JournalAuthentication.swift', root/'swift/JournalAuthenticationView.swift',
+           root/'swift/JournalPlatformWire.swift', root/'swift/JournalPlatformServices.swift',
+           root/'swift/JournalLocalAccountBindingStore.swift',
            root/'apple-tests/authentication/JournalAuthenticationProbe.swift']
 sdk = subprocess.check_output(['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-path'], text=True).strip()
 command = ['xcrun', '--sdk', 'iphonesimulator', 'swiftc', '-swift-version', '6',
+           '-Xfrontend', '-disable-sandbox', '-module-cache-path', str(host/'modules'),
            '-parse-as-library', '-target', 'arm64-apple-ios26.0-simulator', '-sdk', sdk,
            *map(str, sources), '-o', str(app/'AuthenticationProbe')]
 result = subprocess.run(command, text=True, capture_output=True)

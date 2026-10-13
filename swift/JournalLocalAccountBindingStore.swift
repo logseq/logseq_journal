@@ -6,6 +6,7 @@ enum JournalLocalAccountBindingStore {
   private static let maximumBytes = 4_096
 
   private struct Binding: Codable { let version: Int; let userId: String; let managedSyncOrigin: String }
+  private struct Format: Decodable { let version: Int }
 
   static func query() -> [CFString: Any] {
     [
@@ -33,10 +34,22 @@ enum JournalLocalAccountBindingStore {
   }
 
   static func decode(_ data: Data) throws -> [String: Any] {
-    guard data.count <= maximumBytes else { throw CocoaError(.fileReadCorruptFile) }
-    let binding = try JSONDecoder().decode(Binding.self, from: data)
-    guard binding.version == 2 else { throw CocoaError(.fileReadCorruptFile) }
-    _ = try encode(userID: binding.userId, managedSyncOrigin: binding.managedSyncOrigin)
+    guard data.count <= maximumBytes else {
+      throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead)
+    }
+    let version: Int
+    do { version = try JSONDecoder().decode(Format.self, from: data).version }
+    catch { throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead) }
+    guard version == 2 else {
+      throw JournalAccountIssue(kind: .unsupportedFormat, stage: .bindingRead, formatVersion: version)
+    }
+    let binding: Binding
+    do {
+      binding = try JSONDecoder().decode(Binding.self, from: data)
+      _ = try encode(userID: binding.userId, managedSyncOrigin: binding.managedSyncOrigin)
+    } catch {
+      throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead, formatVersion: version)
+    }
     // The key-management bridge accepts domain arguments, separate from the
     // Keychain file's generated Codable representation.
     return ["version": 1, "userId": binding.userId, "managedSyncOrigin": binding.managedSyncOrigin]
@@ -50,7 +63,7 @@ enum JournalLocalAccountBindingStore {
     let status = SecItemCopyMatching(lookup as CFDictionary, &item)
     if status == errSecItemNotFound { return nil }
     guard status == errSecSuccess, let data = item as? Data else {
-      throw CocoaError(.fileReadUnknown)
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingRead)
     }
     return try decode(data)
   }
@@ -64,11 +77,15 @@ enum JournalLocalAccountBindingStore {
       let origin = value["managedSyncOrigin"] as? String
     else { throw CocoaError(.validationMissingMandatoryProperty) }
     let data = try encode(userID: userID, managedSyncOrigin: origin)
-    SecItemDelete(query() as CFDictionary)
-    var addition = query()
-    addition[kSecValueData] = data
-    guard SecItemAdd(addition as CFDictionary, nil) == errSecSuccess else {
-      throw CocoaError(.fileWriteUnknown)
+    // Keep the existing record if a replacement cannot be saved securely.
+    var status = SecItemUpdate(query() as CFDictionary, [kSecValueData: data] as CFDictionary)
+    if status == errSecItemNotFound {
+      var addition = query()
+      addition[kSecValueData] = data
+      status = SecItemAdd(addition as CFDictionary, nil)
+    }
+    guard status == errSecSuccess else {
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite)
     }
   }
 
