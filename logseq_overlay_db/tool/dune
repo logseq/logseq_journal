@@ -10,7 +10,10 @@
   logseq_overlay_db
   sqlite3
   unix
-  yojson))
+  ppx_deriving_yojson.runtime
+  yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))
 
 (executable
  (name performance_benchmark)
@@ -20,4 +23,7 @@
   eio_main
   logseq_overlay_db_fixture_generator
   unix
-  yojson))
+  ppx_deriving_yojson.runtime
+  yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))

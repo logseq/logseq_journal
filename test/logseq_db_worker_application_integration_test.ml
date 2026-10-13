@@ -801,8 +801,15 @@ let test_named_tags_reach_timeline_row () =
   let rec enrich = function
     | `Assoc fields ->
       let fields = List.map (fun (k, v) -> k, enrich v) fields in
-      if List.mem_assoc "renderedPageTitle" fields
-      then `Assoc (("tagTitles", `List [ `String "户外"; `String "周末计划" ]) :: fields)
+      if List.mem_assoc "rendered_page_title" fields
+      then
+        `Assoc
+          (List.map
+             (fun (name, value) ->
+                if name = "tag_titles"
+                then name, `List [ `String "户外"; `String "周末计划" ]
+                else name, value)
+             fields)
       else `Assoc fields
     | `List values -> `List (List.map enrich values)
     | value -> value

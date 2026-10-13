@@ -73,9 +73,9 @@ let with_client config run =
 let v2_graph_info_request () =
   let json =
     `Assoc
-      [ "apiVersion", `Int 2
-      ; "requestId", `String "00000000-0000-4000-8000-000000000001"
-      ; "command", `Assoc [ "type", `String "graphInfo" ]
+      [ "api_version", `Int 2
+      ; "request_id", `String "00000000-0000-4000-8000-000000000001"
+      ; "command", `List [ `String "V2_graph_info" ]
       ]
   in
   match P.request_of_yojson json with
@@ -94,10 +94,13 @@ let test_managed_worker_starts_closed_and_replies_with_v2_envelope () =
       match await_response client id with
       | Service.Graph_response response ->
         (match P.response_to_yojson response with
-         | `Assoc
-             [ ("apiVersion", `Int 2)
-             ; ("requestId", `String "00000000-0000-4000-8000-000000000001")
-             ; ("outcome", `Assoc (("type", `String "failed") :: _))
+         | `List
+             [ `String "V2_response"
+             ; `Assoc
+                 [ ("api_version", `Int 2)
+                 ; ("request_id", `String "00000000-0000-4000-8000-000000000001")
+                 ; ("outcome", `List [ `String "V2_failed"; `Assoc _ ])
+                 ]
              ] -> ()
          | json ->
            T.fail

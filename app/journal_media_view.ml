@@ -1,6 +1,17 @@
 module Ui = Journal_view
 module L = Lui_elements
 
+module Json = struct
+  type preview = { paths : string list; selected_index : int; document : bool option [@default None]; title : string option [@default None] }
+  [@@deriving yojson]
+  type event = { event_type : string [@key "type"] } [@@deriving yojson]
+  let dismissed payload =
+    try match Logseq_db_types.Json_codec.decode event_of_yojson (Yojson.Safe.from_string payload) with
+      | Ok { event_type = "dismiss" } -> true
+      | _ -> false
+    with Yojson.Json_error _ -> false
+end
+
 module Store = struct
   module Runtime = Journal_media_runtime
 
@@ -529,23 +540,15 @@ let view_content
               | None -> L.column ~width:0 ~height:0 []
               | Some (paths, selected_index, image) ->
                 let payload =
-                  Yojson.Safe.to_string
-                    (`Assoc
-                        ([ "paths", `List (List.map (fun path -> `String path) paths)
-                         ; "selected_index", `Int selected_index
-                         ]
-                         @
-                         if image
-                         then []
-                         else
-                           [ "document", `Bool true
-                           ; "title", `String (Option.value title ~default:"Attachment")
-                           ]))
+                  Json.preview_to_yojson
+                    { paths; selected_index; document = (if image then None else Some true)
+                    ; title = (if image then None else Some (Option.value title ~default:"Attachment")) }
+                  |> Yojson.Safe.to_string
                 in
                 Journal_lui_native.image_preview
                   ~payload
                   ~on_event:(fun event ->
-                    if event.payload = "{\"type\":\"dismiss\"}" then close_preview ())
+                    if Json.dismissed event.payload then close_preview ())
                   [])
             (Signal.value preview)
         ]

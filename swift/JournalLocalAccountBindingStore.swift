@@ -5,6 +5,8 @@ import Security
 enum JournalLocalAccountBindingStore {
   private static let maximumBytes = 4_096
 
+  private struct Binding: Codable { let version: Int; let userId: String; let managedSyncOrigin: String }
+
   static func query() -> [CFString: Any] {
     [
       kSecClass: kSecClassGenericPassword,
@@ -25,28 +27,19 @@ enum JournalLocalAccountBindingStore {
       origin.scheme == "https",
       origin.host != nil
     else { throw CocoaError(.validationMissingMandatoryProperty) }
-    let data = try JSONSerialization.data(
-      withJSONObject: [
-        "version": 1,
-        "userId": userID,
-        "managedSyncOrigin": managedSyncOrigin,
-      ],
-      options: [.sortedKeys]
-    )
+    let data = try JSONEncoder().encode(Binding(version: 2, userId: userID, managedSyncOrigin: managedSyncOrigin))
     guard data.count <= maximumBytes else { throw CocoaError(.fileWriteUnknown) }
     return data
   }
 
   static func decode(_ data: Data) throws -> [String: Any] {
-    guard data.count <= maximumBytes,
-      let value = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      value.count == 3,
-      value["version"] as? Int == 1,
-      let userID = value["userId"] as? String,
-      let origin = value["managedSyncOrigin"] as? String
-    else { throw CocoaError(.fileReadCorruptFile) }
-    _ = try encode(userID: userID, managedSyncOrigin: origin)
-    return value
+    guard data.count <= maximumBytes else { throw CocoaError(.fileReadCorruptFile) }
+    let binding = try JSONDecoder().decode(Binding.self, from: data)
+    guard binding.version == 2 else { throw CocoaError(.fileReadCorruptFile) }
+    _ = try encode(userID: binding.userId, managedSyncOrigin: binding.managedSyncOrigin)
+    // The key-management bridge accepts domain arguments, separate from the
+    // Keychain file's generated Codable representation.
+    return ["version": 1, "userId": binding.userId, "managedSyncOrigin": binding.managedSyncOrigin]
   }
 
   static func load() throws -> [String: Any]? {

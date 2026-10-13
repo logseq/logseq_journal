@@ -28,12 +28,27 @@ Make a separate copy of the disposable fixture support directory. Generate
 the left portion of each image; keep its center/right region uniformly colored
 for screenshot assertions. No binary image files belong in Git.
 
-Using the warm-start fixture's OCaml bootstrap, replace its final `#use` with
-`apple-tests/image-preview/generate_assets.ml`. Pass the copied support directory,
+Reuse the warm-start fixture's binary PPX compilation pipeline for
+`apple-tests/image-preview/generate_assets.ml`, then replace the final `#load`
+with the generated `.cmo` file. Avoid pretty-printing a generated AST back into
+source: compiler-only identifiers may not survive that conversion. Pass the copied support directory,
 PNG directory and, for an older fixture, its existing journal-page UUID. The
-generator uses public storage sessions and asset-cache publication, adds three
-ordered direct image children to the known fixture root, and updates only the
-synthetic journal day and title. Regenerate the synthetic date after midnight.
+generator uses public storage sessions and `Core.step` → `Effect_runner.submit`
+asset requests. It starts a disposable Python HTTPS server on an ephemeral
+loopback port, generates a temporary certificate with OpenSSL, and fetches the
+three PNGs through the production asset runner. Its network provider routes
+asset connections to that server while retaining the fixture's
+`https://api.logseq.io` account identity; the production resolver may resolve
+that hostname, but no production server receives an HTTP request. The temporary
+certificate is trusted only by this runner, and the server and certificate files
+are removed when preparation ends. Python 3 with `ssl` and OpenSSL with
+`req -addext` must be available on `PATH`.
+
+The generator releases each lease, closes the cache scope, and reads the
+persisted asset back through the public cache requests before emitting PPX
+metadata. It adds three ordered direct image children to the known fixture root
+and updates only the synthetic journal day and title. Regenerate the synthetic
+date after midnight. Run it only against the separate disposable support copy.
 
 Stage the resulting descriptor as `Documents/timeline-images.json` and its
 support directory as `Documents/support-timeline-images` in the isolated app.
@@ -54,6 +69,6 @@ accessibility match alone does not establish the visible selected image.
 Run `dune build @all app/native_embed.exe.o`, `dune runtest --force` and
 `python3 tool/test_photo_save.py` for compilation, existing lease regressions and
 the native save owner. These checks supplement the real Timeline UI result.
-Keep RED/GREEN result bundles, screenshots, video and source/binary hashes under
-Gitignored `docs/test-reports/`. Do not replace Timeline acceptance with a
-standalone Gallery fixture.
+Keep RED/GREEN result bundles, logs, screenshots, video and source/binary hashes
+outside this repository, for example under `/tmp/journal-image-preview-<date>/`.
+Do not replace Timeline acceptance with a standalone Gallery fixture.

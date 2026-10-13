@@ -723,37 +723,37 @@ let corrupt_outbox_fails_closed () =
         done)))
 ;;
 
-let persistence_outbox_uses_frozen_v16_json () =
+let persistence_outbox_uses_generated_json () =
   let top_level_keys =
-    [ "acceptanceBarrier"
-    ; "attemptCount"
-    ; "blockedPriorState"
-    ; "blockedReason"
+    [ "acceptance_barrier"
+    ; "attempt_count"
+    ; "blocked_prior_state"
+    ; "blocked_reason"
     ; "fingerprint"
-    ; "formatVersion"
-    ; "intentTimeMs"
-    ; "plannedTx"
+    ; "format_version"
+    ; "intent_time_ms"
+    ; "planned_tx"
     ; "sequence"
-    ; "dependencyShadows"
-    ; "effectFootprint"
-    ; "deleteArtifacts"
+    ; "dependency_shadows"
+    ; "effect_footprint"
+    ; "delete_artifacts"
     ; "mutation"
-    ; "normalizedTransaction"
-    ; "protectedTransaction"
+    ; "normalized_transaction"
+    ; "protected_transaction"
     ; "state"
-    ; "sameIdRetryEligible"
-    ; "submissionTBefore"
-    ; "submissionOrdinal"
-    ; "submissionCount"
-    ; "observedOriginCursor"
-    ; "staleEarliestConflictCursor"
-    ; "staleConflicts"
-    ; "syncRevision"
+    ; "same_id_retry_eligible"
+    ; "submission_t_before"
+    ; "submission_ordinal"
+    ; "submission_count"
+    ; "observed_origin_cursor"
+    ; "stale_earliest_conflict_cursor"
+    ; "stale_conflicts"
+    ; "sync_revision"
     ]
   in
   let cases =
     [ ( "saveBlock"
-      , [ "block"; "mutationId"; "title"; "type" ]
+      , [ "block"; "mutation_id"; "title" ]
       , fun database ->
           ( Save_block
               { mutation_id = T.mutation_uuid 600
@@ -763,7 +763,7 @@ let persistence_outbox_uses_frozen_v16_json () =
           , block_precondition database T.authoritative_block_uuid "freeze saveBlock JSON"
           ) )
     ; ( "insertBlocks"
-      , [ "mutationId"; "parent"; "tree"; "asset"; "type" ]
+      , [ "mutation_id"; "parent"; "tree"; "asset" ]
       , fun database ->
           ( T.insert_blocks ~ordinal:601 ()
           , T.insert_precondition
@@ -771,7 +771,7 @@ let persistence_outbox_uses_frozen_v16_json () =
               ~parent:T.page_uuid
               ~behavior:"freeze insertBlocks JSON" ) )
     ; ( "deleteBlocks"
-      , [ "mutationId"; "root"; "type" ]
+      , [ "mutation_id"; "root" ]
       , fun database ->
           ( Delete_blocks
               { mutation_id = T.mutation_uuid 602; root = T.authoritative_block_uuid }
@@ -780,13 +780,13 @@ let persistence_outbox_uses_frozen_v16_json () =
               ~block:T.authoritative_block_uuid
               ~behavior:"freeze deleteBlocks JSON" ) )
     ; ( "createJournalPage"
-      , [ "journalDay"; "mutationId"; "page"; "title"; "type" ]
+      , [ "journal_day"; "mutation_id"; "page"; "title" ]
       , fun database ->
           ( T.create_journal_page ~ordinal:603 ()
           , page_precondition database T.missing_page_uuid "freeze createJournalPage JSON"
           ) )
     ; ( "setTaskStatus"
-      , [ "block"; "mutationId"; "status"; "type" ]
+      , [ "block"; "mutation_id"; "status" ]
       , fun database ->
           ( Set_task_status
               { mutation_id = T.mutation_uuid 604
@@ -798,7 +798,7 @@ let persistence_outbox_uses_frozen_v16_json () =
               T.authoritative_block_uuid
               "freeze setTaskStatus JSON" ) )
     ; ( "clearTaskStatus"
-      , [ "block"; "mutationId"; "type" ]
+      , [ "block"; "mutation_id" ]
       , fun database ->
           let setup =
             Set_task_status
@@ -860,11 +860,20 @@ let persistence_outbox_uses_frozen_v16_json () =
                   match Yojson.Safe.from_string source with
                   | `Assoc fields as json ->
                     (match List.assoc_opt "mutation" fields with
-                     | Some (`Assoc mutation_fields) ->
-                       (match List.assoc_opt "type" mutation_fields with
-                        | Some (`String actual) when String.equal actual mutation_kind ->
-                          Some (source, json, fields, mutation_fields)
-                        | _ -> None)
+                     | Some (`List [ `String _tag; `Assoc mutation_fields ]) ->
+                       let expected_tag =
+                         match mutation_kind with
+                         | "saveBlock" -> "Save_block"
+                         | "insertBlocks" -> "Insert_blocks"
+                         | "deleteBlocks" -> "Delete_blocks"
+                         | "createJournalPage" -> "Create_journal_page"
+                         | "setTaskStatus" -> "Set_task_status"
+                         | "clearTaskStatus" -> "Clear_task_status"
+                         | _ -> Alcotest.fail "unknown mutation case"
+                       in
+                       if _tag = expected_tag
+                       then Some (source, json, fields, mutation_fields)
+                       else None
                      | _ -> None)
                   | _ -> None)
               with
@@ -886,7 +895,7 @@ let persistence_outbox_uses_frozen_v16_json () =
               mutation_keys
               (List.map fst mutation_fields);
             (match List.assoc_opt "state" fields with
-             | Some (`Assoc [ ("type", `String "queued") ]) -> ()
+             | Some (`List [ `String "Queued" ]) -> ()
              | _ ->
                Alcotest.failf "%s did not encode queued state canonically" mutation_kind);
             List.iter
@@ -894,20 +903,20 @@ let persistence_outbox_uses_frozen_v16_json () =
                  match List.assoc_opt field fields with
                  | Some `Null -> ()
                  | _ -> Alcotest.failf "%s did not encode %s as null" mutation_kind field)
-              [ "acceptanceBarrier"
-              ; "blockedPriorState"
-              ; "blockedReason"
-              ; "protectedTransaction"
-              ; "submissionTBefore"
-              ; "submissionOrdinal"
-              ; "submissionCount"
-              ; "observedOriginCursor"
-              ; "staleEarliestConflictCursor"
+              [ "acceptance_barrier"
+              ; "blocked_prior_state"
+              ; "blocked_reason"
+              ; "protected_transaction"
+              ; "submission_t_before"
+              ; "submission_ordinal"
+              ; "submission_count"
+              ; "observed_origin_cursor"
+              ; "stale_earliest_conflict_cursor"
               ]))
     cases
 ;;
 
-let require_frozen_mutation_receipt database_path outcome expected_keys =
+let require_generated_mutation_receipt database_path outcome expected_keys =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
   let receipts =
     Logseq_db_storage.Mutation_receipt_store.read_database sqlite
@@ -918,9 +927,10 @@ let require_frozen_mutation_receipt database_path outcome expected_keys =
     receipts
     |> List.find_map (fun (_key, source) ->
       match Yojson.Safe.from_string source with
-      | `Assoc fields as json ->
-        (match List.assoc_opt "outcome" fields with
-         | Some (`String actual) when String.equal actual outcome ->
+      | `List [ `String _tag; `Assoc fields ] as json ->
+        (match List.assoc_opt "status" fields with
+         | Some (`List [ `String actual ])
+           when String.equal actual (if outcome = "noChange" then "No_change" else "Applied") ->
            Some (source, json, fields)
          | _ -> None)
       | _ -> None)
@@ -1023,8 +1033,8 @@ let noncanonical_outbox_payload_fails_closed () =
             (match Yojson.Safe.from_string source with
              | `Assoc fields ->
                `Assoc
-                 (("normalizedTransaction", `String "tampered")
-                  :: List.remove_assoc "normalizedTransaction" fields)
+                 (("normalized_transaction", `String "tampered")
+                  :: List.remove_assoc "normalized_transaction" fields)
                |> Yojson.Safe.to_string
              | _ -> Alcotest.fail "queued fixture record is not JSON")
           | _ -> Alcotest.fail "queued fixture has the wrong outbox cardinality"
@@ -1076,8 +1086,8 @@ let inconsistent_origin_evidence_fails_closed () =
             (match Yojson.Safe.from_string source with
              | `Assoc fields ->
                `Assoc
-                 (("observedOriginCursor", `String "server-cursor:v1:999")
-                  :: List.remove_assoc "observedOriginCursor" fields)
+                 (("observed_origin_cursor", `String "server-cursor:v1:999")
+                  :: List.remove_assoc "observed_origin_cursor" fields)
                |> Yojson.Safe.to_string
              | _ -> Alcotest.fail "queued fixture record is not JSON")
           | _ -> Alcotest.fail "queued fixture has the wrong outbox cardinality"
@@ -1385,10 +1395,10 @@ let no_change_receipt_survives_reopen () =
          | Local_committed { status = No_change; _ } -> ()
          | _ -> Alcotest.fail "fresh missing-target mutation was not No_change");
         Database.close first |> T.require_ok ~behavior;
-        require_frozen_mutation_receipt
+        require_generated_mutation_receipt
           database_path
           "noChange"
-          [ "fingerprint"; "formatVersion"; "mutationId"; "outcome" ];
+          [ "fingerprint"; "format_version"; "mutation_id"; "status" ];
         let refreshed = inspect_mirror location behavior in
         let opening_inspection = refreshed in
         let second =
@@ -1795,10 +1805,10 @@ let applied_receipt_survives_reopen () =
           |> T.require_ok ~behavior
           |> ignore;
           Database.close first |> T.require_ok ~behavior;
-          require_frozen_mutation_receipt
+          require_generated_mutation_receipt
             database_path
             "applied"
-            [ "fingerprint"; "formatVersion"; "mutationId"; "outcome" ];
+            [ "fingerprint"; "format_version"; "mutation_id"; "status" ];
           let refreshed = inspect_mirror location behavior in
           let opening_inspection = refreshed in
           let second =
@@ -2358,7 +2368,7 @@ let incremental_outbox_legacy_migration () =
          CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
       let legacy = List.map
         (fun record -> match Yojson.Safe.from_string record with
-          | `Assoc fields -> `Assoc (("syncRevision", `Int 57) :: List.remove_assoc "syncRevision" fields)
+          | `Assoc fields -> `Assoc (("sync_revision", `Int 57) :: List.remove_assoc "sync_revision" fields)
                             |> Yojson.Safe.to_string
           | _ -> Alcotest.fail "legacy fixture omitted record JSON") records in
       Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy |> T.require_ok ~behavior;
@@ -2428,7 +2438,11 @@ let incremental_outbox_migration_rejects_stale_rows () =
           (fun record ->
              let open Yojson.Safe.Util in
              let json = Yojson.Safe.from_string record in
-             Store.{ mutation_id = json |> member "mutation" |> member "mutationId" |> to_string
+             let mutation_id =
+               json |> member "mutation" |> to_list |> fun parts ->
+               List.nth parts 1 |> member "mutation_id" |> to_string
+             in
+             Store.{ mutation_id
                    ; sequence = json |> member "sequence" |> to_int
                    ; record }) records in
       let rows = rows_of validated in
@@ -2540,9 +2554,9 @@ let cases =
       stale_delete_cannot_remove_replacement
   ; Alcotest.test_case "corrupt outbox fails closed" `Quick corrupt_outbox_fails_closed
   ; Alcotest.test_case
-      "persistence outbox uses frozen V16 JSON"
+      "persistence outbox uses generated JSON"
       `Quick
-      persistence_outbox_uses_frozen_v16_json
+      persistence_outbox_uses_generated_json
   ; Alcotest.test_case
       "duplicate outbox member fails closed"
       `Quick
@@ -2649,6 +2663,124 @@ let submit_interval_overflow_is_rejected () =
         Database.close reopened |> T.require_ok ~behavior)))
 ;;
 
+(* Receipt retention belongs to SQLite-backed Database opening, not a pure reducer.
+   Seed canonical receipts at its public storage boundary and observe peak live heap. *)
+let receipt_history_open_is_bounded () =
+  let behavior = "receipt history opening has bounded live heap" in
+  T.with_temp_directory "overlay-receipt-history-" (fun support ->
+    let path = T.seed_mirror support in
+    let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+    let module Store = Logseq_db_storage.Mutation_receipt_store in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         Store.initialize_database sqlite |> T.require_ok ~behavior;
+         Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN");
+         for n = 1 to 50_000 do
+           let id = Printf.sprintf "10000000-0000-4000-8000-%012d" n in
+           let key namespace =
+             Digestif.SHA256.(to_hex (digest_string (namespace ^ id)))
+           in
+           let mutation =
+             Printf.sprintf
+               {|["Simple",{"fingerprint":"%s","format_version":2,"mutation_id":"%s","status":["No_change"]}]|}
+               (String.make 64 'a')
+               id
+           in
+           let batch_id = "submission-batch:v1:" ^ id in
+           let terminal =
+             Printf.sprintf
+               {|["Stale",{"batch_id":"%s","format_version":2,"through":"server-cursor:v1:0","executed_through":null}]|}
+               batch_id
+           in
+           Store.upsert_mutations sqlite [ key "mutation-receipt:v1:", mutation ]
+           |> T.require_ok ~behavior;
+           Store.upsert_terminal_batches
+             sqlite
+             [ ( Digestif.SHA256.(
+                   to_hex (digest_string ("terminal-batch-receipt:v1:" ^ batch_id)))
+               , terminal )
+             ]
+           |> T.require_ok ~behavior
+         done;
+         Sqlite3.Rc.check (Sqlite3.exec sqlite "COMMIT");
+         Eio_main.run (fun _ ->
+           Eio.Switch.run (fun sw ->
+             let dependencies, _, inspection = location_and_inspection support behavior in
+             Gc.compact ();
+             let baseline = (Gc.stat ()).live_words in
+             let peak = ref baseline in
+             let alarm =
+               Gc.create_alarm (fun () -> peak := max !peak (Gc.stat ()).live_words)
+             in
+             Fun.protect
+               ~finally:(fun () -> Gc.delete_alarm alarm)
+               (fun () ->
+                  let database =
+                    Database.open_
+                      ~sw
+                      dependencies
+                      inspection
+                      ~graph_name:"receipt-history"
+                    |> T.require_ok ~behavior
+                  in
+                  Database.close database |> T.require_ok ~behavior);
+             let peak_bytes = 8 * (!peak - baseline) in
+             Printf.printf
+               "receipt history rows=100000 peak_live_growth_bytes=%d\n%!"
+               peak_bytes;
+             T.require
+               (peak_bytes < 4 * 1024 * 1024)
+               "opening retained unbounded receipt history";
+             let counts =
+               Database.collect_garbage (inspect_mirror support behavior)
+               |> T.require_ok ~behavior
+             in
+             Alcotest.(check int)
+               "all mutation receipts retained"
+               50_000
+               counts.retained_mutation_receipts;
+             Alcotest.(check int)
+               "all terminal receipts retained"
+               50_000
+               counts.retained_terminal_batch_receipts;
+             List.iter
+               (fun table ->
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec
+                       sqlite
+                       ("UPDATE " ^ table ^ " SET receipt = '{}' WHERE rowid = 25000"));
+                  (match
+                     Database.open_
+                       ~sw
+                       dependencies
+                       (inspect_mirror support behavior)
+                       ~graph_name:"invalid-receipt"
+                   with
+                   | Error _ -> ()
+                   | Ok opened ->
+                     ignore (Database.close opened);
+                     Alcotest.fail "invalid receipt accepted");
+                  (match Database.collect_garbage (inspect_mirror support behavior) with
+                   | Error _ -> ()
+                   | Ok _ -> Alcotest.fail "garbage collection accepted invalid receipt");
+                  let retained = ref 0 in
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec
+                       sqlite
+                       ("SELECT count(*) FROM " ^ table)
+                       ~cb:(fun row _ -> retained := int_of_string (Option.get row.(0))));
+                  Alcotest.(check int)
+                    "failed validation preserves history"
+                    50_000
+                    !retained;
+                  Sqlite3.Rc.check
+                    (Sqlite3.exec
+                       sqlite
+                       ("DELETE FROM " ^ table ^ " WHERE rowid = 25000")))
+               [ "overlay_mutation_receipts"; "overlay_terminal_batch_receipts" ]))))
+;;
+
 let sqlite_full_int64_checkpoint () =
   let module Checkpoint = Logseq_db_types.Sync_checkpoint in
   let module Store = Logseq_db_storage.Sync_checkpoint_store in
@@ -2688,7 +2820,9 @@ let sqlite_full_int64_checkpoint () =
 let () =
   Alcotest.run
     "logseq_overlay_db storage"
-    [ ( "cursor checkpoint"
+    [ ( "receipt history"
+      , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded ] )
+    ; ( "cursor checkpoint"
       , [ Alcotest.test_case
             "submit interval overflow is rejected"
             `Quick

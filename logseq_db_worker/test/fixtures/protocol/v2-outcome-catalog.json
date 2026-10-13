@@ -1,254 +1,584 @@
 {
-  "apiVersion": 2,
+  "api_version": 2,
   "responses": [
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000016","outcome":{"type":"favorites","favoritesPage":"74000000-0000-4000-8000-000000000099","generation":"generation:v1:1","projectionRevision":"projection:v1:1","items":[{"membershipUuid":"74000000-0000-4000-8000-000000000001","membershipOrder":"a0","membershipRevision":"member:v1:1","target":{"type":"page","uuid":"74000000-0000-4000-8000-000000000098","title":"Ordinary page","revision":"page:v1:1"}},{"membershipUuid":"74000000-0000-4000-8000-000000000002","membershipOrder":"a1","membershipRevision":"member:v1:2","target":{"type":"block","uuid":"74000000-0000-4000-8000-000000000097","title":"Favorite task","taskStatus":"doing","revision":"block:v1:1"}}],"nextCursor":null}},
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000001",
-      "outcome": {
-        "type": "graphInfo",
-        "graphUuid": "40000000-0000-4000-8000-000000000001",
-        "graphName": "Journal",
-        "schema": {"major": 65, "minor": 33},
-        "admissionFacts": [
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000016",
+        "outcome": [
+          "V2_favorites_outcome",
           {
-            "type": "compatibleSchema",
-            "minimum": {"major": 65, "minor": 33},
-            "actual": {"major": 65, "minor": 33}
-          },
-          {
-            "type": "syncedGraphIdentity",
-            "graphUuid": "40000000-0000-4000-8000-000000000001"
-          },
-          {"type": "losslessCodec"},
-          {"type": "ownershipVerified"}
-        ],
-        "journalTitleFormat": "MMM do, yyyy",
-        "limits": {
-          "responseBudgetBytes": 262144,
-          "outboxMaxRecords": 4096,
-          "outboxMaxBytes": 8388608,
-          "changeMaxItems": 4096,
-          "changeMaxBytes": 65536,
-          "dispatcherCapacity": 256,
-          "wireBatchMaxBytes": 1048576
-        },
-        "generation": "generation:v1:1",
-        "projectionRevision": "projection-revision:v1:3"
+            "favorites_page": "74000000-0000-4000-8000-000000000099",
+            "generation": "generation:v1:1",
+            "projection_revision": "projection:v1:1",
+            "items": [
+              {
+                "membership_uuid": "74000000-0000-4000-8000-000000000001",
+                "membership_order": "a0",
+                "membership_revision": "member:v1:1",
+                "target": [
+                  "V2_favorite_page",
+                  {
+                    "uuid": "74000000-0000-4000-8000-000000000098",
+                    "title": "Ordinary page",
+                    "revision": "page:v1:1"
+                  }
+                ]
+              },
+              {
+                "membership_uuid": "74000000-0000-4000-8000-000000000002",
+                "membership_order": "a1",
+                "membership_revision": "member:v1:2",
+                "target": [
+                  "V2_favorite_block",
+                  {
+                    "uuid": "74000000-0000-4000-8000-000000000097",
+                    "title": "Favorite task",
+                    "task_status": [
+                      "V2_doing"
+                    ],
+                    "revision": "block:v1:1"
+                  }
+                ]
+              }
+            ],
+            "next_cursor": null
+          }
+        ]
       }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000002",
-      "outcome": {
-        "type": "journals",
-        "items": [
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000001",
+        "outcome": [
+          "V2_graph_info_outcome",
           {
-            "page": {
-              "uuid": "20000000-0000-4000-8000-000000000001",
-              "name": "2026-09-02",
-              "title": "Sep 2nd, 2026",
-              "kind": {"type": "journal", "journalDay": 20260902},
-              "createdAtMs": "1788278400000",
-              "updatedAtMs": "1788278400000",
-              "tags": [],
-              "properties": [],
-              "recycled": false
+            "graph_uuid": "40000000-0000-4000-8000-000000000001",
+            "graph_name": "Journal",
+            "schema": {
+              "major": 65,
+              "minor": 33
             },
-            "journalDay": 20260902,
-            "revision": "page-revision:v1:1"
+            "admission_facts": [
+              [
+                "Compatible_schema",
+                {
+                  "minimum": {
+                    "major": 65,
+                    "minor": 33
+                  },
+                  "actual": {
+                    "major": 65,
+                    "minor": 33
+                  }
+                }
+              ],
+              [
+                "Synced_graph_identity",
+                "40000000-0000-4000-8000-000000000001"
+              ],
+              [
+                "Lossless_codec"
+              ],
+              [
+                "Ownership_verified"
+              ]
+            ],
+            "journal_title_format": "MMM do, yyyy",
+            "limits": {
+              "response_budget_bytes": 262144,
+              "outbox_max_records": 4096,
+              "outbox_max_bytes": 8388608,
+              "change_max_items": 4096,
+              "change_max_bytes": 65536,
+              "dispatcher_capacity": 256,
+              "wire_batch_max_bytes": 1048576
+            },
+            "generation": "generation:v1:1",
+            "projection_revision": "projection-revision:v1:3"
           }
-        ],
-        "nextCursor": null
+        ]
       }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000003",
-      "outcome": {
-        "type": "page",
-        "lookup": {
-          "type": "present",
-          "revision": "page-revision:v1:1",
-          "page": {
-            "uuid": "20000000-0000-4000-8000-000000000001",
-            "name": "2026-09-02",
-            "title": "Sep 2nd, 2026",
-            "kind": {"type": "journal", "journalDay": 20260902},
-            "createdAtMs": "1788278400000",
-            "updatedAtMs": "1788278400000",
-            "tags": [],
-            "properties": [],
-            "recycled": false
-          }
-        }
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000004",
-      "outcome": {
-        "type": "page",
-        "lookup": {
-          "type": "missing",
-          "uuid": "20000000-0000-4000-8000-000000000099",
-          "revision": "page-revision:v1:missing"
-        }
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000005",
-      "outcome": {
-        "type": "block",
-        "lookup": {
-          "type": "present",
-          "revision": "block-revision:v1:1",
-          "taskStatus": "todo",
-          "renderedPageTitle": "Sep 2nd, 2026",
-          "block": {
-            "uuid": "10000000-0000-4000-8000-000000000001",
-            "title": "Write the cutover",
-            "parent": "20000000-0000-4000-8000-000000000001",
-            "page": "20000000-0000-4000-8000-000000000001",
-            "order": "a0",
-            "createdAtMs": "1788278400000",
-            "updatedAtMs": "1788278400000",
-            "refs": [],
-            "tags": [],
-            "properties": []
-          }
-        }
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000006",
-      "outcome": {
-        "type": "block",
-        "lookup": {
-          "type": "missing",
-          "uuid": "10000000-0000-4000-8000-000000000099",
-          "revision": "block-revision:v1:missing"
-        }
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000007",
-      "outcome": {
-        "type": "children",
-        "parent": "20000000-0000-4000-8000-000000000001",
-        "revisionScope": {
-          "type": "children",
-          "parent": "20000000-0000-4000-8000-000000000001"
-        },
-        "scopeRevision": "scope-revision:v1:children",
-        "items": [],
-        "nextCursor": null
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000008",
-      "outcome": {
-        "type": "pageTree",
-        "page": "20000000-0000-4000-8000-000000000001",
-        "maximumDepth": 8,
-        "items": [],
-        "nextCursor": null
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000009",
-      "outcome": {
-        "type": "mutationCommitted",
-        "mutationId": "30000000-0000-4000-8000-000000000001",
-        "status": "applied",
-        "generation": "generation:v1:1",
-        "beforeProjectionRevision": "projection-revision:v1:2",
-        "afterProjectionRevision": "projection-revision:v1:3"
-      }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000010",
-      "outcome": {
-        "type": "changes",
-        "generation": "generation:v1:1",
-        "fromExclusive": null,
-        "through": "change-window:v1:2",
-        "windows": [
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000002",
+        "outcome": [
+          "V2_journals_outcome",
           {
-            "id": "change-window:v1:1",
-            "predecessor": "projection-revision:v1:1",
-            "successor": "projection-revision:v1:2",
-            "blockUuids": ["10000000-0000-4000-8000-000000000001"],
-            "pageUuids": [],
-            "structureInterests": []
+            "items": [
+              {
+                "page": {
+                  "uuid": "20000000-0000-4000-8000-000000000001",
+                  "name": "2026-09-02",
+                  "title": "Sep 2nd, 2026",
+                  "kind": [
+                    "Journal_page",
+                    {
+                      "journal_day": 20260902
+                    }
+                  ],
+                  "created_at_ms": 1788278400000,
+                  "updated_at_ms": 1788278400000,
+                  "tags": [],
+                  "properties": [],
+                  "recycled": false
+                },
+                "journal_day": 20260902,
+                "revision": "page-revision:v1:1"
+              }
+            ],
+            "next_cursor": null
           }
-        ],
-        "next": null
+        ]
       }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000011",
-      "outcome": {
-        "type": "changesAcknowledged",
-        "generation": "generation:v1:1",
-        "through": "change-window:v1:2"
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000003",
+        "outcome": [
+          "V2_page_outcome",
+          [
+            "V2_present_page",
+            {
+              "page": {
+                "uuid": "20000000-0000-4000-8000-000000000001",
+                "name": "2026-09-02",
+                "title": "Sep 2nd, 2026",
+                "kind": [
+                  "Journal_page",
+                  {
+                    "journal_day": 20260902
+                  }
+                ],
+                "created_at_ms": 1788278400000,
+                "updated_at_ms": 1788278400000,
+                "tags": [],
+                "properties": [],
+                "recycled": false
+              },
+              "revision": "page-revision:v1:1"
+            }
+          ]
+        ]
       }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000012",
-      "outcome": {
-        "type": "failed",
-        "code": "revisionConflict",
-        "message": "The target changed."
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000004",
+        "outcome": [
+          "V2_page_outcome",
+          [
+            "V2_missing_page",
+            {
+              "uuid": "20000000-0000-4000-8000-000000000099",
+              "revision": "page-revision:v1:missing"
+            }
+          ]
+        ]
       }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000013",
-      "outcome": {
-        "type": "resyncRequired",
-        "generation": "generation:v1:2",
-        "reason": "generationChanged"
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000005",
+        "outcome": [
+          "V2_block_outcome",
+          [
+            "V2_present_block",
+            {
+              "value": {
+                "block": {
+                  "uuid": "10000000-0000-4000-8000-000000000001",
+                  "title": "Write the cutover",
+                  "parent": "20000000-0000-4000-8000-000000000001",
+                  "page": "20000000-0000-4000-8000-000000000001",
+                  "order": "a0",
+                  "created_at_ms": 1788278400000,
+                  "updated_at_ms": 1788278400000,
+                  "refs": [],
+                  "tags": [],
+                  "properties": []
+                },
+                "task_status": [
+                  "V2_todo"
+                ],
+                "rendered_page_title": "Sep 2nd, 2026",
+                "tag_titles": []
+              },
+              "revision": "block-revision:v1:1"
+            }
+          ]
+        ]
       }
-    },
-    {
-      "apiVersion": 2,
-      "requestId": "00000000-0000-4000-8000-000000000014",
-      "outcome": {
-        "type": "admission",
-        "activeRecords": 3,
-        "activeBytes": 1536,
-        "protectedWireBytes": 512,
-        "retainedOriginEvidenceBytes": 256,
-        "maximumRecords": 4096,
-        "maximumBytes": 8388608
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000006",
+        "outcome": [
+          "V2_block_outcome",
+          [
+            "V2_missing_block",
+            {
+              "uuid": "10000000-0000-4000-8000-000000000099",
+              "revision": "block-revision:v1:missing"
+            }
+          ]
+        ]
       }
-    }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000007",
+        "outcome": [
+          "V2_children_outcome",
+          {
+            "parent": "20000000-0000-4000-8000-000000000001",
+            "revision_scope": [
+              "V2_children_revision",
+              "20000000-0000-4000-8000-000000000001"
+            ],
+            "scope_revision": "scope-revision:v1:children",
+            "items": [
+              {
+                "value": {
+                  "block": {
+                    "uuid": "10000000-0000-4000-8000-000000000001",
+                    "title": "Write the cutover",
+                    "parent": "20000000-0000-4000-8000-000000000001",
+                    "page": "20000000-0000-4000-8000-000000000001",
+                    "order": "a0",
+                    "created_at_ms": 1788278400000,
+                    "updated_at_ms": 1788278400000,
+                    "refs": [],
+                    "tags": [],
+                    "properties": []
+                  },
+                  "task_status": [
+                    "V2_todo"
+                  ],
+                  "rendered_page_title": "Sep 2nd, 2026",
+                  "tag_titles": []
+                },
+                "revision": "child:v1:1"
+              }
+            ],
+            "next_cursor": null
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000008",
+        "outcome": [
+          "V2_page_tree_outcome",
+          {
+            "page": "20000000-0000-4000-8000-000000000001",
+            "maximum_depth": 8,
+            "items": [
+              {
+                "value": {
+                  "block": {
+                    "uuid": "10000000-0000-4000-8000-000000000001",
+                    "title": "Write the cutover",
+                    "parent": "20000000-0000-4000-8000-000000000001",
+                    "page": "20000000-0000-4000-8000-000000000001",
+                    "order": "a0",
+                    "created_at_ms": 1788278400000,
+                    "updated_at_ms": 1788278400000,
+                    "refs": [],
+                    "tags": [],
+                    "properties": []
+                  },
+                  "task_status": [
+                    "V2_todo"
+                  ],
+                  "rendered_page_title": "Sep 2nd, 2026",
+                  "tag_titles": []
+                },
+                "revision": "child:v1:1",
+                "depth": 0,
+                "parent": "20000000-0000-4000-8000-000000000001"
+              }
+            ],
+            "next_cursor": null
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000009",
+        "outcome": [
+          "V2_mutation_committed",
+          {
+            "mutation_id": "30000000-0000-4000-8000-000000000001",
+            "status": [
+              "V2_applied"
+            ],
+            "generation": "generation:v1:1",
+            "before_projection_revision": "projection-revision:v1:2",
+            "after_projection_revision": "projection-revision:v1:3"
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000010",
+        "outcome": [
+          "V2_changes",
+          {
+            "generation": "generation:v1:1",
+            "from_exclusive": null,
+            "through": "change-window:v1:2",
+            "windows": [
+              {
+                "id": "change-window:v1:1",
+                "predecessor": "projection-revision:v1:1",
+                "successor": "projection-revision:v1:2",
+                "block_uuids": [
+                  "10000000-0000-4000-8000-000000000001"
+                ],
+                "page_uuids": [],
+                "structure_interests": [
+                  [
+                    "V2_children_interest",
+                    "10000000-0000-4000-8000-000000000001"
+                  ],
+                  [
+                    "V2_page_tree_interest",
+                    "10000000-0000-4000-8000-000000000001"
+                  ],
+                  [
+                    "V2_journal_index_interest"
+                  ]
+                ]
+              }
+            ],
+            "next": null
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000011",
+        "outcome": [
+          "V2_changes_acknowledged",
+          {
+            "generation": "generation:v1:1",
+            "through": "change-window:v1:2"
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000012",
+        "outcome": [
+          "V2_failed",
+          {
+            "code": "revisionConflict",
+            "message": "The target changed."
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000013",
+        "outcome": [
+          "V2_resync_required",
+          {
+            "generation": "generation:v1:2",
+            "reason": "generationChanged"
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000014",
+        "outcome": [
+          "V2_admission_outcome",
+          {
+            "active_records": 3,
+            "active_bytes": 1536,
+            "protected_wire_bytes": 512,
+            "retained_origin_evidence_bytes": 256,
+            "maximum_records": 4096,
+            "maximum_bytes": 8388608
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000020",
+        "outcome": [
+          "V2_block_summary_outcome",
+          {
+            "lookup": [
+              "V2_present_block",
+              {
+                "value": {
+                  "block": {
+                    "uuid": "10000000-0000-4000-8000-000000000001",
+                    "title": "Write the cutover",
+                    "parent": "20000000-0000-4000-8000-000000000001",
+                    "page": "20000000-0000-4000-8000-000000000001",
+                    "order": "a0",
+                    "created_at_ms": 1788278400000,
+                    "updated_at_ms": 1788278400000,
+                    "refs": [],
+                    "tags": [],
+                    "properties": []
+                  },
+                  "task_status": [
+                    "V2_todo"
+                  ],
+                  "rendered_page_title": "Sep 2nd, 2026",
+                  "tag_titles": []
+                },
+                "revision": "block:v1:1"
+              }
+            ],
+            "page": [
+              "V2_present_page",
+              {
+                "page": {
+                  "uuid": "20000000-0000-4000-8000-000000000001",
+                  "name": "2026-09-02",
+                  "title": "Sep 2nd, 2026",
+                  "kind": [
+                    "Journal_page",
+                    {
+                      "journal_day": 20260902
+                    }
+                  ],
+                  "created_at_ms": 1788278400000,
+                  "updated_at_ms": 1788278400000,
+                  "tags": [],
+                  "properties": [],
+                  "recycled": false
+                },
+                "revision": "page-revision:v1:1"
+              }
+            ],
+            "items": [
+              {
+                "value": {
+                  "block": {
+                    "uuid": "10000000-0000-4000-8000-000000000001",
+                    "title": "Write the cutover",
+                    "parent": "20000000-0000-4000-8000-000000000001",
+                    "page": "20000000-0000-4000-8000-000000000001",
+                    "order": "a0",
+                    "created_at_ms": 1788278400000,
+                    "updated_at_ms": 1788278400000,
+                    "refs": [],
+                    "tags": [],
+                    "properties": []
+                  },
+                  "task_status": [
+                    "V2_todo"
+                  ],
+                  "rendered_page_title": "Sep 2nd, 2026",
+                  "tag_titles": []
+                },
+                "revision": "child:v1:1"
+              }
+            ],
+            "next_cursor": null,
+            "scope_revision": "children:v1:1",
+            "generation": "generation:v1:1",
+            "projection_revision": "projection:v1:1"
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000020",
+        "outcome": [
+          "V2_assets_outcome",
+          {
+            "generation": "generation:v1:1",
+            "projection_revision": "projection:v1:1",
+            "items": [
+              {
+                "uuid": "10000000-0000-4000-8000-000000000001",
+                "source": [
+                  "Managed",
+                  {
+                    "checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "file_type": "png"
+                  }
+                ],
+                "current_checksum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "size": 128,
+                "dimensions": [
+                  10,
+                  20
+                ]
+              }
+            ],
+            "next_cursor": null
+          }
+        ]
+      }
+    ]
   ],
   "pushes": [
-    {
-      "apiVersion": 2,
-      "push": {
-        "type": "changesAvailable",
+    [
+      "V2_changes_available",
+      {
+        "api_version": 2,
         "generation": "generation:v1:1",
         "through": "change-window:v1:2"
       }
-    },
-    {
-      "apiVersion": 2,
-      "push": {
-        "type": "resyncRequired",
+    ],
+    [
+      "V2_resync_required_push",
+      {
+        "api_version": 2,
         "generation": "generation:v1:2",
         "reason": "retentionOverflow"
       }
-    }
+    ]
   ]
 }

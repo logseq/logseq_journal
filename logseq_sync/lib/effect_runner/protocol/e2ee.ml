@@ -27,48 +27,45 @@ let protect operation f =
   | error -> Error (operation ^ ": " ^ Printexc.to_string error)
 ;;
 
-let bounded_string field = function
-  | `String value
-    when String.length value > 0
-         && String.length value <= 65_536
-         && String.is_valid_utf_8 value
-         && not (String.contains value '\000') -> Ok value
-  | `String _
-  | `Assoc _
-  | `List _
-  | `Tuple _
-  | `Variant _
-  | `Null
-  | `Bool _
-  | `Int _
-  | `Intlit _
-  | `Float _ -> Error ("E2EE response " ^ field ^ " must be a bounded non-empty string")
+let bounded_string field value =
+  if
+    String.length value > 0
+    && String.length value <= 65_536
+    && String.is_valid_utf_8 value
+    && not (String.contains value '\000')
+  then Ok value
+  else Error ("E2EE response " ^ field ^ " must be a bounded non-empty string")
 ;;
+
+type graph_key_response_dto = { encrypted_aes_key : string [@key "encrypted-aes-key"] }
+[@@deriving yojson]
+
+type user_keys_response_dto =
+  { public_key : string [@key "public-key"]
+  ; encrypted_private_key : string [@key "encrypted-private-key"]
+  }
+[@@deriving yojson]
 
 let graph_key_response source =
   try
-    match Yojson.Safe.from_string source with
-    | `Assoc [ ("encrypted-aes-key", value) ] -> bounded_string "encrypted-aes-key" value
-    | `Assoc _ | `List _ | `Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _ ->
-      Error "E2EE graph-key response must contain exactly one encrypted-aes-key string"
+    bind
+      (Logseq_db_types.Json_codec.decode
+         graph_key_response_dto_of_yojson
+         (Yojson.Safe.from_string source))
+      (fun dto -> bounded_string "encrypted-aes-key" dto.encrypted_aes_key)
   with
   | Yojson.Json_error _ -> Error "E2EE response must be valid JSON"
 ;;
 
 let user_keys_response source =
   try
-    match Yojson.Safe.from_string source with
-    | `Assoc
-        [ ("public-key", public_key); ("encrypted-private-key", encrypted_private_key) ]
-    | `Assoc
-        [ ("encrypted-private-key", encrypted_private_key); ("public-key", public_key) ]
-      ->
-      bind (bounded_string "public-key" public_key) (fun _ ->
-        bounded_string "encrypted-private-key" encrypted_private_key)
-    | `Assoc _ | `List _ | `Null | `Bool _ | `Int _ | `Intlit _ | `Float _ | `String _ ->
-      Error
-        "E2EE user-key response must contain exactly public-key and \
-         encrypted-private-key strings"
+    bind
+      (Logseq_db_types.Json_codec.decode
+         user_keys_response_dto_of_yojson
+         (Yojson.Safe.from_string source))
+      (fun dto ->
+         bind (bounded_string "public-key" dto.public_key) (fun _ ->
+           bounded_string "encrypted-private-key" dto.encrypted_private_key))
   with
   | Yojson.Json_error _ -> Error "E2EE response must be valid JSON"
 ;;

@@ -6,6 +6,9 @@ module Worker = Logseq_db_worker_lui.Journal_worker
 module Journal_worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module Journal_worker_ids = Logseq_db_worker_lui.Journal_worker_ids
 
+type unlock_chrome_props = { mode : string; title : string; pending : bool; error : string option [@default None] }
+[@@deriving yojson]
+
 (* Shim replacing [Bonsai.Effect]: an effect is just a thunk scheduled by
    the reducer plumbing. Effects run inline on the app thread. *)
 module Effect = struct
@@ -3292,23 +3295,14 @@ let manager_page state dispatch =
         ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
         ~version:2
         ~capabilities:[ Stateful; Semantics ]
-        ~encode_props:(fun props -> Yojson.Basic.to_string props |> Bytes.of_string)
+        ~encode_props:(fun props -> unlock_chrome_props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
         ~decode_event:(fun ~event_id:_ _ -> Error "Unlock uses child control events")
         ()
     in
     Ui.Native_widget.widget
       chrome
       ~key:(Ui.Key.string "graph-unlock")
-      ~props:
-        (`Assoc
-            [ "mode", `String "unlock"
-            ; "title", `String graph_name
-            ; "pending", `Bool pending
-            ; ( "error"
-              , match error with
-                | None -> `Null
-                | Some message -> `String message )
-            ])
+      ~props:{ mode = "unlock"; title = graph_name; pending; error }
       ~on_event:(fun _ -> ())
       ~children:[ editor; unlock_button; choose_graph; diagnostics ]
       ()

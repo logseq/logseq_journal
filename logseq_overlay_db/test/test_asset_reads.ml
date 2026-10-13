@@ -199,6 +199,42 @@ let stale database =
       | _ -> Alcotest.fail "stale cursor accepted"))
 ;;
 
+let generated_asset_cursor database =
+  seed database;
+  with_snapshot database (fun snapshot ->
+    let first =
+      D.get_assets_under_roots
+        snapshot
+        ~recursive:true
+        ~roots:[ id 0 ]
+        ~limit:1
+        ~cursor:None
+      |> get
+    in
+    let cursor = Option.get first.next_cursor in
+    let source = G.Cursor.to_string cursor in
+    T.require
+      (String.length source > 0 && source.[0] = '{')
+      "asset cursor must use generated record format";
+    let reject source =
+      let cursor = G.Cursor.of_string source |> get in
+      T.require
+        (Result.is_error
+           (D.get_assets_under_roots
+              snapshot
+              ~recursive:true
+              ~roots:[ id 0 ]
+              ~limit:1
+              ~cursor:(Some cursor)))
+        "invalid asset cursor accepted"
+    in
+    reject "[\"assets-v1\",\"old-version\",\"old-roots\",[]]";
+    reject
+      "{\"version\":\"x\",\"roots\":\"x\",\"frames\":[[\"Asset_node\",\"not-a-uuid\",-1]]}";
+    T.require (Result.is_error (G.Cursor.of_string (String.make 16385 'x')))
+      "oversized cursor constructor accepted")
+;;
+
 let deletion database =
   seed database;
   with_snapshot database (fun before ->
@@ -1192,6 +1228,7 @@ let () =
           ; "cyclic asset ancestry", cyclic_asset_ancestry
           ; "bounded asset ancestry", bounded_asset_ancestry
           ; "direct and subtree discovery", discovery
+          ; "generated cursor validation", generated_asset_cursor
           ; "cursor fences", stale
           ; "effective overlay", deletion
           ; "complete large reference set", large_reference_set

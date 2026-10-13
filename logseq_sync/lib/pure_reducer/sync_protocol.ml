@@ -162,6 +162,149 @@ let error_to_string (error : codec_error) =
   prefix ^ message_type ^ location ^ ": " ^ detail
 ;;
 
+module Wire = struct
+  type header = { kind : string [@key "type"] } [@@deriving yojson { strict = false }]
+
+  type client_transaction =
+    { tx : string
+    ; tx_id : Logseq_db_types.Graph_types.Uuid.t option [@key "tx-id"] [@default None]
+    ; outliner_op : string option [@key "outliner-op"] [@default None]
+    }
+  [@@deriving yojson]
+
+  type pull_transaction =
+    { t : int64
+    ; tx : string
+    ; outliner_op : string option [@key "outliner-op"] [@default None]
+    }
+  [@@deriving yojson]
+
+  type user_presence =
+    { user_id : string [@key "user-id"]
+    ; email : string option [@default None]
+    ; username : string option [@default None]
+    ; name : string option [@default None]
+    }
+  [@@deriving yojson]
+
+  type client_hello =
+    { kind : string [@key "type"]
+    ; client : string
+    }
+  [@@deriving yojson]
+
+  type client_presence =
+    { kind : string [@key "type"]
+    ; editing_block_uuid : string option [@key "editing-block-uuid"] [@default None]
+    }
+  [@@deriving yojson]
+
+  type client_pull =
+    { kind : string [@key "type"]
+    ; since : int64 option [@default None]
+    }
+  [@@deriving yojson]
+
+  type client_tx_batch =
+    { kind : string [@key "type"]
+    ; client_revision : string option [@key "client-revision"] [@default None]
+    ; t_before : int64 [@key "t-before"]
+    ; txs : client_transaction list
+    }
+  [@@deriving yojson]
+
+  type client_ping = { kind : string [@key "type"] } [@@deriving yojson]
+
+  type server_hello =
+    { kind : string [@key "type"]
+    ; t : int64
+    ; checksum : string option [@default None]
+    }
+  [@@deriving yojson]
+
+  type server_online_users =
+    { kind : string [@key "type"]
+    ; online_users : user_presence list [@key "online-users"]
+    }
+  [@@deriving yojson]
+
+  type server_presence =
+    { kind : string [@key "type"]
+    ; user_id : string [@key "user-id"]
+    ; editing_block_uuid : string option [@key "editing-block-uuid"]
+    }
+  [@@deriving yojson]
+
+  type server_pull_ok =
+    { kind : string [@key "type"]
+    ; t : int64
+    ; checksum : string option [@default None]
+    ; txs : pull_transaction list
+    }
+  [@@deriving yojson]
+
+  type server_tx_batch_ok =
+    { kind : string [@key "type"]
+    ; t : int64
+    ; checksum : string option [@default None]
+    }
+  [@@deriving yojson]
+
+  type server_changed =
+    { kind : string [@key "type"]
+    ; t : int64
+    }
+  [@@deriving yojson]
+
+  type server_tx_reject =
+    { kind : string [@key "type"]
+    ; reason : string
+    ; t : int64 option [@default None]
+    ; checksum : string option [@default None]
+    ; success_tx_ids : Logseq_db_types.Graph_types.Uuid.t list
+          [@key "success-tx-ids"] [@default []]
+    ; failed_tx_id : Logseq_db_types.Graph_types.Uuid.t option
+          [@key "failed-tx-id"] [@default None]
+    ; missing_block_uuids : Logseq_db_types.Graph_types.Uuid.t list
+          [@key "missing-block-uuids"] [@default []]
+    ; error_detail : string option [@key "error-detail"] [@default None]
+    ; data : string option [@default None]
+    }
+  [@@deriving yojson]
+
+  type server_pong = { kind : string [@key "type"] } [@@deriving yojson]
+
+  type server_error =
+    { kind : string [@key "type"]
+    ; message : string
+    }
+  [@@deriving yojson]
+
+  type baseline =
+    { kind : string [@key "type"]
+    ; t : int64
+    }
+  [@@deriving yojson { strict = false }]
+end
+
+(* Structural checks preserve the public safe diagnostics. They never construct
+   protocol values: every record is decoded by its generated Wire codec. *)
+type shape =
+  | Text of int
+  | Nullable_text of int
+  | Cursor
+  | Uuid
+  | Checksum
+  | Rejection_reason
+  | Array of shape
+  | Object of (string * bool * shape) list
+
+let maximum_wire_cursor = 9007199254740991L
+let metadata = Text maximum_metadata_bytes
+let nullable_metadata = Nullable_text maximum_metadata_bytes
+let required name shape = name, true, shape
+let optional name shape = name, false, shape
+
 let duplicate_names names =
   let sorted = List.sort String.compare names in
   let rec loop duplicates = function
@@ -187,205 +330,167 @@ let check_fields context path allowed fields =
      | _ :: _ -> error context path (Unexpected_fields unexpected))
 ;;
 
-let field name fields = List.assoc_opt name fields
-
-let required_field context path name fields =
-  match field name fields with
-  | Some value -> Ok value
-  | None -> error context path (Missing_field name)
-;;
-
-let bounded_string context path ?(maximum = maximum_metadata_bytes) = function
-  | `String value when String.length value <= maximum -> Ok value
-  | `String _ -> error context path (Limit_exceeded { maximum })
-  | _ -> error context path (Invalid_field { expected = "string" })
-;;
-
-let required_string context path ?maximum name fields =
-  let* value = required_field context path name fields in
-  bounded_string context (path @ [ name ]) ?maximum value
-;;
-
-let optional_string context path ?maximum name fields =
-  match field name fields with
-  | None -> Ok None
-  | Some value ->
-    let* value = bounded_string context (path @ [ name ]) ?maximum value in
-    Ok (Some value)
-;;
-
-let optional_nullable_string context path ?maximum name fields =
-  match field name fields with
-  | None | Some `Null -> Ok None
-  | Some value ->
-    let* value = bounded_string context (path @ [ name ]) ?maximum value in
-    Ok (Some value)
-;;
-
-let required_nullable_string context path ?maximum name fields =
-  let* value = required_field context path name fields in
-  match value with
-  | `Null -> Ok None
-  | value ->
-    let* value = bounded_string context (path @ [ name ]) ?maximum value in
-    Ok (Some value)
-;;
-
-let maximum_wire_cursor = 9007199254740991L
-
-let cursor_of_json context path value =
-  let number =
-    match value with
-    | `Int value -> Some (Int64.of_int value)
-    | `Intlit value
-      when String.length value > 0
-           && String.for_all
-                (function
-                  | '0' .. '9' -> true
-                  | _ -> false)
-                value -> Int64.of_string_opt value
-    | _ -> None
-  in
-  match number with
-  | Some value when value >= 0L && value <= maximum_wire_cursor ->
-    (match Logseq_db_types.Server_cursor.of_int64 value with
-     | Ok cursor -> Ok cursor
-     | Error `Negative_cursor -> assert false)
-  | _ ->
-    error
-      context
-      path
-      (Invalid_field { expected = "integer cursor between 0 and 9007199254740991" })
-;;
-
-let cursor_json value =
-  `Intlit (Int64.to_string (Logseq_db_types.Server_cursor.to_int64 value))
-;;
-
-let required_cursor context path name fields =
-  let* value = required_field context path name fields in
-  cursor_of_json context (path @ [ name ]) value
-;;
-
-let optional_cursor context path name fields =
-  match field name fields with
-  | None -> Ok None
-  | Some value ->
-    let* value = cursor_of_json context (path @ [ name ]) value in
-    Ok (Some value)
-;;
-
-let checksum_value context path = function
-  | `String value
+let rec validate context path shape json =
+  let invalid expected = error context path (Invalid_field { expected }) in
+  match shape, json with
+  | Text maximum, `String value | Nullable_text maximum, `String value ->
+    if String.length value <= maximum
+    then Ok ()
+    else error context path (Limit_exceeded { maximum })
+  | Text _, _
+  | Nullable_text _, (`Assoc _ | `List _ | `Bool _ | `Int _ | `Intlit _ | `Float _) ->
+    invalid "string"
+  | Nullable_text _, `Null -> Ok ()
+  | Cursor, value ->
+    let number =
+      match value with
+      | `Int value -> Some (Int64.of_int value)
+      | `Intlit value
+        when String.length value > 0
+             && String.for_all
+                  (function
+                    | '0' .. '9' -> true
+                    | _ -> false)
+                  value -> Int64.of_string_opt value
+      | _ -> None
+    in
+    (match number with
+     | Some value when value >= 0L && value <= maximum_wire_cursor -> Ok ()
+     | _ -> invalid "integer cursor between 0 and 9007199254740991")
+  | Uuid, `String value ->
+    (match Logseq_db_types.Graph_types.Uuid.of_string value with
+     | Ok _ -> Ok ()
+     | Error _ -> invalid "UUID string")
+  | Uuid, _ -> invalid "UUID string"
+  | Checksum, `String value
     when String.length value = 16
          && String.for_all
               (function
                 | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
                 | _ -> false)
-              value -> Ok value
-  | `String _ ->
-    error context path (Invalid_field { expected = "16-character hexadecimal checksum" })
-  | _ ->
-    error context path (Invalid_field { expected = "16-character hexadecimal checksum" })
-;;
-
-let optional_checksum context path fields =
-  match field "checksum" fields with
-  | None -> Ok None
-  | Some value ->
-    let* value = checksum_value context (path @ [ "checksum" ]) value in
-    Ok (Some value)
-;;
-
-let uuid_value context path = function
-  | `String value ->
-    (match Logseq_db_types.Graph_types.Uuid.of_string value with
-     | Ok uuid -> Ok uuid
-     | Error _ -> error context path (Invalid_field { expected = "UUID string" }))
-  | _ -> error context path (Invalid_field { expected = "UUID string" })
-;;
-
-let optional_uuid context path name fields =
-  match field name fields with
-  | None -> Ok None
-  | Some value ->
-    let* value = uuid_value context (path @ [ name ]) value in
-    Ok (Some value)
-;;
-
-let list context path decode = function
-  | `List values ->
-    let rec loop index decoded = function
-      | [] -> Ok (List.rev decoded)
+              value -> Ok ()
+  | Checksum, _ -> invalid "16-character hexadecimal checksum"
+  | ( Rejection_reason
+    , `String
+        ( "stale"
+        | "db transact failed"
+        | "empty tx data"
+        | "invalid tx"
+        | "invalid t-before"
+        | "snapshot upload in progress" ) ) -> Ok ()
+  | Rejection_reason, _ -> invalid "known rejection reason"
+  | Array item, `List values ->
+    let rec loop index = function
+      | [] -> Ok ()
       | value :: rest ->
-        let* value = decode (path @ [ string_of_int index ]) value in
-        loop (index + 1) (value :: decoded) rest
+        let* () = validate context (path @ [ string_of_int index ]) item value in
+        loop (index + 1) rest
     in
-    loop 0 [] values
-  | _ -> error context path (Invalid_field { expected = "array" })
-;;
-
-let required_list context path name decode fields =
-  let* value = required_field context path name fields in
-  list context (path @ [ name ]) decode value
-;;
-
-let optional_uuid_list context path name fields =
-  match field name fields with
-  | None -> Ok []
-  | Some value -> list context (path @ [ name ]) (uuid_value context) value
-;;
-
-let decode_client_transaction context path = function
-  | `Assoc fields ->
-    let* () = check_fields context path [ "tx"; "tx-id"; "outliner-op" ] fields in
-    let* tx =
-      required_string context path ~maximum:(maximum_wire_bytes Client) "tx" fields
-    in
-    let* tx_id = optional_uuid context path "tx-id" fields in
-    let* outliner_op = optional_nullable_string context path "outliner-op" fields in
-    Ok Client.{ tx; tx_id; outliner_op }
-  | _ -> error context path (Invalid_field { expected = "transaction object" })
-;;
-
-let decode_pull_transaction context path = function
-  | `Assoc fields ->
-    let* () = check_fields context path [ "t"; "tx"; "outliner-op" ] fields in
-    let* t = required_cursor context path "t" fields in
-    let* tx =
-      required_string context path ~maximum:(maximum_wire_bytes Server) "tx" fields
-    in
-    let* outliner_op = optional_nullable_string context path "outliner-op" fields in
-    Ok Server.{ t; tx; outliner_op }
-  | _ -> error context path (Invalid_field { expected = "pull transaction object" })
-;;
-
-let decode_user_presence context path = function
-  | `Assoc fields ->
+    loop 0 values
+  | Array _, _ -> invalid "array"
+  | Object schema, `Assoc fields ->
     let* () =
-      check_fields context path [ "user-id"; "email"; "username"; "name" ] fields
+      check_fields context path (List.map (fun (name, _, _) -> name) schema) fields
     in
-    let* user_id = required_string context path "user-id" fields in
-    let* email = optional_nullable_string context path "email" fields in
-    let* username = optional_nullable_string context path "username" fields in
-    let* name = optional_nullable_string context path "name" fields in
-    Ok { user_id; email; username; name }
-  | _ -> error context path (Invalid_field { expected = "user presence object" })
+    let rec loop = function
+      | [] -> Ok ()
+      | (name, is_required, shape) :: rest ->
+        let* () =
+          match List.assoc_opt name fields with
+          | None when is_required -> error context path (Missing_field name)
+          | None -> Ok ()
+          | Some json -> validate context (path @ [ name ]) shape json
+        in
+        loop rest
+    in
+    loop schema
+  | Object _, _ -> invalid "object"
+  | _ -> invalid "string"
 ;;
 
-let rejection_reason context path = function
-  | `String "stale" -> Ok Stale
-  | `String "db transact failed" -> Ok Db_transact_failed
-  | `String "empty tx data" -> Ok Empty_tx_data
-  | `String "invalid tx" -> Ok Invalid_tx
-  | `String "invalid t-before" -> Ok Invalid_t_before
-  | `String "snapshot upload in progress" -> Ok Snapshot_upload_in_progress
-  | `String _ ->
-    error context path (Invalid_field { expected = "known rejection reason" })
-  | _ -> error context path (Invalid_field { expected = "known rejection reason" })
+let client_transaction_shape =
+  Object
+    [ required "tx" (Text (maximum_wire_bytes Client))
+    ; optional "tx-id" Uuid
+    ; optional "outliner-op" nullable_metadata
+    ]
 ;;
 
-let validate_rejection context rejection =
+let pull_transaction_shape =
+  Object
+    [ required "t" Cursor
+    ; required "tx" (Text (maximum_wire_bytes Server))
+    ; optional "outliner-op" nullable_metadata
+    ]
+;;
+
+let user_presence_shape =
+  Object
+    [ required "user-id" metadata
+    ; optional "email" nullable_metadata
+    ; optional "username" nullable_metadata
+    ; optional "name" nullable_metadata
+    ]
+;;
+
+let rejection_shape =
+  [ required "reason" Rejection_reason
+  ; optional "t" Cursor
+  ; optional "checksum" Checksum
+  ; optional "success-tx-ids" (Array Uuid)
+  ; optional "failed-tx-id" Uuid
+  ; optional "missing-block-uuids" (Array Uuid)
+  ; optional "error-detail" metadata
+  ; optional "data" metadata
+  ]
+;;
+
+let decode_dto context schema decoder json =
+  let* () = validate context [] (Object (required "type" metadata :: schema)) json in
+  match Logseq_db_types.Json_codec.decode decoder json with
+  | Ok dto -> Ok dto
+  | Error _ -> error context [] (Invalid_field { expected = "valid protocol fields" })
+;;
+
+let cursor value = Logseq_db_types.Server_cursor.of_int64 value |> Result.get_ok
+let cursor_value value = Logseq_db_types.Server_cursor.to_int64 value
+
+let client_transaction (value : Wire.client_transaction) : Client.transaction =
+  { tx = value.tx; tx_id = value.tx_id; outliner_op = value.outliner_op }
+;;
+
+let pull_transaction (value : Wire.pull_transaction) : Server.pull_transaction =
+  { t = cursor value.t; tx = value.tx; outliner_op = value.outliner_op }
+;;
+
+let user_presence (value : Wire.user_presence) : user_presence =
+  { user_id = value.user_id
+  ; email = value.email
+  ; username = value.username
+  ; name = value.name
+  }
+;;
+
+let rejection_reason = function
+  | "stale" -> Stale
+  | "db transact failed" -> Db_transact_failed
+  | "empty tx data" -> Empty_tx_data
+  | "invalid tx" -> Invalid_tx
+  | "invalid t-before" -> Invalid_t_before
+  | "snapshot upload in progress" -> Snapshot_upload_in_progress
+  | _ -> assert false
+;;
+
+let rejection_reason_string = function
+  | Stale -> "stale"
+  | Db_transact_failed -> "db transact failed"
+  | Empty_tx_data -> "empty tx data"
+  | Invalid_tx -> "invalid tx"
+  | Invalid_t_before -> "invalid t-before"
+  | Snapshot_upload_in_progress -> "snapshot upload in progress"
+;;
+
+let validate_rejection context (rejection : rejection) =
   let operational_fields_absent =
     rejection.checksum = None
     && rejection.success_tx_ids = []
@@ -410,121 +515,136 @@ let validate_rejection context rejection =
       (Invalid_field { expected = "fields allowed for the selected rejection reason" })
 ;;
 
-let decode_rejection context fields =
-  let allowed =
-    [ "type"
-    ; "reason"
-    ; "t"
-    ; "checksum"
-    ; "success-tx-ids"
-    ; "failed-tx-id"
-    ; "missing-block-uuids"
-    ; "error-detail"
-    ; "data"
-    ]
-  in
-  let* () = check_fields context [] allowed fields in
-  let* reason_json = required_field context [] "reason" fields in
-  let* reason = rejection_reason context [ "reason" ] reason_json in
-  let* t = optional_cursor context [] "t" fields in
-  let* checksum = optional_checksum context [] fields in
-  let* success_tx_ids = optional_uuid_list context [] "success-tx-ids" fields in
-  let* failed_tx_id = optional_uuid context [] "failed-tx-id" fields in
-  let* missing_block_uuids = optional_uuid_list context [] "missing-block-uuids" fields in
-  let* error_detail = optional_string context [] "error-detail" fields in
-  let* data = optional_string context [] "data" fields in
-  validate_rejection
-    context
-    { reason
-    ; t
-    ; checksum
-    ; success_tx_ids
-    ; failed_tx_id
-    ; missing_block_uuids
-    ; error_detail
-    ; data
-    }
-;;
-
-let decode_client_fields context message_type fields =
+let decode_client_fields context message_type json =
   match message_type with
   | "hello" ->
-    let* () = check_fields context [] [ "type"; "client" ] fields in
-    let* client = required_string context [] "client" fields in
-    Ok (Client.Hello { client })
+    let* dto =
+      decode_dto context [ required "client" metadata ] Wire.client_hello_of_yojson json
+    in
+    Ok (Client.Hello { client = dto.client })
   | "presence" ->
-    let* () = check_fields context [] [ "type"; "editing-block-uuid" ] fields in
-    let* editing_block_uuid =
-      optional_nullable_string context [] "editing-block-uuid" fields
+    let* dto =
+      decode_dto
+        context
+        [ optional "editing-block-uuid" nullable_metadata ]
+        Wire.client_presence_of_yojson
+        json
     in
-    Ok (Client.Presence { editing_block_uuid })
+    Ok (Client.Presence { editing_block_uuid = dto.editing_block_uuid })
   | "pull" ->
-    let* () = check_fields context [] [ "type"; "since" ] fields in
-    let* since = optional_cursor context [] "since" fields in
-    Ok (Client.Pull { since })
+    let* dto =
+      decode_dto context [ optional "since" Cursor ] Wire.client_pull_of_yojson json
+    in
+    Ok (Client.Pull { since = Option.map cursor dto.since })
   | "tx/batch" ->
-    let* () =
-      check_fields context [] [ "type"; "client-revision"; "t-before"; "txs" ] fields
+    let* dto =
+      decode_dto
+        context
+        [ optional "client-revision" metadata
+        ; required "t-before" Cursor
+        ; required "txs" (Array client_transaction_shape)
+        ]
+        Wire.client_tx_batch_of_yojson
+        json
     in
-    let* client_revision = optional_string context [] "client-revision" fields in
-    let* t_before = required_cursor context [] "t-before" fields in
-    let* txs =
-      required_list context [] "txs" (decode_client_transaction context) fields
-    in
-    Ok (Client.Tx_batch { client_revision; t_before; txs })
+    Ok
+      (Client.Tx_batch
+         { client_revision = dto.client_revision
+         ; t_before = cursor dto.t_before
+         ; txs = List.map client_transaction dto.txs
+         })
   | "ping" ->
-    let* () = check_fields context [] [ "type" ] fields in
+    let* _ = decode_dto context [] Wire.client_ping_of_yojson json in
     Ok Client.Ping
   | unsupported -> error context [] (Unsupported_message_type unsupported)
 ;;
 
-let decode_server_fields context message_type fields =
+let decode_server_fields context message_type json =
   match message_type with
   | "hello" ->
-    let* () = check_fields context [] [ "type"; "t"; "checksum" ] fields in
-    let* t = required_cursor context [] "t" fields in
-    let* checksum = optional_checksum context [] fields in
-    Ok (Server.Hello { t; checksum })
+    let* dto =
+      decode_dto
+        context
+        [ required "t" Cursor; optional "checksum" Checksum ]
+        Wire.server_hello_of_yojson
+        json
+    in
+    Ok (Server.Hello { t = cursor dto.t; checksum = dto.checksum })
   | "online-users" ->
-    let* () = check_fields context [] [ "type"; "online-users" ] fields in
-    let* online_users =
-      required_list context [] "online-users" (decode_user_presence context) fields
+    let* dto =
+      decode_dto
+        context
+        [ required "online-users" (Array user_presence_shape) ]
+        Wire.server_online_users_of_yojson
+        json
     in
-    Ok (Server.Online_users { online_users })
+    Ok (Server.Online_users { online_users = List.map user_presence dto.online_users })
   | "presence" ->
-    let* () =
-      check_fields context [] [ "type"; "user-id"; "editing-block-uuid" ] fields
+    let* dto =
+      decode_dto
+        context
+        [ required "user-id" metadata; required "editing-block-uuid" nullable_metadata ]
+        Wire.server_presence_of_yojson
+        json
     in
-    let* user_id = required_string context [] "user-id" fields in
-    let* editing_block_uuid =
-      required_nullable_string context [] "editing-block-uuid" fields
-    in
-    Ok (Server.Presence { user_id; editing_block_uuid })
+    Ok
+      (Server.Presence
+         { user_id = dto.user_id; editing_block_uuid = dto.editing_block_uuid })
   | "pull/ok" ->
-    let* () = check_fields context [] [ "type"; "t"; "checksum"; "txs" ] fields in
-    let* t = required_cursor context [] "t" fields in
-    let* checksum = optional_checksum context [] fields in
-    let* txs = required_list context [] "txs" (decode_pull_transaction context) fields in
-    Ok (Server.Pull_ok { t; checksum; txs })
+    let* dto =
+      decode_dto
+        context
+        [ required "t" Cursor
+        ; optional "checksum" Checksum
+        ; required "txs" (Array pull_transaction_shape)
+        ]
+        Wire.server_pull_ok_of_yojson
+        json
+    in
+    Ok
+      (Server.Pull_ok
+         { t = cursor dto.t
+         ; checksum = dto.checksum
+         ; txs = List.map pull_transaction dto.txs
+         })
   | "tx/batch/ok" ->
-    let* () = check_fields context [] [ "type"; "t"; "checksum" ] fields in
-    let* t = required_cursor context [] "t" fields in
-    let* checksum = optional_checksum context [] fields in
-    Ok (Server.Tx_batch_ok { t; checksum })
+    let* dto =
+      decode_dto
+        context
+        [ required "t" Cursor; optional "checksum" Checksum ]
+        Wire.server_tx_batch_ok_of_yojson
+        json
+    in
+    Ok (Server.Tx_batch_ok { t = cursor dto.t; checksum = dto.checksum })
   | "changed" ->
-    let* () = check_fields context [] [ "type"; "t" ] fields in
-    let* t = required_cursor context [] "t" fields in
-    Ok (Server.Changed { t })
+    let* dto =
+      decode_dto context [ required "t" Cursor ] Wire.server_changed_of_yojson json
+    in
+    Ok (Server.Changed { t = cursor dto.t })
   | "tx/reject" ->
-    let* rejection = decode_rejection context fields in
+    let* dto = decode_dto context rejection_shape Wire.server_tx_reject_of_yojson json in
+    let* rejection =
+      validate_rejection
+        context
+        { reason = rejection_reason dto.reason
+        ; t = Option.map cursor dto.t
+        ; checksum = dto.checksum
+        ; success_tx_ids = dto.success_tx_ids
+        ; failed_tx_id = dto.failed_tx_id
+        ; missing_block_uuids = dto.missing_block_uuids
+        ; error_detail = dto.error_detail
+        ; data = dto.data
+        }
+    in
     Ok (Server.Tx_reject rejection)
   | "pong" ->
-    let* () = check_fields context [] [ "type" ] fields in
+    let* _ = decode_dto context [] Wire.server_pong_of_yojson json in
     Ok Server.Pong
   | "error" ->
-    let* () = check_fields context [] [ "type"; "message" ] fields in
-    let* message = required_string context [] "message" fields in
-    Ok (Server.Error { message })
+    let* dto =
+      decode_dto context [ required "message" metadata ] Wire.server_error_of_yojson json
+    in
+    Ok (Server.Error { message = dto.message })
   | unsupported -> error context [] (Unsupported_message_type unsupported)
 ;;
 
@@ -536,10 +656,17 @@ let decode ?maximum direction decode_fields wire =
   else (
     try
       match Yojson.Safe.from_string wire with
-      | `Assoc fields ->
-        let* message_type = required_string context [] "type" fields in
-        let context = { context with message_type = Some message_type } in
-        decode_fields context message_type fields
+      | `Assoc fields as json ->
+        let* () =
+          match List.assoc_opt "type" fields with
+          | None -> error context [] (Missing_field "type")
+          | Some json -> validate context [ "type" ] metadata json
+        in
+        (match Wire.header_of_yojson json with
+         | Ok header ->
+           decode_fields { context with message_type = Some header.kind } header.kind json
+         | Error _ ->
+           error context [] (Invalid_field { expected = "message discriminator" }))
       | _ -> error context [] Expected_object
     with
     | Yojson.Json_error _ -> error context [] Invalid_json)
@@ -549,133 +676,93 @@ let decode_snapshot_baseline =
   decode
     ~maximum:Logseq_db_types.Limits.maximum_snapshot_baseline_response_bytes
     Server
-    (fun context message_type fields ->
-       if message_type = "pull/ok"
-       then required_cursor context [] "t" fields
-       else error context [] (Unsupported_message_type message_type))
+    (fun context message_type json ->
+       if message_type <> "pull/ok"
+       then error context [] (Unsupported_message_type message_type)
+       else (
+         match json with
+         | `Assoc fields ->
+           let* () =
+             match List.assoc_opt "t" fields with
+             | None -> error context [] (Missing_field "t")
+             | Some json -> validate context [ "t" ] Cursor json
+           in
+           (match Logseq_db_types.Json_codec.decode Wire.baseline_of_yojson json with
+            | Ok dto -> Ok (cursor dto.t)
+            | Error _ ->
+              error context [] (Invalid_field { expected = "snapshot baseline" }))
+         | _ -> error context [] Expected_object))
 ;;
 
 let decode_client_message = decode Client decode_client_fields
 let decode_server_message = decode Server decode_server_fields
-let uuid_json uuid = `String (Logseq_db_types.Graph_types.Uuid.to_string uuid)
 
-let add_optional name encode value fields =
-  match value with
-  | None -> fields
-  | Some value -> fields @ [ name, encode value ]
+let wire_client_transaction (value : Client.transaction) : Wire.client_transaction =
+  { tx = value.tx; tx_id = value.tx_id; outliner_op = value.outliner_op }
 ;;
 
-let nullable_string_json = function
-  | None -> `Null
-  | Some value -> `String value
+let wire_pull_transaction (value : Server.pull_transaction) : Wire.pull_transaction =
+  { t = cursor_value value.t; tx = value.tx; outliner_op = value.outliner_op }
 ;;
 
-let client_transaction_json (transaction : Client.transaction) =
-  [ "tx", `String transaction.Client.tx ]
-  |> add_optional "tx-id" uuid_json transaction.tx_id
-  |> add_optional "outliner-op" (fun value -> `String value) transaction.outliner_op
-  |> fun fields -> `Assoc fields
+let wire_user_presence (value : user_presence) : Wire.user_presence =
+  { user_id = value.user_id
+  ; email = value.email
+  ; username = value.username
+  ; name = value.name
+  }
 ;;
 
 let client_message_json = function
-  | Client.Hello { client } ->
-    `Assoc [ "type", `String "hello"; "client", `String client ]
+  | Client.Hello { client } -> Wire.client_hello_to_yojson { kind = "hello"; client }
   | Client.Presence { editing_block_uuid } ->
-    let fields = [ "type", `String "presence" ] in
-    let fields =
-      add_optional
-        "editing-block-uuid"
-        (fun value -> `String value)
-        editing_block_uuid
-        fields
-    in
-    `Assoc fields
+    Wire.client_presence_to_yojson { kind = "presence"; editing_block_uuid }
   | Client.Pull { since } ->
-    let fields = [ "type", `String "pull" ] in
-    `Assoc (add_optional "since" cursor_json since fields)
+    Wire.client_pull_to_yojson { kind = "pull"; since = Option.map cursor_value since }
   | Client.Tx_batch { client_revision; t_before; txs } ->
-    let fields = [ "type", `String "tx/batch" ] in
-    let fields =
-      add_optional "client-revision" (fun value -> `String value) client_revision fields
-    in
-    `Assoc
-      (fields
-       @ [ "t-before", cursor_json t_before
-         ; "txs", `List (List.map client_transaction_json txs)
-         ])
-  | Client.Ping -> `Assoc [ "type", `String "ping" ]
-;;
-
-let user_presence_json (user : user_presence) =
-  [ "user-id", `String user.user_id ]
-  |> add_optional "email" (fun value -> `String value) user.email
-  |> add_optional "username" (fun value -> `String value) user.username
-  |> add_optional "name" (fun value -> `String value) user.name
-  |> fun fields -> `Assoc fields
-;;
-
-let pull_transaction_json (transaction : Server.pull_transaction) =
-  [ "t", cursor_json transaction.Server.t; "tx", `String transaction.tx ]
-  |> add_optional "outliner-op" (fun value -> `String value) transaction.outliner_op
-  |> fun fields -> `Assoc fields
-;;
-
-let rejection_reason_json = function
-  | Stale -> "stale"
-  | Db_transact_failed -> "db transact failed"
-  | Empty_tx_data -> "empty tx data"
-  | Invalid_tx -> "invalid tx"
-  | Invalid_t_before -> "invalid t-before"
-  | Snapshot_upload_in_progress -> "snapshot upload in progress"
-;;
-
-let add_non_empty_list name encode values fields =
-  match values with
-  | [] -> fields
-  | _ :: _ -> fields @ [ name, `List (List.map encode values) ]
-;;
-
-let rejection_json (rejection : rejection) =
-  [ "type", `String "tx/reject"
-  ; "reason", `String (rejection_reason_json rejection.reason)
-  ]
-  |> add_optional "t" cursor_json rejection.t
-  |> add_optional "checksum" (fun value -> `String value) rejection.checksum
-  |> add_non_empty_list "success-tx-ids" uuid_json rejection.success_tx_ids
-  |> add_optional "failed-tx-id" uuid_json rejection.failed_tx_id
-  |> add_non_empty_list "missing-block-uuids" uuid_json rejection.missing_block_uuids
-  |> add_optional "error-detail" (fun value -> `String value) rejection.error_detail
-  |> add_optional "data" (fun value -> `String value) rejection.data
-  |> fun fields -> `Assoc fields
+    Wire.client_tx_batch_to_yojson
+      { kind = "tx/batch"
+      ; client_revision
+      ; t_before = cursor_value t_before
+      ; txs = List.map wire_client_transaction txs
+      }
+  | Client.Ping -> Wire.client_ping_to_yojson { kind = "ping" }
 ;;
 
 let server_message_json = function
   | Server.Hello { t; checksum } ->
-    let fields = [ "type", `String "hello"; "t", cursor_json t ] in
-    `Assoc (add_optional "checksum" (fun value -> `String value) checksum fields)
+    Wire.server_hello_to_yojson { kind = "hello"; t = cursor_value t; checksum }
   | Server.Online_users { online_users } ->
-    `Assoc
-      [ "type", `String "online-users"
-      ; "online-users", `List (List.map user_presence_json online_users)
-      ]
+    Wire.server_online_users_to_yojson
+      { kind = "online-users"; online_users = List.map wire_user_presence online_users }
   | Server.Presence { user_id; editing_block_uuid } ->
-    `Assoc
-      [ "type", `String "presence"
-      ; "user-id", `String user_id
-      ; "editing-block-uuid", nullable_string_json editing_block_uuid
-      ]
+    Wire.server_presence_to_yojson { kind = "presence"; user_id; editing_block_uuid }
   | Server.Pull_ok { t; checksum; txs } ->
-    let fields = [ "type", `String "pull/ok"; "t", cursor_json t ] in
-    let fields = add_optional "checksum" (fun value -> `String value) checksum fields in
-    `Assoc (fields @ [ "txs", `List (List.map pull_transaction_json txs) ])
+    Wire.server_pull_ok_to_yojson
+      { kind = "pull/ok"
+      ; t = cursor_value t
+      ; checksum
+      ; txs = List.map wire_pull_transaction txs
+      }
   | Server.Tx_batch_ok { t; checksum } ->
-    let fields = [ "type", `String "tx/batch/ok"; "t", cursor_json t ] in
-    `Assoc (add_optional "checksum" (fun value -> `String value) checksum fields)
-  | Server.Changed { t } -> `Assoc [ "type", `String "changed"; "t", cursor_json t ]
-  | Server.Tx_reject rejection -> rejection_json rejection
-  | Server.Pong -> `Assoc [ "type", `String "pong" ]
-  | Server.Error { message } ->
-    `Assoc [ "type", `String "error"; "message", `String message ]
+    Wire.server_tx_batch_ok_to_yojson
+      { kind = "tx/batch/ok"; t = cursor_value t; checksum }
+  | Server.Changed { t } ->
+    Wire.server_changed_to_yojson { kind = "changed"; t = cursor_value t }
+  | Server.Tx_reject rejection ->
+    Wire.server_tx_reject_to_yojson
+      { kind = "tx/reject"
+      ; reason = rejection_reason_string rejection.reason
+      ; t = Option.map cursor_value rejection.t
+      ; checksum = rejection.checksum
+      ; success_tx_ids = rejection.success_tx_ids
+      ; failed_tx_id = rejection.failed_tx_id
+      ; missing_block_uuids = rejection.missing_block_uuids
+      ; error_detail = rejection.error_detail
+      ; data = rejection.data
+      }
+  | Server.Pong -> Wire.server_pong_to_yojson { kind = "pong" }
+  | Server.Error { message } -> Wire.server_error_to_yojson { kind = "error"; message }
 ;;
 
 let encode decode_message json =

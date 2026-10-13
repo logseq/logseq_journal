@@ -1,35 +1,363 @@
 {
-  "apiVersion": 2,
+  "api_version": 2,
   "bounds": {
-    "requestBytes": 1048576,
-    "responseBytes": 262144,
-    "pushBytes": 65536,
-    "defaultPageSize": 50,
-    "maximumPageSize": 200,
-    "maximumTreeNodes": 2000,
-    "maximumTreeDepth": 64,
-    "maximumChangedUuids": 1024,
-    "maximumUnacknowledgedWindows": 256
+    "request_bytes": 1048576,
+    "response_bytes": 262144,
+    "push_bytes": 65536,
+    "default_page_size": 50,
+    "maximum_page_size": 200,
+    "maximum_tree_nodes": 2000,
+    "maximum_tree_depth": 64,
+    "maximum_changed_uuids": 1024,
+    "maximum_unacknowledged_windows": 256
   },
   "requests": [
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000016","command":{"type":"listFavorites","limit":50,"cursor":null}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000001","command":{"type":"graphInfo"}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000002","command":{"type":"listJournals","fromDay":20260901,"throughDay":20260930,"limit":50,"cursor":null,"revision":null}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000003","command":{"type":"getPage","page":"20000000-0000-4000-8000-000000000001","revision":null}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000004","command":{"type":"getBlock","block":"10000000-0000-4000-8000-000000000001","revision":null}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000005","command":{"type":"getChildren","parent":"20000000-0000-4000-8000-000000000001","limit":50,"cursor":null,"revision":null}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000006","command":{"type":"getPageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":8,"limit":200,"cursor":null,"revision":null}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000007","command":{"type":"saveBlock","mutationId":"30000000-0000-4000-8000-000000000001","block":"10000000-0000-4000-8000-000000000001","title":"Updated","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:1"}],"pages":[],"scopes":[]}}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000008","command":{"type":"insertBlocks","mutationId":"30000000-0000-4000-8000-000000000002","parent":"20000000-0000-4000-8000-000000000001","roots":[{"uuid":"10000000-0000-4000-8000-000000000002","title":"Parent","children":[{"uuid":"10000000-0000-4000-8000-000000000003","title":"Child","children":[]}]}],"preconditions":{"blocks":[],"pages":[],"scopes":[{"scope":{"type":"children","parent":"20000000-0000-4000-8000-000000000001"},"revision":"structure-revision:v1:1"}]}}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000009","command":{"type":"deleteBlocks","mutationId":"30000000-0000-4000-8000-000000000003","root":"10000000-0000-4000-8000-000000000002","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000002","revision":"block-revision:v1:1"}],"pages":[],"scopes":[]}}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000010","command":{"type":"createJournalPage","mutationId":"30000000-0000-4000-8000-000000000004","page":"20000000-0000-4000-8000-000000000002","journalDay":20260902,"title":"Sep 2nd, 2026","preconditions":{"blocks":[],"pages":[{"uuid":"20000000-0000-4000-8000-000000000002","revision":"page-revision:v1:missing"}],"scopes":[]}}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000011","command":{"type":"setTaskStatus","mutationId":"30000000-0000-4000-8000-000000000005","block":"10000000-0000-4000-8000-000000000001","status":"todo","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:1"}],"pages":[],"scopes":[]}}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000012","command":{"type":"clearTaskStatus","mutationId":"30000000-0000-4000-8000-000000000006","block":"10000000-0000-4000-8000-000000000001","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000001","revision":"block-revision:v1:2"}],"pages":[],"scopes":[]}}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000013","command":{"type":"pullChanges","generation":"generation:v1:1","after":null,"limit":50}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000014","command":{"type":"ackChanges","generation":"generation:v1:1","through":"change-window:v1:2"}},
-    {"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000015","command":{"type":"inspectAdmission"}}
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000016",
+      "command": [
+        "V2_list_favorites",
+        {
+          "limit": 50,
+          "cursor": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000001",
+      "command": [
+        "V2_graph_info"
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000002",
+      "command": [
+        "V2_list_journals",
+        {
+          "from_day": 20260901,
+          "through_day": 20260930,
+          "limit": 50,
+          "cursor": null,
+          "revision": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000003",
+      "command": [
+        "V2_get_page",
+        {
+          "page": "20000000-0000-4000-8000-000000000001",
+          "revision": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000004",
+      "command": [
+        "V2_get_block",
+        {
+          "block": "10000000-0000-4000-8000-000000000001",
+          "revision": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000005",
+      "command": [
+        "V2_get_children",
+        {
+          "parent": "20000000-0000-4000-8000-000000000001",
+          "limit": 50,
+          "cursor": null,
+          "revision": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000006",
+      "command": [
+        "V2_get_page_tree",
+        {
+          "page": "20000000-0000-4000-8000-000000000001",
+          "maximum_depth": 8,
+          "limit": 200,
+          "cursor": null,
+          "revision": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000007",
+      "command": [
+        "V2_save_block",
+        {
+          "mutation_id": "30000000-0000-4000-8000-000000000001",
+          "block": "10000000-0000-4000-8000-000000000001",
+          "title": "Updated",
+          "preconditions": {
+            "blocks": [
+              [
+                "10000000-0000-4000-8000-000000000001",
+                "block-revision:v1:1"
+              ]
+            ],
+            "pages": [],
+            "scopes": []
+          }
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000008",
+      "command": [
+        "V2_insert_blocks",
+        {
+          "mutation_id": "30000000-0000-4000-8000-000000000002",
+          "parent": "20000000-0000-4000-8000-000000000001",
+          "roots": [
+            {
+              "uuid": "10000000-0000-4000-8000-000000000002",
+              "title": "Parent",
+              "children": [
+                {
+                  "uuid": "10000000-0000-4000-8000-000000000003",
+                  "title": "Child",
+                  "children": []
+                }
+              ]
+            }
+          ],
+          "preconditions": {
+            "blocks": [],
+            "pages": [],
+            "scopes": [
+              [
+                [
+                  "V2_children_scope",
+                  "20000000-0000-4000-8000-000000000001"
+                ],
+                "structure-revision:v1:1"
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000009",
+      "command": [
+        "V2_delete_blocks",
+        {
+          "mutation_id": "30000000-0000-4000-8000-000000000003",
+          "root": "10000000-0000-4000-8000-000000000002",
+          "preconditions": {
+            "blocks": [
+              [
+                "10000000-0000-4000-8000-000000000002",
+                "block-revision:v1:1"
+              ]
+            ],
+            "pages": [],
+            "scopes": []
+          }
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "command": [
+        "V2_create_journal_page",
+        {
+          "mutation_id": "30000000-0000-4000-8000-000000000004",
+          "page": "20000000-0000-4000-8000-000000000002",
+          "journal_day": 20260902,
+          "title": "Sep 2nd, 2026",
+          "preconditions": {
+            "blocks": [],
+            "pages": [
+              [
+                "20000000-0000-4000-8000-000000000002",
+                "page-revision:v1:missing"
+              ]
+            ],
+            "scopes": []
+          }
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000011",
+      "command": [
+        "V2_set_task_status",
+        {
+          "mutation_id": "30000000-0000-4000-8000-000000000005",
+          "block": "10000000-0000-4000-8000-000000000001",
+          "status": [
+            "V2_todo"
+          ],
+          "preconditions": {
+            "blocks": [
+              [
+                "10000000-0000-4000-8000-000000000001",
+                "block-revision:v1:1"
+              ]
+            ],
+            "pages": [],
+            "scopes": []
+          }
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000012",
+      "command": [
+        "V2_clear_task_status",
+        {
+          "mutation_id": "30000000-0000-4000-8000-000000000006",
+          "block": "10000000-0000-4000-8000-000000000001",
+          "preconditions": {
+            "blocks": [
+              [
+                "10000000-0000-4000-8000-000000000001",
+                "block-revision:v1:2"
+              ]
+            ],
+            "pages": [],
+            "scopes": []
+          }
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000013",
+      "command": [
+        "V2_pull_changes",
+        {
+          "generation": "generation:v1:1",
+          "after": null,
+          "limit": 50
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000014",
+      "command": [
+        "V2_ack_changes",
+        {
+          "generation": "generation:v1:1",
+          "through": "change-window:v1:2"
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000015",
+      "command": [
+        "V2_inspect_admission"
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000017",
+      "command": [
+        "V2_get_asset_descriptors",
+        {
+          "assets": [
+            "10000000-0000-4000-8000-000000000001"
+          ]
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000018",
+      "command": [
+        "V2_list_assets",
+        {
+          "recursive": true,
+          "roots": [
+            "10000000-0000-4000-8000-000000000001"
+          ],
+          "limit": 50,
+          "cursor": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000019",
+      "command": [
+        "V2_get_block_summary",
+        {
+          "block": "10000000-0000-4000-8000-000000000001",
+          "limit": 50,
+          "cursor": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000020",
+      "command": [
+        "V2_set_asset_reference",
+        {
+          "mutation_id": "00000000-0000-4000-8000-000000000020",
+          "block": "10000000-0000-4000-8000-000000000001",
+          "previous": null,
+          "asset": "10000000-0000-4000-8000-000000000001",
+          "preconditions": {
+            "blocks": [
+              [
+                "10000000-0000-4000-8000-000000000001",
+                "block:v1:1"
+              ]
+            ],
+            "pages": [],
+            "scopes": []
+          }
+        }
+      ]
+    }
   ],
-  "readOperations": ["listFavorites", "graphInfo", "inspectAdmission", "listJournals", "getPage", "getBlock", "getChildren", "getPageTree"],
-  "mutationOperations": ["saveBlock", "insertBlocks", "deleteBlocks", "createJournalPage", "setTaskStatus", "clearTaskStatus"],
-  "changeOperations": ["pullChanges", "ackChanges"]
+  "read_operations": [
+    "V2_list_favorites",
+    "V2_graph_info",
+    "V2_list_journals",
+    "V2_get_page",
+    "V2_get_block",
+    "V2_get_children",
+    "V2_get_page_tree",
+    "V2_inspect_admission",
+    "V2_get_asset_descriptors",
+    "V2_list_assets",
+    "V2_get_block_summary"
+  ],
+  "mutation_operations": [
+    "V2_save_block",
+    "V2_insert_blocks",
+    "V2_delete_blocks",
+    "V2_create_journal_page",
+    "V2_set_task_status",
+    "V2_clear_task_status",
+    "V2_set_asset_reference"
+  ],
+  "change_operations": [
+    "V2_pull_changes",
+    "V2_ack_changes"
+  ]
 }

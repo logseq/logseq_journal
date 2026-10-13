@@ -12,6 +12,10 @@ let require condition format =
 
 let read_json path = Yojson.Safe.from_file path
 
+let canonical_json json =
+  Yojson.Safe.from_string (Yojson.Safe.to_string json) |> Yojson.Safe.sort
+;;
+
 let rec repository_root directory =
   if Sys.file_exists (Filename.concat directory "dune-project")
   then directory

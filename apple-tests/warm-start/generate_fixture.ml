@@ -3,6 +3,13 @@ module Core = Logseq_sync_pure_reducer.Core
 module Storage = Logseq_db_storage.Logseq_sqlite_storage
 module Session = Logseq_db_storage.Storage_session
 
+type graph_descriptor = { graphId : string; graphDir : string; expectedTimelineText : string }
+[@@deriving yojson]
+type fixture =
+  { formatVersion : int; supportRoot : string; baseUrl : string; userId : string
+  ; graphs : graph_descriptor list; rootRowCount : int; childRowCount : int }
+[@@deriving yojson]
+
 let seed_graph ~support ~row_count ~child_count ~history_days index =
   let graph_id =
     Graph.Uuid.of_string (Printf.sprintf "60000000-0000-4000-8000-%012d" index)
@@ -217,11 +224,8 @@ let seed_graph ~support ~row_count ~child_count ~history_days index =
     }
   in
   ( graph
-  , `Assoc
-      [ "graphId", `String (Graph.Uuid.to_string graph_id)
-      ; "graphDir", `String (Filename.dirname database_path)
-      ; "expectedTimelineText", `String expected
-      ] )
+  , { graphId = Graph.Uuid.to_string graph_id
+    ; graphDir = Filename.dirname database_path; expectedTimelineText = expected } )
 ;;
 
 let () =
@@ -261,16 +265,9 @@ let () =
   Fun.protect
     ~finally:(fun () -> close_out output)
     (fun () -> output_string output (Core.encode_catalog_cache cache));
-  Yojson.Safe.to_channel
-    stdout
-    (`Assoc
-        [ "formatVersion", `Int 2
-        ; "supportRoot", `String support
-        ; "baseUrl", `String "https://api.logseq.io"
-        ; "userId", `String "user-1"
-        ; "graphs", `List descriptors
-        ; "rootRowCount", `Int row_count
-        ; "childRowCount", `Int child_count
-        ]);
+  fixture_to_yojson
+    { formatVersion = 2; supportRoot = support; baseUrl = "https://api.logseq.io"
+    ; userId = "user-1"; graphs = descriptors; rootRowCount = row_count; childRowCount = child_count }
+  |> Yojson.Safe.to_channel stdout;
   print_newline ()
 ;;

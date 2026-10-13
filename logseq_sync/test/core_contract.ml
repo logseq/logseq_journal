@@ -5075,3 +5075,44 @@ let scenarios =
         reconnect_resets_backoff_after_durable_nonempty_pull
     ]
 ;;
+
+let generated_catalog_cache_rejects_legacy_and_invalid_domain_values () =
+  let cache =
+    Core.catalog_cache ~user_id:"user" ~graphs:[ graph ] ~selected_graph:(Some graph_id)
+  in
+  let encoded = Core.encode_catalog_cache cache in
+  let restored = Core.decode_catalog_cache encoded |> Result.get_ok in
+  Alcotest.(check bool)
+    "generated cache restores validated graph and selection"
+    true
+    (Core.catalog_cache_graphs restored = [ graph ]
+     && Core.catalog_cache_selected_graph restored = Some graph_id);
+  let legacy = {|{"userId":"user","graphs":[],"selectedGraph":null}|} in
+  Alcotest.(check bool)
+    "old internal cache is explicitly rejected"
+    true
+    (Result.is_error (Core.decode_catalog_cache legacy));
+  let native_invalid_selection =
+    {|{"cache_user_id":"user","cache_graphs":[],"cache_selected_graph":"invalid"}|}
+  in
+  Alcotest.(check bool)
+    "invalid optional UUID does not become no selection"
+    true
+    (Result.is_error (Core.decode_catalog_cache native_invalid_selection));
+  let native_invalid_schema =
+    {|{"cache_user_id":"user","cache_graphs":[{"graph_id":"11111111-1111-4111-8111-111111111111","name":"Journal","schema":{"major":-1,"minor":0,"exact":true},"encrypted":false}],"cache_selected_graph":null}|}
+  in
+  Alcotest.(check bool)
+    "schema domain constraints remain enforced"
+    true
+    (Result.is_error (Core.decode_catalog_cache native_invalid_schema))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "generated catalog cache rejects old format and invalid domains"
+        `Quick
+        generated_catalog_cache_rejects_legacy_and_invalid_domain_values
+    ]
+;;

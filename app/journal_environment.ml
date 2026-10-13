@@ -24,44 +24,34 @@ let fallback =
   }
 ;;
 
-let boolean (fields : (string * Yojson.Basic.t) list) name =
-  match List.assoc_opt name fields with
-  | Some (`Bool value) -> Ok value
-  | _ -> Error ("environment " ^ name ^ " is missing or not a bool")
-;;
-
-let string (fields : (string * Yojson.Basic.t) list) name =
-  match List.assoc_opt name fields with
-  | Some (`String value) -> Ok value
-  | _ -> Error ("environment " ^ name ^ " is missing or not a string")
-;;
+type wire_snapshot =
+  { brightness : string
+  ; platform : string
+  ; accessibleNavigation : bool
+  ; highContrast : bool
+  }
+[@@deriving yojson]
 
 let decode_json (json : Yojson.Basic.t) =
-  match json with
-  | `Assoc fields ->
-    let ( let* ) = Result.bind in
-    let* platform = string fields "platform" in
-    let* accessible_navigation = boolean fields "accessibleNavigation" in
-    let* high_contrast = boolean fields "highContrast" in
-    let* brightness =
-      match List.assoc_opt "brightness" fields with
-      | Some (`String "light") -> Ok Light
-      | Some (`String "dark") -> Ok Dark
-      | _ -> Error "environment brightness is missing or unsupported"
-    in
-    Ok { brightness; platform; accessible_navigation; high_contrast }
-  | _ -> Error "environment snapshot must be a JSON object"
+  let ( let* ) = Result.bind in
+  let* wire = Logseq_db_types.Json_codec.decode wire_snapshot_of_yojson (json :> Yojson.Safe.t) in
+  let* brightness =
+    match wire.brightness with
+    | "light" -> Ok Light
+    | "dark" -> Ok Dark
+    | _ -> Error "environment brightness is unsupported"
+  in
+  Ok
+    { brightness; platform = wire.platform
+    ; accessible_navigation = wire.accessibleNavigation
+    ; high_contrast = wire.highContrast }
 ;;
 
-let encode_json snapshot =
-  `Assoc
-    [ ( "brightness"
-      , `String
-          (match snapshot.brightness with
-           | Light -> "light"
-           | Dark -> "dark") )
-    ; "platform", `String snapshot.platform
-    ; "accessibleNavigation", `Bool snapshot.accessible_navigation
-    ; "highContrast", `Bool snapshot.high_contrast
-    ]
+let encode_json (snapshot : snapshot) =
+  wire_snapshot_to_yojson
+    { brightness = (match snapshot.brightness with Light -> "light" | Dark -> "dark")
+    ; platform = snapshot.platform
+    ; accessibleNavigation = snapshot.accessible_navigation
+    ; highContrast = snapshot.high_contrast }
+  |> Yojson.Safe.to_basic
 ;;

@@ -1533,6 +1533,10 @@ let test_native_list_payload_binds_nested_contents () =
       | `Assoc fields -> List.assoc key fields
       | _ -> fail "expected list payload object"
     in
+    let optional_member key = function
+      | `Assoc fields -> List.assoc_opt key fields
+      | _ -> fail "expected list payload object"
+    in
     let children =
       List.filter_map
         (function
@@ -1576,12 +1580,13 @@ let test_native_list_payload_binds_nested_contents () =
                 (text_at (member "header_index" section) = key ^ "-header")
                 "section header bound another child"
             | _ -> fail "expected section key");
-           (match member "footer_index" section with
-            | `Null -> ()
-            | index ->
+           (match key, optional_member "footer_index" section with
+            | `String "second", None -> ()
+            | `String "first", Some index ->
               require
                 (text_at index = "first-footer")
-                "section footer bound another child");
+                "section footer bound another child"
+            | _ -> fail "generated optional footer binding differs");
            match member "rows" section with
            | `List rows -> List.iter check_row rows
            | _ -> fail "expected section rows")

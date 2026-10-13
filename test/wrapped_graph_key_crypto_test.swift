@@ -42,9 +42,7 @@ private func makeFixture() throws -> (privateKey: Data, wrapped: String) {
       &keyError
     ) as Data?
   else { throw HarnessError.failed("failed to wrap the synthetic graph key") }
-  let encoded = try JSONSerialization.data(
-    withJSONObject: ["~#'", "~b\(ciphertext.base64EncodedString())"]
-  )
+  let encoded = try JSONEncoder().encode(["~#'", "~b\(ciphertext.base64EncodedString())"])
   guard let wrapped = String(data: encoded, encoding: .utf8) else {
     throw HarnessError.failed("failed to encode the wrapped graph key")
   }
@@ -57,7 +55,6 @@ private enum WrappedGraphKeyCryptoTest {
     let origin = "https://api.logseq.io"
     let userID = "synthetic-user"
     let graphID = "10000000-0000-4000-8000-000000000001"
-    let fixture = try makeFixture()
     setenv("LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE", "memory", 1)
     setenv("LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE", "memory", 1)
     defer {
@@ -66,6 +63,16 @@ private enum WrappedGraphKeyCryptoTest {
       JournalE2EECrypto.resetTestMemoryPrivateKeys()
     }
 
+    let malformed = "{\"operation\":\"deleteAccountSecrets\",\"origin\":\"\(origin)\",\"userId\":\"\(userID)\",\"iterations\":\"600000\"}"
+    let malformedResponse = malformed.withCString { logseqJournalCryptoJSON($0) }
+    guard let malformedResponse else { throw HarnessError.failed("missing malformed response") }
+    defer { free(malformedResponse) }
+    let malformedObject = try JSONSerialization.jsonObject(
+      with: Data(String(cString: malformedResponse).utf8)) as? [String: Any]
+    try require(malformedObject?["ok"] as? Bool == false,
+      "generated crypto decoder ignored an invalid typed field")
+
+    let fixture = try makeFixture()
     let query = try JournalE2EECrypto.wrappedGraphKeyQuery(
       origin: origin,
       userID: userID,
@@ -82,81 +89,81 @@ private enum WrappedGraphKeyCryptoTest {
       "accessibility belongs to the add attributes, not an exact lookup query"
     )
 
-    _ = try JournalE2EECrypto.handle([
-      "operation": "installTestPrivateKey",
-      "origin": origin,
-      "userId": userID,
-      "privateKey": hex(fixture.privateKey),
-    ])
-    _ = try JournalE2EECrypto.handle([
-      "operation": "verifyAndSaveWrappedGraphKey",
-      "origin": origin,
-      "userId": userID,
-      "graphId": graphID,
-      "encryptedGraphKey": fixture.wrapped,
-    ])
-    let loaded = try JournalE2EECrypto.handle([
-      "operation": "loadAndVerifyWrappedGraphKey",
-      "origin": origin,
-      "userId": userID,
-      "graphId": graphID,
-    ])
-    try require(loaded["value"] as? String == fixture.wrapped, "wrapped key did not round trip")
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "installTestPrivateKey",
+      origin: origin,
+      userId: userID,
+      privateKey: hex(fixture.privateKey)
+    ))
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "verifyAndSaveWrappedGraphKey",
+      origin: origin,
+      userId: userID,
+      graphId: graphID,
+      encryptedGraphKey: fixture.wrapped
+    ))
+    let loaded = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "loadAndVerifyWrappedGraphKey",
+      origin: origin,
+      userId: userID,
+      graphId: graphID
+    ))
+    try require(loaded.value == fixture.wrapped, "wrapped key did not round trip")
     try JournalE2EECrypto.removeTestMemoryPrivateKey(origin: origin, userID: userID)
     do {
-      _ = try JournalE2EECrypto.handle([
-        "operation": "loadAndVerifyWrappedGraphKey",
-        "origin": origin,
-        "userId": userID,
-        "graphId": graphID,
-      ])
+      _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+        operation: "loadAndVerifyWrappedGraphKey",
+        origin: origin,
+        userId: userID,
+        graphId: graphID
+      ))
       throw HarnessError.failed("missing private key loaded the wrapped graph key")
     } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
       // Expected: the serialized worker can report a distinct recovery reason.
     }
-    _ = try JournalE2EECrypto.handle([
-      "operation": "installTestPrivateKey",
-      "origin": origin,
-      "userId": userID,
-      "privateKey": hex(fixture.privateKey),
-    ])
-    _ = try JournalE2EECrypto.handle([
-      "operation": "verifyAndSaveWrappedGraphKey",
-      "origin": origin,
-      "userId": userID,
-      "graphId": graphID,
-      "encryptedGraphKey": fixture.wrapped,
-    ])
-    let transit = try JSONSerialization.jsonObject(with: Data(fixture.wrapped.utf8)) as? [String]
-    guard let encodedCiphertext = transit?[1].dropFirst(2),
-          let ciphertext = Data(base64Encoded: String(encodedCiphertext))
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "installTestPrivateKey",
+      origin: origin,
+      userId: userID,
+      privateKey: hex(fixture.privateKey)
+    ))
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "verifyAndSaveWrappedGraphKey",
+      origin: origin,
+      userId: userID,
+      graphId: graphID,
+      encryptedGraphKey: fixture.wrapped
+    ))
+    let transit = try JSONDecoder().decode([String].self, from: Data(fixture.wrapped.utf8))
+    let encodedCiphertext = transit[1].dropFirst(2)
+    guard let ciphertext = Data(base64Encoded: String(encodedCiphertext))
     else { throw HarnessError.failed("wrapped-key fixture could not be decoded") }
-    let unwrapped = try JournalE2EECrypto.handle([
-      "operation": "unwrapGraphKeyForEngine",
-      "origin": origin,
-      "userId": userID,
-      "ciphertext": hex(ciphertext),
-    ])
+    let unwrapped = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "unwrapGraphKeyForEngine",
+      origin: origin,
+      userId: userID,
+      ciphertext: hex(ciphertext)
+    ))
     try require(
-      unwrapped["value"] as? String == String(repeating: "5a", count: 32),
+      unwrapped.value == String(repeating: "5a", count: 32),
       "Engine unwrap did not return the synthetic graph key"
     )
     try expectFailure("obsolete plaintext-returning operation remained callable") {
-      _ = try JournalE2EECrypto.handle([
-        "operation": "decryptGraphKeyForUser",
-        "origin": origin,
-        "userId": userID,
-        "ciphertext": hex(ciphertext),
-      ])
+      _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+        operation: "decryptGraphKeyForUser",
+        origin: origin,
+        userId: userID,
+        ciphertext: hex(ciphertext)
+      ))
     }
 
     try expectFailure("another user loaded the wrapped key") {
-      _ = try JournalE2EECrypto.handle([
-        "operation": "loadAndVerifyWrappedGraphKey",
-        "origin": origin,
-        "userId": "another-user",
-        "graphId": graphID,
-      ])
+      _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+        operation: "loadAndVerifyWrappedGraphKey",
+        origin: origin,
+        userId: "another-user",
+        graphId: graphID
+      ))
     }
     try expectFailure("an invalid origin was accepted") {
       _ = try JournalE2EECrypto.wrappedGraphKeyQuery(
@@ -173,18 +180,18 @@ private enum WrappedGraphKeyCryptoTest {
       )
     }
 
-    _ = try JournalE2EECrypto.handle([
-      "operation": "deleteAccountSecrets",
-      "origin": origin,
-      "userId": userID,
-    ])
+    _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+      operation: "deleteAccountSecrets",
+      origin: origin,
+      userId: userID
+    ))
     try expectFailure("account cleanup retained the wrapped graph key") {
-      _ = try JournalE2EECrypto.handle([
-        "operation": "loadAndVerifyWrappedGraphKey",
-        "origin": origin,
-        "userId": userID,
-        "graphId": graphID,
-      ])
+      _ = try JournalE2EECrypto.handle(JournalCryptoRequest(
+        operation: "loadAndVerifyWrappedGraphKey",
+        origin: origin,
+        userId: userID,
+        graphId: graphID
+      ))
     }
   }
 }

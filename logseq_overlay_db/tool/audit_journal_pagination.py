@@ -11,6 +11,9 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import sys
+
+sys.dont_write_bytecode = True
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 INSTRUMENTATION = r'''
@@ -20,17 +23,19 @@ let days = ref []
 let add key calls rows =
   let c,r = Option.value (Hashtbl.find_opt metrics key) ~default:(0,0) in
   Hashtbl.replace metrics key (c+calls,r+rows)
+type metric = { calls : int; rows : int } [@@deriving yojson]
+type journal_days = int list [@@deriving yojson]
 let reset () = Hashtbl.clear metrics; days := []
 let json () : Yojson.Safe.t = `Assoc (
-  ("journal_days", `List (List.sort_uniq Int.compare !days |> List.map (fun n -> `Int n))) ::
+  ("journal_days", journal_days_to_yojson (List.sort_uniq Int.compare !days)) ::
   (Hashtbl.fold (fun key (calls,rows) acc ->
-    (key, `Assoc ["calls", `Int calls; "rows", `Int rows]) :: acc) metrics []))
+    (key, metric_to_yojson { calls; rows }) :: acc) metrics []))
 let key op index e a v = op ^ ":" ^
   (match index with Eavt -> "Eavt" | Aevt -> "Aevt" | Avet -> "Avet") ^ ":" ^
   (if Option.is_some e then "entity:" else "*:") ^
   Option.value a ~default:"*" ^ (if Option.is_some v then ":value" else "")
 let observe k seq = Seq.map (fun (d:datom) -> add k 0 1;
-  if d.a = "block/journal-day" then (match d.v with Int day -> days := day :: !days | _ -> ()); d) seq
+  if d.a = "block/journal-day" then (match d.v with Int64 day -> days := Int64.to_int day :: !days | _ -> ()); d) seq
 let datoms db index ?e ?a ?v ?tx () =
   let k = key "datoms" index e a v in add k 1 0;
   Datascript.datoms db index ?e ?a ?v ?tx () |> observe k
@@ -48,6 +53,12 @@ let find_datom db index ?e ?a ?v ?tx () =
 
 def run(args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def probe_ppx_flags():
+    """Use the installed Yojson deriver for probes compiled outside Dune."""
+    return shlex.split(run(['ocamlfind', 'printppx', 'ppx_deriving_yojson'],
+                           capture_output=True).stdout)
 
 
 def main():
@@ -89,7 +100,7 @@ def main():
                  for x in command if x.endswith(".cmxa")]
     includes = {str(pathlib.Path(x).parent) for x in libraries}
     includes.update(str(p) for p in (source / "_build/default").glob("**/.*.objs/byte"))
-    compiler = [command[0], "-thread"]
+    compiler = [command[0], "-thread"] + probe_ppx_flags()
     for path in sorted(includes):
         compiler += ["-I", path]
     probe = output / "journal_pagination_probe.ml"

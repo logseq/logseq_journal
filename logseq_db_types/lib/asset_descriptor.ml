@@ -2,18 +2,7 @@ type version =
   { checksum : string
   ; file_type : string
   }
-
-type source =
-  | Managed of version option
-  | External of string
-
-type t =
-  { uuid : Graph_types.Uuid.t
-  ; source : source
-  ; current_checksum : string option
-  ; size : int64 option
-  ; dimensions : (int * int) option
-  }
+[@@deriving yojson]
 
 let valid_checksum value =
   String.length value = 64
@@ -40,6 +29,25 @@ let version ~checksum ~file_type =
   else Ok { checksum; file_type }
 ;;
 
+let version_of_yojson json =
+  Result.bind (Json_codec.decode version_of_yojson json) (fun value ->
+    version ~checksum:value.checksum ~file_type:value.file_type)
+;;
+
+type source =
+  | Managed of version option
+  | External of string
+[@@deriving yojson]
+
+type t =
+  { uuid : Graph_types.Uuid.t
+  ; source : source
+  ; current_checksum : string option
+  ; size : int64 option
+  ; dimensions : (int * int) option
+  }
+[@@deriving yojson]
+
 let create ~uuid ~source ~current_checksum ~size ~dimensions =
   if
     Option.fold
@@ -59,3 +67,13 @@ let create ~uuid ~source ~current_checksum ~size ~dimensions =
 ;;
 
 let equal_version a b = a = b
+
+let of_yojson json =
+  Result.bind (Json_codec.decode of_yojson json) (fun value ->
+    create
+      ~uuid:value.uuid
+      ~source:value.source
+      ~current_checksum:value.current_checksum
+      ~size:value.size
+      ~dimensions:value.dimensions)
+;;

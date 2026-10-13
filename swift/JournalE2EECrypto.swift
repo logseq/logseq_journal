@@ -2,6 +2,31 @@ import CryptoKit
 import Foundation
 import Security
 
+// Swift's compiler synthesizes the native counterpart of the OCaml PPX DTOs.
+struct JournalCryptoRequest: Codable {
+  var operation: String
+  var origin: String
+  var userId: String
+  var graphId: String? = nil
+  var password: String? = nil
+  var iterations: Int? = nil
+  var salt: String? = nil
+  var iv: String? = nil
+  var ciphertext: String? = nil
+  var encryptedGraphKey: String? = nil
+  var privateKey: String? = nil
+}
+
+struct JournalCryptoResponse: Codable {
+  var ok: Bool
+  var error: String? = nil
+  var value: String? = nil
+  var wrappedKeysDeleted: Bool? = nil
+  var privateKeyDeleted: Bool? = nil
+  var encryptedGraphKey: String? = nil
+  var ciphertext: String? = nil
+}
+
 enum JournalE2EECryptoError: Error {
   case invalidRequest
   case operationFailed
@@ -175,13 +200,13 @@ enum JournalE2EECrypto {
     return canonical
   }
 
-  private static func identity(_ request: [String: Any], includeGraph: Bool) throws
+  private static func identity(_ request: JournalCryptoRequest, includeGraph: Bool) throws
     -> SecretIdentity
   {
     SecretIdentity(
-      origin: try normalizedOrigin(request["origin"]),
-      userID: try boundedUserID(request["userId"]),
-      graphID: includeGraph ? try canonicalGraphID(request["graphId"]) : nil
+      origin: try normalizedOrigin(request.origin),
+      userID: try boundedUserID(request.userId),
+      graphID: includeGraph ? try canonicalGraphID(request.graphId) : nil
     )
   }
 
@@ -191,12 +216,11 @@ enum JournalE2EECrypto {
       encryptedGraphKey.utf8.count <= 65_536,
       !encryptedGraphKey.contains("\0"),
       let data = encryptedGraphKey.data(using: .utf8),
-      let value = try JSONSerialization.jsonObject(with: data) as? [Any],
+      let value = try? JSONDecoder().decode([String].self, from: data),
       value.count == 2,
-      value[0] as? String == "~#'",
-      let encoded = value[1] as? String,
-      encoded.hasPrefix("~b"),
-      let ciphertext = Data(base64Encoded: String(encoded.dropFirst(2))),
+      value[0] == "~#'",
+      value[1].hasPrefix("~b"),
+      let ciphertext = Data(base64Encoded: String(value[1].dropFirst(2))),
       !ciphertext.isEmpty,
       ciphertext.count <= 65_536
     else { throw JournalE2EECryptoError.invalidRequest }
@@ -344,7 +368,7 @@ enum JournalE2EECrypto {
     let encryptedGraphKey = try readLengthDelimited(data, offset: &offset)
     guard offset == data.count else { throw JournalE2EECryptoError.invalidRequest }
     let identity = try self.identity(
-      ["origin": origin, "userId": userID, "graphId": graphID],
+      JournalCryptoRequest(operation: "", origin: origin, userId: userID, graphId: graphID),
       includeGraph: true
     )
     _ = try wrappedCiphertext(encryptedGraphKey)
@@ -359,7 +383,7 @@ enum JournalE2EECrypto {
 
   static func privateKeyQuery(origin: String, userID: String) throws -> [CFString: Any] {
     let identity = try self.identity(
-      ["origin": origin, "userId": userID],
+      JournalCryptoRequest(operation: "", origin: origin, userId: userID),
       includeGraph: false
     )
     var query: [CFString: Any] = [
@@ -377,7 +401,7 @@ enum JournalE2EECrypto {
     graphID: String
   ) throws -> [CFString: Any] {
     let identity = try self.identity(
-      ["origin": origin, "userId": userID, "graphId": graphID],
+      JournalCryptoRequest(operation: "", origin: origin, userId: userID, graphId: graphID),
       includeGraph: true
     )
     var query: [CFString: Any] = [
@@ -502,7 +526,7 @@ enum JournalE2EECrypto {
     environment: [String: String] = ProcessInfo.processInfo.environment
   ) throws {
     let identity = try self.identity(
-      ["origin": origin, "userId": userID],
+      JournalCryptoRequest(operation: "", origin: origin, userId: userID),
       includeGraph: false
     )
     let storage = try secretStorage(
@@ -546,7 +570,7 @@ enum JournalE2EECrypto {
     environment: [String: String] = ProcessInfo.processInfo.environment
   ) throws -> Data? {
     let identity = try self.identity(
-      ["origin": origin, "userId": userID],
+      JournalCryptoRequest(operation: "", origin: origin, userId: userID),
       includeGraph: false
     )
     let storage = try secretStorage(
@@ -804,7 +828,7 @@ enum JournalE2EECrypto {
 
   static func removeTestMemoryPrivateKey(origin: String, userID: String) throws {
     let identity = try self.identity(
-      ["origin": origin, "userId": userID],
+      JournalCryptoRequest(operation: "", origin: origin, userId: userID),
       includeGraph: false
     )
     testMemorySecretsLock.lock()
@@ -814,7 +838,7 @@ enum JournalE2EECrypto {
 
 #endif
 
-  private static func decryptedGraphKey(_ request: [String: Any]) throws -> Data {
+  private static func decryptedGraphKey(_ request: JournalCryptoRequest) throws -> Data {
     let identity = try self.identity(request, includeGraph: false)
     guard
       let privateKey = try loadPrivateKey(
@@ -826,7 +850,7 @@ enum JournalE2EECrypto {
     }
     let graphKey = try rsaOAEPDecrypt(
       privateKeyData: privateKey,
-      ciphertext: try hexData(request["ciphertext"])
+      ciphertext: try hexData(request.ciphertext)
     )
     guard graphKey.count == 32 else { throw JournalE2EECryptoError.operationFailed }
     return graphKey
@@ -851,32 +875,29 @@ enum JournalE2EECrypto {
     guard graphKey.count == 32 else { throw JournalE2EECryptoError.operationFailed }
   }
 
-  static func handle(_ request: [String: Any]) throws -> [String: Any] {
-    guard let operation = request["operation"] as? String else {
-      throw JournalE2EECryptoError.invalidRequest
-    }
-    switch operation {
+  static func handle(_ request: JournalCryptoRequest) throws -> JournalCryptoResponse {
+    switch request.operation {
     case "unlockPrivateKey":
       let identity = try self.identity(request, includeGraph: false)
       guard
-        let password = request["password"] as? String,
+        let password = request.password,
         !password.isEmpty,
         password.utf8.count <= 4096,
-        let iterations = request["iterations"] as? Int
+        let iterations = request.iterations
       else { throw JournalE2EECryptoError.invalidRequest }
       let key = try pbkdf2SHA256(
         password: Data(password.utf8),
-        salt: try hexData(request["salt"]),
+        salt: try hexData(request.salt),
         iterations: iterations
       )
       let privateKey = try aesOpen(
         key: key,
-        iv: try hexData(request["iv"]),
-        ciphertextAndTag: try hexData(request["ciphertext"])
+        iv: try hexData(request.iv),
+        ciphertextAndTag: try hexData(request.ciphertext)
       )
       _ = try rsaPrivateKey(privateKey)
       try savePrivateKey(origin: identity.origin, userID: identity.userID, key: privateKey)
-      return ["ok": true]
+      return JournalCryptoResponse(ok: true)
 
 #if DEBUG
     case "installTestWrappedGraphKeyFixture":
@@ -900,9 +921,7 @@ enum JournalE2EECrypto {
           &keyError
         ) as Data?,
         let transit = String(
-          data: try JSONSerialization.data(
-            withJSONObject: ["~#'", "~b\(ciphertext.base64EncodedString())"]
-          ),
+          data: try JSONEncoder().encode(["~#'", "~b\(ciphertext.base64EncodedString())"]),
           encoding: .utf8
         )
       else { throw JournalE2EECryptoError.operationFailed }
@@ -917,20 +936,17 @@ enum JournalE2EECrypto {
         encryptedGraphKey: transit,
         environment: ProcessInfo.processInfo.environment
       )
-      return [
-        "ok": true,
-        "encryptedGraphKey": transit,
-        "ciphertext": hex(ciphertext),
-      ]
+      return JournalCryptoResponse(ok: true, encryptedGraphKey: transit,
+        ciphertext: hex(ciphertext))
 
     case "installTestPrivateKey":
       let identity = try self.identity(request, includeGraph: false)
       try savePrivateKey(
         origin: identity.origin,
         userID: identity.userID,
-        key: try hexData(request["privateKey"])
+        key: try hexData(request.privateKey)
       )
-      return ["ok": true]
+      return JournalCryptoResponse(ok: true)
 #endif
 
     case "loadAndVerifyWrappedGraphKey":
@@ -956,11 +972,11 @@ enum JournalE2EECrypto {
         )
         throw JournalE2EECryptoError.wrappedGraphKeyUnavailable
       }
-      return ["ok": true, "value": encryptedGraphKey]
+      return JournalCryptoResponse(ok: true, value: encryptedGraphKey)
 
     case "verifyAndSaveWrappedGraphKey":
       let identity = try self.identity(request, includeGraph: true)
-      guard let encryptedGraphKey = request["encryptedGraphKey"] as? String else {
+      guard let encryptedGraphKey = request.encryptedGraphKey else {
         throw JournalE2EECryptoError.invalidRequest
       }
       try verifyWrappedGraphKey(identity: identity, encryptedGraphKey: encryptedGraphKey)
@@ -969,7 +985,7 @@ enum JournalE2EECrypto {
         encryptedGraphKey: encryptedGraphKey,
         environment: ProcessInfo.processInfo.environment
       )
-      return ["ok": true]
+      return JournalCryptoResponse(ok: true)
 
     case "deleteWrappedGraphKey":
       let identity = try self.identity(request, includeGraph: true)
@@ -977,7 +993,7 @@ enum JournalE2EECrypto {
         identity: identity,
         environment: ProcessInfo.processInfo.environment
       )
-      return ["ok": true]
+      return JournalCryptoResponse(ok: true)
 
     case "deleteAccountSecrets":
       let identity = try self.identity(request, includeGraph: false)
@@ -985,10 +1001,10 @@ enum JournalE2EECrypto {
         identity: identity,
         environment: ProcessInfo.processInfo.environment
       )
-      return ["ok": true, "wrappedKeysDeleted": true, "privateKeyDeleted": true]
+      return JournalCryptoResponse(ok: true, wrappedKeysDeleted: true, privateKeyDeleted: true)
 
     case "unwrapGraphKeyForEngine":
-      return ["ok": true, "value": hex(try decryptedGraphKey(request))]
+      return JournalCryptoResponse(ok: true, value: hex(try decryptedGraphKey(request)))
 
     default:
       throw JournalE2EECryptoError.invalidRequest
@@ -1001,25 +1017,25 @@ public func logseqJournalCryptoJSON(
   _ requestPointer: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>? {
   return autoreleasepool { () -> UnsafeMutablePointer<CChar>? in
-    let response: [String: Any]
+    let response: JournalCryptoResponse
     do {
       guard
         let requestPointer,
-        let data = String(cString: requestPointer).data(using: .utf8),
-        let request = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let data = String(cString: requestPointer).data(using: .utf8)
       else { throw JournalE2EECryptoError.invalidRequest }
+      let request = try JSONDecoder().decode(JournalCryptoRequest.self, from: data)
       response = try JournalE2EECrypto.handle(request)
     } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
-      response = ["ok": false, "error": "localPrivateKeyUnavailable"]
+      response = JournalCryptoResponse(ok: false, error: "localPrivateKeyUnavailable")
     } catch JournalE2EECryptoError.wrappedGraphKeyUnavailable {
-      response = ["ok": false, "error": "wrappedGraphKeyUnavailable"]
+      response = JournalCryptoResponse(ok: false, error: "wrappedGraphKeyUnavailable")
     } catch {
-      response = ["ok": false, "error": "cryptoOperationFailed"]
+      response = JournalCryptoResponse(ok: false, error: "cryptoOperationFailed")
     }
     guard
-      let data = try? JSONSerialization.data(withJSONObject: response),
+      let data = try? JSONEncoder().encode(response),
       let string = String(data: data, encoding: .utf8)
-    else { return strdup("{\"ok\":false,\"error\":\"crypto operation failed\"}") }
+    else { return nil }
     return strdup(string)
   }
 }

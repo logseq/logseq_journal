@@ -3,20 +3,11 @@ import SwiftUI
 /// Product preferences pushed to OCaml as an LJP2 tag-24 event, matching
 /// `Journal_environment.decode_json`. Native layout and accessibility behavior
 /// remain owned by SwiftUI and the native controls.
-struct JournalEnvironmentSample: Equatable {
+struct JournalEnvironmentSample: Equatable, Codable {
   var brightness = "light"
   var platform = "ios"
   var accessibleNavigation = false
   var highContrast = false
-
-  func jsonObject() -> [String: Any] {
-    [
-      "brightness": brightness,
-      "platform": platform,
-      "accessibleNavigation": accessibleNavigation,
-      "highContrast": highContrast,
-    ]
-  }
 }
 
 /// Observes product preferences at the application boundary. The platform

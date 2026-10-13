@@ -2044,3 +2044,58 @@ let scenarios =
         test_pull_without_registered_socket_reports_closed
     ]
 ;;
+
+(* Unsupported internal manifests are a filesystem fact owned by the runner. *)
+let test_legacy_manifest_is_rejected_without_cleanup () =
+  with_local_asset_cache (fun support request ->
+    let version =
+      Logseq_db_types.Asset_descriptor.version
+        ~checksum:(String.make 64 'a')
+        ~file_type:"bin"
+      |> Result.get_ok
+    in
+    cache_bool
+      "first cache starts empty"
+      true
+      (request (Core.Check_asset_cache (graph_id (), version))
+       = Ok (Core.Asset_cached None));
+    cache_unit (request Core.Close_asset_scope);
+    let rec graph_directory path =
+      if Filename.basename path = "11111111-1111-4111-8111-111111111111"
+      then Some path
+      else if Sys.is_directory path
+      then
+        Sys.readdir path
+        |> Array.to_list
+        |> List.find_map (fun entry -> graph_directory (Filename.concat path entry))
+      else None
+    in
+    let directory =
+      graph_directory (Filename.concat support "logseq-db-worker/assets") |> Option.get
+    in
+    let manifest = Filename.concat directory "legacy.json" in
+    let source =
+      {|{"asset":"11111111-1111-4111-8111-111111111111","type":"bin","checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":"1"}|}
+    in
+    Out_channel.with_open_bin manifest (fun out -> output_string out source);
+    cache_bool
+      "unsupported manifest fails cache open"
+      true
+      (match request (Core.Check_asset_cache (graph_id (), version)) with
+       | Error _ -> true
+       | Ok _ -> false);
+    cache_bool "unsupported manifest is retained" true (Sys.file_exists manifest);
+    Alcotest.(check string)
+      "unsupported bytes are not rewritten"
+      source
+      (In_channel.with_open_bin manifest In_channel.input_all))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "legacy manifest is rejected without cleanup"
+        `Quick
+        test_legacy_manifest_is_rejected_without_cleanup
+    ]
+;;

@@ -1,5 +1,5 @@
-type compatibility_profile = Logseq_65_33_or_newer
-type target = Managed_sync of { base_url : string }
+type compatibility_profile = Logseq_65_33_or_newer [@@deriving yojson]
+type target = Managed_sync of { base_url : string } [@@deriving yojson]
 
 type t =
   { application_support_directory : string
@@ -8,6 +8,7 @@ type t =
   ; response_budget_bytes : int
   ; default_page_size : int
   }
+[@@deriving yojson]
 
 let maximum_path_bytes = 4096
 
@@ -68,63 +69,12 @@ let create
       (validate_target target)
 ;;
 
-let target_to_yojson (Managed_sync { base_url }) =
-  `Assoc [ "kind", `String "managedSync"; "baseUrl", `String base_url ]
-;;
-
-let to_yojson value =
-  `Assoc
-    [ "applicationSupportDirectory", `String value.application_support_directory
-    ; "target", target_to_yojson value.target
-    ; "compatibilityProfile", `String "logseq-65.33-or-newer"
-    ; "responseBudgetBytes", `Int value.response_budget_bytes
-    ; "defaultPageSize", `Int value.default_page_size
-    ]
-;;
-
-let exact_fields expected fields =
-  let actual = List.map fst fields |> List.sort String.compare in
-  List.sort String.compare expected = actual
-;;
-
-let target_of_yojson = function
-  | `Assoc fields when exact_fields [ "baseUrl"; "kind" ] fields ->
-    (match List.assoc_opt "kind" fields, List.assoc_opt "baseUrl" fields with
-     | Some (`String "managedSync"), Some (`String base_url) ->
-       Ok (Managed_sync { base_url })
-     | _ -> Error "invalid managed sync target")
-  | _ -> Error "invalid target"
-;;
-
-let of_yojson = function
-  | `Assoc fields
-    when exact_fields
-           [ "applicationSupportDirectory"
-           ; "compatibilityProfile"
-           ; "defaultPageSize"
-           ; "responseBudgetBytes"
-           ; "target"
-           ]
-           fields ->
-    (match
-       ( List.assoc_opt "applicationSupportDirectory" fields
-       , List.assoc_opt "target" fields
-       , List.assoc_opt "compatibilityProfile" fields
-       , List.assoc_opt "responseBudgetBytes" fields
-       , List.assoc_opt "defaultPageSize" fields )
-     with
-     | ( Some (`String application_support_directory)
-       , Some target
-       , Some (`String "logseq-65.33-or-newer")
-       , Some (`Int response_budget_bytes)
-       , Some (`Int default_page_size) ) ->
-       Result.bind (target_of_yojson target) (fun target ->
-         create
-           ~application_support_directory
-           ~target
-           ~compatibility_profile:Logseq_65_33_or_newer
-           ~response_budget_bytes
-           ~default_page_size)
-     | _ -> Error "invalid config fields")
-  | _ -> Error "invalid config envelope"
+let of_yojson json =
+  Result.bind (Logseq_db_types.Json_codec.decode of_yojson json) (fun value ->
+    create
+      ~application_support_directory:value.application_support_directory
+      ~target:value.target
+      ~compatibility_profile:value.compatibility_profile
+      ~response_budget_bytes:value.response_budget_bytes
+      ~default_page_size:value.default_page_size)
 ;;

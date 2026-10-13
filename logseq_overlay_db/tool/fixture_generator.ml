@@ -25,6 +25,19 @@ let ensure_directory path =
   create path
 ;;
 
+type fixture_row =
+  { addr : int
+  ; content : string
+  ; addresses : string option
+  }
+[@@deriving yojson { strict = false }]
+
+type storage_fixture =
+  { table_sql : string [@key "tableSql"]
+  ; rows : fixture_row list
+  }
+[@@deriving yojson { strict = false }]
+
 let seed_mirror ~application_support_directory ~block_count =
   let graph_id = uuid "60000000-0000-4000-8000-000000000001" in
   let directory =
@@ -44,29 +57,26 @@ let seed_mirror ~application_support_directory ~block_count =
       (repository_root (Sys.getcwd ()))
       "logseq_db_worker/test/fixtures/storage/logseq-65.33-create-page.json"
     |> Yojson.Safe.from_file
+    |> storage_fixture_of_yojson
+    |> Result.get_ok
   in
-  let open Yojson.Safe.Util in
   let sqlite = Sqlite3.db_open database_path in
-  Sqlite3.Rc.check (Sqlite3.exec sqlite (fixture |> member "tableSql" |> to_string));
+  Sqlite3.Rc.check (Sqlite3.exec sqlite fixture.table_sql);
   let statement =
     Sqlite3.prepare sqlite "INSERT INTO kvs(addr, content, addresses) VALUES(?, ?, ?)"
   in
-  fixture
-  |> member "rows"
-  |> to_list
-  |> List.iter (fun row ->
+  fixture.rows
+  |> List.iter (fun (row : fixture_row) ->
     Sqlite3.Rc.check (Sqlite3.reset statement);
-    Sqlite3.Rc.check (Sqlite3.bind_int statement 1 (row |> member "addr" |> to_int));
-    Sqlite3.Rc.check
-      (Sqlite3.bind_text statement 2 (row |> member "content" |> to_string));
+    Sqlite3.Rc.check (Sqlite3.bind_int statement 1 row.addr);
+    Sqlite3.Rc.check (Sqlite3.bind_text statement 2 row.content);
     Sqlite3.Rc.check
       (Sqlite3.bind
          statement
          3
-         (match row |> member "addresses" with
-          | `Null -> Sqlite3.Data.NULL
-          | `String value -> TEXT value
-          | _ -> failwith "malformed storage fixture"));
+         (match row.addresses with
+          | None -> Sqlite3.Data.NULL
+          | Some value -> TEXT value));
     Sqlite3.Rc.check (Sqlite3.step statement));
   ignore (Sqlite3.finalize statement);
   if not (Sqlite3.db_close sqlite) then failwith "unable to close storage fixture";
@@ -178,109 +188,101 @@ let seed_mirror ~application_support_directory ~block_count =
   graph_id, database_path
 ;;
 
+let outbox_generation = ref 0
+
 let seed_outbox ~database_path ~block_count ~count =
   if count < 0 || count > 4_096 then invalid_arg "invalid performance outbox size";
-  let records =
-    List.init count (fun ordinal ->
-      let mutation_id = mutation_uuid ordinal in
-      let block = block_uuid (ordinal mod block_count) in
-      let title = Printf.sprintf "Pending title %d" ordinal in
-      let plaintext =
-        Printf.sprintf
-          "save:%s:%s:%S"
-          (Graph.Uuid.to_string mutation_id)
-          (Graph.Uuid.to_string block)
-          title
-      in
-      let fingerprint =
-        Digestif.SHA256.digest_string plaintext |> Digestif.SHA256.to_hex
-      in
-      let dependency_shadows = `Assoc [ "blocks", `List []; "pages", `List [] ] in
-      let module Transit = Transit_core.Json in
-      let module Codec = Transit_native.Transit.Json in
-      let entity =
-        Transit.Array
-          [ Transit.Keyword "block/uuid"; Transit.Uuid (Graph.Uuid.to_string block) ]
-      in
-      let normalized_transaction =
-        Codec.to_string
-          ~mode:Codec.Verbose
-          (Transit.Array
-             [ Transit.Array
-                 [ Keyword "db/add"; entity; Keyword "block/title"; String title ]
-             ; Transit.Array
-                 [ Keyword "db/add"
-                 ; entity
-                 ; Keyword "block/updated-at"
-                 ; Int (ordinal + 1)
-                 ]
-             ; Transit.Array
-                 [ Keyword "db/add"; entity; Keyword "block/tx-id"; Int (ordinal + 1) ]
-             ; Transit.Array
-                 [ Keyword "db/add"
-                 ; Keyword "db/current-tx"
-                 ; Keyword "db-sync/tx-id"
-                 ; Uuid (Graph.Uuid.to_string mutation_id)
-                 ]
-             ; Transit.Array
-                 [ Keyword "db/add"
-                 ; Keyword "db/current-tx"
-                 ; Keyword "outliner-op"
-                 ; Keyword "save-block"
-                 ]
-             ; Transit.Array
-                 [ Keyword "db/add"
-                 ; Keyword "db/current-tx"
-                 ; Keyword "logseq-overlay/mutation-digest"
-                 ; String fingerprint
-                 ]
-             ])
-      in
-      `Assoc
-        [ "acceptanceBarrier", `Null
-        ; "attemptCount", `Int 0
-        ; "blockedPriorState", `Null
-        ; "blockedReason", `Null
-        ; "fingerprint", `String fingerprint
-        ; "formatVersion", `Int 14
-        ; "intentTimeMs", `String (Int64.to_string (Int64.of_int (ordinal + 1)))
-        ; "plannedTx", `Int (ordinal + 1)
-        ; "sequence", `Int (ordinal + 1)
-        ; "dependencyShadows", dependency_shadows
-        ; ( "effectFootprint"
-          , `Assoc
-              [ "blocks", `List [ `String (Graph.Uuid.to_string block) ]
-              ; "pages", `List []
-              ; "structures", `List []
-              ] )
-        ; "deleteArtifacts", `Null
-        ; ( "mutation"
-          , `Assoc
-              [ "block", `String (Graph.Uuid.to_string block)
-              ; "mutationId", `String (Graph.Uuid.to_string mutation_id)
-              ; "title", `String title
-              ; "type", `String "saveBlock"
-              ] )
-        ; "normalizedTransaction", `String normalized_transaction
-        ; "protectedTransaction", `Null
-        ; "state", `Assoc [ "type", `String "queued" ]
-        ; "sameIdRetryEligible", `Bool false
-        ; "submissionTBefore", `Null
-        ; "submissionOrdinal", `Null
-        ; "submissionCount", `Null
-        ; "observedOriginCursor", `Null
-        ; "staleEarliestConflictCursor", `Null
-        ; "staleConflicts", `List []
-        ; "syncRevision", `Int count
-        ]
-      |> Yojson.Safe.to_string)
-  in
+  if count > 0 && block_count <= 0 then invalid_arg "outbox needs existing blocks";
+  let module Store = Logseq_db_storage.Sync_outbox_store in
+  let module Database = Logseq_overlay_db.Database in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database_path in
   Fun.protect
     ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
     (fun () ->
-       Logseq_db_storage.Sync_outbox_store.replace_database sqlite records
-       |> Result.get_ok)
+       Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
+       (match Store.read_revision sqlite |> Result.get_ok with
+        | None -> Store.replace_database sqlite [] |> Result.get_ok
+        | Some expected_revision ->
+          let deletes = ref [] in
+          Sqlite3.Rc.check
+            (Sqlite3.exec sqlite "SELECT mutation_id FROM sync_outbox" ~cb:(fun row _ ->
+               deletes := Option.get row.(0) :: !deletes));
+          Store.apply_delta
+            sqlite
+            { expected_revision
+            ; revision = expected_revision + 1
+            ; upserts = []
+            ; deletes = !deletes
+            }
+          |> Result.get_ok);
+       Sqlite3.Rc.check (Sqlite3.exec sqlite "COMMIT"));
+  incr outbox_generation;
+  let generation = !outbox_generation in
+  let graph_id = uuid (Filename.basename (Filename.dirname database_path)) in
+  let support =
+    database_path
+    |> Filename.dirname
+    |> Filename.dirname
+    |> Filename.dirname
+    |> Filename.dirname
+  in
+  let inspection =
+    Database.inspect_mirror ~application_support_directory:support ~graph_id
+    |> Result.get_ok
+  in
+  let clock = ref 1_704_067_200_000L in
+  let dependencies =
+    Database.dependencies
+      ~epoch_ms:(fun () ->
+        clock := Int64.succ !clock;
+        !clock)
+      ~monotonic_ns:(fun () -> Int64.mul !clock 1_000_000L)
+      ~limits:
+        Types.
+          { response_budget_bytes = 8 * 1_024 * 1_024
+          ; outbox_max_records = 4_096
+          ; outbox_max_bytes = 8 * 1_024 * 1_024
+          ; change_max_items = 4_096
+          ; change_max_bytes = 8 * 1_024 * 1_024
+          ; dispatcher_capacity = 128
+          ; wire_batch_max_bytes = 8 * 1_024 * 1_024
+          }
+    |> Result.get_ok
+  in
+  Eio.Switch.run (fun sw ->
+    let database =
+      Database.open_ ~sw dependencies inspection ~graph_name:"performance-fixture"
+      |> Result.get_ok
+    in
+    Fun.protect
+      ~finally:(fun () -> Database.close database |> Result.get_ok)
+      (fun () ->
+         for ordinal = 0 to count - 1 do
+           let block = block_uuid (ordinal mod block_count) in
+           let snapshot = Database.current_snapshot database |> Result.get_ok in
+           let revision =
+             Fun.protect
+               ~finally:(fun () -> Database.release_snapshot snapshot)
+               (fun () ->
+                  match Database.get_blocks snapshot [ block ] |> Result.get_ok with
+                  | [ Types.Present_block { revision; _ } ] -> revision
+                  | _ -> failwith "performance outbox block is missing")
+           in
+           let expected =
+             Database.write_precondition ~blocks:[ block, revision ] ~pages:[] ~scopes:[]
+             |> Result.get_ok
+           in
+           Database.commit_local
+             database
+             ~expected
+             (Types.Save_block
+                { mutation_id = mutation_uuid ((generation * 1_000_000) + ordinal)
+                ; block
+                ; title = Printf.sprintf "Pending title %d" ordinal
+                })
+           |> Result.get_ok
+           |> ignore
+         done))
 ;;
 
 let outbox_bytes ~database_path =

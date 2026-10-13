@@ -138,13 +138,73 @@ let scoped_cleanup () =
         [ c; d ]))
 ;;
 
+let generated_checkpoint_validation () =
+  fixture (fun path ->
+    with_db path (fun db ->
+      let original = intent 2 in
+      get (S.save db ~expected:None original);
+      let payload = ref "" in
+      Sqlite3.Rc.check
+        (Sqlite3.exec db "SELECT payload FROM asset_upload_intents" ~cb:(fun row _ ->
+           payload := Option.get row.(0)));
+      let replace before after source =
+        let n = String.length before in
+        let rec find i =
+          if i + n > String.length source
+          then source
+          else if String.sub source i n = before
+          then
+            String.sub source 0 i
+            ^ after
+            ^ String.sub source (i + n) (String.length source - i - n)
+          else find (i + 1)
+        in
+        find 0
+      in
+      let write payload =
+        let stmt = Sqlite3.prepare db "UPDATE asset_upload_intents SET payload=?" in
+        Fun.protect
+          ~finally:(fun () -> ignore (Sqlite3.finalize stmt))
+          (fun () ->
+             Sqlite3.Rc.check (Sqlite3.bind_text stmt 1 payload);
+             Sqlite3.Rc.check (Sqlite3.step stmt))
+      in
+      let reject label payload =
+        write payload;
+        Alcotest.(check bool)
+          label
+          true
+          (Result.is_error (S.read db ~operation:original.operation_id))
+      in
+      Alcotest.(check bool) "generated phase variant" true (String.contains !payload '[');
+      reject
+        "old checkpoint phase rejected"
+        (replace "[\"Prepared\"]" "\"prepared\"" !payload);
+      reject
+        "invalid UUID rejected"
+        (replace (U.to_string original.graph) "not-a-uuid" !payload);
+      reject "negative asset size rejected" (replace "\"size\":4" "\"size\":-1" !payload);
+      reject
+        "revision invariant rejected"
+        (replace "\"revision\":0" "\"revision\":-1" !payload);
+      Alcotest.(check bool) "oversized encoded checkpoint rejected" true
+        (Result.is_error (S.save db ~expected:None
+           (intent ~origin:(String.make 8193 'x') 3)));
+      write !payload;
+      Alcotest.(check bool)
+        "valid generated checkpoint recovers"
+        true
+        (get (S.read db ~operation:original.operation_id) = Some original)))
+;;
+
 let () =
   Alcotest.run
     "asset upload storage"
     [ ( "SQLite"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "scoped cleanup", scoped_cleanup
+          [ "generated checkpoint validation", generated_checkpoint_validation
+          ; "scoped cleanup", scoped_cleanup
           ; "restart", restart
           ; "atomic revision", atomic_revision
           ; "bounded recovery", paging

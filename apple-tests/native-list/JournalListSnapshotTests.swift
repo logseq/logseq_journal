@@ -10,7 +10,7 @@ import SwiftUI
     if !value() { failures += 1; FileHandle.standardOutput.write(Data(("FAIL: " + message + "\n").utf8)) }
   }
   static func payload(_ keys: [String], expanded: Bool? = nil, track: Bool = true,
-                      token: String? = nil, title: String = "Status") -> String {
+                      token: Int64? = nil, title: String = "Status") -> String {
     var rows: [[String: Any]] = keys.enumerated().map { index, key in
       ["type": "row", "key": key, "content_index": index,
        "context_menu": ["actions": [["key": "status", "title": title]]]]
@@ -116,11 +116,11 @@ import SwiftUI
     try patch(backend, payload(["a", "b"], expanded: true))
     await settle()
     check(!owner.receive(child, appeared: true), "re-expansion does not revive collapsed incarnation")
-    try patch(backend, payload(["a", "b"], expanded: true, track: false, token: "17"))
+    try patch(backend, payload(["a", "b"], expanded: true, track: false, token: 17))
     await settle()
     check(owner.snapshot?.properties.track_visible_range == false && owner.snapshot?.properties.scroll_request?.token == "17", "track flags and scroll tokens invalidate snapshot")
     let beforeNoop = owner.snapshot
-    try patch(backend, payload(["a", "b"], expanded: true, track: false, token: "17"))
+    try patch(backend, payload(["a", "b"], expanded: true, track: false, token: 17))
     await settle()
     check(owner.snapshot === beforeNoop, "identical backend payload does not replace snapshot")
     try patch(backend, "malformed")

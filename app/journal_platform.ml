@@ -98,96 +98,100 @@ let authenticated_user_request = encode_envelope 6 Bytes.empty |> Result.get_ok
 let local_account_binding_request = encode_envelope 20 Bytes.empty |> Result.get_ok
 let timeline_presented_request = encode_envelope 22 Bytes.empty |> Result.get_ok
 
-let decode_json_object label bytes f =
-  try
-    match Yojson.Safe.from_string (Bytes.to_string bytes) with
-    | `Assoc fields -> f fields
-    | _ -> Error (label ^ " must be a JSON object")
-  with
-  | Yojson.Json_error _ -> Error (label ^ " is not valid JSON")
+module Json = struct
+  type account = { userId : string option; managedSyncOrigin : string option }
+  [@@deriving yojson]
+  type user = { userId : string option } [@@deriving yojson]
+  type challenge = { challengeId : string } [@@deriving yojson]
+  type token = { challengeId : string; token : string } [@@deriving yojson]
+  type sign_out = { signedOut : bool } [@@deriving yojson]
+  type ready = { ready : bool } [@@deriving yojson]
+  type presented = { presented : bool } [@@deriving yojson]
+  type notice =
+    { token : int64; message : string; actionLabel : string option [@default None]; durationMs : int }
+  [@@deriving yojson]
+  type notice_result = { token : int64; result : string } [@@deriving yojson]
+  type cancel = { token : int64 } [@@deriving yojson]
+  type text = { text : string } [@@deriving yojson]
+  type copied = { copied : bool } [@@deriving yojson]
+end
+
+let decode_json label decoder bytes =
+  try Logseq_db_types.Json_codec.decode decoder (Yojson.Safe.from_string (Bytes.to_string bytes))
+  with Yojson.Json_error _ -> Error (label ^ " is not valid JSON")
 ;;
 
-let bounded_string maximum = function
-  | `String value
-    when String.length value > 0
-         && String.length value <= maximum
-         && Journal_validation.is_valid_utf_8 value
-         && not (String.contains value '\000') -> Ok value
-  | _ -> Error "platform auth text is invalid"
+let bounded_string maximum value =
+  if String.length value > 0 && String.length value <= maximum
+     && Journal_validation.is_valid_utf_8 value && not (String.contains value '\000')
+  then Ok value else Error "platform auth text is invalid"
 ;;
 
-let secure_origin = function
-  | `String value ->
-    let uri = Uri.of_string value in
-    (match Uri.scheme uri, Uri.host uri with
-     | Some "https", Some _ when String.length value <= 2048 -> Ok value
-     | _ -> Error "managed-sync origin must be one bounded HTTPS origin")
-  | _ -> Error "managed-sync origin is invalid"
+let secure_origin value =
+  let uri = Uri.of_string value in
+  match Uri.scheme uri, Uri.host uri with
+  | Some "https", Some _ when String.length value <= 2048 -> Ok value
+  | _ -> Error "managed-sync origin must be one bounded HTTPS origin"
 ;;
 
 let decode_local_account_binding bytes =
-  Result.bind (decode_envelope [ 21 ] bytes) (fun payload ->
-    decode_json_object "local-account-binding response" payload (fun fields ->
-      if List.length fields <> 2
-      then Error "local-account-binding response fields are invalid"
-      else (
-        match
-          List.assoc_opt "userId" fields, List.assoc_opt "managedSyncOrigin" fields
-        with
-        | Some `Null, Some `Null -> Ok None
-        | Some user_id, Some origin ->
-          Result.bind (bounded_string 512 user_id) (fun user_id ->
-            Result.map
-              (fun managed_sync_origin -> Some { user_id; managed_sync_origin })
-              (secure_origin origin))
-        | _ -> Error "local-account-binding response fields are invalid")))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [21] bytes in
+  let* wire = decode_json "local-account-binding response" Json.account_of_yojson payload in
+  match wire.userId, wire.managedSyncOrigin with
+  | None, None -> Ok None
+  | Some user_id, Some managed_sync_origin ->
+    let* user_id = bounded_string 512 user_id in
+    let* managed_sync_origin = secure_origin managed_sync_origin in
+    Ok (Some { user_id; managed_sync_origin })
+  | _ -> Error "local-account-binding response fields are invalid"
 ;;
 
 let decode_timeline_presented bytes =
-  Result.bind (decode_envelope [ 23 ] bytes) (fun payload ->
-    decode_json_object "Timeline-presented response" payload (fun fields ->
-      if List.length fields = 1 && List.assoc_opt "presented" fields = Some (`Bool true)
-      then Ok ()
-      else Error "Timeline-presented response is malformed"))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [23] bytes in
+  let* wire = decode_json "Timeline-presented response" Json.presented_of_yojson payload in
+  if wire.presented then Ok () else Error "Timeline-presented response is malformed"
 ;;
 
 let decode_authenticated_user bytes =
-  Result.bind (decode_envelope [ 7 ] bytes) (fun payload ->
-    decode_json_object "authenticated-user response" payload (function
-      | [ ("userId", `Null) ] -> Ok None
-      | [ ("userId", value) ] -> Result.map Option.some (bounded_string 512 value)
-      | _ -> Error "authenticated-user response fields are invalid"))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [7] bytes in
+  let* wire = decode_json "authenticated-user response" Json.user_of_yojson payload in
+  match wire.userId with
+  | None -> Ok None
+  | Some user -> Result.map Option.some (bounded_string 512 user)
+;;
+
+let json_request tag encoder value =
+  encoder value |> Yojson.Safe.to_string |> Bytes.of_string |> encode_envelope tag
 ;;
 
 let id_token_request (challenge : Graph_service.token_request) =
-  Yojson.Safe.to_string
-    (`Assoc [ "challengeId", `String (Graph_service.token_request_id challenge) ])
-  |> Bytes.of_string
-  |> encode_envelope 8
-  |> Result.get_ok
+  json_request 8 Json.challenge_to_yojson
+    { challengeId = Graph_service.token_request_id challenge } |> Result.get_ok
 ;;
 
 let decode_id_token_response ~challenge_id bytes =
-  Result.bind (decode_envelope [ 9 ] bytes) (fun payload ->
-    decode_json_object "ID-token response" payload (function
-      | [ ("challengeId", `String actual); ("token", token) ]
-      | [ ("token", token); ("challengeId", `String actual) ]
-        when String.equal actual challenge_id ->
-        bounded_string maximum_envelope_payload_bytes token
-      | _ -> Error "ID-token response is unsolicited or malformed"))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [9] bytes in
+  let* wire = decode_json "ID-token response" Json.token_of_yojson payload in
+  if String.equal wire.challengeId challenge_id
+  then bounded_string maximum_envelope_payload_bytes wire.token
+  else Error "ID-token response is unsolicited"
 ;;
 
 let sign_out_request = encode_envelope 10 Bytes.empty |> Result.get_ok
 
 let decode_sign_out_response bytes =
-  Result.bind (decode_envelope [ 11 ] bytes) (fun payload ->
-    decode_json_object "sign-out response" payload (function
-      | [ ("signedOut", `Bool true) ] -> Ok ()
-      | _ -> Error "sign-out response fields are invalid"))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [11] bytes in
+  let* wire = decode_json "sign-out response" Json.sign_out_of_yojson payload in
+  if wire.signedOut then Ok () else Error "sign-out response fields are invalid"
 ;;
 
 let is_prepare_to_terminate_event bytes =
-  match decode_envelope [ 12 ] bytes with
+  match decode_envelope [12] bytes with
   | Ok payload -> Bytes.length payload = 0
   | Error _ -> false
 ;;
@@ -195,86 +199,56 @@ let is_prepare_to_terminate_event bytes =
 let termination_ready_request = encode_envelope 13 Bytes.empty |> Result.get_ok
 
 let decode_termination_ready_response bytes =
-  Result.bind (decode_envelope [ 14 ] bytes) (fun payload ->
-    decode_json_object "termination-ready response" payload (function
-      | [ ("ready", `Bool true) ] -> Ok ()
-      | _ -> Error "termination-ready response fields are invalid"))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [14] bytes in
+  let* wire = decode_json "termination-ready response" Json.ready_of_yojson payload in
+  if wire.ready then Ok () else Error "termination-ready response fields are invalid"
 ;;
 
-type notice_result =
-  | Notice_action
-  | Notice_dismiss
-  | Notice_swipe
-  | Notice_timeout
+type notice_result = Notice_action | Notice_dismiss | Notice_swipe | Notice_timeout
 
 let decode_environment_event bytes =
-  Result.bind (decode_envelope [ 24 ] bytes) (fun payload ->
-    match
-      Yojson.Basic.from_string (Bytes.to_string payload)
-      |> Journal_environment.decode_json
-    with
+  Result.bind (decode_envelope [24] bytes) (fun payload ->
+    match Yojson.Basic.from_string (Bytes.to_string payload) |> Journal_environment.decode_json with
     | Ok snapshot -> Ok snapshot
     | Error error -> Error ("environment event: " ^ error)
     | exception Yojson.Json_error _ -> Error "environment event is not valid JSON")
 ;;
 
-let is_environment_event bytes =
-  match decode_envelope [ 24 ] bytes with
-  | Ok _ -> true
-  | Error _ -> false
-;;
+let is_environment_event bytes = Result.is_ok (decode_envelope [24] bytes)
 
 let show_notice_request ~token ~message ~action_label ~duration_ms =
-  `Assoc
-    [ "token", `String (Int64.to_string token)
-    ; "message", `String message
-    ; ( "actionLabel"
-      , match action_label with
-        | Some label -> `String label
-        | None -> `Null )
-    ; "durationMs", `Int duration_ms
-    ]
-  |> Yojson.Safe.to_string
-  |> Bytes.of_string
-  |> encode_envelope 25
+  json_request 25 Json.notice_to_yojson
+    { token; message; actionLabel = action_label; durationMs = duration_ms }
   |> Result.get_ok
 ;;
 
 let decode_notice_response ~token bytes =
-  Result.bind (decode_envelope [ 26 ] bytes) (fun payload ->
-    decode_json_object "notice response" payload (fun fields ->
-      match List.assoc_opt "token" fields, List.assoc_opt "result" fields with
-      | Some (`String actual), Some (`String result)
-        when String.equal actual (Int64.to_string token) ->
-        (match result with
-         | "action" -> Ok Notice_action
-         | "dismiss" -> Ok Notice_dismiss
-         | "swipe" -> Ok Notice_swipe
-         | "timeout" -> Ok Notice_timeout
-         | _ -> Error "notice response result is unsupported")
-      | _ -> Error "notice response fields are invalid"))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [26] bytes in
+  let* wire = decode_json "notice response" Json.notice_result_of_yojson payload in
+  if wire.token <> token then Error "notice response token is unsolicited"
+  else match wire.result with
+    | "action" -> Ok Notice_action
+    | "dismiss" -> Ok Notice_dismiss
+    | "swipe" -> Ok Notice_swipe
+    | "timeout" -> Ok Notice_timeout
+    | _ -> Error "notice response result is unsupported"
 ;;
 
 let notice_cancel_request ~token =
-  `Assoc [ "token", `String (Int64.to_string token) ]
-  |> Yojson.Safe.to_string
-  |> Bytes.of_string
-  |> encode_envelope 27
-  |> Result.get_ok
+  json_request 27 Json.cancel_to_yojson { token } |> Result.get_ok
 ;;
 
 let copy_text_request ~text =
   if not (Journal_validation.is_valid_utf_8 text)
   then Error "Clipboard text is invalid."
-  else
-    encode_envelope
-      28
-      (Yojson.Safe.to_string (`Assoc [ "text", `String text ]) |> Bytes.of_string)
+  else json_request 28 Json.text_to_yojson { text }
 ;;
 
 let decode_copy_text_response bytes =
-  Result.bind (decode_envelope [ 29 ] bytes) (fun payload ->
-    decode_json_object "clipboard response" payload (function
-      | [ ("copied", `Bool true) ] -> Ok ()
-      | _ -> Error "Clipboard write was not acknowledged."))
+  let ( let* ) = Result.bind in
+  let* payload = decode_envelope [29] bytes in
+  let* wire = decode_json "clipboard response" Json.copied_of_yojson payload in
+  if wire.copied then Ok () else Error "Clipboard write was not acknowledged."
 ;;

@@ -19,15 +19,15 @@ let strings name json =
   | _ -> T.fail "%s is not a list" name
 ;;
 
+let constructor = function
+  | `List (`String name :: _) -> name
+  | _ -> T.fail "expected a generated variant"
+;;
+
 let command_types json =
   match assoc "requests" json with
   | `List requests ->
-    List.map
-      (fun request ->
-         match assoc "type" (assoc "command" request) with
-         | `String value -> value
-         | _ -> T.fail "command type is not a string")
-      requests
+    List.map (fun request -> constructor (assoc "command" request)) requests
   | _ -> T.fail "requests is not a list"
 ;;
 
@@ -35,10 +35,9 @@ let outcome_types json =
   match assoc "responses" json with
   | `List responses ->
     List.map
-      (fun response ->
-         match assoc "type" (assoc "outcome" response) with
-         | `String value -> value
-         | _ -> T.fail "outcome type is not a string")
+      (function
+        | `List [ `String "V2_response"; fields ] -> constructor (assoc "outcome" fields)
+        | _ -> T.fail "expected a generated response")
       responses
   | _ -> T.fail "responses is not a list"
 ;;
@@ -86,30 +85,34 @@ let () =
     ; T.case "v2 catalog contains only the current App surface" (fun () ->
         require_exact
           "read operations"
-          [ "getBlock"
-          ; "getChildren"
-          ; "getPage"
-          ; "getPageTree"
-          ; "graphInfo"
-          ; "inspectAdmission"
-          ; "listFavorites"
-          ; "listJournals"
+          [ "V2_get_block"
+          ; "V2_get_children"
+          ; "V2_get_page"
+          ; "V2_get_page_tree"
+          ; "V2_graph_info"
+          ; "V2_inspect_admission"
+          ; "V2_list_favorites"
+          ; "V2_list_journals"
+          ; "V2_get_asset_descriptors"
+          ; "V2_list_assets"
+          ; "V2_get_block_summary"
           ]
-          (strings "readOperations" commands);
+          (strings "read_operations" commands);
         require_exact
           "mutation operations"
-          [ "clearTaskStatus"
-          ; "createJournalPage"
-          ; "deleteBlocks"
-          ; "insertBlocks"
-          ; "saveBlock"
-          ; "setTaskStatus"
+          [ "V2_clear_task_status"
+          ; "V2_create_journal_page"
+          ; "V2_delete_blocks"
+          ; "V2_insert_blocks"
+          ; "V2_save_block"
+          ; "V2_set_task_status"
+          ; "V2_set_asset_reference"
           ]
-          (strings "mutationOperations" commands);
+          (strings "mutation_operations" commands);
         require_exact
           "change operations"
-          [ "ackChanges"; "pullChanges" ]
-          (strings "changeOperations" commands))
+          [ "V2_ack_changes"; "V2_pull_changes" ]
+          (strings "change_operations" commands))
     ; T.case "v2 requests contain no basis or generic selector shapes" (fun () ->
         List.iter
           (fun key ->
@@ -139,9 +142,9 @@ let () =
                (contains_substring encoded expected)
                "v2 outcomes omit %s"
                expected)
-          [ "changesAvailable"
-          ; "changesAcknowledged"
-          ; "resyncRequired"
+          [ "V2_changes_available"
+          ; "V2_changes_acknowledged"
+          ; "V2_resync_required"
           ; "predecessor"
           ; "successor"
           ])
@@ -153,17 +156,17 @@ let () =
                (List.mem expected actual)
                "v2 outcomes omit retained App read %s"
                expected)
-          [ "graphInfo"
-          ; "admission"
-          ; "journals"
-          ; "page"
-          ; "block"
-          ; "children"
-          ; "pageTree"
+          [ "V2_graph_info_outcome"
+          ; "V2_admission_outcome"
+          ; "V2_journals_outcome"
+          ; "V2_page_outcome"
+          ; "V2_block_outcome"
+          ; "V2_children_outcome"
+          ; "V2_page_tree_outcome"
           ])
     ; T.case "v2 command catalog is the executable protocol catalog" (fun () ->
         let expected = command_types commands in
-        T.require (List.length expected = 16) "unexpected v2 request count";
+        T.require (List.length expected = 20) "unexpected v2 request count";
         List.iter
           (fun request ->
              match Logseq_db_worker.Protocol.request_of_yojson request with

@@ -62,104 +62,104 @@ let rec block_tree_of_dto tree =
 
 type save_block_v16 =
   { block : string
-  ; mutation_id : string [@key "mutationId"]
+  ; mutation_id : string
   ; title : string
-  ; kind : string [@key "type"]
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type asset_metadata_v16 =
   { replace_reference : string option
   ; checksum : string
   ; file_type : string
-  ; size : string
+  ; size : int64
   }
 [@@deriving yojson]
 
 type insert_blocks_v16 =
-  { mutation_id : string [@key "mutationId"]
+  { mutation_id : string
   ; parent : string
   ; tree : block_tree_v16
   ; asset : asset_metadata_v16 option
-  ; kind : string [@key "type"]
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type delete_blocks_v16 =
-  { mutation_id : string [@key "mutationId"]
+  { mutation_id : string
   ; root : string
-  ; kind : string [@key "type"]
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type create_journal_page_v16 =
-  { journal_day : int [@key "journalDay"]
-  ; mutation_id : string [@key "mutationId"]
+  { journal_day : int
+  ; mutation_id : string
   ; page : string
   ; title : string
-  ; kind : string [@key "type"]
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type set_task_status_v16 =
   { block : string
-  ; mutation_id : string [@key "mutationId"]
-  ; status : string
-  ; kind : string [@key "type"]
+  ; mutation_id : string
+  ; status : Json.task_status
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type clear_task_status_v16 =
   { block : string
-  ; mutation_id : string [@key "mutationId"]
-  ; kind : string [@key "type"]
+  ; mutation_id : string
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 type publish_asset_v16 =
-  { mutation_id : string [@key "mutationId"]
+  { mutation_id : string
   ; block : string
   ; checksum : string
   ; file_type : string
-  ; kind : string [@key "type"]
   }
 [@@deriving yojson]
 
 type asset_reference_v16 =
-  { mutation_id : string [@key "mutationId"]
+  { mutation_id : string
   ; block : string
   ; previous : string option
   ; asset : string
-  ; kind : string [@key "type"]
   }
 [@@deriving yojson]
 
-let mutation_to_yojson = function
+type mutation_wire =
+  | Set_asset_reference of asset_reference_v16
+  | Publish_asset of publish_asset_v16
+  | Save_block of save_block_v16
+  | Insert_blocks of insert_blocks_v16
+  | Delete_blocks of delete_blocks_v16
+  | Create_journal_page of create_journal_page_v16
+  | Set_task_status of set_task_status_v16
+  | Clear_task_status of clear_task_status_v16
+[@@deriving yojson]
+
+let mutation_to_wire = function
   | Types.Set_asset_reference { mutation_id; block; previous; asset } ->
-    asset_reference_v16_to_yojson
+    Set_asset_reference
       { mutation_id = Graph.Uuid.to_string mutation_id
       ; block = Graph.Uuid.to_string block
       ; previous = Option.map Graph.Uuid.to_string previous
       ; asset = Graph.Uuid.to_string asset
-      ; kind = "setAssetReference"
       }
   | Types.Publish_asset { mutation_id; block; version } ->
-    publish_asset_v16_to_yojson
+    Publish_asset
       { mutation_id = Graph.Uuid.to_string mutation_id
       ; block = Graph.Uuid.to_string block
       ; checksum = version.checksum
       ; file_type = version.file_type
-      ; kind = "publishAsset"
       }
   | Types.Save_block { mutation_id; block; title } ->
-    save_block_v16_to_yojson
+    Save_block
       { block = Graph.Uuid.to_string block
       ; mutation_id = Graph.Uuid.to_string mutation_id
       ; title
-      ; kind = "saveBlock"
       }
   | Insert_blocks { mutation_id; tree; parent; asset } ->
-    insert_blocks_v16_to_yojson
+    Insert_blocks
       { mutation_id = Graph.Uuid.to_string mutation_id
       ; parent = Graph.Uuid.to_string parent
       ; tree = block_tree_to_dto tree
@@ -170,152 +170,115 @@ let mutation_to_yojson = function
                    Option.map Graph.Uuid.to_string asset.replace_reference
                ; checksum = asset.version.checksum
                ; file_type = asset.version.file_type
-               ; size = Int64.to_string asset.size
+               ; size = asset.size
                })
             asset
-      ; kind = "insertBlocks"
       }
   | Delete_blocks { mutation_id; root } ->
-    delete_blocks_v16_to_yojson
-      { mutation_id = Graph.Uuid.to_string mutation_id
-      ; root = Graph.Uuid.to_string root
-      ; kind = "deleteBlocks"
-      }
+    Delete_blocks
+      { mutation_id = Graph.Uuid.to_string mutation_id; root = Graph.Uuid.to_string root }
   | Create_journal_page { mutation_id; page; title; journal_day } ->
-    create_journal_page_v16_to_yojson
+    Create_journal_page
       { journal_day
       ; mutation_id = Graph.Uuid.to_string mutation_id
       ; page = Graph.Uuid.to_string page
       ; title
-      ; kind = "createJournalPage"
       }
   | Set_task_status { mutation_id; block; status } ->
-    set_task_status_v16_to_yojson
+    Set_task_status
       { block = Graph.Uuid.to_string block
       ; mutation_id = Graph.Uuid.to_string mutation_id
-      ; status = Json.task_status_to_string status
-      ; kind = "setTaskStatus"
+      ; status
       }
   | Clear_task_status { mutation_id; block } ->
-    clear_task_status_v16_to_yojson
+    Clear_task_status
       { block = Graph.Uuid.to_string block
       ; mutation_id = Graph.Uuid.to_string mutation_id
-      ; kind = "clearTaskStatus"
       }
 ;;
 
+let mutation_of_wire = function
+  | Set_asset_reference value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* block = Graph.Uuid.of_string value.block in
+    let* asset = Graph.Uuid.of_string value.asset in
+    let* previous =
+      match value.previous with
+      | None -> Ok None
+      | Some text -> Result.map Option.some (Graph.Uuid.of_string text)
+    in
+    Ok (Types.Set_asset_reference { mutation_id; block; previous; asset })
+  | Publish_asset value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* block = Graph.Uuid.of_string value.block in
+    let* version =
+      Logseq_db_types.Asset_descriptor.version
+        ~checksum:value.checksum
+        ~file_type:value.file_type
+    in
+    Ok (Types.Publish_asset { mutation_id; block; version })
+  | Save_block value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* block = Graph.Uuid.of_string value.block in
+    Ok (Types.Save_block { mutation_id; block; title = value.title })
+  | Insert_blocks value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* parent = Graph.Uuid.of_string value.parent in
+    let* tree = block_tree_of_dto value.tree in
+    let* asset =
+      match value.asset with
+      | None -> Ok None
+      | Some asset ->
+        let* version =
+          Logseq_db_types.Asset_descriptor.version
+            ~checksum:asset.checksum
+            ~file_type:asset.file_type
+        in
+        let* replace_reference =
+          match asset.replace_reference with
+          | None -> Ok None
+          | Some text -> Result.map Option.some (Graph.Uuid.of_string text)
+        in
+        if asset.size >= 0L && asset.size <= 104857600L
+        then Ok (Some Types.{ replace_reference; version; size = asset.size })
+        else Error "Invalid persisted asset size"
+    in
+    Ok (Types.Insert_blocks { mutation_id; tree; parent; asset })
+  | Delete_blocks value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* root = Graph.Uuid.of_string value.root in
+    Ok (Types.Delete_blocks { mutation_id; root })
+  | Create_journal_page value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* page = Graph.Uuid.of_string value.page in
+    Ok
+      (Types.Create_journal_page
+         { mutation_id; page; title = value.title; journal_day = value.journal_day })
+  | Set_task_status value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* block = Graph.Uuid.of_string value.block in
+    let status = value.status in
+    Ok (Types.Set_task_status { mutation_id; block; status })
+  | Clear_task_status value ->
+    let* mutation_id = Graph.Uuid.of_string value.mutation_id in
+    let* block = Graph.Uuid.of_string value.block in
+    Ok (Types.Clear_task_status { mutation_id; block })
+;;
+
+let mutation_to_yojson value = mutation_wire_to_yojson (mutation_to_wire value)
+
 let mutation_of_yojson json =
-  match json with
-  | `Assoc fields ->
-    (match List.assoc_opt "type" fields with
-     | Some (`String "setAssetReference") ->
-       let* value = asset_reference_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* block = Graph.Uuid.of_string value.block in
-       let* asset = Graph.Uuid.of_string value.asset in
-       let* previous =
-         match value.previous with
-         | None -> Ok None
-         | Some text -> Result.map Option.some (Graph.Uuid.of_string text)
-       in
-       Ok (Types.Set_asset_reference { mutation_id; block; previous; asset })
-     | Some (`String "publishAsset") ->
-       let* value = publish_asset_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* block = Graph.Uuid.of_string value.block in
-       let* version =
-         Logseq_db_types.Asset_descriptor.version
-           ~checksum:value.checksum
-           ~file_type:value.file_type
-       in
-       Ok (Types.Publish_asset { mutation_id; block; version })
-     | Some (`String "saveBlock") ->
-       let* value = save_block_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* block = Graph.Uuid.of_string value.block in
-       Ok (Types.Save_block { mutation_id; block; title = value.title })
-     | Some (`String "insertBlocks") ->
-       let* value = insert_blocks_v16_of_yojson json in
-       let* () =
-         match List.assoc_opt "tree" fields with
-         | Some tree when tree = block_tree_v16_to_yojson value.tree -> Ok ()
-         | _ -> Error "invalid block tree"
-       in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* parent = Graph.Uuid.of_string value.parent in
-       let* tree = block_tree_of_dto value.tree in
-       let* asset =
-         match value.asset with
-         | None -> Ok None
-         | Some asset ->
-           let* version =
-             Logseq_db_types.Asset_descriptor.version
-               ~checksum:asset.checksum
-               ~file_type:asset.file_type
-           in
-           let* replace_reference =
-             match asset.replace_reference with
-             | None -> Ok None
-             | Some text -> Result.map Option.some (Graph.Uuid.of_string text)
-           in
-           (match Int64.of_string_opt asset.size with
-            | Some size when size >= 0L && size <= 104857600L ->
-              Ok (Some Types.{ replace_reference; version; size })
-            | _ -> Error "Invalid persisted asset size")
-       in
-       Ok (Types.Insert_blocks { mutation_id; tree; parent; asset })
-     | Some (`String "deleteBlocks") ->
-       let* value = delete_blocks_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* root = Graph.Uuid.of_string value.root in
-       Ok (Types.Delete_blocks { mutation_id; root })
-     | Some (`String "createJournalPage") ->
-       let* value = create_journal_page_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* page = Graph.Uuid.of_string value.page in
-       Ok
-         (Types.Create_journal_page
-            { mutation_id; page; title = value.title; journal_day = value.journal_day })
-     | Some (`String "setTaskStatus") ->
-       let* value = set_task_status_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* block = Graph.Uuid.of_string value.block in
-       let* status = Json.task_status_of_string value.status in
-       Ok (Types.Set_task_status { mutation_id; block; status })
-     | Some (`String "clearTaskStatus") ->
-       let* value = clear_task_status_v16_of_yojson json in
-       let* mutation_id = Graph.Uuid.of_string value.mutation_id in
-       let* block = Graph.Uuid.of_string value.block in
-       Ok (Types.Clear_task_status { mutation_id; block })
-     | _ -> Error "invalid mutation type")
-  | _ -> Error "mutation is not an object"
+  let* value = mutation_wire_of_yojson json in
+  mutation_of_wire value
 ;;
 
-let structure_interest_to_yojson = function
-  | Types.Children_interest parent ->
-    `Assoc [ "parent", Json.uuid_to_yojson parent; "type", `String "children" ]
-  | Page_tree_interest page ->
-    `Assoc [ "page", Json.uuid_to_yojson page; "type", `String "pageTree" ]
-  | Journal_index_interest -> `Assoc [ "type", `String "journalIndex" ]
-;;
+type structure_interest = Types.structure_interest =
+  | Children_interest of Graph.block_uuid
+  | Page_tree_interest of Graph.page_uuid
+  | Journal_index_interest
+[@@deriving yojson]
 
-let structure_interest_of_yojson = function
-  | `Assoc [ ("parent", parent); ("type", `String "children") ] ->
-    Result.map (fun parent -> Types.Children_interest parent) (Json.uuid_of_yojson parent)
-  | `Assoc [ ("page", page); ("type", `String "pageTree") ] ->
-    Result.map (fun page -> Types.Page_tree_interest page) (Json.uuid_of_yojson page)
-  | `Assoc [ ("type", `String "journalIndex") ] -> Ok Types.Journal_index_interest
-  | _ -> Error "invalid structure interest"
-;;
-
-let structure_interests_to_yojson values =
-  `List (List.map structure_interest_to_yojson values)
-;;
-
-let structure_interests_of_yojson = function
-  | `List values -> list_map_result structure_interest_of_yojson values
-  | _ -> Error "invalid structure interest list"
-;;
+type structure_interests = structure_interest list [@@deriving yojson]
 
 type footprint_v16 =
   { blocks : string list
@@ -340,47 +303,25 @@ let footprint_of_dto footprint =
   Ok { block_uuids; page_uuids; structure_interests = footprint.structures }
 ;;
 
-let page_kind_to_yojson = function
-  | Graph.Ordinary_page -> `Assoc [ "type", `String "ordinary" ]
-  | Journal_page { journal_day } ->
-    `Assoc [ "journalDay", `Int journal_day; "type", `String "journal" ]
-  | Class_page -> `Assoc [ "type", `String "class" ]
-  | Property_page -> `Assoc [ "type", `String "property" ]
-  | Hidden_page -> `Assoc [ "type", `String "hidden" ]
-  | Built_in_page -> `Assoc [ "type", `String "builtIn" ]
-;;
-
-let page_kind_of_yojson = function
-  | `Assoc [ ("type", `String "ordinary") ] -> Ok Graph.Ordinary_page
-  | `Assoc [ ("journalDay", `Int journal_day); ("type", `String "journal") ] ->
-    Ok (Graph.Journal_page { journal_day })
-  | `Assoc [ ("type", `String "class") ] -> Ok Graph.Class_page
-  | `Assoc [ ("type", `String "property") ] -> Ok Graph.Property_page
-  | `Assoc [ ("type", `String "hidden") ] -> Ok Graph.Hidden_page
-  | `Assoc [ ("type", `String "builtIn") ] -> Ok Graph.Built_in_page
-  | _ -> Error "invalid dependency page kind"
-;;
-
 type dependency_block_shadow_v16 =
-  { created_at_ms : int64 [@key "createdAtMs"] [@encoding `string]
+  { created_at_ms : int64
   ; order : string
   ; page : string
   ; parent : string
-  ; task_status : string option [@key "taskStatus"]
+  ; task_status : Json.task_status option
   ; title : string
-  ; updated_at_ms : int64 [@key "updatedAtMs"] [@encoding `string]
+  ; updated_at_ms : int64
   ; uuid : string
   }
 [@@deriving yojson]
 
 type dependency_page_shadow_v16 =
-  { created_at_ms : int64 [@key "createdAtMs"] [@encoding `string]
-  ; kind :
-      (Graph.page_kind[@to_yojson page_kind_to_yojson] [@of_yojson page_kind_of_yojson])
+  { created_at_ms : int64
+  ; kind : Graph.page_kind
   ; name : string
   ; recycled : bool
   ; title : string
-  ; updated_at_ms : int64 [@key "updatedAtMs"] [@encoding `string]
+  ; updated_at_ms : int64
   ; uuid : string
   }
 [@@deriving yojson]
@@ -396,7 +337,7 @@ let dependency_block_shadow_to_dto (shadow : dependency_block_shadow) =
   ; order = shadow.shadow_order
   ; page = Graph.Uuid.to_string shadow.shadow_page
   ; parent = Graph.Uuid.to_string shadow.shadow_parent
-  ; task_status = Option.map Json.task_status_to_string shadow.shadow_task_status
+  ; task_status = shadow.shadow_task_status
   ; title = shadow.shadow_title
   ; updated_at_ms = shadow.shadow_updated_at_ms
   ; uuid = Graph.Uuid.to_string shadow.shadow_block_uuid
@@ -407,11 +348,7 @@ let dependency_block_shadow_of_dto (shadow : dependency_block_shadow_v16) =
   let* shadow_block_uuid = Graph.Uuid.of_string shadow.uuid in
   let* shadow_parent = Graph.Uuid.of_string shadow.parent in
   let* shadow_page = Graph.Uuid.of_string shadow.page in
-  let* shadow_task_status =
-    match shadow.task_status with
-    | None -> Ok None
-    | Some value -> Result.map Option.some (Json.task_status_of_string value)
-  in
+  let shadow_task_status = shadow.task_status in
   Ok
     { shadow_block_uuid
     ; shadow_title = shadow.title
@@ -463,38 +400,38 @@ let dependency_shadows_of_dto (shadows : dependency_shadows_v16) =
 type delete_block_patch_v16 =
   { refs : string list
   ; title : string
-  ; updated_at_ms : int64 [@key "updatedAtMs"] [@encoding `string]
+  ; updated_at_ms : int64
   ; uuid : string
   }
 [@@deriving yojson]
 
 type delete_page_patch_v16 =
-  { updated_at_ms : int64 [@key "updatedAtMs"] [@encoding `string]
+  { updated_at_ms : int64
   ; uuid : string
   }
 [@@deriving yojson]
 
 type delete_property_patch_v16 =
-  { holder_uuid : string [@key "holderUuid"]
-  ; property_ident : string [@key "propertyIdent"]
-  ; replacement_uuid : string [@key "replacementUuid"]
-  ; updated_at_ms : int64 [@key "updatedAtMs"] [@encoding `string]
+  { holder_uuid : string
+  ; property_ident : string
+  ; replacement_uuid : string
+  ; updated_at_ms : int64
   }
 [@@deriving yojson]
 
 type delete_property_guard_v16 =
-  { property_ident : string [@key "propertyIdent"]
-  ; property_uuid : string [@key "propertyUuid"]
-  ; replacement_uuid : string [@key "replacementUuid"]
+  { property_ident : string
+  ; property_uuid : string
+  ; replacement_uuid : string
   }
 [@@deriving yojson]
 
 type delete_artifacts_v16 =
-  { block_patches : delete_block_patch_v16 list [@key "blockPatches"]
+  { block_patches : delete_block_patch_v16 list
   ; frontier : string list
-  ; page_patches : delete_page_patch_v16 list [@key "pagePatches"]
-  ; property_guard : delete_property_guard_v16 option [@key "propertyGuard"]
-  ; property_patches : delete_property_patch_v16 list [@key "propertyPatches"]
+  ; page_patches : delete_page_patch_v16 list
+  ; property_guard : delete_property_guard_v16 option
+  ; property_patches : delete_property_patch_v16 list
   }
 [@@deriving yojson]
 
@@ -584,52 +521,44 @@ let delete_artifacts_of_dto (artifacts : delete_artifacts_v16) =
      : delete_artifacts)
 ;;
 
-let transport_state_to_yojson = function
-  | Types.Queued -> `Assoc [ "type", `String "queued" ]
-  | Submitted id ->
-    `Assoc
-      [ "batchId", `String (Types.Submission_batch_id.to_string id)
-      ; "type", `String "submitted"
-      ]
+type transport_state_wire =
+  | Queued
+  | Submitted of string
+  | Accepted_pending_authoritative of string
+  | Stale_rejected_pending_authoritative of
+      { batch_id : string
+      ; through : string
+      }
+  | Blocked
+[@@deriving yojson]
+
+let transport_state_to_wire = function
+  | Types.Queued -> Queued
+  | Submitted id -> Submitted (Types.Submission_batch_id.to_string id)
   | Accepted_pending_authoritative id ->
-    `Assoc
-      [ "batchId", `String (Types.Submission_batch_id.to_string id)
-      ; "type", `String "acceptedPendingAuthoritative"
-      ]
+    Accepted_pending_authoritative (Types.Submission_batch_id.to_string id)
   | Stale_rejected_pending_authoritative { batch_id; through } ->
-    `Assoc
-      [ "batchId", `String (Types.Submission_batch_id.to_string batch_id)
-      ; "through", `String (Persistence_json.server_cursor_to_string through)
-      ; "type", `String "staleRejectedPendingAuthoritative"
-      ]
-  | Blocked -> `Assoc [ "type", `String "blocked" ]
+    Stale_rejected_pending_authoritative
+      { batch_id = Types.Submission_batch_id.to_string batch_id
+      ; through = Persistence_json.server_cursor_to_string through
+      }
+  | Blocked -> Blocked
 ;;
 
-let transport_state_of_yojson = function
-  | `Assoc [ ("type", `String "queued") ] -> Ok Types.Queued
-  | `Assoc [ ("batchId", `String id); ("type", `String "submitted") ] ->
+let transport_state_of_wire = function
+  | Queued -> Ok Types.Queued
+  | Submitted id ->
     Result.map (fun id -> Types.Submitted id) (Types.Submission_batch_id.of_string id)
-  | `Assoc [ ("batchId", `String id); ("type", `String "acceptedPendingAuthoritative") ]
-    ->
+  | Accepted_pending_authoritative id ->
     Result.map
       (fun id -> Types.Accepted_pending_authoritative id)
       (Types.Submission_batch_id.of_string id)
-  | `Assoc
-      [ ("batchId", `String id)
-      ; ("through", `String through)
-      ; ("type", `String "staleRejectedPendingAuthoritative")
-      ] ->
-    let* batch_id = Types.Submission_batch_id.of_string id in
+  | Stale_rejected_pending_authoritative { batch_id; through } ->
+    let* batch_id = Types.Submission_batch_id.of_string batch_id in
     let* through = Persistence_json.server_cursor_of_string through in
     Ok (Types.Stale_rejected_pending_authoritative { batch_id; through })
-  | `Assoc [ ("type", `String "blocked") ] -> Ok Types.Blocked
-  | _ -> Error "invalid transport state"
+  | Blocked -> Ok Types.Blocked
 ;;
-
-let optional_transport_state_to_yojson = Json.optional_to_yojson transport_state_to_yojson
-let optional_transport_state_of_yojson = Json.optional_of_yojson transport_state_of_yojson
-let optional_block_reason_to_yojson = Json.optional_to_yojson Json.block_reason_to_yojson
-let optional_block_reason_of_yojson = Json.optional_of_yojson Json.block_reason_of_yojson
 
 type acceptance_barrier_v16 =
   { checksum : string
@@ -650,44 +579,34 @@ let acceptance_barrier_of_dto barrier =
 ;;
 
 type outbox_record_v16 =
-  { acceptance_barrier : acceptance_barrier_v16 option [@key "acceptanceBarrier"]
-  ; attempt_count : int [@key "attemptCount"]
-  ; blocked_prior_state :
-      (Types.transport_state option
-      [@to_yojson optional_transport_state_to_yojson]
-      [@of_yojson optional_transport_state_of_yojson])
-        [@key "blockedPriorState"]
-  ; blocked_reason :
-      (Types.block_reason option
-      [@to_yojson optional_block_reason_to_yojson]
-      [@of_yojson optional_block_reason_of_yojson])
-        [@key "blockedReason"]
+  { acceptance_barrier : acceptance_barrier_v16 option
+  ; attempt_count : int
+  ; blocked_prior_state : transport_state_wire option
+  ; blocked_reason : Json.block_reason option
   ; fingerprint : string
-  ; format_version : int [@key "formatVersion"]
-  ; intent_time_ms : int64 [@key "intentTimeMs"] [@encoding `string]
-  ; planned_tx : int [@key "plannedTx"]
+  ; format_version : int
+  ; intent_time_ms : int64
+  ; planned_tx : int
   ; sequence : int
-  ; dependency_shadows : dependency_shadows_v16 [@key "dependencyShadows"]
-  ; effect_footprint : footprint_v16 [@key "effectFootprint"]
-  ; delete_artifacts : delete_artifacts_v16 option [@key "deleteArtifacts"]
+  ; dependency_shadows : dependency_shadows_v16
+  ; effect_footprint : footprint_v16
+  ; delete_artifacts : delete_artifacts_v16 option
   ; mutation :
       (Types.local_mutation
       [@to_yojson mutation_to_yojson] [@of_yojson mutation_of_yojson])
-  ; normalized_transaction : string [@key "normalizedTransaction"]
-  ; protected_transaction : string option [@key "protectedTransaction"]
-  ; state :
-      (Types.transport_state
-      [@to_yojson transport_state_to_yojson] [@of_yojson transport_state_of_yojson])
-  ; same_id_retry_eligible : bool [@key "sameIdRetryEligible"]
-  ; submission_t_before : string option [@key "submissionTBefore"]
-  ; submission_ordinal : int option [@key "submissionOrdinal"]
-  ; submission_count : int option [@key "submissionCount"]
-  ; observed_origin_cursor : string option [@key "observedOriginCursor"]
-  ; stale_earliest_conflict_cursor : string option [@key "staleEarliestConflictCursor"]
-  ; stale_conflicts : string list [@key "staleConflicts"]
-  ; sync_revision : int [@key "syncRevision"]
+  ; normalized_transaction : string
+  ; protected_transaction : string option
+  ; state : transport_state_wire
+  ; same_id_retry_eligible : bool
+  ; submission_t_before : string option
+  ; submission_ordinal : int option
+  ; submission_count : int option
+  ; observed_origin_cursor : string option
+  ; stale_earliest_conflict_cursor : string option
+  ; stale_conflicts : Json.delete_conflict_kind list
+  ; sync_revision : int
   }
-[@@deriving yojson { strict = false }]
+[@@deriving yojson]
 
 let mutation_id = function
   | Types.Save_block value -> value.mutation_id
@@ -703,10 +622,10 @@ let mutation_id = function
 let encode ~sync_revision (record : t) =
   ({ acceptance_barrier = Option.map acceptance_barrier_to_dto record.acceptance_barrier
    ; attempt_count = record.attempt_count
-   ; blocked_prior_state = record.blocked_prior_state
+   ; blocked_prior_state = Option.map transport_state_to_wire record.blocked_prior_state
    ; blocked_reason = record.blocked_reason
    ; fingerprint = record.fingerprint
-   ; format_version = 16
+   ; format_version = 17
    ; intent_time_ms = record.intent_time_ms
    ; planned_tx = record.planned_tx
    ; sequence = record.sequence
@@ -716,7 +635,7 @@ let encode ~sync_revision (record : t) =
    ; mutation = record.mutation
    ; normalized_transaction = record.normalized_transaction
    ; protected_transaction = record.protected_transaction
-   ; state = record.transport_state
+   ; state = transport_state_to_wire record.transport_state
    ; same_id_retry_eligible = record.same_id_retry_eligible
    ; submission_t_before =
        Option.map Persistence_json.server_cursor_to_string record.submission_t_before
@@ -728,7 +647,7 @@ let encode ~sync_revision (record : t) =
        Option.map
          Persistence_json.server_cursor_to_string
          record.stale_earliest_conflict_cursor
-   ; stale_conflicts = List.map Delete_conflict.code record.stale_conflicts
+   ; stale_conflicts = record.stale_conflicts
    ; sync_revision
    }
    : outbox_record_v16)
@@ -741,58 +660,18 @@ let optional_token parse = function
   | Some value -> Result.map Option.some (parse value)
 ;;
 
-let decode_conflicts values =
-  let* conflicts = list_map_result Delete_conflict.of_code values in
-  Ok (List.sort_uniq compare conflicts)
-;;
-
-let encoded_option encode = Json.optional_to_yojson encode
-
-let field_matches fields name expected =
-  match List.assoc_opt name fields with
-  | Some actual -> actual = expected
-  | None -> false
-;;
-
-let nested_values_are_canonical fields dto =
-  field_matches
-    fields
-    "acceptanceBarrier"
-    (encoded_option acceptance_barrier_v16_to_yojson dto.acceptance_barrier)
-  && field_matches
-       fields
-       "blockedPriorState"
-       (optional_transport_state_to_yojson dto.blocked_prior_state)
-  && field_matches
-       fields
-       "blockedReason"
-       (optional_block_reason_to_yojson dto.blocked_reason)
-  && field_matches
-       fields
-       "dependencyShadows"
-       (dependency_shadows_v16_to_yojson dto.dependency_shadows)
-  && field_matches fields "effectFootprint" (footprint_v16_to_yojson dto.effect_footprint)
-  && field_matches
-       fields
-       "deleteArtifacts"
-       (encoded_option delete_artifacts_v16_to_yojson dto.delete_artifacts)
-  && field_matches fields "mutation" (mutation_to_yojson dto.mutation)
-  && field_matches fields "state" (transport_state_to_yojson dto.state)
-;;
-
 let decode source =
   try
     let json = Yojson.Safe.from_string source in
-    let* dto = outbox_record_v16_of_yojson json in
-    let fields =
-      match json with
-      | `Assoc fields -> fields
-      | _ -> []
+    let* dto =
+      Logseq_db_types.Json_codec.decode outbox_record_v16_of_yojson json
+      |> Result.map_error (fun error ->
+        "unsupported or invalid overlay outbox format: " ^ error)
     in
-    if
-      (not (nested_values_are_canonical fields dto))
-      || dto.format_version <> 16
-      || dto.attempt_count < 0
+    if dto.format_version <> 17
+    then Error "unsupported overlay outbox JSON format"
+    else if
+      dto.attempt_count < 0
       || dto.planned_tx < 0
       || dto.sequence <= 0
       || dto.sync_revision < 0
@@ -802,6 +681,12 @@ let decode source =
       || Option.fold ~none:false ~some:(fun value -> value < 0) dto.submission_count
     then Error "invalid overlay outbox record"
     else
+      let* transport_state = transport_state_of_wire dto.state in
+      let* blocked_prior_state =
+        match dto.blocked_prior_state with
+        | None -> Ok None
+        | Some value -> Result.map Option.some (transport_state_of_wire value)
+      in
       let* dependency_shadows = dependency_shadows_of_dto dto.dependency_shadows in
       let* effect_footprint = footprint_of_dto dto.effect_footprint in
       let* delete_artifacts =
@@ -825,7 +710,7 @@ let decode source =
           Persistence_json.server_cursor_of_string
           dto.stale_earliest_conflict_cursor
       in
-      let* stale_conflicts = decode_conflicts dto.stale_conflicts in
+      let stale_conflicts = List.sort_uniq compare dto.stale_conflicts in
       Ok
         ( { mutation_id = mutation_id dto.mutation
           ; fingerprint = dto.fingerprint
@@ -837,10 +722,10 @@ let decode source =
           ; intent_time_ms = dto.intent_time_ms
           ; planned_tx = dto.planned_tx
           ; sequence = dto.sequence
-          ; transport_state = dto.state
+          ; transport_state
           ; protected_transaction = dto.protected_transaction
           ; attempt_count = dto.attempt_count
-          ; blocked_prior_state = dto.blocked_prior_state
+          ; blocked_prior_state
           ; blocked_reason = dto.blocked_reason
           ; same_id_retry_eligible = dto.same_id_retry_eligible
           ; acceptance_barrier

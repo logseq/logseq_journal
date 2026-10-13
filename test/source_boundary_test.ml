@@ -78,6 +78,9 @@ let rec files_with_suffixes root relative suffixes =
     |> List.filter (fun name -> String.length name = 0 || name.[0] <> '.')
     |> List.concat_map (fun name ->
       files_with_suffixes root (Filename.concat relative name) suffixes)
+  else if
+    Filename.check_suffix relative ".pp.ml" || Filename.check_suffix relative ".pp.mli"
+  then []
   else if List.exists (Filename.check_suffix relative) suffixes
   then [ relative ]
   else []
@@ -1598,7 +1601,9 @@ let () =
     [ "JournalPlatformEvents"; "beginShutdown"; "terminationReady" ];
   (* The app scene delegates native startup/account presentation to the host,
      which still owns the RuntimeHost and native progress component. *)
-  require_text root "swift/JournalRuntimeHost.swift"
+  require_text
+    root
+    "swift/JournalRuntimeHost.swift"
     [ "struct JournalHost: View"
     ; "JournalRuntimeHost(platform:"
     ; "JournalStartupLoadingSurface("

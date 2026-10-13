@@ -1,4 +1,4 @@
-"""Run the native wire port against the unchanged public OCaml platform codec.
+"""Run the native wire port against the generated public OCaml platform codec.
 
 Invoke from the repository: dune exec -- python3 tool/test_swiftui_platform.py
 The temporary service adapter uses installed SwiftUI types; no production OCaml
@@ -50,7 +50,9 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-wire-') as directory:
                 libraries.append(str(path.with_suffix('.cmxa')))
     compiler = ['ocamlopt', '-thread', '-w', '-58', *includes]
     for source in sources:
-        (destination / source.name).write_text(source.read_text())
+        compiled_source = (ROOT / '_build/default/app' / (source.stem + '.pp.ml')
+                           if source.suffix == '.ml' and source.parent == ROOT / 'app' else source)
+        (destination / source.name).write_bytes(compiled_source.read_bytes())
         run(destination, [*compiler, '-c', source.name])
     run(destination, [*compiler, *libraries, '-o', 'wire_ocaml',
                       *[source.stem + '.cmx' for source in sources if source.suffix == '.ml']])
@@ -58,6 +60,7 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-wire-') as directory:
     run(destination, ['swiftc', '-swift-version', '6', '-module-cache-path', str(destination / 'module-cache'), '-o', 'wire_swift',
                       str(ROOT / 'swift/JournalPlatformWire.swift'),
                       str(ROOT / 'swift/JournalStartupConfiguration.swift'),
+                      str(ROOT / 'swift/JournalLocalAccountBindingStore.swift'),
                       str(ROOT / 'apple-tests/platform-wire/JournalPlatformWireTests.swift')])
     run(destination, [str(destination / 'wire_swift'), directory])
     run(destination, [str(destination / 'wire_ocaml'), 'verify', 'responses.json'])

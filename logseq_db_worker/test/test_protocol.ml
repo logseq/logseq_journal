@@ -4,7 +4,7 @@ module P = Logseq_db_worker.Protocol
 let page_tree_contract_rejects_retired_scope () =
   let raw =
     Yojson.Safe.from_string
-      {|{"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000009","command":{"type":"deleteBlocks","mutationId":"30000000-0000-4000-8000-000000000003","root":"10000000-0000-4000-8000-000000000002","preconditions":{"blocks":[{"uuid":"10000000-0000-4000-8000-000000000002","revision":"block-revision:v1:1"}],"pages":[],"scopes":[{"scope":{"type":"pageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":8},"revision":"obsolete"}]}}}|}
+      {|{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000009","command":["V2_delete_blocks",{"mutation_id":"30000000-0000-4000-8000-000000000003","root":"10000000-0000-4000-8000-000000000002","preconditions":{"blocks":[["10000000-0000-4000-8000-000000000002","block-revision:v1:1"]],"pages":[],"scopes":[[["V2_page_tree_scope",{"page":"20000000-0000-4000-8000-000000000001","maximum_depth":8}],"obsolete"]]}}]}|}
   in
   match P.request_of_yojson raw with
   | Error _ -> ()
@@ -14,23 +14,30 @@ let page_tree_contract_rejects_retired_scope () =
 let page_tree_result_without_collection_revision () =
   let raw =
     Yojson.Safe.from_string
-      {|{"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000006","outcome":{"type":"pageTree","page":"20000000-0000-4000-8000-000000000001","maximumDepth":1,"items":[],"nextCursor":null}}|}
+      {|["V2_response",{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000006","outcome":["V2_page_tree_outcome",{"page":"20000000-0000-4000-8000-000000000001","maximum_depth":1,"items":[],"next_cursor":null}]}]|}
   in
   match P.response_of_yojson raw with
   | Error message -> T.fail "revision-free page-tree result rejected: %s" message
   | Ok response ->
     T.require
       (Yojson.Safe.equal
-         (Yojson.Safe.sort raw)
-         (Yojson.Safe.sort (P.response_to_yojson response)))
+         (T.canonical_json raw)
+         (T.canonical_json (P.response_to_yojson response)))
       "page-tree result gained a revision"
 ;;
 
 let rec add_tag_titles = function
   | `Assoc fields ->
     let fields = List.map (fun (k, v) -> k, add_tag_titles v) fields in
-    if List.mem_assoc "renderedPageTitle" fields && List.mem_assoc "block" fields
-    then `Assoc (("tagTitles", `List [ `String "户外"; `String "周末计划" ]) :: fields)
+    if List.mem_assoc "rendered_page_title" fields && List.mem_assoc "block" fields
+    then
+      `Assoc
+        (List.map
+           (fun (name, value) ->
+              if name = "tag_titles"
+              then name, `List [ `String "户外"; `String "周末计划" ]
+              else name, value)
+           fields)
     else `Assoc fields
   | `List xs -> `List (List.map add_tag_titles xs)
   | x -> x
@@ -59,8 +66,8 @@ let tag_titles_survive_block_read_json () =
          | Ok decoded ->
            T.require
              (Yojson.Safe.equal
-                (Yojson.Safe.sort expected)
-                (Yojson.Safe.sort (P.response_to_yojson decoded)))
+                (T.canonical_json expected)
+                (T.canonical_json (P.response_to_yojson decoded)))
              "named tags were lost by block read serialization"))
     responses
 ;;
@@ -68,9 +75,9 @@ let tag_titles_survive_block_read_json () =
 let fixture_has_version expected_version path =
   match T.read_json (T.fixture path) with
   | `Assoc fields ->
-    (match List.assoc_opt "apiVersion" fields with
+    (match List.assoc_opt "api_version" fields with
      | Some (`Int version) when version = expected_version -> ()
-     | _ -> T.fail "%s does not declare apiVersion %d" path expected_version)
+     | _ -> T.fail "%s does not declare api_version %d" path expected_version)
   | _ -> T.fail "%s is not a JSON object" path
 ;;
 
@@ -92,8 +99,8 @@ let request_round_trip () =
        | Ok request ->
          T.require
            (Yojson.Safe.equal
-              (Yojson.Safe.sort expected)
-              (Yojson.Safe.sort (P.request_to_yojson request)))
+              (T.canonical_json expected)
+              (T.canonical_json (P.request_to_yojson request)))
            "request changed during round trip")
     (command_catalog_requests ())
 ;;
@@ -119,58 +126,10 @@ let response_round_trip () =
        | Ok response ->
          T.require
            (Yojson.Safe.equal
-              (Yojson.Safe.sort expected)
-              (Yojson.Safe.sort (P.response_to_yojson response)))
+              (T.canonical_json expected)
+              (T.canonical_json (P.response_to_yojson response)))
            "response changed")
     (outcome_field "responses")
-;;
-
-let admission_inspection_request_round_trip () =
-  let expected =
-    `Assoc
-      [ "apiVersion", `Int 2
-      ; "requestId", `String "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-      ; "command", `Assoc [ "type", `String "inspectAdmission" ]
-      ]
-  in
-  match P.request_of_yojson expected with
-  | Error error ->
-    T.fail
-      "admission inspection request decode failed: %s"
-      (Logseq_db_worker.Error.message error)
-  | Ok request ->
-    T.require
-      (Yojson.Safe.equal
-         (Yojson.Safe.sort expected)
-         (Yojson.Safe.sort (P.request_to_yojson request)))
-      "admission inspection request changed during round trip"
-;;
-
-let admission_inspection_response_round_trip () =
-  let expected =
-    `Assoc
-      [ "apiVersion", `Int 2
-      ; "requestId", `String "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-      ; ( "outcome"
-        , `Assoc
-            [ "type", `String "admission"
-            ; "activeRecords", `Int 3
-            ; "activeBytes", `Int 1536
-            ; "protectedWireBytes", `Int 512
-            ; "retainedOriginEvidenceBytes", `Int 256
-            ; "maximumRecords", `Int 1000
-            ; "maximumBytes", `Int 8388608
-            ] )
-      ]
-  in
-  match P.response_of_yojson expected with
-  | Error error -> T.fail "admission inspection response decode failed: %s" error
-  | Ok response ->
-    T.require
-      (Yojson.Safe.equal
-         (Yojson.Safe.sort expected)
-         (Yojson.Safe.sort (P.response_to_yojson response)))
-      "admission inspection response changed during round trip"
 ;;
 
 let push_round_trip () =
@@ -181,15 +140,15 @@ let push_round_trip () =
        | Ok push ->
          T.require
            (Yojson.Safe.equal
-              (Yojson.Safe.sort expected)
-              (Yojson.Safe.sort (P.push_to_yojson push)))
+              (T.canonical_json expected)
+              (T.canonical_json (P.push_to_yojson push)))
            "push changed")
     (outcome_field "pushes")
 ;;
 
 let causal_error_json ~contexts ~origin ~truncated =
   `Assoc
-    [ "code", `String "corruptStorage"
+    [ "code", `List [ `String "Corrupt_storage" ]
     ; "message", `String "The graph storage is corrupt or incomplete."
     ; "details", `List []
     ; ( "trace"
@@ -200,7 +159,7 @@ let causal_error_json ~contexts ~origin ~truncated =
 
 let cause_json ~component ~operation ~code ~message =
   `Assoc
-    [ "component", `String component
+    [ "component", `List [ `String component ]
     ; "operation", `String operation
     ; "code", Option.fold ~none:`Null ~some:(fun value -> `String value) code
     ; "message", `String message
@@ -212,19 +171,19 @@ let causal_error_round_trip () =
     causal_error_json
       ~contexts:
         [ cause_json
-            ~component:"engine"
+            ~component:"Engine"
             ~operation:"openGraph"
             ~code:(Some "corruptStorage")
             ~message:"The graph storage is corrupt or incomplete."
         ; cause_json
-            ~component:"storage"
+            ~component:"Storage"
             ~operation:"restoreDatabase"
             ~code:(Some "SQLITE_CORRUPT")
             ~message:"SQLite rejected the database image."
         ]
       ~origin:
         (cause_json
-           ~component:"sqlite"
+           ~component:"Sqlite"
            ~operation:"readPage"
            ~code:(Some "SQLITE_CORRUPT")
            ~message:"Database page validation failed.")
@@ -235,8 +194,8 @@ let causal_error_round_trip () =
   | Ok error ->
     T.require
       (Yojson.Safe.equal
-         (Yojson.Safe.sort json)
-         (Yojson.Safe.sort (Logseq_db_worker.Error.to_yojson error)))
+         (T.canonical_json json)
+         (T.canonical_json (Logseq_db_worker.Error.to_yojson error)))
       "causal error changed during round trip"
 ;;
 
@@ -359,7 +318,7 @@ let direct_errors_create_complete_origins () =
                  [ ("contexts", `List [])
                  ; ( "origin"
                    , `Assoc
-                       [ ("component", `String "logseqDbWorker")
+                       [ ("component", `List [ `String "Logseq_db_worker" ])
                        ; ("operation", `String operation)
                        ; ("code", `String origin_code)
                        ; ("message", `String origin_message)
@@ -381,7 +340,7 @@ let direct_errors_create_complete_origins () =
 let causal_error_rejects_legacy_and_unsafe_values () =
   let legacy =
     `Assoc
-      [ "code", `String "corruptStorage"
+      [ "code", `List [ `String "Corrupt_storage" ]
       ; "message", `String "Legacy flat error"
       ; "details", `List []
       ]
@@ -394,7 +353,7 @@ let causal_error_rejects_legacy_and_unsafe_values () =
       ~contexts:[]
       ~origin:
         (cause_json
-           ~component:"sqlite"
+           ~component:"Sqlite"
            ~operation:"openDatabase"
            ~code:(Some "SQLITE_CANTOPEN")
            ~message:"cannot open /Users/alice/private-graph/logseq.sqlite")
@@ -405,10 +364,587 @@ let causal_error_rejects_legacy_and_unsafe_values () =
   | Ok _ -> T.fail "unsafe complete home-directory path was accepted"
 ;;
 
+let native_id = "00000000-0000-4000-8000-000000000001"
+let native_variant name fields = `List [ `String name; `Assoc fields ]
+
+let native_request command =
+  `Assoc [ "api_version", `Int 2; "request_id", `String native_id; "command", command ]
+;;
+
+let rec map_json_fields update = function
+  | `Assoc fields ->
+    `Assoc
+      (update (List.map (fun (key, value) -> key, map_json_fields update value) fields))
+  | `List values -> `List (List.map (map_json_fields update) values)
+  | json -> json
+;;
+
+let replace_field name value =
+  map_json_fields (List.map (fun (key, old) -> key, if key = name then value else old))
+;;
+
+let generated_golden_and_legacy_rejection () =
+  let native = native_request (`List [ `String "V2_graph_info" ]) in
+  (match P.request_of_yojson native with
+   | Error error ->
+     T.fail "generated request rejected: %s" (Logseq_db_worker.Error.message error)
+   | Ok request ->
+     T.require
+       (Yojson.Safe.equal native (P.request_to_yojson request))
+       "graph-info encoding differs from the generated golden");
+  let old_request =
+    Yojson.Safe.from_string
+      {|{"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000001","command":{"type":"graphInfo"}}|}
+  in
+  T.require
+    (Result.is_error (P.request_of_yojson old_request))
+    "old request wire accepted";
+  let old_response =
+    Yojson.Safe.from_string
+      {|{"apiVersion":2,"requestId":"00000000-0000-4000-8000-000000000001","outcome":{"type":"failed","code":"closedSession","message":"Safe worker failure"}}|}
+  in
+  T.require
+    (Result.is_error (P.response_of_yojson old_response))
+    "old response wire accepted";
+  let old_push =
+    Yojson.Safe.from_string
+      {|{"apiVersion":2,"push":{"type":"changesAvailable","generation":"g","through":"w"}}|}
+  in
+  T.require (Result.is_error (P.push_of_yojson old_push)) "old push wire accepted"
+;;
+
+let request_domain_constraints () =
+  let reject label json =
+    T.require (Result.is_error (P.request_of_yojson json)) "%s accepted" label
+  in
+  let favorite limit cursor =
+    native_request
+      (native_variant "V2_list_favorites" [ "limit", limit; "cursor", cursor ])
+  in
+  List.iter
+    (fun limit -> reject "invalid page limit" (favorite (`Int limit) `Null))
+    [ 0; -1; P.maximum_page_size + 1 ];
+  List.iter
+    (fun cursor -> reject "invalid cursor" (favorite (`Int 1) cursor))
+    [ `String ""; `String (String.make 16385 'x'); `Bool false; `List []; `String "\255" ];
+  reject "nonintegral limit" (favorite (`Float 1.5) `Null);
+  reject "integer overflow" (favorite (`Intlit "9223372036854775808") `Null);
+  reject
+    "invalid request UUID"
+    (replace_field "request_id" (`String "not-a-uuid") (favorite (`Int 1) `Null));
+  reject
+    "invalid nested UUID"
+    (native_request
+       (native_variant
+          "V2_get_block"
+          [ "block", `String "not-a-uuid"; "revision", `Null ]));
+  let save title =
+    native_request
+      (native_variant
+         "V2_save_block"
+         [ "mutation_id", `String native_id
+         ; "block", `String native_id
+         ; "title", `String title
+         ; ( "preconditions"
+           , `Assoc [ "blocks", `List []; "pages", `List []; "scopes", `List [] ] )
+         ])
+  in
+  reject "invalid title UTF-8" (save "\255");
+  reject "oversized title" (save (String.make (P.maximum_title_bytes + 1) 'x'));
+  let duplicate =
+    native_request
+      (native_variant
+         "V2_list_favorites"
+         [ "limit", `Int 1; "limit", `Int 2; "cursor", `Null ])
+  in
+  reject "duplicate nested field" duplicate;
+  reject
+    "unknown nested field"
+    (native_request
+       (native_variant
+          "V2_list_favorites"
+          [ "limit", `Int 1; "cursor", `Null; "unknown", `Bool true ]));
+  reject
+    "malformed scope UUID"
+    (native_request
+       (native_variant
+          "V2_save_block"
+          [ "mutation_id", `String native_id
+          ; "block", `String native_id
+          ; "title", `String "safe"
+          ; ( "preconditions"
+            , `Assoc
+                [ "blocks", `List []
+                ; "pages", `List []
+                ; ( "scopes"
+                  , `List
+                      [ `List
+                          [ `List [ `String "V2_children_scope"; `String "bad" ]
+                          ; `String "r"
+                          ]
+                      ] )
+                ] )
+          ]));
+  let tree depth =
+    native_request
+      (native_variant
+         "V2_get_page_tree"
+         [ "page", `String native_id
+         ; "maximum_depth", `Int depth
+         ; "limit", `Int 1
+         ; "cursor", `Null
+         ; "revision", `Null
+         ])
+  in
+  List.iter
+    (fun depth -> reject "invalid tree depth" (tree depth))
+    [ -1; P.maximum_tree_depth + 1 ]
+;;
+
+let response_domain_constraints () =
+  let responses = outcome_field "responses" in
+  let present_block =
+    List.find
+      (function
+        | `List [ `String "V2_response"; `Assoc fields ] ->
+          (match List.assoc "outcome" fields with
+           | `List [ `String "V2_block_outcome"; `List [ `String "V2_present_block"; _ ] ]
+             -> true
+           | _ -> false)
+        | _ -> false)
+      responses
+  in
+  let reject label json =
+    T.require (Result.is_error (P.response_of_yojson json)) "%s accepted" label
+  in
+  reject "nested block UUID" (replace_field "uuid" (`String "bad") present_block);
+  reject
+    "invalid nested title UTF-8"
+    (replace_field "title" (`String "\255") present_block);
+  reject
+    "oversized block title"
+    (replace_field
+       "title"
+       (`String (String.make (P.maximum_title_bytes + 1) 'x'))
+       present_block);
+  reject
+    "missing required tag_titles"
+    (map_json_fields (List.filter (fun (name, _) -> name <> "tag_titles")) present_block);
+  reject
+    "malformed tag_titles"
+    (replace_field "tag_titles" (`List [ `Int 1 ]) present_block);
+  reject
+    "invalid task status option"
+    (replace_field "task_status" (`List [ `String "todo" ]) present_block);
+  reject
+    "old textual int64"
+    (replace_field "created_at_ms" (`String "1788278400000") present_block);
+  reject
+    "int64 overflow"
+    (replace_field "updated_at_ms" (`Intlit "9223372036854775808") present_block);
+  let child =
+    List.find
+      (function
+        | `List [ `String "V2_response"; `Assoc fields ] ->
+          (match List.assoc "outcome" fields with
+           | `List [ `String "V2_children_outcome"; _ ] -> true
+           | _ -> false)
+        | _ -> false)
+      responses
+  in
+  reject "invalid nested cursor" (replace_field "next_cursor" (`String "") child);
+  reject
+    "malformed revision scope UUID"
+    (replace_field
+       "revision_scope"
+       (`List [ `String "V2_children_revision"; `String "bad" ])
+       child)
+;;
+
+let property_variants_and_int64_round_trip () =
+  let response =
+    List.find
+      (function
+        | `List [ `String "V2_response"; `Assoc fields ] ->
+          (match List.assoc "outcome" fields with
+           | `List [ `String "V2_block_outcome"; `List [ `String "V2_present_block"; _ ] ]
+             -> true
+           | _ -> false)
+        | _ -> false)
+      (outcome_field "responses")
+  in
+  let internal_values =
+    [ `List [ `String "Internal_null" ]
+    ; `List [ `String "Internal_bool"; `Bool true ]
+    ; `List [ `String "Internal_number"; `String "1.25" ]
+    ; `List [ `String "Internal_string"; `String "文本" ]
+    ; `List [ `String "Internal_keyword"; `String "kind/value" ]
+    ; `List [ `String "Internal_uuid"; `String native_id ]
+    ; `List [ `String "Internal_list"; `List [ `List [ `String "Internal_null" ] ] ]
+    ; `List
+        [ `String "Internal_map"
+        ; `List
+            [ `List
+                [ `List [ `String "Internal_keyword"; `String "key" ]
+                ; `List [ `String "Internal_bool"; `Bool false ]
+                ]
+            ]
+        ]
+    ]
+  in
+  let value name json = `List [ `String name; json ] in
+  let values =
+    [ value "Default_value" (`String "Text")
+    ; value "Number_value" (`String "12345678901234567890.125")
+    ; value "Date_value" (`Assoc [ "journal_day", `Int 20261012 ])
+    ; value "Datetime_value" (`Assoc [ "unix_ms", `Intlit "-9223372036854775808" ])
+    ; value "Datetime_value" (`Assoc [ "unix_ms", `Intlit "9223372036854775807" ])
+    ; value "Checkbox_value" (`Bool true)
+    ; value "Url_value" (`String "https://example.org")
+    ; value "Node_value" (`String native_id)
+    ; value "Asset_value" (`String native_id)
+    ; value "Keyword_value" (`String "kind/value")
+    ; value
+        "Map_value"
+        (`List [ `List [ List.nth internal_values 4; List.nth internal_values 6 ] ])
+    ; value "Collection_value" (`List internal_values)
+    ; value "Any_value" (List.nth internal_values 7)
+    ; value "Entity_value" (`String native_id)
+    ; value "Class_value" (`String native_id)
+    ; value "Page_value" (`String native_id)
+    ; value "Property_value" (`String "user/property")
+    ; value "String_value" (`String "Text")
+    ; value "Json_value" (`String "{\"key\":true}")
+    ; value "Raw_number_value" (`String "-9007199254740993")
+    ]
+  in
+  let property =
+    `Assoc
+      [ "ident", `String "user/property"
+      ; "uuid", `String native_id
+      ; "title", `String "Property"
+      ; ( "schema"
+        , `Assoc
+            [ "property_type", `List [ `String "Any" ]
+            ; "cardinality", `List [ `String "Many" ]
+            ; "hidden", `Bool false
+            ; "public", `Bool true
+            ] )
+      ; "values", `List values
+      ; "values_truncated", `Bool false
+      ]
+  in
+  let expected =
+    response
+    |> replace_field "properties" (`List [ property ])
+    |> replace_field "created_at_ms" (`Intlit "-9223372036854775808")
+    |> replace_field "updated_at_ms" (`Intlit "9223372036854775807")
+  in
+  match P.response_of_yojson expected with
+  | Error message -> T.fail "property variants rejected: %s" message
+  | Ok decoded ->
+    T.require
+      (Yojson.Safe.equal
+         (T.canonical_json expected)
+         (T.canonical_json (P.response_to_yojson decoded)))
+      "property variants/int64 bounds changed during roundtrip"
+;;
+
+let exact_wire_budgets () =
+  let encoded_size json = String.length (Yojson.Safe.to_string json) in
+  let padded target make =
+    let overhead = encoded_size (make 0) in
+    let json = make (target - overhead) in
+    T.require
+      (encoded_size json = target)
+      "test failed to construct exact %d byte wire"
+      target;
+    json
+  in
+  let request_make padding =
+    let remaining = ref padding in
+    let roots =
+      List.init 17 (fun i ->
+        let length = min P.maximum_title_bytes !remaining in
+        remaining := !remaining - length;
+        `Assoc
+          [ "uuid", `String (Printf.sprintf "10000000-0000-4000-8000-%012d" i)
+          ; "title", `String (String.make length 'x')
+          ; "children", `List []
+          ])
+    in
+    native_request
+      (native_variant
+         "V2_insert_blocks"
+         [ "mutation_id", `String native_id
+         ; "parent", `String native_id
+         ; "roots", `List roots
+         ; ( "preconditions"
+           , `Assoc [ "blocks", `List []; "pages", `List []; "scopes", `List [] ] )
+         ])
+  in
+  let accept_request json =
+    match P.request_of_yojson json with
+    | Ok _ -> ()
+    | Error e ->
+      T.fail "request at budget rejected: %s" (Logseq_db_worker.Error.message e)
+  in
+  accept_request (padded P.maximum_request_bytes request_make);
+  T.require
+    (Result.is_error
+       (P.request_of_yojson (padded (P.maximum_request_bytes + 1) request_make)))
+    "request over budget accepted";
+  let response_make padding =
+    `List
+      [ `String "V2_response"
+      ; `Assoc
+          [ "api_version", `Int 2
+          ; "request_id", `String native_id
+          ; ( "outcome"
+            , native_variant
+                "V2_failed"
+                [ "code", `String "failed"; "message", `String (String.make padding 'x') ]
+            )
+          ]
+      ]
+  in
+  let at_limit = padded P.maximum_response_bytes response_make in
+  (match P.response_of_yojson at_limit with
+   | Error message -> T.fail "response at budget rejected: %s" message
+   | Ok response ->
+     T.require
+       (P.encoded_response_bytes response = P.maximum_response_bytes)
+       "actual generated response byte count differs");
+  T.require
+    (Result.is_error
+       (P.response_of_yojson (padded (P.maximum_response_bytes + 1) response_make)))
+    "response over budget accepted";
+  let push_make padding =
+    native_variant
+      "V2_resync_required_push"
+      [ "api_version", `Int 2
+      ; "generation", `String "g"
+      ; "reason", `String (String.make padding 'x')
+      ]
+  in
+  T.require
+    (Result.is_ok (P.push_of_yojson (padded P.maximum_push_bytes push_make)))
+    "push at budget rejected";
+  T.require
+    (Result.is_error (P.push_of_yojson (padded (P.maximum_push_bytes + 1) push_make)))
+    "push over budget accepted"
+;;
+
+let error_details_and_budget () =
+  let module E = Logseq_db_worker.Error in
+  let safe =
+    causal_error_json
+      ~contexts:[]
+      ~origin:
+        (cause_json
+           ~component:"Storage"
+           ~operation:"read"
+           ~code:None
+           ~message:"Safe storage failure")
+      ~truncated:false
+  in
+  let detail_values =
+    [ `List [ `String "Detail_string"; `String "Safe detail" ]
+    ; `List [ `String "Detail_int"; `Intlit "-9223372036854775808" ]
+    ; `List [ `String "Detail_int"; `Intlit "9223372036854775807" ]
+    ; `List [ `String "Detail_bool"; `Bool true ]
+    ; `List [ `String "Detail_uuid"; `String native_id ]
+    ; `List [ `String "Detail_strings"; `List [ `String "Safe one"; `String "Safe two" ] ]
+    ; `List [ `String "Detail_uuids"; `List [ `String native_id ] ]
+    ]
+  in
+  let json =
+    replace_field
+      "details"
+      (`List
+          (List.mapi
+             (fun i value ->
+                `Assoc [ "name", `String ("detail" ^ string_of_int i); "value", value ])
+             detail_values))
+      safe
+  in
+  (match E.of_yojson json with
+   | Error message -> T.fail "generated error details rejected: %s" message
+   | Ok error ->
+     T.require
+       (Yojson.Safe.equal (T.canonical_json json) (T.canonical_json (E.to_yojson error)))
+       "error details changed");
+  T.require
+    (Result.is_error
+       (E.of_yojson
+          (replace_field "value" (`List [ `String "Detail_uuid"; `String "bad" ]) json)))
+    "invalid detail UUID accepted";
+  T.require
+    (Result.is_error
+       (E.of_yojson (replace_field "message" (`String "Bearer secret") safe)))
+    "unsafe error accepted";
+  let slots =
+    (E.maximum_encoded_bytes + E.maximum_message_bytes - 1) / E.maximum_message_bytes
+  in
+  let make padding =
+    let remaining = ref (padding - slots) in
+    let strings =
+      List.init slots (fun _ ->
+        let n = min (E.maximum_message_bytes - 1) !remaining in
+        remaining := !remaining - n;
+        `String (String.make (n + 1) 'x'))
+    in
+    replace_field
+      "details"
+      (`List
+          [ `Assoc
+              [ "name", `String "detail"
+              ; "value", `List [ `String "Detail_strings"; `List strings ]
+              ]
+          ])
+      safe
+  in
+  let capacity = slots * E.maximum_message_bytes in
+  let base = String.length (Yojson.Safe.to_string (make capacity)) - capacity in
+  let exact = make (E.maximum_encoded_bytes - base) in
+  T.require
+    (String.length (Yojson.Safe.to_string exact) = E.maximum_encoded_bytes)
+    "error budget fixture size incorrect";
+  T.require (Result.is_ok (E.of_yojson exact)) "error at exact generated budget rejected";
+  T.require
+    (Result.is_error (E.of_yojson (make (E.maximum_encoded_bytes - base + 1))))
+    "error over generated budget accepted"
+;;
+
+let config_generated_golden_and_validation () =
+  let module C = Logseq_db_worker.Config in
+  let valid =
+    `Assoc
+      [ "application_support_directory", `String "/tmp/logseq-journal-config"
+      ; ( "target"
+        , native_variant "Managed_sync" [ "base_url", `String "https://api.logseq.io" ] )
+      ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
+      ; "response_budget_bytes", `Int P.maximum_response_bytes
+      ; "default_page_size", `Int P.default_page_size
+      ]
+  in
+  (match C.of_yojson valid with
+   | Error message -> T.fail "generated config rejected: %s" message
+   | Ok config ->
+     T.require
+       (Yojson.Safe.equal valid (C.to_yojson config))
+       "config generated golden changed");
+  List.iter
+    (fun url ->
+       T.require
+         (Result.is_error (C.of_yojson (replace_field "base_url" (`String url) valid)))
+         "invalid origin accepted: %s"
+         url)
+    [ "http://api.logseq.io"
+    ; "https://user:secret@api.logseq.io"
+    ; "https://api.logseq.io/path"
+    ; "https://api.logseq.io?key=value"
+    ; "https://api.logseq.io#fragment"
+    ];
+  List.iter
+    (fun path ->
+       T.require
+         (Result.is_error
+            (C.of_yojson
+               (replace_field "application_support_directory" (`String path) valid)))
+         "invalid config path accepted")
+    [ "relative"; "/tmp/../graph"; "/tmp//graph"; "/tmp/\255"; "/tmp/\000" ];
+  List.iter
+    (fun budget ->
+       T.require
+         (Result.is_error
+            (C.of_yojson (replace_field "response_budget_bytes" (`Int budget) valid)))
+         "invalid config response budget accepted")
+    [ 0; P.maximum_response_bytes + 1 ];
+  List.iter
+    (fun size ->
+       T.require
+         (Result.is_error
+            (C.of_yojson (replace_field "default_page_size" (`Int size) valid)))
+         "invalid default page size accepted")
+    [ 0; P.maximum_page_size + 1 ];
+  T.require
+    (Result.is_error
+       (C.of_yojson
+          (map_json_fields
+             (fun fields ->
+                match List.assoc_opt "default_page_size" fields with
+                | None -> fields
+                | Some v -> ("default_page_size", v) :: fields)
+             valid)))
+    "duplicate config field accepted";
+  let legacy =
+    Yojson.Safe.from_string
+      {|{"applicationSupportDirectory":"/tmp/logseq-journal-config","target":{"kind":"managedSync","baseUrl":"https://api.logseq.io"},"compatibilityProfile":"logseq-65.33-or-newer","responseBudgetBytes":262144,"defaultPageSize":50}|}
+  in
+  T.require (Result.is_error (C.of_yojson legacy)) "legacy config accepted"
+;;
+
+let request_tree_boundaries () =
+  let node index children =
+    `Assoc
+      [ "uuid", `String (Printf.sprintf "10000000-0000-4000-8000-%012d" index)
+      ; "title", `String "Node"
+      ; "children", `List children
+      ]
+  in
+  let insert roots =
+    native_request
+      (native_variant
+         "V2_insert_blocks"
+         [ "mutation_id", `String native_id
+         ; "parent", `String native_id
+         ; "roots", `List roots
+         ; ( "preconditions"
+           , `Assoc [ "blocks", `List []; "pages", `List []; "scopes", `List [] ] )
+         ])
+  in
+  let rec chain depth = node depth (if depth = 0 then [] else [ chain (depth - 1) ]) in
+  let accept label json =
+    match P.request_of_yojson json with
+    | Ok _ -> ()
+    | Error error -> T.fail "%s rejected: %s" label (Logseq_db_worker.Error.message error)
+  in
+  accept "tree at maximum depth" (insert [ chain P.maximum_tree_depth ]);
+  T.require
+    (Result.is_error (P.request_of_yojson (insert [ chain (P.maximum_tree_depth + 1) ])))
+    "tree deeper than maximum accepted";
+  let width nodes =
+    insert [ node 0 (List.init (nodes - 1) (fun i -> node (i + 1) [])) ]
+  in
+  accept "tree at maximum node count" (width P.maximum_tree_nodes);
+  T.require
+    (Result.is_error (P.request_of_yojson (width (P.maximum_tree_nodes + 1))))
+    "tree over node bound accepted";
+  accept
+    "tree at maximum root count"
+    (insert (List.init P.maximum_roots (fun i -> node i [])));
+  T.require
+    (Result.is_error
+       (P.request_of_yojson
+          (insert (List.init (P.maximum_roots + 1) (fun i -> node i [])))))
+    "tree over root bound accepted"
+;;
+
 let () =
   T.run
     "protocol"
-    [ T.case "reject retired page-tree scope" page_tree_contract_rejects_retired_scope
+    [ T.case "tree depth node and root boundaries" request_tree_boundaries
+    ; T.case "config golden and validation" config_generated_golden_and_validation
+    ; T.case "generated golden and legacy rejection" generated_golden_and_legacy_rejection
+    ; T.case "request domain constraints" request_domain_constraints
+    ; T.case "response domain constraints" response_domain_constraints
+    ; T.case
+        "property variants and int64 boundaries"
+        property_variants_and_int64_round_trip
+    ; T.case "exact generated wire budgets" exact_wire_budgets
+    ; T.case "error details and exact budget" error_details_and_budget
+    ; T.case "reject retired page-tree scope" page_tree_contract_rejects_retired_scope
     ; T.case
         "page-tree result has no collection revision"
         page_tree_result_without_collection_revision
@@ -430,12 +966,6 @@ let () =
     ; T.case "request JSON round trip" request_round_trip
     ; T.case "response JSON round trip" response_round_trip
     ; T.case "named tags in block reads" tag_titles_survive_block_read_json
-    ; T.case
-        "admission inspection request JSON round trip"
-        admission_inspection_request_round_trip
-    ; T.case
-        "admission inspection response JSON round trip"
-        admission_inspection_response_round_trip
     ; T.case "push JSON round trip" push_round_trip
     ; T.case "causal error JSON round trip" causal_error_round_trip
     ; T.case
@@ -457,9 +987,10 @@ let () =
     ; T.case "reject unknown and trailing fields" (fun () ->
         let invalid =
           `Assoc
-            [ "apiVersion", `Int 1
-            ; "requestId", `String "00000000-0000-4000-8000-000000000001"
-            ; "command", `Assoc [ "type", `String "graphInfo"; "unknown", `Bool true ]
+            [ "api_version", `Int 2
+            ; "request_id", `String "00000000-0000-4000-8000-000000000001"
+            ; ( "command"
+              , `List [ `String "V2_graph_info"; `Assoc [ "unknown", `Bool true ] ] )
             ]
         in
         match P.request_of_yojson invalid with
@@ -468,9 +999,9 @@ let () =
     ; T.case "reject invalid UTF-8 and UUID" (fun () ->
         let invalid =
           `Assoc
-            [ "apiVersion", `Int 1
-            ; "requestId", `String "not-a-uuid"
-            ; "command", `Assoc [ "type", `String "graphInfo" ]
+            [ "api_version", `Int 2
+            ; "request_id", `String "not-a-uuid"
+            ; "command", `List [ `String "V2_graph_info" ]
             ]
         in
         match P.request_of_yojson invalid with
@@ -478,20 +1009,15 @@ let () =
         | Ok _ -> T.fail "invalid UUID accepted")
     ; T.case "reject oversized envelope before Engine" (fun () ->
         let request =
-          `Assoc
-            [ "apiVersion", `Int 1
-            ; "requestId", `String "00000000-0000-4000-8000-000000000001"
-            ; ( "command"
-              , `Assoc
-                  [ "type", `String "getPage"
-                  ; ( "page"
-                    , `Assoc
-                        [ "type", `String "name"
-                        ; "name", `String (String.make P.maximum_request_bytes 'x')
-                        ; "kind", `String "any"
-                        ] )
-                  ] )
-            ]
+          native_request
+            (native_variant
+               "V2_save_block"
+               [ "mutation_id", `String native_id
+               ; "block", `String native_id
+               ; "title", `String (String.make P.maximum_request_bytes 'x')
+               ; ( "preconditions"
+                 , `Assoc [ "blocks", `List []; "pages", `List []; "scopes", `List [] ] )
+               ])
         in
         match P.request_of_yojson request with
         | Error _ -> ()
@@ -544,15 +1070,15 @@ let () =
         in
         let json =
           `Assoc
-            [ "applicationSupportDirectory", `String missing
+            [ "application_support_directory", `String missing
             ; ( "target"
-              , `Assoc
-                  [ "kind", `String "managedSync"
-                  ; "baseUrl", `String "https://api.logseq.io"
+              , `List
+                  [ `String "Managed_sync"
+                  ; `Assoc [ "base_url", `String "https://api.logseq.io" ]
                   ] )
-            ; "compatibilityProfile", `String "logseq-65.33-or-newer"
-            ; "responseBudgetBytes", `Int P.maximum_response_bytes
-            ; "defaultPageSize", `Int P.default_page_size
+            ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
+            ; "response_budget_bytes", `Int P.maximum_response_bytes
+            ; "default_page_size", `Int P.default_page_size
             ]
         in
         match Logseq_db_worker.Config.of_yojson json with
@@ -565,11 +1091,11 @@ let () =
     ; T.case "reject retired startup target wire values" (fun () ->
         let envelope target =
           `Assoc
-            [ "applicationSupportDirectory", `String "/tmp/logseq-journal-support"
+            [ "application_support_directory", `String "/tmp/logseq-journal-support"
             ; "target", target
-            ; "compatibilityProfile", `String "logseq-65.33-or-newer"
-            ; "responseBudgetBytes", `Int P.maximum_response_bytes
-            ; "defaultPageSize", `Int P.default_page_size
+            ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
+            ; "response_budget_bytes", `Int P.maximum_response_bytes
+            ; "default_page_size", `Int P.default_page_size
             ]
         in
         let reject kind fields =
