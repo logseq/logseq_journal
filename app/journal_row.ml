@@ -11,17 +11,14 @@ let preview_text source =
        ~payload:
          (Yojson.Basic.to_string
             (`Assoc
-               [ "mode", `String "bounded-text"
-               ; "text", `String source
-               ; "maxLines", `Int 4
-               ]))
+                [ "mode", `String "bounded-text"
+                ; "text", `String source
+                ; "maxLines", `Int 4
+                ]))
        ~children:[])
 ;;
 
-let body ~render_source block =
-  let source = render_source (Journal_model.source block) in
-  if String.trim source = "" then V.column [] else preview_text source
-;;
+let body source = if String.trim source = "" then V.column [] else preview_text source
 
 let metadata block =
   let status = Journal_model.task_state block in
@@ -91,24 +88,47 @@ let view
       (id, file_type) :: image_children
     | _ -> image_children
   in
-  let body =
+  let source =
     if is_image_asset (Journal_model.asset_file_type block)
-    then V.column []
-    else body ~render_source block
+    then ""
+    else render_source (Journal_model.source block)
   in
-  let content = V.column ~spacing:8. ~alignment:Leading (body :: metadata block) in
+  let text_children =
+    List.map
+      (fun (summary : Journal_graph_projection.child_summary) ->
+         summary, render_source summary.source)
+      text_children
+  in
+  let metadata = metadata block in
+  let empty_preview =
+    String.trim source = ""
+    && metadata = []
+    && image_children = []
+    && Option.is_none (Journal_model.asset_file_type block)
+    && List.for_all
+         (fun ((summary : Journal_graph_projection.child_summary), source) ->
+            String.trim source = "" && Option.is_none summary.asset_file_type)
+         text_children
+  in
+  let root_body =
+    (* A retained parent may have content only beyond the preview budget.
+       Keep its existing whole-row Detail action identifiable without looking
+       past the selected summaries or manufacturing persisted content. *)
+    if empty_preview then preview_text "Open block" else body source
+  in
+  let content = V.column ~spacing:8. ~alignment:Leading (root_body :: metadata) in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
   let labels =
     labels
     @ List.map
-        (fun (summary : Journal_graph_projection.child_summary) ->
+        (fun ((summary : Journal_graph_projection.child_summary), source) ->
            render_media
              ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
-             (preview_text (render_source summary.source)))
+             (body source))
         text_children
   in
   let labels =
