@@ -1741,7 +1741,131 @@ let test_parent_only_cards_and_point_updates () =
     "status-only point update restored an empty card"
 ;;
 
+let test_partial_day_parent_restore () =
+  let summary : Journal_graph_projection.child_summary =
+    { block_id = id "block" 771; source = "Preserved summary"; asset_file_type = None }
+  in
+  let original = block ~day:20260808 ~order:"b" ~child_count:4 770 in
+  let count state =
+    Timeline.fold_slots
+      (fun n -> function
+         | Top_level _ -> n + 1
+         | _ -> n)
+      0
+      state
+  in
+  let failures = ref [] in
+  List.iter
+    (fun partial ->
+       List.iter
+         (fun use_entry ->
+            List.iter
+              (fun restore ->
+                 try
+                   let first_entry = entry ~child_summaries:[ summary ] original in
+                   let day =
+                     { (day_feed ~more:partial 20260808 "Saturday" [ original ]) with
+                       entries = [ first_entry ]
+                     }
+                   in
+                   let first =
+                     Timeline.empty ~today:20260809
+                     |> begin_and_apply_feed
+                          ~generation:1L
+                          ~before_day:None
+                          (feed [ day ])
+                   in
+                   let update state value =
+                     if use_entry
+                     then
+                       Timeline.replace_timeline_entry
+                         state
+                         (entry ~child_summaries:[ summary ] value)
+                     else Timeline.replace_block state value
+                   in
+                   let cleared =
+                     update
+                       first
+                       (block ~day:20260808 ~order:"b" ~source:"" ~child_count:4 770)
+                   in
+                   require (count cleared = 0) "partial-day clear kept an empty card";
+                   let restored = update cleared restore in
+                   Printf.printf
+                     "partial=%b interface=%s cards=%d->%d->%d\n%!"
+                     partial
+                     (if use_entry then "entry" else "block")
+                     (count first)
+                     (count cleared)
+                     (count restored);
+                   require
+                     (count restored = 1)
+                     "partial=%b interface=%s qualifying parent did not restore"
+                     partial
+                     (if use_entry then "entry" else "block");
+                   let duplicate = update restored restore in
+                   require
+                     (count duplicate = 1)
+                     "repeated restoration duplicated the parent";
+                   let shown =
+                     Timeline.fold_slots
+                       (fun found -> function
+                          | Top_level e -> Some e
+                          | _ -> found)
+                       None
+                       duplicate
+                     |> Option.get
+                   in
+                   require
+                     (shown.child_summaries = [ summary ])
+                     "model restoration dropped retained child summaries";
+                   require
+                     (Timeline.pending_request duplicate = None)
+                     "restoration started another read";
+                   let cursors =
+                     Timeline.fold_slots
+                       (fun acc -> function
+                          | Day_continuation { after; _ } -> after :: acc
+                          | _ -> acc)
+                       []
+                       duplicate
+                   in
+                   require
+                     (cursors = if partial then [ day.continuation ] else [])
+                     "restoration changed continuation";
+                   let earlier = block ~day:20260808 ~order:"a" 769 in
+                   let sorted =
+                     Timeline.prepend_timeline_entry duplicate (entry earlier)
+                   in
+                   let ids =
+                     Timeline.fold_slots
+                       (fun acc -> function
+                          | Top_level e -> Journal_model.id e.block :: acc
+                          | _ -> acc)
+                       []
+                       sorted
+                     |> List.rev
+                   in
+                   require_equal_string_list
+                     ids
+                     [ Journal_model.id earlier; Journal_model.id original ]
+                     "restoration broke sibling order"
+                 with
+                 | Failure s -> failures := s :: !failures)
+              [ block ~day:20260808 ~order:"b" ~source:"Restored" ~child_count:4 770
+              ; Journal_model.with_tag_titles
+                  (block ~day:20260808 ~order:"b" ~source:"" ~child_count:4 770)
+                  ~tag_titles:[ "Work" ]
+              ; Journal_model.with_asset_file_type
+                  (block ~day:20260808 ~order:"b" ~source:"" ~child_count:4 770)
+                  ~asset_file_type:(Some "pdf")
+              ])
+         [ false; true ])
+    [ false; true ];
+  require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_partial_day_parent_restore ();
   test_parent_only_cards_and_point_updates ();
   let failures = ref [] in
   List.iter

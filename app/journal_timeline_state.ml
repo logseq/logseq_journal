@@ -714,11 +714,13 @@ let replace_block (state : t) replacement =
   let before = state in
   let retained = ref false in
   let hidden_match = ref false in
+  let restore_in_place = ref false in
   let state =
     update_day state (Journal_model.journal_day replacement) (fun knowledge ->
       match knowledge.hidden_entry with
       | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
         hidden_match := true;
+        restore_in_place := not knowledge.hidden;
         let entry = { entry with block = replacement } in
         { knowledge with
           hidden_entry = Some entry
@@ -740,11 +742,19 @@ let replace_block (state : t) replacement =
       state.slots
   in
   let state = { state with slots } in
-  let entry = { Journal_graph_projection.block = replacement; child_summaries = [] } in
+  let entry =
+    match
+      Option.bind
+        (Days.find_opt (Journal_model.journal_day replacement) state.days)
+        (fun knowledge -> knowledge.hidden_entry)
+    with
+    | Some entry when Journal_model.id entry.block = replacement_id -> entry
+    | _ -> { Journal_graph_projection.block = replacement; child_summaries = [] }
+  in
   let state =
     if
       (not !retained)
-      && (not !hidden_match)
+      && ((not !hidden_match) || !restore_in_place)
       && Journal_model.parent_id replacement = None
       && (not (empty_parent entry))
       && Days.mem (Journal_model.journal_day replacement) state.days
@@ -752,7 +762,10 @@ let replace_block (state : t) replacement =
       { state with slots = insert_entry state.slots entry }
       |> fun state ->
       update_day state (Journal_model.journal_day replacement) (fun k ->
-        { k with block_count = k.block_count + 1 })
+        { k with
+          block_count = (k.block_count + if !hidden_match then 0 else 1)
+        ; hidden_entry = (if !hidden_match then None else k.hidden_entry)
+        })
     else state
   in
   finish_change before state
@@ -771,11 +784,13 @@ let replace_timeline_entry
   let before = state in
   let retained = ref false in
   let hidden_match = ref false in
+  let restore_in_place = ref false in
   let state =
     update_day state (Journal_model.journal_day replacement.block) (fun knowledge ->
       match knowledge.hidden_entry with
       | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
         hidden_match := true;
+        restore_in_place := not knowledge.hidden;
         { knowledge with
           hidden_entry = Some replacement
         ; block_count =
@@ -800,14 +815,18 @@ let replace_timeline_entry
   let state =
     if
       (not !retained)
-      && (not !hidden_match)
+      && ((not !hidden_match) || !restore_in_place)
       && (not (empty_parent replacement))
       && Journal_model.parent_id replacement.block = None
       && Days.mem day state.days
     then
       { state with slots = insert_entry state.slots replacement }
       |> fun state ->
-      update_day state day (fun k -> { k with block_count = k.block_count + 1 })
+      update_day state day (fun k ->
+        { k with
+          block_count = (k.block_count + if !hidden_match then 0 else 1)
+        ; hidden_entry = (if !hidden_match then None else k.hidden_entry)
+        })
     else state
   in
   finish_change before state
