@@ -2,6 +2,25 @@ module Core = Logseq_sync_pure_reducer.Core
 module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
 module Asset_cache = Bootstrap.Asset_cache
 
+type unlock_failure_category = Token | Transport | Http_status | Decode | Crypto
+
+type unlock_failure_trace =
+  { mutable category : unlock_failure_category option
+  ; mutable http_status : int option
+  }
+
+let unlock_failure_trace = Eio.Fiber.create_key ()
+
+let observe_unlock_failure category =
+  if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then
+    Option.iter (fun trace -> trace.category <- Some category) (Eio.Fiber.get unlock_failure_trace)
+;;
+
+let observe_unlock_http_status status =
+  if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" then
+    Option.iter (fun trace -> trace.http_status <- Some status) (Eio.Fiber.get unlock_failure_trace)
+;;
+
 type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
 
@@ -61,14 +80,18 @@ let authenticated_failure = function
 
 let authenticated_operation provider ~account ~perform =
   match provider.acquire account with
-  | Error message -> Error message
+  | Error message ->
+    observe_unlock_failure Token;
+    Error message
   | Ok token ->
     (match perform token with
      | Ok _ as result -> result
      | Error Unauthorized ->
        provider.invalidate account ~token;
        (match provider.acquire account with
-        | Error message -> Error message
+        | Error message ->
+          observe_unlock_failure Token;
+          Error message
         | Ok refreshed -> Result.map_error authenticated_failure (perform refreshed))
      | Error failure -> Error (authenticated_failure failure))
 ;;
@@ -479,12 +502,15 @@ let effect_error message = Error (Core.Effect_failed message)
 
 let successful_response request (response : Http_eio.response) =
   if response.status < 200 || response.status >= 300
-  then
+  then (
+    observe_unlock_failure Http_status;
     effect_error
-      (Printf.sprintf "sync HTTP request failed with status %d" response.status)
+      (Printf.sprintf "sync HTTP request failed with status %d" response.status))
   else (
     match Http.validate_response_content_type request response.headers with
-    | Error message -> effect_error message
+    | Error message ->
+      observe_unlock_failure Decode;
+      effect_error message
     | Ok () -> Ok response)
 ;;
 
@@ -492,10 +518,25 @@ let perform_authenticated_http t account make_request =
   authenticated_operation t.dependencies.id_token_provider ~account ~perform:(fun token ->
     let request = make_request token in
     match t.dependencies.transport.perform_http ~sw:t.sw request with
-    | Error message -> Error (Request_failed message)
-    | Ok response when response.Http_eio.status = 401 -> Error Unauthorized
-    | Ok response when response.Http_eio.status = 403 -> Error Forbidden
+    | Error message ->
+      (* Http_eio validates Content-Type before returning a response. Its two
+         producer-owned codes retain the decode boundary without logging the
+         arbitrary media type suffix. Numeric status is no longer available. *)
+      observe_unlock_failure
+        (if message = "sync HTTP response is missing Content-Type"
+            || String.starts_with ~prefix:"sync HTTP response has unsupported Content-Type " message
+         then Decode else Transport);
+      Error (Request_failed message)
+    | Ok response when response.Http_eio.status = 401 ->
+      observe_unlock_http_status response.status;
+      observe_unlock_failure Http_status;
+      Error Unauthorized
+    | Ok response when response.Http_eio.status = 403 ->
+      observe_unlock_http_status response.status;
+      observe_unlock_failure Http_status;
+      Error Forbidden
     | Ok response ->
+      observe_unlock_http_status response.status;
       successful_response request response
       |> Result.map_error (function
           | Core.Effect_failed message | Crypto_failed (_, message) ->
@@ -561,7 +602,9 @@ let execute_request
          Http.catalog ~base_url:account.managed_sync_origin ~token))
       (fun response ->
          Catalog.decode response.body
-         |> Result.map_error (fun message -> Core.Effect_failed message))
+         |> Result.map_error (fun message ->
+           observe_unlock_failure Decode;
+           Core.Effect_failed message))
   | Fetch_snapshot_baseline graph ->
     Result.map
       (fun response -> response.Http_eio.body)
@@ -587,14 +630,18 @@ let execute_request
            ~token))
       (fun response ->
          E2ee.graph_key_response response.Http_eio.body
-         |> Result.map_error (fun message -> Core.Effect_failed message))
+         |> Result.map_error (fun message ->
+           observe_unlock_failure Decode;
+           Core.Effect_failed message))
   | Fetch_e2ee_user_keys account ->
     Result.bind
       (perform_authenticated_http t account (fun token ->
          Http.e2ee_user_keys ~base_url:account.managed_sync_origin ~token))
       (fun response ->
          E2ee.user_keys_response response.Http_eio.body
-         |> Result.map_error (fun message -> Core.Effect_failed message))
+         |> Result.map_error (fun message ->
+           observe_unlock_failure Decode;
+           Core.Effect_failed message))
   | Download_snapshot download ->
     let staging = t.dependencies.artifact_store.staging_directory in
     let ensure_staging () =
@@ -916,6 +963,11 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
   fun t ticket request ->
   let id = Core.effect_ticket_id ticket |> Core.effect_id_to_string in
   let diagnostic_kind = unlock_request_kind request in
+  let failure_trace =
+    if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1" && Option.is_some diagnostic_kind
+    then Some { category = None; http_status = None }
+    else None
+  in
   let began = Unix.gettimeofday () in
   Option.iter (fun kind -> unlock_log "op=%s request=%s phase=begin" id kind) diagnostic_kind;
   let cancelled, resolve_cancelled = Eio.Promise.create () in
@@ -934,7 +986,10 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
           (Eio.Fiber.first
              (fun () ->
                 if operation.cancelled || t.closed then raise Runner_cancelled;
-                Platform_crypto.with_diagnostic_operation id (fun () -> execute_request t ticket request))
+                let run () = Platform_crypto.with_diagnostic_operation id (fun () -> execute_request t ticket request) in
+                match failure_trace with
+                | None -> run ()
+                | Some trace -> Eio.Fiber.with_binding unlock_failure_trace trace run)
              (fun () ->
                 Eio.Promise.await cancelled;
                 raise Runner_cancelled))
@@ -947,8 +1002,29 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
         | None -> "cancelled"
         | Some _ when t.closed || operation.cancelled -> "retired"
         | Some result -> unlock_result result in
-      unlock_log "op=%s request=%s phase=end result=%s elapsed_ms=%.0f"
-        id kind outcome (Float.max 0. ((Unix.gettimeofday () -. began) *. 1000.))) diagnostic_kind;
+      let category = match result with
+        | None -> "cancelled"
+        | Some _ when t.closed || operation.cancelled -> "retired"
+        | Some (Ok _) -> "none"
+        | Some (Error error) ->
+          let observed = Option.bind failure_trace (fun trace -> trace.category) in
+          let observed = match observed, error with
+            | Some _ as category, _ -> category
+            | None, Core.Crypto_failed _ -> Some Crypto
+            | None, Effect_failed _ when kind = "unlock-private-key"
+                || kind = "fetch-and-unlock-graph-key" || kind = "load-and-unlock-graph-key" -> Some Crypto
+            | None, _ -> None in
+          (match observed with
+           | Some Token -> "token"
+           | Some Transport -> "transport"
+           | Some Http_status -> "http"
+           | Some Decode -> "decode"
+           | Some Crypto -> "crypto"
+           | None -> "unknown") in
+      let http_status = Option.bind failure_trace (fun trace -> trace.http_status)
+        |> Option.fold ~none:"none" ~some:string_of_int in
+      unlock_log "op=%s request=%s phase=end result=%s failure_category=%s http_status=%s elapsed_ms=%.0f"
+        id kind outcome category http_status (Float.max 0. ((Unix.gettimeofday () -. began) *. 1000.))) diagnostic_kind;
     match result with
     | Some result when (not t.closed) && not operation.cancelled ->
       t.post (Core.Runner_completed (Core.Completion (ticket, result)))

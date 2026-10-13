@@ -52,3 +52,11 @@ The user unlocked the Mac and personally performed Retry/password submission onc
 UI request IDs span queue admission/delivery. Core effect IDs span runner/native execution. Correlating a UI submission with the next Core password event relies on serial submission chronology; the protected Core event ABI is unchanged.
 
 The live proof and screenshots are retained in the task external evidence directory: unlock-logging/live-sanitized.log, submitted-busy.png, submitted-diagnostics.png and diagnosis-summary.json. This evidence supports repairing challenge-specific recovery and semantic submission feedback in a separately authorized change. It does not justify deleting a graph or conclude that unavailable outbox diagnostics mean an empty outbox.
+
+## Upstream classification extension
+
+The original completed trace did not retain the graph-key failure category. Extend only the existing completion observations with fiber-local provenance from token acquisition, HTTP transport/status, Content-Type validation and E2EE response decoding; native secret/crypto requests retain a separate crypto boundary category. Fixed enum names and numeric HTTP status reach stderr, never error text, response bodies, tokens, keys or passwords. Existing business returns, spec interfaces and Dune files stay unchanged.
+
+All eight new assertions first failed for absent classifications. Seven public Runner cases use the existing independent TLS peer plus actual secret adapter boundary to generate transport,503,content-type,JSON,crypto failures and success/401-retry-success. The existing token-provider Runner test covers token failure. All pass with sensitive marker exclusion;401success reports none rather than retaining the earlier failure. Http_eio discards the status when its Content-Type check fails; the Runner recognizes only its producer-owned missing/unsupported media-type error codes and reports status unavailable for that case.
+
+The next complete Simulator diagnostic build will perform one credential-free Retry to categorize the failure. Prior user-led causal trace and screenshots are preserved separately; the user is not asked to repeat the password.

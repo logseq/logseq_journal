@@ -106,7 +106,7 @@ let test_unlock_runner_logging () =
       let logs = In_channel.with_open_bin path In_channel.input_all in
       List.iter (fun value -> Alcotest.(check bool) value true (has logs value))
         [ "source=runner"; "request=fetch-catalog"; "phase=begin"; "phase=end"
-        ; "result=effect-failed"; "elapsed_ms="; "op=" ];
+        ; "result=effect-failed"; "failure_category=token"; "elapsed_ms="; "op=" ];
       List.iter (fun value -> Alcotest.(check bool) "sensitive runner value excluded" false (has logs value))
         [ "LOG_SECRET_USER"; "test must not use network"; "example.invalid" ])
 ;;
