@@ -18,6 +18,7 @@ val view
   :  ?store:Store.t
   -> ?on_region:(string -> unit)
   -> render_source:(string -> string)
+  -> ?render_title:(string -> Journal_model.Title.t)
   -> render_media:
        (title:string
         -> root:string

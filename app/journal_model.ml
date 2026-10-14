@@ -309,17 +309,6 @@ let fold_references source ~init ~f =
   scan 0 init
 ;;
 
-let reference_ids source =
-  let seen = Hashtbl.create 8 in
-  fold_references source ~init:[] ~f:(fun ids _ id ->
-    if Hashtbl.mem seen id
-    then ids
-    else (
-      Hashtbl.add seen id ();
-      id :: ids))
-  |> List.rev
-;;
-
 let maximum_reference_depth = 16
 
 let render_references ~lookup source =
@@ -365,3 +354,355 @@ let render_references ~lookup source =
   in
   Option.value (expand [] 0 source) ~default:source
 ;;
+
+
+(* Parse once per source, independently of graph identity. Resolved output is
+   never cached: graph-session sources and their epoch fences remain authoritative. *)
+module Title = struct
+  module I = Mldoc.Inline
+  module B = Mldoc.Type
+
+  type run =
+    { text : string
+    ; styles : string list
+    ; url : string option
+    ; reference : string option
+    }
+  [@@deriving yojson]
+
+  type t = run list
+
+  type atom =
+    | Text of string
+    | Span of string * atom list
+    | External of string * atom list
+    | Reference of string * string * atom list option
+
+  let config =
+    Mldoc.Conf.of_yojson
+      (`Assoc
+          [ "format", `String "Markdown"
+          ; "keep_line_break", `Bool true
+          ; "parse_marker", `Bool false
+          ; "parse_priority", `Bool false
+          ])
+    |> Result.get_ok
+  ;;
+
+  let reference_id = function
+    | I.Page_ref id when Journal_validation.is_uuid id -> Some (String.lowercase_ascii id)
+    | _ -> None
+  ;;
+
+  let external_url url =
+    let value =
+      match url with
+      | I.Complex { protocol; link }
+        when String.lowercase_ascii protocol = "https"
+             || String.lowercase_ascii protocol = "http" ->
+        String.lowercase_ascii protocol
+        ^ ":"
+        ^ if String.starts_with ~prefix:"//" link then link else "//" ^ link
+      | _ -> I.string_of_url url
+    in
+    match
+      String.lowercase_ascii (Uri.scheme (Uri.of_string value) |> Option.value ~default:"")
+    with
+    | "https" | "http" | "mailto" -> Some value
+    | _ -> None
+  ;;
+
+  exception Title_budget
+
+  let spend budget =
+    decr budget;
+    if !budget < 0 then raise Title_budget
+  ;;
+
+  let rec inline budget value =
+    spend budget;
+    match value with
+    | I.Plain text | Spaces text | Verbatim text -> Text text
+    | Code text -> Span ("code", [ Text text ])
+    | Break_Line | Hard_Break_Line -> Text "\n"
+    | Emphasis (kind, content) ->
+      Span
+        ( (match kind with
+           | `Bold -> "bold"
+           | `Italic -> "italic"
+           | `Underline -> "underline"
+           | `Strike_through -> "strike"
+           | `Highlight -> "highlight")
+        , List.map (inline budget) content )
+    | Link link ->
+      let labeled =
+        match link.label with
+        | [] | [ Plain "" ] -> false
+        | _ -> true
+      in
+      let label =
+        if labeled
+        then List.map (inline budget) link.label
+        else
+          [ Text
+              (Option.value (external_url link.url) ~default:(I.string_of_url link.url))
+          ]
+      in
+      (match reference_id link.url with
+       | Some id -> Reference (id, link.full_text, if labeled then Some label else None)
+       | None ->
+         (match external_url link.url with
+          | Some url when not (String.starts_with ~prefix:"!" link.full_text) ->
+            External (url, label)
+          | _ -> Text link.full_text))
+    | Tag content -> Span ("tag", Text "#" :: List.map (inline budget) content)
+    | Subscript content | Superscript content ->
+      Span ("", List.map (inline budget) content)
+    | Entity entity -> Text entity.unicode
+    | Latex_Fragment (Inline text | Displayed text) -> Text text
+    | Target text | Radio_Target text | Inline_Html text | Inline_Hiccup text -> Text text
+    | Export_Snippet (_, text) -> Text text
+    | Inline_Source_Block block -> Span ("code", [ Text block.code ])
+    | Email email -> Text (email.local_part ^ "@" ^ email.domain)
+    | Nested_link value -> Text value.content
+    | Cookie (Percent value) -> Text (Printf.sprintf "[%d%%]" value)
+    | Cookie (Absolute (current, total)) -> Text (Printf.sprintf "[%d/%d]" current total)
+    | Footnote_Reference value -> Text ("[^" ^ value.name ^ "]")
+    | Timestamp (Date value) -> Text (Mldoc.Timestamp.to_string value)
+    | Macro value ->
+      Text
+        ("{{"
+         ^ value.name
+         ^ (match value.arguments with
+            | [] -> ""
+            | args -> " " ^ String.concat ", " args)
+         ^ "}}")
+    | Timestamp (Scheduled value) -> Text ("SCHEDULED: " ^ Mldoc.Timestamp.to_string value)
+    | Timestamp (Deadline value) -> Text ("DEADLINE: " ^ Mldoc.Timestamp.to_string value)
+    | Timestamp (Closed value) -> Text ("CLOSED: " ^ Mldoc.Timestamp.to_string value)
+    | Timestamp (Clock (Started value)) ->
+      Text ("CLOCK: " ^ Mldoc.Timestamp.to_string value)
+    | Timestamp (Clock (Stopped value)) ->
+      Text
+        ("CLOCK: "
+         ^ Mldoc.Timestamp.to_string value.start
+         ^ "--"
+         ^ Mldoc.Timestamp.to_string value.stop)
+    | Timestamp (Range value) ->
+      Text
+        (Mldoc.Timestamp.to_string value.start
+         ^ "--"
+         ^ Mldoc.Timestamp.to_string value.stop)
+  ;;
+
+  let inlines budget values = List.map (fun (value, _) -> inline budget value) values
+
+  let rec blocks budget values =
+    let rec join = function
+      | [] -> []
+      | [ value ] -> block budget value
+      | value :: (next :: _ as rest) ->
+        block budget value
+        @ (match value, next with
+           | B.Paragraph_Sep _, _ | _, B.Paragraph_Sep _ -> []
+           | _ -> [ Text "\n" ])
+        @ join rest
+    in
+    join values
+
+  and block budget value =
+    spend budget;
+    match value with
+    | B.Paragraph content -> inlines budget content
+    | Heading heading -> inlines budget heading.title
+    | Paragraph_Sep _ -> [ Text "\n\n" ]
+    | Paragraph_line text -> [ Text text ]
+    | Quote content -> blocks budget content
+    | List items -> List.concat_map (item budget) items
+    | Src source -> [ Span ("code", [ Text (String.concat "" source.lines) ]) ]
+    | Example lines -> [ Span ("code", [ Text (String.concat "" lines) ]) ]
+    | Property_Drawer _ | Drawer _ | Comment _ | CommentBlock _ -> []
+    | Footnote_Definition (_, content) -> inlines budget content
+    | Table table ->
+      let rows = Option.to_list table.header @ List.concat table.groups in
+      List.concat_map
+        (fun row ->
+           List.concat_map
+             (fun column -> List.map (inline budget) column @ [ Text "  " ])
+             row
+           @ [ Text "\n" ])
+        rows
+    | Custom (_, _, content, _) -> blocks budget content
+    | Displayed_Math text | Raw_Html text | Hiccup text -> [ Text text ]
+    | Latex_Fragment (Inline text | Displayed text) -> [ Text text ]
+    | Latex_Environment (_, _, text) | Export (_, _, text) -> [ Text text ]
+    | Horizontal_Rule -> [ Text "—" ]
+    | Directive (name, value) -> [ Text (name ^ ": " ^ value) ]
+    | Results -> []
+
+  and item budget value =
+    [ Text
+        (match value.B.number with
+         | Some n -> string_of_int n ^ ". "
+         | None -> "• ")
+    ]
+    @ blocks budget value.content
+    @ [ Text "\n" ]
+    @ List.concat_map (item budget) value.items
+  ;;
+
+  let cache = Hashtbl.create 128
+  let order = Queue.create ()
+  let bytes = ref 0
+  let mutex = Mutex.create ()
+  let maximum_cache_entries = 512
+  let maximum_cache_bytes = 2 * 1024 * 1024
+
+  (* A complexity admission check, not a second Markdown parser. mldoc's
+     nested-link backtracking can otherwise spend seconds on a short title. *)
+  let safe_to_parse source =
+    let depth = ref 0
+    and markup = ref 0
+    and safe = ref true in
+    String.iter
+      (function
+        | '[' | '(' | '{' ->
+          incr depth;
+          incr markup;
+          if !depth > 32 || !markup > 4096 then safe := false
+        | ']' | ')' | '}' -> depth := max 0 (!depth - 1)
+        | _ -> ())
+      source;
+    !safe
+  ;;
+
+  let parse source =
+    if String.length source > 65536
+    then [ Text source ]
+    else (
+      Mutex.lock mutex;
+      Fun.protect
+        ~finally:(fun () -> Mutex.unlock mutex)
+        (fun () ->
+           match Hashtbl.find_opt cache source with
+           | Some value -> value
+           | None ->
+             let value =
+               try
+                 if safe_to_parse source
+                 then Mldoc.Parser.parse config source |> List.map fst |> blocks (ref 512)
+                 else [ Text source ]
+               with
+               | _ -> [ Text source ]
+             in
+             while
+               Hashtbl.length cache >= maximum_cache_entries
+               || !bytes + String.length source > maximum_cache_bytes
+             do
+               let old = Queue.pop order in
+               Hashtbl.remove cache old;
+               bytes := !bytes - String.length old
+             done;
+             Hashtbl.add cache source value;
+             Queue.push source order;
+             bytes := !bytes + String.length source;
+             value))
+  ;;
+
+  let reference_ids source =
+    let seen = Hashtbl.create 8
+    and ids = ref [] in
+    let rec visit = function
+      | Reference (id, _, _) ->
+        if not (Hashtbl.mem seen id)
+        then (
+          Hashtbl.add seen id ();
+          ids := id :: !ids)
+      | Span (_, content) | External (_, content) -> List.iter visit content
+      | Text _ -> ()
+    in
+    List.iter visit (parse source);
+    List.rev !ids
+  ;;
+
+  let render ?(lookup = fun _ -> None) source =
+    let remaining = ref 256
+    and work = ref 512 in
+    let rec expand path depth styles url reference atoms =
+      let output = ref []
+      and size = ref 0
+      and cyclic = ref false in
+      let emit runs =
+        List.iter
+          (fun run ->
+             size := !size + String.length run.text;
+             output := run :: !output)
+          runs
+      in
+      List.iter
+        (fun atom ->
+           decr work;
+           if !work >= 0
+           then (
+             match atom with
+             | Text text -> emit [ { text; styles; url; reference } ]
+             | Span (style, content) ->
+               let runs, cycle =
+                 expand
+                   path
+                   depth
+                   (if style = "" then styles else style :: styles)
+                   url
+                   reference
+                   content
+               in
+               cyclic := !cyclic || cycle;
+               emit runs
+             | External (target, content) ->
+               let runs, cycle =
+                 expand path depth styles (Some target) reference content
+               in
+               cyclic := !cyclic || cycle;
+               emit runs
+             | Reference (id, token, label) ->
+               let fallback () = emit [ { text = token; styles; url; reference } ] in
+               if List.mem id path
+               then (
+                 cyclic := true;
+                 fallback ())
+               else if depth >= maximum_reference_depth || !remaining = 0
+               then fallback ()
+               else (
+                 match lookup id with
+                 | None -> fallback ()
+                 | Some target ->
+                   decr remaining;
+                   let content = Option.value label ~default:(parse target) in
+                   let runs, cycle =
+                     expand (id :: path) (depth + 1) styles None (Some id) content
+                   in
+                   if cycle
+                   then (
+                     cyclic := true;
+                     fallback ())
+                   else if
+                     !size
+                     + List.fold_left (fun n run -> n + String.length run.text) 0 runs
+                     > 65536
+                   then fallback ()
+                   else emit runs)))
+        atoms;
+      List.rev !output, !cyclic
+    in
+    let runs, _ = expand [] 0 [] None None (parse source) in
+    if
+      List.fold_left (fun n run -> n + String.length run.text) 0 runs > 65536 || !work < 0
+    then [ { text = source; styles = []; url = None; reference = None } ]
+    else runs
+  ;;
+
+  let plain runs = String.concat "" (List.map (fun run -> run.text) runs)
+  let to_yojson runs = `List (List.map run_to_yojson runs)
+end
+
+let reference_ids = Title.reference_ids

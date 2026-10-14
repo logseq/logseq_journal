@@ -134,7 +134,7 @@ enum JournalExtensionFingerprint {
 
   static func chromeExtension() -> LUIAppleExtension {
     journalExtension(identifier: "journal-chrome", profiles: appleProfiles,
-      standardChildren: true, events: false) { context in
+      standardChildren: true, events: true) { context in
       AnyView(JournalChrome.View(context: context))
     }
   }

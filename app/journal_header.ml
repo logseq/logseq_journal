@@ -99,14 +99,36 @@ let bottom_controls ~key ~controls body =
   |> V.Body.static
 ;;
 
-let detail_text ~id ~depth text =
-  Ui.Native_widget.widget
-    chrome
-    ~key:(Ui.Key.string ("detail-label:" ^ id))
-    ~props:(props ~mode:"detail-text" ~id ~level:(min 2 depth) ~text ())
-    ~on_event:(fun _ -> ())
-    ~children:[]
-    ()
+(* The same wire representation drives bounded previews and unbounded Detail. *)
+let title_text ?on_reference ~mode ?id ~level ?max_lines title =
+  let fields = ["mode", `String mode; "text", `String (Journal_model.Title.plain title);
+    "runs", Journal_model.Title.to_yojson title; "level", `Int level]
+    @ Option.to_list (Option.map (fun id -> "id", `String id) id)
+    @ Option.to_list (Option.map (fun n -> "maxLines", `Int n) max_lines) in
+  let on_event (event : Journal_lui_native.event) =
+    match on_reference with
+    | None -> ()
+    | Some open_reference ->
+      (try match Yojson.Safe.from_string event.payload with
+       | `Assoc [("reference", `String id)]
+         when Journal_validation.is_uuid id
+           && List.exists (fun (run : Journal_model.Title.run) -> run.reference = Some id) title ->
+         open_reference id
+       | _ -> () with _ -> ())
+  in
+  V.of_lui (Journal_lui_native.mount ?key:(Option.map (fun id -> "detail-label:" ^ id) id)
+    ~payload:(Yojson.Safe.to_string (`Assoc fields)) ~children:[] ~on_event
+    Journal_lui_native.chrome_identifier)
+;;
+
+let detail_text ?title ?on_reference ~id ~depth text =
+  title_text ?on_reference ~mode:"detail-text" ~id ~level:(min 2 depth)
+    (match title with Some title -> title | None -> Journal_model.Title.render text)
+;;
+
+let bounded_text ?on_reference ~child title =
+  title_text ?on_reference ~mode:"bounded-text" ~level:(if child then 1 else 0)
+    ~max_lines:(if child then 2 else 4) title
 ;;
 
 let detail_row ~depth body =

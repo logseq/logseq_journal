@@ -39,6 +39,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let pending: Bool?
     let error: String?
     let text: String?
+    let runs: [TitleRun]?
     let maxLines: Int?
     let id: String?
     let level: Int?
@@ -49,13 +50,52 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let message: String?
   }
 
-  private struct DetailText: SwiftUI.View {
+  /// Syntax and reference resolution belong to OCaml; this maps presentation data.
+  private struct TitleRun: Decodable {
     let text: String
+    let styles: [String]
+    let url: String?
+    let reference: String?
+  }
+
+  private static func attributed(_ runs: [TitleRun]?, fallback: String) -> AttributedString {
+    guard let runs else { return AttributedString(fallback) }
+    var result = AttributedString()
+    for run in runs {
+      var fragment = AttributedString(run.text)
+      var intent: InlinePresentationIntent = []
+      if run.styles.contains("bold") { intent.insert(.stronglyEmphasized) }
+      if run.styles.contains("italic") { intent.insert(.emphasized) }
+      if run.styles.contains("code") { intent.insert(.code) }
+      fragment.inlinePresentationIntent = intent
+      if run.styles.contains("underline") { fragment.underlineStyle = .single }
+      if run.styles.contains("strike") { fragment.strikethroughStyle = .single }
+      if run.styles.contains("highlight") { fragment.backgroundColor = .yellow.opacity(0.25) }
+      if let target = run.url.flatMap(URL.init(string:)) {
+        fragment.link = target
+      } else if let id = run.reference {
+        fragment.link = URL(string: "logseq-journal://block/" + id)
+      }
+      result.append(fragment)
+    }
+    return result
+  }
+
+  private static func openTitleURL(_ url: URL, context: LUIAppleExtensionViewContext, runs: [TitleRun]?) -> OpenURLAction.Result {
+    guard url.scheme == "logseq-journal" else { return .systemAction }
+    let id = String(url.path.dropFirst())
+    guard url.host == "block", runs?.contains(where: { $0.reference == id }) == true,
+      let payload = try? JSONEncoder().encode(["reference": id]) else { return .discarded }
+    return JournalExtensions.emit(context: context, payload: payload) ? .handled : .discarded
+  }
+
+  private struct DetailText: SwiftUI.View {
+    let text: AttributedString
     let id: String
     @ScaledMetric(relativeTo: .body) private var size: CGFloat = 17
     @ScaledMetric(relativeTo: .body) private var targetLineHeight: CGFloat = 27
 
-    init(text: String, id: String, level: Int) {
+    init(text: AttributedString, id: String, level: Int) {
       self.text = text
       self.id = id
       let tier = min(2, max(0, level))
@@ -248,7 +288,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
       case .boundedText:
         if let text = properties?.text, let maxLines = properties?.maxLines,
           maxLines > 0, context.childIDs.isEmpty {
-          Text(verbatim: text)
+          Text(JournalChrome.attributed(properties?.runs, fallback: text))
+            .environment(\.openURL, OpenURLAction { url in
+              JournalChrome.openTitleURL(url, context: context, runs: properties?.runs)
+            })
             .font(properties?.level == 1 ? .subheadline : .body)
             .foregroundStyle(properties?.level == 1 ? .secondary : .primary)
             .multilineTextAlignment(.leading)
@@ -260,7 +303,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
       case .detailText:
         if let properties, let text = properties.text, let id = properties.id,
           let level = properties.level, context.childIDs.isEmpty {
-          DetailText(text: text, id: id, level: level)
+          DetailText(text: JournalChrome.attributed(properties.runs, fallback: text), id: id, level: level)
+            .environment(\.openURL, OpenURLAction { url in
+              JournalChrome.openTitleURL(url, context: context, runs: properties.runs)
+            })
         }
       case .detailRow:
         if let level = properties?.level, context.childIDs.count == 1 {

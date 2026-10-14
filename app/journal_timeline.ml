@@ -182,6 +182,7 @@ let view
       ?store
       ?(on_region = fun _ -> ())
       ~render_source
+      ?render_title
       ~render_media
       ~state
       ~day_presentation
@@ -227,7 +228,10 @@ let view
       | Top_level entry ->
         let render entry show_timestamp =
           on_region "timeline-item-build";
-          Journal_row.view ~render_source ~render_media ~show_timestamp entry
+          Journal_row.view ~render_source ?render_title
+            ?on_reference:(if actions_enabled then Some (fun id ->
+              Ui.Event.Handler.Private.invoke on_open_block (Ui.Event.Payload.Text id)) else None)
+            ~render_media ~show_timestamp entry
         in
         (match store with
          | None -> render entry (should_show_timestamp ~today ~previous_slot slot)

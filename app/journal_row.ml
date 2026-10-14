@@ -2,24 +2,9 @@ module Ui = Journal_view
 module V = Ui.View
 module L = Lui_elements
 
-(* OCaml owns the preview policy; native Text owns visual wrapping at the
-   available width and Dynamic Type size. Keep the full source for Detail. *)
-let preview_text ?(child = false) source =
-  V.of_lui
-    (Journal_lui_native.mount
-       Journal_lui_native.chrome_identifier
-       ~payload:
-         (Yojson.Basic.to_string
-            (`Assoc
-                [ "mode", `String "bounded-text"
-                ; "text", `String source
-                ; "maxLines", `Int (if child then 2 else 4)
-                ; "level", `Int (if child then 1 else 0)
-                ]))
-       ~children:[])
-;;
-
-let body ?(child = false) source = if String.trim source = "" then V.column [] else preview_text ~child source
+let body ?on_reference ?(child = false) title =
+  if String.trim (Journal_model.Title.plain title) = "" then V.column []
+  else Journal_header.bounded_text ?on_reference ~child title
 
 let metadata block =
   let status = Journal_model.task_state block in
@@ -61,6 +46,8 @@ let metadata block =
 
 let view
       ?(render_source = Fun.id)
+      ?render_title
+      ?on_reference
       ~render_media
       ~show_timestamp
       (entry : Journal_graph_projection.timeline_entry)
@@ -89,12 +76,15 @@ let view
       (id, file_type) :: image_children
     | _ -> image_children
   in
+  let render source = match render_title with
+    | Some render -> render source
+    | None -> Journal_model.Title.render (render_source source) in
   let source =
     if is_image_asset (Journal_model.asset_file_type block)
-    then ""
-    else render_source (Journal_model.source block)
+    then []
+    else render (Journal_model.source block)
   in
-  let content = V.column ~spacing:8. ~alignment:Leading (body source :: metadata block) in
+  let content = V.column ~spacing:8. ~alignment:Leading (body ?on_reference source :: metadata block) in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
@@ -106,7 +96,7 @@ let view
              ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
-             (body ~child:true (render_source summary.source)))
+             (body ?on_reference ~child:true (render summary.source)))
         text_children
   in
   let labels =

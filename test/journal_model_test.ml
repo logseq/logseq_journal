@@ -295,7 +295,66 @@ let test_reference_text () =
     "reference discovery did not deduplicate UUIDs or preserve escapes"
 ;;
 
+let test_rich_title_boundaries () =
+  let link id = "[[" ^ id ^ "]]" in
+  let render = Journal_model.Title.render ~lookup:(fun target ->
+    List.assoc_opt target [id, "**Target 中文**"; parent_id, link id; mutation_id, "**" ^ link mutation_id ^ "**"]) in
+  let plain source = render source |> Journal_model.Title.plain in
+  List.iter (fun (source, expected) -> require (plain source = expected) "rich title: %s" source)
+    [ "prefix " ^ link parent_id ^ " suffix", "prefix Target 中文 suffix"
+    ; link mutation_id, link mutation_id
+    ; link "00000000-0000-4000-a000-000000000099", link "00000000-0000-4000-a000-000000000099"
+    ; "`" ^ link id ^ "`", link id
+    ; "\\" ^ link id, link id
+    ; "((" ^ id ^ "))", "((" ^ id ^ "))"
+    ; "# First\n# Second", "First\nSecond"
+    ; "[](https://example.org/path)", "https://example.org/path"
+    ; "<admin@example.org>", "admin@example.org"
+    ; "before [1/3] after", "before [1/3] after"
+    ; "before {{renderer :hello}} after", "before {{renderer :hello}} after"
+    ; "{{renderer :hello}} " ^ link id, "{{renderer :hello}} Target 中文"
+    ; "before [[outer [[inner]]]] after", "before [[outer [[inner]]]] after"
+    ; "SCHEDULED: <2026-10-14 Wed> " ^ link id, "SCHEDULED: <2026-10-14 Wed> Target 中文" ];
+  let runs = render ("**" ^ link id ^ "**") in
+  require (List.exists (fun (run : Journal_model.Title.run) -> run.text = "Target 中文" && run.reference = Some id && List.mem "bold" run.styles) runs) "reference lost styles/target";
+  let runs = render "[**标签**](HTTP://example.org/path)" in
+  require (List.exists (fun (run : Journal_model.Title.run) -> run.url = Some "http://example.org/path" && run.text = "标签" && List.mem "bold" run.styles) runs) "URL lost nested style or authority";
+  let repeated = String.concat " " (List.init 600 (fun _ -> link id)) in
+  require (String.length (plain repeated) <= 65536) "title work/output budget exceeded";
+  let long = String.concat "" (List.init 2000 (fun _ -> "中文 English ")) in
+  require (plain long = long) "long bilingual title truncated in OCaml";
+  require (Journal_model.Title.plain (Journal_model.Title.render ~lookup:(fun _ -> Some "") (link id)) = "") "empty target changed";
+  let pathological = String.make 4000 '[' ^ "x" ^ String.make 4000 ']' in
+  let before = Unix.gettimeofday () in
+  require (plain pathological = pathological) "complex title lost literal fallback";
+  require (Unix.gettimeofday () -. before < 0.1) "mldoc complexity admission did not bound parse time";
+  let first = Journal_model.Title.render ~lookup:(fun _ -> Some "first") (link id)
+  and next = Journal_model.Title.render ~lookup:(fun _ -> Some "next") (link id) in
+  require (Journal_model.Title.plain first = "first" && Journal_model.Title.plain next = "next") "parse cache retained stale reference output"
+;;
+
+let test_ast_reference_discovery () =
+  let a = id and b = parent_id in
+  let page id = "[[" ^ id ^ "]]" and ref id = "((" ^ id ^ "))" in
+  let cases =
+    [ "deprecated syntax is literal", ref a ^ " " ^ ref a, []
+    ; "nested formatting", "**" ^ page a ^ "** and _" ^ page b ^ "_", [a;b]
+    ; "code", "`" ^ page a ^ "` ``" ^ ref b ^ "``", []
+    ; "fenced code", "```\n" ^ ref a ^ "\n```", []
+    ; "escaped", "\\" ^ page a ^ " \\" ^ ref b, []
+    ; "labeled reference", "[label](" ^ page a ^ ")", [a]
+    ; "URLs", "https://example.com [label](https://example.com)", []
+    ; "missing valid UUID", page mutation_id, [mutation_id]
+    ; "plain CJK", "普通文本 English 中英文长文", [] ]
+  in
+  List.iter (fun (name, source, expected) ->
+    require (Journal_model.reference_ids source = expected)
+      "AST reference discovery: %s" name) cases
+;;
+
 let () =
+  test_rich_title_boundaries ();
+  test_ast_reference_discovery ();
   test_reference_text ();
   test_squuid_layout ();
   test_squuid_monotonic_transitions ();
