@@ -6,7 +6,7 @@ Timeline dates need immediate today/yesterday context. Block Detail has a redund
 
 ## Decision
 
-Timeline appends lowercase `today` and `yesterday` after the corresponding dates using native `.footnote.weight(.regular)` text alongside the existing `.title2.weight(.semibold)` date, separated by an en space on the shared native Text baseline. Other dates remain unchanged. Detail supplies an empty navigation title while retaining the native bar, back button and options menu.
+Timeline appends lowercase `today` and `yesterday` after the corresponding dates using native `.subheadline.weight(.regular)` text with secondary foreground alongside the existing `.title2.weight(.semibold)` date, separated by an en space on the shared native Text baseline. Other dates remain unchanged. Detail supplies an empty navigation title while retaining the native bar, back button and options menu.
 
 ## Authorization and ownership
 
@@ -42,4 +42,4 @@ Calendar installation belongs to Application's private effect closure. Its publi
 
 ## Relative-label typography
 
-The smaller footnote style (13pt at default Dynamic Type) keeps today/yesterday subordinate to the semibold 22pt date. Regular weight preserves readable strokes without inheriting a header weight. An en space separates the two runs; the single Text preserves native baseline alignment, proportional shrinking, Dynamic Type and combined heading semantics. Actual same-device before/after screenshots and maximum accessibility sizing verify the refinement.
+The native subheadline style (15pt at default Dynamic Type) keeps today/yesterday readable beside the semibold 22pt date. Regular weight and the semantic system `Color.secondary` retain the auxiliary hierarchy without shrinking to the 13pt footnote size the user found too small or adding another hierarchical opacity reduction in the List header. An en space separates the two runs; the single Text preserves native baseline alignment, proportional shrinking, Dynamic Type and combined heading semantics. Actual same-device before/after screenshots and maximum accessibility sizing verify the refinement.
