@@ -179,6 +179,7 @@ end
 let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
+      ?current_day
       ?store
       ?(on_region = fun _ -> ())
       ~render_source
@@ -198,6 +199,7 @@ let view
   =
   let slots = Timeline.fold_slots (fun acc slot -> slot :: acc) [] state |> List.rev in
   let today = Timeline.today state in
+  let current_day = Option.value current_day ~default:today in
   let metadata index slot : Journal_native_collection.row =
     let section, header, block_id =
       match slot with
@@ -218,7 +220,7 @@ let view
       | None -> fallback
     in
     Journal_header.date_header
-      ?relative_label:(Journal_calendar.relative_day_label ~today day)
+      ?relative_label:(Journal_calendar.relative_day_label ~today:current_day day)
       ~title ()
     |> V.with_test_id (Ui.Test_id.string ("journal-day-heading:" ^ string_of_int day))
   in

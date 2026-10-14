@@ -2477,6 +2477,7 @@ let timeline_page
       ~on_favorites_visible_range
       ~on_favorites_retry
       ~timeline_state
+      ~current_day
       ~loading
       ~graph_error
       ~sync_error
@@ -2518,6 +2519,7 @@ let timeline_page
       |> V.Body.static
     | None ->
       Journal_timeline.view
+        ?current_day
         ?store:timeline_store
         ~on_region
         ~render_source
@@ -6425,7 +6427,8 @@ let start
   let equal_calendar_projection left right =
     Option.equal
       (fun left right ->
-         Journal_calendar.equal_projection_fingerprint
+         Journal_calendar.local_day left = Journal_calendar.local_day right
+         && Journal_calendar.equal_projection_fingerprint
            (Journal_calendar.projection_fingerprint left)
            (Journal_calendar.projection_fingerprint right))
       left.calendar
@@ -6715,6 +6718,7 @@ let start
                  | _ -> ()))
             ~on_favorites_retry:(bind_action dispatch Favorites_retry)
             ~timeline_state:state.timeline
+            ~current_day:(Option.map Journal_calendar.local_day state.calendar)
             ~loading:(not state.feed_loaded)
             ~graph_error:(Option.map graph_error_message state.graph_error)
             ~sync_error:
@@ -7403,6 +7407,7 @@ module For_testing = struct
       ~on_favorites_visible_range:handler
       ~on_favorites_retry:handler
       ~timeline_state:(Journal_timeline_state.empty ~today:20260908)
+      ~current_day:None
       ~loading:false
       ~graph_error:None
       ~sync_error:None

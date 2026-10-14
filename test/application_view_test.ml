@@ -392,6 +392,7 @@ let run_favorites_native_visibility
       ?(check_navigation = false)
       ?(check_detail_row_action = false)
       ?(check_covered_update = false)
+      ?calendar_change
       ?(timeline_rows = 3)
       ?(check_generation = false)
       ?(check_chrome = false)
@@ -420,6 +421,14 @@ let run_favorites_native_visibility
   let publish_error = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
+  let calendar_feed_reads = Atomic.make 0 in
+  let calendar_feed_release = Atomic.make false in
+  let calendar_refresh_pending = Atomic.make false in
+  let calendar_seconds = ref (1_788_220_800. +. if calendar_change = Some `Zone then 82_800. else 0.) in
+  let calendar_offset = ref 0. in
+  let calendar_sampler = Option.map (fun _ -> Journal_calendar.Sampler.create
+      ~clock:(fun () -> !calendar_seconds)
+      ~localtime:(fun instant -> Unix.gmtime (instant +. !calendar_offset)) ()) calendar_change in
   let publish_block = Atomic.make false in
   let updated_block = Atomic.make false in
   let media_notices = Atomic.make [] in
@@ -750,7 +759,11 @@ let run_favorites_native_visibility
                 }
             | V2_list_journals _ ->
               Atomic.set feed_queried true;
-              V2_journals_outcome
+              let _ = Atomic.fetch_and_add calendar_feed_reads 1 in
+              if Atomic.get calendar_refresh_pending then (
+                while not (Atomic.get calendar_feed_release) do Unix.sleepf 0.001 done;
+                V2_failed {code="FixtureCalendarRefresh"; message="Calendar refresh fixture failed"})
+              else V2_journals_outcome
                 { items = [ { page; journal_day = 20260901; revision = "p" } ]
                 ; next_cursor = None
                 }
@@ -1112,6 +1125,7 @@ let run_favorites_native_visibility
   let regions = Hashtbl.create 8 in
   let hooks =
     Application.For_testing.app_with_service
+      ?calendar_sampler
       ~on_client:(fun value -> client := Some value)
       ~on_platform_request:(fun request ->
         if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 28
@@ -1263,6 +1277,7 @@ let run_favorites_native_visibility
   Fun.protect
     ~finally:(fun () ->
       Atomic.set child_release true;
+      Atomic.set calendar_feed_release true;
       Atomic.set detail_wait_release true;
       Atomic.set import_release true;
       Atomic.set acquire_release true;
@@ -1295,6 +1310,48 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       if Option.is_some calendar_change then (
+         let label () = Hashtbl.fold (fun _ values found ->
+           match List.assoc_opt "payload" values with
+           | Some (`String payload) ->
+             let props = Yojson.Safe.from_string payload in
+             let open Yojson.Safe.Util in
+             if member "mode" props = `String "header" && member "title" props = `String "2026.09.01"
+             then (match member "text" props with `String text -> Some text | _ -> None) else found
+           | _ -> found) props None in
+         Alcotest.(check (option string)) "initial sampled date is today" (Some "today") (label ());
+         let lifecycle kind =
+           let packet = Bytes.make 48 '\000' in
+           Bytes.blit_string "LJP2" 0 packet 0 4;
+           Bytes.set_uint16_le packet 4 2;
+           Bytes.set_uint16_le packet 6 15;
+           Bytes.set_int32_le packet 24 16l;
+           Bytes.blit_string "LJP1" 0 packet 32 4;
+           Bytes.set_uint16_le packet 36 1;
+           Bytes.set_uint16_le packet 38 kind;
+           Bytes.set_int64_le packet 40 1L;
+           hooks.platform_event (Bytes.to_string packet);
+           hooks.pump () |> consume in
+         lifecycle 1;
+         (match calendar_change with
+          | Some `Zone -> calendar_offset := 7_200.
+          | Some `Day -> calendar_seconds := !calendar_seconds +. 86_400.
+          | None -> ());
+         let previous_reads = Atomic.get calendar_feed_reads in
+         Atomic.set calendar_refresh_pending true;
+         lifecycle 2;
+         wait "calendar refresh starts with retained feed" (fun () -> Atomic.get calendar_feed_reads > previous_reads);
+         Alcotest.(check bool) "feed is still pending" false (Atomic.get calendar_feed_release);
+         Alcotest.(check (option string)) "sampled date updates before feed completion"
+           (Some "yesterday") (label ());
+         Atomic.set calendar_feed_release true;
+         wait "failed refresh exposes current error" (fun () -> Option.is_some (find "accessibility-label" "Error info"));
+         Alcotest.(check (option string)) "failed refresh retains the correct date suffix"
+           (Some "yesterday") (label ());
+         Alcotest.(check bool) "failed refresh keeps the existing Timeline visible" true
+           (Option.is_some (find "text" "Timeline fixture 2"));
+         Alcotest.(check int) "labels add no feed queries" (previous_reads + 1)
+           (Atomic.get calendar_feed_reads));
        if check_detail_wait then (
          Atomic.set detail_fixture true;
          let root_list = Option.get (find "_extension" "journal-list") in
@@ -4841,7 +4898,11 @@ let () =
     "application view"
     [ ( "relative date chrome", [
         Alcotest.test_case "calendar boundaries and date updates" `Quick test_timeline_relative_date_headers;
-        Alcotest.test_case "empty Detail navigation title" `Quick test_detail_empty_navigation_title] )
+        Alcotest.test_case "empty Detail navigation title" `Quick test_detail_empty_navigation_title;
+        Alcotest.test_case "foreground day updates before delayed or failed feed" `Quick
+          (fun () -> run_favorites_native_visibility ~calendar_change:`Day ());
+        Alcotest.test_case "foreground zone updates before delayed or failed feed" `Quick
+          (fun () -> run_favorites_native_visibility ~calendar_change:`Zone ())] )
     ; ( "token control transport"
       , [ Alcotest.test_case
             "full data lane host response"

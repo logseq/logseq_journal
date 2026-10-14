@@ -15,7 +15,8 @@ end
 val loading_view : unit -> Ui.View.t
 
 val view
-  :  ?store:Store.t
+  :  ?current_day:int
+  -> ?store:Store.t
   -> ?on_region:(string -> unit)
   -> render_source:(string -> string)
   -> render_media:
