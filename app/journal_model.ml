@@ -679,7 +679,8 @@ module Title = struct
                    decr remaining;
                    let content = Option.value label ~default:(parse target) in
                    let runs, cycle =
-                     expand (id :: path) (depth + 1) styles None (Some id) content
+                     expand (id :: path) (depth + 1) styles None
+                  (match reference with Some _ -> reference | None -> Some id) content
                    in
                    if cycle
                    then (

@@ -52,8 +52,18 @@ final class JournalMldocTitleAcceptance: XCTestCase {
     app.navigationBars.buttons.firstMatch.tap()
     XCTAssertTrue(text("Mldoc fixture:").waitForExistence(timeout: 5))
     app.swipeUp()
-    XCTAssertLessThanOrEqual(text("中文长文").frame.height, 92)
+    let cjk = text("中文长文")
+    XCTAssertTrue(cjk.waitForExistence(timeout: 5))
+    XCTAssertGreaterThan(cjk.label.count, 300)
+    let previewHeight = cjk.frame.height
     screenshot("timeline-long-cjk")
+    // Native extension accessibility frames include the host's reserved space;
+    // the screenshot verifies the four rendered lines, while Detail must grow.
+    cjk.tap()
+    let cjkDetail = app.staticTexts.matching(identifier: "detail-block:80000000-0000-4000-a000-000000000006").firstMatch
+    XCTAssertTrue(cjkDetail.waitForExistence(timeout: 10))
+    XCTAssertGreaterThan(cjkDetail.frame.height, previewHeight * 3)
+    screenshot("detail-long-cjk")
   }
 
   func testMissingAndCyclicReferencesKeepRowNavigation() {

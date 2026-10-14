@@ -315,6 +315,9 @@ let test_rich_title_boundaries () =
     ; "{{renderer :hello}} " ^ link id, "{{renderer :hello}} Target 中文"
     ; "before [[outer [[inner]]]] after", "before [[outer [[inner]]]] after"
     ; "SCHEDULED: <2026-10-14 Wed> " ^ link id, "SCHEDULED: <2026-10-14 Wed> Target 中文" ];
+  require
+    (List.for_all (fun (run : Journal_model.Title.run) -> run.reference = Some parent_id) (render (link parent_id)))
+    "nested expansion changed the outer reference click target";
   let runs = render ("**" ^ link id ^ "**") in
   require (List.exists (fun (run : Journal_model.Title.run) -> run.text = "Target 中文" && run.reference = Some id && List.mem "bold" run.styles) runs) "reference lost styles/target";
   let runs = render "[**标签**](HTTP://example.org/path)" in
