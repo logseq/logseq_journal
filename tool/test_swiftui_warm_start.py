@@ -97,7 +97,7 @@ generator = host/'generate.ml'
 generator.write_text(bootstrap+'\n#load '+json.dumps(str(fixture_source.with_suffix('.cmo')))+';;\n')
 
 sources = [root/'swift'/name for name in
-           ['JournalInternalJSON.swift', 'JournalE2EECrypto.swift', 'JournalPlatformWire.swift', 'JournalPlatformServices.swift',
+           ['JournalE2EECrypto.swift', 'JournalPlatformWire.swift', 'JournalPlatformServices.swift',
             'JournalStartupConfiguration.swift', 'JournalChrome.swift']]
 source = root/'apple-tests/warm-start/JournalWarmStartAcceptance.swift'
 for tracked in sources + [source]:

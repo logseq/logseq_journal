@@ -1119,7 +1119,7 @@ public func logseqJournalCryptoJSON(
         let requestPointer,
         let data = String(cString: requestPointer).data(using: .utf8)
       else { throw JournalE2EECryptoError.invalidRequest }
-      let request = try JournalInternalJSON.decode(JournalCryptoRequest.self, from: data)
+      let request = try JSONDecoder().decode(JournalCryptoRequest.self, from: data)
       if ProcessInfo.processInfo.environment["JOURNAL_UNLOCK_DIAGNOSTICS"] == "1" {
         trace = JournalUnlockTrace(request)
         JournalUnlockTrace.current = trace

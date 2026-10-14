@@ -86,7 +86,7 @@ import Observation
     let positions: [String: Int]
 
     init?(_ json: String) {
-      guard let properties = try? JournalInternalJSON.decode(Properties.self, from: Data(json.utf8))
+      guard let properties = try? JSONDecoder().decode(Properties.self, from: Data(json.utf8))
       else { return nil }
       var positions: [String: Int] = [:]
       var keys: Set<String> = []

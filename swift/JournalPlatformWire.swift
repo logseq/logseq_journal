@@ -153,7 +153,7 @@ enum JournalPlatformWire {
   }
 
   private static func decode<Value: Decodable>(_ type: Value.Type, _ payload: Data) throws -> Value {
-    do { return try JournalInternalJSON.decode(type, from: payload) }
+    do { return try JSONDecoder().decode(type, from: payload) }
     catch { throw Failure.invalidPacket }
   }
 

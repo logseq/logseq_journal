@@ -6,8 +6,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='journal-platform-events-') as directory:
     executable = Path(directory) / 'events-tests'
-    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-module-cache-path', str(Path(directory)/'modules'),
-                    str(root / 'swift/JournalInternalJSON.swift'), str(root / 'swift/JournalPlatformWire.swift'),
+    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6',
+                    str(root / 'swift/JournalPlatformWire.swift'),
                     str(root / 'swift/JournalPlatformEvents.swift'),
                     str(root / 'apple-tests/platform-events/JournalPlatformEventsTests.swift'),
                     '-o', str(executable)], check=True)

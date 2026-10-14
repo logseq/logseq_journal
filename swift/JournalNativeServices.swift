@@ -102,7 +102,7 @@ private final class JournalNativeAccountStorage: Sendable {
     }
     let recovery: Recovery
     do {
-      recovery = try JournalInternalJSON.decode(Recovery.self, from: bytes)
+      recovery = try JSONDecoder().decode(Recovery.self, from: bytes)
       guard recovery.version == 1 else { throw JournalPlatformServices.Failure.unavailable }
     } catch {
       throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite)

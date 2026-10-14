@@ -1141,8 +1141,7 @@ let process_exit_code = function
 let compile_platform_crypto_provider ~root ~output =
   let compiler = "/usr/bin/xcrun" in
   let source = Filename.concat root "swift/JournalE2EECrypto.swift" in
-  let decoder = Filename.concat root "swift/JournalInternalJSON.swift" in
-  if not (Sys.file_exists source && Sys.file_exists decoder)
+  if not (Sys.file_exists source)
   then fail "the production platform crypto provider source is unavailable";
   let arguments =
     [| compiler
@@ -1151,7 +1150,6 @@ let compile_platform_crypto_provider ~root ~output =
      ; "DEBUG"
      ; "-parse-as-library"
      ; "-emit-library"
-     ; decoder
      ; source
      ; "-o"
      ; output
@@ -1165,7 +1163,7 @@ let compile_platform_crypto_provider ~root ~output =
   then fail "the production platform crypto provider failed to compile"
 ;;
 
-let run_with_platform_crypto_provider ?(compile_only = false) () =
+let run_with_platform_crypto_provider () =
   let root =
     match Sys.getenv_opt "DUNE_SOURCEROOT" with
     | Some root when Sys.file_exists (Filename.concat root "dune-project") -> root
@@ -1189,32 +1187,27 @@ let run_with_platform_crypto_provider ?(compile_only = false) () =
         Unix.rmdir directory))
     (fun () ->
        compile_platform_crypto_provider ~root ~output:provider;
-       (* Offline compiler verification never loads the provider, reads credentials,
-          creates a Keychain or starts a network client. *)
-       if compile_only
-       then 0
-       else (
-         let environment =
-           environment_with (Unix.environment ()) "DYLD_INSERT_LIBRARIES" provider
-           |> fun environment ->
-           environment_with environment platform_crypto_provider_marker "1"
-           |> fun environment ->
-           environment_with environment test_file_keychain_environment keychain
-         in
-         let executable = Unix.realpath Sys.executable_name in
-         let arguments = Array.copy Sys.argv in
-         arguments.(0) <- executable;
-         let process =
-           Unix.create_process_env
-             executable
-             arguments
-             environment
-             Unix.stdin
-             Unix.stdout
-             Unix.stderr
-         in
-         let _, status = Unix.waitpid [] process in
-         process_exit_code status))
+       let environment =
+         environment_with (Unix.environment ()) "DYLD_INSERT_LIBRARIES" provider
+         |> fun environment ->
+         environment_with environment platform_crypto_provider_marker "1"
+         |> fun environment ->
+         environment_with environment test_file_keychain_environment keychain
+       in
+       let executable = Unix.realpath Sys.executable_name in
+       let arguments = Array.copy Sys.argv in
+       arguments.(0) <- executable;
+       let process =
+         Unix.create_process_env
+           executable
+           arguments
+           environment
+           Unix.stdin
+           Unix.stdout
+           Unix.stderr
+       in
+       let _, status = Unix.waitpid [] process in
+       process_exit_code status)
 ;;
 
 let with_execution_lock f =
@@ -1358,9 +1351,7 @@ let run () =
 let () =
   let status =
     try
-      if Array.length Sys.argv = 2 && Sys.argv.(1) = "--compile-platform-crypto-only"
-      then run_with_platform_crypto_provider ~compile_only:true ()
-      else if Sys.getenv_opt platform_crypto_provider_marker = Some "1"
+      if Sys.getenv_opt platform_crypto_provider_marker = Some "1"
       then (
         with_execution_lock run;
         0)

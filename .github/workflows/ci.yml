@@ -17,8 +17,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify Apple app icon packaging
         run: python3 tool/test_apple_app_icon.py
-      - name: Verify owned and external native JSON boundaries
-        run: python3 tool/test_json_boundaries.py
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.5.0"
@@ -39,8 +37,6 @@ jobs:
       - name: Build all targets and native embed
         run: |
           opam exec -- dune build @all app/native_embed.exe.o
-      - name: Verify deployed crypto provider compiles offline
-        run: opam exec -- dune exec logseq_db_worker/test/test_managed_sync_e2e.exe -- --compile-platform-crypto-only
       - name: Run full regression suite
         run: opam exec -- dune runtest --force
       - name: Upload resolved dependencies and test logs

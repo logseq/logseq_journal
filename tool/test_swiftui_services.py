@@ -7,7 +7,7 @@ root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='journal-platform-services-') as directory:
     executable = Path(directory)/'services-tests'
     subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-module-cache-path', str(Path(directory)/'modules'),
-                    str(root / 'swift/JournalInternalJSON.swift'), str(root / 'swift/JournalPlatformWire.swift'),
+                    str(root/'swift/JournalPlatformWire.swift'),
                     str(root/'swift/JournalPlatformServices.swift'),
                     str(root/'apple-tests/platform-services/JournalPlatformServicesTests.swift'),
                     '-o', str(executable)], check=True)
@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-services-') as directo
     recovery = Path(directory)/'recovery-tests'
     subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-Xfrontend', '-disable-sandbox',
                     '-module-cache-path', str(Path(directory)/'modules'),
-                    str(root / 'swift/JournalInternalJSON.swift'), str(root / 'swift/JournalPlatformWire.swift'),
+                    str(root/'swift/JournalPlatformWire.swift'),
                     str(root/'swift/JournalPlatformServices.swift'),
                     str(root/'swift/JournalLocalAccountBindingStore.swift'),
                     str(root/'apple-tests/platform-services/JournalAccountRecoveryTests.swift'),
@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-services-') as directo
     subprocess.run([str(recovery)], check=True, timeout=60)
     threading = Path(directory)/'account-threading-tests'
     subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-module-cache-path', str(Path(directory)/'modules'),
-                    str(root / 'swift/JournalInternalJSON.swift'), str(root / 'swift/JournalPlatformWire.swift'),
+                    str(root/'swift/JournalPlatformWire.swift'),
                     str(root/'swift/JournalPlatformServices.swift'),
                     str(root/'swift/JournalStartupConfiguration.swift'),
                     str(root/'swift/JournalNativeServices.swift'),
@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-services-') as directo
     subprocess.run([str(threading)], check=True, timeout=60)
     cold = Path(directory)/'cold-tests'
     subprocess.run(['xcrun','swiftc','-swift-version','6','-module-cache-path',str(Path(directory)/'modules'),
-                    str(root / 'swift/JournalInternalJSON.swift'), str(root / 'swift/JournalPlatformWire.swift'),
+                    str(root/'swift/JournalPlatformWire.swift'),
                     str(root/'swift/JournalPlatformServices.swift'),
                     str(root/'swift/JournalStartupConfiguration.swift'),
                     str(root/'swift/JournalNativeServices.swift'),

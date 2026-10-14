@@ -8,7 +8,6 @@ trap 'rm -f "$binary"' EXIT HUP INT TERM
 swiftc \
   -swift-version 6 \
   -D DEBUG \
-  "$root/swift/JournalInternalJSON.swift" \
   "$root/swift/JournalE2EECrypto.swift" \
   "$root/test/wrapped_graph_key_crypto_test.swift" \
   -o "$binary"

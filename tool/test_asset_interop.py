@@ -22,7 +22,7 @@ work = Path(tempfile.mkdtemp(prefix="journal-asset-interop-"))
 print(work, flush=True)
 record = {"commands": [], "sources": {}, "result": "incomplete"}
 for source in [crypt, upstream / "deps/db/src/logseq/db/sqlite/util.cljs",
-               root / "swift/JournalInternalJSON.swift", root / "swift/JournalE2EECrypto.swift",
+               root / "swift/JournalE2EECrypto.swift",
                root / "logseq_sync/lib/effect_runner/protocol/asset_codec.ml",
                root / "logseq_sync/test/asset_native_interop.ml",
                root / "logseq_sync/test/asset_adapter_memory.ml",
@@ -67,7 +67,7 @@ run(["nbb", "--version"])
 run(["swiftc", "--version"])
 run(nbb + ["generate", str(work)])
 library = work / "libJournalAssetCrypto.dylib"
-run(["swiftc", "-emit-library", str(root / "swift/JournalInternalJSON.swift"), str(root / "swift/JournalE2EECrypto.swift"),
+run(["swiftc", "-emit-library", str(root / "swift/JournalE2EECrypto.swift"),
      "-o", str(library)])
 run(["dune", "build", "logseq_sync/test/asset_native_interop.exe",
      "logseq_sync/test/asset_adapter_memory.exe"])

@@ -1,70 +1,45 @@
-# Open external JSON inputs and close owned JSON contracts
+# Open external OCaml JSON inputs and keep owned contracts closed
 
 ## Problem
 
-A real Journal sync error rejects the extra tx-id field on pull/ok.txs[0] before any transaction is applied. The generated server DTO and manual structural whitelist both reject it. External services can extend responses without changing the fields Journal consumes. Shared input/output DTOs also obscure which side owns a schema; synthesized Swift internal decoders currently tolerate unknown fields.
+A real Journal sync error rejects pull/ok.txs[0].tx-id before transactions are applied. Both the generated server DTO and the structural whitelist reject external response extensions. External services can add fields Journal does not consume without changing required fields.
 
 ## Decision
 
-Follow the user-approved boundary policy. External server/HTTP JSON input DTOs derive open PPX readers, including nested records; validate declared required fields, their types and domain semantics. Continue rejecting unsupported message variants and malformed JSON. Ignore unused pull tx-id regardless of its value. Keep generated closed output DTOs separate, with semantic and wire budget checks; client wire validation remains closed. Internal OCaml commands, outcomes and persistence domain codecs remain closed. Swift-owned internal/native receivers use a recursive Decoder wrapper that rejects keys absent from synthesized CodingKeys; external Cognito and Transit readers do not use it. Keep generated Codable/PPX construction, existing keys and formats.
+Limit this PR to OCaml JSON codecs, as explicitly requested by the user. Keep PPX. External WS and E2EE HTTP records use separate input-only open readers, including nested records; declared required fields, types, nullability, supported variants, semantics and size budgets remain validated. Unused pull tx-id is ignored. Owned client/output DTOs remain closed, and existing internal Config/Protocol/full persistence admission stays closed. Catalog and snapshot metadata retain open input behavior with decode-only derivations. Outbox metadata readers remain decode-only projections rather than full-record admission.
 
-The existing metadata-only outbox/format readers are projections of a complete record, not full-record admission or constructors; make decode-only derivations explicit where applicable. Their extra declared owner fields must not be rejected as projection extras. The domain owner remains responsible for the full closed contract.
+All Swift codec behavior and its compiler/test/CI configuration are restored exactly to the PR's merge-base. The generic Swift decoder, native call-site replacements, native boundary tests and offline provider compile mode are outside the narrowed scope.
 
 ## Alternatives considered
 
 ### Declare only tx-id
 
-Rejected because the user explicitly authorized open external inputs, including nested future fields. Adding a whitelist entry would leave the same failure for the next external extension.
+Would still reject the next external extension. The user requested open external input schemas.
 
-### Make all shared DTOs open
+### Make shared input/output DTOs open
 
-Rejected because it would extend open semantics to internal receivers and weaken validation of owned output. Use separate external-input and closed-output DTOs.
+Would spread external tolerance into owned contracts. Keep separate input-only readers and closed output DTOs.
 
-## Acceptance criteria
+### Add strict Swift receiving infrastructure
 
-- Public Sync_protocol API accepts top-level and nested server extensions while preserving required/type/null/semantic, cursor/budget and discriminator failures; all client input remains closed and generated outbound shapes contain only contract fields.
-- Public Runner requests exercise open HTTP catalog/E2EE inputs through the existing isolated TLS peer. Core public completions retain snapshot metadata field/URL validation.
-- Native public wire and closed-decoder utility tests reject root/nested/array extras, retain required/type/null/default behavior and leave external Cognito decode open.
-- Tests are written before implementation and demonstrably RED for the old behavior, then GREEN. Existing targeted regressions and appropriate broader checks pass.
-- No Dune/spec files, UI PR73 checkout, user graph, credentials, phone installation or temporary diagnostic observer is changed.
-- Create a formal PR, freeze head SHA, wait for that exact head CI terminal results, then request independent journal-code-review. Do not merge.
-
-## Risks
-
-- Open schemas still enforce standard JSON safety and declared semantic constraints; unknown event types are not extension fields.
-- Swift native receiver fields must match the complete OCaml producer contract. Nested checking must preserve optional nulls, arrays and dynamic dictionaries rather than guess field lists.
-- Public Core receives already-decoded WS messages and HTTP key values, so it cannot reproduce raw field rejection. The narrowest raw WS boundary is public Sync_protocol; HTTP raw parsing belongs to the public Runner and its transport peer. Do not inject an already incorrect parsed result into a reducer as a reproduction.
-- Existing live evidence covers the reported WS extra-field rejection and historical catalog/E2EE paths, plus a public JWKS read. Synthetic tests are not live service validation; actual signed-in response variants remain unobserved.
-
-## Questions
-
-- None. The user expressly authorized this policy change and a separate formal PR; any necessary Dune/spec edit would require a separate minimal-diff request.
+Not part of the narrowed OCaml scope. Generated Encodable/PPX writers already emit their declared fields; strict receiving is a separate defensive policy. Restore Swift and dependent wiring to their prior behavior.
 
 ## Consequences
 
-WS server records now have separate input-only open PPX DTOs. The discriminator remains owned by its header reader and semantic validator. Open object validation checks declared values and duplicate safety without running the owned-field whitelist. Output uses the original closed DTO serializers and generated closed readers, plus existing semantic and size validation. HTTP E2EE inputs are open; catalog and snapshot metadata retain their already-open behavior but expose no encoders. Internal Config/Protocol/full persistence codecs stay closed. Decode-only outbox indexing and account-format projections remain explicitly separate from full-record admission.
+Open object validation checks declared fields and duplicate safety without applying the owned-field whitelist. Output uses the original generated closed DTOs and readers with semantic/budget validation. Internal full-record codecs stay closed; projections do not expose encoders. All Dune/spec/Swift/CI files have no net changes relative to the merge-base. No UI changes, real account/graph writes, new diagnostics, merge or phone installation belong to this PR.
 
-Swift native wire, extension properties, persisted token/binding/recovery records and the crypto bridge use the closed recursive Decoder. It derives allowed keys from each Decodable container's synthesized CodingKeys, including nested arrays/enums; dynamic dictionaries keep their intentional key space. Foundation's Data/Date/URL/Decimal decoding is preserved. External OAuth/JWT/JWKS/Transit readers keep their existing open behavior. Unknown-field diagnostics omit unknown names and values.
+## Validation and coverage
 
-The user explicitly approved the one-line JournalInternalJSON.swift dependency in the existing wrapped-key crypto Dune rule. It is the only Dune change; all OCaml spec files remain untouched.
+Tests were written first. Against unchanged main953, public WS extension/declared-control tests failed, and public Runner/local TLS HTTP tests failed four extension-acceptance assertions; required/type/null/duplicate controls passed. Core metadata and internal Config controls passed at baseline. These are synthetic regression payloads, not live service compatibility claims.
 
-## Validation and actual-data coverage
-
-Tests were added first. With production at main953, the public WS codec failed its two new extension/declared-constraint tests, native wire/binding plus recursive utility behavior failed five extension assertions, and the public Runner/local TLS peer failed four E2EE extension-acceptance assertions. Existing required/type/null/duplicate controls passed. The Core metadata and internal Config controls passed at baseline. These fixtures are synthetic, including the independent local TLS peer and signed Cognito issuer.
-
-| Boundary | Real evidence | Regression coverage |
+| Boundary | Actual evidence | Public regression boundary |
 | --- | --- | --- |
-| WS server/client | Materialized and viewed error screenshot proves pull/ok.txs[0].tx-id rejection; full payload and deployed SHA unknown | All supported server variants/rejection reasons, top/nested extensions, ignored tx-id shapes, required/type/null/semantic/variant errors, closed client/output and wire limits |
-| Catalog and E2EE HTTP | Earlier authorized App type-only logs: catalog/user keys HTTP 200; graph key before/after PR72; no new signed-in response collection | Public Runner with independent localhost TLS peer, valid extensions and invalid consumed fields |
-| Cognito OAuth/JWT/JWKS | Public JWKS read returned 200, two RSA keys and decoded through the existing Swift reader; no tokens recorded | Existing production owner with synthetic signed issuer; open response and authentication failure controls |
-| Snapshot metadata/baseline | Upstream schema only; no live signed-in response | Public Core raw completions verify extension tolerance, required/type/null and HTTPS URL constraints |
-| Transit sync/snapshot/assets | No new live graph/asset samples | Existing envelope/size/transaction/snapshot/asset regression suites; no format changes |
-| Owned native/persistence/output | OCaml producer emitted real generated bytes to the Swift public receiver in an isolated harness; no real account store accessed | Native wire round trip, nested closed decoder, optional/dictionary behavior and account recovery; existing OCaml closed persistence tests |
+| WS server/client | Materialized and viewed screenshot establishes pull/ok.txs[0].tx-id rejection; payload and deployed SHA unknown | Sync_protocol: all supported variants and rejection reasons, root/nested extras, ignored tx-id shapes, required/type/null/semantic/variant failures, closed client/output and limits |
+| Catalog/E2EE HTTP | Prior authorized type-only App logs show catalog/user-key HTTP 200 and graph-key behavior before/after PR72; no fresh signed-in payload collection | Runner with independent localhost TLS peer and generated readers |
+| Snapshot metadata/baseline | Upstream schema, no live signed-in response | Core raw completions preserve required/type/null/HTTPS URL checks |
+| Internal/outbound | No real account record accessed | Config rejects root/nested extras; existing Protocol and persistence suites retain closed full admission; generated client/server output round trips |
+| Transit/snapshot/assets | No new live graph/asset samples | Existing envelope/size/transaction/snapshot/asset regressions; formats unchanged |
 
-Current upstream dev `949a4f0e72cddb2dad34091393bfa09592171944` declares optional non-null UUID tx-id on server tx-log entries; old `015cc9f` does not declare that server field. Both use open Malli maps. This is source evidence, not the screenshot field's observed type or deployed revision: [frozen dev schema](https://github.com/logseq/logseq/blob/949a4f0e72cddb2dad34091393bfa09592171944/deps/db-sync/src/logseq/db_sync/malli_schema.cljs#L10). Journal does not consume tx-id, so its external input reader ignores it.
+Frozen upstream dev 949a4f0e72cddb2dad34091393bfa09592171944 declares optional non-null UUID tx-id in server entries; old 015cc9f does not declare that server field. Both use open Malli maps. This source evidence does not establish the screenshot value/type or deployment revision: [frozen schema](https://github.com/logseq/logseq/blob/949a4f0e72cddb2dad34091393bfa09592171944/deps/db-sync/src/logseq/db_sync/malli_schema.cljs#L10). Journal does not consume tx-id.
 
-The complete build (`@all` and native embed), full regression recheck (259 sync cases), 10 native JSON boundary assertions, account/recovery/event and synthetic signed-Cognito suites, public OCaml-to-Swift wire round trip and production iOS SwiftUI typecheck passed. The initial concurrent full run exposed one existing 20ms/30ms RFC Pong timing failure; both original and restored protocol single-case checks then passed, followed by the full regression recheck. No transport timing or production transport code was changed. The document passes spec-dev-tool; check --all reports three unchanged preexisting invalid historical decisions.
-
-A preliminary independent read-only review of the uncommitted diff using journal-code-review found no evidenced P1/P2. It does not replace the independent Codex session review of the formal PR snapshot.
-
-The formal independent Codex review of head 3511e42 found one P2: the deployed E2E provider compiler still passed only JournalE2EECrypto.swift. Its actual compiler function now includes JournalInternalJSON.swift. A compile-only public executable mode stops before provider loading, environment/credential reading, Keychain creation or networking; this mode reproduced the missing-type compiler error (exit 2) and passed after the source-list fix (exit 0). CI runs this offline compiler regression after building targets. No online E2E was executed.
+After scope removal, rerun the OCaml build/native embed and regression suite, review the exact new head in the existing independent Codex session using journal-code-review, and track its CI to success. Prior Swift-inclusive review/CI snapshots are superseded. spec-dev-tool check --all has three preexisting invalid historical decisions unrelated to this change.

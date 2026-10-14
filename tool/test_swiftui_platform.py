@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix='journal-platform-wire-') as directory:
                       *[source.stem + '.cmx' for source in sources if source.suffix == '.ml']])
     run(destination, [str(destination / 'wire_ocaml'), 'emit', 'requests.json'])
     run(destination, ['swiftc', '-swift-version', '6', '-module-cache-path', str(destination / 'module-cache'), '-o', 'wire_swift',
-                      str(ROOT / 'swift/JournalInternalJSON.swift'), str(ROOT / 'swift/JournalPlatformWire.swift'),
+                      str(ROOT / 'swift/JournalPlatformWire.swift'),
                       str(ROOT / 'swift/JournalPlatformServices.swift'),
                       str(ROOT / 'swift/JournalStartupConfiguration.swift'),
                       str(ROOT / 'swift/JournalLocalAccountBindingStore.swift'),

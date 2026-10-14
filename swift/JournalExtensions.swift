@@ -96,7 +96,7 @@ enum JournalExtensionFingerprint {
     _ type: Properties.Type, context: LUIAppleExtensionViewContext
   ) -> Properties? {
     guard case let .string(json) = context.property("payload"),
-      let value = try? JournalInternalJSON.decode(type, from: Data(json.utf8))
+      let value = try? JSONDecoder().decode(type, from: Data(json.utf8))
     else { return nil }
     return value
   }
