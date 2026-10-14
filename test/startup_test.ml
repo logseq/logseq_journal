@@ -350,7 +350,21 @@ let test_stable_startup_presentation () =
   require (!failures=[]) "Startup regressions: %s" (String.concat ", " (List.rev !failures))
 ;;
 
+(* Startup recovery projection owns action choice, not Core challenge storage. *)
+let test_e2ee_recovery_requires_a_prepared_challenge () =
+  List.iter (fun ready ->
+    let state = Journal_startup.derive
+      ~snapshot:(startup_snapshot ~failure:During_e2ee ~awaiting_e2ee_password:ready ())
+      ~graph:(graph_state ~phase:Graph_closed ()) in
+    require (state.phase = Failed) "E2EE failure was hidden";
+    let expected = if ready then Journal_startup.Submit_e2ee_password
+      else Journal_startup.Begin_online_recovery in
+    require (Option.bind state.error (fun error -> error.Journal_startup.recovery)
+      = Some expected) "E2EE recovery offers password without a prepared challenge") [false;true]
+;;
+
 let () =
+  test_e2ee_recovery_requires_a_prepared_challenge ();
   test_stable_startup_presentation ();
   test_deletion_failure_has_no_recovery ();
   test_exact_codec_and_round_trip ();

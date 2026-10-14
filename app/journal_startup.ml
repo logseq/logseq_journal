@@ -44,14 +44,16 @@ type startup_state =
   ; error : startup_error option
   }
 
-let startup_error stage message =
+let startup_error ~awaiting_e2ee_password stage message =
   let owner, recovery =
     match stage with
     | Graph_service.During_authentication -> Authentication, Some Sign_in
     | During_catalog -> Catalog, Some Refresh_catalog
     | During_local_restore -> Local_restore, Some Begin_online_recovery
     | During_bootstrap -> Bootstrap, Some Begin_online_recovery
-    | During_e2ee -> E2ee, Some Submit_e2ee_password
+    | During_e2ee ->
+      E2ee, Some (if awaiting_e2ee_password then Submit_e2ee_password
+                  else Begin_online_recovery)
   in
   { owner; message; recovery }
 ;;
@@ -94,7 +96,7 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
   else if not facts.authenticated
   then
     (match facts.failure with
-     | Some stage -> { phase = Failed; error = Some (startup_error stage
+     | Some stage -> { phase = Failed; error = Some (startup_error ~awaiting_e2ee_password:facts.awaiting_e2ee_password stage
          (Option.value snapshot.last_error ~default:"Startup failed.")) }
      | None when facts.restoring_local -> { phase = Restoring_local; error = None }
      | None -> { phase = Signed_out; error = None })
@@ -119,6 +121,7 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
       ; error =
           Some
             (startup_error
+               ~awaiting_e2ee_password:facts.awaiting_e2ee_password
                stage
                (Option.value snapshot.last_error ~default:"Startup failed."))
       }

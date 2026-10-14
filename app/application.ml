@@ -336,6 +336,7 @@ type state =
   ; next_sync_error_sequence : int64
   ; e2ee_password : Journal_capture.t
   ; e2ee_submission_pending : bool
+  ; e2ee_submission_error : string option
   ; modal : modal
   ; confirmation_sequence : int64
   ; environment : Journal_environment.snapshot
@@ -428,6 +429,7 @@ let initial_state =
   ; next_sync_error_sequence = 1L
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
   ; e2ee_submission_pending = false
+  ; e2ee_submission_error = None
   ; modal = No_modal
   ; confirmation_sequence = 0L
   ; environment = Journal_environment.fallback
@@ -700,6 +702,11 @@ let local_deletion_available state =
 let apply_manager_state state (manager_state : Graph_service.state) =
   let e2ee_submission_was_pending = state.e2ee_submission_pending in
   let snapshot = manager_state.snapshot in
+  let owner_changed = match state.manager with
+    | Some previous ->
+      previous.startup.account_generation <> snapshot.startup.account_generation
+      || previous.startup.graph_generation <> snapshot.startup.graph_generation
+    | None -> true in
   let state =
     match state.manager with
     | Some previous
@@ -737,7 +744,8 @@ let apply_manager_state state (manager_state : Graph_service.state) =
   in
   let is_awaiting_password = snapshot.startup.awaiting_e2ee_password in
   let e2ee_password, next_local_sequence =
-    if is_awaiting_password = was_awaiting_password && not graph_context_changed
+    if is_awaiting_password = was_awaiting_password
+       && not (owner_changed || graph_context_changed)
     then state.e2ee_password, state.next_local_sequence
     else
       ( Journal_capture.create ~session_number:state.next_local_sequence ~source:""
@@ -766,13 +774,19 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     ; e2ee_submission_pending =
         state.e2ee_submission_pending
         && not
-             (graph_context_changed
+             (owner_changed
+              || graph_context_changed
               || is_awaiting_password
               || Option.is_some snapshot.startup.failure
               || snapshot.startup.bootstrapping
               || (not snapshot.startup.authenticated)
               || (Journal_startup.derive ~snapshot ~graph:state.graph_state).phase = Ready
              )
+    ; e2ee_submission_error =
+        (if owner_changed || graph_context_changed
+            || was_awaiting_password <> is_awaiting_password
+            || Option.is_some snapshot.startup.failure
+         then None else state.e2ee_submission_error)
     ; next_local_sequence
     ; modal
     ; graph_ready = state.graph_ready && not graph_context_changed
@@ -3256,6 +3270,8 @@ let manager_page state dispatch =
       content
   in
   let unlock error =
+    let error = match state.e2ee_submission_error with
+      | Some _ as error -> error | None -> error in
     let pending = state.e2ee_submission_pending in
     let password = state.e2ee_password in
     let ignored = Ui.Event.Handler.create (fun _ -> ()) in
@@ -3937,18 +3953,31 @@ let start
          Option.map (fun settings -> calendar, settings) !asset_settings))
   in
   let started_graph_generation = ref None in
+  let unlock_request = ref None in
+  let unlock_owner state = Option.map (fun (snapshot : Graph_service.snapshot) ->
+    snapshot.startup.account_generation, snapshot.startup.graph_generation) state.manager in
+  let reject_unlock owner () =
+    set_state (fun state ->
+      if unlock_owner state <> owner then state
+      else
+        { state with
+          e2ee_submission_pending = false
+        ; e2ee_submission_error = Some "Unable to unlock the graph. Try again."
+        }) () in
   let send_manager command =
     Effect.of_thunk (fun () ->
+      let owner = unlock_owner !state_ref in
       let result = Worker.send client (Graph_service.Client_command command) in
       (match command with
        | Graph_service.Submit_e2ee_password _ ->
          (match result with
           | Worker.Accepted request_id ->
+            unlock_request := Some (request_id, owner);
             unlock_log "phase=queue result=accepted request_id=%Ld"
               (Journal_worker_ids.Worker.Request_id.to_int64 request_id)
-          | Full -> unlock_log "phase=queue result=full"
-          | Not_ready -> unlock_log "phase=queue result=not-ready"
-          | Stopping -> unlock_log "phase=queue result=stopping")
+          | Full -> unlock_log "phase=queue result=full"; reject_unlock owner ()
+          | Not_ready -> unlock_log "phase=queue result=not-ready"; reject_unlock owner ()
+          | Stopping -> unlock_log "phase=queue result=stopping"; reject_unlock owner ())
        | _ -> ()))
   in
   let submit request = Journal_graph_runtime.submit graph_runtime request in
@@ -4590,6 +4619,13 @@ let start
       Effect.bind
         (Effect.many [ capture_completion; completion ])
         ~f:(fun () -> !drain_capture_imports ())
+    | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
+      when Option.fold ~none:false ~some:(fun (owned, _) -> owned = request_id) !unlock_request ->
+      let _, owner = Option.get !unlock_request in
+      unlock_request := None;
+      if owner = unlock_owner !state_ref && (!state_ref).e2ee_submission_pending
+      then Effect.of_thunk (reject_unlock owner)
+      else Effect.ignore
     | Worker.Response { outcome = Completed (Asset_file _); _ } -> Effect.ignore
     | Worker.Response { outcome = Completed Client_command_completed; _ } -> Effect.ignore
     | Worker.Response { outcome = Completed (Graph_state graph_state); _ }
@@ -4696,6 +4732,10 @@ let start
         let worker_error = service_error ~operation:"terminal" error in
         record_worker_error state ~operation:"terminal" worker_error
         |> fun state ->
+        let state = if state.e2ee_submission_pending then
+          { state with e2ee_submission_pending = false
+          ; e2ee_submission_error = Some "Unable to unlock the graph. Try again." }
+          else state in
         terminal_graph_state state (Worker_graph_error (latest_worker_error state)))
   in
   let install_calendar set_state calendar =
@@ -5852,8 +5892,7 @@ let start
       let password = Journal_capture.source snapshot.e2ee_password in
       let awaiting =
         match snapshot.manager with
-        | Some { startup = { awaiting_e2ee_password = true; _ }; _ }
-        | Some { startup = { failure = Some During_e2ee; _ }; _ } -> true
+        | Some { startup = { awaiting_e2ee_password = true; _ }; _ } -> true
         | None | Some _ -> false
       in
       if
@@ -5869,6 +5908,7 @@ let start
           (update (fun state ->
              { state with
                e2ee_submission_pending = true
+             ; e2ee_submission_error = None
              ; e2ee_password =
                  Journal_capture.create
                    ~session_number:state.next_local_sequence

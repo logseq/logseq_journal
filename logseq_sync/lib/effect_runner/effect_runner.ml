@@ -607,13 +607,24 @@ let observe_graph_key_response_shape body =
   if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
      && Atomic.get unlock_log_count <= 256
   then Option.iter (fun trace ->
-    let kind, known, unknown, present =
-      if String.length body > 65_536 then "unavailable", "unavailable", "unavailable", "unavailable"
+    let kind, known, unknown, present, base64_kind =
+      if String.length body > 65_536 then "unavailable", "unavailable", "unavailable", "unavailable", "unavailable"
       else try
-        let kind, known, unknown = match Yojson.Safe.from_string body with
+        let json = Yojson.Safe.from_string body in
+        let value_kind = function
+          | `String _ -> "string" | `Null -> "null" | `Bool _ -> "boolean"
+          | `Int _ | `Intlit _ | `Float _ -> "number"
+          | `Assoc _ -> "object" | `List _ -> "array" in
+        let base64_kind = match json with
+          | `Assoc fields ->
+            (match List.assoc_opt "encrypted-aes-key-base64" fields with
+             | None -> "absent" | Some value -> value_kind value)
+          | _ -> "absent" in
+        let kind, known, unknown = match json with
           | `Assoc fields ->
             let known, unknown = List.fold_left (fun (known, unknown) (name, _) ->
-              if String.equal name "encrypted-aes-key" then known+1, unknown
+              if String.equal name "encrypted-aes-key"
+                 || String.equal name "encrypted-aes-key-base64" then known+1, unknown
               else known, unknown+1) (0, 0) fields in
             "object", known, unknown
           | `List _ -> "array", 0, 0
@@ -621,11 +632,14 @@ let observe_graph_key_response_shape body =
           | `Null -> "null", 0, 0
           | `Bool _ -> "boolean", 0, 0
           | `Int _ | `Intlit _ | `Float _ -> "number", 0, 0 in
-        kind, string_of_int known, string_of_int unknown, string_of_bool (known>0)
-      with _ -> "invalid", "unavailable", "unavailable", "unavailable"
+        let present = match json with
+          | `Assoc fields -> List.mem_assoc "encrypted-aes-key" fields
+          | _ -> false in
+        kind, string_of_int known, string_of_int unknown, string_of_bool present, base64_kind
+      with _ -> "invalid", "unavailable", "unavailable", "unavailable", "unavailable"
     in
-    unlock_log "op=%s request=fetch-e2ee-graph-key phase=response-shape json_kind=%s known_fields=%s unknown_fields=%s encrypted_key_present=%s"
-      trace.operation_id kind known unknown present) (Eio.Fiber.get unlock_failure_trace)
+    unlock_log "op=%s request=fetch-e2ee-graph-key phase=response-shape json_kind=%s known_fields=%s unknown_fields=%s encrypted_key_present=%s base64_field_kind=%s"
+      trace.operation_id kind known unknown present base64_kind) (Eio.Fiber.get unlock_failure_trace)
 ;;
 
 let execute_request

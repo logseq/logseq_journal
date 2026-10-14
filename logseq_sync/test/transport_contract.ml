@@ -4070,3 +4070,25 @@ let scenarios=scenarios @
         ("\""^String.make (64*1024+1) 'x'^"\""))
   ]
 ;;
+
+(* The private PPX decoder cannot originate its defect in Core. The public
+   Runner API is the narrowest accessible boundary; strictness is retained. *)
+let scenarios = scenarios @
+  [ Alcotest.test_case "E2EE DTO declares base64 string" `Quick
+      (test_unlock_response_structure ~success:true
+        ~expected:"base64_field_kind=string"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":"LOG_SECRET_BODY"}|})
+  ; Alcotest.test_case "E2EE DTO declares nullable base64" `Quick
+      (test_unlock_response_structure ~success:true
+        ~expected:"base64_field_kind=null"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":null}|})
+  ; Alcotest.test_case "E2EE DTO rejects numeric base64" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"base64_field_kind=number"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":7}|})
+  ; Alcotest.test_case "E2EE DTO retains unrelated field strictness" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"base64_field_kind=string"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":"LOG_SECRET_BODY","LOG_SECRET_UNKNOWN_FIELD_NAME":false}|})
+  ]
+;;

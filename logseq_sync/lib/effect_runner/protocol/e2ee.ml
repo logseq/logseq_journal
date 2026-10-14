@@ -37,7 +37,11 @@ let bounded_string field value =
   else Error ("E2EE response " ^ field ^ " must be a bounded non-empty string")
 ;;
 
-type graph_key_response_dto = { encrypted_aes_key : string [@key "encrypted-aes-key"] }
+type graph_key_response_dto =
+  { encrypted_aes_key : string [@key "encrypted-aes-key"]
+  ; encrypted_aes_key_base64 : string option
+      [@key "encrypted-aes-key-base64"] [@default None]
+  }
 [@@deriving yojson]
 
 type user_keys_response_dto =
