@@ -9,3 +9,6 @@ val view
   -> show_timestamp:bool
   -> Journal_graph_projection.timeline_entry
   -> Journal_view.View.t
+
+(** Shared status and tag presentation. *)
+val metadata : Journal_model.t -> Journal_view.View.t list

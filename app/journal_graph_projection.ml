@@ -244,6 +244,8 @@ let block_in_context
       ~revision
       ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
     |> Result.map (fun block ->
+      Journal_model.with_properties block ~properties:value.properties
+      |> fun block ->
       Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value)
       |> fun block ->
       Journal_model.with_content_metadata
@@ -275,6 +277,24 @@ let block_on_page ~(page : Graph.page) ~revision ~child_count ~time_context valu
     ~child_count
     ~time_context
     value
+;;
+
+let property_value_block (block : Graph.block) =
+  List.exists (fun (p : Graph.property_summary) ->
+    p.ident = "logseq.property/created-from-property" && p.values <> []) block.properties
+;;
+
+(* Stop once three ordinary children are found; property values must not
+   allocate an intermediate copy of the complete child page. *)
+let preview_children children =
+  let rec take remaining reversed = function
+    | _ when remaining = 0 -> List.rev reversed
+    | [] -> List.rev reversed
+    | (child : tree_member) :: rest ->
+      if property_value_block child.block then take remaining reversed rest
+      else take (remaining - 1) (child :: reversed) rest
+  in
+  take 3 [] children
 ;;
 
 let timeline_entry_page
@@ -314,6 +334,7 @@ let timeline_entry_page
          let children = if item.depth = 0 then direct_children item.block else [] in
          if
            item.depth = 0
+           && not (property_value_block item.block)
            && (String.trim item.block.title <> ""
                || item.block.tags <> []
                || tag_titles item.block.uuid <> []
@@ -357,7 +378,7 @@ let timeline_entry_page
                 ; asset_file_type = asset_file_type child.block
                 })
              (* Preview only: raw tree members and child_count stay complete. *)
-             (List.take 3 children)
+             (preview_children children)
          in
          project ({ block; child_summaries } :: reversed) rest)
   in

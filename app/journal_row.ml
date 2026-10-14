@@ -4,7 +4,7 @@ module L = Lui_elements
 
 (* OCaml owns the preview policy; native Text owns visual wrapping at the
    available width and Dynamic Type size. Keep the full source for Detail. *)
-let preview_text source =
+let preview_text ?(child = false) source =
   V.of_lui
     (Journal_lui_native.mount
        Journal_lui_native.chrome_identifier
@@ -13,12 +13,13 @@ let preview_text source =
             (`Assoc
                 [ "mode", `String "bounded-text"
                 ; "text", `String source
-                ; "maxLines", `Int 4
+                ; "maxLines", `Int (if child then 2 else 4)
+                ; "level", `Int (if child then 1 else 0)
                 ]))
        ~children:[])
 ;;
 
-let body source = if String.trim source = "" then V.column [] else preview_text source
+let body ?(child = false) source = if String.trim source = "" then V.column [] else preview_text ~child source
 
 let metadata block =
   let status = Journal_model.task_state block in
@@ -105,7 +106,7 @@ let view
              ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
-             (body (render_source summary.source)))
+             (body ~child:true (render_source summary.source)))
         text_children
   in
   let labels =

@@ -60,7 +60,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
       self.id = id
       let tier = min(2, max(0, level))
       _size = ScaledMetric(wrappedValue: [24, 19, 15][tier], relativeTo: .body)
-      _targetLineHeight = ScaledMetric(wrappedValue: [40, 33, 27][tier], relativeTo: .body)
+      _targetLineHeight = ScaledMetric(wrappedValue: [31, 25, 20][tier], relativeTo: .body)
     }
 
     private var lineSpacing: CGFloat {
@@ -89,7 +89,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     init(content: AnyView, level: Int) {
       self.content = content
-      _paragraphGap = ScaledMetric(wrappedValue: [24, 18, 12][min(2, max(0, level))], relativeTo: .body)
+      _paragraphGap = ScaledMetric(wrappedValue: [24, 20, 18][min(2, max(0, level))], relativeTo: .body)
     }
 
     var body: some SwiftUI.View {
@@ -249,7 +249,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if let text = properties?.text, let maxLines = properties?.maxLines,
           maxLines > 0, context.childIDs.isEmpty {
           Text(verbatim: text)
-            .font(.body)
+            .font(properties?.level == 1 ? .subheadline : .body)
+            .foregroundStyle(properties?.level == 1 ? .secondary : .primary)
             .multilineTextAlignment(.leading)
             .lineLimit(maxLines)
             .truncationMode(.tail)

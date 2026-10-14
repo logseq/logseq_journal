@@ -4590,10 +4590,47 @@ let test_parent_visibility_confirmations () =
     [ `Capture; `Update; `Status ]
 ;;
 
+
+(* The public runtime owner must discover properties only on Detail demand,
+   sharing the existing deduplicated reference cache with ordinary text. *)
+let test_detail_property_reference_reads_are_deduplicated () =
+  let runtime=Runtime.create () in
+  seed_feed runtime;
+  let property:Graph.property_summary=
+    {ident="user.property/repro";uuid=unrelated_uuid;title="Reproducible?"
+    ;schema={property_type=Default;cardinality=Many;hidden=false;public=false}
+    ;values=[Default_value (Graph.Uuid.to_string unrelated_uuid);Default_value (Graph.Uuid.to_string unrelated_uuid)]
+    ;values_truncated=false} in
+  let root={record with block={block with properties=[property]}} in
+  let read=Runtime.submit runtime (Journal_graph_request.Load_detail
+    {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
+    |> fun o->only "property root read" o.requests in
+  let child=Runtime.receive runtime (response read (Protocol.V2_block_outcome
+    (V2_present_block {value=root;revision="root-with-properties"})))
+    |> fun o->only "property child read" o.requests in
+  let children=Protocol.V2_children_outcome
+    {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None} in
+  let output=Runtime.receive runtime (response child children) in
+  let reference=only "one deduplicated closed property reference" output.requests in
+  (match reference.command with
+   |Protocol.V2_get_block {block;_}->Alcotest.(check string) "closed value UUID"
+      (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
+   |_ ->Alcotest.fail "property value must use the existing bounded block read");
+  let closed={record with block={block with uuid=unrelated_uuid;title="Yes";properties=[]}} in
+  let output=Runtime.receive runtime (response reference (Protocol.V2_block_outcome
+    (V2_present_block {value=closed;revision="closed-1"}))) in
+  Alcotest.(check int) "no repeated reference read" 0 (List.length output.requests);
+  Alcotest.(check bool) "closed value enters reference presentation cache" true
+    (List.exists (fun (r:Runtime.response)->match r.payload with
+      |Reference_sources_changed values->List.mem (Graph.Uuid.to_string unrelated_uuid,Some "Yes") values
+      |_ ->false) output.responses)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "parent-only Timeline visibility"
+    [ ( "property references", [Alcotest.test_case "Detail closed property deduplicates" `Quick test_detail_property_reference_reads_are_deduplicated] )
+    ; ( "parent-only Timeline visibility"
       , [Alcotest.test_case "feed day remote legacy and metadata" `Quick test_parent_visibility_tree_paths;
          Alcotest.test_case "Capture Update Status completions" `Quick test_parent_visibility_confirmations])
     ; ( "bounded Timeline preview"

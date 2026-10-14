@@ -3014,23 +3014,48 @@ let detail_page
                  then []
                  else [ V.text "Waiting for another branch to finish" ])
         | Block { block; depth; _ } ->
-          let source =
-            if Journal_model.task_state block = No_status
-            then render_source state (Journal_model.source block)
-            else
-              Journal_model.status_name (Journal_model.task_state block)
-              ^ "  "
-              ^ render_source state (Journal_model.source block)
-          in
+          let source = Journal_model.source block in
           let id = "detail-block:" ^ Journal_model.id block in
-          Journal_header.detail_text ~id ~depth source
-          |> fun text ->
-          let tags = Journal_model.tag_titles block in
-          V.column ~spacing:8. (text ::
-            (if tags = [] then [] else
-              [ Journal_header.detail_text
-                  ~id:("detail-tags:" ^ Journal_model.id block) ~depth:2
-                  (String.concat "  " (List.map (fun title -> "#" ^ title) tags)) ]))
+          let property_value = List.exists (fun (p : Logseq_db_types.Graph_types.property_summary) ->
+            p.ident = "logseq.property/created-from-property" && p.values <> []) (Journal_model.properties block) in
+          let owned_value source =
+            List.exists (fun id -> match Journal_detail.find_block detail ~block_id:id with
+              | Some child -> Journal_model.parent_id child = Some (Journal_model.id block)
+                && List.exists (fun (p : Logseq_db_types.Graph_types.property_summary) ->
+                  p.ident = "logseq.property/created-from-property" && p.values <> [])
+                  (Journal_model.properties child)
+              | None -> false) (Journal_model.reference_ids source)
+          in
+          let named_sources =
+            Journal_model.properties block
+            |> List.map (fun (p : Logseq_db_types.Graph_types.property_summary) ->
+              { p with values = List.filter (fun value ->
+                  match Journal_model.property_sources [{ p with values = [value] }] with
+                  | [(_, source)] -> not (owned_value source)
+                  | _ -> true) p.values })
+            |> Journal_model.property_sources
+          in
+          let property_name =
+            Option.bind (Journal_model.parent_id block) (fun parent_id ->
+              Option.bind (Journal_detail.find_block detail ~block_id:parent_id) (fun parent ->
+                List.find_map (fun (name, value) ->
+                  if List.mem (Journal_model.id block) (Journal_model.reference_ids value)
+                  then Some name else None)
+                  (Journal_model.property_sources (Journal_model.properties parent))))
+          in
+          let field ~key name value =
+            V.column ~spacing:4. ~alignment:Leading
+              [ V.of_lui (Lui_elements.text ~value:name ~style_class:"caption" ~foreground:"secondary" [])
+              ; Journal_header.detail_text ~id:key ~depth:2 (render_source state value) ]
+          in
+          let text =
+            if property_value then field ~key:id (Option.value property_name ~default:"Property") source
+            else Journal_header.detail_text ~id ~depth (render_source state source)
+          in
+          let fields = List.map (fun (name, value) ->
+            field ~key:("detail-property:" ^ Journal_model.id block ^ ":" ^ name) name value) named_sources in
+          V.column ~spacing:8. ~alignment:Leading
+            (text :: Journal_row.metadata block @ fields)
           |> V.with_test_id (Ui.Test_id.string id)
           |> media_label
                ~store:media_store

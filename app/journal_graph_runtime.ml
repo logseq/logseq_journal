@@ -1839,7 +1839,17 @@ let invalidate_reference t block_id =
     else reference_read t block_id depth
 ;;
 
-let observe_reference_sources t ~source_epoch depth values =
+let reference_source (block : Graph.block) =
+  if String.trim block.title <> "" then block.title else
+  List.find_map (fun (p : Graph.property_summary) ->
+    if p.ident = "logseq.property/value" then
+      match Journal_model.property_sources [{p with schema={p.schema with hidden=false}}] with
+      | (_, source) :: _ -> Some source | [] -> None
+    else None) block.properties
+  |> Option.value ~default:block.title
+;;
+
+let observe_reference_sources ?(extra_sources = []) t ~source_epoch depth values =
   let updates = ref []
   and reads = ref [] in
   (* Install the whole fragment before discovery. Epochs belong to request
@@ -1887,6 +1897,7 @@ let observe_reference_sources t ~source_epoch depth values =
         (Journal_model.reference_ids source)
   in
   List.iter (fun (_, source) -> Option.iter (discover depth) source) values;
+  List.iter (discover depth) extra_sources;
   { requests = List.rev !reads
   ; responses =
       (if !updates = []
@@ -3117,7 +3128,7 @@ let receive_response t (protocol_response : Protocol.response) =
           else (
             let source =
               match lookup with
-              | V2_present_block { value; _ } -> Some value.block.title
+              | V2_present_block { value; _ } -> Some (reference_source value.block)
               | V2_missing_block _ -> None
             in
             observe_reference_sources t ~source_epoch depth [ block_id, source ])
@@ -3565,7 +3576,7 @@ let receive t (protocol_response : Protocol.response) =
       empty
     | Some { operation; source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
       let block (value : Protocol.v2_block_record) =
-        Graph.Uuid.to_string value.block.uuid, Some value.block.title
+        Graph.Uuid.to_string value.block.uuid, Some (reference_source value.block)
       in
       let values =
         match outcome with
@@ -3615,7 +3626,21 @@ let receive t (protocol_response : Protocol.response) =
           values
           output.responses
       in
-      observe_reference_sources t ~source_epoch 0 values
+      (* Property references are demanded by Detail only. Timeline continues
+         reading its bounded tree fragment without property hydration. All
+         child titles enter the cache before discovery, avoiding duplicate reads. *)
+      let extra_sources =
+        match operation with
+        | Detail_children { root; _ } ->
+          List.map snd (Journal_model.property_sources root.block.properties)
+        | Changed_detail_block _ ->
+          (match outcome with
+           | V2_block_outcome (V2_present_block { value; _ }) ->
+             List.map snd (Journal_model.property_sources value.block.properties)
+           | _ -> [])
+        | _ -> []
+      in
+      observe_reference_sources ~extra_sources t ~source_epoch 0 values
   in
   let output = { output with responses = output.responses @ references.responses } in
   if background
