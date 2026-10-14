@@ -30,7 +30,7 @@ Rejected because the OCaml calendar already owns local date updates.
 - Existing date text, native soft section behavior and header accessibility remain; suffix uses dynamic smaller text.
 - Detail has no visible `Block` title; back and options remain available.
 - No protected Dune/spec interfaces/locks or mldoc changes enter the PR.
-- Native presentation tests cover civil boundaries and updates; all 84 application-view tests, existing calendar/Timeline tests and source-boundary checks pass. The Simulator app builds with the pinned lui source. Actual Simulator layout/screenshots await device/window coordination before publication.
+- Native presentation tests cover civil boundaries and updates; all 84 application-view tests, existing calendar/Timeline tests and source-boundary checks pass. The Simulator app builds with the pinned lui source. An isolated iPhone 13 / iOS 26.1 synthetic host verifies actual date labels, next-day/year changes, maximum Dynamic Type, empty Detail title, native Back and menu selection. The host mounts the production components; it does not exercise a personal graph or real device.
 
 ## Risks
 
