@@ -6,7 +6,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='journal-authentication-') as directory:
     executable = Path(directory) / 'auth-tests'
-    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6',
+    subprocess.run(['xcrun', 'swiftc', '-swift-version', '6', '-Xfrontend', '-disable-sandbox',
+                    '-module-cache-path', str(Path(directory)/'modules'),
                     str(root / 'swift/JournalAuthentication.swift'),
                     str(root / 'apple-tests/authentication/JournalAuthenticationTests.swift'),
                     '-o', str(executable)], check=True)

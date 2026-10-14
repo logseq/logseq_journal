@@ -123,6 +123,42 @@ let test_managed_client_command_is_accepted () =
       | _ -> T.fail "managed client command returned the wrong response"))
 ;;
 
+let test_unlock_ignored_logging () =
+  let path = Filename.temp_file "journal-unlock-worker-log-" "" in
+  let saved = Unix.dup Unix.stderr in
+  let output = Unix.openfile path [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
+  let previous = Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" in
+  Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" "1";
+  Unix.dup2 output Unix.stderr;
+  let read () = flush stderr; In_channel.with_open_bin path In_channel.input_all in
+  let contains text value =
+    let n = String.length value in
+    let rec loop i = i + n <= String.length text
+      && (String.sub text i n = value || loop (i + 1)) in loop 0
+  in
+  Fun.protect ~finally:(fun () ->
+    flush stderr; Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close output;
+    Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" (Option.value previous ~default:"");
+    Sys.remove path)
+    (fun () ->
+      T.with_managed (fun fixture ->
+        with_client fixture.config (fun client ->
+          let id = Worker.send client (Service.Client_command
+            (Submit_e2ee_password "LOG_SECRET_PASSWORD")) |> accepted in
+          (match await_response client id with
+           | Service.Client_command_completed -> ()
+           | _ -> T.fail "password queue acknowledgement changed");
+          let deadline = Unix.gettimeofday () +. 2. in
+          while not (contains (read ()) "decision=ignored") && Unix.gettimeofday () < deadline do
+            Unix.sleepf 0.002
+          done));
+      let logs = read () in
+      List.iter (fun value -> T.require (contains logs value) "missing unlock observation: %s" value)
+        [ "source=queue"; "request_id="; "source=core"; "decision=ignored"
+        ; "challenge_advertised=false" ];
+      T.require (not (contains logs "LOG_SECRET_PASSWORD")) "worker diagnostics leaked the password")
+;;
+
 module Mailbox = Logseq_db_worker_lui.Journal_bounded_mailbox.Coalesced
 module Transfer = Logseq_sync_pure_reducer.Asset_transfer
 
@@ -1141,6 +1177,7 @@ let () =
     ; T.case
         "managed worker starts closed with a v2 envelope"
         test_managed_worker_starts_closed_and_replies_with_v2_envelope
+    ; T.case "ignored unlock is diagnosed without secrets" test_unlock_ignored_logging
     ; T.case "managed client command is accepted" test_managed_client_command_is_accepted
     ]
 ;;

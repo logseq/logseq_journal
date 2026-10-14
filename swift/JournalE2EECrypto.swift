@@ -2,9 +2,84 @@ import CryptoKit
 import Foundation
 import Security
 
+private final class JournalUnlockLogState: @unchecked Sendable {
+  let lock = NSLock()
+  var count = 0
+  var operation = 0
+}
+
+// Only fixed vocabulary and numeric IDs/status codes reach this opt-in channel.
+private final class JournalUnlockTrace: NSObject {
+  private static let state = JournalUnlockLogState()
+  private static let threadKey = "com.logseq.journal.unlock-diagnostic"
+  let operation: String
+  let request: String
+  let began = ProcessInfo.processInfo.systemUptime
+  var stage = "decode-request"
+
+  static var current: JournalUnlockTrace? {
+    get { Thread.current.threadDictionary[threadKey] as? JournalUnlockTrace }
+    set { Thread.current.threadDictionary[threadKey] = newValue }
+  }
+
+  init(_ decoded: JournalCryptoRequest?) {
+    Self.state.lock.lock()
+    Self.state.operation += 1
+    let nativeID = Self.state.operation
+    Self.state.lock.unlock()
+    if let id = decoded?.diagnosticOperation, !id.isEmpty, id.utf8.count <= 20,
+       id.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) {
+      operation = id
+    } else {
+      operation = "native-\(nativeID)"
+    }
+    switch decoded?.operation {
+    case "unlockPrivateKey", "loadAndVerifyWrappedGraphKey", "verifyAndSaveWrappedGraphKey",
+         "unwrapGraphKeyForEngine": request = decoded!.operation
+    case nil: request = "decode-request"
+    default: request = "unsupported"
+    }
+    super.init()
+    write("phase=begin")
+  }
+
+  private func write(_ fields: String) {
+    guard ProcessInfo.processInfo.environment["JOURNAL_UNLOCK_DIAGNOSTICS"] == "1" else { return }
+    Self.state.lock.lock()
+    defer { Self.state.lock.unlock() }
+    let count = Self.state.count
+    Self.state.count += 1
+    let line: String
+    if count < 256 {
+      line = "[journal-unlock] source=crypto op=\(operation) request=\(request) \(fields)\n"
+    } else if count == 256 {
+      line = "[journal-unlock] source=crypto limit=reached\n"
+    } else { return }
+    try? FileHandle.standardError.write(contentsOf: Data(line.utf8))
+  }
+
+  static func mark(_ stage: String) {
+    guard let trace = current else { return }
+    trace.stage = stage
+    trace.write("phase=stage stage=\(stage)")
+  }
+
+  static func keychain(_ stage: String, _ status: OSStatus) {
+    guard let trace = current else { return }
+    trace.stage = stage
+    trace.write("phase=keychain stage=\(stage) osstatus=\(status)")
+  }
+
+  func finish(_ result: String) {
+    let elapsed = max(0, (ProcessInfo.processInfo.systemUptime - began) * 1000)
+    write("phase=end result=\(result) stage=\(stage) elapsed_ms=\(Int(elapsed))")
+  }
+}
+
 // Swift's compiler synthesizes the native counterpart of the OCaml PPX DTOs.
 struct JournalCryptoRequest: Codable {
   var operation: String
+  var diagnosticOperation: String? = nil
   var origin: String
   var userId: String
   var graphId: String? = nil
@@ -551,12 +626,15 @@ enum JournalE2EECrypto {
     var query = try privateKeyQuery(origin: origin, userID: userID)
     try searchQuery(&query, storage: storage)
     let status = SecItemUpdate(query as CFDictionary, [kSecValueData: key] as CFDictionary)
+    JournalUnlockTrace.keychain("private-key-update", status)
     if status == errSecItemNotFound {
       query = try privateKeyQuery(origin: origin, userID: userID)
       try additionQuery(&query, storage: storage)
       query[kSecValueData] = key
       query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-      guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
+      let addStatus = SecItemAdd(query as CFDictionary, nil)
+      JournalUnlockTrace.keychain("private-key-add", addStatus)
+      guard addStatus == errSecSuccess else {
         throw JournalE2EECryptoError.operationFailed
       }
     } else if status != errSecSuccess {
@@ -597,6 +675,7 @@ enum JournalE2EECrypto {
     query[kSecMatchLimit] = kSecMatchLimitOne
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
+    JournalUnlockTrace.keychain("private-key-copy", status)
     if status == errSecItemNotFound { return nil }
     guard status == errSecSuccess, let data = result as? Data else {
       throw JournalE2EECryptoError.operationFailed
@@ -640,6 +719,7 @@ enum JournalE2EECrypto {
     )
     try searchQuery(&query, storage: storage)
     let status = SecItemUpdate(query as CFDictionary, [kSecValueData: encoded] as CFDictionary)
+    JournalUnlockTrace.keychain("wrapped-key-update", status)
     if status == errSecItemNotFound {
       query = try wrappedGraphKeyQuery(
         origin: identity.origin,
@@ -649,7 +729,9 @@ enum JournalE2EECrypto {
       try additionQuery(&query, storage: storage)
       query[kSecValueData] = encoded
       query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-      guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else {
+      let addStatus = SecItemAdd(query as CFDictionary, nil)
+      JournalUnlockTrace.keychain("wrapped-key-add", addStatus)
+      guard addStatus == errSecSuccess else {
         throw JournalE2EECryptoError.operationFailed
       }
     } else if status != errSecSuccess {
@@ -715,6 +797,7 @@ enum JournalE2EECrypto {
       query[kSecMatchLimit] = kSecMatchLimitOne
       var result: CFTypeRef?
       let status = SecItemCopyMatching(query as CFDictionary, &result)
+      JournalUnlockTrace.keychain("wrapped-key-copy", status)
       if status == errSecItemNotFound { return nil }
       guard status == errSecSuccess, let data = result as? Data else {
         throw JournalE2EECryptoError.operationFailed
@@ -839,6 +922,7 @@ enum JournalE2EECrypto {
 #endif
 
   private static func decryptedGraphKey(_ request: JournalCryptoRequest) throws -> Data {
+    JournalUnlockTrace.mark("load-private-key")
     let identity = try self.identity(request, includeGraph: false)
     guard
       let privateKey = try loadPrivateKey(
@@ -848,6 +932,7 @@ enum JournalE2EECrypto {
     else {
       throw JournalE2EECryptoError.operationFailed
     }
+    JournalUnlockTrace.mark("unwrap-graph-key")
     let graphKey = try rsaOAEPDecrypt(
       privateKeyData: privateKey,
       ciphertext: try hexData(request.ciphertext)
@@ -861,6 +946,7 @@ enum JournalE2EECrypto {
     encryptedGraphKey: String,
     environment: [String: String] = ProcessInfo.processInfo.environment
   ) throws {
+    JournalUnlockTrace.mark("load-private-key")
     guard
       let privateKey = try loadPrivateKey(
         origin: identity.origin,
@@ -868,6 +954,7 @@ enum JournalE2EECrypto {
         environment: environment
       )
     else { throw JournalE2EECryptoError.localPrivateKeyUnavailable }
+    JournalUnlockTrace.mark("verify-wrapped-graph-key")
     let graphKey = try rsaOAEPDecrypt(
       privateKeyData: privateKey,
       ciphertext: try wrappedCiphertext(encryptedGraphKey)
@@ -878,6 +965,7 @@ enum JournalE2EECrypto {
   static func handle(_ request: JournalCryptoRequest) throws -> JournalCryptoResponse {
     switch request.operation {
     case "unlockPrivateKey":
+      JournalUnlockTrace.mark("validate-private-key-request")
       let identity = try self.identity(request, includeGraph: false)
       guard
         let password = request.password,
@@ -885,17 +973,21 @@ enum JournalE2EECrypto {
         password.utf8.count <= 4096,
         let iterations = request.iterations
       else { throw JournalE2EECryptoError.invalidRequest }
+      JournalUnlockTrace.mark("derive-private-key")
       let key = try pbkdf2SHA256(
         password: Data(password.utf8),
         salt: try hexData(request.salt),
         iterations: iterations
       )
+      JournalUnlockTrace.mark("open-private-key")
       let privateKey = try aesOpen(
         key: key,
         iv: try hexData(request.iv),
         ciphertextAndTag: try hexData(request.ciphertext)
       )
+      JournalUnlockTrace.mark("validate-private-key")
       _ = try rsaPrivateKey(privateKey)
+      JournalUnlockTrace.mark("save-private-key")
       try savePrivateKey(origin: identity.origin, userID: identity.userID, key: privateKey)
       return JournalCryptoResponse(ok: true)
 
@@ -1018,19 +1110,35 @@ public func logseqJournalCryptoJSON(
 ) -> UnsafeMutablePointer<CChar>? {
   return autoreleasepool { () -> UnsafeMutablePointer<CChar>? in
     let response: JournalCryptoResponse
+    var trace: JournalUnlockTrace?
+    let previousTrace = JournalUnlockTrace.current
+    defer { JournalUnlockTrace.current = previousTrace }
+    var diagnosticResult = "ok"
     do {
       guard
         let requestPointer,
         let data = String(cString: requestPointer).data(using: .utf8)
       else { throw JournalE2EECryptoError.invalidRequest }
       let request = try JSONDecoder().decode(JournalCryptoRequest.self, from: data)
+      if ProcessInfo.processInfo.environment["JOURNAL_UNLOCK_DIAGNOSTICS"] == "1" {
+        trace = JournalUnlockTrace(request)
+        JournalUnlockTrace.current = trace
+      }
       response = try JournalE2EECrypto.handle(request)
     } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
+      diagnosticResult = "local-private-key-unavailable"
       response = JournalCryptoResponse(ok: false, error: "localPrivateKeyUnavailable")
     } catch JournalE2EECryptoError.wrappedGraphKeyUnavailable {
+      diagnosticResult = "wrapped-key-unavailable"
       response = JournalCryptoResponse(ok: false, error: "wrappedGraphKeyUnavailable")
     } catch {
+      diagnosticResult = (error as? JournalE2EECryptoError) == .invalidRequest
+        ? "invalid-request" : "crypto-failed"
       response = JournalCryptoResponse(ok: false, error: "cryptoOperationFailed")
+    }
+    if ProcessInfo.processInfo.environment["JOURNAL_UNLOCK_DIAGNOSTICS"] == "1" {
+      if trace == nil { trace = JournalUnlockTrace(nil) }
+      trace?.finish(diagnosticResult)
     }
     guard
       let data = try? JSONEncoder().encode(response),

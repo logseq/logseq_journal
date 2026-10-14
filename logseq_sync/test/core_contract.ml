@@ -5116,3 +5116,83 @@ let scenarios =
         generated_catalog_cache_rejects_legacy_and_invalid_domain_values
     ]
 ;;
+
+(* Core owns challenge validity/recovery. Only its public events and opaque
+   effect tickets reproduce these state defects; no runner/UI duplication. *)
+let e2ee_preparation_fixture () =
+  let selected, scope = selected_graph encrypted_graph in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) in
+  let cached = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+      Some (Core.step absent.next (Core.Runner_completed (Core.Completion
+        (ticket, Error (Core.Effect_failed "synthetic absent cache")))))
+    | _ -> None) absent.effects |> Option.get in
+  Core.step cached.next Core.Online_recovery_requested, scope
+;;
+
+let e2ee_finish_graph_fetch preparation (result : (string, Core.effect_error) result) =
+  List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+      Some (Core.step preparation.Core.next
+        (Core.Runner_completed (Core.Completion (ticket, result))))
+    | _ -> None) preparation.effects |> Option.get
+;;
+
+let e2ee_finish_user_fetch preparation (result : (string, Core.effect_error) result) =
+  List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+      Some (Core.step preparation.Core.next
+        (Core.Runner_completed (Core.Completion (ticket, result))))
+    | _ -> None) preparation.effects |> Option.get
+;;
+
+let e2ee_preparation_failure_retries fetch_user () =
+  let preparation, scope = e2ee_preparation_fixture () in
+  let error = Error (Core.Effect_failed "synthetic preparation failed") in
+  let failed = if fetch_user then
+    e2ee_finish_user_fetch (e2ee_finish_graph_fetch preparation (Ok "wrapped")) error
+    else e2ee_finish_graph_fetch preparation error in
+  let rejected = Core.step failed.next (Core.E2ee_password_submitted "unused-synthetic") in
+  Alcotest.(check bool) "no challenge is advertised" false
+    (Core.state rejected.next).snapshot.startup.awaiting_e2ee_password;
+  Alcotest.(check int) "password without challenge starts no work" 0
+    (List.length rejected.effects);
+  let retry = Core.step rejected.next Core.Online_recovery_requested in
+  let fetched = List.filter (function
+    | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key actual)) -> actual = scope
+    | _ -> false) retry.effects in
+  Alcotest.(check int) "Retry reacquires graph key in retained scope" 1 (List.length fetched);
+  Alcotest.(check bool) "Retry clears failure" true
+    ((Core.state retry.next).snapshot.startup.failure = None);
+  Alcotest.(check bool) "selected graph retained" true
+    ((Core.state retry.next).snapshot.selected_graph = Some scope.graph_id);
+  Alcotest.(check bool) "Retry performs no cache or credential deletion" false
+    (List.exists (function
+      | Core.Run (Core.Request (_, Core.Delete_account_secrets _)) -> true
+      | _ -> false) retry.effects)
+;;
+
+let e2ee_invalidated_challenge_is_not_advertised () =
+  let preparation, _ = e2ee_preparation_fixture () in
+  let prompt = e2ee_finish_user_fetch
+    (e2ee_finish_graph_fetch preparation (Ok "wrapped")) (Ok "package") in
+  let refresh = Core.step prompt.next Core.Catalog_refresh_requested in
+  let failed = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+      Some (Core.step refresh.next (Core.Runner_completed (Core.Completion
+        (ticket, Error (Core.Effect_failed "synthetic catalog refresh failed")))))
+    | _ -> None) refresh.effects |> Option.get in
+  Alcotest.(check bool) "cleared key package cannot advertise a challenge" false
+    (Core.state failed.next).snapshot.startup.awaiting_e2ee_password;
+  let submit = Core.step failed.next (Core.E2ee_password_submitted "unused-synthetic") in
+  Alcotest.(check int) "invalidated challenge starts no crypto" 0 (List.length submit.effects)
+;;
+
+let scenarios = scenarios @
+  [ Alcotest.test_case "E2EE graph preparation failure Retry" `Quick
+      (e2ee_preparation_failure_retries false)
+  ; Alcotest.test_case "E2EE user preparation failure Retry" `Quick
+      (e2ee_preparation_failure_retries true)
+  ; Alcotest.test_case "E2EE invalidated challenge is not advertised" `Quick
+      e2ee_invalidated_challenge_is_not_advertised ]
+;;

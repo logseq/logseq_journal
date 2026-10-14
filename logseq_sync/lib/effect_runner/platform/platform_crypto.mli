@@ -1,3 +1,5 @@
+val with_diagnostic_operation : string -> (unit -> 'a) -> 'a
+
 type crypto =
   { encrypt_aes_gcm : key:string -> plaintext:string -> (string * string, string) result
   ; decrypt_aes_gcm :

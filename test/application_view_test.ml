@@ -4230,7 +4230,7 @@ let test_fixture_exception_cleanup exception_ =
 
 (* Application owns password admission and UI. No public pure root event exists
    for E2EE; this fixture exercises mounted Application through its public hooks. *)
-let unlock_fixture () =
+let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
@@ -4267,6 +4267,7 @@ let unlock_fixture () =
     ; diagnostics = { groups = [] }
     }
   in
+  let graph_reads = Atomic.make 0 in
   let current = Atomic.make manager in
   let submissions = Atomic.make [] in
   let release = Atomic.make false in
@@ -4292,6 +4293,10 @@ let unlock_fixture () =
         in
         match request with
         | Service.Get_graph_state ->
+          if queue_full && Atomic.fetch_and_add graph_reads 1 > 0 then (
+            while not (Atomic.get release) do
+              Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+            done);
           Ok
             (Service.Graph_state
                { generation = 1
@@ -4299,6 +4304,8 @@ let unlock_fixture () =
                ; phase = Graph_closed
                ; error = None
                })
+        | Client_command (Submit_e2ee_password _) when worker_failure ->
+          Error "Synthetic unlock worker failure"
         | Client_command (Submit_e2ee_password password) ->
           Atomic.set submissions (password :: Atomic.get submissions);
           let old = Atomic.get current in
@@ -4366,8 +4373,30 @@ let unlock_fixture () =
   hooks, submissions, release, client
 ;;
 
-let test_unlock_application () =
-  let hooks, submissions, release, client = unlock_fixture () in
+let capture_unlock_logs run =
+  let path = Filename.temp_file "journal-unlock-ui-log-" "" in
+  let saved = Unix.dup Unix.stderr in
+  let output = Unix.openfile path [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+  let previous = Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" in
+  Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" "1";
+  Unix.dup2 output Unix.stderr;
+  Fun.protect
+    ~finally:(fun () ->
+      flush stderr;
+      Unix.dup2 saved Unix.stderr;
+      Unix.close saved;
+      Unix.close output;
+      Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" (Option.value previous ~default:"");
+      Sys.remove path)
+    (fun () ->
+       run ();
+       flush stderr;
+       In_channel.with_open_bin path In_channel.input_all)
+;;
+
+let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
+    ?(stopping = false) () =
+  let hooks, submissions, release, client = unlock_fixture ~worker_failure ~queue_full () in
   let props = Hashtbl.create 64 in
   let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
   let consume encoded =
@@ -4446,9 +4475,27 @@ let test_unlock_application () =
          "blank Return sends nothing"
          0
          (List.length (Atomic.get submissions));
+       if stopping then Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client;
+       if queue_full then (
+         let client = Option.get !client in
+         let module W = Logseq_db_worker_lui.Journal_worker in
+         let rec fill remaining =
+           if remaining = 0 then failwith "Unlock queue did not saturate"
+           else match W.send client Service.Get_graph_state with
+             | W.Accepted _ -> fill (remaining - 1)
+             | Full -> ()
+             | Not_ready | Stopping -> failwith "Unlock queue unexpectedly unavailable"
+         in
+         fill 2048);
        dispatch
          (Lui_protocol.TextChanged (node "e2ee-password-editor", " synthetic-only "));
        dispatch (Lui_protocol.Submit (node "e2ee-password-editor"));
+       if worker_failure || queue_full || stopping then (
+         wait "worker failure releases unlock pending" (fun () ->
+           property (node "e2ee-password-editor") "enabled" = Some (`Bool true));
+         Alcotest.(check int) "failure bypasses no crypto service" 0
+           (List.length (Atomic.get submissions)))
+       else (
        wait "Return reaches worker" (fun () -> List.length (Atomic.get submissions) = 1);
        Alcotest.(check string)
          "password bytes preserved"
@@ -4478,7 +4525,24 @@ let test_unlock_application () =
        dispatch (Lui_protocol.Press graph);
        (* Native list activation is exercised on Simulator. Headless assertions
          above cover the shared Return/button admission and cancel boundary. *)
-       ())
+       ()))
+;;
+
+let test_unlock_application () =
+  let logs = capture_unlock_logs (fun () -> run_unlock_application ()) in
+  let has value =
+    let n = String.length value in
+    let rec loop i =
+      i + n <= String.length logs
+      && (String.sub logs i n = value || loop (i + 1))
+    in
+    loop 0
+  in
+  List.iter (fun value -> Alcotest.(check bool) value true (has value))
+    [ "source=ui"; "phase=submit"; "pending=true"; "phase=queue result=accepted"
+    ; "pending=false"; "failure=e2ee" ];
+  List.iter (fun value -> Alcotest.(check bool) "sensitive UI value excluded" false (has value))
+    [ "synthetic-only"; "Private Journal"; "Check your encryption password" ]
 ;;
 
 (* Root_navigation public reducer events do not own platform continuations,
@@ -4678,7 +4742,13 @@ let () =
             (test_application_token_control ~saturated:false ~failure:true)
         ] )
     ; ( "E2EE input"
-      , [ Alcotest.test_case "Application admission and recovery" `Quick test_unlock_application ] )
+      , [ Alcotest.test_case "Application admission and recovery" `Quick test_unlock_application
+        ; Alcotest.test_case "Application unlock worker failure releases pending" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ())
+        ; Alcotest.test_case "Application unlock Full releases pending" `Quick
+            (fun () -> run_unlock_application ~queue_full:true ())
+        ; Alcotest.test_case "Application unlock Stopping releases pending" `Quick
+            (fun () -> run_unlock_application ~stopping:true ()) ] )
     ; ( "native navigation"
       , [ Alcotest.test_case
             "retained root across actual push and native Back"

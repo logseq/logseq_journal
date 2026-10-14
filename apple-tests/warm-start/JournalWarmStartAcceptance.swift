@@ -81,7 +81,8 @@ private struct WarmFixture: Decodable {
     services = JournalPlatformServices(auth: auth,
       account: JournalAccountStore(
         load: { JournalLocalAccount(userID: fixture.userId, managedSyncOrigin: fixture.baseUrl) },
-        save: { _ in }, clear: { throw JournalPlatformServices.Failure.unavailable }),
+        save: { _ in JournalAccountSave(commit: {}, rollback: {}) },
+        clear: { throw JournalPlatformServices.Failure.unavailable }),
       managedSyncOrigin: fixture.baseUrl)
     platform = JournalApplicationPlatform(services: services)
     auth.isTimelinePresented = { [weak services] in services?.timelinePresented == true }

@@ -34,7 +34,9 @@ import Foundation
   var capability: JournalAccountStore {
     JournalAccountStore(load: { self.value }, save: {
       if self.failSave { throw CocoaError(.fileWriteUnknown) }
+      let previous = self.value
       self.writes += 1; self.value = $0
+      return JournalAccountSave(commit: {}, rollback: { self.value = previous })
     }, clear: { self.clears += 1; self.value = nil })
   }
 }
@@ -80,6 +82,11 @@ import Foundation
     precondition(store.value == old && store.clears == 0 && store.writes == 0)
 
     auth.user = "online-user"
+    do {
+      _ = try await platform.response(for: .authenticatedUser)
+      fatalError("A different identity must not take over a presented graph")
+    } catch let issue as JournalAccountIssue { precondition(issue.kind == .accountChangeBlocked) }
+    platform.invalidateConnection()
     require(try await platform.response(for: .authenticatedUser) == .authenticatedUser("online-user"))
     precondition(store.value?.userID == "online-user")
     store.failSave = true

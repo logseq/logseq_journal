@@ -171,13 +171,10 @@ struct JournalHost: View {
         JournalRuntimeHost(platform: platform, payload: setup.payload, extensions: setup.extensions)
           .font(.body)
           .safeAreaInset(edge: .top, spacing: 0) {
-            if platform.authenticationRequired {
-              HStack {
-                Text("Sign in to connect your account")
-                Spacer()
-                Button("Sign in") { signInPresented = true }.buttonStyle(.bordered)
-                  .accessibilityIdentifier("journal-sign-in")
-              }.padding(12)
+            if platform.authenticationRequired || platform.accountIssue != nil {
+              JournalAccountRecoveryView(issue: platform.accountIssue,
+                signInAvailable: platform.authenticationRequired || platform.accountIssue?.offersSignIn == true,
+                signIn: { signInPresented = true }, retry: { platform.refreshAuthentication() })
             }
           }
       }
@@ -194,15 +191,21 @@ struct JournalHost: View {
     }
     .onChange(of: platform.authenticationRequired) { _, required in
       if required && platform.localAccountAvailable == false { signInPresented = true }
-      if !required { signInPresented = false }
+      // The authentication owner closes its sheet after account preparation.
+      // Closing on the intermediate native identity update can cancel that work.
     }
     .onChange(of: platform.localAccountAvailable) { _, available in
       if available == false && platform.authenticationRequired { signInPresented = true }
     }
     .sheet(isPresented: $signInPresented) {
       NavigationStack {
-        JournalAuthenticationView(api: authentication) {
-          platform.refreshAuthentication(); signInPresented = false
+        JournalAuthenticationView(api: JournalPreparedAuthentication(api: authentication,
+          prepare: { try await platform.prepareAccount() },
+          cancelPreparation: { platform.cancelAccountPreparation() },
+          preparationMessage: {
+            platform.accountIssue.map { ($0.errorDescription ?? "") + "\n" + $0.diagnostic }
+          })) {
+          signInPresented = false
         }
         .toolbar {
           ToolbarItem(placement: .cancellationAction) {
@@ -211,6 +214,8 @@ struct JournalHost: View {
           }
         }
       }
+      .onAppear { platform.setAccountAuthenticationPresented(true) }
+      .onDisappear { platform.setAccountAuthenticationPresented(false) }
       .presentationSizing(.form).presentationDetents([.large]).frame(idealWidth: 480)
       #if os(macOS)
       .frame(minWidth: 320, minHeight: 360)

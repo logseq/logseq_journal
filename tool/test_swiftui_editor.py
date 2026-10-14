@@ -52,7 +52,8 @@ import SwiftUI
       JournalRuntimeHost(
         platform: JournalApplicationPlatform(services: JournalPlatformServices(
           auth: ProbeAuth(),
-          account: JournalAccountStore(load: { nil }, save: { _ in }, clear: {}),
+          account: JournalAccountStore(load: { nil },
+            save: { _ in JournalAccountSave(commit: {}, rollback: {}) }, clear: {}),
           managedSyncOrigin: "https://example.invalid")),
         payload: (try? JournalNativeServices.startupPayload()) ?? Data(),
         extensions: (try? JournalExtensions.registry()) ?? LUIAppleExtensionRegistry())

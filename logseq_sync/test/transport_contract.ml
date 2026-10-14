@@ -3881,3 +3881,214 @@ let scenarios =
         test_unanswered_dns_obeys_shared_dial_deadline
     ]
 ;;
+
+
+(* Failure provenance belongs to actual Runner IO. Pure Core is used only to
+   issue opaque production tickets; a TLS peer originates HTTP/decode failures. *)
+let unlock_classification_effect origin =
+  let initial = Core.config ~managed_sync_origin:origin ~limits:(Core_contract.limits ())
+    |> Result.get_ok |> Core.initial |> Result.get_ok in
+  let encrypted = { graph with encrypted = true } in
+  let auth = Core.step initial (Core.Account_authenticated {user_id=Some "LOG_SECRET_USER"}) in
+  let catalog = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+      Some (Core.step auth.next (Core.Runner_completed (Core.Completion (ticket, Ok [encrypted]))))
+    | _ -> None) auth.effects |> Option.get in
+  let selected = Core.step catalog.next (Core.Graph_selected encrypted.graph_id) in
+  let scope = Core.admitted_graph_scope selected.next |> Option.get in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) in
+  let cached = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+      Some (Core.step absent.next (Core.Runner_completed (Core.Completion
+        (ticket, Error (Core.Effect_failed "synthetic cached key absent")))))
+    | _ -> None) absent.effects |> Option.get in
+  let keys = Core.step cached.next Core.Online_recovery_requested in
+  let request = List.find_map (function
+    | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key _) as request) -> Some request
+    | _ -> None) keys.effects |> Option.get in
+  keys, request
+;;
+
+let capture_unlock_classification run =
+  let path = Filename.temp_file "journal-unlock-classification-" "" in
+  let saved = Unix.dup Unix.stderr in
+  let output = Unix.openfile path [Unix.O_WRONLY;Unix.O_TRUNC] 0o600 in
+  let previous = Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" in
+  Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" "1";
+  Unix.dup2 output Unix.stderr;
+  Fun.protect ~finally:(fun () ->
+    flush stderr; Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close output;
+    Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" (Option.value previous ~default:""); Sys.remove path)
+    (fun () -> run (); flush stderr; read_file path)
+;;
+
+let require_unlock_classification logs category =
+  let has value =
+    let n = String.length value in
+    let rec loop i = i+n <= String.length logs
+      && (String.sub logs i n = value || loop (i+1)) in loop 0 in
+  Alcotest.(check bool) ("terminal category=" ^ category) true
+    (has ("failure_category=" ^ category));
+  List.iter (fun secret -> Alcotest.(check bool) "sensitive marker excluded" false (has secret))
+    ["LOG_SECRET_USER";"LOG_SECRET_PASSWORD";"LOG_SECRET_TOKEN";"LOG_SECRET_BODY";
+     "LOG_SECRET_PACKAGE";"LOG_SECRET_WRAPPED"]
+;;
+
+let test_unlock_fetch_classification ~category ~success cases () =
+  let logs = capture_unlock_classification (fun () ->
+    ignore (with_peer cases (fun ~environment ~sw ~support ~origin ->
+      let posted = ref [] and invalidations = ref 0 in
+      let t = runner ~acquire:(fun _ -> Ok "LOG_SECRET_TOKEN")
+        ~environment ~sw ~support ~posted ~invalidations () in
+      let _, request = unlock_classification_effect origin in
+      Fun.protect ~finally:(fun () -> Runner.shutdown t) (fun () ->
+        Runner.submit t request;
+        wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+        Alcotest.(check bool) "business completion unchanged" success
+          (List.exists (function
+           | Core.Runner_completed (Core.Completion (_, result)) -> Result.is_ok result
+           | _ -> false) !posted))) : Yojson.Basic.t)) in
+  require_unlock_classification logs category;
+  if category = "http" then (
+    let status = "http_status=503" in
+    let rec has i = i+String.length status <= String.length logs
+      && (String.sub logs i (String.length status) = status || has (i+1)) in
+    Alcotest.(check bool) "numeric HTTP status preserved" true (has 0))
+;;
+
+let test_unlock_crypto_classification () =
+  let logs = capture_unlock_classification (fun () ->
+    with_support (fun support -> Eio_main.run (fun environment -> Eio.Switch.run (fun sw ->
+      let posted = ref [] and invalidations = ref 0 in
+      let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+      let keys, _ = unlock_classification_effect (Uri.of_string "https://example.invalid") in
+      let graph_key = List.find_map (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+          Some (Core.step keys.next (Core.Runner_completed (Core.Completion (ticket, Ok "LOG_SECRET_WRAPPED"))))
+        | _ -> None) keys.effects |> Option.get in
+      let private_key = List.find_map (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+          Some (Core.step graph_key.next (Core.Runner_completed (Core.Completion (ticket, Ok "LOG_SECRET_PACKAGE"))))
+        | _ -> None) graph_key.effects |> Option.get in
+      let unlock = Core.step private_key.next (Core.E2ee_password_submitted "LOG_SECRET_PASSWORD") in
+      let request = List.find_map (function
+        | Core.Run (Core.Request (_, Core.Unlock_private_key _) as request) -> Some request
+        | _ -> None) unlock.effects |> Option.get in
+      Fun.protect ~finally:(fun () -> Runner.shutdown t) (fun () ->
+        Runner.submit t request;
+        wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+        Alcotest.(check bool) "actual secret adapter failure is posted" true
+          (List.exists (function Core.Runner_completed (Core.Completion (_,Error _)) -> true | _ -> false) !posted)))))) in
+  require_unlock_classification logs "crypto"
+;;
+
+let unlock_json_wire ?(status="200 OK") ?(content_type="application/json") body =
+  Printf.sprintf "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+    status content_type (String.length body) body
+;;
+
+let scenarios = scenarios @
+  [ Alcotest.test_case "unlock failure transport category" `Quick
+      (test_unlock_fetch_classification ~category:"transport" ~success:false [case ~eof:true ""])
+  ; Alcotest.test_case "unlock failure HTTP status category" `Quick
+      (test_unlock_fetch_classification ~category:"http" ~success:false
+        [case (unlock_json_wire ~status:"503 Service Unavailable" "LOG_SECRET_BODY")])
+  ; Alcotest.test_case "unlock failure content type category" `Quick
+      (test_unlock_fetch_classification ~category:"decode" ~success:false
+        [case (unlock_json_wire ~content_type:"text/plain" "LOG_SECRET_BODY")])
+  ; Alcotest.test_case "unlock failure JSON decode category" `Quick
+      (test_unlock_fetch_classification ~category:"decode" ~success:false
+        [case (unlock_json_wire "LOG_SECRET_BODY")])
+  ; Alcotest.test_case "unlock failure success does not retain error" `Quick
+      (test_unlock_fetch_classification ~category:"none" ~success:true
+        [case (unlock_json_wire {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED"}|})])
+  ; Alcotest.test_case "unlock failure 401 retry success clears category" `Quick
+      (test_unlock_fetch_classification ~category:"none" ~success:true
+        [case (unlock_json_wire ~status:"401 Unauthorized" "LOG_SECRET_BODY");
+         case (unlock_json_wire {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED"}|})])
+  ; Alcotest.test_case "unlock failure crypto category" `Quick test_unlock_crypto_classification
+  ]
+;;
+
+
+let test_unlock_response_structure ~expected ~success body () =
+  let logs = capture_unlock_classification (fun () ->
+    ignore (with_peer [case (unlock_json_wire body)] (fun ~environment ~sw ~support ~origin ->
+      let posted = ref [] and invalidations = ref 0 in
+      let t = runner ~acquire:(fun _ -> Ok "LOG_SECRET_TOKEN")
+        ~environment ~sw ~support ~posted ~invalidations () in
+      let _, request = unlock_classification_effect origin in
+      Fun.protect ~finally:(fun () -> Runner.shutdown t) (fun () ->
+        Runner.submit t request;
+        wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+        Alcotest.(check bool) "existing strict decode result unchanged" success
+          (List.exists (function
+           | Core.Runner_completed (Core.Completion (_,result)) -> Result.is_ok result
+           | _ -> false) !posted))) : Yojson.Basic.t)) in
+  let has value =
+    let n=String.length value in
+    let rec loop i=i+n<=String.length logs && (String.sub logs i n=value || loop(i+1)) in loop 0 in
+  Alcotest.(check bool) "required safe structure observation" true (has expected);
+  List.iter (fun secret -> Alcotest.(check bool) "field names and values excluded" false (has secret))
+    ["LOG_SECRET_USER";"LOG_SECRET_PASSWORD";"LOG_SECRET_TOKEN";"LOG_SECRET_BODY";
+     "LOG_SECRET_PACKAGE";"LOG_SECRET_WRAPPED";"LOG_SECRET_UNKNOWN_FIELD_NAME";
+     "LOG_SECRET_UNKNOWN_FIELD_NAME2"]
+;;
+
+let scenarios=scenarios @
+  [ Alcotest.test_case "unlock shape object extra secret field" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=object known_fields=1 unknown_fields=1 encrypted_key_present=true"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","LOG_SECRET_UNKNOWN_FIELD_NAME":"LOG_SECRET_BODY"}|})
+  ; Alcotest.test_case "unlock shape array" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=array known_fields=0 unknown_fields=0 encrypted_key_present=false"
+        {|[{"encrypted-aes-key":"LOG_SECRET_WRAPPED"}]|})
+  ; Alcotest.test_case "unlock shape string" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=string known_fields=0 unknown_fields=0 encrypted_key_present=false"
+        {|"LOG_SECRET_BODY"|})
+  ; Alcotest.test_case "unlock shape missing known field" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=object known_fields=0 unknown_fields=2 encrypted_key_present=false"
+        {|{"LOG_SECRET_UNKNOWN_FIELD_NAME":"LOG_SECRET_BODY","LOG_SECRET_UNKNOWN_FIELD_NAME2":"LOG_SECRET_WRAPPED"}|})
+  ; Alcotest.test_case "unlock shape valid strict object" `Quick
+      (test_unlock_response_structure ~success:true
+        ~expected:"json_kind=object known_fields=1 unknown_fields=0 encrypted_key_present=true"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED"}|})
+  ; Alcotest.test_case "unlock shape duplicate known field" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=object known_fields=2 unknown_fields=0 encrypted_key_present=true"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key":"LOG_SECRET_BODY"}|})
+  ; Alcotest.test_case "unlock shape malformed JSON" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=invalid known_fields=unavailable unknown_fields=unavailable encrypted_key_present=unavailable"
+        "LOG_SECRET_BODY")
+  ; Alcotest.test_case "unlock shape observation has independent byte cap" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"json_kind=unavailable known_fields=unavailable unknown_fields=unavailable encrypted_key_present=unavailable"
+        ("\""^String.make (64*1024+1) 'x'^"\""))
+  ]
+;;
+
+(* The private PPX decoder cannot originate its defect in Core. The public
+   Runner API is the narrowest accessible boundary; strictness is retained. *)
+let scenarios = scenarios @
+  [ Alcotest.test_case "E2EE DTO declares base64 string" `Quick
+      (test_unlock_response_structure ~success:true
+        ~expected:"base64_field_kind=string"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":"LOG_SECRET_BODY"}|})
+  ; Alcotest.test_case "E2EE DTO declares nullable base64" `Quick
+      (test_unlock_response_structure ~success:true
+        ~expected:"base64_field_kind=null"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":null}|})
+  ; Alcotest.test_case "E2EE DTO rejects numeric base64" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"base64_field_kind=number"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":7}|})
+  ; Alcotest.test_case "E2EE DTO retains unrelated field strictness" `Quick
+      (test_unlock_response_structure ~success:false
+        ~expected:"base64_field_kind=string"
+        {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":"LOG_SECRET_BODY","LOG_SECRET_UNKNOWN_FIELD_NAME":false}|})
+  ]
+;;

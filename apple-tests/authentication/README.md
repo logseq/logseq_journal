@@ -21,7 +21,10 @@ application with the production view and a local presentation provider. Scenario
 are `success`, `error`, `cancel` and `busy`. The optional `--large-text`, `--dark` and
 `--rtl` launch arguments retain visual checks. It does not open a real browser or
 validate Cognito. Coordinate GUI ownership before installing or launching it.
-The Continue button, progress, retry, Cancel, Close and sheet dismissal should be
+The additional prepare-error scenario exercises a secure binding-write failure.
+The production recovery panel rejects a synthetic version1 binding; success runs
+the real services and binding codec against isolated memory storage. No real
+Keychain item is accessed. The Continue button, progress, retry, Cancel, Close and sheet dismissal should be
 reachable in portrait/landscape with large text. No username/password fields
 remain. Do not label unobserved visual acceptance as passed.
 
@@ -44,6 +47,14 @@ tokens, passwords or authorization codes, install on a physical device, or open
 personal graphs without separately authorized acceptance scope.
 
 ## Storage and upgrade
+
+Unsupported/corrupt local bindings are rejected, never migrated. A verified OAuth
+identity may establish a current-format advisory binding through atomic update.
+Storage/network failures preserve the record and expose only safe type, stage
+and format metadata. Once a graph session is presented, a different identity
+cannot replace its binding or release a foreign token to it; reconnect the
+original account and finish pending work before using normal account switching.
+Canceling preparation does not remove this protection or sign out an active graph.
 
 OAuth tokens use the same app Keychain access identity with a dedicated generic
 password item `com.logseq.journal.cognito.tokens` / `current-session`, Data

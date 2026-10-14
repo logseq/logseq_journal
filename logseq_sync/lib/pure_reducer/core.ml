@@ -866,7 +866,12 @@ let set_snapshot core snapshot =
 ;;
 
 let fail core stage message =
-  let startup = { core.public_state.snapshot.startup with failure = Some stage } in
+  let startup =
+    { core.public_state.snapshot.startup with
+      failure = Some stage
+    ; awaiting_e2ee_password = false
+    }
+  in
   let snapshot =
     { core.public_state.snapshot with
       sync_phase = Failed
@@ -2838,7 +2843,8 @@ let step core event =
          { next; effects = [ Run request ] })
     | Online_recovery_requested ->
       (match core.current_graph_scope, core.public_state.snapshot.startup.failure with
-       | Some scope, Some During_local_restore ->
+       | Some scope, Some (During_local_restore | During_e2ee)
+         when not core.public_state.snapshot.startup.awaiting_e2ee_password ->
          let startup =
            { core.public_state.snapshot.startup with
              awaiting_e2ee_password = false

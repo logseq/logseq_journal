@@ -1,0 +1,78 @@
+# Unlock Diagnostic Logging 20261013
+
+## Problem
+
+The user-led full-product Simulator reaches an E2EE busy page while startup diagnostics report Failed. Public synthetic events prove that password submission can be ignored without a prepared challenge, but the preceding live request/error is hidden.
+
+## Proposal
+
+Add opt-in, bounded stderr observations at the UI send/pending boundary, database worker dispatch, sync runner requests and native crypto stages. Use numeric operation/ticket/request IDs, fixed stage/category names, challenge readiness, pending transitions, duration and numeric Keychain OSStatus. Never emit identity, graph IDs, credentials, key material, plaintext or arbitrary error/network bodies. Preserve all business transitions and recovery behavior.
+
+## Decision
+
+The user's instruction to first add logs and confirm the reproduced case authorizes only sanitized observability and an in-place update of the dedicated Simulator. No E2EE behavior repair, phone update, PR publication, network repair, sign-out or data cleanup is included. The user handles credential entry.
+
+## Alternatives considered
+
+### Fix the synthetic mismatch first
+
+Deferred because it would change the live failure before identifying its exact preceding stage.
+
+### Print arbitrary exceptions or request bodies
+
+Rejected because these may contain credentials, identity or graph data.
+
+## Acceptance criteria
+
+- Existing public worker/runner and native crypto boundaries emit finite stage/admission/outcome observations when opted in and none by default.
+- Tests first fail for missing observations, then pass, including arbitrary sensitive marker exclusion and bounded output.
+- A full product build on the dedicated Simulator preserves its existing login and graph storage. Preserve prior scene/evidence before updating.
+- Report the actual logged live branch, or the exact missing human input/environment prerequisite. Do not claim synthetic evidence establishes the live root cause.
+
+## Risks
+
+- Logging is opt-in and capped per process; a cap can omit later observations and emits a single limit notice.
+- The existing Simulator build uses verified host ARM64 OCaml/runtime inputs restamped for Simulator with genuine Simulator platform C, which is not a full iOS runtime ABI proof.
+- Core business interfaces under spec and all Dune files remain unchanged. If required changes cannot fit that boundary, stop and report the precise proposed interface change.
+
+## Questions
+
+None. Logging scope and Simulator update are authorized in the session. Credential input remains with the user.
+
+## Validation so far
+
+Four existing public owner boundaries first failed because observations were missing. Native crypto then passed default-off, numeric ID correlation, actual KDF/AES stage, typed missing-key result, arbitrary secret-marker exclusion and 256-line cap checks. Actual Worker service tests and the 17-test runner suite pass. All 79 mounted Application tests pass. Full production OCaml was rebuilt in the task-owned external build directory. The prior busy screenshot was preserved. The user has now completed the logged Retry/password attempt, and read-only CUA diagnostics verified the resulting busy/Failed mismatch.
+
+## Consequences
+
+The complete cb0b76e product was installed in-place as Simulator1.5877.24 and launched with logging enabled. The previous busy screenshot was preserved. The actual startup logs correlate Core/Runner/native operation2: wrapped-key-copy OSStatus-25300 (Apple errSecItemNotFound), wrapped-key-unavailable, and Core During_local_restore with no advertised password challenge. Catalog operation3 succeeds. The actual page shows Unable to open graph / wrappedGraphKeyUnavailable / Retry. This does not establish that the prior busy UI had the identical preceding failure.
+
+The user unlocked the Mac and personally performed Retry/password submission once. Actual runner operation5 Fetch_e2ee_graph_key fails after2066ms with effect-failed, and Core publishes During_e2ee with challenge_advertised=false. UI then sets pending=true and queues request5; the real Core logs decision=ignored/challenge_ready=false/op=none. No Unlock_private_key request or native private-key derivation begins. Read-only CUA confirms persistent Unlocking plus Sync Failed, Startup Failed and Graph Closed. This is a real full-product reproduction of the no-challenge password submission case, rather than an inference from a synthetic sequence. The underlying fetch cause remains unclassified: the current sanitized effect-failed category does not distinguish token, transport or response decoding. No password correctness conclusion is made. Recording remains active; no more human input is required to identify this branch. No credentials were read or entered, no data was deleted or signed out, and no graph was switched. simctl relocated the data container UUID during its in-place install; nine files remain and the persisted account/graph were restored automatically. No claim of a complete data backup is made. Phone and PR72 remain unchanged. Each component caps its process output at256lines plus one limit notice.
+
+UI request IDs span queue admission/delivery. Core effect IDs span runner/native execution. Correlating a UI submission with the next Core password event relies on serial submission chronology; the protected Core event ABI is unchanged.
+
+The live proof and screenshots are retained in the task external evidence directory: unlock-logging/live-sanitized.log, submitted-busy.png, submitted-diagnostics.png and diagnosis-summary.json. This evidence supports repairing challenge-specific recovery and semantic submission feedback in a separately authorized change. It does not justify deleting a graph or conclude that unavailable outbox diagnostics mean an empty outbox.
+
+## Upstream classification extension
+
+The original completed trace did not retain the graph-key failure category. Extend only the existing completion observations with fiber-local provenance from token acquisition, HTTP transport/status, Content-Type validation and E2EE response decoding; native secret/crypto requests retain a separate crypto boundary category. Fixed enum names and numeric HTTP status reach stderr, never error text, response bodies, tokens, keys or passwords. Existing business returns, spec interfaces and Dune files stay unchanged.
+
+All eight new assertions first failed for absent classifications. Seven public Runner cases use the existing independent TLS peer plus actual secret adapter boundary to generate transport,503,content-type,JSON,crypto failures and success/401-retry-success. The existing token-provider Runner test covers token failure. All pass with sensitive marker exclusion;401success reports none rather than retaining the earlier failure. Http_eio discards the status when its Content-Type check fails; the Runner recognizes only its producer-owned missing/unsupported media-type error codes and reports status unavailable for that case.
+
+The complete1ede9e0Simulator product was installed in-place as1.5877.25 and restored the existing account/graph. One credential-free Retry logs operation5 Fetch_e2ee_graph_key ending with failure_category=decode,http_status=200 after1931ms; Core publishes During_e2ee with no password challenge. No user-key fetch or private-key unlock starts. Prior user-led causal trace and screenshots remain separately preserved; no password was repeated.
+
+Whitelisted CUA accessibility matching recovers the fixed visible code E2ee.graph_key_response_dto without emitting arbitrary error text. The actual generated decoder (expanded from the production preprocessed AST) returns that code for either a non-object root or an undeclared object field; it expects encrypted-aes-key:string. These branches cannot be distinguished from the fixed code because actual response structure was not recorded. The current response decode failure is confirmed; the previous request has insufficient retained provenance to retroactively assign its exact subcause. Business recovery/decoder behavior remains unchanged.
+
+## Final structural classification scope
+
+Add only opt-in Runner observations of JSON top-level kind, known/unknown top-level field occurrence counts and presence of encrypted-aes-key. Arbitrary field names, field values and payload bytes are never emitted. A64KiB independent observation cap and the existing256line cap bound diagnostic work; invalid/too-large JSON reports unavailable counters rather than claiming fields are absent. Business E2EE DTOs, spec interfaces and Dune stay unchanged. Eight structure tests first fail for absent observations, then exercise object-extra/missing/duplicate fields, array/string, malformed JSON, strict success and the independent cap using actual TLS peer responses and secret field-name/value markers.
+
+Official logseq/logseq fixed commit3cb8b829 is verified via matching four local/GitHub blob hashes. The HTTP graph-key GET handler returns ordinary JSON; its Malli response schema allows an optional/nullable encrypted-aes-key. This is fixed-source contract evidence, not a claim about the deployed server version. PR68metadata confirms8f1caad is one of its commits; that commit introduced the current PPX DTO. The active single-field response validation function was introduced earlier by7a6fcae (2026-09-04), with a similar restriction in the older f6564bf session implementation. The current strictness therefore cannot simply be attributed as a new PR68 regression.
+
+## Confirmed structural outcome
+
+The actual full-product0eec7d0Simulator build1.5877.26 preserves login/selection and performs exactly one password-free Retry. Operation5 returnsHTTP200 with json_kind=object,known_fields=1,unknown_fields=1,encrypted_key_present=true; completion is decode failure and Core has no password challenge. The generated decoder unknown-field arm returns E2ee.graph_key_response_dto. Non-object top-level is now excluded. Unknown field names and every value remain unobserved; the required key value/type has not been proven valid, so removing this first rejection does not establish successful graph unlock.
+
+The minimal suggested repair is limited to the external graph-key response decoder unknown-field policy, retaining known-field type/nonempty/bounded/UTF8/NUL and JSON duplicate/syntax validation. The official fixed response schema is an open Malli map; an external DTO can accept metadata without adding alternative formats or stored-data migration. Separately, no-challenge preparation failures must route to preparation retry/error and cannot become indefinite optimistic password pending. Internal DTOs stay strict. These business changes were not implemented in the logging task.
+
+Evidence: task external unlock-structure/live-sanitized.log and diagnosis-summary.json, preserved prior-busy-causality.log/prior-http200-decode.log, official-contract-proof.json and pr68.json. The structural test suite8cases plus existing7classification cases and17Runner cases pass. All GUI/tool calls have returned; no user input or build is pending.

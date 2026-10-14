@@ -69,6 +69,48 @@ let asset_io_runner ~env ~sw ~support ~post =
   R.create ~sw dependencies ~post |> Result.get_ok
 ;;
 
+let test_unlock_runner_logging () =
+  let path = Filename.temp_file "journal-unlock-runner-log-" "" in
+  let saved = Unix.dup Unix.stderr in
+  let output = Unix.openfile path [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
+  let previous = Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" in
+  Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" "1";
+  Unix.dup2 output Unix.stderr;
+  let has text value =
+    let n = String.length value in
+    let rec loop i = i + n <= String.length text
+      && (String.sub text i n = value || loop (i + 1)) in loop 0
+  in
+  Fun.protect ~finally:(fun () ->
+    flush stderr; Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close output;
+    Unix.putenv "JOURNAL_UNLOCK_DIAGNOSTICS" (Option.value previous ~default:""); Sys.remove path)
+    (fun () ->
+      Eio_main.run (fun env -> Eio.Switch.run (fun sw -> T.with_managed (fun fixture ->
+        let completions = ref [] in
+        let runner = asset_io_runner ~env ~sw
+          ~support:fixture.config.application_support_directory
+          ~post:(fun event -> completions := event :: !completions) in
+        let limits = Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024
+          ~submission_batch_size:1 |> Result.get_ok in
+        let config = Sync.config ~managed_sync_origin:(Uri.of_string "https://example.invalid")
+          ~limits |> Result.get_ok in
+        let state = Sync.initial config |> Result.get_ok in
+        let transition = Sync.step state (Sync.Account_authenticated {user_id=Some "LOG_SECRET_USER"}) in
+        let request = List.find_map (function
+          | Sync.Run (Sync.Request (_, Sync.Fetch_catalog _) as request) -> Some request
+          | _ -> None) transition.effects |> Option.get in
+        Sync_runner.submit runner request;
+        Alcotest.(check bool) "runner still posts typed completion" true (!completions <> []);
+        Sync_runner.shutdown runner)));
+      flush stderr;
+      let logs = In_channel.with_open_bin path In_channel.input_all in
+      List.iter (fun value -> Alcotest.(check bool) value true (has logs value))
+        [ "source=runner"; "request=fetch-catalog"; "phase=begin"; "phase=end"
+        ; "result=effect-failed"; "failure_category=token"; "elapsed_ms="; "op=" ];
+      List.iter (fun value -> Alcotest.(check bool) "sensitive runner value excluded" false (has logs value))
+        [ "LOG_SECRET_USER"; "test must not use network"; "example.invalid" ])
+;;
+
 let far_future_token = "header.eyJleHAiOjIwMDAwMDAwMDB9.signature"
 let two_hour_token = "header.eyJleHAiOjE3MDAwMDcyMDB9.signature"
 let one_hour_token = "header.eyJleHAiOjE3MDAwMDM2MDB9.signature"
@@ -1350,6 +1392,7 @@ let () =
             `Quick
             test_id_token_cache_shutdown_clears_entry_and_cancels_waiters
         ] )
+    ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
       , [ Alcotest.test_case
             "cancel queued staging output"
