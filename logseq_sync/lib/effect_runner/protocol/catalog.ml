@@ -44,7 +44,7 @@ let schema = function
 ;;
 
 type readiness = { ready : bool option [@key "graph-ready-for-use?"] [@default None] }
-[@@deriving yojson { strict = false }]
+[@@deriving of_yojson { strict = false }]
 
 type graph_dto =
   { graph_id : Graph_types.Uuid.t [@key "graph-id"]
@@ -52,9 +52,9 @@ type graph_dto =
   ; schema_version : string option [@key "schema-version"] [@default None]
   ; encrypted : bool option [@key "graph-e2ee?"] [@default None]
   }
-[@@deriving yojson { strict = false }]
+[@@deriving of_yojson { strict = false }]
 
-type response = { graphs : Yojson.Safe.t list } [@@deriving yojson { strict = false }]
+type response = { graphs : Yojson.Safe.t list } [@@deriving of_yojson { strict = false }]
 
 let decode_graph json =
   bind (readiness_of_yojson json) (fun ready ->

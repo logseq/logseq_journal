@@ -163,8 +163,6 @@ let error_to_string (error : codec_error) =
 ;;
 
 module Wire = struct
-  type header = { kind : string [@key "type"] } [@@deriving yojson { strict = false }]
-
   type client_transaction =
     { tx : string
     ; tx_id : Logseq_db_types.Graph_types.Uuid.t option [@key "tx-id"] [@default None]
@@ -279,12 +277,74 @@ module Wire = struct
     ; message : string
     }
   [@@deriving yojson]
+end
 
-  type baseline =
-    { kind : string [@key "type"]
-    ; t : int64
+(* External input has readers only; owned output keeps the closed Wire codecs. *)
+module External_input = struct
+  type header = { kind : string [@key "type"] } [@@deriving of_yojson { strict = false }]
+
+  type pull_transaction =
+    { t : int64
+    ; tx : string
+    ; outliner_op : string option [@key "outliner-op"] [@default None]
     }
-  [@@deriving yojson { strict = false }]
+  [@@deriving of_yojson { strict = false }]
+
+  type user_presence =
+    { user_id : string [@key "user-id"]
+    ; email : string option [@default None]
+    ; username : string option [@default None]
+    ; name : string option [@default None]
+    }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_hello =
+    { t : int64
+    ; checksum : string option [@default None]
+    }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_online_users = { online_users : user_presence list [@key "online-users"] }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_presence =
+    { user_id : string [@key "user-id"]
+    ; editing_block_uuid : string option [@key "editing-block-uuid"]
+    }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_pull_ok =
+    { t : int64
+    ; checksum : string option [@default None]
+    ; txs : pull_transaction list
+    }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_tx_batch_ok =
+    { t : int64
+    ; checksum : string option [@default None]
+    }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_changed = { t : int64 } [@@deriving of_yojson { strict = false }]
+
+  type server_tx_reject =
+    { reason : string
+    ; t : int64 option [@default None]
+    ; checksum : string option [@default None]
+    ; success_tx_ids : Logseq_db_types.Graph_types.Uuid.t list
+          [@key "success-tx-ids"] [@default []]
+    ; failed_tx_id : Logseq_db_types.Graph_types.Uuid.t option
+          [@key "failed-tx-id"] [@default None]
+    ; missing_block_uuids : Logseq_db_types.Graph_types.Uuid.t list
+          [@key "missing-block-uuids"] [@default []]
+    ; error_detail : string option [@key "error-detail"] [@default None]
+    ; data : string option [@default None]
+    }
+  [@@deriving of_yojson { strict = false }]
+
+  type server_error = { message : string } [@@deriving of_yojson { strict = false }]
+  type baseline = { t : int64 } [@@deriving of_yojson { strict = false }]
 end
 
 (* Structural checks preserve the public safe diagnostics. They never construct
@@ -330,7 +390,11 @@ let check_fields context path allowed fields =
      | _ :: _ -> error context path (Unexpected_fields unexpected))
 ;;
 
-let rec validate context path shape json =
+type object_policy =
+  | Closed
+  | Open
+
+let rec validate ?(object_policy = Closed) context path shape json =
   let invalid expected = error context path (Invalid_field { expected }) in
   match shape, json with
   | Text maximum, `String value | Nullable_text maximum, `String value ->
@@ -383,14 +447,23 @@ let rec validate context path shape json =
     let rec loop index = function
       | [] -> Ok ()
       | value :: rest ->
-        let* () = validate context (path @ [ string_of_int index ]) item value in
+        let* () =
+          validate ~object_policy context (path @ [ string_of_int index ]) item value
+        in
         loop (index + 1) rest
     in
     loop 0 values
   | Array _, _ -> invalid "array"
   | Object schema, `Assoc fields ->
     let* () =
-      check_fields context path (List.map (fun (name, _, _) -> name) schema) fields
+      match object_policy with
+      | Closed ->
+        check_fields context path (List.map (fun (name, _, _) -> name) schema) fields
+      | Open ->
+        (match duplicate_names (List.map fst fields) with
+         | [] -> Ok ()
+         | _ :: _ ->
+           error context path (Invalid_field { expected = "unique object fields" }))
     in
     let rec loop = function
       | [] -> Ok ()
@@ -399,7 +472,7 @@ let rec validate context path shape json =
           match List.assoc_opt name fields with
           | None when is_required -> error context path (Missing_field name)
           | None -> Ok ()
-          | Some json -> validate context (path @ [ name ]) shape json
+          | Some json -> validate ~object_policy context (path @ [ name ]) shape json
         in
         loop rest
     in
@@ -445,8 +518,10 @@ let rejection_shape =
   ]
 ;;
 
-let decode_dto context schema decoder json =
-  let* () = validate context [] (Object (required "type" metadata :: schema)) json in
+let decode_dto ?(object_policy = Closed) context schema decoder json =
+  let* () =
+    validate ~object_policy context [] (Object (required "type" metadata :: schema)) json
+  in
   match Logseq_db_types.Json_codec.decode decoder json with
   | Ok dto -> Ok dto
   | Error _ -> error context [] (Invalid_field { expected = "valid protocol fields" })
@@ -459,11 +534,11 @@ let client_transaction (value : Wire.client_transaction) : Client.transaction =
   { tx = value.tx; tx_id = value.tx_id; outliner_op = value.outliner_op }
 ;;
 
-let pull_transaction (value : Wire.pull_transaction) : Server.pull_transaction =
+let pull_transaction (value : External_input.pull_transaction) : Server.pull_transaction =
   { t = cursor value.t; tx = value.tx; outliner_op = value.outliner_op }
 ;;
 
-let user_presence (value : Wire.user_presence) : user_presence =
+let user_presence (value : External_input.user_presence) : user_presence =
   { user_id = value.user_id
   ; email = value.email
   ; username = value.username
@@ -560,13 +635,16 @@ let decode_client_fields context message_type json =
 ;;
 
 let decode_server_fields context message_type json =
+  let decode_dto context schema decoder json =
+    decode_dto ~object_policy:Open context schema decoder json
+  in
   match message_type with
   | "hello" ->
     let* dto =
       decode_dto
         context
         [ required "t" Cursor; optional "checksum" Checksum ]
-        Wire.server_hello_of_yojson
+        External_input.server_hello_of_yojson
         json
     in
     Ok (Server.Hello { t = cursor dto.t; checksum = dto.checksum })
@@ -575,7 +653,7 @@ let decode_server_fields context message_type json =
       decode_dto
         context
         [ required "online-users" (Array user_presence_shape) ]
-        Wire.server_online_users_of_yojson
+        External_input.server_online_users_of_yojson
         json
     in
     Ok (Server.Online_users { online_users = List.map user_presence dto.online_users })
@@ -584,7 +662,7 @@ let decode_server_fields context message_type json =
       decode_dto
         context
         [ required "user-id" metadata; required "editing-block-uuid" nullable_metadata ]
-        Wire.server_presence_of_yojson
+        External_input.server_presence_of_yojson
         json
     in
     Ok
@@ -598,7 +676,7 @@ let decode_server_fields context message_type json =
         ; optional "checksum" Checksum
         ; required "txs" (Array pull_transaction_shape)
         ]
-        Wire.server_pull_ok_of_yojson
+        External_input.server_pull_ok_of_yojson
         json
     in
     Ok
@@ -612,17 +690,23 @@ let decode_server_fields context message_type json =
       decode_dto
         context
         [ required "t" Cursor; optional "checksum" Checksum ]
-        Wire.server_tx_batch_ok_of_yojson
+        External_input.server_tx_batch_ok_of_yojson
         json
     in
     Ok (Server.Tx_batch_ok { t = cursor dto.t; checksum = dto.checksum })
   | "changed" ->
     let* dto =
-      decode_dto context [ required "t" Cursor ] Wire.server_changed_of_yojson json
+      decode_dto
+        context
+        [ required "t" Cursor ]
+        External_input.server_changed_of_yojson
+        json
     in
     Ok (Server.Changed { t = cursor dto.t })
   | "tx/reject" ->
-    let* dto = decode_dto context rejection_shape Wire.server_tx_reject_of_yojson json in
+    let* dto =
+      decode_dto context rejection_shape External_input.server_tx_reject_of_yojson json
+    in
     let* rejection =
       validate_rejection
         context
@@ -638,11 +722,15 @@ let decode_server_fields context message_type json =
     in
     Ok (Server.Tx_reject rejection)
   | "pong" ->
-    let* _ = decode_dto context [] Wire.server_pong_of_yojson json in
+    let* _ = decode_dto context [] External_input.header_of_yojson json in
     Ok Server.Pong
   | "error" ->
     let* dto =
-      decode_dto context [ required "message" metadata ] Wire.server_error_of_yojson json
+      decode_dto
+        context
+        [ required "message" metadata ]
+        External_input.server_error_of_yojson
+        json
     in
     Ok (Server.Error { message = dto.message })
   | unsupported -> error context [] (Unsupported_message_type unsupported)
@@ -662,7 +750,7 @@ let decode ?maximum direction decode_fields wire =
           | None -> error context [] (Missing_field "type")
           | Some json -> validate context [ "type" ] metadata json
         in
-        (match Wire.header_of_yojson json with
+        (match External_input.header_of_yojson json with
          | Ok header ->
            decode_fields { context with message_type = Some header.kind } header.kind json
          | Error _ ->
@@ -687,7 +775,9 @@ let decode_snapshot_baseline =
              | None -> error context [] (Missing_field "t")
              | Some json -> validate context [ "t" ] Cursor json
            in
-           (match Logseq_db_types.Json_codec.decode Wire.baseline_of_yojson json with
+           (match
+              Logseq_db_types.Json_codec.decode External_input.baseline_of_yojson json
+            with
             | Ok dto -> Ok (cursor dto.t)
             | Error _ ->
               error context [] (Invalid_field { expected = "snapshot baseline" }))
@@ -775,6 +865,31 @@ let encode_client_message message =
   encode decode_client_message (client_message_json message)
 ;;
 
+(* The external reader is never used as the field-set validator for output. *)
+let validate_server_output json =
+  let context = { direction = Server; message_type = None } in
+  let check decoder =
+    match Logseq_db_types.Json_codec.decode decoder json with
+    | Ok _ -> Ok ()
+    | Error _ ->
+      error context [] (Invalid_field { expected = "closed server output fields" })
+  in
+  match External_input.header_of_yojson json with
+  | Ok { kind = "hello" } -> check Wire.server_hello_of_yojson
+  | Ok { kind = "online-users" } -> check Wire.server_online_users_of_yojson
+  | Ok { kind = "presence" } -> check Wire.server_presence_of_yojson
+  | Ok { kind = "pull/ok" } -> check Wire.server_pull_ok_of_yojson
+  | Ok { kind = "tx/batch/ok" } -> check Wire.server_tx_batch_ok_of_yojson
+  | Ok { kind = "changed" } -> check Wire.server_changed_of_yojson
+  | Ok { kind = "tx/reject" } -> check Wire.server_tx_reject_of_yojson
+  | Ok { kind = "pong" } -> check Wire.server_pong_of_yojson
+  | Ok { kind = "error" } -> check Wire.server_error_of_yojson
+  | Ok { kind } -> error context [] (Unsupported_message_type kind)
+  | Error _ -> error context [] (Invalid_field { expected = "message discriminator" })
+;;
+
 let encode_server_message message =
-  encode decode_server_message (server_message_json message)
+  let json = server_message_json message in
+  let* () = validate_server_output json in
+  encode decode_server_message json
 ;;

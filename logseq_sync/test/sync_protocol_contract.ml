@@ -215,36 +215,7 @@ let test_unknown_fields_are_strict_and_safe () =
     Alcotest.bool
     "nested error omits transaction"
     false
-    (contains (Protocol.error_to_string nested) "secret tx");
-  let pulled_transaction =
-    Protocol.decode_server_message
-      {|{"type":"pull/ok","t":1,"txs":[{"t":1,"tx":"secret tx","extra":1}]}|}
-    |> require_error "unknown pulled transaction field"
-  in
-  Alcotest.(check (list string))
-    "pulled transaction path is precise"
-    [ "txs"; "0" ]
-    pulled_transaction.path;
-  Alcotest.check
-    Alcotest.bool
-    "pulled transaction field is named"
-    true
-    (pulled_transaction.kind = Protocol.Unexpected_fields [ "extra" ]);
-  Alcotest.check
-    Alcotest.bool
-    "pulled transaction error omits transaction"
-    false
-    (contains (Protocol.error_to_string pulled_transaction) "secret tx");
-  let presence =
-    Protocol.decode_server_message
-      {|{"type":"online-users","online-users":[{"user-id":"u1","future":true}]}|}
-    |> require_error "unknown online user field"
-  in
-  Alcotest.check Alcotest.bool "direction is server" true (presence.direction = Server);
-  Alcotest.(check (list string))
-    "online-user path is precise"
-    [ "online-users"; "0" ]
-    presence.path
+    (contains (Protocol.error_to_string nested) "secret tx")
 ;;
 
 let test_decode_errors_are_structured () =
@@ -388,8 +359,165 @@ let test_cursor_wire_range () =
           (Client.Pull { since = Some (server_cursor_of_int 9007199254740992) })))
 ;;
 
+(* Core receives typed Server.message values, so raw extension acceptance is
+   owned by this public codec boundary rather than a fabricated reducer event. *)
+let external_server_cases =
+  [ {|{"type":"hello","t":0}|}
+  ; {|{"type":"online-users","online-users":[{"user-id":"u","future-user":{"nested":true}}]}|}
+  ; {|{"type":"presence","user-id":"u","editing-block-uuid":null}|}
+  ; {|{"type":"pull/ok","t":1,"txs":[{"t":1,"tx":"synthetic transit","outliner-op":null,"future-entry":{"nested":true}}]}|}
+  ; {|{"type":"tx/batch/ok","t":1}|}
+  ; {|{"type":"changed","t":1}|}
+  ; {|{"type":"tx/reject","reason":"stale","t":1}|}
+  ; {|{"type":"tx/reject","reason":"snapshot upload in progress","t":1}|}
+  ; {|{"type":"tx/reject","reason":"empty tx data"}|}
+  ; {|{"type":"tx/reject","reason":"invalid tx"}|}
+  ; {|{"type":"tx/reject","reason":"invalid t-before"}|}
+  ; {|{"type":"tx/reject","reason":"db transact failed","t":1}|}
+  ; {|{"type":"pong"}|}
+  ; {|{"type":"error","message":"synthetic server error"}|}
+  ]
+;;
+
+let test_external_server_extensions_are_open () =
+  List.iter
+    (fun source ->
+       let json = Yojson.Safe.from_string source in
+       let extended =
+         match json with
+         | `Assoc fields ->
+           `Assoc
+             (("future-top", `Assoc [ "nested", `List [ `Null; `Bool true ] ]) :: fields)
+         | _ -> assert false
+       in
+       let input = Yojson.Safe.to_string extended in
+       let message =
+         Protocol.decode_server_message input |> require_ok "open external server input"
+       in
+       let canonical =
+         Protocol.encode_server_message message |> require_ok "closed server output"
+       in
+       let without_extension = Yojson.Safe.from_string canonical in
+       let fields =
+         match without_extension with
+         | `Assoc f -> f
+         | _ -> assert false
+       in
+       Alcotest.(check bool)
+         "external extension does not enter owned output"
+         false
+         (List.mem_assoc "future-top" fields))
+    external_server_cases;
+  List.iter
+    (fun ignored ->
+       let json =
+         `Assoc
+           [ "type", `String "pull/ok"
+           ; "t", `Int 1
+           ; ( "txs"
+             , `List
+                 [ `Assoc
+                     [ "t", `Int 1; "tx", `String "synthetic transit"; "tx-id", ignored ]
+                 ] )
+           ]
+       in
+       let message =
+         Protocol.decode_server_message (Yojson.Safe.to_string json)
+         |> require_ok "unused real-world tx-id extension"
+       in
+       let wire =
+         Protocol.encode_server_message message |> require_ok "re-encode owned pull"
+       in
+       Alcotest.(check bool)
+         "unused tx-id is not reflected in output"
+         false
+         (contains wire "tx-id"))
+    [ `Null; `String "synthetic-id"; `Int 1; `Bool true; `List []; `Assoc [] ]
+;;
+
+let test_external_declared_fields_remain_validated () =
+  List.iter
+    (fun source ->
+       let error =
+         Protocol.decode_server_message source
+         |> require_error "declared external contract violation"
+       in
+       Alcotest.(check bool)
+         "extensions never bypass declared-field validation"
+         false
+         (match error.kind with
+          | Protocol.Unexpected_fields _ -> true
+          | _ -> false))
+    [ {|{"type":"changed","future":true}|}
+    ; {|{"type":"changed","t":"1","future":true}|}
+    ; {|{"type":"changed","t":null,"future":true}|}
+    ; {|{"type":"pull/ok","t":1,"txs":[{"t":1,"future":true}],"future":true}|}
+    ; {|{"type":"pull/ok","t":1,"txs":[{"t":1,"tx":null,"future":true}]}|}
+    ; {|{"type":"online-users","online-users":[{"user-id":null,"future":true}]}|}
+    ; {|{"type":"presence","user-id":"u","future":true}|}
+    ; {|{"type":"hello","t":1,"checksum":null,"future":true}|}
+    ; {|{"type":"tx/reject","reason":"unrecognized","future":true}|}
+    ; {|{"type":"tx/reject","reason":"stale","t":1,"failed-tx-id":"not-a-uuid","future":true}|}
+    ; {|{"type":"future-event","future":true}|}
+    ; {|{"type":"changed","t":1,"t":2,"future":true}|}
+    ];
+  let missing =
+    Protocol.decode_server_message {|{"type":"changed","future":true}|}
+    |> require_error "missing required cursor remains classified"
+  in
+  Alcotest.(check bool)
+    "required field takes precedence over extras"
+    true
+    (missing.kind = Protocol.Missing_field "t")
+;;
+
+let test_outgoing_wire_contracts_are_closed () =
+  List.iter
+    (fun (message, expected) ->
+       let wire =
+         Protocol.encode_client_message message |> require_ok "outgoing contract"
+       in
+       Alcotest.(check bool)
+         "generated output has exactly the contract fields"
+         true
+         (Yojson.Safe.equal
+            (Yojson.Safe.from_string wire)
+            (Yojson.Safe.from_string expected));
+       let extended =
+         match Yojson.Safe.from_string wire with
+         | `Assoc fields -> `Assoc (("future", `Bool true) :: fields)
+         | _ -> assert false
+       in
+       ignore
+         (Protocol.decode_client_message (Yojson.Safe.to_string extended)
+          |> require_error "closed owned client wire"))
+    [ Client.Hello { client = "synthetic" }, {|{"type":"hello","client":"synthetic"}|}
+    ; Client.Presence { editing_block_uuid = None }, {|{"type":"presence"}|}
+    ; Client.Pull { since = None }, {|{"type":"pull"}|}
+    ; ( Client.Tx_batch
+          { client_revision = None
+          ; t_before = server_cursor_of_int 0
+          ; txs = [ { tx = "synthetic"; tx_id = None; outliner_op = None } ]
+          }
+      , {|{"type":"tx/batch","t-before":0,"txs":[{"tx":"synthetic"}]}|} )
+    ; Client.Ping, {|{"type":"ping"}|}
+    ]
+;;
+
 let scenarios =
   [ Alcotest.test_case
+      "external server extensions are open"
+      `Quick
+      test_external_server_extensions_are_open
+  ; Alcotest.test_case
+      "external declared fields remain validated"
+      `Quick
+      test_external_declared_fields_remain_validated
+  ; Alcotest.test_case
+      "outgoing JSON contracts are closed"
+      `Quick
+      test_outgoing_wire_contracts_are_closed
+  ; Alcotest.test_case
       "numeric cursor wire safe integer range"
       `Quick
       test_cursor_wire_range
@@ -406,7 +534,7 @@ let scenarios =
       `Quick
       test_all_rejection_shapes_round_trip
   ; Alcotest.test_case
-      "unknown fields are strict and safe"
+      "owned client fields are strict and safe"
       `Quick
       test_unknown_fields_are_strict_and_safe
   ; Alcotest.test_case

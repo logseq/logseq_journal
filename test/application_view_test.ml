@@ -1176,10 +1176,10 @@ let run_favorites_native_visibility
             ((key, member "value" op) :: List.remove_assoc key previous)
         | _ -> ())
   in
-  let find key value =
+  let find ?(accept = fun _ -> true) key value =
     let direct = Hashtbl.fold
       (fun id values found ->
-         if List.assoc_opt key values = Some (`String value) then Some id else found)
+         if accept id && List.assoc_opt key values = Some (`String value) then Some id else found)
       props
       None
     in
@@ -1189,7 +1189,7 @@ let run_favorites_native_visibility
         match List.assoc_opt "payload" values with
         | Some (`String payload) ->
           let p = Yojson.Safe.from_string payload in
-          if (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
+          if accept id && (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
              && Yojson.Safe.Util.member "text" p = `String value then Some id else found
         | _ -> found) props None
     | None -> None
@@ -1786,19 +1786,23 @@ let run_favorites_native_visibility
                        ~some:inside_body
                        (Hashtbl.find_opt parents id)
                 in
+                let root_content =
+                  find ~accept:(fun id -> navigation_page id = Some (`String "root"))
+                    "text" "Timeline fixture 1" |> Option.get
+                in
                 Alcotest.(check bool)
                   "root feedback reserves space for the retained page content"
                   true
-                  (inside_body (Option.get (find "text" "Timeline fixture 1")));
+                  (inside_body root_content);
                 Alcotest.(check int)
                   "showing feedback preserves the original root content node"
                   original_root_content
-                  (Option.get (find "text" "Timeline fixture 1"));
+                  root_content;
                 Alcotest.(check bool)
                   "failed import keeps its own staged file"
                   true
                   (Sys.file_exists (List.hd !staged_paths));
-                let retained_root = Option.get (find "text" "Timeline fixture 1") in
+                let retained_root = root_content in
                 back ();
                 Alcotest.(check int)
                   "Back retains the root feedback owner and its unresolved error"
@@ -1807,7 +1811,9 @@ let run_favorites_native_visibility
                 Alcotest.(check int)
                   "feedback updates retain the root content"
                   retained_root
-                  (Option.get (find "text" "Timeline fixture 1"));
+                  (find
+                     ~accept:(fun id -> navigation_page id = Some (`String "root"))
+                     "text" "Timeline fixture 1" |> Option.get);
                 enter 0;
                 dispatch (Lui_protocol.Press detail_actions);
                 settle_worker ();
