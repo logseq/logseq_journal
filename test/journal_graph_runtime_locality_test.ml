@@ -4590,10 +4590,481 @@ let test_parent_visibility_confirmations () =
     [ `Capture; `Update; `Status ]
 ;;
 
+
+(* The public runtime owner must discover properties only on Detail demand,
+   sharing the existing deduplicated reference cache with ordinary text. *)
+let test_detail_property_reference_reads_are_deduplicated () =
+  let runtime=Runtime.create () in
+  seed_feed runtime;
+  let property:Graph.property_summary=
+    {ident="user.property/repro";uuid=unrelated_uuid;title="Reproducible?"
+    ;schema={property_type=Default;cardinality=Many;hidden=false;public=false}
+    ;values=[Default_value (Graph.Uuid.to_string unrelated_uuid);Default_value (Graph.Uuid.to_string unrelated_uuid)]
+    ;values_truncated=false} in
+  let root={record with block={block with properties=[property]}} in
+  let read=Runtime.submit runtime (Journal_graph_request.Load_detail
+    {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
+    |> fun o->only "property root read" o.requests in
+  let child=Runtime.receive runtime (response read (Protocol.V2_block_outcome
+    (V2_present_block {value=root;revision="root-with-properties"})))
+    |> fun o->only "property child read" o.requests in
+  let children=Protocol.V2_children_outcome
+    {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None} in
+  let output=Runtime.receive runtime (response child children) in
+  let reference=only "one deduplicated closed property reference" output.requests in
+  (match reference.command with
+   |Protocol.V2_get_block {block;_}->Alcotest.(check string) "closed value UUID"
+      (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
+   |_ ->Alcotest.fail "property value must use the existing bounded block read");
+  let closed={record with block={block with uuid=unrelated_uuid;title="Yes";properties=[]}} in
+  let output=Runtime.receive runtime (response reference (Protocol.V2_block_outcome
+    (V2_present_block {value=closed;revision="closed-1"}))) in
+  Alcotest.(check int) "no repeated reference read" 0 (List.length output.requests);
+  Alcotest.(check bool) "closed value enters reference presentation cache" true
+    (List.exists (fun (r:Runtime.response)->match r.payload with
+      |Reference_sources_changed values->List.mem (Graph.Uuid.to_string unrelated_uuid,Some "Yes") values
+      |_ ->false) output.responses)
+;;
+
+let test_changed_journal_detail_discovers_property_reference () =
+  let runtime = Runtime.create () in
+  seed_children_interest runtime;
+  let property : Graph.property_summary =
+    { ident = "user.property/repro"
+    ; uuid = uuid "a1000000-0000-4000-8000-000000000012"
+    ; title = "Reproducible?"
+    ; schema = { property_type=Default; cardinality=One; hidden=false; public=false }
+    ; values = [Default_value (Graph.Uuid.to_string unrelated_uuid)]
+    ; values_truncated = false } in
+  let output = changed runtime (window ~blocks:[block_uuid] ()) in
+  let request = only "changed active journal detail" (hydration_requests output) in
+  let output = Runtime.receive runtime (response request
+    (Protocol.V2_block_outcome (V2_present_block
+      {value={record with block={block with properties=[property]}}; revision="block-2"}))) in
+  let reference = only "new property reference after sync" output.requests in
+  (match reference.command with
+   | Protocol.V2_get_block {block;_} -> Alcotest.(check string) "new closed value"
+       (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
+   | _ -> Alcotest.fail "sync did not use the owned reference reader")
+;;
+
+let test_materialized_detail_leaf_discovers_property_reference () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let leaf_uuid = uuid "a1000000-0000-4000-9000-000000000013" in
+  let leaf =
+    { record with
+      block =
+        { block with uuid = leaf_uuid; parent = block_uuid; title = "Materialized leaf" }
+    }
+  in
+  let root =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_detail
+         { block_id = Graph.Uuid.to_string block_uuid
+         ; after = None
+         ; limit = 128
+         ; request_generation = 41L
+         })
+    |> fun o -> only "materialized root" o.requests
+  in
+  let children =
+    Runtime.receive
+      runtime
+      (response
+         root
+         (Protocol.V2_block_outcome
+            (V2_present_block { value = record; revision = "root-1" })))
+    |> fun o -> only "materialized parent page" o.requests
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (response
+          children
+          (Protocol.V2_children_outcome
+             { parent = block_uuid
+             ; revision_scope = V2_children_revision block_uuid
+             ; scope_revision = "children-1"
+             ; items = [ { value = leaf; revision = "leaf-1" } ]
+             ; next_cursor = None
+             })));
+  (* This node is displayed, but no own children page is requested: exactly
+     the runtime ownership state of a depth/budget boundary Detail leaf. *)
+  let property : Graph.property_summary =
+    { ident = "user.property/repro"
+    ; uuid = uuid "a1000000-0000-4000-8000-000000000012"
+    ; title = "Reproducible?"
+    ; schema =
+        { property_type = Default; cardinality = One; hidden = false; public = false }
+    ; values = [ Default_value (Graph.Uuid.to_string unrelated_uuid) ]
+    ; values_truncated = false
+    }
+  in
+  let update =
+    changed runtime (window ~blocks:[ leaf_uuid ] ())
+    |> fun o -> only "materialized leaf sync" (hydration_requests o)
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         update
+         (Protocol.V2_block_outcome
+            (V2_present_block
+               { value =
+                   { leaf with block = { leaf.block with properties = [ property ] } }
+               ; revision = "leaf-2"
+               })))
+  in
+  let read = only "displayed leaf property demand" output.requests in
+  match read.command with
+  | Protocol.V2_get_block { block; _ } ->
+    Alcotest.(check string)
+      "leaf closed value UUID"
+      (Graph.Uuid.to_string unrelated_uuid)
+      (Graph.Uuid.to_string block)
+  | _ -> Alcotest.fail "materialized Detail leaf did not demand its property"
+;;
+
+let test_timeline_only_property_update_does_not_hydrate () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let property : Graph.property_summary =
+    { ident = "user.property/repro"
+    ; uuid = uuid "a1000000-0000-4000-8000-000000000012"
+    ; title = "Reproducible?"
+    ; schema =
+        { property_type = Default; cardinality = One; hidden = false; public = false }
+    ; values = [ Default_value (Graph.Uuid.to_string unrelated_uuid) ]
+    ; values_truncated = false
+    }
+  in
+  let update =
+    changed runtime (window ~blocks:[ block_uuid ] ())
+    |> fun o -> only "Timeline-only sync" (hydration_requests o)
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         update
+         (Protocol.V2_block_outcome
+            (V2_present_block
+               { value = { record with block = { block with properties = [ property ] } }
+               ; revision = "root-2"
+               })))
+  in
+  Alcotest.(check int)
+    "Timeline alone must not hydrate property values"
+    0
+    (List.length output.requests)
+;;
+
+let test_detail_child_property_reference_without_child_load () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let property : Graph.property_summary =
+    { ident = "user.property/reference"
+    ; uuid = uuid "a1000000-0000-4000-8000-000000000012"
+    ; title = "Reference"
+    ; schema = { property_type = Node; cardinality = One; hidden = false; public = false }
+    ; values = [ Node_value unrelated_uuid ]
+    ; values_truncated = false
+    }
+  in
+  let leaf =
+    { record with
+      block =
+        { block with
+          uuid = uuid "a1000000-0000-4000-9000-000000000013"
+        ; parent = block_uuid
+        ; title = "Leaf"
+        ; properties = [ property ]
+        }
+    }
+  in
+  let root =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_detail
+         { block_id = Graph.Uuid.to_string block_uuid
+         ; after = None
+         ; limit = 128
+         ; request_generation = 41L
+         })
+    |> fun o -> only "child property root" o.requests
+  in
+  let children =
+    Runtime.receive
+      runtime
+      (response
+         root
+         (Protocol.V2_block_outcome
+            (V2_present_block { value = record; revision = "root-1" })))
+    |> fun o -> only "child property page" o.requests
+  in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         children
+         (Protocol.V2_children_outcome
+            { parent = block_uuid
+            ; revision_scope = V2_children_revision block_uuid
+            ; scope_revision = "children-1"
+            ; items = [ { value = leaf; revision = "leaf-1" } ]
+            ; next_cursor = None
+            }))
+  in
+  let request = only "returned child property demand" output.requests in
+  match request.command with
+  | Protocol.V2_get_block { block; _ } ->
+    Alcotest.(check bool)
+      "child property target"
+      true
+      (Graph.Uuid.equal block unrelated_uuid)
+  | _ -> Alcotest.fail "child field was left unresolved until own children load"
+;;
+
+let test_detail_page_and_class_property_uses_page_lookup () =
+  List.iter
+    (fun (typ, value) ->
+       let runtime = Runtime.create () in
+       seed_feed runtime;
+       let property : Graph.property_summary =
+         { ident = "user.property/page"
+         ; uuid = block_uuid
+         ; title = "Page reference"
+         ; schema =
+             { property_type = typ; cardinality = Many; hidden = false; public = false }
+         ; values = [ value; value ]
+         ; values_truncated = false
+         }
+       in
+       let read =
+         Runtime.submit
+           runtime
+           (Journal_graph_request.Load_detail
+              { block_id = Graph.Uuid.to_string block_uuid
+              ; after = None
+              ; limit = 128
+              ; request_generation = 91L
+              })
+         |> fun o -> only "page property root" o.requests
+       in
+       let children =
+         Runtime.receive
+           runtime
+           (response
+              read
+              (Protocol.V2_block_outcome
+                 (V2_present_block
+                    { value =
+                        { record with block = { block with properties = [ property ] } }
+                    ; revision = "root-1"
+                    })))
+         |> fun o -> only "page property children" o.requests
+       in
+       let output =
+         Runtime.receive
+           runtime
+           (response
+              children
+              (Protocol.V2_children_outcome
+                 { parent = block_uuid
+                 ; revision_scope = V2_children_revision block_uuid
+                 ; scope_revision = "children-1"
+                 ; items = []
+                 ; next_cursor = None
+                 }))
+       in
+       let read = only "one deduplicated page value" output.requests in
+       (match read.command with
+        | Protocol.V2_get_page { page; _ } ->
+          Alcotest.(check bool)
+            "typed page UUID"
+            true
+            (Graph.Uuid.equal page unrelated_uuid)
+        | _ -> Alcotest.fail "page/class property was routed to a block lookup");
+       let output =
+         Runtime.receive
+           runtime
+           (response
+              read
+              (Protocol.V2_page_outcome
+                 (V2_present_page
+                    { page =
+                        { page with
+                          uuid = unrelated_uuid
+                        ; title = "Visible page title"
+                        ; kind = Class_page
+                        }
+                    ; revision = "page-value-1"
+                    })))
+       in
+       Alcotest.(check int) "no duplicate page read" 0 (List.length output.requests);
+       Alcotest.(check bool)
+         "page title published"
+         true
+         (List.exists
+            (fun (r : Runtime.response) ->
+               match r.payload with
+               | Reference_sources_changed values ->
+                 List.mem
+                   (Graph.Uuid.to_string unrelated_uuid, Some "Visible page title")
+                   values
+               | _ -> false)
+            output.responses);
+       let update =
+         changed runtime (window ~pages:[ unrelated_uuid ] ())
+         |> fun o -> only "changed page property value" (hydration_requests o)
+       in
+       (match update.command with
+        | Protocol.V2_get_page _ -> ()
+        | _ -> Alcotest.fail "page value change did not invalidate the typed cache");
+       let output =
+         Runtime.receive
+           runtime
+           (response
+              update
+              (Protocol.V2_page_outcome
+                 (V2_present_page
+                    { page =
+                        { page with
+                          uuid = unrelated_uuid
+                        ; title = "Updated title"
+                        ; kind = Class_page
+                        }
+                    ; revision = "page-value-2"
+                    })))
+       in
+       Alcotest.(check bool)
+         "updated page title published"
+         true
+         (List.exists
+            (fun (r : Runtime.response) ->
+               match r.payload with
+               | Reference_sources_changed values ->
+                 List.mem
+                   (Graph.Uuid.to_string unrelated_uuid, Some "Updated title")
+                   values
+               | _ -> false)
+            output.responses))
+    [ Graph.Page, Graph.Page_value unrelated_uuid
+    ; Graph.Class, Graph.Class_value unrelated_uuid
+    ]
+;;
+
+let test_page_property_promotes_prior_block_reference () =
+  List.iter (fun pending ->
+    let runtime=Runtime.create () in
+    let tree=initial_tree runtime in
+    let title="See [[" ^ Graph.Uuid.to_string unrelated_uuid ^ "]]" in
+    let root : Protocol.v2_tree_member =
+      {value={record with block={block with title}};revision="root-1";depth=0;parent=page_uuid} in
+    let first=Runtime.receive runtime (tree_page tree [root] None)
+      |> fun o -> only "initial generic reference" o.requests in
+    (match first.command with Protocol.V2_get_block _ -> () | _ -> Alcotest.fail "expected generic block lookup");
+    if not pending then ignore (Runtime.receive runtime (response first (Protocol.V2_block_outcome
+      (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
+    let property : Graph.property_summary =
+      {ident="user.property/page";uuid=block_uuid;title="Actual page"
+      ;schema={property_type=Page;cardinality=One;hidden=false;public=false}
+      ;values=[Page_value unrelated_uuid];values_truncated=false} in
+    let read=Runtime.submit runtime (Journal_graph_request.Load_detail
+      {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
+      |> fun o -> only "promoted Detail root" o.requests in
+    let children=Runtime.receive runtime (response read (Protocol.V2_block_outcome
+      (V2_present_block {value={record with block={block with properties=[property]}};revision="root-2"})))
+      |> fun o -> only "promoted Detail children" o.requests in
+    let output=Runtime.receive runtime (response children (Protocol.V2_children_outcome
+      {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
+    let output=if pending then (
+      Alcotest.(check int) "retain one pending reference read" 0 (List.length output.requests);
+      Runtime.receive runtime (response first (Protocol.V2_block_outcome
+        (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})))) else output in
+    let page_read=only "page type supersedes old block missing/pending cache" output.requests in
+    (match page_read.command with
+     |Protocol.V2_get_page {page;_}->Alcotest.(check bool) "promoted UUID" true (Graph.Uuid.equal page unrelated_uuid)
+     |_ -> Alcotest.fail "semantic page type did not supersede the generic block lookup");
+    let output=Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
+      (V2_present_page {page={page with uuid=unrelated_uuid;title="Actual page title";kind=Ordinary_page};revision="actual-page-1"}))) in
+    Alcotest.(check bool) "promoted title published" true (List.exists (fun (r:Runtime.response)->match r.payload with
+      |Reference_sources_changed values->List.mem (Graph.Uuid.to_string unrelated_uuid,Some "Actual page title") values
+      |_ ->false) output.responses)) [false;true]
+;;
+
+let test_changed_tree_all_property_slice_continues () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let read =
+    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page_uuid ] ())
+    |> fun o -> only "property-only changed tree" (hydration_requests o)
+  in
+  let marker : Graph.property_summary =
+    { ident = "logseq.property/created-from-property"
+    ; uuid = unrelated_uuid
+    ; title = "Created from property"
+    ; schema =
+        { property_type = Entity; cardinality = One; hidden = true; public = false }
+    ; values = [ Entity_value unrelated_uuid ]
+    ; values_truncated = false
+    }
+  in
+  let cursor = Graph.Cursor.of_string "after-property-only-slice" |> Result.get_ok in
+  let root : Protocol.v2_tree_member =
+    { value =
+        { record with
+          block = { block with title = "Property value"; properties = [ marker ] }
+        }
+    ; revision = "property-1"
+    ; depth = 0
+    ; parent = page_uuid
+    }
+  in
+  let output = Runtime.receive runtime (tree_page read [ root ] (Some cursor)) in
+  Alcotest.(check int)
+    "do not replace day with a filtered empty slice"
+    0
+    (List.length output.responses);
+  let next = only "continue past property roots" output.requests in
+  (match next.command with
+   | Protocol.V2_get_page_tree { cursor = Some actual; _ } ->
+     Alcotest.(check string)
+       "same opaque cursor"
+       (Graph.Cursor.to_string cursor)
+       (Graph.Cursor.to_string actual)
+   | _ -> Alcotest.fail "lost property-only continuation");
+  let ordinary : Protocol.v2_tree_member =
+    { value = record; revision = "root-2"; depth = 0; parent = page_uuid }
+  in
+  let output = Runtime.receive runtime (tree_page next [ ordinary ] None) in
+  Alcotest.(check bool)
+    "later ordinary root retained"
+    true
+    (List.exists
+       (fun (r : Runtime.response) ->
+          match r.payload with
+          | Page_tree_reconciled { value; _ } ->
+            List.length value.entries = 1 && value.continuation = None
+          | _ -> false)
+       output.responses)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "parent-only Timeline visibility"
+    [ ( "property references", [Alcotest.test_case "Detail closed property deduplicates" `Quick test_detail_property_reference_reads_are_deduplicated
+      ;Alcotest.test_case "changed journal Detail discovers property" `Quick test_changed_journal_detail_discovers_property_reference
+      ;Alcotest.test_case "materialized Detail leaf discovers property" `Quick test_materialized_detail_leaf_discovers_property_reference
+      ;Alcotest.test_case "returned child property resolves without own load" `Quick test_detail_child_property_reference_without_child_load
+      ;Alcotest.test_case "page/class properties use page lookup" `Quick test_detail_page_and_class_property_uses_page_lookup
+      ;Alcotest.test_case "page type supersedes cached or pending block reference" `Quick test_page_property_promotes_prior_block_reference
+      ;Alcotest.test_case "filtered changed tree follows continuation" `Quick test_changed_tree_all_property_slice_continues
+      ;Alcotest.test_case "Timeline-only property change does not hydrate" `Quick test_timeline_only_property_update_does_not_hydrate] )
+    ; ( "parent-only Timeline visibility"
       , [Alcotest.test_case "feed day remote legacy and metadata" `Quick test_parent_visibility_tree_paths;
          Alcotest.test_case "Capture Update Status completions" `Quick test_parent_visibility_confirmations])
     ; ( "bounded Timeline preview"

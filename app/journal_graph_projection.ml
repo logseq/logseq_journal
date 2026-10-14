@@ -244,6 +244,11 @@ let block_in_context
       ~revision
       ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
     |> Result.map (fun block ->
+      Journal_model.with_properties
+        ~localtime:time_context.localtime
+        block
+        ~properties:value.properties
+      |> fun block ->
       Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value)
       |> fun block ->
       Journal_model.with_content_metadata
@@ -277,17 +282,35 @@ let block_on_page ~(page : Graph.page) ~revision ~child_count ~time_context valu
     value
 ;;
 
+let property_value_block (block : Graph.block) =
+  List.exists (fun (p : Graph.property_summary) ->
+    p.ident = "logseq.property/created-from-property" && p.values <> []) block.properties
+;;
+
+(* Stop once three ordinary children are found; property values must not
+   allocate an intermediate copy of the complete child page. *)
+let preview_children children =
+  let rec take remaining reversed = function
+    | _ when remaining = 0 -> List.rev reversed
+    | [] -> List.rev reversed
+    | (child : tree_member) :: rest ->
+      if property_value_block child.block then take remaining reversed rest
+      else take (remaining - 1) (child :: reversed) rest
+  in
+  take 3 [] children
+;;
+
 let timeline_entry_page
       ?(tag_titles = fun _ -> [])
       ~page
       ~time_context
       (result : tree_member Graph.page_result)
   =
-  let cursor block =
+  let cursor (block : Graph.block) =
     Option.map
       (fun protocol_cursor ->
-         { after_sibling_order = Journal_model.sibling_order block
-         ; after_block_id = Journal_model.id block
+         { after_sibling_order = block.order
+         ; after_block_id = Graph.Uuid.to_string block.uuid
          ; protocol_cursor = Some protocol_cursor
          })
       result.continuation
@@ -314,6 +337,7 @@ let timeline_entry_page
          let children = if item.depth = 0 then direct_children item.block else [] in
          if
            item.depth = 0
+           && (not (property_value_block item.block))
            && (String.trim item.block.title <> ""
                || item.block.tags <> []
                || tag_titles item.block.uuid <> []
@@ -331,9 +355,13 @@ let timeline_entry_page
       Ok
         { entries = List.rev reversed
         ; continuation =
-            (match reversed with
-             | [] -> None
-             | entry :: _ -> cursor entry.block)
+            Option.bind
+              (List.fold_left
+                 (fun last (item : tree_member) ->
+                    if item.depth = 0 then Some item.block else last)
+                 None
+                 result.items)
+              cursor
         }
     | ((root : tree_member), children) :: rest ->
       (match
@@ -357,7 +385,7 @@ let timeline_entry_page
                 ; asset_file_type = asset_file_type child.block
                 })
              (* Preview only: raw tree members and child_count stay complete. *)
-             (List.take 3 children)
+             (preview_children children)
          in
          project ({ block; child_summaries } :: reversed) rest)
   in

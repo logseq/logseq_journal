@@ -1100,9 +1100,8 @@ let test_reference_body_and_summary () =
         let value = Yojson.Basic.from_string json in
         if Yojson.Basic.Util.member "mode" value = `String "bounded-text"
         then Some value else None | _ -> None) (ops ()) in
-    require (List.length bounded = 2 && List.for_all (fun value ->
-      Yojson.Basic.Util.member "maxLines" value = `Int 4) bounded)
-      "resolved root/summary bodies do not share the four-line policy";
+    require (List.map (Yojson.Basic.Util.member "maxLines") bounded = [ `Int 4; `Int 2 ])
+      "resolved root/summary bodies lost four/two-line policies";
     require
       (Journal_model.source entry.block = token)
       "rendering changed persisted source")
@@ -1159,6 +1158,102 @@ let projected_entry nodes =
   in
   require (List.length result.entries = 1) "image parent disappeared from projection";
   List.hd result.entries
+;;
+
+
+(* Projection owns the loss before any state transition: valid typed Graph
+   properties become the production model. Routes then exercise the normal
+   bounded staging owner; native presentation has no pure reducer owner. *)
+let display_property ?(hidden = false) ~ident ~uuid ~title property_type values =
+  Graph.{ ident; uuid = Uuid.of_string uuid |> require_ok; title
+        ; schema = {property_type; cardinality = Many; hidden; public = false}
+        ; values; values_truncated = false }
+;;
+
+let test_property_values_are_not_timeline_children () =
+  let property_id = "20000000-0000-4000-9000-000000000010" in
+  let value_id = "20000000-0000-4000-a000-000000000010" in
+  let marker = display_property ~hidden:true ~ident:"logseq.property/created-from-property"
+      ~uuid:mutation_id ~title:"Created from property" Entity
+      [Entity_value (Graph.Uuid.of_string property_id |> require_ok)] in
+  let property = display_property ~ident:"user.property/custom-name"
+      ~uuid:property_id ~title:"Arbitrary field" Node
+      [Node_value (Graph.Uuid.of_string value_id |> require_ok)] in
+  let root = { (graph_node ~id:block_id ~parent:page_id "Parent") with properties=[property] } in
+  let value = { (graph_node ~order:"0" ~id:value_id ~parent:block_id "https://example.com/value") with properties=[marker] } in
+  let ordinary n title = graph_node ~order:(string_of_int n)
+      ~id:(Printf.sprintf "20000000-0000-4000-a000-%012d" n) ~parent:block_id title in
+  let entry = projected_entry ([0,root;1,value] @ List.init 4 (fun n ->
+      1,ordinary (n+20) (if n=0 then "GitHub URL" else "Ordinary child " ^ string_of_int n))) in
+  require (List.map (fun (c:Journal_graph_projection.child_summary)->c.source) entry.child_summaries =
+      ["GitHub URL";"Ordinary child 1";"Ordinary child 2"])
+    "semantic property value displaced an ordinary child preview";
+  require (Journal_model.child_count entry.block = 5)
+    "presentation classification altered the complete child ownership count";
+  with_mounted (Journal_row.view ~show_timestamp:false
+      ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child->child) entry) (fun _ ops ->
+    require (not (has_text (ops ()) "https://example.com/value")) "Timeline exposes property value";
+    let payloads = List.filter_map (function
+      | Lui_protocol.SetExtensionProp (_,"payload",StringValue json) ->
+        let p=Yojson.Basic.from_string json in
+        if Yojson.Basic.Util.member "mode" p=`String "bounded-text" then Some p else None
+      | _ -> None) (ops ()) in
+    require (List.map (Yojson.Basic.Util.member "maxLines") payloads=[`Int 4;`Int 2;`Int 2;`Int 2])
+      "Timeline must cap parent at four lines and three children at two";
+    require (List.for_all (fun p->Yojson.Basic.Util.member "level" p=`Int 1) (List.tl payloads))
+      "child previews do not request subordinate native typography";
+    require (not (has_text (ops ()) "Show more")) "Timeline added expansion")
+;;
+
+let test_detail_preserves_named_properties_and_independent_status () =
+  let prop_id = "20000000-0000-4000-9000-000000000010" in
+  let value_id = "20000000-0000-4000-a000-000000000010" in
+  let url_prop_id = "20000000-0000-4000-9000-000000000011" in
+  let p ?hidden ident uuid title typ values = display_property ?hidden ~ident ~uuid ~title typ values in
+  let marker=p ~hidden:true "logseq.property/created-from-property" mutation_id "Created from property" Entity
+    [Entity_value (Graph.Uuid.of_string url_prop_id |> require_ok)] in
+  List.iter (fun yes ->
+    let root = { (graph_node ~id:block_id ~parent:page_id "Full parent body") with properties=
+      [p "user.property/repro" prop_id "Reproducible?" Checkbox [Checkbox_value yes]
+      ;p "user.property/url" url_prop_id "GitHub URL" Url [Any_value (Internal_uuid (Graph.Uuid.of_string value_id |> require_ok))]
+      ;p "logseq.property/status" mutation_id "Status" Default [Default_value "logseq.property/status.in-review"]
+      ;p ~hidden:true "user.property/secret" "20000000-0000-4000-9000-000000000012" "Hidden field" String [String_value "hidden value"]
+      ;p "logseq.property/priority" "20000000-0000-4000-9000-000000000015" "Priority" Default
+        [Default_value "logseq.property/priority.high"]
+      ;p "block/tags" "20000000-0000-4000-9000-000000000013" "Tags" Class [Class_value (Graph.Uuid.of_string mutation_id |> require_ok)]
+      ;p "user.property/when" "20000000-0000-4000-9000-000000000016" "When" Datetime [Datetime_value {unix_ms=0L}]
+      ;p "user.property/note" "20000000-0000-4000-9000-000000000014" "Related note" String
+        [String_value ("See [[" ^ value_id ^ "]] for context")]] } in
+    let child = { (graph_node ~id:value_id ~parent:block_id "https://example.com/issue") with properties=[marker] } in
+    let page:Journal_graph_projection.page={id=page_id;day=20260809;title="Example journal"} in
+    let member block:Journal_graph_projection.block_member={block;revision="fixture-1"} in
+    let projection=Journal_graph_projection.detail ~page ~time_context:{localtime=(fun instant -> Unix.gmtime (instant -. 28800.))}
+      ~root:(member root) {items=[member child];continuation=None} |> require_ok in
+    let routes=Journal_routes.create () |> fun r->Journal_routes.open_detail r ~block_id ~request_generation:1L
+      |> fun r->Journal_routes.apply_detail_response r ~request_generation:1L projection in
+    let routes, requests=Journal_routes.load_initial routes in
+    let generation=match requests with
+      |[Journal_graph_request.Load_detail {request_generation;_}]->request_generation
+      |_ -> fail "property staging lost its public bounded read" in
+    let leaf=Journal_graph_projection.detail ~page ~time_context:{localtime=(fun instant -> Unix.gmtime (instant -. 28800.))}
+      ~root:(member child) {items=[];continuation=None} |> require_ok in
+    let routes=Journal_routes.apply_detail_response routes ~request_generation:generation leaf in
+    let body=Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
+    with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
+      List.iter (fun text->require (has_text (ops ()) text) "Detail lost named property/status %S" text)
+        ["When";"1969-12-31 16:00";"Reproducible?";(if yes then "Yes" else "No");"GitHub URL";"https://example.com/issue";"In review";"Priority";"High";"Related note";("See [[" ^ value_id ^ "]] for context")];
+      require (not (has_text (ops ()) "Property")) "typed URL reference lost its owning property name";
+      require (not (has_text (ops ()) "hidden value")) "Detail exposes hidden property";
+      require (not (has_text (ops ()) ("[[" ^ mutation_id ^ "]]")))
+        "Detail duplicates built-in tags as unresolved UUID properties";
+      let labels=List.filter_map (function
+        | Lui_protocol.SetExtensionProp (_,"payload",StringValue json) ->
+          let p=Yojson.Basic.from_string json in
+          if Yojson.Basic.Util.member "mode" p=`String "detail-text" then Some p else None
+        |_ ->None) (ops ()) in
+      let root_label=List.find (fun p->Yojson.Basic.Util.member "id" p=`String ("detail-block:"^block_id)) labels in
+      require (Yojson.Basic.Util.member "text" root_label=`String "Full parent body")
+        "status is still concatenated into the title")) [true;false]
 ;;
 
 let asset_id (item : Journal_media_runtime.item) = Graph.Uuid.to_string item.asset.uuid
@@ -2486,8 +2581,7 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
       require (Yojson.Basic.Util.member "type" row = `String "row") "Detail retains disclosure nesting";
       require (Yojson.Basic.Util.member "separator" row = `String "hidden") "Detail retains hierarchy separators") rows;
     let labels = List.filter (fun p -> Yojson.Basic.Util.member "mode" p = `String "detail-text") payloads in
-    require (List.exists (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-tags:" ^ block_id)
-      && Yojson.Basic.Util.member "text" p = `String "#周末  #trip") labels) "Detail drops owned tags";
+    require (has_text (ops ()) "#周末  #trip") "Detail drops owned tags";
     let expected = [ root, 0; child, 1; grandchild, 2; deep, 2; deeper, 2; sibling, 1 ] in
     List.iter (fun (block, level) ->
       let label = List.find (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-block:" ^ Journal_model.id block)) labels in
@@ -2627,6 +2721,8 @@ let test_detail_known_image_reserves_initial_slot () =
 ;;
 
 let tests =
+  [ "Typed properties omitted from Timeline", test_property_values_are_not_timeline_children
+  ; "Detail named properties and status", test_detail_preserves_named_properties_and_independent_status ] @
   [ "Detail initial blank preserves chrome", test_detail_initial_blank_preserves_chrome
   ; "Detail known image initial slot", test_detail_known_image_reserves_initial_slot ] @
   [ "Feedback native inset visibility and events", test_feedback_reuses_lui_inset_and_keeps_control_events

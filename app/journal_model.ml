@@ -45,6 +45,8 @@ type t =
   ; sibling_order : string
   ; source : string
   ; asset_file_type : string option
+  ; properties : Logseq_db_types.Graph_types.property_summary list
+  ; display_properties : Logseq_db_types.Graph_types.property_summary list
   ; task_state : task_state
   ; tag_titles : string list
   ; tags_present : bool
@@ -112,6 +114,8 @@ let create_on_page
         ; sibling_order
         ; source
         ; asset_file_type = None
+        ; properties = []
+        ; display_properties = []
         ; task_state
         ; tag_titles = []
         ; tags_present = false
@@ -154,7 +158,74 @@ let id value = value.id
 let page_id value = value.page_id
 let parent_id value = value.parent_id
 let sibling_order value = value.sibling_order
-let source value = value.source
+module Graph = Logseq_db_types.Graph_types
+
+let reference uuid = "[[" ^ Graph.Uuid.to_string uuid ^ "]]"
+
+let rec internal_source = function
+  | Graph.Internal_null -> ""
+  | Internal_bool value -> if value then "Yes" else "No"
+  | Internal_number value | Internal_string value | Internal_keyword value -> value
+  | Internal_uuid uuid -> reference uuid
+  | Internal_list values -> String.concat ", " (List.map internal_source values)
+  | Internal_map values -> String.concat ", " (List.map (fun (key,value) ->
+      internal_source key ^ ": " ^ internal_source value) values)
+;;
+
+let datetime_source ~localtime unix_ms =
+  let (tm : Unix.tm) = localtime (Int64.to_float unix_ms /. 1000.) in
+  Printf.sprintf "%04d-%02d-%02d %02d:%02d"
+    (tm.tm_year+1900) (tm.tm_mon+1) tm.tm_mday tm.tm_hour tm.tm_min
+;;
+
+let property_source ~localtime = function
+  | Graph.Checkbox_value value -> if value then "Yes" else "No"
+  | Default_value value ->
+    (match Graph.Uuid.of_string value with Ok uuid -> reference uuid | Error _ -> value)
+  | String_value value | Url_value value | Number_value value | Raw_number_value value
+  | Keyword_value value | Property_value value | Json_value value -> value
+  | Node_value uuid | Asset_value uuid | Entity_value uuid | Class_value uuid
+  | Page_value uuid -> reference uuid
+  | Date_value {journal_day} -> Printf.sprintf "%04d-%02d-%02d"
+      (journal_day / 10000) ((journal_day / 100) mod 100) (journal_day mod 100)
+  | Datetime_value {unix_ms} ->
+    datetime_source ~localtime unix_ms
+  | Any_value value -> internal_source value
+  | Map_value values -> internal_source (Internal_map values)
+  | Collection_value values -> internal_source (Internal_list values)
+;;
+
+let property_sources ?(localtime = Unix.localtime) properties =
+  List.filter_map (fun (p : Graph.property_summary) ->
+    if p.schema.hidden || p.ident = "logseq.property/status" || p.ident = "block/tags" || p.values = [] then None
+    else
+      let render = function
+        | Graph.Default_value "logseq.property/priority.low" when p.ident = "logseq.property/priority" -> "Low"
+        | Default_value "logseq.property/priority.medium" when p.ident = "logseq.property/priority" -> "Medium"
+        | Default_value "logseq.property/priority.high" when p.ident = "logseq.property/priority" -> "High"
+        | Default_value "logseq.property/priority.urgent" when p.ident = "logseq.property/priority" -> "Urgent"
+        | value -> property_source ~localtime value
+      in
+      let values = List.map render p.values |> List.filter (fun s -> String.trim s <> "") in
+      if values = [] then None
+      else Some (p.title, String.concat ", " values ^ if p.values_truncated then " …" else "")) properties
+;;
+
+let source value =
+  if String.trim value.source <> "" then value.source else
+  List.find_map (fun (p : Graph.property_summary) ->
+    if p.ident = "logseq.property/value" then
+      Some (String.concat ", " (List.map (property_source ~localtime:Unix.localtime) p.values)) else None)
+    value.display_properties |> Option.value ~default:value.source
+let properties value = value.properties
+let display_properties value = value.display_properties
+let with_properties ?(localtime = Unix.localtime) value ~properties =
+  let display_properties = List.map (fun (p : Graph.property_summary) ->
+    {p with values=List.map (function
+      | Graph.Datetime_value {unix_ms} -> Graph.String_value (datetime_source ~localtime unix_ms)
+      | value -> value) p.values}) properties in
+  {value with properties; display_properties}
+;;
 
 let is_image_file_type value =
   match String.lowercase_ascii (String.trim value) with

@@ -3014,23 +3014,57 @@ let detail_page
                  then []
                  else [ V.text "Waiting for another branch to finish" ])
         | Block { block; depth; _ } ->
-          let source =
-            if Journal_model.task_state block = No_status
-            then render_source state (Journal_model.source block)
-            else
-              Journal_model.status_name (Journal_model.task_state block)
-              ^ "  "
-              ^ render_source state (Journal_model.source block)
-          in
+          let source = Journal_model.source block in
           let id = "detail-block:" ^ Journal_model.id block in
-          Journal_header.detail_text ~id ~depth source
-          |> fun text ->
-          let tags = Journal_model.tag_titles block in
-          V.column ~spacing:8. (text ::
-            (if tags = [] then [] else
-              [ Journal_header.detail_text
-                  ~id:("detail-tags:" ^ Journal_model.id block) ~depth:2
-                  (String.concat "  " (List.map (fun title -> "#" ^ title) tags)) ]))
+          let module Graph = Logseq_db_types.Graph_types in
+          let created_from block =
+            List.find_map (fun (p : Graph.property_summary) ->
+              if p.ident = "logseq.property/created-from-property" then
+                List.find_map (function Graph.Entity_value uuid -> Some uuid | _ -> None) p.values
+              else None) (Journal_model.properties block)
+          in
+          let value_id = function
+            | Graph.Default_value id when Journal_validation.is_uuid id -> Some id
+            | Node_value uuid | Entity_value uuid | Asset_value uuid
+            | Any_value (Internal_uuid uuid) -> Some (Graph.Uuid.to_string uuid)
+            | _ -> None
+          in
+          let owned_value property_uuid value =
+            Option.fold ~none:false ~some:(fun id ->
+              match Journal_detail.find_block detail ~block_id:id with
+              | Some child -> Journal_model.parent_id child = Some (Journal_model.id block)
+                && Option.fold ~none:false ~some:(Graph.Uuid.equal property_uuid) (created_from child)
+              | None -> false) (value_id value)
+          in
+          let named_sources =
+            Journal_model.display_properties block
+            |> List.map (fun (p : Graph.property_summary) ->
+              { p with values = List.filter (fun value -> not (owned_value p.uuid value)) p.values })
+            |> Journal_model.property_sources
+          in
+          let property_name =
+            Option.bind (created_from block) (fun property_uuid ->
+              Option.bind (Journal_model.parent_id block) (fun parent_id ->
+                Option.bind (Journal_detail.find_block detail ~block_id:parent_id) (fun parent ->
+                  List.find_map (fun (p : Graph.property_summary) ->
+                    if Graph.Uuid.equal p.uuid property_uuid
+                      && List.exists (fun value -> value_id value = Some (Journal_model.id block)) p.values
+                    then Some p.title else None) (Journal_model.properties parent))))
+          in
+          let property_value = Option.is_some (created_from block) in
+          let field ~key name value =
+            V.column ~spacing:4. ~alignment:Leading
+              [ V.of_lui (Lui_elements.text ~value:name ~style_class:"caption" ~foreground:"secondary" [])
+              ; Journal_header.detail_text ~id:key ~depth:2 (render_source state value) ]
+          in
+          let text =
+            if property_value then field ~key:id (Option.value property_name ~default:"Property") source
+            else Journal_header.detail_text ~id ~depth (render_source state source)
+          in
+          let fields = List.map (fun (name, value) ->
+            field ~key:("detail-property:" ^ Journal_model.id block ^ ":" ^ name) name value) named_sources in
+          V.column ~spacing:8. ~alignment:Leading
+            (text :: Journal_row.metadata block @ fields)
           |> V.with_test_id (Ui.Test_id.string id)
           |> media_label
                ~store:media_store
