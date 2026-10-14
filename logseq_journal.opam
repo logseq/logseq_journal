@@ -47,7 +47,7 @@ depends: [
   "uutf" {= "1.0.4"}
 ]
 pin-depends: [
-  ["mldoc.dev" "git+https://github.com/logseq/mldoc.git#f11230c367964af2b575524d00779cfb1ffc7147"]
+  ["mldoc.dev" "git+https://github.com/logseq/mldoc.git#b3e06c030b7396f7992ebe1c3a4f35f5e6983200"]
   ["xmlm.dev" "git+https://github.com/logseq/xmlm.git#eb469d536e98c98f2754c0ff8813c92b3a17fe9f"]
   ["rrbvec.dev" "git+https://github.com/logseq/rrbvec.git#main"]
   ["lui.0.1.0" "git+https://github.com/logseq/lui.git#4fdb9136026af7863a8d025133871e34864eace1"]

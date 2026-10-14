@@ -9,6 +9,8 @@ homepage: "https://github.com/logseq/logseq_journal"
 bug-reports: "https://github.com/logseq/logseq_journal/issues"
 build: ["dune" "build" "-p" name "-j" jobs]
 pin-depends: [
+  ["mldoc.dev" "git+https://github.com/logseq/mldoc.git#b3e06c030b7396f7992ebe1c3a4f35f5e6983200"]
+  ["xmlm.dev" "git+https://github.com/logseq/xmlm.git#eb469d536e98c98f2754c0ff8813c92b3a17fe9f"]
   [
   "angstrom.dev"
   "git+https://github.com/logseq/angstrom.git#fork"
@@ -52,6 +54,8 @@ pin-depends: [
   ["rrbvec.dev" "git+https://github.com/logseq/rrbvec.git#main"]
 ]
 depends: [
+  "mldoc" {= "dev"}
+  "xmlm" {= "dev"}
   "angstrom" {= "dev"}
   "asn1-combinators" {= "0.3.3"}
   "astring" {= "0.8.5"}
