@@ -42,3 +42,5 @@ type date_presentation =
   }
 
 val present_journal_day : int -> (date_presentation, string) result
+
+val relative_day_label : today:int -> int -> string option

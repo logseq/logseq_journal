@@ -170,12 +170,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
   private struct SectionDate: SwiftUI.View {
     let title: String
+    let relativeLabel: String?
     @Environment(\.journalControlsSize) private var controlsSize
 
     var body: some SwiftUI.View {
       HStack(spacing: 0) {
-        Text(title)
-          .font(.title2.weight(.semibold))
+        Text("\(Text(verbatim: title).font(.title2.weight(.semibold)))\(Text(verbatim: relativeLabel.map { "\u{2002}" + $0 } ?? "").font(.subheadline.weight(.regular)).foregroundStyle(Color.secondary))")
           .foregroundStyle(.primary)
           .monospacedDigit()
           .textCase(nil)
@@ -225,7 +225,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
         }
       case .header:
         if let properties, context.childIDs.isEmpty, let title = properties.title {
-          SectionDate(title: title)
+          SectionDate(title: title, relativeLabel: properties.text)
         }
       case .detail:
         if let title = properties?.title, context.childIDs.count == 2 {

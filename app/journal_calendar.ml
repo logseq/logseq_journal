@@ -210,3 +210,13 @@ let present_journal_day day =
       ; accessibility_label = date_text ^ ", " ^ full_weekdays.(index)
       })
 ;;
+
+let relative_day_label ~today day =
+  if not (Journal_validation.is_journal_day today && Journal_validation.is_journal_day day)
+  then None
+  else
+    match days_from_civil today - days_from_civil day with
+    | 0 -> Some "today"
+    | 1 -> Some "yesterday"
+    | _ -> None
+;;
