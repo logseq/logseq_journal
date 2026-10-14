@@ -10,8 +10,9 @@ Preserve property summaries in the abstract Journal_model without changing exist
 
 ```ocaml
 val properties : t -> Logseq_db_types.Graph_types.property_summary list
-val with_properties : t -> properties:Logseq_db_types.Graph_types.property_summary list -> t
-val property_sources : Logseq_db_types.Graph_types.property_summary list -> (string * string) list
+val display_properties : t -> Logseq_db_types.Graph_types.property_summary list
+val with_properties : ?localtime:(float -> Unix.tm) -> t -> properties:Logseq_db_types.Graph_types.property_summary list -> t
+val property_sources : ?localtime:(float -> Unix.tm) -> Logseq_db_types.Graph_types.property_summary list -> (string * string) list
 ```
 
 Expose the existing shared status/tag presentation in app/journal_row.mli:
@@ -60,3 +61,9 @@ Regression ownership: property metadata is discarded in the public pure Graph pr
 Manual acceptance on the current iPhone 13/iOS 26.1 Simulator confirmed property removal from Timeline, two-line subordinate children, independent status badges, named URL/steps fields, Yes and No values, full Detail text and distinct block spacing. Only read-only navigation occurred in the existing graph. Build caches were reused; SwiftPM's link product was explicitly regenerated after native object changes. The Simulator uses the existing host ARM64 complete-object restamp pipeline plus Simulator-compiled platform crypto, not a full cross-runtime ABI proof. Temporary diagnostics, screenshots, manifests and logs remain outside the repository and are excluded from public PR content.
 
 Independent review identified three P2 cases. Typed ownership now checks the same parent and created-from-property UUID, including a scalar-string-reference regression. Existing Detail interests also demand newly changed journal property references through the same bounded deduplicated reader. Official reserved Priority closed-value idents render Low/Medium/High/Urgent within that property only, preserving literal strings elsewhere. Both remaining bugs failed through public interfaces before their fixes.
+
+Final Simulator revalidation reproduced the storage API's legitimate Url Ref fallback to Any_value(Internal_uuid). The ownership check now covers that typed UUID case; the matching public regression failed before the one-branch fix. Arbitrary String_value text is still never used as ownership evidence.
+
+Further public regressions reproduced the materialized Detail leaf boundary and four automated review findings. Changed properties now follow retained Detail membership, including nodes without an own children-page query. Initial and reconciled children discover their own property sources from the returned bounded fragment; all fragment titles are installed before discovery. Page/Class values register their semantic lookup kind, reuse known page metadata, and otherwise share bounded get-page resolution and cache invalidation with the existing reference owner. Property-source accumulation uses streaming sequences and Rrbvec, not an unbounded flattened list.
+
+Timeline cursor keys now come from the last raw root rather than only visible roots. Changed-page reconciliation follows property-only slices before emitting a replacement, retaining the protocol cursor and registered query budget. Datetime presentation is projected with the injected active local-time context while raw typed semantic properties remain available for ownership. The deterministic UTC-8 mounted regression confirms a midnight-UTC value renders the prior local date at 16:00 without a UTC label.

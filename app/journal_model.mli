@@ -76,7 +76,10 @@ val render_references : lookup:(string -> string option) -> string -> string
 
 (** Typed graph properties retained by the projection, including hidden ownership metadata. *)
 val properties : t -> Logseq_db_types.Graph_types.property_summary list
-val with_properties : t -> properties:Logseq_db_types.Graph_types.property_summary list -> t
+
+(** Property presentation projected with the active local-time context; semantic values remain in [properties]. *)
+val display_properties : t -> Logseq_db_types.Graph_types.property_summary list
+val with_properties : ?localtime:(float -> Unix.tm) -> t -> properties:Logseq_db_types.Graph_types.property_summary list -> t
 
 (** Visible named property values. UUID values use the existing bounded reference syntax. *)
-val property_sources : Logseq_db_types.Graph_types.property_summary list -> (string * string) list
+val property_sources : ?localtime:(float -> Unix.tm) -> Logseq_db_types.Graph_types.property_summary list -> (string * string) list

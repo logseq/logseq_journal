@@ -310,6 +310,7 @@ type t =
   ; mutable block_pages : (string * Projection.page) list
   ; tag_titles : (string, string list) Hashtbl.t
   ; reference_sources : (string, int64 * string option) Hashtbl.t
+  ; reference_pages : (string, unit) Hashtbl.t
   ; reference_depths : (string, int) Hashtbl.t
   ; reference_pending : (string, unit) Hashtbl.t
   ; reference_dirty : (string, unit) Hashtbl.t
@@ -380,6 +381,7 @@ let create ?(localtime = Unix.localtime) () =
   ; block_pages = []
   ; tag_titles = Hashtbl.create 64
   ; reference_sources = Hashtbl.create 64
+  ; reference_pages = Hashtbl.create 64
   ; reference_depths = Hashtbl.create 64
   ; reference_pending = Hashtbl.create 64
   ; reference_dirty = Hashtbl.create 16
@@ -419,6 +421,7 @@ let reset t =
   t.pages <- [];
   t.block_pages <- [];
   Hashtbl.clear t.reference_sources;
+  Hashtbl.clear t.reference_pages;
   Hashtbl.clear t.reference_depths;
   Hashtbl.clear t.reference_pending;
   Hashtbl.clear t.reference_dirty;
@@ -1814,8 +1817,10 @@ let reference_read t block_id depth =
       (read
          t
          (Reference_read { block_id; depth })
-         (Protocol.V2_get_block
-            { block = Graph.Uuid.of_string block_id |> Result.get_ok; revision = None })))
+         (let uuid = Graph.Uuid.of_string block_id |> Result.get_ok in
+          if Hashtbl.mem t.reference_pages block_id
+          then Protocol.V2_get_page { page = uuid; revision = None }
+          else Protocol.V2_get_block { block = uuid; revision = None })))
 ;;
 
 let fence_reference t block_id =
@@ -1839,25 +1844,42 @@ let invalidate_reference t block_id =
     else reference_read t block_id depth
 ;;
 
-let reference_source (block : Graph.block) =
-  if String.trim block.title <> "" then block.title else
-  List.find_map (fun (p : Graph.property_summary) ->
-    if p.ident = "logseq.property/value" then
-      match Journal_model.property_sources [{p with schema={p.schema with hidden=false}}] with
-      | (_, source) :: _ -> Some source | [] -> None
-    else None) block.properties
-  |> Option.value ~default:block.title
+let reference_source t (block : Graph.block) =
+  if String.trim block.title <> ""
+  then block.title
+  else
+    List.find_map
+      (fun (p : Graph.property_summary) ->
+         if p.ident = "logseq.property/value"
+         then (
+           match
+             Journal_model.property_sources
+               ~localtime:t.localtime
+               [ { p with schema = { p.schema with hidden = false } } ]
+           with
+           | (_, source) :: _ -> Some source
+           | [] -> None)
+         else None)
+      block.properties
+    |> Option.value ~default:block.title
 ;;
 
-let observe_reference_sources ?(extra_sources = []) t ~source_epoch depth values =
+let observe_reference_sources
+      ?(extra_sources = Seq.empty)
+      ?(known_sources = Seq.empty)
+      t
+      ~source_epoch
+      depth
+      values
+  =
   let updates = ref []
   and reads = ref [] in
   (* Install the whole fragment before discovery. Epochs belong to request
      issuance, not completion order; revision strings are opaque. Advance the
      fence even when the title did not change. *)
   let values =
-    List.filter
-      (fun (id, source) ->
+    Seq.fold_left
+      (fun installed ((id, source) as value) ->
          let previous = Hashtbl.find_opt t.reference_sources id in
          if
            match previous with
@@ -1869,9 +1891,10 @@ let observe_reference_sources ?(extra_sources = []) t ~source_epoch depth values
            Hashtbl.replace t.reference_sources id (source_epoch, source);
            if Option.map snd previous <> Some source && Hashtbl.mem t.reference_depths id
            then updates := (id, source) :: !updates;
-           true)
-         else false)
-      values
+           Rrbvec.push_back installed value)
+         else installed)
+      Rrbvec.empty
+      (Seq.append (List.to_seq values) known_sources)
   in
   let rec discover depth source =
     if depth < Journal_model.maximum_reference_depth
@@ -1896,8 +1919,8 @@ let observe_reference_sources ?(extra_sources = []) t ~source_epoch depth values
                  (reference_read t id next_depth)))
         (Journal_model.reference_ids source)
   in
-  List.iter (fun (_, source) -> Option.iter (discover depth) source) values;
-  List.iter (discover depth) extra_sources;
+  Rrbvec.iter (fun (_, source) -> Option.iter (discover depth) source) values;
+  Seq.iter (discover depth) extra_sources;
   { requests = List.rev !reads
   ; responses =
       (if !updates = []
@@ -1906,11 +1929,28 @@ let observe_reference_sources ?(extra_sources = []) t ~source_epoch depth values
   }
 ;;
 
+let complete_reference_read t ~source_epoch ~block_id ~depth source =
+  let depth =
+    Hashtbl.find_opt t.reference_depths block_id |> Option.value ~default:depth
+  in
+  Hashtbl.remove t.reference_pending block_id;
+  if Hashtbl.mem t.reference_dirty block_id
+  then (
+    Hashtbl.remove t.reference_dirty block_id;
+    requests (Option.to_list (reference_read t block_id depth)))
+  else observe_reference_sources t ~source_epoch depth [ block_id, source ]
+;;
+
 let hydration_for_changes t ~request_generation windows =
   let blocks, pages, structures = changed_interests windows in
   let favorites = favorite_changes t blocks pages structures in
   (* Fence old fragments before issuing the shared or dedicated point reads. *)
   List.iter (fun block -> fence_reference t (Graph.Uuid.to_string block)) blocks;
+  List.iter (fun page -> fence_reference t (Graph.Uuid.to_string page)) pages;
+  let owns_detail_page page =
+    Hashtbl.to_seq_values t.children_interests
+    |> Seq.exists (fun interest -> Graph.Uuid.equal interest.page.uuid page)
+  in
   let point_reads =
     List.filter_map
       (fun block ->
@@ -1943,6 +1983,19 @@ let hydration_for_changes t ~request_generation windows =
            then Hashtbl.replace t.reference_dirty id ();
            None))
       blocks
+    @ List.filter_map
+        (fun page ->
+           let id = Graph.Uuid.to_string page in
+           if Hashtbl.mem t.reference_pages id
+           then
+             if owns_detail_page page
+             then (
+               if Hashtbl.mem t.reference_pending id
+               then Hashtbl.replace t.reference_dirty id ();
+               None)
+             else invalidate_reference t id
+           else None)
+        pages
   in
   let tree_reads =
     List.filter_map
@@ -1957,9 +2010,7 @@ let hydration_for_changes t ~request_generation windows =
   let detail_page_reads =
     List.filter_map
       (fun page ->
-         if
-           Hashtbl.to_seq_values t.children_interests
-           |> Seq.exists (fun interest -> Graph.Uuid.equal interest.page.uuid page)
+         if owns_detail_page page
          then
            Some
              (read
@@ -2685,6 +2736,13 @@ let receive_response t (protocol_response : Protocol.response) =
         | _ -> failure_output t operation request_id "Unexpected journal response.")
      | V2_page_outcome lookup ->
        (match lookup, operation with
+        | (V2_present_page _ | V2_missing_page _), Reference_read { block_id; depth } ->
+          let source =
+            match lookup with
+            | V2_present_page { page; _ } when not page.recycled -> Some page.title
+            | V2_present_page _ | V2_missing_page _ -> None
+          in
+          complete_reference_read t ~source_epoch ~block_id ~depth source
         | _, Favorite_dependency { epoch; _ } when epoch <> t.favorite_epoch -> empty
         | _, Favorite_dependency { uuid; seen; page; _ }
           when Hashtbl.mem t.favorite_dirty (Graph.Uuid.to_string uuid) ->
@@ -2734,7 +2792,8 @@ let receive_response t (protocol_response : Protocol.response) =
                       | Error _ -> ()
                       | Ok time_context ->
                         (match
-                           detail_projection t
+                           detail_projection
+                             t
                              ~page
                              ~time_context
                              ~root:interest.root
@@ -3117,21 +3176,12 @@ let receive_response t (protocol_response : Protocol.response) =
                 { refresh with responses = completion :: refresh.responses }
               | Error message, _ | _, Error message -> reject message))
         | (V2_present_block _ | V2_missing_block _), Reference_read { block_id; depth } ->
-          let depth =
-            Hashtbl.find_opt t.reference_depths block_id |> Option.value ~default:depth
+          let source =
+            match lookup with
+            | V2_present_block { value; _ } -> Some (reference_source t value.block)
+            | V2_missing_block _ -> None
           in
-          Hashtbl.remove t.reference_pending block_id;
-          if Hashtbl.mem t.reference_dirty block_id
-          then (
-            Hashtbl.remove t.reference_dirty block_id;
-            requests (Option.to_list (reference_read t block_id depth)))
-          else (
-            let source =
-              match lookup with
-              | V2_present_block { value; _ } -> Some (reference_source value.block)
-              | V2_missing_block _ -> None
-            in
-            observe_reference_sources t ~source_epoch depth [ block_id, source ])
+          complete_reference_read t ~source_epoch ~block_id ~depth source
         | V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
@@ -3506,8 +3556,19 @@ let receive_response t (protocol_response : Protocol.response) =
               with
               | Error message -> reject message
               | Ok value ->
-                remember_entries t page value.entries;
-                responses [ response (Page_tree_reconciled { page; value }) ]))
+                (match value.entries, result.continuation with
+                 | [], Some cursor ->
+                   (match
+                      registered_tree t (Graph.Uuid.of_string page.id |> Result.get_ok)
+                    with
+                    | Some interest ->
+                      (match page_tree t operation page ~cursor interest.limit with
+                       | Ok request -> requests [ request ]
+                       | Error message -> reject message)
+                    | None -> reject "The changed page query is no longer retained.")
+                 | _ ->
+                   remember_entries t page value.entries;
+                   responses [ response (Page_tree_reconciled { page; value }) ])))
         | _ -> failure_output t operation request_id "Unexpected page-tree response.")
      | V2_mutation_committed _ ->
        (match operation with
@@ -3576,7 +3637,7 @@ let receive t (protocol_response : Protocol.response) =
       empty
     | Some { operation; source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
       let block (value : Protocol.v2_block_record) =
-        Graph.Uuid.to_string value.block.uuid, Some (reference_source value.block)
+        Graph.Uuid.to_string value.block.uuid, Some (reference_source t value.block)
       in
       let values =
         match outcome with
@@ -3601,6 +3662,14 @@ let receive t (protocol_response : Protocol.response) =
                (Rrbvec.map
                   (fun (item : Protocol.v2_child_member) -> block item.value)
                   (Rrbvec.append_list retained items))
+        | V2_page_outcome (V2_present_page { page; _ })
+          when Hashtbl.mem t.reference_pages (Graph.Uuid.to_string page.uuid) ->
+          [ ( Graph.Uuid.to_string page.uuid
+            , if page.recycled then None else Some page.title )
+          ]
+        | V2_page_outcome (V2_missing_page { uuid; _ })
+          when Hashtbl.mem t.reference_pages (Graph.Uuid.to_string uuid) ->
+          [ Graph.Uuid.to_string uuid, None ]
         | V2_children_outcome { items; _ } ->
           List.map (fun (item : Protocol.v2_child_member) -> block item.value) items
         | V2_page_tree_outcome { items; _ } ->
@@ -3629,19 +3698,75 @@ let receive t (protocol_response : Protocol.response) =
       (* Property references are demanded by Detail only. Timeline continues
          reading its bounded tree fragment without property hydration. All
          child titles enter the cache before discovery, avoiding duplicate reads. *)
-      let extra_sources =
-        match operation with
-        | Detail_children { root; _ } ->
-          List.map snd (Journal_model.property_sources root.block.properties)
-        | Changed_detail_block {block_id;_}
-        | Changed_block {block_id;_} when Hashtbl.mem t.children_interests block_id ->
-          (match outcome with
-           | V2_block_outcome (V2_present_block { value; _ }) ->
-             List.map snd (Journal_model.property_sources value.block.properties)
-           | _ -> [])
-        | _ -> []
+      let property_blocks =
+        match operation, outcome with
+        | ( (Detail_children { root; _ } | Changed_children { root; _ })
+          , V2_children_outcome { items; _ } ) ->
+          Seq.cons
+            root.block
+            (List.to_seq items
+             |> Seq.map (fun (item : Protocol.v2_child_member) -> item.value.block))
+        | ( (Changed_detail_block { block_id; _ } | Changed_block { block_id; _ })
+          , V2_block_outcome (V2_present_block { value; _ }) )
+          when Hashtbl.mem t.detail_pages block_id -> Seq.return value.block
+        | _ -> Seq.empty
       in
-      observe_reference_sources ~extra_sources t ~source_epoch 0 values
+      let known_pages = ref Rrbvec.empty in
+      let seen_pages = Hashtbl.create 16 in
+      let extra_sources =
+        Seq.flat_map
+          (fun (block : Graph.block) ->
+             List.iter
+               (fun (p : Graph.property_summary) ->
+                  if
+                    (not p.schema.hidden)
+                    && p.ident <> "block/tags"
+                    && p.ident <> "logseq.property/status"
+                  then
+                    List.iter
+                      (function
+                        | Graph.Page_value uuid | Class_value uuid ->
+                          let id = Graph.Uuid.to_string uuid in
+                          if
+                            Hashtbl.mem t.reference_pages id
+                            || Hashtbl.length t.reference_pages
+                               < maximum_reference_targets
+                          then (
+                            Hashtbl.replace t.reference_pages id ();
+                            if
+                              not
+                                (Hashtbl.mem t.reference_sources id
+                                 || Hashtbl.mem seen_pages id)
+                            then (
+                              Hashtbl.replace seen_pages id ();
+                              Option.iter
+                                (fun (page : Graph.page) ->
+                                   known_pages
+                                   := Rrbvec.push_back
+                                        !known_pages
+                                        ( id
+                                        , if page.recycled then None else Some page.title
+                                        ))
+                                (Hashtbl.find_opt t.graph_pages id)))
+                        | _ -> ())
+                      p.values)
+               block.properties;
+             Journal_model.property_sources ~localtime:t.localtime block.properties
+             |> List.to_seq
+             |> Seq.map snd)
+          property_blocks
+        |> Seq.fold_left
+             (fun sources source -> Rrbvec.push_back sources source)
+             Rrbvec.empty
+        |> Rrbvec.to_seq
+      in
+      observe_reference_sources
+        ~extra_sources
+        ~known_sources:(Rrbvec.to_seq !known_pages)
+        t
+        ~source_epoch
+        0
+        values
   in
   let output = { output with responses = output.responses @ references.responses } in
   if background

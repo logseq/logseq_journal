@@ -1215,18 +1215,19 @@ let test_detail_preserves_named_properties_and_independent_status () =
   List.iter (fun yes ->
     let root = { (graph_node ~id:block_id ~parent:page_id "Full parent body") with properties=
       [p "user.property/repro" prop_id "Reproducible?" Checkbox [Checkbox_value yes]
-      ;p "user.property/url" url_prop_id "GitHub URL" Node [Node_value (Graph.Uuid.of_string value_id |> require_ok)]
+      ;p "user.property/url" url_prop_id "GitHub URL" Url [Any_value (Internal_uuid (Graph.Uuid.of_string value_id |> require_ok))]
       ;p "logseq.property/status" mutation_id "Status" Default [Default_value "logseq.property/status.in-review"]
       ;p ~hidden:true "user.property/secret" "20000000-0000-4000-9000-000000000012" "Hidden field" String [String_value "hidden value"]
       ;p "logseq.property/priority" "20000000-0000-4000-9000-000000000015" "Priority" Default
         [Default_value "logseq.property/priority.high"]
       ;p "block/tags" "20000000-0000-4000-9000-000000000013" "Tags" Class [Class_value (Graph.Uuid.of_string mutation_id |> require_ok)]
+      ;p "user.property/when" "20000000-0000-4000-9000-000000000016" "When" Datetime [Datetime_value {unix_ms=0L}]
       ;p "user.property/note" "20000000-0000-4000-9000-000000000014" "Related note" String
         [String_value ("See [[" ^ value_id ^ "]] for context")]] } in
     let child = { (graph_node ~id:value_id ~parent:block_id "https://example.com/issue") with properties=[marker] } in
     let page:Journal_graph_projection.page={id=page_id;day=20260809;title="Example journal"} in
     let member block:Journal_graph_projection.block_member={block;revision="fixture-1"} in
-    let projection=Journal_graph_projection.detail ~page ~time_context:{localtime=Unix.gmtime}
+    let projection=Journal_graph_projection.detail ~page ~time_context:{localtime=(fun instant -> Unix.gmtime (instant -. 28800.))}
       ~root:(member root) {items=[member child];continuation=None} |> require_ok in
     let routes=Journal_routes.create () |> fun r->Journal_routes.open_detail r ~block_id ~request_generation:1L
       |> fun r->Journal_routes.apply_detail_response r ~request_generation:1L projection in
@@ -1234,13 +1235,14 @@ let test_detail_preserves_named_properties_and_independent_status () =
     let generation=match requests with
       |[Journal_graph_request.Load_detail {request_generation;_}]->request_generation
       |_ -> fail "property staging lost its public bounded read" in
-    let leaf=Journal_graph_projection.detail ~page ~time_context:{localtime=Unix.gmtime}
+    let leaf=Journal_graph_projection.detail ~page ~time_context:{localtime=(fun instant -> Unix.gmtime (instant -. 28800.))}
       ~root:(member child) {items=[];continuation=None} |> require_ok in
     let routes=Journal_routes.apply_detail_response routes ~request_generation:generation leaf in
     let body=Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
     with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
       List.iter (fun text->require (has_text (ops ()) text) "Detail lost named property/status %S" text)
-        ["Reproducible?";(if yes then "Yes" else "No");"GitHub URL";"https://example.com/issue";"In review";"Priority";"High";"Related note";("See [[" ^ value_id ^ "]] for context")];
+        ["When";"1969-12-31 16:00";"Reproducible?";(if yes then "Yes" else "No");"GitHub URL";"https://example.com/issue";"In review";"Priority";"High";"Related note";("See [[" ^ value_id ^ "]] for context")];
+      require (not (has_text (ops ()) "Property")) "typed URL reference lost its owning property name";
       require (not (has_text (ops ()) "hidden value")) "Detail exposes hidden property";
       require (not (has_text (ops ()) ("[[" ^ mutation_id ^ "]]")))
         "Detail duplicates built-in tags as unresolved UUID properties";

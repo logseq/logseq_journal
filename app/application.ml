@@ -3025,7 +3025,8 @@ let detail_page
           in
           let value_id = function
             | Graph.Default_value id when Journal_validation.is_uuid id -> Some id
-            | Node_value uuid | Entity_value uuid | Asset_value uuid -> Some (Graph.Uuid.to_string uuid)
+            | Node_value uuid | Entity_value uuid | Asset_value uuid
+            | Any_value (Internal_uuid uuid) -> Some (Graph.Uuid.to_string uuid)
             | _ -> None
           in
           let owned_value property_uuid value =
@@ -3036,7 +3037,7 @@ let detail_page
               | None -> false) (value_id value)
           in
           let named_sources =
-            Journal_model.properties block
+            Journal_model.display_properties block
             |> List.map (fun (p : Graph.property_summary) ->
               { p with values = List.filter (fun value -> not (owned_value p.uuid value)) p.values })
             |> Journal_model.property_sources
