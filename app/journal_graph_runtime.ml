@@ -3732,7 +3732,19 @@ let receive t (protocol_response : Protocol.response) =
                             || Hashtbl.length t.reference_pages
                                < maximum_reference_targets
                           then (
+                            let new_page_kind = not (Hashtbl.mem t.reference_pages id) in
                             Hashtbl.replace t.reference_pages id ();
+                            if new_page_kind then (
+                              (* A generic block miss is not a page miss. Reset
+                                 discovery once when semantic metadata refines
+                                 the lookup kind, fencing an older in-flight read. *)
+                              (match Hashtbl.find_opt t.reference_sources id with
+                               | Some (_, None) ->
+                                 Hashtbl.remove t.reference_sources id;
+                                 Hashtbl.remove t.reference_depths id
+                               | Some (_, Some _) | None -> ());
+                              if Hashtbl.mem t.reference_pending id then
+                                Hashtbl.replace t.reference_dirty id ());
                             if
                               not
                                 (Hashtbl.mem t.reference_sources id

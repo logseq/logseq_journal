@@ -4957,6 +4957,45 @@ let test_detail_page_and_class_property_uses_page_lookup () =
     ]
 ;;
 
+let test_page_property_promotes_prior_block_reference () =
+  List.iter (fun pending ->
+    let runtime=Runtime.create () in
+    let tree=initial_tree runtime in
+    let title="See [[" ^ Graph.Uuid.to_string unrelated_uuid ^ "]]" in
+    let root : Protocol.v2_tree_member =
+      {value={record with block={block with title}};revision="root-1";depth=0;parent=page_uuid} in
+    let first=Runtime.receive runtime (tree_page tree [root] None)
+      |> fun o -> only "initial generic reference" o.requests in
+    (match first.command with Protocol.V2_get_block _ -> () | _ -> Alcotest.fail "expected generic block lookup");
+    if not pending then ignore (Runtime.receive runtime (response first (Protocol.V2_block_outcome
+      (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
+    let property : Graph.property_summary =
+      {ident="user.property/page";uuid=block_uuid;title="Actual page"
+      ;schema={property_type=Page;cardinality=One;hidden=false;public=false}
+      ;values=[Page_value unrelated_uuid];values_truncated=false} in
+    let read=Runtime.submit runtime (Journal_graph_request.Load_detail
+      {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
+      |> fun o -> only "promoted Detail root" o.requests in
+    let children=Runtime.receive runtime (response read (Protocol.V2_block_outcome
+      (V2_present_block {value={record with block={block with properties=[property]}};revision="root-2"})))
+      |> fun o -> only "promoted Detail children" o.requests in
+    let output=Runtime.receive runtime (response children (Protocol.V2_children_outcome
+      {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
+    let output=if pending then (
+      Alcotest.(check int) "retain one pending reference read" 0 (List.length output.requests);
+      Runtime.receive runtime (response first (Protocol.V2_block_outcome
+        (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})))) else output in
+    let page_read=only "page type supersedes old block missing/pending cache" output.requests in
+    (match page_read.command with
+     |Protocol.V2_get_page {page;_}->Alcotest.(check bool) "promoted UUID" true (Graph.Uuid.equal page unrelated_uuid)
+     |_ -> Alcotest.fail "semantic page type did not supersede the generic block lookup");
+    let output=Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
+      (V2_present_page {page={page with uuid=unrelated_uuid;title="Actual page title";kind=Ordinary_page};revision="actual-page-1"}))) in
+    Alcotest.(check bool) "promoted title published" true (List.exists (fun (r:Runtime.response)->match r.payload with
+      |Reference_sources_changed values->List.mem (Graph.Uuid.to_string unrelated_uuid,Some "Actual page title") values
+      |_ ->false) output.responses)) [false;true]
+;;
+
 let test_changed_tree_all_property_slice_continues () =
   let runtime = Runtime.create () in
   seed_feed runtime;
@@ -5022,6 +5061,7 @@ let () =
       ;Alcotest.test_case "materialized Detail leaf discovers property" `Quick test_materialized_detail_leaf_discovers_property_reference
       ;Alcotest.test_case "returned child property resolves without own load" `Quick test_detail_child_property_reference_without_child_load
       ;Alcotest.test_case "page/class properties use page lookup" `Quick test_detail_page_and_class_property_uses_page_lookup
+      ;Alcotest.test_case "page type supersedes cached or pending block reference" `Quick test_page_property_promotes_prior_block_reference
       ;Alcotest.test_case "filtered changed tree follows continuation" `Quick test_changed_tree_all_property_slice_continues
       ;Alcotest.test_case "Timeline-only property change does not hydrate" `Quick test_timeline_only_property_update_does_not_hydrate] )
     ; ( "parent-only Timeline visibility"
