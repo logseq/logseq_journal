@@ -175,7 +175,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     var body: some SwiftUI.View {
       HStack(spacing: 0) {
-        Text("\(Text(verbatim: title).font(.title2.weight(.semibold)))\(Text(verbatim: relativeLabel.map { " " + $0 } ?? "").font(.subheadline))")
+        Text("\(Text(verbatim: title).font(.title2.weight(.semibold)))\(Text(verbatim: relativeLabel.map { "\u{2002}" + $0 } ?? "").font(.footnote.weight(.regular)))")
           .foregroundStyle(.primary)
           .monospacedDigit()
           .textCase(nil)

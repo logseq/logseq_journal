@@ -6,7 +6,7 @@ Timeline dates need immediate today/yesterday context. Block Detail has a redund
 
 ## Decision
 
-Timeline appends lowercase `today` and `yesterday` after the corresponding dates using the native `.subheadline` style alongside the existing `.title2` date. Other dates remain unchanged. Detail supplies an empty navigation title while retaining the native bar, back button and options menu.
+Timeline appends lowercase `today` and `yesterday` after the corresponding dates using native `.footnote.weight(.regular)` text alongside the existing `.title2.weight(.semibold)` date, separated by an en space on the shared native Text baseline. Other dates remain unchanged. Detail supplies an empty navigation title while retaining the native bar, back button and options menu.
 
 ## Authorization and ownership
 
@@ -39,3 +39,7 @@ Rejected because the OCaml calendar already owns local date updates.
 ## Regression ownership
 
 Calendar installation belongs to Application's private effect closure. Its public pure `Root_navigation` events do not expose calendar installation or delayed feed completion; the new regression therefore uses the existing `For_testing.app_with_service` boundary, injected sampler and real foreground packets. It blocks the actual fixture feed request and then fails it, rather than injecting an already incorrect projection. Day and zone cases demonstrate suffix changes before completion, retention after failure, and no added feed query. The independent review found this gap in head `6f8f026`; the initial tests failed with `today` where `yesterday` was required before the fix.
+
+## Relative-label typography
+
+The smaller footnote style (13pt at default Dynamic Type) keeps today/yesterday subordinate to the semibold 22pt date. Regular weight preserves readable strokes without inheriting a header weight. An en space separates the two runs; the single Text preserves native baseline alignment, proportional shrinking, Dynamic Type and combined heading semantics. Actual same-device before/after screenshots and maximum accessibility sizing verify the refinement.
