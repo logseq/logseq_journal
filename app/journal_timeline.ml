@@ -217,7 +217,9 @@ let view
       | Some value -> value.Journal_calendar.date_text
       | None -> fallback
     in
-    Journal_header.date_header ~title
+    Journal_header.date_header
+      ?relative_label:(Journal_calendar.relative_day_label ~today day)
+      ~title ()
     |> V.with_test_id (Ui.Test_id.string ("journal-day-heading:" ^ string_of_int day))
   in
   let render previous_slot slot =

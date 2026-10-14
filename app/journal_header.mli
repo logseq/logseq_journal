@@ -65,7 +65,7 @@ val feedback
   -> Journal_view.View.Body.t
   -> Journal_view.View.Body.t
 
-val date_header : title:string -> Journal_view.View.t
+val date_header : ?relative_label:string -> title:string -> unit -> Journal_view.View.t
 
 val detail_text : id:string -> depth:int -> string -> Journal_view.View.t
 val detail_row : depth:int -> Journal_view.View.t -> Journal_view.View.t
