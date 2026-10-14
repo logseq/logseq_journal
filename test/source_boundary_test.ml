@@ -639,7 +639,8 @@ let test_standalone_sync_protocol_boundary root =
     [ "module Protocol = Logseq_sync_pure_reducer.Sync_protocol"
     ; "all client messages round trip"
     ; "all server messages round trip"
-    ; "unknown fields are strict and safe"
+    ; "owned client fields are strict and safe"
+    ; "external server extensions are open"
     ; "protocol validation is fail closed"
     ]
 ;;

@@ -1019,7 +1019,7 @@ type snapshot_uri_response =
   { ok : bool
   ; url : string
   }
-[@@deriving yojson { strict = false }]
+[@@deriving of_yojson { strict = false }]
 
 let decode_snapshot_uri source =
   try

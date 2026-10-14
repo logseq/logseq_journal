@@ -5196,3 +5196,61 @@ let scenarios = scenarios @
   ; Alcotest.test_case "E2EE invalidated challenge is not advertised" `Quick
       e2ee_invalidated_challenge_is_not_advertised ]
 ;;
+
+
+let snapshot_metadata_open_fields_keep_declared_constraints () =
+  List.iter
+    (fun ((body : string), success) ->
+       let requested, _ = begin_snapshot_bootstrap () in
+       let metadata =
+         List.find_map
+           (function
+             | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
+               Some
+                 (Core.step
+                    requested.next
+                    (Core.Runner_completed
+                       (Core.Completion
+                          ( ticket
+                          , Ok {|{"type":"pull/ok","t":1,"future":{"nested":true}}|} ))))
+             | _ -> None)
+           requested.effects
+         |> Option.get
+       in
+       let downloaded =
+         List.find_map
+           (function
+             | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+               Some
+                 (Core.step
+                    metadata.next
+                    (Core.Runner_completed (Core.Completion (ticket, Ok body))))
+             | _ -> None)
+           metadata.effects
+         |> Option.get
+       in
+       Alcotest.(check bool)
+         "public Core owns metadata decoding and download decision"
+         success
+         (List.exists
+            (function
+              | Core.Run (Core.Request (_, Core.Download_snapshot _)) -> true
+              | _ -> false)
+            downloaded.effects))
+    [ ( {|{"ok":true,"url":"https://example.com/snapshot","key":"synthetic","future":{"nested":true}}|}
+      , true )
+    ; {|{"ok":true,"future":true}|}, false
+    ; {|{"ok":true,"url":null,"future":true}|}, false
+    ; {|{"ok":"true","url":"https://example.com/snapshot","future":true}|}, false
+    ; {|{"ok":true,"url":"http://example.com/snapshot","future":true}|}, false
+    ]
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "snapshot metadata open fields keep declared constraints"
+        `Quick
+        snapshot_metadata_open_fields_keep_declared_constraints
+    ]
+;;

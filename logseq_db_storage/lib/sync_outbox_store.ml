@@ -33,7 +33,9 @@ let schema db =
        | _ -> Error "unsupported sync outbox storage format")
 ;;
 
-type mutation_identity = { mutation_id : string } [@@deriving yojson { strict = false }]
+(* These decode-only projections extract indexing metadata. The full persisted
+   record is admitted by the closed domain codec at its owner. *)
+type mutation_identity = { mutation_id : string } [@@deriving of_yojson { strict = false }]
 
 type mutation_identity_wire =
   | Save_block of mutation_identity
@@ -44,7 +46,7 @@ type mutation_identity_wire =
   | Create_journal_page of mutation_identity
   | Set_task_status of mutation_identity
   | Clear_task_status of mutation_identity
-[@@deriving yojson]
+[@@deriving of_yojson]
 
 type payload_header =
   { format_version : int
@@ -52,7 +54,7 @@ type payload_header =
   ; sequence : int
   ; sync_revision : int
   }
-[@@deriving yojson { strict = false }]
+[@@deriving of_yojson { strict = false }]
 
 let payload_identity record =
   match

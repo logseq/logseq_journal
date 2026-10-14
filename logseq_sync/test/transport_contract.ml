@@ -4037,7 +4037,7 @@ let test_unlock_response_structure ~expected ~success body () =
 
 let scenarios=scenarios @
   [ Alcotest.test_case "unlock shape object extra secret field" `Quick
-      (test_unlock_response_structure ~success:false
+      (test_unlock_response_structure ~success:true
         ~expected:"json_kind=object known_fields=1 unknown_fields=1 encrypted_key_present=true"
         {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","LOG_SECRET_UNKNOWN_FIELD_NAME":"LOG_SECRET_BODY"}|})
   ; Alcotest.test_case "unlock shape array" `Quick
@@ -4086,9 +4086,131 @@ let scenarios = scenarios @
       (test_unlock_response_structure ~success:false
         ~expected:"base64_field_kind=number"
         {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":7}|})
-  ; Alcotest.test_case "E2EE DTO retains unrelated field strictness" `Quick
-      (test_unlock_response_structure ~success:false
+  ; Alcotest.test_case "E2EE DTO ignores unrelated external fields" `Quick
+      (test_unlock_response_structure ~success:true
         ~expected:"base64_field_kind=string"
         {|{"encrypted-aes-key":"LOG_SECRET_WRAPPED","encrypted-aes-key-base64":"LOG_SECRET_BODY","LOG_SECRET_UNKNOWN_FIELD_NAME":false}|})
   ]
+;;
+
+
+let test_external_http_contract kind ~success body () =
+  ignore
+    (with_peer
+       [ case (unlock_json_wire body) ]
+       (fun ~environment ~sw ~support ~origin ->
+          let initial =
+            Core.config ~managed_sync_origin:origin ~limits:(Core_contract.limits ())
+            |> Result.get_ok
+            |> Core.initial
+            |> Result.get_ok
+          in
+          let request =
+            match kind with
+            | `Catalog ->
+              let auth =
+                Core.step
+                  initial
+                  (Core.Account_authenticated { user_id = Some "synthetic-user" })
+              in
+              List.find_map
+                (function
+                  | Core.Run (Core.Request (_, Core.Fetch_catalog _) as request) ->
+                    Some request
+                  | _ -> None)
+                auth.effects
+              |> Option.get
+            | `Graph_key -> snd (unlock_classification_effect origin)
+            | `User_keys ->
+              let keys, _ = unlock_classification_effect origin in
+              let private_keys =
+                List.find_map
+                  (function
+                    | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+                      Some
+                        (Core.step
+                           keys.next
+                           (Core.Runner_completed
+                              (Core.Completion (ticket, Ok "synthetic wrapped key"))))
+                    | _ -> None)
+                  keys.effects
+                |> Option.get
+              in
+              List.find_map
+                (function
+                  | Core.Run (Core.Request (_, Core.Fetch_e2ee_user_keys _) as request) ->
+                    Some request
+                  | _ -> None)
+                private_keys.effects
+              |> Option.get
+          in
+          let posted = ref []
+          and invalidations = ref 0 in
+          let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+          Fun.protect
+            ~finally:(fun () -> Runner.shutdown t)
+            (fun () ->
+               Runner.submit t request;
+               wait (Eio.Stdenv.clock environment) (fun () -> !posted <> []);
+               Alcotest.(check bool)
+                 "actual HTTP JSON decoder completion"
+                 success
+                 (List.exists
+                    (function
+                      | Core.Runner_completed (Core.Completion (_, result)) ->
+                        Result.is_ok result
+                      | _ -> false)
+                    !posted)))
+     : Yojson.Basic.t)
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "HTTP graph key ignores external extensions"
+        `Quick
+        (test_external_http_contract
+           `Graph_key
+           ~success:true
+           {|{"encrypted-aes-key":"synthetic","future":{"nested":null}}|})
+    ; Alcotest.test_case
+        "HTTP user keys ignore external extensions"
+        `Quick
+        (test_external_http_contract
+           `User_keys
+           ~success:true
+           {|{"public-key":"synthetic","encrypted-private-key":"synthetic","future":{"nested":[1,null]}}|})
+    ; Alcotest.test_case
+        "HTTP catalog ignores nested external extensions"
+        `Quick
+        (test_external_http_contract
+           `Catalog
+           ~success:true
+           {|{"graphs":[{"graph-id":"11111111-1111-4111-8111-111111111111","graph-name":"synthetic","graph-ready-for-use?":true,"schema-version":null,"future":{"nested":true}}],"future":[1,null]}|})
+    ; Alcotest.test_case
+        "HTTP graph key validates declared fields with extras"
+        `Quick
+        (test_external_http_contract
+           `Graph_key
+           ~success:false
+           {|{"encrypted-aes-key":null,"future":true}|})
+    ; Alcotest.test_case
+        "HTTP graph key still requires declared fields"
+        `Quick
+        (test_external_http_contract `Graph_key ~success:false {|{"future":true}|})
+    ; Alcotest.test_case
+        "HTTP user keys validate declared fields with extras"
+        `Quick
+        (test_external_http_contract
+           `User_keys
+           ~success:false
+           {|{"public-key":"synthetic","encrypted-private-key":false,"future":true}|})
+    ; Alcotest.test_case
+        "HTTP catalog validates nested declared fields"
+        `Quick
+        (test_external_http_contract
+           `Catalog
+           ~success:false
+           {|{"graphs":[{"graph-id":"11111111-1111-4111-8111-111111111111","graph-name":null,"graph-ready-for-use?":true,"future":true}]}|})
+    ]
 ;;

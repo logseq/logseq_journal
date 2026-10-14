@@ -40,15 +40,15 @@ let bounded_string field value =
 type graph_key_response_dto =
   { encrypted_aes_key : string [@key "encrypted-aes-key"]
   ; encrypted_aes_key_base64 : string option
-      [@key "encrypted-aes-key-base64"] [@default None]
+        [@key "encrypted-aes-key-base64"] [@default None]
   }
-[@@deriving yojson]
+[@@deriving of_yojson { strict = false }]
 
 type user_keys_response_dto =
   { public_key : string [@key "public-key"]
   ; encrypted_private_key : string [@key "encrypted-private-key"]
   }
-[@@deriving yojson]
+[@@deriving of_yojson { strict = false }]
 
 let graph_key_response source =
   try
@@ -56,7 +56,10 @@ let graph_key_response source =
       (Logseq_db_types.Json_codec.decode
          graph_key_response_dto_of_yojson
          (Yojson.Safe.from_string source))
-      (fun dto -> bounded_string "encrypted-aes-key" dto.encrypted_aes_key)
+      (fun dto ->
+         (* The optional compatibility field is validated by PPX but not consumed. *)
+         let _ = dto.encrypted_aes_key_base64 in
+         bounded_string "encrypted-aes-key" dto.encrypted_aes_key)
   with
   | Yojson.Json_error _ -> Error "E2EE response must be valid JSON"
 ;;

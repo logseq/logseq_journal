@@ -124,6 +124,7 @@
  (deps
   test_wrapped_graph_key_crypto.sh
   wrapped_graph_key_crypto_test.swift
+  ../swift/JournalInternalJSON.swift
   ../swift/JournalE2EECrypto.swift)
  (action
   (run sh %{dep:test_wrapped_graph_key_crypto.sh} %{workspace_root})))

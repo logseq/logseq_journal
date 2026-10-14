@@ -25,7 +25,7 @@ bundle = 'org.logseq.journal.authentication-probe'
         'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight'],
 }))
 sources = [root/'swift/JournalAuthentication.swift', root/'swift/JournalAuthenticationView.swift',
-           root/'swift/JournalPlatformWire.swift', root/'swift/JournalPlatformServices.swift',
+           root/'swift/JournalInternalJSON.swift', root/'swift/JournalPlatformWire.swift', root/'swift/JournalPlatformServices.swift',
            root/'swift/JournalLocalAccountBindingStore.swift',
            root/'apple-tests/authentication/JournalAuthenticationProbe.swift']
 sdk = subprocess.check_output(['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-path'], text=True).strip()

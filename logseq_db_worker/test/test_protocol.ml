@@ -1,6 +1,56 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
 
+let closed_internal_config_fields () =
+  let base =
+    `Assoc
+      [ "application_support_directory", `String "/tmp/synthetic-support"
+      ; ( "target"
+        , `List
+            [ `String "Managed_sync"
+            ; `Assoc [ "base_url", `String "https://example.invalid" ]
+            ] )
+      ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
+      ; "response_budget_bytes", `Int P.maximum_response_bytes
+      ; "default_page_size", `Int P.default_page_size
+      ]
+  in
+  T.require
+    (Result.is_ok (Logseq_db_worker.Config.of_yojson base))
+    "valid owned Config control was rejected";
+  let outer =
+    match base with
+    | `Assoc fields -> `Assoc (("future", `Bool true) :: fields)
+    | _ -> assert false
+  in
+  let nested =
+    match base with
+    | `Assoc fields ->
+      `Assoc
+        (List.map
+           (fun (key, value) ->
+              if key = "target"
+              then
+                ( key
+                , `List
+                    [ `String "Managed_sync"
+                    ; `Assoc
+                        [ "base_url", `String "https://example.invalid"
+                        ; "future", `Bool true
+                        ]
+                    ] )
+              else key, value)
+           fields)
+    | _ -> assert false
+  in
+  List.iter
+    (fun json ->
+       T.require
+         (Result.is_error (Logseq_db_worker.Config.of_yojson json))
+         "owned internal Config accepted an extra field")
+    [ outer; nested ]
+;;
+
 let page_tree_contract_rejects_retired_scope () =
   let raw =
     Yojson.Safe.from_string
@@ -934,7 +984,8 @@ let request_tree_boundaries () =
 let () =
   T.run
     "protocol"
-    [ T.case "tree depth node and root boundaries" request_tree_boundaries
+    [ T.case "closed internal Config root and nested fields" closed_internal_config_fields
+    ; T.case "tree depth node and root boundaries" request_tree_boundaries
     ; T.case "config golden and validation" config_generated_golden_and_validation
     ; T.case "generated golden and legacy rejection" generated_golden_and_legacy_rejection
     ; T.case "request domain constraints" request_domain_constraints

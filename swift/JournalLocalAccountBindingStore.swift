@@ -6,6 +6,7 @@ enum JournalLocalAccountBindingStore {
   private static let maximumBytes = 4_096
 
   private struct Binding: Codable { let version: Int; let userId: String; let managedSyncOrigin: String }
+  // Version projection only; Binding below admits the complete closed record.
   private struct Format: Decodable { let version: Int }
 
   static func query() -> [CFString: Any] {
@@ -45,7 +46,7 @@ enum JournalLocalAccountBindingStore {
     }
     let binding: Binding
     do {
-      binding = try JSONDecoder().decode(Binding.self, from: data)
+      binding = try JournalInternalJSON.decode(Binding.self, from: data)
       _ = try encode(userID: binding.userId, managedSyncOrigin: binding.managedSyncOrigin)
     } catch {
       throw JournalAccountIssue(kind: .corruptBinding, stage: .bindingRead, formatVersion: version)

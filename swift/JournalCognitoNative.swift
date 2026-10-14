@@ -37,7 +37,7 @@ private final class JournalCognitoKeychain: Sendable {
       if status == errSecItemNotFound { return nil }
       guard status == errSecSuccess, let data = item as? Data, data.count <= 131072
       else { throw JournalCognitoError.storage }
-      return try JSONDecoder().decode(JournalCognitoTokens.self, from: data)
+      return try JournalInternalJSON.decode(JournalCognitoTokens.self, from: data)
     }
   }
   func save(_ tokens: JournalCognitoTokens) async throws {
