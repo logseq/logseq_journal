@@ -3633,7 +3633,8 @@ let receive t (protocol_response : Protocol.response) =
         match operation with
         | Detail_children { root; _ } ->
           List.map snd (Journal_model.property_sources root.block.properties)
-        | Changed_detail_block _ ->
+        | Changed_detail_block {block_id;_}
+        | Changed_block {block_id;_} when Hashtbl.mem t.children_interests block_id ->
           (match outcome with
            | V2_block_outcome (V2_present_block { value; _ }) ->
              List.map snd (Journal_model.property_sources value.block.properties)

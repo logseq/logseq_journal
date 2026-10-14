@@ -4626,10 +4626,33 @@ let test_detail_property_reference_reads_are_deduplicated () =
       |_ ->false) output.responses)
 ;;
 
+let test_changed_journal_detail_discovers_property_reference () =
+  let runtime = Runtime.create () in
+  seed_children_interest runtime;
+  let property : Graph.property_summary =
+    { ident = "user.property/repro"
+    ; uuid = uuid "a1000000-0000-4000-8000-000000000012"
+    ; title = "Reproducible?"
+    ; schema = { property_type=Default; cardinality=One; hidden=false; public=false }
+    ; values = [Default_value (Graph.Uuid.to_string unrelated_uuid)]
+    ; values_truncated = false } in
+  let output = changed runtime (window ~blocks:[block_uuid] ()) in
+  let request = only "changed active journal detail" (hydration_requests output) in
+  let output = Runtime.receive runtime (response request
+    (Protocol.V2_block_outcome (V2_present_block
+      {value={record with block={block with properties=[property]}}; revision="block-2"}))) in
+  let reference = only "new property reference after sync" output.requests in
+  (match reference.command with
+   | Protocol.V2_get_block {block;_} -> Alcotest.(check string) "new closed value"
+       (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
+   | _ -> Alcotest.fail "sync did not use the owned reference reader")
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "property references", [Alcotest.test_case "Detail closed property deduplicates" `Quick test_detail_property_reference_reads_are_deduplicated] )
+    [ ( "property references", [Alcotest.test_case "Detail closed property deduplicates" `Quick test_detail_property_reference_reads_are_deduplicated
+      ;Alcotest.test_case "changed journal Detail discovers property" `Quick test_changed_journal_detail_discovers_property_reference] )
     ; ( "parent-only Timeline visibility"
       , [Alcotest.test_case "feed day remote legacy and metadata" `Quick test_parent_visibility_tree_paths;
          Alcotest.test_case "Capture Update Status completions" `Quick test_parent_visibility_confirmations])

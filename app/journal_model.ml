@@ -193,7 +193,14 @@ let property_sources properties =
   List.filter_map (fun (p : Graph.property_summary) ->
     if p.schema.hidden || p.ident = "logseq.property/status" || p.ident = "block/tags" || p.values = [] then None
     else
-      let values = List.map property_source p.values |> List.filter (fun s -> String.trim s <> "") in
+      let render = function
+        | Graph.Default_value "logseq.property/priority.low" when p.ident = "logseq.property/priority" -> "Low"
+        | Default_value "logseq.property/priority.medium" when p.ident = "logseq.property/priority" -> "Medium"
+        | Default_value "logseq.property/priority.high" when p.ident = "logseq.property/priority" -> "High"
+        | Default_value "logseq.property/priority.urgent" when p.ident = "logseq.property/priority" -> "Urgent"
+        | value -> property_source value
+      in
+      let values = List.map render p.values |> List.filter (fun s -> String.trim s <> "") in
       if values = [] then None
       else Some (p.title, String.concat ", " values ^ if p.values_truncated then " …" else "")) properties
 ;;

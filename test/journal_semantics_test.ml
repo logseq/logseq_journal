@@ -1208,16 +1208,21 @@ let test_property_values_are_not_timeline_children () =
 let test_detail_preserves_named_properties_and_independent_status () =
   let prop_id = "20000000-0000-4000-9000-000000000010" in
   let value_id = "20000000-0000-4000-a000-000000000010" in
+  let url_prop_id = "20000000-0000-4000-9000-000000000011" in
   let p ?hidden ident uuid title typ values = display_property ?hidden ~ident ~uuid ~title typ values in
   let marker=p ~hidden:true "logseq.property/created-from-property" mutation_id "Created from property" Entity
-    [Entity_value (Graph.Uuid.of_string value_id |> require_ok)] in
+    [Entity_value (Graph.Uuid.of_string url_prop_id |> require_ok)] in
   List.iter (fun yes ->
     let root = { (graph_node ~id:block_id ~parent:page_id "Full parent body") with properties=
       [p "user.property/repro" prop_id "Reproducible?" Checkbox [Checkbox_value yes]
-      ;p "user.property/url" value_id "GitHub URL" Node [Node_value (Graph.Uuid.of_string value_id |> require_ok)]
+      ;p "user.property/url" url_prop_id "GitHub URL" Node [Node_value (Graph.Uuid.of_string value_id |> require_ok)]
       ;p "logseq.property/status" mutation_id "Status" Default [Default_value "logseq.property/status.in-review"]
-      ;p ~hidden:true "user.property/secret" mutation_id "Hidden field" String [String_value "hidden value"]
-      ;p "block/tags" mutation_id "Tags" Class [Class_value (Graph.Uuid.of_string mutation_id |> require_ok)]] } in
+      ;p ~hidden:true "user.property/secret" "20000000-0000-4000-9000-000000000012" "Hidden field" String [String_value "hidden value"]
+      ;p "logseq.property/priority" "20000000-0000-4000-9000-000000000015" "Priority" Default
+        [Default_value "logseq.property/priority.high"]
+      ;p "block/tags" "20000000-0000-4000-9000-000000000013" "Tags" Class [Class_value (Graph.Uuid.of_string mutation_id |> require_ok)]
+      ;p "user.property/note" "20000000-0000-4000-9000-000000000014" "Related note" String
+        [String_value ("See [[" ^ value_id ^ "]] for context")]] } in
     let child = { (graph_node ~id:value_id ~parent:block_id "https://example.com/issue") with properties=[marker] } in
     let page:Journal_graph_projection.page={id=page_id;day=20260809;title="Example journal"} in
     let member block:Journal_graph_projection.block_member={block;revision="fixture-1"} in
@@ -1235,7 +1240,7 @@ let test_detail_preserves_named_properties_and_independent_status () =
     let body=Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
     with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
       List.iter (fun text->require (has_text (ops ()) text) "Detail lost named property/status %S" text)
-        ["Reproducible?";(if yes then "Yes" else "No");"GitHub URL";"https://example.com/issue";"In review"];
+        ["Reproducible?";(if yes then "Yes" else "No");"GitHub URL";"https://example.com/issue";"In review";"Priority";"High";"Related note";("See [[" ^ value_id ^ "]] for context")];
       require (not (has_text (ops ()) "hidden value")) "Detail exposes hidden property";
       require (not (has_text (ops ()) ("[[" ^ mutation_id ^ "]]")))
         "Detail duplicates built-in tags as unresolved UUID properties";
