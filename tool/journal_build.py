@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -105,7 +106,8 @@ class Build:
         # They must not affect the explicit target SDK or switch in subprocesses.
         ignored = {name: self.env.pop(name) for name in ("SDKROOT", "CPATH", "LIBRARY_PATH",
                    "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH") if name in self.env}
-        mode = "experimental-host-restamp" if args.experimental_host_restamp else "link-only" if args.link_only else "native"
+        mode = ("probe-object" if getattr(args, "probe_native_object", None) else
+                "experimental-host-restamp" if args.experimental_host_restamp else "link-only" if args.link_only else "native")
         self.report = {"status": "running", "started": datetime.now(timezone.utc).isoformat(),
                        "commands": [], "mode": mode, "cross_abi_validated": False,
                        "runtime_acceptance": False, "installed": False, "ignored_environment": ignored}
@@ -183,17 +185,22 @@ class Build:
             if installed.get(name) != version:
                 continue
             metadata = self.prefix / ".opam-switch/packages" / package / "opam"
-            actual = self.opam("show", "--just-file", "--field=url.src", metadata).strip('"')
-            if current_pins.get(name) != actual:
-                errors.append(f"{name}: active pin {current_pins.get(name)!r} differs from installed source {actual!r}")
+            actual = current_pins.get(name, "")
+            installed_source = self.opam("show", "--just-file", "--field=url.src", metadata).strip('"')
+            # Raw source metadata may omit url; the pin belongs to switch state.
+            # When recorded, installed provenance must still agree with that state.
+            if installed_source and installed_source != actual:
+                errors.append(f"{name}: active pin {actual!r} differs from installed source {installed_source!r}")
             checkout = self.prefix / ".opam-switch/sources" / name
             ref = expected.rsplit("#", 1)[1]
             if actual != expected:
                 record = ci.get(package, {})
                 checkout = (ROOT / record.get("checkout", "missing-ci-checkout")).resolve()
                 # A local pin needs the existing CI resolution record, including exact source URL.
-                if record.get("source") != expected or actual.removeprefix("file://") != str(checkout):
-                    errors.append(f"{name}: installed pin {actual!r} differs from lock {expected!r}")
+                target = urlsplit(actual.removeprefix("git+"))
+                local_path = unquote(target.path) if target.scheme == "file" and not target.netloc else actual
+                if record.get("source") != expected or local_path != str(checkout):
+                    errors.append(f"{name}: active pin {actual!r} differs from lock {expected!r}")
                     continue
                 ref = record.get("resolved_sha", "")
             if not (checkout / ".git").exists():
@@ -207,7 +214,8 @@ class Build:
                 continue
             if dirty or (re.fullmatch(r"[0-9a-f]{40}", ref) and head != ref):
                 errors.append(f"{name}: dirty or wrong resolved source: {head}; expected {ref}")
-            resolved[package] = {"source": expected, "resolved_sha": head, "checkout": str(checkout)}
+            resolved[package] = {"source": expected, "active_pin": actual,
+                                 "resolved_sha": head, "checkout": str(checkout)}
         self.report["dependency_errors"] = errors
         self.report["dependencies"] = {"installed": installed, "pins": resolved,
             "freshness": "offline: moving refs use the currently installed resolved checkout; no remote update"}
@@ -371,6 +379,7 @@ class Build:
 
     def preflight(self):
         a = self.args
+        probe = getattr(a, "probe_native_object", None)
         if self.run("uname", "-m") != "arm64":
             raise RuntimeError("only Darwin arm64 is supported")
         sdk_name = {"macos": "macosx", "ios-simulator": "iphonesimulator", "ios-device": "iphoneos"}[a.platform]
@@ -390,7 +399,7 @@ class Build:
             raise RuntimeError(f"LUI Apple package missing: {self.lui}; set --lui-package")
         # Production Swift LUI must agree with the OCaml lock; link-only may intentionally inspect another backend.
         lui_sha = self.lui_sha = self.run("git", "-C", self.lui, "rev-parse", "HEAD")
-        if not a.link_only:
+        if not (a.link_only or probe):
             expected = re.search(r'"git\+https://github.com/logseq/lui.git#([0-9a-f]{40})"',
                                  (ROOT / "logseq_journal.opam.locked").read_text()).group(1)
             if lui_sha != expected or self.run("git", "-C", self.lui, "status", "--porcelain", "--untracked-files=all"):
@@ -401,6 +410,9 @@ class Build:
                 raise RuntimeError(f"missing {key}: {self.plist}")
         if self.info["CFBundleExecutable"] != "JournalApp":
             raise RuntimeError("CFBundleExecutable must be JournalApp")
+        if probe and (not self.info["CFBundleIdentifier"].endswith("-probe")
+                      or any(path == ROOT or ROOT in path.parents for path in (self.swift_dir, self.plist))):
+            raise RuntimeError("probe mode requires external staged Swift/plist and a distinct -probe bundle ID")
         if a.version:
             self.info["CFBundleShortVersionString"] = a.version
         if a.build_number:
@@ -420,7 +432,17 @@ class Build:
         self.tools = tools
         source = source_inputs()
         dependencies = {"mode": "stub; OCaml dependencies not used or validated"}
-        if a.native_manifest:
+        if probe:
+            probe = probe.resolve()
+            self.verify_target(probe)
+            symbols = self.run("nm", "-U", probe)
+            if any(not re.search(r"\b_" + name + r"$", symbols, re.M)
+                   for name in ("caml_startup", "lui_ocaml_start")):
+                raise RuntimeError("probe object must define OCaml runtime and LUI bridge entry points")
+            self.native_files = {str(probe): sha(probe)}
+            dependencies = {"mode": "caller-supplied probe object; no production source or OCaml ABI proof",
+                            "files": self.native_files, "production_source_validated": False}
+        elif a.native_manifest:
             dependencies = self.imported_native(source)
         elif not a.link_only:
             self.prefix = Path(self.opam("var", "prefix"))
@@ -452,6 +474,8 @@ class Build:
             native = workspace / "journal_stub.o"
             self.run(self.tools["clang"], "-target", self.triple, "-isysroot", self.sdk,
                      "-fPIC", "-c", source, "-o", native)
+        elif a.probe_native_object:
+            native = a.probe_native_object.resolve()
         elif a.native_manifest:
             native = workspace / "journal_complete_restamped.o"
             platform = "2" if a.platform == "ios-device" else "7"
@@ -586,6 +610,9 @@ class Build:
                     JournalBuildInputDigest=self.report["cache_key"], JournalBuildMode=self.report["mode"])
         if self.args.experimental_host_restamp:
             info.update(JournalOCamlRuntimeOrigin="host-arm64-restamp", JournalCrossABIValidated=False)
+        if self.report["mode"] == "probe-object":
+            info.update(JournalOCamlRuntimeOrigin="caller-supplied-probe", JournalCrossABIValidated=False,
+                        JournalProductionSourceValidated=False)
         info["LSMinimumSystemVersion" if mac else "MinimumOSVersion"] = self.args.deployment_target
         info.setdefault("CFBundleURLTypes", []).append({"CFBundleURLName": "com.logseq.journal.auth",
                                                        "CFBundleURLSchemes": ["logseqjournal"]})
@@ -635,6 +662,27 @@ class Build:
         self.report["artifact"] = {"app": str(app), "info": packaged, "files": files(app), "signature": signature,
                                    "executable_sha256": sha(executable), "sign_identity": self.args.sign_identity}
 
+    def verify_inputs(self):
+        self.phase = "verify-inputs"
+        if (source_inputs() != self.inputs["source"] or files(self.swift_dir) != self.inputs["swift"]
+                or files(self.lui) != self.inputs["lui"] or sha(self.plist) != self.inputs["plist"]
+                or files(self.entitlements) != self.inputs["entitlements"]):
+            raise RuntimeError("source changed during build; artifact is not accepted, rerun with stable inputs")
+        if any(sha(path) != self.inputs["toolchain"]["hashes"][name] for name, path in self.tools.items()):
+            raise RuntimeError("Apple toolchain changed during build; artifact is not accepted")
+        if any(sha(p) != h for p, h in self.inputs["toolchain"]["sdk_identity"]["settings"].items()):
+            raise RuntimeError("SDK identity changed during build; artifact is not accepted")
+        gmp = self.inputs["toolchain"].get("gmp")
+        if gmp and sha(gmp["path"]) != gmp["sha256"]:
+            raise RuntimeError("GMP archive changed during build; artifact is not accepted")
+        imported = getattr(self, "native_files", {})
+        if any(sha(p) != h for p, h in {**imported, **self.inputs["signing"]}.items()):
+            raise RuntimeError("imported native/signing inputs changed during build; artifact is not accepted")
+        a = self.args
+        if not (a.link_only or a.native_manifest or getattr(a, "probe_native_object", None)):
+            if self.dependencies() != self.inputs["dependencies"]:
+                raise RuntimeError("switch changed during build; artifact is not accepted")
+
 
 def arguments():
     parser = argparse.ArgumentParser(description="Build Journal Apple host; never installs or updates dependencies.")
@@ -647,6 +695,7 @@ def arguments():
     parser.add_argument("--link-only", action="store_true", help="explicit stub build; not runnable acceptance")
     parser.add_argument("--experimental-host-restamp", action="store_true", help="explicit existing host ARM64 compatibility route; full iOS ABI unverified")
     parser.add_argument("--native-manifest", type=Path, help="hash-verified source/link/XMLm producer evidence envelope")
+    parser.add_argument("--probe-native-object", type=Path, help="isolated macOS/Simulator probe only; target-checked object, no production source/ABI proof")
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "logseq-journal-build")
     parser.add_argument("--configuration", choices=("debug", "release"), default="debug")
     parser.add_argument("--jobs", type=int, default=2)
@@ -657,19 +706,21 @@ def arguments():
     parser.add_argument("--provisioning-profile", type=Path, help="existing device profile; never downloaded")
     parser.add_argument("--sign-entitlements", type=Path, help="existing device signing entitlements")
     a = parser.parse_args()
+    if a.probe_native_object and (a.platform == "ios-device" or a.switch or a.link_only or a.native_manifest or a.experimental_host_restamp):
+        parser.error("probe mode is isolated macOS/Simulator object import, separate from production/stub modes")
     for name in ("JOURNAL_OCAML_OBJECT", "JOURNAL_EXTRA_OBJECTS", "JOURNAL_NATIVE_LINK_INPUTS"):
         if os.environ.get(name):
             parser.error(f"{name} is unproven input; use native macOS --switch or explicit --link-only. "
-                         "Legacy Dune aliases/probe object injection need provenance support; host restamp is not cross compilation.")
+                         "Probe helpers use isolated --probe-native-object; host restamp is not cross compilation.")
     if bool(a.native_manifest) != a.experimental_host_restamp:
         parser.error("--native-manifest and --experimental-host-restamp must be supplied together")
     if a.experimental_host_restamp and (a.link_only or a.switch or a.platform == "macos"):
         parser.error("experimental import is an iOS mode, separate from --link-only and --switch")
     if a.platform == "ios-device" and not a.experimental_host_restamp:
         parser.error("iPhone build blocked: no verified complete OCaml iOS cross toolchain/ABI route; host restamp is unsupported")
-    if a.platform == "ios-simulator" and not (a.link_only or a.experimental_host_restamp):
+    if a.platform == "ios-simulator" and not (a.link_only or a.experimental_host_restamp or a.probe_native_object):
         parser.error("Simulator runtime build blocked; use --link-only for Swift/link checks. Host restamp is not verified cross compilation.")
-    if not (a.link_only or a.native_manifest or a.switch):
+    if not (a.link_only or a.native_manifest or a.probe_native_object or a.switch):
         parser.error("native macOS requires --switch; no implicit switch/pin changes")
     if a.platform == "ios-simulator" and a.sign_identity != "-":
         parser.error("Simulator requires adhoc signature; entitlements live in __TEXT")
@@ -705,7 +756,7 @@ def main():
         run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=a.cache_dir))
         build = Build(a, run_dir)
         try:
-            if not a.link_only and not a.native_manifest:
+            if not (a.link_only or a.native_manifest or a.probe_native_object):
                 prefix = Path(build.opam("var", "prefix"))
                 # opam uses POSIX record locks. Keep its switch read-locked for the whole build.
                 switch_lock = stack.enter_context((prefix / ".opam-switch/lock").open("rb"))
@@ -721,20 +772,7 @@ def main():
                 (workspace / "inputs.json").write_text(json.dumps(build.inputs, indent=2) + "\n")
                 product = build.compile(workspace)
                 build.assemble(product, a.app_dir or run_dir / "LogseqJournal.app")
-                build.phase = "verify-inputs"
-                if (source_inputs() != build.inputs["source"] or files(build.swift_dir) != build.inputs["swift"]
-                        or files(build.lui) != build.inputs["lui"] or sha(build.plist) != build.inputs["plist"]
-                        or files(build.entitlements) != build.inputs["entitlements"]):
-                    raise RuntimeError("source changed during build; artifact is not accepted, rerun with stable inputs")
-                if any(sha(path) != build.inputs["toolchain"]["hashes"][name] for name, path in build.tools.items()):
-                    raise RuntimeError("Apple toolchain changed during build; artifact is not accepted")
-                if any(sha(p) != h for p, h in build.inputs["toolchain"]["sdk_identity"]["settings"].items()):
-                    raise RuntimeError("SDK identity changed during build; artifact is not accepted")
-                imported = getattr(build, "native_files", {})
-                if any(sha(p) != h for p, h in {**imported, **build.inputs["signing"]}.items()):
-                    raise RuntimeError("imported native/signing inputs changed during build; artifact is not accepted")
-                if not a.link_only and not a.native_manifest and build.dependencies() != build.inputs["dependencies"]:
-                    raise RuntimeError("switch changed during build; artifact is not accepted")
+                build.verify_inputs()
             build.report["status"] = "preflight-passed" if a.preflight else "built"
             build.report["finished"] = datetime.now(timezone.utc).isoformat()
             build.save()

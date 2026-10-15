@@ -65,6 +65,15 @@ class BuildBoundaryTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected, result.stderr)
 
+    def test_probe_object_cannot_select_device_or_production_modes(self):
+        for args in [('ios-device', '--probe-native-object', '/tmp/probe.o'),
+                     ('macos', '--probe-native-object', '/tmp/probe.o', '--link-only'),
+                     ('macos', '--probe-native-object', '/tmp/probe.o', '--switch', 'unused')]:
+            with self.subTest(args=args):
+                result = self.cli(*args, '--preflight')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('probe mode', result.stderr)
+
     def test_foreign_dune_root_and_runtime_cannot_change_provenance(self):
         for name in ("DUNE_ROOT", "DUNE_WORKSPACE", "DUNE_CROSS_TARGET", "DUNE_INSTRUMENT_WITH", "OCAMLLIB",
                      "MACOSX_DEPLOYMENT_TARGET", "CAML_LD_LIBRARY_PATH", "OCAMLFIND_COMMANDS"):
@@ -95,6 +104,134 @@ class CacheBoundaryTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("journal_build", path)
         cls.build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.build)
+
+    @contextmanager
+    def pinned_switch(self):
+        """Real offline switch; original source metadata deliberately has no url."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository, checkout, journal = (root / name for name in ('repository', 'checkout', 'journal'))
+            for path in (repository, checkout, journal):
+                path.mkdir()
+            (repository / 'repo').write_text('opam-version: "2.0"\n')
+            metadata = 'opam-version: "2.0"\nversion: "dev"\nsynopsis: "Offline build fixture"\n'
+            (checkout / 'fixture.opam').write_text(metadata)
+            for argv in (['git', 'init', '-q', checkout], ['git', '-C', checkout, 'add', '.'],
+                         ['git', '-C', checkout, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                          'commit', '-qm', 'fixture']):
+                subprocess.run(argv, check=True, capture_output=True)
+            commit = subprocess.check_output(['git', '-C', checkout, 'rev-parse', 'HEAD'], text=True).strip()
+            expected = 'git+https://example.invalid/fixture.git#' + commit
+            (journal / 'journal.opam').write_text('opam-version: "2.0"\n')
+            lock = journal / 'journal.opam.locked'
+            lock.write_text('depends: [ "fixture" {= "dev"} ]\npin-depends: [ [ "fixture.dev" "' + expected + '" ] ]\n')
+            (journal / '.ci-reports').mkdir()
+            (journal / '.ci-reports/dependencies.json').write_text(json.dumps([
+                dict(package='fixture.dev', source=expected, checkout=str(checkout), resolved_sha=commit)]))
+            env = dict(os.environ, OPAMROOT=str(root / 'opam'), OPAMYES='1', OPAMNOENVNOTICE='1')
+            for argv in (['opam', 'init', '--bare', '--no-setup', '--no-opamrc', '--disable-sandboxing', 'local', str(repository)],
+                         ['opam', 'switch', 'create', 'fixture', '--empty'],
+                         ['opam', 'pin', 'add', '--switch', 'fixture', '--no-action', 'fixture.dev', str(checkout)],
+                         ['opam', 'install', '--switch', 'fixture', 'fixture.dev', '--assume-depexts']):
+                subprocess.run(argv, env=env, check=True, capture_output=True)
+            build = self.build.Build(SimpleNamespace(link_only=False, experimental_host_restamp=False,
+                native_manifest=None, switch='fixture'), root)
+            build.env = env
+            build.prefix = root / 'opam/fixture'
+            # Keep the active pin intact while storing the original no-url opam file.
+            (build.prefix / '.opam-switch/packages/fixture.dev/opam').write_text(metadata)
+            with patch.object(self.build, 'ROOT', journal):
+                yield SimpleNamespace(root=root, journal=journal, checkout=checkout, lock=lock, build=build)
+
+    def test_active_switch_pin_does_not_require_raw_metadata_url(self):
+        with self.pinned_switch() as f:
+            dependencies = f.build.dependencies()
+            self.assertEqual(dependencies['pins']['fixture.dev']['checkout'], str(f.checkout))
+            metadata = f.build.prefix / '.opam-switch/packages/fixture.dev/opam'
+            original = metadata.read_text()
+            metadata.write_text(original + 'url { src: "git+https://example.invalid/stale" }\n')
+            with self.assertRaisesRegex(RuntimeError, 'installed source'):
+                f.build.dependencies()
+            metadata.write_text(original)
+            f.lock.write_text(f.lock.read_text().replace('example.invalid/fixture', 'example.invalid/other'))
+            with self.assertRaisesRegex(RuntimeError, 'differs from lock'):
+                f.build.dependencies()
+
+    def test_final_verification_rejects_changed_gmp_and_probe_input(self):
+        self.assertTrue(hasattr(self.build.Build, 'verify_inputs'), 'final input verification boundary missing')
+        with self.pinned_switch() as f:
+            build = f.build
+            build.swift_dir, build.lui, build.entitlements = (f.root / name for name in ('swift', 'lui', 'entitlements'))
+            for path in (build.swift_dir, build.lui, build.entitlements):
+                path.mkdir()
+            build.plist = f.root / 'Info.plist'
+            build.plist.write_bytes(b'plist fixture')
+            gmp, probe = f.root / 'libgmp.a', f.root / 'probe.o'
+            gmp.write_bytes(b'original GMP bytes')
+            probe.write_bytes(b'original probe bytes')
+            build.tools = {}
+            build.native_files = {str(probe): self.build.sha(probe)}
+            build.inputs = dict(source=self.build.source_inputs(), swift={}, lui={}, entitlements={},
+                plist=self.build.sha(build.plist), signing={}, dependencies=build.dependencies(),
+                toolchain=dict(hashes={}, sdk_identity={'settings': {}},
+                               gmp=dict(path=str(gmp), sha256=self.build.sha(gmp))))
+            build.verify_inputs()
+            gmp.write_bytes(b'changed GMP bytes')
+            with self.assertRaisesRegex(RuntimeError, 'GMP'):
+                build.verify_inputs()
+            gmp.write_bytes(b'original GMP bytes')
+            probe.write_bytes(b'changed probe bytes')
+            with self.assertRaisesRegex(RuntimeError, 'native'):
+                build.verify_inputs()
+
+    def test_probe_helper_preflight_supports_stub_and_platform_matched_objects(self):
+        sys.path.insert(0, str(ROOT / 'tool'))
+        import lui_probe_host
+        import inspect
+        self.assertIn('preflight', inspect.signature(lui_probe_host.build).parameters,
+                      'probe helper has no reusable preflight path')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            lui = root / 'lui'
+            lui.mkdir()
+            (lui / 'Package.swift').write_text('// preflight only\n')
+            for argv in (['git', 'init', '-q', lui], ['git', '-C', lui, 'add', '.'],
+                         ['git', '-C', lui, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                          'commit', '-qm', 'fixture']):
+                subprocess.run(argv, check=True, capture_output=True)
+            source = root / 'probe.c'
+            source.write_text('void caml_startup(void) {}\nvoid lui_ocaml_start(void) {}\n')
+            for platform, triple in [('macos', 'arm64-apple-macosx26.0'),
+                                     ('ios-simulator', 'arm64-apple-ios26.0-simulator')]:
+                obj = root / (platform + '.o')
+                subprocess.run(['xcrun', 'clang', '-target', triple, '-c', source, '-o', obj],
+                               check=True, capture_output=True)
+                for native in (None, obj):
+                    host = root / (platform + ('-native' if native else '-stub'))
+                    lui_probe_host.stage(host, '/* preflight only */', 'fixture.journal-probe', 'Probe')
+                    lui_probe_host.build(host, platform=platform, native_object=native, preflight=True,
+                        extra_env={'JOURNAL_LUI_PACKAGE_PATH': str(lui)})
+                    manifest = json.loads(next((host / 'build-cache').glob('run-*/manifest.json')).read_text())
+                    self.assertEqual(manifest['status'], 'preflight-passed')
+                    self.assertEqual(manifest['mode'], 'probe-object' if native else 'link-only')
+                if platform == 'ios-simulator':
+                    with self.assertRaises(SystemExit):
+                        lui_probe_host.build(root / (platform + '-native'), platform=platform,
+                            native_object=root / 'macos.o', preflight=True,
+                            extra_env={'JOURNAL_LUI_PACKAGE_PATH': str(lui)})
+            host = root / 'production-id'
+            lui_probe_host.stage(host, '/* preflight only */', 'org.logseq.journal', 'Production')
+            with self.assertRaises(SystemExit):
+                lui_probe_host.build(host, native_object=root / 'macos.o', preflight=True,
+                    extra_env={'JOURNAL_LUI_PACKAGE_PATH': str(lui)})
+            source.write_text('int unrelated_object;\n')
+            subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-macosx26.0', '-c', source,
+                            '-o', root / 'unrelated.o'], check=True, capture_output=True)
+            host = root / 'missing-runtime'
+            lui_probe_host.stage(host, '/* preflight only */', 'fixture.journal-probe', 'Probe')
+            with self.assertRaises(SystemExit):
+                lui_probe_host.build(host, native_object=root / 'unrelated.o', preflight=True,
+                    extra_env={'JOURNAL_LUI_PACKAGE_PATH': str(lui)})
 
     def test_source_toolchain_dependency_flags_and_target_separate_caches(self):
         self.assertTrue(hasattr(self, "build"), "build input fingerprint missing")
