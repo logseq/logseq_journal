@@ -37,7 +37,7 @@ jq -e '
     (.wall_time_samples | length) >= 5 and
     (.allocation_samples | length) >= 5 and
     (.rss_samples | length) >= 5 and
-    (.get_blocks_64 | length) >= 5 and
+    (.get_outline_blocks_64 | length) >= 5 and
     (.get_structure_200 | length) >= 5 and
     (.get_journals_200 | length) >= 5 and
     (.reopen | length) >= 5 and
@@ -45,11 +45,11 @@ jq -e '
     all(.allocation_samples[]; . > 0) and
     all(.rss_samples[]; . > 0)) and
   all(.samples[] | select(.active_outbox_records < 4096);
-    all(.get_blocks_64[].wall_time_ms; . < 20) and
+    all(.get_outline_blocks_64[].wall_time_ms; . < 20) and
     all(.get_structure_200[].wall_time_ms; . < 20) and
     all(.get_journals_200[].wall_time_ms; . < 25)) and
   all(.samples[] | select(.active_outbox_records == 4096);
-    all(.get_blocks_64[].wall_time_ms; . < 80) and
+    all(.get_outline_blocks_64[].wall_time_ms; . < 80) and
     all(.get_structure_200[].wall_time_ms; . < 80) and
     all(.get_journals_200[].wall_time_ms; . < 100)) and
   all(.samples[] | select(.active_outbox_records == 0);
@@ -66,7 +66,7 @@ jq -e '
     all(.replan_and_diff[].wall_time_ms; . < 3200) and
     all(.delete_conflict[].wall_time_ms; . < 3200) and
     all(.reopen[].wall_time_ms; . < 500)) and
-  all(.samples[] | .get_blocks_64[], .get_structure_200[], .get_journals_200[];
+  all(.samples[] | .get_outline_blocks_64[], .get_structure_200[], .get_journals_200[];
     .allocation_bytes < 33554432) and
   all(.samples[];
     ([.rss_samples[]] | max)

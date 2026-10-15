@@ -264,7 +264,7 @@ let seed_outbox ~database_path ~block_count ~count =
              Fun.protect
                ~finally:(fun () -> Database.release_snapshot snapshot)
                (fun () ->
-                  match Database.get_blocks snapshot [ block ] |> Result.get_ok with
+                  match Database.get_outline_blocks snapshot [ block ] |> Result.get_ok with
                   | [ Types.Present_block { revision; _ } ] -> revision
                   | _ -> failwith "performance outbox block is missing")
            in

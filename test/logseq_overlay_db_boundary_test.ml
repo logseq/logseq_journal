@@ -132,7 +132,7 @@ let test_canonical_modules root =
     ; "type snapshot"
     ; "val current_snapshot"
     ; "val release_snapshot"
-    ; "val get_blocks"
+    ; "val get_outline_blocks"
     ; "val get_pages"
     ; "val get_journals"
     ; "val get_structure"

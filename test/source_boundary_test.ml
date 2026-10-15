@@ -1036,7 +1036,7 @@ let test_deployed_managed_sync_e2e_boundary root =
     ; "Service.Graph_request"
     ; "V2_list_journals"
     ; "V2_insert_blocks"
-    ; "V2_get_block"
+    ; "V2_get_outline_block"
     ; "V2_delete_blocks"
     ; "swift/JournalE2EECrypto.swift"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_FILE_KEYCHAIN"

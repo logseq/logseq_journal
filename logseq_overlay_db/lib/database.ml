@@ -2671,7 +2671,7 @@ let read_page context uuid =
   cached_logical_page context.read_snapshot (Lazy.force context.metadata) uuid
 ;;
 
-let get_blocks snapshot uuids =
+let get_outline_blocks snapshot uuids =
   with_snapshot_read snapshot (fun snapshot ->
     let context = lazy (read_context snapshot) in
     Ok

@@ -546,7 +546,7 @@ let raw r n (block : G.block) =
     Wire.
       { api_version = 2
       ; request_id = uuid n
-      ; command = V2_get_block { block = block.uuid; revision = None }
+      ; command = V2_get_outline_block { block = block.uuid; revision = None }
       }
   in
   Runtime.observe_request r request;
@@ -658,7 +658,7 @@ let runtime_fixture
                        }
                  ; revision = "r"
                  }))
-       | V2_get_block { block = target; _ } ->
+       | V2_get_outline_block { block = target; _ } ->
          respond
            r
            request.request_id
@@ -707,7 +707,7 @@ let runtime_unconfigured_changes after_shutdown () =
       Wire.
         { api_version = 2
         ; request_id = uuid (600 + n)
-        ; command = V2_get_block { block = uuid n; revision = None }
+        ; command = V2_get_outline_block { block = uuid n; revision = None }
         }
     in
     Runtime.observe_request r request;
@@ -754,7 +754,7 @@ let runtime_unknown_unrelated () =
       check (!rounds <= 4) "unknown unrelated holder lookup must terminate";
       match Queue.take sent with
       | Service.Graph_request
-          ({ command = Wire.V2_get_block { block = target; _ }; _ } as request) ->
+          ({ command = Wire.V2_get_outline_block { block = target; _ }; _ } as request) ->
         respond
           r
           request.request_id
@@ -855,7 +855,7 @@ let runtime_late_fact () =
     Wire.
       { api_version = 2
       ; request_id = uuid 601
-      ; command = V2_get_block { block = uuid 2; revision = None }
+      ; command = V2_get_outline_block { block = uuid 2; revision = None }
       }
   in
   Runtime.observe_request r late_request;
@@ -931,7 +931,7 @@ let runtime_real_capture_sibling () =
       incr rounds;
       check (!rounds <= 2) "Capture dependency point reads remain bounded";
       match Queue.take sent with
-      | Service.Graph_request ({ command = V2_get_block _; _ } as request) ->
+      | Service.Graph_request ({ command = V2_get_outline_block _; _ } as request) ->
         respond r request.request_id (present (block 7 1 1 []))
       | Service.Graph_request ({ command = V2_get_page { page; _ }; _ } as request) ->
         respond
@@ -972,7 +972,7 @@ let runtime_registry_capacity () =
       Wire.
         { api_version = 2
         ; request_id = uuid n
-        ; command = V2_get_block { block = uuid 99; revision = None }
+        ; command = V2_get_outline_block { block = uuid 99; revision = None }
         }
   done;
   check
@@ -1065,7 +1065,7 @@ let runtime_hidden_holder_fanout () =
   while not (Queue.is_empty sent) do
     match Queue.take sent with
     | Service.Graph_request
-        ({ command = V2_get_block { block = target; _ }; _ } as request) ->
+        ({ command = V2_get_outline_block { block = target; _ }; _ } as request) ->
       respond
         r
         request.request_id
@@ -1192,7 +1192,7 @@ let runtime_unknown_old_parent () =
   while not (Queue.is_empty sent) do
     match Queue.take sent with
     | Service.Graph_request
-        ({ command = V2_get_block { block = target; _ }; _ } as request) ->
+        ({ command = V2_get_outline_block { block = target; _ }; _ } as request) ->
       respond
         r
         request.request_id

@@ -67,8 +67,8 @@ val feedback
 
 val date_header : ?relative_label:string -> title:string -> unit -> Journal_view.View.t
 
-val detail_text : ?title:Journal_model.Title.t -> ?on_reference:(string -> unit) -> id:string -> depth:int -> string -> Journal_view.View.t
-val bounded_text : ?on_reference:(string -> unit) -> child:bool -> Journal_model.Title.t -> Journal_view.View.t
+val detail_text : ?title:Journal_model.Title.t -> id:string -> depth:int -> string -> Journal_view.View.t
+val bounded_text : child:bool -> Journal_model.Title.t -> Journal_view.View.t
 val detail_row : depth:int -> Journal_view.View.t -> Journal_view.View.t
 
 val detail

@@ -98,9 +98,9 @@ let measure_point_read database block_count =
   with_snapshot database (fun snapshot ->
     measure (fun () ->
       let results =
-        Database.get_blocks snapshot requested |> get_ok "measured get_blocks"
+        Database.get_outline_blocks snapshot requested |> get_ok "measured get_outline_blocks"
       in
-      if List.length results <> 64 then fail "measured get_blocks cardinality mismatch"))
+      if List.length results <> 64 then fail "measured get_outline_blocks cardinality mismatch"))
 ;;
 
 let performance_page =
@@ -234,7 +234,7 @@ let measure_single_block_classification database cursor ordinal =
 let delete_precondition database block =
   with_snapshot database (fun snapshot ->
     let block_revision, parent =
-      match Database.get_blocks snapshot [ block ] |> get_ok "delete block revision" with
+      match Database.get_outline_blocks snapshot [ block ] |> get_ok "delete block revision" with
       | [ Types.Present_block { value; revision } ] -> revision, value.block.parent
       | _ -> fail "delete performance target is missing"
     in
@@ -300,7 +300,7 @@ type sample =
   ; wall_time_samples : float list
   ; allocation_samples : float list
   ; rss_samples : int list
-  ; get_blocks_64 : measurement list
+  ; get_outline_blocks_64 : measurement list
   ; get_structure_200 : measurement list
   ; get_journals_200 : measurement list
   ; single_block_change_classification : measurement list
@@ -383,7 +383,7 @@ let benchmark ~open_database ~database_path ~block_count required_sizes =
        ; wall_time_samples = values (fun value -> value.elapsed_ms)
        ; allocation_samples = values (fun value -> value.allocation_bytes)
        ; rss_samples = values (fun value -> value.rss_bytes)
-       ; get_blocks_64 = point_samples
+       ; get_outline_blocks_64 = point_samples
        ; get_structure_200 = structure_samples
        ; get_journals_200 = journal_samples
        ; single_block_change_classification = single_block_samples

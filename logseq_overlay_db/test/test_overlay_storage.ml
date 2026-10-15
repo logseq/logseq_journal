@@ -27,7 +27,7 @@ let block_precondition database block behavior =
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
        let revision =
-         match Database.get_blocks snapshot [ block ] |> T.require_ok ~behavior with
+         match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
          | [ Present_block { revision; _ } ] | [ Missing_block { revision; _ } ] ->
            revision
          | _ -> Alcotest.fail "block precondition returned the wrong cardinality"
@@ -1186,7 +1186,7 @@ let pending_outbox_survives_reopen () =
         in
         let snapshot = Database.current_snapshot second |> T.require_ok ~behavior in
         (match
-           Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior
+           Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior
          with
          | [ Present_block { value; _ } ] ->
            T.require (value.block.title = "Inserted") "reopened pending title changed"
@@ -1301,7 +1301,7 @@ let submitted_dependency_shadow_survives_reopen () =
         in
         let snapshot = Database.current_snapshot second |> T.require_ok ~behavior in
         (match
-           Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+           Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
            |> T.require_ok ~behavior
          with
          | [ Present_block { value; _ } ] ->
@@ -1370,7 +1370,7 @@ let no_change_receipt_survives_reopen () =
         let snapshot = Database.current_snapshot first |> T.require_ok ~behavior in
         let revision =
           match
-            Database.get_blocks snapshot [ T.missing_block_uuid ]
+            Database.get_outline_blocks snapshot [ T.missing_block_uuid ]
             |> T.require_ok ~behavior
           with
           | [ Missing_block { revision; _ } ] -> revision
@@ -1494,7 +1494,7 @@ let authoritative_checkpoint_and_root_survive_reopen () =
         in
         let snapshot = Database.current_snapshot second |> T.require_ok ~behavior in
         (match
-           Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+           Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
            |> T.require_ok ~behavior
          with
          | [ Present_block { value; _ } ] ->
@@ -1542,7 +1542,7 @@ let outbox_persistence_failure_is_atomic () =
              before_version.projection_revision
              after_version.projection_revision)
           "failed outbox commit advanced projection revision";
-        (match Database.get_blocks after [ T.block_uuid ] |> T.require_ok ~behavior with
+        (match Database.get_outline_blocks after [ T.block_uuid ] |> T.require_ok ~behavior with
          | [ Missing_block _ ] -> ()
          | _ -> Alcotest.fail "failed outbox commit exposed the pending block");
         Database.release_snapshot after;

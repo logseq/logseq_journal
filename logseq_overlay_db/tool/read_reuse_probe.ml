@@ -114,7 +114,7 @@ let empty () = D.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> ok "empty
 
 let block_pre db b =
   snap db (fun s ->
-    match D.get_blocks s [ b ] |> ok "get revision" with
+    match D.get_outline_blocks s [ b ] |> ok "get revision" with
     | [ T.Present_block { revision; _ } ] ->
       D.write_precondition ~blocks:[ b, revision ] ~pages:[] ~scopes:[] |> ok "pre"
     | _ -> failwith "missing pre block")
@@ -374,7 +374,7 @@ let shadow_insert db =
   metadata_gate "shadow insert";
   gate "shadow insertion scans once" (calls "datoms:Avet:*:block/parent:value" = 1);
   snap db (fun s ->
-    match D.get_blocks s [ target ] |> ok "shadow visibility" with
+    match D.get_outline_blocks s [ target ] |> ok "shadow visibility" with
     | [ T.Present_block { value; _ } ] ->
       require (value.block.title = "Shadow title") "lost shadow"
     | _ -> failwith "authoritative miss hid dependency shadow")
@@ -413,7 +413,7 @@ let deletion_comments db =
        (T.Delete_blocks { mutation_id = mid 30; root }));
   block_gate "comments deletion";
   snap db (fun s ->
-    match D.get_blocks s [ root; area; child; source ] |> ok "comments footprint" with
+    match D.get_outline_blocks s [ root; area; child; source ] |> ok "comments footprint" with
     | [ T.Missing_block _
       ; T.Missing_block _
       ; T.Missing_block _
@@ -456,7 +456,7 @@ let structural_eligibility db =
   metadata_gate "structural eligibility";
   gate "structural eligibility one scan" (calls "datoms:Avet:*:block/parent:value" = 1);
   snap db (fun s ->
-    match D.get_blocks s [ mid 603; mid 601 ] |> ok "eligibility orders" with
+    match D.get_outline_blocks s [ mid 603; mid 601 ] |> ok "eligibility orders" with
     | [ T.Present_block { value; _ }; T.Missing_block _ ] ->
       require (value.block.order = "b01") "structural eligibility tightened"
     | _ -> failwith "incomplete sibling hydration")
@@ -464,19 +464,19 @@ let structural_eligibility db =
 
 let selected db =
   snap db (fun s ->
-    ignore (run "get_blocks/empty" (fun () -> D.get_blocks s []));
+    ignore (run "get_outline_blocks/empty" (fun () -> D.get_outline_blocks s []));
     gate "empty block datoms" (A.logical_counts () = []);
     List.iter
       (fun (name, ids) ->
-         let first = run name (fun () -> D.get_blocks s ids) in
+         let first = run name (fun () -> D.get_outline_blocks s ids) in
          block_gate name;
          let counts = A.logical_counts () in
-         let second = run (name ^ "-repeat") (fun () -> D.get_blocks s ids) in
+         let second = run (name ^ "-repeat") (fun () -> D.get_outline_blocks s ids) in
          require (first = second) "repeat block results";
          gate "block contexts must not survive calls" (counts = A.logical_counts ()))
-      [ "get_blocks/1", [ block ]
-      ; "get_blocks/64", List.init 64 F.block_uuid
-      ; "get_blocks/duplicates", [ block; mid 9000; block; mid 9000 ]
+      [ "get_outline_blocks/1", [ block ]
+      ; "get_outline_blocks/64", List.init 64 F.block_uuid
+      ; "get_outline_blocks/duplicates", [ block; mid 9000; block; mid 9000 ]
       ];
     get_pages
       db
@@ -484,7 +484,7 @@ let selected db =
       (List.init 64 (fun n -> uuid (Printf.sprintf "10000000-0000-4000-8001-%012d" n))));
   let old = D.current_snapshot db |> ok "old snapshot" in
   let root = mid 200 in
-  ignore (run "get_blocks/before-insert" (fun () -> D.get_blocks old [ root; root ]));
+  ignore (run "get_outline_blocks/before-insert" (fun () -> D.get_outline_blocks old [ root; root ]));
   let tree =
     T.
       { uuid = root
@@ -505,10 +505,10 @@ let selected db =
   gate "insert one sibling enumeration" (calls "datoms:Avet:*:block/parent:value" = 1);
   gate "insert no full sibling payload scan" (calls "seek:Eavt:entity:*" = 0);
   snap db (fun s ->
-    match D.get_blocks s [ root ] |> ok "insert visibility" with
+    match D.get_outline_blocks s [ root ] |> ok "insert visibility" with
     | [ T.Present_block _ ] -> ()
     | _ -> failwith "cached missing escaped");
-  (match D.get_blocks old [ root ] |> ok "old snapshot" with
+  (match D.get_outline_blocks old [ root ] |> ok "old snapshot" with
    | [ T.Missing_block _ ] -> ()
    | _ -> failwith "old snapshot changed");
   let expected = block_pre db root in
@@ -652,7 +652,7 @@ let selected db =
         (fun () -> D.get_pages s ids |> ok "concurrent right")
     in
     require (left = pages && right = pages) "concurrent results";
-    match D.get_blocks s [ F.block_uuid 1 ] |> ok "rendered title" with
+    match D.get_outline_blocks s [ F.block_uuid 1 ] |> ok "rendered title" with
     | [ T.Present_block { value; _ } ] ->
       require
         (value.rendered_page_title = "Changed page title")
@@ -666,12 +666,12 @@ let selected db =
   deletion_comments db;
   structural_eligibility db;
   D.release_snapshot old;
-  (match D.get_blocks old [] with
+  (match D.get_outline_blocks old [] with
    | Error T.Snapshot_released -> ()
    | _ -> failwith "empty released snapshot");
   let s = D.current_snapshot db |> ok "closing snapshot" in
   D.close db |> ok "close";
-  (match D.get_blocks s [] with
+  (match D.get_outline_blocks s [] with
    | Error T.Database_closed | Error T.Snapshot_generation_invalidated -> ()
    | _ -> failwith "empty closed database");
   D.release_snapshot s

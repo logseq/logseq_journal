@@ -3064,12 +3064,12 @@ let detail_page
             V.column ~spacing:4. ~alignment:Leading
               [ V.of_lui (Lui_elements.text ~value:name ~style_class:"caption" ~foreground:"secondary" [])
               ; Journal_header.detail_text ~title:(render_title state value)
-                  ~on_reference:(fun id -> local.send (Detail_open id)) ~id:key ~depth:2 value ]
+                  ~id:key ~depth:2 value ]
           in
           let text =
             if property_value then field ~key:id (Option.value property_name ~default:"Property") source
             else Journal_header.detail_text ~title:(render_title state source)
-              ~on_reference:(fun id -> local.send (Detail_open id)) ~id ~depth source
+              ~id ~depth source
           in
           let fields = List.map (fun (name, value) ->
             field ~key:("detail-property:" ^ Journal_model.id block ^ ":" ^ name) name value) named_sources in
