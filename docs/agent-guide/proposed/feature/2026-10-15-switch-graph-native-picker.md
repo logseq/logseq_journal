@@ -38,6 +38,8 @@ Presence observations are cached by account and invalidated for a graph lifecycl
 
 Deletion uses a single account-scoped flight and exact terminal result. It preserves the selected graph and catalog, validates persisted local ownership, cancels target work, waits for native leases, and revalidates before mirror removal under the existing exclusive ownership primitive. Unsynchronized local content is intentionally discarded after the warning. Unbound legacy mirrors require opening once and switching away before removal.
 
+The active graph remains usable when the picker closes during deletion of another graph. Application owns the manager snapshot and action gate; the public Root_navigation reducer does not own either, so its events cannot reproduce that guard. A regression at the public mounted Application boundary holds deletion in flight and exercises the current graph's Capture action. Each new confirmation also advances its request token so an older response cannot authorize a newer dialog.
+
 ## Questions
 
 - Design A, Simulator verification, discard semantics and PR publication are already answered by the user's recorded instructions. No unanswered UI/presence question blocks this scope.

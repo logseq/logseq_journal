@@ -4906,6 +4906,8 @@ let test_graph_picker_controls scenario () =
     ; diagnostics = { groups = [] } } in
   let current = Atomic.make manager and commands = Atomic.make [] in
   let inspections = Atomic.make 0 and deletions = Atomic.make [] in
+  let finish_deletion = Atomic.make false in
+  let deletion_terminal = ref false in
   let graph_opens = Atomic.make 0 in
   let root_renders = ref 0 in
   let client = ref None in
@@ -4925,6 +4927,11 @@ let test_graph_picker_controls scenario () =
             else Ok (if scenario = `Visible then Service.Not_downloaded else Service.Downloaded)))
         | Service.Delete_local_copy request ->
           Atomic.set deletions (request :: Atomic.get deletions);
+          if scenario = `During_delete then (
+            let previous = Atomic.get current in
+            publish { previous with snapshot = { previous.snapshot with
+              local_deletion = Some (Deletion_in_progress Deleting_mirror) } };
+            while not (Atomic.get finish_deletion) do Unix.sleepf 0.001 done);
           Ok (Service.Local_copy_deleted (request, if scenario = `Failure_select then Error "Synthetic delete failed. Try again." else Ok ()))
         | Service.Get_graph_state ->
           let value = Atomic.get current in
@@ -4968,7 +4975,12 @@ let test_graph_picker_controls scenario () =
       ~shutdown:(fun () -> ()) () in
   let hooks = Application.For_testing.app_with_service
     ~on_view_region:(fun region -> if region = "root" then incr root_renders)
-    ~on_client:(fun value -> client := Some value) service in
+    ~on_client:(fun value ->
+      client := Some value;
+      W.on_event value (function
+        | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
+          deletion_terminal := true
+        | _ -> ())) service in
   let props = Hashtbl.create 128 in
   let retained_select = ref None and select_detached = ref false in
   let teardown = track_json_wire_teardown (fun id ->
@@ -5006,6 +5018,7 @@ let test_graph_picker_controls scenario () =
       ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
+    Atomic.set finish_deletion true;
     ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
       consume (hooks.init 2 2 config);
@@ -5040,7 +5053,7 @@ let test_graph_picker_controls scenario () =
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
           List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
-      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure) ->
+      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `During_delete) ->
         let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
         if scenario = `Failure_select then retained_select := Some stable_select;
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
@@ -5062,7 +5075,7 @@ let test_graph_picker_controls scenario () =
         if scenario = `Cancel then (
           press (Option.get (find "text" "Cancel"));
           Alcotest.(check int) "Cancel sends no deletion" 0 (List.length (Atomic.get deletions)))
-        else if scenario = `Confirm || scenario = `Reopen || scenario = `Failure_select then (
+        else if scenario = `Confirm || scenario = `Reopen || scenario = `Failure_select || scenario = `During_delete then (
           let confirm = Hashtbl.fold (fun id values found ->
             if List.assoc_opt "text" values = Some (`String "Delete local copy")
               && List.assoc_opt "__kind" values <> Some (`String "menu-item")
@@ -5072,7 +5085,21 @@ let test_graph_picker_controls scenario () =
           let deleted = List.hd (Atomic.get deletions) in
           Alcotest.(check bool) "deletion identity is exact" true
             (deleted.graph_id = second && deleted.account_generation = 1);
-          if scenario = `Failure_select then (
+          if scenario = `During_delete then (
+            wait "worker publishes deletion in flight" (fun () ->
+              (Atomic.get current).snapshot.local_deletion <> None);
+            for _ = 1 to 8 do consume (hooks.pump ()) done;
+            press (node "graph-picker-close");
+            wait "Timeline is reachable while another graph deletes" (fun () ->
+              Option.is_some (find "accessibility-label" "Capture"));
+            press (Option.get (find "accessibility-label" "Capture"));
+            wait "current graph Capture responds during noncurrent deletion" (fun () ->
+              Option.is_some (find "accessibility-identifier" "journal-capture-composer"));
+            Atomic.set finish_deletion true;
+            wait "noncurrent deletion reaches its terminal" (fun () -> !deletion_terminal);
+            Alcotest.(check bool) "deletion completion preserves current graph composer" true
+              (Option.is_some (find "accessibility-identifier" "journal-capture-composer")))
+          else if scenario = `Failure_select then (
             wait "delete failure is visible" (fun () -> Option.is_some (find "text" "Synthetic delete failed. Try again."));
             Alcotest.(check bool) "native List retains live interactive row during operation status changes" false !select_detached;
             press stable_select;
@@ -5117,7 +5144,8 @@ let () =
         Alcotest.test_case "presence failure is bounded and visible" `Quick (test_graph_picker_controls `Presence_failure);
         Alcotest.test_case "visible presence is bounded and cached" `Quick (test_graph_picker_controls `Visible);
         Alcotest.test_case "reopened copy invalidates absence observation" `Quick (test_graph_picker_controls `Reopen);
-        Alcotest.test_case "deletion failure keeps live row callback identity" `Quick (test_graph_picker_controls `Failure_select)])
+        Alcotest.test_case "deletion failure keeps live row callback identity" `Quick (test_graph_picker_controls `Failure_select);
+        Alcotest.test_case "noncurrent deletion keeps current Timeline interactive" `Quick (test_graph_picker_controls `During_delete)])
     ; ( "relative date chrome", [
         Alcotest.test_case "calendar boundaries and date updates" `Quick test_timeline_relative_date_headers;
         Alcotest.test_case "empty Detail navigation title" `Quick test_detail_empty_navigation_title;

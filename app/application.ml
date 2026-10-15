@@ -3852,7 +3852,6 @@ let start
     && !state_ref.graph_state.generation = fst owner
     && !state_ref.graph_state.phase = Graph_open
     && !state_ref.graph_ready
-    && not (local_deletion_active !state_ref)
   in
   let copy_error owner message =
     set_state (fun state ->
@@ -4464,7 +4463,7 @@ let start
           let result = match outcome with
             | Worker.Completed (Graph_service.Local_copy_deleted (actual, result)) when actual = request -> result
             | _ -> Error "Local copy deletion was interrupted. Check the copy and try again." in
-          let state = { state with local_copy_deleting = None; modal = No_modal } in
+          let state = { state with local_copy_deleting = None } in
           match result with
           | Error message -> { state with local_copy_message = Some message }
           | Ok () -> { (discard_graph_copy_draft state request.graph_id) with
@@ -4482,7 +4481,9 @@ let start
                 result state.local_copies } in
           if not confirm || not visible || manager.selected_graph = Some request.graph_id then state
           else match result with
-            | Ok Graph_service.Downloaded -> { state with modal = Cache_reset_confirmation request.graph_id; local_copy_message = None }
+            | Ok Graph_service.Downloaded -> { state with modal = Cache_reset_confirmation request.graph_id
+                ; confirmation_sequence = Int64.succ state.confirmation_sequence
+                ; local_copy_message = None }
             | Ok Not_downloaded -> { state with local_copy_message = Some "No local copy on this device." }
             | Error message -> { state with local_copy_message = Some message })))
         ~f:(fun () -> !drain_visible_copies ())
@@ -5630,14 +5631,6 @@ let start
       | action -> action
     in
     match payload with
-    | payload
-      when local_deletion_active snapshot
-           &&
-           match payload with
-           | Open_diagnostics | Close_diagnostics | Close_graph_picker | Sign_out
-           | Native_payload (Ui.Event.Payload.Navigation_path_changed _) -> false
-           | Asset_settings _ -> false
-           | _ -> true -> Effect.ignore
     | Startup_retry ->
       Effect.bind (update (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation Retry})) ~f:(fun () -> managed_startup)
@@ -5649,9 +5642,6 @@ let start
        | Some Dismissed ->
          update (fun state -> { state with asset_settings_open = false })
        | Some (Retry_upload operation) ->
-         if local_deletion_active snapshot
-         then Effect.ignore
-         else
            Effect.of_thunk (fun () ->
              let current = !state_ref in
              let uploads =
