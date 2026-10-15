@@ -1,5 +1,7 @@
 val view
   :  ?render_source:(string -> string)
+  -> ?render_title:(string -> Journal_model.Title.t)
+  -> ?on_reference:(string -> unit)
   -> render_media:
        (title:string
         -> root:string

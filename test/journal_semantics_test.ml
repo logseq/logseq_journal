@@ -783,15 +783,15 @@ let test_timeline_body_four_lines () =
         | _ -> None) (ops ()) in
       require (List.length payloads = 1) "Timeline body has no native bounded text";
       let payload = List.hd payloads in
-      require (Yojson.Basic.Util.member "text" payload = `String source)
-        "Timeline truncated or changed the full source";
+      require (Yojson.Basic.Util.member "text" payload = `String (Journal_model.Title.render source |> Journal_model.Title.plain))
+        "Timeline truncated the parsed title";
       require (Yojson.Basic.Util.member "maxLines" payload = `Int 4)
         "Timeline body is not limited to four visual lines";
       require (not (has_text (ops ()) "Show more" || has_text (ops ()) "Show less"))
         "Timeline retained a local expansion action");
     with_mounted (Journal_header.detail_text ~id:"full-detail" ~depth:0 source)
       (fun _ ops ->
-        require (has_text (ops ()) source) "Detail lost the full source";
+        require (has_text (ops ()) (Journal_model.Title.render source |> Journal_model.Title.plain)) "Detail lost the full parsed title";
         require (not (List.exists (function
           | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
             Yojson.Basic.Util.member "maxLines" (Yojson.Basic.from_string json) <> `Null
@@ -1062,6 +1062,59 @@ let test_status_and_tags_mount () =
   with_mounted view (fun _ ops ->
     require (has_text (ops ()) "Doing") "status must mount using supported LUI nodes";
     require (has_text (ops ()) "#阅读  #工作") "named tags must accompany status")
+;;
+
+(* Title layout is owned by the mounted view, outside the pure reducers. *)
+let test_rich_title_reference_events () =
+  let received = ref [] in
+  let target = "20000000-0000-4000-a000-000000000099" in
+  let title = Journal_model.Title.render ~lookup:(fun _ -> Some "Target") ("[[" ^ target ^ "]]") in
+  with_mounted (Journal_header.detail_text ~title ~on_reference:(fun id -> received := id :: !received) ~id:"rich-event" ~depth:0 "") (fun app ops ->
+    let node = List.find_map (function Lui_protocol.CreateExtension (node, name, _) when name = Journal_lui_native.chrome_identifier -> Some node | _ -> None) (ops ()) |> Option.get in
+    let send payload =
+      let values = Lui_protocol.String_map.empty
+        |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
+        |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue payload) in
+      ignore (Lui_app.dispatch_event app (Lui_protocol.ExtensionEvent (node, Journal_lui_native.chrome_identifier, "event", values)));
+      ignore (Lui_app.flush app) in
+    send (Yojson.Basic.to_string (`Assoc ["reference", `String target]));
+    send (Yojson.Basic.to_string (`Assoc ["reference", `String block_id]));
+    send "broken";
+    require (!received = [target]) "reference event did not bind to rendered target");
+  with_mounted (Journal_header.detail_text ~on_reference:(fun id -> received := id :: !received) ~id:"missing-event" ~depth:0 ("[[" ^ target ^ "]]")) (fun app ops ->
+    let node = List.find_map (function Lui_protocol.CreateExtension (node, name, _) when name = Journal_lui_native.chrome_identifier -> Some node | _ -> None) (ops ()) |> Option.get in
+    let values = Lui_protocol.String_map.empty |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
+      |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue (Yojson.Basic.to_string (`Assoc ["reference", `String target]))) in
+    ignore (Lui_app.dispatch_event app (Lui_protocol.ExtensionEvent (node, Journal_lui_native.chrome_identifier, "event", values)));
+    ignore (Lui_app.flush app);
+    require (!received = [target]) "missing reference became clickable")
+;;
+
+let test_mldoc_titles_share_runs () =
+  let source = "普通文本 **bold _nested_** `code` https://example.com [标签](https://example.org/path)" in
+  let entry = { Journal_graph_projection.block = block ~source ()
+    ; child_summaries = [{ block_id = "rich-child"; source; asset_file_type = None }] } in
+  let check mode expected_lines view =
+    with_mounted view (fun _ ops ->
+      let payloads = List.filter_map (function
+        | Lui_protocol.SetExtensionProp (_, "payload", StringValue json) ->
+          let value = Yojson.Basic.from_string json in
+          if Yojson.Basic.Util.member "mode" value = `String mode then Some value else None
+        | _ -> None) (ops ()) in
+      require (List.length payloads = List.length expected_lines) "missing rich title surface";
+      List.iter2 (fun payload lines ->
+        require (Yojson.Basic.Util.member "maxLines" payload = lines) "rich title line policy changed";
+        let runs = match Yojson.Basic.Util.member "runs" payload with `List runs -> runs | _ -> [] in
+        require (runs <> []) "title did not use shared mldoc runs";
+        let text = String.concat "" (List.map (fun run -> Yojson.Basic.Util.member "text" run |> Yojson.Basic.Util.to_string) runs) in
+        require (text = "普通文本 bold nested code https://example.com 标签") "AST title labels/styles were flattened incorrectly";
+        require (List.exists (fun run -> Yojson.Basic.Util.member "url" run = `String "https://example.org/path" && Yojson.Basic.Util.member "text" run = `String "标签") runs) "labeled URL lost target";
+        require (List.exists (fun run -> Yojson.Basic.Util.member "styles" run = `List [`String "italic"; `String "bold"] || Yojson.Basic.Util.member "styles" run = `List [`String "bold"; `String "italic"]) runs) "nested styles lost" ) payloads expected_lines)
+  in
+  check "bounded-text" [`Int 4; `Int 2]
+    (Journal_row.view ~show_timestamp:false ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child) entry);
+  check "detail-text" [`Null]
+    (Journal_header.detail_text ~id:"rich-detail" ~depth:0 source)
 ;;
 
 let test_reference_body_and_summary () =
@@ -2773,6 +2826,8 @@ let tests =
   ; "top image asset body", test_top_image_asset_has_no_filename_body
   ; "scoped theme wire properties", test_scoped_theme_wire_properties
   ; "loading indicator and message", test_loading_keeps_indicator_and_message
+  ; "rich title reference events", test_rich_title_reference_events
+  ; "shared mldoc title runs", test_mldoc_titles_share_runs
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount
   ; "timeline no chevron", test_timeline_has_no_chevron

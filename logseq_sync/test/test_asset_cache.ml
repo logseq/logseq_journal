@@ -1,14 +1,29 @@
 (* Cache filesystem scenarios run through Core.step/Effect_runner.submit in
    runner_contract and transport_contract. This existing test entry checks the
    public compiler boundary, without including implementation/private CMIs. *)
-let rec repository_root directory =
-  if Sys.file_exists (Filename.concat directory ".git")
+let public_interfaces =
+  [ ( "logseq_sync/spec/pure_reducer/.logseq_sync_pure_reducer.objs/byte"
+    , "logseq_sync_pure_reducer.cmi" )
+  ; ( "logseq_sync/spec/effect_runner/.logseq_sync_effect_runner.objs/byte"
+    , "logseq_sync_effect_runner.cmi" )
+  ; "logseq_db_types/lib/.logseq_db_types.objs/byte", "logseq_db_types.cmi"
+  ]
+;;
+
+(* Compiler inputs belong to this executable's build, including --build-dir
+   builds outside the source checkout. Only public interface paths are used. *)
+let rec compilation_root directory =
+  if
+    List.for_all
+      (fun (relative, interface) ->
+         Sys.file_exists (Filename.concat (Filename.concat directory relative) interface))
+      public_interfaces
   then directory
   else (
     let parent = Filename.dirname directory in
     if parent = directory
-    then failwith "repository root not found"
-    else repository_root parent)
+    then failwith "public compiler interfaces not found beside test executable"
+    else compilation_root parent)
 ;;
 
 let read_file path = In_channel.with_open_bin path In_channel.input_all
@@ -34,11 +49,7 @@ let compile root source =
     (fun () ->
        Out_channel.with_open_bin filename (fun channel -> output_string channel source);
        let directories =
-         [ "logseq_sync/spec/pure_reducer/.logseq_sync_pure_reducer.objs/byte"
-         ; "logseq_sync/spec/effect_runner/.logseq_sync_effect_runner.objs/byte"
-         ; "logseq_db_types/lib/.logseq_db_types.objs/byte"
-         ]
-         |> List.map (Filename.concat (Filename.concat root "_build/default"))
+         List.map (fun (relative, _) -> Filename.concat root relative) public_interfaces
        in
        let arguments =
          Array.of_list
@@ -71,7 +82,12 @@ let negative root source reason =
 ;;
 
 let sealed_public_interface () =
-  let root = repository_root (Sys.getcwd ()) in
+  let executable =
+    if Filename.is_relative Sys.executable_name
+    then Filename.concat (Sys.getcwd ()) Sys.executable_name
+    else Sys.executable_name
+  in
+  let root = compilation_root (Filename.dirname executable) in
   let prefix = "module C = Logseq_sync_pure_reducer.Core\n" in
   positive
     root

@@ -82,6 +82,7 @@
  (name logseq_journal)
  (allow_empty)
  (depends
+  (mldoc (= dev))
   (rrbvec (= dev))
   (ocaml (>= 5.4))
   (dune (= 3.23.1))

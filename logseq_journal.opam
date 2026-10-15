@@ -20,6 +20,7 @@ depends: [
   "base" {= "v0.17.3"}
   "bigstringaf" {= "0.10.0"}
   "core" {= "v0.17.2"}
+  "mldoc" {= "dev"}
   "ca-certs-nss" {= "3.126"}
   "cstruct" {= "6.2.0"}
   "datascript_ocaml" {= "dev"}
@@ -46,6 +47,8 @@ depends: [
   "uutf" {= "1.0.4"}
 ]
 pin-depends: [
+  ["mldoc.dev" "git+https://github.com/logseq/mldoc.git#b3e06c030b7396f7992ebe1c3a4f35f5e6983200"]
+  ["xmlm.dev" "git+https://github.com/logseq/xmlm.git#eb469d536e98c98f2754c0ff8813c92b3a17fe9f"]
   ["rrbvec.dev" "git+https://github.com/logseq/rrbvec.git#main"]
   ["lui.0.1.0" "git+https://github.com/logseq/lui.git#4fdb9136026af7863a8d025133871e34864eace1"]
   ["ocaml-signal.0.1.0" "git+https://github.com/logseq/ocaml-signal.git#02e18cdc5e0ad672aa223f638eaa3ba52fc9421e"]

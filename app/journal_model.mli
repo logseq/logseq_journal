@@ -83,3 +83,13 @@ val with_properties : ?localtime:(float -> Unix.tm) -> t -> properties:Logseq_db
 
 (** Visible named property values. UUID values use the existing bounded reference syntax. *)
 val property_sources : ?localtime:(float -> Unix.tm) -> Logseq_db_types.Graph_types.property_summary list -> (string * string) list
+
+
+(** mldoc owns syntax; native views consume these shared presentation runs. *)
+module Title : sig
+  type run = { text : string; styles : string list; url : string option; reference : string option }
+  type t = run list
+  val render : ?lookup:(string -> string option) -> string -> t
+  val plain : t -> string
+  val to_yojson : t -> Yojson.Safe.t
+end

@@ -2141,6 +2141,10 @@ let render_source state =
     Reference_sources.find_opt id state.reference_sources)
 ;;
 
+let render_title state =
+  Journal_model.Title.render ~lookup:(fun id -> Reference_sources.find_opt id state.reference_sources)
+;;
+
 let favorites_view
       ~render_source
       ~render_media
@@ -2466,6 +2470,7 @@ let timeline_page
       ~timeline_store
       ~on_region
       ~render_source
+      ~render_title
       ~render_media
       ~render_row_media
       ~platform
@@ -2523,6 +2528,7 @@ let timeline_page
         ?store:timeline_store
         ~on_region
         ~render_source
+        ~render_title
         ~render_media:render_row_media
         ~state:timeline_state
         ~day_presentation
@@ -3057,11 +3063,13 @@ let detail_page
           let field ~key name value =
             V.column ~spacing:4. ~alignment:Leading
               [ V.of_lui (Lui_elements.text ~value:name ~style_class:"caption" ~foreground:"secondary" [])
-              ; Journal_header.detail_text ~id:key ~depth:2 (render_source state value) ]
+              ; Journal_header.detail_text ~title:(render_title state value)
+                  ~on_reference:(fun id -> local.send (Detail_open id)) ~id:key ~depth:2 value ]
           in
           let text =
             if property_value then field ~key:id (Option.value property_name ~default:"Property") source
-            else Journal_header.detail_text ~id ~depth (render_source state source)
+            else Journal_header.detail_text ~title:(render_title state source)
+              ~on_reference:(fun id -> local.send (Detail_open id)) ~id ~depth source
           in
           let fields = List.map (fun (name, value) ->
             field ~key:("detail-property:" ^ Journal_model.id block ^ ":" ^ name) name value) named_sources in
@@ -6685,6 +6693,7 @@ let start
             ~timeline_store:(Some timeline_store)
             ~on_region:on_view_region
             ~render_source:(render_source state)
+            ~render_title:(render_title state)
             ~render_media:
               (media_label ~store:media_store ~on_region:on_view_region state dispatch)
             ~render_row_media:(fun ~title ~root ~image_children child ->
@@ -7388,6 +7397,7 @@ module For_testing = struct
       ~timeline_store:None
       ~on_region:(fun _ -> ())
       ~render_source:(render_source initial_state)
+      ~render_title:(render_title initial_state)
       ~render_media:
         (media_label
            ~store:(Journal_media_view.Store.create ())

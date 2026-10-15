@@ -39,7 +39,7 @@ let registry =
   in
   register_component
     registry
-    (component chrome_identifier apple_profiles true children [ payload_property ] []);
+    (component chrome_identifier apple_profiles true children [ payload_property ] [ event_schema ]);
   register_component
     registry
     (component

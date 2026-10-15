@@ -41,6 +41,7 @@
   rrbvec
   base
   core
+  mldoc
   lui
   ocaml-signal
   datascript-ocaml-native
