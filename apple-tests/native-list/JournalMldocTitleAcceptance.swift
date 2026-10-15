@@ -77,14 +77,15 @@ final class JournalMldocTitleAcceptance: XCTestCase {
     screenshot("detail-cyclic-reference")
   }
 
-  func testLinksAndReferenceNavigation() {
+  func testURLsAndPlainReferenceText() {
     screenshot("links-before-taps")
     print("MLDOC_LINKS\n\(app.links.debugDescription)")
-    let reference = app.links.matching(NSPredicate(format: "label CONTAINS %@", "Referenced")).firstMatch
-    XCTAssertTrue(reference.waitForExistence(timeout: 5))
-    reference.tap()
-    XCTAssertTrue(app.staticTexts.matching(identifier: "detail-block:82000000-0000-4000-a000-000000000001").firstMatch.waitForExistence(timeout: 10))
-    screenshot("reference-target-detail")
+    XCTAssertEqual(app.links.matching(NSPredicate(format: "label CONTAINS %@", "Referenced")).count, 0)
+    let root = text("Mldoc fixture:")
+    root.coordinate(withNormalizedOffset: CGVector(dx: 0.03, dy: 0.08)).tap()
+    XCTAssertTrue(app.staticTexts.matching(identifier: rootID).firstMatch.waitForExistence(timeout: 10))
+    XCTAssertEqual(app.links.matching(NSPredicate(format: "label CONTAINS %@", "Referenced")).count, 0)
+    screenshot("plain-reference-detail")
     app.navigationBars.buttons.firstMatch.tap()
     let labeled = app.links["标签链接"].firstMatch
     XCTAssertTrue(labeled.waitForExistence(timeout: 5))

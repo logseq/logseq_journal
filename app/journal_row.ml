@@ -2,9 +2,9 @@ module Ui = Journal_view
 module V = Ui.View
 module L = Lui_elements
 
-let body ?on_reference ?(child = false) title =
+let body ?(child = false) title =
   if String.trim (Journal_model.Title.plain title) = "" then V.column []
-  else Journal_header.bounded_text ?on_reference ~child title
+  else Journal_header.bounded_text ~child title
 
 let metadata block =
   let status = Journal_model.task_state block in
@@ -47,7 +47,6 @@ let metadata block =
 let view
       ?(render_source = Fun.id)
       ?render_title
-      ?on_reference
       ~render_media
       ~show_timestamp
       (entry : Journal_graph_projection.timeline_entry)
@@ -84,7 +83,7 @@ let view
     then []
     else render (Journal_model.source block)
   in
-  let content = V.column ~spacing:8. ~alignment:Leading (body ?on_reference source :: metadata block) in
+  let content = V.column ~spacing:8. ~alignment:Leading (body source :: metadata block) in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
@@ -96,7 +95,7 @@ let view
              ~title:summary.source
              ~root:summary.block_id
              ~image_children:[]
-             (body ?on_reference ~child:true (render summary.source)))
+             (body ~child:true (render summary.source)))
         text_children
   in
   let labels =

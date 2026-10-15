@@ -18,13 +18,13 @@
     "maximum_bytes": 8388608
   },
   "p95_milliseconds": {
-    "get_blocks_64": 20,
+    "get_outline_blocks_64": 20,
     "get_structure_200": 20,
     "get_journals_200": 25,
     "single_block_change_classification": 10,
     "replan_and_diff_128": 100,
     "reopen_1024": 100,
-    "maximum_get_blocks_64": 80,
+    "maximum_get_outline_blocks_64": 80,
     "maximum_get_structure_200": 80,
     "maximum_get_journals_200": 100,
     "maximum_rebase_and_diff_4096": 3200,

@@ -1065,29 +1065,26 @@ let test_status_and_tags_mount () =
 ;;
 
 (* Title layout is owned by the mounted view, outside the pure reducers. *)
-let test_rich_title_reference_events () =
-  let received = ref [] in
-  let target = "20000000-0000-4000-a000-000000000099" in
-  let title = Journal_model.Title.render ~lookup:(fun _ -> Some "Target") ("[[" ^ target ^ "]]") in
-  with_mounted (Journal_header.detail_text ~title ~on_reference:(fun id -> received := id :: !received) ~id:"rich-event" ~depth:0 "") (fun app ops ->
-    let node = List.find_map (function Lui_protocol.CreateExtension (node, name, _) when name = Journal_lui_native.chrome_identifier -> Some node | _ -> None) (ops ()) |> Option.get in
-    let send payload =
-      let values = Lui_protocol.String_map.empty
-        |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
-        |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue payload) in
-      ignore (Lui_app.dispatch_event app (Lui_protocol.ExtensionEvent (node, Journal_lui_native.chrome_identifier, "event", values)));
-      ignore (Lui_app.flush app) in
-    send (Yojson.Basic.to_string (`Assoc ["reference", `String target]));
-    send (Yojson.Basic.to_string (`Assoc ["reference", `String block_id]));
-    send "broken";
-    require (!received = [target]) "reference event did not bind to rendered target");
-  with_mounted (Journal_header.detail_text ~on_reference:(fun id -> received := id :: !received) ~id:"missing-event" ~depth:0 ("[[" ^ target ^ "]]")) (fun app ops ->
-    let node = List.find_map (function Lui_protocol.CreateExtension (node, name, _) when name = Journal_lui_native.chrome_identifier -> Some node | _ -> None) (ops ()) |> Option.get in
-    let values = Lui_protocol.String_map.empty |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
-      |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue (Yojson.Basic.to_string (`Assoc ["reference", `String target]))) in
-    ignore (Lui_app.dispatch_event app (Lui_protocol.ExtensionEvent (node, Journal_lui_native.chrome_identifier, "event", values)));
+let test_rich_title_references_are_not_links () =
+  let target="20000000-0000-4000-a000-000000000099" in
+  let title=Journal_model.Title.render ~lookup:(fun _->Some "Target") ("[["^target^"]]") in
+  with_mounted (Journal_header.detail_text ~title ~id:"rich-plain" ~depth:0 "") (fun app ops ->
+    let payload=List.find_map (function
+      | Lui_protocol.SetExtensionProp (_, "payload", StringValue value)->Some (Yojson.Basic.from_string value)
+      | _->None) (ops ()) |> Option.get in
+    let runs=Yojson.Basic.Util.member "runs" payload |> Yojson.Basic.Util.to_list in
+    List.iter (fun run ->
+      require (not (List.mem_assoc "reference" (Yojson.Basic.Util.to_assoc run)))
+        "plain UUID label retained reference action metadata") runs;
+    let node=List.find_map (function Lui_protocol.CreateExtension (node,name,_) when name=Journal_lui_native.chrome_identifier -> Some node | _->None) (ops ()) |> Option.get in
+    let properties=Lui_protocol.String_map.empty
+      |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
+      |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue
+        (Yojson.Basic.to_string (`Assoc ["reference",`String target]))) in
+    let before=List.length (ops ()) in
+    ignore (Lui_app.dispatch_event app (Lui_protocol.ExtensionEvent (node,Journal_lui_native.chrome_identifier,"event",properties)));
     ignore (Lui_app.flush app);
-    require (!received = [target]) "missing reference became clickable")
+    require (List.length (ops ())=before) "removed UUID event changed the mounted view")
 ;;
 
 let test_mldoc_titles_share_runs () =
@@ -2826,7 +2823,7 @@ let tests =
   ; "top image asset body", test_top_image_asset_has_no_filename_body
   ; "scoped theme wire properties", test_scoped_theme_wire_properties
   ; "loading indicator and message", test_loading_keeps_indicator_and_message
-  ; "rich title reference events", test_rich_title_reference_events
+  ; "rich title references are plain text", test_rich_title_references_are_not_links
   ; "shared mldoc title runs", test_mldoc_titles_share_runs
   ; "UUID reference body and summary", test_reference_body_and_summary
   ; "status and tags mount", test_status_and_tags_mount

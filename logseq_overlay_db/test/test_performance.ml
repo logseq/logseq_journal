@@ -28,13 +28,13 @@ let manifest_has_every_numeric_gate () =
   let p95 = manifest |> member "p95_milliseconds" in
   List.iter
     (fun name -> ignore (require_positive_member p95 name))
-    [ "get_blocks_64"
+    [ "get_outline_blocks_64"
     ; "get_structure_200"
     ; "get_journals_200"
     ; "single_block_change_classification"
     ; "replan_and_diff_128"
     ; "reopen_1024"
-    ; "maximum_get_blocks_64"
+    ; "maximum_get_outline_blocks_64"
     ; "maximum_get_structure_200"
     ; "maximum_get_journals_200"
     ; "maximum_rebase_and_diff_4096"

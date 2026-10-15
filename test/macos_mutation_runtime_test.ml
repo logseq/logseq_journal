@@ -194,7 +194,7 @@ let outcome worker ordinal value =
 ;;
 
 let block_revision worker block =
-  match outcome worker 801 (P.V2_get_block { block; revision = None }) with
+  match outcome worker 801 (P.V2_get_outline_block { block; revision = None }) with
   | V2_block_outcome (V2_present_block { revision; _ }) -> revision
   | _ -> failwith "worker block missing"
 ;;
@@ -817,7 +817,7 @@ let test_encoded_utf8_budget_boundary () =
   let title = String.concat "" (List.init 300 (fun _ -> "日\"\n")) in
   let prepare = prepare_tagged_fixture ~count:1 ~title in
   let request =
-    command 1110 (P.V2_get_block { block = Fixture.mutation_uuid 10000; revision = None })
+    command 1110 (P.V2_get_outline_block { block = Fixture.mutation_uuid 10000; revision = None })
   in
   let size = ref 0 in
   with_worker ~prepare (fun worker ->
@@ -891,7 +891,7 @@ let test_canonical_target_summary_query () =
          |> ignore)
   in
   let query ?(limit = P.default_page_size) ordinal cursor =
-    command ordinal (P.V2_get_block_summary { block = target; limit; cursor })
+    command ordinal (P.V2_get_outline_block_summary { block = target; limit; cursor })
     |> P.request_to_yojson
     |> P.request_of_yojson
     |> Result.fold ~ok:Fun.id ~error:(fun error ->

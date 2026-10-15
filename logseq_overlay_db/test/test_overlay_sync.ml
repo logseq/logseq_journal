@@ -285,7 +285,7 @@ let block_precondition database block behavior =
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
        let revision =
-         match Database.get_blocks snapshot [ block ] |> T.require_ok ~behavior with
+         match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
          | [ Present_block { revision; _ } ] | [ Missing_block { revision; _ } ] ->
            revision
          | _ -> Alcotest.fail "block precondition returned the wrong cardinality"
@@ -1076,7 +1076,7 @@ let definitive_rejection_rolls_back_once database =
    | No_logical_change | Logical_resync_required _ ->
      Alcotest.fail "single rejected insertion did not return an exact rollback");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+  (match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
    | [ Missing_block _ ] -> ()
    | _ -> Alcotest.fail "rejected insertion remained visible");
   Database.release_snapshot snapshot;
@@ -1197,7 +1197,7 @@ let authoritative_batch_updates_the_logical_snapshot database =
     "visible authoritative update did not advance projection";
   let after = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks after [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks after [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -1212,7 +1212,7 @@ let authoritative_rebase_replans_queued_ordinary_mutation database =
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   let revision =
     match
-      Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
       |> T.require_ok ~behavior
     with
     | [ Present_block { revision; _ } ] -> revision
@@ -1256,7 +1256,7 @@ let authoritative_rebase_replans_queued_ordinary_mutation database =
     "queued ordinary mutation was not reported as replanned";
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -1310,7 +1310,7 @@ let retained_effect_order_and_frozen_snapshot database =
   let current = Database.current_snapshot database |> T.require_ok ~behavior in
   let title snapshot =
     match
-      Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
       |> T.require_ok ~behavior
     with
     | [ Present_block { value; _ } ] -> value.block.title
@@ -1559,7 +1559,7 @@ let authoritative_crypto_is_correlated_and_applied database =
    | Ok _ -> Alcotest.fail "stale authoritative crypto was accepted");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -1744,7 +1744,7 @@ let pull_first_delete_conflict_proves_non_execution database =
    | _ -> Alcotest.fail "Pull-first conflict omitted its retained terminal receipt");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2406,7 +2406,7 @@ let accepted_member_uses_intermediate_barrier_root database =
    | _ -> Alcotest.fail "intermediate barrier did not earn Applied receipt");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2590,7 +2590,7 @@ let accepted_delete_rejects_missing_own_incorporation database =
    | Ok _ -> Alcotest.fail "accepted delete tolerated missing own incorporation");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Missing_block _ ] -> ()
    | _ -> Alcotest.fail "failed integrity preparation changed the logical delete");
@@ -2763,7 +2763,7 @@ let queued_delete_yields_to_remote_change_before_submission database =
    | _ -> Alcotest.fail "queued delete conflict omitted Remote_won receipt");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -2897,7 +2897,7 @@ let submitted_save_retains_required_block_shadow database =
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
        (match
-          Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+          Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
           |> T.require_ok ~behavior
         with
         | [ Present_block { value; _ } ] ->
@@ -2934,7 +2934,7 @@ let submitted_save_retains_required_block_shadow database =
              items
          in
          (match
-            Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+            Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
             |> T.require_ok ~behavior
           with
           | [ Present_block { value; revision } ] ->
@@ -3094,7 +3094,7 @@ let partial_rejection_preserves_prefix_and_retries_independent_suffix database =
    | _ -> Alcotest.fail "independent suffix did not enter its retry group");
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   (match
-     Database.get_blocks snapshot [ first_uuid; second_uuid; third_uuid ]
+     Database.get_outline_blocks snapshot [ first_uuid; second_uuid; third_uuid ]
      |> T.require_ok ~behavior
    with
    | [ Present_block _; Missing_block _; Present_block _ ] -> ()
@@ -3202,7 +3202,7 @@ let partial_rejection_blocks_suffix_dependent_on_failed_insert database =
     (states = [ Blocked; Blocked ])
     "failed member and dependent suffix did not become atomically Blocked";
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+  (match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
    | [ Missing_block _ ] -> ()
    | _ -> Alcotest.fail "dependent suffix remained in the logical projection");
   Database.release_snapshot snapshot
@@ -3693,7 +3693,7 @@ let stale_insert_collision_blocks_intent database =
      = [ Blocked ])
     "replanning a conflicting insertion overwrote the authoritative UUID";
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
-  (match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+  (match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
    | [ Present_block { value; _ } ] ->
      T.require
        (value.block.title = "Peer owns this UUID")

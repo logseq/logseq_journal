@@ -421,7 +421,7 @@ let journal_parent context =
 ;;
 
 let read_block context block_uuid =
-  match graph_request context (V2_get_block { block = block_uuid; revision = None }) with
+  match graph_request context (V2_get_outline_block { block = block_uuid; revision = None }) with
   | V2_response { outcome = V2_block_outcome (V2_present_block { value; revision }); _ }
     -> Ok (value, revision)
   | V2_response { outcome = V2_block_outcome (V2_missing_block _); _ } -> Error ()

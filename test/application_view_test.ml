@@ -802,7 +802,7 @@ let run_favorites_native_visibility
             | V2_ack_changes _ ->
               Atomic.set changes_acknowledged true;
               V2_changes_acknowledged { generation = "g"; through = "p2" }
-            | V2_get_block { block; _ } ->
+            | V2_get_outline_block { block; _ } ->
               V2_block_outcome
                 (match
                    List.find_opt
@@ -831,7 +831,7 @@ let run_favorites_native_visibility
                     | Some n ->
                       V2_present_block { value = timeline_block n; revision = "root" }
                     | None -> V2_missing_block { uuid = block; revision = "p" }))
-            | V2_get_block_summary { block; _ } when check_capture_imports ->
+            | V2_get_outline_block_summary { block; _ } when check_capture_imports ->
               let root = Atomic.get capture_root |> Option.get in
               let page = Atomic.get capture_page |> Option.get in
               Alcotest.(check string)
@@ -3677,7 +3677,7 @@ let test_reference_outer_terminals cancel =
         | Import_asset _ -> Error "unused import"
         | Graph_request request ->
           (match request.command with
-           | P.V2_get_block { block = target; _ }
+           | P.V2_get_outline_block { block = target; _ }
              when not (Array.exists (G.Uuid.equal target) targets) ->
              completed
                request
@@ -3685,7 +3685,8 @@ let test_reference_outer_terminals cancel =
                   (if G.Uuid.equal target block.uuid
                    then V2_present_block { value = record block; revision = "root" }
                    else V2_missing_block { uuid = target; revision = "p" }))
-           | P.V2_get_block { block = target; _ } ->
+           | P.V2_get_page { page = target; _ }
+             when Array.exists (G.Uuid.equal target) targets ->
              let index =
                Array.to_list targets
                |> List.mapi (fun i id -> i, id)
@@ -3709,14 +3710,9 @@ let test_reference_outer_terminals cancel =
                  Atomic.incr late_returns;
                  completed
                    request
-                   (V2_block_outcome
-                      (V2_present_block
-                         { value =
-                             record
-                               { block with
-                                 uuid = target
-                               ; title = "Late cancelled target"
-                               }
+                   (V2_page_outcome
+                      (V2_present_page
+                         { page = { page with uuid = target; title = "Late cancelled target"; kind = Ordinary_page }
                          ; revision = "old"
                          })))
                else (
@@ -3725,14 +3721,9 @@ let test_reference_outer_terminals cancel =
              else
                completed
                  request
-                 (V2_block_outcome
-                    (V2_present_block
-                       { value =
-                           record
-                             { block with
-                               uuid = target
-                             ; title = Printf.sprintf "Fresh target %d" index
-                             }
+                 (V2_page_outcome
+                    (V2_present_page
+                       { page = { page with uuid = target; title = Printf.sprintf "Fresh target %d" index; kind = Ordinary_page }
                        ; revision = "fresh"
                        }))
            | V2_graph_info ->

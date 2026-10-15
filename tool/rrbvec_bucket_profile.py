@@ -34,7 +34,7 @@ let profile_append kind f =
 
 def instrument(source):
     for start, end in [('let logical_page_at', 'let logical_block_at'),
-                       ('let logical_block_at', 'let get_blocks')]:
+                       ('let logical_block_at', 'let get_outline_blocks')]:
         a, b = source.index(start), source.index(end)
         region = source[a:b]
         old = '(fun current (record : outbox_record) ->'

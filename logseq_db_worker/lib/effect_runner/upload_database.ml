@@ -89,7 +89,7 @@ let apply_local db (i : I.t) =
           match pages with
           | [ T.Present_page { revision; _ } ] -> Ok ([], [ i.target, revision ])
           | _ ->
-            let* blocks = read (D.get_blocks s [ i.target ]) in
+            let* blocks = read (D.get_outline_blocks s [ i.target ]) in
             (match blocks with
              | [ T.Present_block { revision; _ } ] -> Ok ([ i.target, revision ], [])
              | _ -> Error U.Invalid_content)
@@ -119,7 +119,7 @@ let apply_metadata db (i : I.t) =
   | Local_present ->
     let* expected =
       snapshot db (fun s ->
-        let* blocks = read (D.get_blocks s [ i.asset ]) in
+        let* blocks = read (D.get_outline_blocks s [ i.asset ]) in
         match blocks with
         | [ T.Present_block { revision; _ } ] ->
           read (D.write_precondition ~blocks:[ i.asset, revision ] ~pages:[] ~scopes:[])

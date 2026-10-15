@@ -55,7 +55,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let text: String
     let styles: [String]
     let url: String?
-    let reference: String?
   }
 
   private static func attributed(_ runs: [TitleRun]?, fallback: String) -> AttributedString {
@@ -73,20 +72,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
       if run.styles.contains("highlight") { fragment.backgroundColor = .yellow.opacity(0.25) }
       if let target = run.url.flatMap(URL.init(string:)) {
         fragment.link = target
-      } else if let id = run.reference {
-        fragment.link = URL(string: "logseq-journal://block/" + id)
       }
       result.append(fragment)
     }
     return result
-  }
-
-  private static func openTitleURL(_ url: URL, context: LUIAppleExtensionViewContext, runs: [TitleRun]?) -> OpenURLAction.Result {
-    guard url.scheme == "logseq-journal" else { return .systemAction }
-    let id = String(url.path.dropFirst())
-    guard url.host == "block", runs?.contains(where: { $0.reference == id }) == true,
-      let payload = try? JSONEncoder().encode(["reference": id]) else { return .discarded }
-    return JournalExtensions.emit(context: context, payload: payload) ? .handled : .discarded
   }
 
   private struct DetailText: SwiftUI.View {
@@ -289,9 +278,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if let text = properties?.text, let maxLines = properties?.maxLines,
           maxLines > 0, context.childIDs.isEmpty {
           Text(JournalChrome.attributed(properties?.runs, fallback: text))
-            .environment(\.openURL, OpenURLAction { url in
-              JournalChrome.openTitleURL(url, context: context, runs: properties?.runs)
-            })
             .font(properties?.level == 1 ? .subheadline : .body)
             .foregroundStyle(properties?.level == 1 ? .secondary : .primary)
             .multilineTextAlignment(.leading)
@@ -304,9 +290,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if let properties, let text = properties.text, let id = properties.id,
           let level = properties.level, context.childIDs.isEmpty {
           DetailText(text: JournalChrome.attributed(properties.runs, fallback: text), id: id, level: level)
-            .environment(\.openURL, OpenURLAction { url in
-              JournalChrome.openTitleURL(url, context: context, runs: properties.runs)
-            })
         }
       case .detailRow:
         if let level = properties?.level, context.childIDs.count == 1 {

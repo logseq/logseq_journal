@@ -325,7 +325,7 @@ the validated-result wrapper, not the external-crypto boundary.
 
 ### Merge all read APIs into one request/result ADT
 
-Rejected. `get_blocks`, `get_pages`, `get_journals`, and `get_structure` have
+Rejected. `get_outline_blocks`, `get_pages`, `get_journals`, and `get_structure` have
 different result shapes and caller intent. One union would replace clear functions
 with request/result coupling and exhaustive irrelevant cases without removing a
 domain concept.

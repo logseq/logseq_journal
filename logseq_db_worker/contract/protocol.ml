@@ -45,11 +45,12 @@ and command =
       { page : page_uuid
       ; revision : string option
       }
-  | V2_get_block of
+  (* Outline content requires parent/page/order; page targets use V2_get_page. *)
+  | V2_get_outline_block of
       { block : block_uuid
       ; revision : string option
       }
-  | V2_get_block_summary of
+  | V2_get_outline_block_summary of
       { block : block_uuid
       ; limit : int
       ; cursor : Cursor.t option
@@ -395,7 +396,7 @@ let validate_command = function
     List.length roots <= maximum_filter_values && valid_limit limit
   | V2_list_favorites { limit; _ }
   | V2_list_journals { limit; _ }
-  | V2_get_block_summary { limit; _ }
+  | V2_get_outline_block_summary { limit; _ }
   | V2_get_children { limit; _ }
   | V2_pull_changes { limit; _ } -> valid_limit limit
   | V2_get_page_tree { maximum_depth; limit; _ } ->
@@ -405,7 +406,7 @@ let validate_command = function
   | V2_graph_info
   | V2_inspect_admission
   | V2_get_page _
-  | V2_get_block _
+  | V2_get_outline_block _
   | V2_set_asset_reference _
   | V2_delete_blocks _
   | V2_set_task_status _

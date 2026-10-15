@@ -45,14 +45,15 @@ and command =
       { page : page_uuid
       ; revision : string option
       }
-  | V2_get_block of
+  (* Outline content requires parent/page/order; page targets use V2_get_page. *)
+  | V2_get_outline_block of
       { block : block_uuid
       ; revision : string option
       }
   (* Canonical target, owning page and a bounded direct-child slice share one
      Database snapshot. Limit is 1..maximum_page_size; use default_page_size
      for normal metadata. The opaque child cursor is projection-version-bound. *)
-  | V2_get_block_summary of
+  | V2_get_outline_block_summary of
       { block : block_uuid
       ; limit : int
       ; cursor : Cursor.t option

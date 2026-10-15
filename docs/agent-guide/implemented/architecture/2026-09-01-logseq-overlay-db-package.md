@@ -472,7 +472,7 @@ All blocked queued intents remain durable for diagnostics and explicit user reco
 
 Move authoritative Datascript projection and logical effect composition into one `Overlay_read` implementation.
 
-`get_blocks` queries authoritative blocks by UUID, applies only indexed effects for the requested UUIDs, applies tombstones, and preserves request order.
+`get_outline_blocks` queries authoritative blocks by UUID, applies only indexed effects for the requested UUIDs, applies tombstones, and preserves request order.
 
 Every present or missing point result carries its block or page state revision so a later mutation can form a target-local precondition.
 
@@ -1169,7 +1169,7 @@ val inspect_admission
   :  t
   -> (Types.admission_inspection, Types.admission_inspection_error) result
 
-val get_blocks
+val get_outline_blocks
   :  snapshot
   -> Graph.block_uuid list
   -> (Types.block_lookup list, Types.read_error) result
@@ -1569,13 +1569,13 @@ Measure these release-profile budgets on the repository reference machine:
 
 | Operation | Required p95 |
 | --- | ---: |
-| `get_blocks` for 64 UUIDs | Less than 20 ms. |
+| `get_outline_blocks` for 64 UUIDs | Less than 20 ms. |
 | `get_structure` for 256 members | Less than 20 ms. |
 | `get_journals` for 512 pages | Less than 25 ms. |
 | Single-block logical change classification | Less than 10 ms. |
 | Pure replan and logical diff for 128 active records | Less than 100 ms. |
 | Reopen and index reconstruction for 1,024 active records | Less than 100 ms. |
-| Maximum-admission `get_blocks` for 64 UUIDs | Less than 80 ms. |
+| Maximum-admission `get_outline_blocks` for 64 UUIDs | Less than 80 ms. |
 | Maximum-admission `get_structure` for 256 members | Less than 80 ms. |
 | Maximum-admission `get_journals` for 512 pages | Less than 100 ms. |
 | Maximum-admission rebase and logical diff for 4,096 records | Less than 3.2 seconds. |

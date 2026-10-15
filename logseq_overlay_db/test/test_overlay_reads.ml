@@ -123,7 +123,7 @@ let point_reads_preserve_property_summaries database =
        "page property summary was discarded"
    | _ -> Alcotest.fail "property fixture page is missing");
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ] |> T.require_ok ~behavior
    with
    | [ Present_block { value; _ } ] ->
      T.require
@@ -135,7 +135,7 @@ let point_reads_preserve_property_summaries database =
 
 let authoritative_block_is_projected_by_uuid_and_structure _database snapshot =
   (match
-     Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+     Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
      |> T.require_ok ~behavior:"authoritative block UUID projection"
    with
    | [ Present_block { value; _ } ] ->
@@ -585,7 +585,7 @@ let pinned_snapshot_keeps_optimistic_outbox_root database =
       (fun () ->
          let revision =
            match
-             Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+             Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
              |> T.require_ok ~behavior
            with
            | [ Present_block { revision; _ } ] -> revision
@@ -615,7 +615,7 @@ let pinned_snapshot_keeps_optimistic_outbox_root database =
   let pinned = Database.current_snapshot database |> T.require_ok ~behavior in
   let block_title snapshot =
     match
-      Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
       |> T.require_ok ~behavior
     with
     | [ Present_block { value; _ } ] -> value.block.title
@@ -1011,7 +1011,7 @@ let page_tree_preserves_valid_windows_and_snapshots database =
            List.iter
              (fun (item : tree_member) ->
                 match
-                  Database.get_blocks snapshot [ item.block.block.uuid ]
+                  Database.get_outline_blocks snapshot [ item.block.block.uuid ]
                   |> T.require_ok ~behavior
                 with
                 | [ Present_block { value; revision } ] ->
@@ -1049,7 +1049,7 @@ let page_tree_preserves_valid_windows_and_snapshots database =
        let first, cursor = read pinned 64 1 None in
        T.require (List.length first = 1 && Option.is_some cursor) "missing continuation";
        let expected =
-         match Database.get_blocks pinned [ id 1 ] |> T.require_ok ~behavior with
+         match Database.get_outline_blocks pinned [ id 1 ] |> T.require_ok ~behavior with
          | [ Present_block { revision; _ } ] ->
            Database.write_precondition ~blocks:[ id 1, revision ] ~pages:[] ~scopes:[]
            |> T.require_ok ~behavior
@@ -1241,7 +1241,7 @@ let favorites_resolve_order_filter_and_snapshot database =
      | _ -> Alcotest.fail "favorite target kinds were lost");
     let expected =
       match
-        Database.get_blocks pinned [ T.authoritative_block_uuid ]
+        Database.get_outline_blocks pinned [ T.authoritative_block_uuid ]
         |> T.require_ok ~behavior
       with
       | [ Present_block { revision; _ } ] ->

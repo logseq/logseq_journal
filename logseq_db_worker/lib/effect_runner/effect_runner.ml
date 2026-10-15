@@ -829,8 +829,8 @@ let local_mutation = function
   | V2_list_favorites _
   | V2_list_journals _
   | V2_get_page _
-  | V2_get_block _
-  | V2_get_block_summary _
+  | V2_get_outline_block _
+  | V2_get_outline_block_summary _
   | V2_get_children _
   | V2_get_page_tree _
   | V2_pull_changes _
@@ -1078,8 +1078,8 @@ let read_snapshot database request command =
                    (V2_missing_page
                       { uuid; revision = Overlay.Page_state_revision.to_string revision }))
             | Ok _ | Error _ -> failure request Corrupt_storage "The page lookup failed.")
-         | V2_get_block { block; _ } ->
-           (match Database.get_blocks snapshot [ block ] with
+         | V2_get_outline_block { block; _ } ->
+           (match Database.get_outline_blocks snapshot [ block ] with
             | Ok [ Overlay.Present_block { value; revision } ] ->
               response
                 request
@@ -1095,7 +1095,7 @@ let read_snapshot database request command =
                    (V2_missing_block
                       { uuid; revision = Overlay.Block_state_revision.to_string revision }))
             | Ok _ | Error _ -> failure request Corrupt_storage "The block lookup failed.")
-         | V2_get_block_summary { block; limit; cursor } ->
+         | V2_get_outline_block_summary { block; limit; cursor } ->
            let version = Database.snapshot_version snapshot in
            let summary lookup page scope_revision items next_cursor =
              response
@@ -1114,7 +1114,7 @@ let read_snapshot database request command =
            if limit < 1 || limit > Protocol.maximum_page_size
            then failure request Invalid_request "Invalid block summary limit."
            else (
-             match Database.get_blocks snapshot [ block ] with
+             match Database.get_outline_blocks snapshot [ block ] with
              | Ok [ Overlay.Missing_block { uuid; revision } ] ->
                summary
                  (V2_missing_block

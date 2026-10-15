@@ -166,7 +166,7 @@ let concurrent_commits_publish_in_revision_order database =
     Fun.protect
       ~finally:(fun () -> Database.release_snapshot snapshot)
       (fun () ->
-         match Database.get_blocks snapshot [ block ] |> T.require_ok ~behavior with
+         match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
          | [ Present_block { revision; _ } ] -> revision
          | _ -> Alcotest.fail "concurrent commit fixture block is missing")
   in

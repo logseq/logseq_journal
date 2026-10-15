@@ -147,7 +147,7 @@ let measured name snapshot page depth limit cursor =
     require (calls "seek:Eavt:entity:*" = 0) "unrelated entity range scan");
   List.iter
     (fun (item : T.tree_member) ->
-       match D.get_blocks snapshot [ item.block.block.uuid ] |> ok "point" with
+       match D.get_outline_blocks snapshot [ item.block.block.uuid ] |> ok "point" with
        | [ T.Present_block { value; revision } ] ->
          require (value = item.block && revision = item.revision) "point equivalence"
        | _ -> failwith "missing selected block")
@@ -377,7 +377,7 @@ let audit_local support graph_id =
     snapshot (fun pinned ->
       let expected =
         let revision =
-          match D.get_blocks pinned [ root ] |> ok "root" with
+          match D.get_outline_blocks pinned [ root ] |> ok "root" with
           | [ T.Present_block { revision; _ } ] -> revision
           | _ -> failwith "root missing"
         in

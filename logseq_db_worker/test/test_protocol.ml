@@ -486,7 +486,7 @@ let request_domain_constraints () =
     "invalid nested UUID"
     (native_request
        (native_variant
-          "V2_get_block"
+          "V2_get_outline_block"
           [ "block", `String "not-a-uuid"; "revision", `Null ]));
   let save title =
     native_request

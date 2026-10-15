@@ -57,7 +57,7 @@ let () =
         self.assertEqual(sample['active_outbox_records'], 1)
         self.assertGreater(sample['active_outbox_bytes'], 0)
         self.assertEqual(len(sample['reopen']), 5)
-        self.assertEqual(len(sample['get_blocks_64']), 5)
+        self.assertEqual(len(sample['get_outline_blocks_64']), 5)
 
 
 if __name__ == '__main__':

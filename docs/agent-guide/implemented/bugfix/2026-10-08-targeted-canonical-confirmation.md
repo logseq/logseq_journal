@@ -6,7 +6,7 @@ Confirming one changed block paginated a page tree until the requested root was 
 
 ## Decision
 
-`logseq_db_worker/contract/protocol.ml` and `.mli` expose `V2_get_block_summary`. Its runner reads the target block, page, and direct children from one captured Database snapshot through existing public APIs. `app/journal_graph_runtime.ml` uses this query after Capture, source edits, and status changes. It paginates only target children at `Protocol.default_page_size` (50); conflict reconciliation retains its existing page-tree path.
+`logseq_db_worker/contract/protocol.ml` and `.mli` expose `V2_get_outline_block_summary`. Its runner reads the target block, page, and direct children from one captured Database snapshot through existing public APIs. `app/journal_graph_runtime.ml` uses this query after Capture, source edits, and status changes. It paginates only target children at `Protocol.default_page_size` (50); conflict reconciliation retains its existing page-tree path.
 
 ## Identity, pagination, and retained behavior
 
