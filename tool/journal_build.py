@@ -134,10 +134,14 @@ class Build:
                 try:
                     os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=5)
-                except ProcessLookupError:
+                except (ProcessLookupError, subprocess.TimeoutExpired):
                     pass
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                finally:
+                    # The leader may exit before a descendant that ignores SIGTERM.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     process.wait()
                 raise
             stream.seek(offset)

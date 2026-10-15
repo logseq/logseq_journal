@@ -9,6 +9,10 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import signal
+import sys
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -114,6 +118,56 @@ class CacheBoundaryTests(unittest.TestCase):
                 self.assertIn("busy", result.stderr)
             with self.build.resource_lock(path):
                 pass
+
+    def test_cancellation_stops_descendant_even_when_parent_exits_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            ready = directory / 'child.pid'
+            pipe = directory / 'writer-lifetime'
+            os.mkfifo(pipe)
+            reader = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
+            stop = threading.Event()
+            code = '''import os,signal,sys,time
+from pathlib import Path
+if os.fork() == 0:
+ signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ fd = os.open(sys.argv[2], os.O_WRONLY)
+ Path(sys.argv[1]).write_text(str(os.getpid()))
+ time.sleep(10)
+ os._exit(0)
+while True: time.sleep(1)
+'''
+            def cancel_when_ready():
+                for _ in range(300):
+                    if ready.exists():
+                        os.kill(os.getpid(), signal.SIGINT)
+                        return
+                    if stop.wait(.01):
+                        return
+            sender = threading.Thread(target=cancel_when_ready, daemon=True)
+            build = self.build.Build(SimpleNamespace(link_only=True, experimental_host_restamp=False), directory)
+            try:
+                with self.build.resource_lock(directory / 'cache.lock'):
+                    sender.start()
+                    with self.assertRaises(KeyboardInterrupt):
+                        build.run(sys.executable, '-c', code, ready, pipe)
+                    closed = False
+                    for _ in range(100):
+                        try:
+                            closed = os.read(reader, 1) == b''
+                            break
+                        except BlockingIOError:
+                            time.sleep(.01)
+                    self.assertTrue(closed, 'cancelled descendant still holds writer before lock release')
+            finally:
+                os.close(reader)
+                stop.set()
+                sender.join(timeout=1)
+                if ready.exists():
+                    try:
+                        os.kill(int(ready.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_link_stub_defines_current_swift_runtime_entries(self):
         self.assertTrue(hasattr(self, "build"), "link stub missing")
