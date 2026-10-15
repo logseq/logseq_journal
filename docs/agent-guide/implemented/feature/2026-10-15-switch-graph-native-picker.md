@@ -4,7 +4,7 @@
 
 The graph picker uses uneven capsule buttons and loses the active graph when opened. It has no per-row local-copy management or durable presence observation.
 
-## Proposal
+## Decision
 
 Implement the user's selected concept A with native equal-width list rows, a full-canvas List with Timeline-style floating close/refresh/existing account controls, an inline current marker and a separate row menu. Keep picker and request ownership in OCaml. Query one graph's mirror presence on demand with an account-generation fence; cache observations outside rendering.
 
@@ -18,14 +18,17 @@ The user subsequently requested removing the header entirely and making the whol
 
 It detaches the current graph and clears its identity. Keep an application-owned picker presentation instead, and use the existing Select_graph lifecycle only for an actual switch.
 
-## Acceptance criteria
+## Validation
 
 - Uniform native rows preserve catalog order, expose the current marker and support long names and Dynamic Type.
 - Close returns to the retained current graph; name activation switches through the worker.
 - Row menus are independently reachable; current graph deletion is disabled with an explanation.
 - Presence is bounded and requested only for the relevant graph, with stale and cancelled results ignored.
 - Confirmation names the graph, warns that unsynchronized changes/drafts/attachments will be lost and says the cloud copy remains downloadable.
-- Isolated synthetic Simulator acceptance covers cancellation, deletion, failure recovery and redownload before PR publication.
+- Two native XCTest cases pass on the isolated iPhone 13 / iOS 26.1 Simulator: actual menu and row taps, cancellation, current-graph protection, ownership-busy failure and retry, retained Not downloaded rows, real-worker snapshot redownload through a controlled loopback TLS fixture, close/session retention and accessibility XXXL scrolling/menu reachability. The fixture does not implement a live remote sync service.
+- Real UI submission also produced an unsent text capture and photo attachment; inspection found three durable outbox records and one account/graph-specific upload intent before confirmed local deletion removed that copy and its intent.
+- Application regression: 98 tests pass, including deletion-in-flight Capture and composer retention. Sync and overlay storage suites pass 261 and 50 cases respectively; worker service, startup, semantics and source-boundary checks pass.
+- Independent read-only journal-code-review found and prompted fixes for action gating and confirmation identity; the code-fix commit was re-reviewed with no remaining evidenced findings. All temporary reports, builds, hosts, network fixtures and screenshots remain outside Git.
 
 ## Risks
 
@@ -40,6 +43,3 @@ Deletion uses a single account-scoped flight and exact terminal result. It prese
 
 The active graph remains usable when the picker closes during deletion of another graph. Application owns the manager snapshot and action gate; the public Root_navigation reducer does not own either, so its events cannot reproduce that guard. A regression at the public mounted Application boundary holds deletion in flight and exercises the current graph's Capture action. Each new confirmation also advances its request token so an older response cannot authorize a newer dialog.
 
-## Questions
-
-- Design A, Simulator verification, discard semantics and PR publication are already answered by the user's recorded instructions. No unanswered UI/presence question blocks this scope.
