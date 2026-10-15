@@ -304,6 +304,9 @@ let handle_event context = function
   | Response { outcome = Completed (Service.Asset_imported _); _ }
   | Response { outcome = Completed (Service.Asset_file _); _ } ->
     fail_worker context "assets" "unexpected file response"
+  | Response { outcome = Completed (Service.Local_copy_inspected _); _ }
+  | Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
+    fail_worker context "local-copy" "unexpected local-copy response"
   | Response { outcome = Completed Service.Client_command_completed; _ } -> None
   | Response { outcome = Completed (Service.Graph_state state); _ } ->
     handle_graph_state context state;
