@@ -202,7 +202,20 @@ class Build:
                 if record.get("source") != expected or local_path != str(checkout):
                     errors.append(f"{name}: active pin {actual!r} differs from lock {expected!r}")
                     continue
-                ref = record.get("resolved_sha", "")
+                resolved_sha = record.get("resolved_sha", "")
+                if not re.fullmatch(r"[0-9a-f]{40}", resolved_sha):
+                    errors.append(f"{name}: invalid CI resolved_sha")
+                    continue
+                if re.fullmatch(r"[0-9a-f]{40}", ref) and resolved_sha != ref:
+                    errors.append(f"{name}: CI resolution differs from locked commit {ref}")
+                    continue
+                if target.fragment:
+                    selected = self.run("git", "-C", checkout, "rev-parse", "--verify", "--end-of-options",
+                                        unquote(target.fragment) + "^{commit}")
+                    if selected != resolved_sha:
+                        errors.append(f"{name}: active local pin selects {selected}, CI resolved {resolved_sha}")
+                        continue
+                ref = resolved_sha
             if not (checkout / ".git").exists():
                 errors.append(f"{name}: resolved source checkout missing: {checkout}")
                 continue

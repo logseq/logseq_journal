@@ -153,6 +153,31 @@ class CacheBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'installed source'):
                 f.build.dependencies()
             metadata.write_text(original)
+            record_path = f.journal / '.ci-reports/dependencies.json'
+            records = json.loads(record_path.read_text())
+            commit = records[0]['resolved_sha']
+            records[0]['resolved_sha'] = ''
+            record_path.write_text(json.dumps(records))
+            with self.subTest(case='invalid resolution'), self.assertRaisesRegex(RuntimeError, 'resolved'):
+                f.build.dependencies()
+            records[0]['resolved_sha'] = commit
+            record_path.write_text(json.dumps(records))
+            (f.checkout / 'other').write_text('another real commit\n')
+            subprocess.run(['git', '-C', f.checkout, 'add', '.'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', f.checkout, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                            'commit', '-qm', 'other'], check=True, capture_output=True)
+            other = subprocess.check_output(['git', '-C', f.checkout, 'rev-parse', 'HEAD'], text=True).strip()
+            records[0]['resolved_sha'] = other
+            record_path.write_text(json.dumps(records))
+            with self.subTest(case='fixed lock'), self.assertRaisesRegex(RuntimeError, 'locked commit'):
+                f.build.dependencies()
+            subprocess.run(['git', '-C', f.checkout, 'reset', '--hard', commit], check=True, capture_output=True)
+            records[0]['resolved_sha'] = commit
+            record_path.write_text(json.dumps(records))
+            f.build.opam('pin', 'add', '--no-action', 'fixture.dev', 'git+file://' + str(f.checkout) + '#' + other)
+            metadata.write_text(original)
+            with self.subTest(case='active pin ref'), self.assertRaisesRegex(RuntimeError, 'active local pin'):
+                f.build.dependencies()
             f.lock.write_text(f.lock.read_text().replace('example.invalid/fixture', 'example.invalid/other'))
             with self.assertRaisesRegex(RuntimeError, 'differs from lock'):
                 f.build.dependencies()
