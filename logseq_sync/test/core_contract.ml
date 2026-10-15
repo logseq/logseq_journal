@@ -2439,12 +2439,14 @@ let deletion_save_completion effects (result : (unit, Core.effect_error) result)
 ;;
 
 let deletion_mirror effects =
-  List.find_map
+  let request = List.find_map
     (function
       | Core.Delegate (Core.Delete_mirror request) -> Some request
       | _ -> None)
-    effects
-  |> Option.get
+    effects in
+  match request with
+  | Some request -> request
+  | None -> Alcotest.fail "non-current deletion must delegate mirror removal"
 ;;
 
 let check_deletion_stage stage core =
@@ -2494,254 +2496,117 @@ let deletion_blocked_events scope sync =
   ]
 ;;
 
+let deletion_noncurrent core =
+  let target = List.find (fun (candidate : Core.graph) -> candidate.graph_id = graph_id)
+      (Core.state core).snapshot.catalog in
+  let catalog = refresh_catalog core [ target; other_graph ] in
+  let selected = Core.step catalog.next (Core.Graph_selected other_graph_id) in
+  let request = inspect_mirror_request selected.effects in
+  let inspected = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available request)) in
+  let token = Overlay.sync_token_of_string "sync-token:v1:noncurrent" |> Result.get_ok in
+  let sync = Overlay.sync_view ~token ~checkpoint:(server_cursor_of_int 0) ~submissions:[] in
+  let attached = Core.step inspected.next (Core.Graph_attached { scope = request.scope; sync }) in
+  let ready = Core.step attached.next Core.Timeline_presented in
+  ready.next, request.scope, sync, selected.effects
+;;
+
 let local_deletion_orders_cleanup encrypted () =
-  let ready, scope, sync, old_effects = deletion_ready_graph encrypted in
-  let refreshing = Core.step ready Core.Catalog_refresh_requested in
-  let late_catalog = fetch_catalog_completion refreshing.effects [] in
-  let ready = refreshing.next in
+  let original, old_scope, _, _ = deletion_ready_graph encrypted in
+  let ready, scope, sync, selection_effects = deletion_noncurrent original in
   check_no_work ready [ Core.Local_cache_deletion_requested other_graph_id ];
   let deleting = Core.step ready (Core.Local_cache_deletion_requested graph_id) in
-  check_deletion_stage Closing_graph deleting.next;
-  Alcotest.(check bool)
-    "no graph work admitted"
-    true
-    (Core.admitted_graph_scope deleting.next = None);
-  Alcotest.(check bool)
-    "selection retained until mirror removed"
-    true
-    ((Core.state deleting.next).snapshot.selected_graph = Some graph_id);
-  let worker =
-    List.filter_map
-      (function
-        | Core.Delegate instruction -> Some instruction
-        | _ -> None)
-      deleting.effects
-  in
-  Alcotest.(check bool)
-    "only close is delegated initially"
-    true
-    (worker = [ Core.Detach_graph scope ]);
-  Alcotest.(check bool)
-    "old transport is cancelled"
-    true
-    (List.exists
-       (function
-         | Core.Run (Core.Cancel_effects _) -> true
-         | _ -> false)
-       deleting.effects);
-  Alcotest.(check bool)
-    "socket explicitly closes"
-    true
-    (List.exists
-       (function
-         | Core.Run (Core.Close_websocket connection) -> connection.graph = scope
-         | _ -> false)
-       deleting.effects);
-  let snapshot = (Core.state deleting.next).snapshot in
-  Alcotest.(check bool)
-    "graph and presentation fences advance"
-    true
-    (snapshot.startup.graph_generation > scope.graph_generation
-     && snapshot.startup.presentation_generation > scope.account.presentation_generation);
-  let blocked = late_catalog :: deletion_blocked_events scope sync in
-  check_no_work deleting.next blocked;
-  let stale_scope = { scope with graph_generation = scope.graph_generation + 99 } in
-  check_no_work
-    deleting.next
-    [ Core.Graph_detached (stale_scope, Ok ())
-    ; Core.Mirror_deleted
-        ( { account = scope.account; graph_id; scope = Core.effect_scope_of_graph scope }
-        , Ok () )
-    ];
-  let closed = Core.step deleting.next (Core.Graph_detached (scope, Ok ())) in
-  check_deletion_stage Deleting_mirror closed.next;
-  let request = deletion_mirror closed.effects in
-  Alcotest.(check bool)
-    "mirror carries captured scope"
-    true
-    (request.graph_id = graph_id && request.scope = Core.effect_scope_of_graph scope);
-  check_no_work closed.next (Core.Graph_detached (scope, Ok ()) :: blocked);
-  let removed = Core.step closed.next (Core.Mirror_deleted (request, Ok ())) in
-  check_deletion_stage Clearing_selection removed.next;
-  let cache = save_catalog_cache removed.effects in
-  Alcotest.(check bool)
-    "saved selection cleared; catalog retained"
-    true
-    (Core.catalog_cache_selected_graph cache = None
-     && Core.catalog_cache_graphs cache = [ { graph with encrypted } ]);
-  Alcotest.(check bool)
-    "active selection cleared after cleanup"
-    true
-    ((Core.state removed.next).snapshot.selected_graph = None);
-  check_no_work removed.next (Core.Mirror_deleted (request, Ok ()) :: blocked);
-  let saved = Core.step removed.next (deletion_save_completion removed.effects (Ok ())) in
-  let snapshot = (Core.state saved.next).snapshot in
-  Alcotest.(check bool)
-    "success reaches graph selection"
-    true
-    (snapshot.startup.awaiting_selection
-     && snapshot.selected_graph = None
-     && snapshot.local_deletion = None
-     && snapshot.last_error = None);
-  Alcotest.(check bool)
-    "completion only publishes"
-    true
-    (List.for_all
-       (function
-         | Core.Publish _ -> true
-         | _ -> false)
-       saved.effects);
-  List.iter
-    (fun transition ->
-       Alcotest.(check bool)
-         "cleanup performs no key or bootstrap requests"
-         true
-         (List.for_all
-            (function
-              | Core.Run (Core.Request (_, Core.Save_catalog _)) -> true
-              | Core.Run (Core.Request _) -> false
-              | _ -> true)
-            transition.Core.effects))
-    [ deleting; closed; removed; saved ];
-  check_no_work
-    saved.next
-    [ late_catalog
-    ; Core.Graph_detached (scope, Ok ())
-    ; Core.Mirror_deleted (request, Ok ())
-    ; deletion_save_completion old_effects (Error (Core.Effect_failed "stale"))
-    ];
-  let restarting =
-    Core.step (initial ()) (Core.Restore_local_account { user_id = "user" })
-  in
-  let restored =
-    Core.step restarting.next (load_catalog_completion restarting.effects (Some cache))
-  in
-  Alcotest.(check bool)
-    "restart has no selected graph or opening work"
-    true
-    ((Core.state restored.next).snapshot.selected_graph = None
-     && (Core.state restored.next).snapshot.startup.awaiting_selection
-     && not (has_graph_open_work restored.effects));
-  let catalog = refresh_catalog saved.next [ { graph with encrypted }; other_graph ] in
-  let other_selected = Core.step catalog.next (Core.Graph_selected other_graph_id) in
-  let other_mirror = inspect_mirror_request other_selected.effects in
-  Alcotest.(check bool)
-    "another explicit selection follows normal opening"
-    true
-    (other_mirror.graph = other_graph && other_mirror.scope.graph_id = other_graph_id);
-  check_no_work
-    other_selected.next
-    [ Core.Graph_detached (scope, Ok ())
-    ; Core.Mirror_deleted (request, Ok ())
-    ; Core.Graph_attached { scope; sync }
-    ; Core.Snapshot_activated { scope }
-    ];
-  let selected = Core.step saved.next (Core.Graph_selected graph_id) in
+  check_deletion_stage Deleting_mirror deleting.next;
+  let request = deletion_mirror deleting.effects in
+  Alcotest.(check bool) "target differs from current" true
+    (request.graph_id = graph_id && scope.graph_id = other_graph_id);
+  Alcotest.(check bool) "selected graph and admitted session remain unchanged" true
+    ((Core.state deleting.next).snapshot.selected_graph = Some other_graph_id
+     && Core.admitted_graph_scope deleting.next = Some scope);
+  Alcotest.(check bool) "no active graph close or remote request" true
+    (List.for_all (function Core.Delegate (Core.Delete_mirror _) | Core.Publish _ -> true | _ -> false) deleting.effects);
+  check_no_work deleting.next
+    [ Core.Local_cache_deletion_requested graph_id; Core.Local_cache_deletion_requested other_graph_id ];
+  let stale = { request with scope = { request.scope with lifecycle_generation = Some 99999L } } in
+  check_no_work deleting.next [ Core.Mirror_deleted (stale, Ok ()); Core.Graph_detached (old_scope, Ok ()) ];
+  let removed = Core.step deleting.next (Core.Mirror_deleted (request, Ok ())) in
+  let snapshot = (Core.state removed.next).snapshot in
+  Alcotest.(check bool) "success retains current and catalog" true
+    (snapshot.selected_graph = Some other_graph_id && snapshot.local_deletion = None
+     && snapshot.catalog = (Core.state ready).snapshot.catalog
+     && Core.admitted_graph_scope removed.next = Some scope && snapshot.last_error = None);
+  check_no_work removed.next [ Core.Mirror_deleted (request, Ok ()); Core.Graph_detached (old_scope, Ok ()) ];
+  let cache = save_catalog_cache selection_effects in
+  Alcotest.(check bool) "saved selection remains the other graph" true
+    (Core.catalog_cache_selected_graph cache = Some other_graph_id);
+  let restarting = Core.step (initial ()) (Core.Restore_local_account { user_id = "user" }) in
+  let restored = Core.step restarting.next (load_catalog_completion restarting.effects (Some cache)) in
+  Alcotest.(check bool) "restart restores unchanged selection" true
+    ((Core.state restored.next).snapshot.selected_graph = Some other_graph_id);
+  let selected = Core.step removed.next (Core.Graph_selected graph_id) in
   let mirror = inspect_mirror_request selected.effects in
-  Alcotest.(check bool)
-    "explicit selection uses a fresh scope"
-    true
-    (mirror.scope <> scope);
-  let absent =
-    Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope))
-  in
-  Alcotest.(check bool)
-    "explicit selection starts normal absent-mirror flow"
-    true
-    (List.exists
-       (function
-         | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key _)) -> encrypted
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> not encrypted
-         | _ -> false)
-       absent.effects);
-  check_no_work
-    selected.next
-    [ Core.Graph_detached (scope, Ok ())
-    ; Core.Mirror_deleted (request, Ok ())
-    ; Core.Graph_attached { scope; sync }
-    ; Core.Snapshot_activated { scope }
-    ]
+  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope)) in
+  Alcotest.(check bool) "deleted graph uses normal absent-mirror download" true
+    (List.exists (function
+       | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> not encrypted
+       | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key _)) -> encrypted
+       | _ -> false) absent.effects);
+  let _ = sync in
+  ()
 ;;
 
 let local_deletion_discards_unsynchronized_work () =
-  let core, connection = submitted_core () in
-  Alcotest.(check bool)
-    "fixture has an unacknowledged submission"
-    true
-    ((Core.state core).snapshot.sync_phase = Core.Submitting);
-  let deleting = Core.step core (Core.Local_cache_deletion_requested graph_id) in
-  check_deletion_stage Closing_graph deleting.next;
-  Alcotest.(check bool)
-    "deletion neither flushes nor waits for the remote submission"
-    true
-    (List.for_all
-       (function
-         | Core.Publish _
-         | Core.Run (Core.Close_websocket _ | Core.Cancel_effects _)
-         | Core.Delegate (Core.Detach_graph _) -> true
-         | _ -> false)
-       deleting.effects);
-  check_no_work
-    deleting.next
-    [ Core.Websocket_message
-        ( connection
-        , Protocol.Server.Tx_batch_ok
-            { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" } )
-    ];
-  let closed = Core.step deleting.next (Core.Graph_detached (connection.graph, Ok ())) in
-  ignore (deletion_mirror closed.effects)
+  let submitted, connection = submitted_core () in
+  Alcotest.(check bool) "fixture has unacknowledged work" true
+    ((Core.state submitted).snapshot.sync_phase = Core.Submitting);
+  let ready, scope, _, _ = deletion_noncurrent submitted in
+  let deleting = Core.step ready (Core.Local_cache_deletion_requested graph_id) in
+  let request = deletion_mirror deleting.effects in
+  Alcotest.(check bool) "confirmed deletion does not wait for upload" true
+    (request.graph_id = graph_id
+     && Core.admitted_graph_scope deleting.next = Some scope
+     && List.for_all (function Core.Publish _ | Core.Delegate (Core.Delete_mirror _) -> true | _ -> false) deleting.effects);
+  check_no_work deleting.next
+    [ Core.Websocket_message (connection, Protocol.Server.Tx_batch_ok
+        { t = server_cursor_of_int 1; checksum = Some "0123456789abcdef" }) ];
+  let removed = Core.step deleting.next (Core.Mirror_deleted (request, Ok ())) in
+  Alcotest.(check bool) "unsynced discard completes locally" true
+    ((Core.state removed.next).snapshot.local_deletion = None)
 ;;
 
 let local_deletion_failures_stop encrypted () =
-  let ready, scope, sync, _ = deletion_ready_graph encrypted in
+  let original, _, _, _ = deletion_ready_graph encrypted in
+  let ready, scope, _, _ = deletion_noncurrent original in
   let deleting = Core.step ready (Core.Local_cache_deletion_requested graph_id) in
-  let closed = Core.step deleting.next (Core.Graph_detached (scope, Ok ())) in
-  let request = deletion_mirror closed.effects in
-  let removed = Core.step closed.next (Core.Mirror_deleted (request, Ok ())) in
-  List.iter
-    (fun (stage, core, event, message) ->
-       let failed = Core.step core event in
-       let snapshot = (Core.state failed.next).snapshot in
-       Alcotest.(check bool)
-         "stage failure is terminal"
-         true
-         (snapshot.local_deletion = Some (Core.Deletion_failed stage)
-          && snapshot.sync_phase = Core.Failed
-          && not snapshot.startup.awaiting_selection);
-       Alcotest.(check (option string))
-         "sanitized stage error"
-         (Some message)
-         snapshot.last_error;
-       Alcotest.(check bool)
-         "failure only publishes"
-         true
-         (List.for_all
-            (function
-              | Core.Publish _ -> true
-              | _ -> false)
-            failed.effects);
-       check_no_work
-         failed.next
-         (deletion_blocked_events scope sync
-          @ [ Core.Graph_detached (scope, Ok ())
-            ; Core.Mirror_deleted (request, Ok ())
-            ; deletion_save_completion removed.effects (Ok ())
-            ]))
-    [ ( Core.Closing_graph
-      , deleting.next
-      , Core.Graph_detached (scope, Error "secret path")
-      , "Local graph close failed." )
-    ; ( Core.Deleting_mirror
-      , closed.next
-      , Core.Mirror_deleted (request, Error "secret path")
-      , "Local graph deletion failed." )
-    ; ( Core.Clearing_selection
-      , removed.next
-      , deletion_save_completion
-          removed.effects
-          (Error (Core.Effect_failed "secret path"))
-      , "Clearing the saved graph selection failed." )
-    ]
+  let request = deletion_mirror deleting.effects in
+  let failed = Core.step deleting.next (Core.Mirror_deleted (request, Error "secret path")) in
+  let snapshot = (Core.state failed.next).snapshot in
+  Alcotest.(check bool) "failure releases the flight and retains current session" true
+    (snapshot.local_deletion = None && snapshot.selected_graph = Some other_graph_id
+     && Core.admitted_graph_scope failed.next = Some scope);
+  Alcotest.(check (option string)) "failure is sanitized"
+    (Some "Local graph deletion failed. Try again.") snapshot.last_error;
+  let retry = Core.step failed.next (Core.Local_cache_deletion_requested graph_id) in
+  let retry_request = deletion_mirror retry.effects in
+  Alcotest.(check bool) "retry has a distinct identity" true (retry_request <> request);
+  check_no_work retry.next [ Core.Mirror_deleted (request, Ok ()); Core.Mirror_deleted (request, Error "late") ];
+  let recovered = Core.step retry.next (Core.Mirror_deleted (retry_request, Ok ())) in
+  Alcotest.(check bool) "retry recovers" true ((Core.state recovered.next).snapshot.last_error = None);
+  let reopened = Core.step failed.next (Core.Graph_selected graph_id) in
+  Alcotest.(check bool) "failed deletion can reopen intact graph" true
+    ((inspect_mirror_request reopened.effects).graph.graph_id = graph_id)
+;;
+
+let local_deletion_account_change_fences_completion () =
+  let original, _, _, _ = deletion_ready_graph false in
+  let ready, _, _, _ = deletion_noncurrent original in
+  let deleting = Core.step ready (Core.Local_cache_deletion_requested graph_id) in
+  let request = deletion_mirror deleting.effects in
+  let changed = Core.step deleting.next (Core.Account_authenticated { user_id = Some "another-user" }) in
+  Alcotest.(check bool) "account change retires deletion" true
+    ((Core.state changed.next).snapshot.startup.account_generation
+      > (Core.state deleting.next).snapshot.startup.account_generation
+     && (Core.state changed.next).snapshot.local_deletion = None);
+  check_no_work changed.next [ Core.Mirror_deleted (request, Ok ()); Core.Mirror_deleted (request, Error "late") ]
 ;;
 
 let recovery_connection effects =
@@ -4236,6 +4101,10 @@ let scenarios =
       "encrypted local deletion failures"
       `Quick
       (local_deletion_failures_stop true)
+  ; Alcotest.test_case
+      "local deletion account change fences completion"
+      `Quick
+      local_deletion_account_change_fences_completion
   ; Alcotest.test_case
       "cold start absent mirror reaches pull after snapshot activation"
       `Quick

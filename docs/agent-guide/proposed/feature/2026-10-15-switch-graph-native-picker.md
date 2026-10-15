@@ -6,9 +6,11 @@ The graph picker uses uneven capsule buttons and loses the active graph when ope
 
 ## Proposal
 
-Implement the user's selected concept A with native equal-width list rows, a soft header, close/refresh/existing account actions, an inline current marker and a separate row menu. Keep picker and request ownership in OCaml. Query one graph's mirror presence on demand with an account-generation fence; cache observations outside rendering.
+Implement the user's selected concept A with native equal-width list rows, a full-canvas List with Timeline-style floating close/refresh/existing account controls, an inline current marker and a separate row menu. Keep picker and request ownership in OCaml. Query one graph's mirror presence on demand with an account-generation fence; cache observations outside rendering.
 
-The user explicitly permits discarding unsynchronized local content after confirmation (Sentinel_3c2ff0ee96f88191ab349fca7f7befe9). The confirmation must explain this loss, device-only deletion and the retained cloud copy. The active graph requires switching first. Deletion-owner semantics remain gated on separate approval for the existing protected Core contract comment; this document does not grant that approval.
+The user explicitly permits discarding unsynchronized local content after confirmation (Sentinel_3c2ff0ee96f88191ab349fca7f7befe9). The confirmation must explain this loss, device-only deletion and the retained cloud copy. The active graph requires switching first. The user separately approved the minimal existing protected Core contract comment change (Sentinel_752ae13c79888191aeb7123ba1d9fd25). No other protected spec, Dune or lock edit is part of this change.
+
+The user subsequently requested removing the header entirely and making the whole UI a List like Timeline. Reuse the existing floating chrome; retain the native controls and per-row actions without a title bar.
 
 ## Alternatives considered
 
@@ -28,7 +30,13 @@ It detaches the current graph and clears its identity. Keep an application-owned
 ## Risks
 
 - Presence can be unknown or fail; expose a clear retry/status rather than assuming a downloaded copy.
-- The protected deletion contract approval is separate from this UI/presence implementation.
+- Host ARM64 OCaml restamping is an experimental Simulator compatibility path; actual runtime acceptance does not establish full iOS cross-compilation or ABI validity.
+
+## Consequences
+
+Presence observations are cached by account and invalidated for a graph lifecycle change. Native row controls stay mounted while property signals update text and enabled state: real Simulator testing showed that replacing interactive subtrees could leave the retained List cell with an obsolete callback binding. Headless final-state assertions alone did not reproduce that native retention boundary, so the acceptance check is the real Simulator flow.
+
+Deletion uses a single account-scoped flight and exact terminal result. It preserves the selected graph and catalog, validates persisted local ownership, cancels target work, waits for native leases, and revalidates before mirror removal under the existing exclusive ownership primitive. Unsynchronized local content is intentionally discarded after the warning. Unbound legacy mirrors require opening once and switching away before removal.
 
 ## Questions
 

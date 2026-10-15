@@ -215,23 +215,13 @@ let test_stale_graph_generation_and_structured_failures () =
   | None | Some _ -> fail "graph failure did not expose structured recovery"
 ;;
 
-let test_deletion_failure_has_no_recovery () =
-  let snapshot =
-    { (startup_snapshot ()) with
-      local_deletion = Some (Graph_service.Deletion_failed Closing_graph)
-    ; last_error = Some "Local graph close failed."
-    }
-  in
-  let derived = Journal_startup.derive ~snapshot ~graph:(graph_state ()) in
-  require
-    (derived.phase = Journal_startup.Failed)
-    "deletion failure returned to ready timeline";
-  require
-    (Option.fold
-       ~none:false
-       ~some:(fun error -> error.Journal_startup.recovery = None)
-       derived.error)
-    "deletion failure offered recovery"
+let test_noncurrent_deletion_keeps_active_graph_ready () =
+  List.iter (fun local_deletion ->
+    let snapshot = { (startup_snapshot ()) with local_deletion = Some local_deletion } in
+    let derived = Journal_startup.derive ~snapshot ~graph:(graph_state ()) in
+    require (derived.phase = Journal_startup.Ready)
+      "non-current deletion displaced the active graph")
+    [ Graph_service.Deletion_in_progress Deleting_mirror; Deletion_failed Deleting_mirror ]
 ;;
 
 let test_stable_startup_presentation () =
@@ -366,7 +356,7 @@ let test_e2ee_recovery_requires_a_prepared_challenge () =
 let () =
   test_e2ee_recovery_requires_a_prepared_challenge ();
   test_stable_startup_presentation ();
-  test_deletion_failure_has_no_recovery ();
+  test_noncurrent_deletion_keeps_active_graph_ready ();
   test_exact_codec_and_round_trip ();
   test_bounded_rejection ();
   test_startup_phase_is_owned_by_ui_domain ();

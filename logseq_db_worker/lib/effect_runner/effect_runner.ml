@@ -296,6 +296,8 @@ let shutdown_id_token_cache cache =
       clear_id_token_cache cache "ID token cache is stopped."))
 ;;
 
+module Authorized_graphs = Set.Make (String)
+
 type runtime =
   { fork : sw:Eio.Switch.t -> (unit -> unit) -> unit
   ; sleep : float -> unit
@@ -374,6 +376,9 @@ type t =
   ; mutable attached : (string * Sync.graph_scope) option
   ; mutable next_database_id : int64
   ; mutable stopped : bool
+  ; mutable latest_snapshot : Sync.snapshot option
+  ; mutable authorized_graphs : Authorized_graphs.t
+  ; mutable deletion_owner : Sync.mirror_deletion option
   }
 
 let runtime ~fork ~sleep = Ok { fork; sleep }
@@ -405,6 +410,9 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; attached = None
     ; next_database_id = 0L
     ; stopped = false
+    ; latest_snapshot = None
+    ; authorized_graphs = Authorized_graphs.empty
+    ; deletion_owner = None
     }
 ;;
 
@@ -1430,6 +1438,63 @@ let authoritative_transition_error = function
     "authoritative commit fatal state: " ^ message
 ;;
 
+let mirror_directory t graph_id =
+  Filename.concat t.dependencies.config.application_support_directory
+    ("logseq-db-worker/synced-graphs/" ^ Graph.Uuid.to_string graph_id)
+;;
+
+let local_owner (account : Sync.account_scope) graph_id =
+  Yojson.Safe.sort (`Assoc
+    ["user_id", `String account.user_id; "origin", `String (Uri.to_string account.managed_sync_origin)
+    ; "graph_id", `String (Graph.Uuid.to_string graph_id)])
+;;
+
+let check_local_owner t (account : Sync.account_scope) graph_id ~bind =
+  let directory = mirror_directory t graph_id in
+  let path = Filename.concat directory ".journal-local-owner.json" in
+  try
+    let expected = local_owner account graph_id in
+    if Sys.file_exists path then (
+      let stat = Unix.lstat path in
+      if stat.st_kind <> Unix.S_REG || stat.st_nlink <> 1 || stat.st_size > 4096
+      then Error "The local copy ownership could not be verified."
+      else if Yojson.Safe.sort (Yojson.Safe.from_file path) = expected then Ok ()
+      else Error "This local copy belongs to another account.")
+    else if not bind then Error "Open this graph once, then switch to another graph before deleting."
+    else (
+      let temporary, output = Filename.open_temp_file ~temp_dir:directory ".journal-owner-" ".tmp" in
+      Fun.protect ~finally:(fun () -> close_out_noerr output;
+        if Sys.file_exists temporary then Sys.remove temporary)
+        (fun () -> output_string output (Yojson.Safe.to_string expected); flush output;
+          Unix.fsync (Unix.descr_of_out_channel output); close_out output; Unix.rename temporary path);
+      Ok ())
+  with _ -> Error "The local copy ownership could not be verified."
+;;
+
+let open_owned_database t (request : Sync.mirror_request) inspection =
+  match Database.open_ ~sw:t.sw t.dependencies.overlay inspection ~graph_name:request.graph.name with
+  | Error _ as error -> error
+  | Ok database ->
+    (match check_local_owner t request.scope.account request.scope.graph_id ~bind:true with
+     | Ok () -> Ok database
+     | Error message -> ignore (Database.close database); Error (Overlay.Open_resource_failed message))
+;;
+
+let deletion_authorized t (request : Sync.mirror_deletion) =
+  match t.latest_snapshot with
+  | Some snapshot ->
+    snapshot.startup.authenticated
+    && snapshot.startup.account_generation = request.account.account_generation
+    && snapshot.selected_graph <> Some request.graph_id
+    && snapshot.local_deletion = Some (Sync.Deletion_in_progress Sync.Deleting_mirror)
+    && Authorized_graphs.mem (Graph.Uuid.to_string request.graph_id) t.authorized_graphs
+  | None -> false
+;;
+
+let deletion_current t request =
+  not t.stopped && t.deletion_owner = Some request && deletion_authorized t request
+;;
+
 let handle_sync_worker_effect t = function
   | Sync.Inspect_mirror request ->
     (match
@@ -1512,36 +1577,56 @@ let handle_sync_worker_effect t = function
                          ~event:(Sync.Snapshot_activated { scope = request.scope })
                          ())))))
   | Delete_mirror request ->
-    let key = Graph.Uuid.to_string request.graph_id in
-    (match Hashtbl.find_opt t.inspections key with
-     | None -> Error (effect_error "The mirror deletion inspection is unavailable.")
-     | Some inspection ->
-       (match
-          Result.bind
-            (Result.bind
-               (with_upload_store t (fun db ->
-                  Logseq_db_storage.Asset_upload_store.delete_graph
-                    db
-                    ~origin:(Uri.to_string request.account.managed_sync_origin)
-                    ~account:request.account.user_id
-                    ~graph:request.graph_id))
-               (fun () ->
-                  asset_unit
-                    t
-                    ~scope:
-                      { Sync.account = request.account
-                      ; graph_id = request.graph_id
-                      ; graph_generation = 0
-                      }
-                    Sync.Delete_graph_assets)
-             |> Result.map_error (fun _ -> ()))
-            (fun () ->
-               Database.delete_mirror inspection |> Result.map_error (fun _ -> ()))
-        with
-        | Error _ -> Error (effect_error "The overlay mirror could not be deleted.")
-        | Ok _ ->
-          Hashtbl.remove t.inspections key;
-          Ok (sync_result ~event:(Sync.Mirror_deleted (request, Ok ())) ())))
+    let ( let* ) = Result.bind in
+    let current () = deletion_current t request in
+    let result =
+      let* () = if current () then Ok () else Error "The graph account is no longer current." in
+      let* () = match t.attached with
+        | Some (_, scope) when scope.graph_id = request.graph_id ->
+          Error "Switch to another graph before deleting."
+        | _ -> Ok () in
+      let* inspection = Database.inspect_mirror
+          ~application_support_directory:t.dependencies.config.application_support_directory
+          ~graph_id:request.graph_id
+        |> Result.map_error (fun _ -> "The local copy could not be inspected.") in
+      let present = match Database.mirror_presence inspection with Overlay.Absent _ -> false | Available _ -> true in
+      let* () = if present then check_local_owner t request.account request.graph_id ~bind:false else Ok () in
+      let same_target (scope : Sync.graph_scope) =
+        scope.graph_id = request.graph_id
+        && scope.account.user_id = request.account.user_id
+        && Uri.equal scope.account.managed_sync_origin request.account.managed_sync_origin in
+      Hashtbl.iter (fun (ticket : Upload.ticket) resolve ->
+        if same_target ticket.scope then ignore (Eio.Promise.try_resolve resolve () : bool)) t.upload_operations;
+      let rec drain attempts =
+        if not (current ()) then Error "The graph account is no longer current."
+        else if not (Hashtbl.fold (fun (ticket : Upload.ticket) _ busy -> busy || same_target ticket.scope)
+          t.upload_operations false) then Ok ()
+        else if attempts = 0 then Error "The local copy is still in use. Close attachment previews and try again."
+        else (t.dependencies.runtime.sleep 0.005; drain (attempts - 1)) in
+      let* () = drain 1000 in
+      with_staging_lock t (fun () ->
+        let* () = if current () then Ok () else Error "The graph account is no longer current." in
+        let* () = asset_unit t
+          ~scope:{ Sync.account = request.account; graph_id = request.graph_id; graph_generation = 0 }
+          Sync.Delete_graph_assets |> Result.map_error (fun _ ->
+            "The local copy is still in use. Close attachment previews and try again.") in
+        let* () = if current () then Ok () else Error "The graph account is no longer current." in
+        let* () = if present then check_local_owner t request.account request.graph_id ~bind:false else Ok () in
+        let* () =
+          if not present then Ok ()
+          else Database.delete_mirror inspection |> Result.map (fun _ -> ())
+            |> Result.map_error (function
+              | Overlay.Mirror_delete_busy -> "The local copy is still in use. Close attachment previews and try again."
+              | _ -> "Local graph deletion failed. Try again.") in
+        let* () = with_upload_store t (fun db ->
+          Logseq_db_storage.Asset_upload_store.delete_graph db
+            ~origin:(Uri.to_string request.account.managed_sync_origin)
+            ~account:request.account.user_id ~graph:request.graph_id)
+          |> Result.map_error (fun _ -> "Local graph deletion failed. Try again.") in
+        Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
+        Ok ())
+    in
+    Ok (sync_result ~event:(Sync.Mirror_deleted (request, result)) ())
   | Attach_graph request ->
     ignore (close_attached t);
     let key = Graph.Uuid.to_string request.graph.graph_id in
@@ -1549,11 +1634,7 @@ let handle_sync_worker_effect t = function
      | None -> Error (effect_error "The graph attachment inspection is stale.")
      | Some inspection ->
        (match
-          Database.open_
-            ~sw:t.sw
-            t.dependencies.overlay
-            inspection
-            ~graph_name:request.graph.name
+          open_owned_database t request inspection
         with
         | Error _ -> Error (effect_error "The overlay graph could not be opened.")
         | Ok database ->
@@ -2016,6 +2097,9 @@ let submit t = function
   | Core.Run_asset (context, instruction) ->
     if not t.stopped then run_asset t context instruction
   | Close_asset_scope scope -> send_asset t ~scope Sync.Close_asset_scope
+  | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror deletion)) as request) ->
+    if deletion_authorized t deletion then t.deletion_owner <- Some deletion;
+    if not t.stopped then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
   | Core.Run_worker request ->
     if not t.stopped
     then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
@@ -2040,6 +2124,14 @@ let submit t = function
     t.dependencies.sync_runner.submit sync_effect
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect
+  | Publish (Core.Sync_output (Sync.State_changed state) as output) ->
+    if not (Option.fold ~none:false ~some:(fun old -> old.Sync.catalog == state.snapshot.catalog) t.latest_snapshot)
+    then t.authorized_graphs <- List.fold_left (fun ids (graph : Sync.graph) ->
+      Authorized_graphs.add (Graph.Uuid.to_string graph.graph_id) ids) Authorized_graphs.empty state.snapshot.catalog;
+    t.latest_snapshot <- Some state.snapshot;
+    if not (Option.fold ~none:false ~some:(deletion_authorized t) t.deletion_owner)
+    then t.deletion_owner <- None;
+    if not t.stopped then t.dependencies.publish output
   | Publish output -> if not t.stopped then t.dependencies.publish output
 ;;
 

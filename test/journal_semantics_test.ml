@@ -822,9 +822,9 @@ let test_timeline_options_menu () =
         | _ -> None) (ops ()) |> Option.get in
       ignore (Lui_app.dispatch_event app (Lui_protocol.Press node));
       ignore (Lui_app.flush app))
-      [ "Attachment settings"; "Diagnostics"; "Switch graph"; "Delete local graph copy"; "Sign out" ];
+      [ "Attachment settings"; "Diagnostics"; "Switch graph"; "Sign out" ];
     require (List.rev !actions = Journal_header.[Open_asset_settings; Open_diagnostics;
-      Switch_graph; Request_local_cache_reset; Sign_out]) "Options lost an existing action")
+      Switch_graph; Sign_out]) "Options lost an existing action")
 ;;
 
 let media_item n file_type presentation size =

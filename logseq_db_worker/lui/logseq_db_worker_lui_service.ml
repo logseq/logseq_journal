@@ -6,6 +6,7 @@ module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 module Protocol = Db.Protocol
 module Overlay = Logseq_overlay_db.Database
 module ID = Journal_worker_ids
+module Authorized_graphs = Set.Make (String)
 
 let unlock_log_count = Atomic.make 0
 
@@ -237,7 +238,16 @@ type asset_command =
   | Retry_asset of Logseq_db_types.Graph_types.Uuid.t
   | Retry_upload of Logseq_db_types.Graph_types.Uuid.t
 
+type local_copy_presence = Downloaded | Not_downloaded
+
+type local_copy_request =
+  { graph_id : graph_id
+  ; account_generation : int
+  }
+
 type request =
+  | Inspect_local_copy of local_copy_request
+  | Delete_local_copy of local_copy_request
   | Import_asset of
       { graph_generation : int
       ; source : Logseq_db_types.Asset_import.t
@@ -263,6 +273,8 @@ type request =
       }
 
 type response =
+  | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
+  | Local_copy_deleted of local_copy_request * (unit, string) result
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
   | Asset_file of (string * string) option
@@ -509,6 +521,9 @@ let create ~(dependencies : dependencies) =
   let module Session = struct
     type t =
       { worker : Db.t
+      ; application_support_directory : string
+      ; mutable catalog_source : Sync.graph list
+      ; mutable authorized_graphs : Authorized_graphs.t
       ; token_cache : Worker_runner.id_token_cache
       ; authenticated_user : string option ref
       ; auth_seen : bool ref
@@ -666,6 +681,9 @@ let create ~(dependencies : dependencies) =
                  Ok
                    Session.
                      { worker
+                     ; application_support_directory = config.Db.Config.application_support_directory
+                     ; catalog_source = []
+                     ; authorized_graphs = Authorized_graphs.empty
                      ; token_cache
                      ; authenticated_user
                      ; auth_seen
@@ -676,6 +694,35 @@ let create ~(dependencies : dependencies) =
                      }))))
     ~handle:(fun context session request ->
       match request with
+      | Delete_local_copy request ->
+        Eio.Condition.loop_no_mutex session.auth_wake (fun () ->
+          if !(session.auth_enqueued_sequence) >= !(session.auth_sequence) then Some () else None);
+        Ok (Local_copy_deleted (request,
+          Db.delete_local_copy session.worker ~account_generation:request.account_generation
+            ~graph_id:request.graph_id))
+      | Inspect_local_copy request ->
+        let snapshot = (Db.view session.worker).sync.snapshot in
+        if session.catalog_source != snapshot.catalog then (
+          session.catalog_source <- snapshot.catalog;
+          session.authorized_graphs <- List.fold_left (fun ids (graph : Sync.graph) ->
+            Authorized_graphs.add (Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id) ids)
+              Authorized_graphs.empty snapshot.catalog);
+        let result =
+          if not snapshot.startup.authenticated
+             || request.account_generation <> snapshot.startup.account_generation
+             || not (Authorized_graphs.mem (Logseq_db_types.Graph_types.Uuid.to_string request.graph_id) session.authorized_graphs)
+          then Error "The graph account is no longer current."
+          else
+            match Overlay.inspect_mirror
+              ~application_support_directory:session.application_support_directory
+              ~graph_id:request.graph_id with
+            | Error _ -> Error "Unable to check the local copy. Try again."
+            | Ok inspection ->
+              Ok (match Overlay.mirror_presence inspection with
+                | Logseq_overlay_db.Types.Absent _ -> Not_downloaded
+                | Available _ -> Downloaded)
+        in
+        Ok (Local_copy_inspected (request, result))
       | Import_asset { graph_generation; source } ->
         Ok (Asset_imported (Db.import_asset session.worker ~graph_generation source))
       | Get_graph_state -> Ok (Graph_state (Db.graph_state session.worker))
@@ -734,6 +781,8 @@ let create ~(dependencies : dependencies) =
            Reassert the observed SDK state after restoration's ordered post. *)
         if !(session.auth_seen) then session.queue_auth !(session.authenticated_user);
         Ok Client_command_completed
+      | Client_command (Delete_local_cache _) ->
+        Error "Local deletion requires an account-scoped request."
       | Client_command command ->
         (match command with Submit_e2ee_password _ -> unlock_queue_log context | _ -> ());
         Db.post session.worker (client_event command);

@@ -25,6 +25,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
     case page, header, detail, unlock, startup
+    case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
     case boundedText = "bounded-text"
@@ -136,12 +137,13 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let cluster: AnyView
     let progress: AnyView
     let properties: Properties
+    var leading: AnyView? = nil
     @Environment(\.journalContainerTopInset) private var containerTopInset
     @State private var controlsSize = CGSize.zero
 
     var body: some SwiftUI.View {
       GeometryReader { bounds in
-        content.frame(width: bounds.size.width, height: bounds.size.height)
+        scrollingContent.frame(width: bounds.size.width, height: bounds.size.height)
           .scrollContentBackground(.hidden)
           #if os(iOS)
           // Journals has no section title; named sections retain native indicators.
@@ -159,6 +161,11 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .overlay(alignment: .topTrailing) {
             if properties.title == nil {
               controls.padding(.trailing, 16)
+            }
+          }
+          .overlay(alignment: .topLeading) {
+            if let leading {
+              leading.glassEffect(.regular, in: .capsule).padding(.leading, 16)
             }
           }
           .safeAreaBar(edge: .top, spacing: 0) {
@@ -185,6 +192,14 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .safeAreaPadding(.top, containerTopInset)
       .ignoresSafeArea(.container, edges: .top)
       #endif
+    }
+
+    @ViewBuilder private var scrollingContent: some SwiftUI.View {
+      if properties.mode == .graphPicker {
+        content.contentMargins(.top, 52, for: .scrollContent)
+      } else {
+        content
+      }
     }
 
     private var controls: some SwiftUI.View {
@@ -236,6 +251,12 @@ struct JournalSheetDismissButton: SwiftUI.View {
           properties.connecting != nil, properties.controls != nil {
           FloatingChrome(content: child(0), cluster: child(1),
             progress: child(2), properties: properties)
+        }
+      case .graphPicker:
+        if let properties, context.childIDs.count == 4,
+          properties.connecting != nil, properties.controls != nil {
+          FloatingChrome(content: child(0), cluster: child(1),
+            progress: child(2), properties: properties, leading: child(3))
         }
       case .startup:
         if let properties, context.childIDs.count == 1 {

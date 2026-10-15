@@ -1484,6 +1484,24 @@ let test_cache_durable_staging () =
       (request (Core.Retain_staged_file file) = Ok (Core.Asset_retained None)))
 ;;
 
+let test_cache_deletion_waits_for_native_lease () =
+  with_local_asset_cache (fun support request ->
+    let source = Filename.concat support "preview.bin" in
+    Out_channel.with_open_bin source (fun output -> output_string output "preview");
+    let file, _, _ = cache_stage request source in
+    let lease, path = request (Core.Retain_staged_file file) |> retained_value in
+    cache_bool "deletion waits or reports resources in use" true
+      (Result.is_error (request Core.Delete_graph_assets));
+    cache_bool "live preview keeps its file" true (Sys.file_exists path);
+    cache_unit (request (Core.Release_asset_file lease));
+    (match request Core.Delete_graph_assets with
+     | Ok Core.Asset_unit -> ()
+     | Error (Core.Asset_invalid_content message) -> Alcotest.fail message
+     | Error Core.Asset_cancelled -> Alcotest.fail "cleanup unexpectedly cancelled"
+     | _ -> Alcotest.fail "cleanup returned another result");
+    cache_bool "retry removes released file" false (Sys.file_exists path))
+;;
+
 let test_cache_staging_limits () =
   with_local_asset_cache ~pending_budget:4L (fun support request ->
     let source = Filename.concat support "picker.bin" in
@@ -1638,6 +1656,7 @@ let test_cache_staged_preview () =
 
 let scenarios =
   scenarios
+  @ [ Alcotest.test_case "graph deletion waits for native preview lease" `Quick test_cache_deletion_waits_for_native_lease ]
   @ List.map
       (fun (name, test) -> Alcotest.test_case name `Quick test)
       [ "cache durable staging via submit", test_cache_durable_staging

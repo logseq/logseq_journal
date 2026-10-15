@@ -1066,7 +1066,8 @@ let authenticate_new_account core user_id =
   in
   let snapshot =
     { core.public_state.snapshot with
-      catalog = []
+      local_deletion = None
+    ; catalog = []
     ; selected_graph = None
     ; applied_server_t = None
     ; startup
@@ -1080,6 +1081,7 @@ let authenticate_new_account core user_id =
       ; pending_effects = []
       ; catalog_cache_loading = false
       ; deferred_catalog_reconciliation = false
+      ; deletion_scope = None
       ; cached_selected_graph = None
       ; current_graph_scope = None
       ; graph_key = None
@@ -1162,6 +1164,7 @@ let restore_local core user_id =
       ; pending_effects = []
       ; catalog_cache_loading = true
       ; deferred_catalog_reconciliation = false
+      ; deletion_scope = None
       ; cached_selected_graph = None
       ; selected_graph_value = None
       ; current_graph_scope = None
@@ -1186,7 +1189,7 @@ let restore_local core user_id =
       ; deferred_authoritative_owner = None
       ; websocket_live = false
       }
-      { core.public_state.snapshot with startup }
+      { core.public_state.snapshot with local_deletion = None; startup }
   in
   let next, request = issue_request core (Load_catalog (account_scope core user_id)) in
   { next; effects = [ publish next; Run request ] }
@@ -1198,7 +1201,8 @@ let sign_out core =
   let current_startup = core.public_state.snapshot.startup in
   let snapshot =
     { core.public_state.snapshot with
-      sync_phase = Offline
+      local_deletion = None
+    ; sync_phase = Offline
     ; catalog = []
     ; selected_graph = None
     ; applied_server_t = None
@@ -1218,6 +1222,7 @@ let sign_out core =
       ; pending_effects = []
       ; catalog_cache_loading = false
       ; deferred_catalog_reconciliation = false
+      ; deletion_scope = None
       ; cached_selected_graph = None
       ; current_graph_scope = None
       ; graph_key = None
@@ -2366,15 +2371,14 @@ let deletion_failed core stage =
   let message =
     match stage with
     | Closing_graph -> "Local graph close failed."
-    | Deleting_mirror -> "Local graph deletion failed."
+    | Deleting_mirror -> "Local graph deletion failed. Try again."
     | Clearing_selection -> "Clearing the saved graph selection failed."
   in
   let next =
     set_snapshot
-      { core with pending_effects = [] }
+      { core with deletion_scope = None }
       { core.public_state.snapshot with
-        local_deletion = Some (Deletion_failed stage)
-      ; sync_phase = Failed
+        local_deletion = None
       ; last_error = Some message
       }
   in
@@ -2669,50 +2673,27 @@ let inspect_sync core scope =
 
 let begin_local_deletion core graph_id =
   let snapshot = core.public_state.snapshot in
-  match core.current_graph_scope, core.sync_view with
-  | Some scope, Some _
-    when scope.graph_id = graph_id
-         && snapshot.selected_graph = Some graph_id
-         && snapshot.startup.authenticated
-         && snapshot.startup.failure = None
-         && (not snapshot.startup.restoring_local)
-         && (not snapshot.startup.bootstrapping)
-         && (not snapshot.startup.awaiting_selection)
-         && (not snapshot.startup.awaiting_e2ee_password)
-         && core.pending_attachment = None
-         && core.active_snapshot_download = None ->
-    let closing = return_to_graph_picker core in
-    let cleared = closing.next.public_state.snapshot in
-    let next =
-      set_snapshot
-        { closing.next with
-          deletion_scope = Some scope
-        ; lifecycle_generation = Int64.succ core.lifecycle_generation
-        ; connection_generation = core.connection_generation + 1
-        ; catalog_cache_loading = false
-        ; deferred_catalog_reconciliation = false
-        }
-        { cleared with
-          selected_graph = snapshot.selected_graph
-        ; local_deletion = Some (Deletion_in_progress Closing_graph)
-        ; startup = { cleared.startup with awaiting_selection = false }
-        }
-    in
-    { next
-    ; effects =
-        [ publish next
-        ; Run
-            (Close_websocket
-               { graph = scope; connection_generation = core.connection_generation })
-        ; Run
-            (Cancel_effects
-               { (effect_scope_of_account scope.account) with
-                 presentation_generation = None
-               ; lifecycle_generation = None
-               })
-        ; Delegate (Detach_graph scope)
-        ]
-    }
+  match core.user_id, graph_in_catalog snapshot.catalog graph_id with
+  | Some user_id, Some _
+    when snapshot.startup.authenticated
+      && snapshot.selected_graph <> Some graph_id
+      && snapshot.local_deletion = None
+      && not snapshot.startup.restoring_local
+      && not snapshot.startup.bootstrapping
+      && not snapshot.startup.awaiting_e2ee_password
+      && core.pending_attachment = None
+      && core.active_snapshot_download = None ->
+    let account = account_scope core user_id in
+    (* A private flight identity leaves the live graph's generations untouched. *)
+    let account = { account with lifecycle_generation = Int64.of_int core.next_effect_id } in
+    let scope = { account; graph_id; graph_generation = snapshot.startup.graph_generation } in
+    let next = set_snapshot
+        { core with deletion_scope = Some scope
+          ; next_effect_id = core.next_effect_id + 1
+ }
+        { snapshot with local_deletion = Some (Deletion_in_progress Deleting_mirror); last_error = None } in
+    { next; effects = [publish next; Delegate (Delete_mirror
+        { account; graph_id; scope = effect_scope_of_graph scope })] }
   | _ -> unchanged core
 ;;
 
@@ -2746,38 +2727,33 @@ let graph_detached core scope result =
 let mirror_deleted core (request : mirror_deletion) result =
   match core.deletion_scope, core.public_state.snapshot.local_deletion with
   | Some scope, Some (Deletion_in_progress Deleting_mirror)
-    when request.account = scope.account
-         && request.graph_id = scope.graph_id
-         && request.scope = effect_scope_of_graph scope ->
+    when request.account = scope.account && request.graph_id = scope.graph_id
+      && request.scope = effect_scope_of_graph scope ->
     (match result with
-     | Error _ -> deletion_failed core Deleting_mirror
+     | Error message ->
+       let failed = deletion_failed core Deleting_mirror in
+       if List.mem message
+         [ "This local copy belongs to another account."
+         ; "Open this graph once, then switch to another graph before deleting."
+         ; "The local copy ownership could not be verified."
+         ; "Switch to another graph before deleting."
+         ; "The local copy is still in use. Close attachment previews and try again." ]
+       then
+         let next = set_snapshot failed.next { failed.next.public_state.snapshot with last_error = Some message } in
+         { next; effects = [publish next] }
+       else failed
      | Ok () ->
-       let snapshot = core.public_state.snapshot in
-       let next =
-         set_snapshot
-           { core with cached_selected_graph = None }
-           { snapshot with
-             selected_graph = None
-           ; local_deletion = Some (Deletion_in_progress Clearing_selection)
-           }
-       in
-       let account = account_scope next scope.account.user_id in
-       let cache =
-         catalog_cache
-           ~user_id:account.user_id
-           ~graphs:snapshot.catalog
-           ~selected_graph:None
-       in
-       let next, save = issue_request next (Save_catalog { account; cache }) in
-       { next; effects = [ publish next; Run save ] })
+       let next = set_snapshot { core with deletion_scope = None }
+           { core.public_state.snapshot with local_deletion = None; last_error = None } in
+       { next; effects = [publish next] })
   | _ -> unchanged core
 ;;
 
 let deletion_blocks_event core event =
   match core.public_state.snapshot.local_deletion, event with
-  | None, _ -> false
-  | Some _, (Graph_detached _ | Mirror_deleted _ | Runner_completed _ | Shutdown) -> false
-  | Some _, _ -> true
+  | Some (Deletion_in_progress _),
+    (Local_cache_deletion_requested _ | Graph_selected _ | Graph_picker_requested) -> true
+  | _ -> false
 ;;
 
 let step core event =
@@ -3181,7 +3157,9 @@ let request_asset core (request : asset_request) =
             (fun (scope : graph_scope) -> scope.account = request.scope.account)
             core.asset_known_scopes
         | Delete_graph_assets ->
-          List.exists
+          Option.fold ~none:false ~some:(fun (scope : graph_scope) ->
+            scope.account = request.scope.account && scope.graph_id = request.scope.graph_id) core.deletion_scope
+          || List.exists
             (fun (scope : graph_scope) ->
                scope.account = request.scope.account
                && scope.graph_id = request.scope.graph_id)

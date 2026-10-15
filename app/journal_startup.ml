@@ -75,7 +75,7 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     && graph.phase = Logseq_db_worker.Graph_open
     && not snapshot.timeline_presentation_pending
   in
-  if Option.is_some snapshot.local_deletion
+  if Option.is_some snapshot.local_deletion && not ready
   then (
     match snapshot.local_deletion with
     | Some (Graph_service.Deletion_in_progress _) ->
@@ -236,7 +236,7 @@ module Presentation = struct
     | Some o ->
       (match o.manager with
        | Some manager when o.graph_ready && o.feed_loaded && not o.graph_error
-           && manager.local_deletion = None && manager.startup.authenticated
+           && manager.startup.authenticated
            && o.graph.phase = Logseq_db_worker.Graph_open && graph_matches manager o.graph -> Timeline
        | Some manager ->
          let startup = derive ~snapshot:manager ~graph:o.graph in

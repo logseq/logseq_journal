@@ -269,9 +269,18 @@ let mirror_generation value =
 
 let mirror_generation_for_path path =
   let stat = Unix.stat path in
+  let owner_path = Filename.concat (Filename.dirname path) ".journal-local-owner.json" in
+  let owner_identity =
+    try
+      let owner = Unix.lstat owner_path in
+      if owner.st_kind <> Unix.S_REG || owner.st_nlink <> 1 || owner.st_size > 4096
+      then "invalid-owner"
+      else In_channel.with_open_bin owner_path In_channel.input_all
+        |> Digestif.SHA256.digest_string |> Digestif.SHA256.to_hex
+    with Unix.Unix_error (Unix.ENOENT, _, _) -> "no-owner" in
   mirror_generation
     (Digestif.SHA256.digest_string
-       (Printf.sprintf "%s:%d:%d" path stat.st_dev stat.st_ino)
+       (Printf.sprintf "%s:%d:%d:%s" path stat.st_dev stat.st_ino owner_identity)
      |> Digestif.SHA256.to_hex)
 ;;
 
@@ -698,34 +707,40 @@ let rec remove_mirror_tree path =
   | _ -> Unix.unlink path
 ;;
 
+let deletion_sequence = Atomic.make 0
+
 let delete_mirror inspection =
   let path = inspection.location.database_path in
   match inspection.presence with
   | Types.Absent _ -> Error Types.Mirror_delete_stale
   | Available { generation = expected; _ } ->
-    (match inspect_durable_mirror inspection.location with
-     | Error _ | Ok { presence = Absent _; _ } -> Error Types.Mirror_delete_stale
-     | Ok { presence = Available { generation = current; _ }; _ }
-       when not (Types.Mirror_generation.equal expected current) ->
-       Error Types.Mirror_delete_stale
-     | Ok { presence = Available _; _ } ->
-       let graph_directory = Filename.dirname path in
-       (match Ownership.acquire ~graph_directory with
-        | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
-        | Error (Unavailable message) -> Error (Types.Mirror_delete_failed message)
-        | Ok ownership ->
-          (try
-             remove_mirror_tree graph_directory;
-             ignore (Ownership.release ownership);
-             Ok
-               { Types.graph_uuid = Some inspection.location.graph_id
-               ; previous_generation = expected
-               ; absent_generation = absent_mirror_generation path
-               }
-           with
-           | exn ->
-             ignore (Ownership.release ownership);
-             Error (Types.Mirror_delete_failed (Printexc.to_string exn)))))
+    let graph_directory = Filename.dirname path in
+    let ownership =
+      try Ownership.acquire ~graph_directory with
+      | exn -> Error (Ownership.Unavailable (Printexc.to_string exn)) in
+    (match ownership with
+     | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
+     | Error (Unavailable message) ->
+       if not (Sys.file_exists graph_directory) then Error Types.Mirror_delete_stale
+       else Error (Types.Mirror_delete_failed message)
+     | Ok ownership ->
+       Fun.protect ~finally:(fun () -> ignore (Ownership.release ownership)) (fun () ->
+         match inspect_durable_mirror inspection.location with
+         | Error _ | Ok { presence = Absent _; _ } -> Error Types.Mirror_delete_stale
+         | Ok { presence = Available { generation = current; _ }; _ }
+           when not (Types.Mirror_generation.equal expected current) -> Error Types.Mirror_delete_stale
+         | Ok _ ->
+           try
+             let retired = Printf.sprintf "%s.deleted-%d-%d" graph_directory (Unix.getpid ())
+                 (Atomic.fetch_and_add deletion_sequence 1) in
+             if Sys.file_exists retired then Error (Types.Mirror_delete_failed "retired location is occupied")
+             else (
+               Unix.rename graph_directory retired;
+               ignore (Ownership.release ownership);
+               remove_mirror_tree retired;
+               Ok { Types.graph_uuid = Some inspection.location.graph_id
+                  ; previous_generation = expected; absent_generation = absent_mirror_generation path })
+           with exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn))))
 ;;
 
 let validate_receipts sqlite =

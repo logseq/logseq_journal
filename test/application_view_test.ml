@@ -610,6 +610,7 @@ let run_favorites_native_visibility
         Ok ())
       ~handle:(fun context () request ->
         match request with
+        | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.get import_probe then Atomic.set import_probed true;
           if Atomic.exchange publish_block false
@@ -3661,6 +3662,7 @@ let test_reference_outer_terminals cancel =
                   }))
         in
         match request with
+        | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.exchange refresh false
           then
@@ -4312,9 +4314,9 @@ let test_reactive_header_current_controls () =
        ignore (Lui_app.flush app);
        Alcotest.(check int) "Capture consults current disabled gate" 0 !capture_count;
        Alcotest.(check bool)
-         "current cache capability exposes menu action"
+         "current graph cannot be deleted from the account menu"
          true
-         (Option.is_some (find TextValue "Delete local graph copy"));
+         (Option.is_none (find TextValue "Delete local graph copy"));
        ignore
          (Lui_app.dispatch_event
             app
@@ -4456,6 +4458,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
             (Service.Client_state_changed value)
         in
         match request with
+        | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if queue_full && Atomic.fetch_and_add graph_reads 1 > 0 then (
             while not (Atomic.get release) do
@@ -4902,6 +4905,9 @@ let test_graph_picker_controls scenario () =
         ; last_error = None; local_deletion = None }
     ; diagnostics = { groups = [] } } in
   let current = Atomic.make manager and commands = Atomic.make [] in
+  let inspections = Atomic.make 0 and deletions = Atomic.make [] in
+  let graph_opens = Atomic.make 0 in
+  let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:6 ~concurrency:Serial
       ~init:(fun context _ ->
@@ -4912,6 +4918,14 @@ let test_graph_picker_controls scenario () =
           Atomic.set current value;
           W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
         match request with
+        | Service.Inspect_local_copy request ->
+          Atomic.incr inspections;
+          Ok (Service.Local_copy_inspected (request,
+            if scenario = `Presence_failure then Error "Synthetic presence read failed. Try again."
+            else Ok (if scenario = `Visible then Service.Not_downloaded else Service.Downloaded)))
+        | Service.Delete_local_copy request ->
+          Atomic.set deletions (request :: Atomic.get deletions);
+          Ok (Service.Local_copy_deleted (request, if scenario = `Failure_select then Error "Synthetic delete failed. Try again." else Ok ()))
         | Service.Get_graph_state ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
@@ -4935,7 +4949,7 @@ let test_graph_picker_controls scenario () =
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
         | Graph_request request ->
           let outcome = match request.P.command with
-            | V2_graph_info -> P.V2_graph_info_outcome
+            | V2_graph_info -> Atomic.incr graph_opens; P.V2_graph_info_outcome
                 { graph_uuid = Option.get (Atomic.get current).snapshot.selected_graph
                 ; graph_name = "Synthetic"; schema = { major = 65; minor = 33 }
                 ; admission_facts = []; journal_title_format = None
@@ -4952,16 +4966,22 @@ let test_graph_picker_controls scenario () =
             { api_version = P.api_version; request_id = request.request_id; outcome }))
         | Import_asset _ -> Error "Unused graph-picker fixture import")
       ~shutdown:(fun () -> ()) () in
-  let hooks = Application.For_testing.app_with_service ~on_client:(fun value -> client := Some value) service in
+  let hooks = Application.For_testing.app_with_service
+    ~on_view_region:(fun region -> if region = "root" then incr root_renders)
+    ~on_client:(fun value -> client := Some value) service in
   let props = Hashtbl.create 128 in
-  let teardown = track_json_wire_teardown (Hashtbl.remove props) in
+  let retained_select = ref None and select_detached = ref false in
+  let teardown = track_json_wire_teardown (fun id ->
+    if !retained_select = Some id then select_detached := true;
+    Hashtbl.remove props id) in
   let consume source =
     if source <> "" then
       let open Yojson.Safe.Util in
       Yojson.Safe.from_string source |> member "ops" |> to_list |> List.iter (fun op ->
         teardown op;
         match member "op" op |> to_string with
-        | "create-node" | "create-extension" -> Hashtbl.replace props (member "id" op |> to_int) []
+        | "create-node" | "create-extension" ->
+          Hashtbl.replace props (member "id" op |> to_int) ["__kind", member "kind" op; "_extension", member "identifier" op]
         | "set-prop" | "set-extension-prop" ->
           let id = member "id" op |> to_int in
           let key = member "property" op |> to_string in
@@ -4993,6 +5013,17 @@ let test_graph_picker_controls scenario () =
       press (Option.get (find "text" "Switch graph"));
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
       match scenario with
+      | `Visible ->
+        let before = !root_renders in
+        let list = Option.get (find "_extension" "journal-list") in
+        let range () = consume (hooks.extension_event list "event"
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":0,\"last\":9223372036854775807}"}|}) in
+        range ();
+        wait "visible rows are inspected" (fun () -> Atomic.get inspections = 2
+          && Option.is_some (find "text" "Not downloaded"));
+        for _ = 1 to 10 do range (); consume (hooks.pump ()) done;
+        Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
+        Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
       | `Current ->
         Alcotest.(check bool) "current marker stays in catalog row" true
           (Option.is_some (find "text" "Current graph"));
@@ -5009,20 +5040,63 @@ let test_graph_picker_controls scenario () =
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
           List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
-      | `Delete_menu ->
+      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure) ->
+        let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+        if scenario = `Failure_select then retained_select := Some stable_select;
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "row action is exposed" (fun () -> Option.is_some (find "text" "Delete local copy"));
         press (node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        if scenario = `Presence_failure then (
+          wait "presence failure is visible" (fun () -> Option.is_some (find "text" "Synthetic presence read failed. Try again."));
+          Alcotest.(check int) "one bounded presence request" 1 (Atomic.get inspections))
+        else (
         wait "confirm names data loss" (fun () ->
           Hashtbl.fold (fun _ values found -> found || List.exists (fun (_, value) ->
             match value with `String text -> String.starts_with ~prefix:"Remove “" text
               && String.contains text '\n' | _ -> false) values) props false);
         Alcotest.(check bool) "requesting confirmation does not delete" false
-          (List.exists (function Service.Delete_local_cache _ -> true | _ -> false) (Atomic.get commands))
+          (List.exists (function Service.Delete_local_cache _ -> true | _ -> false) (Atomic.get commands));
+        wait "single presence request completes" (fun () -> Atomic.get inspections = 1);
+        for _ = 1 to 8 do consume (hooks.pump ()) done;
+        Alcotest.(check int) "rendering never repeats presence IO" 1 (Atomic.get inspections);
+        if scenario = `Cancel then (
+          press (Option.get (find "text" "Cancel"));
+          Alcotest.(check int) "Cancel sends no deletion" 0 (List.length (Atomic.get deletions)))
+        else if scenario = `Confirm || scenario = `Reopen || scenario = `Failure_select then (
+          let confirm = Hashtbl.fold (fun id values found ->
+            if List.assoc_opt "text" values = Some (`String "Delete local copy")
+              && List.assoc_opt "__kind" values <> Some (`String "menu-item")
+            then Some id else found) props None |> Option.get in
+          press confirm;
+          wait "confirmed delete reaches account-scoped worker request" (fun () -> Atomic.get deletions <> []);
+          let deleted = List.hd (Atomic.get deletions) in
+          Alcotest.(check bool) "deletion identity is exact" true
+            (deleted.graph_id = second && deleted.account_generation = 1);
+          if scenario = `Failure_select then (
+            wait "delete failure is visible" (fun () -> Option.is_some (find "text" "Synthetic delete failed. Try again."));
+            Alcotest.(check bool) "native List retains live interactive row during operation status changes" false !select_detached;
+            press stable_select;
+            wait "existing row callback retains its graph after failure" (fun () ->
+              List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands)))
+          else wait "deleted graph stays available to download" (fun () -> Option.is_some (find "text" "Not downloaded"));
+          if scenario = `Reopen then (
+            let switch id =
+              let before = Atomic.get graph_opens in
+              press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string id));
+              wait "reopened graph becomes current" (fun () -> (Atomic.get current).snapshot.selected_graph = Some id);
+              wait "reopened graph handshake runs" (fun () -> Atomic.get graph_opens > before);
+              wait "reopened graph presents timeline" (fun () -> Option.is_none (find "accessibility-identifier" "graph-picker-list")
+                && Option.is_some (find "text" "Switch graph"));
+              press (Option.get (find "text" "Switch graph"));
+              wait "picker returns after reopening" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list")) in
+            switch second;
+            switch first;
+            Alcotest.(check bool) "reopened copy does not keep the stale not-downloaded label" true
+              (Option.is_none (find "text" "Not downloaded")))))
       | `Current_menu ->
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
         Alcotest.(check bool) "current protection explains switching first" true
-          (Option.is_some (find "text" "Switch to another graph before deleting.")))
+          (Option.is_some (find "text" "Switch graphs first.")))
 ;;
 
 let () =
@@ -5037,7 +5111,13 @@ let () =
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
         Alcotest.test_case "row deletion confirmation" `Quick (test_graph_picker_controls `Delete_menu);
-        Alcotest.test_case "current row deletion protection" `Quick (test_graph_picker_controls `Current_menu)])
+        Alcotest.test_case "current row deletion protection" `Quick (test_graph_picker_controls `Current_menu);
+        Alcotest.test_case "cancel deletion keeps local copy" `Quick (test_graph_picker_controls `Cancel);
+        Alcotest.test_case "confirmed deletion preserves downloadable row" `Quick (test_graph_picker_controls `Confirm);
+        Alcotest.test_case "presence failure is bounded and visible" `Quick (test_graph_picker_controls `Presence_failure);
+        Alcotest.test_case "visible presence is bounded and cached" `Quick (test_graph_picker_controls `Visible);
+        Alcotest.test_case "reopened copy invalidates absence observation" `Quick (test_graph_picker_controls `Reopen);
+        Alcotest.test_case "deletion failure keeps live row callback identity" `Quick (test_graph_picker_controls `Failure_select)])
     ; ( "relative date chrome", [
         Alcotest.test_case "calendar boundaries and date updates" `Quick test_timeline_relative_date_headers;
         Alcotest.test_case "empty Detail navigation title" `Quick test_detail_empty_navigation_title;

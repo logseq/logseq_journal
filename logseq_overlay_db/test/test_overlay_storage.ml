@@ -683,6 +683,20 @@ let stale_snapshot_commit_can_be_canceled () =
     | Ok _ -> Alcotest.fail "canceled persisted preparation was committed")
 ;;
 
+let stale_delete_cannot_remove_rebound_owner () =
+  let behavior = "mirror owner identity changed after inspection" in
+  T.with_temp_directory "overlay-owner-rebind-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let owner = Filename.concat (Filename.dirname database_path) ".journal-local-owner.json" in
+    Out_channel.with_open_bin owner (fun output -> output_string output "account-A");
+    let _, _, inspection = location_and_inspection support behavior in
+    Out_channel.with_open_bin owner (fun output -> output_string output "account-B");
+    (match Database.delete_mirror inspection with
+     | Error Mirror_delete_stale -> ()
+     | _ -> Alcotest.fail "an old observation deleted the rebound account's mirror");
+    Alcotest.(check bool) "new owner's mirror is retained" true (Sys.file_exists database_path))
+;;
+
 let stale_delete_cannot_remove_replacement () =
   let behavior = "stale mirror delete is rejected" in
   T.with_temp_directory "overlay-stale-delete-" (fun support ->
@@ -2832,6 +2846,7 @@ let () =
             `Quick
             sqlite_full_int64_checkpoint
         ] )
-    ; "mirror and durability", cases
+    ; "mirror and durability", cases @
+        [Alcotest.test_case "owner rebind invalidates deletion" `Quick stale_delete_cannot_remove_rebound_owner]
     ]
 ;;

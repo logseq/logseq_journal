@@ -373,6 +373,7 @@ type t =
   ; asset_byte_reservation_lock : Eio.Semaphore.t
   ; secret_lock : Eio.Mutex.t
   ; asset_caches : (Core.graph_scope, Asset_cache.t) Hashtbl.t
+  ; asset_leases : ((Core.graph_scope * string), unit) Hashtbl.t
   ; mutable closed : bool
   }
 
@@ -394,6 +395,7 @@ let create ~sw dependencies ~post =
     ; asset_byte_reservation_lock = Eio.Semaphore.make 1
     ; secret_lock = Eio.Mutex.create ()
     ; asset_caches = Hashtbl.create 4
+    ; asset_leases = Hashtbl.create 16
     ; closed = false
     }
 ;;
@@ -1512,19 +1514,20 @@ let retain_asset_file t ~scope ~handle =
     Option.bind (Hashtbl.find_opt t.asset_caches scope) (fun cache ->
       Option.bind (Asset_cache.retain cache handle) (fun lease ->
         match Asset_cache.path cache lease with
-        | Some path -> Some (lease, path)
+        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
         | None ->
           Asset_cache.release cache lease;
           None))
 ;;
 
 let release_asset_file t ~scope ~handle =
+  Hashtbl.remove t.asset_leases (scope, handle);
   Option.iter
     (fun cache -> Asset_cache.release cache handle)
     (Hashtbl.find_opt t.asset_caches scope)
 ;;
 
-let delete_graph_assets ?except_id t (request : Core.mirror_deletion) =
+let cancel_graph_asset_operations ?except_id t (request : Core.mirror_deletion) =
   Hashtbl.iter
     (fun id (operation : operation) ->
        match operation.asset_identity with
@@ -1538,7 +1541,25 @@ let delete_graph_assets ?except_id t (request : Core.mirror_deletion) =
          operation.cancelled <- true;
          operation.cancel ()
        | Some _ | None -> ())
-    t.operations;
+    t.operations
+;;
+
+let delete_graph_assets ?except_id t (request : Core.mirror_deletion) ~current =
+  cancel_graph_asset_operations ?except_id t request;
+  let same_target (scope : Core.graph_scope) =
+    scope.graph_id = request.graph_id && scope.account.user_id = request.account.user_id
+    && Uri.equal scope.account.managed_sync_origin request.account.managed_sync_origin in
+  let busy () =
+    Hashtbl.fold (fun id (operation : operation) busy ->
+      busy || (Some id <> except_id && Option.fold ~none:false
+        ~some:(fun (scope, _) -> same_target scope) operation.asset_identity)) t.operations false
+    || Hashtbl.fold (fun (scope, _) () busy -> busy || same_target scope) t.asset_leases false in
+  let rec await_retirement attempts =
+    if not (current ()) then Error "The graph cleanup was cancelled."
+    else if not (busy ()) then Ok ()
+    else if attempts = 0 then Error "Attachment resources are still in use."
+    else (t.dependencies.runtime.sleep 0.005; await_retirement (attempts - 1)) in
+  Result.bind (await_retirement 1000) (fun () ->
   let scopes =
     Hashtbl.fold
       (fun (scope : Core.graph_scope) _ acc ->
@@ -1558,7 +1579,7 @@ let delete_graph_assets ?except_id t (request : Core.mirror_deletion) =
     ~root:(asset_root t)
     ~account:request.account
     ~graph_id:request.graph_id
-  |> Result.map_error (fun _ -> "The graph asset cache could not be removed.")
+  |> Result.map_error (fun _ -> "The graph asset cache could not be removed."))
 ;;
 
 let read_upload_source ~maximum_plaintext_bytes source_file =
@@ -1752,7 +1773,7 @@ let retain_staged_file t ~scope ~file =
     | Ok cache ->
       Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
         match Asset_cache.path cache lease with
-        | Some path -> Some (lease, path)
+        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
         | None ->
           Asset_cache.release cache lease;
           None))
@@ -1840,7 +1861,7 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
       ; scope = Core.effect_scope_of_graph scope
       }
     in
-    delete_graph_assets ?except_id t deletion |> storage_result |> map_unit
+    delete_graph_assets ?except_id t deletion ~current |> storage_result |> map_unit
   | Delete_account_assets ->
     delete_account_assets ?except_id t scope.account
     |> Result.map_error asset_cache_failure
@@ -1887,6 +1908,12 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
   in
   if claim_operation t instruction
   then (
+    (match request.action with
+     | Core.Delete_graph_assets ->
+       let scope = request.context.scope in
+       cancel_graph_asset_operations t
+         { Core.account = scope.account; graph_id = scope.graph_id; scope = Core.effect_scope_of_graph scope }
+     | _ -> ());
     let cancelled, resolve_cancelled = Eio.Promise.create () in
     let operation =
       { scope = Core.effect_scope_of_graph request.context.scope
@@ -1993,6 +2020,12 @@ let cleanup_asset_action = function
 
 let submit t instruction =
   match instruction with
+  | Core.Asset_io (ticket, ({ action = Core.Delete_graph_assets; _ } as request)) ->
+    (* Deletion may wait for native leases. It must not block the event consumer
+       that delivers their release, and shutdown must revoke its execution. *)
+    if t.closed
+    then t.post (Core.Runner_completed (Core.Asset_completion (ticket, Error Core.Asset_cancelled)))
+    else submit_asset_io t instruction ticket request
   | Core.Asset_io (ticket, request) ->
     if cleanup_asset_action request.action
     then (

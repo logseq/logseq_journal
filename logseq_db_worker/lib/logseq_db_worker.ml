@@ -67,12 +67,24 @@ type graph_state = Pure_reducer.graph_state =
   ; error : Error.t option
   }
 
+type local_deletion_waiter =
+  { graph_id : Logseq_db_types.Graph_types.Uuid.t
+  ; account_generation : int
+  ; mutable request : Sync.mirror_deletion option
+  ; resolve : (unit, string) result Eio.Promise.u
+  }
+
+type queued_event =
+  | Event of Pure_reducer.event
+  | Delete_copy of local_deletion_waiter
+
 type t =
   { state : Pure_reducer.state ref
   ; runner : Effect_runner.t
-  ; events : Pure_reducer.event Eio.Stream.t
+  ; events : queued_event Eio.Stream.t
   ; mutable next_request_id : int64
   ; mutable stopped : bool
+  ; mutable local_deletion_waiter : local_deletion_waiter option
   }
 
 type create_error = Invalid_create of string
@@ -82,6 +94,27 @@ let dispatch t event =
   let transition = Pure_reducer.step before event in
   observe_unlock before transition event;
   t.state := transition.next;
+  (match t.local_deletion_waiter with
+   | None -> ()
+   | Some waiter ->
+     let finish result =
+       t.local_deletion_waiter <- None;
+       ignore (Eio.Promise.try_resolve waiter.resolve result : bool) in
+     let snapshot = (Pure_reducer.view transition.next).sync.snapshot in
+     if snapshot.startup.account_generation <> waiter.account_generation
+     then finish (Error "The graph account is no longer current.")
+     else (
+       (match waiter.request, event with
+        | None, Pure_reducer.Sync_event (Sync.Local_cache_deletion_requested graph_id)
+          when graph_id = waiter.graph_id ->
+          waiter.request <- List.find_map (function
+            | Pure_reducer.Run_worker (Pure_reducer.Request (_, Pure_reducer.Handle_sync_worker_effect (Sync.Delete_mirror request))) ->
+              Some request
+            | _ -> None) transition.effects;
+          if waiter.request = None then finish (Error "This local copy cannot be deleted now.")
+        | _ -> ());
+       if waiter.request <> None && snapshot.local_deletion = None
+       then finish (match snapshot.last_error with None -> Ok () | Some message -> Error message)));
   List.iter (Effect_runner.submit t.runner) transition.effects
 ;;
 
@@ -96,7 +129,22 @@ let accepts_after_shutdown = function
 let route_event t event =
   if t.stopped
   then (if accepts_after_shutdown event then dispatch t event)
-  else Eio.Stream.add t.events event
+  else Eio.Stream.add t.events (Event event)
+;;
+
+let dispatch_queued t = function
+  | Event event -> dispatch t event
+  | Delete_copy waiter ->
+    let snapshot = (Pure_reducer.view !(t.state)).sync.snapshot in
+    if not t.stopped && snapshot.startup.authenticated
+       && snapshot.startup.account_generation = waiter.account_generation
+       && snapshot.selected_graph <> Some waiter.graph_id
+       && Option.fold ~none:false ~some:(fun active -> active == waiter) t.local_deletion_waiter
+    then dispatch t (Pure_reducer.Sync_event (Sync.Local_cache_deletion_requested waiter.graph_id))
+    else (
+      if Option.fold ~none:false ~some:(fun active -> active == waiter) t.local_deletion_waiter
+      then t.local_deletion_waiter <- None;
+      ignore (Eio.Promise.try_resolve waiter.resolve (Error "The graph account is no longer current.") : bool))
 ;;
 
 let create ~sw ~config ~runner_dependencies =
@@ -105,7 +153,7 @@ let create ~sw ~config ~runner_dependencies =
   | Ok state ->
     let events = Eio.Stream.create 256 in
     let state_ref = ref state in
-    let event_sink = ref (fun event -> Eio.Stream.add events event) in
+    let event_sink = ref (fun event -> Eio.Stream.add events (Event event)) in
     (match
        Effect_runner.create
          ~sw
@@ -121,13 +169,14 @@ let create ~sw ~config ~runner_dependencies =
      | Error (Effect_runner.Invalid_create message) -> Error (Invalid_create message)
      | Ok runner ->
        let t =
-         { state = state_ref; runner; events; next_request_id = 0L; stopped = false }
+         { state = state_ref; runner; events; next_request_id = 0L; stopped = false
+         ; local_deletion_waiter = None }
        in
        event_sink := route_event t;
        dispatch t Pure_reducer.Start;
        Eio.Fiber.fork ~sw (fun () ->
          while not t.stopped do
-           dispatch t (Eio.Stream.take events)
+           dispatch_queued t (Eio.Stream.take events)
          done);
        Ok t)
 ;;
@@ -135,6 +184,26 @@ let create ~sw ~config ~runner_dependencies =
 let post t event = route_event t event
 let view t = Pure_reducer.view !(t.state)
 let graph_state t = (view t).graph
+
+let delete_local_copy t ~account_generation ~graph_id =
+  let snapshot = (view t).sync.snapshot in
+  if t.stopped || t.local_deletion_waiter <> None
+     || not snapshot.startup.authenticated
+     || snapshot.startup.account_generation <> account_generation
+     || snapshot.selected_graph = Some graph_id
+     || not (List.exists (fun (graph : Sync.graph) -> graph.graph_id = graph_id) snapshot.catalog)
+  then Error "This local copy cannot be deleted now."
+  else (
+    let outcome, resolve = Eio.Promise.create () in
+    let waiter = { graph_id; account_generation; request = None; resolve } in
+    t.local_deletion_waiter <- Some waiter;
+    (try Eio.Stream.add t.events (Delete_copy waiter)
+     with error ->
+       if Option.fold ~none:false ~some:(fun active -> active == waiter) t.local_deletion_waiter
+       then t.local_deletion_waiter <- None;
+       raise error);
+    Eio.Promise.await outcome)
+;;
 
 let request t request =
   let id = Pure_reducer.request_id_of_int64 t.next_request_id in
@@ -147,16 +216,23 @@ let shutdown t =
   if not t.stopped
   then (
     t.stopped <- true;
+    Option.iter (fun waiter ->
+      ignore (Eio.Promise.try_resolve waiter.resolve (Error "The Worker stopped.") : bool))
+      t.local_deletion_waiter;
+    t.local_deletion_waiter <- None;
     dispatch t Pure_reducer.Shutdown;
     let rec drain () =
       match Eio.Stream.take_nonblocking t.events with
       | None -> ()
-      | Some event ->
+      | Some (Event event) ->
         if accepts_after_shutdown event then dispatch t event;
+        drain ()
+      | Some (Delete_copy waiter) ->
+        ignore (Eio.Promise.try_resolve waiter.resolve (Error "The Worker stopped.") : bool);
         drain ()
     in
     drain ();
-    Eio.Stream.add t.events Pure_reducer.Shutdown;
+    Eio.Stream.add t.events (Event Pure_reducer.Shutdown);
     Effect_runner.shutdown t.runner)
 ;;
 

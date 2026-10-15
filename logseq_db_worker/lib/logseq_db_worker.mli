@@ -30,6 +30,16 @@ val create
 val post : t -> Pure_reducer.event -> unit
 val view : t -> Pure_reducer.view
 val graph_state : t -> graph_state
+
+(** Waits for the exact local deletion flight's terminal result. The caller has
+    confirmed discard of unsynchronized local content; current and unauthorized
+    graphs, stale accounts and overlapping requests are rejected. *)
+val delete_local_copy
+  :  t
+  -> account_generation:int
+  -> graph_id:Logseq_db_types.Graph_types.Uuid.t
+  -> (unit, string) result
+
 val request : t -> Protocol.request -> Protocol.response
 val shutdown : t -> unit
 

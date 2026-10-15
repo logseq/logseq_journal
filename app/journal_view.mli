@@ -711,6 +711,7 @@ module View : sig
       :  ?key:Key.t
       -> activation_id:string
       -> ?enabled:bool
+      -> ?enabled_signal:bool Signal.signal
       -> ?disclosure:bool
       -> on_activate:Event.handler
       -> label:t
@@ -781,6 +782,7 @@ module View : sig
       -> title:string
       -> ?icon:string
       -> ?enabled:bool
+      -> ?enabled_signal:bool Signal.signal
       -> ?role:Button_role.t
       -> ?test_id:Test_id.t
       -> unit
