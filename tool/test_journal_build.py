@@ -193,6 +193,8 @@ class CacheBoundaryTests(unittest.TestCase):
             build.plist.write_bytes(b'plist fixture')
             gmp, probe = f.root / 'libgmp.a', f.root / 'probe.o'
             gmp.write_bytes(b'original GMP bytes')
+            build.native_gmp = f.root / 'linked-libgmp.a'
+            build.native_gmp.write_bytes(gmp.read_bytes())
             probe.write_bytes(b'original probe bytes')
             build.tools = {}
             build.native_files = {str(probe): self.build.sha(probe)}
@@ -205,6 +207,10 @@ class CacheBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'GMP'):
                 build.verify_inputs()
             gmp.write_bytes(b'original GMP bytes')
+            build.native_gmp.write_bytes(b'different pkg-config-selected GMP copy')
+            with self.assertRaisesRegex(RuntimeError, 'GMP'):
+                build.verify_inputs()
+            build.native_gmp.write_bytes(gmp.read_bytes())
             probe.write_bytes(b'changed probe bytes')
             with self.assertRaisesRegex(RuntimeError, 'native'):
                 build.verify_inputs()

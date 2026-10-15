@@ -509,6 +509,8 @@ class Build:
                       "--profile", "dev" if a.configuration == "debug" else "release",
                       "-j", str(a.jobs), "app/native_embed.exe.o")
             native = dune_dir / "default/app/native_embed.exe.o"
+            self.native_gmp = dune_dir / "default/app/libgmp.a"
+            self.report["linked_gmp"] = {"path": str(self.native_gmp), "sha256": sha(self.native_gmp)}
             symbols = self.run("nm", "-U", native)
             for library in ("Mldoc", "Xmlm"):
                 if not re.search(r"caml" + library + r"(?:__|_)", symbols):
@@ -686,7 +688,8 @@ class Build:
         if any(sha(p) != h for p, h in self.inputs["toolchain"]["sdk_identity"]["settings"].items()):
             raise RuntimeError("SDK identity changed during build; artifact is not accepted")
         gmp = self.inputs["toolchain"].get("gmp")
-        if gmp and sha(gmp["path"]) != gmp["sha256"]:
+        if gmp and (sha(gmp["path"]) != gmp["sha256"]
+                    or sha(getattr(self, "native_gmp", gmp["path"])) != gmp["sha256"]):
             raise RuntimeError("GMP archive changed during build; artifact is not accepted")
         imported = getattr(self, "native_files", {})
         if any(sha(p) != h for p, h in {**imported, **self.inputs["signing"]}.items()):
