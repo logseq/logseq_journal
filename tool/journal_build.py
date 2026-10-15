@@ -393,7 +393,7 @@ class Build:
         if not a.link_only:
             expected = re.search(r'"git\+https://github.com/logseq/lui.git#([0-9a-f]{40})"',
                                  (ROOT / "logseq_journal.opam.locked").read_text()).group(1)
-            if lui_sha != expected or self.run("git", "-C", self.lui, "status", "--porcelain", "--untracked-files=no"):
+            if lui_sha != expected or self.run("git", "-C", self.lui, "status", "--porcelain", "--untracked-files=all"):
                 raise RuntimeError(f"LUI Swift checkout must be clean at locked {expected}, found {lui_sha}")
         self.info = plistlib.loads(self.plist.read_bytes())
         for key in ("CFBundleIdentifier", "CFBundleExecutable", "CFBundleShortVersionString", "CFBundleVersion"):

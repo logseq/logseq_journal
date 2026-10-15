@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from functools import partial
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import subprocess
@@ -139,7 +140,7 @@ while True: time.sleep(1)
 '''
             def cancel_when_ready():
                 for _ in range(300):
-                    if ready.exists():
+                    if ready.exists() and ready.read_text():
                         os.kill(os.getpid(), signal.SIGINT)
                         return
                     if stop.wait(.01):
@@ -317,6 +318,30 @@ while True: time.sleep(1)
             f.source['app/unit.ml'] = 'f' * 64
             with self.assertRaisesRegex(ValueError, 'native sources'):
                 f.build.imported_native(f.source)
+
+    def test_production_lui_pin_rejects_untracked_swift_sources(self):
+        with self.producer_fixture() as f:
+            lui = f.repo.parent / 'lui'
+            target = lui / 'Sources/Backend'
+            target.mkdir(parents=True)
+            (lui / 'Package.swift').write_text('// swift-tools-version: 6.0\nimport PackageDescription\n'
+                'let package = Package(name: "Fixture", targets: [.target(name: "Backend")])\n')
+            (target / 'Tracked.swift').write_text('func tracked() {}\n')
+            subprocess.run(['git', 'init', '-q', lui], check=True, capture_output=True)
+            subprocess.run(['git', '-C', lui, 'add', '.'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', lui, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                            'commit', '-qm', 'pinned LUI'], check=True, capture_output=True)
+            pinned = subprocess.check_output(['git', '-C', lui, 'rev-parse', 'HEAD'], text=True).strip()
+            (target / 'Unpinned.swift').write_text('func unpinned() {}\n')
+            (f.repo / 'logseq_journal.opam.locked').write_text(f'"git+https://github.com/logseq/lui.git#{pinned}"')
+            (f.repo / 'apple').mkdir()
+            (f.repo / 'apple/Info.plist').write_bytes(plistlib.dumps(dict(CFBundleIdentifier='fixture.journal',
+                CFBundleExecutable='JournalApp', CFBundleVersion='1.0', CFBundleShortVersionString='1.0')))
+            f.build.args.lui_package, f.build.args.deployment_target = lui, '26.0'
+            f.build.args.version = f.build.args.build_number = None
+            with patch.object(f.build, 'imported_native', side_effect=AssertionError('unpinned LUI reached native import')):
+                with self.assertRaisesRegex(RuntimeError, 'LUI Swift checkout must be clean'):
+                    f.build.preflight()
 
     def test_fixed_object_source_and_current_c_headers_remain_strict(self):
         for case in ('object', 'source_sha', 'native_source', 'target_c', 'target_header', 'runtime_header'):
