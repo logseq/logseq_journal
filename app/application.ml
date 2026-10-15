@@ -327,6 +327,7 @@ type state =
   ; graph_error : graph_error option
   ; sync_error : sync_error_notice option
   ; manager : Graph_service.snapshot option
+  ; graph_picker_open : bool
   ; graph_state : Logseq_db_worker.graph_state
   ; diagnostics : Graph_service.diagnostics option
   ; admission_refresh : Admission_refresh.t
@@ -420,6 +421,7 @@ let initial_state =
   ; graph_error = None
   ; sync_error = None
   ; manager = None
+  ; graph_picker_open = false
   ; graph_state = { generation = -1; graph_id = None; phase = Graph_closed; error = None }
   ; diagnostics = None
   ; admission_refresh = Admission_refresh.closed
@@ -755,8 +757,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     match state.modal, snapshot.selected_graph with
     | (Status_sheet _ | Capture_sheet | Append_sheet), _ when graph_context_changed ->
       No_modal
-    | Cache_reset_confirmation confirmation, Some selected
-      when Logseq_db_types.Graph_types.Uuid.equal confirmation selected -> state.modal
+    | Cache_reset_confirmation _, _ when not owner_changed -> state.modal
     | ( ( No_modal
         | Capture_sheet
         | Append_sheet
@@ -769,6 +770,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
   let state =
     { state with
       manager = Some snapshot
+    ; graph_picker_open = state.graph_picker_open && not owner_changed
     ; diagnostics = Some manager_state.diagnostics
     ; e2ee_password
     ; e2ee_submission_pending =
@@ -1693,6 +1695,8 @@ type command =
   | Retry_capture_imports
   | Close_error_info
   | Switch_graph
+  | Close_graph_picker
+  | Request_graph_local_cache_reset of string
   | Sign_out
   | Submit_e2ee_password
   | Request_local_cache_reset
@@ -1751,28 +1755,12 @@ module Presentation = struct
     |> fun content -> V.Body.Vertical.create [ content ]
   ;;
 
-  let list children =
-    V.Body.Vertical.create
-      [ V.Body.Vertical.fixed
-          (V.Native_list.vertical
-             ~key:(Ui.Key.string "graph-list")
-             ~style:Inset
-             [ V.Native_list.section
-                 ~key:(Ui.Key.string "graphs")
-                 ~separator:Hidden
-                 (List.mapi
-                    (fun index child ->
-                       let key =
-                         match V.For_testing.test_id child with
-                         | Some id -> Ui.Key.string id
-                         | None -> Ui.Key.int index
-                       in
-                       V.Native_list.row ~key ~separator:Hidden child)
-                    children)
-             ])
-      ]
-    |> V.Body.Private.to_widget
-    |> V.frame ~max_height:Fill
+  let list rows =
+    V.Native_list.vertical ~key:(Ui.Key.string "graph-list") ~style:Inset
+      [ V.Native_list.section ~key:(Ui.Key.string "graphs") ~separator:Hidden rows ]
+    |> V.with_test_id (Ui.Test_id.string "graph-picker-list")
+    |> fun list -> V.column ~spacing:0. [list]
+    |> V.frame ~max_width:Fill ~max_height:Fill
     |> V.Body.static
   ;;
 
@@ -2850,21 +2838,23 @@ let diagnostics_page ~snapshot ~graph ~admission diagnostics dispatch =
 ;;
 
 module Cache_confirmation = struct
-  let local_cache ~token dispatch body =
+  let local_cache ~token ~graph_name dispatch body =
     let request =
       Option.map
         (fun token ->
            V.Confirmation.request
              ~token
-             ~title:"Delete local graph copy?"
+             ~title:"Delete local copy?"
              ~message:
-               "This deletes the local copy, including unsaved drafts and pending local \
-                changes, then returns to graph selection. The remote graph and cached \
-                encryption key are retained. Select a graph to open or download it."
+               (Printf.sprintf
+                  "Remove “%s” from this device only.\n\nUnsynced changes, drafts, and \
+                   attachments on this device will be lost.\n\nYour cloud copy will be \
+                   kept. You can download it again."
+                  graph_name)
              [ V.Confirmation.action ~key:"cancel" ~title:"Cancel" ~role:Cancel ()
              ; V.Confirmation.action
                  ~key:"delete"
-                 ~title:"Delete local graph copy"
+                 ~title:"Delete local copy"
                  ~role:Destructive
                  ()
              ])
@@ -3289,28 +3279,54 @@ let manager_page state dispatch =
           ~message:"Refresh to check for graphs available to your account."
           ~actions:(V.empty ())
       | graphs ->
-        Presentation.list
-          (List.map
-             (fun (graph : Graph_service.graph) ->
-                let graph_id =
-                  Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id
-                in
-                button
-                  ~id:("graph-picker:" ^ graph_id)
-                  ~command:(Select_graph graph_id)
-                  graph.name
-                  (if graph.encrypted then "lock.doc" else "folder"))
-             graphs)
+        let rows = List.map (fun (graph : Graph_service.graph) ->
+          let id = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
+          let current = snapshot.selected_graph = Some graph.graph_id in
+          let select =
+            V.Navigation_link.create ~key:(Ui.Key.string ("graph-picker:" ^ id))
+              ~activation_id:id ~disclosure:false
+              ~on_activate:(bind_action dispatch (Select_graph id))
+              ~label:(V.row ~spacing:12.
+                [ V.symbol ~name:(if graph.encrypted then "lock.doc" else "folder") ()
+                ; V.column ~spacing:3. ~alignment:Leading
+                    (V.text graph.name :: if current then [V.text "Current graph" |> V.opacity 0.65] else [])
+                  |> V.frame ~max_width:Fill
+                ; (if current then V.symbol ~name:"checkmark" () else V.empty ()) ]
+                |> V.frame ~max_width:Fill ~min_height:44.)
+              () |> V.with_test_id (Ui.Test_id.string ("graph-picker:" ^ id))
+              |> V.frame ~max_width:Fill in
+          let options =
+            V.buttons ~key:(Ui.Key.string ("graph-picker-options:" ^ id))
+              ~actions:[V.buttons_menu_action ~label:("Options for " ^ graph.name)
+                ~icon:"ellipsis"
+                ~on_select:(Ui.Event.Handler.create (function
+                  | Ui.Event.Payload.Int64 1L when not current ->
+                    dispatch.send (Request_graph_local_cache_reset id)
+                  | _ -> ()))
+                ([V.Menu.action ~id:1L ~title:"Delete local copy" ~icon:"trash"
+                    ~role:Destructive ~enabled:(not current)
+                    ~test_id:(Ui.Test_id.string ("graph-picker-delete:" ^ id)) ()]
+                 @ if current then [V.Menu.action ~id:2L
+                     ~title:"Switch to another graph before deleting." ~enabled:false ()] else [])]
+              () |> V.with_test_id (Ui.Test_id.string ("graph-picker-options:" ^ id)) in
+          V.Native_list.row ~key:(Ui.Key.string id) ~separator:Hidden
+            (V.row ~spacing:8. [select; options] |> V.frame ~max_width:Fill)
+        ) graphs in
+        Presentation.list rows
         |> V.Body.with_test_id (Ui.Test_id.string "graph-picker-list")
     in
     toolbar
       ~sign_out:snapshot.startup.authenticated
-      "Choose a graph"
-      [ V.Toolbar.item
+      "Switch graph"
+      ((if Option.is_some snapshot.selected_graph then
+          [V.Toolbar.item ~key:(Ui.Key.string "graph-picker-close") ~placement:Cancellation_action
+             (button ~id:"graph-picker-close" ~command:Close_graph_picker "Close" "xmark")]
+        else [])
+       @ [ V.Toolbar.item
           ~key:(Ui.Key.string "graph-picker-refresh")
           ~placement:Primary_action
           refresh
-      ]
+      ])
       content
   in
   let unlock error =
@@ -3422,6 +3438,7 @@ let manager_page state dispatch =
         | Interaction startup -> startup
         | _ -> Journal_startup.derive ~snapshot ~graph:state.graph_state in
       (match startup.phase with
+       | _ when state.graph_picker_open -> graph_picker snapshot
        | _ when state.e2ee_submission_pending -> unlock None
        | Awaiting_selection -> graph_picker snapshot
        | Awaiting_e2ee_password -> unlock None
@@ -5775,7 +5792,12 @@ let start
       let graph_id = value in
       (match Logseq_db_types.Graph_types.Uuid.of_string graph_id with
        | Error _ -> Effect.ignore
-       | Ok graph_id -> send_manager (Graph_service.Select_graph graph_id))
+       | Ok graph_id ->
+         Effect.bind (update (fun state -> { state with graph_picker_open = false }))
+           ~f:(fun () ->
+             if Option.bind snapshot.manager (fun value -> value.selected_graph) = Some graph_id
+             then Effect.ignore
+             else send_manager (Graph_service.Select_graph graph_id)))
     | Refresh_catalog -> send_manager Graph_service.Refresh_catalog
     | Begin_online_recovery -> send_manager Graph_service.Begin_online_recovery
     | Open_capture
@@ -5911,19 +5933,19 @@ let start
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
     | Switch_graph ->
       cancel_copy ();
-      Effect.many
-        [ update (fun state ->
-            { state with
-              modal = No_modal
-            ; e2ee_submission_pending = false
-            ; e2ee_password =
-                Journal_capture.create
-                  ~session_number:state.next_local_sequence
-                  ~source:""
-            ; next_local_sequence = Int64.succ state.next_local_sequence
-            })
-        ; send_manager Graph_service.Return_to_graph_picker
-        ]
+      update (fun state -> { state with graph_picker_open = true; modal = No_modal })
+    | Close_graph_picker ->
+      update (fun state -> { state with graph_picker_open = false; modal = No_modal })
+    | Request_graph_local_cache_reset value ->
+      update (fun state ->
+        match state.manager, Logseq_db_types.Graph_types.Uuid.of_string value with
+        | Some manager, Ok graph_id
+          when manager.startup.authenticated
+            && manager.selected_graph <> Some graph_id
+            && List.exists (fun (graph : Graph_service.graph) -> graph.graph_id = graph_id) manager.catalog ->
+          { state with modal = Cache_reset_confirmation graph_id
+            ; confirmation_sequence = Int64.succ state.confirmation_sequence }
+        | _ -> state)
     | Sign_out ->
       cancel_copy ();
       sign_out_in_flight := true;
@@ -6448,7 +6470,8 @@ let start
     || Option.is_some (operation_failure state.timeline_notice)
   in
   let equal_root_presentation left right =
-    if (not left.graph_ready) || not right.graph_ready
+    if left.graph_picker_open <> right.graph_picker_open then false
+    else if (not left.graph_ready) || not right.graph_ready
     then left == right
     else
       Journal_startup.Presentation.equal_presentation left.startup_presentation right.startup_presentation
@@ -6686,6 +6709,7 @@ let start
     let root =
       region "root" ~equal:equal_root_presentation (fun state ->
         match Journal_startup.Presentation.screen state.startup_presentation with
+        | _ when state.graph_picker_open -> manager_page state dispatch
         | Waiting | Interaction _ | Account_failure -> manager_page state dispatch
         | Timeline ->
           timeline_page
@@ -7019,6 +7043,11 @@ let start
           && left.confirmation_sequence = right.confirmation_sequence)
         (fun current ->
            Cache_confirmation.local_cache
+             ~graph_name:(match current.modal, current.manager with
+               | Cache_reset_confirmation id, Some manager ->
+                 (match List.find_opt (fun (graph : Graph_service.graph) -> graph.graph_id = id) manager.catalog with
+                  | Some graph -> graph.name | None -> "this graph")
+               | _ -> "this graph")
              ~token:
                (match current.modal with
                 | Cache_reset_confirmation _ -> Some current.confirmation_sequence

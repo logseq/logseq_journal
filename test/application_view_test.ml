@@ -4889,6 +4889,151 @@ let test_application_token_control ~saturated ~failure () =
          !token_error)
 ;;
 
+(* Picker presentation and native controls are owned by Application; Root_navigation
+   has no public picker event. Exercise its mounted public hooks and worker lane. *)
+let test_graph_picker_controls scenario () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module P = Logseq_db_worker.Protocol in
+  let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
+      (Printf.sprintf "94000000-0000-4000-8000-%012d" n) |> Result.get_ok in
+  let first = uuid 1 and second = uuid 2 in
+  let long_name = "Synthetic very long graph name — 工作笔记 and attachments across multiple lines" in
+  let graph graph_id name : Service.graph =
+    { graph_id; name; schema = { major = 65; minor = 33; exact = true }; encrypted = false } in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Current; catalog = [graph first "Current synthetic graph"; graph second long_name]
+        ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
+        ; timeline_presentation_pending = false
+        ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+          ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
+          ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
+        ; last_error = None; local_deletion = None }
+    ; diagnostics = { groups = [] } } in
+  let current = Atomic.make manager and commands = Atomic.make [] in
+  let client = ref None in
+  let service = W.Service.create ~push_topic_count:6 ~concurrency:Serial
+      ~init:(fun context _ ->
+        W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
+        Ok ())
+      ~handle:(fun context () request ->
+        let publish value =
+          Atomic.set current value;
+          W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
+        match request with
+        | Service.Get_graph_state ->
+          let value = Atomic.get current in
+          Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
+            ; graph_id = value.snapshot.selected_graph; phase = Graph_open; error = None })
+        | Client_command command ->
+          Atomic.set commands (command :: Atomic.get commands);
+          let previous = Atomic.get current in
+          (match command with
+           | Return_to_graph_picker ->
+             publish { previous with snapshot = { previous.snapshot with selected_graph = None
+               ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
+           | Select_graph id ->
+             let generation = previous.snapshot.startup.graph_generation + 1 in
+             publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
+               ; startup = { previous.snapshot.startup with awaiting_selection = false; graph_generation = generation } } };
+             W.Request_context.emit context ~topic:Service.graph_state_topic
+               (Service.Graph_state_changed { generation; graph_id = Some id; phase = Graph_open; error = None })
+           | _ -> ());
+          Ok Service.Client_command_completed
+        | Asset_command _ | Release_asset_file _ -> Ok Service.Client_command_completed
+        | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Graph_request request ->
+          let outcome = match request.P.command with
+            | V2_graph_info -> P.V2_graph_info_outcome
+                { graph_uuid = Option.get (Atomic.get current).snapshot.selected_graph
+                ; graph_name = "Synthetic"; schema = { major = 65; minor = 33 }
+                ; admission_facts = []; journal_title_format = None
+                ; limits = { response_budget_bytes = P.maximum_response_bytes
+                  ; outbox_max_records = 4096; outbox_max_bytes = 8388608
+                  ; change_max_items = 4096; change_max_bytes = 1048576
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
+                ; generation = "g"; projection_revision = "p" }
+            | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
+            | V2_get_asset_descriptors _ | V2_list_assets _ ->
+              P.V2_assets_outcome { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
+            | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused graph-picker fixture read" } in
+          Ok (Service.Graph_response (P.V2_response
+            { api_version = P.api_version; request_id = request.request_id; outcome }))
+        | Import_asset _ -> Error "Unused graph-picker fixture import")
+      ~shutdown:(fun () -> ()) () in
+  let hooks = Application.For_testing.app_with_service ~on_client:(fun value -> client := Some value) service in
+  let props = Hashtbl.create 128 in
+  let teardown = track_json_wire_teardown (Hashtbl.remove props) in
+  let consume source =
+    if source <> "" then
+      let open Yojson.Safe.Util in
+      Yojson.Safe.from_string source |> member "ops" |> to_list |> List.iter (fun op ->
+        teardown op;
+        match member "op" op |> to_string with
+        | "create-node" | "create-extension" -> Hashtbl.replace props (member "id" op |> to_int) []
+        | "set-prop" | "set-extension-prop" ->
+          let id = member "id" op |> to_int in
+          let key = member "property" op |> to_string in
+          let old = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
+        | _ -> ()) in
+  let find key value = Hashtbl.fold (fun id values found ->
+    if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
+  let node name = match find "accessibility-identifier" name with
+    | Some id -> id | None -> failwith ("Missing " ^ name) in
+  let press id = consume (hooks.dispatch (Lui_protocol.Press id)) in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 3. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ()); Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ()) in
+  let config = Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-graph-picker-synthetic"
+      ~target:(Managed_sync { base_url = "https://example.invalid" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
+      |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () ->
+    ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+      consume (hooks.init 2 2 config);
+      wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
+      press (Option.get (find "text" "Switch graph"));
+      wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
+      match scenario with
+      | `Current ->
+        Alcotest.(check bool) "current marker stays in catalog row" true
+          (Option.is_some (find "text" "Current graph"));
+        Alcotest.(check bool) "long name is preserved" true (Option.is_some (find "text" long_name));
+        Alcotest.(check bool) "opening picker keeps selected graph" true
+          ((Atomic.get current).snapshot.selected_graph = Some first)
+      | `Close ->
+        press (node "graph-picker-close");
+        wait "close returns to retained graph" (fun () ->
+          Option.is_none (find "accessibility-identifier" "graph-picker-list"));
+        Alcotest.(check bool) "picker never detaches current graph" false
+          (List.exists (function Service.Return_to_graph_picker -> true | _ -> false) (Atomic.get commands))
+      | `Select ->
+        press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "name selection reaches worker" (fun () ->
+          List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
+      | `Delete_menu ->
+        ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "row action is exposed" (fun () -> Option.is_some (find "text" "Delete local copy"));
+        press (node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "confirm names data loss" (fun () ->
+          Hashtbl.fold (fun _ values found -> found || List.exists (fun (_, value) ->
+            match value with `String text -> String.starts_with ~prefix:"Remove “" text
+              && String.contains text '\n' | _ -> false) values) props false);
+        Alcotest.(check bool) "requesting confirmation does not delete" false
+          (List.exists (function Service.Delete_local_cache _ -> true | _ -> false) (Atomic.get commands))
+      | `Current_menu ->
+        ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
+        Alcotest.(check bool) "current protection explains switching first" true
+          (Option.is_some (find "text" "Switch to another graph before deleting.")))
+;;
+
 let () =
   if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
   then (
@@ -4896,7 +5041,13 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "relative date chrome", [
+    [ ( "graph picker", [
+        Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
+        Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
+        Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
+        Alcotest.test_case "row deletion confirmation" `Quick (test_graph_picker_controls `Delete_menu);
+        Alcotest.test_case "current row deletion protection" `Quick (test_graph_picker_controls `Current_menu)])
+    ; ( "relative date chrome", [
         Alcotest.test_case "calendar boundaries and date updates" `Quick test_timeline_relative_date_headers;
         Alcotest.test_case "empty Detail navigation title" `Quick test_detail_empty_navigation_title;
         Alcotest.test_case "foreground day updates before delayed or failed feed" `Quick

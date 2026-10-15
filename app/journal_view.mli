@@ -782,6 +782,7 @@ module View : sig
       -> ?icon:string
       -> ?enabled:bool
       -> ?role:Button_role.t
+      -> ?test_id:Test_id.t
       -> unit
       -> entry
   end

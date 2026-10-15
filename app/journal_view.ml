@@ -1966,10 +1966,11 @@ module View = struct
       ; icon : string option
       ; enabled : bool
       ; role : Button_role.t
+      ; test_id : Test_id.t option
       }
 
-    let action ~id ~title ?icon ?(enabled = true) ?(role = Button_role.Normal) () =
-      { id; title; icon; enabled; role }
+    let action ~id ~title ?icon ?(enabled = true) ?(role = Button_role.Normal) ?test_id () =
+      { id; title; icon; enabled; role; test_id }
     ;;
 
     let to_elements ~on_select entries =
@@ -1977,6 +1978,7 @@ module View = struct
         (fun entry ->
            Lui_elements.menu_item
              ~key:(Int64.to_string entry.id)
+             ?accessibility_identifier:entry.test_id
              ~text:(if String.length entry.title = 0 then " " else entry.title)
              ?icon:(Option.map journal_icon entry.icon)
              ~disabled:(not entry.enabled)

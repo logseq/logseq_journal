@@ -37,8 +37,10 @@ type startup_facts =
   ; presentation_generation : presentation_generation
   }
 
-(** Non-resumable cleanup of the normally open selected graph. Success removes
-    this status only after Save_catalog acknowledges the cleared selection. *)
+(** Cleanup of an authorized, non-current graph's local copy. The host must
+    obtain explicit confirmation that unsynchronized content will be discarded.
+    The selected graph and catalog entry are retained. Completion or failure
+    releases the deletion flight so selection and retry remain available. *)
 type local_deletion_stage =
   | Closing_graph
   | Deleting_mirror
