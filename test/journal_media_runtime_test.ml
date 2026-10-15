@@ -448,7 +448,7 @@ let observe runtime (block : G.block) =
     runtime
     { api_version = 2
     ; request_id = uuid 999
-    ; command = P.V2_get_block { block = block.G.uuid; revision = None }
+    ; command = P.V2_get_outline_block { block = block.G.uuid; revision = None }
     };
   R.observe_response runtime (block_response block)
 ;;
@@ -489,7 +489,7 @@ let reply_block runtime sent (block : G.block) =
   let ticket, request = Queue.take sent in
   match ticket, request with
   | ( Some ticket
-    , S.Graph_request { request_id; command = P.V2_get_block { block = uuid; _ }; _ } )
+    , S.Graph_request { request_id; command = P.V2_get_outline_block { block = uuid; _ }; _ } )
     when uuid = block.G.uuid ->
     let outcome =
       match block_response block with
@@ -499,7 +499,7 @@ let reply_block runtime sent (block : G.block) =
       runtime
       ticket
       (S.Graph_response (P.V2_response { api_version = 2; request_id; outcome }))
-  | _ -> failwith "holder/liveness must use its owned bounded get_block"
+  | _ -> failwith "holder/liveness must use its owned bounded get_outline_block"
 ;;
 
 let window ?(structures = []) blocks : P.v2_change_window =
@@ -527,7 +527,7 @@ let membership_change runtime n target =
 let reply_missing runtime sent n =
   let ticket, request = Queue.take sent in
   match ticket, request with
-  | Some ticket, S.Graph_request { request_id; command = P.V2_get_block { block; _ }; _ }
+  | Some ticket, S.Graph_request { request_id; command = P.V2_get_outline_block { block; _ }; _ }
     when block = uuid n ->
     R.receive
       runtime
@@ -771,7 +771,7 @@ let () =
             r
             { P.api_version = 2
             ; request_id = uuid 998
-            ; command = P.V2_get_block { block = uuid 1; revision = None }
+            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
             };
           for n = 10000 to 14100 do
             change r [ n ]
@@ -806,7 +806,7 @@ let () =
           change r [ 80 ];
           let ticket, request = Queue.take q in
           (match ticket, request with
-           | Some ticket, S.Graph_request { command = P.V2_get_block { block; _ }; _ }
+           | Some ticket, S.Graph_request { command = P.V2_get_outline_block { block; _ }; _ }
              when block = uuid 60 -> R.reject r ticket
            | _ -> failwith "missing ancestor must have one owned fact read");
           let root = G.Uuid.to_string (uuid 1) in
@@ -828,7 +828,7 @@ let () =
           let request id =
             { P.api_version = 2
             ; request_id = uuid id
-            ; command = P.V2_get_block { block = uuid 1; revision = None }
+            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
             }
           in
           let answer id refs =
@@ -859,7 +859,7 @@ let () =
             r
             { P.api_version = 2
             ; request_id = uuid 998
-            ; command = P.V2_get_block { block = uuid 1; revision = None }
+            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
             };
           change r [ 80 ];
           let answer =
@@ -942,7 +942,7 @@ let () =
           change r [ 60 ];
           reply_missing r q 60;
           check (list_reads q = 1) "ancestor tombstone refreshes its dependent only" )
-    ; ( "unknown ancestor is filled through bounded get_block"
+    ; ( "unknown ancestor is filled through bounded get_outline_block"
       , fun () ->
           let r, q, _, _ = fixture () in
           observe r (raw_block 1 60);
@@ -952,7 +952,7 @@ let () =
             let ticket, request = Queue.take q in
             match ticket, request with
             | ( Some ticket
-              , S.Graph_request { request_id; command = P.V2_get_block { block; _ }; _ } )
+              , S.Graph_request { request_id; command = P.V2_get_outline_block { block; _ }; _ } )
               when block = uuid 60 ->
               let value =
                 match block_response (raw_block 60 61) with
@@ -963,7 +963,7 @@ let () =
                 ticket
                 (S.Graph_response
                    (P.V2_response { api_version = 2; request_id; outcome = value }))
-            | _ -> failwith "unknown ancestor requires a public bounded get_block"
+            | _ -> failwith "unknown ancestor requires a public bounded get_outline_block"
           in
           if Queue.is_empty q then change r [ 61 ];
           answer ();

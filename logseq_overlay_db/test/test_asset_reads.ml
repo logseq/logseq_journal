@@ -239,7 +239,7 @@ let deletion database =
   seed database;
   with_snapshot database (fun before ->
     let revision =
-      match D.get_blocks before [ id 1 ] |> get with
+      match D.get_outline_blocks before [ id 1 ] |> get with
       | [ Types.Present_block b ] -> b.revision
       | _ -> Alcotest.fail "missing block"
     in
@@ -347,7 +347,7 @@ let local_asset_import database =
       "duplicate import created another asset");
   let expected =
     with_snapshot database (fun snapshot ->
-      match D.get_blocks snapshot [ id 90 ] |> get with
+      match D.get_outline_blocks snapshot [ id 90 ] |> get with
       | [ Types.Present_block b ] ->
         D.write_precondition ~blocks:[ id 90, b.revision ] ~pages:[] ~scopes:[] |> get
       | _ -> Alcotest.fail "imported asset block missing")
@@ -406,7 +406,7 @@ let local_page_asset_import database =
   let expected =
     with_snapshot database (fun snapshot ->
       let revision =
-        match D.get_blocks snapshot [ text ] |> get with
+        match D.get_outline_blocks snapshot [ text ] |> get with
         | [ Types.Present_block block ] -> block.revision
         | _ -> Alcotest.fail "local capture text missing"
       in
@@ -553,7 +553,7 @@ let reuse_asset_reference database =
   seed database;
   let expected block =
     with_snapshot database (fun snapshot ->
-      match D.get_blocks snapshot [ block ] |> get with
+      match D.get_outline_blocks snapshot [ block ] |> get with
       | [ Types.Present_block b ] ->
         D.write_precondition ~blocks:[ block, b.revision ] ~pages:[] ~scopes:[] |> get
       | _ -> Alcotest.fail "reference holder missing")
@@ -628,7 +628,7 @@ let reference_pending_asset database =
   local_asset_import database;
   let expected =
     with_snapshot database (fun s ->
-      match D.get_blocks s [ id 1 ] |> get with
+      match D.get_outline_blocks s [ id 1 ] |> get with
       | [ Types.Present_block holder ] ->
         D.write_precondition ~blocks:[ id 1, holder.revision ] ~pages:[] ~scopes:[] |> get
       | _ -> Alcotest.fail "holder missing")
@@ -656,7 +656,7 @@ let replace_asset_binary database =
   let expected =
     with_snapshot database (fun snapshot ->
       let revision =
-        match D.get_blocks snapshot [ parent ] |> get with
+        match D.get_outline_blocks snapshot [ parent ] |> get with
         | [ Types.Present_block holder ] -> holder.revision
         | _ -> Alcotest.fail "replacement holder missing"
       in
@@ -950,7 +950,7 @@ let asset_target_classification_budget () =
            (function
              | Types.Missing_block _ -> true
              | _ -> false)
-           (D.get_blocks snapshot (List.init 8 (fun n -> id (100 + n))) |> get))
+           (D.get_outline_blocks snapshot (List.init 8 (fun n -> id (100 + n))) |> get))
         "unresolved reference stubs must not be projected blocks");
     let subscriber, predecessor = D.listen database |> get in
     let revision = (D.snapshot_version predecessor).projection_revision in
@@ -1130,7 +1130,7 @@ let negative_favorite_target_changes ?(link_changed = false) database =
     if List.length favorites.items <> 1
     then (
       let target =
-        match D.get_blocks snapshot [ id 96 ] |> get with
+        match D.get_outline_blocks snapshot [ id 96 ] |> get with
         | [ Types.Present_block { value; _ } ] ->
           Printf.sprintf
             "%s parent=%s page=%s"

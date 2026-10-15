@@ -227,8 +227,9 @@ val inspect_admission
     [Types.Stale_read_cursor]. Malformed cursors or out-of-range offsets return
     [Types.Invalid_read_request]. Restart the query after a stale projection. *)
 
-(** Looks up blocks by UUID in the captured projection. *)
-val get_blocks
+(** Looks up outline content blocks by UUID in the captured projection. These
+    records require parent, page and order; page records are read with [get_pages]. *)
+val get_outline_blocks
   :  snapshot
   -> Graph.block_uuid list
   -> (Types.block_lookup list, Types.read_error) result
@@ -292,7 +293,7 @@ val get_structure
         | Ok snapshot ->
           Fun.protect
             ~finally:(fun () -> release_snapshot snapshot)
-            (fun () -> get_blocks snapshot uuids)
+            (fun () -> get_outline_blocks snapshot uuids)
     ]} *)
 
 (** {1 Crossing from a snapshot to live changes}

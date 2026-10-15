@@ -59,7 +59,7 @@ Use a small test-local helper that:
    `after_revision` equals the transition result's projection revision.
 5. Acquires `Database.current_snapshot` only after receiving the notification.
 6. Proves that the acquired snapshot has the notified `after_revision`.
-7. Reads the affected entities and structure through `Database.get_blocks` and
+7. Reads the affected entities and structure through `Database.get_outline_blocks` and
    `Database.get_structure`.
 8. Releases the snapshot and unlistens through cleanup paths even when an
    assertion fails.
@@ -126,7 +126,7 @@ update in the same publication and is therefore required in addition to the two
 direct publication cases. Its assertions must stay at the stable public
 projection and sync-view boundary rather than inspect private planner details.
 
-All three cases must use `Database.get_blocks` plus a `Children` structure read
+All three cases must use `Database.get_outline_blocks` plus a `Children` structure read
 as their baseline successor pull. A case should add a complete `Page_tree` read
 only when its fixture introduces a multi-level subtree whose recursive nesting
 or ordering is not established by the direct children result. The proposed
@@ -140,7 +140,7 @@ on 2026-09-04:
 - require the independent optimistic outbox case A and authoritative case B;
 - also require combined authoritative-rebase case C so one publication proves
   the merged authoritative and pending-outbox contract; and
-- use `get_blocks` plus `Children` as the normal successor pull, adding
+- use `get_outline_blocks` plus `Children` as the normal successor pull, adding
   `Page_tree` only when a case introduces a multi-level subtree.
 
 ## Alternatives considered
@@ -194,7 +194,7 @@ to the merged logical change suite. Keeping the closed-loop cases in
   successor snapshot version.
 - Each case validates notification interests and the corresponding block and
   structure reads, rather than checking revision advancement alone.
-- Each case uses `get_blocks` and a `Children` request for its baseline pull.
+- Each case uses `get_outline_blocks` and a `Children` request for its baseline pull.
   `Page_tree` is required only for a fixture that introduces a multi-level
   subtree.
 - Outbox-driven coverage verifies the durable submission state with
@@ -243,5 +243,5 @@ snapshot.
 ## Questions
 
 None. The user confirmed that cases A, B, and C are all required, that
-`get_blocks` plus `Children` is the baseline pull, and that `Page_tree` is
+`get_outline_blocks` plus `Children` is the baseline pull, and that `Page_tree` is
 required only for a multi-level subtree fixture on 2026-09-04.

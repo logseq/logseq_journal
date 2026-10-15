@@ -59,7 +59,7 @@
       "api_version": 2,
       "request_id": "00000000-0000-4000-8000-000000000004",
       "command": [
-        "V2_get_block",
+        "V2_get_outline_block",
         {
           "block": "10000000-0000-4000-8000-000000000001",
           "revision": null
@@ -302,7 +302,7 @@
       "api_version": 2,
       "request_id": "00000000-0000-4000-8000-000000000019",
       "command": [
-        "V2_get_block_summary",
+        "V2_get_outline_block_summary",
         {
           "block": "10000000-0000-4000-8000-000000000001",
           "limit": 50,
@@ -339,13 +339,13 @@
     "V2_graph_info",
     "V2_list_journals",
     "V2_get_page",
-    "V2_get_block",
+    "V2_get_outline_block",
     "V2_get_children",
     "V2_get_page_tree",
     "V2_inspect_admission",
     "V2_get_asset_descriptors",
     "V2_list_assets",
-    "V2_get_block_summary"
+    "V2_get_outline_block_summary"
   ],
   "mutation_operations": [
     "V2_save_block",

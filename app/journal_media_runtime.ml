@@ -212,7 +212,7 @@ let observe_request t (request : Protocol.request) =
         "Attachment dependency requests are full. Retry."
     in
     match request.command with
-    | Protocol.V2_get_block { block; _ } | V2_get_block_summary { block; _ } -> fail block
+    | Protocol.V2_get_outline_block { block; _ } | V2_get_outline_block_summary { block; _ } -> fail block
     | V2_get_children { parent; _ } -> fail parent
     | V2_get_page { page; _ } ->
       dependency_failure
@@ -608,7 +608,7 @@ let request_fact t block =
            ; command =
                (if page
                 then V2_get_page { page = uuid; revision = None }
-                else V2_get_block { block = uuid; revision = None })
+                else V2_get_outline_block { block = uuid; revision = None })
            }))
 ;;
 

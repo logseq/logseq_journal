@@ -37,7 +37,7 @@ let journal_precondition database page behavior =
 let block_precondition database block behavior =
   current_snapshot database behavior (fun snapshot ->
     let block_revision =
-      match Database.get_blocks snapshot [ block ] |> T.require_ok ~behavior with
+      match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
       | [ Present_block { revision; _ } ] | [ Missing_block { revision; _ } ] -> revision
       | _ -> Alcotest.fail "block precondition lookup returned the wrong cardinality"
     in
@@ -48,7 +48,7 @@ let block_precondition database block behavior =
 let delete_precondition database block behavior =
   current_snapshot database behavior (fun snapshot ->
     let block_revision =
-      match Database.get_blocks snapshot [ block ] |> T.require_ok ~behavior with
+      match Database.get_outline_blocks snapshot [ block ] |> T.require_ok ~behavior with
       | [ Present_block { revision; _ } ] -> revision
       | _ -> Alcotest.fail "delete target block is missing"
     in
@@ -82,7 +82,7 @@ let insert_precondition database parent behavior =
 let block_insert_precondition database parent behavior =
   current_snapshot database behavior (fun snapshot ->
     let parent_revision =
-      match Database.get_blocks snapshot [ parent ] |> T.require_ok ~behavior with
+      match Database.get_outline_blocks snapshot [ parent ] |> T.require_ok ~behavior with
       | [ Present_block { revision; _ } ] -> revision
       | _ -> Alcotest.fail "insert parent block is missing"
     in
@@ -120,7 +120,7 @@ let insert_is_immediately_readable database =
   in
   T.require (commit.status = Applied) "pending insert did not report Applied";
   current_snapshot database behavior (fun snapshot ->
-    match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+    match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
     | [ Present_block { value; _ } ] ->
       T.require (value.block.title = "Inserted") "pending insert title is not visible"
     | _ -> Alcotest.fail "pending inserted block is not visible")
@@ -172,7 +172,7 @@ let pending_insert_can_be_saved database =
        behavior
      |> require_new_commit behavior);
   current_snapshot database behavior (fun snapshot ->
-    match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+    match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
     | [ Present_block { value; _ } ] ->
       T.require
         (value.block.title = "Edited pending")
@@ -205,7 +205,7 @@ let pending_block_can_receive_an_inserted_child database =
        behavior
      |> require_new_commit behavior);
   current_snapshot database behavior (fun snapshot ->
-    match Database.get_blocks snapshot [ T.child_uuid ] |> T.require_ok ~behavior with
+    match Database.get_outline_blocks snapshot [ T.child_uuid ] |> T.require_ok ~behavior with
     | [ Present_block { value; _ } ] ->
       T.require
         (Graph.Uuid.equal value.block.parent T.block_uuid)
@@ -258,7 +258,7 @@ let pending_insert_can_be_deleted database =
        behavior
      |> require_new_commit behavior);
   current_snapshot database behavior (fun snapshot ->
-    match Database.get_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
+    match Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior with
     | [ Missing_block _ ] -> ()
     | _ -> Alcotest.fail "delete tombstone did not hide the pending block")
 ;;
@@ -381,14 +381,14 @@ let delete_uses_root_revision_and_latest_local_subtree database =
          (commit database expected (T.delete_blocks ~ordinal:43 ()) behavior
           |> require_new_commit behavior);
        current_snapshot database behavior (fun snapshot ->
-         Database.get_blocks snapshot [ T.block_uuid; T.child_uuid; newer; grandchild ]
+         Database.get_outline_blocks snapshot [ T.block_uuid; T.child_uuid; newer; grandchild ]
          |> T.require_ok ~behavior
          |> List.iter (function
            | Missing_block _ -> ()
            | Present_block _ ->
              Alcotest.fail "latest local descendant survived delete admission"));
        match
-         Database.get_blocks pinned [ T.block_uuid; newer ] |> T.require_ok ~behavior
+         Database.get_outline_blocks pinned [ T.block_uuid; newer ] |> T.require_ok ~behavior
        with
        | [ Present_block _; Missing_block _ ] -> ()
        | _ -> Alcotest.fail "delete changed the earlier snapshot")
@@ -532,7 +532,7 @@ let delete_rewrites_external_reference_source database =
      |> require_new_commit behavior);
   current_snapshot database behavior (fun snapshot ->
     match
-      Database.get_blocks snapshot [ T.authoritative_block_uuid; T.reference_source_uuid ]
+      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid; T.reference_source_uuid ]
       |> T.require_ok ~behavior
     with
     | [ Missing_block _; Present_block { value = source; _ } ] ->
@@ -557,7 +557,7 @@ let delete_default_property_value_replaces_holders database =
      |> require_new_commit behavior);
   current_snapshot database behavior (fun snapshot ->
     match
-      Database.get_blocks snapshot [ T.default_value_uuid; T.property_holder_uuid ]
+      Database.get_outline_blocks snapshot [ T.default_value_uuid; T.property_holder_uuid ]
       |> T.require_ok ~behavior
     with
     | [ Present_block _; Present_block { value = holder; _ } ] ->
@@ -609,7 +609,7 @@ let deterministic_model_projection_matches_naive_oracle database =
     in
     current_snapshot database behavior (fun snapshot ->
       let actual =
-        Database.get_blocks
+        Database.get_outline_blocks
           snapshot
           (List.map (fun (block : Oracle.block) -> block.Oracle.uuid) expected_blocks)
         |> T.require_ok ~behavior
@@ -695,7 +695,7 @@ let deterministic_model_projection_matches_naive_oracle database =
 let order_of database uuid =
   current_snapshot database "read assigned order" (fun snapshot ->
     match
-      Database.get_blocks snapshot [ uuid ] |> T.require_ok ~behavior:"read order"
+      Database.get_outline_blocks snapshot [ uuid ] |> T.require_ok ~behavior:"read order"
     with
     | [ Present_block { value; _ } ] -> value.block.order
     | _ -> Alcotest.fail "ordered block is missing")
@@ -993,7 +993,7 @@ let orders_survive_reopen_and_outbox_drain () =
           let module Codec = Transit_native.Transit.Json in
           let records =
             current_snapshot database behavior (fun snapshot ->
-              Database.get_blocks snapshot (List.map order_uuid [ 600; 601; 602 ])
+              Database.get_outline_blocks snapshot (List.map order_uuid [ 600; 601; 602 ])
               |> T.require_ok ~behavior
               |> List.map (function
                 | Present_block { value; _ } -> value.block

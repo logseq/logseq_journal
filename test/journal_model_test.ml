@@ -316,10 +316,10 @@ let test_rich_title_boundaries () =
     ; "before [[outer [[inner]]]] after", "before [[outer [[inner]]]] after"
     ; "SCHEDULED: <2026-10-14 Wed> " ^ link id, "SCHEDULED: <2026-10-14 Wed> Target 中文" ];
   require
-    (List.for_all (fun (run : Journal_model.Title.run) -> run.reference = Some parent_id) (render (link parent_id)))
-    "nested expansion changed the outer reference click target";
+    (List.for_all (fun (run : Journal_model.Title.run) -> run.url = None) (render (link parent_id)))
+    "nested expansion gained a link target";
   let runs = render ("**" ^ link id ^ "**") in
-  require (List.exists (fun (run : Journal_model.Title.run) -> run.text = "Target 中文" && run.reference = Some id && List.mem "bold" run.styles) runs) "reference lost styles/target";
+  require (List.exists (fun (run : Journal_model.Title.run) -> run.text = "Target 中文" && run.url = None && List.mem "bold" run.styles) runs) "reference lost text styles";
   let runs = render "[**标签**](HTTP://example.org/path)" in
   require (List.exists (fun (run : Journal_model.Title.run) -> run.url = Some "http://example.org/path" && run.text = "标签" && List.mem "bold" run.styles) runs) "URL lost nested style or authority";
   let repeated = String.concat " " (List.init 600 (fun _ -> link id)) in
@@ -355,7 +355,28 @@ let test_ast_reference_discovery () =
       "AST reference discovery: %s" name) cases
 ;;
 
+let test_resolved_references_are_plain_text () =
+  let token target = "[[" ^ target ^ "]]" in
+  let lookup target =
+    if target=id then Some ("**Date** " ^ token parent_id ^ " https://example.org/in-reference")
+    else if target=parent_id then Some "nested" else None in
+  let runs=Journal_model.Title.render ~lookup (token id ^ " https://example.org/ordinary") in
+  let json=Journal_model.Title.to_yojson runs in
+  (match json with
+   | `List values -> List.iter (function
+       | `Assoc fields -> require (not (List.mem_assoc "reference" fields))
+           "resolved UUID still carries navigation metadata"
+       | _ -> require false "run JSON shape") values
+   | _ -> require false "runs JSON shape");
+  require (List.filter_map (fun (run:Journal_model.Title.run)->run.url) runs
+    = ["https://example.org/in-reference";"https://example.org/ordinary"])
+    "ordinary URLs lost their existing link behavior";
+  require (List.exists (fun (run:Journal_model.Title.run)->run.text="Date" && List.mem "bold" run.styles) runs)
+    "plain reference lost content formatting"
+;;
+
 let () =
+  test_resolved_references_are_plain_text ();
   test_rich_title_boundaries ();
   test_ast_reference_discovery ();
   test_reference_text ();

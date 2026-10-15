@@ -85,7 +85,7 @@ let () =
     ; T.case "v2 catalog contains only the current App surface" (fun () ->
         require_exact
           "read operations"
-          [ "V2_get_block"
+          [ "V2_get_outline_block"
           ; "V2_get_children"
           ; "V2_get_page"
           ; "V2_get_page_tree"
@@ -95,7 +95,7 @@ let () =
           ; "V2_list_journals"
           ; "V2_get_asset_descriptors"
           ; "V2_list_assets"
-          ; "V2_get_block_summary"
+          ; "V2_get_outline_block_summary"
           ]
           (strings "read_operations" commands);
         require_exact

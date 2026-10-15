@@ -604,7 +604,7 @@ let test_capture_task_reads_inserted_block_revision_before_status () =
   ignore (seed_visible_block runtime);
   let block_request = capture_task_block_request runtime in
   (match block_request.command with
-   | V2_get_block { block; revision = None } ->
+   | V2_get_outline_block { block; revision = None } ->
      Alcotest.(check string)
        "captured block read target"
        capture_task.block_id
@@ -918,7 +918,7 @@ let test_point_read_tag_metadata () =
          List.find
            (fun (request : Protocol.request) ->
               match request.command with
-              | V2_get_block _ -> true
+              | V2_get_outline_block _ -> true
               | _ -> false)
            hydrated.requests
        in

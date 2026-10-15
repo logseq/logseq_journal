@@ -87,7 +87,7 @@ val property_sources : ?localtime:(float -> Unix.tm) -> Logseq_db_types.Graph_ty
 
 (** mldoc owns syntax; native views consume these shared presentation runs. *)
 module Title : sig
-  type run = { text : string; styles : string list; url : string option; reference : string option }
+  type run = { text : string; styles : string list; url : string option }
   type t = run list
   val render : ?lookup:(string -> string option) -> string -> t
   val plain : t -> string

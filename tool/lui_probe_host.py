@@ -10,8 +10,11 @@ The OCaml side is produced separately: build the workspace (`dune build`) and
 create the complete object with `ocamlfind ocamlopt -linkpkg
 -output-complete-obj` over the `app` archive plus the probe module (the probe
 self-registers via `Journal_bridge.register`, so link it last so its
-registration wins). Pass the result via `--native-object` / JOURNAL_OCAML_OBJECT;
-without it the build links the stub object (link-only validation).
+registration wins). Pass the result via `--native-object`; the helper selects
+isolated `--probe-native-object`, records its hash and checks its target/runtime
+entries. Supply an object already built for macOS or Simulator; no restamping
+is done. This records caller-supplied probe input, not production source or ABI
+proof. Without it the build explicitly selects stub link-only validation.
 """
 import os
 from pathlib import Path
@@ -46,10 +49,10 @@ def stage(host, app_swift, bundle_id, display_name, swift_names=None):
 
 
 def build(host, platform="macos", app_name="JournalApp.app", native_object=None,
-          extra_env=None):
+          extra_env=None, preflight=False):
     """Build the staged host through tool/build_journal_apple.sh. Returns the
     assembled .app path. `platform` is 'macos' or 'ios-simulator'."""
-    host = Path(host)
+    host = Path(host).resolve()
     env = dict(
         os.environ,
         JOURNAL_SWIFT_DIR=str(host / "swift"),
@@ -59,11 +62,14 @@ def build(host, platform="macos", app_name="JournalApp.app", native_object=None,
             str((ROOT / "../lui/platform/apple").resolve())),
     )
     env.update(extra_env or {})
-    if native_object:
-        env["JOURNAL_OCAML_OBJECT"] = str(Path(native_object).resolve())
+    mode = (["--probe-native-object", str(Path(native_object).resolve())]
+            if native_object else ["--link-only"])
+    if preflight:
+        mode.append("--preflight")
     app_dir = host / "apple" / app_name
     result = subprocess.run(
-        ["bash", str(ROOT / "tool" / "build_journal_apple.sh"), platform, str(app_dir)],
+        ["bash", str(ROOT / "tool" / "build_journal_apple.sh"), platform, str(app_dir),
+         "--cache-dir", str(host / "build-cache"), *mode],
         cwd=ROOT, env=env, capture_output=True, text=True)
     print(result.stdout, end="")
     print(result.stderr, end="")

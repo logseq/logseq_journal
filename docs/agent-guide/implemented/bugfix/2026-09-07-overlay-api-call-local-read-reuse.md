@@ -13,7 +13,7 @@ The user selected five findings for this proposal:
 2. Repeated block, subtree, and affected-page reads during deletion admission.
 3. Duplicate sibling scans for insertion precondition validation and order
    assignment, including unnecessary full entity reads.
-4. Metadata enumeration for an empty `Database.get_blocks` request.
+4. Metadata enumeration for an empty `Database.get_outline_blocks` request.
 5. Repeated metadata reads across one `Database.get_pages` batch.
 
 The 2026-09-07 audit used source commit
@@ -24,9 +24,9 @@ children; deletion targeted the just-inserted ten-block overlay tree.
 
 | Operation | Consumed datom results | Relevant measured repetition |
 | --- | ---: | --- |
-| `get_blocks []` | 173 | One unnecessary ident enumeration |
-| `get_blocks`, one existing block | 222 | Includes the 173-ident catalog |
-| `get_blocks`, 64 blocks | 600 | Existing batch-local hydration reuse |
+| `get_outline_blocks []` | 173 | One unnecessary ident enumeration |
+| `get_outline_blocks`, one existing block | 222 | Includes the 173-ident catalog |
+| `get_outline_blocks`, 64 blocks | 600 | Existing batch-local hydration reuse |
 | `get_pages`, 64 pages | 1,408 | Repeated metadata lookups across pages |
 | `commit_local`, insert ten blocks | 3,266 | Two sibling scans: 2,562 entity results and 512 parent-index results |
 | `commit_local`, delete ten blocks | 7,920 | 33 ident enumerations, totaling 5,709 results |
@@ -183,7 +183,7 @@ outside this scope.
 
 ### Empty block requests and batched page reads
 
-For `get_blocks []`, preserve the existing `with_snapshot_read` lifecycle and
+For `get_outline_blocks []`, preserve the existing `with_snapshot_read` lifecycle and
 error validation before returning `Ok []`. Do not allocate or enumerate a
 hydration cache. A released snapshot or closed database must not become valid
 merely because the request is empty.
@@ -201,7 +201,7 @@ Likely production touch points are internal helpers in
 `logseq_overlay_db/lib/database.ml`:
 
 - `hydration_cache`, property-definition/summary helpers, and UUID resolution.
-- `logical_block_at`, `logical_page_at`, `get_blocks`, and `get_pages`.
+- `logical_block_at`, `logical_page_at`, `get_outline_blocks`, and `get_pages`.
 - `preconditions_match`, `revision_for_scope`, and structural child-fact helpers.
 - `insertion_orders`, `local_candidate_record`, `planned_effect`, and deletion
   artifact construction.

@@ -205,7 +205,7 @@ let rec pump_dependencies t =
       in
       let command =
         match dependency with
-        | Block block -> Protocol.V2_get_block { block; revision = None }
+        | Block block -> Protocol.V2_get_outline_block { block; revision = None }
         | Page page -> V2_get_page { page; revision = None }
       in
       let request = Protocol.{ api_version = 2; request_id; command } in

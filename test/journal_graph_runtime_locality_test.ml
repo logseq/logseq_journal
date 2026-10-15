@@ -318,7 +318,7 @@ let test_large_changes_are_bounded fail_one =
     | (request : Protocol.request) :: rest ->
       let id =
         match request.command with
-        | V2_get_block { block; _ } -> block
+        | V2_get_outline_block { block; _ } -> block
         | _ -> Alcotest.fail "unexpected background request"
       in
       let outcome =
@@ -478,7 +478,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
               ; items = []
               ; next_cursor = None
               } )
-        | V2_get_block { block = id; _ } ->
+        | V2_get_outline_block { block = id; _ } ->
           let value =
             List.find
               (fun (value : Protocol.v2_block_record) ->
@@ -597,7 +597,7 @@ let test_one_block_change_hydrates_only_that_block () =
   let output = changed runtime (window ~blocks:[ block_uuid; unrelated_uuid ] ()) in
   require_ack output;
   match hydration_requests output with
-  | [ { Protocol.command = V2_get_block { block; _ }; _ } ] ->
+  | [ { Protocol.command = V2_get_outline_block { block; _ }; _ } ] ->
     Alcotest.(check string)
       "hydrated block"
       (Graph.Uuid.to_string block_uuid)
@@ -1230,7 +1230,7 @@ let summary_response request page lookup children next_cursor revision =
 
 let check_target_summary (request : Protocol.request) cursor =
   match request.command with
-  | V2_get_block_summary { block; limit; cursor = actual_cursor } ->
+  | V2_get_outline_block_summary { block; limit; cursor = actual_cursor } ->
     Alcotest.(check bool) "target identity" true (Graph.Uuid.equal block block_uuid);
     Alcotest.(check int) "bounded target children" Protocol.default_page_size limit;
     Alcotest.(check bool) "target children cursor" true (actual_cursor = cursor)
@@ -2373,12 +2373,23 @@ let reference_updates output =
     output.Runtime.responses
 ;;
 
-let check_target_request output =
-  let request = only "shared reference point read" (hydration_requests output) in
+let outline_after_page_miss runtime request =
+  match request.Protocol.command with
+  | V2_get_page {page;_} ->
+    Runtime.receive runtime (response request (Protocol.V2_page_outcome
+      (V2_missing_page {uuid=page;revision="page-absent"})))
+    |> fun output -> only "outline lookup after page absence" output.requests
+  | V2_get_outline_block _ -> request
+  | _ -> Alcotest.fail "not a reference lookup"
+;;
+
+let check_target_request runtime output =
+  let request = only "shared reference point read" (hydration_requests output)
+    |> outline_after_page_miss runtime in
   Alcotest.(check bool)
     "reads only target UUID"
     true
-    (request.Protocol.command = V2_get_block { block = target_uuid; revision = None });
+    (request.Protocol.command = V2_get_outline_block { block = target_uuid; revision = None });
   request
 ;;
 
@@ -2386,7 +2397,7 @@ let test_reference_hydration_and_changes () =
   let runtime = Runtime.create () in
   let request =
     reference_feed runtime (reference ^ " " ^ reference ^ " [[page]]")
-    |> check_target_request
+    |> check_target_request runtime
   in
   let resolved = Runtime.receive runtime (target_response request "Referenced content") in
   Alcotest.(check (option string))
@@ -2399,7 +2410,7 @@ let test_reference_hydration_and_changes () =
     (List.length resolved.requests);
   let changed_request =
     changed runtime (window ~blocks:[ target_uuid; unrelated_uuid ] ())
-    |> check_target_request
+    |> check_target_request runtime
   in
   let updated =
     Runtime.receive runtime (target_response changed_request "Edited content")
@@ -2409,7 +2420,7 @@ let test_reference_hydration_and_changes () =
     (Some "Edited content")
     (List.assoc_opt target_id (reference_updates updated) |> Option.join);
   let deleted_request =
-    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   let deleted =
     Runtime.receive
@@ -2424,7 +2435,7 @@ let test_reference_hydration_and_changes () =
     true
     (List.assoc_opt target_id (reference_updates deleted) = Some None);
   let recreated_request =
-    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   ignore (Runtime.receive runtime (target_response recreated_request "Recreated"));
   let resync =
@@ -2442,7 +2453,7 @@ let test_reference_hydration_and_changes () =
     true
     (List.exists
        (fun (request : Protocol.request) ->
-          request.command = V2_get_block { block = target_uuid; revision = None })
+          request.command = V2_get_page { page = target_uuid; revision = None })
        resync.requests);
   Runtime.reset runtime;
   Alcotest.(check int)
@@ -2454,7 +2465,7 @@ let test_reference_hydration_and_changes () =
 
 let test_reference_cycle_and_failure () =
   let runtime = Runtime.create () in
-  let request = reference_feed runtime reference |> check_target_request in
+  let request = reference_feed runtime reference |> check_target_request runtime in
   let output =
     Runtime.receive
       runtime
@@ -2465,7 +2476,7 @@ let test_reference_cycle_and_failure () =
     0
     (List.length output.requests);
   let changed_request =
-    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   let failed =
     Runtime.receive
@@ -2479,14 +2490,14 @@ let test_reference_cycle_and_failure () =
     "failed target clears stale content"
     true
     (List.assoc_opt target_id (reference_updates failed) = Some None);
-  ignore (changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request)
+  ignore (changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime)
 ;;
 
 let test_reference_invalidation_during_read () =
   List.iter
     (fun fail ->
        let runtime = Runtime.create () in
-       let request = reference_feed runtime reference |> check_target_request in
+       let request = reference_feed runtime reference |> check_target_request runtime in
        let changed = changed runtime (window ~blocks:[ target_uuid ] ()) in
        Alcotest.(check int)
          "pending target invalidation coalesces"
@@ -2507,7 +2518,7 @@ let test_reference_invalidation_during_read () =
          "stale completion is not published"
          true
          (not (List.mem (target_id, Some "Stale") (reference_updates stale)));
-       let fresh = check_target_request stale in
+       let fresh = check_target_request runtime stale in
        let result = Runtime.receive runtime (target_response fresh "Fresh") in
        Alcotest.(check (option string))
          "newest content wins"
@@ -2535,7 +2546,7 @@ let test_abandoned_reference_can_refresh () =
   List.iter
     (fun fail ->
        let runtime = Runtime.create () in
-       let request = reference_feed runtime reference |> check_target_request in
+       let request = reference_feed runtime reference |> check_target_request runtime in
        if fail
        then ignore (Runtime.fail_request runtime request ~message:"Worker interrupted")
        else Runtime.abandon runtime request;
@@ -2545,7 +2556,7 @@ let test_abandoned_reference_can_refresh () =
          0
          (List.length late.responses + List.length late.requests);
        let fresh =
-         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
        in
        ignore (Runtime.receive runtime (target_response fresh "Recovered"));
        let duplicate = Runtime.fail_request runtime request ~message:"Late terminal" in
@@ -2562,7 +2573,7 @@ let test_shorter_reference_path_discovers_nested_targets () =
   let link n = "[[" ^ id n ^ "]]" in
   let output = ref (reference_feed runtime (link 1)) in
   for n = 1 to Journal_model.maximum_reference_depth do
-    let request = only "chain point read" !output.requests in
+    let request = only "chain point read" !output.requests |> outline_after_page_miss runtime in
     output
     := Runtime.receive
          runtime
@@ -2584,8 +2595,8 @@ let test_shorter_reference_path_discovers_nested_targets () =
     "reads next nested target"
     true
     (request.Protocol.command
-     = V2_get_block
-         { block = uuid (id (Journal_model.maximum_reference_depth + 1))
+     = V2_get_page
+         { page = uuid (id (Journal_model.maximum_reference_depth + 1))
          ; revision = None
          })
 ;;
@@ -2609,8 +2620,8 @@ let test_reference_burst_is_bounded () =
       runtime
       (response
          request
-         (Protocol.V2_block_outcome
-            (V2_missing_block { uuid = target_uuid; revision = "missing" })))
+         (Protocol.V2_page_outcome
+            (V2_missing_page { uuid = (match request.command with V2_get_page {page;_}->page | _->assert false); revision = "missing" })))
   in
   Alcotest.(check int)
     "completion drains one queued lookup"
@@ -2672,7 +2683,7 @@ let test_stale_feed_cannot_replace_reference_source () =
        let current = begin_reference_tree runtime 9L in
        ignore (Runtime.receive runtime (reference_tree_response current fresh_title));
        let changed_read =
-         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
        in
        let stale = Runtime.receive runtime (reference_tree_response old "Stale") in
        Alcotest.(check bool)
@@ -2683,7 +2694,7 @@ let test_stale_feed_cannot_replace_reference_source () =
        ignore fresh;
        let old = begin_reference_tree runtime 10L in
        let newer =
-         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+         changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
        in
        ignore (Runtime.receive runtime (target_response newer fresh_title));
        let stale = Runtime.receive runtime (reference_tree_response old "Rollback") in
@@ -2700,7 +2711,7 @@ let test_shared_change_failure_invalidates_reference () =
   let initial = begin_reference_tree runtime 7L in
   ignore (Runtime.receive runtime (reference_tree_response initial "Old"));
   let changed_read =
-    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   let failed =
     Runtime.receive
@@ -2714,9 +2725,9 @@ let test_shared_change_failure_invalidates_reference () =
     "shared failure removes old source"
     true
     (List.mem (target_id, None) (reference_updates failed));
-  let old = changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request in
+  let old = changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime in
   let newer =
-    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   ignore (Runtime.receive runtime (target_response newer "Fresh"));
   let failed =
@@ -2731,7 +2742,7 @@ let test_shared_change_failure_invalidates_reference () =
     false
     (List.mem (target_id, None) (reference_updates failed));
   let retry =
-    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request
+    changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   ignore (Runtime.receive runtime (target_response retry "Recovered"))
 ;;
@@ -2925,7 +2936,7 @@ let copy_start root =
     "Copy reads selected root only"
     true
     (match snd (copy_read effects) with
-     | Protocol.V2_get_block { block; _ } -> Graph.Uuid.equal block root
+     | Protocol.V2_get_outline_block { block; _ } -> Graph.Uuid.equal block root
      | _ -> false);
   state, effects
 ;;
@@ -3245,7 +3256,7 @@ let test_ordinary_detail_point_change child_changed =
   let output = changed runtime (window ~blocks:[ value.block.uuid ] ()) in
   let request = only "ordinary detail changed identity" (hydration_requests output) in
   (match request.command with
-   | V2_get_block { block; _ } ->
+   | V2_get_outline_block { block; _ } ->
      Alcotest.(check bool)
        "only changed identity"
        true
@@ -3295,7 +3306,7 @@ let test_detail_children_uses_latest_root () =
     List.find
       (fun (request : Protocol.request) ->
          match request.command with
-         | V2_get_block _ -> true
+         | V2_get_outline_block _ -> true
          | _ -> false)
       (hydration_requests output)
   in
@@ -3367,7 +3378,7 @@ let test_detail_resync_reads_latest_root () =
     (List.exists
        (fun (request : Protocol.request) ->
           match request.command with
-          | V2_get_block { block; _ } -> Graph.Uuid.equal block block_uuid
+          | V2_get_outline_block { block; _ } -> Graph.Uuid.equal block block_uuid
           | _ -> false)
        output.requests)
 ;;
@@ -3444,7 +3455,7 @@ let seed_favorite_dependencies
                 ]
             ; next_cursor = None
             }
-        | V2_get_block { block = id; _ } ->
+        | V2_get_outline_block { block = id; _ } ->
           visited := Graph.Uuid.to_string id :: !visited;
           let value =
             if Graph.Uuid.equal id block_uuid
@@ -4611,9 +4622,10 @@ let test_detail_property_reference_reads_are_deduplicated () =
   let children=Protocol.V2_children_outcome
     {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None} in
   let output=Runtime.receive runtime (response child children) in
-  let reference=only "one deduplicated closed property reference" output.requests in
+  let reference=only "one deduplicated closed property reference" output.requests
+    |> outline_after_page_miss runtime in
   (match reference.command with
-   |Protocol.V2_get_block {block;_}->Alcotest.(check string) "closed value UUID"
+   |Protocol.V2_get_outline_block {block;_}->Alcotest.(check string) "closed value UUID"
       (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
    |_ ->Alcotest.fail "property value must use the existing bounded block read");
   let closed={record with block={block with uuid=unrelated_uuid;title="Yes";properties=[]}} in
@@ -4643,7 +4655,7 @@ let test_changed_journal_detail_discovers_property_reference () =
       {value={record with block={block with properties=[property]}}; revision="block-2"}))) in
   let reference = only "new property reference after sync" output.requests in
   (match reference.command with
-   | Protocol.V2_get_block {block;_} -> Alcotest.(check string) "new closed value"
+   | Protocol.V2_get_page {page=block;_} -> Alcotest.(check string) "new closed value"
        (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
    | _ -> Alcotest.fail "sync did not use the owned reference reader")
 ;;
@@ -4720,7 +4732,7 @@ let test_materialized_detail_leaf_discovers_property_reference () =
   in
   let read = only "displayed leaf property demand" output.requests in
   match read.command with
-  | Protocol.V2_get_block { block; _ } ->
+  | Protocol.V2_get_page { page=block; _ } ->
     Alcotest.(check string)
       "leaf closed value UUID"
       (Graph.Uuid.to_string unrelated_uuid)
@@ -4820,7 +4832,7 @@ let test_detail_child_property_reference_without_child_load () =
   in
   let request = only "returned child property demand" output.requests in
   match request.command with
-  | Protocol.V2_get_block { block; _ } ->
+  | Protocol.V2_get_page { page=block; _ } ->
     Alcotest.(check bool)
       "child property target"
       true
@@ -4965,8 +4977,9 @@ let test_page_property_promotes_prior_block_reference () =
     let root : Protocol.v2_tree_member =
       {value={record with block={block with title}};revision="root-1";depth=0;parent=page_uuid} in
     let first=Runtime.receive runtime (tree_page tree [root] None)
-      |> fun o -> only "initial generic reference" o.requests in
-    (match first.command with Protocol.V2_get_block _ -> () | _ -> Alcotest.fail "expected generic block lookup");
+      |> fun o -> only "initial generic page reference" o.requests
+      |> outline_after_page_miss runtime in
+    (match first.command with Protocol.V2_get_outline_block _ -> () | _ -> Alcotest.fail "expected generic block lookup");
     if not pending then ignore (Runtime.receive runtime (response first (Protocol.V2_block_outcome
       (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
     let property : Graph.property_summary =
@@ -5053,10 +5066,347 @@ let test_changed_tree_all_property_slice_continues () =
        output.responses)
 ;;
 
+(* The runtime owns reference discovery and its private cache; exercise its
+   public requests/completions instead of injecting an application cache result. *)
+let expect_reference_page output id =
+  let request = only "one deduplicated page-first request" (hydration_requests output) in
+  Alcotest.(check bool) "page lookup precedes outline lookup" true
+    (request.Protocol.command = V2_get_page { page = id; revision = None });
+  request
+;;
+
+let missing_reference_page runtime request id =
+  Runtime.receive runtime
+    (response request (Protocol.V2_page_outcome
+      (V2_missing_page { uuid = id; revision = "page-absent" })))
+;;
+
+let expect_reference_outline output id =
+  let request = only "one outline fallback after explicit page miss" (hydration_requests output) in
+  Alcotest.(check bool) "outline target" true
+    (request.Protocol.command = V2_get_outline_block { block = id; revision = None });
+  request
+;;
+
+let reference_page_response ?(recycled = false) request kind title =
+  response request (Protocol.V2_page_outcome
+    (V2_present_page { page = { page with uuid = target_uuid; kind; title; recycled }
+      ; revision = "resolved-page" }))
+;;
+
+let test_reference_page_first_resolves_pages () =
+  List.iter (fun kind ->
+    let runtime = Runtime.create () in
+    let request = reference_feed runtime (reference ^ " " ^ reference)
+      |> fun output -> expect_reference_page output target_uuid in
+    let resolved = Runtime.receive runtime
+      (reference_page_response request kind "2026-09-01") in
+    Alcotest.(check (option string)) "actual page title is published"
+      (Some "2026-09-01") (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
+    Alcotest.(check int) "present page never queries outline" 0 (List.length resolved.requests);
+    let cached = reference_feed runtime reference in
+    Alcotest.(check int) "positive page source is reused" 0 (List.length cached.requests);
+    let refresh = changed runtime (window ~pages:[target_uuid] ())
+      |> fun output -> expect_reference_page output target_uuid in
+    let updated = Runtime.receive runtime (reference_page_response refresh kind "Edited page") in
+    Alcotest.(check (option string)) "page change invalidates typed cache"
+      (Some "Edited page") (List.assoc_opt target_id (reference_updates updated) |> Option.join))
+    [Graph.Journal_page {journal_day=20260901}; Ordinary_page]
+;;
+
+let test_reference_page_miss_then_outline () =
+  let runtime = Runtime.create () in
+  let page_read = reference_feed runtime reference
+    |> fun output -> expect_reference_page output target_uuid in
+  let fallback = missing_reference_page runtime page_read target_uuid in
+  Alcotest.(check bool) "page miss is not a negative target result" false
+    (List.mem (target_id,None) (reference_updates fallback));
+  let outline = expect_reference_outline fallback target_uuid in
+  Alcotest.(check int) "duplicate source joins pending fallback" 0
+    (List.length (reference_feed runtime (reference ^ " " ^ reference)).requests);
+  let resolved = Runtime.receive runtime (target_response outline "Outline body") in
+  Alcotest.(check (option string)) "outline source resolves after page absence"
+    (Some "Outline body") (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
+  Alcotest.(check int) "positive outline source is reused" 0
+    (List.length (reference_feed runtime reference).requests)
+;;
+
+let test_reference_negative_cache_requires_both_misses () =
+  let runtime = Runtime.create () in
+  let page_read = reference_feed runtime reference
+    |> fun output -> expect_reference_page output target_uuid in
+  let fallback = missing_reference_page runtime page_read target_uuid in
+  let outline = expect_reference_outline fallback target_uuid in
+  let missing = Runtime.receive runtime (response outline (Protocol.V2_block_outcome
+    (V2_missing_block {uuid=target_uuid;revision="outline-absent"}))) in
+  Alcotest.(check bool) "both misses publish unavailable source" true
+    (List.mem (target_id,None) (reference_updates missing));
+  Alcotest.(check int) "both misses are cached" 0
+    (List.length (reference_feed runtime reference).requests)
+;;
+
+let test_reference_errors_and_cancellation_retry_page_first () =
+  List.iter (fun outline_stage -> List.iter (fun terminal ->
+    let runtime=Runtime.create () in
+    let first=reference_feed runtime reference
+      |> fun output->expect_reference_page output target_uuid in
+    let current=if outline_stage then
+      missing_reference_page runtime first target_uuid |> fun output->expect_reference_outline output target_uuid
+      else first in
+    let failed = match terminal with
+      | 0 -> Runtime.receive runtime (response current
+          (Protocol.V2_failed {code="StorageBusy";message="transient"}))
+      | 1 -> Runtime.fail_request runtime current ~message:"Worker cancelled"
+      | _ -> Runtime.abandon runtime current; {Runtime.requests=[];responses=[]} in
+    Alcotest.(check int) "failure/cancel is not page absence" 0 (List.length failed.requests);
+    let retry=reference_feed runtime reference
+      |> fun output->expect_reference_page output target_uuid in
+    let late=Runtime.receive runtime (reference_page_response first Ordinary_page "Late") in
+    Alcotest.(check int) "old terminal cannot complete the retry" 0
+      (List.length late.requests+List.length late.responses);
+    let fresh=Runtime.receive runtime (reference_page_response retry Ordinary_page "Recovered") in
+    Alcotest.(check (option string)) "retry is not poisoned by negative cache"
+      (Some "Recovered") (List.assoc_opt target_id (reference_updates fresh) |> Option.join)) [0;1;2]) [false;true]
+;;
+
+let test_reference_reset_discards_both_stages () =
+  List.iter (fun outline_stage ->
+    let runtime=Runtime.create () in
+    let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+    let old=if outline_stage then missing_reference_page runtime first target_uuid
+      |> fun output->expect_reference_outline output target_uuid else first in
+    Runtime.reset runtime;
+    let fresh=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+    let late=Runtime.receive runtime
+      (if outline_stage then target_response old "Old graph"
+       else reference_page_response old Ordinary_page "Old graph") in
+    Alcotest.(check int) "reset rejects old graph completion" 0
+      (List.length late.requests+List.length late.responses);
+    let result=Runtime.receive runtime (reference_page_response fresh Ordinary_page "New graph") in
+    Alcotest.(check (option string)) "new graph owns source"
+      (Some "New graph") (List.assoc_opt target_id (reference_updates result) |> Option.join)) [false;true]
+;;
+
+let test_reference_invalidation_restarts_page_phase () =
+  List.iter (fun outline_stage ->
+    let runtime=Runtime.create () in
+    let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+    let current=if outline_stage then missing_reference_page runtime first target_uuid
+      |> fun output->expect_reference_outline output target_uuid else first in
+    let invalidated=changed runtime (window ~pages:[target_uuid] ()) in
+    Alcotest.(check int) "in-flight invalidations coalesce" 0
+      (List.length (hydration_requests invalidated));
+    let stale=Runtime.receive runtime
+      (if outline_stage then target_response current "Stale"
+       else response current (Protocol.V2_page_outcome
+         (V2_missing_page {uuid=target_uuid;revision="old-page-miss"}))) in
+    Alcotest.(check bool) "stale phase never publishes" false
+      (List.mem (target_id,Some "Stale") (reference_updates stale));
+    let refresh=expect_reference_page stale target_uuid in
+    let result=Runtime.receive runtime (reference_page_response refresh Ordinary_page "Fresh") in
+    Alcotest.(check (option string)) "invalidation restarts from page"
+      (Some "Fresh") (List.assoc_opt target_id (reference_updates result) |> Option.join)) [false;true]
+;;
+
+let test_reference_fallback_keeps_original_epoch () =
+  let runtime=Runtime.create () in
+  let old=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+  let newer=begin_reference_tree runtime 20L in
+  let newest = Runtime.receive runtime (reference_tree_response newer "Newer fragment") in
+  Alcotest.(check (option string)) "newer fragment publishes source"
+    (Some "Newer fragment") (List.assoc_opt target_id (reference_updates newest) |> Option.join);
+  let fallback=missing_reference_page runtime old target_uuid in
+  let completed=match hydration_requests fallback with
+    | [] -> fallback
+    | [_] -> Runtime.receive runtime (target_response
+        (expect_reference_outline fallback target_uuid) "Older fallback")
+    | _ -> Alcotest.fail "duplicate fallback" in
+  Alcotest.(check bool) "old two-stage lookup cannot replace a newer fragment" false
+    (List.mem (target_id,Some "Older fallback") (reference_updates completed));
+  let cached=reference_feed runtime reference in
+  Alcotest.(check int) "newer cached source remains available without a retry"
+    0 (List.length cached.requests);
+  Alcotest.(check bool) "older missing result cannot clear a newer source" false
+    (List.mem (target_id,None) (reference_updates completed))
+;;
+
+let test_reference_two_stage_burst_stays_bounded () =
+  let runtime=Runtime.create () in
+  let source=String.concat " " (List.init 30 (fun n->
+    Printf.sprintf "[[a4000000-0000-4000-9000-%012d]]" n)) in
+  let pending=Queue.create () in
+  List.iter (fun request->Queue.push request pending) (reference_feed runtime source).requests;
+  Alcotest.(check int) "four initial page reads" 4 (Queue.length pending);
+  let pages=ref 0 and outlines=ref 0 in
+  while not (Queue.is_empty pending) do
+    let request : Protocol.request = Queue.pop pending in
+    let outcome=match request.command with
+      | V2_get_page {page;_}->incr pages;Protocol.V2_page_outcome
+          (V2_missing_page {uuid=page;revision="page-missing"})
+      | V2_get_outline_block {block;_}->incr outlines;Protocol.V2_block_outcome
+          (V2_missing_block {uuid=block;revision="outline-missing"})
+      | _->Alcotest.fail "unexpected hydration request" in
+    List.iter (fun request->Queue.push request pending)
+      (Runtime.receive runtime (response request outcome)).requests;
+    Alcotest.(check bool) "both phases share four-read admission" true (Queue.length pending<=4)
+  done;
+  Alcotest.(check int) "one page read per UUID" 30 !pages;
+  Alcotest.(check int) "one fallback per explicit miss" 30 !outlines;
+  Alcotest.(check int) "negative results remain deduplicated" 0
+    (List.length (reference_feed runtime source).requests)
+;;
+
+let test_recycled_reference_page_never_falls_back () =
+  let runtime=Runtime.create () in
+  let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+  let hidden=Runtime.receive runtime (reference_page_response ~recycled:true first Ordinary_page "Hidden") in
+  Alcotest.(check int) "existing recycled page is not a missing page" 0 (List.length hidden.requests);
+  Alcotest.(check bool) "recycled title is never shown" false
+    (List.mem (target_id,Some "Hidden") (reference_updates hidden));
+  ignore (reference_feed runtime reference |> fun output->expect_reference_page output target_uuid)
+;;
+
+let test_reference_failed_read_retains_epoch_fence () =
+  List.iter (fun abandon ->
+    let runtime=Runtime.create () in
+    let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+    let old_fragment=begin_reference_tree runtime 11L in
+    ignore (changed runtime (window ~pages:[target_uuid] ()));
+    let retry=missing_reference_page runtime first target_uuid
+      |> fun output->expect_reference_page output target_uuid in
+    if abandon then Runtime.abandon runtime retry
+    else ignore (Runtime.fail_request runtime retry ~message:"transient failure");
+    let late=Runtime.receive runtime (reference_tree_response old_fragment "Rollback") in
+    Alcotest.(check bool) "failure/cancel preserves its epoch fence" false
+      (List.mem (target_id,Some "Rollback") (reference_updates late));
+    let retry_output =
+      if hydration_requests late <> [] then late
+      else reference_feed runtime reference
+    in
+    ignore (expect_reference_page retry_output target_uuid);
+    Alcotest.(check int) "pending retry remains deduplicated" 0
+      (List.length (reference_feed runtime reference).requests)) [false;true]
+;;
+
+let test_reference_abandon_preserves_newer_source () =
+  let runtime=Runtime.create () in
+  let old=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+  let older_fragment=begin_reference_tree runtime 12L in
+  let current_fragment=begin_reference_tree runtime 13L in
+  let fresh=Runtime.receive runtime (reference_tree_response current_fragment "Current") in
+  Alcotest.(check bool) "fresh fragment published" true
+    (List.mem (target_id,Some "Current") (reference_updates fresh));
+  Runtime.abandon runtime old;
+  let rollback=Runtime.receive runtime (reference_tree_response older_fragment "Rollback") in
+  Alcotest.(check bool) "abandon cannot delete a newer source fence" false
+    (List.mem (target_id,Some "Rollback") (reference_updates rollback));
+  Alcotest.(check int) "newer source remains cached" 0
+    (List.length (reference_feed runtime reference).requests)
+;;
+
+let test_reference_shared_failure_can_retry_discovery () =
+  let runtime=Runtime.create () in
+  set_calendar runtime;
+  let initial=begin_reference_tree runtime 14L in
+  ignore (Runtime.receive runtime (reference_tree_response initial "Loaded"));
+  let update=changed runtime (window ~blocks:[target_uuid] ())
+    |> check_target_request runtime in
+  ignore (Runtime.fail_request runtime update ~message:"shared point-read failed");
+  ignore (reference_feed runtime reference |> fun output->expect_reference_page output target_uuid)
+;;
+
+let test_reference_page_survives_unrelated_outline_miss () =
+  let runtime=Runtime.create () in
+  let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+  ignore (Runtime.receive runtime (reference_page_response first Ordinary_page "Actual page"));
+  let wrong_projection=Runtime.submit runtime (Journal_graph_request.Find_block target_id)
+    |> fun output->only "independent outline request" output.requests in
+  let missing=Runtime.receive runtime (response wrong_projection (Protocol.V2_block_outcome
+    (V2_missing_block {uuid=target_uuid;revision="not-an-outline"}))) in
+  Alcotest.(check bool) "outline miss does not invalidate an existing page" false
+    (List.mem (target_id,None) (reference_updates missing));
+  Alcotest.(check int) "existing page stays positively cached" 0
+    (List.length (reference_feed runtime reference).requests)
+;;
+
+let test_reference_shared_page_miss_is_not_negative_cache () =
+  let runtime=Runtime.create () in
+  let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+  ignore (Runtime.receive runtime (reference_page_response first Ordinary_page "Actual page"));
+  let root=Runtime.submit runtime (Journal_graph_request.Load_detail
+    {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=22L})
+    |> fun output->only "unretained owning page root" output.requests in
+  let owning=Runtime.receive runtime (response root (Protocol.V2_block_outcome
+    (V2_present_block {value={record with block={block with page=target_uuid;parent=target_uuid}};revision="owning"})))
+    |> fun output->only "owning page metadata read" output.requests in
+  ignore (missing_reference_page runtime owning target_uuid);
+  ignore (reference_feed runtime reference |> fun output->expect_reference_page output target_uuid)
+;;
+
+let test_typed_metadata_preserves_newer_reference_fence () =
+  let runtime=Runtime.create () in
+  let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+  let property : Graph.property_summary =
+    {ident="user.property/page";uuid=block_uuid;title="Actual page"
+    ;schema={property_type=Page;cardinality=One;hidden=false;public=false}
+    ;values=[Page_value target_uuid];values_truncated=false} in
+  let root=Runtime.submit runtime (Journal_graph_request.Load_detail
+    {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=31L})
+    |> fun output->only "old typed Detail root" output.requests in
+  let children=Runtime.receive runtime (response root (Protocol.V2_block_outcome
+    (V2_present_block {value={record with block={block with properties=[property]}};revision="typed"})))
+    |> fun output->only "old typed Detail children" output.requests in
+  let middle=begin_reference_tree runtime 32L in
+  ignore (changed runtime (window ~pages:[target_uuid] ()));
+  let fresh=missing_reference_page runtime first target_uuid
+    |> fun output->expect_reference_page output target_uuid in
+  ignore (Runtime.fail_request runtime fresh ~message:"newer failure fence");
+  ignore (Runtime.receive runtime (response children (Protocol.V2_children_outcome
+    {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="typed";items=[];next_cursor=None})));
+  let late=Runtime.receive runtime (reference_tree_response middle "Rollback") in
+  Alcotest.(check bool) "old typed metadata cannot lower a newer fence" false
+    (List.mem (target_id,Some "Rollback") (reference_updates late))
+;;
+
+let test_dirty_abandon_keeps_reference_retryable () =
+  List.iter (fun positive ->
+    let runtime=Runtime.create () in
+    let first=reference_feed runtime reference |> fun output->expect_reference_page output target_uuid in
+    if positive then ignore (Runtime.receive runtime (reference_page_response first Ordinary_page "Before"))
+    else (
+      let outline=missing_reference_page runtime first target_uuid
+        |> fun output->expect_reference_outline output target_uuid in
+      ignore (Runtime.receive runtime (response outline (Protocol.V2_block_outcome
+        (V2_missing_block {uuid=target_uuid;revision="missing"})))));
+    let pending=changed runtime (window ~pages:[target_uuid] ())
+      |> fun output->expect_reference_page output target_uuid in
+    ignore (changed runtime (window ~pages:[target_uuid] ()));
+    Runtime.abandon runtime pending;
+    ignore (reference_feed runtime reference |> fun output->expect_reference_page output target_uuid)) [false;true]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "property references", [Alcotest.test_case "Detail closed property deduplicates" `Quick test_detail_property_reference_reads_are_deduplicated
+    [ ( "review reference ownership", [
+        Alcotest.test_case "typed metadata retains newer fence" `Quick test_typed_metadata_preserves_newer_reference_fence;
+        Alcotest.test_case "dirty abandon remains retryable" `Quick test_dirty_abandon_keeps_reference_retryable;
+        Alcotest.test_case "failed lookup retains epoch fence" `Quick test_reference_failed_read_retains_epoch_fence;
+        Alcotest.test_case "abandon retains newer source" `Quick test_reference_abandon_preserves_newer_source;
+        Alcotest.test_case "shared failure can retry discovery" `Quick test_reference_shared_failure_can_retry_discovery;
+        Alcotest.test_case "outline miss cannot hide a page" `Quick test_reference_page_survives_unrelated_outline_miss;
+        Alcotest.test_case "shared page miss remains retryable" `Quick test_reference_shared_page_miss_is_not_negative_cache])
+    ; ( "page-first UUID references", [
+        Alcotest.test_case "journal and ordinary page sources" `Quick test_reference_page_first_resolves_pages;
+        Alcotest.test_case "explicit page miss then outline" `Quick test_reference_page_miss_then_outline;
+        Alcotest.test_case "only both misses cache absence" `Quick test_reference_negative_cache_requires_both_misses;
+        Alcotest.test_case "errors and cancellation retry" `Quick test_reference_errors_and_cancellation_retry_page_first;
+        Alcotest.test_case "reset fences both stages" `Quick test_reference_reset_discards_both_stages;
+        Alcotest.test_case "invalidation restarts page lookup" `Quick test_reference_invalidation_restarts_page_phase;
+        Alcotest.test_case "fallback inherits original epoch" `Quick test_reference_fallback_keeps_original_epoch;
+        Alcotest.test_case "two-stage bursts remain bounded" `Quick test_reference_two_stage_burst_stays_bounded;
+        Alcotest.test_case "recycled page is not missing" `Quick test_recycled_reference_page_never_falls_back])
+    ; ( "property references", [Alcotest.test_case "Detail closed property deduplicates" `Quick test_detail_property_reference_reads_are_deduplicated
       ;Alcotest.test_case "changed journal Detail discovers property" `Quick test_changed_journal_detail_discovers_property_reference
       ;Alcotest.test_case "materialized Detail leaf discovers property" `Quick test_materialized_detail_leaf_discovers_property_reference
       ;Alcotest.test_case "returned child property resolves without own load" `Quick test_detail_child_property_reference_without_child_load

@@ -461,7 +461,7 @@ let delete_precondition database ~block ~behavior =
     ~finally:(fun () -> Database.release_snapshot snapshot)
     (fun () ->
        let block_revision =
-         match Database.get_blocks snapshot [ block ] |> require_ok ~behavior with
+         match Database.get_outline_blocks snapshot [ block ] |> require_ok ~behavior with
          | [ Present_block { revision; _ } ] -> revision
          | _ -> Alcotest.fail "fixture delete target is missing"
        in

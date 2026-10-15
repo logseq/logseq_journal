@@ -28,7 +28,7 @@ parser.add_argument('--graphs', type=int, default=1, help='Independent encrypted
 parser.add_argument('--history-days', type=int, default=0, help='Additional journal days with 12 rows each (0–30)')
 parser.add_argument('--references', action='store_true', help='Seed isolated UUID reference and literal fallback cases')
 parser.add_argument('--platform', choices=['macos', 'ios-simulator'], default='macos')
-parser.add_argument('--native-object', type=Path, help='Use the current verified production object')
+parser.add_argument('--native-object', type=Path, help='Current complete object already matching the selected macOS/Simulator target')
 arguments = parser.parse_args()
 if not 1 <= arguments.rows <= 5000:
     parser.error('--rows must be between 1 and 5000')
@@ -60,7 +60,8 @@ def run(command, cwd=host):
 
 # The OCaml side ships the production complete object: app/native_embed.exe.o.
 # Build it first with the workspace dune build (see tool/build_journal_apple.sh);
-# pass a prebuilt artifact via --native-object.
+# pass a prebuilt artifact via --native-object. Simulator needs a Simulator
+# object; the shared builder does not silently restamp host runtime objects.
 artifact = arguments.native_object.resolve() if arguments.native_object else (
     root/'_build/default/app/native_embed.exe.o')
 if not artifact.is_file():

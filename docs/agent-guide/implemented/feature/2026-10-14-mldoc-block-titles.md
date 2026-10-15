@@ -6,7 +6,7 @@ Timeline and Detail expose markup and raw URLs; string reference expansion misre
 
 ## Decision
 
-Use official native mldoc AST in Journal_model.Title to emit styled runs with explicit URL/block targets. Timeline root/child and Detail share this adapter and graph-session reference cache. Swift maps runs to AttributedString and native Text for wrapping, truncation and clicks; it does not parse Markdown. Only UUID Page_ref nodes written as [[uuid]] are business references. Code, escapes and ordinary page names remain literal; missing/cyclic targets fall back to their tokens. Expanded nested labels retain their outer reference click target, while explicit URL fragments keep their URL.
+Use official native mldoc AST in Journal_model.Title to emit styled runs with explicit URL targets. Timeline root/child and Detail share this adapter and graph-session reference cache. Swift maps runs to AttributedString and native Text for wrapping, truncation and clicks; it does not parse Markdown. Only UUID Page_ref nodes written as [[uuid]] are business references. Code, escapes and ordinary page names remain literal; missing/cyclic targets fall back to their tokens. Expanded nested labels are plain text, while explicit URL fragments keep their URL. The later page-first outline-block decision removes reference navigation at the user’s request.
 
 Admit at most 64 KiB source, 32 delimiter depth and 4096 open delimiters before parsing, then cap semantic conversion at 512 nodes. Keep a FIFO 512-entry/2 MiB source-byte syntax cache. Expansion is limited to 16 reference levels, 256 targets, 512 work nodes and 64 KiB output. Timeline keeps four parent lines and at most three smaller/fainter children of two lines; Detail retains status, properties, ten-level pagination, 100 ms loading and asset ownership.
 
@@ -32,4 +32,4 @@ Three actual native XCTest cases pass on the isolated iPhone 13/iOS 26.1 synthet
 
 ## Test ownership
 
-The nested-reference click defect belongs to pure Title.render, which has no reducer-event boundary. Its public output regression failed before the minimal fix and passed afterward, without injected DB/effect results. The external-build path defect belongs to the existing public compiler test harness; its direct execution and unchanged compiler assertions exercise the narrowest boundary. Native XCTest is the separately requested feature acceptance.
+The original nested-reference click regression has been replaced by plain-text output coverage after the user removed reference navigation. Title.render has no reducer-event boundary; public output tests verify no reference metadata while preserving formatting and explicit URL fragments. The external-build path defect belongs to the existing public compiler test harness; its direct execution and unchanged compiler assertions exercise the narrowest boundary. Native XCTest is the separately requested feature acceptance.

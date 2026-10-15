@@ -366,7 +366,6 @@ module Title = struct
     { text : string
     ; styles : string list
     ; url : string option
-    ; reference : string option
     }
   [@@deriving yojson]
 
@@ -628,7 +627,7 @@ module Title = struct
   let render ?(lookup = fun _ -> None) source =
     let remaining = ref 256
     and work = ref 512 in
-    let rec expand path depth styles url reference atoms =
+    let rec expand path depth styles url atoms =
       let output = ref []
       and size = ref 0
       and cyclic = ref false in
@@ -645,7 +644,7 @@ module Title = struct
            if !work >= 0
            then (
              match atom with
-             | Text text -> emit [ { text; styles; url; reference } ]
+             | Text text -> emit [ { text; styles; url } ]
              | Span (style, content) ->
                let runs, cycle =
                  expand
@@ -653,19 +652,18 @@ module Title = struct
                    depth
                    (if style = "" then styles else style :: styles)
                    url
-                   reference
                    content
                in
                cyclic := !cyclic || cycle;
                emit runs
              | External (target, content) ->
                let runs, cycle =
-                 expand path depth styles (Some target) reference content
+                 expand path depth styles (Some target) content
                in
                cyclic := !cyclic || cycle;
                emit runs
              | Reference (id, token, label) ->
-               let fallback () = emit [ { text = token; styles; url; reference } ] in
+               let fallback () = emit [ { text = token; styles; url } ] in
                if List.mem id path
                then (
                  cyclic := true;
@@ -679,8 +677,7 @@ module Title = struct
                    decr remaining;
                    let content = Option.value label ~default:(parse target) in
                    let runs, cycle =
-                     expand (id :: path) (depth + 1) styles None
-                  (match reference with Some _ -> reference | None -> Some id) content
+                     expand (id :: path) (depth + 1) styles None content
                    in
                    if cycle
                    then (
@@ -695,10 +692,10 @@ module Title = struct
         atoms;
       List.rev !output, !cyclic
     in
-    let runs, _ = expand [] 0 [] None None (parse source) in
+    let runs, _ = expand [] 0 [] None (parse source) in
     if
       List.fold_left (fun n run -> n + String.length run.text) 0 runs > 65536 || !work < 0
-    then [ { text = source; styles = []; url = None; reference = None } ]
+    then [ { text = source; styles = []; url = None } ]
     else runs
   ;;
 

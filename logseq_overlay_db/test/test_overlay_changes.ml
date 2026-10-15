@@ -345,7 +345,7 @@ let paused_subscription_overflow_coalesces_to_resync database =
         ~finally:(fun () -> Database.release_snapshot snapshot)
         (fun () ->
            match
-             Database.get_blocks snapshot [ T.authoritative_block_uuid ]
+             Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
              |> T.require_ok ~behavior
            with
            | [ Present_block { revision; _ } ] -> revision
@@ -468,7 +468,7 @@ let semantic_no_op_publishes_no_event database =
   let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
   let revision =
     match
-      Database.get_blocks snapshot [ T.missing_block_uuid ] |> T.require_ok ~behavior
+      Database.get_outline_blocks snapshot [ T.missing_block_uuid ] |> T.require_ok ~behavior
     with
     | [ Missing_block { revision; _ } ] -> revision
     | _ -> Alcotest.fail "missing no-op target unexpectedly exists"
@@ -600,7 +600,7 @@ let local_outbox_commit_notifies_and_successor_snapshot_is_readable database =
     Fun.protect
       ~finally:(fun () -> Database.release_snapshot before)
       (fun () ->
-         match Database.get_blocks before [ T.block_uuid ] |> T.require_ok ~behavior with
+         match Database.get_outline_blocks before [ T.block_uuid ] |> T.require_ok ~behavior with
          | [ Missing_block { revision; _ } ] -> revision
          | _ -> Alcotest.fail "local listener target already exists")
   in
@@ -614,7 +614,7 @@ let local_outbox_commit_notifies_and_successor_snapshot_is_readable database =
        T.require (commit.status = Applied) "local listener commit was not applied";
        require_interest change ~block:T.block_uuid ~page:T.page_uuid;
        (match
-          Database.get_blocks successor [ T.block_uuid ] |> T.require_ok ~behavior
+          Database.get_outline_blocks successor [ T.block_uuid ] |> T.require_ok ~behavior
         with
         | [ Present_block { value; revision } ] ->
           T.require
@@ -672,7 +672,7 @@ let authoritative_update_notifies_and_successor_snapshot_is_readable database =
          "authoritative listener commit did not advance the checkpoint";
        require_interest change ~block:T.missing_block_uuid ~page:T.page_uuid;
        (match
-          Database.get_blocks successor [ T.missing_block_uuid ] |> T.require_ok ~behavior
+          Database.get_outline_blocks successor [ T.missing_block_uuid ] |> T.require_ok ~behavior
         with
         | [ Present_block { value; _ } ] ->
           T.require
@@ -708,7 +708,7 @@ let authoritative_rebase_notifies_and_publishes_merged_pending_intent database =
       ~finally:(fun () -> Database.release_snapshot before)
       (fun () ->
          match
-           Database.get_blocks before [ T.authoritative_block_uuid ]
+           Database.get_outline_blocks before [ T.authoritative_block_uuid ]
            |> T.require_ok ~behavior
          with
          | [ Present_block { revision; _ } ] -> revision
@@ -764,7 +764,7 @@ let authoritative_rebase_notifies_and_publishes_merged_pending_intent database =
         | Projection_resync_required _ ->
           Alcotest.fail "bounded listener rebase unexpectedly required resync");
        (match
-          Database.get_blocks successor [ T.authoritative_block_uuid ]
+          Database.get_outline_blocks successor [ T.authoritative_block_uuid ]
           |> T.require_ok ~behavior
         with
         | [ Present_block { value; _ } ] ->

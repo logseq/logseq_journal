@@ -3,7 +3,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-platform=${1:?usage: package_journal_apple_icons.sh <macos|ios-simulator> APP_DIR}
+platform=${1:?usage: package_journal_apple_icons.sh <macos|ios-simulator|ios-device> APP_DIR}
 app_dir=${2:?missing app directory}
 case "$platform" in
   macos)
@@ -13,8 +13,9 @@ case "$platform" in
     info_plist="$app_dir/Contents/Info.plist"
     target_devices=(--target-device mac)
     ;;
-  ios-simulator)
+  ios-simulator|ios-device)
     sdk=iphonesimulator
+    [[ $platform != ios-device ]] || sdk=iphoneos
     deployment_target=${JOURNAL_IOS_DEPLOYMENT_TARGET:-26.0}
     resources="$app_dir"
     info_plist="$app_dir/Info.plist"
