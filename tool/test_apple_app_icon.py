@@ -13,7 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class AppIconPackagingTests(unittest.TestCase):
     def test_journal_icon_is_packaged(self):
         with tempfile.TemporaryDirectory(prefix="journal-app-icon-") as directory:
-            for platform in ("ios-simulator", "macos"):
+            for platform in ("ios-simulator", "ios-device", "macos"):
                 with self.subTest(platform=platform):
                     app = pathlib.Path(directory) / (platform + ".app")
                     info_path = app / ("Contents/Info.plist" if platform == "macos" else "Info.plist")
