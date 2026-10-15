@@ -59,10 +59,10 @@ let feedback ~key ~top ~visible ~compact ~expanded body =
   feedback_with_visibility ~key ~top ~visible ~compact ~expanded body
 ;;
 
-let date_header ~title =
+let date_header ?relative_label ~title () =
   Ui.Native_widget.widget
     chrome
-    ~props:(props ~mode:"header" ~title ())
+    ~props:(props ~mode:"header" ~title ?text:relative_label ())
     ~on_event:(fun _ -> ())
     ~children:[]
     ()
@@ -154,7 +154,7 @@ let detail ~capture_enabled ~on_capture ~copy_enabled ~on_copy ~copy_feedback bo
   Ui.Native_widget.widget
     chrome
     ~key:(Ui.Key.string "journal-detail-header")
-    ~props:(props ~mode:"detail" ~title:"Block" ())
+    ~props:(props ~mode:"detail" ~title:"" ())
     ~on_event:(fun _ -> ())
     ~children:[ V.Body.Private.to_widget body; options ]
     ()
