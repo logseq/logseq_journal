@@ -110,8 +110,9 @@ let scoped_cleanup () =
     and d = intent ~origin:"https://other.example" 5 in
     with_db path (fun db ->
       List.iter (fun i -> get (S.save db ~expected:None i)) [ a; b; c; d ];
-      get (S.delete_graph db ~origin:a.origin ~account:a.account ~graph:a.graph);
-      get (S.delete_graph db ~origin:a.origin ~account:a.account ~graph:a.graph);
+      let captured = get (S.capture_graph db ~origin:a.origin ~account:a.account ~graph:a.graph) in
+      get (S.delete_captured_graph db captured);
+      get (S.delete_captured_graph db captured);
       Alcotest.(check bool)
         "selected graph removed"
         true
@@ -197,13 +198,50 @@ let generated_checkpoint_validation () =
         (get (S.read db ~operation:original.operation_id) = Some original)))
 ;;
 
+let exact_retirement_preserves_new_and_changed_operations () =
+  fixture (fun path ->
+    let first = intent 2 and second = intent 3 and replacement = intent 8 in
+    let captured = with_db path (fun db ->
+      get (S.save db ~expected:None first); get (S.save db ~expected:None second);
+      get (S.capture_graph db ~origin:first.origin ~account:first.account ~graph:first.graph)) in
+    let captured = S.captured_graph_to_yojson captured |> S.captured_graph_of_yojson |> get in
+    with_db path (fun db ->
+      get (S.save db ~expected:None replacement);
+      let changed = get (I.advance second Local_committed) in
+      get (S.save db ~expected:(Some second.revision) changed);
+      Alcotest.(check bool) "changed captured checkpoint defers cleanup" true
+        (Result.is_error (S.delete_captured_graph db captured));
+      Alcotest.(check bool) "failed cleanup retains every captured row" true
+        (get (S.read db ~operation:first.operation_id) = Some first);
+      Alcotest.(check bool) "new operation survives failed old cleanup" true
+        (get (S.read db ~operation:replacement.operation_id) = Some replacement)))
+;;
+
+let exact_retirement_survives_restart_and_replacement () =
+  fixture (fun path ->
+    let old = intent 2 and fresh = intent 8 in
+    let captured = with_db path (fun db ->
+      get (S.save db ~expected:None old);
+      get (S.capture_graph db ~origin:old.origin ~account:old.account ~graph:old.graph)) in
+    with_db path (fun db ->
+      get (S.save db ~expected:None fresh);
+      get (S.delete_captured_graph db captured));
+    with_db path (fun db ->
+      get (S.delete_captured_graph db captured);
+      Alcotest.(check bool) "old captured row absent" true (get (S.read db ~operation:old.operation_id) = None);
+      Alcotest.(check bool) "new same-graph row retained after replay" true
+        (get (S.read db ~operation:fresh.operation_id) = Some fresh)))
+;;
+
 let () =
   Alcotest.run
     "asset upload storage"
     [ ( "SQLite"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "generated checkpoint validation", generated_checkpoint_validation
+          [ "retirement preserves changed operations", exact_retirement_preserves_new_and_changed_operations
+          ; "retirement restart and replacement isolation", exact_retirement_survives_restart_and_replacement
+          ; "generated checkpoint validation", generated_checkpoint_validation
           ; "scoped cleanup", scoped_cleanup
           ; "restart", restart
           ; "atomic revision", atomic_revision

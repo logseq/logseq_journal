@@ -196,7 +196,9 @@ module Asset_cache = struct
 
   let protect f =
     try f () with
-    | Sys_error message -> Error (Io message)
+    | Sys_error message | Failure message -> Error (Io message)
+    | Yojson.Json_error message -> Error (Invalid message)
+    | Yojson.Safe.Util.Type_error (message, _) -> Error (Invalid message)
     | Unix.Unix_error (error, operation, _) ->
       Error (Io (operation ^ ": " ^ Unix.error_message error))
   ;;
@@ -325,76 +327,6 @@ module Asset_cache = struct
     Filename.concat root name
   ;;
 
-  let create ~root ~(scope : Core.graph_scope) ~budget_bytes ~maximum_file_bytes =
-    protect (fun () ->
-      if
-        budget_bytes < 0L
-        || maximum_file_bytes < 0
-        || maximum_file_bytes > 100 * 1024 * 1024
-      then Error (Invalid "Invalid cache size limits")
-      else (
-        let directory =
-          Filename.concat
-            (account_directory ~root scope.account)
-            (Uuid.to_string scope.graph_id)
-        in
-        mkdir directory;
-        (* Validate all persisted JSON before cleaning anything. Unsupported
-           internal formats require an explicit caller-visible failure. *)
-        let rec load_manifests records = function
-          | [] -> Ok (List.rev records)
-          | file :: rest when Filename.check_suffix file ".json" ->
-            let* record = read_manifest directory file in
-            load_manifests ((file, record) :: records) rest
-          | _ :: rest -> load_manifests records rest
-        in
-        let* manifests = load_manifests [] (Array.to_list (Sys.readdir directory)) in
-        let pending = Filename.concat directory "pending" in
-        if Sys.file_exists pending
-        then
-          Array.iter
-            (fun file ->
-               if Filename.check_suffix file ".part"
-               then unlink (Filename.concat pending file))
-            (Sys.readdir pending);
-        let t =
-          { directory
-          ; budget = budget_bytes
-          ; maximum_file_bytes
-          ; records = Hashtbl.create 64
-          ; handles = Hashtbl.create 64
-          ; staged_records = Hashtbl.create 8
-          ; staged_handles = Hashtbl.create 8
-          ; closed = false
-          }
-        in
-        List.iter
-          (fun (file, (record : record)) ->
-             if
-               record.size <= Int64.of_int maximum_file_bytes
-               && Sys.file_exists (data_path t record)
-             then Hashtbl.replace t.records record.name record
-             else unlink (Filename.concat directory file))
-          manifests;
-        Array.iter
-          (fun file ->
-             if Filename.check_suffix file ".part"
-             then unlink (Filename.concat directory file))
-          (Sys.readdir directory);
-        let kept = Hashtbl.create (2 * Hashtbl.length t.records) in
-        Hashtbl.iter
-          (fun _ record ->
-             Hashtbl.replace kept (record.name ^ ".json") ();
-             Hashtbl.replace kept (record.name ^ "." ^ record.file_type) ())
-          t.records;
-        Array.iter
-          (fun file ->
-             let path = Filename.concat directory file in
-             if (not (Hashtbl.mem kept file)) && not (Sys.is_directory path)
-             then unlink path)
-          (Sys.readdir directory);
-        Ok t))
-  ;;
 
   let lookup t ~asset ~version =
     protect (fun () ->
@@ -587,11 +519,238 @@ module Asset_cache = struct
       Ok ())
   ;;
 
-  let delete_account ~root ~account = remove_tree (account_directory ~root account)
+  external rename_exclusive : string -> string -> int = "logseq_journal_rename_exclusive"
 
-  let delete_graph ~root ~account ~graph_id =
-    remove_tree
-      (Filename.concat (account_directory ~root account) (Uuid.to_string graph_id))
+  let graph_deletion_paths ~root (scope : Core.graph_scope) retirement =
+    let account = account_directory ~root scope.account in
+    let graph = Uuid.to_string scope.graph_id in
+    let directory = Filename.concat
+      (Filename.concat (Filename.concat root ".asset-retirements") (Filename.basename account)) graph in
+    Filename.concat account graph, directory,
+    Filename.concat (Filename.concat directory "states") (Core.retirement_id_to_string retirement ^ ".json"),
+    Filename.concat (Filename.concat directory "pending") (Core.retirement_id_to_string retirement ^ ".data")
+  ;;
+
+  let sync_path directory =
+    let fd = Unix.openfile directory [Unix.O_RDONLY] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd)
+  ;;
+
+  let write_retirement path json =
+    let temporary = path ^ ".part" in
+    write temporary (Yojson.Safe.to_string json);
+    Unix.rename temporary path;
+    sync_path (Filename.dirname path)
+  ;;
+
+  let identity path =
+    match Unix.lstat path with
+    | { Unix.st_kind = Unix.S_DIR; st_dev; st_ino; _ } -> Printf.sprintf "%d:%d" st_dev st_ino
+    | _ -> failwith "asset namespace is not a directory"
+  ;;
+
+  let retirement_state manifest_path =
+    let open Yojson.Safe.Util in
+    let json = Yojson.Safe.from_file manifest_path in
+    if json |> member "version" |> to_int <> 1 then failwith "unsupported asset retirement";
+    json |> member "identity" |> to_string, json |> member "state" |> to_string
+  ;;
+
+  let retirement_json captured state =
+    `Assoc ["version", `Int 1; "identity", `String captured; "state", `String state]
+  ;;
+
+  let graph_deletion_terminal ~root ~scope ~retirement =
+    protect (fun () ->
+      let _, _, manifest, _ = graph_deletion_paths ~root scope retirement in
+      if not (Sys.file_exists manifest) then Ok None else
+        let _, state = retirement_state manifest in
+        Ok (match state with
+          | "complete" | "committed" ->
+            let fd = Unix.openfile manifest [Unix.O_RDONLY] 0 in
+            Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd);
+            sync_path (Filename.dirname manifest);
+            Some `Committed
+          | "aborted" | "account-deleted" -> Some `Aborted
+          | _ -> None))
+  ;;
+
+  let prepare_graph_deletion ~root ~(scope : Core.graph_scope) ~retirement =
+    protect (fun () ->
+      let canonical, directory, manifest, data = graph_deletion_paths ~root scope retirement in
+      mkdir directory;
+      mkdir (Filename.dirname manifest); mkdir (Filename.dirname data);
+      let captured, state =
+        if Sys.file_exists manifest then retirement_state manifest
+        else (
+          let captured = if Sys.file_exists canonical then identity canonical else "absent" in
+          write_retirement manifest (retirement_json captured "preparing"); captured, "preparing") in
+      if state <> "preparing" && state <> "prepared" then Error Stale
+      else (
+        if Sys.file_exists data then (
+          if identity data <> captured then failwith "retired asset identity changed")
+        else if captured <> "absent" then (
+          if not (Sys.file_exists canonical) || identity canonical <> captured
+          then failwith "canonical asset identity changed";
+          let error = rename_exclusive canonical data in
+          if error <> 0 then failwith ("asset retirement rename failed: " ^ string_of_int error);
+          sync_path (Filename.dirname canonical); sync_path (Filename.dirname data));
+        write_retirement manifest (retirement_json captured "prepared");
+        Ok ()))
+  ;;
+
+  let finish_graph_deletion ~root ~deletion ~commit =
+    protect (fun () ->
+      let scope = Core.asset_deletion_scope deletion in
+      let canonical, _directory, manifest, data = graph_deletion_paths ~root scope
+          (Core.asset_deletion_retirement deletion) in
+      if not (Sys.file_exists manifest) then (
+        if Sys.file_exists data then Error Stale
+        else if commit then Error Stale
+        else (
+          mkdir (Filename.dirname manifest);
+          write_retirement manifest (retirement_json "absent" "aborted"); Ok ()))
+      else
+        let captured, state = retirement_state manifest in
+        if state = "account-deleted" then (
+          ignore (remove_tree data); Ok ())
+        else if state = "aborted" || state = "complete" then Ok ()
+        else if commit then (
+          if Sys.file_exists data && identity data <> captured then failwith "retired asset identity changed";
+          write_retirement manifest (retirement_json captured "committed");
+          (* The producer owns deferred collection. A purge failure must not
+             block a replacement cache or undo the durable commit decision. *)
+          (match remove_tree data with
+           | Error _ -> ()
+           | Ok () ->
+             (try sync_path (Filename.dirname data);
+                  write_retirement manifest (retirement_json captured "complete") with _ -> ()));
+          Ok ())
+        else if state = "committed" then Ok ()
+        else (
+          if Sys.file_exists data then (
+            if identity data <> captured then failwith "retired asset identity changed";
+            mkdir (Filename.dirname canonical);
+            let error = rename_exclusive data canonical in
+            if error <> 0 then failwith ("asset restore conflict; retirement retained: " ^ string_of_int error);
+            sync_path (Filename.dirname canonical); sync_path (Filename.dirname data))
+          else if captured <> "absent" &&
+            (not (Sys.file_exists canonical) || identity canonical <> captured)
+          then failwith "asset restore is incomplete; retirement retained";
+          if Sys.file_exists (Filename.dirname canonical) then sync_path (Filename.dirname canonical);
+          if Sys.file_exists (Filename.dirname data) then sync_path (Filename.dirname data);
+          write_retirement manifest (retirement_json captured "aborted");
+          Ok ()))
+  ;;
+
+  let collect_retired_assets ~root ~(scope : Core.graph_scope) =
+    let _, directory, _, _ = graph_deletion_paths ~root scope
+      (Core.retirement_id_of_string "00000000-0000-4000-8000-000000000000" |> Result.get_ok) in
+    let pending = Filename.concat directory "pending" in
+    if Sys.file_exists pending then
+      Array.iter (fun name ->
+        if Filename.check_suffix name ".data" then
+          try
+            let retirement = Filename.chop_suffix name ".data" |> Core.retirement_id_of_string |> Result.get_ok in
+            let _, _, manifest, _ = graph_deletion_paths ~root scope retirement in
+            let _, state = retirement_state manifest in
+            if state = "committed" || state = "complete" || state = "account-deleted" then
+              ignore (finish_graph_deletion ~root
+                ~deletion:(Core.asset_deletion_reference ~scope ~retirement) ~commit:true)
+          with _ -> ()) (Sys.readdir pending)
+  ;;
+
+  let delete_account ~root ~account =
+    protect (fun () ->
+      let directory = account_directory ~root account in
+      let retired = Filename.concat (Filename.concat root ".asset-retirements") (Filename.basename directory) in
+      if Sys.file_exists retired then
+        Array.iter (fun graph ->
+          match Uuid.of_string graph with
+          | Error _ -> ()
+          | Ok _ ->
+            let folder = Filename.concat retired graph in
+            let states = Filename.concat folder "states" in
+            if Sys.file_exists states then Array.iter (fun file ->
+              if Filename.check_suffix file ".json" then (
+                let manifest = Filename.concat states file in
+                let captured, _ = retirement_state manifest in
+                write_retirement manifest (retirement_json captured "account-deleted"))) (Sys.readdir states);
+            match remove_tree (Filename.concat folder "pending") with
+            | Ok () -> () | Error _ -> failwith "retired account assets remain") (Sys.readdir retired);
+      remove_tree directory)
+  ;;
+
+  let create ~root ~(scope : Core.graph_scope) ~budget_bytes ~maximum_file_bytes =
+    (try collect_retired_assets ~root ~scope with _ -> ());
+    protect (fun () ->
+      if
+        budget_bytes < 0L
+        || maximum_file_bytes < 0
+        || maximum_file_bytes > 100 * 1024 * 1024
+      then Error (Invalid "Invalid cache size limits")
+      else (
+        let directory =
+          Filename.concat
+            (account_directory ~root scope.account)
+            (Uuid.to_string scope.graph_id)
+        in
+        mkdir directory;
+        (* Validate all persisted JSON before cleaning anything. Unsupported
+           internal formats require an explicit caller-visible failure. *)
+        let rec load_manifests records = function
+          | [] -> Ok (List.rev records)
+          | file :: rest when Filename.check_suffix file ".json" ->
+            let* record = read_manifest directory file in
+            load_manifests ((file, record) :: records) rest
+          | _ :: rest -> load_manifests records rest
+        in
+        let* manifests = load_manifests [] (Array.to_list (Sys.readdir directory)) in
+        let pending = Filename.concat directory "pending" in
+        if Sys.file_exists pending
+        then
+          Array.iter
+            (fun file ->
+               if Filename.check_suffix file ".part"
+               then unlink (Filename.concat pending file))
+            (Sys.readdir pending);
+        let t =
+          { directory
+          ; budget = budget_bytes
+          ; maximum_file_bytes
+          ; records = Hashtbl.create 64
+          ; handles = Hashtbl.create 64
+          ; staged_records = Hashtbl.create 8
+          ; staged_handles = Hashtbl.create 8
+          ; closed = false
+          }
+        in
+        List.iter
+          (fun (file, (record : record)) ->
+             if
+               record.size <= Int64.of_int maximum_file_bytes
+               && Sys.file_exists (data_path t record)
+             then Hashtbl.replace t.records record.name record
+             else unlink (Filename.concat directory file))
+          manifests;
+        Array.iter
+          (fun file ->
+             if Filename.check_suffix file ".part"
+             then unlink (Filename.concat directory file))
+          (Sys.readdir directory);
+        let kept = Hashtbl.create (2 * Hashtbl.length t.records) in
+        Hashtbl.iter
+          (fun _ record ->
+             Hashtbl.replace kept (record.name ^ ".json") ();
+             Hashtbl.replace kept (record.name ^ "." ^ record.file_type) ())
+          t.records;
+        Array.iter
+          (fun file ->
+             let path = Filename.concat directory file in
+             if (not (Hashtbl.mem kept file)) && not (Sys.is_directory path)
+             then unlink path)
+          (Sys.readdir directory);
+        Ok t))
   ;;
 
   type staged =

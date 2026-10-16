@@ -4478,7 +4478,7 @@ let asset_cleanup_requires_admitted_scope () =
     [ Core.Release_asset_file "resource"
     ; Core.Release_staged_file "stage"
     ; Core.Close_asset_scope
-    ; Core.Delete_graph_assets
+    ; (Core.Prepare_graph_asset_deletion (Core.retirement_id_of_string "96000000-0000-4000-8000-000000000001" |> Result.get_ok))
     ; Core.Delete_account_assets
     ; Core.Cancel_asset_operation "pending"
     ];
@@ -4559,7 +4559,7 @@ let asset_graph_deletion_cancels_other_generation () =
     core
     scope
     { scope with graph_generation = 0 }
-    Core.Delete_graph_assets
+    (Core.Prepare_graph_asset_deletion (Core.retirement_id_of_string "96000000-0000-4000-8000-000000000001" |> Result.get_ok))
 ;;
 
 let asset_account_deletion_cancels_other_known_graph () =
@@ -4583,8 +4583,65 @@ let asset_account_deletion_cancels_other_known_graph () =
     Core.Delete_account_assets
 ;;
 
+let completed_retirement_cannot_cancel_replacement_work () =
+  let core, scope = asset_fixture () in
+  let retirement = Core.retirement_id_of_string "96000000-0000-4000-8000-000000000003" |> Result.get_ok in
+  let deletion = Core.asset_deletion_reference ~scope ~retirement in
+  let preparing, ticket, _ = asset_issue core scope "prepare-old" (Core.Prepare_graph_asset_deletion retirement) in
+  let prepared = asset_complete preparing.next ticket (Ok (Core.Asset_deletion_prepared deletion)) in
+  let committing, ticket, _ = asset_issue prepared.next scope "commit-old" (Core.Commit_graph_asset_deletion deletion) in
+  let committed = asset_complete committing.next ticket (Ok Core.Asset_unit) in
+  let pending, _, fresh = asset_issue committed.next scope "replacement-fetch"
+      (Core.Fetch_asset {asset=graph_id;version=asset_version;maximum_plaintext_bytes=8}) in
+  let replay = Core.step pending.next (Core.Asset_requested
+      {scope;operation="replay-old-prepare";action=Core.Prepare_graph_asset_deletion retirement}) in
+  Alcotest.(check bool) "old retirement cannot cancel replacement work" false
+    (List.exists (fun (output : Core.asset_output) -> output.request = fresh && output.result = Error Core.Asset_cancelled)
+      (asset_outputs replay.effects))
+;;
+
+let retirement_replay_preserves_inflight_and_account_cleanup () =
+  List.iter (fun after_account_cleanup ->
+    let core, scope = asset_fixture () in
+    let retirement = Core.retirement_id_of_string "96000000-0000-4000-8000-000000000014" |> Result.get_ok in
+    let deletion = Core.asset_deletion_reference ~scope ~retirement in
+    let preparing, ticket, original = asset_issue core scope "initial-prepare" (Core.Prepare_graph_asset_deletion retirement) in
+    let owner, pending =
+      if not after_account_cleanup then preparing.next, original
+      else (
+        let prepared = asset_complete preparing.next ticket (Ok (Core.Asset_deletion_prepared deletion)) in
+        let clearing, ticket, _ = asset_issue prepared.next scope "account-cleanup" Core.Delete_account_assets in
+        let cleared = asset_complete clearing.next ticket (Ok Core.Asset_unit) in
+        let fresh, _, request = asset_issue cleared.next scope "new-account-fetch"
+          (Core.Fetch_asset {asset=graph_id;version=asset_version;maximum_plaintext_bytes=8}) in
+        fresh.next, request) in
+    let replay = Core.step owner (Core.Asset_requested
+      {scope;operation="replay-initial-prepare";action=Core.Prepare_graph_asset_deletion retirement}) in
+    Alcotest.(check bool) "replay does not cancel the existing owner" false
+      (List.exists (fun (output : Core.asset_output) -> output.request=pending && output.result=Error Core.Asset_cancelled)
+        (asset_outputs replay.effects))) [false;true]
+;;
+
+let retirement_terminal_rejects_mismatched_token_scope () =
+  let core, scope = asset_fixture () in
+  let foreign = {scope with account={scope.account with user_id="foreign-token-account"}} in
+  let retirement = Core.retirement_id_of_string "96000000-0000-4000-8000-000000000015" |> Result.get_ok in
+  let deletion = Core.asset_deletion_reference ~scope:foreign ~retirement in
+  List.iter (fun action ->
+    let transition = Core.step core (Core.Asset_requested {scope;operation="foreign-token";action}) in
+    Alcotest.(check bool) "current scope cannot execute another token's cleanup" false
+      (List.exists (function Core.Run (Core.Asset_io _) -> true | _ -> false) transition.effects))
+    [Core.Commit_graph_asset_deletion deletion;Core.Cancel_graph_asset_deletion deletion]
+;;
+
 let asset_scenarios =
-  [ Alcotest.test_case
+  [ Alcotest.test_case "retirement replay preserves inflight and account cleanup" `Quick
+      retirement_replay_preserves_inflight_and_account_cleanup
+  ; Alcotest.test_case "retirement token scope is checked for active context" `Quick
+      retirement_terminal_rejects_mismatched_token_scope
+  ; Alcotest.test_case "completed retirement preserves replacement work" `Quick
+      completed_retirement_cannot_cancel_replacement_work
+  ; Alcotest.test_case
       "graph asset deletion cancels pending work across generations"
       `Quick
       asset_graph_deletion_cancels_other_generation

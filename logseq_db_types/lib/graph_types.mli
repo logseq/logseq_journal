@@ -13,6 +13,13 @@ module Uuid : sig
   val of_yojson : Yojson.Safe.t -> (t, string) result
 end
 
+(** Identity of one local resource retirement, never a graph identity. *)
+module Retirement_id : sig
+  type t
+  val of_string : string -> (t, string) result
+  val to_string : t -> string
+end
+
 module Cursor : sig
   type t
 

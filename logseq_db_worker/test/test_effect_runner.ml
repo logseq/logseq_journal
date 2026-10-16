@@ -1347,6 +1347,147 @@ let test_upload_checkpoint_io () =
         Runner.shutdown restarted)))
 ;;
 
+let deletion_runtime_fixture ~busy () =
+  let module Db = Logseq_db_worker in
+  let module G = Logseq_db_types.Graph_types in
+  T.with_managed (fun fixture ->
+    Eio_main.run (fun env -> Eio.Switch.run (fun sw ->
+      let graph_id suffix = G.Uuid.of_string ("94000000-0000-4000-8000-" ^ suffix) |> Result.get_ok in
+      let first = graph_id "000000000201" and second = graph_id "000000000202" in
+      let graph graph_id : Sync.graph =
+        { graph_id; name = "Deletion waiter fixture"; encrypted = false
+        ; schema = { major = 65; minor = 33; exact = true } } in
+      let root = fixture.config.application_support_directory in
+      let worker_root = Filename.concat root "logseq-db-worker" in
+      Unix.mkdir worker_root 0o700;
+      let mirrors = Filename.concat worker_root "synced-graphs" in
+      Unix.mkdir mirrors 0o700;
+      let directory = Filename.concat mirrors (G.Uuid.to_string first) in
+      Unix.mkdir directory 0o700;
+      let first_database_path = Filename.concat directory "db.sqlite" in
+      let sqlite = Sqlite3.db_open first_database_path in
+      let checkpoint = Logseq_db_types.Sync_checkpoint.create ~graph_id:first
+          ~schema:{ major = 65; minor = 33 }
+          ~applied_server_t:(Logseq_db_types.Server_cursor.of_int64 0L |> Result.get_ok)
+          ~checksum:"0123456789abcdef" |> Result.get_ok in
+      Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok;
+      ignore (Sqlite3.db_close sqlite);
+      Out_channel.with_open_bin (Filename.concat directory ".journal-local-owner.json") (fun output ->
+        Printf.fprintf output {|{"origin":"https://api.logseq.io","user_id":"user-1","graph_id":%S}|}
+          (G.Uuid.to_string first));
+      let second_directory = Filename.concat mirrors (G.Uuid.to_string second) in
+      Unix.mkdir second_directory 0o700;
+      let sqlite = Sqlite3.db_open (Filename.concat second_directory "db.sqlite") in
+      let open Yojson.Safe.Util in
+      let storage = T.read_json (T.fixture "storage/logseq-65.33-create-page.json") in
+      Sqlite3.Rc.check (Sqlite3.exec sqlite (storage |> member "tableSql" |> to_string));
+      let statement = Sqlite3.prepare sqlite "INSERT INTO kvs(addr, content, addresses) VALUES(?, ?, ?)" in
+      storage |> member "rows" |> to_list |> List.iter (fun row ->
+        Sqlite3.Rc.check (Sqlite3.reset statement);
+        Sqlite3.Rc.check (Sqlite3.bind_int statement 1 (row |> member "addr" |> to_int));
+        Sqlite3.Rc.check (Sqlite3.bind_text statement 2 (row |> member "content" |> to_string));
+        Sqlite3.Rc.check (Sqlite3.bind statement 3 (match member "addresses" row with
+          | `Null -> Sqlite3.Data.NULL | `String value -> TEXT value | _ -> assert false));
+        Sqlite3.Rc.check (Sqlite3.step statement));
+      Sqlite3.Rc.check (Sqlite3.finalize statement);
+      let checkpoint = Logseq_db_types.Sync_checkpoint.create ~graph_id:second
+          ~schema:{ major = 65; minor = 33 }
+          ~applied_server_t:(Logseq_db_types.Server_cursor.of_int64 0L |> Result.get_ok)
+          ~checksum:"0123456789abcdef" |> Result.get_ok in
+      Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok;
+      Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
+      ignore (Sqlite3.db_close sqlite);
+      let worker = ref None and refreshed = ref false and held_cleanup = ref None in
+      let destructive_requests = ref 0 in
+      let post event = Db.post (Option.get !worker) (Core.Sync_event event) in
+      let sync_runner = Runner.sync_runner ~submit:(function
+        | Sync.Request (ticket, Sync.Load_catalog _) ->
+          post (Sync.Runner_completed (Sync.Completion (ticket, Ok None)))
+        | Sync.Request (ticket, Sync.Save_catalog _) ->
+          post (Sync.Runner_completed (Sync.Completion (ticket, Ok ())))
+        | Sync.Request (ticket, Sync.Fetch_catalog _) ->
+          post (Sync.Runner_completed (Sync.Completion
+            (ticket, Ok (if !refreshed then [graph first] else [graph first; graph second]))))
+        | Sync.Request (ticket, Sync.Fetch_snapshot_baseline _) ->
+          post (Sync.Runner_completed (Sync.Completion
+            (ticket, Error (Sync.Effect_failed "Synthetic bootstrap unavailable."))))
+        | Sync.Request (ticket, Sync.Fetch_snapshot_metadata _) ->
+          post (Sync.Runner_completed (Sync.Completion
+            (ticket, Error (Sync.Effect_failed "Synthetic bootstrap unavailable."))))
+        | Sync.Asset_io (ticket, { context; action = Sync.Prepare_graph_asset_deletion retirement; _ }) ->
+          incr destructive_requests;
+          let deletion = Sync.asset_deletion_reference ~scope:context.scope ~retirement in
+          if busy then post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))
+          else held_cleanup := Some (ticket, deletion)
+        | Sync.Asset_io (ticket, _) ->
+          post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok Sync.Asset_unit)))
+        | _ -> ()) ~shutdown:(fun () -> ()) () in
+      let dependencies = Runner.dependencies
+          ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
+              ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock env)) |> Result.get_ok)
+          ~config:fixture.config ~overlay:fixture.overlay ~sync_runner ~publish:(fun _ -> ())
+          |> Result.get_ok in
+      let limits = Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024
+          ~submission_batch_size:1 |> Result.get_ok in
+      let sync = Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
+          |> Result.get_ok in
+      let db = Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync)
+          ~runner_dependencies:dependencies |> Result.get_ok in
+      worker := Some db;
+      let wait predicate =
+        match Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. (fun () ->
+          while not (predicate ()) do Eio.Fiber.yield () done) with
+        | () -> ()
+        | exception error ->
+          let snapshot = (Db.view db).sync.snapshot in
+          Alcotest.failf "Wait failed: %s selected=%s bootstrap=%b restore=%b failure=%b error=%s"
+            (Printexc.to_string error)
+            (Option.fold ~none:"none" ~some:G.Uuid.to_string snapshot.selected_graph)
+            snapshot.startup.bootstrapping snapshot.startup.restoring_local
+            (Option.is_some snapshot.startup.failure)
+            (Option.value snapshot.last_error ~default:"none") in
+      Fun.protect ~finally:(fun () ->
+        Option.iter (fun (ticket, _) -> post (Sync.Runner_completed
+          (Sync.Asset_completion (ticket, Error Sync.Asset_cancelled)))) !held_cleanup;
+        Db.shutdown db)
+        (fun () ->
+          post (Sync.Account_authenticated { user_id = Some "user-1" });
+          wait (fun () -> (Db.view db).sync.snapshot.catalog <> []);
+          post (Sync.Graph_selected second);
+          wait (fun () -> let snapshot = (Db.view db).sync.snapshot in
+            snapshot.selected_graph = Some second && (Db.graph_state db).phase = Db.Graph_open
+            && not snapshot.startup.bootstrapping && not snapshot.startup.restoring_local);
+          let generation = (Db.view db).sync.snapshot.startup.account_generation in
+          if busy then (
+            let lock = Sqlite3.db_open (Filename.concat directory ".logseq-overlay-owner.sqlite") in
+            Fun.protect ~finally:(fun () -> ignore (Sqlite3.exec lock "ROLLBACK"); ignore (Sqlite3.db_close lock)) (fun () ->
+              Sqlite3.Rc.check (Sqlite3.exec lock "BEGIN IMMEDIATE");
+              Alcotest.(check bool) "busy mirror reports failure" true
+                (Result.is_error (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
+              Alcotest.(check int) "busy mirror never starts destructive asset work" 0 !destructive_requests;
+              Alcotest.(check bool) "busy mirror remains usable" true (Sys.file_exists first_database_path)))
+          else (
+          let result, resolve = Eio.Promise.create () in
+          Eio.Fiber.fork ~sw (fun () -> Eio.Promise.resolve resolve
+            (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
+          wait (fun () -> Option.is_some !held_cleanup);
+          refreshed := true;
+          post Sync.Catalog_refresh_requested;
+          wait (fun () -> (Db.view db).sync.snapshot.selected_graph = None);
+          Alcotest.(check bool) "catalog refresh cannot report deletion success" true
+            (match Eio.Promise.peek result with Some (Ok ()) -> false | _ -> true);
+          Option.iter (fun (ticket, deletion) -> post (Sync.Runner_completed
+            (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))) !held_cleanup;
+          held_cleanup := None;
+          Alcotest.(check bool) "matching deletion finishes with cancellation failure" true
+            (match Eio.Promise.await result with Error _ -> true | Ok () -> false);
+          Alcotest.(check bool) "unauthorized deletion preserves its mirror" true
+            (Sys.file_exists first_database_path))))))
+;;
+
+let test_catalog_refresh_cannot_complete_another_deletion () = deletion_runtime_fixture ~busy:false ()
+let test_deletion_checks_ownership_before_assets () = deletion_runtime_fixture ~busy:true ()
+
 let () =
   Alcotest.run
     "logseq db worker effect runner"
@@ -1418,6 +1559,12 @@ let () =
             "sync and publish delegation"
             `Quick
             test_sync_and_publish_instructions_are_not_reduced_recursively
+        ; Alcotest.test_case
+            "catalog refresh cannot complete another deletion"
+            `Quick
+            test_catalog_refresh_cannot_complete_another_deletion
+        ; Alcotest.test_case "busy mirror preserves attachment sources" `Quick
+            test_deletion_checks_ownership_before_assets
         ] )
     ]
 ;;

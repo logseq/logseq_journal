@@ -241,15 +241,6 @@ let list db ~origin ~account ~graph ~after ~limit =
          rows [])
 ;;
 
-let delete_graph db ~origin ~account ~graph =
-  statement
-    db
-    "DELETE FROM asset_upload_intents WHERE origin=? AND account=? AND graph=?"
-    (fun stmt ->
-       bind stmt [ TEXT origin; TEXT account; TEXT (Uuid.to_string graph) ];
-       check db (Sqlite3.step stmt))
-;;
-
 let delete_account db ~origin ~account =
   statement
     db
@@ -257,4 +248,78 @@ let delete_account db ~origin ~account =
     (fun stmt ->
        bind stmt [ TEXT origin; TEXT account ];
        check db (Sqlite3.step stmt))
+;;
+
+module Captured_rows = Map.Make (struct type t = Uuid.t let compare = Uuid.compare end)
+
+type captured_graph =
+  { captured_origin : string; captured_account : string; captured_graph : Uuid.t
+  ; captured_rows : string Captured_rows.t }
+
+let captured_graph_matches capture ~origin ~account ~graph =
+  capture.captured_origin = origin && capture.captured_account = account && Uuid.equal capture.captured_graph graph
+;;
+
+let capture_graph db ~origin ~account ~graph =
+  statement db "SELECT operation,payload FROM asset_upload_intents WHERE origin=? AND account=? AND graph=? ORDER BY operation"
+    (fun stmt ->
+      bind stmt [TEXT origin; TEXT account; TEXT (Uuid.to_string graph)];
+      let rec rows acc = match Sqlite3.step stmt with
+        | DONE -> Ok {captured_origin=origin; captured_account=account; captured_graph=graph; captured_rows=acc}
+        | ROW ->
+          let payload = Sqlite3.column_text stmt 1 in
+          let* intent = decode payload in
+          if intent.origin <> origin || intent.account <> account || not (Uuid.equal intent.graph graph)
+             || Uuid.to_string intent.operation_id <> Sqlite3.column_text stmt 0
+          then Error "Retirement checkpoint scope mismatch"
+          else rows (Captured_rows.add intent.operation_id payload acc)
+        | rc -> let* () = check db rc in Error "Unexpected retirement capture result" in
+      rows Captured_rows.empty)
+;;
+
+let captured_graph_to_yojson capture =
+  `Assoc ["version", `Int 1; "origin", `String capture.captured_origin
+    ; "account", `String capture.captured_account; "graph", Uuid.to_yojson capture.captured_graph
+    ; "rows", `List (Captured_rows.bindings capture.captured_rows |> List.map (fun (id,payload) ->
+        `List [Uuid.to_yojson id; `String payload]))]
+;;
+
+let captured_graph_of_yojson json =
+  try
+    let open Yojson.Safe.Util in
+    if json |> member "version" |> to_int <> 1 then failwith "Unsupported retirement capture";
+    let origin = json |> member "origin" |> to_string in
+    let account = json |> member "account" |> to_string in
+    let* graph = json |> member "graph" |> Uuid.of_yojson in
+    let rec decode_rows acc = function
+      | [] -> Ok acc
+      | `List [id; `String payload] :: rest ->
+        let* id = Uuid.of_yojson id in let* intent = decode payload in
+        if intent.origin <> origin || intent.account <> account || not (Uuid.equal graph intent.graph)
+           || not (Uuid.equal id intent.operation_id) then Error "Retirement capture scope mismatch"
+        else if Captured_rows.mem id acc then Error "Duplicate retirement checkpoint"
+        else decode_rows (Captured_rows.add id payload acc) rest
+      | _ -> Error "Invalid retirement capture" in
+    let* rows = decode_rows Captured_rows.empty (json |> member "rows" |> to_list) in
+    Ok {captured_origin=origin;captured_account=account;captured_graph=graph;captured_rows=rows}
+  with _ -> Error "Invalid retirement capture"
+;;
+
+let delete_captured_graph db capture =
+  let* () = check db (Sqlite3.exec db "BEGIN IMMEDIATE") in
+  let result =
+    let* () = Captured_rows.fold (fun id payload result ->
+      let* () = result in
+      statement db "SELECT payload FROM asset_upload_intents WHERE operation=?" (fun stmt ->
+        bind stmt [TEXT (Uuid.to_string id)]; match Sqlite3.step stmt with
+        | DONE -> Ok () | ROW when Sqlite3.column_text stmt 0 = payload -> Ok ()
+        | ROW -> Error "A captured upload changed; retirement cleanup remains pending."
+        | rc -> check db rc)) capture.captured_rows (Ok ()) in
+    Captured_rows.fold (fun id payload result -> let* () = result in
+      statement db "DELETE FROM asset_upload_intents WHERE operation=? AND payload=?" (fun stmt ->
+        bind stmt [TEXT (Uuid.to_string id); TEXT payload]; check db (Sqlite3.step stmt)))
+      capture.captured_rows (Ok ()) in
+  match result with
+  | Ok () -> check db (Sqlite3.exec db "COMMIT")
+  | Error _ as error -> ignore (Sqlite3.exec db "ROLLBACK"); error
 ;;

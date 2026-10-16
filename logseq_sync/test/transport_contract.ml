@@ -2877,7 +2877,7 @@ let test_downloaded_cache_isolation () =
          true
          (cache_lookup request second second_scope "file" = None);
        ignore (cache_download request second second_scope "next");
-       Runner_contract.cache_unit (request first first_scope Core.Delete_graph_assets);
+       Runner_contract.cache_unit (Runner_contract.retire_cache (request first first_scope));
        Alcotest.(check bool)
          "deletion leaves other account"
          true
@@ -2942,8 +2942,8 @@ let test_downloaded_cache_graph_cleanup () =
        List.iter
          (fun (core, scope) -> ignore (cache_download request core scope "file"))
          [ first, scope; another, another_scope ];
-       Runner_contract.cache_unit (request first scope Core.Delete_graph_assets);
-       Runner_contract.cache_unit (request first scope Core.Delete_graph_assets);
+       Runner_contract.cache_unit (Runner_contract.retire_cache (request first scope));
+       Runner_contract.cache_unit (Runner_contract.retire_cache (request first scope));
        Alcotest.(check bool)
          "selected graph removed"
          true

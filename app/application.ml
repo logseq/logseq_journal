@@ -4109,6 +4109,14 @@ let start
   in
   let local_copy_request ?(confirm = true) ~deleting (request : Graph_service.local_copy_request) =
     Effect.of_thunk (fun () ->
+      if confirm then (
+        let superseded = Hashtbl.fold (fun id (previous, pending_delete, _) ids ->
+          if not pending_delete && previous.Graph_service.graph_id = request.graph_id
+             && previous.account_generation = request.account_generation
+          then id :: ids else ids) local_copy_requests [] in
+        List.iter (fun id ->
+          Hashtbl.remove local_copy_requests id;
+          Worker.cancel client ~request_id:id) superseded);
       let command = if deleting then Graph_service.Delete_local_copy request else Inspect_local_copy request in
       match Worker.send client command with
       | Worker.Accepted id -> Hashtbl.replace local_copy_requests id (request, deleting, confirm)

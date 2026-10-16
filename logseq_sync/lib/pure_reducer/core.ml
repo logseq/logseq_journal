@@ -301,6 +301,15 @@ type private_key_unlock =
   ; private_key_package : string
   }
 
+type retirement_id = Logseq_db_types.Graph_types.Retirement_id.t
+let retirement_id_of_string = Logseq_db_types.Graph_types.Retirement_id.of_string
+let retirement_id_to_string = Logseq_db_types.Graph_types.Retirement_id.to_string
+
+type asset_deletion = { deletion_scope : graph_scope; retirement : retirement_id }
+let asset_deletion_reference ~scope ~retirement = { deletion_scope = scope; retirement }
+let asset_deletion_scope deletion = deletion.deletion_scope
+let asset_deletion_retirement deletion = deletion.retirement
+
 type asset_context =
   { scope : graph_scope
   ; encrypted : bool
@@ -331,7 +340,9 @@ type asset_action =
   | Release_staged_file of string
   | Prune_asset_staging of string list
   | Close_asset_scope
-  | Delete_graph_assets
+  | Prepare_graph_asset_deletion of retirement_id
+  | Commit_graph_asset_deletion of asset_deletion
+  | Cancel_graph_asset_deletion of asset_deletion
   | Delete_account_assets
   | Asset_retry_after of float
   | Cancel_asset_operation of string
@@ -359,6 +370,7 @@ type asset_value =
       ; size : int64
       }
   | Asset_retained of (string * string) option
+  | Asset_deletion_prepared of asset_deletion
   | Asset_pruned of int
   | Asset_retry_elapsed
 
@@ -720,8 +732,16 @@ type websocket_owner =
   ; phase : websocket_phase
   }
 
+module Asset_retirement_set = Map.Make (String)
+let asset_retirement_key (scope : graph_scope) retirement =
+  Printf.sprintf "%S:%S:%S:%S" (Uri.to_string scope.account.managed_sync_origin)
+    scope.account.user_id (Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id)
+    (retirement_id_to_string retirement)
+;;
+
 type t =
-  { asset_known_scopes : graph_scope list
+  { asset_retirement_observed : unit Asset_retirement_set.t
+  ; asset_known_scopes : graph_scope list
   ; protected_pending : protected_ticket list
   ; assets_pending : pending_asset list
   ; config : config
@@ -796,7 +816,8 @@ let initial config =
     }
   in
   Ok
-    { asset_known_scopes = []
+    { asset_retirement_observed = Asset_retirement_set.empty
+    ; asset_known_scopes = []
     ; protected_pending = []
     ; assets_pending = []
     ; config
@@ -3024,7 +3045,9 @@ let asset_cleanup_action = function
   | Release_asset_file _
   | Release_staged_file _
   | Close_asset_scope
-  | Delete_graph_assets
+  | Prepare_graph_asset_deletion _
+  | Commit_graph_asset_deletion _
+  | Cancel_graph_asset_deletion _
   | Delete_account_assets
   | Cancel_asset_operation _ -> true
   | Check_asset_cache _
@@ -3044,6 +3067,7 @@ let asset_cleanup core (request : asset_io_request) result =
       Some (Release_asset_file handle)
     | Ok (Asset_retained (Some (lease, _))) -> Some (Release_asset_file lease)
     | Ok (Asset_staged { file; _ }) -> Some (Release_staged_file file)
+    | Ok (Asset_deletion_prepared deletion) -> Some (Cancel_graph_asset_deletion deletion)
     | Ok
         ( Asset_cached None
         | Asset_retained None
@@ -3059,10 +3083,10 @@ let asset_cleanup core (request : asset_io_request) result =
       { request with operation = "cleanup:" ^ string_of_int core.next_effect_id; action }
 ;;
 
-let asset_result_matches action = function
+let asset_result_matches (request : asset_io_request) = function
   | Error _ -> true
   | Ok value ->
-    (match action, value with
+    (match request.action, value with
      | Check_asset_cache _, Asset_cached _
      | Fetch_asset _, Asset_downloaded _
      | Stage_asset_file _, Asset_staged _
@@ -3073,7 +3097,11 @@ let asset_result_matches action = function
      | Release_staged_file _, Asset_unit
      | Prune_asset_staging _, Asset_pruned _
      | Close_asset_scope, Asset_unit
-     | Delete_graph_assets, Asset_unit
+     -> true
+     | Prepare_graph_asset_deletion retirement, Asset_deletion_prepared deletion ->
+       retirement = deletion.retirement && request.context.scope = deletion.deletion_scope
+     | Commit_graph_asset_deletion _, Asset_unit
+     | Cancel_graph_asset_deletion _, Asset_unit
      | Delete_account_assets, Asset_unit
      | Asset_retry_after _, Asset_retry_elapsed
      | Cancel_asset_operation _, Asset_unit -> true
@@ -3093,9 +3121,15 @@ let complete_asset core ticket result =
       }
     in
     let request = ticket.asset_request in
+    let core = match request.action, result with
+      | (Commit_graph_asset_deletion deletion | Cancel_graph_asset_deletion deletion), Ok Asset_unit ->
+        {core with asset_retirement_observed=Asset_retirement_set.add
+          (asset_retirement_key (asset_deletion_scope deletion) (asset_deletion_retirement deletion)) ()
+          core.asset_retirement_observed}
+      | _ -> core in
     if pending.asset_cancelled
     then asset_cleanup core request result
-    else if not (asset_result_matches request.action result)
+    else if not (asset_result_matches request result)
     then (
       let cleaned = asset_cleanup core request result in
       { cleaned with
@@ -3156,14 +3190,15 @@ let request_asset core (request : asset_request) =
           List.exists
             (fun (scope : graph_scope) -> scope.account = request.scope.account)
             core.asset_known_scopes
-        | Delete_graph_assets ->
-          Option.fold ~none:false ~some:(fun (scope : graph_scope) ->
-            scope.account = request.scope.account && scope.graph_id = request.scope.graph_id) core.deletion_scope
-          || List.exists
-            (fun (scope : graph_scope) ->
-               scope.account = request.scope.account
-               && scope.graph_id = request.scope.graph_id)
-            core.asset_known_scopes
+        | Commit_graph_asset_deletion deletion | Cancel_graph_asset_deletion deletion ->
+          asset_deletion_scope deletion = request.scope
+          && (List.mem request.scope core.asset_known_scopes
+              || Option.fold ~none:false ~some:(fun user -> request.scope.account = account_scope core user) core.user_id)
+        | Prepare_graph_asset_deletion _ ->
+          let same_target (scope : graph_scope) = scope.account = request.scope.account
+            && scope.graph_id = request.scope.graph_id in
+          Option.fold ~none:false ~some:same_target core.deletion_scope
+          || Option.fold ~none:false ~some:same_target core.current_graph_scope
         | _ -> List.mem request.scope core.asset_known_scopes
       in
       if known
@@ -3188,11 +3223,15 @@ let request_asset core (request : asset_request) =
     | Put_asset_file { maximum_plaintext_bytes; _ } ->
       maximum_plaintext_bytes >= 0 && maximum_plaintext_bytes <= 100 * 1024 * 1024
     | Asset_retry_after seconds -> Float.is_finite seconds && seconds >= 0.
+    | Commit_graph_asset_deletion deletion | Cancel_graph_asset_deletion deletion ->
+      asset_deletion_scope deletion = request.scope
     | _ -> true
   in
   if duplicate
   then unchanged core
-  else if (core.closed && not cleanup) || context = None || not valid
+  else if (core.closed && not cleanup)
+       || (match request.action with Prepare_graph_asset_deletion _ -> core.closed || core.user_id=None | _ -> false)
+       || context = None || not valid
   then { next = core; effects = [ asset_output request (Error Asset_cancelled) ] }
   else (
     let core, cancelled =
@@ -3202,7 +3241,8 @@ let request_asset core (request : asset_request) =
           previous.context.scope = request.scope && previous.operation = operation)
       | Close_asset_scope ->
         cancel_asset_pending core (fun previous -> previous.context.scope = request.scope)
-      | Delete_graph_assets ->
+      | Prepare_graph_asset_deletion retirement
+        when not (Asset_retirement_set.mem (asset_retirement_key request.scope retirement) core.asset_retirement_observed) ->
         cancel_asset_pending core (fun previous ->
           same_asset_account previous.context.scope.account request.scope.account
           && previous.context.scope.graph_id = request.scope.graph_id)
@@ -3211,6 +3251,14 @@ let request_asset core (request : asset_request) =
           same_asset_account previous.context.scope.account request.scope.account)
       | _ -> core, []
     in
+    let core = match request.action with
+      | Prepare_graph_asset_deletion retirement ->
+        {core with
+          asset_retirement_observed=Asset_retirement_set.add (asset_retirement_key request.scope retirement) ()
+            core.asset_retirement_observed
+        ; asset_known_scopes=if List.mem request.scope core.asset_known_scopes then core.asset_known_scopes
+            else request.scope :: core.asset_known_scopes}
+      | _ -> core in
     let issued =
       issue_asset
         core

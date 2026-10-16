@@ -70,7 +70,7 @@ type graph_state = Pure_reducer.graph_state =
 type local_deletion_waiter =
   { graph_id : Logseq_db_types.Graph_types.Uuid.t
   ; account_generation : int
-  ; mutable request : Sync.mirror_deletion option
+  ; mutable request : (Pure_reducer.ticket * Sync.mirror_deletion) option
   ; resolve : (unit, string) result Eio.Promise.u
   }
 
@@ -108,13 +108,22 @@ let dispatch t event =
         | None, Pure_reducer.Sync_event (Sync.Local_cache_deletion_requested graph_id)
           when graph_id = waiter.graph_id ->
           waiter.request <- List.find_map (function
-            | Pure_reducer.Run_worker (Pure_reducer.Request (_, Pure_reducer.Handle_sync_worker_effect (Sync.Delete_mirror request))) ->
-              Some request
+            | Pure_reducer.Run_worker (Pure_reducer.Request (ticket, Pure_reducer.Handle_sync_worker_effect (Sync.Delete_mirror request))) ->
+              Some (ticket, request)
             | _ -> None) transition.effects;
           if waiter.request = None then finish (Error "This local copy cannot be deleted now.")
         | _ -> ());
-       if waiter.request <> None && snapshot.local_deletion = None
-       then finish (match snapshot.last_error with None -> Ok () | Some message -> Error message)));
+       match waiter.request, event with
+       | Some (expected_ticket, expected),
+         Pure_reducer.Runner_completed
+           (Pure_reducer.Sync_worker_effect_completed
+             (ticket, Ok { event = Some (Sync.Mirror_deleted (actual, result)); _ }))
+         when ticket = expected_ticket && actual = expected -> finish result
+       | Some (expected_ticket, _),
+         Pure_reducer.Runner_completed
+           (Pure_reducer.Sync_worker_effect_completed (ticket, Error _))
+         when ticket = expected_ticket -> finish (Error "Mirror deletion failed.")
+       | _ -> ()));
   List.iter (Effect_runner.submit t.runner) transition.effects
 ;;
 

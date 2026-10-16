@@ -2,44 +2,61 @@
 
 ## Problem
 
-The graph picker uses uneven capsule buttons and loses the active graph when opened. It has no per-row local-copy management or durable presence observation.
+The graph picker used uneven capsule buttons and lost the active graph when opened. It had no per-row local-copy management or durable presence observation. Deleting several local resources in sequence could lose attachment sources before mirror ownership was checked, or strand partially collected retired bytes after a failed purge.
 
 ## Decision
 
-Implement the user's selected concept A with native equal-width list rows, a full-canvas List with Timeline-style floating close/refresh/existing account controls, an inline current marker and a separate row menu. Keep picker and request ownership in OCaml. Query one graph's mirror presence on demand with an account-generation fence; cache observations outside rendering.
+Use the selected concept A with native equal-width list rows and no header, following Timeline's full-canvas List and floating controls. Retain close, refresh and existing account controls. Keep catalog order, mark the current graph in place, activate names to switch, and expose Delete local copy only through the separate row menu. Do not add search, graph creation or remote deletion. OCaml owns presentation and request state; Swift provides native-specific list controls.
 
-The user explicitly permits discarding unsynchronized local content after confirmation (Sentinel_3c2ff0ee96f88191ab349fca7f7befe9). The confirmation must explain this loss, device-only deletion and the retained cloud copy. The active graph requires switching first. The user separately approved the minimal existing protected Core contract comment change (Sentinel_752ae13c79888191aeb7123ba1d9fd25). No other protected spec, Dune or lock edit is part of this change.
+The user explicitly permits discarding unsynchronized content after confirmation (Sentinel_3c2ff0ee96f88191ab349fca7f7befe9). The confirmation explains that unsynchronized changes, drafts and attachments are discarded on this device, while the cloud copy remains downloadable. The active graph must be switched away from first. Unbound legacy mirrors require opening once and switching away before removal.
 
-The user subsequently requested removing the header entirely and making the whole UI a List like Timeline. Reuse the existing floating chrome; retain the native controls and per-row actions without a title bar.
+The user authorized the two protected deletion interface changes (Sentinel_098717acd4dc8191baeaae8a9cdbee4b), migration without compatibility paths (Sentinel_17788ec75690819198347944f824cd8c and Sentinel_8265ed5fca0c8191852d23c144887053), and retaining Delete_account_assets. Remove Delete_graph_assets, Database.delete_mirror and the obsolete graph-wide upload-checkpoint delete. Do not add wrappers or fallbacks. Dune, lockfiles and shared opam/pins remain unchanged.
+
+Use an independent Retirement_id value type, distinct from a graph UUID. Share that storage-independent type through the existing value library, avoiding a runtime dependency from the pure reducer into the database I/O implementation.
+
+Keep a single worker business deletion flight. Its internal resource protocol is:
+
+- Acquire the inspected mirror's existing exclusive ownership primitive before retiring any asset source. Revalidate the physical generation and persisted account owner immediately before the namespace commit.
+- Cancel and drain target uploads, then freeze staging/checkpoint writers while capturing exact operation/payload pairs. Persist a coordinator journal before preparing assets.
+- The asset owner blocks new work for the target origin/account/graph across generations, cancels existing operations and asynchronously waits for native leases. Release and cancellation controls remain available; destructive staging cleanup waits. Move the captured cache into a unique retirement namespace without unlinking its bytes.
+- Mirror commit atomically renames that one canonical mirror namespace. This is not an atomic transaction over all directories. Synchronize the directory chain and persist this retirement's committed receipt before destructive cleanup in another producer. An unrelated missing or changed canonical mirror is never commit evidence.
+- After durable commit, conditionally remove only captured upload rows and collect only the captured retired asset namespace. Preserve new same-graph operations and replacement canonical files. Physical purge failures stay in producer-owned pending queues; committed collection failure must not prevent redownload.
+- Before commit, cancel restores only the captured asset directory with an atomic no-replace rename. A conflict preserves bytes, journal and the barrier for recovery. Aborted/account-deleted tombstones reject late preparation or restoration. Before a mirror is inspected or attached, replay its journal using exact durable commit evidence; unknown outcomes fail closed.
+
+The producer APIs expose prepare/commit/cancel because the worker coordinates independently owned resources between those steps. Durable receipts and cleanup queues remain private. Completed receipts are looked up by ID; ordinary collection visits pending namespaces rather than all historical receipts.
 
 ## Alternatives considered
 
-### Reuse the existing graph-picker transition unchanged
+### Reuse the original picker transition
 
-It detaches the current graph and clears its identity. Keep an application-owned picker presentation instead, and use the existing Select_graph lifecycle only for an actual switch.
+It detached the current graph and cleared its identity. Keep an application-owned picker presentation, using the existing graph selection lifecycle only for an actual switch.
+
+### Delete attachments and then delete the mirror
+
+A busy or stale mirror could reject deletion after its attachment sources were already gone. Merely reversing the calls would still leave post-commit cleanup failures and retries unsafe. Explicitly capture each resource and retain durable recovery evidence.
+
+### Retain the old single-graph deletion APIs
+
+Their production callers belong to this workflow. Migrate those callers and their contract tests, then remove the obsolete entry points rather than maintain parallel destructive paths. Account cleanup retains its separate existing purpose.
 
 ## Validation
 
-- Uniform native rows preserve catalog order, expose the current marker and support long names and Dynamic Type.
-- Close returns to the retained current graph; name activation switches through the worker.
-- Row menus are independently reachable; current graph deletion is disabled with an explanation.
-- Presence is bounded and requested only for the relevant graph, with stale and cancelled results ignored.
-- Confirmation names the graph, warns that unsynchronized changes/drafts/attachments will be lost and says the cloud copy remains downloadable.
-- Two native XCTest cases pass on the isolated iPhone 13 / iOS 26.1 Simulator: actual menu and row taps, cancellation, current-graph protection, ownership-busy failure and retry, retained Not downloaded rows, real-worker snapshot redownload through a controlled loopback TLS fixture, close/session retention and accessibility XXXL scrolling/menu reachability. The fixture does not implement a live remote sync service.
-- Real UI submission also produced an unsent text capture and photo attachment; inspection found three durable outbox records and one account/graph-specific upload intent before confirmed local deletion removed that copy and its intent.
-- Application regression: 98 tests pass, including deletion-in-flight Capture and composer retention. Sync and overlay storage suites pass 261 and 50 cases respectively; worker service, startup, semantics and source-boundary checks pass.
-- Independent read-only journal-code-review found and prompted fixes for action gating and confirmation identity; the code-fix commit was re-reviewed with no remaining evidenced findings. All temporary reports, builds, hosts, network fixtures and screenshots remain outside Git.
+- Public mounted Application tests cover current marking, close/session retention, name switching, menu confirmation, action usability while another graph is deleting, and cancellation of superseded presence checks.
+- Public worker actor tests use real SQLite ownership contention to prove that busy admission precedes asset retirement. They also hold an asset preparation completion while catalog reconciliation retires another graph, proving only the exact deletion ticket/request can resolve its waiter.
+- Public Database tests cover stale generations, rebound account ownership, preparation ownership, cancellation, durable commit replay, partial-purge retry and replacement-mirror isolation. A pure reducer cannot execute filesystem permission failures or ownership acquisition; injecting a failed completion there would not reproduce either bug.
+- Public asset reducer events cover token scope validation and replay during pending work, after commit and after account cleanup. Public runner requests exercise native leases, staged-file restoration, atomic restore conflicts and replacement-cache isolation.
+- Upload checkpoint tests cover durable capture roundtrips, changed-row refusal with no partial deletion, restart/replay and preservation of new same-graph rows.
+- Run full repository compilation and regression/source-boundary checks before building the native probe. Simulator acceptance uses only an isolated iPhone 13 / iOS 26.1 device and rebuildable synthetic graphs, with actual list/menu taps, long names and accessibility Dynamic Type, cancellation, current-graph protection, busy failure/retry, retained Not downloaded rows and real-worker redownload through a controlled loopback TLS fixture. Also exercise intentional discard of an unsent text capture and photo attachment. The fixture is not a live remote sync service.
+- Keep build manifests, exact source hashes, test results, screenshots and independent review reports outside Git. Review the final PR head with journal-code-review and wait for that head's CI terminal result.
 
 ## Risks
 
-- Presence can be unknown or fail; expose a clear retry/status rather than assuming a downloaded copy.
-- Host ARM64 OCaml restamping is an experimental Simulator compatibility path; actual runtime acceptance does not establish full iOS cross-compilation or ABI validity.
+Unknown presence or an unresolved recovery conflict must expose an actionable error rather than assume a safe downloaded state. Restoring a prepared directory can fail if another namespace has appeared; retain the exclusive captured bytes for retry instead of overwriting the new copy.
+
+Host ARM64 OCaml restamping is an experimental Simulator compatibility route. Runtime acceptance does not establish full iOS cross-compilation or ABI validity.
 
 ## Consequences
 
-Presence observations are cached by account and invalidated for a graph lifecycle change. Native row controls stay mounted while property signals update text and enabled state: real Simulator testing showed that replacing interactive subtrees could leave the retained List cell with an obsolete callback binding. Headless final-state assertions alone did not reproduce that native retention boundary, so the acceptance check is the real Simulator flow.
+Presence observations are cached by account and invalidated for graph lifecycle changes. Native row controls stay mounted while property signals update text and enabled state: real Simulator testing showed that replacing interactive subtrees could retain obsolete callbacks. The active graph remains usable when the picker closes while another graph's copy is deleting.
 
-Deletion uses a single account-scoped flight and exact terminal result. It preserves the selected graph and catalog, validates persisted local ownership, cancels target work, waits for native leases, and revalidates before mirror removal under the existing exclusive ownership primitive. Unsynchronized local content is intentionally discarded after the warning. Unbound legacy mirrors require opening once and switching away before removal.
-
-The active graph remains usable when the picker closes during deletion of another graph. Application owns the manager snapshot and action gate; the public Root_navigation reducer does not own either, so its events cannot reproduce that guard. A regression at the public mounted Application boundary holds deletion in flight and exercises the current graph's Capture action. Each new confirmation also advances its request token so an older response cannot authorize a newer dialog.
-
+Application owns the manager snapshot and action gate; Root_navigation does not, so its events cannot reproduce those UI guards. The worker runtime owns exact promise completion; a reducer supplied with an already incorrect completion cannot reproduce its wrapper inference bug. Resource producers own filesystem transitions, durable receipts and native leases. Each regression lives at the narrowest public owner that executes its defect.
