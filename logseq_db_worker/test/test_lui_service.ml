@@ -1123,7 +1123,7 @@ let test_local_copy_presence mode () =
     let cache = Core.catalog_cache ~user_id:user ~graphs:[graph] ~selected_graph:None in
     Out_channel.with_open_bin (Filename.concat catalogs (name ^ ".json"))
       (fun output -> output_string output (Core.encode_catalog_cache cache));
-    if List.mem mode ["downloaded"; "corrupt"; "delete"; "busy"; "owner"] then (
+    if List.mem mode ["downloaded"; "corrupt"; "delete"; "busy"] then (
       let mirrors = Filename.concat directory "synced-graphs" in
       Unix.mkdir mirrors 0o700;
       let mirror = Filename.concat mirrors (G.Uuid.to_string graph_id) in
@@ -1138,11 +1138,6 @@ let test_local_copy_presence mode () =
               ~checksum:"0123456789abcdef" |> Result.get_ok in
           Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok)));
     let mirror_directory = Filename.concat (Filename.concat directory "synced-graphs") (G.Uuid.to_string graph_id) in
-    if List.mem mode ["delete"; "busy"; "owner"] then
-      Out_channel.with_open_bin (Filename.concat mirror_directory ".journal-local-owner.json") (fun output ->
-        output_string output (Yojson.Safe.to_string (`Assoc
-          ["user_id", `String (if mode = "owner" then "another-account" else user)
-          ; "origin", `String "https://api.logseq.io"; "graph_id", `String (G.Uuid.to_string graph_id)])));
 
     with_client fixture.config (fun client ->
       ignore (Worker.send client (Service.Client_command (Restore_local_account { user_id = user })) |> accepted);
@@ -1165,10 +1160,10 @@ let test_local_copy_presence mode () =
         T.require (actual = request) "presence result retains exact identity";
         (match mode, result with
          | "absent", Ok Service.Not_downloaded
-         | ("downloaded" | "delete" | "busy" | "owner"), Ok Service.Downloaded -> ()
-         | ("stale" | "unauthorized" | "corrupt"), Error _ -> ()
+         | ("downloaded" | "corrupt" | "delete" | "busy"), Ok Service.Downloaded -> ()
+         | ("stale" | "unauthorized"), Error _ -> ()
          | _ -> T.fail "unexpected presence result for %s" mode);
-        if List.mem mode ["delete"; "busy"; "owner"] then (
+        if List.mem mode ["delete"; "busy"] then (
           let lock = if mode <> "busy" then None else (
             let db = Sqlite3.db_open (Filename.concat mirror_directory ".logseq-overlay-owner.sqlite") in
             Sqlite3.Rc.check (Sqlite3.exec db "CREATE TABLE owner_primitive (protocol INTEGER NOT NULL); BEGIN IMMEDIATE");
@@ -1194,12 +1189,11 @@ let () =
     "lui worker service"
     [ T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
     ; T.case "local copy busy failure recovers" (test_local_copy_presence "busy")
-    ; T.case "local copy refuses another account mirror" (test_local_copy_presence "owner")
     ; T.case "local copy absent metadata" (test_local_copy_presence "absent")
     ; T.case "local copy downloaded without body decoding" (test_local_copy_presence "downloaded")
     ; T.case "local copy stale account is rejected" (test_local_copy_presence "stale")
     ; T.case "local copy unauthorized graph is rejected" (test_local_copy_presence "unauthorized")
-    ; T.case "local copy corrupt metadata reports failure" (test_local_copy_presence "corrupt")
+    ; T.case "local copy corrupt database still exists" (test_local_copy_presence "corrupt")
     ; T.case
         "control bypasses full data and handler waits"
         test_control_bypasses_full_data_and_waiting_handlers

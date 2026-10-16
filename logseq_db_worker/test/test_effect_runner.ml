@@ -1347,7 +1347,7 @@ let test_upload_checkpoint_io () =
         Runner.shutdown restarted)))
 ;;
 
-let deletion_runtime_fixture ?(journal_failure = false) ~busy () =
+let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () =
   let module Db = Logseq_db_worker in
   let module G = Logseq_db_types.Graph_types in
   T.with_managed (fun fixture ->
@@ -1372,9 +1372,19 @@ let deletion_runtime_fixture ?(journal_failure = false) ~busy () =
           ~checksum:"0123456789abcdef" |> Result.get_ok in
       Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok;
       ignore (Sqlite3.db_close sqlite);
-      Out_channel.with_open_bin (Filename.concat directory ".journal-local-owner.json") (fun output ->
-        Printf.fprintf output {|{"origin":"https://api.logseq.io","user_id":"user-1","graph_id":%S}|}
-          (G.Uuid.to_string first));
+      (match deletion_case with
+       | None | Some `Legacy -> ()
+       | Some `Corrupt_sqlite ->
+         Out_channel.with_open_bin first_database_path (fun output -> output_string output "not a SQLite database")
+       | Some `Corrupt_checkpoint ->
+         let db = Sqlite3.db_open first_database_path in
+         Sqlite3.Rc.check (Sqlite3.exec db "DROP TABLE sync_meta; CREATE TABLE sync_meta (broken TEXT)");
+         ignore (Sqlite3.db_close db)
+       | Some `Missing_database -> Unix.unlink first_database_path
+       | Some `Linked_database ->
+         let external_database = Filename.concat root "unrelated-database.sqlite" in
+         Unix.rename first_database_path external_database;
+         Unix.symlink external_database first_database_path);
       let second_directory = Filename.concat mirrors (G.Uuid.to_string second) in
       Unix.mkdir second_directory 0o700;
       let sqlite = Sqlite3.db_open (Filename.concat second_directory "db.sqlite") in
@@ -1417,7 +1427,7 @@ let deletion_runtime_fixture ?(journal_failure = false) ~busy () =
         | Sync.Asset_io (ticket, { context; action = Sync.Prepare_graph_asset_deletion retirement; _ }) ->
           incr destructive_requests;
           let deletion = Sync.asset_deletion_reference ~scope:context.scope ~retirement in
-          if busy then post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))
+          if busy || Option.is_some deletion_case then post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))
           else held_cleanup := Some (ticket, deletion)
         | Sync.Asset_io (ticket, _) ->
           post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok Sync.Asset_unit)))
@@ -1458,7 +1468,19 @@ let deletion_runtime_fixture ?(journal_failure = false) ~busy () =
             snapshot.selected_graph = Some second && (Db.graph_state db).phase = Db.Graph_open
             && not snapshot.startup.bootstrapping && not snapshot.startup.restoring_local);
           let generation = (Db.view db).sync.snapshot.startup.account_generation in
-          if journal_failure then (
+          if Option.is_some deletion_case then (
+            let result = Db.delete_local_copy db ~account_generation:generation ~graph_id:first in
+            (match result with Ok () -> () | Error message -> Alcotest.failf "unopened local copy must delete: %s" message);
+            Alcotest.(check bool) "selected target directory is absent" false (Sys.file_exists directory);
+            Alcotest.(check bool) "other graph database survives" true
+              (Sys.file_exists (Filename.concat second_directory "db.sqlite"));
+            Alcotest.(check bool) "current Worker remains open" true ((Db.graph_state db).phase = Db.Graph_open);
+            Alcotest.(check bool) "opening current graph creates no account-owner JSON" false
+              (Sys.file_exists (Filename.concat second_directory ".journal-local-owner.json"));
+            if deletion_case = Some `Linked_database then
+              Alcotest.(check bool) "linked external database survives deletion" true
+                (Sys.file_exists (Filename.concat root "unrelated-database.sqlite")))
+          else if journal_failure then (
             let blocked = Filename.concat worker_root "local-copy-retirements" in
             Out_channel.with_open_bin blocked (fun output -> output_string output "synthetic mkdir fault");
             Alcotest.(check bool) "journal IO failure returns a deletion error" true
@@ -1578,6 +1600,16 @@ let () =
             test_deletion_checks_ownership_before_assets
         ; Alcotest.test_case "journal IO failure preserves current Worker" `Quick
             test_deletion_journal_failure_preserves_worker
+        ; Alcotest.test_case "delete never-opened legacy copy" `Quick
+            (deletion_runtime_fixture ~deletion_case:`Legacy ~busy:false)
+        ; Alcotest.test_case "delete non-SQLite copy" `Quick
+            (deletion_runtime_fixture ~deletion_case:`Corrupt_sqlite ~busy:false)
+        ; Alcotest.test_case "delete invalid checkpoint copy" `Quick
+            (deletion_runtime_fixture ~deletion_case:`Corrupt_checkpoint ~busy:false)
+        ; Alcotest.test_case "delete residual directory without database" `Quick
+            (deletion_runtime_fixture ~deletion_case:`Missing_database ~busy:false)
+        ; Alcotest.test_case "delete contained database link without following it" `Quick
+            (deletion_runtime_fixture ~deletion_case:`Linked_database ~busy:false)
         ] )
     ]
 ;;

@@ -713,14 +713,13 @@ let create ~(dependencies : dependencies) =
              || not (Authorized_graphs.mem (Logseq_db_types.Graph_types.Uuid.to_string request.graph_id) session.authorized_graphs)
           then Error "The graph account is no longer current."
           else
-            match Overlay.inspect_mirror
-              ~application_support_directory:session.application_support_directory
-              ~graph_id:request.graph_id with
-            | Error _ -> Error "Unable to check the local copy. Try again."
-            | Ok inspection ->
-              Ok (match Overlay.mirror_presence inspection with
-                | Logseq_overlay_db.Types.Absent _ -> Not_downloaded
-                | Available _ -> Downloaded)
+            let path = Filename.concat session.application_support_directory
+              ("logseq-db-worker/synced-graphs/" ^ Logseq_db_types.Graph_types.Uuid.to_string request.graph_id) in
+            (match Unix.lstat path with
+             | { st_kind = Unix.S_DIR; _ } -> Ok Downloaded
+             | _ -> Error "Unable to check the local copy. Try again."
+             | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Ok Not_downloaded
+             | exception _ -> Error "Unable to check the local copy. Try again.")
         in
         Ok (Local_copy_inspected (request, result))
       | Import_asset { graph_generation; source } ->
