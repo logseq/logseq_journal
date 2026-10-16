@@ -52,7 +52,7 @@ def cache_identity(root):
         system_libraries[name] = {"version": capture("pkg-config", "--modversion", name),
             "flags": capture("pkg-config", "--cflags", "--libs", name),
             "files": {str(p): sha(p) for p in sorted(inputs)}}
-    recipe = [root / name for name in (".github/workflows/ci.yml", "tool/prepare_ci_dependencies.py", "tool/journal_build.py")]
+    recipe = [root / name for name in (".github/workflows/ci.yml", ".agents/skills/journal-build/scripts/prepare_ci_dependencies.py", ".agents/skills/journal-build/scripts/journal_build.py")]
     identity.update(schema_version=2, host=dict(system=platform.system(), architecture=platform.machine(),
                     release=platform.release(), image=image),
                     workspace=str(root), opam_root=str(Path(capture("opam", "var", "root")).resolve()),

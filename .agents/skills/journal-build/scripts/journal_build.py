@@ -19,7 +19,7 @@ import sys
 import tempfile
 from urllib.parse import unquote, urlsplit
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 def fingerprint(value):
@@ -83,6 +83,9 @@ def source_inputs():
                 result[path.name] = sha(path)
         elif path.name in {"dune-project", "dune", "dune-workspace"}:
             result[path.name] = sha(path)
+    skill_scripts = ROOT / ".agents/skills/journal-build/scripts"
+    result.update({str(skill_scripts.relative_to(ROOT) / name): digest
+                   for name, digest in files(skill_scripts).items()})
     return result
 
 
@@ -262,7 +265,7 @@ class Build:
         removed = self.run("git", "diff", "--name-only", "--diff-filter=D", pre["commit"], "--").splitlines()
         for name in sorted(set(source) | set(removed)):
             if (Path(name).name in {"dune", "dune-project", "dune-workspace"}
-                    or name.endswith((".opam", ".opam.locked")) or name == "tool/native_static_link_flags.sh"):
+                    or name.endswith((".opam", ".opam.locked")) or name == ".agents/skills/journal-build/scripts/native_static_link_flags.sh"):
                 original = subprocess.check_output(["git", "show", pre["commit"] + ":" + name], cwd=ROOT)
                 if hashlib.sha256(original).hexdigest() != source.get(name):
                     raise ValueError(f"native build configuration changed since producer commit: {name}")
@@ -644,7 +647,7 @@ class Build:
         # SwiftPM resource bundles must travel with the executable.
         for bundle in product.parent.glob("*.bundle"):
             shutil.copytree(bundle, resource / bundle.name)
-        self.run("bash", ROOT / "tool/package_journal_apple_icons.sh", self.args.platform, app)
+        self.run("bash", ROOT / ".agents/skills/journal-build/scripts/package_journal_apple_icons.sh", self.args.platform, app)
         if not (resource / "Assets.car").is_file():
             raise RuntimeError("icon Assets.car missing")
         packaged = plistlib.loads(plist.read_bytes())

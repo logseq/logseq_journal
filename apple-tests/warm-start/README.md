@@ -53,7 +53,7 @@ successful selection persists graph 2 as the next launch target.
 ## Isolated iPhone host
 
 Build the simulator host (device builds additionally need the shared iOS OCaml
-toolchain object — see tool/build_journal_apple.sh):
+toolchain object — see .agents/skills/journal-build/scripts/build_journal_apple.sh):
 
 ```sh
 python3 tool/test_swiftui_warm_start.py --platform ios-simulator \

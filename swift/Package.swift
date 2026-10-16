@@ -11,7 +11,7 @@ let luiPackagePath =
 
 // Colon-separated native objects/archives to link into the app binary:
 // the OCaml complete object plus the compiled journal_lui_bridge.o. The build
-// script (tool/build_journal_apple.sh) supplies them.
+// script (.agents/skills/journal-build/scripts/build_journal_apple.sh) supplies them.
 let nativeLinkInputs = ProcessInfo.processInfo.environment["JOURNAL_NATIVE_LINK_INPUTS"]?
     .split(separator: ":")
     .map(String.init) ?? []

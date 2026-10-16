@@ -1,6 +1,6 @@
 """Build a native encrypted warm-start acceptance host with the real Journal object.
 
-Stages an LUI probe host (tool/lui_probe_host.py) with
+Stages an LUI probe host (.agents/skills/journal-build/scripts/lui_probe_host.py) with
 apple-tests/warm-start/JournalWarmStartAcceptance.swift as the @main app,
 linked against the production native_embed complete object. The fixture uses
 generated disposable data, memory-only E2EE secrets and blocked network
@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.agents/skills/journal-build/scripts'))
 import lui_probe_host
 
 root = lui_probe_host.ROOT
@@ -59,7 +59,7 @@ def run(command, cwd=host):
 
 
 # The OCaml side ships the production complete object: app/native_embed.exe.o.
-# Build it first with the workspace dune build (see tool/build_journal_apple.sh);
+# Build it first with the workspace dune build (see .agents/skills/journal-build/scripts/build_journal_apple.sh);
 # pass a prebuilt artifact via --native-object. Simulator needs a Simulator
 # object; the shared builder does not silently restamp host runtime objects.
 artifact = arguments.native_object.resolve() if arguments.native_object else (

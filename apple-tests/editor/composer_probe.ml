@@ -4,7 +4,7 @@
    native widget has no lui extension counterpart; the probe exercises the
    same input->state->observed flow through Lui_elements text_field/button).
    Linked into a probe complete object for the staged LUI host (see
-   tool/test_swiftui_editor.py + tool/lui_probe_host.py). *)
+   tool/test_swiftui_editor.py + .agents/skills/journal-build/scripts/lui_probe_host.py). *)
 
 open Lui_protocol
 open Lui_elements

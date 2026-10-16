@@ -16,7 +16,7 @@ sign-out and stale completion fencing, including cancellation during secure save
 `python3 tool/test_swiftui_services.py` retains account/graph protocol and storage
 threading checks. `python3 tool/test_swiftui_events.py` retains lifecycle checks.
 
-`python3 tool/build_authentication_probe.py` builds a disposable Simulator
+`python3 .agents/skills/journal-build/scripts/build_authentication_probe.py` builds a disposable Simulator
 application with the production view and a local presentation provider. Scenarios
 are `success`, `error`, `cancel` and `busy`. The optional `--large-text`, `--dark` and
 `--rtl` launch arguments retain visual checks. It does not open a real browser or

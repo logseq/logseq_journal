@@ -6,7 +6,7 @@ import plistlib
 import subprocess
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+root = Path(__file__).resolve().parents[4]
 host = Path(tempfile.mkdtemp(prefix='journal-authentication-probe-'))
 app = host / 'AuthenticationProbe.app'
 app.mkdir()

@@ -2,7 +2,7 @@
 # Compile the shared C4 catalog into an assembled app before code signing.
 set -euo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 platform=${1:?usage: package_journal_apple_icons.sh <macos|ios-simulator|ios-device> APP_DIR}
 app_dir=${2:?missing app directory}
 case "$platform" in
