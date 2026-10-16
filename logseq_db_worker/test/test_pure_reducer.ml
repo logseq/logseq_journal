@@ -399,7 +399,7 @@ let test_asset_demand_lifecycle () =
   Alcotest.(check bool)
     "live ticket"
     true
-    (Core.asset_ticket_current requested.next ticket);
+    (Core.asset_ticket_current requested.next (Transfer.Lookup ticket));
   let completed =
     Core.step
       requested.next
