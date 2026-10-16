@@ -7,7 +7,7 @@ import AppKit
 #endif
 
 /// Boots one `JournalRuntime` for the given startup payload and renders the
-/// lui root with the environment/notice plumbing attached. Shared by the app
+/// lui root with the environment plumbing attached. Shared by the app
 /// scene (App.swift) and the apple-tests acceptance harnesses — it replaces
 /// `BonsaiApplicationView(entrypoint:payload:nativeViews:applicationBridge:)`.
 struct JournalRuntimeHost: View {
@@ -53,7 +53,6 @@ struct JournalRuntimeHost: View {
       #endif
     }
     .environment(\.journalStartupClock, clock)
-    .modifier(JournalNoticePresenter(controller: platform.notices))
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
     .task(id: retry) {
       if runtime == nil {

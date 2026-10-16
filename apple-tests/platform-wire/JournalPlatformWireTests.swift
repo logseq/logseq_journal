@@ -25,8 +25,6 @@ import Foundation
       "local-account": .localAccount,
       "timeline-presented": .timelinePresented,
       "copy-text": .copyText("Root\n  - 中文😀"),
-      "notice": .showNotice(token: String(Int64.max), message: "Fixture", actionLabel: nil, durationMs: 5000),
-      "cancel-notice": .cancelNotice(token: String(Int64.max)),
     ]
     var baseRequest = Data()
     for (name, expectedRequest) in expected {
@@ -66,7 +64,6 @@ import Foundation
       "sign-out": .signedOut, "termination-ready": .terminationReady,
       "local-account": .localAccount(userID: "fixture-user", origin: "https://api.logseq.io"),
       "no-local-account": .noLocalAccount, "timeline-presented": .timelinePresented,
-      "notice": .notice(token: String(Int64.max), result: "action"),
       "copy-text": .textCopied,
     ]
     var encoded: [String: String] = [:]

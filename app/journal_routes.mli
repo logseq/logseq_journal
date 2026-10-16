@@ -123,7 +123,6 @@ module Favorites : sig
     | Select of bool
     | Invalidate
     | Hide_target of string
-    | Reveal_target of string
     | Retry
     | Visible of
         { first_index : int

@@ -1066,7 +1066,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
     "inactive current completion was discarded"
 ;;
 
-let test_favorite_target_origin_and_undo () =
+let test_favorite_target_origin_and_delete () =
   let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let module F = Journal_routes.Favorites in
@@ -1134,8 +1134,7 @@ let test_favorite_target_origin_and_undo () =
   require
     (List.length (F.items hidden) = 1)
     "delete did not hide only the matching block favorite";
-  let restored, _ = F.step hidden (Reveal_target (G.Uuid.to_string target)) in
-  require (F.items restored = F.items loaded) "Undo did not restore favorite membership"
+
 ;;
 
 let load_parent routes parent generation =
@@ -3681,7 +3680,7 @@ let tests =
     , test_graph_interruption_preserves_capture_attempt )
   ; "Append drafts follow parent navigation", test_append_drafts_follow_parent_navigation
   ; "detached Append completion and failure", test_detached_append_completion_and_failure
-  ; "favorite target identity, origin and Undo", test_favorite_target_origin_and_undo
+  ; "favorite target identity, origin and deletion", test_favorite_target_origin_and_delete
   ; ( "detail rejects another root even with matching generation"
     , fun () ->
         let routes =

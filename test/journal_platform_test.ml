@@ -199,12 +199,6 @@ let test_generated_native_decoders_reject_untyped_payloads () =
              ; "unsupported", `Bool true ])))
     "environment accepted an unknown generated-record field";
   require
-    (Result.is_error
-       (Journal_platform.decode_notice_response ~token:7L
-          (envelope 26
-             (Bytes.of_string {|{"token":7,"result":"action","unexpected":true}|}))))
-    "notice accepted an unknown generated-record field";
-  require
     (Result.is_error (Journal_asset_import.decode_event {|{"action":"unavailable"}|}))
     "picker accepted unavailable without its required reason";
   require

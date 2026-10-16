@@ -762,7 +762,6 @@ module Favorites = struct
     | Select of bool
     | Invalidate
     | Hide_target of string
-    | Reveal_target of string
     | Retry
     | Visible of
         { first_index : int
@@ -869,15 +868,6 @@ module Favorites = struct
           { t with hidden_targets = id :: t.hidden_targets; revision = t.revision + 1 }
         in
         start_if_needed next)
-    | Reveal_target id ->
-      if not (List.mem id t.hidden_targets)
-      then t, []
-      else
-        ( { t with
-            hidden_targets = List.filter (( <> ) id) t.hidden_targets
-          ; revision = t.revision + 1
-          }
-        , [] )
     | Retry -> if t.pending = None then refresh t else t, []
     | Visible { first_index = _; last_exclusive } ->
       let visible = visible_items t in

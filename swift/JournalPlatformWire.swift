@@ -6,8 +6,6 @@ enum JournalPlatformWire {
   enum Request: Equatable {
     case authenticatedUser, signOut, terminationReady, localAccount, timelinePresented
     case idToken(challengeID: String)
-    case showNotice(token: String, message: String, actionLabel: String?, durationMs: Int)
-    case cancelNotice(token: String)
     case copyText(String)
   }
   enum Response: Equatable {
@@ -16,11 +14,7 @@ enum JournalPlatformWire {
     case signedOut, terminationReady, timelinePresented
     case localAccount(userID: String, origin: String)
     case noLocalAccount
-    case notice(token: String, result: String)
     case textCopied
-  }
-  enum NoticeResult: String {
-    case action, dismiss, swipe, timeout
   }
   enum Lifecycle: UInt16 { case backgrounded = 1, foregroundResumed = 2 }
 
@@ -47,9 +41,6 @@ enum JournalPlatformWire {
   private struct SignedOut: Codable { let signedOut: Bool }
   private struct Ready: Codable { let ready: Bool }
   private struct Presented: Codable { let presented: Bool }
-  private struct Notice: Codable { let token: Int64; let message: String; let actionLabel: String?; let durationMs: Int }
-  private struct NoticeResponse: Codable { let token: Int64; let result: String }
-  private struct Cancel: Codable { let token: Int64 }
   private struct Text: Codable { let text: String }
   private struct Copied: Codable { let copied: Bool }
 
@@ -82,15 +73,8 @@ enum JournalPlatformWire {
     case 8:
       let value = try decode(Challenge.self, payload)
       return .idToken(challengeID: value.challengeId)
-    case 25:
-      let value = try decode(Notice.self, payload)
-      guard value.durationMs > 0, value.actionLabel?.isEmpty != true else { throw Failure.invalidPacket }
-      return .showNotice(token: String(value.token), message: value.message,
-        actionLabel: value.actionLabel, durationMs: value.durationMs)
     case 28:
       return .copyText(try decode(Text.self, payload).text)
-    case 27:
-      return .cancelNotice(token: String(try decode(Cancel.self, payload).token))
     default:
       throw Failure.invalidPacket
     }
@@ -120,9 +104,7 @@ enum JournalPlatformWire {
       return try json(tag: 23, Presented(presented: true))
     case .textCopied:
       return try json(tag: 29, Copied(copied: true))
-    case .notice(let token, let result):
-      guard let token = Int64(token), NoticeResult(rawValue: result) != nil else { throw Failure.invalidPacket }
-      return try json(tag: 26, NoticeResponse(token: token, result: result))
+
     }
   }
 
