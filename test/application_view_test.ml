@@ -385,6 +385,79 @@ let test_root_navigation_capture_lifecycle () =
      && Journal_routes.Favorites.items (R.favorites replaced) = [])
 ;;
 
+(* Repeated destination selection is owned by the public Root_navigation reducer.
+   Native geometry/animation has no pure state representation and is checked separately. *)
+let test_timeline_reselect ~rows () =
+  let module R = Application.Root_navigation in
+  let module T = Journal_timeline_state in
+  let initial = R.create ~graph_generation:3 in
+  let creation_time =
+    Journal_time.create ~instant_unix_ms:1_788_825_600_000L ~local_day:20260908
+      ~local_minute_of_day:0 |> Result.get_ok
+  in
+  let block n =
+    Journal_model.create
+      ~id:(Printf.sprintf "76000000-0000-4000-8000-%012d" n)
+      ~page_id:"76000000-0000-4000-8000-999999999999" ~journal_day:20260908
+      ~parent_id:None ~sibling_order:(Printf.sprintf "%06d" n)
+      ~source:"Reselect retains content" ~task_state:No_status ~child_count:0
+      ~creation_time ~revision:"r" ~last_mutation_id:"76000000-0000-4000-8000-999999999998" |> Result.get_ok
+  in
+  let loaded = List.init rows block |> List.fold_left (fun state block ->
+    R.step state (Completed {payload=Block_captured
+      {block;timeline_entry_update=Some {block;child_summaries=[]}}})) initial in
+  let before = R.timeline loaded in
+  let counts = Hashtbl.create 8 in
+  let observe name = Hashtbl.replace counts name (1 + Option.value (Hashtbl.find_opt counts name) ~default:0) in
+  let store = Journal_timeline.Store.create ~observe () in
+  let revision = Journal_timeline.Store.synchronize store before in
+  Hashtbl.clear counts;
+  let selected = R.step loaded (Select Journals) in
+  let top = R.timeline selected in
+  Alcotest.(check bool) "reselect requests a fresh native scroll" true
+    (T.scroll_generation top > T.scroll_generation before && Option.is_some (T.scroll_target top));
+  Alcotest.(check int) "retained content count" (T.total_count before) (T.total_count top);
+  for index = 0 to T.retained_slot_count before - 1 do
+    Alcotest.(check bool) "persistent slots retained" true
+      (match T.retained_slot before index, T.retained_slot top index with
+       | Some left, Some right -> left == right
+       | None, None -> true
+       | _ -> false)
+  done;
+  Alcotest.(check bool) "demand is retained until native visibility" true
+    (T.first_visible_index top = T.first_visible_index before
+     && T.pending_request top = T.pending_request before && T.next_request top = T.next_request before);
+  let next_revision = Journal_timeline.Store.synchronize store top in
+  Alcotest.(check int) "scroll keeps native row structure" revision next_revision;
+  Alcotest.(check int) "scroll does not compare each retained item" 0
+    (Option.value (Hashtbl.find_opt counts "timeline-item-compare") ~default:0);
+  Alcotest.(check int) "scroll does not publish row content" 0
+    (Option.value (Hashtbl.find_opt counts "timeline-item-notify") ~default:0);
+  let repeated = R.step selected (Select Journals) in
+  let latest = R.timeline repeated in
+  Alcotest.(check bool) "same destination and target get a fresh identity" true
+    (T.scroll_generation latest > T.scroll_generation top);
+  List.iter (fun outcome ->
+    let stale = T.complete_scroll latest ~token:(T.scroll_generation top) ~outcome in
+    Alcotest.(check bool) "old outcome cannot consume latest request" true (stale == latest);
+    let completed = T.complete_scroll stale ~token:(T.scroll_generation latest) ~outcome in
+    Alcotest.(check bool) "latest outcome releases command" true
+      (T.scroll_target completed = None && T.scroll_outcome completed = Some outcome))
+    Journal_view.Event.Payload.[Succeeded;Missing_target;Cancelled;Superseded;Positioning_failed];
+  let captured = R.step repeated (Completed {payload=Block_captured
+    {block=block (rows + 1);timeline_entry_update=Some {block=block (rows + 1);child_summaries=[]}}}) in
+  Alcotest.(check bool) "Capture supersedes top using the shared token sequence" true
+    (T.scroll_generation (R.timeline captured) > T.scroll_generation latest);
+  let favorite = R.step repeated (Select Favorites) in
+  let returned = R.step favorite (Select Journals) in
+  Alcotest.(check bool) "Favorites return keeps original navigation behavior" true
+    (R.timeline returned == latest);
+  let composing = R.step returned Capture_opened |> fun state -> R.step state (Select Journals) in
+  Alcotest.(check bool) "covered Timeline does not issue scrolling" true (R.timeline composing == latest);
+  let replaced = R.step returned (Graph_replaced {generation=4;graph_id=None}) in
+  Alcotest.(check bool) "graph lifetime retires command" true (T.scroll_target (R.timeline replaced) = None)
+;;
+
 (* Fixture teardown is outside pure reducer ownership: dispose requests an
    asynchronous stop on the process-wide Worker Domain. Check its public
    lifecycle before another fixture can attach. *)
@@ -5819,7 +5892,9 @@ let () =
             (fun () -> test_reference_outer_terminals true)
         ] )
     ; ( "root navigation"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "empty Timeline reselect" `Quick (test_timeline_reselect ~rows:0)
+        ; Alcotest.test_case "long Timeline reselect" `Quick (test_timeline_reselect ~rows:1200)
+        ; Alcotest.test_case
             "native Favorites media visibility"
             `Quick
             test_favorites_native_visibility_retires_media

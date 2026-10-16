@@ -14,6 +14,10 @@ type slot =
       }
   | Feed_continuation of { before_day : int }
 
+type scroll_target =
+  | Row of { token : int64; day : int; row : string }
+  | Top of { token : int64; day : int }
+
 type recovery =
   { day : int
   ; target_count : int
@@ -43,7 +47,7 @@ type t =
   ; visible_first : int
   ; visible_last_exclusive : int
   ; scroll_generation : int64
-  ; scroll_target : (int64 * int * string) option
+  ; scroll_target : scroll_target option
   ; scroll_outcome : Journal_view.View.Native_list.outcome option
   ; visible_demand : request list option
   ; pending : (int64 * request) option
@@ -1116,8 +1120,8 @@ let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timelin
       Rrbvec.find_map
         (function
           | Top_level entry as slot ->
-            Some (token, Journal_model.journal_day entry.block, slot_key slot)
-          | Day_continuation { day; _ } as slot -> Some (token, day, slot_key slot)
+            Some (Row { token; day = Journal_model.journal_day entry.block; row = slot_key slot })
+          | Day_continuation { day; _ } as slot -> Some (Row { token; day; row = slot_key slot })
           | Day_heading _ | Feed_continuation _ -> None)
         next.slots
   }
@@ -1186,14 +1190,26 @@ let observe_visible_range (state : t) ~first_index ~last_exclusive =
 
 (* Rendering consumes slots/date/errors and the active scroll command, not the
    latest demand window or recovery bookkeeping. Slots are persistent. *)
-let equal_presentation (left : t) (right : t) =
+let equal_content (left : t) (right : t) =
   left == right
   || (left.slots == right.slots
       && left.today = right.today
       && left.day_failures == right.day_failures
-      && left.scroll_target = right.scroll_target
       && (left.day_failures = []
           || Option.is_some left.pending = Option.is_some right.pending))
+;;
+
+let equal_presentation (left : t) (right : t) =
+  equal_content left right && left.scroll_target = right.scroll_target
+;;
+
+let scroll_to_top state =
+  let token = Int64.succ state.scroll_generation in
+  { state with
+    scroll_generation = token
+  ; scroll_target = Some (Top { token; day = state.today })
+  ; scroll_outcome = None
+  }
 ;;
 
 let retained_slot (state : t) index = Rrbvec.nth_opt state.slots index
@@ -1232,7 +1248,7 @@ let scroll_outcome (state : t) = state.scroll_outcome
 
 let complete_scroll state ~token ~outcome =
   match state.scroll_target with
-  | Some (current, _, _) when current = token ->
+  | Some (Row { token = current; _ } | Top { token = current; _ }) when current = token ->
     { state with scroll_target = None; scroll_outcome = Some outcome }
   | None | Some _ -> state
 ;;

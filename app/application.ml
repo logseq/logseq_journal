@@ -1460,6 +1460,11 @@ module Root_navigation = struct
   let step state event =
     let state =
       match event with
+      | Select Journal_routes.Journals
+        when Journal_routes.destination state.routes = Journals
+             && Journal_routes.route state.routes = Timeline
+             && state.modal = No_modal ->
+        { state with timeline = Journal_timeline_state.scroll_to_top state.timeline }
       | Select destination -> select_destination state destination
       | Capture_opened ->
         let state =
@@ -1620,6 +1625,7 @@ module Root_navigation = struct
   ;;
 
   let destination state = Journal_routes.destination state.routes
+  let timeline state = state.timeline
   let capture_presented state = state.modal = Capture_sheet
   let capture state = state.direct_capture
   let favorites state = state.favorites
