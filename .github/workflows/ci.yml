@@ -20,13 +20,33 @@ jobs:
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.5.0"
+          # This workflow owns installed-switch caching with stricter identity.
+          cache: false
       - name: Resolve declared dependency sources
         run: python3 tool/prepare_ci_dependencies.py
+      - name: Prepare native system dependencies
+        run: |
+          python3 tool/prepare_ci_dependencies.py --pin
+          opam install . --deps-only --with-test --locked --ignore-pin-depends --depext-only --yes
+      - name: Identify installed dependency cache
+        id: dependency-identity
+        run: |
+          python3 tool/prepare_ci_dependencies.py --cache-identity
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(Path('.ci-reports/opam-cache.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('prefix=' + report['identity']['opam_prefix'], file=output)
+              print('key=' + report['key'], file=output)
+          PY
       - name: Cache installed dependencies
+        id: dependency-cache
         uses: actions/cache@v4
         with:
-          path: ~/.opam
-          key: journal-opam-v1-${{ runner.os }}-${{ hashFiles('*.opam*', '.ci-reports/dependencies.json') }}
+          path: ${{ steps.dependency-identity.outputs.prefix }}
+          # Exact only: compiled switches are not relocatable or cross-platform.
+          key: journal-opam-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}
       - name: Pin resolved checkouts after cache restoration
         run: python3 tool/prepare_ci_dependencies.py --pin
       - name: Install locked dependencies

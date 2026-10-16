@@ -182,6 +182,82 @@ class CacheBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'differs from lock'):
                 f.build.dependencies()
 
+    def compiler_fixture(self, prefix):
+        compiler = prefix / 'bin/ocamlopt.opt'
+        compiler.parent.mkdir(exist_ok=True)
+        compiler.write_text('#!/bin/sh\nprintf "architecture: arm64\\nsystem: macosx\\n"\n')
+        compiler.chmod(0o755)
+        return compiler
+
+    def test_opam_identity_binds_absolute_prefix_and_compiler(self):
+        self.assertTrue(hasattr(self.build, 'opam_identity'), 'shared absolute switch identity missing')
+        with self.pinned_switch() as f:
+            compiler = self.compiler_fixture(f.build.prefix)
+            original = self.build.opam_identity(f.build.opam)
+            self.assertEqual(original['opam_prefix'], str(f.build.prefix))
+            self.assertEqual(original, self.build.opam_identity(f.build.opam))
+            compiler.write_text(compiler.read_text() + '# changed compiler bytes\n')
+            self.assertNotEqual(original, self.build.opam_identity(f.build.opam))
+            f.build.opam('switch', 'create', 'second', '--empty')
+            self.compiler_fixture(f.root / 'opam/second')
+            f.build.args.switch = 'second'
+            other = self.build.opam_identity(f.build.opam)
+            self.assertEqual(original['compiler_sha256'], other['compiler_sha256'])
+            self.assertNotEqual(self.build.fingerprint(original), self.build.fingerprint(other))
+
+    def test_ci_identity_is_stable_and_invalidates_required_inputs(self):
+        sys.path.insert(0, str(ROOT / 'tool'))
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'cache_identity'), 'CI switch identity missing')
+        with self.pinned_switch() as f:
+            self.compiler_fixture(f.build.prefix)
+            # Repository fixtures only contain inputs this boundary consumes.
+            (f.journal / 'tool').mkdir()
+            for name in ('prepare_ci_dependencies.py', 'journal_build.py'):
+                (f.journal / 'tool' / name).write_bytes((ROOT / 'tool' / name).read_bytes())
+            workflow = f.journal / '.github/workflows/ci.yml'
+            workflow.parent.mkdir(parents=True)
+            workflow.write_bytes((ROOT / '.github/workflows/ci.yml').read_bytes())
+            env = dict(f.build.env, OPAMSWITCH='fixture', RUNNER_OS='macOS', RUNNER_ARCH='ARM64',
+                       ImageOS='macos26-arm64', ImageVersion='fixture-image')
+            with patch.dict(os.environ, env, clear=True):
+                baseline = ci.cache_identity(f.journal)
+                self.assertEqual(baseline, ci.cache_identity(f.journal))
+                self.assertEqual(baseline['identity']['opam_prefix'], str(f.build.prefix))
+                inputs = [f.lock, f.journal / 'journal.opam',
+                          f.journal / '.ci-reports/dependencies.json', workflow,
+                          f.journal / 'tool/prepare_ci_dependencies.py', f.journal / 'tool/journal_build.py',
+                          f.build.prefix / 'bin/ocamlopt.opt']
+                for path in inputs:
+                    with self.subTest(path=path):
+                        data = path.read_bytes()
+                        # JSON whitespace must not change resolution semantics; a new SHA does.
+                        changed = data.replace(baseline['identity']['resolved'][0]['resolved_sha'].encode(), b'1' * 40) if path.suffix == '.json' else data + b'\n# changed bytes\n'
+                        path.write_bytes(changed)
+                        self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                        path.write_bytes(data)
+                for name in ('ImageVersion', 'CFLAGS', 'DEVELOPER_DIR'):
+                    with self.subTest(environment=name), patch.dict(os.environ, {name: 'changed'}):
+                        if name == 'DEVELOPER_DIR':
+                            # An unavailable selected toolchain must fail, not restore an old key.
+                            with self.assertRaises(subprocess.CalledProcessError):
+                                ci.cache_identity(f.journal)
+                        else:
+                            self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                for name, value in [('ImageVersion', ''), ('ImageOS', ''), ('RUNNER_ARCH', 'X64'), ('RUNNER_OS', 'Linux')]:
+                    with self.subTest(invalid=name), patch.dict(os.environ, {name: value}):
+                        with self.assertRaises(ValueError):
+                            ci.cache_identity(f.journal)
+                resolution = f.journal / '.ci-reports/dependencies.json'
+                records = json.loads(resolution.read_text())
+                for invalid in ([], [dict(records[0], resolved_sha='moving-ref')]):
+                    resolution.write_text(json.dumps(invalid))
+                    with self.assertRaises(ValueError):
+                        ci.cache_identity(f.journal)
+                resolution.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    ci.cache_identity(f.journal)
+
     def test_final_verification_rejects_changed_gmp_and_probe_input(self):
         self.assertTrue(hasattr(self.build.Build, 'verify_inputs'), 'final input verification boundary missing')
         with self.pinned_switch() as f:

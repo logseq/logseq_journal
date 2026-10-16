@@ -34,6 +34,15 @@ def sha(path):
     return digest.hexdigest()
 
 
+def opam_identity(opam):
+    """Describe the selected compiler without provisioning or accepting dependencies."""
+    prefix = Path(opam("var", "prefix")).resolve()
+    compiler = prefix / "bin/ocamlopt.opt"
+    return {"opam_prefix": str(prefix),
+            "ocaml": opam("exec", "--", str(compiler), "-config"),
+            "compiler_sha256": sha(compiler)}
+
+
 def read_evidence(record, directory):
     path = (directory / record["path"]).resolve()
     if sha(path) != record["sha256"]:
@@ -458,10 +467,9 @@ class Build:
         elif a.native_manifest:
             dependencies = self.imported_native(source)
         elif not a.link_only:
-            self.prefix = Path(self.opam("var", "prefix"))
+            toolchain.update(opam_identity(self.opam))
+            self.prefix = Path(toolchain["opam_prefix"])
             dependencies = self.dependencies()
-            toolchain["ocaml"] = self.opam("exec", "--", "ocamlopt", "-config")
-            toolchain["compiler_sha256"] = sha(self.prefix / "bin/ocamlopt.opt")
             if "architecture: arm64" not in toolchain["ocaml"] or "system: macosx" not in toolchain["ocaml"]:
                 raise RuntimeError("macOS build requires native arm64 macosx OCaml compiler")
             toolchain["dune"] = self.opam("exec", "--", "dune", "--version")
