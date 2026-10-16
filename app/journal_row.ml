@@ -6,9 +6,12 @@ let body ?(child = false) title =
   if String.trim (Journal_model.Title.plain title) = "" then V.column []
   else Journal_header.bounded_text ~child title
 
-let metadata block =
+let metadata_view ~timeline block =
   let status = Journal_model.task_state block in
   let titles = Journal_model.tag_titles block in
+  let visible_titles, remaining =
+    if timeline then List.take 3 titles, max 0 (List.length titles - 3) else titles, 0
+  in
   let state =
     if status = No_status
     then []
@@ -32,7 +35,12 @@ let metadata block =
     then []
     else
       [ L.text
-          ~value:(String.concat "  " (List.map (fun title -> "#" ^ title) titles))
+          ~value:
+            (String.concat
+               "  "
+               (List.map (fun title -> "#" ^ title) visible_titles
+                @ if remaining = 0 then [] else [ "+" ^ string_of_int remaining ]))
+          ?text_alignment:(if timeline then Some `end_ else None)
           ~grow:1.
           ~style_class:"caption"
           ~foreground:"secondary"
@@ -43,6 +51,8 @@ let metadata block =
   | [] -> []
   | children -> [ V.of_lui (L.row ~gap:8 ~cross:`start children) ]
 ;;
+
+let metadata block = metadata_view ~timeline:false block
 
 let view
       ?(render_source = Fun.id)
@@ -83,7 +93,12 @@ let view
     then []
     else render (Journal_model.source block)
   in
-  let content = V.column ~spacing:8. ~alignment:Leading (body source :: metadata block) in
+  let content =
+    V.column
+      ~spacing:8.
+      ~alignment:Leading
+      (body source :: metadata_view ~timeline:true block)
+  in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]
   in
