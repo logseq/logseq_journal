@@ -2754,10 +2754,7 @@ let mirror_deleted core (request : mirror_deletion) result =
      | Error message ->
        let failed = deletion_failed core Deleting_mirror in
        if List.mem message
-         [ "This local copy belongs to another account."
-         ; "Open this graph once, then switch to another graph before deleting."
-         ; "The local copy ownership could not be verified."
-         ; "Switch to another graph before deleting."
+         [ "Switch to another graph before deleting."
          ; "The local copy is still in use. Close attachment previews and try again." ]
        then
          let next = set_snapshot failed.next { failed.next.public_state.snapshot with last_error = Some message } in
