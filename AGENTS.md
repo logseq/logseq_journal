@@ -12,4 +12,4 @@
 
 ## Build
 
-Use `bash tool/build_journal_apple.sh --help` as the Apple build entry point. Read [journal-build](.agents/skills/journal-build/SKILL.md) for target selection, prerequisites, cache/provenance, failure handling and acceptance limits.
+Use `bash .agents/skills/journal-build/scripts/build_journal_apple.sh --help` as the Apple build entry point. Read [journal-build](.agents/skills/journal-build/SKILL.md) for target selection, prerequisites, cache/provenance, failure handling and acceptance limits.

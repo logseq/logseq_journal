@@ -19,7 +19,7 @@ import sys
 import tempfile
 from urllib.parse import unquote, urlsplit
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 def fingerprint(value):
@@ -32,6 +32,15 @@ def sha(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def opam_identity(opam):
+    """Describe the selected compiler without provisioning or accepting dependencies."""
+    prefix = Path(opam("var", "prefix")).resolve()
+    compiler = prefix / "bin/ocamlopt.opt"
+    return {"opam_prefix": str(prefix),
+            "ocaml": opam("exec", "--", str(compiler), "-config"),
+            "compiler_sha256": sha(compiler)}
 
 
 def read_evidence(record, directory):
@@ -74,6 +83,9 @@ def source_inputs():
                 result[path.name] = sha(path)
         elif path.name in {"dune-project", "dune", "dune-workspace"}:
             result[path.name] = sha(path)
+    skill_scripts = ROOT / ".agents/skills/journal-build/scripts"
+    result.update({str(skill_scripts.relative_to(ROOT) / name): digest
+                   for name, digest in files(skill_scripts).items()})
     return result
 
 
@@ -253,7 +265,7 @@ class Build:
         removed = self.run("git", "diff", "--name-only", "--diff-filter=D", pre["commit"], "--").splitlines()
         for name in sorted(set(source) | set(removed)):
             if (Path(name).name in {"dune", "dune-project", "dune-workspace"}
-                    or name.endswith((".opam", ".opam.locked")) or name == "tool/native_static_link_flags.sh"):
+                    or name.endswith((".opam", ".opam.locked")) or name == ".agents/skills/journal-build/scripts/native_static_link_flags.sh"):
                 original = subprocess.check_output(["git", "show", pre["commit"] + ":" + name], cwd=ROOT)
                 if hashlib.sha256(original).hexdigest() != source.get(name):
                     raise ValueError(f"native build configuration changed since producer commit: {name}")
@@ -458,10 +470,9 @@ class Build:
         elif a.native_manifest:
             dependencies = self.imported_native(source)
         elif not a.link_only:
-            self.prefix = Path(self.opam("var", "prefix"))
+            toolchain.update(opam_identity(self.opam))
+            self.prefix = Path(toolchain["opam_prefix"])
             dependencies = self.dependencies()
-            toolchain["ocaml"] = self.opam("exec", "--", "ocamlopt", "-config")
-            toolchain["compiler_sha256"] = sha(self.prefix / "bin/ocamlopt.opt")
             if "architecture: arm64" not in toolchain["ocaml"] or "system: macosx" not in toolchain["ocaml"]:
                 raise RuntimeError("macOS build requires native arm64 macosx OCaml compiler")
             toolchain["dune"] = self.opam("exec", "--", "dune", "--version")
@@ -636,7 +647,7 @@ class Build:
         # SwiftPM resource bundles must travel with the executable.
         for bundle in product.parent.glob("*.bundle"):
             shutil.copytree(bundle, resource / bundle.name)
-        self.run("bash", ROOT / "tool/package_journal_apple_icons.sh", self.args.platform, app)
+        self.run("bash", ROOT / ".agents/skills/journal-build/scripts/package_journal_apple_icons.sh", self.args.platform, app)
         if not (resource / "Assets.car").is_file():
             raise RuntimeError("icon Assets.car missing")
         packaged = plistlib.loads(plist.read_bytes())

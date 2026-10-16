@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 
 class AppIconPackagingTests(unittest.TestCase):
@@ -20,7 +20,7 @@ class AppIconPackagingTests(unittest.TestCase):
                     info_path.parent.mkdir(parents=True)
                     info_path.write_bytes((ROOT / "apple/Info.plist").read_bytes())
                     result = subprocess.run([
-                        "bash", str(ROOT / "tool/package_journal_apple_icons.sh"), platform, str(app),
+                        "bash", str(ROOT / ".agents/skills/journal-build/scripts/package_journal_apple_icons.sh"), platform, str(app),
                     ], capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     info = plistlib.loads(info_path.read_bytes())

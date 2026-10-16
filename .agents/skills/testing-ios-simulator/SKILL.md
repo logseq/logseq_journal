@@ -5,26 +5,20 @@ description: How to build, sign, install, and drive the logseq_journal iOS app o
 
 # Testing logseq_journal on the iOS Simulator
 
-## Build environment (lui stack, branch devin/lui-migration)
+## Build environment
 
-- OCaml switch: `eval "$(opam env --switch=5.5.0 --set-switch)"` (or `logseq-journal` — check `opam switch list`).
-- The lui checkout must exist at `~/repos/lui` (blueprint clones it; swift/Package.swift reads `JOURNAL_LUI_PACKAGE_PATH`, default `../../lui/platform/apple`).
-- Build the .app: `dune build @ios-app` — it runs
-  `vtool -set-build-version 7 <minos> <sdk> -replace -output journal_complete_iossim.o native_embed.exe.o`
-  then `tool/build_journal_apple.sh ios-simulator` → `_build/apple/ios-simulator/LogseqJournal.app`.
-- Producing the sim complete object manually (equivalent to what @ios-app does):
-  1. `export JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path); dune build app/native_embed.exe.o` (macOS object)
-  2. `vtool -set-build-version 7 26.0 26.5 -replace -output journal_complete_iossim.o _build/default/app/native_embed.exe.o` (platform 7 = IOSSIMULATOR)
-  3. `JOURNAL_OCAML_OBJECT=$PWD/_build/default/app/journal_complete_iossim.o tool/build_journal_apple.sh ios-simulator`
-- A "proper" cross-link with the target toolchain's ocamlopt is NOT currently feasible: target `ld` rejects host-built `.cmx` ("building for iOS Simulator, but linking in object file built for macOS"). The vtool restamp of the merged macOS complete object works because it is a single `ld -r` object.
-- iOS-sim OCaml toolchain provisioning: `LG_IOS_DEPLOYMENT_TARGET=26.0 ac_cv_func_pipe2=no ac_cv_func_dup3=no ac_cv_func_shmat=no ~/repos/lg/scripts/lg-mobile setup ios simulator` — the `ac_cv_*` overrides are REQUIRED: configure's link-check finds `pipe2`/`dup3`/`shmat` in libSystem.tbd but iOS headers don't declare them, and without the overrides crossopt fails in `pipe_unix.c`.
-- `journal_lui_bridge.o` inside `_build/default/app/` is only a compile check — safe to ignore.
+Use [journal-build](../journal-build/SKILL.md) and its `scripts/build_journal_apple.sh`
+entry point for current target, switch, cache and provenance requirements.
+`--link-only` validates a Simulator stub; runtime builds need the explicit verified
+experimental native-manifest route. The legacy `@ios-app` alias and raw
+`JOURNAL_OCAML_OBJECT` injection are refused by the current builder. Do not
+manually restamp an object to bypass its provenance or target checks.
 
 ## Signing / entitlements (iOS 26.5+ simulator — verified 26.5 AND 27.0)
 
 - **Any `codesign --entitlements` blob makes the binary fail to exec on the iOS 27.0 sim** — `simctl launch` reports "No such process" / "Launchd job spawn failed". Verified with: the build script's expanded `keychain-access-groups=[com.logseq.journal]`, a `FAKETEAMID.`-prefixed variant with `application-identifier`, and even `get-task-allow` alone — ALL fail at exec. Only linker-signed (no entitlements) or plain-adhoc (`codesign --sign -` without `--entitlements`) binaries launch.
 - Launchable recipe: flat .app = `Info.plist` + raw swift product `swift/.build/arm64-apple-ios-simulator/debug/JournalApp`, NO codesign. iOS bundles are flat — a stray `Contents/` dir makes `simctl install` fail with "Missing bundle ID".
-- **SOLVED — embedded entitlements**: the sim reads entitlements from the `__TEXT,__entitlements` section, NOT the code signature (signature-carried entitlements are validated as *macOS* entitlements and get the exec killed, error 163 — that was the old "no entitlement-bearing binary can exec" trap). `tool/build_journal_apple.sh ios-simulator` now passes `-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements` (like Xcode) with `application-identifier` + `keychain-access-groups`, then signs plain-adhoc. Result: `dune build @ios-app` produces a launchable binary whose keychain WORKS — Amplify sign-in, `localAccount`, E2EE graph-key storage all succeed with NO Apple certificate. DEVELOPMENT_TEAM default baked in is `K378MFWK59` (override with `JOURNAL_IOS_TEAM_ID`; the value is also baked into the section so it does not need a matching signature).
+- **SOLVED — embedded entitlements**: the sim reads entitlements from the `__TEXT,__entitlements` section, NOT the code signature (signature-carried entitlements are validated as *macOS* entitlements and get the exec killed, error 163 — that was the old "no entitlement-bearing binary can exec" trap). `.agents/skills/journal-build/scripts/build_journal_apple.sh ios-simulator` now passes `-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements` (like Xcode) with `application-identifier` + `keychain-access-groups`, then signs plain-adhoc. Historical result before the current provenance entry point: the assembled binary launched and its keychain worked — Amplify sign-in, `localAccount`, E2EE graph-key storage all succeed with NO Apple certificate. DEVELOPMENT_TEAM default baked in is `K378MFWK59` (override with `JOURNAL_IOS_TEAM_ID`; the value is also baked into the section so it does not need a matching signature).
 - A signing identity still helps for real-device runs: an Apple Development cert was installed for dev@logseq.com (Logseq Inc., team K378MFWK59) — `security find-identity` lists it.
 - macOS app caveats: (a) `config/entitlements/macos-debug-profile.entitlements` historically shipped literal `$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)` — killed at exec (Killed:9, error 163). (b) Plain-adhoc macOS builds DO reach the sign-in dialog (generic-password reads to the app's own group work), but Amplify sign-in still fails -34018 for its access-group keychain ops; re-signing adhoc WITH `keychain-access-groups=[com.logseq.journal]` → AMFI spawn kill (error 163). No signing identity exists on the box → Cognito sign-in cannot complete on macOS either.
 - Startup wakeup storm (observed on iOS): ~25-30k `wakeup` callbacks in the first ~40s (~700/s) — OCaml cross-thread pump enqueue floods the MainActor task queue; the first `platformRequest` delivery waits behind the flood (~25s delay), then the system settles to 0% CPU. Not fatal, but adds startup latency and floods instrumented logs.

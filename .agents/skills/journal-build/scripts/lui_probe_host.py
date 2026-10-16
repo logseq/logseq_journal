@@ -2,7 +2,7 @@
 
 A probe host is a copy of the repo's `swift/` SwiftPM package with the probe's
 `App.swift` (and a probe `Info.plist`) laid on top, then built through
-`tool/build_journal_apple.sh` — the same LUI plumbing the app uses:
+`.agents/skills/journal-build/scripts/build_journal_apple.sh` — the same LUI plumbing the app uses:
 `JournalRuntimeHost` + `JournalRuntime` + `JournalApplicationPlatform` boot the
 probe's OCaml complete object.
 
@@ -22,7 +22,7 @@ import plistlib
 import shutil
 import subprocess
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 def stage(host, app_swift, bundle_id, display_name, swift_names=None):
@@ -50,7 +50,7 @@ def stage(host, app_swift, bundle_id, display_name, swift_names=None):
 
 def build(host, platform="macos", app_name="JournalApp.app", native_object=None,
           extra_env=None, preflight=False):
-    """Build the staged host through tool/build_journal_apple.sh. Returns the
+    """Build the staged host through .agents/skills/journal-build/scripts/build_journal_apple.sh. Returns the
     assembled .app path. `platform` is 'macos' or 'ios-simulator'."""
     host = Path(host).resolve()
     env = dict(
@@ -68,7 +68,7 @@ def build(host, platform="macos", app_name="JournalApp.app", native_object=None,
         mode.append("--preflight")
     app_dir = host / "apple" / app_name
     result = subprocess.run(
-        ["bash", str(ROOT / "tool" / "build_journal_apple.sh"), platform, str(app_dir),
+        ["bash", str(ROOT / ".agents/skills/journal-build/scripts/build_journal_apple.sh"), platform, str(app_dir),
          "--cache-dir", str(host / "build-cache"), *mode],
         cwd=ROOT, env=env, capture_output=True, text=True)
     print(result.stdout, end="")

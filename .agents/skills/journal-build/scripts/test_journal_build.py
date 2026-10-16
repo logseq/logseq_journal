@@ -18,8 +18,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "tool/build_journal_apple.sh"
+ROOT = Path(__file__).resolve().parents[4]
+SCRIPTS = ROOT / ".agents/skills/journal-build/scripts"
+SCRIPT = ROOT / ".agents/skills/journal-build/scripts/build_journal_apple.sh"
 
 
 class BuildBoundaryTests(unittest.TestCase):
@@ -33,6 +34,14 @@ class BuildBoundaryTests(unittest.TestCase):
         self.assertIn("--link-only", result.stdout)
         self.assertIn("--preflight", result.stdout)
         self.assertIn("--experimental-host-restamp", result.stdout)
+
+    def test_skill_entry_resolves_from_an_external_working_directory(self):
+        script = ROOT / '.agents/skills/journal-build/scripts/build_journal_apple.sh'
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(['bash', str(script), '--help'], cwd=directory,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('--preflight', result.stdout)
 
     def test_iphone_is_explicitly_blocked(self):
         result = self.cli("ios-device", "--preflight")
@@ -98,7 +107,7 @@ class BuildBoundaryTests(unittest.TestCase):
 class CacheBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        path = ROOT / "tool/journal_build.py"
+        path = ROOT / ".agents/skills/journal-build/scripts/journal_build.py"
         if not path.exists():
             return
         spec = importlib.util.spec_from_file_location("journal_build", path)
@@ -182,6 +191,96 @@ class CacheBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'differs from lock'):
                 f.build.dependencies()
 
+    def compiler_fixture(self, prefix):
+        compiler = prefix / 'bin/ocamlopt.opt'
+        compiler.parent.mkdir(exist_ok=True)
+        compiler.write_text('#!/bin/sh\nprintf "architecture: arm64\\nsystem: macosx\\n"\n')
+        compiler.chmod(0o755)
+        return compiler
+
+    def test_skill_script_bytes_participate_in_source_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / '.agents/skills/journal-build/scripts/fixture.py'
+            helper.parent.mkdir(parents=True)
+            helper.write_text('original helper bytes')
+            name = str(helper.relative_to(root))
+            with patch.object(self.build, 'ROOT', root):
+                baseline = self.build.source_inputs()
+                self.assertEqual(baseline.get(name), self.build.sha(helper))
+                helper.write_text('changed helper bytes')
+                self.assertNotEqual(baseline, self.build.source_inputs())
+
+    def test_opam_identity_binds_absolute_prefix_and_compiler(self):
+        self.assertTrue(hasattr(self.build, 'opam_identity'), 'shared absolute switch identity missing')
+        with self.pinned_switch() as f:
+            compiler = self.compiler_fixture(f.build.prefix)
+            original = self.build.opam_identity(f.build.opam)
+            self.assertEqual(original['opam_prefix'], str(f.build.prefix))
+            self.assertEqual(original, self.build.opam_identity(f.build.opam))
+            compiler.write_text(compiler.read_text() + '# changed compiler bytes\n')
+            self.assertNotEqual(original, self.build.opam_identity(f.build.opam))
+            f.build.opam('switch', 'create', 'second', '--empty')
+            self.compiler_fixture(f.root / 'opam/second')
+            f.build.args.switch = 'second'
+            other = self.build.opam_identity(f.build.opam)
+            self.assertEqual(original['compiler_sha256'], other['compiler_sha256'])
+            self.assertNotEqual(self.build.fingerprint(original), self.build.fingerprint(other))
+
+    def test_ci_identity_is_stable_and_invalidates_required_inputs(self):
+        sys.path.insert(0, str(SCRIPTS))
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'cache_identity'), 'CI switch identity missing')
+        with self.pinned_switch() as f:
+            self.compiler_fixture(f.build.prefix)
+            # Repository fixtures only contain inputs this boundary consumes.
+            fixture_scripts = f.journal / '.agents/skills/journal-build/scripts'
+            fixture_scripts.mkdir(parents=True)
+            for name in ('prepare_ci_dependencies.py', 'journal_build.py'):
+                (fixture_scripts / name).write_bytes((SCRIPTS / name).read_bytes())
+            workflow = f.journal / '.github/workflows/ci.yml'
+            workflow.parent.mkdir(parents=True)
+            workflow.write_bytes((ROOT / '.github/workflows/ci.yml').read_bytes())
+            env = dict(f.build.env, OPAMSWITCH='fixture', RUNNER_OS='macOS', RUNNER_ARCH='ARM64',
+                       ImageOS='macos26-arm64', ImageVersion='fixture-image')
+            with patch.dict(os.environ, env, clear=True):
+                baseline = ci.cache_identity(f.journal)
+                self.assertEqual(baseline, ci.cache_identity(f.journal))
+                self.assertEqual(baseline['identity']['opam_prefix'], str(f.build.prefix))
+                inputs = [f.lock, f.journal / 'journal.opam',
+                          f.journal / '.ci-reports/dependencies.json', workflow,
+                          f.journal / '.agents/skills/journal-build/scripts/prepare_ci_dependencies.py', f.journal / '.agents/skills/journal-build/scripts/journal_build.py',
+                          f.build.prefix / 'bin/ocamlopt.opt']
+                for path in inputs:
+                    with self.subTest(path=path):
+                        data = path.read_bytes()
+                        # JSON whitespace must not change resolution semantics; a new SHA does.
+                        changed = data.replace(baseline['identity']['resolved'][0]['resolved_sha'].encode(), b'1' * 40) if path.suffix == '.json' else data + b'\n# changed bytes\n'
+                        path.write_bytes(changed)
+                        self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                        path.write_bytes(data)
+                for name in ('ImageVersion', 'CFLAGS', 'DEVELOPER_DIR'):
+                    with self.subTest(environment=name), patch.dict(os.environ, {name: 'changed'}):
+                        if name == 'DEVELOPER_DIR':
+                            # An unavailable selected toolchain must fail, not restore an old key.
+                            with self.assertRaises(subprocess.CalledProcessError):
+                                ci.cache_identity(f.journal)
+                        else:
+                            self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                for name, value in [('ImageVersion', ''), ('ImageOS', ''), ('RUNNER_ARCH', 'X64'), ('RUNNER_OS', 'Linux')]:
+                    with self.subTest(invalid=name), patch.dict(os.environ, {name: value}):
+                        with self.assertRaises(ValueError):
+                            ci.cache_identity(f.journal)
+                resolution = f.journal / '.ci-reports/dependencies.json'
+                records = json.loads(resolution.read_text())
+                for invalid in ([], [dict(records[0], resolved_sha='moving-ref')]):
+                    resolution.write_text(json.dumps(invalid))
+                    with self.assertRaises(ValueError):
+                        ci.cache_identity(f.journal)
+                resolution.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    ci.cache_identity(f.journal)
+
     def test_final_verification_rejects_changed_gmp_and_probe_input(self):
         self.assertTrue(hasattr(self.build.Build, 'verify_inputs'), 'final input verification boundary missing')
         with self.pinned_switch() as f:
@@ -216,7 +315,7 @@ class CacheBoundaryTests(unittest.TestCase):
                 build.verify_inputs()
 
     def test_probe_helper_preflight_supports_stub_and_platform_matched_objects(self):
-        sys.path.insert(0, str(ROOT / 'tool'))
+        sys.path.insert(0, str(SCRIPTS))
         import lui_probe_host
         import inspect
         self.assertIn('preflight', inspect.signature(lui_probe_host.build).parameters,
@@ -281,7 +380,7 @@ class CacheBoundaryTests(unittest.TestCase):
                 code = ("import sys;sys.path.insert(0,sys.argv[1]);"
                         "from journal_build import resource_lock;from pathlib import Path;"
                         "\nwith resource_lock(Path(sys.argv[2])): pass")
-                result = subprocess.run(["python3", "-c", code, str(ROOT / "tool"), str(path)],
+                result = subprocess.run(["python3", "-c", code, str(SCRIPTS), str(path)],
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("busy", result.stderr)

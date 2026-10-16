@@ -18,14 +18,15 @@ Verify `git -C ../lui rev-parse HEAD` matches
 Apple builds must use the same checkout's backend package:
 
 ```sh
-JOURNAL_OCAML_OBJECT="/path/to/simulator-compatible-production.o" \
-  JOURNAL_LUI_PACKAGE_PATH="$PWD/../lui/platform/apple" \
-  bash tool/build_journal_apple.sh ios-simulator /tmp/JournalComposer.app
+JOURNAL_LUI_PACKAGE_PATH="$PWD/../lui/platform/apple" \
+  bash .agents/skills/journal-build/scripts/build_journal_apple.sh ios-simulator \
+  /tmp/JournalComposer.app --link-only --cache-dir /tmp/journal-composer-cache
 ```
 
-Use the repository's runnable OCaml object/host workflow; the Apple build
-script's default stub is link-only. Set `JOURNAL_OCAML_OBJECT` to the complete
-simulator-compatible production object when using this command for UI checks.
+This assembles a link-only stub for Swift/package checks. For runtime UI checks,
+use the verified native-manifest workflow in [journal-build](../../.agents/skills/journal-build/SKILL.md).
+The entry point rejects raw `JOURNAL_OCAML_OBJECT` injection; a stub does not
+establish runtime acceptance.
 
 LUI owns composer measurement, attachment preview/remove targets and the
 feedback slot above controls. Journal supplies descriptors and public events.

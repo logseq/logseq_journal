@@ -73,14 +73,14 @@
  (action
   (with-stdout-to
    native_static_link_flags.sexp
-   (run ../tool/native_static_link_flags.sh libgmp.a %{context_name}))))
+   (run ../.agents/skills/journal-build/scripts/native_static_link_flags.sh libgmp.a %{context_name}))))
 
 (rule
  (alias macos-app)
  (deps native_embed.exe.o)
  (action
   (system
-   "JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/native_embed.exe.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh macos")))
+   "JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/native_embed.exe.o $(git rev-parse --show-toplevel)/.agents/skills/journal-build/scripts/build_journal_apple.sh macos")))
 
 ; vtool restamps the host complete object for the simulator triple (the app .cmx
 ; are identical arm64 code; a target-toolchain recompile replaces this when the
@@ -90,4 +90,4 @@
  (deps native_embed.exe.o)
  (action
   (system
-   "vtool -set-build-version 7 ${JOURNAL_IOS_DEPLOYMENT_TARGET:-26.0} $(xcrun --sdk iphonesimulator --show-sdk-version) -replace -output $PWD/journal_complete_iossim.o $PWD/native_embed.exe.o && JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/journal_complete_iossim.o $(git rev-parse --show-toplevel)/tool/build_journal_apple.sh ios-simulator")))
+   "vtool -set-build-version 7 ${JOURNAL_IOS_DEPLOYMENT_TARGET:-26.0} $(xcrun --sdk iphonesimulator --show-sdk-version) -replace -output $PWD/journal_complete_iossim.o $PWD/native_embed.exe.o && JOURNAL_APPLE_SDK_ROOT=$(xcrun --show-sdk-path) JOURNAL_OCAML_OBJECT=$PWD/journal_complete_iossim.o $(git rev-parse --show-toplevel)/.agents/skills/journal-build/scripts/build_journal_apple.sh ios-simulator")))

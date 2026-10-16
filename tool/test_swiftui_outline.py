@@ -1,13 +1,13 @@
 """Build a public journal-list disclosure probe with observable, non-destructive events.
 
-Stages an LUI probe host (tool/lui_probe_host.py) embedding
+Stages an LUI probe host (.agents/skills/journal-build/scripts/lui_probe_host.py) embedding
 apple-tests/native-outline/outline_probe.ml — a Lui_app signal+update probe
 mounting the `journal-list` extension (Journal_lui_native.list) with
 disclosure rows; expand + row events are decoded back through the extension
 event contract.
 
 The probe's OCaml complete object is produced by the workspace build (see
-tool/lui_probe_host.py): pass it via --native-object, otherwise the host links
+.agents/skills/journal-build/scripts/lui_probe_host.py): pass it via --native-object, otherwise the host links
 the stub object and only verifies the Swift side.
 """
 import argparse
@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.agents/skills/journal-build/scripts'))
 import lui_probe_host
 
 root = lui_probe_host.ROOT

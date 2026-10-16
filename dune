@@ -1,0 +1,2 @@
+; Skill resources are source data, not additional Dune build rules.
+(data_only_dirs .agents)

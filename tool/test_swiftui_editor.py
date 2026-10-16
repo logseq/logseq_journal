@@ -1,6 +1,6 @@
 """Build an isolated native composer input probe using only public framework APIs.
 
-Stages an LUI probe host (tool/lui_probe_host.py) embedding
+Stages an LUI probe host (.agents/skills/journal-build/scripts/lui_probe_host.py) embedding
 apple-tests/editor/composer_probe.ml — a Lui_app signal+update probe that
 self-registers via Journal_bridge.register. Launch the assembled .app binary.
 Type the alphabet rapidly into the Capture field and compare native editor
@@ -11,7 +11,7 @@ has no lui counterpart (Expandable_message_composer is gone); the probe
 covers the same input -> state -> observed flow.
 
 The probe's OCaml complete object is produced by the workspace build (see
-tool/lui_probe_host.py): pass it via --native-object, otherwise the host links
+.agents/skills/journal-build/scripts/lui_probe_host.py): pass it via --native-object, otherwise the host links
 the stub object and only verifies the Swift side.
 """
 import argparse
@@ -21,7 +21,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '.agents/skills/journal-build/scripts'))
 import lui_probe_host
 
 root = lui_probe_host.ROOT
