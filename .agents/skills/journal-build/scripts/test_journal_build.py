@@ -194,7 +194,7 @@ class CacheBoundaryTests(unittest.TestCase):
     def compiler_fixture(self, prefix):
         compiler = prefix / 'bin/ocamlopt.opt'
         compiler.parent.mkdir(exist_ok=True)
-        compiler.write_text('#!/bin/sh\nprintf "architecture: arm64\\nsystem: macosx\\n"\n')
+        compiler.write_text('#!/bin/sh\nprintf "version: 5.5.0\\narchitecture: arm64\\nsystem: macosx\\n"\n')
         compiler.chmod(0o755)
         return compiler
 
@@ -242,15 +242,23 @@ class CacheBoundaryTests(unittest.TestCase):
             workflow.parent.mkdir(parents=True)
             workflow.write_bytes((ROOT / '.github/workflows/ci.yml').read_bytes())
             env = dict(f.build.env, OPAMSWITCH='fixture', RUNNER_OS='macOS', RUNNER_ARCH='ARM64',
-                       ImageOS='macos26-arm64', ImageVersion='fixture-image')
+                       ImageOS='macos26-arm64', ImageVersion='fixture-image',
+                       CI_COMPILER='ocaml-base-compiler.5.5.0', CI_OPAM_VERSION='2.6.1',
+                       PKG_CONFIG_PATH=':'.join(str(Path(subprocess.check_output(
+                           ['brew', '--prefix', name], text=True).strip()) / 'lib/pkgconfig')
+                           for name in ('gmp', 'sqlite', 'zlib', 'zstd')),
+                       CI_OPAM_REPOSITORY='git+https://github.com/ocaml/opam-repository.git#' + 'a' * 40)
             with patch.dict(os.environ, env, clear=True):
                 baseline = ci.cache_identity(f.journal)
                 self.assertEqual(baseline, ci.cache_identity(f.journal))
-                self.assertEqual(baseline['identity']['opam_prefix'], str(f.build.prefix))
+                self.assertEqual(baseline['identity']['opam_prefix'], str(f.journal / '_opam'))
+                # Lookup must work before setup creates a compiler or a switch.
+                compiler = f.build.prefix / 'bin/ocamlopt.opt'
+                compiler.unlink()
+                self.assertEqual(baseline, ci.cache_identity(f.journal))
                 inputs = [f.lock, f.journal / 'journal.opam',
                           f.journal / '.ci-reports/dependencies.json', workflow,
-                          f.journal / '.agents/skills/journal-build/scripts/prepare_ci_dependencies.py', f.journal / '.agents/skills/journal-build/scripts/journal_build.py',
-                          f.build.prefix / 'bin/ocamlopt.opt']
+                          f.journal / '.agents/skills/journal-build/scripts/prepare_ci_dependencies.py', f.journal / '.agents/skills/journal-build/scripts/journal_build.py']
                 for path in inputs:
                     with self.subTest(path=path):
                         data = path.read_bytes()
@@ -259,11 +267,11 @@ class CacheBoundaryTests(unittest.TestCase):
                         path.write_bytes(changed)
                         self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
                         path.write_bytes(data)
-                for name in ('ImageVersion', 'CFLAGS', 'DEVELOPER_DIR'):
+                for name in ('ImageVersion', 'CFLAGS', 'DEVELOPER_DIR', 'OPAMROOT', 'CI_OPAM_VERSION', 'CI_COMPILER', 'CI_OPAM_REPOSITORY'):
                     with self.subTest(environment=name), patch.dict(os.environ, {name: 'changed'}):
-                        if name == 'DEVELOPER_DIR':
+                        if name in ('DEVELOPER_DIR', 'CI_COMPILER', 'CI_OPAM_REPOSITORY', 'CI_OPAM_VERSION'):
                             # An unavailable selected toolchain must fail, not restore an old key.
-                            with self.assertRaises(subprocess.CalledProcessError):
+                            with self.assertRaises((subprocess.CalledProcessError, ValueError)):
                                 ci.cache_identity(f.journal)
                         else:
                             self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
@@ -280,6 +288,69 @@ class CacheBoundaryTests(unittest.TestCase):
                 resolution.unlink()
                 with self.assertRaises(FileNotFoundError):
                     ci.cache_identity(f.journal)
+
+    def test_ci_cache_receipt_accepts_exact_state_and_rejects_mismatches(self):
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'cache_receipt'), 'restored cache validation missing')
+        with self.pinned_switch() as f:
+            compiler = self.compiler_fixture(f.build.prefix)
+            report = dict(key='a' * 64, identity=dict(opam_prefix=str(f.build.prefix),
+                          opam_root=str(f.root / 'opam'), compiler='ocaml-base-compiler.5.5.0',
+                          opam_version=f.build.opam('--version')))
+            receipt = ci.cache_receipt(report, f.build.opam)
+            receipt_path = f.build.prefix / '.journal-ci-cache.json'
+            receipt_path.write_text(json.dumps(receipt))
+            self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'accepted')
+            self.assertEqual(ci.validate_restored_cache(report, False)['status'], 'rejected')
+            changed = dict(report, key='b' * 64)
+            self.assertEqual(ci.validate_restored_cache(changed, True)['status'], 'rejected')
+            for path in (compiler, f.build.prefix / '.opam-switch/switch-state',
+                         f.build.prefix / '.opam-switch/switch-config', f.root / 'opam/config'):
+                with self.subTest(path=path):
+                    original = path.read_bytes()
+                    path.write_bytes(original + b'\nchanged\n')
+                    self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+                    path.write_bytes(original)
+            self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'accepted')
+            for malformed in ('{}', 'invalid json'):
+                receipt_path.write_text(malformed)
+                self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+            receipt_path.write_text(json.dumps(receipt))
+            compiler.unlink()
+            self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+            receipt_path.unlink()
+            self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+
+    def test_ci_rejection_quarantines_only_owned_runner_paths(self):
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'quarantine_cache'), 'safe cold fallback missing')
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / 'workspace'
+            runner_temp = Path(directory).resolve() / 'runner-temp'
+            workspace.mkdir()
+            runner_temp.mkdir()
+            opam_root = Path(directory).resolve() / 'opam'
+            prefix = workspace / '_opam'
+            for path in (opam_root, prefix):
+                path.mkdir()
+                (path / 'keep').write_text('owned cached state')
+            report = dict(identity=dict(opam_prefix=str(prefix), opam_root=str(opam_root)))
+            env = dict(GITHUB_WORKSPACE=str(workspace), RUNNER_TEMP=str(runner_temp),
+                       RUNNER_ENVIRONMENT='github-hosted', GITHUB_ACTIONS='true')
+            with patch.dict(os.environ, env), patch('prepare_ci_dependencies.Path.home', return_value=opam_root.parent):
+                # A foreign root is refused; no caller-provided path is moved.
+                with self.assertRaises(ValueError):
+                    ci.quarantine_cache(report)
+                self.assertTrue((prefix / 'keep').exists())
+                opam_root.rename(opam_root.parent / '.opam')
+                report['identity']['opam_root'] = str(opam_root.parent / '.opam')
+                destination = ci.quarantine_cache(report)
+                self.assertFalse(prefix.exists())
+                self.assertFalse(Path(report['identity']['opam_root']).exists())
+                self.assertEqual(len(list(Path(destination).glob('*/keep'))), 2)
+                self.assertTrue(workspace.exists())
+            with self.assertRaises(ValueError):
+                ci.quarantine_cache(report)
 
     def test_final_verification_rejects_changed_gmp_and_probe_input(self):
         self.assertTrue(hasattr(self.build.Build, 'verify_inputs'), 'final input verification boundary missing')
