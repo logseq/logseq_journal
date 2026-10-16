@@ -807,6 +807,100 @@ let deletion_does_not_follow_external_paths kind () =
       (Sys.file_exists (Filename.concat external_directory ".logseq-overlay-owner.sqlite")))
 ;;
 
+let legacy_retirement_replays_without_content_load mode () =
+  let behavior = "obsolete retirement terminates without opening contents" in
+  T.with_temp_directory "overlay-legacy-retirement-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let directory = Filename.dirname database_path in
+    let fixture = Yojson.Safe.from_file (Filename.concat T.root
+      "logseq_overlay_db/test/fixtures/legacy-retirement-v1.json") in
+    let open Yojson.Safe.Util in
+    let receipt = fixture |> member "receipt" in
+    let id = receipt |> member "retirement" |> to_string in
+    let retirement = Database.retirement_id_of_string id |> T.require_ok ~behavior in
+    let previous = receipt |> member "previous" |> to_string
+      |> Mirror_generation.of_string |> T.require_ok ~behavior in
+    let root = Filename.concat (Filename.dirname directory) (".mirror-deletions/" ^ Graph.Uuid.to_string T.graph_uuid) in
+    List.iter (fun path -> Unix.mkdir path 0o700)
+      [Filename.dirname root; root; Filename.concat root "states"; Filename.concat root "pending"];
+    let receipt_path = Filename.concat root ("states/" ^ id ^ ".json") in
+    Out_channel.with_open_bin receipt_path (fun output -> output_string output (Yojson.Safe.to_string receipt));
+    (* This is captured v1 wire data from the actual pre-upgrade public producer,
+       not a reimplementation of its former generation algorithm. *)
+    let dependencies = T.dependencies ~behavior in
+    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+      let inspection = inspect_mirror support behavior in
+      let database = Database.open_ ~sw dependencies inspection ~graph_name:"Synthetic legacy lease"
+        |> T.require_ok ~behavior in
+      if mode = `Before then (
+        let busy = Database.prepare_mirror_deletion ~application_support_directory:support
+          ~graph_id:T.graph_uuid ~retirement in
+        Alcotest.(check bool) "legacy cancellation waits for live ownership" true
+          (match busy with Error Mirror_delete_busy -> true | _ -> false));
+      ignore (Database.close database |> T.require_ok ~behavior)));
+    let data = Filename.concat root ("pending/" ^ id ^ ".data") in
+    if mode = `Missing then Unix.rename directory (Filename.concat support "preserved-before-missing");
+    if mode = `After || mode = `Linked then (
+      Unix.rename directory data;
+      Out_channel.with_open_bin (Filename.concat data "db.sqlite")
+        (fun output -> output_string output "synthetic corrupted legacy retired contents");
+      ignore (T.seed_mirror support);
+      if mode = `Linked then (
+        let external_directory = Filename.concat support "captured-external" in
+        Unix.rename data external_directory; Unix.symlink (Filename.concat external_directory "missing") data));
+    let observed = Database.prepare_mirror_deletion ~application_support_directory:support
+      ~graph_id:T.graph_uuid ~retirement in
+    if mode = `Linked then (
+      Option.iter (fun (prepared, _) -> Database.cancel_mirror_deletion prepared) (Result.to_option observed);
+      Alcotest.(check bool) "legacy dangling pending symlink is rejected" true (Result.is_error observed);
+      Alcotest.(check bool) "captured external contents survive" true
+        (Sys.file_exists (Filename.concat support "captured-external/db.sqlite")))
+    else (
+      let prepared, generation = observed |> T.require_ok ~behavior in
+      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
+        Alcotest.(check bool) "legacy generation remains an opaque journal identity" true
+          (Mirror_generation.equal generation previous);
+        if mode = `Before || mode = `Missing then (
+          Alcotest.(check bool) "uncommitted legacy preparation is canceled" false (Database.mirror_deletion_committed prepared);
+          Alcotest.(check bool) "old preparation cannot rename a live replacement" true
+            (Result.is_error (Database.commit_mirror_deletion prepared)))
+        else (
+          Alcotest.(check bool) "legacy retired namespace yields durable commit evidence" true
+            (Database.mirror_deletion_committed prepared);
+          ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior);
+          Alcotest.(check bool) "legacy retired contents are collected" false (Sys.file_exists data))));
+    Alcotest.(check bool) "canonical is preserved without manufacturing a missing copy" (mode <> `Missing) (Sys.file_exists database_path))
+;;
+
+let current_retirement_rejects_replaced_pending_data () =
+  let behavior = "new retirement format rejects replaced pending data" in
+  T.with_temp_directory "overlay-current-retirement-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let directory = Filename.dirname database_path in
+    let retirement = next_retirement () in
+    let prepared, _ = Database.prepare_mirror_deletion ~application_support_directory:support
+      ~graph_id:T.graph_uuid ~retirement |> T.require_ok ~behavior in
+    let root = Filename.concat (Filename.dirname directory) (".mirror-deletions/" ^ Graph.Uuid.to_string T.graph_uuid) in
+    let states = Filename.concat root "states" in
+    Unix.chmod states 0o500;
+    Fun.protect ~finally:(fun () -> Unix.chmod states 0o700; Database.cancel_mirror_deletion prepared)
+      (fun () -> ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior));
+    let data = Filename.concat root ("pending/" ^ Database.retirement_id_to_string retirement ^ ".data") in
+    Unix.rename data (Filename.concat support "captured-old");
+    ignore (T.seed_mirror support);
+    let dependencies, _, inspection = location_and_inspection support behavior in
+    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+      let database = Database.open_ ~sw dependencies inspection ~graph_name:"Synthetic replacement"
+        |> T.require_ok ~behavior in
+      ignore (Database.close database |> T.require_ok ~behavior)));
+    Unix.rename directory data;
+    let replay = Database.prepare_mirror_deletion ~application_support_directory:support
+      ~graph_id:T.graph_uuid ~retirement in
+    Option.iter (fun (p, _) -> Database.cancel_mirror_deletion p) (Result.to_option replay);
+    Alcotest.(check bool) "replacement pending namespace is rejected" true (Result.is_error replay);
+    Alcotest.(check bool) "replacement pending contents survive" true (Sys.file_exists (Filename.concat data "db.sqlite")))
+;;
+
 let corrupt_outbox_fails_closed () =
   let behavior = "corrupt durable outbox fails closed" in
   T.with_temp_directory "overlay-corrupt-outbox-" (fun support ->
@@ -2945,7 +3039,12 @@ let () =
             sqlite_full_int64_checkpoint
         ] )
     ; "mirror and durability", cases @
-        [Alcotest.test_case "graph directory symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Graph);
+        [Alcotest.test_case "legacy post-rename retirement replays" `Quick (legacy_retirement_replays_without_content_load `After);
+         Alcotest.test_case "legacy pre-rename retirement cancels with lease fencing" `Quick (legacy_retirement_replays_without_content_load `Before);
+         Alcotest.test_case "obsolete preparation with missing canonical cancels" `Quick (legacy_retirement_replays_without_content_load `Missing);
+         Alcotest.test_case "legacy pending symlink is rejected" `Quick (legacy_retirement_replays_without_content_load `Linked);
+         Alcotest.test_case "current pending replacement is rejected" `Quick current_retirement_rejects_replaced_pending_data;
+         Alcotest.test_case "graph directory symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Graph);
          Alcotest.test_case "graph ancestor symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Ancestor);
          Alcotest.test_case "retirement directory symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Retirement);
          Alcotest.test_case "lease file symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Lease);

@@ -792,7 +792,7 @@ let mirror_deletion_paths (location : durable_mirror_location) retirement =
 
 let write_deletion_receipt path (result : Types.mirror_delete) committed =
   let data = Yojson.Safe.to_string (`Assoc
-    [ "version", `Int 1
+    [ "version", `Int 2
     ; "graph", Graph.Uuid.to_yojson (Option.get result.graph_uuid)
     ; "retirement", `String (Filename.chop_suffix (Filename.basename path) ".json")
     ; "previous", `String (Types.Mirror_generation.to_string result.previous_generation)
@@ -812,7 +812,8 @@ let read_deletion_receipt (location : durable_mirror_location) receipt_path =
   if not (is_regular_single_link receipt_path) || (Unix.stat receipt_path).st_size > 4096
   then failwith "invalid retirement receipt";
   let json = Yojson.Safe.from_file receipt_path in
-  if json |> member "version" |> to_int <> 1 then failwith "unsupported retirement receipt";
+  let version = json |> member "version" |> to_int in
+  if version <> 1 && version <> 2 then failwith "unsupported retirement receipt";
   if json |> member "graph" |> to_string <> Graph.Uuid.to_string location.graph_id
      || json |> member "retirement" |> to_string <> Filename.chop_suffix (Filename.basename receipt_path) ".json"
   then failwith "retirement receipt identity mismatch";
@@ -820,7 +821,7 @@ let read_deletion_receipt (location : durable_mirror_location) receipt_path =
     |> Types.Mirror_generation.of_string |> Result.get_ok in
   ({ Types.graph_uuid = Some location.graph_id
    ; previous_generation = generation "previous"; absent_generation = generation "absent" },
-   json |> member "committed" |> to_bool)
+   json |> member "committed" |> to_bool, version)
 ;;
 
 let collect_retired_mirrors (location : durable_mirror_location) =
@@ -833,7 +834,7 @@ let collect_retired_mirrors (location : durable_mirror_location) =
         try
           let id = String.sub name 0 (String.length name - 5) |> retirement_id_of_string |> Result.get_ok in
           let _, receipt, data = mirror_deletion_paths location id in
-          let _, committed = read_deletion_receipt location receipt in
+          let _, committed, _ = read_deletion_receipt location receipt in
           if committed && Sys.file_exists data then (
             ignore (directory_stat data);
             validate_deletion_lease data;
@@ -853,21 +854,47 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
     validate_retirement_directories location;
     let _root, receipt, data = mirror_deletion_paths location retirement in
     let graph_directory = Filename.dirname location.database_path in
-    let existing = if Sys.file_exists receipt then Some (read_deletion_receipt location receipt) else None in
+    let exists path = match Unix.lstat path with
+      | _ -> true
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> false in
+    let read_existing () = if exists receipt then Some (read_deletion_receipt location receipt) else None in
+    let existing = read_existing () in
     let preparation ?ownership ?committed ~durable generation =
       { deletion_location = location; deletion_generation = generation; deletion_ancestors = ancestors
       ; deletion_retirement = retirement; deletion_ownership = ownership; deletion_committed = committed
       ; deletion_cancelled = false; deletion_durable = durable }, generation in
     match existing with
-    | Some (result, committed) when committed || Sys.file_exists data ->
-      if not committed then (
-        if not (Types.Mirror_generation.equal result.previous_generation
-          (directory_generation_as ~identity_path:graph_directory data))
-        then failwith "retired mirror identity mismatch");
-      sync_deletion_directory (Filename.dirname data);
-      sync_deletion_directory (Filename.dirname graph_directory);
-      write_deletion_receipt receipt result true;
-      Ok (preparation ~committed:result ~durable:true result.previous_generation)
+    | Some (result, committed, version) when committed || exists data ->
+      let persist_commit () =
+        sync_deletion_directory (Filename.dirname data);
+        sync_deletion_directory (Filename.dirname graph_directory);
+        write_deletion_receipt receipt result true;
+        Ok (preparation ~committed:result ~durable:true result.previous_generation) in
+      if committed then persist_commit () else (
+        let observed = directory_stat data in
+        validate_deletion_lease data;
+        match Ownership.acquire ~graph_directory:data with
+        | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
+        | Error (Unavailable message) -> Error (Types.Mirror_delete_failed message)
+        | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner)) (fun () ->
+          validate_deletion_ancestors ancestors;
+          validate_retirement_directories location;
+          if not (same_directory data observed) || read_existing () <> existing
+          then failwith "retired mirror changed while acquiring ownership";
+          (* An obsolete transaction can only finish its already-retired namespace;
+             it never receives a new canonical rename capability. Its generation
+             is only the existing coordinator's opaque identity. *)
+          if version = 2 && not (Types.Mirror_generation.equal result.previous_generation
+            (directory_generation_as ~identity_path:graph_directory data))
+          then failwith "retired mirror identity mismatch";
+          persist_commit ()))
+    | Some (old, false, 1) when not (exists graph_directory) ->
+      (* With neither namespace present there is nothing to commit. Recheck the
+         receipt and destination rather than inferring commit from absence. *)
+      validate_deletion_ancestors ancestors;
+      if exists data || read_existing () <> existing then Error Types.Mirror_delete_stale else
+      let canceled, _ = preparation ~durable:false old.previous_generation in
+      Ok ({ canceled with deletion_cancelled = true }, old.previous_generation)
     | _ ->
       let observed = directory_stat graph_directory in
       validate_deletion_lease graph_directory;
@@ -878,12 +905,18 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
          let fail error = ignore (Ownership.release owner); Error error in
          try
            validate_deletion_ancestors ancestors;
-           if not (same_directory graph_directory observed) then fail Types.Mirror_delete_stale else
+           if not (same_directory graph_directory observed) || exists data
+              || read_existing () <> existing then fail Types.Mirror_delete_stale else
            let generation = directory_generation_as ~identity_path:graph_directory graph_directory in
            let result = { Types.graph_uuid = Some graph_id; previous_generation = generation
              ; absent_generation = absent_mirror_generation location.database_path } in
            (match existing with
-            | Some (old, _) when not (Types.Mirror_generation.equal old.previous_generation generation) ->
+            | Some (old, false, 1) ->
+              (* A pre-rename V1 preparation can only be canceled after acquiring
+                 the live lease. Never grant it a fresh rename capability. *)
+              let canceled, _ = preparation ~ownership:owner ~durable:false generation in
+              Ok ({ canceled with deletion_cancelled = true }, old.previous_generation)
+            | Some (old, _, _) when not (Types.Mirror_generation.equal old.previous_generation generation) ->
               fail Types.Mirror_delete_stale
             | _ ->
               ensure_retirement_directory (Filename.dirname receipt);
@@ -911,7 +944,7 @@ let commit_mirror_deletion preparation =
     try
       validate_deletion_ancestors preparation.deletion_ancestors;
       validate_retirement_directories location;
-      let result, committed = read_deletion_receipt location receipt in
+      let result, committed, _ = read_deletion_receipt location receipt in
       if committed then Some result else None
     with _ -> None in
   match preparation.deletion_committed, durable with
@@ -941,7 +974,7 @@ let commit_mirror_deletion preparation =
     let renamed =
       try
         if Sys.file_exists data then failwith "retirement destination is occupied";
-        let result, _ = read_deletion_receipt location receipt in
+        let result, _, _ = read_deletion_receipt location receipt in
         Unix.rename graph_directory data;
         Ok result
       with exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn)) in

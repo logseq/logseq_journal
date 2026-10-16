@@ -1,0 +1,12 @@
+{
+  "producer": "1c4ce398b44ea08cbafa596ec7d86307b9172a3e",
+  "mode": "after-rename",
+  "receipt": {
+    "version": 1,
+    "graph": "60000000-0000-4000-8000-000000000001",
+    "retirement": "98000000-0000-4000-8000-000000000001",
+    "previous": "mirror-generation:v1:75b34f5c7f5d6c17bde592fa49c10cb92965e9728243f6ca53f2552ed03ad649",
+    "absent": "mirror-generation:v1:8955f711d787b45e8f60fdfa1e67a47e76435460953bdb5b565892f5272e9929",
+    "committed": false
+  }
+}
