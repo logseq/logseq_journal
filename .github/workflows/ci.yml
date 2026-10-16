@@ -13,22 +13,27 @@ jobs:
     # The production transport explicitly requires Apple DNS-SD.
     runs-on: macos-latest
     timeout-minutes: 60
+    env:
+      CI_COMPILER: ocaml-base-compiler.5.5.0
+      # This commit binds compiler source checksums, patches, build commands and
+      # every repository package recipe. Update deliberately with the toolchain.
+      CI_OPAM_REPOSITORY: git+https://github.com/ocaml/opam-repository.git#7b5e9a2b084fe7ff750c4a9449289065ef9f9216
+      CI_OPAM_VERSION: 2.6.1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      OPAMJOBS: 3
+      OPAMEXTERNALSOLVER: builtin-0install
+      OPAMPRECISETRACKING: 1
     steps:
       - uses: actions/checkout@v4
       - name: Verify Apple app icon packaging
         run: python3 .agents/skills/journal-build/scripts/test_apple_app_icon.py
-      - uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.5.0"
-          # This workflow owns installed-switch caching with stricter identity.
-          cache: false
+      - name: Prepare native system libraries before cache lookup
+        run: |
+          brew install pkg-config gmp sqlite zlib zstd
+          echo "PKG_CONFIG_PATH=$(brew --prefix gmp)/lib/pkgconfig:$(brew --prefix sqlite)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig" >> "$GITHUB_ENV"
       - name: Resolve declared dependency sources
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py
-      - name: Prepare native system dependencies
-        run: |
-          python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --pin
-          opam install . --deps-only --with-test --locked --ignore-pin-depends --depext-only --yes
-      - name: Identify installed dependency cache
+      - name: Identify dependency build inputs before compiler setup
         id: dependency-identity
         run: |
           python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --cache-identity
@@ -38,17 +43,34 @@ jobs:
           report = json.loads(Path('.ci-reports/opam-cache.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               print('prefix=' + report['identity']['opam_prefix'], file=output)
+              print('root=' + report['identity']['opam_root'], file=output)
               print('key=' + report['key'], file=output)
           PY
-      - name: Cache installed dependencies
+      - name: Restore compiler, installed dependencies and opam metadata
         id: dependency-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
+        continue-on-error: true
         with:
-          path: ${{ steps.dependency-identity.outputs.prefix }}
+          path: |
+            ${{ steps.dependency-identity.outputs.prefix }}
+            ${{ steps.dependency-identity.outputs.root }}
           # Exact only: compiled switches are not relocatable or cross-platform.
-          key: journal-opam-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}
+          key: journal-opam-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}
+      - name: Validate restored cache or select a clean cold setup
+        env:
+          CI_CACHE_HIT: ${{ steps.dependency-cache.outputs.cache-hit }}
+        run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --validate-cache
+      # Pinned because its provisioning behavior participates in the input key.
+      - uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3
+        with:
+          ocaml-compiler: ${{ env.CI_COMPILER }}
+          opam-repositories: |
+            default: ${{ env.CI_OPAM_REPOSITORY }}
+          cache: false
       - name: Pin resolved checkouts after cache restoration
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --pin
+      - name: Verify native system dependencies on the fresh runner
+        run: opam install . --deps-only --with-test --locked --ignore-pin-depends --depext-only --yes
       - name: Install locked dependencies
         run: opam install . --deps-only --with-test --locked --ignore-pin-depends --yes
       - name: Record installed package versions
@@ -59,6 +81,16 @@ jobs:
           opam exec -- dune build @all app/native_embed.exe.o
       - name: Run full regression suite
         run: opam exec -- dune runtest --force
+      - name: Verify final cache inputs and seal installed state
+        run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --seal-cache
+      - name: Save compiler, installed dependencies and opam metadata
+        if: success() && steps.dependency-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ steps.dependency-identity.outputs.prefix }}
+            ${{ steps.dependency-identity.outputs.root }}
+          key: journal-opam-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}
       - name: Upload resolved dependencies and test logs
         if: always()
         uses: actions/upload-artifact@v4
