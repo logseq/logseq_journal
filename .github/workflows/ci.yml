@@ -1,9 +1,20 @@
 name: Journal CI
 
 on:
+  workflow_call:
+    inputs:
+      sqlite-profile:
+        type: string
+        default: brew
   pull_request:
   push:
     branches: [main]
+
+# Only a newer head for this PR supersedes its old run. Main and controlled
+# comparisons use unique run groups and cannot cancel one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.ref, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
@@ -14,6 +25,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 60
     env:
+      CI_SQLITE_PROFILE: ${{ inputs.sqlite-profile || 'brew' }}
       CI_COMPILER: ocaml-base-compiler.5.5.0
       # This commit binds compiler source checksums, patches, build commands and
       # every repository package recipe. Update deliberately with the toolchain.
@@ -31,6 +43,8 @@ jobs:
         run: |
           brew install pkg-config gmp sqlite zlib zstd
           echo "PKG_CONFIG_PATH=$(brew --prefix gmp)/lib/pkgconfig:$(brew --prefix sqlite)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: Prepare optional controlled SQLite provider
+        run: python3 .agents/skills/journal-build/scripts/prepare_ci_sqlite.py
       - name: Resolve declared dependency sources
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py
       - name: Identify dependency build inputs before compiler setup
@@ -45,7 +59,18 @@ jobs:
               print('prefix=' + report['identity']['opam_prefix'], file=output)
               print('root=' + report['identity']['opam_root'], file=output)
               print('key=' + report['key'], file=output)
+              print('native-key=' + report['native_key'], file=output)
           PY
+      # This small, data-only record explains misses outside the compatible
+      # switch family. It never authorizes executable state restoration.
+      - name: Restore prior input record for miss diagnostics
+        id: input-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: .ci-reports/cache-candidate
+          key: journal-opam-input-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}
+          restore-keys: journal-opam-input-v4-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore compiler, installed dependencies and opam metadata
         id: dependency-cache
         uses: actions/cache/restore@v4
@@ -54,11 +79,14 @@ jobs:
           path: |
             ${{ steps.dependency-identity.outputs.prefix }}
             ${{ steps.dependency-identity.outputs.root }}
-          # Exact only: compiled switches are not relocatable or cross-platform.
-          key: journal-opam-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}
+          # Prefix fallback is confined to the same compiler/SDK/lock family.
+          # Native provider differences require receipt + real link/runtime probes.
+          key: journal-opam-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}
+          restore-keys: journal-opam-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-
       - name: Validate restored cache or select a clean cold setup
         env:
           CI_CACHE_HIT: ${{ steps.dependency-cache.outputs.cache-hit }}
+          CI_CACHE_MATCHED_KEY: ${{ steps.dependency-cache.outputs.cache-matched-key }}
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --validate-cache
       # Pinned because its provisioning behavior participates in the input key.
       - uses: ocaml/setup-ocaml@93303b622b2522e4411e295f9e77411a24912ac7 # v3
@@ -71,8 +99,15 @@ jobs:
         run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --pin
       - name: Verify native system dependencies on the fresh runner
         run: opam install . --deps-only --with-test --locked --ignore-pin-depends --depext-only --yes
+      - name: Probe restored native bindings and repair incompatible packages only
+        run: python3 .agents/skills/journal-build/scripts/prepare_ci_dependencies.py --check-native-cache
       - name: Install locked dependencies
         run: opam install . --deps-only --with-test --locked --ignore-pin-depends --yes
+      - name: Verify build and cache helper boundaries
+        env:
+          JOURNAL_TEST_SWITCH: ${{ github.workspace }}
+          PYTHONDONTWRITEBYTECODE: 1
+        run: python3 .agents/skills/journal-build/scripts/test_journal_build.py
       - name: Record installed package versions
         if: always()
         run: opam list --installed --columns=name,installed-version --short --color=never > .ci-reports/packages.txt
@@ -90,12 +125,18 @@ jobs:
           path: |
             ${{ steps.dependency-identity.outputs.prefix }}
             ${{ steps.dependency-identity.outputs.root }}
-          key: journal-opam-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}
+          key: journal-opam-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}
+      - name: Save successful input record for miss diagnostics
+        if: success() && steps.input-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-reports/cache-candidate
+          key: journal-opam-input-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.dependency-identity.outputs.key }}-${{ steps.dependency-identity.outputs.native-key }}
       - name: Upload resolved dependencies and test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: journal-ci-evidence
+          name: journal-ci-evidence${{ inputs.sqlite-profile && format('-{0}', inputs.sqlite-profile) || '' }}
           include-hidden-files: true
           if-no-files-found: error
           path: |

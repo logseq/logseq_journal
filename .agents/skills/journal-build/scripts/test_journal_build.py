@@ -256,9 +256,7 @@ class CacheBoundaryTests(unittest.TestCase):
                 compiler = f.build.prefix / 'bin/ocamlopt.opt'
                 compiler.unlink()
                 self.assertEqual(baseline, ci.cache_identity(f.journal))
-                inputs = [f.lock, f.journal / 'journal.opam',
-                          f.journal / '.ci-reports/dependencies.json', workflow,
-                          f.journal / '.agents/skills/journal-build/scripts/prepare_ci_dependencies.py', f.journal / '.agents/skills/journal-build/scripts/journal_build.py']
+                inputs = [f.lock, f.journal / 'journal.opam', f.journal / '.ci-reports/dependencies.json']
                 for path in inputs:
                     with self.subTest(path=path):
                         data = path.read_bytes()
@@ -267,7 +265,45 @@ class CacheBoundaryTests(unittest.TestCase):
                         path.write_bytes(changed)
                         self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
                         path.write_bytes(data)
-                for name in ('ImageVersion', 'CFLAGS', 'DEVELOPER_DIR', 'OPAMROOT', 'CI_OPAM_VERSION', 'CI_COMPILER', 'CI_OPAM_REPOSITORY'):
+                for path in (workflow, fixture_scripts / 'prepare_ci_dependencies.py', fixture_scripts / 'journal_build.py'):
+                    original = path.read_bytes()
+                    path.write_bytes(original + b'\n# unrelated comment\n')
+                    self.assertEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                    path.write_bytes(original)
+                with patch.dict(os.environ, {'ImageVersion': 'other-image', 'PATH': str(f.root / 'empty') + ':' + env['PATH']}):
+                    moved = ci.cache_identity(f.journal)
+                    self.assertEqual(baseline['key'], moved['key'])
+                    self.assertEqual(baseline['native_key'], moved['native_key'])
+                    self.assertNotEqual(baseline['observed'], moved['observed'])
+                native = f.root / 'sqlite-provider'
+                for sub in ('lib/pkgconfig', 'include'):
+                    (native / sub).mkdir(parents=True)
+                (native / 'lib/libsqlite3.a').write_bytes(b'fixture native archive bytes')
+                for header in ('sqlite3.h', 'sqlite3ext.h'):
+                    (native / 'include' / header).write_text('fixture header bytes')
+                pc = native / 'lib/pkgconfig/sqlite3.pc'
+                pc.write_text('prefix=' + str(native) + '\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n'
+                              'Name: sqlite3\nDescription: identity fixture\nVersion: 3.54.0\n'
+                              'Libs: -L${libdir} -lsqlite3\nCflags: -I${includedir}\n')
+                with patch.dict(os.environ, {'PKG_CONFIG_PATH': str(pc.parent) + ':' + env['PKG_CONFIG_PATH']}):
+                    first = ci.cache_identity(f.journal)
+                    pc.write_text(pc.read_text().replace('3.54.0', '3.53.4'))
+                    (native / 'lib/libsqlite3.a').write_bytes(b'changed fixture native archive')
+                    second = ci.cache_identity(f.journal)
+                    self.assertEqual(first['key'], second['key'])
+                    self.assertNotEqual(first['native_key'], second['native_key'])
+                empty = f.root / 'empty'
+                empty.mkdir()
+                wrapper = empty / 'cc'
+                wrapper.write_text('#!/bin/sh\nexec /usr/bin/cc "$@"\n')
+                wrapper.chmod(0o755)
+                with patch.dict(os.environ, {'PATH': str(empty) + ':' + env['PATH']}):
+                    self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                original = workflow.read_text()
+                workflow.write_text(original.replace('93303b622b2522e4411e295f9e77411a24912ac7', 'f' * 40))
+                self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
+                workflow.write_text(original)
+                for name in ('CFLAGS', 'DEVELOPER_DIR', 'OPAMROOT', 'CI_OPAM_VERSION', 'CI_COMPILER', 'CI_OPAM_REPOSITORY'):
                     with self.subTest(environment=name), patch.dict(os.environ, {name: 'changed'}):
                         if name in ('DEVELOPER_DIR', 'CI_COMPILER', 'CI_OPAM_REPOSITORY', 'CI_OPAM_VERSION'):
                             # An unavailable selected toolchain must fail, not restore an old key.
@@ -275,7 +311,7 @@ class CacheBoundaryTests(unittest.TestCase):
                                 ci.cache_identity(f.journal)
                         else:
                             self.assertNotEqual(baseline['key'], ci.cache_identity(f.journal)['key'])
-                for name, value in [('ImageVersion', ''), ('ImageOS', ''), ('RUNNER_ARCH', 'X64'), ('RUNNER_OS', 'Linux')]:
+                for name, value in [('RUNNER_ARCH', 'X64'), ('RUNNER_OS', 'Linux')]:
                     with self.subTest(invalid=name), patch.dict(os.environ, {name: value}):
                         with self.assertRaises(ValueError):
                             ci.cache_identity(f.journal)
@@ -292,9 +328,10 @@ class CacheBoundaryTests(unittest.TestCase):
     def test_ci_cache_receipt_accepts_exact_state_and_rejects_mismatches(self):
         import prepare_ci_dependencies as ci
         self.assertTrue(hasattr(ci, 'cache_receipt'), 'restored cache validation missing')
+        self.assertTrue(hasattr(ci, 'cache_key'), 'compatible cache family missing')
         with self.pinned_switch() as f:
             compiler = self.compiler_fixture(f.build.prefix)
-            report = dict(key='a' * 64, identity=dict(opam_prefix=str(f.build.prefix),
+            report = dict(key='a' * 64, native_key='d' * 64, observed={}, identity=dict(opam_prefix=str(f.build.prefix),
                           opam_root=str(f.root / 'opam'), compiler='ocaml-base-compiler.5.5.0',
                           opam_version=f.build.opam('--version')))
             receipt = ci.cache_receipt(report, f.build.opam)
@@ -304,20 +341,40 @@ class CacheBoundaryTests(unittest.TestCase):
             self.assertEqual(ci.validate_restored_cache(report, False)['status'], 'rejected')
             changed = dict(report, key='b' * 64)
             self.assertEqual(ci.validate_restored_cache(changed, True)['status'], 'rejected')
+            variant = dict(report, native_key='c' * 64, observed={'system_libraries': {'sqlite3': {'version': '3.49.2'}}})
+            receipt['inputs']['native_key'] = 'd' * 64
+            receipt['inputs']['observed'] = {'system_libraries': {'sqlite3': {'version': '3.50.4'}}}
+            receipt_path.write_text(json.dumps(receipt))
+            match = ci.cache_key(receipt['inputs'])
+            restored = ci.validate_restored_cache(variant, False, matched_key=match)
+            self.assertEqual(restored['status'], 'accepted')
+            self.assertEqual(restored['source'], 'compatible')
+            incompatible = dict(variant, key='f' * 64, identity=dict(variant['identity'], compiler='ocaml-base-compiler.5.4.0'))
+            rejected = ci.validate_restored_cache(incompatible, False, matched_key=match)
+            self.assertEqual(rejected['status'], 'rejected')
+            self.assertTrue(any(d['field'].endswith('compiler') for d in rejected['differences']))
+            report['observed'] = receipt['inputs']['observed']
             for path in (compiler, f.build.prefix / '.opam-switch/switch-state',
                          f.build.prefix / '.opam-switch/switch-config', f.root / 'opam/config'):
                 with self.subTest(path=path):
                     original = path.read_bytes()
                     path.write_bytes(original + b'\nchanged\n')
-                    self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+                    rejected = ci.validate_restored_cache(report, True)
+                    self.assertEqual(rejected['status'], 'rejected')
+                    self.assertTrue(any(d['field'].startswith('files.') and d['cached'] != d['current'] for d in rejected['differences']))
                     path.write_bytes(original)
             self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'accepted')
             for malformed in ('{}', 'invalid json'):
                 receipt_path.write_text(malformed)
                 self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+            for inputs in ('broken', [], None, dict(report, observed='broken')):
+                receipt_path.write_text(json.dumps(dict(receipt, inputs=inputs)))
+                self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
             receipt_path.write_text(json.dumps(receipt))
             compiler.unlink()
-            self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
+            rejected = ci.validate_restored_cache(report, True)
+            self.assertEqual(rejected['status'], 'rejected')
+            self.assertTrue(any(d['current'] is None and d['field'].endswith('bin/ocamlopt.opt') for d in rejected['differences']))
             receipt_path.unlink()
             self.assertEqual(ci.validate_restored_cache(report, True)['status'], 'rejected')
 
@@ -351,6 +408,91 @@ class CacheBoundaryTests(unittest.TestCase):
                 self.assertTrue(workspace.exists())
             with self.assertRaises(ValueError):
                 ci.quarantine_cache(report)
+
+    def test_ci_diagnostics_are_truthful_specific_and_redacted(self):
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'cache_diagnostics'), 'specific miss diagnostics missing')
+        current = dict(key='b' * 64, native_key='c' * 64,
+                       identity=dict(compiler='ocaml-base-compiler.5.5.0', environment={'CFLAGS': 'private-token-value'},
+                                     workspace='/Users/private-person/project'), observed={})
+        missing = ci.cache_diagnostics(current, None, 'miss', 'no accessible candidate')
+        self.assertFalse(missing['comparison_available'])
+        self.assertEqual(missing['differences'], [])
+        for invalid in ('broken', [], dict(current, observed='broken')):
+            self.assertFalse(ci.cache_diagnostics(current, invalid, 'miss', 'invalid prior record')['comparison_available'])
+        cached = dict(current, key='a' * 64, identity=dict(current['identity'], compiler='ocaml-base-compiler.5.4.0'))
+        result = ci.cache_diagnostics(current, cached, 'miss', 'compatibility key mismatch')
+        self.assertTrue(result['comparison_available'])
+        difference = next(d for d in result['differences'] if d['field'].endswith('compiler'))
+        self.assertEqual(difference['cached'], 'ocaml-base-compiler.5.4.0')
+        self.assertEqual(difference['current'], 'ocaml-base-compiler.5.5.0')
+        rendered = json.dumps(result)
+        self.assertNotIn('private-token-value', rendered)
+        self.assertNotIn('/Users/private-person', rendered)
+        same = ci.cache_diagnostics(current, current, 'miss', 'no archive despite matching input record')
+        self.assertTrue(same['comparison_available'])
+        self.assertEqual(same['differences'], [])
+        self.assertEqual(same['status'], 'miss')
+
+    def test_native_symbol_probe_uses_real_dylib_and_rejects_missing_exports(self):
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'require_native_symbols'), 'native symbol validation missing')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, library = root / 'fixture.c', root / 'libfixture.dylib'
+            source.write_text('int sqlite3_fixture(void) { return 42; }\n')
+            subprocess.run(['xcrun', '--sdk', 'macosx', 'clang', '-dynamiclib', str(source), '-o', str(library)],
+                           check=True, capture_output=True)
+            ci.require_native_symbols(str(library), ['sqlite3_fixture'])
+            with self.assertRaisesRegex(RuntimeError, 'sqlite3_missing'):
+                ci.require_native_symbols(str(library), ['sqlite3_fixture', 'sqlite3_missing'])
+            library.unlink()
+            with self.assertRaises(RuntimeError):
+                ci.require_native_symbols(str(library), ['sqlite3_fixture'])
+
+    def test_native_reinstall_rebuilds_real_reverse_dependents_only(self):
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'rebuild_native_packages'), 'selective native repair missing')
+        with self.pinned_switch() as f:
+            metadata = f.checkout / 'fixture.opam'
+            metadata.write_text(metadata.read_text() + 'build: [["sh" "-c" "echo fixture >> %{prefix}%/fixture-events"]]\n')
+            subprocess.run(['git', '-C', f.checkout, 'add', '.'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', f.checkout, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                            'commit', '-qm', 'fixture build marker'], check=True, capture_output=True)
+            f.build.opam('pin', 'add', '--no-action', 'fixture.dev', str(f.checkout))
+            repo = f.root / 'repository'
+            for name, dependency in [('dependent', 'depends: ["fixture"]'), ('unrelated', '')]:
+                path = repo / f'packages/{name}/{name}.1/opam'
+                path.parent.mkdir(parents=True)
+                path.write_text('opam-version: "2.0"\nsynopsis: "Offline native repair fixture"\n' + dependency +
+                                '\nbuild: [["sh" "-c" "echo ' + name + ' >> %{prefix}%/fixture-events"]]\n')
+            f.build.opam('update')
+            f.build.opam('install', '--assume-depexts', 'dependent', 'unrelated')
+            events = f.build.prefix / 'fixture-events'
+            events.write_text('')
+            repaired = ci.rebuild_native_packages(['fixture', 'not-installed'], f.build.opam)
+            self.assertEqual(repaired, ['fixture'])
+            self.assertEqual(events.read_text().splitlines(), ['fixture', 'dependent'])
+            events.write_text('')
+            self.assertEqual(ci.rebuild_native_packages(['not-installed'], f.build.opam), [])
+            self.assertEqual(events.read_text(), '')
+
+    def test_sqlite_runtime_probe_reuses_installed_binding_read_only(self):
+        import prepare_ci_dependencies as ci
+        self.assertTrue(hasattr(ci, 'probe_sqlite_binding'), 'SQLite native/bytecode runtime probe missing')
+        switch = os.environ.get('JOURNAL_TEST_SWITCH')
+        if not switch:
+            self.skipTest('set JOURNAL_TEST_SWITCH to an already prepared switch; this test never provisions it')
+        prefix = Path(subprocess.check_output(['opam', 'var', '--safe', '--switch', switch, 'prefix'], text=True).strip())
+        stubs = prefix / 'lib/sqlite3/libsqlite3_stubs.a'
+        before = self.build.sha(stubs)
+        result = ci.probe_sqlite_binding(prefix)
+        self.assertEqual(result['status'], 'compatible')
+        self.assertTrue(result['native_version'].startswith('3.'))
+        self.assertEqual(result['native_version'], result['bytecode_version'])
+        self.assertEqual(before, self.build.sha(stubs))
+        with self.assertRaisesRegex(RuntimeError, 'version'):
+            ci.probe_sqlite_binding(prefix, expected_version='4.0.0')
 
     def test_final_verification_rejects_changed_gmp_and_probe_input(self):
         self.assertTrue(hasattr(self.build.Build, 'verify_inputs'), 'final input verification boundary missing')
